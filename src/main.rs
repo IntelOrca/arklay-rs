@@ -1,12 +1,3 @@
-mod bmp;
-mod convert;
-mod engine;
-mod lzw;
-mod pack;
-mod rdt;
-mod state;
-mod tim;
-
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -56,7 +47,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::ConvertGame { root, out }) => convert::convert_game(&root, &out),
+        Some(Command::ConvertGame { root, out }) => arklay::convert::convert_game(&root, &out),
         None => {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
@@ -64,7 +55,7 @@ fn main() -> Result<()> {
             let Some(room) = cli.room else {
                 bail!("--room is required when launching a pack");
             };
-            engine::run(&pack, room, cli.player, cli.capture.as_deref())
+            arklay::engine::run(&pack, room, cli.player, cli.capture.as_deref())
         }
     }
 }
