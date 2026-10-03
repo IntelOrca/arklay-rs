@@ -17,7 +17,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --features sdl3-sys/build-from-source
+      - run: cargo test --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
 
