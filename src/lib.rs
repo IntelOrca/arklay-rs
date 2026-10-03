@@ -13,6 +13,7 @@ pub mod pack;
 pub mod player;
 pub mod rdt;
 pub mod render;
+pub mod scd;
 pub mod state;
 pub mod tim;
 pub mod tmd;

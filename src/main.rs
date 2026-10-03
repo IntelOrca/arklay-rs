@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -41,6 +41,58 @@ enum Command {
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
     },
+
+    /// Script tools
+    Scd {
+        #[command(subcommand)]
+        action: ScdAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ScdAction {
+    /// Export the SCD embedded in an RDT as disassembly or decompilation
+    Export {
+        /// Input RDT file
+        rdt: PathBuf,
+
+        /// Output file: .s for disassembly, .bio for decompilation
+        #[arg(long, short)]
+        out: PathBuf,
+
+        /// Also write a .lst listing next to the output
+        #[arg(long)]
+        list: bool,
+    },
+}
+
+/// Export an RDT's SCD streams to `out` (`.s` disassembly or `.bio`
+/// decompilation), optionally writing a `.lst` listing beside it.
+fn export_scd(rdt: &std::path::Path, out: &std::path::Path, list: bool) -> Result<()> {
+    let data = std::fs::read(rdt).with_context(|| format!("failed to read {}", rdt.display()))?;
+    let scripts = arklay::scd::reader::parse(&data)
+        .with_context(|| format!("failed to parse the SCD in {}", rdt.display()))?;
+
+    let extension = out
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let text = if extension.eq_ignore_ascii_case("bio") {
+        arklay::scd::decomp::render(&scripts, &data)
+    } else if extension.eq_ignore_ascii_case("s") {
+        arklay::scd::disasm::render(&scripts, &data)
+    } else {
+        bail!("output `{}` must end in .s or .bio", out.display());
+    };
+    std::fs::write(out, text).with_context(|| format!("failed to write {}", out.display()))?;
+
+    if list {
+        let listing = arklay::scd::disasm::render_listing(&scripts, &data);
+        let listing_path = out.with_extension("lst");
+        std::fs::write(&listing_path, listing)
+            .with_context(|| format!("failed to write {}", listing_path.display()))?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -48,6 +100,9 @@ fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::ConvertGame { root, out }) => arklay::convert::convert_game(&root, &out),
+        Some(Command::Scd { action }) => match action {
+            ScdAction::Export { rdt, out, list } => export_scd(&rdt, &out, list),
+        },
         None => {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
