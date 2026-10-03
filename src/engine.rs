@@ -13,6 +13,7 @@ use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit};
 use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_ESCAPE, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
+use sdl3_sys::rect::SDL_Rect;
 use sdl3_sys::render::{
     SDL_CreateRenderer, SDL_CreateTexture, SDL_DestroyRenderer, SDL_DestroyTexture,
     SDL_RenderClear, SDL_RenderPresent, SDL_RenderReadPixels, SDL_RenderTexture, SDL_Renderer,
@@ -26,7 +27,9 @@ use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_SetWindowTitle, SDL_Window, SDL_WindowFlags,
 };
 
+use crate::audio::{self, MusicPlayer};
 use crate::bmp;
+use crate::music;
 use crate::pack::Pack;
 use crate::rdt;
 use crate::state::{Image, RoomId};
@@ -36,7 +39,6 @@ const HEIGHT: i32 = 240;
 const SCALE: i32 = 3;
 const WINDOW_WIDTH: i32 = WIDTH * SCALE;
 const WINDOW_HEIGHT: i32 = HEIGHT * SCALE;
-const PIXEL_PITCH: i32 = WIDTH * 4;
 
 struct SdlHandle;
 
@@ -93,6 +95,11 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
             .with_context(|| format!("missing background for cut {}", cut.index))?;
         cut.background = Some(bmp::decode(bytes).with_context(|| format!("invalid {path}"))?);
     }
+
+    // Room music: for now the engine plays the room's primary track from the
+    // hardcoded table. The SCD will start/stop/pan/volume tracks later and the
+    // table itself should move to a game init script in the pack.
+    let music_wav = load_room_music(&pack, id);
 
     if capture.is_some() {
         unsafe {
@@ -163,6 +170,8 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         return Ok(());
     }
 
+    let mut music = start_music(music_wav);
+
     let mut event = SDL_Event::default();
     loop {
         while unsafe { SDL_PollEvent(&mut event) } {
@@ -202,6 +211,9 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
             .as_ref()
             .context("current cut has no background")?;
         draw(renderer, texture, image)?;
+        if let Some(player) = &mut music {
+            player.update();
+        }
         if !unsafe { SDL_RenderPresent(renderer) } {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
         }
@@ -219,24 +231,77 @@ fn window_title(room: &str, cut: usize, count: usize) -> Result<CString> {
         .context("window title contains a NUL byte")
 }
 
+/// Load the room's primary music track from the pack, if the table names one.
+fn load_room_music(pack: &Pack, id: RoomId) -> Option<audio::Wav> {
+    let (name, _looping) = music::primary_track(id)?;
+    let path = music::pack_path(name)?;
+    match pack.read(&path) {
+        Ok(bytes) => match audio::parse_wav(bytes) {
+            Ok(wav) => Some(wav),
+            Err(err) => {
+                eprintln!("warning: invalid music track {path}: {err:#}");
+                None
+            }
+        },
+        Err(err) => {
+            eprintln!("warning: missing music track {path}: {err:#}");
+            None
+        }
+    }
+}
+
+/// Open the audio device and start looping `wav`, if one was loaded.
+///
+/// Audio is best-effort: a missing device or an SDL failure logs a warning and
+/// the engine keeps running silently.
+fn start_music(wav: Option<audio::Wav>) -> Option<MusicPlayer> {
+    let wav = wav?;
+    let mut player = match MusicPlayer::open() {
+        Some(player) => player,
+        None => {
+            eprintln!("warning: no audio device; continuing without music");
+            return None;
+        }
+    };
+    if let Err(err) = player.play(wav) {
+        eprintln!("warning: failed to start music: {err:#}");
+        return None;
+    }
+    Some(player)
+}
+
 fn draw(renderer: *mut SDL_Renderer, texture: *mut SDL_Texture, image: &Image) -> Result<()> {
-    if image.width != WIDTH as u32
-        || image.height != HEIGHT as u32
-        || image.rgba.len() != (WIDTH * HEIGHT * 4) as usize
+    if image.width == 0
+        || image.height == 0
+        || image.width > WIDTH as u32
+        || image.height > HEIGHT as u32
     {
         bail!(
-            "expected a {WIDTH}x{HEIGHT} background, got {}x{} with {} bytes",
+            "expected a background up to {WIDTH}x{HEIGHT}, got {}x{}",
+            image.width,
+            image.height
+        );
+    }
+    if image.rgba.len() != (image.width * image.height * 4) as usize {
+        bail!(
+            "background is {}x{} but has {} bytes",
             image.width,
             image.height,
             image.rgba.len()
         );
     }
+    let rect = SDL_Rect {
+        x: 0,
+        y: 0,
+        w: image.width as i32,
+        h: image.height as i32,
+    };
     if !unsafe {
         SDL_UpdateTexture(
             texture,
-            std::ptr::null(),
+            &rect,
             image.rgba.as_ptr().cast::<c_void>(),
-            PIXEL_PITCH,
+            (image.width * 4) as i32,
         )
     } {
         bail!("SDL_UpdateTexture failed: {}", sdl_error());
@@ -364,5 +429,20 @@ mod tests {
         assert_eq!(decoded.width, WIDTH as u32);
         assert_eq!(decoded.height, HEIGHT as u32);
         assert_eq!(decoded.rgba, image.rgba);
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn loads_save_room_music_from_real_pack() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let wav = load_room_music(&pack, RoomId::parse("1001").unwrap())
+            .expect("room 1001 should have a primary music track");
+        assert_eq!(wav.sample_rate, 22050);
+        assert_eq!(wav.channels, 1);
+        assert!(matches!(wav.format, audio::WavFormat::U8));
+        assert!(!wav.data.is_empty());
     }
 }

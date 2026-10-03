@@ -1,32 +1,25 @@
-//! `convert-game`: migrate a game installation into an `.akpak` pack.
+//! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
-//! M0 converts only room 1000 of RE1: the RDT plus every camera background
-//! (`RC100<cam>.pak` -> `/roomcut/100_<cam:03>.bmp`).
+//! Discovers `STAGE1`..`STAGE7` (case-insensitively, up to two levels below
+//! the root), stores every `ROOM####.RDT`, converts the camera backgrounds of
+//! every distinct room once, and copies the `BGM_*.WAV` music files. Stages 6
+//! and 7 reuse the backgrounds of STAGE1/STAGE2 with the stage digit reduced
+//! by 5.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
+use crate::music;
 use crate::pack::PackWriter;
 use crate::state::RoomId;
 use crate::{bmp, lzw, rdt, tim};
 
-/// How many directory levels below the root are searched for `stage1`.
-const MAX_STAGE_DEPTH: usize = 2;
-
-/// Three-digit room number converted by M0.
-const ROOM: u32 = 100;
-
-/// RDT file name within the stage directory.
-const RDT_FILE: &str = "room1000.rdt";
-
-/// Pack path of the raw RDT.
-const RDT_ENTRY: &str = "room/1000.rdt";
-
-/// Pack path prefix of the camera backgrounds.
-const ROOMCUT_PREFIX: &str = "roomcut/";
+/// How many directory levels below the root are searched for the stage and
+/// `sound` directories.
+const MAX_DEPTH: usize = 2;
 
 /// Expected camera background width.
 const CUT_WIDTH: u32 = 320;
@@ -36,80 +29,130 @@ const CUT_HEIGHT: u32 = 240;
 /// Byte offset of the bit depth field in a BMP header.
 const BMP_BPP_OFFSET: usize = 28;
 
-/// One printed summary row.
-struct Row {
-    pack_path: String,
-    source: String,
-    dimensions: String,
-    bpp: String,
-}
-
-/// Convert `root`'s room 1000 into the `.akpak` pack `out`.
+/// Convert the game installation under `root` into the `.akpak` pack `out`.
 pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
-    let stage = find_stage1(root)?;
-    let rdt_path = find_file(&stage, RDT_FILE)?;
-    let rdt_bytes =
-        fs::read(&rdt_path).with_context(|| format!("failed to read {}", rdt_path.display()))?;
-    let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player("100", 0).unwrap())
-        .with_context(|| format!("failed to parse {}", rdt_path.display()))?;
+    let Plan { rooms, sound } = build_plan(root)?;
 
-    let paks = find_camera_paks(&stage, room.cuts.len())?;
     let mut writer = PackWriter::new();
-    let mut rows = Vec::with_capacity(room.cuts.len() + 1);
+    let mut stage_counts = [(0usize, 0usize); RoomId::MAX_STAGE as usize];
+    let mut rdt_count = 0usize;
+    let mut rdt_bytes = 0usize;
+    let mut cut_count = 0usize;
+    let mut cut_bytes = 0usize;
 
-    rows.push(Row {
-        pack_path: RDT_ENTRY.to_owned(),
-        source: file_name(&rdt_path),
-        dimensions: "-".to_owned(),
-        bpp: "-".to_owned(),
-    });
-    writer.add(RDT_ENTRY, rdt_bytes)?;
-
-    for (camera, pak) in paks.iter().enumerate() {
-        let source = file_name(pak);
-        let compressed = fs::read(pak).with_context(|| format!("failed to read {source}"))?;
-        let decoded =
-            lzw::decode(&compressed).with_context(|| format!("failed to LZW-decode {source}"))?;
-        let image =
-            tim::decode(&decoded).with_context(|| format!("failed to decode {source} as TIM"))?;
-        if image.width != CUT_WIDTH || image.height != CUT_HEIGHT {
-            bail!(
-                "{source}: expected {CUT_WIDTH}x{CUT_HEIGHT}, got {}x{}",
-                image.width,
-                image.height
-            );
+    for room in rooms {
+        for rdt in room.rdts {
+            let entry = rdt.id.rdt_entry();
+            rdt_bytes += rdt.bytes.len();
+            rdt_count += 1;
+            stage_counts[rdt.id.stage_index() as usize].0 += 1;
+            writer
+                .add(&entry, rdt.bytes)
+                .with_context(|| format!("failed to add {entry}"))?;
         }
 
-        let bmp_bytes = bmp::encode_to_vec(&image)
-            .with_context(|| format!("failed to encode {source} as BMP"))?;
-        let bpp = bmp_bpp(&bmp_bytes)?;
-        let entry = format!("{ROOMCUT_PREFIX}{ROOM}_{camera:03}.bmp");
-        writer.add(&entry, bmp_bytes)?;
-        rows.push(Row {
-            pack_path: entry,
-            source,
-            dimensions: format!("{}x{}", image.width, image.height),
-            bpp: bpp.to_string(),
-        });
+        for (camera, pak) in room.paks.iter().enumerate() {
+            let bmp_bytes = convert_camera(pak)?;
+            let entry = room.id.cut_entry(camera);
+            cut_bytes += bmp_bytes.len();
+            cut_count += 1;
+            stage_counts[room.id.stage_index() as usize].1 += 1;
+            writer
+                .add(&entry, bmp_bytes)
+                .with_context(|| format!("failed to add {entry}"))?;
+        }
     }
 
+    let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer)?;
+
+    for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
+        println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
+    }
+    println!("room: {rdt_count} entries, {rdt_bytes} bytes");
+    println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
+    println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
     writer.write(out)?;
-    print_summary(&rows, out);
+    println!("wrote {}", out.display());
     Ok(())
 }
 
-/// Breadth-first, case-insensitive search for a `stage1` directory.
-fn find_stage1(root: &Path) -> Result<PathBuf> {
+/// Decode one `RC*.pak` camera background into BMP bytes.
+fn convert_camera(pak: &Path) -> Result<Vec<u8>> {
+    let source = file_name(pak);
+    let compressed = fs::read(pak).with_context(|| format!("failed to read {}", pak.display()))?;
+    let decoded =
+        lzw::decode(&compressed).with_context(|| format!("failed to LZW-decode {source}"))?;
+    let image =
+        tim::decode(&decoded).with_context(|| format!("failed to decode {source} as TIM"))?;
+    // The retail data contains one 316x236 background (the screen-border
+    // variant), so any non-empty image up to the 320x240 frame is accepted.
+    if image.width == 0 || image.height == 0 || image.width > CUT_WIDTH || image.height > CUT_HEIGHT
+    {
+        bail!(
+            "{source}: background {}x{} does not fit in {CUT_WIDTH}x{CUT_HEIGHT}",
+            image.width,
+            image.height
+        );
+    }
+
+    let bmp_bytes =
+        bmp::encode_to_vec(&image).with_context(|| format!("failed to encode {source} as BMP"))?;
+    let bpp = bmp_bpp(&bmp_bytes)?;
+    if bpp != 8 && bpp != 24 {
+        bail!("{source}: encoded BMP has unsupported bit depth {bpp}");
+    }
+    Ok(bmp_bytes)
+}
+
+/// Add every `BGM_*.WAV` in the sound directory; returns entry count and bytes.
+fn copy_music(sound: &Option<PathBuf>, writer: &mut PackWriter) -> Result<(usize, usize)> {
+    let Some(sound) = sound else {
+        return Ok((0, 0));
+    };
+
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for entry in read_dir_sorted(sound)? {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(path) = music::pack_path(name) else {
+            continue;
+        };
+        let data = fs::read(entry.path())
+            .with_context(|| format!("failed to read {}", entry.path().display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&path, data)
+            .with_context(|| format!("failed to add {path}"))?;
+    }
+    Ok((count, bytes))
+}
+
+/// Stage and sound directories discovered under the conversion root.
+#[derive(Debug)]
+struct Layout {
+    stages: BTreeMap<u8, PathBuf>,
+    sound: Option<PathBuf>,
+}
+
+/// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7` and `sound`.
+fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
+    let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
+    let mut sound = None;
+
     while let Some((dir, depth)) = queue.pop_front() {
-        if dir.is_dir()
-            && dir
-                .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("stage1"))
-        {
-            return Ok(dir);
+        if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
+            if let Some(digit) = stage_dir_digit(name) {
+                stages.entry(digit).or_insert_with(|| dir.clone());
+            } else if sound.is_none() && name.eq_ignore_ascii_case("sound") {
+                sound = Some(dir.clone());
+            }
         }
-        if depth == MAX_STAGE_DEPTH {
+        if depth >= MAX_DEPTH {
             continue;
         }
         for entry in read_dir_sorted(&dir)? {
@@ -118,68 +161,164 @@ fn find_stage1(root: &Path) -> Result<PathBuf> {
             }
         }
     }
-    bail!(
-        "no `stage1` directory within {MAX_STAGE_DEPTH} levels of {}",
-        root.display()
-    )
-}
 
-/// Case-insensitive lookup of one file directly inside `dir`.
-fn find_file(dir: &Path, name: &str) -> Result<PathBuf> {
-    for entry in read_dir_sorted(dir)? {
-        if entry.file_name().eq_ignore_ascii_case(name) {
-            return Ok(entry.path());
-        }
-    }
-    bail!("no file named {name} in {}", dir.display())
-}
-
-/// Expected camera background file name, e.g. `RC100A.pak`.
-fn camera_pak_name(camera: usize) -> String {
-    format!("RC{ROOM}{camera:X}.pak")
-}
-
-/// Resolve every camera background, aggregating all missing names.
-fn find_camera_paks(dir: &Path, count: usize) -> Result<Vec<PathBuf>> {
-    let entries = read_dir_sorted(dir)?;
-    let actual: Vec<String> = entries
-        .iter()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    let missing: Vec<String> = (1..=RoomId::MAX_STAGE)
+        .filter(|digit| !stages.contains_key(digit))
+        .map(|digit| format!("STAGE{digit}"))
         .collect();
-    let expected: Vec<String> = (0..count).map(camera_pak_name).collect();
-
-    let missing = missing_names(&expected, &actual);
     if !missing.is_empty() {
         bail!(
-            "missing camera background file(s) in {}: {}",
-            dir.display(),
+            "missing stage director{} within {MAX_DEPTH} levels of {}: {}",
+            if missing.len() == 1 { "y" } else { "ies" },
+            root.display(),
             missing.join(", ")
         );
     }
 
-    expected
-        .iter()
-        .map(|name| {
-            entries
-                .iter()
-                .find(|entry| entry.file_name().eq_ignore_ascii_case(name))
-                .map(|entry| entry.path())
-                .with_context(|| format!("missing camera background {name} in {}", dir.display()))
-        })
-        .collect()
+    Ok(Layout { stages, sound })
 }
 
-/// Names in `expected` without a case-insensitive match in `actual`.
-fn missing_names(expected: &[String], actual: &[String]) -> Vec<String> {
-    expected
+/// `stage1`..`stage7` (case-insensitive) -> `Some(1..=7)`.
+fn stage_dir_digit(name: &str) -> Option<u8> {
+    if name.len() != 6 || !name.get(..5)?.eq_ignore_ascii_case("stage") {
+        return None;
+    }
+    let digit = *name.as_bytes().get(5)?;
+    (b'1'..=b'7').contains(&digit).then_some(digit - b'0')
+}
+
+/// One RDT file and its parsed identity.
+#[derive(Debug)]
+struct Rdt {
+    id: RoomId,
+    bytes: Vec<u8>,
+}
+
+/// One distinct room (`stage` + `room`, player variants merged).
+#[derive(Debug)]
+struct Room {
+    /// Player-variant-independent identity used for entry names.
+    id: RoomId,
+    /// Every RDT found for the room, one per player variant.
+    rdts: Vec<Rdt>,
+    /// Highest camera count across the variants.
+    cameras: usize,
+    /// Resolved background paks for cameras `0..cameras`.
+    paks: Vec<PathBuf>,
+}
+
+/// Everything conversion needs, resolved and validated before any decoding.
+#[derive(Debug)]
+struct Plan {
+    rooms: Vec<Room>,
+    sound: Option<PathBuf>,
+}
+
+/// Discover, enumerate, and validate every conversion input.
+fn build_plan(root: &Path) -> Result<Plan> {
+    let Layout { stages, sound } = discover_layout(root)?;
+    let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
+
+    for (digit, dir) in &stages {
+        for entry in read_dir_sorted(dir)? {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(parsed) = rdt_id_from_file_name(name) else {
+                continue;
+            };
+            let id =
+                parsed.with_context(|| format!("invalid RDT file name in {}", dir.display()))?;
+            if id.stage != *digit {
+                bail!(
+                    "RDT `{name}` in {} has stage digit {}, expected {digit}",
+                    dir.display(),
+                    id.stage
+                );
+            }
+
+            let path = entry.path();
+            let bytes =
+                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+            let state = rdt::parse(&bytes, id)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+
+            let room = rooms.entry((id.stage, id.room)).or_insert_with(|| Room {
+                id,
+                rdts: Vec::new(),
+                cameras: 0,
+                paks: Vec::new(),
+            });
+            room.cameras = room.cameras.max(state.cuts.len());
+            room.rdts.push(Rdt { id, bytes });
+        }
+    }
+
+    let indices: BTreeMap<u8, HashMap<String, PathBuf>> = stages
         .iter()
-        .filter(|name| {
-            !actual
-                .iter()
-                .any(|candidate| candidate.eq_ignore_ascii_case(name))
-        })
-        .cloned()
-        .collect()
+        .map(|(digit, dir)| Ok((*digit, index_dir(dir)?)))
+        .collect::<Result<_>>()?;
+
+    let mut missing = Vec::new();
+    for room in rooms.values_mut() {
+        let fold = room.id.fold_stage_digit();
+        let dir = &stages[&fold];
+        let index = &indices[&fold];
+        for camera in 0..room.cameras {
+            let name = camera_pak_name(room.id, camera);
+            match index.get(&name.to_ascii_lowercase()) {
+                Some(path) => room.paks.push(path.clone()),
+                None => missing.push(format!("{name} in {}", dir.display())),
+            }
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "missing {} camera background file(s): {}",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+
+    Ok(Plan {
+        rooms: rooms.into_values().collect(),
+        sound,
+    })
+}
+
+/// Parse `ROOM####.RDT` (case-insensitive) into its identity.
+///
+/// Returns `None` when the name is not an RDT name at all and an error when it
+/// looks like one but its hex digits are invalid.
+fn rdt_id_from_file_name(name: &str) -> Option<Result<RoomId>> {
+    let lower = name.to_ascii_lowercase();
+    let digits = lower.strip_prefix("room")?.strip_suffix(".rdt")?;
+    if digits.len() != 4 {
+        return Some(Err(anyhow!(
+            "RDT file name `{name}` must be `ROOM` plus four hex digits plus `.RDT`"
+        )));
+    }
+    Some(RoomId::parse(digits).map_err(|err| anyhow!("RDT file name `{name}`: {err}")))
+}
+
+/// Camera background file name for room `id`, e.g. `RC100A.pak`.
+///
+/// Stages 6 and 7 use the STAGE1/STAGE2 directory and file-name digit.
+fn camera_pak_name(id: RoomId, camera: usize) -> String {
+    format!("RC{}{:02X}{camera:X}.pak", id.fold_stage_digit(), id.room)
+}
+
+/// Case-insensitive index of the file names directly inside `dir`.
+fn index_dir(dir: &Path) -> Result<HashMap<String, PathBuf>> {
+    let mut index = HashMap::new();
+    for entry in read_dir_sorted(dir)? {
+        index.insert(
+            entry.file_name().to_string_lossy().to_ascii_lowercase(),
+            entry.path(),
+        );
+    }
+    Ok(index)
 }
 
 /// Read a directory and sort its entries by file name.
@@ -207,43 +346,12 @@ fn bmp_bpp(data: &[u8]) -> Result<u16> {
     Ok(u16::from_le_bytes([raw[0], raw[1]]))
 }
 
-/// Print the conversion table and the output path.
-fn print_summary(rows: &[Row], out: &Path) {
-    let pack_width = rows
-        .iter()
-        .map(|row| row.pack_path.len())
-        .chain([4])
-        .max()
-        .unwrap();
-    let source_width = rows
-        .iter()
-        .map(|row| row.source.len())
-        .chain([6])
-        .max()
-        .unwrap();
-    let dim_width = rows
-        .iter()
-        .map(|row| row.dimensions.len())
-        .chain([10])
-        .max()
-        .unwrap();
-
-    println!(
-        "{:<pack_width$}  {:<source_width$}  {:<dim_width$}  bpp",
-        "pack", "source", "dimensions"
-    );
-    for row in rows {
-        println!(
-            "{:<pack_width$}  {:<source_width$}  {:<dim_width$}  {}",
-            row.pack_path, row.source, row.dimensions, row.bpp
-        );
-    }
-    println!("wrote {}", out.display());
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RDT_HEADER_LEN: usize = 0x94;
+    const RDT_CAMERA_LEN: usize = 44;
 
     /// Self-deleting temporary directory unique to this process and label.
     struct TempDir {
@@ -266,115 +374,280 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discovers_stage1_at_root_and_depths() {
-        let root = TempDir::new("discover-root");
-        let stage = root.path.join("sTaGe1");
-        fs::create_dir_all(&stage).unwrap();
-        assert_eq!(find_stage1(&stage).unwrap(), stage);
+    fn make_stage_dirs(root: &Path) {
+        for digit in 1..=RoomId::MAX_STAGE {
+            fs::create_dir_all(root.join(format!("STAGE{digit}"))).unwrap();
+        }
+    }
 
-        let depth1 = TempDir::new("discover-depth1");
-        fs::create_dir_all(depth1.path.join("STAGE1")).unwrap();
-        assert_eq!(
-            find_stage1(&depth1.path).unwrap(),
-            depth1.path.join("STAGE1")
-        );
+    /// A minimal RDT with `cameras` zeroed camera records.
+    fn rdt_bytes(cameras: u8) -> Vec<u8> {
+        let mut data = vec![0u8; RDT_HEADER_LEN + RDT_CAMERA_LEN * usize::from(cameras)];
+        data[0x01] = cameras;
+        data
+    }
 
-        let depth2 = TempDir::new("discover-depth2");
-        fs::create_dir_all(depth2.path.join("a/StAgE1")).unwrap();
-        assert_eq!(
-            find_stage1(&depth2.path).unwrap(),
-            depth2.path.join("a/StAgE1")
-        );
+    fn write_code(out: &mut Vec<u8>, acc: &mut u32, bits: &mut u32, code: u16, width: u8) {
+        *acc = (*acc << width) | u32::from(code);
+        *bits += u32::from(width);
+        while *bits >= 8 {
+            *bits -= 8;
+            out.push(((*acc >> *bits) & 0xFF) as u8);
+        }
+        *acc &= (1 << *bits) - 1;
+    }
 
-        let shallow = TempDir::new("discover-shallow");
-        fs::create_dir_all(shallow.path.join("stage1")).unwrap();
-        fs::create_dir_all(shallow.path.join("aaa/STAGE1")).unwrap();
-        assert_eq!(
-            find_stage1(&shallow.path).unwrap(),
-            shallow.path.join("stage1")
-        );
+    /// LZW-encode `data` as 9-bit literals with periodic dictionary resets,
+    /// followed by the end code.
+    fn lzw_literals(data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        let mut since_reset = 0usize;
+        for &byte in data {
+            if since_reset >= 30_000 {
+                write_code(&mut out, &mut acc, &mut bits, 0x102, 9);
+                since_reset = 0;
+            }
+            write_code(&mut out, &mut acc, &mut bits, u16::from(byte), 9);
+            since_reset += 1;
+        }
+        write_code(&mut out, &mut acc, &mut bits, 0x100, 9);
+        if bits > 0 {
+            out.push((acc << (8 - bits)) as u8);
+        }
+        out
+    }
+
+    /// A valid 16bpp TIM of the given size wrapped in a real LZW stream.
+    fn camera_pak_at(width: u16, height: u16) -> Vec<u8> {
+        let mut tim = Vec::new();
+        tim.extend_from_slice(&0x10u32.to_le_bytes());
+        tim.extend_from_slice(&2u32.to_le_bytes());
+        tim.extend_from_slice(&0u32.to_le_bytes());
+        tim.extend_from_slice(&0i16.to_le_bytes());
+        tim.extend_from_slice(&0i16.to_le_bytes());
+        tim.extend_from_slice(&width.to_le_bytes());
+        tim.extend_from_slice(&height.to_le_bytes());
+        for _ in 0..usize::from(width) * usize::from(height) {
+            tim.extend_from_slice(&0x7FFFu16.to_le_bytes());
+        }
+        lzw_literals(&tim)
+    }
+
+    /// A valid 320x240 16bpp TIM wrapped in a real LZW stream.
+    fn camera_pak() -> Vec<u8> {
+        camera_pak_at(320, 240)
     }
 
     #[test]
-    fn errors_when_stage1_is_missing() {
-        let temp = TempDir::new("missing-stage1");
-        fs::create_dir_all(temp.path.join("a/b/stage1")).unwrap();
+    fn discovers_stages_case_insensitively_and_breadth_first() {
+        let root = TempDir::new("discover");
+        for digit in 1..=RoomId::MAX_STAGE {
+            fs::create_dir_all(root.path.join(format!("install/sTaGe{digit}"))).unwrap();
+        }
+        fs::create_dir_all(root.path.join("STAGE1")).unwrap();
+        fs::create_dir_all(root.path.join("install/sound")).unwrap();
 
-        let message = find_stage1(&temp.path).unwrap_err().to_string();
+        let layout = discover_layout(&root.path).unwrap();
 
-        assert!(message.contains("stage1"), "{message}");
+        assert_eq!(layout.stages[&1], root.path.join("STAGE1"));
+        assert_eq!(layout.stages[&2], root.path.join("install/sTaGe2"));
+        assert_eq!(layout.stages[&7], root.path.join("install/sTaGe7"));
+        assert_eq!(layout.sound.unwrap(), root.path.join("install/sound"));
+    }
+
+    #[test]
+    fn missing_stages_are_reported_together() {
+        let root = TempDir::new("missing-stages");
+        fs::create_dir_all(root.path.join("JPN/STAGE1")).unwrap();
+
+        let message = discover_layout(&root.path).unwrap_err().to_string();
+
+        for digit in 2..=7 {
+            assert!(message.contains(&format!("STAGE{digit}")), "{message}");
+        }
+        assert!(!message.contains("STAGE1"), "{message}");
         assert!(
-            message.contains(&temp.path.display().to_string()),
+            message.contains(&root.path.display().to_string()),
             "{message}"
         );
     }
 
     #[test]
-    fn finds_rdt_case_insensitively() {
-        let temp = TempDir::new("rdt-case");
-        let rdt = temp.path.join("Room1000.RDT");
-        fs::write(&rdt, b"rdt").unwrap();
+    fn parses_rdt_ids_from_file_names() {
+        let id = rdt_id_from_file_name("ROOM1001.RDT").unwrap().unwrap();
+        assert_eq!(id, RoomId::parse("1001").unwrap());
 
-        assert_eq!(find_file(&temp.path, RDT_FILE).unwrap(), rdt);
+        let id = rdt_id_from_file_name("room11C0.rdt").unwrap().unwrap();
+        assert_eq!(id.room3(), "11C");
+        assert_eq!(id.player_flag, 0);
+
+        assert!(rdt_id_from_file_name("background.bin").is_none());
+        assert!(rdt_id_from_file_name("room.txt").is_none());
+        assert!(rdt_id_from_file_name("room.rdt").unwrap().is_err());
+        assert!(rdt_id_from_file_name("ROOM10001.RDT").unwrap().is_err());
+        assert!(rdt_id_from_file_name("ROOM100Z.RDT").unwrap().is_err());
     }
 
     #[test]
-    fn errors_when_rdt_is_missing() {
-        let temp = TempDir::new("missing-rdt");
-
-        let message = find_file(&temp.path, RDT_FILE).unwrap_err().to_string();
-
-        assert!(message.contains(RDT_FILE), "{message}");
-        assert!(
-            message.contains(&temp.path.display().to_string()),
-            "{message}"
+    fn camera_pak_names_fold_return_stages() {
+        assert_eq!(
+            camera_pak_name(RoomId::parse("1001").unwrap(), 0xA),
+            "RC100A.pak"
+        );
+        assert_eq!(
+            camera_pak_name(RoomId::parse("6100").unwrap(), 3),
+            "RC1103.pak"
+        );
+        assert_eq!(
+            camera_pak_name(RoomId::parse("71C1").unwrap(), 0),
+            "RC21C0.pak"
         );
     }
 
     #[test]
-    fn missing_names_reports_every_expected_file() {
-        let expected = [
-            "RC1000.pak".to_owned(),
-            "RC1001.pak".to_owned(),
-            "RC1002.pak".to_owned(),
-        ];
-        let actual = ["rc1002.PAK".to_owned(), "other.bin".to_owned()];
+    fn enumerates_rdt_files_case_insensitively() {
+        let root = TempDir::new("rdt-case");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/RoOm1000.RdT"), rdt_bytes(0)).unwrap();
 
-        let missing = missing_names(&expected, &actual);
+        let plan = build_plan(&root.path).unwrap();
 
-        assert_eq!(missing, ["RC1000.pak", "RC1001.pak"]);
+        assert_eq!(plan.rooms.len(), 1);
+        assert_eq!(plan.rooms[0].id, RoomId::parse("1000").unwrap());
     }
 
     #[test]
-    fn missing_camera_paks_aggregate_in_one_error() {
-        let temp = TempDir::new("missing-paks");
-        fs::write(temp.path.join("rc1000.PAK"), b"x").unwrap();
-        fs::write(temp.path.join("RC1002.pak"), b"x").unwrap();
+    fn rdt_stage_digit_must_match_its_directory() {
+        let root = TempDir::new("stage-mismatch");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE2/ROOM1000.RDT"), rdt_bytes(0)).unwrap();
 
-        let message = find_camera_paks(&temp.path, 4).unwrap_err().to_string();
+        let message = build_plan(&root.path).unwrap_err().to_string();
+
+        assert!(message.contains("ROOM1000.RDT"), "{message}");
+        assert!(message.contains("expected 2"), "{message}");
+    }
+
+    #[test]
+    fn stub_rdts_need_no_paks() {
+        let root = TempDir::new("stub");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert_eq!(plan.rooms.len(), 1);
+        assert_eq!(plan.rooms[0].cameras, 0);
+        assert!(plan.rooms[0].paks.is_empty());
+        assert_eq!(plan.rooms[0].rdts[0].bytes.len(), 4);
+    }
+
+    #[test]
+    fn plan_merges_player_variants_and_unions_cameras() {
+        let root = TempDir::new("variants");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/ROOM1001.RDT"), rdt_bytes(3)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), b"0").unwrap();
+        fs::write(root.path.join("STAGE1/RC1001.pak"), b"1").unwrap();
+        fs::write(root.path.join("STAGE1/RC1002.pak"), b"2").unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert_eq!(plan.rooms.len(), 1);
+        let room = &plan.rooms[0];
+        assert_eq!(room.id, RoomId::parse("1000").unwrap());
+        assert_eq!(room.rdts.len(), 2);
+        assert_eq!(room.cameras, 3);
+        assert_eq!(room.paks.len(), 3);
+    }
+
+    #[test]
+    fn missing_paks_require_the_union_of_variants() {
+        let root = TempDir::new("union-missing");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/ROOM1001.RDT"), rdt_bytes(3)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), b"0").unwrap();
+        fs::write(root.path.join("STAGE1/RC1001.pak"), b"1").unwrap();
+
+        let message = build_plan(&root.path).unwrap_err().to_string();
+
+        assert!(message.contains("RC1002.pak"), "{message}");
+        assert!(!message.contains("RC1001.pak"), "{message}");
+    }
+
+    #[test]
+    fn converts_synthetic_game_and_dedupes_variants() {
+        let root = TempDir::new("synthetic-full");
+        make_stage_dirs(&root.path);
+        let pak = camera_pak();
+
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/room1001.rdt"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), &pak).unwrap();
+        fs::write(root.path.join("STAGE6/ROOM6000.RDT"), rdt_bytes(1)).unwrap();
+
+        fs::create_dir_all(root.path.join("sound")).unwrap();
+        fs::write(root.path.join("sound/BGM_13.WAV"), b"wav13").unwrap();
+        fs::write(root.path.join("sound/bgm_24a.wav"), b"wav24a").unwrap();
+        fs::write(root.path.join("sound/BGM_02.WAV"), b"wav02").unwrap();
+        fs::write(root.path.join("sound/not_bgm.wav"), b"other").unwrap();
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+
+        assert!(pack.contains("room/1000.rdt"));
+        assert!(pack.contains("room/1001.rdt"));
+        assert!(pack.contains("room/6000.rdt"));
+        assert!(pack.contains("roomcut/100_000.bmp"));
+        assert!(pack.contains("roomcut/600_000.bmp"));
+        assert!(pack.contains("bgm/013.wav"));
+        assert!(pack.contains("bgm/024_00.wav"));
+        assert!(pack.contains("bgm/002.wav"));
+        assert!(!pack.contains("bgm/000.wav"));
+
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("room/"), 3);
+        assert_eq!(count("roomcut/"), 2);
+        assert_eq!(count("bgm/"), 3);
+
+        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    fn accepts_a_316x236_background() {
+        let root = TempDir::new("small-cut");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE3/ROOM3000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE3/RC3000.pak"), camera_pak_at(316, 236)).unwrap();
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        let image = bmp::decode(pack.read("roomcut/300_000.bmp").unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (316, 236));
+    }
+
+    #[test]
+    fn missing_paks_are_aggregated_and_no_pack_is_written() {
+        let root = TempDir::new("missing-paks");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(2)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), b"0").unwrap();
+        fs::write(root.path.join("STAGE2/ROOM2000.RDT"), rdt_bytes(1)).unwrap();
+
+        let out = root.path.join("out.akpak");
+        let message = convert_game(&root.path, &out).unwrap_err().to_string();
 
         assert!(message.contains("RC1001.pak"), "{message}");
-        assert!(message.contains("RC1003.pak"), "{message}");
-        assert!(!message.contains("RC1000.pak"), "{message}");
-        assert!(!message.contains("RC1002.pak"), "{message}");
-        assert!(
-            message.contains(&temp.path.display().to_string()),
-            "{message}"
-        );
-    }
-
-    #[test]
-    fn finds_camera_paks_in_camera_order() {
-        let temp = TempDir::new("pak-order");
-        fs::write(temp.path.join("rc1001.PAK"), b"second").unwrap();
-        fs::write(temp.path.join("RC1000.pak"), b"first").unwrap();
-
-        let paks = find_camera_paks(&temp.path, 2).unwrap();
-
-        assert_eq!(paks.len(), 2);
-        assert_eq!(fs::read(&paks[0]).unwrap(), b"first");
-        assert_eq!(fs::read(&paks[1]).unwrap(), b"second");
+        assert!(message.contains("RC2000.pak"), "{message}");
+        assert!(!out.exists(), "a failed conversion must not write a pack");
     }
 
     #[test]
@@ -394,27 +667,24 @@ mod tests {
             return;
         };
         let root = PathBuf::from(root);
-        let stage = find_stage1(&root).unwrap();
-        let rdt_path = find_file(&stage, RDT_FILE).unwrap();
-        let rdt_bytes = fs::read(&rdt_path).unwrap();
-        let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player("100", 0).unwrap()).unwrap();
-
         let temp = TempDir::new("real-install");
         let out = temp.path.join("re1.akpak");
+
         convert_game(&root, &out).unwrap();
 
         let pack = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(pack.len(), 1 + room.cuts.len());
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("room/"), 348);
+        // One cut set per distinct room; stages 6/7 reuse the stage 1/2 pak
+        // files (620 distinct paks) but still name their cuts with their own
+        // room id, e.g. roomcut/600_000.bmp.
+        assert_eq!(count("roomcut/"), 842);
+        assert_eq!(count("bgm/"), 61);
+        assert!(pack.contains("room/1001.rdt"));
+        assert!(pack.contains("roomcut/100_000.bmp"));
+        assert!(pack.contains("bgm/013.wav"));
 
-        let mut cuts = 0;
-        for path in pack.paths() {
-            if path.starts_with(ROOMCUT_PREFIX) {
-                let image = bmp::decode(pack.read(path).unwrap()).unwrap();
-                assert_eq!(image.width, CUT_WIDTH);
-                assert_eq!(image.height, CUT_HEIGHT);
-                cuts += 1;
-            }
-        }
-        assert_eq!(cuts, room.cuts.len());
+        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
     }
 }
