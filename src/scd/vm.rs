@@ -136,7 +136,12 @@ struct EventSlot {
     state: u8,
     active: bool,
     pc: usize,
+    /// Entity type selected by `evt_work_set` (0 player, 1 enemy, 2 omodel,
+    /// 3 item model).
     entity: u8,
+    /// Entity index selected by `evt_work_set`; the game state turns the
+    /// `(entity, entity_index)` pair into an entity slot.
+    entity_index: u8,
     return_stack: [usize; EVENT_STACK_SIZE],
     call_stack: [usize; EVENT_STACK_SIZE],
     counter_stack: [i16; EVENT_STACK_SIZE],
@@ -153,6 +158,7 @@ impl Default for EventSlot {
             active: false,
             pc: 0,
             entity: 0,
+            entity_index: 0,
             return_stack: [0; EVENT_STACK_SIZE],
             call_stack: [0; EVENT_STACK_SIZE],
             counter_stack: [0; EVENT_STACK_SIZE],
@@ -246,13 +252,14 @@ impl<'a> EventVm<'a> {
         if slot >= SLOT_COUNT {
             return;
         }
-        let entity = if keep_entity {
-            self.slots[slot].entity
+        let (entity, entity_index) = if keep_entity {
+            (self.slots[slot].entity, self.slots[slot].entity_index)
         } else {
-            0
+            (0, 0)
         };
         let mut state = EventSlot {
             entity,
+            entity_index,
             ..EventSlot::default()
         };
         if let Some(stream) = self.scripts.events.get(event as usize)
@@ -398,13 +405,23 @@ impl<'a> EventVm<'a> {
                 self.slots[index].pc = next;
                 true
             }
-            0x02 | 0x03 => {
+            0x02 => {
+                // `evt_tween_begin` resets the selected entity as it enters the
+                // tween state; the host records the reset.
+                host.on_misc(op, &insn.operands);
+                self.slots[index].state = 2;
+                self.slots[index].pc = next;
+                true
+            }
+            0x03 => {
                 self.slots[index].state = 2;
                 self.slots[index].pc = next;
                 true
             }
             0x04 => {
                 self.slots[index].entity = operand_u8(insn, 0);
+                self.slots[index].entity_index = operand_u8(insn, 1);
+                host.on_misc(op, &insn.operands);
                 self.slots[index].pc = next;
                 true
             }
@@ -441,6 +458,12 @@ impl<'a> EventVm<'a> {
         }
     }
 
+    /// One actor-state step.
+    ///
+    /// The host can hold the slot on the same instruction (`Yield`) while a
+    /// multi-tick motion integrates, and can report the motion done
+    /// (`Finished`), which drops the slot back to state 0. The three opcodes
+    /// that unambiguously leave the actor state do so here.
     fn step_actor(
         &mut self,
         index: usize,
@@ -449,11 +472,24 @@ impl<'a> EventVm<'a> {
         host: &mut impl ScdHost,
     ) -> bool {
         let result = host.on_misc(op, &insn.operands);
-        if matches!(op.op, 0x80 | 0x8B) {
+        let next = insn.offset + insn.bytes.len();
+        if matches!(op.op, 0x80 | 0x86 | 0x8B) {
             self.slots[index].state = 0;
+            self.slots[index].pc = next;
+            return true;
         }
-        self.slots[index].pc = insn.offset + insn.bytes.len();
-        result != StepResult::Yield
+        match result {
+            StepResult::Yield => false,
+            StepResult::Finished => {
+                self.slots[index].state = 0;
+                self.slots[index].pc = next;
+                true
+            }
+            _ => {
+                self.slots[index].pc = next;
+                true
+            }
+        }
     }
 
     fn step_tween(
@@ -1414,6 +1450,45 @@ mod tests {
         let mut host = RecordingHost::default();
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
+        assert_eq!(vm.slots[0].entity, 1);
+        assert_eq!(vm.slots[0].entity_index, 2);
+    }
+
+    #[test]
+    fn event_actor_yield_repeats_the_instruction() {
+        let scripts = event_scripts(vec![vec![
+            event(0x7300, &EVT_ACTOR_BEGIN, 1, Vec::new()),
+            actor(0x7301, &ACT_FLAG_OP, 4, vec![value(0), value(1), value(0)]),
+            event(0x7305, &EVT_FINISH, 1, Vec::new()),
+        ]]);
+        let mut vm = EventVm::new(&scripts);
+        let mut host = RecordingHost::default();
+        host.results.push_back(StepResult::Yield);
+        host.results.push_back(StepResult::Continue);
+        vm.start(0, 0);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        assert_eq!(host.class_names("misc"), vec!["act_flag_op"]);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(host.class_names("misc"), vec!["act_flag_op", "act_flag_op"]);
+    }
+
+    #[test]
+    fn event_actor_finished_returns_to_state_zero() {
+        let scripts = event_scripts(vec![vec![
+            event(0x7400, &EVT_ACTOR_BEGIN, 1, Vec::new()),
+            actor(0x7401, &ACT_FLAG_OP, 4, vec![value(0), value(1), value(0)]),
+            event(0x7405, &EVT_NOP, 1, Vec::new()),
+            control(0x7406, &EVT_FINISH, 1, Vec::new()),
+        ]]);
+        let mut vm = EventVm::new(&scripts);
+        let mut host = RecordingHost::default();
+        host.results.push_back(StepResult::Finished);
+        vm.start(0, 0);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(host.class_names("misc"), vec!["act_flag_op"]);
     }
 
     #[test]
@@ -1463,7 +1538,10 @@ mod tests {
         let mut host = RecordingHost::default();
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
-        assert_eq!(host.class_names("misc"), vec!["tw_nop", "tw_end"]);
+        assert_eq!(
+            host.class_names("misc"),
+            vec!["evt_tween_begin", "tw_nop", "tw_end"]
+        );
     }
 
     #[test]

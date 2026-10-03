@@ -108,6 +108,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     let mut loaded = load_room(&pack, id)?;
     let mut game = game::GameState::new(id, &loaded.room);
     let mut player_state = player::spawn(id, &loaded.room);
+    game.sync_entity_from_player(&player_state);
 
     if capture.is_some() {
         unsafe {
@@ -383,6 +384,13 @@ fn tick_room(
     {
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
+    }
+    // Scripts may have moved the player entity directly (dir_set, actor
+    // motion); mirror that onto the visible player before interaction and
+    // physics run.
+    context.game.sync_player(context.player);
+    {
+        let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, action);
     }
     context.game.advance_frame();
@@ -395,6 +403,7 @@ fn tick_room(
             input,
         );
     }
+    context.game.sync_entity_from_player(context.player);
     apply_camera(context.room, context.game, Some(context.player.pos));
     context.game.transition.take()
 }
@@ -414,6 +423,7 @@ fn enter_transition(
     *player_state = player::spawn(transition.target, &loaded.room);
     player_state.pos = transition.pos;
     player_state.angle = transition.angle;
+    game.sync_entity_from_player(player_state);
     Ok(loaded)
 }
 
@@ -972,6 +982,7 @@ mod tests {
         let mut game = game::GameState::new(a, &loaded.room);
         let mut player_state = player::spawn(a, &loaded.room);
         player_state.pos = [150, 0, 250];
+        game.sync_entity_from_player(&player_state);
 
         let transition = {
             let scripts = &loaded.scripts;

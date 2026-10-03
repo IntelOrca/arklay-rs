@@ -15,6 +15,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::Operand;
 use crate::scd::opcode::Op;
@@ -30,6 +31,15 @@ pub const STATE_BYTES: usize = 64;
 pub const STATE_WORDS: usize = 32;
 /// Number of room action slots the game state tracks.
 pub const ROOM_ACTION_SLOTS: usize = 20;
+/// Entity slots: 0 is the player, 1.. are enemies and scripted objects.
+pub const ENTITY_COUNT: usize = 32;
+/// `selected_entity` value when the event pointed at something this slice does
+/// not model as an entity (object models and item models).
+pub const ENTITY_NONE: u8 = u8::MAX;
+/// Default per-tick yaw step of an `act_motion` instruction.
+const MOTION_DEFAULT_STEP: u8 = 0xC0;
+/// Default per-tick pitch step of an `act_motion` instruction.
+const MOTION_DEFAULT_PITCH_STEP: u8 = 0x40;
 /// Placeholder message id displayed by a door that refuses to open.
 pub const LOCKED_MESSAGE: u8 = 200;
 /// `room_check_actions` index of the item pickup handler.
@@ -298,6 +308,112 @@ pub struct RoomInteraction {
     pub message: Option<u16>,
 }
 
+/// One scripted entity.
+///
+/// Slot 0 is the player; slots 1.. are enemies and objects that later
+/// milestones spawn. The actor and tween sub-ISAs operate on the entity the
+/// current event selected with `evt_work_set`.
+///
+/// `state_field` packs the two state-block bytes at entity offset 0x84: the
+/// low byte is the entity state (1 idle, 8 scripted animation) and the high
+/// byte is the player-ignore flag. The tween `tw_set_rot` instruction stores
+/// a sign-extended byte into that same word, so it is kept as one u16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Entity {
+    /// Room position.
+    pub pos: [i32; 3],
+    /// 12-bit yaw.
+    pub angle: u16,
+    /// Rotation X component of the entity's rotation vector.
+    pub pitch: u16,
+    /// Rotation Z, the companion of `pitch` in the rotation SVECTOR.
+    pub roll: u16,
+    /// Animation behavior byte (`action_behavior`).
+    pub behavior: u8,
+    /// Animation action state byte.
+    pub action_state: u8,
+    /// Animation id.
+    pub anim: u16,
+    /// Scripted animation frame id.
+    pub anim_frame: u8,
+    /// Whether the slot is spawned.
+    pub active: bool,
+    /// `scd_entity_flags`, OR/SET/XORed by `act_flag_op`.
+    pub flags: u16,
+    /// Per-tick translation from the tween `tw_set_pos` instruction.
+    pub move_speed: [i16; 3],
+    /// Per-tick rotation steps from the tween `tw_set_rot` instruction:
+    /// `[0]` drives `pitch`, `[2]` drives `angle`.
+    pub move_step: [i16; 3],
+    /// The entity state word (`state | ignore << 8`).
+    pub state_field: u16,
+    /// Damage hit state (`tw_set_8a`).
+    pub hit_state: u8,
+    /// Last `tw_set_sel` selector.
+    pub selector: u16,
+    /// Health word written by `tw_set_sel` selector 3 and `tw_set_field`.
+    pub health: i16,
+    /// Animation position offsets (`unk_c6`/`unk_c8`).
+    pub unk_c6: u16,
+    /// Animation position offset Z.
+    pub unk_c8: u16,
+    /// SCD animation parameter.
+    pub anim_param: u8,
+    /// SCD animation timer.
+    pub timer: u16,
+    /// Animation frame blend counter.
+    pub blend: u8,
+    /// Look-at control byte set by `act_motion`.
+    pub look_at_flags: u8,
+    /// Look-at target position; for an entity target this is refreshed every
+    /// tick from the target's current position.
+    pub target: [i32; 3],
+    /// Entity slot this entity is moving toward, when the target is an entity.
+    pub target_entity: Option<u8>,
+    /// Per-tick yaw step of the active `act_motion`.
+    pub step: u8,
+    /// Per-tick pitch step of the active `act_motion`.
+    pub pitch_step: u8,
+}
+
+impl Entity {
+    /// The entity state byte (offset 0x84).
+    pub fn state(&self) -> u8 {
+        self.state_field as u8
+    }
+
+    /// Overwrite the entity state byte, keeping the ignore flag.
+    pub fn set_state(&mut self, state: u8) {
+        self.state_field = (self.state_field & 0xFF00) | u16::from(state);
+    }
+
+    /// The player-ignore flag (offset 0x85).
+    pub fn ignore(&self) -> u8 {
+        (self.state_field >> 8) as u8
+    }
+
+    /// Overwrite the player-ignore flag, keeping the entity state.
+    pub fn set_ignore(&mut self, ignore: u8) {
+        self.state_field = (self.state_field & 0x00FF) | (u16::from(ignore) << 8);
+    }
+
+    /// `tw_set_field`: store one byte of the entity state block at 0x84 plus
+    /// `offset`. Returns `false` for an offset with no modelled field.
+    fn set_state_byte(&mut self, offset: u8, value: u8) -> bool {
+        match offset {
+            0 => self.set_state(value),
+            1 => self.set_ignore(value),
+            2 => self.behavior = value,
+            3 => self.action_state = value,
+            4 => self.health = (self.health & !0x00FF) | i16::from(value),
+            5 => self.health = (self.health & 0x00FF) | (i16::from(value) << 8),
+            6 => self.hit_state = value,
+            _ => return false,
+        }
+        true
+    }
+}
+
 /// The game state the SCD scripts read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
@@ -321,6 +437,10 @@ pub struct GameState {
     pub room_actions: [Option<RoomAction>; ROOM_ACTION_SLOTS],
     /// Door records, one per door action slot.
     pub doors: [Option<Door>; ROOM_ACTION_SLOTS],
+    /// Scripted entities; slot 0 is the player.
+    pub entities: [Entity; ENTITY_COUNT],
+    /// Entity slot the current event operates on, or [`ENTITY_NONE`].
+    pub selected_entity: u8,
     /// The last item picked up by any path.
     pub last_picked_item: Option<u8>,
     /// The last item used from a menu.
@@ -343,6 +463,13 @@ pub struct GameState {
     pub pending_events: Vec<(u8, u8)>,
 }
 
+/// The initial entity array: only the player slot is spawned.
+fn initial_entities() -> [Entity; ENTITY_COUNT] {
+    let mut entities = [Entity::default(); ENTITY_COUNT];
+    entities[0].active = true;
+    entities
+}
+
 impl Default for GameState {
     fn default() -> Self {
         Self {
@@ -356,6 +483,8 @@ impl Default for GameState {
             inventory: Vec::new(),
             room_actions: [None; ROOM_ACTION_SLOTS],
             doors: [None; ROOM_ACTION_SLOTS],
+            entities: initial_entities(),
+            selected_entity: 0,
             last_picked_item: None,
             last_used_item: None,
             equipped: None,
@@ -444,9 +573,389 @@ impl GameState {
         self.frame = self.frame.saturating_add(1);
     }
 
+    /// `evt_work_set`: turn an entity type/index pair into a slot. Type 0 is
+    /// the player, type 1 an enemy (`index` becomes slot `index + 1`), and
+    /// object/item models have no entity this slice and select
+    /// [`ENTITY_NONE`]. Returns whether a slot was selected.
+    pub fn select_entity(&mut self, entity_type: u8, index: u8) -> bool {
+        let slot = match entity_type {
+            0 => Some(0usize),
+            1 => 1usize.checked_add(usize::from(index)),
+            _ => None,
+        }
+        .filter(|slot| *slot < ENTITY_COUNT);
+        match slot {
+            Some(slot) => {
+                self.selected_entity = slot as u8;
+                true
+            }
+            None => {
+                self.selected_entity = ENTITY_NONE;
+                false
+            }
+        }
+    }
+
+    /// One entity by slot.
+    pub fn entity(&self, slot: u8) -> Option<&Entity> {
+        self.entities.get(usize::from(slot))
+    }
+
+    /// One entity by slot, mutably.
+    pub fn entity_mut(&mut self, slot: u8) -> Option<&mut Entity> {
+        self.entities.get_mut(usize::from(slot))
+    }
+
+    /// The entity the current event selected.
+    pub fn selected_entity(&self) -> Option<&Entity> {
+        if self.selected_entity == ENTITY_NONE {
+            return None;
+        }
+        self.entity(self.selected_entity)
+    }
+
+    /// The entity the current event selected, mutably.
+    pub fn selected_entity_mut(&mut self) -> Option<&mut Entity> {
+        if self.selected_entity == ENTITY_NONE {
+            return None;
+        }
+        self.entity_mut(self.selected_entity)
+    }
+
+    /// Mirror entity 0 into the engine's player state when the scripts moved
+    /// it, leaving the player alone otherwise. Called after the scripts run
+    /// each tick so `dir_set` and actor motions move the visible player.
+    pub fn sync_player(&self, player: &mut PlayerState) {
+        let entity = &self.entities[0];
+        if entity.pos != player.pos {
+            player.pos = entity.pos;
+        }
+        let angle = entity.angle & 0x0FFF;
+        if player.angle != angle {
+            player.angle = angle;
+        }
+    }
+
+    /// Mirror the visible player back onto entity 0 after physics moved it, so
+    /// the next script tick sees the current position.
+    pub fn sync_entity_from_player(&mut self, player: &PlayerState) {
+        let entity = &mut self.entities[0];
+        entity.pos = player.pos;
+        entity.angle = player.angle & 0x0FFF;
+    }
+
+    /// `evt_tween_begin`: reset the selected entity as it enters the movement
+    /// state (ignore flag 2, behavior and action state cleared).
+    pub fn reset_tween_entity(&mut self) {
+        if let Some(entity) = self.selected_entity_mut() {
+            entity.set_ignore(2);
+            entity.behavior = 0;
+            entity.action_state = 0;
+        }
+    }
+
+    /// Apply one actor sub-ISA instruction to the selected entity.
+    ///
+    /// The event VM reads the result: `Yield` keeps the slot on the same
+    /// instruction for another tick and `Finished` drops it back to state 0.
+    fn apply_actor_op(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.mnemonic {
+            "act_motion" | "act_motion_path" => self.apply_act_motion(op, operands),
+            "act_nop" => StepResult::Continue,
+            "act_reset" | "act_end" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.set_ignore(0);
+                }
+                StepResult::Continue
+            }
+            "act_motion_bitclr" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.look_at_flags &= !0x10;
+                }
+                StepResult::Continue
+            }
+            "act_idle" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.state_field = 1;
+                    entity.behavior = 0;
+                    entity.action_state = 0;
+                    entity.hit_state = 0;
+                }
+                StepResult::Continue
+            }
+            "act_anim_seq" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    let word0 = operand_u16(operands, 0);
+                    let word1 = operand_u16(operands, 1);
+                    let word2 = operand_u16(operands, 2);
+                    entity.set_state(8);
+                    entity.set_ignore(0);
+                    entity.behavior = word0 as u8;
+                    entity.action_state = 0;
+                    entity.unk_c6 = (word0 >> 8) | ((word1 as u8 as u16) << 8);
+                    entity.unk_c8 = (word1 >> 8) | ((word2 as u8 as u16) << 8);
+                    entity.anim_param = (word2 >> 8) as u8;
+                    entity.timer = 0x28;
+                    entity.flags = 0;
+                }
+                StepResult::Continue
+            }
+            "act_anim_flags" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    let anim_data = u16::from(operand_u8(operands, 1))
+                        | (u16::from(operand_u8(operands, 2)) << 8);
+                    entity.set_state(8);
+                    entity.set_ignore(0);
+                    entity.behavior = 1;
+                    entity.action_state = 0;
+                    entity.anim = u16::from(operand_u8(operands, 0));
+                    entity.anim_param = operand_u8(operands, 1);
+                    entity.flags = (anim_data >> 6) & 0x3FC;
+                    entity.timer = 0;
+                }
+                StepResult::Continue
+            }
+            "act_anim_set" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.set_state(8);
+                    entity.set_ignore(0);
+                    entity.behavior = operand_u8(operands, 0);
+                    entity.action_state = 0;
+                    entity.anim = u16::from(operand_u8(operands, 1));
+                    entity.anim_param = operand_u8(operands, 2);
+                    entity.timer = 0;
+                    entity.flags = 0;
+                }
+                StepResult::Continue
+            }
+            "act_flag_op" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    let mode = operand_u8(operands, 0);
+                    let value = operand_u16(operands, 1);
+                    match mode {
+                        0 => entity.flags |= value,
+                        1 => entity.flags = value,
+                        2 => entity.flags ^= value,
+                        _ => {}
+                    }
+                }
+                StepResult::Continue
+            }
+            "act_param_set" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.timer =
+                        (operand_u16(operands, 0) >> 8) | (u16::from(operand_u8(operands, 1)) << 8);
+                }
+                StepResult::Continue
+            }
+            "act_action_a" | "act_action_b" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.anim_frame = operand_u8(operands, 0);
+                    entity.blend = if entity.flags & 0x20 != 0 { 0 } else { 7 };
+                    entity.action_state = 1;
+                }
+                StepResult::Continue
+            }
+            _ => {
+                self.record_placeholder(op.op);
+                StepResult::Placeholder
+            }
+        }
+    }
+
+    /// One actor motion instruction. While the target is out of reach the
+    /// result is `Yield`, so the event VM re-runs the instruction next tick;
+    /// on arrival the result is `Finished` and the actor state ends.
+    ///
+    /// Convention: the entity turns toward the target by at most the yaw step
+    /// and translates by that same step along the target direction, on the XZ
+    /// plane. The step is the low byte of the word at instruction offset +8
+    /// (default 0xC0); the high byte is the pitch step (default 0x40). Flag
+    /// 0x20 wraps negative target coordinates by +0x1000 before use, and flag
+    /// set `0x93` targets another entity instead of a fixed point.
+    fn apply_act_motion(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        let flags = operand_u8(operands, 0);
+        let step_word =
+            u16::from(operand_u8(operands, 4)) | (u16::from(operand_u8(operands, 5)) << 8);
+        let yaw_step = match step_word as u8 {
+            0 => MOTION_DEFAULT_STEP,
+            step => step,
+        };
+        let pitch_step = match (step_word >> 8) as u8 {
+            0 => MOTION_DEFAULT_PITCH_STEP,
+            step => step,
+        };
+
+        if flags & 0x0F == 0 {
+            if let Some(entity) = self.selected_entity_mut() {
+                entity.look_at_flags = flags;
+            }
+            return StepResult::Continue;
+        }
+
+        let target_entity = if flags == 0x93 {
+            let Some(slot) = motion_target_slot(operand_u8(operands, 1), operand_i16(operands, 2))
+            else {
+                self.record_placeholder(op.op);
+                return StepResult::Placeholder;
+            };
+            Some(slot)
+        } else {
+            None
+        };
+        let target = match target_entity {
+            Some(slot) => self.entities[usize::from(slot)].pos,
+            None => {
+                let mut x = i32::from(operand_i16(operands, 1));
+                let mut y = i32::from(operand_i16(operands, 2));
+                let z = i32::from(operand_i16(operands, 3));
+                if flags & 0x20 != 0 {
+                    if x < 0 {
+                        x += 0x1000;
+                    }
+                    if y < 0 {
+                        y += 0x1000;
+                    }
+                }
+                [x, y, z]
+            }
+        };
+
+        let Some(entity) = self.selected_entity_mut() else {
+            self.record_placeholder(op.op);
+            return StepResult::Placeholder;
+        };
+        entity.look_at_flags = flags;
+        entity.step = yaw_step;
+        entity.pitch_step = pitch_step;
+        entity.target = target;
+        entity.target_entity = target_entity;
+
+        let dx = target[0] - entity.pos[0];
+        let dz = target[2] - entity.pos[2];
+        let step = i32::from(yaw_step);
+        let distance = xz_distance(dx, dz);
+        if distance <= step {
+            entity.pos[0] = target[0];
+            entity.pos[2] = target[2];
+            entity.target_entity = None;
+            return StepResult::Finished;
+        }
+        let target_angle = angle_between(entity.pos, target);
+        entity.angle = rotate_toward(entity.angle, target_angle, u16::from(yaw_step));
+        entity.pos[0] += step * dx / distance;
+        entity.pos[2] += step * dz / distance;
+        StepResult::Yield
+    }
+
+    /// Apply one tween sub-ISA instruction to the selected entity. The tween
+    /// state never yields.
+    fn apply_tween_op(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.mnemonic {
+            "tw_nop" | "tw_end" => StepResult::Continue,
+            "tw_pos_add" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    for axis in 0..3 {
+                        entity.pos[axis] =
+                            entity.pos[axis].wrapping_add(i32::from(entity.move_speed[axis]));
+                    }
+                }
+                StepResult::Continue
+            }
+            "tw_rot_add" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.pitch = entity.pitch.wrapping_add(entity.move_step[0] as u16);
+                    entity.angle = entity.angle.wrapping_add(entity.move_step[2] as u16);
+                    entity.roll = entity.roll.wrapping_add(entity.state_field);
+                }
+                StepResult::Continue
+            }
+            "tw_pos_rot_add" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    for axis in 0..3 {
+                        entity.pos[axis] =
+                            entity.pos[axis].wrapping_add(i32::from(entity.move_speed[axis]));
+                    }
+                    entity.pitch = entity.pitch.wrapping_add(entity.move_step[0] as u16);
+                    entity.angle = entity.angle.wrapping_add(entity.move_step[2] as u16);
+                    entity.roll = entity.roll.wrapping_add(entity.state_field);
+                }
+                StepResult::Continue
+            }
+            "tw_set_pos" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.move_speed = [
+                        i16::from(operand_i8(operands, 0)),
+                        i16::from(operand_i8(operands, 1)),
+                        i16::from(operand_i8(operands, 2)),
+                    ];
+                }
+                StepResult::Continue
+            }
+            "tw_set_rot" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.move_step[0] = i16::from(operand_i8(operands, 0));
+                    entity.move_step[2] = i16::from(operand_i8(operands, 1));
+                    entity.state_field = operand_i8(operands, 2) as i16 as u16;
+                }
+                StepResult::Continue
+            }
+            "tw_abs_pos" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.pos = [
+                        i32::from(operand_i16(operands, 0)),
+                        i32::from(operand_i16(operands, 1)),
+                        i32::from(operand_i16(operands, 2)),
+                    ];
+                }
+                StepResult::Continue
+            }
+            "tw_set_field" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.set_state_byte(operand_u8(operands, 0), operand_u8(operands, 1));
+                }
+                StepResult::Continue
+            }
+            "tw_set_8a" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.hit_state = operand_u8(operands, 0);
+                }
+                StepResult::Continue
+            }
+            "tw_set_sel" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    let selector = operand_u8(operands, 0);
+                    let value = operand_u16(operands, 1);
+                    entity.selector = u16::from(selector);
+                    match selector {
+                        0..=2 => entity.pos[usize::from(selector)] = i32::from(value as i16),
+                        3 => entity.health = value as i16,
+                        4 => entity.unk_c6 = value,
+                        5 => entity.unk_c8 = value,
+                        _ => {}
+                    }
+                }
+                StepResult::Continue
+            }
+            "tw_abs_rot" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.pitch = operand_u16(operands, 0);
+                    entity.angle = operand_u16(operands, 1);
+                    entity.roll = operand_u16(operands, 2);
+                }
+                StepResult::Continue
+            }
+            _ => {
+                self.record_placeholder(op.op);
+                StepResult::Placeholder
+            }
+        }
+    }
+
     /// Move into `id`: the flags, state blocks and inventory survive a room
     /// change; the room action table, message, camera and per-room requests do
-    /// not. The identity bytes are reseeded from the new room.
+    /// not. The player entity slot survives; the other entity slots reset. The
+    /// identity bytes are reseeded from the new room.
     pub fn enter_room(&mut self, id: RoomId, _room: &RoomState) {
         self.id = id;
         self.state_bytes[0] = id.stage;
@@ -454,6 +963,10 @@ impl GameState {
         self.state_bytes[2] = id.player_flag;
         self.room_actions = [None; ROOM_ACTION_SLOTS];
         self.doors = [None; ROOM_ACTION_SLOTS];
+        let player_entity = self.entities[0];
+        self.entities = initial_entities();
+        self.entities[0] = player_entity;
+        self.selected_entity = 0;
         self.transition = None;
         self.message = MessageState::default();
         self.camera = CameraState::default();
@@ -998,12 +1511,62 @@ impl ScdHost for ScdGameHost<'_> {
         }
     }
 
-    fn on_enemy(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
-        self.placeholder(op)
+    fn on_enemy(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.op {
+            // pos_set: enemyIdx, position.pad, yaw, roll, x, y, z.
+            0x21 => {
+                let index = operand_u8(operands, 0);
+                if let Some(entity) = self.state.entities.get_mut(usize::from(index) + 1) {
+                    entity.pos = [
+                        i32::from(operand_i16(operands, 4)),
+                        i32::from(operand_i16(operands, 5)),
+                        i32::from(operand_i16(operands, 6)),
+                    ];
+                    entity.pitch = operand_i16(operands, 1) as u16;
+                    entity.angle = operand_i16(operands, 2) as u16 & 0x0FFF;
+                    entity.roll = operand_i16(operands, 3) as u16;
+                    entity.flags &= 0xFFF3;
+                    entity.active = true;
+                }
+                StepResult::Continue
+            }
+            // spd_set: entity index (0 player), new posY word.
+            0x41 => {
+                let slot = usize::from(operand_u8(operands, 0));
+                if let Some(entity) = self.state.entities.get_mut(slot) {
+                    entity.pos[1] = i32::from(operand_i16(operands, 1));
+                }
+                StepResult::Continue
+            }
+            _ => self.placeholder(op),
+        }
     }
 
-    fn on_player(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
-        self.placeholder(op)
+    fn on_player(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.op {
+            // dir_set: pad, position.pad (pitch), yaw, speed.x, x, y, z.
+            0x20 => {
+                let entity = &mut self.state.entities[0];
+                entity.pos = [
+                    i32::from(operand_i16(operands, 4)),
+                    i32::from(operand_i16(operands, 5)),
+                    i32::from(operand_i16(operands, 6)),
+                ];
+                entity.pitch = operand_i16(operands, 1) as u16;
+                entity.angle = operand_i16(operands, 2) as u16 & 0x0FFF;
+                entity.move_speed[0] = operand_i16(operands, 3);
+                entity.flags &= 0xFFF3;
+                entity.active = true;
+                StepResult::Continue
+            }
+            // spd_add: signed byte added to the player posY.
+            0x45 => {
+                let entity = &mut self.state.entities[0];
+                entity.pos[1] = entity.pos[1].wrapping_add(i32::from(operand_i8(operands, 0)));
+                StepResult::Continue
+            }
+            _ => self.placeholder(op),
+        }
     }
 
     fn on_model(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
@@ -1049,16 +1612,29 @@ impl ScdHost for ScdGameHost<'_> {
     }
 
     fn on_misc(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
-        match op.op {
-            // evt_exec: pad, slot, script index. `slot` 8 or more means "first
-            // free slot"; the engine maps that when it starts the event.
-            0x14 => {
-                let slot = operand_u8(operands, 1);
-                let event = operand_u8(operands, 2);
-                self.state.pending_events.push((slot, event));
+        match op.mnemonic {
+            "evt_work_set" => {
+                self.state
+                    .select_entity(operand_u8(operands, 0), operand_u8(operands, 1));
                 StepResult::Continue
             }
-            _ => self.placeholder(op),
+            "evt_tween_begin" => {
+                self.state.reset_tween_entity();
+                StepResult::Continue
+            }
+            mnemonic if mnemonic.starts_with("act_") => self.state.apply_actor_op(op, operands),
+            mnemonic if mnemonic.starts_with("tw_") => self.state.apply_tween_op(op, operands),
+            // evt_exec: pad, slot, script index. `slot` 8 or more means "first
+            // free slot"; the engine maps that when it starts the event.
+            _ => match op.op {
+                0x14 => {
+                    let slot = operand_u8(operands, 1);
+                    let event = operand_u8(operands, 2);
+                    self.state.pending_events.push((slot, event));
+                    StepResult::Continue
+                }
+                _ => self.placeholder(op),
+            },
         }
     }
 
@@ -1072,6 +1648,56 @@ fn channel_bit(channel: u8) -> u8 {
     1u8.checked_shl(u32::from(channel) + 3).unwrap_or(0)
 }
 
+/// The entity slot an `act_motion` target pair resolves to: type 0 the player,
+/// type 1 enemy `index` (slot `index + 1`). Object and item models have no
+/// entity this slice.
+fn motion_target_slot(entity_type: u8, index: i16) -> Option<u8> {
+    match entity_type {
+        0 => Some(0),
+        1 => u8::try_from(index)
+            .ok()
+            .and_then(|index| 1u8.checked_add(index))
+            .filter(|slot| usize::from(*slot) < ENTITY_COUNT),
+        _ => None,
+    }
+}
+
+/// Distance between two XZ offsets, rounded down.
+fn xz_distance(dx: i32, dz: i32) -> i32 {
+    let dx = i64::from(dx);
+    let dz = i64::from(dz);
+    ((dx * dx + dz * dz) as f64).sqrt() as i32
+}
+
+/// 12-bit angle from `from` to `to` on the XZ plane. Angle 0 faces +X and
+/// increasing yaw turns towards -Z, the engine's movement convention.
+fn angle_between(from: [i32; 3], to: [i32; 3]) -> u16 {
+    let dx = (to[0] as i16).wrapping_sub(from[0] as i16);
+    let dz = (to[2] as i16).wrapping_sub(from[2] as i16);
+    if dx != 0 {
+        let slope = (i32::from(dz) * 4096) / i32::from(dx);
+        let angle = (f64::from(slope) / 4096.0).atan() * (2048.0 / std::f64::consts::PI);
+        let quadrant = if dx < 0 { 0x800 } else { 0 };
+        return ((-(quadrant + angle as i32)) as u32 & 0x0FFF) as u16;
+    }
+    ((if dz > 0 { 0x800 } else { 0 }) + 0x400) as u16
+}
+
+/// Step `angle` toward `target` by at most `step`, using unsigned 12-bit
+/// angle arithmetic: snap when the remaining turn is under two steps,
+/// otherwise take one step in the shorter direction.
+fn rotate_toward(angle: u16, target: u16, step: u16) -> u16 {
+    let delta = step.wrapping_sub(angle).wrapping_add(target) & 0x0FFF;
+    if i32::from(delta) < i32::from(step as i16) * 2 {
+        return target & 0x0FFF;
+    }
+    let mut turned = angle.wrapping_sub(step) & 0x0FFF;
+    if delta < 0x801 {
+        turned = turned.wrapping_add(step.wrapping_mul(2)) & 0x0FFF;
+    }
+    turned
+}
+
 fn condition_result(value: bool) -> StepResult {
     if value {
         StepResult::Continue
@@ -1082,6 +1708,10 @@ fn condition_result(value: bool) -> StepResult {
 
 fn operand_u8(operands: &[Operand], index: usize) -> u8 {
     operands.get(index).map_or(0, |operand| operand.value as u8)
+}
+
+fn operand_i8(operands: &[Operand], index: usize) -> i8 {
+    operands.get(index).map_or(0, |operand| operand.value as i8)
 }
 
 fn operand_u16(operands: &[Operand], index: usize) -> u16 {
@@ -1099,7 +1729,9 @@ fn operand_i16(operands: &[Operand], index: usize) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scd::opcode::command_op;
+    use crate::scd::ir::{Decoded, Insn, Scripts, Stream, StreamKind};
+    use crate::scd::opcode::{actor_op, command_op, event_control_op, event_top_op, tween_op};
+    use crate::scd::vm::EventVm;
 
     fn operands(values: &[i64]) -> Vec<Operand> {
         values
@@ -1117,6 +1749,48 @@ mod tests {
 
     fn game() -> GameState {
         GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default())
+    }
+
+    fn insn(offset: usize, op: &'static Op, decoded: Decoded, len: usize, values: &[i64]) -> Insn {
+        Insn {
+            offset,
+            op: op.op,
+            bytes: vec![op.op; len],
+            decoded,
+            operands: operands(values),
+        }
+    }
+
+    fn event_insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+        insn(offset, op, Decoded::Event(op), len, values)
+    }
+
+    fn actor_insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+        insn(offset, op, Decoded::Actor(op), len, values)
+    }
+
+    fn tween_insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+        insn(offset, op, Decoded::Tween(op), len, values)
+    }
+
+    fn control_insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+        insn(offset, op, Decoded::Control(op), len, values)
+    }
+
+    fn event_scripts(events: Vec<Vec<Insn>>) -> Scripts {
+        Scripts {
+            events: events
+                .into_iter()
+                .enumerate()
+                .map(|(index, insns)| Stream {
+                    kind: StreamKind::Event(index as u8),
+                    offset: 0,
+                    insns,
+                    trailing: Vec::new(),
+                })
+                .collect(),
+            ..Scripts::default()
+        }
     }
 
     #[test]
@@ -1387,7 +2061,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_player(op(0x20), &operands(&[0])),
+                host.on_player(op(0x2B), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -1421,7 +2095,7 @@ mod tests {
         }
         assert_eq!(state.placeholders.len(), 9);
         assert_eq!(state.placeholders[&0x1B], 1);
-        assert_eq!(state.placeholders[&0x20], 1);
+        assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x1F], 1);
         assert_eq!(state.placeholders[&0x2A], 1);
         assert_eq!(state.placeholders[&0x25], 1);
@@ -1429,6 +2103,219 @@ mod tests {
         assert_eq!(state.placeholders[&0x40], 1);
         assert_eq!(state.placeholders[&0x27], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
+    }
+
+    #[test]
+    fn evt_work_set_selects_the_entity_slot() {
+        let mut state = game();
+        let op = event_top_op(0x04).unwrap();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_misc(op, &operands(&[1, 2, 0])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().selected_entity, 3);
+            assert_eq!(
+                host.on_misc(op, &operands(&[0, 9, 0])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().selected_entity, 0);
+            assert_eq!(
+                host.on_misc(op, &operands(&[2, 0, 0])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().selected_entity, ENTITY_NONE);
+        }
+    }
+
+    #[test]
+    fn dir_set_writes_the_player_entity() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_player(op(0x20), &operands(&[0, 0, 2048, 0, 6800, 0, 9000])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.entities[0].pos, [6800, 0, 9000]);
+        assert_eq!(state.entities[0].angle, 2048);
+        assert!(state.entities[0].active);
+    }
+
+    #[test]
+    fn actor_motion_walks_the_entity_and_ends_the_state() {
+        let scripts = event_scripts(vec![vec![
+            event_insn(0x1000, event_top_op(0x01).unwrap(), 1, &[]),
+            actor_insn(0x1001, actor_op(0x81).unwrap(), 10, &[1, 100, 0, 0, 10, 0]),
+            control_insn(0x100B, event_control_op(0xFF).unwrap(), 1, &[]),
+        ]]);
+        let mut state = game();
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        for _ in 0..20 {
+            let mut host = ScdGameHost::new(&mut state);
+            vm.step(&mut host);
+        }
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(state.entities[0].pos, [100, 0, 0]);
+        assert_eq!(state.entities[0].target_entity, None);
+    }
+
+    #[test]
+    fn actor_motion_wraps_negative_coordinates() {
+        let mut state = game();
+        state.selected_entity = 0;
+        let op = actor_op(0x81).unwrap();
+        let mut host = ScdGameHost::new(&mut state);
+        // flags 0x21: motion plus the +0x1000 wrap for negative x/y.
+        assert_eq!(
+            host.on_misc(op, &operands(&[0x21, -100, -200, 0, 4, 0])),
+            StepResult::Yield
+        );
+        assert_eq!(
+            host.state().entities[0].target,
+            [0x1000 - 100, 0x1000 - 200, 0]
+        );
+    }
+
+    #[test]
+    fn actor_target_entity_uses_its_position() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[1].pos = [50, 0, 0];
+        let mut host = ScdGameHost::new(&mut state);
+        let op = actor_op(0x81).unwrap();
+        // flags 0x93: target entity type 1, index 0.
+        assert_eq!(
+            host.on_misc(op, &operands(&[0x93, 1, 0, 0, 4, 0])),
+            StepResult::Yield
+        );
+        assert_eq!(host.state().entities[0].target, [50, 0, 0]);
+        assert_eq!(host.state().entities[0].target_entity, Some(1));
+    }
+
+    #[test]
+    fn tween_position_integrates_over_ticks() {
+        let scripts = event_scripts(vec![vec![
+            event_insn(0x2000, event_top_op(0x03).unwrap(), 1, &[]),
+            tween_insn(0x2001, tween_op(0x05).unwrap(), 4, &[0, 0, 10]),
+            tween_insn(0x2005, tween_op(0x07).unwrap(), 8, &[0, 0, 0, 0]),
+            tween_insn(0x200D, tween_op(0x02).unwrap(), 1, &[]),
+            control_insn(0x200E, event_control_op(0xFE).unwrap(), 1, &[]),
+            tween_insn(0x200F, tween_op(0x02).unwrap(), 1, &[]),
+            control_insn(0x2010, event_control_op(0xFE).unwrap(), 1, &[]),
+            tween_insn(0x2011, tween_op(0x02).unwrap(), 1, &[]),
+            tween_insn(0x2012, tween_op(0x01).unwrap(), 1, &[]),
+            control_insn(0x2013, event_control_op(0xFF).unwrap(), 1, &[]),
+        ]]);
+        let mut state = game();
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        for _ in 0..6 {
+            let mut host = ScdGameHost::new(&mut state);
+            vm.step(&mut host);
+        }
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(state.entities[0].pos, [0, 0, 30]);
+    }
+
+    #[test]
+    fn tween_rotation_adds_the_step_fields() {
+        let mut state = game();
+        state.entities[0].move_step = [5, 0, 7];
+        state.entities[0].state_field = 9;
+        let mut host = ScdGameHost::new(&mut state);
+        let op = tween_op(0x03).unwrap();
+        assert_eq!(host.on_misc(op, &operands(&[])), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.pitch, 5);
+        assert_eq!(entity.angle, 7);
+        assert_eq!(entity.roll, 9);
+    }
+
+    #[test]
+    fn tween_absolute_and_selector_ops_write_the_entity() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_misc(tween_op(0x07).unwrap(), &operands(&[10, 20, 30, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(tween_op(0x0B).unwrap(), &operands(&[1, 2, 3, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(tween_op(0x0A).unwrap(), &operands(&[3, 96, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(tween_op(0x09).unwrap(), &operands(&[7])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(tween_op(0x08).unwrap(), &operands(&[2, 4])),
+            StepResult::Continue
+        );
+        let entity = host.state().entities[0];
+        assert_eq!(entity.pos, [10, 20, 30]);
+        assert_eq!(entity.pitch, 1);
+        assert_eq!(entity.angle, 2);
+        assert_eq!(entity.roll, 3);
+        assert_eq!(entity.health, 96);
+        assert_eq!(entity.selector, 3);
+        assert_eq!(entity.hit_state, 7);
+        assert_eq!(entity.behavior, 4);
+    }
+
+    #[test]
+    fn tween_begin_resets_the_selected_entity() {
+        let mut state = game();
+        state.entities[0].behavior = 4;
+        state.entities[0].action_state = 9;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            let op = event_top_op(0x02).unwrap();
+            assert_eq!(host.on_misc(op, &operands(&[])), StepResult::Continue);
+        }
+        assert_eq!(state.entities[0].behavior, 0);
+        assert_eq!(state.entities[0].action_state, 0);
+        assert_eq!(state.entities[0].ignore(), 2);
+    }
+
+    #[test]
+    fn sync_player_mirrors_entity_zero_into_the_player() {
+        let mut state = game();
+        let mut player =
+            crate::player::spawn(RoomId::parse("1001").unwrap(), &RoomState::default());
+        state.entities[0].pos = [100, 0, 200];
+        state.entities[0].angle = 0x456;
+        state.sync_player(&mut player);
+        assert_eq!(player.pos, [100, 0, 200]);
+        assert_eq!(player.angle, 0x456);
+
+        state.sync_player(&mut player);
+        assert_eq!(player.pos, [100, 0, 200]);
+        assert_eq!(player.angle, 0x456);
+    }
+
+    #[test]
+    fn angle_and_rotation_helpers_follow_the_engine_convention() {
+        assert_eq!(angle_between([0, 0, 0], [100, 0, 0]), 0);
+        assert_eq!(angle_between([0, 0, 0], [0, 0, -100]), 0x400);
+        assert_eq!(angle_between([0, 0, 0], [0, 0, 100]), 0xC00);
+        assert_eq!(angle_between([50, 0, 50], [50, 0, 50]), 0x400);
+
+        assert_eq!(rotate_toward(0, 0x400, 0x100), 0x100);
+        assert_eq!(rotate_toward(0x400, 0, 0x100), 0x300);
+        assert_eq!(rotate_toward(0, 0xC00, 0x100), 0xF00);
+        let mut angle = 0x3F0;
+        for _ in 0..4 {
+            angle = rotate_toward(angle, 0, 0x100);
+        }
+        assert_eq!(angle, 0);
     }
 
     fn item_action(slot: u8, item: u8, quantity: u8, zone: [i16; 4]) -> RoomAction {
@@ -1996,5 +2883,49 @@ mod tests {
         assert_eq!(serum.item_id(), 0x42);
         assert_eq!(serum.item_quantity(), 1);
         assert_eq!(serum.item_model(), 1);
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn room_1001_events_run_and_dir_set_moves_the_player() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let path = std::path::Path::new(&root).join("JPN/STAGE1/ROOM1001.RDT");
+        let data = std::fs::read(&path).expect("read ROOM1001.RDT");
+        let id = RoomId::parse("1001").unwrap();
+        let room = crate::rdt::parse(&data, id).unwrap();
+        let scripts = crate::scd::reader::parse(&data).unwrap();
+
+        let mut state = GameState::new(id, &room);
+        let mut command_vm = crate::scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = EventVm::new(&scripts);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            command_vm.run_init(&mut host);
+        }
+        // A fresh state has the flags that gate `evt_exec` clear, so start
+        // event_00 directly in a free slot.
+        event_vm.start(9, 0);
+        for _ in 0..30 {
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                command_vm.run_main(&mut host);
+            }
+            for (slot, event) in std::mem::take(&mut state.pending_events) {
+                event_vm.start(usize::from(slot), event);
+            }
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                event_vm.step(&mut host);
+            }
+            state.advance_frame();
+        }
+
+        let entity = state.entities[0];
+        assert_eq!(entity.pos, [6800, 0, 9000], "dir_set position applied");
+        assert_eq!(entity.angle, 2048);
+        assert_eq!(entity.flags & 0x40, 0x40, "act_flag_op ran");
+        assert_eq!(entity.health, 96, "tw_set_sel ran");
     }
 }
