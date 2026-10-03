@@ -12,6 +12,7 @@ const RESET: u16 = 0x102;
 const FIRST_CODE: u16 = 0x103;
 const DICT_ENTRIES: u16 = 34981;
 const MAX_WIDTH: u8 = 16;
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
 struct BitReader<'a> {
     data: &'a [u8],
@@ -100,6 +101,9 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
         let first = string[0];
         if special {
             string.push(first);
+        }
+        if out.len() + string.len() > MAX_OUTPUT {
+            bail!("LZW output exceeds the {MAX_OUTPUT}-byte limit");
         }
         out.extend_from_slice(&string);
 
