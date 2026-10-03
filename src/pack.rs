@@ -201,15 +201,20 @@ impl Pack {
                 .with_context(|| format!("entry {index} path is not NUL-terminated"))?;
             let path = std::str::from_utf8(&data[path_offset..path_offset + nul])
                 .with_context(|| format!("entry {index} path is not valid UTF-8"))?;
+            if path.is_empty() {
+                bail!("entry {index} has an empty path");
+            }
+            let key = path.to_ascii_lowercase();
+            if lookup.contains_key(&key) {
+                bail!("duplicate pack entry: {path}");
+            }
             let end = data_offset
                 .checked_add(length)
                 .with_context(|| format!("entry {index} data range overflows"))?;
             if end > data.len() {
                 bail!("entry {index} data range {data_offset}..{end} is out of bounds");
             }
-            lookup
-                .entry(path.to_ascii_lowercase())
-                .or_insert(entries.len());
+            lookup.insert(key, entries.len());
             entries.push(Entry {
                 path: path.to_owned(),
                 offset: data_offset,
@@ -320,6 +325,42 @@ mod tests {
         bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
     }
 
+    fn multi_entry_pack(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let toc_len = entries.len() * ENTRY_LEN;
+        let paths_start = HEADER_LEN + toc_len;
+        let data_start = paths_start
+            + entries
+                .iter()
+                .map(|(path, _)| path.len() + 1)
+                .sum::<usize>();
+        let mut toc = Vec::new();
+        let mut path_offset = paths_start;
+        let mut data_offset = data_start;
+        for (path, data) in entries {
+            toc.extend_from_slice(&(path_offset as u64).to_le_bytes());
+            toc.extend_from_slice(&(data_offset as u64).to_le_bytes());
+            toc.extend_from_slice(&(data.len() as u64).to_le_bytes());
+            toc.push(0);
+            toc.extend_from_slice(&[0; 7]);
+            path_offset += path.len() + 1;
+            data_offset += data.len();
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        out.extend_from_slice(&toc);
+        for (path, _) in entries {
+            out.extend_from_slice(path.as_bytes());
+            out.push(0);
+        }
+        for (_, data) in entries {
+            out.extend_from_slice(data);
+        }
+        out
+    }
+
     #[test]
     fn roundtrip_several_entries() {
         let mut writer = PackWriter::new();
@@ -347,6 +388,34 @@ mod tests {
         assert_eq!(&bytes[..4], b"APAK");
         assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), VERSION);
         assert_eq!(u32::from_le_bytes(bytes[6..10].try_into().unwrap()), 2);
+    }
+
+    #[test]
+    fn writer_golden_bytes() {
+        let mut writer = PackWriter::new();
+        writer.add("b.txt", vec![0xDE, 0xAD]).unwrap();
+        writer.add("a.bin", vec![0x01, 0x02, 0x03]).unwrap();
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"APAK");
+        expected.extend_from_slice(&VERSION.to_le_bytes());
+        expected.extend_from_slice(&2u32.to_le_bytes());
+        // Entry 0 (a.bin): path at 74, data at 86, length 3.
+        expected.extend_from_slice(&74u64.to_le_bytes());
+        expected.extend_from_slice(&86u64.to_le_bytes());
+        expected.extend_from_slice(&3u64.to_le_bytes());
+        expected.push(0);
+        expected.extend_from_slice(&[0; 7]);
+        // Entry 1 (b.txt): path at 80, data at 89, length 2.
+        expected.extend_from_slice(&80u64.to_le_bytes());
+        expected.extend_from_slice(&89u64.to_le_bytes());
+        expected.extend_from_slice(&2u64.to_le_bytes());
+        expected.push(0);
+        expected.extend_from_slice(&[0; 7]);
+        expected.extend_from_slice(b"a.bin\0b.txt\0");
+        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0xDE, 0xAD]);
+
+        assert_eq!(writer.to_bytes().unwrap(), expected);
     }
 
     #[test]
@@ -385,6 +454,20 @@ mod tests {
         writer.add("room/1000.rdt", vec![]).unwrap();
         assert!(writer.add("ROOM/1000.RDT", vec![]).is_err());
         assert!(writer.add("room/1000.rdt", vec![]).is_err());
+    }
+
+    #[test]
+    fn reader_rejects_empty_path() {
+        let bytes = multi_entry_pack(&[("", b"x")]);
+        let err = Pack::from_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("empty path"), "{err}");
+    }
+
+    #[test]
+    fn reader_rejects_case_insensitive_duplicates() {
+        let bytes = multi_entry_pack(&[("room/a.bin", b"a"), ("ROOM/A.BIN", b"b")]);
+        let err = Pack::from_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("duplicate"), "{err}");
     }
 
     #[test]
