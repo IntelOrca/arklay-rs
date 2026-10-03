@@ -409,12 +409,16 @@ pub const ROOM_STATE: [u8; 224] = [
 
 /// BGM group selected for `id` by the remembered state byte, if any.
 pub fn group_for(id: RoomId) -> Option<u8> {
-    let index = usize::from(id.stage_index()) * 32 + usize::from(id.room);
-    let state = *ROOM_STATE.get(index)?;
+    let stage = usize::from(id.stage.checked_sub(1)?);
+    let room = usize::from(id.room);
+    let state = *ROOM_STATE.get(stage * 32 + room)?;
     if state == 0xFF {
         return None;
     }
-    let group = ROOM_GROUPS[id.stage_index() as usize][id.room as usize][usize::from(state & 7)];
+    let group = *ROOM_GROUPS
+        .get(stage)?
+        .get(room)?
+        .get(usize::from(state & 7))?;
     if group == 0xFF { None } else { Some(group) }
 }
 
@@ -446,18 +450,18 @@ pub fn primary_track(id: RoomId) -> Option<(&'static str, bool)> {
 pub fn pack_path(name: &str) -> Option<String> {
     let stem = match name.get(name.len().saturating_sub(4)..) {
         Some(suffix) if name.len() >= 4 && suffix.eq_ignore_ascii_case(".wav") => {
-            &name[..name.len() - 4]
+            name.get(..name.len() - 4)?
         }
         _ => name,
     };
-    if stem.len() < 4 || !stem[..4].eq_ignore_ascii_case("bgm_") {
+    if !stem.get(..4)?.eq_ignore_ascii_case("bgm_") {
         return None;
     }
 
     let mut value = 0u32;
     let mut digits = 0usize;
     let mut variant = None;
-    let mut chars = stem[4..].chars();
+    let mut chars = stem.get(4..)?.chars();
     while digits < 2 {
         let Some(c) = chars.next() else {
             break;

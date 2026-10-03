@@ -202,8 +202,8 @@ impl MusicPlayer {
             bail!("SDL_ClearAudioStream failed: {}", sdl_error());
         }
         self.pcm = wav.data;
-        self.playing = true;
         self.push_buffer()?;
+        self.playing = true;
         if !unsafe { SDL_ResumeAudioStreamDevice(self.stream) } {
             bail!("SDL_ResumeAudioStreamDevice failed: {}", sdl_error());
         }

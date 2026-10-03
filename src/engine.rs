@@ -13,7 +13,7 @@ use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit};
 use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_ESCAPE, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
-use sdl3_sys::rect::SDL_Rect;
+use sdl3_sys::rect::{SDL_FRect, SDL_Rect};
 use sdl3_sys::render::{
     SDL_CreateRenderer, SDL_CreateTexture, SDL_DestroyRenderer, SDL_DestroyTexture,
     SDL_RenderClear, SDL_RenderPresent, SDL_RenderReadPixels, SDL_RenderTexture, SDL_Renderer,
@@ -309,7 +309,21 @@ fn draw(renderer: *mut SDL_Renderer, texture: *mut SDL_Texture, image: &Image) -
     if !unsafe { SDL_RenderClear(renderer) } {
         bail!("SDL_RenderClear failed: {}", sdl_error());
     }
-    if !unsafe { SDL_RenderTexture(renderer, texture, std::ptr::null(), std::ptr::null()) } {
+    // Only draw the uploaded region so stale pixels from a previous, larger cut
+    // are never shown.
+    let src = SDL_FRect {
+        x: 0.0,
+        y: 0.0,
+        w: image.width as f32,
+        h: image.height as f32,
+    };
+    let dst = SDL_FRect {
+        x: 0.0,
+        y: 0.0,
+        w: (image.width * SCALE as u32) as f32,
+        h: (image.height * SCALE as u32) as f32,
+    };
+    if !unsafe { SDL_RenderTexture(renderer, texture, &src, &dst) } {
         bail!("SDL_RenderTexture failed: {}", sdl_error());
     }
     Ok(())
