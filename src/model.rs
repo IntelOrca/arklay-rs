@@ -93,9 +93,12 @@ pub struct Emd {
     pub texture: Texture8,
 }
 
-/// A no-weapon EMW animation + mesh file.
+/// A no-weapon EMW animation + mesh file. The EMW carries its own armature and
+/// keyframes; its locomotion clips drive the same 15-joint skeleton as the EMD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Emw {
+    pub skeleton: Skeleton,
+    pub keyframes: Vec<Keyframe>,
     pub clips: Vec<Clip>,
     pub mesh: Tmd,
 }

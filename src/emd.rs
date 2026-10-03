@@ -79,12 +79,19 @@ pub fn parse_emw(data: &[u8]) -> Result<Emw> {
     }
 
     let clips = parse_clips(data, edd_offset, mesh_offset)?;
+    let skeleton = parse_skeleton(data, 0, edd_offset)?;
+    let keyframes = parse_keyframes(data, 0, edd_offset)?;
     let mesh = tmd::parse(
         data.get(mesh_offset..)
             .context("EMW mesh offset is out of range")?,
     )?;
 
-    Ok(Emw { clips, mesh })
+    Ok(Emw {
+        skeleton,
+        keyframes,
+        clips,
+        mesh,
+    })
 }
 
 fn check_order(directory: &[usize], directory_start: usize, kind: &str) -> Result<()> {
@@ -433,10 +440,12 @@ mod tests {
     }
 
     fn minimal_emw() -> Vec<u8> {
-        let mut data = minimal_edd();
+        let mut data = minimal_emr();
+        let edd_offset = data.len();
+        data.extend_from_slice(&minimal_edd());
         let mesh_offset = data.len();
         data.extend_from_slice(&minimal_tmd());
-        for value in [0u32, mesh_offset as u32] {
+        for value in [edd_offset as u32, mesh_offset as u32] {
             data.extend_from_slice(&value.to_le_bytes());
         }
         data
@@ -486,6 +495,9 @@ mod tests {
 
         let emw = parse_emw(&data).unwrap();
 
+        assert_eq!(emw.skeleton.relative, [[1, 2, 3], [4, 5, 6]]);
+        assert_eq!(emw.keyframes.len(), 1);
+        assert_eq!(emw.keyframes[0].offset, [7, 8, 9]);
         assert_eq!(emw.clips.len(), 1);
         assert_eq!(
             emw.clips[0].frames,
