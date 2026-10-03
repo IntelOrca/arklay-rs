@@ -16,7 +16,7 @@ use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
 use sdl3_sys::render::{
     SDL_CreateRenderer, SDL_CreateTexture, SDL_DestroyRenderer, SDL_DestroyTexture,
     SDL_RenderClear, SDL_RenderPresent, SDL_RenderReadPixels, SDL_RenderTexture, SDL_Renderer,
-    SDL_SetRenderDrawColor, SDL_SetTextureBlendMode, SDL_SetTextureScaleMode,
+    SDL_SetRenderDrawColor, SDL_SetRenderVSync, SDL_SetTextureBlendMode, SDL_SetTextureScaleMode,
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::surface::{
@@ -128,6 +128,7 @@ pub fn run(pack: &Path, room: u32, player: u8, capture: Option<&Path>) -> Result
         bail!("SDL_CreateRenderer failed: {}", sdl_error());
     }
     let _renderer = RendererHandle(renderer);
+    let _ = unsafe { SDL_SetRenderVSync(renderer, 1) };
 
     let texture = unsafe {
         SDL_CreateTexture(

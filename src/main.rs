@@ -15,11 +15,11 @@ struct Cli {
     pack: Option<PathBuf>,
 
     /// Room number, e.g. 100 for RDT 1000
-    #[arg(long, value_name = "ROOM", requires = "pack")]
+    #[arg(long, value_name = "ROOM", requires = "pack", value_parser = clap::value_parser!(u32).range(100..=999))]
     room: Option<u32>,
 
     /// Player/flag digit selecting the RDT variant (0-9)
-    #[arg(long, default_value_t = 0, value_name = "N", requires = "pack")]
+    #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
     player: u8,
 
     /// Render one frame to a file and exit (headless testing)
