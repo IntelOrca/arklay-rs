@@ -223,6 +223,9 @@ pub struct RoomAction {
     pub flags: u8,
     /// Raw parameter bytes.
     pub params: [u8; 8],
+    /// Bank-7 (room items) flag index used to remember a taken item; `0xFF`
+    /// when the action does not use one.
+    pub room_items_flag: u8,
 }
 
 impl RoomAction {
@@ -839,7 +842,8 @@ impl GameState {
             entity.pos[0] = target[0];
             entity.pos[2] = target[2];
             entity.target_entity = None;
-            return StepResult::Finished;
+            // Arrival does not leave the actor state; only act_reset/act_end do.
+            return StepResult::Continue;
         }
         let target_angle = angle_between(entity.pos, target);
         entity.angle = rotate_toward(entity.angle, target_angle, u16::from(yaw_step));
@@ -1107,6 +1111,11 @@ impl GameState {
         self.add_item(item, action.item_quantity().max(1));
         self.last_picked_item = Some(item);
         self.item_events.push(item);
+        // Remember the pickup in the room items flag bank so the item does not
+        // come back when the room is re-entered.
+        if action.room_items_flag != 0xFF {
+            self.apply_flag(7, action.room_items_flag, 0);
+        }
         self.room_actions[usize::from(slot)] = None;
         self.doors[usize::from(slot)] = None;
         true
@@ -1142,7 +1151,15 @@ impl GameState {
     }
 
     fn door_locked(&self, door: &Door) -> bool {
-        door.lock & 0x80 != 0 && !self.flag_test(2, door.lock & 0x3F, false)
+        match door.lock {
+            // UNLOCKED, LOCK and LOCKED key states: `LOCK` needs the matching
+            // key item, which the inventory key system does not model yet.
+            0 => false,
+            0xFE | 0xFF => true,
+            // Any other value is a lock flag index: the door is open once the
+            // flag has been set (the scripts set it after using the key).
+            lock => !self.flag_test(2, lock & 0x3F, false),
+        }
     }
 
     fn show_message(&mut self, id: u8, pause: u16) {
@@ -1376,6 +1393,7 @@ impl ScdHost for ScdGameHost<'_> {
                     sce: HANDLER_DOOR,
                     handler: HANDLER_DOOR,
                     flags: door.sub_type,
+                    room_items_flag: 0xFF,
                     params: [
                         door.lock,
                         door.next_room,
@@ -1410,6 +1428,7 @@ impl ScdHost for ScdGameHost<'_> {
                     handler,
                     flags,
                     params,
+                    room_items_flag: 0xFF,
                 };
                 self.store_action(action);
                 StepResult::Continue
@@ -1477,13 +1496,21 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_item(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x18 => {
-                let slot = operand_u8(operands, 0);
+                // Byte layout: slot/rot, zone x4, item type, entry flags, model
+                // index, sca parent, model xyz, anim, roomItems flag, entry
+                // flags, flags word.
+                let slot = operand_u8(operands, 0) & 0x7F;
                 let item = operand_u8(operands, 5);
                 let quantity = operand_u8(operands, 6);
                 let model = operand_u8(operands, 7);
                 let parent = operand_u8(operands, 8);
                 let x = operand_i16(operands, 9).to_le_bytes();
                 let z = operand_i16(operands, 11).to_le_bytes();
+                let room_items_flag = operand_u8(operands, 13);
+                // A set roomItems flag means the item was already taken.
+                if self.state.flag_test(7, room_items_flag, false) {
+                    return StepResult::Continue;
+                }
                 let action = RoomAction {
                     slot,
                     kind: RoomActionKind::Item,
@@ -1497,6 +1524,7 @@ impl ScdHost for ScdGameHost<'_> {
                     handler: HANDLER_ITEM,
                     flags: operand_u8(operands, 14),
                     params: [item, quantity, model, parent, x[0], x[1], z[0], z[1]],
+                    room_items_flag,
                 };
                 self.store_action(action);
                 StepResult::Continue
@@ -1636,6 +1664,10 @@ impl ScdHost for ScdGameHost<'_> {
                 _ => self.placeholder(op),
             },
         }
+    }
+
+    fn on_select_entity(&mut self, entity_type: u8, index: u8) {
+        self.state.select_entity(entity_type, index);
     }
 
     fn flag_test(&mut self, bank: u8, bit: u8, expected: bool) -> bool {
@@ -2327,6 +2359,7 @@ mod tests {
             handler: HANDLER_ITEM,
             flags: 0x81,
             params: [item, quantity, 1, 0xFF, 0, 0, 0, 0],
+            room_items_flag: 0xFF,
         }
     }
 
@@ -2338,6 +2371,7 @@ mod tests {
             sce: HANDLER_DOOR,
             handler: HANDLER_DOOR,
             flags: door.sub_type,
+            room_items_flag: 0xFF,
             params: [
                 door.lock,
                 door.next_room,
@@ -2374,6 +2408,7 @@ mod tests {
             handler: 1,
             flags: 0,
             params: [0; 8],
+            room_items_flag: 0xFF,
         };
         assert!(action.contains(100, 200));
         assert!(action.contains(400, 600));
@@ -2481,6 +2516,30 @@ mod tests {
     }
 
     #[test]
+    fn picked_up_items_stay_taken() {
+        let mut state = game();
+        let item_operands = [3, 0, 0, 100, 100, 0x42, 1, 1, 0xFF, 50, 0, 50, 0, 23, 0, 0];
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_operands));
+        }
+        assert!(state.room_actions[3].is_some());
+        state.interact([50, 0, 50], true);
+        assert_eq!(state.last_picked_item, Some(0x42));
+        assert!(
+            state.flag_test(7, 23, false),
+            "a pickup must set its room-items flag"
+        );
+
+        // Re-running the init script must not bring the item back.
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_operands));
+        }
+        assert!(state.room_actions[3].is_none());
+    }
+
+    #[test]
     fn item_aot_set_stores_item_fields() {
         let mut state = game();
         {
@@ -2548,6 +2607,7 @@ mod tests {
             handler: HANDLER_ITEMBOX,
             flags: 0x81,
             params: [0; 8],
+            room_items_flag: 0xFF,
         });
         state.interact([50, 0, 50], true);
         assert!(state.inventory.is_empty());
@@ -2572,6 +2632,7 @@ mod tests {
             handler: HANDLER_MESSAGE,
             flags: 0x81,
             params: [HANDLER_MESSAGE, 0x81, 170, 0, 79, 0, 0, 0],
+            room_items_flag: 0xFF,
         });
         state.interact([50, 0, 50], true);
         assert_eq!(state.message.id, Some(170));

@@ -421,6 +421,7 @@ impl<'a> EventVm<'a> {
             0x04 => {
                 self.slots[index].entity = operand_u8(insn, 0);
                 self.slots[index].entity_index = operand_u8(insn, 1);
+                host.on_select_entity(self.slots[index].entity, self.slots[index].entity_index);
                 host.on_misc(op, &insn.operands);
                 self.slots[index].pc = next;
                 true
@@ -471,20 +472,18 @@ impl<'a> EventVm<'a> {
         op: &'static Op,
         host: &mut impl ScdHost,
     ) -> bool {
+        host.on_select_entity(self.slots[index].entity, self.slots[index].entity_index);
         let result = host.on_misc(op, &insn.operands);
         let next = insn.offset + insn.bytes.len();
-        if matches!(op.op, 0x80 | 0x86 | 0x8B) {
+        // Only `act_reset` (0x80) and `act_end` (0x8B) leave the actor state;
+        // `act_idle` clears the entity's behaviour but stays in state 1.
+        if matches!(op.op, 0x80 | 0x8B) {
             self.slots[index].state = 0;
             self.slots[index].pc = next;
             return true;
         }
         match result {
             StepResult::Yield => false,
-            StepResult::Finished => {
-                self.slots[index].state = 0;
-                self.slots[index].pc = next;
-                true
-            }
             _ => {
                 self.slots[index].pc = next;
                 true
@@ -499,6 +498,7 @@ impl<'a> EventVm<'a> {
         op: &'static Op,
         host: &mut impl ScdHost,
     ) -> bool {
+        host.on_select_entity(self.slots[index].entity, self.slots[index].entity_index);
         let result = host.on_misc(op, &insn.operands);
         if op.op == 0x01 {
             self.slots[index].state = 0;
@@ -678,9 +678,11 @@ fn eval_condition(host: &mut impl ScdHost, insn: &Insn, op: &'static Op) -> bool
         let expected = operand_u8(insn, 2) != 0;
         host.flag_test(bank, bit, expected)
     } else {
-        !matches!(
+        // An unimplemented condition (Placeholder) must not take the branch:
+        // treating it as true would run one-time script bodies by accident.
+        matches!(
             dispatch_command(host, op, &insn.operands),
-            StepResult::Finished
+            StepResult::Continue | StepResult::Yield
         )
     }
 }
@@ -1262,7 +1264,9 @@ mod tests {
                 ("sound", "bgm_play"),
                 ("misc", "aot_switch"),
                 ("flow", "ck_bits"),
-                ("flow", "nop"),
+                // `ck_bits` is a condition; the default host records a
+                // placeholder, which the VM treats as false, so the following
+                // `nop` body is skipped.
             ]
         );
         assert!(host.flag_calls.is_empty());
@@ -1304,6 +1308,31 @@ mod tests {
         let mut host = RecordingHost::default();
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
+    }
+
+    #[test]
+    fn actor_motion_does_not_end_the_actor_state() {
+        let motion = crate::scd::opcode::actor_op(0x81).unwrap();
+        let scripts = event_scripts(vec![vec![
+            event(0x7A00, &EVT_ACTOR_BEGIN, 1, Vec::new()),
+            actor(0x7A01, motion, 2, vec![value(0)]),
+            actor(0x7A03, &ACT_FLAG_OP, 4, vec![value(0), value(1), value(0)]),
+            actor(
+                0x7A07,
+                crate::scd::opcode::actor_op(0x8B).unwrap(),
+                1,
+                Vec::new(),
+            ),
+            control(0x7A08, &EVT_FINISH, 1, Vec::new()),
+        ]]);
+        let mut vm = EventVm::new(&scripts);
+        let mut host = RecordingHost::default();
+        vm.start(0, 0);
+        vm.step(&mut host);
+        assert!(
+            host.class_names("misc").contains(&"act_flag_op"),
+            "the actor op after a motion must still run"
+        );
     }
 
     #[test]

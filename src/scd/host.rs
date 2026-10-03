@@ -23,6 +23,11 @@ pub enum StepResult {
 /// Host interface: every game effect is a method with a default that records a
 /// placeholder. M4 fills these in without touching the decoder.
 pub trait ScdHost {
+    /// The event VM's `evt_work_set` (and every actor/tween dispatch) selects
+    /// an entity by type and index; hosts keep this per event slot by replaying
+    /// the selection before each actor/tween instruction.
+    fn on_select_entity(&mut self, _entity_type: u8, _index: u8) {}
+
     fn on_flow(&mut self, _op: &Op, _operands: &[Operand]) -> StepResult {
         StepResult::Placeholder
     }
