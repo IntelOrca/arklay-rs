@@ -1,10 +1,11 @@
 //! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
-//! Discovers `STAGE1`..`STAGE7` (case-insensitively, up to two levels below
-//! the root), stores every `ROOM####.RDT`, converts the camera backgrounds of
-//! every distinct room once, and copies the `BGM_*.WAV` music files. Stages 6
-//! and 7 reuse the backgrounds of STAGE1/STAGE2 with the stage digit reduced
-//! by 5.
+//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS` and `sound`
+//! (case-insensitively, up to two levels below the root), stores every
+//! `ROOM####.RDT`, converts the camera backgrounds of every distinct room
+//! once, copies the `BGM_*.WAV` music files and the four player models plus
+//! the two no-weapon locomotion clips. Stages 6 and 7 reuse the backgrounds
+//! of STAGE1/STAGE2 with the stage digit reduced by 5.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -31,7 +32,11 @@ const BMP_BPP_OFFSET: usize = 28;
 
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
-    let Plan { rooms, sound } = build_plan(root)?;
+    let Plan {
+        rooms,
+        sound,
+        players,
+    } = build_plan(root)?;
 
     let mut writer = PackWriter::new();
     let mut stage_counts = [(0usize, 0usize); RoomId::MAX_STAGE as usize];
@@ -64,6 +69,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     }
 
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer)?;
+    let (player_count, player_bytes) = copy_players(&players, &mut writer)?;
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
         println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
@@ -71,6 +77,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     println!("room: {rdt_count} entries, {rdt_bytes} bytes");
     println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
     println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
+    println!("player: {player_count} entries, {player_bytes} bytes");
     writer.write(out)?;
     println!("wrote {}", out.display());
     Ok(())
@@ -131,18 +138,40 @@ fn copy_music(sound: &Option<PathBuf>, writer: &mut PackWriter) -> Result<(usize
     Ok((count, bytes))
 }
 
-/// Stage and sound directories discovered under the conversion root.
+/// Add every resolved player model and locomotion clip to the pack.
+fn copy_players(players: &[PlayerAsset], writer: &mut PackWriter) -> Result<(usize, usize)> {
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for asset in players {
+        let data = fs::read(&asset.source)
+            .with_context(|| format!("failed to read {}", asset.source.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&asset.entry, data)
+            .with_context(|| format!("failed to add {}", asset.entry))?;
+    }
+    Ok((count, bytes))
+}
+
+/// Stage, sound, enemy-model and player-directory roots discovered under the
+/// conversion root.
 #[derive(Debug)]
 struct Layout {
     stages: BTreeMap<u8, PathBuf>,
     sound: Option<PathBuf>,
+    enemy: Option<PathBuf>,
+    players: Option<PathBuf>,
 }
 
-/// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7` and `sound`.
+/// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
+/// `enemy` and `players`.
 fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
     let mut sound = None;
+    let mut enemy = None;
+    let mut players = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -150,6 +179,10 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 stages.entry(digit).or_insert_with(|| dir.clone());
             } else if sound.is_none() && name.eq_ignore_ascii_case("sound") {
                 sound = Some(dir.clone());
+            } else if enemy.is_none() && name.eq_ignore_ascii_case("enemy") {
+                enemy = Some(dir.clone());
+            } else if players.is_none() && name.eq_ignore_ascii_case("players") {
+                players = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -175,7 +208,12 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         );
     }
 
-    Ok(Layout { stages, sound })
+    Ok(Layout {
+        stages,
+        sound,
+        enemy,
+        players,
+    })
 }
 
 /// `stage1`..`stage7` (case-insensitive) -> `Some(1..=7)`.
@@ -192,6 +230,15 @@ fn stage_dir_digit(name: &str) -> Option<u8> {
 struct Rdt {
     id: RoomId,
     bytes: Vec<u8>,
+}
+
+/// One player asset resolved to its pack entry.
+#[derive(Debug)]
+struct PlayerAsset {
+    /// Pack entry, e.g. `player/01.emd`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
 }
 
 /// One distinct room (`stage` + `room`, player variants merged).
@@ -212,11 +259,17 @@ struct Room {
 struct Plan {
     rooms: Vec<Room>,
     sound: Option<PathBuf>,
+    players: Vec<PlayerAsset>,
 }
 
 /// Discover, enumerate, and validate every conversion input.
 fn build_plan(root: &Path) -> Result<Plan> {
-    let Layout { stages, sound } = discover_layout(root)?;
+    let Layout {
+        stages,
+        sound,
+        enemy,
+        players,
+    } = discover_layout(root)?;
     let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
 
     for (digit, dir) in &stages {
@@ -284,7 +337,47 @@ fn build_plan(root: &Path) -> Result<Plan> {
     Ok(Plan {
         rooms: rooms.into_values().collect(),
         sound,
+        players: resolve_players(enemy.as_deref(), players.as_deref())?,
     })
+}
+
+/// Resolve the four player models (`ENEMY/Char10..13.EMD`) and the two
+/// no-weapon locomotion clips (`PLAYERS/W00.EMW`, `W10.EMW`) by character
+/// index. Missing files are reported together.
+fn resolve_players(enemy: Option<&Path>, players: Option<&Path>) -> Result<Vec<PlayerAsset>> {
+    let enemy_index = enemy.map(index_dir).transpose()?;
+    let players_index = players.map(index_dir).transpose()?;
+
+    let mut assets = Vec::new();
+    let mut missing = Vec::new();
+    for id in 0..4usize {
+        let file = format!("char1{id}.emd");
+        match enemy_index.as_ref().and_then(|index| index.get(&file)) {
+            Some(path) => assets.push(PlayerAsset {
+                entry: format!("player/{id:02}.emd"),
+                source: path.clone(),
+            }),
+            None => missing.push(format!("ENEMY/Char1{id}.EMD")),
+        }
+    }
+    for (id, file) in [(0usize, "w00.emw"), (1, "w10.emw")] {
+        match players_index.as_ref().and_then(|index| index.get(file)) {
+            Some(path) => assets.push(PlayerAsset {
+                entry: format!("player/{id:02}.emw"),
+                source: path.clone(),
+            }),
+            None => missing.push(format!("PLAYERS/{}", file.to_ascii_uppercase())),
+        }
+    }
+
+    if !missing.is_empty() {
+        bail!(
+            "missing {} player asset(s): {}",
+            missing.len(),
+            missing.join(", ")
+        );
+    }
+    Ok(assets)
 }
 
 /// Parse `ROOM####.RDT` (case-insensitive) into its identity.
@@ -378,6 +471,22 @@ mod tests {
         for digit in 1..=RoomId::MAX_STAGE {
             fs::create_dir_all(root.join(format!("STAGE{digit}"))).unwrap();
         }
+        make_player_dirs(root);
+    }
+
+    /// Player models and no-weapon clips, with mixed-case names like the
+    /// shipped install.
+    fn make_player_dirs(root: &Path) {
+        let enemy = root.join("ENEMY");
+        let players = root.join("PLAYERS");
+        fs::create_dir_all(&enemy).unwrap();
+        fs::create_dir_all(&players).unwrap();
+        fs::write(enemy.join("Char10.emd"), b"emd0").unwrap();
+        fs::write(enemy.join("CHAR11.EMD"), b"emd1").unwrap();
+        fs::write(enemy.join("Char12.EMD"), b"emd2").unwrap();
+        fs::write(enemy.join("char13.emd"), b"emd3").unwrap();
+        fs::write(players.join("W00.EMW"), b"emw0").unwrap();
+        fs::write(players.join("w10.emw"), b"emw1").unwrap();
     }
 
     /// A minimal RDT with `cameras` zeroed camera records.
@@ -448,6 +557,8 @@ mod tests {
         }
         fs::create_dir_all(root.path.join("STAGE1")).unwrap();
         fs::create_dir_all(root.path.join("install/sound")).unwrap();
+        fs::create_dir_all(root.path.join("install/EnEmY")).unwrap();
+        fs::create_dir_all(root.path.join("pLaYeRs")).unwrap();
 
         let layout = discover_layout(&root.path).unwrap();
 
@@ -455,6 +566,8 @@ mod tests {
         assert_eq!(layout.stages[&2], root.path.join("install/sTaGe2"));
         assert_eq!(layout.stages[&7], root.path.join("install/sTaGe7"));
         assert_eq!(layout.sound.unwrap(), root.path.join("install/sound"));
+        assert_eq!(layout.enemy.unwrap(), root.path.join("install/EnEmY"));
+        assert_eq!(layout.players.unwrap(), root.path.join("pLaYeRs"));
     }
 
     #[test]
@@ -472,6 +585,26 @@ mod tests {
             message.contains(&root.path.display().to_string()),
             "{message}"
         );
+    }
+
+    #[test]
+    fn missing_player_assets_are_aggregated() {
+        let root = TempDir::new("missing-players");
+        for digit in 1..=RoomId::MAX_STAGE {
+            fs::create_dir_all(root.path.join(format!("STAGE{digit}"))).unwrap();
+        }
+        fs::create_dir_all(root.path.join("ENEMY")).unwrap();
+        fs::write(root.path.join("ENEMY/Char10.emd"), b"emd0").unwrap();
+        fs::create_dir_all(root.path.join("PLAYERS")).unwrap();
+        fs::write(root.path.join("PLAYERS/W00.EMW"), b"emw0").unwrap();
+
+        let message = build_plan(&root.path).unwrap_err().to_string();
+
+        for name in ["Char11.EMD", "Char12.EMD", "Char13.EMD", "W10.EMW"] {
+            assert!(message.contains(name), "{message}");
+        }
+        assert!(!message.contains("Char10"), "{message}");
+        assert!(!message.contains("W00"), "{message}");
     }
 
     #[test]
@@ -610,10 +743,26 @@ mod tests {
         assert!(pack.contains("bgm/002.wav"));
         assert!(!pack.contains("bgm/000.wav"));
 
+        assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
+        assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
+
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("room/"), 3);
         assert_eq!(count("roomcut/"), 2);
         assert_eq!(count("bgm/"), 3);
+        assert_eq!(count("player/"), 6);
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("player/") && path.ends_with(".emd"))
+                .count(),
+            4
+        );
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("player/") && path.ends_with(".emw"))
+                .count(),
+            2
+        );
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
@@ -683,6 +832,13 @@ mod tests {
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
         assert!(pack.contains("bgm/013.wav"));
+
+        // Four character models (Char10..Char13) plus the two no-weapon
+        // locomotion clips (W00, W10). player/01 is Jill, the character that
+        // owns ROOM1001.
+        assert_eq!(count("player/"), 6);
+        assert!(pack.contains("player/01.emd"));
+        assert!(pack.contains("player/01.emw"));
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));

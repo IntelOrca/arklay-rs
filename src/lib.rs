@@ -3,10 +3,13 @@
 pub mod audio;
 pub mod bmp;
 pub mod convert;
+pub mod emd;
 pub mod engine;
 pub mod lzw;
+pub mod model;
 pub mod music;
 pub mod pack;
 pub mod rdt;
 pub mod state;
 pub mod tim;
+pub mod tmd;

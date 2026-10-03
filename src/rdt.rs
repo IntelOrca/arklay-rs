@@ -1,19 +1,46 @@
 //! RDT room parser.
 //!
-//! Reads the camera cut table from an RDT file's header.
+//! Reads the header pointers of an RDT file and everything gameplay needs:
+//! camera cuts, ambient and point lights, collision boundaries, camera switch
+//! zones and walkable zones.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
+pub use crate::state::{Collision, CollisionRect, Light, WalkZone, Zone};
 use crate::state::{Cut, RoomId, RoomState};
 
+/// Offset of the ambient light color within an RDT file.
+const AMBIENT_OFFSET: usize = 0x06;
+/// Offset of the three room light records within an RDT file.
+const LIGHTS_OFFSET: usize = 0x0C;
+/// Number of room light records.
+const LIGHT_COUNT: usize = 3;
+/// Size in bytes of one room light record.
+const LIGHT_SIZE: usize = 0x14;
+/// Offset of the data pointer table within an RDT file.
+const POINTERS_OFFSET: usize = 0x48;
+/// Number of data pointers in the header.
+const POINTER_COUNT: usize = 19;
+/// Pointer slot of the camera switch zone table.
+const CAMERA_ZONES_SLOT: usize = 0;
+/// Pointer slot of the collision boundary table.
+const COLLISION_SLOT: usize = 1;
+/// Pointer slot of the walkable zone table.
+const WALK_ZONES_SLOT: usize = 4;
 /// Offset of the camera records within an RDT file.
 const CAMERAS_OFFSET: usize = 0x94;
-
 /// Number of little-endian `i32` fields in one camera record.
 const CAMERA_FIELDS: usize = 11;
-
 /// Size in bytes of one camera record.
 const CAMERA_SIZE: usize = CAMERA_FIELDS * 4;
+/// Size in bytes of one camera switch zone record.
+const ZONE_SIZE: usize = 0x14;
+/// Size in bytes of the collision boundary header.
+const COLLISION_HEADER_SIZE: usize = 0x18;
+/// Size in bytes of one collision boundary record.
+const COLLISION_RECORD_SIZE: usize = 0xC;
+/// Size in bytes of one walkable zone record.
+const WALK_ZONE_SIZE: usize = 0xC;
 
 /// Parse an RDT file into internal room state.
 pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
@@ -24,24 +51,13 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         );
     };
 
-    if cameras_count == 0 {
-        return Ok(empty_room(id));
-    }
-
-    let required = CAMERAS_OFFSET + cameras_count as usize * CAMERA_SIZE;
-    if data.len() < required {
-        bail!(
-            "RDT is truncated for {cameras_count} camera(s): need {required} bytes, got {}",
-            data.len()
-        );
-    }
-
-    let cuts = (0..cameras_count as usize)
-        .map(|index| {
-            let start = CAMERAS_OFFSET + index * CAMERA_SIZE;
-            parse_cut(&data[start..start + CAMERA_SIZE], index)
-        })
-        .collect();
+    let cuts = parse_cameras(data, cameras_count)?;
+    let ambient = parse_ambient(data)?;
+    let lights = parse_lights(data)?;
+    let pointers = read_pointers(data);
+    let collision = parse_collision(data, pointers[COLLISION_SLOT])?;
+    let zones = parse_zones(data, pointers[CAMERA_ZONES_SLOT])?;
+    let walk_zones = parse_walk_zones(data, pointers[WALK_ZONES_SLOT])?;
 
     Ok(RoomState {
         stage: id.stage,
@@ -49,18 +65,246 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         player_flag: id.player_flag,
         cuts,
         current_cut: 0,
+        ambient,
+        lights,
+        collision,
+        zones,
+        walk_zones,
     })
 }
 
-/// Build the state of a room without any camera cuts.
-fn empty_room(id: RoomId) -> RoomState {
-    RoomState {
-        stage: id.stage,
-        room: id.room,
-        player_flag: id.player_flag,
-        cuts: Vec::new(),
-        current_cut: 0,
+/// Parse the camera records, one per cut.
+fn parse_cameras(data: &[u8], cameras_count: u8) -> Result<Vec<Cut>> {
+    if cameras_count == 0 {
+        return Ok(Vec::new());
     }
+
+    let required = CAMERAS_OFFSET + usize::from(cameras_count) * CAMERA_SIZE;
+    if data.len() < required {
+        bail!(
+            "RDT is truncated for {cameras_count} camera(s): need {required} bytes, got {}",
+            data.len()
+        );
+    }
+
+    Ok((0..usize::from(cameras_count))
+        .map(|index| {
+            let start = CAMERAS_OFFSET + index * CAMERA_SIZE;
+            parse_cut(&data[start..start + CAMERA_SIZE], index)
+        })
+        .collect())
+}
+
+/// Parse the ambient light color, defaulting to black when absent.
+fn parse_ambient(data: &[u8]) -> Result<[i16; 3]> {
+    if data.len() < AMBIENT_OFFSET + 6 {
+        return Ok([0; 3]);
+    }
+    Ok([
+        i16_at(data, AMBIENT_OFFSET)?,
+        i16_at(data, AMBIENT_OFFSET + 2)?,
+        i16_at(data, AMBIENT_OFFSET + 4)?,
+    ])
+}
+
+/// Parse the three room light records, defaulting to dark when absent.
+fn parse_lights(data: &[u8]) -> Result<[Light; LIGHT_COUNT]> {
+    if data.len() < LIGHTS_OFFSET + LIGHT_COUNT * LIGHT_SIZE {
+        return Ok([Light::default(); LIGHT_COUNT]);
+    }
+
+    let mut lights = [Light::default(); LIGHT_COUNT];
+    for (index, light) in lights.iter_mut().enumerate() {
+        *light = parse_light(data, LIGHTS_OFFSET + index * LIGHT_SIZE)?;
+    }
+    Ok(lights)
+}
+
+/// Parse one room light record.
+fn parse_light(data: &[u8], offset: usize) -> Result<Light> {
+    let color = bytes_at(data, offset + 0x0C, 3)?;
+    Ok(Light {
+        pos: [
+            i32_at(data, offset)?,
+            i32_at(data, offset + 4)?,
+            i32_at(data, offset + 8)?,
+        ],
+        color: [color[0], color[1], color[2]],
+        kind: u16_at(data, offset + 0x10)?,
+        radius: i16_at(data, offset + 0x12)?,
+    })
+}
+
+/// Read the data pointer table. A truncated table reads as all-null pointers.
+fn read_pointers(data: &[u8]) -> [u32; POINTER_COUNT] {
+    if data.len() < POINTERS_OFFSET + POINTER_COUNT * 4 {
+        return [0; POINTER_COUNT];
+    }
+
+    let mut pointers = [0u32; POINTER_COUNT];
+    for (index, pointer) in pointers.iter_mut().enumerate() {
+        let Ok(value) = u32_at(data, POINTERS_OFFSET + index * 4) else {
+            return [0; POINTER_COUNT];
+        };
+        *pointer = value;
+    }
+    pointers
+}
+
+/// Parse the collision boundary table at `pointer`, if it has one.
+fn parse_collision(data: &[u8], pointer: u32) -> Result<Collision> {
+    if pointer == 0 {
+        return Ok(Collision::default());
+    }
+
+    let base = pointer as usize;
+    base.checked_add(COLLISION_HEADER_SIZE)
+        .filter(|&end| end <= data.len())
+        .with_context(|| {
+            format!(
+                "collision pointer 0x{pointer:x} is out of bounds for the {}-byte RDT",
+                data.len()
+            )
+        })?;
+
+    let cell_x = i16_at(data, base)?;
+    let cell_z = i16_at(data, base + 2)?;
+    let mut counts = [0i32; 5];
+    for (index, count) in counts.iter_mut().enumerate() {
+        *count = i32_at(data, base + 4 + index * 4)?;
+    }
+
+    let mut total = 0usize;
+    for (quadrant, &count) in counts[..4].iter().enumerate() {
+        if count < 0 {
+            bail!("collision quadrant {quadrant} has negative record count {count}");
+        }
+        total = total
+            .checked_add(count as usize)
+            .context("collision record count overflows")?;
+    }
+
+    let records_start = base + COLLISION_HEADER_SIZE;
+    let records_end = total
+        .checked_mul(COLLISION_RECORD_SIZE)
+        .and_then(|bytes| records_start.checked_add(bytes))
+        .context("collision record table overflows")?;
+    if records_end > data.len() {
+        bail!(
+            "collision table at 0x{base:x} with {total} record(s) overruns the {}-byte RDT",
+            data.len()
+        );
+    }
+
+    let mut quadrants: [Vec<CollisionRect>; 4] = std::array::from_fn(|_| Vec::new());
+    let mut offset = records_start;
+    for (quadrant, &count) in quadrants.iter_mut().zip(counts[..4].iter()) {
+        for _ in 0..count {
+            quadrant.push(parse_collision_rect(data, offset)?);
+            offset += COLLISION_RECORD_SIZE;
+        }
+    }
+
+    Ok(Collision {
+        cell_x,
+        cell_z,
+        quadrants,
+    })
+}
+
+/// Parse one collision boundary record.
+fn parse_collision_rect(data: &[u8], offset: usize) -> Result<CollisionRect> {
+    Ok(CollisionRect {
+        x_max: u16_at(data, offset)?,
+        z_max: u16_at(data, offset + 2)?,
+        x_min: u16_at(data, offset + 4)?,
+        z_min: u16_at(data, offset + 6)?,
+        kind: u16_at(data, offset + 8)?,
+        flags: u16_at(data, offset + 10)?,
+    })
+}
+
+/// Parse the camera switch zone table at `pointer`, if it has one.
+///
+/// The table has no count: records are read in file order until one whose
+/// `cam_from` is not a camera id (the trailing `0xFFFFFFFF` sentinel).
+fn parse_zones(data: &[u8], pointer: u32) -> Result<Vec<Zone>> {
+    if pointer == 0 {
+        return Ok(Vec::new());
+    }
+
+    let base = pointer as usize;
+    if base >= data.len() {
+        bail!(
+            "camera switch zone pointer 0x{pointer:x} is out of bounds for the {}-byte RDT",
+            data.len()
+        );
+    }
+
+    let mut zones = Vec::new();
+    let mut offset = base;
+    while offset + ZONE_SIZE <= data.len() {
+        let cam_to = i16_at(data, offset)?;
+        let cam_from = i16_at(data, offset + 2)?;
+        if !(0..=7).contains(&cam_from) {
+            break;
+        }
+
+        let mut corners = [[0i16; 2]; 4];
+        for (index, corner) in corners.iter_mut().enumerate() {
+            corner[0] = i16_at(data, offset + 4 + index * 4)?;
+            corner[1] = i16_at(data, offset + 6 + index * 4)?;
+        }
+        zones.push(Zone {
+            cam_to,
+            cam_from,
+            corners,
+        });
+        offset += ZONE_SIZE;
+    }
+    Ok(zones)
+}
+
+/// Parse the walkable zone table at `pointer`, if it has one.
+fn parse_walk_zones(data: &[u8], pointer: u32) -> Result<Vec<WalkZone>> {
+    if pointer == 0 {
+        return Ok(Vec::new());
+    }
+
+    let base = pointer as usize;
+    let start = base
+        .checked_add(2)
+        .filter(|&end| end <= data.len())
+        .with_context(|| {
+            format!(
+                "walk zone pointer 0x{pointer:x} is out of bounds for the {}-byte RDT",
+                data.len()
+            )
+        })?;
+    let count = usize::from(data[base]);
+    let required = start
+        .checked_add(count * WALK_ZONE_SIZE)
+        .context("walk zone table size overflows")?;
+    if required > data.len() {
+        bail!(
+            "walk zone table at 0x{base:x} with {count} zone(s) overruns the {}-byte RDT",
+            data.len()
+        );
+    }
+
+    let mut walk_zones = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = start + index * WALK_ZONE_SIZE;
+        walk_zones.push(WalkZone {
+            x1: i16_at(data, offset)?,
+            z1: i16_at(data, offset + 2)?,
+            x2: i16_at(data, offset + 4)?,
+            z2: i16_at(data, offset + 6)?,
+            field_08: u16_at(data, offset + 8)?,
+            flags: u16_at(data, offset + 10)?,
+        });
+    }
+    Ok(walk_zones)
 }
 
 /// Parse one 44-byte camera record.
@@ -80,8 +324,45 @@ fn parse_cut(record: &[u8], index: usize) -> Cut {
     }
 }
 
+/// Read a bounds-checked byte range.
+fn bytes_at(data: &[u8], offset: usize, length: usize) -> Result<&[u8]> {
+    let end = offset
+        .checked_add(length)
+        .with_context(|| format!("RDT read at 0x{offset:x} overflows"))?;
+    data.get(offset..end).with_context(|| {
+        format!(
+            "RDT read of {length} byte(s) at 0x{offset:x} is out of bounds ({} bytes)",
+            data.len()
+        )
+    })
+}
+
+/// Read a little-endian `u16`.
+fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
+    let raw = bytes_at(data, offset, 2)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+/// Read a little-endian `i16`.
+fn i16_at(data: &[u8], offset: usize) -> Result<i16> {
+    Ok(u16_at(data, offset)? as i16)
+}
+
+/// Read a little-endian `u32`.
+fn u32_at(data: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes_at(data, offset, 4)?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+/// Read a little-endian `i32`.
+fn i32_at(data: &[u8], offset: usize) -> Result<i32> {
+    Ok(u32_at(data, offset)? as i32)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const ROOM_ID: RoomId = RoomId {
@@ -89,6 +370,7 @@ mod tests {
         room: 5,
         player_flag: 3,
     };
+    const RDT_HEADER_LEN: usize = 0x94;
 
     fn encode_record(fields: [i32; CAMERA_FIELDS]) -> Vec<u8> {
         fields
@@ -98,12 +380,58 @@ mod tests {
     }
 
     fn build_rdt(cameras_count: u8, records: &[[i32; CAMERA_FIELDS]]) -> Vec<u8> {
-        let mut data = vec![0u8; CAMERAS_OFFSET];
+        let mut data = vec![0u8; RDT_HEADER_LEN];
         data[0x01] = cameras_count;
         for fields in records {
             data.extend_from_slice(&encode_record(*fields));
         }
         data
+    }
+
+    fn set_ptr(data: &mut [u8], slot: usize, offset: usize) {
+        let start = POINTERS_OFFSET + slot * 4;
+        data[start..start + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+    }
+
+    fn set_light(
+        data: &mut [u8],
+        index: usize,
+        pos: [i32; 3],
+        color: [u8; 3],
+        kind: u16,
+        radius: i16,
+    ) {
+        let offset = LIGHTS_OFFSET + index * LIGHT_SIZE;
+        for (axis, value) in pos.iter().enumerate() {
+            data[offset + axis * 4..offset + axis * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        data[offset + 0x0C..offset + 0x0F].copy_from_slice(&color);
+        data[offset + 0x0F] = 0;
+        data[offset + 0x10..offset + 0x12].copy_from_slice(&kind.to_le_bytes());
+        data[offset + 0x12..offset + 0x14].copy_from_slice(&radius.to_le_bytes());
+    }
+
+    fn push_collision_rect(data: &mut Vec<u8>, record: [u16; 6]) {
+        for value in record {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn push_zone(data: &mut Vec<u8>, cam_to: i16, cam_from: i16, corners: [[i16; 2]; 4]) {
+        data.extend_from_slice(&cam_to.to_le_bytes());
+        data.extend_from_slice(&cam_from.to_le_bytes());
+        for corner in corners {
+            data.extend_from_slice(&corner[0].to_le_bytes());
+            data.extend_from_slice(&corner[1].to_le_bytes());
+        }
+    }
+
+    fn push_walk_zone(data: &mut Vec<u8>, record: [i16; 4], field_08: u16, flags: u16) {
+        for value in record {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data.extend_from_slice(&field_08.to_le_bytes());
+        data.extend_from_slice(&flags.to_le_bytes());
     }
 
     #[test]
@@ -159,6 +487,18 @@ mod tests {
     }
 
     #[test]
+    fn stub_rdt_parses_into_an_empty_room() {
+        let state = parse(&[0x00, 0x00, 0x00, 0x00], ROOM_ID).unwrap();
+
+        assert!(state.cuts.is_empty());
+        assert_eq!(state.ambient, [0; 3]);
+        assert_eq!(state.lights, [Light::default(); LIGHT_COUNT]);
+        assert!(state.collision.quadrants.iter().all(Vec::is_empty));
+        assert!(state.zones.is_empty());
+        assert!(state.walk_zones.is_empty());
+    }
+
+    #[test]
     fn errors_when_header_is_too_short() {
         assert!(parse(&[], ROOM_ID).is_err());
         assert!(parse(&[0x02], ROOM_ID).is_err());
@@ -177,10 +517,272 @@ mod tests {
 
     #[test]
     fn errors_when_camera_table_is_missing() {
-        let data = build_rdt(0, &[]);
-        let mut data = data;
+        let mut data = build_rdt(0, &[]);
         data[0x01] = 1;
 
         assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn parses_ambient_and_lights() {
+        let mut data = build_rdt(0, &[]);
+        data[AMBIENT_OFFSET..AMBIENT_OFFSET + 2].copy_from_slice(&896i16.to_le_bytes());
+        data[AMBIENT_OFFSET + 2..AMBIENT_OFFSET + 4].copy_from_slice(&976i16.to_le_bytes());
+        data[AMBIENT_OFFSET + 4..AMBIENT_OFFSET + 6].copy_from_slice(&656i16.to_le_bytes());
+        set_light(&mut data, 0, [1, 2, 3], [10, 20, 30], 0, 7000);
+        set_light(&mut data, 1, [-4, -5, -6], [40, 50, 60], 1, -1);
+        set_light(&mut data, 2, [7, 8, 9], [70, 80, 90], 2, 100);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.ambient, [896, 976, 656]);
+        assert_eq!(state.lights[0].pos, [1, 2, 3]);
+        assert_eq!(state.lights[0].color, [10, 20, 30]);
+        assert_eq!(state.lights[0].kind, 0);
+        assert_eq!(state.lights[0].radius, 7000);
+        assert_eq!(state.lights[1].pos, [-4, -5, -6]);
+        assert_eq!(state.lights[1].kind, 1);
+        assert_eq!(state.lights[1].radius, -1);
+        assert_eq!(state.lights[2].color, [70, 80, 90]);
+        assert_eq!(state.lights[2].radius, 100);
+    }
+
+    #[test]
+    fn parses_collision_quadrants() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, COLLISION_SLOT, offset);
+        data.extend_from_slice(&10i16.to_le_bytes());
+        data.extend_from_slice(&20i16.to_le_bytes());
+        for count in [2i32, 1, 0, 0, 0] {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+        push_collision_rect(&mut data, [100, 110, 10, 20, 1, 0x300]);
+        push_collision_rect(&mut data, [200, 210, 110, 120, 5, 0x200]);
+        push_collision_rect(&mut data, [300, 310, 210, 220, 3, 0x100]);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+        let collision = &state.collision;
+
+        assert_eq!(collision.cell_x, 10);
+        assert_eq!(collision.cell_z, 20);
+        assert_eq!(collision.quadrants[0].len(), 2);
+        assert_eq!(collision.quadrants[1].len(), 1);
+        assert!(collision.quadrants[2].is_empty());
+        assert!(collision.quadrants[3].is_empty());
+        assert_eq!(collision.quadrants[0][0].kind, 1);
+        assert_eq!(collision.quadrants[0][0].flags, 0x300);
+        assert_eq!(collision.quadrants[1][0].x_max, 300);
+
+        assert_eq!(collision.records(50, 50)[0].x_max, 100);
+        assert_eq!(collision.records(5, 50)[0].x_max, 300);
+        assert!(collision.records(50, 5).is_empty());
+        assert!(collision.records(5, 5).is_empty());
+    }
+
+    #[test]
+    fn parses_switch_zones_in_file_order() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, CAMERA_ZONES_SLOT, offset);
+        push_zone(&mut data, 9, 0, [[0, 0], [0, 100], [100, 100], [100, 0]]);
+        push_zone(&mut data, 1, 0, [[10, 10], [10, 90], [90, 90], [90, 10]]);
+        push_zone(
+            &mut data,
+            5,
+            1,
+            [[200, 200], [200, 300], [300, 300], [300, 200]],
+        );
+        data.extend_from_slice(&[0xFF; ZONE_SIZE]);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.zones.len(), 3);
+        assert_eq!(state.zones[0].cam_to, 9);
+        assert_eq!(state.zones[0].cam_from, 0);
+        assert_eq!(state.zones[1].cam_from, 0);
+        assert_eq!(state.zones[2].cam_to, 5);
+        assert_eq!(state.zones[2].cam_from, 1);
+    }
+
+    #[test]
+    fn zone_contains_matches_the_edge_tests() {
+        let zone = Zone {
+            cam_to: 1,
+            cam_from: 0,
+            corners: [[0, 0], [0, 100], [100, 100], [100, 0]],
+        };
+
+        assert!(zone.contains(50, 50));
+        assert!(zone.contains(1, 99));
+        assert!(!zone.contains(-1, 50));
+        assert!(!zone.contains(50, -1));
+        assert!(!zone.contains(101, 50));
+        assert!(!zone.contains(50, 101));
+        assert!(zone.contains(0, 0));
+        assert!(zone.contains(100, 100));
+    }
+
+    #[test]
+    fn zone_contains_zero_extends_corners() {
+        let zone = Zone {
+            cam_to: 1,
+            cam_from: 0,
+            corners: [[-1, -1], [-1, 1], [1, 1], [1, -1]],
+        };
+
+        assert!(zone.contains(65535, 65535));
+        assert!(!zone.contains(0, 0));
+    }
+
+    #[test]
+    fn parses_walk_zones_with_half_open_edges() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, WALK_ZONES_SLOT, offset);
+        data.push(2);
+        data.push(0);
+        push_walk_zone(&mut data, [100, 300, 200, 400], 0x3FF, 0);
+        push_walk_zone(&mut data, [100, 0, -100, 100], 0x100, 0x10);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.walk_zones.len(), 2);
+        let zone = &state.walk_zones[0];
+        assert_eq!(zone.field_08, 0x3FF);
+        assert!(zone.contains(100, 300));
+        assert!(zone.contains(199, 399));
+        assert!(!zone.contains(200, 300));
+        assert!(!zone.contains(100, 400));
+        assert!(!zone.contains(99, 300));
+
+        // x wraps from 100 to -100 (unsigned 65436), so -101 is the last
+        // inside value before the half-open end.
+        let wrapped = &state.walk_zones[1];
+        assert!(wrapped.contains(100, 50));
+        assert!(wrapped.contains(-101, 50));
+        assert!(!wrapped.contains(-100, 50));
+        assert!(!wrapped.contains(0, 50));
+        assert_eq!(wrapped.flags, 0x10);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_collision_pointer() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len() + 4;
+        set_ptr(&mut data, COLLISION_SLOT, offset);
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_collision_record_overrun() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, COLLISION_SLOT, offset);
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        for count in [3i32, 0, 0, 0, 0] {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_negative_collision_count() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, COLLISION_SLOT, offset);
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        for count in [-1i32, 0, 0, 0, 0] {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_zone_pointer() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, CAMERA_ZONES_SLOT, offset);
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_walk_zone_overrun() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, WALK_ZONES_SLOT, offset);
+        data.push(2);
+        data.push(0);
+        push_walk_zone(&mut data, [0, 0, 10, 10], 0, 0);
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn parses_real_room_1001() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let path = Path::new(&root).join("JPN/STAGE1/ROOM1001.RDT");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        let state = parse(&data, RoomId::parse("1001").unwrap()).unwrap();
+
+        assert_eq!(state.ambient, [896, 976, 656]);
+        assert_eq!(state.lights[0].pos, [4680, -2222, 6360]);
+        assert_eq!(state.lights[0].color, [100, 100, 100]);
+        assert_eq!(state.lights[0].kind, 0);
+        assert_eq!(state.lights[0].radius, 7000);
+
+        assert_eq!(state.cuts.len(), 6);
+        assert_eq!(state.cuts[0].fov, 221);
+
+        assert_eq!(state.collision.cell_x, 5188);
+        assert_eq!(state.collision.cell_z, 6038);
+        assert_eq!(state.collision.quadrants[0].len(), 4);
+        assert_eq!(state.collision.quadrants[1].len(), 4);
+        assert_eq!(state.collision.quadrants[2].len(), 4);
+        assert_eq!(state.collision.quadrants[3].len(), 2);
+        let record = state.collision.quadrants[0][0];
+        assert_eq!(record.x_max, 10864);
+        assert_eq!(record.z_max, 12330);
+        assert_eq!(record.x_min, 8490);
+        assert_eq!(record.z_min, 4);
+        assert_eq!(record.kind, 1);
+        assert_eq!(record.flags, 0x300);
+
+        assert_eq!(state.zones.len(), 14);
+        assert_eq!(state.zones[0].cam_to, 9);
+        assert_eq!(state.zones[0].cam_from, 0);
+        assert_eq!(
+            state.zones[0].corners,
+            [[1100, 893], [600, 10702], [9807, 10600], [9685, 900]]
+        );
+        assert!(state.zones[0].contains(2000, 5000));
+        assert!(!state.zones[0].contains(11000, 5000));
+        assert_eq!(state.zones[3].cam_from, 1);
+        assert_eq!(
+            state.zones[3].corners,
+            [[700, 900], [700, 11014], [9871, 11014], [9971, 900]]
+        );
+
+        assert_eq!(state.walk_zones.len(), 1);
+        let zone = state.walk_zones[0];
+        assert_eq!(
+            (zone.x1, zone.z1, zone.x2, zone.z2),
+            (1700, 1800, 8000, 8100)
+        );
+        assert_eq!(zone.field_08, 0x3FF);
+        assert_eq!(zone.flags, 0);
+        assert!(zone.contains(1700, 1800));
+        assert!(!zone.contains(8000, 8100));
     }
 }

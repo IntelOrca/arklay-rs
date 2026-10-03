@@ -2,12 +2,16 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::model::Texture8;
 use crate::state::Image;
 
 const TIM_MAGIC: u32 = 0x10;
 const HEADER_LEN: usize = 8;
+const BLOCK_HEADER_LEN: usize = 12;
 const IMAGE_BLOCK_HEADER_LEN: usize = 12;
 const PIXEL_BYTES: usize = 2;
+const CLUT_FLAG: u32 = 1 << 3;
+const MODE_8BPP: u32 = 1;
 
 /// Decode a PSX TIM image. Only 16bpp direct color (mode 2) is supported.
 ///
@@ -80,6 +84,122 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         height: height as u32,
         rgba,
     })
+}
+
+/// Decode a TIM with an 8bpp indexed image and its CLUT.
+///
+/// The flags must select mode 1 (8bpp indexed) and set the CLUT bit. The CLUT
+/// block's length field covers its 12-byte header and all BGR555 entries; the
+/// image block's width field is in 16-bit units, so the pixel width is twice
+/// the stored value. Palettes are flattened row-major with the 256 entries of
+/// the player texture's CLUT row first. The STP bit is ignored.
+pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
+    if data.len() < HEADER_LEN {
+        bail!(
+            "TIM is truncated: {} bytes, need at least {HEADER_LEN}",
+            data.len()
+        );
+    }
+    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if magic != TIM_MAGIC {
+        bail!("not a TIM file: magic 0x{magic:08X}, expected 0x{TIM_MAGIC:08X}");
+    }
+
+    let flags = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let mode = flags & 7;
+    if mode != MODE_8BPP {
+        bail!("unsupported TIM color mode {mode}: expected mode {MODE_8BPP} (8bpp indexed)");
+    }
+    if flags & CLUT_FLAG == 0 {
+        bail!("8bpp TIM has no CLUT block: flags 0x{flags:02X}");
+    }
+
+    let clut_block = block_header(data, HEADER_LEN, "CLUT")?;
+    let clut_length = u32::from_le_bytes(clut_block[0..4].try_into().unwrap()) as usize;
+    if clut_length < BLOCK_HEADER_LEN {
+        bail!(
+            "TIM CLUT block length {clut_length} is smaller than its {BLOCK_HEADER_LEN}-byte header"
+        );
+    }
+    let clut_width = u16::from_le_bytes(clut_block[8..10].try_into().unwrap()) as usize;
+    let clut_height = u16::from_le_bytes(clut_block[10..12].try_into().unwrap()) as usize;
+    let clut_count = clut_width
+        .checked_mul(clut_height)
+        .context("TIM CLUT dimensions overflow")?;
+    let clut_start = HEADER_LEN + BLOCK_HEADER_LEN;
+    let clut_end = clut_start
+        .checked_add(
+            clut_count
+                .checked_mul(PIXEL_BYTES)
+                .context("TIM CLUT size overflows")?,
+        )
+        .context("TIM CLUT size overflows")?;
+    if clut_end > HEADER_LEN + clut_length {
+        bail!(
+            "TIM CLUT block length {clut_length} does not cover its {clut_width}x{clut_height} palette"
+        );
+    }
+    let clut_bytes = data.get(clut_start..clut_end).with_context(|| {
+        format!(
+            "truncated TIM CLUT data: need {} bytes, have {}",
+            clut_count * PIXEL_BYTES,
+            data.len().saturating_sub(clut_start)
+        )
+    })?;
+    let palettes = clut_bytes
+        .as_chunks::<PIXEL_BYTES>()
+        .0
+        .iter()
+        .map(|entry| expand_bgr555(u16::from_le_bytes([entry[0], entry[1]])))
+        .collect();
+
+    let image_start = HEADER_LEN
+        .checked_add(clut_length)
+        .context("TIM block offset overflows")?;
+    let image_block = block_header(data, image_start, "image")?;
+    let _image_length = u32::from_le_bytes(image_block[0..4].try_into().unwrap());
+    let width_units = u16::from_le_bytes(image_block[8..10].try_into().unwrap()) as usize;
+    let height = u16::from_le_bytes(image_block[10..12].try_into().unwrap()) as usize;
+    let pixel_count = width_units
+        .checked_mul(2)
+        .and_then(|width| width.checked_mul(height))
+        .context("TIM image dimensions overflow")?;
+    let pixel_start = image_start + BLOCK_HEADER_LEN;
+    let indices = data
+        .get(pixel_start..pixel_start + pixel_count)
+        .with_context(|| {
+            format!(
+                "truncated TIM 8bpp pixel data: need {pixel_count} bytes, have {}",
+                data.len().saturating_sub(pixel_start)
+            )
+        })?
+        .to_vec();
+
+    Ok(Texture8 {
+        width: (width_units * 2) as u32,
+        height: height as u32,
+        indices,
+        palettes,
+    })
+}
+
+fn block_header(data: &[u8], offset: usize, what: &str) -> Result<[u8; BLOCK_HEADER_LEN]> {
+    data.get(offset..offset + BLOCK_HEADER_LEN)
+        .with_context(|| format!("TIM {what} block header at offset 0x{offset:X} is truncated"))?
+        .try_into()
+        .context("TIM block header is truncated")
+}
+
+fn expand_bgr555(value: u16) -> [u8; 4] {
+    let r = value & 31;
+    let g = (value >> 5) & 31;
+    let b = (value >> 10) & 31;
+    [
+        (r * 255 / 31) as u8,
+        (g * 255 / 31) as u8,
+        (b * 255 / 31) as u8,
+        255,
+    ]
 }
 
 #[cfg(test)]
@@ -194,5 +314,116 @@ mod tests {
         assert_eq!(image.height, 240);
         assert_eq!(image.rgba.len(), 320 * 240 * 4);
         assert_eq!(&image.rgba[image.rgba.len() - 4..], &[255, 255, 255, 255]);
+    }
+
+    fn tim_8bpp(
+        palette_width: u16,
+        palette_height: u16,
+        palette: &[u16],
+        image_width: u16,
+        image_height: u16,
+        pixels: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&TIM_MAGIC.to_le_bytes());
+        out.extend_from_slice(&(CLUT_FLAG | MODE_8BPP).to_le_bytes());
+        out.extend_from_slice(
+            &((BLOCK_HEADER_LEN + palette.len() * PIXEL_BYTES) as u32).to_le_bytes(),
+        );
+        out.extend_from_slice(&0i16.to_le_bytes());
+        out.extend_from_slice(&480i16.to_le_bytes());
+        out.extend_from_slice(&palette_width.to_le_bytes());
+        out.extend_from_slice(&palette_height.to_le_bytes());
+        for entry in palette {
+            out.extend_from_slice(&entry.to_le_bytes());
+        }
+        out.extend_from_slice(&((BLOCK_HEADER_LEN + pixels.len()) as u32).to_le_bytes());
+        out.extend_from_slice(&0i16.to_le_bytes());
+        out.extend_from_slice(&0i16.to_le_bytes());
+        out.extend_from_slice(&image_width.to_le_bytes());
+        out.extend_from_slice(&image_height.to_le_bytes());
+        out.extend_from_slice(pixels);
+        out
+    }
+
+    #[test]
+    fn decodes_8bpp_indexed_with_clut() {
+        let palette = [pixel(31, 0, 0), pixel(0, 31, 0), 0x8000, pixel(0, 0, 31)];
+        let pixels = [0u8, 1, 2, 3, 3, 2, 1, 0];
+        let data = tim_8bpp(2, 2, &palette, 2, 2, &pixels);
+
+        let texture = decode_8bpp(&data).unwrap();
+
+        assert_eq!(texture.width, 4);
+        assert_eq!(texture.height, 2);
+        assert_eq!(texture.indices, pixels);
+        assert_eq!(texture.palettes.len(), 4);
+        assert_eq!(texture.palettes[0], [255, 0, 0, 255]);
+        assert_eq!(texture.palettes[1], [0, 255, 0, 255]);
+        assert_eq!(texture.palettes[2], [0, 0, 0, 255]);
+        assert_eq!(texture.palettes[3], [0, 0, 255, 255]);
+        assert_eq!(texture.palette(0, 3), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn flattens_palette_rows_in_file_order() {
+        let mut palette = vec![pixel(0, 0, 0); 256];
+        palette.push(pixel(31, 31, 31));
+        palette.resize(512, pixel(0, 0, 0));
+        let data = tim_8bpp(256, 2, &palette, 1, 1, &[0, 1]);
+
+        let texture = decode_8bpp(&data).unwrap();
+
+        assert_eq!(texture.palette(0, 0), [0, 0, 0, 255]);
+        assert_eq!(texture.palette(1, 0), [255, 255, 255, 255]);
+        assert_eq!(texture.palette(1, 1), [0, 0, 0, 255]);
+        assert_eq!(texture.palette(2, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_8bpp_without_clut() {
+        let mut data = tim_8bpp(1, 1, &[pixel(31, 31, 31)], 1, 1, &[0]);
+        data[4..8].copy_from_slice(&MODE_8BPP.to_le_bytes());
+
+        let err = decode_8bpp(&data).unwrap_err().to_string();
+
+        assert!(err.contains("CLUT"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_non_8bpp_mode() {
+        let mut data = tim_8bpp(1, 1, &[pixel(31, 31, 31)], 1, 1, &[0]);
+        data[4..8].copy_from_slice(&(2 | CLUT_FLAG).to_le_bytes());
+
+        let err = decode_8bpp(&data).unwrap_err().to_string();
+
+        assert!(err.contains("mode 2"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_truncated_clut() {
+        let mut data = tim_8bpp(
+            2,
+            2,
+            &[pixel(31, 0, 0), pixel(0, 31, 0), pixel(0, 0, 31), 0x8000],
+            1,
+            1,
+            &[0],
+        );
+        data.truncate(HEADER_LEN + BLOCK_HEADER_LEN + 4);
+
+        let err = decode_8bpp(&data).unwrap_err().to_string();
+
+        assert!(err.contains("truncated"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_truncated_8bpp_pixels() {
+        let mut data = tim_8bpp(1, 1, &[pixel(31, 31, 31)], 2, 2, &[0, 1, 2, 3]);
+        data.truncate(data.len() - 1);
+
+        let err = decode_8bpp(&data).unwrap_err().to_string();
+
+        assert!(err.contains("truncated"), "unexpected error: {err}");
     }
 }

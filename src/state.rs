@@ -112,6 +112,128 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+/// One room light. The RDT stores three of them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Light {
+    /// World-space position.
+    pub pos: [i32; 3],
+    /// Red, green and blue components.
+    pub color: [u8; 3],
+    /// Light type: 0 is a point light with radial falloff, anything else is
+    /// directional.
+    pub kind: u16,
+    /// Falloff radius, used by point lights.
+    pub radius: i16,
+}
+
+/// One collision boundary rectangle, corners stored max-first.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionRect {
+    pub x_max: u16,
+    pub z_max: u16,
+    pub x_min: u16,
+    pub z_min: u16,
+    pub kind: u16,
+    pub flags: u16,
+}
+
+/// Room collision boundaries, split into quadrants around `(cell_x, cell_z)`.
+#[derive(Debug, Clone)]
+pub struct Collision {
+    pub cell_x: i16,
+    pub cell_z: i16,
+    pub quadrants: [Vec<CollisionRect>; 4],
+}
+
+impl Default for Collision {
+    fn default() -> Self {
+        Self {
+            cell_x: 0,
+            cell_z: 0,
+            quadrants: std::array::from_fn(|_| Vec::new()),
+        }
+    }
+}
+
+impl Collision {
+    /// The records of the quadrant containing `(x, z)`.
+    pub fn records(&self, x: i32, z: i32) -> &[CollisionRect] {
+        let quadrant = (usize::from(z < i32::from(self.cell_z)) << 1)
+            | usize::from(x < i32::from(self.cell_x));
+        &self.quadrants[quadrant]
+    }
+}
+
+/// One camera switch zone record. Every record is a zone; the first record of
+/// each `cam_from` group is that group's header.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Zone {
+    pub cam_to: i16,
+    pub cam_from: i16,
+    pub corners: [[i16; 2]; 4],
+}
+
+impl Zone {
+    /// Whether `(x, z)` lies inside the quad.
+    ///
+    /// Faithful to the original: every corner is zero-extended to unsigned
+    /// before the four cross-product edge tests, pivoting on corners 0 and 2.
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        let corner = |index: usize| {
+            [
+                i64::from(self.corners[index][0] as u16),
+                i64::from(self.corners[index][1] as u16),
+            ]
+        };
+        let [x0, z0] = corner(0);
+        let [x1, z1] = corner(1);
+        let [x2, z2] = corner(2);
+        let [x3, z3] = corner(3);
+        let x = i64::from(x);
+        let z = i64::from(z);
+
+        let dx = x - x0;
+        let dz = z - z0;
+        if (x1 - x0) * dz > (z1 - z0) * dx {
+            return false;
+        }
+        if (x3 - x0) * dz < (z3 - z0) * dx {
+            return false;
+        }
+        let dx2 = x - x2;
+        let dz2 = z - z2;
+        if (x1 - x2) * dz2 < (z1 - z2) * dx2 {
+            return false;
+        }
+        if (x3 - x2) * dz2 > (z3 - z2) * dx2 {
+            return false;
+        }
+        true
+    }
+}
+
+/// One walkable zone used by NPC navigation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct WalkZone {
+    pub x1: i16,
+    pub z1: i16,
+    pub x2: i16,
+    pub z2: i16,
+    pub field_08: u16,
+    pub flags: u16,
+}
+
+impl WalkZone {
+    /// Half-open containment: `x in [x1, x2)` and `z in [z1, z2)`, compared
+    /// with the original's wrapping unsigned-short arithmetic.
+    pub fn contains(&self, x: i32, z: i32) -> bool {
+        let wrap = |value: i64| value as u16;
+        wrap(i64::from(x) - i64::from(self.x1)) < wrap(i64::from(self.x2) - i64::from(self.x1))
+            && wrap(i64::from(z) - i64::from(self.z1))
+                < wrap(i64::from(self.z2) - i64::from(self.z1))
+    }
+}
+
 /// One camera background plus its camera transform.
 #[derive(Debug, Default, Clone)]
 pub struct Cut {
@@ -123,7 +245,7 @@ pub struct Cut {
     pub background: Option<Image>,
 }
 
-/// The loaded room: its cuts and the currently displayed one.
+/// The loaded room: its contents and the currently displayed cut.
 #[derive(Debug, Default, Clone)]
 pub struct RoomState {
     pub stage: u8,
@@ -131,6 +253,16 @@ pub struct RoomState {
     pub player_flag: u8,
     pub cuts: Vec<Cut>,
     pub current_cut: usize,
+    /// Ambient light color, 12-bit per channel.
+    pub ambient: [i16; 3],
+    /// The room's three lights.
+    pub lights: [Light; 3],
+    /// Collision boundary records.
+    pub collision: Collision,
+    /// Camera switch zones in file order, group headers included.
+    pub zones: Vec<Zone>,
+    /// Walkable zones for NPC navigation.
+    pub walk_zones: Vec<WalkZone>,
 }
 
 #[cfg(test)]
