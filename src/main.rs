@@ -14,9 +14,9 @@ struct Cli {
     #[arg(value_name = "PACK")]
     pack: Option<PathBuf>,
 
-    /// Room number, e.g. 100 for RDT 1000
-    #[arg(long, value_name = "ROOM", requires = "pack", value_parser = clap::value_parser!(u32).range(100..=999))]
-    room: Option<u32>,
+    /// Room id, three hex digits: stage digit plus room, e.g. 100 or 11C
+    #[arg(long, value_name = "ROOM", requires = "pack")]
+    room: Option<String>,
 
     /// Player/flag digit selecting the RDT variant (0-9)
     #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
@@ -55,7 +55,8 @@ fn main() -> Result<()> {
             let Some(room) = cli.room else {
                 bail!("--room is required when launching a pack");
             };
-            arklay::engine::run(&pack, room, cli.player, cli.capture.as_deref())
+            let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
+            arklay::engine::run(&pack, id, cli.capture.as_deref())
         }
     }
 }

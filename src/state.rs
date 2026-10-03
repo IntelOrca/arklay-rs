@@ -3,35 +3,104 @@
 //! These are the engine's internal state after an RDT has been loaded. Source
 //! file formats are not kept around during gameplay.
 
-/// A stage/room/player identity, e.g. room 100 player 0 -> RDT 1000.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// A stage/room/player identity, e.g. stage 1, room 0x00, player 1 -> RDT 1001.
+///
+/// The identity is packed hex: the first digit is the stage, the middle two are
+/// the room in hex, and the last is the player/flag digit. This matches the
+/// shipped `ROOM####.RDT` names and the `RC` background names.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RoomId {
-    /// 1-based stage number.
+    /// 1-based stage number (1-7).
     pub stage: u8,
-    /// Room number within the stage (0-99).
+    /// Room number within the stage (0x00-0x1F).
     pub room: u8,
-    /// Player/flag digit (0-9).
+    /// Player/flag digit (0 = Chris, 1 = Jill).
     pub player_flag: u8,
 }
 
 impl RoomId {
-    /// `room` is the three-digit room id, e.g. 100.
-    pub fn from_room_and_player(room: u32, player: u8) -> Self {
-        Self {
-            stage: (room / 100) as u8,
-            room: (room % 100) as u8,
-            player_flag: player,
+    /// Highest valid stage digit.
+    pub const MAX_STAGE: u8 = 7;
+    /// Highest valid room number.
+    pub const MAX_ROOM: u8 = 0x1F;
+
+    /// Parse a three- or four-digit RDT identity, e.g. `100`, `1001`, `11C1`.
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let digits: Vec<u8> = text
+            .chars()
+            .map(|c| c.to_digit(16).map(|d| d as u8))
+            .collect::<Option<_>>()
+            .ok_or_else(|| anyhow::anyhow!("`{text}` is not a hex RDT identity"))?;
+        match digits.as_slice() {
+            [stage, hi, lo] => Self::from_digits(*stage, (*hi << 4) | *lo, 0, text),
+            [stage, hi, lo, player] => Self::from_digits(*stage, (*hi << 4) | *lo, *player, text),
+            _ => anyhow::bail!("`{text}` must be three or four hex digits, e.g. 100 or 1001"),
         }
     }
 
-    /// Four-digit RDT number, e.g. 1000.
-    pub fn rdt_number(self) -> u32 {
-        (self.stage as u32 * 100 + self.room as u32) * 10 + self.player_flag as u32
+    /// Parse a three-digit room id (`100`, `11C`) plus a player digit.
+    pub fn from_room_and_player(room: &str, player: u8) -> anyhow::Result<Self> {
+        let digits: Vec<u8> = room
+            .chars()
+            .map(|c| c.to_digit(16).map(|d| d as u8))
+            .collect::<Option<_>>()
+            .ok_or_else(|| anyhow::anyhow!("`{room}` is not a hex room id"))?;
+        match digits.as_slice() {
+            [stage, hi, lo] => Self::from_digits(*stage, (*hi << 4) | *lo, player, room),
+            _ => anyhow::bail!("`{room}` must be exactly three hex digits, e.g. 100 or 11C"),
+        }
     }
 
-    /// Three-digit room id, e.g. 100.
-    pub fn room_number(self) -> u32 {
-        self.stage as u32 * 100 + self.room as u32
+    fn from_digits(stage: u8, room: u8, player_flag: u8, text: &str) -> anyhow::Result<Self> {
+        if !(1..=Self::MAX_STAGE).contains(&stage) {
+            anyhow::bail!("stage digit in `{text}` must be 1-7");
+        }
+        if room > Self::MAX_ROOM {
+            anyhow::bail!("room in `{text}` must be 00-1F");
+        }
+        if player_flag > 9 {
+            anyhow::bail!("player digit in `{text}` must be 0-9");
+        }
+        Ok(Self {
+            stage,
+            room,
+            player_flag,
+        })
+    }
+
+    /// Four-digit packed hex RDT number, e.g. 0x1001.
+    pub fn rdt_number(self) -> u16 {
+        ((self.stage as u16) << 12) | ((self.room as u16) << 4) | self.player_flag as u16
+    }
+
+    /// Pack path of the raw RDT, e.g. `room/1001.rdt`.
+    pub fn rdt_entry(self) -> String {
+        format!("room/{:04x}.rdt", self.rdt_number())
+    }
+
+    /// Three-digit room id used by cut names, e.g. `100`, `11C`.
+    pub fn room3(self) -> String {
+        format!("{}{:02X}", self.stage, self.room)
+    }
+
+    /// Pack path of a camera background, e.g. `roomcut/100_000.bmp`.
+    pub fn cut_entry(self, camera: usize) -> String {
+        format!("roomcut/{}_{camera:03}.bmp", self.room3())
+    }
+
+    /// Zero-based stage index for stage-indexed tables.
+    pub fn stage_index(self) -> u8 {
+        self.stage - 1
+    }
+
+    /// Stage digit used by the background files. Stages 6 and 7 reuse the
+    /// STAGE1/STAGE2 backgrounds with the digit reduced by 5.
+    pub fn fold_stage_digit(self) -> u8 {
+        if self.stage >= 6 {
+            self.stage - 5
+        } else {
+            self.stage
+        }
     }
 }
 
@@ -70,16 +139,103 @@ mod tests {
 
     #[test]
     fn room_id_roundtrip() {
-        let id = RoomId::from_room_and_player(100, 0);
+        let id = RoomId::from_room_and_player("100", 0).unwrap();
         assert_eq!(id.stage, 1);
-        assert_eq!(id.room, 0);
-        assert_eq!(id.rdt_number(), 1000);
-        assert_eq!(id.room_number(), 100);
+        assert_eq!(id.room, 0x00);
+        assert_eq!(id.rdt_number(), 0x1000);
+        assert_eq!(id.rdt_entry(), "room/1000.rdt");
+        assert_eq!(id.room3(), "100");
+        assert_eq!(id.cut_entry(3), "roomcut/100_003.bmp");
+        assert_eq!(id.stage_index(), 0);
+        assert_eq!(id.fold_stage_digit(), 1);
 
-        let id = RoomId::from_room_and_player(205, 3);
+        let id = RoomId::from_room_and_player("205", 3).unwrap();
         assert_eq!(id.stage, 2);
-        assert_eq!(id.room, 5);
-        assert_eq!(id.rdt_number(), 2053);
-        assert_eq!(id.room_number(), 205);
+        assert_eq!(id.room, 0x05);
+        assert_eq!(id.rdt_number(), 0x2053);
+        assert_eq!(id.room3(), "205");
+    }
+
+    #[test]
+    fn parses_four_digit_identities() {
+        let id = RoomId::parse("1001").unwrap();
+        assert_eq!(
+            id,
+            RoomId {
+                stage: 1,
+                room: 0x00,
+                player_flag: 1
+            }
+        );
+        assert_eq!(id.rdt_entry(), "room/1001.rdt");
+        assert_eq!(id.room3(), "100");
+
+        let id = RoomId::parse("11C0").unwrap();
+        assert_eq!(
+            id,
+            RoomId {
+                stage: 1,
+                room: 0x1C,
+                player_flag: 0
+            }
+        );
+        assert_eq!(id.room3(), "11C");
+
+        let id = RoomId::parse("71A1").unwrap();
+        assert_eq!(
+            id,
+            RoomId {
+                stage: 7,
+                room: 0x1A,
+                player_flag: 1
+            }
+        );
+        assert_eq!(id.rdt_entry(), "room/71a1.rdt");
+        assert_eq!(id.room3(), "71A");
+    }
+
+    #[test]
+    fn every_shipped_room_id_roundtrips() {
+        for stage in 1..=RoomId::MAX_STAGE {
+            for room in 0..=RoomId::MAX_ROOM {
+                for player in 0..=1u8 {
+                    let id = RoomId {
+                        stage,
+                        room,
+                        player_flag: player,
+                    };
+                    let text = format!("{:04X}", id.rdt_number());
+                    assert_eq!(RoomId::parse(&text).unwrap(), id);
+                    assert_eq!(
+                        RoomId::from_room_and_player(&id.room3(), player).unwrap(),
+                        id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn folds_return_stages() {
+        let cases = [(1, 1), (5, 5), (6, 1), (7, 2)];
+        for (stage, folded) in cases {
+            let id = RoomId {
+                stage,
+                room: 0,
+                player_flag: 0,
+            };
+            assert_eq!(id.fold_stage_digit(), folded);
+        }
+    }
+
+    #[test]
+    fn rejects_bad_identities() {
+        assert!(RoomId::parse("").is_err());
+        assert!(RoomId::parse("10012").is_err());
+        assert!(RoomId::parse("0A0").is_err());
+        assert!(RoomId::parse("800").is_err());
+        assert!(RoomId::parse("1FF").is_err());
+        assert!(RoomId::parse("1X0").is_err());
+        assert!(RoomId::from_room_and_player("1001", 0).is_err());
     }
 }

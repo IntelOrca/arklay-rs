@@ -19,9 +19,6 @@ const MAX_STAGE_DEPTH: usize = 2;
 /// Three-digit room number converted by M0.
 const ROOM: u32 = 100;
 
-/// Player/flag digit converted by M0.
-const PLAYER: u8 = 0;
-
 /// RDT file name within the stage directory.
 const RDT_FILE: &str = "room1000.rdt";
 
@@ -53,7 +50,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     let rdt_path = find_file(&stage, RDT_FILE)?;
     let rdt_bytes =
         fs::read(&rdt_path).with_context(|| format!("failed to read {}", rdt_path.display()))?;
-    let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player(ROOM, PLAYER))
+    let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player("100", 0).unwrap())
         .with_context(|| format!("failed to parse {}", rdt_path.display()))?;
 
     let paks = find_camera_paks(&stage, room.cuts.len())?;
@@ -400,7 +397,7 @@ mod tests {
         let stage = find_stage1(&root).unwrap();
         let rdt_path = find_file(&stage, RDT_FILE).unwrap();
         let rdt_bytes = fs::read(&rdt_path).unwrap();
-        let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player(ROOM, PLAYER)).unwrap();
+        let room = rdt::parse(&rdt_bytes, RoomId::from_room_and_player("100", 0).unwrap()).unwrap();
 
         let temp = TempDir::new("real-install");
         let out = temp.path.join("re1.akpak");

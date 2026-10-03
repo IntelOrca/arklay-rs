@@ -79,16 +79,15 @@ impl Drop for SurfaceHandle {
 }
 
 /// Load `room` from `pack`, display its cuts, and optionally capture cut zero.
-pub fn run(pack: &Path, room: u32, player: u8, capture: Option<&Path>) -> Result<()> {
-    let id = RoomId::from_room_and_player(room, player);
+pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     let pack = Pack::open(pack)?;
-    let rdt_bytes = pack.read(&format!("room/{}.rdt", id.rdt_number()))?;
+    let rdt_bytes = pack.read(&id.rdt_entry())?;
     let mut state = rdt::parse(rdt_bytes, id)?;
     if state.cuts.is_empty() {
-        bail!("room {} has no camera cuts", id.room_number());
+        bail!("room {} has no camera cuts", id.room3());
     }
     for cut in &mut state.cuts {
-        let path = format!("roomcut/{}_{:03}.bmp", id.room_number(), cut.index);
+        let path = id.cut_entry(cut.index);
         let bytes = pack
             .read(&path)
             .with_context(|| format!("missing background for cut {}", cut.index))?;
@@ -108,8 +107,8 @@ pub fn run(pack: &Path, room: u32, player: u8, capture: Option<&Path>) -> Result
     }
     let _sdl = SdlHandle;
 
-    let room_number = id.room_number();
-    let title = window_title(room_number, state.current_cut, state.cuts.len())?;
+    let room3 = id.room3();
+    let title = window_title(&room3, state.current_cut, state.cuts.len())?;
     let window = unsafe {
         SDL_CreateWindow(
             title.as_ptr(),
@@ -189,7 +188,7 @@ pub fn run(pack: &Path, room: u32, player: u8, capture: Option<&Path>) -> Result
                         false
                     };
                     if moved {
-                        let title = window_title(room_number, state.current_cut, count)?;
+                        let title = window_title(&room3, state.current_cut, count)?;
                         if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
                             bail!("SDL_SetWindowTitle failed: {}", sdl_error());
                         }
@@ -215,7 +214,7 @@ fn sdl_error() -> String {
         .into_owned()
 }
 
-fn window_title(room: u32, cut: usize, count: usize) -> Result<CString> {
+fn window_title(room: &str, cut: usize, count: usize) -> Result<CString> {
     CString::new(format!("Arklay - room {room} cut {cut}/{}", count - 1))
         .context("window title contains a NUL byte")
 }
@@ -353,12 +352,13 @@ mod tests {
         let image = test_image();
         let bmp_bytes = bmp::encode_to_vec(&image).unwrap();
 
+        let id = RoomId::parse("1000").unwrap();
         let mut writer = PackWriter::new();
-        writer.add("room/1000.rdt", rdt).unwrap();
-        writer.add("roomcut/100_000.bmp", bmp_bytes).unwrap();
+        writer.add(&id.rdt_entry(), rdt).unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
         writer.write(&pack_path).unwrap();
 
-        run(&pack_path, 100, 0, Some(&capture_path)).unwrap();
+        run(&pack_path, id, Some(&capture_path)).unwrap();
 
         let decoded = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
         assert_eq!(decoded.width, WIDTH as u32);
