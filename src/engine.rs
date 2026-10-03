@@ -21,8 +21,8 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RIGHT,
-    SDL_SCANCODE_RSHIFT, SDL_SCANCODE_UP,
+    SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN,
+    SDL_SCANCODE_RIGHT, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_UP,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -95,37 +95,19 @@ impl Drop for SurfaceHandle {
     }
 }
 
-/// Load `room` from `pack`, simulate it and optionally capture one frame.
+/// Load `id` from `pack`, simulate it and optionally capture one frame.
+///
+/// The room keeps running until the game quits: when a door sets a transition
+/// the target room is loaded with [`load_room`], the player is placed at the
+/// door's spawn and the room's scripts restart. Inventory and flags survive
+/// through [`game::GameState::enter_room`]; room-scoped state (the action
+/// table, camera, message) is rebuilt by the new room. Capture mode renders a
+/// single frame and never interacts.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     let pack = Pack::open(pack)?;
-    let rdt_bytes = pack.read(&id.rdt_entry())?;
-    let mut room = rdt::parse(rdt_bytes, id)?;
-    if room.cuts.is_empty() {
-        bail!("room {} has no camera cuts", id.room3());
-    }
-    for cut in &mut room.cuts {
-        let path = id.cut_entry(cut.index);
-        let bytes = pack
-            .read(&path)
-            .with_context(|| format!("missing background for cut {}", cut.index))?;
-        cut.background = Some(bmp::decode(bytes).with_context(|| format!("invalid {path}"))?);
-    }
-
-    // Room music: for now the engine plays the room's primary track from the
-    // hardcoded table. The SCD will start/stop/pan/volume tracks later and the
-    // table itself should move to a game init script in the pack.
-    let music_wav = load_room_music(&pack, id);
-    let player_assets = load_player_assets(&pack, id);
-
-    let scripts = scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?;
-    let mut game = game::GameState::new(id, &room);
-    let mut command_vm = scd::vm::CommandVm::new(&scripts);
-    let mut event_vm = scd::vm::EventVm::new(&scripts);
-    {
-        let mut host = game::ScdGameHost::new(&mut game);
-        command_vm.run_init(&mut host);
-    }
-    apply_camera(&mut room, &mut game, None);
+    let mut loaded = load_room(&pack, id)?;
+    let mut game = game::GameState::new(id, &loaded.room);
+    let mut player_state = player::spawn(id, &loaded.room);
 
     if capture.is_some() {
         unsafe {
@@ -140,8 +122,11 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     }
     let _sdl = SdlHandle;
 
-    let room3 = id.room3();
-    let title = window_title(&room3, room.current_cut, room.cuts.len())?;
+    let title = window_title(
+        &loaded.id.room3(),
+        loaded.room.current_cut,
+        loaded.room.cuts.len(),
+    )?;
     let window = unsafe {
         SDL_CreateWindow(
             title.as_ptr(),
@@ -186,112 +171,271 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
     }
 
-    let mut player_state = player::spawn(id, &room);
     let mut framebuffer = Framebuffer::new();
 
     if let Some(capture_path) = capture {
+        run_room_init(&loaded, &mut game);
+        apply_camera(&mut loaded.room, &mut game, None);
         render_frame(
             &mut framebuffer,
-            &room,
+            &loaded.room,
             &player_state,
-            player_assets.as_ref(),
+            loaded.player_assets.as_ref(),
         );
         present(renderer, texture, &framebuffer)?;
         capture_frame(renderer, capture_path)?;
         return Ok(());
     }
 
-    let mut music = start_music(music_wav);
+    let mut music = start_music(loaded.music.take());
 
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
-    let mut titled_cut = room.current_cut;
+    let mut titled_cut = loaded.room.current_cut;
+    let mut pending_transition: Option<game::RoomTransition> = None;
     loop {
-        while unsafe { SDL_PollEvent(&mut event) } {
-            let kind = unsafe { event.r#type };
-            if kind == SDL_EVENT_QUIT {
-                return Ok(());
-            }
-            if kind == SDL_EVENT_KEY_DOWN {
-                let key = unsafe { event.key.key };
-                let modifiers = unsafe { event.key.r#mod };
-                if key == SDLK_ESCAPE {
-                    return Ok(());
-                }
-                if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
-                    let count = room.cuts.len();
-                    let moved = if key == SDLK_COMMA {
-                        room.current_cut = (room.current_cut + count - 1) % count;
-                        true
-                    } else if key == SDLK_PERIOD {
-                        room.current_cut = (room.current_cut + 1) % count;
-                        true
-                    } else {
-                        false
-                    };
-                    if moved {
-                        game.camera.current_cut = room.current_cut;
-                        let title = window_title(&room3, room.current_cut, count)?;
-                        if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
-                            bail!("SDL_SetWindowTitle failed: {}", sdl_error());
-                        }
-                        titled_cut = room.current_cut;
-                    }
-                }
-            }
-        }
-
-        let now = unsafe { SDL_GetTicks() };
-        accumulator += now.saturating_sub(last_ticks) as f64;
-        last_ticks = now;
-        // Avoid a burst of catch-up ticks after a stall (window drag, debugger).
-        if accumulator > 250.0 {
-            accumulator = 250.0;
-        }
-        while accumulator >= TICK_MS {
+        {
+            let scripts = &loaded.scripts;
+            let mut command_vm = scd::vm::CommandVm::new(scripts);
+            let mut event_vm = scd::vm::EventVm::new(scripts);
             {
                 let mut host = game::ScdGameHost::new(&mut game);
-                command_vm.run_main(&mut host);
-                event_vm.step(&mut host);
+                command_vm.run_init(&mut host);
             }
-            apply_bgm_requests(&mut music, &mut game.room_bgm_requests, &pack, id);
-            game.advance_frame();
-            if let Some(assets) = &player_assets {
-                let input = read_input();
-                player::update(
-                    &mut player_state,
-                    &room,
-                    &assets.emd.clips,
-                    &assets.emw.clips,
-                    input,
+            start_pending_events(&mut game, &mut event_vm);
+            apply_camera(&mut loaded.room, &mut game, None);
+            update_window_title(window, &loaded, &mut titled_cut)?;
+
+            loop {
+                while unsafe { SDL_PollEvent(&mut event) } {
+                    let kind = unsafe { event.r#type };
+                    if kind == SDL_EVENT_QUIT {
+                        return Ok(());
+                    }
+                    if kind == SDL_EVENT_KEY_DOWN {
+                        let key = unsafe { event.key.key };
+                        let modifiers = unsafe { event.key.r#mod };
+                        if key == SDLK_ESCAPE {
+                            return Ok(());
+                        }
+                        if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
+                            let count = loaded.room.cuts.len();
+                            let moved = if key == SDLK_COMMA {
+                                loaded.room.current_cut =
+                                    (loaded.room.current_cut + count - 1) % count;
+                                true
+                            } else if key == SDLK_PERIOD {
+                                loaded.room.current_cut = (loaded.room.current_cut + 1) % count;
+                                true
+                            } else {
+                                false
+                            };
+                            if moved {
+                                game.camera.current_cut = loaded.room.current_cut;
+                                update_window_title(window, &loaded, &mut titled_cut)?;
+                            }
+                        }
+                    }
+                }
+
+                let now = unsafe { SDL_GetTicks() };
+                accumulator += now.saturating_sub(last_ticks) as f64;
+                last_ticks = now;
+                // Avoid a burst of catch-up ticks after a stall (window drag, debugger).
+                if accumulator > 250.0 {
+                    accumulator = 250.0;
+                }
+                let (input, action) = read_input();
+                while accumulator >= TICK_MS {
+                    let transition = tick_room(
+                        &mut command_vm,
+                        &mut event_vm,
+                        RoomContext {
+                            room: &mut loaded.room,
+                            game: &mut game,
+                            player: &mut player_state,
+                            player_assets: loaded.player_assets.as_ref(),
+                        },
+                        input,
+                        action,
+                    );
+                    apply_bgm_requests(&mut music, &mut game.room_bgm_requests, &pack, loaded.id);
+                    accumulator -= TICK_MS;
+                    if let Some(transition) = transition {
+                        pending_transition = Some(transition);
+                        break;
+                    }
+                }
+                if pending_transition.is_some() {
+                    break;
+                }
+
+                render_frame(
+                    &mut framebuffer,
+                    &loaded.room,
+                    &player_state,
+                    loaded.player_assets.as_ref(),
                 );
-            }
-            apply_camera(&mut room, &mut game, Some(player_state.pos));
-            if room.current_cut != titled_cut {
-                titled_cut = room.current_cut;
-                let title = window_title(&room3, room.current_cut, room.cuts.len())?;
-                if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
-                    bail!("SDL_SetWindowTitle failed: {}", sdl_error());
+                present(renderer, texture, &framebuffer)?;
+                if let Some(player) = &mut music {
+                    player.update();
+                }
+                if !unsafe { SDL_RenderPresent(renderer) } {
+                    bail!("SDL_RenderPresent failed: {}", sdl_error());
                 }
             }
-            accumulator -= TICK_MS;
         }
 
-        render_frame(
-            &mut framebuffer,
-            &room,
-            &player_state,
-            player_assets.as_ref(),
-        );
-        present(renderer, texture, &framebuffer)?;
-        if let Some(player) = &mut music {
-            player.update();
+        let Some(transition) = pending_transition.take() else {
+            return Ok(());
+        };
+        loaded = enter_transition(&pack, &mut game, &mut player_state, &transition)?;
+        if let Some(player) = music.as_mut() {
+            player.stop();
         }
-        if !unsafe { SDL_RenderPresent(renderer) } {
-            bail!("SDL_RenderPresent failed: {}", sdl_error());
+        if let Some(wav) = loaded.music.take() {
+            match music.as_mut() {
+                Some(player) => {
+                    if let Err(err) = player.play(wav) {
+                        eprintln!("warning: failed to start music: {err:#}");
+                    }
+                }
+                None => music = start_music(Some(wav)),
+            }
         }
     }
+}
+
+/// Everything loaded for one room, so a transition can load the next room with
+/// the same code path as the initial load.
+struct LoadedRoom {
+    id: RoomId,
+    room: RoomState,
+    scripts: scd::ir::Scripts,
+    player_assets: Option<PlayerAssets>,
+    music: Option<audio::Wav>,
+}
+
+/// Load `id` from `pack`: RDT, camera backgrounds, SCD scripts, player assets
+/// and the room's primary music track.
+fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
+    let rdt_bytes = pack.read(&id.rdt_entry())?;
+    let mut room = rdt::parse(rdt_bytes, id)?;
+    if room.cuts.is_empty() {
+        bail!("room {} has no camera cuts", id.room3());
+    }
+    for cut in &mut room.cuts {
+        let path = id.cut_entry(cut.index);
+        let bytes = pack
+            .read(&path)
+            .with_context(|| format!("missing background for cut {}", cut.index))?;
+        cut.background = Some(bmp::decode(bytes).with_context(|| format!("invalid {path}"))?);
+    }
+    let scripts = scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?;
+    let player_assets = load_player_assets(pack, id);
+    let music = load_room_music(pack, id);
+    Ok(LoadedRoom {
+        id,
+        room,
+        scripts,
+        player_assets,
+        music,
+    })
+}
+
+/// Run a room's init script against `game`.
+fn run_room_init(loaded: &LoadedRoom, game: &mut game::GameState) {
+    let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
+    let mut host = game::ScdGameHost::new(game);
+    command_vm.run_init(&mut host);
+}
+
+/// Start every event script requested by `evt_exec` in the command scripts.
+fn start_pending_events(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm<'_>) {
+    for (slot, event) in game.pending_events.drain(..) {
+        event_vm.start(usize::from(slot), event);
+    }
+}
+
+/// The mutable state one simulated tick works on.
+struct RoomContext<'a> {
+    room: &'a mut RoomState,
+    game: &'a mut game::GameState,
+    player: &'a mut player::PlayerState,
+    player_assets: Option<&'a PlayerAssets>,
+}
+
+/// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
+/// Returns the door transition the tick requested, if any.
+fn tick_room(
+    command_vm: &mut scd::vm::CommandVm<'_>,
+    event_vm: &mut scd::vm::EventVm<'_>,
+    context: RoomContext<'_>,
+    input: player::Input,
+    action: bool,
+) -> Option<game::RoomTransition> {
+    {
+        let mut host = game::ScdGameHost::new(context.game);
+        command_vm.run_main(&mut host);
+    }
+    start_pending_events(context.game, event_vm);
+    {
+        let mut host = game::ScdGameHost::new(context.game);
+        event_vm.step(&mut host);
+        host.interact(context.player.pos, action);
+    }
+    context.game.advance_frame();
+    if let Some(assets) = context.player_assets {
+        player::update(
+            context.player,
+            context.room,
+            &assets.emd.clips,
+            &assets.emw.clips,
+            input,
+        );
+    }
+    apply_camera(context.room, context.game, Some(context.player.pos));
+    context.game.transition.take()
+}
+
+/// Load the transition's target room and place the player in it.
+///
+/// Inventory and flags survive through [`game::GameState::enter_room`]; the
+/// room action table, camera and message are rebuilt by the new room.
+fn enter_transition(
+    pack: &Pack,
+    game: &mut game::GameState,
+    player_state: &mut player::PlayerState,
+    transition: &game::RoomTransition,
+) -> Result<LoadedRoom> {
+    let loaded = load_room(pack, transition.target)?;
+    game.enter_room(transition.target, &loaded.room);
+    *player_state = player::spawn(transition.target, &loaded.room);
+    player_state.pos = transition.pos;
+    player_state.angle = transition.angle;
+    Ok(loaded)
+}
+
+/// Update the window title when the active camera cut changed.
+fn update_window_title(
+    window: *mut SDL_Window,
+    loaded: &LoadedRoom,
+    titled_cut: &mut usize,
+) -> Result<()> {
+    if loaded.room.current_cut == *titled_cut {
+        return Ok(());
+    }
+    *titled_cut = loaded.room.current_cut;
+    let title = window_title(
+        &loaded.id.room3(),
+        loaded.room.current_cut,
+        loaded.room.cuts.len(),
+    )?;
+    if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
+        bail!("SDL_SetWindowTitle failed: {}", sdl_error());
+    }
+    Ok(())
 }
 
 /// Apply the SCD camera state to the room.
@@ -329,21 +473,22 @@ fn apply_bgm_requests(
     }
 }
 
-/// Read the keyboard into a movement input.
-fn read_input() -> player::Input {
+/// Read the keyboard into a movement input plus the action key (Space/Return).
+fn read_input() -> (player::Input, bool) {
     let mut count = 0i32;
     let keys = unsafe { SDL_GetKeyboardState(&mut count) };
     let down = |scancode: sdl3_sys::scancode::SDL_Scancode| {
         let index = scancode.0;
         index >= 0 && index < count && !keys.is_null() && unsafe { *keys.add(index as usize) }
     };
-    player::Input {
+    let input = player::Input {
         up: down(SDL_SCANCODE_UP),
         down: down(SDL_SCANCODE_DOWN),
         left: down(SDL_SCANCODE_LEFT),
         right: down(SDL_SCANCODE_RIGHT),
         run: down(SDL_SCANCODE_LSHIFT) || down(SDL_SCANCODE_RSHIFT),
-    }
+    };
+    (input, down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN))
 }
 
 /// The player's character model plus its no-weapon locomotion clips.
@@ -595,6 +740,64 @@ mod tests {
         }
     }
 
+    /// One block plus the terminator, packed as an SCD procedure container.
+    fn container(blocks: &[&[u8]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for body in blocks {
+            let size = u16::try_from(body.len() + 2).unwrap();
+            out.extend_from_slice(&size.to_le_bytes());
+            out.extend_from_slice(body);
+        }
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    /// Minimal one-camera RDT carrying `init` as its init script.
+    fn synthetic_rdt(init: &[u8]) -> Vec<u8> {
+        const INIT_POINTER: usize = 0x48 + 6 * 4;
+        const MAIN_POINTER: usize = 0x48 + 7 * 4;
+        const EVENT_POINTER: usize = 0x48 + 8 * 4;
+
+        let mut data = vec![0u8; 0x94];
+        data[0x01] = 1;
+        data.extend_from_slice(&[0u8; 44]);
+        while !data.len().is_multiple_of(4) {
+            data.push(0);
+        }
+
+        let init_offset = data.len();
+        data.extend_from_slice(&container(&[init]));
+        let main_offset = data.len();
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        let events_offset = data.len();
+        data.extend_from_slice(&[0, 0, 0, 0]);
+
+        for (pointer, offset) in [
+            (INIT_POINTER, init_offset),
+            (MAIN_POINTER, main_offset),
+            (EVENT_POINTER, events_offset),
+        ] {
+            data[pointer..pointer + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        data
+    }
+
+    /// `door_aot_set(0, 100, 200, 300, 400, ..., RDT_001, 555, 0, 666, 1024, 0, 0)`.
+    fn door_init() -> Vec<u8> {
+        let mut body = vec![0x0C, 0x00];
+        for value in [100i16, 200, 300, 400] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&[0, 0, 0, 0, 0]);
+        body.push(1);
+        for value in [555i16, 0, 666, 1024] {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&[0x00, 0x00]);
+        body
+    }
+
     #[test]
     fn capture_writes_bmp() {
         let dir = TempDir::new();
@@ -717,14 +920,111 @@ mod tests {
             !game.placeholders.is_empty(),
             "unimplemented opcodes should be recorded"
         );
-        assert!(game.placeholders.contains_key(&0x0C), "doors are recorded");
-        assert!(game.placeholders.contains_key(&0x18), "items are recorded");
+        assert_eq!(
+            game.room_actions[0].map(|action| action.kind),
+            Some(game::RoomActionKind::Door),
+            "init should register the save-room door"
+        );
+        assert_eq!(
+            game.room_actions[1].map(|action| action.kind),
+            Some(game::RoomActionKind::Item),
+            "init should register the ink ribbon"
+        );
+        assert!(game.doors[0].is_some(), "door record is stored");
         assert_eq!(game.camera.current_cut, 0);
         assert_eq!(game.camera.saved_cut, None);
         assert_eq!(game.message.id, None);
         assert_eq!(game.message.pause, 0);
         assert!(!game.message.active);
         assert_eq!(game.room_bgm_requests, Vec::new());
+    }
+
+    #[test]
+    fn door_action_transitions_to_the_next_room() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(&a.rdt_entry(), synthetic_rdt(&door_init()))
+            .unwrap();
+        writer
+            .add(&b.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut loaded = load_room(&pack, a).unwrap();
+        assert_eq!(loaded.id, a);
+        let mut game = game::GameState::new(a, &loaded.room);
+        let mut player_state = player::spawn(a, &loaded.room);
+        player_state.pos = [150, 0, 250];
+
+        let transition = {
+            let scripts = &loaded.scripts;
+            let mut command_vm = scd::vm::CommandVm::new(scripts);
+            let mut event_vm = scd::vm::EventVm::new(scripts);
+            {
+                let mut host = game::ScdGameHost::new(&mut game);
+                command_vm.run_init(&mut host);
+            }
+            assert!(game.doors[0].is_some(), "init should register the door");
+
+            let idle = tick_room(
+                &mut command_vm,
+                &mut event_vm,
+                RoomContext {
+                    room: &mut loaded.room,
+                    game: &mut game,
+                    player: &mut player_state,
+                    player_assets: None,
+                },
+                player::Input::default(),
+                false,
+            );
+            assert!(idle.is_none(), "walking alone must not trigger the door");
+            tick_room(
+                &mut command_vm,
+                &mut event_vm,
+                RoomContext {
+                    room: &mut loaded.room,
+                    game: &mut game,
+                    player: &mut player_state,
+                    player_assets: None,
+                },
+                player::Input::default(),
+                true,
+            )
+            .expect("the action key should open the door")
+        };
+
+        assert_eq!(transition.target, b);
+        assert_eq!(transition.pos, [555, 0, 666]);
+        assert_eq!(transition.angle, 1024);
+
+        loaded = enter_transition(&pack, &mut game, &mut player_state, &transition).unwrap();
+        assert_eq!(loaded.id, b);
+        assert_eq!(game.id, b);
+        assert_eq!(game.state_bytes[0], 1);
+        assert_eq!(game.state_bytes[1], 1);
+        assert_eq!(game.state_bytes[2], 0);
+        assert_eq!(player_state.pos, [555, 0, 666]);
+        assert_eq!(player_state.angle, 1024);
+        assert!(game.doors[0].is_none());
+        assert!(game.room_actions[0].is_none());
     }
 
     #[test]
