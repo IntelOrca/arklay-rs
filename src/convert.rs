@@ -31,9 +31,9 @@ const RDT_ENTRY: &str = "room/1000.rdt";
 /// Pack path prefix of the camera backgrounds.
 const ROOMCUT_PREFIX: &str = "roomcut/";
 
-/// Expected camera background dimensions.
+/// Expected camera background width.
 const CUT_WIDTH: u32 = 320;
-/// Expected camera background dimensions.
+/// Expected camera background height.
 const CUT_HEIGHT: u32 = 240;
 
 /// Byte offset of the bit depth field in a BMP header.

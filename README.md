@@ -31,6 +31,14 @@ cargo run -- re1.akpak --room 100 --player 0
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
 ```
 
+### Controls
+
+| Key | Action |
+| --- | --- |
+| `Shift` + `,` | Previous camera cut |
+| `Shift` + `.` | Next camera cut |
+| `Esc` | Quit |
+
 ## License
 
 MIT. No game assets or converted game data are distributed with this project.
