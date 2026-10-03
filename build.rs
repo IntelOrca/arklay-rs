@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SDL3_DIR");
+    println!("cargo:rerun-if-changed=../vendor/sdl3");
 
     // Prefer an explicit SDL3_DIR, then the workspace vendor directory
     // (<workspace>/vendor/sdl3, one level above this crate). When neither
@@ -15,6 +16,9 @@ fn main() {
         });
 
     if let Some(dir) = dir {
+        // Absolute paths keep the link search and rpath valid no matter where
+        // the binary is run from.
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let lib = dir.join("lib");
         println!("cargo:rustc-link-search=native={}", lib.display());
         println!("cargo:rustc-link-lib=dylib=SDL3");
