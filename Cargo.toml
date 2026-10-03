@@ -1,0 +1,18 @@
+[package]
+name = "arklay"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A from-scratch engine for the classic Resident Evil games"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+sdl3-sys = { version = "0.7", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
+
+[profile.release]
+lto = "thin"
