@@ -10,6 +10,9 @@ const IMAGE_BLOCK_HEADER_LEN: usize = 12;
 const PIXEL_BYTES: usize = 2;
 
 /// Decode a PSX TIM image. Only 16bpp direct color (mode 2) is supported.
+///
+/// The image block length field is ignored: the shipped paks store only the
+/// pixel byte count there, so it cannot bound the pixel data.
 pub fn decode(data: &[u8]) -> Result<Image> {
     if data.len() < HEADER_LEN {
         bail!(
@@ -61,9 +64,9 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let mut rgba = Vec::with_capacity(pixel_bytes / PIXEL_BYTES * 4);
     for px in raw.as_chunks::<PIXEL_BYTES>().0 {
         let v = u16::from_le_bytes([px[0], px[1]]);
-        let r = (v >> 10) & 31;
+        let r = v & 31;
         let g = (v >> 5) & 31;
-        let b = v & 31;
+        let b = (v >> 10) & 31;
         rgba.extend_from_slice(&[
             (r * 255 / 31) as u8,
             (g * 255 / 31) as u8,
@@ -84,7 +87,7 @@ mod tests {
     use super::*;
 
     fn pixel(r: u16, g: u16, b: u16) -> u16 {
-        (r << 10) | (g << 5) | b
+        r | (g << 5) | (b << 10)
     }
 
     fn tim(mode: u32, width: u16, height: u16, pixels: &[u16], length: u32) -> Vec<u8> {
@@ -135,6 +138,22 @@ mod tests {
     }
 
     #[test]
+    fn extracts_channels_in_psx_order() {
+        let data = tim(2, 4, 1, &[0x001F, 0x03E0, 0x7C00, 0x7FFF], 12 + 8);
+
+        let image = decode(&data).unwrap();
+
+        let expected: Vec<u8> = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+            [255, 255, 255, 255],
+        ]
+        .concat();
+        assert_eq!(image.rgba, expected);
+    }
+
+    #[test]
     fn rejects_bad_magic() {
         let mut data = tim(2, 1, 1, &[pixel(31, 31, 31)], 12 + 2);
         data[0..4].copy_from_slice(&0x11u32.to_le_bytes());
@@ -164,18 +183,16 @@ mod tests {
     }
 
     #[test]
-    fn decodes_320x240_with_short_length_field() {
+    fn decodes_320x240_with_spec_length_field() {
         let pixels = vec![pixel(31, 31, 31); 320 * 240];
-        let data = tim(2, 320, 240, &pixels, 153600);
+        let mut data = tim(2, 320, 240, &pixels, 153600);
+        data[8..12].copy_from_slice(&153612u32.to_le_bytes());
 
         let image = decode(&data).unwrap();
 
         assert_eq!(image.width, 320);
         assert_eq!(image.height, 240);
         assert_eq!(image.rgba.len(), 320 * 240 * 4);
-
-        let mut spec = data.clone();
-        spec[12..16].copy_from_slice(&153612u32.to_le_bytes());
-        assert!(decode(&spec).is_ok());
+        assert_eq!(&image.rgba[image.rgba.len() - 4..], &[255, 255, 255, 255]);
     }
 }
