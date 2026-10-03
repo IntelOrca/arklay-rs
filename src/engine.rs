@@ -36,12 +36,14 @@ use crate::anim;
 use crate::audio::{self, MusicPlayer};
 use crate::bmp;
 use crate::emd;
+use crate::game;
 use crate::model::Emd;
 use crate::music;
 use crate::pack::Pack;
 use crate::player;
 use crate::rdt;
 use crate::render::{Camera, Framebuffer, Lighting};
+use crate::scd;
 use crate::state::{Image, RoomId, RoomState};
 
 const WIDTH: i32 = 320;
@@ -114,6 +116,16 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     // table itself should move to a game init script in the pack.
     let music_wav = load_room_music(&pack, id);
     let player_assets = load_player_assets(&pack, id);
+
+    let scripts = scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?;
+    let mut game = game::GameState::new(id, &room);
+    let mut command_vm = scd::vm::CommandVm::new(&scripts);
+    let mut event_vm = scd::vm::EventVm::new(&scripts);
+    {
+        let mut host = game::ScdGameHost::new(&mut game);
+        command_vm.run_init(&mut host);
+    }
+    apply_camera(&mut room, &mut game, None);
 
     if capture.is_some() {
         unsafe {
@@ -194,6 +206,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
+    let mut titled_cut = room.current_cut;
     loop {
         while unsafe { SDL_PollEvent(&mut event) } {
             let kind = unsafe { event.r#type };
@@ -218,10 +231,12 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
                         false
                     };
                     if moved {
+                        game.camera.current_cut = room.current_cut;
                         let title = window_title(&room3, room.current_cut, count)?;
                         if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
                             bail!("SDL_SetWindowTitle failed: {}", sdl_error());
                         }
+                        titled_cut = room.current_cut;
                     }
                 }
             }
@@ -235,6 +250,13 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
             accumulator = 250.0;
         }
         while accumulator >= TICK_MS {
+            {
+                let mut host = game::ScdGameHost::new(&mut game);
+                command_vm.run_main(&mut host);
+                event_vm.step(&mut host);
+            }
+            apply_bgm_requests(&mut music, &mut game.room_bgm_requests, &pack, id);
+            game.advance_frame();
             if let Some(assets) = &player_assets {
                 let input = read_input();
                 player::update(
@@ -245,16 +267,15 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
                     input,
                 );
             }
-            accumulator -= TICK_MS;
-        }
-
-        let cut = player::camera_for_position(&room, room.current_cut, player_state.pos);
-        if cut != room.current_cut {
-            room.current_cut = cut;
-            let title = window_title(&room3, room.current_cut, room.cuts.len())?;
-            if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
-                bail!("SDL_SetWindowTitle failed: {}", sdl_error());
+            apply_camera(&mut room, &mut game, Some(player_state.pos));
+            if room.current_cut != titled_cut {
+                titled_cut = room.current_cut;
+                let title = window_title(&room3, room.current_cut, room.cuts.len())?;
+                if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
+                    bail!("SDL_SetWindowTitle failed: {}", sdl_error());
+                }
             }
+            accumulator -= TICK_MS;
         }
 
         render_frame(
@@ -269,6 +290,41 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         }
         if !unsafe { SDL_RenderPresent(renderer) } {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
+        }
+    }
+}
+
+/// Apply the SCD camera state to the room.
+///
+/// When the scripts hold the camera lock, their cut wins; otherwise the M2 zone
+/// switching picks the cut from the player position. `None` keeps the current
+/// cut when no position is available yet (room load and capture).
+fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i32; 3]>) {
+    let selected = if game.camera.locked && game.camera.current_cut < room.cuts.len() {
+        game.camera.current_cut
+    } else if let Some(pos) = pos {
+        player::camera_for_position(room, room.current_cut, pos)
+    } else {
+        room.current_cut
+    };
+    game.camera.current_cut = selected;
+    room.current_cut = selected;
+}
+
+/// Apply the room's queued BGM requests; the engine plays one track at a time.
+fn apply_bgm_requests(
+    music: &mut Option<MusicPlayer>,
+    requests: &mut Vec<game::BgmRequest>,
+    pack: &Pack,
+    id: RoomId,
+) {
+    for request in requests.drain(..) {
+        if request.start {
+            if !music.as_ref().is_some_and(MusicPlayer::is_playing) {
+                *music = start_music(load_room_music(pack, id));
+            }
+        } else if let Some(player) = music {
+            player.stop();
         }
     }
 }
@@ -624,6 +680,51 @@ mod tests {
         assert_eq!(wav.channels, 1);
         assert!(matches!(wav.format, audio::WavFormat::U8));
         assert!(!wav.data.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn room_1001_runs_its_scd_through_the_game_state() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("1001").unwrap();
+        let rdt_bytes = pack.read(&id.rdt_entry()).unwrap();
+        let room = rdt::parse(rdt_bytes, id).unwrap();
+        let scripts = scd::reader::parse(rdt_bytes).unwrap();
+
+        let mut game = game::GameState::new(id, &room);
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_init(&mut host);
+        }
+        assert_eq!(game.state_bytes[2], 1, "player flag is untouched");
+        assert_eq!(game.bgm.state, 0x09, "init should write the BGM state");
+        assert!(!game.camera.locked);
+
+        for _ in 0..10 {
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_main(&mut host);
+            event_vm.step(&mut host);
+            game.advance_frame();
+        }
+
+        assert_eq!(game.frame, 10);
+        assert!(
+            !game.placeholders.is_empty(),
+            "unimplemented opcodes should be recorded"
+        );
+        assert!(game.placeholders.contains_key(&0x0C), "doors are recorded");
+        assert!(game.placeholders.contains_key(&0x18), "items are recorded");
+        assert_eq!(game.camera.current_cut, 0);
+        assert_eq!(game.camera.saved_cut, None);
+        assert_eq!(game.message.id, None);
+        assert_eq!(game.message.pause, 0);
+        assert!(!game.message.active);
+        assert_eq!(game.room_bgm_requests, Vec::new());
     }
 
     #[test]

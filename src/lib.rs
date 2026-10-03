@@ -6,6 +6,7 @@ pub mod bmp;
 pub mod convert;
 pub mod emd;
 pub mod engine;
+pub mod game;
 pub mod lzw;
 pub mod model;
 pub mod music;
