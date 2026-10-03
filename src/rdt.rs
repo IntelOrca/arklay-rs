@@ -66,8 +66,8 @@ fn empty_room(id: RoomId) -> RoomState {
 /// Parse one 44-byte camera record.
 fn parse_cut(record: &[u8], index: usize) -> Cut {
     let mut fields = [0i32; CAMERA_FIELDS];
-    for (field, bytes) in fields.iter_mut().zip(record.chunks_exact(4)) {
-        *field = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    for (field, bytes) in fields.iter_mut().zip(record.as_chunks::<4>().0) {
+        *field = i32::from_le_bytes(*bytes);
     }
 
     Cut {

@@ -59,7 +59,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     })?;
 
     let mut rgba = Vec::with_capacity(pixel_bytes / PIXEL_BYTES * 4);
-    for px in raw.chunks_exact(PIXEL_BYTES) {
+    for px in raw.as_chunks::<PIXEL_BYTES>().0 {
         let v = u16::from_le_bytes([px[0], px[1]]);
         let r = (v >> 10) & 31;
         let g = (v >> 5) & 31;

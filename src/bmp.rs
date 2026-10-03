@@ -86,7 +86,9 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         for entry in data
             .get(dib_end..)
             .unwrap_or(&[])
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(palette_len.min(256))
         {
             palette.push([entry[2], entry[1], entry[0]]);
@@ -159,7 +161,7 @@ pub fn encode_to_vec(image: &Image) -> Result<Vec<u8>> {
     let mut palette: Vec<[u8; 3]> = Vec::new();
     let mut indices: HashMap<[u8; 3], u8> = HashMap::new();
     let mut indexed = true;
-    for pixel in image.rgba.chunks_exact(4) {
+    for pixel in image.rgba.as_chunks::<4>().0 {
         let rgb = [pixel[0], pixel[1], pixel[2]];
         if let Entry::Vacant(slot) = indices.entry(rgb) {
             if palette.len() == 256 {
@@ -205,11 +207,11 @@ pub fn encode_to_vec(image: &Image) -> Result<Vec<u8>> {
     for y in (0..height).rev() {
         let row = &image.rgba[y * width * 4..(y + 1) * width * 4];
         if indexed {
-            for pixel in row.chunks_exact(4) {
+            for pixel in row.as_chunks::<4>().0 {
                 out.push(indices[&[pixel[0], pixel[1], pixel[2]]]);
             }
         } else {
-            for pixel in row.chunks_exact(4) {
+            for pixel in row.as_chunks::<4>().0 {
                 out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
             }
         }
