@@ -2605,8 +2605,10 @@ fn play_footsteps(
         return;
     };
     for footstep in footsteps {
-        // The entity sound modifier is the original's effect-zone flag, which
-        // no room script in this slice raises; footsteps always use type 0.
+        // The footstep carries its own entity sound type (0 for the walk,
+        // turn and backward run, 1 for the forward run). The slow argument is
+        // the original's effect-zone flag, which no room script in this slice
+        // raises.
         let Some(name) = sfx::footstep_sound(room, footstep.pos, footstep.sound_type, false) else {
             continue;
         };
@@ -4292,6 +4294,101 @@ mod tests {
         // The engine's cache resolves the pack entry the mixer would play.
         let mut cache = SfxCache::default();
         assert!(cache.load(&pack, "ft_wdA").is_some());
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_room_1001_run_emits_ft_wdb_faster_than_walk() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("1001").unwrap();
+        let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+        let assets = load_player_assets(&pack, id).expect("player assets");
+
+        type Footfall = (usize, u8, u8, [i32; 3], Option<&'static str>);
+
+        let drive = |input: player::Input, ticks: usize| {
+            let mut player_state = player::spawn(id, &room);
+            let mut log: Vec<Footfall> = Vec::new();
+            for tick in 0..ticks {
+                player::update(
+                    &mut player_state,
+                    &room,
+                    &assets.emd.clips,
+                    &assets.emw.clips,
+                    input,
+                );
+                for footstep in player_state.take_footsteps() {
+                    let name = sfx::footstep_sound(&room, footstep.pos, footstep.sound_type, false);
+                    log.push((
+                        tick,
+                        footstep.frame,
+                        footstep.sound_type,
+                        footstep.pos,
+                        name,
+                    ));
+                }
+            }
+            log
+        };
+
+        let walk = drive(
+            player::Input {
+                up: true,
+                ..player::Input::default()
+            },
+            60,
+        );
+        let run = drive(
+            player::Input {
+                up: true,
+                run: true,
+                ..player::Input::default()
+            },
+            60,
+        );
+        println!("walk: {walk:?}");
+        println!("run: {run:?}");
+
+        // The shipped no-weapon model: the walk cycle (clip 2) is 28 frames
+        // with contacts on 0x08/0x16, the forward run (clip 3) is 20 frames
+        // with contacts on 0x00/0x0A. The run therefore lands more footfalls in
+        // the same window, and they are the B variant.
+        assert!(
+            run.len() > walk.len(),
+            "run {} footfalls, walk {}",
+            run.len(),
+            walk.len()
+        );
+        assert!(run.iter().all(|entry| entry.2 == 1), "{run:?}");
+        assert!(walk.iter().all(|entry| entry.2 == 0), "{walk:?}");
+
+        // Run contacts are 10 ticks apart and walk contacts 14, so the run is
+        // faster at 3/s against the walk's 2.14/s.
+        let gaps = |log: &[Footfall]| -> Vec<usize> {
+            log.windows(2).map(|pair| pair[1].0 - pair[0].0).collect()
+        };
+        assert!(gaps(&run).iter().all(|&gap| gap == 10), "{run:?}");
+        assert!(gaps(&walk).iter().all(|&gap| gap == 14), "{walk:?}");
+
+        // The M5/M6 zone lookup names the early run contacts within room 1001,
+        // and the 3D path yields a finite gain and an in-range pan.
+        let run_names: Vec<&str> = run.iter().filter_map(|entry| entry.4).collect();
+        assert_eq!(
+            run_names.iter().take(2).copied().collect::<Vec<&str>>(),
+            ["ft_wdB", "ft_wdB"],
+            "{run:?}"
+        );
+        let cut = &room.cuts[room.current_cut];
+        let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, run[0].3);
+        assert!(gain.is_finite() && (0.0..=1.1).contains(&gain));
+        assert!((-1.0..=1.0).contains(&pan));
+
+        // The run's sound resolves through the same mixer cache as the walk's.
+        let mut cache = SfxCache::default();
+        assert!(cache.load(&pack, "ft_wdB").is_some());
     }
 
     /// A pack carrying `font/font.tim`: the real pack when it has the entry,

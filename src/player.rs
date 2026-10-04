@@ -10,6 +10,15 @@
 //! locomotion frame for an extra tick while a room flag is set. No state
 //! source sets that flag in this engine yet, so the port always runs at full
 //! speed and the modifier's doubled footstep cadence is not modelled.
+//!
+//! Footsteps follow the clip each behavior plays. The walk and the in-place
+//! turn share the no-weapon walk cycle and fire on its contact frames `0x08`
+//! and `0x16` with the "A" footstep; the forward run plays the no-weapon run
+//! cycle whose contacts are the first and tenth frames and uses the "B"
+//! footstep; the backward run plays the body model's run cycle and fires on
+//! `0x08`/`0x16` with the "A" footstep. The run cycle is both shorter and has
+//! its contacts closer together, so running produces more footfalls per second
+//! than walking.
 
 use crate::anim::AnimPlayer;
 use crate::model::Clip;
@@ -28,9 +37,9 @@ const BREATHE_IN_CLIP: usize = 0;
 const BREATHE_CLIP: usize = 1;
 /// EMW clip 2: the walk cycle, also used for turning in place.
 const WALK_CLIP: usize = 2;
-/// EMW clip 3: the run.
+/// EMW clip 3: the forward run.
 const RUN_CLIP: usize = 3;
-/// EMD clip 3: the backward walk. The original plays it from the body model,
+/// EMD clip 3: the backward run. The original plays it from the body model,
 /// not the no-weapon EMW, and only falls back to EMD clip 2 while an enemy is
 /// in view (this engine has no enemy visibility test yet).
 const BACK_CLIP: usize = 3;
@@ -94,16 +103,62 @@ pub struct Input {
     pub run: bool,
 }
 
-/// A footstep sound request emitted when a locomotion clip applies a contact
-/// frame.
+/// A footstep sound request emitted when a locomotion clip is about to apply
+/// a contact frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Footstep {
-    /// Player position when the contact frame was applied.
+    /// Player position when the footstep is emitted, before the tick's
+    /// movement.
     pub pos: [i32; 3],
-    /// The contact frame: `0x08` or `0x16`.
+    /// The contact frame: `0x08`/`0x16` for the walk, turn and backward run,
+    /// `0x00`/`0x0A` for the forward run.
     pub frame: u8,
-    /// Entity sound type; walking, turning and running all use type 0.
+    /// Entity sound type: 0 (the A footstep) for the walk, turn and backward
+    /// run, 1 (the B footstep) for the forward run.
     pub sound_type: u8,
+}
+
+/// The footstep rule of one locomotion behavior: which clip's frames apply a
+/// footfall and which entity sound type each contact plays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FootstepRule {
+    /// File the clip plays from.
+    source: ClipSource,
+    /// Clip index inside that file.
+    clip: usize,
+    /// Frames that apply a footfall.
+    frames: &'static [usize],
+    /// Entity sound type passed to the room's footstep lookup.
+    sound_type: u8,
+}
+
+/// The original's contact frames and footstep variant per behavior.
+///
+/// The walk and in-place turn share the no-weapon walk cycle; the forward run
+/// uses its own run cycle and the B footstep; the backward run uses the body
+/// model's run cycle with the walk contact frames.
+fn footstep_rule(behavior: u8) -> Option<FootstepRule> {
+    match behavior {
+        BEHAVIOR_WALK | BEHAVIOR_TURN => Some(FootstepRule {
+            source: ClipSource::Emw,
+            clip: WALK_CLIP,
+            frames: &[0x08, 0x16],
+            sound_type: 0,
+        }),
+        BEHAVIOR_RUN => Some(FootstepRule {
+            source: ClipSource::Emw,
+            clip: RUN_CLIP,
+            frames: &[0x00, 0x0A],
+            sound_type: 1,
+        }),
+        BEHAVIOR_BACK => Some(FootstepRule {
+            source: ClipSource::Emd,
+            clip: BACK_CLIP,
+            frames: &[0x08, 0x16],
+            sound_type: 0,
+        }),
+        _ => None,
+    }
 }
 
 /// Stair/ladder movement state driven by the room scripts.
@@ -227,6 +282,11 @@ pub fn update(
         BEHAVIOR_RUN => RUN_SPEED,
         _ => 0,
     };
+    // The original checks the pending animation frame and plays the footstep
+    // before `Joint_move` applies it and before the tick's movement, so the
+    // sound uses the pre-move position.
+    player.emit_footsteps(behavior, emd_clips, emw_clips);
+
     let offset = if behavior == BEHAVIOR_BACK {
         BACK_OFFSET
     } else {
@@ -271,7 +331,6 @@ pub fn update(
     } else {
         player.advance(emd_clips, emw_clips);
     }
-    player.emit_footsteps(behavior);
 }
 
 impl PlayerState {
@@ -287,25 +346,36 @@ impl PlayerState {
         }
     }
 
-    /// Emit a footstep when the displayed frame of a walk, turn or run clip is
-    /// a contact frame.
+    /// Emit a footstep when the behavior's locomotion clip is about to apply
+    /// one of its contact frames.
     ///
-    /// The original tests frames `0x08` and `0x16` on every frame rather than
-    /// on the transition into them, so a contact frame held by its timing
-    /// re-fires each tick it is displayed.
-    fn emit_footsteps(&mut self, behavior: u8) {
-        if self.clip_source != ClipSource::Emw
-            || !matches!(behavior, BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_RUN)
-        {
+    /// The original tests `animation_frame_id` before `Joint_move` applies the
+    /// frame, so the pending frame is the one checked. A contact frame whose
+    /// own timing holds it therefore fires exactly once, while a contact
+    /// reached with the previous frame still held fires on each held tick
+    /// until it is applied - both behaviours fall out of checking the pending
+    /// frame here.
+    fn emit_footsteps(&mut self, behavior: u8, emd_clips: &[Clip], emw_clips: &[Clip]) {
+        let Some(rule) = footstep_rule(behavior) else {
+            return;
+        };
+        if self.clip_source != rule.source || self.anim.clip != rule.clip {
             return;
         }
 
-        let frame = self.anim.display_frame;
-        if frame == 0x08 || frame == 0x16 {
+        let clips = match rule.source {
+            ClipSource::Emd => emd_clips,
+            ClipSource::Emw => emw_clips,
+        };
+        let Some(clip) = clips.get(rule.clip) else {
+            return;
+        };
+        let frame = self.anim.frame;
+        if frame < clip.frames.len() && rule.frames.contains(&frame) {
             self.footsteps.push(Footstep {
                 pos: self.pos,
                 frame: frame as u8,
-                sound_type: 0,
+                sound_type: rule.sound_type,
             });
         }
     }
@@ -1514,9 +1584,13 @@ mod tests {
             },
             30,
         );
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].frame, 0x08);
-        assert_eq!(events[1].frame, 0x16);
+        // The fixture's run clip has 28 frames: its first and tenth frames
+        // contact, and frame 0 wraps around once more inside the 30 ticks.
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0].frame, 0x00);
+        assert_eq!(events[1].frame, 0x0A);
+        assert_eq!(events[2].frame, 0x00);
+        assert!(events.iter().all(|event| event.sound_type == 1));
     }
 
     #[test]
@@ -1533,8 +1607,8 @@ mod tests {
         };
 
         let mut mixer = MixState::new();
-        // Longer than the 14-tick gap between the run's two contact frames, so
-        // the second footfall starts while the first copy is still playing.
+        // Longer than the 10-tick gap between the run's contact frames, so the
+        // second footfall starts while the first copy is still playing.
         let step_pcm = vec![1000i16; 2000];
         let mut out = Vec::new();
         let mut triggers = Vec::new();
@@ -1572,7 +1646,7 @@ mod tests {
     }
 
     #[test]
-    fn backward_walk_does_not_emit_footsteps() {
+    fn backward_run_emits_footsteps_from_the_body_clip() {
         let room = RoomState::default();
         let clips = clips();
         let mut player = player_at(1000, 1000);
@@ -1583,12 +1657,17 @@ mod tests {
 
         let events = step_events(&mut player, &room, &clips, input, 30);
 
-        assert!(events.is_empty(), "{events:?}");
+        // The body EMD's run clip carries the walk contact frames and the A
+        // footstep.
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x08);
+        assert_eq!(events[1].frame, 0x16);
+        assert!(events.iter().all(|event| event.sound_type == 0));
         assert_eq!(player.clip_source, ClipSource::Emd);
     }
 
     #[test]
-    fn a_held_contact_frame_repeats_its_footstep() {
+    fn a_contact_frame_held_by_its_timing_fires_once() {
         let room = RoomState::default();
         let mut clips = clips();
         clips[WALK_CLIP].frames[0x08].timing = 2;
@@ -1599,26 +1678,148 @@ mod tests {
         };
 
         // Advance to the tick that first applies contact frame 0x08.
-        let mut ticks = 0;
-        loop {
+        let mut fired = false;
+        for _ in 0..30 {
             step(&mut player, &room, &clips, input);
             let taken = player.take_footsteps();
             if !taken.is_empty() {
+                assert_eq!(taken.len(), 1, "{taken:?}");
                 assert_eq!(taken[0].frame, 0x08);
+                fired = true;
                 break;
             }
-            ticks += 1;
-            assert!(ticks < 30, "the 0x08 contact frame was never applied");
         }
+        assert!(fired, "the 0x08 contact frame was never applied");
 
-        // The next tick holds the same frame and must fire again.
+        // The contact is still displayed while its timing runs down, but the
+        // pending frame has already moved past it: no re-fire.
         step(&mut player, &room, &clips, input);
-        let held = player.take_footsteps();
-        assert_eq!(held.len(), 1, "{held:?}");
-        assert_eq!(held[0].frame, 0x08);
+        assert_eq!(player.anim.display_frame, 0x08);
+        assert!(
+            player.take_footsteps().is_empty(),
+            "a held contact frame re-fired"
+        );
+    }
 
-        // Once the clip moves on, the held frame stops firing.
-        step(&mut player, &room, &clips, input);
-        assert!(player.take_footsteps().is_empty(), "still on the contact");
+    #[test]
+    fn a_contact_reached_while_the_previous_frame_is_held_fires_each_held_tick() {
+        // The original tests the pending frame before Joint_move decides
+        // whether it can apply it, so a contact reached with the preceding
+        // frame still held fires on every held tick until it is applied.
+        let room = RoomState::default();
+        let mut clips = clips();
+        clips[WALK_CLIP].frames[0x07].timing = 2;
+        let mut player = player_at(1000, 1000);
+
+        let log = footfall_log(
+            &mut player,
+            &room,
+            &clips,
+            &clips,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+            30,
+        );
+
+        let fires: Vec<(usize, u8, u8)> = log
+            .iter()
+            .copied()
+            .filter(|entry| entry.1 == 0x08)
+            .collect();
+        assert_eq!(fires, [(8, 0x08, 0), (9, 0x08, 0)], "not exactly two fires");
+    }
+
+    /// Clip sets shaped like the shipped models: the body EMD's run clip 3 has
+    /// 28 frames and the no-weapon EMW carries the 28-frame walk cycle (clip 2)
+    /// and the 20-frame forward run (clip 3). Every frame lasts one tick.
+    fn shipped_clips() -> (Vec<Clip>, Vec<Clip>) {
+        (
+            vec![clip(3), clip(20), clip(35), clip(28), clip(30)],
+            vec![clip(35), clip(16), clip(28), clip(20), clip(25)],
+        )
+    }
+
+    /// Drive `ticks` ticks and collect `(tick, contact frame, sound type)` for
+    /// every footfall.
+    fn footfall_log(
+        player: &mut PlayerState,
+        room: &RoomState,
+        emd_clips: &[Clip],
+        emw_clips: &[Clip],
+        input: Input,
+        ticks: usize,
+    ) -> Vec<(usize, u8, u8)> {
+        let mut log = Vec::new();
+        for tick in 0..ticks {
+            update(player, room, emd_clips, emw_clips, input);
+            for event in player.take_footsteps() {
+                log.push((tick, event.frame, event.sound_type));
+            }
+        }
+        log
+    }
+
+    #[test]
+    fn running_emits_footfalls_faster_than_walking() {
+        const TICKS: usize = 300;
+        let room = RoomState::default();
+        let (emd_clips, emw_clips) = shipped_clips();
+
+        let mut walking = player_at(1000, 1000);
+        let walk = footfall_log(
+            &mut walking,
+            &room,
+            &emd_clips,
+            &emw_clips,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+            TICKS,
+        );
+
+        let mut running = player_at(1000, 1000);
+        let run = footfall_log(
+            &mut running,
+            &room,
+            &emd_clips,
+            &emw_clips,
+            Input {
+                up: true,
+                run: true,
+                ..Input::default()
+            },
+            TICKS,
+        );
+
+        let walk_ticks: Vec<usize> = walk.iter().map(|&(tick, ..)| tick).collect();
+        let run_ticks: Vec<usize> = run.iter().map(|&(tick, ..)| tick).collect();
+
+        // The 28-frame walk cycle contacts on frames 8 and 0x16: a footfall
+        // every 14 ticks (about 2.14/s).
+        assert_eq!(walk_ticks.len(), 21, "{walk_ticks:?}");
+        assert!(walk_ticks.windows(2).all(|pair| pair[1] - pair[0] == 14));
+        assert!(
+            walk.iter()
+                .all(|&(_, frame, sound)| { sound == 0 && (frame == 0x08 || frame == 0x16) })
+        );
+
+        // The 20-frame run cycle contacts on frames 0 and 0x0A: a footfall
+        // every 10 ticks (3/s).
+        assert_eq!(run_ticks.len(), 30, "{run_ticks:?}");
+        assert!(run_ticks.windows(2).all(|pair| pair[1] - pair[0] == 10));
+        assert!(
+            run.iter()
+                .all(|&(_, frame, sound)| { sound == 1 && (frame == 0x00 || frame == 0x0A) })
+        );
+
+        assert!(
+            run_ticks.len() > walk_ticks.len(),
+            "run {} footfalls, walk {}",
+            run_ticks.len(),
+            walk_ticks.len()
+        );
     }
 }
