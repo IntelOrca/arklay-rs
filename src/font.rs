@@ -96,15 +96,30 @@ pub struct Glyphs<'a> {
     bytes: &'a [u8],
     position: usize,
     metrics: FontMetrics,
+    remap_parentheses: bool,
 }
 
 impl<'a> Glyphs<'a> {
-    /// Decode `bytes` with `metrics`.
+    /// Decode `bytes` with `metrics`, remapping `0x28`/`0x29` to the
+    /// controller-symbol cells like the original's game-text renderer.
     pub fn new(bytes: &'a [u8], metrics: FontMetrics) -> Self {
         Self {
             bytes,
             position: 0,
             metrics,
+            remap_parentheses: true,
+        }
+    }
+
+    /// Decode `bytes` with `metrics` without the controller-symbol remap, so
+    /// `0x28`/`0x29` are the ordinary letters L and M. The save screen's
+    /// header uses the original's plain formatted path, which has no remap.
+    pub fn plain(bytes: &'a [u8], metrics: FontMetrics) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            metrics,
+            remap_parentheses: false,
         }
     }
 
@@ -152,11 +167,13 @@ impl Iterator for Glyphs<'_> {
                     self.position += 1;
                     // ASCII '(' and ')' are the controller-symbol cells in
                     // both sheet widths.
-                    if byte == 0x28 {
-                        return Some(self.glyph(56, 224));
-                    }
-                    if byte == 0x29 {
-                        return Some(self.glyph(70, 224));
+                    if self.remap_parentheses {
+                        if byte == 0x28 {
+                            return Some(self.glyph(56, 224));
+                        }
+                        if byte == 0x29 {
+                            return Some(self.glyph(70, 224));
+                        }
                     }
                     let byte = i32::from(byte);
                     let col = byte % 18;
@@ -198,8 +215,41 @@ impl Font {
         brightness: u8,
         bytes: &[u8],
     ) {
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, true);
+    }
+
+    /// Draw an encoded stream without the controller-symbol remap; see
+    /// [`Glyphs::plain`].
+    pub fn draw_text_plain(
+        &self,
+        framebuffer: &mut Framebuffer,
+        x: i32,
+        y: i32,
+        tint: Tint,
+        brightness: u8,
+        bytes: &[u8],
+    ) {
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyphs(
+        &self,
+        framebuffer: &mut Framebuffer,
+        x: i32,
+        y: i32,
+        tint: Tint,
+        brightness: u8,
+        bytes: &[u8],
+        remap_parentheses: bool,
+    ) {
+        let glyphs = if remap_parentheses {
+            Glyphs::new(bytes, self.metrics)
+        } else {
+            Glyphs::plain(bytes, self.metrics)
+        };
         let mut cursor = x;
-        for glyph in Glyphs::new(bytes, self.metrics) {
+        for glyph in glyphs {
             if glyph.visible() {
                 framebuffer.draw_indexed_sprite(
                     &self.texture,
@@ -366,6 +416,15 @@ mod tests {
         assert_eq!((open[0].u, open[0].v), (56, 224));
         let close = steps(&[0x29], metrics_jpn());
         assert_eq!((close[0].u, close[0].v), (70, 224));
+    }
+
+    #[test]
+    fn the_plain_iterator_keeps_parentheses_as_letters() {
+        let metrics = metrics_jpn();
+        let open: Vec<Glyph> = Glyphs::plain(&[0x28], metrics).collect();
+        assert_eq!((open[0].u, open[0].v), (4 * 14, 28 + 2 * 14));
+        let close: Vec<Glyph> = Glyphs::plain(&[0x29], metrics).collect();
+        assert_eq!((close[0].u, close[0].v), (5 * 14, 28 + 2 * 14));
     }
 
     #[test]

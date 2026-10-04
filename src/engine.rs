@@ -42,6 +42,7 @@ use crate::door;
 use crate::emd;
 use crate::font;
 use crate::game;
+use crate::items;
 use crate::mask;
 use crate::message::MessageInput;
 use crate::model::Emd;
@@ -121,6 +122,7 @@ impl Drop for SurfaceHandle {
 /// room. Capture mode renders one frame (with its room-mask layer) and never
 /// opens audio.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
+    let save_dir = save::default_save_dir_for_pack(pack);
     let pack = Pack::open(pack)?;
 
     if let Some(capture_path) = capture {
@@ -151,7 +153,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         return display.capture(capture_path);
     }
 
-    let mut session = GameSession::from_room(&pack, id)?;
+    let mut session = GameSession::from_room(&pack, id, &save_dir)?;
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
@@ -373,6 +375,10 @@ struct GameSession {
     file: Option<FileScreen>,
     /// FILE tab art, loaded on the first open.
     file_assets: Option<FileAssets>,
+    /// The typewriter save screen; the room stays frozen while it is up.
+    save_screen: Option<ui::save_load::SaveLoadScreen>,
+    /// Where `savedat*.dat` slot files live for this session.
+    save_dir: PathBuf,
     framebuffer: Framebuffer,
     titled_cut: usize,
     transition: Option<TransitionMode>,
@@ -431,7 +437,7 @@ impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): stage 1 room 0 with
     /// the original's start position, health, items and room-item flags, then
     /// the room init/main/event VMs.
-    fn new(pack: &Pack, character: u8) -> Result<Self> {
+    fn new(pack: &Pack, character: u8, save_dir: &Path) -> Result<Self> {
         let character = character & 1;
         let id = RoomId {
             stage: 1,
@@ -445,21 +451,21 @@ impl GameSession {
         player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
         player_state.angle = NEW_GAME_ANGLE;
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(pack, loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
     /// Boot `id` directly, the `--room` path.
-    fn from_room(pack: &Pack, id: RoomId) -> Result<Self> {
+    fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Self> {
         let loaded = load_room(pack, id)?;
         let mut game = game::GameState::new(id, &loaded.room);
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(pack, loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
     /// Continue from a parsed save: the block replaces the state, the saved
     /// position and angle place the player and the saved room loads.
-    fn from_save(pack: &Pack, file: &save::SaveFile) -> Result<Self> {
+    fn from_save(pack: &Pack, file: &save::SaveFile, save_dir: &Path) -> Result<Self> {
         let id = RoomId {
             stage: file.stage,
             room: file.room,
@@ -476,7 +482,7 @@ impl GameSession {
         ];
         player_state.angle = file.angle as u16 & 0x0FFF;
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(pack, loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
     /// Assemble a session around already-built state and run the room boot.
@@ -485,6 +491,7 @@ impl GameSession {
         loaded: LoadedRoom,
         game: game::GameState,
         player_state: player::PlayerState,
+        save_dir: &Path,
     ) -> Result<Self> {
         let scripts = Rc::new(loaded.scripts.clone());
         let command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -519,6 +526,8 @@ impl GameSession {
             item_box_assets: None,
             file: None,
             file_assets: None,
+            save_screen: None,
+            save_dir: save_dir.to_path_buf(),
             framebuffer: Framebuffer::new(),
             titled_cut: usize::MAX,
             transition: None,
@@ -555,6 +564,10 @@ impl GameSession {
     /// opens the pause menu instead of ticking the room; while the menu is up
     /// the room stays frozen and the same input drives the menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        if self.save_screen.is_some() {
+            self.tick_save_screen(pack, ui);
+            return Ok(());
+        }
         if self.menu.is_some() {
             self.tick_menu(pack, ui, input, action);
             return Ok(());
@@ -571,6 +584,13 @@ impl GameSession {
             &self.loaded.room,
             &self.text,
         );
+
+        // The typewriter prompt was answered: a confirmed save opens the save
+        // screen instead of running the room this tick.
+        if let Some(ink_ribbon) = self.game.take_typewriter_confirm() {
+            self.open_typewriter_save(pack, ink_ribbon);
+            return Ok(());
+        }
 
         if ui.start && !self.game.message.active {
             self.open_menu(pack);
@@ -607,13 +627,17 @@ impl GameSession {
             input,
             action,
         );
-        // A room `item_box` action opened this tick raises the overlay. The
-        // interaction is consumed so the next probe has to fire again.
-        let item_box_fired = self
-            .game
-            .last_interaction
-            .take()
+        // A room `item_box` action opened this tick raises the overlay; a
+        // typewriter runs its save prompt. The interaction is consumed so the
+        // next probe has to fire again.
+        let interaction = self.game.last_interaction.take();
+        let item_box_fired = interaction
             .is_some_and(|interaction| interaction.kind == game::RoomActionKind::ItemBox);
+        let typewriter_fired = interaction
+            .is_some_and(|interaction| interaction.kind == game::RoomActionKind::Typewriter);
+        if typewriter_fired {
+            self.game.check_typewriter();
+        }
         apply_bgm_requests(
             &mut self.music,
             &mut self.game.room_bgm_requests,
@@ -725,6 +749,91 @@ impl GameSession {
         if let Some(item) = self.viewed_item.take() {
             self.game.mark_examined(item);
         }
+    }
+
+    /// Open the save screen over the frozen room after the typewriter prompt
+    /// was confirmed. The last gameplay frame is painted first so the screen
+    /// fades in over it; the pending block is the state snapshot plus the
+    /// bio-card prefix, and `ink_ribbon` makes the write consume one.
+    fn open_typewriter_save(&mut self, pack: &Pack, ink_ribbon: bool) {
+        if self.save_screen.is_some() {
+            return;
+        }
+        self.render(pack);
+        let file = self.snapshot_save(pack);
+        let mut screen = ui::save_load::SaveLoadScreen::save(file, ink_ribbon);
+        let mut cx = self.ui_context(pack);
+        if let Err(err) = screen.open(&mut cx) {
+            eprintln!("warning: save screen unavailable: {err:#}");
+        }
+        self.save_screen = Some(screen);
+    }
+
+    /// Capture the current game state as a save block with the bio-card
+    /// prefix, when the pack carries one.
+    fn snapshot_save(&self, pack: &Pack) -> save::SaveFile {
+        let Ok(prefix) = pack.read(save::SAVE_PREFIX_ENTRY) else {
+            return save::SaveFile::from_state(&self.game);
+        };
+        match save::SaveFile::from_state_with_prefix(&self.game, prefix) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("warning: invalid {0}: {err:#}", save::SAVE_PREFIX_ENTRY);
+                save::SaveFile::from_state(&self.game)
+            }
+        }
+    }
+
+    /// The session's UI context for a screen that runs over the frozen room.
+    fn ui_context<'a>(&'a self, pack: &'a Pack) -> UiContext<'a> {
+        UiContext {
+            pack,
+            save_dir: &self.save_dir,
+            font: self.font.as_ref(),
+            text: Some(&self.text),
+            ticks: self.game.frame,
+        }
+    }
+
+    /// One frozen tick of the typewriter save screen. The screen writes the
+    /// block itself; on completion the engine mirrors the write into the live
+    /// state (ribbon and save counter) and resumes gameplay.
+    fn tick_save_screen(&mut self, pack: &Pack, ui: UiInput) {
+        let result = {
+            let Self {
+                save_screen,
+                save_dir,
+                font,
+                text,
+                game,
+                ..
+            } = self;
+            let Some(screen) = save_screen.as_mut() else {
+                return;
+            };
+            let cx = UiContext {
+                pack,
+                save_dir,
+                font: font.as_ref(),
+                text: Some(text),
+                ticks: game.frame,
+            };
+            screen.update(&cx, ui)
+        };
+        if result == ScreenResult::Continue {
+            return;
+        }
+        if let Some(outcome) = self
+            .save_screen
+            .as_mut()
+            .and_then(ui::save_load::SaveLoadScreen::take_outcome)
+        {
+            if outcome.ink_ribbon {
+                self.game.consume_ink_ribbon();
+            }
+            self.game.increment_saves();
+        }
+        self.save_screen = None;
     }
 
     /// One frozen tick of the pause menu. A message owns the input while it is
@@ -987,6 +1096,29 @@ impl GameSession {
                 );
             }
         }
+        if self.save_screen.is_some() {
+            let Self {
+                save_screen,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = save_screen {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                };
+                screen.draw(&cx, framebuffer);
+                let fade = screen.fade();
+                framebuffer.fade_to_black(fade);
+            }
+        }
         if let Some(font) = &self.font {
             self.game
                 .message
@@ -1072,8 +1204,10 @@ pub enum AppBoot {
     Title,
     /// The character-selection screen.
     CharSelect,
-    /// The load-screen picker.
+    /// The load screen.
     SaveLoad,
+    /// The typewriter save screen over the deterministic capture room.
+    Save,
     /// A new game as the character (`0` Chris, `1` Jill).
     NewGame(u8),
     /// The pause menu over the deterministic capture room.
@@ -1096,12 +1230,14 @@ const MENU_CAPTURE_TICKS: u32 = 30;
 const ITEM_BOX_CAPTURE_TICKS: u32 = 30;
 /// Fixed ticks the headless FILE capture settles before the frame.
 const FILE_CAPTURE_TICKS: u32 = 30;
+/// Fixed ticks the headless save-screen capture settles before the frame.
+const SAVE_CAPTURE_TICKS: u32 = 36;
 
 /// The app's current screen.
 enum Mode {
     Title(ui::title::TitleScreen),
     Select(ui::char_select::CharSelectScreen),
-    Load(ui::save_load::SaveLoadScreen),
+    Load(Box<ui::save_load::SaveLoadScreen>),
     Play(Box<GameSession>),
 }
 
@@ -1170,8 +1306,9 @@ impl App {
             AppBoot::Title => self.open_title(),
             AppBoot::CharSelect => self.open_select(),
             AppBoot::SaveLoad => self.open_load(),
+            AppBoot::Save => self.open_save_capture(),
             AppBoot::NewGame(character) => {
-                let session = GameSession::new(&self.pack, character)?;
+                let session = GameSession::new(&self.pack, character, &self.save_dir)?;
                 self.start_session(session);
                 Ok(())
             }
@@ -1198,11 +1335,11 @@ impl App {
         Ok(())
     }
 
-    /// Open the load-screen picker.
+    /// Open the load screen.
     fn open_load(&mut self) -> Result<()> {
-        let mut screen = ui::save_load::SaveLoadScreen::new();
+        let mut screen = ui::save_load::SaveLoadScreen::load();
         screen.open(&mut self.context())?;
-        self.mode = Mode::Load(screen);
+        self.mode = Mode::Load(Box::new(screen));
         Ok(())
     }
 
@@ -1218,7 +1355,7 @@ impl App {
     /// capture inventory and the menu already open.
     fn open_menu(&mut self) -> Result<()> {
         let id = RoomId::parse(MENU_ROOM)?;
-        let mut session = GameSession::from_room(&self.pack, id)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_menu_capture();
         session.open_menu(&self.pack);
         self.start_session(session);
@@ -1229,7 +1366,7 @@ impl App {
     /// a few box slots, with the box overlay already open.
     fn open_item_box_capture(&mut self) -> Result<()> {
         let id = RoomId::parse(MENU_ROOM)?;
-        let mut session = GameSession::from_room(&self.pack, id)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_menu_capture();
         session.seed_item_box_capture();
         session.open_item_box(&self.pack);
@@ -1241,7 +1378,7 @@ impl App {
     /// collected documents.
     fn open_file_capture(&mut self) -> Result<()> {
         let id = RoomId::parse(MENU_ROOM)?;
-        let mut session = GameSession::from_room(&self.pack, id)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_file_capture();
         session.open_file(&self.pack);
         self.start_session(session);
@@ -1252,11 +1389,24 @@ impl App {
     /// combat knife examined, the deterministic `--ui view` path.
     fn open_view(&mut self) -> Result<()> {
         let id = RoomId::parse(MENU_ROOM)?;
-        let mut session = GameSession::from_room(&self.pack, id)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_menu_capture();
         session.game.add_item(ITEM_KNIFE, 0);
         session.open_menu(&self.pack);
         session.open_item_view(&self.pack, ITEM_KNIFE);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the deterministic `--ui save` capture: a session over
+    /// [`MENU_ROOM`] with the known inventory plus an ink ribbon, and the
+    /// typewriter save screen already open over the frozen frame.
+    fn open_save_capture(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
+        session.seed_menu_capture();
+        session.game.add_item(items::ITEM_INK_RIBBONS, 1);
+        session.open_typewriter_save(&self.pack, true);
         self.start_session(session);
         Ok(())
     }
@@ -1267,12 +1417,12 @@ impl App {
             ScreenAction::CharSelect => self.open_select()?,
             ScreenAction::SaveLoad => self.open_load()?,
             ScreenAction::NewGame { character } => {
-                let session = GameSession::new(&self.pack, character)?;
+                let session = GameSession::new(&self.pack, character, &self.save_dir)?;
                 self.start_session(session);
             }
             ScreenAction::LoadGame { slot } => {
                 let file = save::load(&self.save_dir, slot)?;
-                let session = GameSession::from_save(&self.pack, &file)?;
+                let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
                 self.start_session(session);
             }
             ScreenAction::Title => self.open_title()?,
@@ -1480,11 +1630,11 @@ impl App {
 /// Boot one UI screen directly instead of a room.
 ///
 /// `font` renders the decoded font sheet with sample text; `title`, `select`,
-/// `game` and `load` boot the app screens, `menu` boots the pause menu over
-/// [`MENU_ROOM`] with the deterministic capture inventory, and `view` boots
-/// the item viewer over that same inventory with the combat knife examined.
-/// `capture` renders one deterministic frame and exits; otherwise the window
-/// stays up until the user quits.
+/// `game`, `load` and `save` boot the app screens, `menu` boots the pause menu
+/// over [`MENU_ROOM`] with the deterministic capture inventory, and `view`
+/// boots the item viewer over that same inventory with the combat knife
+/// examined. `capture` renders one deterministic frame and exits; otherwise
+/// the window stays up until the user quits.
 pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     run_ui_with_options(pack, screen, capture, &save_dir, 0)
@@ -1503,6 +1653,7 @@ pub fn run_ui_with_options(
         "title" => AppBoot::Title,
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
+        "save" => AppBoot::Save,
         "game" => AppBoot::NewGame(character & 1),
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
@@ -1511,7 +1662,7 @@ pub fn run_ui_with_options(
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu`, `box`, `file`, `view` or `load`"
+                 `menu`, `box`, `file`, `view`, `save` or `load`"
             )
         }
     };
@@ -1541,8 +1692,12 @@ pub fn run_ui_with_options(
                 app.open_load()?;
                 app.settle(48)?;
             }
+            AppBoot::Save => {
+                app.open_save_capture()?;
+                app.settle(SAVE_CAPTURE_TICKS)?;
+            }
             AppBoot::NewGame(character) => {
-                let session = GameSession::new(&app.pack, character)?;
+                let session = GameSession::new(&app.pack, character, &app.save_dir)?;
                 app.start_session(session);
             }
             AppBoot::Menu => {
@@ -2252,6 +2407,103 @@ pub fn simulate_door(
         mid_frame,
         mid_index,
         gameplay_frame,
+    })
+}
+
+/// The result of a headless typewriter save/load round trip.
+pub struct SimulatedTypewriter {
+    /// Room the typewriter was used in.
+    pub room: RoomId,
+    /// Zero-based slot the screen wrote.
+    pub slot: usize,
+    /// Whether the flow consumed an ink ribbon.
+    pub ink_ribbon: bool,
+    /// The block that was written.
+    pub saved: save::SaveFile,
+    /// Live state after the typewriter save finished.
+    pub state_after_save: game::GameState,
+    /// State after rebuilding a session from the written block.
+    pub state_after_load: game::GameState,
+}
+
+/// Drive a room's typewriter headlessly: add an ink ribbon, position the
+/// player at the typewriter, answer the save prompt, run the save screen to
+/// completion and rebuild a gameplay session from the written slot.
+///
+/// This is the deterministic seam the real-asset tests use; it writes the slot
+/// through the same [`ui::save_load::SaveLoadScreen`] path the engine uses.
+pub fn simulate_typewriter(
+    pack: &Pack,
+    id: RoomId,
+    save_dir: &Path,
+) -> Result<SimulatedTypewriter> {
+    let mut session = GameSession::from_room(pack, id, save_dir)?;
+    session.game.add_item(ITEM_KNIFE, 0);
+    session.game.add_item(items::ITEM_INK_RIBBONS, 1);
+    let action = session
+        .game
+        .room_actions
+        .iter()
+        .flatten()
+        .find(|action| action.kind == game::RoomActionKind::Typewriter)
+        .copied()
+        .with_context(|| format!("room {} has no typewriter action", id.room3()))?;
+    let center_x = i32::from(action.zone[0]) + i32::from(action.zone[2]) / 2;
+    let center_z = i32::from(action.zone[1]) + i32::from(action.zone[3]) / 2;
+    let (dx, dz) = player::reach_offset(0);
+    let typewriter_pos = [center_x - dx, session.player.pos[1], center_z - dz];
+
+    // Probe the typewriter, dismiss any startup message, page the prompt and
+    // answer its yes/no choice. Action presses alternate with idle ticks so
+    // the window and the probe see a fresh edge; the player is re-placed every
+    // tick in case a script keeps moving them.
+    let mut prompted = false;
+    let mut pressed = true;
+    for _ in 0..40_000 {
+        if session.save_screen.is_some() {
+            prompted = true;
+            break;
+        }
+        session.player.pos = typewriter_pos;
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+        session.tick(pack, UiInput::default(), player::Input::default(), pressed)?;
+        pressed = !pressed;
+    }
+    if !prompted {
+        bail!(
+            "the typewriter prompt never resolved for room {}",
+            id.room3()
+        );
+    }
+
+    // The confirmation opens the save screen; select the first slot and run
+    // the reveal out.
+    for step in 0..20_000u32 {
+        if session.save_screen.is_none() {
+            break;
+        }
+        let ui = UiInput {
+            confirm: step == 0,
+            ..UiInput::default()
+        };
+        session.tick(pack, ui, player::Input::default(), false)?;
+    }
+    if session.save_screen.is_some() {
+        bail!("the typewriter save screen never finished");
+    }
+
+    let saved = save::load(save_dir, 0)?;
+    let state_after_save = session.game.clone();
+    let loaded = GameSession::from_save(pack, &saved, save_dir)?;
+    let ink_ribbon = saved.used_item == items::ITEM_INK_RIBBONS;
+    Ok(SimulatedTypewriter {
+        room: id,
+        slot: 0,
+        ink_ribbon,
+        saved,
+        state_after_save,
+        state_after_load: loaded.game,
     })
 }
 
@@ -4271,7 +4523,7 @@ mod tests {
         writer.write(&pack_path).unwrap();
 
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, a).unwrap();
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
         session.player.pos = [-450, 0, 250];
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
@@ -4350,7 +4602,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         // Global id 0x40 with a pause word that masks the control bit.
         session.game.show_message(0x40, 0x145);
@@ -4388,7 +4642,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         // An action-gated item zone the player stands in and faces, so any
         // action press the room tick sees picks the spray up.
@@ -4459,7 +4715,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         // The per-frame bank starts cleared: a script-set bit from last frame
         // must not leak into this frame's USE checks.
@@ -4479,7 +4737,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         let before = session.game.frame;
         session
@@ -4538,7 +4798,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
         session.game.add_item(ITEM_KNIFE, 0);
 
         session
@@ -4610,7 +4872,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         // The sword key's name class is 3: it starts unexamined and its real
         // name is hidden until the viewer has run.
@@ -4653,7 +4917,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         // A room item action armed behind a yes/no message; the zone sits far
         // from the spawn so the action key cannot fire it directly.
@@ -4706,7 +4972,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
         session.game.add_item(ITEM_FIRST_AID_SPRAY, 1);
 
         // An item box action probing the player position.
@@ -4780,7 +5048,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
         session.game.set_file_collected(0x0F, true);
 
         session
@@ -4879,7 +5149,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
 
         session.game.show_message(0x40, 0);
         session
@@ -4902,7 +5174,9 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
         // At full health the green herb's USE is refused; the menu reports
         // the refusal as 0xf7 + the heal category (7).
         session.game.entities[0].health = session.game.max_health;
@@ -4964,7 +5238,7 @@ mod tests {
         let pack = Pack::open(&pack_path).unwrap();
 
         for character in 0..=1u8 {
-            let session = GameSession::new(&pack, character).unwrap();
+            let session = GameSession::new(&pack, character, Path::new("saves")).unwrap();
             assert_eq!(
                 session.game.id,
                 RoomId {
@@ -5021,7 +5295,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         for character in 0..=1u8 {
-            let session = GameSession::new(&pack, character).unwrap();
+            let session = GameSession::new(&pack, character, Path::new("saves")).unwrap();
             assert_eq!(session.loaded.id.room3(), "100");
             assert_eq!(
                 session.game.id,
@@ -5055,7 +5329,7 @@ mod tests {
             return;
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
-        let mut session = GameSession::new(&pack, 0).unwrap();
+        let mut session = GameSession::new(&pack, 0, Path::new("saves")).unwrap();
         session.game.entities[0].health = 88;
         session.game.entities[0].pos = [12000, 0, 3300];
         session.game.entities[0].angle = 512;
@@ -5070,7 +5344,7 @@ mod tests {
         save::save(&saves, 3, &file).unwrap();
 
         let parsed = save::load(&saves, 3).unwrap();
-        let continued = GameSession::from_save(&pack, &parsed).unwrap();
+        let continued = GameSession::from_save(&pack, &parsed, Path::new("saves")).unwrap();
         assert_eq!(continued.game.id, session.game.id);
         assert_eq!(continued.game.entities[0].health, 88);
         // The maximum is re-derived from the saved character, not left at 0.
@@ -5101,7 +5375,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         let id = RoomId::parse("1010").unwrap();
-        let mut session = GameSession::from_room(&pack, id).unwrap();
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
 
         // Stand in the key door's zone with no key: the next ticks request and
         // resolve its locked message without the player moving.

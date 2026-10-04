@@ -158,6 +158,16 @@ const MSF_MENU_ITEM_VIEW: u8 = 20;
 pub const BANK_ITEM_USE: u8 = 9;
 /// Scenario flag raised by the chemical combine effect.
 pub const SCENARIO_FLAG_CHEMICAL_COMBINE: u8 = 0x16;
+/// Scenario flag marking a second (hard) playthrough. While it is clear, a
+/// typewriter may be used without an ink ribbon and the save prompt asks
+/// "Will you save your progress?" instead of naming the ribbon.
+pub const SCENARIO_FLAG_SECOND_PLAYTHROUGH: u8 = 0x7B;
+/// Global message shown by a typewriter when no ink ribbon is held.
+pub const MESSAGE_TYPEWRITER_NO_RIBBON: u8 = 0xDE;
+/// Global prompt shown when a save will consume an ink ribbon.
+pub const MESSAGE_TYPEWRITER_RIBBON_PROMPT: u8 = 0xDF;
+/// Global prompt shown on a first Jill playthrough, when saving is free.
+pub const MESSAGE_TYPEWRITER_SAVE_PROMPT: u8 = 0xE0;
 /// Scenario-2 flag cleared when a `0x10` cure removes the poison bit `0x20`.
 pub const SCENARIO2_FLAG_YAWN_POISONED: u8 = 0x43;
 /// Item-use flag bit of the red book.
@@ -373,6 +383,19 @@ impl RoomActionKind {
             _ => Self::Other,
         }
     }
+}
+
+/// The typewriter save flow, the part of the original's `g_typewriter_state`
+/// the engine observes: idle, or a yes/no save prompt awaiting its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TypewriterFlow {
+    /// No prompt is up.
+    #[default]
+    Idle,
+    /// The save prompt is displayed; `ink_ribbon` records whether a confirmed
+    /// save consumes one (a ribbon held by Chris, or by Jill on a second
+    /// playthrough).
+    Prompt { ink_ribbon: bool },
 }
 
 /// One entry of the room action table.
@@ -694,6 +717,8 @@ pub struct GameState {
     pub max_health: i16,
     /// Health status flags (bit `0x20`/`0x02` poison).
     pub health_status: u8,
+    /// The typewriter save prompt state (`g_typewriter_state`).
+    pub typewriter: TypewriterFlow,
     /// The 48 item-box slots.
     pub item_box: [InventoryItem; ITEM_BOX_SLOTS],
     /// A room change requested by a door.
@@ -754,6 +779,7 @@ impl Default for GameState {
             selected_item: None,
             max_health: 0,
             health_status: 0,
+            typewriter: TypewriterFlow::Idle,
             item_box: [InventoryItem::default(); ITEM_BOX_SLOTS],
             transition: None,
             transition_door: None,
@@ -1283,6 +1309,7 @@ impl GameState {
             self.message_flags = MESSAGE_FLAGS_INITIAL;
         }
         self.camera = CameraState::default();
+        self.typewriter = TypewriterFlow::Idle;
         self.last_interaction = None;
         self.room_bgm_requests.clear();
         self.pending_events.clear();
@@ -1376,6 +1403,81 @@ impl GameState {
             .filter(|stack| stack.id == item)
             .map(|stack| u32::from(stack.quantity))
             .sum()
+    }
+
+    /// The room-action typewriter handler (`room_check_actions[0x10]`).
+    ///
+    /// An ink ribbon starts the save prompt; without one, a first Jill
+    /// playthrough may still save (and does not consume anything), while every
+    /// other character/playthrough gets the "no ink ribbon" message instead.
+    /// Returns whether the prompt was shown.
+    pub fn check_typewriter(&mut self) -> bool {
+        if self.typewriter != TypewriterFlow::Idle {
+            return false;
+        }
+        let character = self.id.player_flag & 1;
+        let second_playthrough =
+            self.flags[usize::from(BANK_SCENARIO)].bit(SCENARIO_FLAG_SECOND_PLAYTHROUGH);
+        let jill_first_playthrough = character == 1 && !second_playthrough;
+        let ribbon = self.has_item(items::ITEM_INK_RIBBONS);
+        if !ribbon && !jill_first_playthrough {
+            self.show_message(MESSAGE_TYPEWRITER_NO_RIBBON, 0xFF);
+            return false;
+        }
+        let message = if jill_first_playthrough {
+            MESSAGE_TYPEWRITER_SAVE_PROMPT
+        } else {
+            MESSAGE_TYPEWRITER_RIBBON_PROMPT
+        };
+        self.show_message(message, 0xFF);
+        if !self.message.active {
+            return false;
+        }
+        let ink_ribbon = ribbon && (character == 0 || second_playthrough);
+        self.typewriter = TypewriterFlow::Prompt { ink_ribbon };
+        true
+    }
+
+    /// The prompt's answer once the window dismissed it. `Some(ink_ribbon)`
+    /// when the player confirmed the save, `None` while the prompt is up or
+    /// when it was declined.
+    pub fn take_typewriter_confirm(&mut self) -> Option<bool> {
+        let TypewriterFlow::Prompt { ink_ribbon } = self.typewriter else {
+            return None;
+        };
+        if self.message.active {
+            return None;
+        }
+        self.typewriter = TypewriterFlow::Idle;
+        (self.message.menu_choice_id() & 1 == 0).then_some(ink_ribbon)
+    }
+
+    /// Spend one ink ribbon the way the save flow does: record the use and
+    /// remove (or decrement) the stack.
+    pub fn consume_ink_ribbon(&mut self) {
+        self.record_used_item(items::ITEM_INK_RIBBONS);
+        let Some(index) = self
+            .inventory
+            .iter()
+            .position(|stack| stack.id == items::ITEM_INK_RIBBONS && stack.quantity > 0)
+        else {
+            return;
+        };
+        self.inventory[index].quantity -= 1;
+        if self.inventory[index].quantity == 0 {
+            self.inventory.remove(index);
+        }
+        self.rebuild_slots();
+    }
+
+    /// The save screen's completion: raise the save counter, clamped at 99.
+    pub fn increment_saves(&mut self) {
+        let saves = self.state_bytes[usize::from(STATE_BYTE_SAVES)];
+        self.state_bytes[usize::from(STATE_BYTE_SAVES)] = if u16::from(saves) + 1 >= 100 {
+            99
+        } else {
+            saves + 1
+        };
     }
 
     /// Remove one `item`, reporting whether it was held.
@@ -5335,5 +5437,83 @@ mod tests {
         assert_eq!(entity.angle, 2048);
         assert_eq!(entity.flags & 0x40, 0x40, "act_flag_op ran");
         assert_eq!(entity.health, 96, "tw_set_sel ran");
+    }
+
+    #[test]
+    fn typewriter_prompts_follow_the_ribbon_and_playthrough_rules() {
+        // Chris without a ribbon: refused with the no-ribbon message.
+        let mut chris = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        assert!(!chris.check_typewriter());
+        assert_eq!(chris.message.id, Some(MESSAGE_TYPEWRITER_NO_RIBBON));
+        assert_eq!(chris.typewriter, TypewriterFlow::Idle);
+
+        // Chris with a ribbon: the ribbon prompt, and a confirmed save says
+        // the write must consume one.
+        let mut chris = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        chris.add_item(items::ITEM_INK_RIBBONS, 1);
+        assert!(chris.check_typewriter());
+        assert_eq!(chris.message.id, Some(MESSAGE_TYPEWRITER_RIBBON_PROMPT));
+        assert_eq!(
+            chris.typewriter,
+            TypewriterFlow::Prompt { ink_ribbon: true }
+        );
+        // The answer only lands once the window dismissed.
+        assert_eq!(chris.take_typewriter_confirm(), None);
+        chris.message = MessageWindow::default();
+        chris.message.set_menu_choice_id(0x00);
+        assert_eq!(chris.take_typewriter_confirm(), Some(true));
+        assert_eq!(chris.typewriter, TypewriterFlow::Idle);
+
+        // Jill's first playthrough saves without a ribbon and gets the
+        // progress prompt.
+        let mut jill = GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default());
+        assert!(jill.check_typewriter());
+        assert_eq!(jill.message.id, Some(MESSAGE_TYPEWRITER_SAVE_PROMPT));
+        assert_eq!(
+            jill.typewriter,
+            TypewriterFlow::Prompt { ink_ribbon: false }
+        );
+        jill.message = MessageWindow::default();
+        jill.message.set_menu_choice_id(0x00);
+        assert_eq!(jill.take_typewriter_confirm(), Some(false));
+
+        // A decline clears the flow without a save.
+        let mut jill = GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default());
+        assert!(jill.check_typewriter());
+        jill.message = MessageWindow::default();
+        jill.message.set_menu_choice_id(0x01);
+        assert_eq!(jill.take_typewriter_confirm(), None);
+        assert_eq!(jill.typewriter, TypewriterFlow::Idle);
+
+        // On a second playthrough Jill needs a ribbon like Chris.
+        let mut jill = GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default());
+        jill.apply_flag(0, SCENARIO_FLAG_SECOND_PLAYTHROUGH, 0);
+        assert!(!jill.check_typewriter());
+        assert_eq!(jill.message.id, Some(MESSAGE_TYPEWRITER_NO_RIBBON));
+    }
+
+    #[test]
+    fn consuming_a_ribbon_records_the_use_and_compacts_the_inventory() {
+        let mut state = game();
+        state.add_item(items::ITEM_INK_RIBBONS, 1);
+        assert_eq!(state.item_count(items::ITEM_INK_RIBBONS), 3);
+        state.consume_ink_ribbon();
+        assert_eq!(state.item_count(items::ITEM_INK_RIBBONS), 2);
+        assert_eq!(state.last_used_item, Some(items::ITEM_INK_RIBBONS));
+        state.consume_ink_ribbon();
+        state.consume_ink_ribbon();
+        assert!(!state.has_item(items::ITEM_INK_RIBBONS));
+        assert!(state.inventory.is_empty());
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 0);
+    }
+
+    #[test]
+    fn the_save_counter_clamps_at_ninety_nine() {
+        let mut state = game();
+        state.state_bytes[usize::from(STATE_BYTE_SAVES)] = 98;
+        state.increment_saves();
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
+        state.increment_saves();
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
     }
 }
