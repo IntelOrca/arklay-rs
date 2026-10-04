@@ -18,6 +18,9 @@ use crate::render::{Framebuffer, Tint};
 
 use super::layout;
 
+/// Bottom edge of the EKG window: the heal flush stops drawing at this Y.
+const FLUSH_BOTTOM_Y: i32 = 0xB0;
+
 /// EKG colour per health state (red, orange, yellow, green) plus the black
 /// placeholder the poisoned row indexes.
 pub const HEALTH_COLORS: [[u8; 3]; 5] = [
@@ -389,28 +392,25 @@ impl HealthBar {
         );
     }
 
-    /// Draw the vertical heal flush: up to 15 one-pixel lines rising from the
-    /// sweep, their tint fading by `0x10` each line.
+    /// Draw the vertical heal flush: the original's state-3 sweep draws up to
+    /// 15 one-pixel lines downward from the flush base, their tint starting at
+    /// `0xFF` (or the scaled value once the base has entered the window) and
+    /// dropping by `0x10` each line, stopping at the window's bottom edge.
     fn draw_flush(&self, framebuffer: &mut Framebuffer) {
         let Some(flush) = self.flush else {
             return;
         };
         let base = flush.color();
-        let head = i32::from(self.head);
-        let (start_y, count) = if head < 0x92 {
-            let count = 0x0F - (0x92 - head) / 0x10;
-            (0x92, count.max(0))
-        } else {
-            (head, 0x0F)
-        };
-        for step in 0..count {
-            let fade = 1.0 - (step as f32) * (16.0 / 255.0);
+        let (mut y, count, mut tint) = Self::flush_tail(i32::from(self.head));
+        for _ in 0..count {
+            if y >= FLUSH_BOTTOM_Y {
+                break;
+            }
             let color = [
-                (base[0] as f32 * fade) as u8,
-                (base[1] as f32 * fade) as u8,
-                (base[2] as f32 * fade) as u8,
+                if base[0] != 0 { tint } else { 0 },
+                if base[1] != 0 { tint } else { 0 },
+                if base[2] != 0 { tint } else { 0 },
             ];
-            let y = start_y - step;
             draw_line(
                 framebuffer,
                 layout::EKG_MIN_X,
@@ -419,6 +419,27 @@ impl HealthBar {
                 y,
                 color,
             );
+            if tint != 0 {
+                tint = tint.wrapping_sub(0x10);
+            }
+            y += 1;
+        }
+    }
+
+    /// The heal flush's first line Y, line count and first-line tint for the
+    /// current flush base. Once the base has left the window (`head < 0x92`)
+    /// the original trims the tail and pre-fades the tint by how many rows
+    /// were skipped; at or above it, a full 15-line tail starts at full tint.
+    fn flush_tail(head: i32) -> (i32, i32, u8) {
+        if head < 0x92 {
+            let offset = (0x92 - head) as u8;
+            (
+                0x92,
+                (0x0F - i32::from(offset)).max(0),
+                0xFFu8.wrapping_sub(offset.wrapping_mul(0x10)),
+            )
+        } else {
+            (head, 0x0F, 0xFF)
         }
     }
 
@@ -628,6 +649,42 @@ mod tests {
             bar.update(96, 96, 0);
         }
         assert_eq!(bar.flush, None);
+    }
+
+    #[test]
+    fn the_flush_tail_scales_its_count_and_tint() {
+        // At or above the window top, a full 15-line tail starts at full tint.
+        assert_eq!(HealthBar::flush_tail(0x92), (0x92, 0x0F, 0xFF));
+        assert_eq!(HealthBar::flush_tail(0xAF), (0xAF, 0x0F, 0xFF));
+        // Below it, skipped rows are removed and the first line is pre-faded.
+        assert_eq!(HealthBar::flush_tail(0x91), (0x92, 0x0E, 0xEF));
+        assert_eq!(HealthBar::flush_tail(0x85), (0x92, 0x02, 0x2F));
+    }
+
+    #[test]
+    fn the_flush_draws_downward_from_the_window_top_with_the_scaled_tint() {
+        let mut bar = HealthBar::new();
+        bar.flush = Some(Flush::Blue);
+        bar.head = 0x91;
+        let mut framebuffer = Framebuffer::new();
+        bar.draw_flush(&mut framebuffer);
+        let pixel = |x: i32, y: i32| -> [u8; 4] {
+            let offset = (y as usize * 320 + x as usize) * 4;
+            framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+        };
+        // The row above the window is untouched: the tail starts at 0x92.
+        assert_eq!(pixel(layout::EKG_MIN_X, 0x91), [0, 0, 0, 0]);
+        // The first line uses the pre-faded tint, the next drops by 0x10.
+        assert_eq!(
+            pixel(layout::EKG_MIN_X, 0x92),
+            [0, 0, 0xEF, 0xFF],
+            "first tail line"
+        );
+        assert_eq!(
+            pixel(layout::EKG_MIN_X, 0x93),
+            [0, 0, 0xDF, 0xFF],
+            "second tail line"
+        );
     }
 
     #[test]

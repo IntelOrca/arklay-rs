@@ -1,15 +1,17 @@
 //! Real-asset FILE tab tests.
 //!
 //! Run with:
-//! `ARKLAY_RE1_PACK=re1.akpak cargo test --test file_real -- --ignored --nocapture`
+//! `ARKLAY_RE1_ROOT=assets/re1 ARKLAY_RE1_PACK=re1.akpak cargo test --test file_real -- --ignored --nocapture`
 //!
-//! The pack must carry the 62 `file/*.tim` entries (two covers, 17 backdrops,
-//! 43 page packs) plus the menu sheets and font. The first test loads every
-//! TIM, checks the sizes the JPN reader indexes, and pages a collected
-//! document through to its last half-page. The second renders the `--ui file`
-//! capture twice and requires it to be deterministic and non-empty.
+//! Both `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` must be set together; with
+//! neither the tests skip, and with only one they fail. The pack must carry
+//! the 62 `file/*.tim` entries (two covers, 17 backdrops, 43 page packs) plus
+//! the menu sheets and font. The first test loads every TIM, checks the sizes
+//! the JPN reader indexes, and pages a collected document through to its last
+//! half-page. The second renders the `--ui file` capture twice and requires it
+//! to be deterministic and to draw its own layer over the menu.
 
-use std::path::Path;
+mod common;
 
 use arklay::bmp;
 use arklay::engine;
@@ -24,8 +26,8 @@ use arklay::ui::file::{
 use arklay::ui::main_menu::MenuAssets;
 
 fn pack() -> Option<Pack> {
-    let path = std::env::var("ARKLAY_RE1_PACK").ok()?;
-    Some(Pack::open(Path::new(&path)).unwrap())
+    let (_, path) = common::asset_env()?;
+    Some(Pack::open(&path).unwrap())
 }
 
 fn non_black(image: &Image) -> usize {
@@ -39,7 +41,7 @@ fn non_black(image: &Image) -> usize {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_file_art_loads_and_a_collected_document_pages_through() {
     let Some(pack) = pack() else {
         return;
@@ -140,9 +142,9 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_file_capture_is_deterministic_and_draws_the_list() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("arklay-file-{}", std::process::id()));
@@ -150,9 +152,13 @@ fn real_file_capture_is_deterministic_and_draws_the_list() {
     let saves = dir.join("saves");
     let first = dir.join("file_a.bmp");
     let second = dir.join("file_b.bmp");
+    let menu_path = dir.join("menu.bmp");
 
-    engine::run_ui_with_options(Path::new(&path), "file", Some(&first), &saves, 0).unwrap();
-    engine::run_ui_with_options(Path::new(&path), "file", Some(&second), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "file", Some(&first), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "file", Some(&second), &saves, 0).unwrap();
+    // The same capture path without the FILE tab: the room, camera and panel
+    // beneath are the same, so the delta is the file selector's own layer.
+    engine::run_ui_with_options(&path, "menu", Some(&menu_path), &saves, 0).unwrap();
 
     let first_bytes = std::fs::read(&first).unwrap();
     let second_bytes = std::fs::read(&second).unwrap();
@@ -163,6 +169,21 @@ fn real_file_capture_is_deterministic_and_draws_the_list() {
         non_black(&image) > 5000,
         "the file capture is mostly black: {} pixels",
         non_black(&image)
+    );
+
+    // A missing FILE layer would leave the menu over the same room; require a
+    // known delta so that case cannot pass.
+    let menu = bmp::decode(&std::fs::read(&menu_path).unwrap()).unwrap();
+    let changed = image
+        .rgba
+        .iter()
+        .zip(&menu.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("file vs menu: {changed} changed pixels");
+    assert!(
+        changed > 60000,
+        "the FILE tab only repainted {changed} pixels over the menu"
     );
     println!("wrote {}", first.display());
 }

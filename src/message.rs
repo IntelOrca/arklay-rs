@@ -175,7 +175,7 @@ pub fn item_name_bytes(text: &Text, item: u8, examined: &[u8; 4]) -> Vec<u8> {
 
 /// Whether `class` is set in the four-byte examined-item flag bank, using the
 /// original's most-significant-bit-first selector.
-fn examined_bit(examined: &[u8; 4], class: u8) -> bool {
+pub fn examined_bit(examined: &[u8; 4], class: u8) -> bool {
     let bank = u32::from_le_bytes(*examined);
     bank & (0x8000_0000u32 >> (class & 0x1F)) != 0
 }
@@ -1097,13 +1097,25 @@ mod tests {
         assert_eq!(window.name, vec![0xCC, 0x07]);
 
         // Examining the class makes the real name appear.
+        let examined_flags = (0x8000_0000u32 >> (class & 0x1F)).to_le_bytes();
         let mut examined = MessageWindow {
-            examined: (0x8000_0000u32 >> (class & 0x1F)).to_le_bytes(),
+            examined: examined_flags,
             ..MessageWindow::default()
         };
         assert!(examined.start(1, 0, &[0x06, item, 0x07, 0x01, 0x00], false));
         examined.update(held(false), &text, 99);
         assert_eq!(examined.name, vec![0xAA, 0x07]);
+
+        // The direct item-name lookup (menu, item box, viewer) reads the same
+        // bank: generic before, real after.
+        assert_eq!(
+            crate::ui::main_menu::item_name_bytes(&text, item, &[0; 4]),
+            Some([0xCC, 0x07].as_slice())
+        );
+        assert_eq!(
+            crate::ui::main_menu::item_name_bytes(&text, item, &examined_flags),
+            Some([0xAA, 0x07].as_slice())
+        );
     }
 
     #[test]

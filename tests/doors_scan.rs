@@ -3,6 +3,8 @@
 //! Run with:
 //! `ARKLAY_RE1_ROOT=/home/ted/openre/assets/re1 cargo test --test doors_scan -- --ignored --nocapture`
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -121,12 +123,11 @@ fn run_room(scripts: &arklay::scd::ir::Scripts, state: &mut GameState) {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn scan_doors_in_the_corpus() {
-    let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+    let Some((root, _pack)) = common::asset_env() else {
         return;
     };
-    let root = PathBuf::from(root);
 
     let mut lock_hist: BTreeMap<u8, u32> = BTreeMap::new();
     let mut key_hist: BTreeMap<u8, u32> = BTreeMap::new();

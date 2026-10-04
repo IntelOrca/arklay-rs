@@ -1,19 +1,20 @@
 //! Real-asset item box tests.
 //!
 //! Run with:
-//! `ARKLAY_RE1_PACK=re1.akpak cargo test --test item_box_real -- --ignored --nocapture`
+//! `ARKLAY_RE1_ROOT=assets/re1 ARKLAY_RE1_PACK=re1.akpak cargo test --test item_box_real -- --ignored --nocapture`
 //!
-//! The pack must carry the slice-5/6 art (`ui/itemboxn.tim`, the menu sheets,
-//! `item/item_all.bmp`, `font/font.tim`) and `data/bio_card.dat`; a stale pack
-//! fails rather than silently skipping. Only an unset `ARKLAY_RE1_PACK`
-//! skips.
+//! Both `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` must be set together; with
+//! neither the tests skip, and with only one they fail. The pack must carry
+//! the slice-5/6 art (`ui/itemboxn.tim`, the menu sheets, `item/item_all.bmp`,
+//! `font/font.tim`) and `data/bio_card.dat`; a stale pack fails rather than
+//! silently skipping.
 //!
 //! The first test deposits a stack in room 1001, changes rooms, withdraws it
 //! again and round-trips the whole state through a save block. The second
 //! renders the `--ui box` capture twice and requires it to be deterministic
 //! and non-empty.
 
-use std::path::Path;
+mod common;
 
 use arklay::bmp;
 use arklay::engine;
@@ -27,8 +28,8 @@ const SPRAY: u8 = 0x41;
 const GREEN_HERB: u8 = 0x44;
 
 fn pack() -> Option<Pack> {
-    let path = std::env::var("ARKLAY_RE1_PACK").ok()?;
-    Some(Pack::open(Path::new(&path)).unwrap())
+    let (_, path) = common::asset_env()?;
+    Some(Pack::open(&path).unwrap())
 }
 
 fn room_game(pack: &Pack, id: RoomId) -> GameState {
@@ -47,7 +48,7 @@ fn non_black(image: &arklay::state::Image) -> usize {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_item_box_deposit_survives_room_changes_and_a_save_round_trip() {
     let Some(pack) = pack() else {
         return;
@@ -115,9 +116,9 @@ fn real_item_box_deposit_survives_room_changes_and_a_save_round_trip() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("arklay-itembox-{}", std::process::id()));
@@ -125,9 +126,11 @@ fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
     let saves = dir.join("saves");
     let first = dir.join("box_a.bmp");
     let second = dir.join("box_b.bmp");
+    let menu_path = dir.join("menu.bmp");
 
-    engine::run_ui_with_options(Path::new(&path), "box", Some(&first), &saves, 0).unwrap();
-    engine::run_ui_with_options(Path::new(&path), "box", Some(&second), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "box", Some(&first), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "box", Some(&second), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "menu", Some(&menu_path), &saves, 0).unwrap();
 
     let first_bytes = std::fs::read(&first).unwrap();
     let second_bytes = std::fs::read(&second).unwrap();
@@ -138,6 +141,21 @@ fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
         non_black(&image) > 5000,
         "the item-box capture is mostly black: {} pixels",
         non_black(&image)
+    );
+
+    // The box overlay must add a large, known delta over the inventory panel
+    // beneath it: a capture that lost the box layer would be the menu capture.
+    let menu = bmp::decode(&std::fs::read(&menu_path).unwrap()).unwrap();
+    let changed = image
+        .rgba
+        .iter()
+        .zip(&menu.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("box vs menu: {changed} changed pixels");
+    assert!(
+        changed > 15000,
+        "the item-box overlay only repainted {changed} pixels over the menu"
     );
     println!("wrote {}", first.display());
 }

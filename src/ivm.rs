@@ -209,7 +209,10 @@ fn parse_prims(
     let count = usize::try_from(count)
         .with_context(|| format!("IVM TMD object {object} primitive count is negative: {count}"))?;
     let mut position = relative(data, offset, object, "primitive")?;
-    let mut prims = Vec::with_capacity(count);
+    // A primitive packet is at least 4 bytes, so the remaining mesh bytes cap
+    // how many can possibly parse; never reserve an attacker-sized count.
+    let capacity = count.min(data.len().saturating_sub(position) / 4);
+    let mut prims = Vec::with_capacity(capacity);
     for index in 0..count {
         let packet = data
             .get(position..position + 4)
@@ -535,6 +538,21 @@ mod tests {
         let error = parse(&data).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("0x34000404"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_absurd_primitive_count_without_reserving_it() {
+        let mut data = sample_ivm();
+        // Descriptor field 5 is the primitive count; overwrite it with a huge
+        // attacker-controlled value. The parser must cap its reservation by the
+        // remaining mesh bytes and fail on the truncated list instead of
+        // trying to allocate 2 GiB.
+        let tmd = texture_end(&data).unwrap();
+        let count_at = tmd + TMD_HEADER_LEN + 5 * 4;
+        data[count_at..count_at + 4].copy_from_slice(&0x7FFF_FFFFi32.to_le_bytes());
+        let error = parse(&data).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("primitive"), "{message}");
     }
 
     #[test]

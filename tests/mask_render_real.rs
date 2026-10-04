@@ -14,7 +14,7 @@
 //! assets under test are the mask page, the parsed mask table and the
 //! per-(room, camera) ordering records.
 
-use std::path::Path;
+mod common;
 
 use arklay::anim;
 use arklay::bmp;
@@ -100,19 +100,22 @@ fn page_pixel(page: &arklay::state::Image, x: usize, y: usize) -> [u8; 4] {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(Path::new(&path)).unwrap();
+    let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1000").unwrap();
     let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let entry = id.roommask_entry(0);
-    let page_bytes = pack
-        .read(&entry)
-        .unwrap_or_else(|err| panic!("pack `{path}` has no {entry}: {err} (reconvert the pack)"));
+    let page_bytes = pack.read(&entry).unwrap_or_else(|err| {
+        panic!(
+            "pack `{}` has no {entry}: {err} (reconvert the pack)",
+            path.display()
+        )
+    });
     let page = bmp::decode_mask(page_bytes).unwrap();
 
     // The first group-1 sprite is the pillar top at screen (9, 73): 8x40,
@@ -213,18 +216,21 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn room1000_player_frame_is_deterministic_and_mask_aware() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(Path::new(&path)).unwrap();
+    let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1000").unwrap();
     let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let mask_entry = id.roommask_entry(0);
     let page_bytes = pack.read(&mask_entry).unwrap_or_else(|err| {
-        panic!("pack `{path}` has no {mask_entry}: {err} (reconvert the pack)")
+        panic!(
+            "pack `{}` has no {mask_entry}: {err} (reconvert the pack)",
+            path.display()
+        )
     });
     let background = bmp::decode(pack.read(&id.cut_entry(0)).unwrap()).unwrap();
     let page = bmp::decode_mask(page_bytes).unwrap();

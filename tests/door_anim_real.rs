@@ -6,6 +6,8 @@
 //! The tests parse the shipped door corpus, drive `DOOR00.DOR`'s main script
 //! through the VM and render a mid-animation frame to a BMP.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use arklay::door::parse;
@@ -14,7 +16,7 @@ use arklay::render::{Framebuffer, draw_door_scene};
 use arklay::state::Image;
 
 fn asset_root() -> Option<PathBuf> {
-    std::env::var("ARKLAY_RE1_ROOT").ok().map(PathBuf::from)
+    Some(common::asset_env()?.0)
 }
 
 /// Every `.DOR` under `JPN/ITEM_M1`, matched case-insensitively and sorted.
@@ -56,7 +58,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn every_shipped_door_parses() {
     let Some(root) = asset_root() else {
         return;
@@ -98,7 +100,7 @@ fn every_shipped_door_parses() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn door00_main_script_moves_the_camera_and_sets_order_flags() {
     let Some(root) = asset_root() else {
         return;
@@ -140,7 +142,7 @@ fn door00_main_script_moves_the_camera_and_sets_order_flags() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn every_shipped_door_runs_frames_without_panicking() {
     let Some(root) = asset_root() else {
         return;
@@ -163,7 +165,7 @@ fn every_shipped_door_runs_frames_without_panicking() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn ele03_vertex_add_moves_cage_door_vertices() {
     let Some(root) = asset_root() else {
         return;
@@ -205,7 +207,7 @@ fn ele03_vertex_add_moves_cage_door_vertices() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn door00_mid_animation_frame_renders_non_black_and_stable() {
     let Some(root) = asset_root() else {
         return;

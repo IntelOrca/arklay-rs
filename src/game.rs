@@ -177,6 +177,12 @@ pub const STAGE_GUARDHOUSE: u8 = 3;
 /// Room id of the drug storehouse in the guardhouse.
 pub const ROOM_DRUG_STOREHOUSE: u8 = 9;
 
+/// The character's maximum health: Chris (0) 140, Jill (1) 96. The original
+/// derives it as `140 - 44 * (id & 1)` on both the new-game and continue paths.
+pub fn character_max_health(character: u8) -> i16 {
+    140 - 44 * i16::from(character & 1)
+}
+
 /// One MSB-first flag bank.
 ///
 /// A selector byte chooses a little-endian dword by its high three bits and a
@@ -773,6 +779,9 @@ impl GameState {
         state.state_bytes[1] = id.room;
         state.set_camera_cut(0);
         state.state_bytes[STATE_BYTE_CHARACTER as usize] = id.player_flag & 1;
+        // InitializeGame derives the maximum from the character on every path,
+        // so a state built without `seed_new_game` still has a real maximum.
+        state.max_health = character_max_health(id.player_flag);
         state
     }
 
@@ -1501,6 +1510,33 @@ impl GameState {
         self.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)] = status;
     }
 
+    /// Clear the per-frame item-use flag bank. The original zeroes both
+    /// `g_itemUseFlags` words at the top of every game frame, before the room
+    /// scripts re-arm the bits this frame's interactions need.
+    pub fn clear_item_use_flags(&mut self) {
+        self.flags[usize::from(BANK_ITEM_USE)] = FlagBank::new();
+    }
+
+    /// The four-byte examined-item bank the item-name lookup reads.
+    pub fn examined_flags(&self) -> [u8; 4] {
+        self.message.examined
+    }
+
+    /// Mark an item examined, exactly like the original's `Flg_on` on
+    /// `g_itemExaminedFlags`: only items whose lookup name class is not a real
+    /// name (bit `0x80` clear) are tracked, and the class selects the bit.
+    pub fn mark_examined(&mut self, item: u8) {
+        let Some(record) = items::record(item) else {
+            return;
+        };
+        if record.name_valid() {
+            return;
+        }
+        let bank = u32::from_le_bytes(self.message.examined);
+        let bank = bank | (0x8000_0000u32 >> (record.name_class & 0x1F));
+        self.message.examined = bank.to_le_bytes();
+    }
+
     /// Whether the player carries the radio (scenario bank 0, bit `0x7F`),
     /// which enables the pause menu's radio tab.
     pub fn has_radio(&self) -> bool {
@@ -1552,12 +1588,23 @@ impl GameState {
                 let mut cured = false;
                 if effect.cure != items::StatusCure::None && self.health_status & 0x22 != 0 {
                     let cleared = items::cured_status(effect.cure, self.health_status);
-                    if cleared != self.health_status {
-                        if effect.cure == items::StatusCure::Poison20 {
-                            self.apply_flag(1, SCENARIO2_FLAG_YAWN_POISONED, 1);
+                    match effect.cure {
+                        // The 0x20 cure counts as used whenever either poison
+                        // flag is up, even when only the 0x02 bit is set and
+                        // nothing is actually cleared.
+                        items::StatusCure::Poison20 => {
+                            if cleared != self.health_status {
+                                self.apply_flag(1, SCENARIO2_FLAG_YAWN_POISONED, 1);
+                                self.set_health_status(cleared);
+                            }
+                            cured = true;
                         }
-                        self.set_health_status(cleared);
-                        cured = true;
+                        // The 0x02 cure only counts when the 0x02 bit is set.
+                        items::StatusCure::Poison02 if self.health_status & 0x02 != 0 => {
+                            self.set_health_status(cleared);
+                            cured = true;
+                        }
+                        _ => {}
                     }
                 }
                 if healed || cured {
@@ -1620,6 +1667,14 @@ impl GameState {
         let Some(record) = items::combine(cursor.id, target.id) else {
             return CombineResult::NoRecipe;
         };
+        // The one-way ammo transfers need an empty destination: effect 6 fills
+        // the cursor stack, effect 7 the target stack, and the original refuses
+        // the recipe untouched when that slot already holds rounds.
+        if (record.effect == 6 && cursor.quantity != 0)
+            || (record.effect == 7 && target.quantity != 0)
+        {
+            return CombineResult::NoRecipe;
+        }
         if (CHEMICAL_MIN..=CHEMICAL_MAX).contains(&cursor.id) && !self.is_drug_store() {
             return CombineResult::NeedsDrugStore;
         }
@@ -2001,8 +2056,10 @@ impl GameState {
         let Some(door) = self.doors.get(usize::from(slot)).copied().flatten() else {
             return false;
         };
-        // Some doors are barred to one of the two characters.
-        if door.lock & 0x40 != 0 && self.id.player_flag & 1 == 1 {
+        // The character-restriction test is inert for the two PC characters:
+        // it compares the player id against 3, and ids 0/1 never match. Keep
+        // the original's exact test so a record with bit 0x40 behaves the same.
+        if door.lock & 0x40 != 0 && self.id.player_flag & 3 == 3 {
             self.show_message(MESSAGE_WRONG_CHARACTER, 0xFF);
             return false;
         }
@@ -4330,23 +4387,32 @@ mod tests {
 
     #[test]
     fn unlocked_door_with_a_character_restriction() {
-        // Lock byte 0x40: bit 7 clear, so the door is not locked, but only
-        // Chris may use it. The old code treated the low bits as a lock flag.
+        // Lock byte 0x40: bit 7 clear, so the door is not locked. The
+        // original's character test compares `id & 3` against 3, which is
+        // never true for the PC characters, so the restriction is inert.
         let mut state = game();
         let restricted = door(1, 0x40);
         state.room_actions[0] = Some(door_action(restricted));
         state.doors[0] = Some(restricted);
 
-        // Jill (player flag 1) is turned away.
+        // Jill (player flag 1) walks through: 0x40 does not bar her.
         state.interact([-550, 0, 50], 0, true);
-        assert!(state.transition.is_none());
-        assert_eq!(state.message.id, Some(0xD6));
+        assert!(state.transition.is_some());
+        assert_ne!(state.message.id, Some(0xD6));
 
-        // Chris walks through.
+        // Chris walks through too.
         state.id.player_flag = 0;
         state.transition = None;
         state.interact([-550, 0, 50], 0, true);
         assert!(state.transition.is_some());
+
+        // The original's literal test still refuses id 3, keeping the branch
+        // reachable for non-PC records.
+        state.id.player_flag = 3;
+        state.transition = None;
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(0xD6));
     }
 
     #[test]
@@ -4900,6 +4966,84 @@ mod tests {
     }
 
     #[test]
+    fn a_new_state_derives_its_maximum_and_a_heal_changes_health() {
+        let chris_id = RoomId::parse("100").unwrap();
+        let jill_id = RoomId {
+            player_flag: 1,
+            ..chris_id
+        };
+        let mut chris = GameState::new(chris_id, &RoomState::default());
+        assert_eq!(chris.max_health, 140);
+        let mut jill = GameState::new(jill_id, &RoomState::default());
+        assert_eq!(jill.max_health, 96);
+        assert_eq!(character_max_health(0), 140);
+        assert_eq!(character_max_health(1), 96);
+
+        // The derived maximum makes a heal actually raise the health: a green
+        // herb restores one third of 96 from 20.
+        jill.entities[0].health = 20;
+        assert_eq!(
+            jill.use_item(0x44),
+            UseResult::Used {
+                healed: true,
+                cured: false
+            }
+        );
+        assert_eq!(jill.entities[0].health, 20 + 32);
+
+        chris.entities[0].health = 20;
+        assert_eq!(
+            chris.use_item(0x44),
+            UseResult::Used {
+                healed: true,
+                cured: false
+            }
+        );
+        assert_eq!(chris.entities[0].health, 20 + 140 / 3);
+    }
+
+    #[test]
+    fn the_serum_counts_as_used_with_only_the_secondary_poison_flag() {
+        // The original's 0x10 cure nibble marks the item used whenever either
+        // poison flag is up; with only 0x02 set nothing is cleared but the
+        // serum is still consumed (blue EKG flush).
+        let mut state = game();
+        state.entities[0].health = state.max_health;
+        state.set_health_status(0x02);
+        assert_eq!(
+            state.use_item(0x42),
+            UseResult::Used {
+                healed: false,
+                cured: true
+            }
+        );
+        assert_eq!(state.health_status, 0x02, "the 0x02 bit is left alone");
+
+        // The 0x02 cure nibble does not count when only the 0x20 bit is set.
+        state.set_health_status(0x20);
+        assert_eq!(state.use_item(0x45), UseResult::Unusable);
+
+        // No poison at all: unusable.
+        state.set_health_status(0);
+        assert_eq!(state.use_item(0x42), UseResult::Unusable);
+    }
+
+    #[test]
+    fn mark_examined_raises_the_lookup_class_bit() {
+        // Item 0x33 (the sword key) has name class 3.
+        let mut state = game();
+        assert!(!crate::message::examined_bit(&state.examined_flags(), 3));
+        state.mark_examined(0x33);
+        assert!(crate::message::examined_bit(&state.examined_flags(), 3));
+        assert_eq!(state.examined_flags(), [0, 0, 0, 0x10]);
+
+        // Real-name items (name class 0x80) are never tracked.
+        state.mark_examined(0x44);
+        assert!(!crate::message::examined_bit(&state.examined_flags(), 4));
+        assert_eq!(state.examined_flags(), [0, 0, 0, 0x10]);
+    }
+
+    #[test]
     fn menu_use_flags_gate_keys_and_the_red_book() {
         let mut state = game();
         assert_eq!(state.use_item(0x33), UseResult::Unusable);
@@ -4954,6 +5098,46 @@ mod tests {
         // The target (Beretta) fills to its maximum, 20 + 7 - 15 stay.
         assert_eq!(state.inventory[0].quantity, 20 + 7 - 15);
         assert_eq!(state.inventory[1].quantity, 15);
+
+        // Effect 6 fills the cursor weapon from the target ammo, but refuses
+        // when the weapon already holds rounds.
+        let mut state = game();
+        state.add_item(0x07, 1); // loaded weapon
+        state.add_item(0x11, 5); // its ammo
+        assert_eq!(state.combine_slots(0, 1), CombineResult::NoRecipe);
+        assert_eq!(state.inventory[0].id, 0x07);
+        assert_eq!(state.inventory[0].quantity, 1, "the loaded rounds stay");
+        assert_eq!(state.inventory[1].quantity, 5, "the ammo stays");
+
+        // Empty cursor: the same recipe transfers the target's rounds.
+        state.inventory[0].quantity = 0;
+        assert!(matches!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied { .. }
+        ));
+        assert_eq!(state.inventory[0].quantity, 5);
+
+        // Effect 7 fills the target weapon from the cursor ammo, but refuses
+        // when the weapon already holds rounds (the reverse pair).
+        let mut state = game();
+        state.add_item(0x10, 4); // ammo
+        state.add_item(0x08, 2); // loaded weapon
+        assert_eq!(state.combine_slots(0, 1), CombineResult::NoRecipe);
+        assert_eq!(state.inventory[0].quantity, 4, "the ammo stays");
+
+        // Empty target: the recipe transfers the cursor's rounds into it.
+        state.inventory[1].quantity = 0;
+        assert!(matches!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied { .. }
+        ));
+        let weapon = state
+            .inventory
+            .iter()
+            .find(|slot| slot.id == 0x07)
+            .expect("the target weapon stays");
+        assert_eq!(weapon.quantity, 4);
+        assert!(!state.inventory.iter().any(|slot| slot.id == 0x10));
 
         // The chemical flag effect.
         let mut state = game();

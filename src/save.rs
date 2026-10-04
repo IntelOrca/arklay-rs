@@ -23,7 +23,7 @@ use crate::game::{
     STATE_BYTE_CHARACTER, STATE_BYTE_CUT, STATE_BYTE_ENT_ACTION, STATE_BYTE_EQUIPPED,
     STATE_BYTE_FWD_ACTION, STATE_BYTE_HEALTH_STATUS, STATE_BYTE_MENU_CHOICE,
     STATE_BYTE_PICKED_ITEM, STATE_BYTE_ROOM_CAMERA, STATE_BYTE_SAVES, STATE_BYTE_SELECTED_ITEM,
-    STATE_BYTE_TOTAL_HELD, STATE_BYTE_USED_ITEM, STATE_BYTES,
+    STATE_BYTE_TOTAL_HELD, STATE_BYTE_USED_ITEM, STATE_BYTES, character_max_health,
 };
 use crate::music;
 use crate::state::RoomId;
@@ -188,6 +188,7 @@ impl SaveFile {
             pos_z: state.entities[0].pos[2] as i16,
             angle: state.entities[0].angle as i16,
             health_status: state.health_status,
+            examined: state.examined_flags(),
             item_box: state.item_box,
             room_bgm: music::ROOM_STATE,
             ..Self::default()
@@ -255,7 +256,11 @@ impl SaveFile {
             i32::from(self.pos_z),
         ];
         state.entities[0].angle = self.angle as u16 & 0x0FFF;
+        // The maximum is not stored in the block; InitializeGame re-derives it
+        // from the selected character on every path, new game or continue.
+        state.max_health = character_max_health(self.character);
         state.health_status = self.health_status;
+        state.message.examined = self.examined;
         state.selected_item = (self.selected_item != 0).then_some(self.selected_item);
         state.last_used_item = (self.used_item != 0).then_some(self.used_item);
         state.last_picked_item = (self.picked_item != 0).then_some(self.picked_item);
@@ -645,7 +650,8 @@ mod tests {
         state.entities[0].health = 96;
         state.entities[0].pos = [1234, 7, -2345];
         state.entities[0].angle = 0x456;
-        state.max_health = 140;
+        // Jill's derived maximum; the block does not carry it.
+        state.max_health = 96;
         state.health_status = 0x20;
         state.camera.current_cut = 3;
         state.state_bytes[0x24..0x28].copy_from_slice(&123456u32.to_le_bytes());
@@ -659,6 +665,7 @@ mod tests {
         state.select_item(Some(0x0B));
         state.record_used_item(0x41);
         state.set_equipped(Some(0x02));
+        state.mark_examined(0x33);
         state.item_box[3] = InventoryItem {
             id: 0x41,
             quantity: 1,
@@ -683,17 +690,25 @@ mod tests {
         assert_eq!(file.used_item, 0x41);
         assert_eq!(file.equipped, 0x02);
         assert_eq!(file.item_box[3].id, 0x41);
+        // The examined bank comes from the item-name lookup's own store (item
+        // 0x33's class-3 bit) and round-trips at BioCard 0x29C.
+        assert_eq!(file.examined[3] & 0x10, 0x10);
+        assert_eq!(file.to_bytes()[0x29F] & 0x10, 0x10);
 
         let parsed = SaveFile::from_bytes(&file.to_bytes()).unwrap();
         let mut restored = GameState::default();
         parsed.apply_to(&mut restored);
 
         assert_eq!(restored.id, state.id);
+        // The maximum is not in the block; apply_to re-derives it from the
+        // saved character exactly as InitializeGame does (Jill here).
+        assert_eq!(restored.max_health, 96);
         assert_eq!(restored.entities[0].health, 96);
         assert_eq!(restored.entities[0].pos[0], 1234);
         assert_eq!(restored.entities[0].pos[2], -2345);
         assert_eq!(restored.entities[0].angle, 0x456);
         assert_eq!(restored.health_status, 0x20);
+        assert_eq!(restored.examined_flags(), state.examined_flags());
         assert_eq!(restored.inventory, state.inventory);
         assert_eq!(restored.item_box, state.item_box);
         assert_eq!(restored.selected_item, Some(0x0B));

@@ -1,19 +1,20 @@
 //! Real-asset inventory/status screen tests.
 //!
 //! Run with:
-//! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_PACK=target/tmp-test/game.akpak cargo test --test inventory_real -- --ignored --nocapture`
+//! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=assets/re1 ARKLAY_RE1_PACK=target/tmp-test/game.akpak cargo test --test inventory_real -- --ignored --nocapture`
 //!
-//! The pack must contain the slice-5 assets (`ui/status.tim`, `ui/blue.tim`,
-//! `ui/statface.tim`, `ui/staitem.tim`, `item/item_all.bmp`, `font/font.tim`);
-//! a stale pack fails the test rather than silently skipping. Only an unset
-//! `ARKLAY_RE1_PACK` skips.
+//! Both `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` must be set together; with
+//! neither the tests skip, and with only one they fail. The pack must contain
+//! the slice-5 assets (`ui/status.tim`, `ui/blue.tim`, `ui/statface.tim`,
+//! `ui/staitem.tim`, `item/item_all.bmp`, `font/font.tim`); a stale pack fails
+//! the test rather than silently skipping.
 //!
 //! The first test freezes ROOM1001's first camera cut and renders the menu
 //! over it twice, asserting the two frames are byte-identical and that the
 //! screen repainted a meaningful area. The second drives the menu API through
 //! a herb heal and a two-herb combine.
 
-use std::path::Path;
+mod common;
 
 use arklay::bmp;
 use arklay::game::GameState;
@@ -25,8 +26,8 @@ use arklay::text::Text;
 use arklay::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
 
 fn pack() -> Option<Pack> {
-    let path = std::env::var("ARKLAY_RE1_PACK").ok()?;
-    Some(Pack::open(Path::new(&path)).unwrap())
+    let (_, path) = common::asset_env()?;
+    Some(Pack::open(&path).unwrap())
 }
 
 fn jill_game(pack: &Pack) -> (RoomId, GameState) {
@@ -39,7 +40,7 @@ fn jill_game(pack: &Pack) -> (RoomId, GameState) {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn menu_over_room1001_is_deterministic_and_draws_the_ship_art() {
     let Some(pack) = pack() else {
         return;
@@ -131,7 +132,7 @@ fn menu_over_room1001_is_deterministic_and_draws_the_ship_art() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn a_herb_heal_and_a_two_herb_combine_through_the_menu() {
     let Some(pack) = pack() else {
         return;

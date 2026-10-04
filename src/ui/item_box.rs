@@ -434,7 +434,7 @@ impl ItemBox {
         for row in 0..3 {
             let stack = game.item_box[usize::from(slot)];
             if stack.id != 0
-                && let Some(name) = item_name_bytes(text, stack.id)
+                && let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags())
             {
                 menu.font.draw_text(
                     framebuffer,

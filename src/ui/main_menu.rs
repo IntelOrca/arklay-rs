@@ -441,7 +441,7 @@ impl MainMenu {
             self.draw_submenu(framebuffer, assets);
         }
         self.draw_cursor(framebuffer, assets);
-        self.draw_item_name(framebuffer, assets, text);
+        self.draw_item_name(framebuffer, assets, text, game);
     }
 
     fn draw_background(&self, framebuffer: &mut Framebuffer) {
@@ -599,11 +599,17 @@ impl MainMenu {
         }
     }
 
-    fn draw_item_name(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets, text: &Text) {
+    fn draw_item_name(
+        &self,
+        framebuffer: &mut Framebuffer,
+        assets: &MenuAssets,
+        text: &Text,
+        game: &GameState,
+    ) {
         if self.selected_item == 0 {
             return;
         }
-        let Some(name) = item_name_bytes(text, self.selected_item) else {
+        let Some(name) = item_name_bytes(text, self.selected_item, &game.examined_flags()) else {
             return;
         };
         assets.font.draw_text(
@@ -660,10 +666,17 @@ fn consume_slot(game: &mut GameState, slot: usize) {
 }
 
 /// The item's encoded name: the real name when the record has one, the
-/// generic-name class otherwise.
-pub fn item_name_bytes(text: &Text, item: u8) -> Option<&[u8]> {
+/// generic-name class otherwise. An item the player has not examined yet (its
+/// class bit clear in `examined`) shows the generic name, exactly like the
+/// original's `message_item_name_lookup`.
+pub fn item_name_bytes<'a>(text: &'a Text, item: u8, examined: &[u8; 4]) -> Option<&'a [u8]> {
     match items::record(item) {
-        Some(record) if !record.name_valid() => text.unknown_name(usize::from(record.name_class)),
+        Some(record)
+            if !record.name_valid()
+                && !crate::message::examined_bit(examined, record.name_class) =>
+        {
+            text.unknown_name(usize::from(record.name_class))
+        }
         _ => text.item_name(u16::from(item)),
     }
 }

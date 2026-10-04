@@ -8,6 +8,8 @@
 //! gameplay order: movement first, then the room action probe and the stair
 //! state hand-off, exactly as `engine::tick_room` does.
 
+mod common;
+
 use std::path::PathBuf;
 
 use arklay::anim;
@@ -24,7 +26,7 @@ use arklay::scd::vm::CommandVm;
 use arklay::state::{Image, RoomId, RoomState};
 
 fn pack_path() -> Option<PathBuf> {
-    std::env::var("ARKLAY_RE1_PACK").ok().map(PathBuf::from)
+    Some(common::asset_env()?.1)
 }
 
 /// Load `id`, run its init script and return the room and game state.
@@ -55,7 +57,7 @@ fn tick(
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn lab_stairway_ramps_height_up_and_down() {
     let Some(path) = pack_path() else {
         return;
@@ -149,7 +151,7 @@ fn lab_stairway_ramps_height_up_and_down() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn lab_ladder_zone_latches_flags_and_base() {
     let Some(path) = pack_path() else {
         return;
@@ -214,7 +216,7 @@ fn lab_ladder_zone_latches_flags_and_base() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
     let Some(path) = pack_path() else {
         return;
@@ -263,7 +265,7 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn west_stairwell_101_to_201_marks_the_climb() {
     let Some(path) = pack_path() else {
         return;
@@ -304,7 +306,7 @@ fn west_stairwell_101_to_201_marks_the_climb() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn capture_player_partway_up_the_lab_stairway() {
     let Some(path) = pack_path() else {
         return;

@@ -89,8 +89,12 @@ impl ItemViewScreen {
     /// Every failure is a warning: a missing `item/{name}.ivm` leaves
     /// [`ItemViewScreen::model`] empty and the screen still shows the text
     /// layers, which is how ING/MINI items and stale packs stay usable.
-    pub fn open_with(&mut self, pack: &Pack, text: &Text) {
-        self.name = item_name_bytes(text, self.item).unwrap_or(&[]).to_vec();
+    /// `examined` is the game state's examined-item bank, so an unexamined
+    /// item still draws its generic name.
+    pub fn open_with(&mut self, pack: &Pack, text: &Text, examined: &[u8; 4]) {
+        self.name = item_name_bytes(text, self.item, examined)
+            .unwrap_or(&[])
+            .to_vec();
         self.description = description_bytes(text, self.item).map(<[u8]>::to_vec);
         self.model = load_model(pack, self.item);
     }
@@ -186,7 +190,7 @@ fn load_model(pack: &Pack, item: u8) -> Option<Ivm> {
 impl Screen for ItemViewScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         let empty = Text::default();
-        self.open_with(cx.pack, cx.text.unwrap_or(&empty));
+        self.open_with(cx.pack, cx.text.unwrap_or(&empty), &[0; 4]);
         Ok(())
     }
 
@@ -465,7 +469,7 @@ mod tests {
         // index past the table: both layers stay empty and drawing does not
         // panic.
         let mut screen = ItemViewScreen::new(0x6E);
-        screen.open_with(&pack, &Text::default());
+        screen.open_with(&pack, &Text::default(), &[0; 4]);
         assert!(screen.model().is_none());
         assert!(screen.description().is_none());
 

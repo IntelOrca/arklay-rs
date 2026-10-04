@@ -8,6 +8,8 @@
 //! a point 600 units in front of the player, so the helper below stands the
 //! player short of the zone and lets the reach point land inside it.
 
+mod common;
+
 use std::path::PathBuf;
 
 use arklay::game::{Door, GameState, RoomTransition, ScdGameHost};
@@ -17,7 +19,7 @@ use arklay::scd::vm::{CommandVm, EventVm};
 use arklay::state::{RoomId, RoomState};
 
 fn asset_root() -> Option<PathBuf> {
-    std::env::var("ARKLAY_RE1_ROOT").ok().map(PathBuf::from)
+    Some(common::asset_env()?.0)
 }
 
 /// Load `ROOM<name>.RDT` from the JPN install, run its init script and return
@@ -67,7 +69,7 @@ fn assert_destination_exists(root: &std::path::Path, transition: &RoomTransition
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn save_room_door_survives_main_ticks_and_transitions() {
     let Some(root) = asset_root() else {
         return;
@@ -101,7 +103,7 @@ fn save_room_door_survives_main_ticks_and_transitions() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn stairwell_doors_cross_stage_with_exact_placement() {
     let Some(root) = asset_root() else {
         return;
@@ -144,7 +146,7 @@ fn stairwell_doors_cross_stage_with_exact_placement() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn elevator_door_crosses_to_an_earlier_stage() {
     let Some(root) = asset_root() else {
         return;
@@ -177,7 +179,7 @@ fn elevator_door_crosses_to_an_earlier_stage() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn key_locked_door_needs_and_consumes_its_key() {
     let Some(root) = asset_root() else {
         return;
@@ -216,19 +218,22 @@ fn key_locked_door_needs_and_consumes_its_key() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-fn character_restricted_door_blocks_jill_only() {
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn character_restriction_bit_is_inert_for_pc_characters() {
     let Some(root) = asset_root() else {
         return;
     };
-    // ROOM1031 is Jill's variant: lock 0x40 (not locked, Chris only).
+    // ROOM1031 is Jill's variant with lock 0x40 (bit 7 clear, so unlocked).
+    // The original's wrong-character test compares `id & 3` against 3, which
+    // is never true for Chris/Jill, so the bit does not bar her.
     let (_, _, _, mut state) = load_room(&root, "1031");
     let door = state.doors[2].expect("restricted door");
     assert_eq!(door.lock, 0x40);
-    assert!(press(&mut state, 2).is_none());
-    assert_eq!(state.message.id, Some(0xD6));
+    let transition = press(&mut state, 2).expect("Jill transition");
+    assert_ne!(state.message.id, Some(0xD6), "the restriction is inert");
+    assert_destination_exists(&root, &transition);
 
-    // Chris's variant walks through.
+    // Chris's variant walks through the same way.
     let (_, _, _, mut state) = load_room(&root, "1030");
     let transition = press(&mut state, 2).expect("Chris transition");
     assert_eq!(transition.target.room, 12);
@@ -236,7 +241,7 @@ fn character_restricted_door_blocks_jill_only() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn other_side_key_door_unlocks_on_the_first_probe() {
     let Some(root) = asset_root() else {
         return;
@@ -258,7 +263,7 @@ fn other_side_key_door_unlocks_on_the_first_probe() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn event_payload_rearms_the_door_with_an_auto_probe() {
     let Some(root) = asset_root() else {
         return;
@@ -305,7 +310,7 @@ fn event_payload_rearms_the_door_with_an_auto_probe() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn dead_lock_door_never_opens() {
     let Some(root) = asset_root() else {
         return;

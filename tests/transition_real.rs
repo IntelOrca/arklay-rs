@@ -10,6 +10,8 @@
 //! teardown the player is ticked against the destination room with no clips so
 //! only locomotion and collision run.
 
+mod common;
+
 use std::path::PathBuf;
 
 use arklay::engine::simulate_door;
@@ -18,7 +20,7 @@ use arklay::player::{self, Input, PlayerState};
 use arklay::state::{RoomId, RoomState};
 
 fn pack_path() -> Option<PathBuf> {
-    std::env::var("ARKLAY_RE1_PACK").ok().map(PathBuf::from)
+    Some(common::asset_env()?.1)
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -91,7 +93,7 @@ fn assert_spawn_is_playable(sim: &arklay::engine::SimulatedDoor) {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn stairs_101_to_201_spawns_free_with_the_zone_camera() {
     let Some(path) = pack_path() else {
         return;
@@ -146,7 +148,7 @@ fn stairs_101_to_201_spawns_free_with_the_zone_camera() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn stairs_201_to_101_spawns_free_and_walks_back_down() {
     let Some(path) = pack_path() else {
         return;
@@ -170,7 +172,7 @@ fn stairs_201_to_101_spawns_free_and_walks_back_down() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn door_101_to_103_camera_follows_the_zone_not_the_entry_byte() {
     let Some(path) = pack_path() else {
         return;

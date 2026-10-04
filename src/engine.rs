@@ -387,6 +387,13 @@ struct GameSession {
     /// the modal's draw and applying its [`ui::Screen::fade`] overlay. A modal
     /// closes by reporting [`ScreenAction::Resume`].
     modal: Option<Box<dyn ui::Screen>>,
+    /// The item the open viewer was asked to examine; leaving the viewer
+    /// marks it examined in [`game::GameState`].
+    viewed_item: Option<u8>,
+    /// A message dismissal consumed the action key while it was still held;
+    /// the room tick keeps ignoring the action until the key is released,
+    /// matching the original's cleared held/previous-held pad bits.
+    swallow_action: bool,
 }
 
 /// New-game start position X (the original's `InitPlayerData`).
@@ -397,6 +404,9 @@ pub const NEW_GAME_POS_Z: i32 = 5000;
 pub const NEW_GAME_ANGLE: u16 = 3072;
 /// New-game starting health: Chris then Jill.
 pub const NEW_GAME_HEALTH: [i16; 2] = [140, 96];
+/// New-game carried room-pickup quantities (BioCard 0x20C..0x20E): ROOM1160's
+/// shotgun shells and ROOM30B0/ROOM3080's flamethrower fuel.
+pub const NEW_GAME_PICKUP_QUANTITIES: [u8; 3] = [7, 240, 240];
 /// The shipped 32-byte room-items flag pattern: bit set = item still there.
 pub const NEW_GAME_ROOM_ITEMS: [u8; 32] = [
     0xFF, 0xFF, 0xFF, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
@@ -514,6 +524,8 @@ impl GameSession {
             transition: None,
             transition_finished: false,
             modal: None,
+            viewed_item: None,
+            swallow_action: false,
         };
         session.enter_room();
         Ok(session)
@@ -548,6 +560,7 @@ impl GameSession {
             return Ok(());
         }
 
+        let was_active = self.game.message.active;
         let was_locked = self.game.message_locks_controls();
         self.game.update_message(
             MessageInput {
@@ -565,8 +578,18 @@ impl GameSession {
         }
 
         // A paused message ignores the player this tick; the press that
-        // dismissed it is spent on the window rather than the room.
-        let (input, action) = if was_locked {
+        // dismissed it is spent on the window rather than the room (the
+        // original clears the held and previous held pad bits on dismissal),
+        // so an action-gated zone behind the window never sees the same press.
+        // The swallow then latches until the key is released, exactly like the
+        // cleared edge-detect history.
+        let dismissed = was_active && !self.game.message.active;
+        if dismissed && action {
+            self.swallow_action = true;
+        } else if !action {
+            self.swallow_action = false;
+        }
+        let (input, action) = if was_locked || self.swallow_action {
             (player::Input::default(), false)
         } else {
             (input, action)
@@ -689,8 +712,19 @@ impl GameSession {
     fn open_item_view(&mut self, pack: &Pack, item: u8) {
         self.render(pack);
         let mut screen = ui::item_view::ItemViewScreen::new(item);
-        screen.open_with(pack, &self.text);
+        screen.open_with(pack, &self.text, &self.game.examined_flags());
+        self.viewed_item = Some(item);
         self.open_modal(Box::new(screen));
+    }
+
+    /// Close the gameplay modal and run its close-out side effects. Returning
+    /// from the item viewer marks the examined item, so the next name lookup
+    /// shows its real name.
+    fn close_modal(&mut self) {
+        self.modal = None;
+        if let Some(item) = self.viewed_item.take() {
+            self.game.mark_examined(item);
+        }
     }
 
     /// One frozen tick of the pause menu. A message owns the input while it is
@@ -1010,11 +1044,18 @@ impl GameSession {
 fn seed_new_game(game: &mut game::GameState, character: u8) {
     let character = character & 1;
     game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
-    game.max_health = NEW_GAME_HEALTH[usize::from(character)];
-    game.health_status = 0x10;
+    game.max_health = game::character_max_health(character);
+    // `set_health_status` also mirrors the byte the scripts read with `cmpb 50`.
+    game.set_health_status(0x10);
     game.flags[7]
         .bytes_mut()
         .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    // The three carried room-pickup quantities SetInitialItems seeds
+    // (BioCard 0x20C..0x20E): ROOM1160's shotgun shells and the two
+    // flamethrower rooms' fuel.
+    game.state_bytes[0x0C] = NEW_GAME_PICKUP_QUANTITIES[0];
+    game.state_bytes[0x0D] = NEW_GAME_PICKUP_QUANTITIES[1];
+    game.state_bytes[0x0E] = NEW_GAME_PICKUP_QUANTITIES[2];
     game.state_bytes[usize::from(game::STATE_BYTE_SAVES)] = 0;
     game.state_bytes[0x24..0x28].fill(0);
     game.add_item(ITEM_KNIFE, 0);
@@ -1237,7 +1278,7 @@ impl App {
             ScreenAction::Title => self.open_title()?,
             ScreenAction::Resume => {
                 if let Mode::Play(session) = &mut self.mode {
-                    session.modal = None;
+                    session.close_modal();
                 }
             }
             ScreenAction::Quit => return Ok(AppFlow::Quit),
@@ -1304,7 +1345,7 @@ impl App {
                 ticks: *ticks,
             };
             match modal.update(&cx, ui) {
-                ScreenResult::Done(ScreenAction::Resume) => session.modal = None,
+                ScreenResult::Done(ScreenAction::Resume) => session.close_modal(),
                 ScreenResult::Done(ScreenAction::Quit) => return Ok(AppFlow::Quit),
                 _ => {}
             }
@@ -2494,6 +2535,9 @@ fn tick_room(
     input: player::Input,
     action: bool,
 ) -> Option<game::RoomTransition> {
+    // The original zeroes the per-frame item-use flag bank at the top of every
+    // game frame, before the room scripts decide what is usable this frame.
+    context.game.clear_item_use_flags();
     {
         let mut host = game::ScdGameHost::new(context.game);
         command_vm.run_main(&mut host);
@@ -4142,6 +4186,10 @@ mod tests {
             panic!("expected a play mode");
         };
         assert_eq!(session.game.entities[0].health, 77);
+        assert_eq!(
+            session.game.max_health, 140,
+            "a loaded save restores the character's maximum health"
+        );
         assert_eq!(session.player.pos, [1234, 0, 5678]);
         assert_eq!(session.player.angle, 1024);
     }
@@ -4336,6 +4384,97 @@ mod tests {
     }
 
     #[test]
+    fn a_dismissed_message_swallows_the_held_action_key() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        // An action-gated item zone the player stands in and faces, so any
+        // action press the room tick sees picks the spray up.
+        session.player.pos = [0, 0, 0];
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+        session.game.room_actions[2] = Some(game::RoomAction {
+            slot: 2,
+            kind: game::RoomActionKind::Item,
+            zone: [0, 0, 1000, 1000],
+            sce: 4,
+            handler: 4,
+            flags: 0x81,
+            room_items_flag: 0xFF,
+            params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
+        });
+
+        // A message that does not pause gameplay: the action key still
+        // dismisses it, and the same held key must not reach the room probe.
+        session.game.show_message(0x40, 0);
+        for _ in 0..600 {
+            if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
+                break;
+            }
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(
+            session.game.message.phase(),
+            crate::message::MessagePhase::WaitInput
+        );
+
+        // The dismissing tick swallows the press.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert!(!session.game.message.active);
+        assert!(
+            !session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "the dismissing press triggered the zone behind the window"
+        );
+
+        // The still-held key stays swallowed until it is released.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert!(
+            !session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "a still-held action key re-triggered the zone"
+        );
+
+        // Releasing and pressing again is a fresh edge and fires as usual.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert!(
+            session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "a fresh press after release must reach the zone"
+        );
+    }
+
+    #[test]
+    fn every_room_tick_clears_the_item_use_flag_bank_first() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        // The per-frame bank starts cleared: a script-set bit from last frame
+        // must not leak into this frame's USE checks.
+        session.game.set_item_use_flag(ITEM_SWORD_KEY, true);
+        assert!(session.game.item_use_flag(ITEM_SWORD_KEY));
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(
+            !session.game.item_use_flag(ITEM_SWORD_KEY),
+            "the room tick must clear bank 9 before the main script runs"
+        );
+    }
+
+    #[test]
     fn start_opens_the_menu_freezes_the_room_and_cancel_resumes() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
@@ -4464,6 +4603,49 @@ mod tests {
             ScreenResult::Done(ScreenAction::Resume)
         );
         assert!(session.menu.is_some(), "resuming lands back on the menu");
+    }
+
+    #[test]
+    fn resuming_the_item_viewer_marks_the_item_examined() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        // The sword key's name class is 3: it starts unexamined and its real
+        // name is hidden until the viewer has run.
+        assert!(!crate::message::examined_bit(
+            &session.game.examined_flags(),
+            3
+        ));
+        session.open_item_view(&pack, ITEM_SWORD_KEY);
+        assert!(session.modal.is_some());
+
+        // The modal reports Resume on cancel; the app applies that through
+        // `close_modal`, which is where the examine mark lands.
+        let mut modal = session.modal.take().unwrap();
+        let cx = UiContext {
+            pack: &pack,
+            save_dir: Path::new("."),
+            font: None,
+            text: Some(&session.text),
+            ticks: 0,
+        };
+        assert_eq!(
+            modal.update(
+                &cx,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            ScreenResult::Done(ScreenAction::Resume)
+        );
+        session.close_modal();
+        assert!(
+            crate::message::examined_bit(&session.game.examined_flags(), 3),
+            "leaving the viewer marks the item examined"
+        );
     }
 
     #[test]
@@ -4723,6 +4905,7 @@ mod tests {
         let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
         // At full health the green herb's USE is refused; the menu reports
         // the refusal as 0xf7 + the heal category (7).
+        session.game.entities[0].health = session.game.max_health;
         session.game.add_item(ITEM_GREEN_HERB, 1);
 
         session
@@ -4806,6 +4989,17 @@ mod tests {
                 0
             );
             assert_eq!(&session.game.state_bytes[0x24..0x28], &[0; 4]);
+            // The starting health status reaches the `cmpb 50` state byte.
+            assert_eq!(session.game.health_status, 0x10);
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_HEALTH_STATUS)],
+                0x10
+            );
+            // SetInitialItems seeds the three carried room-pickup quantities.
+            assert_eq!(
+                &session.game.state_bytes[0x0C..0x0F],
+                &NEW_GAME_PICKUP_QUANTITIES
+            );
             let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
             if character == 0 {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
@@ -4879,6 +5073,8 @@ mod tests {
         let continued = GameSession::from_save(&pack, &parsed).unwrap();
         assert_eq!(continued.game.id, session.game.id);
         assert_eq!(continued.game.entities[0].health, 88);
+        // The maximum is re-derived from the saved character, not left at 0.
+        assert_eq!(continued.game.max_health, 140, "Chris's continue maximum");
         assert_eq!(continued.player.pos, [12000, 0, 3300]);
         assert_eq!(continued.player.angle, 512);
         assert_eq!(continued.game.item_count(0x0F), 30);

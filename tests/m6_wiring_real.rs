@@ -1,10 +1,11 @@
 //! M6 wiring: message/menu integration against the real converted pack.
 //!
-//! These tests need `ARKLAY_RE1_PACK`; without it they return early. They run
-//! the same public seams the engine's `--ui menu` capture, the door
-//! transition path and the locked-door message path use.
+//! These tests need both `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK`; with neither
+//! set they return early, and a partial configuration fails. They run the same
+//! public seams the engine's `--ui menu` capture, the door transition path and
+//! the locked-door message path use.
 
-use std::path::Path;
+mod common;
 
 use arklay::bmp;
 use arklay::engine;
@@ -37,10 +38,15 @@ fn assert_capture_has_content(bytes: &[u8]) {
     );
 }
 
+/// Pixels that differ between two decoded captures.
+fn changed_pixels(a: &Image, b: &Image) -> usize {
+    a.rgba.iter().zip(&b.rgba).filter(|(a, b)| a != b).count()
+}
+
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_menu_capture_over_room_1001_is_deterministic() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
     let dir = std::env::temp_dir().join(format!("arklay-m6-menu-{}", std::process::id()));
@@ -49,22 +55,36 @@ fn real_menu_capture_over_room_1001_is_deterministic() {
     let first = dir.join("menu_a.bmp");
     let second = dir.join("menu_b.bmp");
 
-    engine::run_ui_with_options(Path::new(&path), "menu", Some(&first), &saves, 0).unwrap();
-    engine::run_ui_with_options(Path::new(&path), "menu", Some(&second), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "menu", Some(&first), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "menu", Some(&second), &saves, 0).unwrap();
 
     let first_bytes = std::fs::read(&first).unwrap();
     let second_bytes = std::fs::read(&second).unwrap();
     assert_eq!(first_bytes, second_bytes, "two menu captures differ");
     assert_capture_has_content(&first_bytes);
+
+    // The menu layer must contribute a large delta over the plain room: a
+    // capture that lost its UI layer would otherwise still pass the non-black
+    // check on the room background alone.
+    let baseline_path = dir.join("room.bmp");
+    engine::run(&path, RoomId::parse("1001").unwrap(), Some(&baseline_path)).unwrap();
+    let menu = bmp::decode(&first_bytes).unwrap();
+    let baseline = bmp::decode(&std::fs::read(&baseline_path).unwrap()).unwrap();
+    let changed = changed_pixels(&menu, &baseline);
+    println!("menu vs no-UI room: {changed} changed pixels");
+    assert!(
+        changed > 80000,
+        "the menu only repainted {changed} pixels over the room"
+    );
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_save_room_door_walk_runs_the_destination_message_path() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(Path::new(&path)).unwrap();
+    let pack = Pack::open(&path).unwrap();
     let source = RoomId::parse("1001").unwrap();
     let sim = engine::simulate_door(&pack, source, 0, None).unwrap();
     assert_eq!(sim.target, RoomId::parse("1011").unwrap());
@@ -118,12 +138,12 @@ fn real_save_room_door_walk_runs_the_destination_message_path() {
 }
 
 #[test]
-#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_locked_door_message_renders_over_a_frozen_frame() {
-    let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+    let Some((_root, path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(Path::new(&path)).unwrap();
+    let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1010").unwrap();
 
     // Probe the sword-key door with no key: the door handler requests its
@@ -158,7 +178,7 @@ fn real_locked_door_message_renders_over_a_frozen_frame() {
     let dir = std::env::temp_dir().join(format!("arklay-m6-door-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let capture = dir.join("room1010.bmp");
-    engine::run(Path::new(&path), id, Some(&capture)).unwrap();
+    engine::run(&path, id, Some(&capture)).unwrap();
     let frozen = bmp::decode(&std::fs::read(&capture).unwrap()).unwrap();
 
     let font = Font::new(
