@@ -9,10 +9,12 @@ use anyhow::{Context, Result, bail};
 
 use sdl3_sys::blendmode::SDL_BLENDMODE_NONE;
 use sdl3_sys::error::SDL_GetError;
-use sdl3_sys::events::{SDL_EVENT_KEY_DOWN, SDL_EVENT_QUIT, SDL_Event, SDL_PollEvent};
+use sdl3_sys::events::{
+    SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP, SDL_EVENT_KEYBOARD_REMOVED, SDL_EVENT_QUIT,
+    SDL_EVENT_WINDOW_FOCUS_LOST, SDL_Event, SDL_PollEvent,
+};
 use sdl3_sys::hints::{SDL_HINT_RENDER_DRIVER, SDL_HINT_VIDEO_DRIVER, SDL_SetHint};
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit};
-use sdl3_sys::keyboard::SDL_GetKeyboardState;
 use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_ESCAPE, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
@@ -26,6 +28,7 @@ use sdl3_sys::scancode::{
     SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
     SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
     SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+    SDL_Scancode,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -169,17 +172,15 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
 /// The interactive gameplay loop shared by `--room` and the app's Play mode.
 fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -> Result<()> {
     let mut framebuffer = Framebuffer::new();
-    let mut edges = InputEdges::default();
+    let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
-        let mut any_key = false;
-        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
+        if poll_events(&mut event, &mut input, &mut cut_delta) {
             return Ok(());
         }
-        let ui = edges.read(any_key);
         if cut_delta != 0 {
             session.step_camera_cut(cut_delta);
         }
@@ -191,16 +192,19 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         if accumulator > 250.0 {
             accumulator = 250.0;
         }
-        let (input, action) = read_input();
         while accumulator >= TICK_MS {
             if session.transition_finished {
                 accumulator = 0.0;
                 break;
             }
+            // Each fixed tick consumes its own latched press, so a frame that
+            // catches up several ticks cannot replay one edge and a press that
+            // arrived between two ticks is never dropped.
+            let tick = input.tick();
             if session.transition.is_some() {
-                session.tick_transition(pack, action || input.run);
+                session.tick_transition(pack, tick.action || tick.player.run);
             } else {
-                session.tick(pack, ui, input, action)?;
+                session.tick(pack, tick.ui, tick.player, tick.action)?;
                 if session.transition.is_some() {
                     // The original drops the remainder of the frame's time
                     // when a door hands control to its transition phase.
@@ -1730,17 +1734,15 @@ pub fn run_ui_with_options(
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
-    let mut edges = InputEdges::default();
+    let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
-        let mut any_key = false;
-        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
+        if poll_events(&mut event, &mut input, &mut cut_delta) {
             return Ok(());
         }
-        let ui = edges.read(any_key);
         if cut_delta != 0 {
             app.step_camera_cut(cut_delta);
         }
@@ -1752,9 +1754,9 @@ pub fn run_ui_with_options(
         if accumulator > 250.0 {
             accumulator = 250.0;
         }
-        let (input, action) = read_input();
         while accumulator >= TICK_MS {
-            if let AppFlow::Quit = app.update(ui, input, action)? {
+            let tick = input.tick();
+            if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
                 return Ok(());
             }
             accumulator -= TICK_MS;
@@ -1843,9 +1845,9 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>) -> Result<()> {
 
     let mut event = SDL_Event::default();
     let mut cut_delta = 0i32;
-    let mut any_key = false;
+    let mut input = InputState::default();
     loop {
-        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
+        if poll_events(&mut event, &mut input, &mut cut_delta) {
             return Ok(());
         }
         present(renderer, texture, &framebuffer)?;
@@ -2620,10 +2622,14 @@ fn play_footsteps(
     }
 }
 
-/// Poll every queued SDL event, reporting whether the user quit and
-/// accumulating the shift+`,`/`.` camera-cut step. A non-repeat key-down also
-/// sets `any_key`, the UI screens' "any button" edge.
-fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32, any_key: &mut bool) -> bool {
+/// Poll every queued SDL event into `input`, reporting whether the user quit
+/// and accumulating the shift+`,`/`.` camera-cut step.
+///
+/// Keyboard transitions are latched here rather than sampled from
+/// `SDL_GetKeyboardState` later, because the render loop runs at the display's
+/// refresh rate while the simulation runs at a fixed 30 Hz: a press that lands
+/// between two ticks must still be there when the next tick asks.
+fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i32) -> bool {
     let mut quit = false;
     while unsafe { SDL_PollEvent(event) } {
         let kind = unsafe { event.r#type };
@@ -2631,10 +2637,10 @@ fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32, any_key: &mut bool) -
             quit = true;
         } else if kind == SDL_EVENT_KEY_DOWN {
             let key = unsafe { event.key.key };
+            let scancode = unsafe { event.key.scancode };
             let modifiers = unsafe { event.key.r#mod };
-            if !unsafe { event.key.repeat } {
-                *any_key = true;
-            }
+            let repeat = unsafe { event.key.repeat };
+            input.key_down(scancode, repeat);
             if key == SDLK_ESCAPE {
                 quit = true;
             } else if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
@@ -2644,6 +2650,12 @@ fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32, any_key: &mut bool) -
                     *cut_delta += 1;
                 }
             }
+        } else if kind == SDL_EVENT_KEY_UP {
+            input.key_up(unsafe { event.key.scancode });
+        } else if kind == SDL_EVENT_WINDOW_FOCUS_LOST || kind == SDL_EVENT_KEYBOARD_REMOVED {
+            // Focusing away (or unplugging the keyboard) never delivers the
+            // held keys' key-up events; drop them so nothing sticks down.
+            input.clear();
         }
     }
     quit
@@ -2947,41 +2959,139 @@ fn apply_bgm_requests(
     }
 }
 
-/// One frame of level-triggered UI keys.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Keys {
-    up: bool,
-    down: bool,
-    left: bool,
-    right: bool,
-    confirm: bool,
-    cancel: bool,
-    /// L1, the item box's previous-page key (`[`).
-    page_left: bool,
-    /// R1, the item box's next-page key (`]`).
-    page_right: bool,
-    /// START, the gameplay pause menu (Tab).
-    start: bool,
+/// One bit per physical key the engine maps.
+///
+/// Confirm, cancel and run each accept two keys, so the bits stay per physical
+/// key: releasing Space while Return is still held must not clear confirm, and
+/// the same goes for X/Backspace and the two Shifts.
+const KEY_UP: u32 = 1 << 0;
+const KEY_DOWN: u32 = 1 << 1;
+const KEY_LEFT: u32 = 1 << 2;
+const KEY_RIGHT: u32 = 1 << 3;
+const KEY_SPACE: u32 = 1 << 4;
+const KEY_RETURN: u32 = 1 << 5;
+const KEY_X: u32 = 1 << 6;
+const KEY_BACKSPACE: u32 = 1 << 7;
+const KEY_LEFTBRACKET: u32 = 1 << 8;
+const KEY_RIGHTBRACKET: u32 = 1 << 9;
+const KEY_TAB: u32 = 1 << 10;
+const KEY_LSHIFT: u32 = 1 << 11;
+const KEY_RSHIFT: u32 = 1 << 12;
+/// Confirm (Space or Return).
+const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
+/// Cancel (X or Backspace).
+const KEY_CANCEL: u32 = KEY_X | KEY_BACKSPACE;
+/// Run (either Shift).
+const KEY_RUN: u32 = KEY_LSHIFT | KEY_RSHIFT;
+
+/// The bit `scancode` maps to, or `None` for keys the engine ignores.
+fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
+    Some(match scancode {
+        SDL_SCANCODE_UP => KEY_UP,
+        SDL_SCANCODE_DOWN => KEY_DOWN,
+        SDL_SCANCODE_LEFT => KEY_LEFT,
+        SDL_SCANCODE_RIGHT => KEY_RIGHT,
+        SDL_SCANCODE_SPACE => KEY_SPACE,
+        SDL_SCANCODE_RETURN => KEY_RETURN,
+        SDL_SCANCODE_X => KEY_X,
+        SDL_SCANCODE_BACKSPACE => KEY_BACKSPACE,
+        SDL_SCANCODE_LEFTBRACKET => KEY_LEFTBRACKET,
+        SDL_SCANCODE_RIGHTBRACKET => KEY_RIGHTBRACKET,
+        SDL_SCANCODE_TAB => KEY_TAB,
+        SDL_SCANCODE_LSHIFT => KEY_LSHIFT,
+        SDL_SCANCODE_RSHIFT => KEY_RSHIFT,
+        _ => return None,
+    })
 }
 
-/// Read the UI keys from the current keyboard state.
-fn read_keys() -> Keys {
-    let mut count = 0i32;
-    let keys = unsafe { SDL_GetKeyboardState(&mut count) };
-    let down = |scancode: sdl3_sys::scancode::SDL_Scancode| {
-        let index = scancode.0;
-        index >= 0 && index < count && !keys.is_null() && unsafe { *keys.add(index as usize) }
-    };
-    Keys {
-        up: down(SDL_SCANCODE_UP),
-        down: down(SDL_SCANCODE_DOWN),
-        left: down(SDL_SCANCODE_LEFT),
-        right: down(SDL_SCANCODE_RIGHT),
-        confirm: down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN),
-        cancel: down(SDL_SCANCODE_X) || down(SDL_SCANCODE_BACKSPACE),
-        page_left: down(SDL_SCANCODE_LEFTBRACKET),
-        page_right: down(SDL_SCANCODE_RIGHTBRACKET),
-        start: down(SDL_SCANCODE_TAB),
+/// The keyboard, latched from the SDL event queue.
+///
+/// The render loop runs at the display's refresh rate, which is not the 30 Hz
+/// tick rate; deriving edges from `SDL_GetKeyboardState` every rendered frame
+/// drops presses (the frame that sees the edge may run no tick, and by the
+/// next tick the key is already held) and can replay one edge over a frame
+/// that catches up several ticks. Feeding every key event into this latch
+/// makes a press reach exactly one tick, whenever it arrived.
+#[derive(Default)]
+struct InputState {
+    /// Keys currently down, for continuous movement.
+    held: u32,
+    /// Keys that went down since the last tick; consumed by [`Self::tick`].
+    pressed: u32,
+    /// A non-repeat key-down of any key since the last tick.
+    any_pressed: bool,
+}
+
+/// One fixed tick of latched input, split into the shapes its consumers want.
+struct TickInput {
+    /// Held movement and run for the player.
+    player: player::Input,
+    /// Action level: held, or this tick's press so a quick tap still registers.
+    action: bool,
+    /// Edge-triggered keys for the menu, message and UI screens.
+    ui: UiInput,
+}
+
+impl InputState {
+    /// Latch a key-down. Auto-repeat keeps the held bit fresh but is not a new
+    /// press, so holding a key cannot storm edges.
+    fn key_down(&mut self, scancode: SDL_Scancode, repeat: bool) {
+        if let Some(bit) = key_bit(scancode) {
+            self.held |= bit;
+            if !repeat {
+                self.pressed |= bit;
+            }
+        }
+        if !repeat {
+            self.any_pressed = true;
+        }
+    }
+
+    /// Latch a key-up. A pending press is left alone: a tap released before
+    /// the tick must still reach it.
+    fn key_up(&mut self, scancode: SDL_Scancode) {
+        if let Some(bit) = key_bit(scancode) {
+            self.held &= !bit;
+        }
+    }
+
+    /// Drop every held and pending key (window focus loss, keyboard removal).
+    fn clear(&mut self) {
+        self.held = 0;
+        self.pressed = 0;
+        self.any_pressed = false;
+    }
+
+    /// Consume the presses latched since the last tick.
+    ///
+    /// Held keys stay in the movement input every tick; each press is reported
+    /// to the UI exactly once and, through `active`, still counts as one tick
+    /// of movement/action even when its key was released before the tick.
+    fn tick(&mut self) -> TickInput {
+        let pressed = std::mem::take(&mut self.pressed);
+        let active = self.held | pressed;
+        TickInput {
+            player: player::Input {
+                up: active & KEY_UP != 0,
+                down: active & KEY_DOWN != 0,
+                left: active & KEY_LEFT != 0,
+                right: active & KEY_RIGHT != 0,
+                run: active & KEY_RUN != 0,
+            },
+            action: active & KEY_CONFIRM != 0,
+            ui: UiInput {
+                up: pressed & KEY_UP != 0,
+                down: pressed & KEY_DOWN != 0,
+                left: pressed & KEY_LEFT != 0,
+                right: pressed & KEY_RIGHT != 0,
+                confirm: pressed & KEY_CONFIRM != 0,
+                cancel: pressed & KEY_CANCEL != 0,
+                page_left: pressed & KEY_LEFTBRACKET != 0,
+                page_right: pressed & KEY_RIGHTBRACKET != 0,
+                start: pressed & KEY_TAB != 0,
+                any: std::mem::take(&mut self.any_pressed),
+            },
+        }
     }
 }
 
@@ -3007,54 +3117,6 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
     } else {
         None
     }
-}
-
-/// Turn the level-triggered keys into the screens' edge-triggered input.
-///
-/// `any_key` comes from the SDL event queue (a non-repeat key-down), so F-keys
-/// and other unbound keys still open the title menu.
-#[derive(Default)]
-struct InputEdges {
-    previous: Keys,
-}
-
-impl InputEdges {
-    /// Read the current keys and report which went down since the last call.
-    fn read(&mut self, any_key: bool) -> UiInput {
-        let keys = read_keys();
-        let input = UiInput {
-            up: keys.up && !self.previous.up,
-            down: keys.down && !self.previous.down,
-            left: keys.left && !self.previous.left,
-            right: keys.right && !self.previous.right,
-            confirm: keys.confirm && !self.previous.confirm,
-            cancel: keys.cancel && !self.previous.cancel,
-            page_left: keys.page_left && !self.previous.page_left,
-            page_right: keys.page_right && !self.previous.page_right,
-            start: keys.start && !self.previous.start,
-            any: any_key || (keys.confirm && !self.previous.confirm),
-        };
-        self.previous = keys;
-        input
-    }
-}
-
-/// Read the keyboard into a movement input plus the action key (Space/Return).
-fn read_input() -> (player::Input, bool) {
-    let mut count = 0i32;
-    let keys = unsafe { SDL_GetKeyboardState(&mut count) };
-    let down = |scancode: sdl3_sys::scancode::SDL_Scancode| {
-        let index = scancode.0;
-        index >= 0 && index < count && !keys.is_null() && unsafe { *keys.add(index as usize) }
-    };
-    let input = player::Input {
-        up: down(SDL_SCANCODE_UP),
-        down: down(SDL_SCANCODE_DOWN),
-        left: down(SDL_SCANCODE_LEFT),
-        right: down(SDL_SCANCODE_RIGHT),
-        run: down(SDL_SCANCODE_LSHIFT) || down(SDL_SCANCODE_RSHIFT),
-    };
-    (input, down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN))
 }
 
 /// The player's character model plus its no-weapon locomotion clips.
@@ -4515,6 +4577,245 @@ mod tests {
             }
         }
         false
+    }
+
+    #[test]
+    fn a_press_released_between_ticks_is_seen_exactly_once() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_SPACE, false);
+        input.key_up(SDL_SCANCODE_SPACE);
+
+        let tick = input.tick();
+        assert!(tick.ui.confirm, "the quick tap must reach its tick");
+        assert!(tick.action, "the tap is still an action press");
+        assert!(tick.ui.any);
+
+        let next = input.tick();
+        assert!(!next.ui.confirm, "the press must not repeat");
+        assert!(!next.action, "a released key must not act again");
+        assert!(!next.ui.any);
+        assert_eq!(next.player, player::Input::default());
+    }
+
+    #[test]
+    fn a_held_key_edges_once_and_keeps_moving() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_UP, false);
+        // OS auto-repeat refreshes the held state without adding an edge.
+        input.key_down(SDL_SCANCODE_UP, true);
+        input.key_down(SDL_SCANCODE_UP, true);
+
+        let first = input.tick();
+        assert!(first.ui.up, "the initial press is an edge");
+        assert!(first.ui.any);
+        assert!(first.player.up);
+
+        for _ in 0..3 {
+            let held = input.tick();
+            assert!(!held.ui.up, "a held key must not re-edge");
+            assert!(!held.ui.any);
+            assert!(held.player.up, "a held key keeps moving");
+        }
+
+        input.key_up(SDL_SCANCODE_UP);
+        let released = input.tick();
+        assert!(!released.player.up, "release clears the held direction");
+        assert!(!released.ui.up);
+    }
+
+    #[test]
+    fn paired_keys_are_tracked_per_physical_key() {
+        let mut confirm = InputState::default();
+        confirm.key_down(SDL_SCANCODE_SPACE, false);
+        confirm.key_down(SDL_SCANCODE_RETURN, false);
+        confirm.tick();
+        confirm.key_up(SDL_SCANCODE_SPACE);
+        assert!(confirm.tick().action, "Return is still held");
+        confirm.key_up(SDL_SCANCODE_RETURN);
+        assert!(!confirm.tick().action);
+
+        let mut run = InputState::default();
+        run.key_down(SDL_SCANCODE_LSHIFT, false);
+        run.key_down(SDL_SCANCODE_RSHIFT, false);
+        run.tick();
+        run.key_up(SDL_SCANCODE_LSHIFT);
+        assert!(run.tick().player.run, "the right Shift is still held");
+        run.key_up(SDL_SCANCODE_RSHIFT);
+        assert!(!run.tick().player.run);
+    }
+
+    #[test]
+    fn focus_loss_clears_held_and_pending_keys() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_DOWN, false);
+        input.key_down(SDL_SCANCODE_SPACE, false);
+        input.clear();
+
+        let tick = input.tick();
+        assert_eq!(tick.player, player::Input::default());
+        assert!(!tick.action);
+        assert_eq!(tick.ui, UiInput::default());
+    }
+
+    #[test]
+    fn a_catching_up_frame_consumes_each_press_once() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_TAB, false);
+        input.key_up(SDL_SCANCODE_TAB);
+
+        // One slow frame runs two ticks; only the first may see the press.
+        assert!(input.tick().ui.start);
+        assert!(!input.tick().ui.start);
+        assert_eq!(menu_input(input.tick().ui), None);
+    }
+
+    #[test]
+    fn every_bound_key_maps_to_its_edge_and_movement_field() {
+        let ui_cases = [
+            (
+                SDL_SCANCODE_UP,
+                UiInput {
+                    up: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_DOWN,
+                UiInput {
+                    down: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_LEFT,
+                UiInput {
+                    left: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_RIGHT,
+                UiInput {
+                    right: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_SPACE,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_RETURN,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_X,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_BACKSPACE,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_LEFTBRACKET,
+                UiInput {
+                    page_left: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_RIGHTBRACKET,
+                UiInput {
+                    page_right: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_TAB,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+            ),
+        ];
+        for (scancode, expected) in ui_cases {
+            let mut input = InputState::default();
+            input.key_down(scancode, false);
+            input.key_up(scancode);
+            let mut expected = expected;
+            expected.any = true;
+            assert_eq!(input.tick().ui, expected, "scancode {}", scancode.0);
+        }
+
+        let move_cases = [
+            (
+                SDL_SCANCODE_UP,
+                player::Input {
+                    up: true,
+                    ..player::Input::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_DOWN,
+                player::Input {
+                    down: true,
+                    ..player::Input::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_LEFT,
+                player::Input {
+                    left: true,
+                    ..player::Input::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_RIGHT,
+                player::Input {
+                    right: true,
+                    ..player::Input::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_LSHIFT,
+                player::Input {
+                    run: true,
+                    ..player::Input::default()
+                },
+            ),
+            (
+                SDL_SCANCODE_RSHIFT,
+                player::Input {
+                    run: true,
+                    ..player::Input::default()
+                },
+            ),
+        ];
+        for (scancode, expected) in move_cases {
+            let mut input = InputState::default();
+            input.key_down(scancode, false);
+            input.key_up(scancode);
+            assert_eq!(input.tick().player, expected, "scancode {}", scancode.0);
+        }
+
+        for scancode in [SDL_SCANCODE_SPACE, SDL_SCANCODE_RETURN] {
+            let mut input = InputState::default();
+            input.key_down(scancode, false);
+            input.key_up(scancode);
+            assert!(input.tick().action, "scancode {}", scancode.0);
+        }
     }
 
     #[test]
