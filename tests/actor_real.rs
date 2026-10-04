@@ -19,7 +19,7 @@ use arklay::state::{RoomId, RoomState};
 /// Parse the SCD streams of the room's pack entry.
 fn room_scripts(pack: &Pack, id: RoomId) -> Scripts {
     let data = pack.read(&id.rdt_entry()).expect("room entry");
-    arklay::scd::reader::parse(&data).expect("parse SCD")
+    arklay::scd::reader::parse(data).expect("parse SCD")
 }
 
 /// The union of every collision record's extents, when the room has any.
