@@ -8,12 +8,14 @@
 //! NUL-terminated UTF-8 paths in entry order, followed by the entry data in
 //! entry order with no padding. Writers sort entries by ASCII-lowercased path
 //! so output is byte-deterministic; readers key entries by ASCII-lowercased
-//! path while preserving the original path strings.
+//! path while preserving the original path strings. Both the writer and the
+//! reader reject unsafe paths (absolute, `..` components, backslashes, NUL
+//! bytes or empty), so a pack can never name a file outside its pack root.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 /// Magic bytes at the start of every pack.
 pub const MAGIC: [u8; 4] = *b"APAK";
@@ -41,8 +43,8 @@ impl PackWriter {
 
     /// Add one entry.
     ///
-    /// Paths must be non-empty and relative, must not contain backslashes or
-    /// NUL bytes, and must be unique ignoring ASCII case.
+    /// Paths must be non-empty and relative, must not contain backslashes,
+    /// NUL bytes or `..` components, and must be unique ignoring ASCII case.
     pub fn add(&mut self, path: &str, data: Vec<u8>) -> Result<()> {
         validate_path(path)?;
         if self
@@ -130,6 +132,25 @@ impl PackWriter {
     }
 }
 
+/// One entry of a pack, as reported by [`Pack::entries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackEntry<'a> {
+    path: &'a str,
+    size: usize,
+}
+
+impl<'a> PackEntry<'a> {
+    /// The entry path with its original case and `/` separators.
+    pub fn path(self) -> &'a str {
+        self.path
+    }
+
+    /// The entry size in bytes.
+    pub fn size(self) -> usize {
+        self.size
+    }
+}
+
 /// One table-of-contents entry resolved against the pack data.
 #[derive(Debug)]
 struct Entry {
@@ -204,6 +225,8 @@ impl Pack {
             if path.is_empty() {
                 bail!("entry {index} has an empty path");
             }
+            validate_path(path)
+                .map_err(|err| anyhow!("entry {index} has an unsafe path: {err}"))?;
             let key = path.to_ascii_lowercase();
             if lookup.contains_key(&key) {
                 bail!("duplicate pack entry: {path}");
@@ -249,6 +272,14 @@ impl Pack {
         self.entries.iter().map(|entry| entry.path.as_str())
     }
 
+    /// Every entry in table-of-contents order, with its path and size.
+    pub fn entries(&self) -> impl Iterator<Item = PackEntry<'_>> {
+        self.entries.iter().map(|entry| PackEntry {
+            path: entry.path.as_str(),
+            size: entry.length,
+        })
+    }
+
     /// Number of entries in the pack.
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -260,19 +291,33 @@ impl Pack {
     }
 }
 
-/// Validate a writer-supplied entry path.
+/// Validate an entry path for safe use on disk.
+///
+/// Paths must be non-empty and relative, must not contain backslashes, NUL
+/// bytes or `..` components. Both the writer and the reader enforce these
+/// rules, so an untrusted pack can never escape an extraction root.
 fn validate_path(path: &str) -> Result<()> {
     if path.is_empty() {
         bail!("pack entry path is empty");
     }
-    if path.starts_with('/') {
-        bail!("pack entry path must be relative: {path}");
+    if path.contains('\0') {
+        bail!("pack entry path contains a NUL byte");
     }
     if path.contains('\\') {
         bail!("pack entry path contains a backslash: {path}");
     }
-    if path.contains('\0') {
-        bail!("pack entry path contains a NUL byte");
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        bail!("pack entry path must be relative: {path}");
+    }
+    for component in candidate.components() {
+        match component {
+            Component::ParentDir => bail!("pack entry path contains a `..` component: {path}"),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("pack entry path must be relative: {path}");
+            }
+            Component::CurDir | Component::Normal(_) => {}
+        }
     }
     Ok(())
 }
@@ -477,7 +522,43 @@ mod tests {
         assert!(writer.add("/absolute", vec![]).is_err());
         assert!(writer.add("back\\slash", vec![]).is_err());
         assert!(writer.add("nul\0byte", vec![]).is_err());
+        assert!(writer.add("..", vec![]).is_err());
+        assert!(writer.add("../escape", vec![]).is_err());
+        assert!(writer.add("room/../../escape", vec![]).is_err());
         assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn reader_rejects_parent_directory_paths() {
+        for path in ["..", "../up.bin", "room/../../escape.bin"] {
+            let err = Pack::from_bytes(multi_entry_pack(&[(path, b"x")]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`..` component"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn reader_rejects_absolute_and_backslash_paths() {
+        for path in ["/etc/passwd", "back\\slash.bin"] {
+            let err = Pack::from_bytes(multi_entry_pack(&[(path, b"x")]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("unsafe path"), "{path}: {err}");
+        }
+    }
+
+    #[test]
+    fn entries_expose_paths_and_sizes() {
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", vec![1, 2, 3]).unwrap();
+        writer.add("bgm/013.wav", vec![0; 100]).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let entries: Vec<(&str, usize)> = pack
+            .entries()
+            .map(|entry| (entry.path(), entry.size()))
+            .collect();
+        assert_eq!(entries, [("bgm/013.wav", 100), ("room/1000.rdt", 3)]);
     }
 
     #[test]

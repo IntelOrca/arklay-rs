@@ -24,12 +24,26 @@ cargo build
 # Convert an RE1 installation into a game pack
 cargo run -- convert-game /path/to/re1 --out re1.akpak
 
+# List every pack entry with its size, then the entry count and total bytes
+cargo run -- list re1.akpak
+
+# Extract every pack entry below a directory, preserving relative paths
+cargo run -- extract re1.akpak --out extracted/
+
 # Launch room 100 as player 0 (RDT 1000)
 cargo run -- re1.akpak --room 100 --player 0
 
 # Headless capture (no display)
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
 ```
+
+`convert-game` and `extract` report progress on stderr per phase (RDTs,
+camera cuts, BGM, player files, bytes written): one in-place line with
+`done/total`, percentage, elapsed time and ETA when stderr is a terminal, or
+periodic plain lines without control characters when it is redirected.
+Conversions end with per-category totals, the output size and the total
+elapsed time. `extract` rejects packs whose entry paths are absolute, contain
+`..` or backslashes, or are empty, so it never writes outside `--out`.
 
 ### Controls
 

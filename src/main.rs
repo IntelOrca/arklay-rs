@@ -1,7 +1,12 @@
-use std::path::PathBuf;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+
+use arklay::pack::Pack;
+use arklay::progress::{Progress, format_duration};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,6 +45,24 @@ enum Command {
         /// Output pack path
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
+    },
+
+    /// Extract every entry of a game pack into a directory
+    Extract {
+        /// Game pack to read
+        #[arg(value_name = "PACK")]
+        pack: PathBuf,
+
+        /// Output directory (created if needed)
+        #[arg(long, short, value_name = "OUT_DIR")]
+        out: PathBuf,
+    },
+
+    /// List every entry of a game pack with its size
+    List {
+        /// Game pack to read
+        #[arg(value_name = "PACK")]
+        pack: PathBuf,
     },
 
     /// Script tools
@@ -95,11 +118,70 @@ fn export_scd(rdt: &std::path::Path, out: &std::path::Path, list: bool) -> Resul
     Ok(())
 }
 
+/// Extract every entry of `pack_path` below `out_dir`, preserving paths.
+///
+/// The pack reader validates every entry path, so no file can be written
+/// outside `out_dir`.
+fn extract_pack(pack_path: &Path, out_dir: &Path) -> Result<()> {
+    let pack = Pack::open(pack_path)?;
+    let mut progress = Progress::new();
+    progress.begin("extract", pack.len() as u64, "files");
+
+    let mut bytes = 0u64;
+    for entry in pack.entries() {
+        let data = pack.read(entry.path())?;
+        let destination = out_dir.join(entry.path());
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::write(&destination, data)
+            .with_context(|| format!("failed to write {}", destination.display()))?;
+        bytes += data.len() as u64;
+        progress.advance(entry.path());
+    }
+    progress.end_phase();
+
+    println!(
+        "extracted {} entries, {bytes} bytes to {} in {}",
+        pack.len(),
+        out_dir.display(),
+        format_duration(progress.elapsed())
+    );
+    Ok(())
+}
+
+/// Write one deterministic `list` line per entry: right-aligned size, path.
+///
+/// Returns the entry count and the total bytes listed.
+fn write_list(pack: &Pack, out: &mut impl Write) -> Result<(u64, u64)> {
+    let mut count = 0u64;
+    let mut bytes = 0u64;
+    for entry in pack.entries() {
+        writeln!(out, "{:>12} {}", entry.size(), entry.path())?;
+        count += 1;
+        bytes += entry.size() as u64;
+    }
+    Ok((count, bytes))
+}
+
+/// Print every entry of `pack_path` and a final count/bytes summary.
+fn list_pack(pack_path: &Path) -> Result<()> {
+    let pack = Pack::open(pack_path)?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let (count, bytes) = write_list(&pack, &mut out)?;
+    writeln!(out, "{count} entries, {bytes} bytes")?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Command::ConvertGame { root, out }) => arklay::convert::convert_game(&root, &out),
+        Some(Command::Extract { pack, out }) => extract_pack(&pack, &out),
+        Some(Command::List { pack }) => list_pack(&pack),
         Some(Command::Scd { action }) => match action {
             ScdAction::Export { rdt, out, list } => export_scd(&rdt, &out, list),
         },
@@ -113,5 +195,101 @@ fn main() -> Result<()> {
             let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
             arklay::engine::run(&pack, id, cli.capture.as_deref())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use arklay::pack::PackWriter;
+
+    /// Self-deleting temporary directory unique to this process and label.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("arklay-cli-{}-{label}", std::process::id()));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A two-entry pack written to `path`, also opened for comparison.
+    fn sample_pack(path: &Path) -> Pack {
+        let mut writer = PackWriter::new();
+        writer.add("room/1001.rdt", vec![0x11, 0x22, 0x33]).unwrap();
+        writer.add("bgm/013.wav", b"RIFF....WAVE".to_vec()).unwrap();
+        writer.write(path).unwrap();
+        Pack::open(path).unwrap()
+    }
+
+    #[test]
+    fn extraction_round_trips_every_entry() {
+        let dir = TempDir::new("extract");
+        let pack_path = dir.path.join("game.akpak");
+        let pack = sample_pack(&pack_path);
+
+        let out = dir.path.join("out");
+        extract_pack(&pack_path, &out).unwrap();
+
+        for entry in pack.entries() {
+            let extracted = fs::read(out.join(entry.path())).unwrap();
+            assert_eq!(extracted, pack.read(entry.path()).unwrap());
+        }
+        assert_eq!(
+            fs::read(out.join("room/1001.rdt")).unwrap(),
+            pack.read("room/1001.rdt").unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn extraction_of_real_pack_matches_reader() {
+        let Ok(pack_path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack_path = PathBuf::from(pack_path);
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let dir = TempDir::new("real-extract");
+        let out = dir.path.join("out");
+        extract_pack(&pack_path, &out).unwrap();
+
+        for sample in ["room/1001.rdt", "roomcut/100_000.bmp", "bgm/013.wav"] {
+            let extracted = fs::read(out.join(sample)).unwrap();
+            assert_eq!(extracted, pack.read(sample).unwrap(), "{sample}");
+        }
+    }
+
+    #[test]
+    fn list_lines_are_right_aligned_and_summarized() {
+        let dir = TempDir::new("list");
+        let pack_path = dir.path.join("game.akpak");
+        let pack = sample_pack(&pack_path);
+
+        let mut out = Vec::new();
+        let (count, bytes) = write_list(&pack, &mut out).unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(bytes, 15);
+        let expected = format!(
+            "{:>12} {}\n{:>12} {}\n",
+            "RIFF....WAVE".len(),
+            "bgm/013.wav",
+            3,
+            "room/1001.rdt"
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 }

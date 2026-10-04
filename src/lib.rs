@@ -12,6 +12,7 @@ pub mod model;
 pub mod music;
 pub mod pack;
 pub mod player;
+pub mod progress;
 pub mod rdt;
 pub mod render;
 pub mod scd;

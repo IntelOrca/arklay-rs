@@ -9,12 +9,14 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::music;
 use crate::pack::PackWriter;
+use crate::progress::{Progress, format_duration};
 use crate::state::RoomId;
 use crate::{bmp, lzw, rdt, tim};
 
@@ -30,8 +32,12 @@ const CUT_HEIGHT: u32 = 240;
 /// Byte offset of the bit depth field in a BMP header.
 const BMP_BPP_OFFSET: usize = 28;
 
+/// Bytes written per chunk while streaming the finished pack to disk.
+const WRITE_CHUNK: usize = 1 << 20;
+
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
+    let mut progress = Progress::new();
     let Plan {
         rooms,
         sound,
@@ -45,6 +51,17 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     let mut cut_count = 0usize;
     let mut cut_bytes = 0usize;
 
+    // Resolve the cut jobs first so RDTs and backgrounds can be reported as
+    // two clean phases instead of alternating per room.
+    let mut cut_jobs: Vec<(RoomId, usize, PathBuf)> = Vec::new();
+    for room in &rooms {
+        for (camera, pak) in room.paks.iter().enumerate() {
+            cut_jobs.push((room.id, camera, pak.clone()));
+        }
+    }
+
+    let rdt_total = rooms.iter().map(|room| room.rdts.len() as u64).sum();
+    progress.begin("room", rdt_total, "files");
     for room in rooms {
         for rdt in room.rdts {
             let entry = rdt.id.rdt_entry();
@@ -54,22 +71,28 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
             writer
                 .add(&entry, rdt.bytes)
                 .with_context(|| format!("failed to add {entry}"))?;
-        }
-
-        for (camera, pak) in room.paks.iter().enumerate() {
-            let bmp_bytes = convert_camera(pak)?;
-            let entry = room.id.cut_entry(camera);
-            cut_bytes += bmp_bytes.len();
-            cut_count += 1;
-            stage_counts[room.id.stage_index() as usize].1 += 1;
-            writer
-                .add(&entry, bmp_bytes)
-                .with_context(|| format!("failed to add {entry}"))?;
+            progress.advance(&entry);
         }
     }
+    progress.end_phase();
 
-    let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer)?;
-    let (player_count, player_bytes) = copy_players(&players, &mut writer)?;
+    let cut_total = cut_jobs.len() as u64;
+    progress.begin("roomcut", cut_total, "cuts");
+    for (id, camera, pak) in cut_jobs {
+        let bmp_bytes = convert_camera(&pak)?;
+        let entry = id.cut_entry(camera);
+        cut_bytes += bmp_bytes.len();
+        cut_count += 1;
+        stage_counts[id.stage_index() as usize].1 += 1;
+        writer
+            .add(&entry, bmp_bytes)
+            .with_context(|| format!("failed to add {entry}"))?;
+        progress.advance(&entry);
+    }
+    progress.end_phase();
+
+    let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
+    let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
         println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
@@ -78,8 +101,26 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
     println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
-    writer.write(out)?;
-    println!("wrote {}", out.display());
+
+    let pack_bytes = writer.to_bytes()?;
+    let size = pack_bytes.len();
+    progress.begin("write", size as u64, "bytes");
+    let mut file =
+        fs::File::create(out).with_context(|| format!("failed to create {}", out.display()))?;
+    for chunk in pack_bytes.chunks(WRITE_CHUNK) {
+        file.write_all(chunk)
+            .with_context(|| format!("failed to write {}", out.display()))?;
+        progress.advance_by(chunk.len() as u64);
+    }
+    drop(file);
+    progress.end_phase();
+
+    let entries = rdt_count + cut_count + bgm_count + player_count;
+    println!(
+        "wrote {} ({entries} entries, {size} bytes) in {}",
+        out.display(),
+        format_duration(progress.elapsed())
+    );
     Ok(())
 }
 
@@ -112,13 +153,16 @@ fn convert_camera(pak: &Path) -> Result<Vec<u8>> {
 }
 
 /// Add every `BGM_*.WAV` in the sound directory; returns entry count and bytes.
-fn copy_music(sound: &Option<PathBuf>, writer: &mut PackWriter) -> Result<(usize, usize)> {
+fn copy_music(
+    sound: &Option<PathBuf>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
     let Some(sound) = sound else {
         return Ok((0, 0));
     };
 
-    let mut count = 0usize;
-    let mut bytes = 0usize;
+    let mut files = Vec::new();
     for entry in read_dir_sorted(sound)? {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -127,19 +171,33 @@ fn copy_music(sound: &Option<PathBuf>, writer: &mut PackWriter) -> Result<(usize
         let Some(path) = music::pack_path(name) else {
             continue;
         };
-        let data = fs::read(entry.path())
-            .with_context(|| format!("failed to read {}", entry.path().display()))?;
+        files.push((path, entry.path()));
+    }
+
+    progress.begin("bgm", files.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (path, source) in files {
+        let data =
+            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
         bytes += data.len();
         count += 1;
         writer
             .add(&path, data)
             .with_context(|| format!("failed to add {path}"))?;
+        progress.advance(&path);
     }
+    progress.end_phase();
     Ok((count, bytes))
 }
 
 /// Add every resolved player model and locomotion clip to the pack.
-fn copy_players(players: &[PlayerAsset], writer: &mut PackWriter) -> Result<(usize, usize)> {
+fn copy_players(
+    players: &[PlayerAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    progress.begin("player", players.len() as u64, "files");
     let mut count = 0usize;
     let mut bytes = 0usize;
     for asset in players {
@@ -150,7 +208,9 @@ fn copy_players(players: &[PlayerAsset], writer: &mut PackWriter) -> Result<(usi
         writer
             .add(&asset.entry, data)
             .with_context(|| format!("failed to add {}", asset.entry))?;
+        progress.advance(&asset.entry);
     }
+    progress.end_phase();
     Ok((count, bytes))
 }
 
