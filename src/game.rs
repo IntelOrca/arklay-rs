@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::items;
 use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::Operand;
@@ -32,6 +33,38 @@ pub const FLAG_BANK_BYTES: usize = 32;
 pub const STATE_BYTES: usize = 64;
 /// Words in the fading-state block.
 pub const STATE_WORDS: usize = 32;
+/// State byte holding the current room camera id (BioCard 0x202).
+pub const STATE_BYTE_ROOM_CAMERA: u8 = 2;
+/// State byte holding the cut saved by `cutnext` (BioCard 0x204).
+pub const STATE_BYTE_CUT: u8 = 4;
+/// State byte holding the message-window menu choice (BioCard 0x205).
+pub const STATE_BYTE_MENU_CHOICE: u8 = 5;
+/// State byte holding the selected inventory item (BioCard 0x206).
+pub const STATE_BYTE_SELECTED_ITEM: u8 = 6;
+/// State byte holding the number of held inventory slots (BioCard 0x207).
+pub const STATE_BYTE_TOTAL_HELD: u8 = 7;
+/// State byte holding the action hit by the forward position probe.
+pub const STATE_BYTE_FWD_ACTION: u8 = 16;
+/// State byte holding the action hit by the entity position probe.
+pub const STATE_BYTE_ENT_ACTION: u8 = 17;
+/// State byte holding the last used item (BioCard 0x212).
+pub const STATE_BYTE_USED_ITEM: u8 = 18;
+/// State byte holding the last picked item (BioCard 0x213).
+pub const STATE_BYTE_PICKED_ITEM: u8 = 19;
+/// State byte holding the save counter (BioCard 0x228).
+pub const STATE_BYTE_SAVES: u8 = 40;
+/// State byte holding the equipped item (BioCard 0x229).
+pub const STATE_BYTE_EQUIPPED: u8 = 41;
+/// State byte holding the selected character (BioCard 0x22B).
+pub const STATE_BYTE_CHARACTER: u8 = 43;
+/// State byte holding the health status flags (BioCard 0x232).
+pub const STATE_BYTE_HEALTH_STATUS: u8 = 50;
+/// Inventory slots Chris can use (the first half of the 12 slot bytes).
+pub const INVENTORY_SLOTS_CHRIS: usize = 6;
+/// Inventory slots Jill can use (Chris's six plus two more).
+pub const INVENTORY_SLOTS_JILL: usize = 8;
+/// Item box slots stored in the save block.
+pub const ITEM_BOX_SLOTS: usize = 48;
 /// Number of room action slots the game state tracks.
 pub const ROOM_ACTION_SLOTS: usize = 20;
 /// Entity slots: 0 is the player, 1.. are enemies and scripted objects.
@@ -105,6 +138,16 @@ impl FlagBank {
     /// One raw byte of the bank.
     pub fn byte(&self, offset: usize) -> u8 {
         self.0.get(offset).copied().unwrap_or(0)
+    }
+
+    /// The bank's raw bytes, for save/load.
+    pub fn bytes(&self) -> &[u8; FLAG_BANK_BYTES] {
+        &self.0
+    }
+
+    /// The bank's raw bytes, mutably, for save/load.
+    pub fn bytes_mut(&mut self) -> &mut [u8; FLAG_BANK_BYTES] {
+        &mut self.0
     }
 
     /// Whether the bit selected by `sel` is set.
@@ -183,6 +226,13 @@ pub struct InventoryItem {
     pub id: u8,
     /// How many are held.
     pub quantity: u8,
+}
+
+impl Default for InventoryItem {
+    /// The empty slot: item id 0, quantity 0.
+    fn default() -> Self {
+        Self { id: 0, quantity: 0 }
+    }
 }
 
 /// A BGM request queued for the engine to apply.
@@ -496,7 +546,9 @@ pub struct GameState {
     pub id: RoomId,
     /// The ten flag banks addressed by `ck`/`set`.
     pub flags: [FlagBank; FLAG_BANK_COUNT],
-    /// BioCard-like state bytes (0 stage, 1 room, 2 player flag).
+    /// BioCard-like state bytes, indexed by their offset from BioCard 0x200
+    /// (`0` stage, `1` room, `2` room camera id, `5` menu choice, `6` selected
+    /// item, `7` total held, `18`/`19` used/picked item, ...).
     pub state_bytes: [u8; STATE_BYTES],
     /// Fading-state words.
     pub state_words: [u16; STATE_WORDS],
@@ -533,6 +585,14 @@ pub struct GameState {
     pub last_used_item: Option<u8>,
     /// The item currently equipped.
     pub equipped: Option<u8>,
+    /// The item the inventory cursor last selected.
+    pub selected_item: Option<u8>,
+    /// The player's maximum health (`max_health >> 2` drives the EKG colour).
+    pub max_health: i16,
+    /// Health status flags (bit `0x20`/`0x02` poison).
+    pub health_status: u8,
+    /// The 48 item-box slots.
+    pub item_box: [InventoryItem; ITEM_BOX_SLOTS],
     /// A room change requested by a door.
     pub transition: Option<RoomTransition>,
     /// The record that requested the pending [`GameState::transition`], so the
@@ -584,6 +644,10 @@ impl Default for GameState {
             last_picked_item: None,
             last_used_item: None,
             equipped: None,
+            selected_item: None,
+            max_health: 0,
+            health_status: 0,
+            item_box: [InventoryItem::default(); ITEM_BOX_SLOTS],
             transition: None,
             transition_door: None,
             mask_toggles: Vec::new(),
@@ -606,8 +670,16 @@ impl GameState {
         };
         state.state_bytes[0] = id.stage;
         state.state_bytes[1] = id.room;
-        state.state_bytes[2] = id.player_flag;
+        state.set_camera_cut(0);
+        state.state_bytes[STATE_BYTE_CHARACTER as usize] = id.player_flag & 1;
         state
+    }
+
+    /// Store the current room camera id in both the camera state and the
+    /// BioCard byte the scripts read with `setb`/`cmpb`.
+    pub fn set_camera_cut(&mut self, cut: usize) {
+        self.camera.current_cut = cut;
+        self.set_byte(STATE_BYTE_ROOM_CAMERA, cut as u8);
     }
 
     /// The `ck` condition: true when the selected bit differs from `expected`.
@@ -648,7 +720,13 @@ impl GameState {
     }
 
     /// Write one `setb` state byte. Out-of-range indices are dropped.
+    ///
+    /// Index [`STATE_BYTE_ROOM_CAMERA`] is the live camera id, so writing it
+    /// also moves [`GameState::camera`].
     pub fn set_byte(&mut self, index: u8, value: u8) {
+        if index == STATE_BYTE_ROOM_CAMERA {
+            self.camera.current_cut = usize::from(value);
+        }
         if let Some(slot) = self.state_bytes.get_mut(usize::from(index)) {
             *slot = value;
         }
@@ -1059,7 +1137,7 @@ impl GameState {
         self.id = id;
         self.state_bytes[0] = id.stage;
         self.state_bytes[1] = id.room;
-        self.state_bytes[2] = id.player_flag;
+        self.set_camera_cut(0);
         self.room_actions = [None; ROOM_ACTION_SLOTS];
         self.doors = [None; ROOM_ACTION_SLOTS];
         self.clear_stairs();
@@ -1077,13 +1155,78 @@ impl GameState {
         self.pending_events.clear();
     }
 
-    /// Add `quantity` of `item`, merging into an existing stack.
-    pub fn add_item(&mut self, item: u8, quantity: u8) {
-        if let Some(stack) = self.inventory.iter_mut().find(|stack| stack.id == item) {
-            stack.quantity = stack.quantity.saturating_add(quantity);
+    /// The number of inventory slots the current character uses.
+    pub fn inventory_capacity(&self) -> usize {
+        if self.id.player_flag & 1 == 1 {
+            INVENTORY_SLOTS_JILL
         } else {
-            self.inventory.push(InventoryItem { id: item, quantity });
+            INVENTORY_SLOTS_CHRIS
         }
+    }
+
+    /// Add `quantity` of `item` with the original's merge rules.
+    ///
+    /// Stackable items (the ammunition range and the ink ribbon) merge into an
+    /// existing stack; the ribbon is always taken three at a time. A merge that
+    /// would pass [`items::ITEM_QUANTITY_CAP`] caps the stack and spills the
+    /// remainder into a new slot, exactly like the original's pickup path.
+    pub fn add_item(&mut self, item: u8, quantity: u8) {
+        let quantity = if item == items::ITEM_INK_RIBBONS {
+            3
+        } else {
+            quantity
+        };
+        let capacity = self.inventory_capacity();
+        if items::is_stackable(item)
+            && let Some(index) = self.inventory.iter().position(|stack| stack.id == item)
+        {
+            let merged = u16::from(self.inventory[index].quantity) + u16::from(quantity);
+            if merged <= u16::from(items::ITEM_QUANTITY_CAP) {
+                self.inventory[index].quantity = merged as u8;
+                self.rebuild_slots();
+                return;
+            }
+            if self.inventory.len() < capacity {
+                self.inventory[index].quantity = items::ITEM_QUANTITY_CAP;
+                let spill = (merged as u8).wrapping_add(6);
+                self.inventory.push(InventoryItem {
+                    id: item,
+                    quantity: spill,
+                });
+                self.rebuild_slots();
+                return;
+            }
+        }
+        self.inventory.push(InventoryItem { id: item, quantity });
+        self.rebuild_slots();
+    }
+
+    /// Rebuild the inventory slot bookkeeping after an add, remove or
+    /// rearrange: drop empty stacks and refresh the total-held and selected
+    /// state bytes the scripts read.
+    pub fn rebuild_slots(&mut self) {
+        self.inventory.retain(|stack| stack.id != 0);
+        self.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)] = self.inventory.len() as u8;
+        self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)] = self.selected_item.unwrap_or(0);
+    }
+
+    /// Select the inventory item under the cursor.
+    pub fn select_item(&mut self, item: Option<u8>) {
+        self.selected_item = item;
+        self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)] = item.unwrap_or(0);
+    }
+
+    /// Record an item use: the `testitem`/`usedItemId` byte and the typed
+    /// field the SCD conditions read.
+    pub fn record_used_item(&mut self, item: u8) {
+        self.last_used_item = Some(item);
+        self.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = item;
+    }
+
+    /// Equip (or clear) an item.
+    pub fn set_equipped(&mut self, item: Option<u8>) {
+        self.equipped = item;
+        self.state_bytes[usize::from(STATE_BYTE_EQUIPPED)] = item.unwrap_or(0);
     }
 
     /// Whether at least one `item` is held.
@@ -1114,6 +1257,7 @@ impl GameState {
         self.inventory[index].quantity -= 1;
         if self.inventory[index].quantity == 0 {
             self.inventory.remove(index);
+            self.rebuild_slots();
         }
         true
     }
@@ -1288,6 +1432,15 @@ impl GameState {
             if !room_action.contains(probe[0], probe[2]) {
                 continue;
             }
+            // Record which entry the probe hit: the forward reach point writes
+            // `fwdPosActionId`, the entity-position probe `entPosActionId`.
+            // Scripts read both with `cmpb` 16/17.
+            let hit = (slot as u8).saturating_add(1);
+            if flags & 0x40 != 0 {
+                self.state_bytes[usize::from(STATE_BYTE_ENT_ACTION)] = hit;
+            } else {
+                self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = hit;
+            }
             match room_action.kind {
                 RoomActionKind::Door => {
                     self.try_door(room_action.slot);
@@ -1383,6 +1536,8 @@ impl GameState {
         let item = action.item_id();
         self.add_item(item, action.item_quantity().max(1));
         self.last_picked_item = Some(item);
+        // BioCard 0x213 (`pickedItemId`) is what the scripts test with cmpb 19.
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = item;
         self.item_events.push(item);
         // Remember the pickup in the room items flag bank so the item does not
         // come back when the room is re-entered.
@@ -1672,14 +1827,18 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_camera(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x09 => {
-                self.state.camera.saved_cut = Some(self.state.camera.current_cut);
-                self.state.camera.current_cut = usize::from(operand_u8(operands, 0));
+                let cut = self.state.camera.current_cut;
+                self.state.camera.saved_cut = Some(cut);
+                self.state.set_byte(STATE_BYTE_CUT, cut as u8);
+                self.state
+                    .set_camera_cut(usize::from(operand_u8(operands, 0)));
                 self.state.camera.locked = true;
                 StepResult::Continue
             }
             0x0A => {
                 if let Some(saved) = self.state.camera.saved_cut.take() {
-                    self.state.camera.current_cut = saved;
+                    self.state.set_camera_cut(saved);
+                    self.state.set_byte(STATE_BYTE_CUT, saved as u8);
                 }
                 self.state.camera.locked = false;
                 StepResult::Continue
@@ -2190,10 +2349,19 @@ mod tests {
         let state = game();
         assert_eq!(state.state_bytes[0], 1);
         assert_eq!(state.state_bytes[1], 0);
-        assert_eq!(state.state_bytes[2], 1);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 0);
         assert_eq!(state.state_bytes[3], 0);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_CHARACTER)], 1);
         assert_eq!(state.camera, CameraState::default());
         assert_eq!(state.frame, 0);
+    }
+
+    #[test]
+    fn setb_2_moves_the_camera() {
+        let mut state = game();
+        state.set_byte(STATE_BYTE_ROOM_CAMERA, 4);
+        assert_eq!(state.camera.current_cut, 4);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 4);
     }
 
     #[test]
@@ -3129,8 +3297,9 @@ mod tests {
     #[test]
     fn item_pickup_stacks_and_consumes_the_action() {
         let mut state = game();
-        state.room_actions[0] = Some(item_action(0, 10, 3, [0, 0, 100, 100]));
-        state.room_actions[1] = Some(item_action(1, 10, 2, [0, 0, 100, 100]));
+        // 0x0B (handgun clip) is in the stackable ammunition range.
+        state.room_actions[0] = Some(item_action(0, 0x0B, 3, [0, 0, 100, 100]));
+        state.room_actions[1] = Some(item_action(1, 0x0B, 2, [0, 0, 100, 100]));
 
         state.interact([-550, 0, 50], 0, false);
         assert!(
@@ -3144,22 +3313,22 @@ mod tests {
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
-                id: 10,
+                id: 0x0B,
                 quantity: 3
             }]
         );
-        assert_eq!(state.last_picked_item, Some(10));
-        assert_eq!(state.item_events, vec![10]);
+        assert_eq!(state.last_picked_item, Some(0x0B));
+        assert_eq!(state.item_events, vec![0x0B]);
 
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
-                id: 10,
+                id: 0x0B,
                 quantity: 5
             }]
         );
-        assert_eq!(state.item_events, vec![10, 10]);
+        assert_eq!(state.item_events, vec![0x0B, 0x0B]);
         assert!(state.room_actions.iter().all(Option::is_none));
 
         state.interact([-550, 0, 50], 0, true);
@@ -3605,13 +3774,134 @@ mod tests {
         assert_eq!(state.id, next);
         assert_eq!(state.state_bytes[0], 2);
         assert_eq!(state.state_bytes[1], 3);
-        assert_eq!(state.state_bytes[2], 1);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 0);
         assert_eq!(state.inventory[0].quantity, 2);
         assert!(state.flags[0].bit(1));
         assert!(state.room_actions.iter().all(Option::is_none));
         assert!(state.doors.iter().all(Option::is_none));
         assert_eq!(state.message.id, None);
         assert_eq!(state.camera.current_cut, 0);
+    }
+
+    #[test]
+    fn add_item_merges_stackables_and_forces_ribbons_to_three() {
+        let mut state = game();
+        state.add_item(0x0B, 10);
+        state.add_item(0x0B, 4);
+        assert_eq!(
+            state.inventory,
+            vec![InventoryItem {
+                id: 0x0B,
+                quantity: 14
+            }]
+        );
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 1);
+
+        state.add_item(0x2F, 1);
+        assert_eq!(state.item_count(0x2F), 3, "ribbons are always taken three");
+        state.add_item(0x2F, 2);
+        assert_eq!(state.item_count(0x2F), 6);
+
+        state.add_item(1, 1);
+        state.add_item(1, 1);
+        assert_eq!(state.item_count(1), 2, "non-stackables take new slots");
+    }
+
+    #[test]
+    fn add_item_caps_a_merge_and_spills_the_remainder() {
+        let mut state = game();
+        state.add_item(0x0B, 0xFA);
+        state.add_item(0x0B, 5);
+        assert_eq!(state.inventory[0].quantity, 0xFA);
+        assert_eq!(
+            state.inventory[1],
+            InventoryItem {
+                id: 0x0B,
+                quantity: 5
+            }
+        );
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 2);
+    }
+
+    #[test]
+    fn inventory_capacity_follows_the_character() {
+        let chris = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        assert_eq!(chris.inventory_capacity(), INVENTORY_SLOTS_CHRIS);
+        let jill = game();
+        assert_eq!(jill.inventory_capacity(), INVENTORY_SLOTS_JILL);
+    }
+
+    #[test]
+    fn item_writers_update_their_state_bytes_and_conditions() {
+        let mut state = game();
+        state.select_item(Some(0x42));
+        state.record_used_item(0x42);
+        state.set_equipped(Some(0x42));
+        assert_eq!(state.selected_item, Some(0x42));
+        assert_eq!(state.last_used_item, Some(0x42));
+        assert_eq!(state.equipped, Some(0x42));
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
+            0x42
+        );
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)], 0x42);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_EQUIPPED)], 0x42);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_flow(op(0x10), &operands(&[0x42])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.on_flow(op(0x1D), &operands(&[0x42])),
+                StepResult::Continue
+            );
+        }
+
+        state.select_item(None);
+        state.set_equipped(None);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)], 0);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_EQUIPPED)], 0);
+        assert_eq!(state.selected_item, None);
+        assert_eq!(state.equipped, None);
+    }
+
+    #[test]
+    fn pickup_writes_the_picked_item_and_total_state_bytes() {
+        let mut state = game();
+        let mut action = item_action(0, 0x42, 2, [0, 0, 100, 100]);
+        action.room_items_flag = 7;
+        state.room_actions[0] = Some(action);
+        state.interact([-550, 0, 50], 0, true);
+        assert_eq!(state.last_picked_item, Some(0x42));
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0x42);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 1);
+        assert!(state.flag_test(7, 7, false));
+    }
+
+    #[test]
+    fn cutnext_and_cutcurr_mirror_the_camera_bytes() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_camera(op(0x09), &operands(&[3])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.state().state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)],
+                3
+            );
+            assert_eq!(host.state().state_bytes[usize::from(STATE_BYTE_CUT)], 0);
+            assert_eq!(
+                host.on_camera(op(0x0A), &operands(&[])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.state().state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)],
+                0
+            );
+        }
     }
 
     #[test]

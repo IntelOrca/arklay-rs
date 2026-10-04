@@ -1836,7 +1836,12 @@ mod tests {
             let mut host = game::ScdGameHost::new(&mut game);
             command_vm.run_init(&mut host);
         }
-        assert_eq!(game.state_bytes[2], 1, "player flag is untouched");
+        assert_eq!(game.state_bytes[2], 0, "the camera id starts at zero");
+        assert_eq!(
+            game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER)],
+            1,
+            "the character byte carries the player flag"
+        );
         assert_eq!(game.bgm.state, 0x09, "init should write the BGM state");
         assert!(!game.camera.locked);
 
@@ -2389,7 +2394,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
-    fn real_room_1000_capture_uses_the_mask_layer() {
+    fn real_room_1000_capture_and_mask_layer() {
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -2398,15 +2403,26 @@ mod tests {
         let dir = TempDir::new();
         let capture_path = dir.0.join("room1000_masked.bmp");
         run(Path::new(&path), id, Some(&capture_path)).unwrap();
-        let masked = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
+        let captured = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
 
-        // Rebuild the same pose without the mask layer through the render API.
+        // The capture path is deterministic.
+        let repeat_path = dir.0.join("room1000_masked2.bmp");
+        run(Path::new(&path), id, Some(&repeat_path)).unwrap();
+        let repeat = bmp::decode(&std::fs::read(&repeat_path).unwrap()).unwrap();
+        assert_eq!(captured.rgba, repeat.rgba, "two captures differ");
+
+        // Rebuild the same pose through the render API. The init script writes
+        // state byte 2 (`roomCameraId`), which moves the camera to cut 2; that
+        // cut has no mask sprites, so compare a masked cut's render instead.
         let mut loaded = load_room(&pack, id).unwrap();
         let mut game = game::GameState::new(id, &loaded.room);
         run_room_init(&loaded, &mut game);
         apply_camera(&mut loaded.room, &mut game, None);
+        assert_eq!(loaded.room.current_cut, 2, "init selects camera 2");
+        assert!(loaded.room.cuts[2].masks.is_empty());
+
         let player_state = player::spawn(id, &loaded.room);
-        let cut = &loaded.room.cuts[loaded.room.current_cut];
+        let cut = &loaded.room.cuts[0];
         assert!(!cut.masks.is_empty(), "room 1000 cut 0 has mask sprites");
         let assets = loaded.player_assets.as_ref().expect("player assets");
         let (keyframes, clips) = match player_state.clip_source {
@@ -2423,6 +2439,23 @@ mod tests {
         };
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
+        let page = bmp::decode_mask(pack.read(&id.roommask_entry(0)).unwrap()).unwrap();
+        let layer = MaskLayer {
+            room: id,
+            camera: 0,
+            cut,
+            page: &page,
+            active: cut.mask_active,
+        };
+        let mut masked = Framebuffer::new();
+        render::draw_gameplay_scene(
+            &mut masked,
+            cut.background.as_ref(),
+            Some(&player),
+            &camera,
+            &lighting,
+            Some(&layer),
+        );
         let mut plain = Framebuffer::new();
         render::draw_gameplay_scene(
             &mut plain,
@@ -2445,12 +2478,6 @@ mod tests {
             changed > 500,
             "the mask layer repainted only {changed} pixels"
         );
-
-        // The capture path is deterministic.
-        let repeat_path = dir.0.join("room1000_masked2.bmp");
-        run(Path::new(&path), id, Some(&repeat_path)).unwrap();
-        let repeat = bmp::decode(&std::fs::read(&repeat_path).unwrap()).unwrap();
-        assert_eq!(masked.rgba, repeat.rgba, "two captures differ");
     }
 
     #[test]
