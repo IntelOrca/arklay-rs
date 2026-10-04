@@ -27,6 +27,15 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
     player: u8,
 
+    /// UI screen to boot straight into instead of a room, e.g. `font`
+    #[arg(
+        long,
+        value_name = "SCREEN",
+        requires = "pack",
+        conflicts_with = "room"
+    )]
+    ui: Option<String>,
+
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
@@ -196,8 +205,11 @@ fn main() -> Result<()> {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
+            if let Some(screen) = cli.ui {
+                return arklay::engine::run_ui(&pack, &screen, cli.capture.as_deref());
+            }
             let Some(room) = cli.room else {
-                bail!("--room is required when launching a pack");
+                bail!("--room is required when launching a pack (or use --ui)");
             };
             let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
             arklay::engine::run(&pack, id, cli.capture.as_deref())

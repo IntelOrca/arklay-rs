@@ -38,6 +38,7 @@ use crate::audio::{self, Mixer, MusicPlayer};
 use crate::bmp;
 use crate::door;
 use crate::emd;
+use crate::font;
 use crate::game;
 use crate::mask;
 use crate::model::Emd;
@@ -49,6 +50,7 @@ use crate::render::{self, Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh};
 use crate::scd;
 use crate::sfx;
 use crate::state::{Image, RoomId, RoomState};
+use crate::tim;
 use crate::transition::{self, DoorStepper};
 
 const WIDTH: i32 = 320;
@@ -234,6 +236,196 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         }
     }
 }
+
+/// Boot one UI screen directly instead of a room.
+///
+/// The only screen for now is `font`: the decoded font sheet with a sample of
+/// plain, extended and tinted text. `capture` renders one deterministic frame
+/// offscreen; otherwise the window stays up until the user quits.
+pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
+    match screen {
+        "font" => run_font_ui(pack, capture),
+        other => bail!("unknown --ui screen `{other}`; expected `font`"),
+    }
+}
+
+/// The `--ui font` screen.
+fn run_font_ui(pack_path: &Path, capture: Option<&Path>) -> Result<()> {
+    let pack = Pack::open(pack_path)?;
+    let bytes = pack
+        .read("font/font.tim")
+        .context("the pack has no font/font.tim (re-run convert-game)")?;
+    let texture = tim::decode_4bpp(bytes).context("failed to decode font/font.tim")?;
+    let font = font::Font::new(texture);
+
+    if capture.is_some() {
+        unsafe {
+            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
+            SDL_SetHint(SDL_HINT_RENDER_DRIVER, c"software".as_ptr());
+        }
+    }
+
+    unsafe { SDL_SetMainReady() };
+    if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
+        bail!("SDL_Init failed: {}", sdl_error());
+    }
+    let _sdl = SdlHandle;
+
+    let title = CString::new("Arklay - font").context("window title contains a NUL byte")?;
+    let window = unsafe {
+        SDL_CreateWindow(
+            title.as_ptr(),
+            WINDOW_WIDTH,
+            WINDOW_HEIGHT,
+            SDL_WindowFlags::default(),
+        )
+    };
+    if window.is_null() {
+        bail!("SDL_CreateWindow failed: {}", sdl_error());
+    }
+    let _window = WindowHandle(window);
+
+    let renderer = unsafe { SDL_CreateRenderer(window, std::ptr::null()) };
+    if renderer.is_null() {
+        bail!("SDL_CreateRenderer failed: {}", sdl_error());
+    }
+    let _renderer = RendererHandle(renderer);
+    let _ = unsafe { SDL_SetRenderVSync(renderer, 1) };
+
+    let texture = unsafe {
+        SDL_CreateTexture(
+            renderer,
+            SDL_PIXELFORMAT_ABGR8888,
+            SDL_TEXTUREACCESS_STREAMING,
+            WIDTH,
+            HEIGHT,
+        )
+    };
+    if texture.is_null() {
+        bail!("SDL_CreateTexture failed: {}", sdl_error());
+    }
+    let _texture = TextureHandle(texture);
+
+    if !unsafe { SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE) } {
+        bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
+    }
+    if !unsafe { SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST) } {
+        bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
+    }
+    if !unsafe { SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255) } {
+        bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
+    }
+
+    let mut framebuffer = Framebuffer::new();
+    draw_font_screen(&mut framebuffer, &font);
+
+    if let Some(capture_path) = capture {
+        present(renderer, texture, &framebuffer)?;
+        return capture_frame(renderer, capture_path);
+    }
+
+    let mut event = SDL_Event::default();
+    let mut cut_delta = 0i32;
+    loop {
+        if poll_events(&mut event, &mut cut_delta) {
+            return Ok(());
+        }
+        present(renderer, texture, &framebuffer)?;
+        if !unsafe { SDL_RenderPresent(renderer) } {
+            bail!("SDL_RenderPresent failed: {}", sdl_error());
+        }
+    }
+}
+
+/// The `--ui font` frame: the decoded sheet scaled into the top band, then one
+/// sample line per tint and the extended glyph pages over a dark background.
+fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
+    framebuffer.clear();
+    for pixel in framebuffer.rgba.as_chunks_mut::<4>().0 {
+        *pixel = [24, 24, 24, 255];
+    }
+    framebuffer.draw_indexed_sprite(
+        &font.texture,
+        [0, 0, font.texture.width as i32, font.texture.height as i32],
+        [0, 0, WIDTH, 72],
+        0,
+        2,
+        font::Tint::White,
+    );
+
+    let margin = font.metrics.left_margin;
+    for (line, tint) in [
+        font::Tint::White,
+        font::Tint::Green,
+        font::Tint::Red,
+        font::Tint::Grey,
+        font::Tint::Yellow,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        font.draw_text(
+            framebuffer,
+            margin,
+            76 + line as i32 * 16,
+            tint,
+            2,
+            SAMPLE_TEXT,
+        );
+    }
+    font.draw_text(
+        framebuffer,
+        margin,
+        156,
+        font::Tint::White,
+        2,
+        SAMPLE_SYMBOLS,
+    );
+    font.draw_text(
+        framebuffer,
+        margin,
+        172,
+        font::Tint::White,
+        2,
+        SAMPLE_KANJI_TOP,
+    );
+    font.draw_text(
+        framebuffer,
+        margin,
+        188,
+        font::Tint::White,
+        2,
+        SAMPLE_KANJI_BOTTOM,
+    );
+    font.draw_text(
+        framebuffer,
+        margin,
+        204,
+        font::Tint::White,
+        2,
+        SAMPLE_SPACING,
+    );
+    font.draw_text(framebuffer, margin, 222, font::Tint::White, 15, SAMPLE_TEXT);
+}
+
+/// Digits, letters, the remapped parentheses and an end byte.
+const SAMPLE_TEXT: &[u8] = &[
+    0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x00, 0x1D, 0x1E, 0x1F, 0x20, 0x21,
+    0x22, 0x23, 0x24, 0x00, 0x28, 0x00, 0x29, 0x01,
+];
+/// The first twelve `0xF8` left-page glyphs, the 14x14 kana past the plain grid.
+const SAMPLE_SYMBOLS: &[u8] = &[
+    0xF8, 0, 0xF8, 1, 0xF8, 2, 0xF8, 3, 0xF8, 4, 0xF8, 5, 0xF8, 6, 0xF8, 7, 0xF8, 8, 0xF8, 9, 0xF8,
+    10, 0xF8, 11, 0x01,
+];
+/// Right-page rows at the top (`0xF9`).
+const SAMPLE_KANJI_TOP: &[u8] = &[0xF9, 0, 0xF9, 18, 0xF9, 36, 0xF9, 54, 0xF9, 72, 0x01];
+/// Right-page rows beyond row 13 (`0xFA`).
+const SAMPLE_KANJI_BOTTOM: &[u8] = &[0xFA, 0, 0xFA, 18, 0xFA, 36, 0xFA, 54, 0x01];
+/// Half advances and no-op pad bytes.
+const SAMPLE_SPACING: &[u8] = &[
+    0x0C, 0xFF, 0x0C, 0xFF, 0x0C, 0x00, 0x0D, 0xFB, 0xFB, 0x0E, 0x01,
+];
 
 /// How a phase ended.
 enum Flow {
@@ -2521,5 +2713,80 @@ mod tests {
         // The engine's cache resolves the pack entry the mixer would play.
         let mut cache = SfxCache::default();
         assert!(cache.load(&pack, "ft_wdA").is_some());
+    }
+
+    /// A pack carrying `font/font.tim`: the real pack when it has the entry,
+    /// otherwise a one-entry pack built from the installation's raw sheet.
+    fn font_pack(path: &str, dir: &TempDir) -> Option<std::path::PathBuf> {
+        let pack = Pack::open(Path::new(path)).unwrap();
+        if pack.contains("font/font.tim") {
+            return Some(std::path::PathBuf::from(path));
+        }
+        let root = std::env::var("ARKLAY_RE1_ROOT").ok()?;
+        let font = std::fs::read(std::path::PathBuf::from(root).join("JPN/DATA/FONT.TIM")).ok()?;
+        let mini = dir.0.join("font.akpak");
+        let mut writer = PackWriter::new();
+        writer.add("font/font.tim", font).unwrap();
+        writer.write(&mini).unwrap();
+        Some(mini)
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_font_string_render_is_stable() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let Some(font_pack) = font_pack(&path, &dir) else {
+            eprintln!("warning: neither the pack nor ARKLAY_RE1_ROOT carries FONT.TIM");
+            return;
+        };
+        let pack = Pack::open(&font_pack).unwrap();
+        let font = font::Font::new(tim::decode_4bpp(pack.read("font/font.tim").unwrap()).unwrap());
+        assert_eq!((font.texture.width, font.texture.height), (768, 256));
+        assert_eq!(font.metrics, font::FontMetrics::from_sheet_width(768));
+
+        let mut first = Framebuffer::new();
+        draw_font_screen(&mut first, &font);
+        let mut second = Framebuffer::new();
+        draw_font_screen(&mut second, &font);
+        assert_eq!(fnv1a(&first.rgba), fnv1a(&second.rgba));
+        let opaque = first
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[..3] != [24, 24, 24] && pixel[3] != 0)
+            .count();
+        assert!(opaque > 1000, "the font sample drew only {opaque} pixels");
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_font_capture_is_deterministic() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let Some(font_pack) = font_pack(&path, &dir) else {
+            eprintln!("warning: neither the pack nor ARKLAY_RE1_ROOT carries FONT.TIM");
+            return;
+        };
+        let first_path = dir.0.join("font_a.bmp");
+        let second_path = dir.0.join("font_b.bmp");
+
+        run_ui(&font_pack, "font", Some(&first_path)).unwrap();
+        run_ui(&font_pack, "font", Some(&second_path)).unwrap();
+
+        let first = std::fs::read(&first_path).unwrap();
+        let second = std::fs::read(&second_path).unwrap();
+        assert_eq!(first, second, "two font captures differ");
+        let decoded = bmp::decode(&first).unwrap();
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (WIDTH as u32, HEIGHT as u32)
+        );
+        assert!(non_black_pixels(&decoded) > 5000);
     }
 }

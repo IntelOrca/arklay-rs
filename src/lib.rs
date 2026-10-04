@@ -7,6 +7,7 @@ pub mod convert;
 pub mod door;
 pub mod emd;
 pub mod engine;
+pub mod font;
 pub mod game;
 pub mod items;
 pub mod ivm;

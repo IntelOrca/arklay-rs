@@ -4,8 +4,9 @@
 //! and [`crate::tim`] produce them and the renderer consumes them. No file
 //! format details leak into this module.
 
-/// Number of palette entries in one row of a decoded 8bpp texture.
-const PALETTE_ROW_LEN: usize = 256;
+/// Number of palette entries in one row of a decoded texture; every decoder
+/// normalizes its CLUT rows to this stride.
+pub const PALETTE_ROW_LEN: usize = 256;
 
 /// One textured, Gouraud-shaded triangle packet from a TMD primitive list.
 ///

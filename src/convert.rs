@@ -62,6 +62,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         players,
         roommask,
         data,
+        font,
         mut warnings,
     } = build_plan(root)?;
     let exe = match exe {
@@ -151,6 +152,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
+    let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
@@ -168,6 +170,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     println!("se: {se_count} entries, {se_bytes} bytes");
     println!("door: {door_count} entries, {door_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
+    println!("font: {font_count} entries, {font_bytes} bytes");
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
     println!("item: {item_count} entries, {item_bytes} bytes");
     println!("data: {data_count} entries, {data_bytes} bytes");
@@ -198,6 +201,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         + ui_count
         + item_count
         + data_count
+        + font_count
         + text_count
         + ivm_count
         + file_count;
@@ -1186,6 +1190,27 @@ fn copy_file_art(
     Ok((count, bytes))
 }
 
+/// Add `DATA/FONT.TIM` raw as `font/font.tim`; the JPN sheet is 4bpp and
+/// decoded by the engine, so no conversion is needed.
+fn copy_font(
+    font: Option<&Path>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(font) = font else {
+        return Ok((0, 0));
+    };
+    let data = fs::read(font).with_context(|| format!("failed to read {}", font.display()))?;
+    let bytes = data.len();
+    writer
+        .add("font/font.tim", data)
+        .context("failed to add font/font.tim")?;
+    progress.begin("font", 1, "files");
+    progress.advance("font/font.tim");
+    progress.end_phase();
+    Ok((1, bytes))
+}
+
 /// Stage, sound, enemy-model, player, room-mask, door-art, data and item-view
 /// directory roots discovered under the conversion root.
 #[derive(Debug)]
@@ -1350,6 +1375,8 @@ struct Plan {
     roommask: Vec<RoomMask>,
     /// Resolved `DATA` UI, item and save-prefix assets.
     data: DataPlan,
+    /// `DATA/FONT.TIM` to pack raw as `font/font.tim`.
+    font: Option<PathBuf>,
     /// Non-fatal problems found while resolving optional inputs.
     warnings: Vec<String>,
 }
@@ -1366,6 +1393,19 @@ fn build_plan(root: &Path) -> Result<Plan> {
         data,
         item_m2,
     } = discover_layout(root)?;
+    // The font is optional and only diagnosable when the install actually has
+    // a DATA directory; a missing DATA root is not reported so partial trees
+    // stay warning-free.
+    let (font, font_warning) = match data.as_deref() {
+        Some(dir) => match index_dir(dir)?.get("font.tim") {
+            Some(path) => (Some(path.clone()), None),
+            None => (
+                None,
+                Some(format!("missing DATA/FONT.TIM in {}", dir.display())),
+            ),
+        },
+        None => (None, None),
+    };
     let data = resolve_data_assets(data.as_deref())?;
     let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
 
@@ -1476,6 +1516,9 @@ fn build_plan(root: &Path) -> Result<Plan> {
     }
 
     warnings.extend(data.warnings.iter().cloned());
+    if let Some(font_warning) = font_warning {
+        warnings.push(font_warning);
+    }
     Ok(Plan {
         rooms: rooms.into_values().collect(),
         sound,
@@ -1484,6 +1527,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
         roommask,
         data,
+        font,
         warnings,
     })
 }
@@ -2933,5 +2977,25 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    fn packs_font_tim_raw() {
+        let root = TempDir::new("font-pack");
+        make_stage_dirs(&root.path);
+        let data = root.path.join("DaTa");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("FONT.TIM"), b"raw-font-sheet").unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.font.as_deref(), Some(data.join("FONT.TIM").as_path()));
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new();
+        let (count, bytes) = copy_font(plan.font.as_deref(), &mut writer, &mut progress).unwrap();
+
+        assert_eq!((count, bytes), (1, 14));
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.read("font/font.tim").unwrap(), b"raw-font-sheet");
     }
 }

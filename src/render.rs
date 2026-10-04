@@ -63,6 +63,126 @@ impl Default for Framebuffer {
     }
 }
 
+/// The original's pending-sprite ordering-table depth of the default text
+/// brightness: `brightness * 16 + 0x1C2`.
+pub const PENDING_SPRITE_DEPTH_BASE: u32 = 0x1C2;
+
+/// The original's text tint table: the palette row (`clutY - 0x1E0`) picks a
+/// colour multiplier over the sheet's grey ramp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tint {
+    White,
+    Green,
+    Red,
+    Grey,
+    Yellow,
+}
+
+impl Tint {
+    /// The tint a font CLUT row selects. Row 8 is the shadow row and behaves
+    /// as green; anything outside 0..=3 is yellow.
+    pub fn from_clut_row(row: i32) -> Self {
+        match row {
+            0 => Self::White,
+            1 | 8 => Self::Green,
+            2 => Self::Red,
+            3 => Self::Grey,
+            _ => Self::Yellow,
+        }
+    }
+
+    /// The tint's per-channel multiplier.
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            Self::White => [255, 255, 255],
+            Self::Green => [0, 255, 0],
+            Self::Red => [255, 0, 0],
+            Self::Grey => [204, 204, 204],
+            Self::Yellow => [255, 255, 0],
+        }
+    }
+}
+
+/// Where a queued 2D sprite samples its pixels.
+#[derive(Debug, Clone, Copy)]
+pub enum SpriteSource<'a> {
+    /// An indexed texture with one palette row and a tint multiplier.
+    Indexed {
+        texture: &'a Texture8,
+        clut_row: usize,
+        tint: Tint,
+    },
+    /// A direct RGBA image.
+    Rgba(&'a Image),
+}
+
+/// One pending 2D sprite, submitted to [`Framebuffer::draw_sprites`].
+///
+/// Both rectangles are `[x, y, width, height]`: `src` in texture pixels and
+/// `dst` in framebuffer pixels, so unequal sizes scale with nearest sampling.
+/// [`SpriteDraw::indexed`] and [`SpriteDraw::rgba`] derive `depth` from the
+/// brightness the way the original's pending-sprite queue does.
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteDraw<'a> {
+    /// Ordering-table depth; higher depths are farther behind and paint first.
+    pub depth: u32,
+    pub source: SpriteSource<'a>,
+    pub src: [i32; 4],
+    pub dst: [i32; 4],
+    /// Brightness in the original's 0..=30 range; 0 and 2 are both full.
+    pub brightness: u8,
+}
+
+impl<'a> SpriteDraw<'a> {
+    /// A queued indexed sprite.
+    pub fn indexed(
+        texture: &'a Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+    ) -> Self {
+        Self {
+            depth: pending_sprite_depth(brightness),
+            source: SpriteSource::Indexed {
+                texture,
+                clut_row,
+                tint,
+            },
+            src,
+            dst,
+            brightness,
+        }
+    }
+
+    /// A queued RGBA sprite.
+    pub fn rgba(image: &'a Image, src: [i32; 4], dst: [i32; 4], brightness: u8) -> Self {
+        Self {
+            depth: pending_sprite_depth(brightness),
+            source: SpriteSource::Rgba(image),
+            src,
+            dst,
+            brightness,
+        }
+    }
+}
+
+/// The original's pending-sprite OT depth for a brightness.
+pub fn pending_sprite_depth(brightness: u8) -> u32 {
+    u32::from(brightness) * 16 + PENDING_SPRITE_DEPTH_BASE
+}
+
+/// The original's brightness scale: 0 and 2 are the same full-brightness
+/// render, anything else is `brightness * 255 / 30` clamped to 255.
+fn brightness_scale(brightness: u8) -> u32 {
+    if brightness == 0 || brightness == 2 {
+        255
+    } else {
+        (u32::from(brightness) * 255 / 30).min(255)
+    }
+}
+
 impl Framebuffer {
     /// A black 320x240 framebuffer.
     pub fn new() -> Self {
@@ -96,6 +216,160 @@ impl Framebuffer {
             let target_start = row * target_stride;
             if let Some(target) = self.rgba.get_mut(target_start..target_start + source.len()) {
                 target.copy_from_slice(source);
+            }
+        }
+    }
+
+    /// Draw one indexed sprite with nearest sampling, clipped to the
+    /// framebuffer.
+    ///
+    /// `src` and `dst` are `[x, y, width, height]`; the palette row and tint
+    /// mix the texel colour and `brightness` scales it. Palette index 0 and
+    /// zero-alpha palette entries are transparent. Out-of-range source pixels
+    /// leave the framebuffer untouched.
+    pub fn draw_indexed_sprite(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+    ) {
+        if texture.width == 0 || texture.height == 0 {
+            return;
+        }
+        let scale = brightness_scale(brightness);
+        let tint = tint.rgb();
+        self.draw_sprite(src, dst, |u, v| {
+            if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
+                return None;
+            }
+            let index = *texture
+                .indices
+                .get(v as usize * texture.width as usize + u as usize)?;
+            if index == 0 {
+                return None;
+            }
+            let texel = texture.palette(clut_row, index);
+            if texel[3] == 0 {
+                return None;
+            }
+            let mix = |channel: u8, tint: u8| {
+                (u32::from(channel) * u32::from(tint) / 255 * scale / 255) as u8
+            };
+            Some([
+                mix(texel[0], tint[0]),
+                mix(texel[1], tint[1]),
+                mix(texel[2], tint[2]),
+                255,
+            ])
+        });
+    }
+
+    /// Draw one RGBA sprite with nearest sampling, clipped to the framebuffer.
+    ///
+    /// Zero-alpha texels are transparent; `brightness` scales the colour
+    /// channels exactly like [`Framebuffer::draw_indexed_sprite`].
+    pub fn draw_rgba_sprite(
+        &mut self,
+        image: &Image,
+        src: [i32; 4],
+        dst: [i32; 4],
+        brightness: u8,
+    ) {
+        if image.width == 0 || image.height == 0 {
+            return;
+        }
+        let scale = brightness_scale(brightness);
+        self.draw_sprite(src, dst, |u, v| {
+            if u < 0 || v < 0 || u >= image.width as i32 || v >= image.height as i32 {
+                return None;
+            }
+            let offset = (v as usize * image.width as usize + u as usize) * 4;
+            let texel = image.rgba.get(offset..offset + 4)?;
+            if texel[3] == 0 {
+                return None;
+            }
+            Some([
+                (u32::from(texel[0]) * scale / 255) as u8,
+                (u32::from(texel[1]) * scale / 255) as u8,
+                (u32::from(texel[2]) * scale / 255) as u8,
+                texel[3],
+            ])
+        });
+    }
+
+    /// Draw a pending list far-to-near.
+    ///
+    /// The sort is stable on descending [`SpriteDraw::depth`] (higher depths
+    /// are farther behind and paint first), so equal-depth sprites keep their
+    /// submission order, exactly like the original's pending-sprite queue.
+    pub fn draw_sprites(&mut self, sprites: &mut [SpriteDraw<'_>]) {
+        sprites.sort_by_key(|sprite| std::cmp::Reverse(sprite.depth));
+        for sprite in sprites.iter() {
+            match sprite.source {
+                SpriteSource::Indexed {
+                    texture,
+                    clut_row,
+                    tint,
+                } => self.draw_indexed_sprite(
+                    texture,
+                    sprite.src,
+                    sprite.dst,
+                    clut_row,
+                    sprite.brightness,
+                    tint,
+                ),
+                SpriteSource::Rgba(image) => {
+                    self.draw_rgba_sprite(image, sprite.src, sprite.dst, sprite.brightness);
+                }
+            }
+        }
+    }
+
+    /// Visit the framebuffer-visible pixels of a sprite: clip `dst` and map
+    /// each destination pixel back to `src` with nearest sampling.
+    fn draw_sprite(
+        &mut self,
+        src: [i32; 4],
+        dst: [i32; 4],
+        mut sample: impl FnMut(i32, i32) -> Option<[u8; 4]>,
+    ) {
+        let [src_x, src_y, src_w, src_h] = src;
+        let [dst_x, dst_y, dst_w, dst_h] = dst;
+        if src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 {
+            return;
+        }
+        let start_x = dst_x.max(0);
+        let start_y = dst_y.max(0);
+        let end_x = dst_x.saturating_add(dst_w).min(self.width as i32);
+        let end_y = dst_y.saturating_add(dst_h).min(self.height as i32);
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+        let width = self.width as usize;
+        for y in start_y..end_y {
+            let Ok(tex_y) = i32::try_from(
+                i64::from(src_y)
+                    + (i64::from(y) - i64::from(dst_y)) * i64::from(src_h) / i64::from(dst_h),
+            ) else {
+                continue;
+            };
+            for x in start_x..end_x {
+                let Ok(tex_x) = i32::try_from(
+                    i64::from(src_x)
+                        + (i64::from(x) - i64::from(dst_x)) * i64::from(src_w) / i64::from(dst_w),
+                ) else {
+                    continue;
+                };
+                let Some(pixel) = sample(tex_x, tex_y) else {
+                    continue;
+                };
+                let offset = (y as usize * width + x as usize) * 4;
+                if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
+                    slot.copy_from_slice(&pixel);
+                }
             }
         }
     }
@@ -1555,5 +1829,145 @@ mod tests {
         // a hole and keeps it.
         assert_eq!(framebuffer_pixel(&framebuffer, 10, 10), [9, 8, 7, 255]);
         assert_eq!(framebuffer_pixel(&framebuffer, 11, 10), [7, 8, 9, 255]);
+    }
+
+    fn indexed_texture(indices: Vec<u8>, entries: &[[u8; 4]]) -> Texture8 {
+        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
+        for (index, entry) in entries.iter().enumerate() {
+            palettes[index] = *entry;
+        }
+        Texture8 {
+            width: 2,
+            height: 2,
+            indices,
+            palettes,
+        }
+    }
+
+    fn checkered_texture() -> Texture8 {
+        indexed_texture(
+            vec![0, 1, 2, 3],
+            &[
+                [0, 0, 0, 0],
+                [255, 0, 0, 255],
+                [0, 255, 0, 255],
+                [0, 0, 255, 255],
+            ],
+        )
+    }
+
+    #[test]
+    fn indexed_sprite_scales_with_nearest_sampling() {
+        let texture = checkered_texture();
+        let mut framebuffer = Framebuffer::new();
+
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 2, 2], [0, 0, 4, 4], 0, 2, Tint::White);
+
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 1, 0), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 2, 0), [255, 0, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 3, 1), [255, 0, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 2), [0, 255, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 2, 2), [0, 0, 255, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 4, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn indexed_sprite_clips_to_the_framebuffer() {
+        let texture = checkered_texture();
+        let mut framebuffer = Framebuffer::new();
+
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 2, 2], [-1, -1, 4, 4], 0, 2, Tint::White);
+
+        // The top-left texel is transparent, so the clipped screen corner
+        // stays untouched; the sprite ends at screen (3, 3) exclusive.
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 3, 3), [0, 0, 0, 0]);
+        // Everything outside the sprite is untouched too.
+        assert_eq!(framebuffer_pixel(&framebuffer, 4, 4), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn indexed_sprite_applies_tint_and_brightness() {
+        let texture = indexed_texture(vec![1], &[[0, 0, 0, 0], [255, 255, 255, 255]]);
+
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::Green);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 255, 0, 255]);
+
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 1, 1], [1, 0, 1, 1], 0, 2, Tint::Grey);
+        assert_eq!(framebuffer_pixel(&framebuffer, 1, 0), [204, 204, 204, 255]);
+
+        // Brightness 0 is the same full-brightness render as 2; 15 is dimmed.
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 1, 1], [2, 0, 1, 1], 0, 0, Tint::White);
+        assert_eq!(framebuffer_pixel(&framebuffer, 2, 0), [255, 255, 255, 255]);
+        framebuffer.draw_indexed_sprite(&texture, [0, 0, 1, 1], [3, 0, 1, 1], 0, 15, Tint::White);
+        assert_eq!(framebuffer_pixel(&framebuffer, 3, 0), [127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn rgba_sprite_skips_zero_alpha_and_clips() {
+        let mut image = solid_image(2, 2, [10, 20, 30, 255]);
+        image.rgba[0..4].copy_from_slice(&[0, 0, 0, 0]);
+        let mut framebuffer = Framebuffer::new();
+
+        framebuffer.draw_rgba_sprite(&image, [0, 0, 2, 2], [5, 5, 2, 2], 2);
+
+        assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 6, 5), [10, 20, 30, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 7, 7), [0, 0, 0, 0]);
+
+        // A negative destination clips instead of panicking; the second pass
+        // paints over the transparent corner from the first.
+        framebuffer.draw_rgba_sprite(&image, [0, 0, 2, 2], [-10, -10, 20, 20], 2);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [10, 20, 30, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn pending_sprites_keep_submission_order_for_equal_depths() {
+        let red = indexed_texture(vec![1], &[[0, 0, 0, 0], [255, 0, 0, 255]]);
+        let green = indexed_texture(vec![1], &[[0, 0, 0, 0], [0, 255, 0, 255]]);
+        let mut framebuffer = Framebuffer::new();
+        let mut sprites = vec![
+            SpriteDraw::indexed(&red, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::White),
+            SpriteDraw::indexed(&green, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::White),
+        ];
+        assert_eq!(pending_sprite_depth(2), 482);
+
+        framebuffer.draw_sprites(&mut sprites);
+
+        // Equal depths keep submission order; the later sprite paints over.
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn pending_sprites_paint_farther_depths_first() {
+        let red = indexed_texture(vec![1], &[[0, 0, 0, 0], [255, 0, 0, 255]]);
+        let green = indexed_texture(vec![1], &[[0, 0, 0, 0], [0, 255, 0, 255]]);
+        let mut framebuffer = Framebuffer::new();
+        // The far (brighter depth) sprite is submitted last but paints first.
+        let mut sprites = vec![
+            SpriteDraw::indexed(&red, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::White),
+            SpriteDraw::indexed(&green, [0, 0, 1, 1], [0, 0, 1, 1], 0, 4, Tint::White),
+        ];
+
+        framebuffer.draw_sprites(&mut sprites);
+
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [255, 0, 0, 255]);
+        assert_eq!(pending_sprite_depth(30), 930);
+    }
+
+    #[test]
+    fn tint_table_matches_the_original() {
+        assert_eq!(Tint::from_clut_row(0), Tint::White);
+        assert_eq!(Tint::from_clut_row(1), Tint::Green);
+        assert_eq!(Tint::from_clut_row(2), Tint::Red);
+        assert_eq!(Tint::from_clut_row(3), Tint::Grey);
+        assert_eq!(Tint::from_clut_row(8), Tint::Green);
+        assert_eq!(Tint::from_clut_row(4), Tint::Yellow);
+        assert_eq!(Tint::from_clut_row(-1), Tint::Yellow);
+        assert_eq!(Tint::Grey.rgb(), [204, 204, 204]);
+        assert_eq!(Tint::Yellow.rgb(), [255, 255, 0]);
     }
 }
