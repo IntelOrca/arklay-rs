@@ -3,6 +3,8 @@
 //! These are the engine's internal state after an RDT has been loaded. Source
 //! file formats are not kept around during gameplay.
 
+use crate::mask::MaskSprite;
+
 /// A stage/room/player identity, e.g. stage 1, room 0x00, player 1 -> RDT 1001.
 ///
 /// The identity is packed hex: the first digit is the stage, the middle two are
@@ -86,6 +88,11 @@ impl RoomId {
     /// Pack path of a camera background, e.g. `roomcut/100_000.bmp`.
     pub fn cut_entry(self, camera: usize) -> String {
         format!("roomcut/{}_{camera:03}.bmp", self.room3())
+    }
+
+    /// Pack path of a camera's mask page, e.g. `roommask/100_000.bmp`.
+    pub fn roommask_entry(self, camera: usize) -> String {
+        format!("roommask/{}_{camera:03}.bmp", self.room3())
     }
 
     /// Zero-based stage index for stage-indexed tables.
@@ -243,6 +250,16 @@ pub struct Cut {
     pub roll: i32,
     pub fov: i32,
     pub background: Option<Image>,
+    /// Direct file offset of the camera's mask sprite table; zero when absent.
+    pub mask_pointer: u32,
+    /// Direct file offset of the camera's embedded mask TIM; zero when absent.
+    pub tim_mask_pointer: u32,
+    /// Number of groups in the camera's mask table.
+    pub mask_group_count: u8,
+    /// One bit per one-based group id: set while the group is visible.
+    pub mask_active: u32,
+    /// The camera's parsed mask sprites in group order.
+    pub masks: Vec<MaskSprite>,
 }
 
 /// The loaded room: its contents and the currently displayed cut.

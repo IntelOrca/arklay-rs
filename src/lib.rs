@@ -9,6 +9,7 @@ pub mod emd;
 pub mod engine;
 pub mod game;
 pub mod lzw;
+pub mod mask;
 pub mod model;
 pub mod music;
 pub mod pack;

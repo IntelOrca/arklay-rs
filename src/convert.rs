@@ -1,11 +1,12 @@
 //! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
-//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS` and `sound`
+//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound` and `objspr`
 //! (case-insensitively, up to two levels below the root), stores every
 //! `ROOM####.RDT`, converts the camera backgrounds of every distinct room
-//! once, copies the `BGM_*.WAV` music files and the four player models plus
+//! once, converts the room mask pages of every camera that has sprite groups,
+//! copies the `BGM_*.WAV` music files and the four player models plus
 //! the two no-weapon locomotion clips. Stages 6 and 7 reuse the backgrounds
-//! of STAGE1/STAGE2 with the stage digit reduced by 5.
+//! and mask pages of STAGE1/STAGE2 with the stage digit reduced by 5.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -42,7 +43,12 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
         rooms,
         sound,
         players,
+        roommask,
+        warnings,
     } = build_plan(root)?;
+    for warning in &warnings {
+        println!("warning: {warning}");
+    }
 
     let mut writer = PackWriter::new();
     let mut stage_counts = [(0usize, 0usize); RoomId::MAX_STAGE as usize];
@@ -50,6 +56,8 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     let mut rdt_bytes = 0usize;
     let mut cut_count = 0usize;
     let mut cut_bytes = 0usize;
+    let mut mask_count = 0usize;
+    let mut mask_bytes = 0usize;
 
     // Resolve the cut jobs first so RDTs and backgrounds can be reported as
     // two clean phases instead of alternating per room.
@@ -91,6 +99,19 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     }
     progress.end_phase();
 
+    let mask_total = roommask.len() as u64;
+    progress.begin("roommask", mask_total, "files");
+    for asset in &roommask {
+        let bmp_bytes = convert_roommask(&asset.source)?;
+        mask_bytes += bmp_bytes.len();
+        mask_count += 1;
+        writer
+            .add(&asset.entry, bmp_bytes)
+            .with_context(|| format!("failed to add {}", asset.entry))?;
+        progress.advance(&asset.entry);
+    }
+    progress.end_phase();
+
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
 
@@ -99,6 +120,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     }
     println!("room: {rdt_count} entries, {rdt_bytes} bytes");
     println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
+    println!("roommask: {mask_count} entries, {mask_bytes} bytes");
     println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
 
@@ -115,7 +137,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     drop(file);
     progress.end_phase();
 
-    let entries = rdt_count + cut_count + bgm_count + player_count;
+    let entries = rdt_count + cut_count + mask_count + bgm_count + player_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -150,6 +172,18 @@ fn convert_camera(pak: &Path) -> Result<Vec<u8>> {
         bail!("{source}: encoded BMP has unsupported bit depth {bpp}");
     }
     Ok(bmp_bytes)
+}
+
+/// Decode one `OSP*.pak` room mask page into BMP bytes.
+fn convert_roommask(pak: &Path) -> Result<Vec<u8>> {
+    let source = file_name(pak);
+    let compressed = fs::read(pak).with_context(|| format!("failed to read {}", pak.display()))?;
+    let decoded = lzw::decode(&compressed)
+        .with_context(|| format!("failed to LZW-decode room mask {source}"))?;
+    let texture = tim::decode_8bpp(&decoded)
+        .with_context(|| format!("failed to decode room mask {source} as an 8bpp TIM"))?;
+    bmp::encode_texture8_to_vec(&texture)
+        .with_context(|| format!("failed to encode room mask {source} as BMP"))
 }
 
 /// Add every `BGM_*.WAV` in the sound directory; returns entry count and bytes.
@@ -214,24 +248,26 @@ fn copy_players(
     Ok((count, bytes))
 }
 
-/// Stage, sound, enemy-model and player-directory roots discovered under the
-/// conversion root.
+/// Stage, sound, enemy-model, player and room-mask directory roots discovered
+/// under the conversion root.
 #[derive(Debug)]
 struct Layout {
     stages: BTreeMap<u8, PathBuf>,
     sound: Option<PathBuf>,
     enemy: Option<PathBuf>,
     players: Option<PathBuf>,
+    objspr: Option<PathBuf>,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
-/// `enemy` and `players`.
+/// `enemy`, `players` and `objspr`.
 fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
     let mut sound = None;
     let mut enemy = None;
     let mut players = None;
+    let mut objspr = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -243,6 +279,8 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 enemy = Some(dir.clone());
             } else if players.is_none() && name.eq_ignore_ascii_case("players") {
                 players = Some(dir.clone());
+            } else if objspr.is_none() && name.eq_ignore_ascii_case("objspr") {
+                objspr = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -273,6 +311,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         sound,
         enemy,
         players,
+        objspr,
     })
 }
 
@@ -301,6 +340,15 @@ struct PlayerAsset {
     source: PathBuf,
 }
 
+/// One room mask page resolved to its pack entry.
+#[derive(Debug)]
+struct RoomMask {
+    /// Pack entry, e.g. `roommask/100_000.bmp`.
+    entry: String,
+    /// Source `objspr` pak in the installation.
+    source: PathBuf,
+}
+
 /// One distinct room (`stage` + `room`, player variants merged).
 #[derive(Debug)]
 struct Room {
@@ -312,6 +360,8 @@ struct Room {
     cameras: usize,
     /// Resolved background paks for cameras `0..cameras`.
     paks: Vec<PathBuf>,
+    /// Highest mask group count per camera across the variants.
+    mask_groups: Vec<u8>,
 }
 
 /// Everything conversion needs, resolved and validated before any decoding.
@@ -320,6 +370,9 @@ struct Plan {
     rooms: Vec<Room>,
     sound: Option<PathBuf>,
     players: Vec<PlayerAsset>,
+    roommask: Vec<RoomMask>,
+    /// Non-fatal problems found while resolving optional inputs.
+    warnings: Vec<String>,
 }
 
 /// Discover, enumerate, and validate every conversion input.
@@ -329,6 +382,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         sound,
         enemy,
         players,
+        objspr,
     } = discover_layout(root)?;
     let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
 
@@ -362,8 +416,13 @@ fn build_plan(root: &Path) -> Result<Plan> {
                 rdts: Vec::new(),
                 cameras: 0,
                 paks: Vec::new(),
+                mask_groups: Vec::new(),
             });
             room.cameras = room.cameras.max(state.cuts.len());
+            room.mask_groups.resize(room.cameras, 0);
+            for (camera, cut) in state.cuts.iter().enumerate() {
+                room.mask_groups[camera] = room.mask_groups[camera].max(cut.mask_group_count);
+            }
             room.rdts.push(Rdt { id, bytes });
         }
     }
@@ -394,10 +453,51 @@ fn build_plan(root: &Path) -> Result<Plan> {
         );
     }
 
+    // Mask pages are optional: a missing page only drops that camera's
+    // foreground layer, so unresolved files are collected as warnings.
+    let objspr_index = objspr.as_deref().map(index_dir).transpose()?;
+    let mut roommask = Vec::new();
+    let mut missing_masks = Vec::new();
+    for room in rooms.values() {
+        for camera in 0..room.cameras {
+            if room.mask_groups.get(camera).copied().unwrap_or(0) == 0 {
+                continue;
+            }
+            let name = mask_pak_name(room.id, camera);
+            match objspr_index
+                .as_ref()
+                .and_then(|index| index.get(&name.to_ascii_lowercase()))
+            {
+                Some(path) => roommask.push(RoomMask {
+                    entry: room.id.roommask_entry(camera),
+                    source: path.clone(),
+                }),
+                None => missing_masks.push(name),
+            }
+        }
+    }
+    let mut warnings = Vec::new();
+    if !missing_masks.is_empty() {
+        if objspr.is_none() {
+            warnings.push(format!(
+                "no objspr directory found; {} room mask page(s) will be missing",
+                missing_masks.len()
+            ));
+        } else {
+            warnings.push(format!(
+                "missing {} room mask page(s): {}",
+                missing_masks.len(),
+                missing_masks.join(", ")
+            ));
+        }
+    }
+
     Ok(Plan {
         rooms: rooms.into_values().collect(),
         sound,
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
+        roommask,
+        warnings,
     })
 }
 
@@ -460,6 +560,19 @@ fn rdt_id_from_file_name(name: &str) -> Option<Result<RoomId>> {
 /// Stages 6 and 7 use the STAGE1/STAGE2 directory and file-name digit.
 fn camera_pak_name(id: RoomId, camera: usize) -> String {
     format!("RC{}{:02X}{camera:X}.pak", id.fold_stage_digit(), id.room)
+}
+
+/// Room mask file name for room `id`, e.g. `OSP00000.pak`.
+///
+/// Stages 6 and 7 reuse the STAGE1/STAGE2 digit and the room number is printed
+/// as two decimal digits, matching the shipped `objspr` names.
+fn mask_pak_name(id: RoomId, camera: usize) -> String {
+    format!(
+        "OSP0{}{:02}{}.pak",
+        id.fold_stage_digit() - 1,
+        id.room,
+        camera
+    )
 }
 
 /// Case-insensitive index of the file names directly inside `dir`.
@@ -609,6 +722,51 @@ mod tests {
         camera_pak_at(320, 240)
     }
 
+    /// A valid 8bpp TIM of the given size, one 256-colour CLUT row, wrapped in
+    /// a real LZW stream like the shipped `objspr` pages.
+    fn mask_pak_at(width: u16, height: u16) -> Vec<u8> {
+        let palette: Vec<u16> = (0..256u16)
+            .map(|index| index.wrapping_mul(0x0841))
+            .collect();
+        let pixels: Vec<u8> = (0..usize::from(width) * usize::from(height))
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let mut tim = Vec::new();
+        tim.extend_from_slice(&0x10u32.to_le_bytes());
+        tim.extend_from_slice(&9u32.to_le_bytes());
+        tim.extend_from_slice(&(12u32 + palette.len() as u32 * 2).to_le_bytes());
+        tim.extend_from_slice(&0i16.to_le_bytes());
+        tim.extend_from_slice(&480i16.to_le_bytes());
+        tim.extend_from_slice(&256u16.to_le_bytes());
+        tim.extend_from_slice(&1u16.to_le_bytes());
+        for entry in &palette {
+            tim.extend_from_slice(&entry.to_le_bytes());
+        }
+        tim.extend_from_slice(&(12u32 + pixels.len() as u32).to_le_bytes());
+        tim.extend_from_slice(&0i16.to_le_bytes());
+        tim.extend_from_slice(&0i16.to_le_bytes());
+        tim.extend_from_slice(&(width / 2).to_le_bytes());
+        tim.extend_from_slice(&height.to_le_bytes());
+        tim.extend_from_slice(&pixels);
+        lzw_literals(&tim)
+    }
+
+    /// A one-camera RDT whose camera 0 carries a one-group mask table with a
+    /// single 8x16 sprite.
+    fn rdt_with_masks() -> Vec<u8> {
+        let mut data = rdt_bytes(1);
+        let offset = data.len();
+        data[0x94..0x98].copy_from_slice(&(offset as i32).to_le_bytes());
+        data.extend_from_slice(&1i32.to_le_bytes());
+        for word in [1u16, 0, 0, 0] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        for word in [0u16, 0, 380, 0x0800, 8, 16] {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+        data
+    }
+
     #[test]
     fn discovers_stages_case_insensitively_and_breadth_first() {
         let root = TempDir::new("discover");
@@ -619,6 +777,7 @@ mod tests {
         fs::create_dir_all(root.path.join("install/sound")).unwrap();
         fs::create_dir_all(root.path.join("install/EnEmY")).unwrap();
         fs::create_dir_all(root.path.join("pLaYeRs")).unwrap();
+        fs::create_dir_all(root.path.join("install/ObJsPr")).unwrap();
 
         let layout = discover_layout(&root.path).unwrap();
 
@@ -628,6 +787,7 @@ mod tests {
         assert_eq!(layout.sound.unwrap(), root.path.join("install/sound"));
         assert_eq!(layout.enemy.unwrap(), root.path.join("install/EnEmY"));
         assert_eq!(layout.players.unwrap(), root.path.join("pLaYeRs"));
+        assert_eq!(layout.objspr.unwrap(), root.path.join("install/ObJsPr"));
     }
 
     #[test]
@@ -809,6 +969,7 @@ mod tests {
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("room/"), 3);
         assert_eq!(count("roomcut/"), 2);
+        assert_eq!(count("roommask/"), 0);
         assert_eq!(count("bgm/"), 3);
         assert_eq!(count("player/"), 6);
         assert_eq!(
@@ -826,6 +987,74 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    fn converts_room_masks_and_folds_return_stages() {
+        let root = TempDir::new("masks");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_with_masks()).unwrap();
+        fs::write(root.path.join("STAGE6/ROOM6000.RDT"), rdt_with_masks()).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), camera_pak()).unwrap();
+        fs::create_dir_all(root.path.join("ObJsPr")).unwrap();
+        let mask = mask_pak_at(16, 8);
+        fs::write(root.path.join("ObJsPr/osp00000.PAK"), &mask).unwrap();
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+
+        assert!(pack.contains("roommask/100_000.bmp"));
+        assert!(pack.contains("roommask/600_000.bmp"));
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("roommask/"), 2);
+
+        let decoded = tim::decode_8bpp(&lzw::decode(&mask).unwrap()).unwrap();
+        let expected = bmp::encode_texture8_to_vec(&decoded).unwrap();
+        assert_eq!(pack.read("roommask/100_000.bmp").unwrap(), expected);
+        let image = bmp::decode(&expected).unwrap();
+        assert_eq!((image.width, image.height), (16, 8));
+        let direct = bmp::encode_texture8_to_vec(&decoded).unwrap();
+        assert_eq!(image.rgba, bmp::decode(&direct).unwrap().rgba);
+    }
+
+    #[test]
+    fn missing_mask_paks_are_warnings() {
+        let root = TempDir::new("missing-masks");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_with_masks()).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), camera_pak()).unwrap();
+        fs::create_dir_all(root.path.join("objspr")).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert!(plan.roommask.is_empty());
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(
+            plan.warnings[0].contains("OSP00000.pak"),
+            "{:?}",
+            plan.warnings
+        );
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("roommask/"), 0);
+    }
+
+    #[test]
+    fn a_missing_objspr_directory_warns_once() {
+        let root = TempDir::new("no-objspr");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_with_masks()).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), camera_pak()).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert!(plan.roommask.is_empty());
+        assert_eq!(plan.warnings.len(), 1);
+        assert!(plan.warnings[0].contains("objspr"), "{:?}", plan.warnings);
     }
 
     #[test]
@@ -888,10 +1117,21 @@ mod tests {
         // files (620 distinct paks) but still name their cuts with their own
         // room id, e.g. roomcut/600_000.bmp.
         assert_eq!(count("roomcut/"), 842);
+        // One mask page per camera that carries sprite groups; stages 6/7
+        // reuse the stage 1/2 pages.
+        assert_eq!(count("roommask/"), 601);
         assert_eq!(count("bgm/"), 61);
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
+        assert!(pack.contains("roommask/100_000.bmp"));
         assert!(pack.contains("bgm/013.wav"));
+
+        // The converted page must be exactly the `objspr` pak decode.
+        let pak = std::fs::read(root.join("JPN/objspr/OSP00000.pak")).unwrap();
+        let decoded = lzw::decode(&pak).unwrap();
+        let texture = tim::decode_8bpp(&decoded).unwrap();
+        let expected = bmp::encode_texture8_to_vec(&texture).unwrap();
+        assert_eq!(pack.read("roommask/100_000.bmp").unwrap(), expected);
 
         // Four character models (Char10..Char13) plus the two no-weapon
         // locomotion clips (W00, W10). player/01 is Jill, the character that

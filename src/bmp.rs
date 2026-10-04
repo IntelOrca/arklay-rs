@@ -10,6 +10,7 @@ use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 
+use crate::model::Texture8;
 use crate::state::Image;
 
 const FILE_HEADER_LEN: usize = 14;
@@ -221,6 +222,33 @@ pub fn encode_to_vec(image: &Image) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode an 8bpp indexed texture through its first CLUT row as a BMP.
+///
+/// Mask pages carry one 256-colour CLUT row, so row 0 is the whole palette.
+pub fn encode_texture8_to_vec(texture: &Texture8) -> Result<Vec<u8>> {
+    let width = texture.width as usize;
+    let height = texture.height as usize;
+    let expected = width * height;
+    if texture.indices.len() != expected {
+        bail!(
+            "texture has {} indices but a {}x{} image needs {expected}",
+            texture.indices.len(),
+            texture.width,
+            texture.height
+        );
+    }
+
+    let mut rgba = Vec::with_capacity(expected * 4);
+    for &index in &texture.indices {
+        rgba.extend_from_slice(&texture.palette(0, index));
+    }
+    encode_to_vec(&Image {
+        width: texture.width,
+        height: texture.height,
+        rgba,
+    })
+}
+
 fn u16_at(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([data[offset], data[offset + 1]])
 }
@@ -399,6 +427,38 @@ mod tests {
         .concat();
         assert_eq!((image.width, image.height), (2, 2));
         assert_eq!(image.rgba, expected);
+    }
+
+    #[test]
+    fn encodes_an_indexed_texture_through_its_first_palette_row() {
+        let mut palettes = vec![[0u8; 4]; 256];
+        palettes[0] = [10, 20, 30, 255];
+        palettes[1] = [200, 100, 50, 255];
+        let texture = Texture8 {
+            width: 3,
+            height: 1,
+            indices: vec![0, 1, 0],
+            palettes,
+        };
+
+        let data = encode_texture8_to_vec(&texture).unwrap();
+        let image = decode(&data).unwrap();
+
+        assert_eq!((image.width, image.height), (3, 1));
+        let expected: Vec<u8> =
+            [[10, 20, 30, 255], [200, 100, 50, 255], [10, 20, 30, 255]].concat();
+        assert_eq!(image.rgba, expected);
+    }
+
+    #[test]
+    fn encode_texture_rejects_wrong_index_len() {
+        let texture = Texture8 {
+            width: 2,
+            height: 2,
+            indices: vec![0; 3],
+            palettes: vec![[0u8; 4]; 256],
+        };
+        assert!(encode_texture8_to_vec(&texture).is_err());
     }
 
     #[test]

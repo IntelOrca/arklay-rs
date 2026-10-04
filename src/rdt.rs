@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::mask;
 pub use crate::state::{Collision, CollisionRect, Light, WalkZone, Zone};
 use crate::state::{Cut, RoomId, RoomState};
 
@@ -87,12 +88,9 @@ fn parse_cameras(data: &[u8], cameras_count: u8) -> Result<Vec<Cut>> {
         );
     }
 
-    Ok((0..usize::from(cameras_count))
-        .map(|index| {
-            let start = CAMERAS_OFFSET + index * CAMERA_SIZE;
-            parse_cut(&data[start..start + CAMERA_SIZE], index)
-        })
-        .collect())
+    (0..usize::from(cameras_count))
+        .map(|index| parse_cut(data, CAMERAS_OFFSET + index * CAMERA_SIZE, index))
+        .collect()
 }
 
 /// Parse the ambient light color, defaulting to black when absent.
@@ -307,21 +305,37 @@ fn parse_walk_zones(data: &[u8], pointer: u32) -> Result<Vec<WalkZone>> {
     Ok(walk_zones)
 }
 
-/// Parse one 44-byte camera record.
-fn parse_cut(record: &[u8], index: usize) -> Cut {
+/// Parse one 44-byte camera record and its mask table.
+///
+/// Fields 0 and 1 are direct file offsets to the camera's mask sprite table
+/// and its embedded mask TIM; the table itself is parsed into the cut.
+fn parse_cut(data: &[u8], start: usize, index: usize) -> Result<Cut> {
+    let record = &data[start..start + CAMERA_SIZE];
     let mut fields = [0i32; CAMERA_FIELDS];
     for (field, bytes) in fields.iter_mut().zip(record.as_chunks::<4>().0) {
         *field = i32::from_le_bytes(*bytes);
     }
 
-    Cut {
+    let mask_pointer = u32::try_from(fields[0])
+        .with_context(|| format!("camera {index} has negative mask pointer {}", fields[0]))?;
+    let tim_mask_pointer = u32::try_from(fields[1])
+        .with_context(|| format!("camera {index} has negative mask TIM pointer {}", fields[1]))?;
+    let table = mask::MaskTable::parse(data, mask_pointer)
+        .with_context(|| format!("failed to parse the mask table of camera {index}"))?;
+
+    Ok(Cut {
         index,
         pos: [fields[2], fields[3], fields[4]],
         look_at: [fields[5], fields[6], fields[7]],
         roll: fields[8],
         fov: fields[10],
         background: None,
-    }
+        mask_pointer,
+        tim_mask_pointer,
+        mask_group_count: table.groups.len() as u8,
+        mask_active: table.active_bits(),
+        masks: table.sprites,
+    })
 }
 
 /// Read a bounds-checked byte range.
@@ -436,8 +450,8 @@ mod tests {
 
     #[test]
     fn parses_two_camera_records() {
-        let first = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
-        let second = [-11, -12, -13, -14, -15, -16, -17, -18, -19, -20, -21];
+        let first = [0, 0, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        let second = [0, 0, -13, -14, -15, -16, -17, -18, -19, -20, -21];
         let data = build_rdt(2, &[first, second]);
 
         let state = parse(&data, ROOM_ID).unwrap();
@@ -455,6 +469,11 @@ mod tests {
         assert_eq!(cut.roll, 19);
         assert_eq!(cut.fov, 21);
         assert!(cut.background.is_none());
+        assert_eq!(cut.mask_pointer, 0);
+        assert_eq!(cut.tim_mask_pointer, 0);
+        assert_eq!(cut.mask_group_count, 0);
+        assert_eq!(cut.mask_active, 0);
+        assert!(cut.masks.is_empty());
 
         let cut = &state.cuts[1];
         assert_eq!(cut.index, 1);
@@ -463,6 +482,70 @@ mod tests {
         assert_eq!(cut.roll, -19);
         assert_eq!(cut.fov, -21);
         assert!(cut.background.is_none());
+        assert!(cut.masks.is_empty());
+    }
+
+    /// Append a mask table: an `i32` group count, the group headers, then the
+    /// flattened sprite words.
+    fn push_mask_table(data: &mut Vec<u8>, groups: &[[u16; 4]], sprites: &[u16]) {
+        data.extend_from_slice(&(groups.len() as i32).to_le_bytes());
+        for group in groups {
+            for word in group {
+                data.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        for word in sprites {
+            data.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn parses_camera_masks_into_the_cut() {
+        let mut data = build_rdt(1, &[[0; CAMERA_FIELDS]]);
+        let offset = data.len();
+        data[CAMERAS_OFFSET..CAMERAS_OFFSET + 4].copy_from_slice(&(offset as i32).to_le_bytes());
+        data[CAMERAS_OFFSET + 4..CAMERAS_OFFSET + 8].copy_from_slice(&1234i32.to_le_bytes());
+        push_mask_table(
+            &mut data,
+            &[[1, 0, 10, 20]],
+            &[0x0201, 0x0403, 380, 0x0800, 8, 40],
+        );
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        let cut = &state.cuts[0];
+        assert_eq!(cut.mask_pointer as usize, offset);
+        assert_eq!(cut.tim_mask_pointer, 1234);
+        assert_eq!(cut.mask_group_count, 1);
+        assert_eq!(cut.mask_active, 1);
+        assert_eq!(cut.masks.len(), 1);
+        let sprite = cut.masks[0];
+        assert_eq!(sprite.uv, (1, 2));
+        assert_eq!(sprite.pos, (13, 24));
+        assert_eq!(sprite.size, (8, 40));
+        assert_eq!(sprite.pos_data, 380);
+        assert_eq!(sprite.flags, 0x0800);
+        assert_eq!(sprite.group, 1);
+    }
+
+    #[test]
+    fn errors_on_malformed_camera_masks() {
+        let mut data = build_rdt(1, &[[0; CAMERA_FIELDS]]);
+        let offset = data.len();
+        data[CAMERAS_OFFSET..CAMERAS_OFFSET + 4].copy_from_slice(&(offset as i32).to_le_bytes());
+        data.extend_from_slice(&1i32.to_le_bytes());
+
+        let message = parse(&data, ROOM_ID).unwrap_err().to_string();
+        assert!(message.contains("mask table of camera 0"), "{message}");
+    }
+
+    #[test]
+    fn errors_on_negative_mask_pointer() {
+        let mut data = build_rdt(1, &[[0; CAMERA_FIELDS]]);
+        data[CAMERAS_OFFSET..CAMERAS_OFFSET + 4].copy_from_slice(&(-1i32).to_le_bytes());
+
+        let message = parse(&data, ROOM_ID).unwrap_err().to_string();
+        assert!(message.contains("negative mask pointer"), "{message}");
     }
 
     #[test]
@@ -784,5 +867,34 @@ mod tests {
         assert_eq!(zone.flags, 0);
         assert!(zone.contains(1700, 1800));
         assert!(!zone.contains(8000, 8100));
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn parses_real_room_1000_masks() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let path = Path::new(&root).join("JPN/STAGE1/ROOM1000.RDT");
+        let data = std::fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        let state = parse(&data, RoomId::parse("1000").unwrap()).unwrap();
+
+        let cut = &state.cuts[0];
+        assert_eq!(cut.mask_group_count, 7);
+        assert_eq!(cut.masks.len(), 53);
+        assert_eq!(cut.mask_active, 0b111_1111);
+        assert_ne!(cut.mask_pointer, 0);
+        assert_ne!(cut.tim_mask_pointer, 0);
+
+        let first = cut.masks[0];
+        assert_eq!(first.uv, (0, 0));
+        assert_eq!(first.pos, (9, 73));
+        assert_eq!(first.size, (8, 40));
+        assert_eq!(first.pos_data, 380);
+        assert_eq!(first.flags, 0x80);
+        assert_eq!(first.group, 1);
+        assert_eq!(cut.masks.last().unwrap().group, 7);
     }
 }
