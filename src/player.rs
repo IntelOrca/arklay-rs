@@ -1213,6 +1213,58 @@ mod tests {
     }
 
     #[test]
+    fn running_footsteps_play_overlapping_copies() {
+        use crate::audio::MixState;
+
+        let room = RoomState::default();
+        let clips = clips();
+        let mut player = player_at(1000, 1000);
+        let input = Input {
+            up: true,
+            run: true,
+            ..Input::default()
+        };
+
+        let mut mixer = MixState::new();
+        // Longer than the 14-tick gap between the run's two contact frames, so
+        // the second footfall starts while the first copy is still playing.
+        let step_pcm = vec![1000i16; 2000];
+        let mut out = Vec::new();
+        let mut triggers = Vec::new();
+        let mut overlaps = 0usize;
+
+        for tick in 0..60 {
+            step(&mut player, &room, &clips, input);
+            let events = player.take_footsteps();
+            if !events.is_empty() {
+                triggers.push(tick);
+            }
+            for _ in &events {
+                mixer.play_sfx(step_pcm.clone(), 1.0, 0.0);
+            }
+
+            let active = mixer.active_sfx();
+            mixer.render(1, &mut out);
+            if active >= 2 {
+                overlaps += 1;
+                // Every center-panned copy contributes 1000/sqrt(2); the sum
+                // must hold all of them, not just the newest.
+                let level = active as i16 * 707;
+                let left = i16::from_le_bytes([out[out.len() - 4], out[out.len() - 3]]);
+                let right = i16::from_le_bytes([out[out.len() - 2], out[out.len() - 1]]);
+                assert_eq!((left, right), (level, level), "tick {tick}");
+            }
+        }
+
+        assert!(
+            triggers.len() >= 2,
+            "the run triggered {} footfalls in 60 ticks",
+            triggers.len()
+        );
+        assert!(overlaps >= 1, "no frame mixed two footstep voices");
+    }
+
+    #[test]
     fn backward_walk_does_not_emit_footsteps() {
         let room = RoomState::default();
         let clips = clips();

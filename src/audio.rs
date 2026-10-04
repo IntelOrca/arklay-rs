@@ -4,8 +4,15 @@
 //! converted to 16-bit signed mono at 22050 Hz on load (8-bit samples are
 //! upsampled, other rates are linearly resampled). Each [`Mixer::update`]
 //! renders and queues interleaved stereo samples: one looping BGM voice plus a
-//! pool of one-shot voices, each with its own gain and pan. A missing device or
-//! a failed SDL call leaves the engine silent, never fatal.
+//! pool of one-shot voices, each with its own gain and pan.
+//!
+//! Starting a one-shot never replaces or restarts an existing voice: a new
+//! [`Voice`] is appended, including when the source buffer is already playing,
+//! so several copies of the same WAV (a run's overlapping footsteps) mix
+//! together. Voices are summed as 32-bit floats and each output sample is
+//! saturated to the 16-bit rail, matching the hardware sum the original mixer
+//! relies on. A missing device or a failed SDL call leaves the engine silent,
+//! never fatal.
 
 use std::ffi::c_int;
 use std::ptr;
@@ -221,16 +228,19 @@ struct Voice {
     gain: f32,
     pan: f32,
     looping: bool,
+    /// Start order among one-shot voices; smaller values are older.
+    seq: u64,
 }
 
 impl Voice {
-    fn new(pcm: Vec<i16>, gain: f32, pan: f32, looping: bool) -> Self {
+    fn new(pcm: Vec<i16>, gain: f32, pan: f32, looping: bool, seq: u64) -> Self {
         Self {
             pcm,
             pos: 0,
             gain,
             pan,
             looping,
+            seq,
         }
     }
 
@@ -241,24 +251,36 @@ impl Voice {
 }
 
 /// Device-independent mixer state: the voices and their mix parameters.
-struct MixState {
+///
+/// Visible to the crate so behaviour tests can drive the mixer without an SDL
+/// device. Every one-shot start appends a voice, so the same source may be
+/// sounding many times over.
+pub(crate) struct MixState {
     bgm: Option<Voice>,
     bgm_gain: f32,
     sfx: Vec<Voice>,
+    next_sfx_seq: u64,
 }
 
 impl MixState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             bgm: None,
             bgm_gain: 1.0,
             sfx: Vec::new(),
+            next_sfx_seq: 0,
         }
+    }
+
+    /// Number of one-shot voices currently sounding.
+    #[cfg(test)]
+    pub(crate) fn active_sfx(&self) -> usize {
+        self.sfx.len()
     }
 
     /// Replace the BGM voice with `pcm`, keeping the current BGM volume.
     fn play_bgm(&mut self, pcm: Vec<i16>) {
-        self.bgm = (!pcm.is_empty()).then(|| Voice::new(pcm, 1.0, 0.0, true));
+        self.bgm = (!pcm.is_empty()).then(|| Voice::new(pcm, 1.0, 0.0, true, 0));
     }
 
     fn stop_bgm(&mut self) {
@@ -269,9 +291,13 @@ impl MixState {
         self.bgm_gain = gain.max(0.0);
     }
 
-    /// Start a one-shot voice. When the pool is full the voice that has played
-    /// the most of its buffer is stolen.
-    fn play_sfx(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
+    /// Start a one-shot voice.
+    ///
+    /// Always appends, even when an identical buffer is already playing. When
+    /// the pool is full the voice that has played the most of its buffer is
+    /// stolen; voices tied on progress give way oldest-first, so a burst of
+    /// new sounds can never evict the copy that was just started.
+    pub(crate) fn play_sfx(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
         if pcm.is_empty() {
             return;
         }
@@ -280,11 +306,14 @@ impl MixState {
                 .sfx
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, voice)| voice.pos)
+                .max_by_key(|(_, voice)| (voice.pos, std::cmp::Reverse(voice.seq)))
         {
             self.sfx.remove(index);
         }
-        self.sfx.push(Voice::new(pcm, gain.max(0.0), pan, false));
+        let seq = self.next_sfx_seq;
+        self.next_sfx_seq += 1;
+        self.sfx
+            .push(Voice::new(pcm, gain.max(0.0), pan, false, seq));
     }
 
     fn is_silent(&self) -> bool {
@@ -292,7 +321,11 @@ impl MixState {
     }
 
     /// Mix `frames` stereo frames and append them to `out`.
-    fn render(&mut self, frames: usize, out: &mut Vec<u8>) {
+    ///
+    /// Voices are summed without a per-voice headroom term; each sample is
+    /// saturated by [`push_sample`], which is how the original's hardware mixer
+    /// handles overlapping banks.
+    pub(crate) fn render(&mut self, frames: usize, out: &mut Vec<u8>) {
         for _ in 0..frames {
             let mut left = 0.0f32;
             let mut right = 0.0f32;
@@ -731,21 +764,129 @@ mod tests {
     }
 
     #[test]
-    fn mixer_steals_the_most_played_voice() {
+    fn mixer_same_source_overlaps_and_sums() {
+        let mut state = MixState::new();
+        let pcm = vec![1000i16; 8];
+
+        state.play_sfx(pcm.clone(), 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 1);
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![707, 707]);
+
+        // A second copy started one tick later must add to the first voice,
+        // not replace it or restart it from zero.
+        state.play_sfx(pcm.clone(), 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 2, "the second voice replaced the first");
+        assert_eq!(state.sfx[0].pos, 1, "the first voice was restarted");
+        assert_eq!(state.sfx[1].pos, 0);
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![1414, 1414]);
+
+        // Both voices step forward independently.
+        assert_eq!(state.sfx[0].pos, 2);
+        assert_eq!(state.sfx[1].pos, 1);
+    }
+
+    #[test]
+    fn mixer_four_same_sources_stack() {
+        let mut state = MixState::new();
+        for _ in 0..4 {
+            state.play_sfx(vec![1000i16; 4], 1.0, 0.0);
+        }
+        assert_eq!(state.active_sfx(), 4);
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![2828, 2828]);
+        assert!(state.sfx.iter().all(|voice| voice.pos == 1));
+
+        // All four expire together and the mixer goes silent.
+        state.render(3, &mut out);
+        assert_eq!(state.active_sfx(), 0);
+        assert!(state.is_silent());
+    }
+
+    #[test]
+    fn mixer_pool_exhaustion_steals_the_furthest_voice() {
+        let mut state = MixState::new();
+        state.play_sfx(vec![111; 32], 1.0, 0.0);
+        let mut out = Vec::new();
+        state.render(5, &mut out);
+        for index in 1..MAX_SFX_VOICES {
+            state.play_sfx(vec![index as i16; 32], 1.0, 0.0);
+        }
+        assert_eq!(state.active_sfx(), MAX_SFX_VOICES);
+        assert_eq!(state.sfx[0].pos, 5, "the lone older voice should lead");
+
+        // The full pool drops the most-played voice, not the newest one.
+        state.play_sfx(vec![999; 32], 1.0, 0.0);
+        assert_eq!(state.active_sfx(), MAX_SFX_VOICES);
+        assert!(
+            !state.sfx.iter().any(|voice| voice.pcm[0] == 111),
+            "the furthest voice was not the one stolen"
+        );
+        assert!(state.sfx.iter().any(|voice| voice.pcm[0] == 999));
+        assert!(state.sfx.iter().any(|voice| voice.pcm[0] == 15));
+    }
+
+    #[test]
+    fn mixer_pool_exhaustion_ties_break_oldest_first() {
         let mut state = MixState::new();
         for index in 0..MAX_SFX_VOICES {
             state.play_sfx(vec![index as i16; 8], 1.0, 0.0);
         }
-        assert_eq!(state.sfx.len(), MAX_SFX_VOICES);
-
-        let mut out = Vec::new();
-        state.render(3, &mut out);
-        assert!(state.sfx.iter().all(|voice| voice.pos == 3));
-
+        // Nothing has rendered, so every voice is tied at position zero: the
+        // oldest voice must be the one evicted.
         state.play_sfx(vec![999; 8], 1.0, 0.0);
-        assert_eq!(state.sfx.len(), MAX_SFX_VOICES);
+        assert_eq!(state.active_sfx(), MAX_SFX_VOICES);
+        assert!(
+            !state.sfx.iter().any(|voice| voice.pcm[0] == 0),
+            "the oldest voice was not the one stolen"
+        );
+        assert!(state.sfx.iter().any(|voice| voice.pcm[0] == 15));
         assert_eq!(state.sfx.last().unwrap().pcm[0], 999);
-        assert!(!state.sfx.iter().any(|voice| voice.pcm[0] == 15));
+    }
+
+    #[test]
+    fn mixer_long_bgm_mixes_with_overlapping_sfx() {
+        let mut state = MixState::new();
+        let bgm = vec![100i16; 64];
+        state.play_bgm(bgm);
+        state.set_bgm_volume(1.0);
+
+        // Two identical one-shots over a BGM that keeps looping.
+        state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
+        state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
+
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+        let expected = (100.0 * center + 2.0 * 1000.0 * center) as i16;
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![expected, expected]);
+        assert!(state.bgm.is_some(), "the BGM voice was dropped");
+        assert_eq!(state.active_sfx(), 2);
+
+        // Render past the BGM buffer and the one-shots: the loop survives.
+        state.render(64, &mut out);
+        assert!(state.bgm.is_some());
+        assert_eq!(state.active_sfx(), 0);
+        assert!(!state.is_silent());
+    }
+
+    #[test]
+    fn mixer_many_voices_clamp_instead_of_wrapping() {
+        let mut state = MixState::new();
+        for _ in 0..4 {
+            state.play_sfx(vec![20000i16; 2], 2.0, -1.0);
+        }
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        // Four copies of 20000 at gain 2 sum to 160000 on the hard-left
+        // channel: it saturates at the rail and never wraps negative.
+        assert_eq!(out_samples(&out), vec![i16::MAX, 0]);
     }
 
     #[test]
