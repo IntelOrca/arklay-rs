@@ -6,7 +6,7 @@
 //! SDL; the engine owns presentation and only uploads [`Framebuffer::rgba`].
 
 use crate::anim;
-use crate::model::{Texture8, Tmd};
+use crate::model::{Texture8, Tmd, TmdObject};
 use crate::state::{Cut, Image, Light, RoomState};
 
 /// Default framebuffer width in pixels.
@@ -91,87 +91,47 @@ impl Framebuffer {
         lighting: &Lighting,
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
-
-        for (object_index, object) in mesh.objects.iter().enumerate() {
-            let Some(joint) = joints.get(object_index) else {
-                continue;
-            };
-
-            let vertices: Vec<[i32; 3]> = object
-                .vertices
-                .iter()
-                .map(|vertex| fixed_mul(joint, *vertex))
-                .collect();
-            let normals: Vec<Option<[f64; 3]>> = object
-                .normals
-                .iter()
-                .map(|normal| normalize(rotate(joint, *normal)))
-                .collect();
-
-            for prim in &object.prims {
-                let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
-                    vertices.get(usize::from(prim.vertices[0])),
-                    vertices.get(usize::from(prim.vertices[1])),
-                    vertices.get(usize::from(prim.vertices[2])),
-                ) else {
-                    continue;
-                };
-                let (Some(normal0), Some(normal1), Some(normal2)) = (
-                    normals.get(usize::from(prim.normals[0])),
-                    normals.get(usize::from(prim.normals[1])),
-                    normals.get(usize::from(prim.normals[2])),
-                ) else {
-                    continue;
-                };
-                let (Some(screen0), Some(screen1), Some(screen2)) = (
-                    camera.project(*vertex0),
-                    camera.project(*vertex1),
-                    camera.project(*vertex2),
-                ) else {
-                    continue;
-                };
-
-                let position0 = [screen0[0] as f64, screen0[1] as f64];
-                let position1 = [screen1[0] as f64, screen1[1] as f64];
-                let position2 = [screen2[0] as f64, screen2[1] as f64];
-                let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
-                    - (position2[0] - position0[0]) * (position1[1] - position0[1]);
-                if !faces_camera(area) {
-                    continue;
-                }
-
-                let depth0 = f64::from(camera.view_position(*vertex0)[2]);
-                let depth1 = f64::from(camera.view_position(*vertex1)[2]);
-                let depth2 = f64::from(camera.view_position(*vertex2)[2]);
-
-                let page_x = f64::from(u32::from(prim.tsb & 0xF) * 128);
-                let page_y = f64::from(u32::from((prim.tsb >> 4) & 1) * 256);
-
-                let corners = [
-                    (position0, depth0, &prim.uv[0], normal0, vertex0),
-                    (position1, depth1, &prim.uv[1], normal1, vertex1),
-                    (position2, depth2, &prim.uv[2], normal2, vertex2),
-                ];
-                let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
-                    let (position, depth, uv, normal, vertex) = corners[corner];
-                    RasterVertex {
-                        position,
-                        inv_z: 1.0 / depth,
-                        u: f64::from(uv[0]) + page_x,
-                        v: f64::from(uv[1]) + page_y,
-                        shade: shade_vertex(normal, *vertex, lighting),
-                    }
-                });
-
-                let palette_row = usize::from(((prim.clut >> 6) & 0x01FF).saturating_sub(480));
-                triangles.push(Triangle {
-                    raster,
-                    depth: (depth0 + depth1 + depth2) / 3.0,
-                    palette_row,
-                });
-            }
+        for (object, joint) in mesh.objects.iter().zip(joints) {
+            collect_triangles(object, joint, camera, Some(lighting), true, &mut triangles);
         }
+        self.rasterize_triangles(texture, triangles);
+    }
 
+    /// Draw a TMD mesh full-bright, without lighting or backface culling.
+    ///
+    /// This is the door animation's path: panels are drawn over black with the
+    /// door texture's single 256-colour CLUT row and direct (unpaged) UVs, and
+    /// the original's TMD renderer runs with culling disabled. Triangles are
+    /// painter-sorted back-to-front exactly like [`Framebuffer::draw_model`].
+    pub fn draw_model_unlit(
+        &mut self,
+        mesh: &Tmd,
+        texture: &Texture8,
+        joints: &[anim::Mat4x3],
+        camera: &Camera,
+    ) {
+        self.draw_objects_unlit(mesh.objects.iter().zip(joints), texture, camera);
+    }
+
+    /// Draw one or more objects full-bright with one matrix per object.
+    ///
+    /// Every object's triangles are collected first and painter-sorted
+    /// together, so overlapping door panels interleave by depth the way the
+    /// original's depth-keyed TMD queue does.
+    pub fn draw_objects_unlit<'a>(
+        &mut self,
+        objects: impl IntoIterator<Item = (&'a TmdObject, &'a anim::Mat4x3)>,
+        texture: &Texture8,
+        camera: &Camera,
+    ) {
+        let mut triangles: Vec<Triangle> = Vec::new();
+        for (object, joint) in objects {
+            collect_triangles(object, joint, camera, None, false, &mut triangles);
+        }
+        self.rasterize_triangles(texture, triangles);
+    }
+
+    fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
         triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
         for triangle in &triangles {
             self.rasterize(texture, triangle);
@@ -185,7 +145,7 @@ impl Framebuffer {
         let [a, b, c] = &triangle.raster;
         let area = (b.position[0] - a.position[0]) * (c.position[1] - a.position[1])
             - (c.position[0] - a.position[0]) * (b.position[1] - a.position[1]);
-        if !faces_camera(area) {
+        if triangle.cull && !faces_camera(area) {
             return;
         }
 
@@ -259,6 +219,53 @@ impl Framebuffer {
     }
 }
 
+/// Draw one frame of a parsed door animation over black.
+///
+/// Sets up the door VM camera (from/to points and focal length), draws every
+/// order whose flags submit a draw (bit `0x8000` plus a low nibble of 1, 2 or
+/// 3) with the door texture full-bright, then blends the frame's fade overlay.
+/// The background stays black because the room behind the animation is hidden.
+pub fn draw_door_scene(
+    framebuffer: &mut Framebuffer,
+    dor: &crate::door::Dor,
+    frame: &crate::door::vm::Frame<'_>,
+) {
+    framebuffer.clear();
+    let camera = Camera::from_points(frame.camera.from, frame.camera.to, frame.camera.focal);
+    let objects = frame.orders.iter().filter_map(|order| {
+        let draws = order.flags & 0x8000 != 0 && matches!(order.flags & 0xF, 1..=3);
+        if !draws {
+            return None;
+        }
+        order.mesh.map(|mesh| (mesh, &order.matrix))
+    });
+    framebuffer.draw_objects_unlit(objects, &dor.texture, &camera);
+    draw_fade_overlay(framebuffer, &frame.fade);
+}
+
+/// Blend a full-screen fade overlay over the framebuffer.
+///
+/// `fade_type` 1 is a white flash and 2 (or anything else) is black. The
+/// overlay alpha is `state >> 7` clamped to 0..=255, matching the original's
+/// fading-rect brightness.
+pub fn draw_fade_overlay(framebuffer: &mut Framebuffer, fade: &crate::door::vm::Fade) {
+    let alpha = (fade.state >> 7).clamp(0, 255) as u32;
+    if alpha == 0 {
+        return;
+    }
+    let colour: [u8; 3] = if fade.fade_type == 1 {
+        [255, 255, 255]
+    } else {
+        [0, 0, 0]
+    };
+    for pixel in framebuffer.rgba.as_chunks_mut::<4>().0 {
+        for (channel, &target) in pixel.iter_mut().zip(&colour) {
+            *channel =
+                ((u32::from(*channel) * (255 - alpha) + u32::from(target) * alpha) / 255) as u8;
+        }
+    }
+}
+
 /// A cut camera: a 4.12 view rotation, a world-unit translation and the cut's
 /// focal length in pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,19 +276,15 @@ pub struct Camera {
 }
 
 impl Camera {
-    /// Build the view rotation and translation from the cut's position and
-    /// look-at point. The focal length is `cut.fov`.
-    pub fn from_cut(cut: &Cut) -> Self {
-        let from = [
-            f64::from(cut.pos[0]),
-            f64::from(cut.pos[1]),
-            f64::from(cut.pos[2]),
-        ];
-        let to = [
-            f64::from(cut.look_at[0]),
-            f64::from(cut.look_at[1]),
-            f64::from(cut.look_at[2]),
-        ];
+    /// Build the view rotation and translation from a from/to point pair. The
+    /// focal length is `fov`.
+    ///
+    /// This is the door animation's `CAM_MATRIX` camera as well as the room
+    /// cut camera: the same from/look-at construction the original's
+    /// `MatrixToCamera` performs, with the scene's focal length in pixels.
+    pub fn from_points(from: [i32; 3], to: [i32; 3], fov: i32) -> Self {
+        let from = [f64::from(from[0]), f64::from(from[1]), f64::from(from[2])];
+        let to = [f64::from(to[0]), f64::from(to[1]), f64::from(to[2])];
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
         let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
         let h = (d[0] * d[0] + d[2] * d[2]).sqrt();
@@ -320,11 +323,13 @@ impl Camera {
                 / 4096.0)
                 .round() as i32
         });
-        Self {
-            view,
-            trans,
-            fov: cut.fov,
-        }
+        Self { view, trans, fov }
+    }
+
+    /// Build the view rotation and translation from the cut's position and
+    /// look-at point. The focal length is `cut.fov`.
+    pub fn from_cut(cut: &Cut) -> Self {
+        Self::from_points(cut.pos, cut.look_at, cut.fov)
     }
 
     /// Project a world-space point to screen pixels.
@@ -389,6 +394,107 @@ struct Triangle {
     raster: [RasterVertex; 3],
     depth: f64,
     palette_row: usize,
+    cull: bool,
+}
+
+/// Project and shade one TMD object into `triangles`.
+///
+/// `lighting` selects the gameplay path (room lights, the primitive's own
+/// palette row and paged UVs); `None` is the full-bright door path (white
+/// shade, palette row 0, direct UVs). `cull` drops back-facing triangles; the
+/// door path disables it because the original renders with culling off.
+fn collect_triangles(
+    object: &TmdObject,
+    joint: &anim::Mat4x3,
+    camera: &Camera,
+    lighting: Option<&Lighting>,
+    cull: bool,
+    triangles: &mut Vec<Triangle>,
+) {
+    let vertices: Vec<[i32; 3]> = object
+        .vertices
+        .iter()
+        .map(|vertex| fixed_mul(joint, *vertex))
+        .collect();
+    let normals: Vec<Option<[f64; 3]>> = object
+        .normals
+        .iter()
+        .map(|normal| normalize(rotate(joint, *normal)))
+        .collect();
+
+    for prim in &object.prims {
+        let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
+            vertices.get(usize::from(prim.vertices[0])),
+            vertices.get(usize::from(prim.vertices[1])),
+            vertices.get(usize::from(prim.vertices[2])),
+        ) else {
+            continue;
+        };
+        let normal0 = normals.get(usize::from(prim.normals[0])).copied().flatten();
+        let normal1 = normals.get(usize::from(prim.normals[1])).copied().flatten();
+        let normal2 = normals.get(usize::from(prim.normals[2])).copied().flatten();
+        if lighting.is_some() && (normal0.is_none() || normal1.is_none() || normal2.is_none()) {
+            continue;
+        }
+        let (Some(screen0), Some(screen1), Some(screen2)) = (
+            camera.project(*vertex0),
+            camera.project(*vertex1),
+            camera.project(*vertex2),
+        ) else {
+            continue;
+        };
+
+        let position0 = [screen0[0] as f64, screen0[1] as f64];
+        let position1 = [screen1[0] as f64, screen1[1] as f64];
+        let position2 = [screen2[0] as f64, screen2[1] as f64];
+        let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
+            - (position2[0] - position0[0]) * (position1[1] - position0[1]);
+        if cull && !faces_camera(area) {
+            continue;
+        }
+
+        let depth0 = f64::from(camera.view_position(*vertex0)[2]);
+        let depth1 = f64::from(camera.view_position(*vertex1)[2]);
+        let depth2 = f64::from(camera.view_position(*vertex2)[2]);
+
+        let (page_x, page_y, palette_row) = match lighting {
+            Some(_) => (
+                f64::from(u32::from(prim.tsb & 0xF) * 128),
+                f64::from(u32::from((prim.tsb >> 4) & 1) * 256),
+                usize::from(((prim.clut >> 6) & 0x01FF).saturating_sub(480)),
+            ),
+            // The door TIM is a single 128x256 page with one CLUT row and its
+            // UVs are direct, so neither the primitive's page bits nor its
+            // VRAM CLUT word offset the lookup.
+            None => (0.0, 0.0, 0),
+        };
+
+        let corners = [
+            (position0, depth0, &prim.uv[0], normal0, vertex0),
+            (position1, depth1, &prim.uv[1], normal1, vertex1),
+            (position2, depth2, &prim.uv[2], normal2, vertex2),
+        ];
+        let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
+            let (position, depth, uv, normal, vertex) = corners[corner];
+            RasterVertex {
+                position,
+                inv_z: 1.0 / depth,
+                u: f64::from(uv[0]) + page_x,
+                v: f64::from(uv[1]) + page_y,
+                shade: match lighting {
+                    Some(lighting) => shade_vertex(&normal, *vertex, lighting),
+                    None => [CHANNEL_MAX; 3],
+                },
+            }
+        });
+
+        triangles.push(Triangle {
+            raster,
+            depth: (depth0 + depth1 + depth2) / 3.0,
+            palette_row,
+            cull,
+        });
+    }
 }
 
 /// Rotate `vector` by `rotation` and negate the resulting Y.

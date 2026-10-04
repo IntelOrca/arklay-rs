@@ -4,6 +4,7 @@ pub mod anim;
 pub mod audio;
 pub mod bmp;
 pub mod convert;
+pub mod door;
 pub mod emd;
 pub mod engine;
 pub mod game;

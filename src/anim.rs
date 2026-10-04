@@ -202,8 +202,8 @@ fn rotation_components(sx: i32, sy: i32, sz: i32) -> [i32; 9] {
 /// `(0x1000 - x, y, 0x1000 - z)` and the nine 14-bit components are scaled to
 /// 4.12 with a truncating `>> 2`. The result is row-major; at `(0, 0, 0)` it is
 /// the near-identity `diag(4095, 4095, 4095)` because the cosine table
-/// saturates.
-fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
+/// saturates. The door animation's `ORDER_ROT` path uses the same builder.
+pub(crate) fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
     let components = rotation_components(0x1000 - x, y, 0x1000 - z);
     let mut matrix = [[0i32; 3]; 3];
     for (slot, component) in components.iter().enumerate() {
@@ -220,8 +220,9 @@ fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
 /// Y-sign conjugation around the rotation differs from a plain product, and it
 /// matters for every pitched or rolled joint: with a plain product the child
 /// translations come out mirrored, which visibly throws limbs to the wrong
-/// side.
-fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
+/// side. The door animation's hierarchical order matrices compose with the
+/// same operation.
+pub(crate) fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
     let mut r = [[0i32; 3]; 3];
     for (i, row) in r.iter_mut().enumerate() {
         for (j, entry) in row.iter_mut().enumerate() {
