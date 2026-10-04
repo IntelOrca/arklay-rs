@@ -1034,7 +1034,7 @@ impl MaskCache {
         if !self.pages.contains_key(&camera) && !self.missing.contains(&camera) {
             let entry = id.roommask_entry(camera);
             match pack.read(&entry) {
-                Ok(bytes) => match bmp::decode(bytes) {
+                Ok(bytes) => match bmp::decode_mask(bytes) {
                     Ok(image) => {
                         self.pages.insert(camera, image);
                     }

@@ -28,6 +28,22 @@ pub fn encode(image: &Image, path: &Path) -> Result<()> {
 /// Alpha is set to 255. Top-down images, compressed data, and other bit
 /// depths are rejected.
 pub fn decode(data: &[u8]) -> Result<Image> {
+    decode_with_key(data, None)
+}
+
+/// Decode a room-mask page, cutting exact black `(0, 0, 0)` texels out.
+///
+/// A mask page's key colour is black: texels of that colour are holes and
+/// every other texel is opaque. The converter preserves the page's colours
+/// but rebuilds its palette in first-use order, so the key has to be matched
+/// by colour rather than by palette index.
+pub fn decode_mask(data: &[u8]) -> Result<Image> {
+    decode_with_key(data, Some([0, 0, 0]))
+}
+
+/// Decode a BMP into RGBA8, giving texels equal to `key` a zero alpha when a
+/// key is supplied. Every other texel is opaque.
+fn decode_with_key(data: &[u8], key: Option<[u8; 3]>) -> Result<Image> {
     if data.len() < 2 || &data[0..2] != b"BM" {
         bail!("not a BMP file: bad magic");
     }
@@ -134,7 +150,11 @@ pub fn decode(data: &[u8]) -> Result<Image> {
             dst[x * 4] = r;
             dst[x * 4 + 1] = g;
             dst[x * 4 + 2] = b;
-            dst[x * 4 + 3] = 255;
+            dst[x * 4 + 3] = if key.is_some_and(|key| [r, g, b] == key) {
+                0
+            } else {
+                255
+            };
         }
     }
 
@@ -448,6 +468,53 @@ mod tests {
         let expected: Vec<u8> =
             [[10, 20, 30, 255], [200, 100, 50, 255], [10, 20, 30, 255]].concat();
         assert_eq!(image.rgba, expected);
+    }
+
+    #[test]
+    fn mask_decode_makes_exact_black_transparent_regardless_of_palette_order() {
+        // The first pixel is red, so the encoder's first-use palette starts
+        // with red and the black entry lands at index 1 - the converter really
+        // does produce such pages.
+        let image = build(4, 1, |x, _| match x {
+            0 => [200, 30, 40, 255],
+            1 | 2 => [0, 0, 0, 255],
+            _ => [10, 220, 60, 255],
+        });
+        let data = encode_to_vec(&image).unwrap();
+
+        let mask = decode_mask(&data).unwrap();
+        let expected: Vec<u8> = [
+            [200, 30, 40, 255],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [10, 220, 60, 255],
+        ]
+        .concat();
+        assert_eq!(mask.rgba, expected);
+
+        // The plain decoder still reports every texel opaque.
+        let plain = decode(&data).unwrap();
+        assert!(
+            plain
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
+    }
+
+    #[test]
+    fn mask_decode_leaves_near_black_opaque() {
+        let image = build(2, 1, |x, _| match x {
+            0 => [0, 0, 0, 255],
+            _ => [0, 0, 8, 255],
+        });
+        let data = encode_to_vec(&image).unwrap();
+
+        let mask = decode_mask(&data).unwrap();
+        assert_eq!(&mask.rgba[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&mask.rgba[4..8], &[0, 0, 8, 255]);
     }
 
     #[test]

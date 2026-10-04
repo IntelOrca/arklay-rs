@@ -113,7 +113,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     let page_bytes = pack
         .read(&entry)
         .unwrap_or_else(|err| panic!("pack `{path}` has no {entry}: {err} (reconvert the pack)"));
-    let page = bmp::decode(page_bytes).unwrap();
+    let page = bmp::decode_mask(page_bytes).unwrap();
 
     // The first group-1 sprite is the pillar top at screen (9, 73): 8x40,
     // page UV (0, 0), so pixel (12, 80) samples page texel (3, 7).
@@ -226,7 +226,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
         panic!("pack `{path}` has no {mask_entry}: {err} (reconvert the pack)")
     });
     let background = bmp::decode(pack.read(&id.cut_entry(0)).unwrap()).unwrap();
-    let page = bmp::decode(page_bytes).unwrap();
+    let page = bmp::decode_mask(page_bytes).unwrap();
     let emd = arklay::emd::parse(pack.read("player/00.emd").unwrap()).unwrap();
 
     // The same pose the engine's gameplay render would use at spawn.

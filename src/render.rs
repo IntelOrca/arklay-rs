@@ -267,7 +267,9 @@ impl Framebuffer {
 
     /// Rasterize one mask sprite: opaque, unshaded, nearest-sampled, clipped
     /// to the framebuffer. The sprite's size equals its sampled region, so
-    /// every screen pixel maps to exactly one page texel.
+    /// every screen pixel maps to exactly one page texel. A transparent texel
+    /// (zero alpha, the page's black key colour) is a hole: it leaves the
+    /// framebuffer pixel underneath untouched.
     fn rasterize_mask(&mut self, page: &Image, quad: &MaskQuad) {
         if page.width == 0 || page.height == 0 || quad.size.0 == 0 || quad.size.1 == 0 {
             return;
@@ -307,6 +309,9 @@ impl Framebuffer {
                 ) else {
                     continue;
                 };
+                if texel[3] == 0 {
+                    continue;
+                }
                 slot[0] = texel[0];
                 slot[1] = texel[1];
                 slot[2] = texel[2];
@@ -377,8 +382,9 @@ pub struct PlayerMesh<'a> {
 /// One camera's room-mask layer: its decoded page plus the ordering inputs.
 ///
 /// The engine loads the camera's `roommask/{room}_{camera:03}.bmp` entry from
-/// the pack, decodes it with [`crate::bmp::decode`] and pairs it with the
-/// camera's [`Cut`]. [`MaskLayer::new`] starts from the cut's own
+/// the pack, decodes it with [`crate::bmp::decode_mask`] (which cuts the
+/// page's black key colour to transparent) and pairs it with the camera's
+/// [`Cut`]. [`MaskLayer::new`] starts from the cut's own
 /// `mask_active` bits; a script toggle can pass an updated `active` instead.
 #[derive(Debug, Clone, Copy)]
 pub struct MaskLayer<'a> {
@@ -1508,5 +1514,46 @@ mod tests {
         assert_eq!(framebuffer_pixel(&framebuffer, 4, 4), [1, 2, 3, 255]);
         assert_eq!(framebuffer_pixel(&framebuffer, 5, 4), [0, 0, 0, 0]);
         assert_eq!(framebuffer_pixel(&framebuffer, 319, 239), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn transparent_mask_texels_leave_the_framebuffer_untouched() {
+        let cut = Cut {
+            masks: vec![crate::mask::MaskSprite {
+                uv: (0, 0),
+                pos: (10, 10),
+                size: (2, 1),
+                pos_data: 4,
+                flags: 0,
+                group: 1,
+            }],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        // One opaque page texel and one transparent (keyed) texel.
+        let mut page = solid_image(2, 1, [0, 0, 0, 0]);
+        page.rgba[0..4].copy_from_slice(&[9, 8, 7, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+
+        let background = solid_image(320, 240, [7, 8, 9, 255]);
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            Some(&background),
+            None,
+            &straight_camera(),
+            &lighting,
+            Some(&layer),
+        );
+
+        // The opaque texel paints over the background; the transparent one is
+        // a hole and keeps it.
+        assert_eq!(framebuffer_pixel(&framebuffer, 10, 10), [9, 8, 7, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 11, 10), [7, 8, 9, 255]);
     }
 }
