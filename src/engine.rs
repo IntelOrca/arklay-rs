@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{Context, Result, bail};
 
@@ -22,8 +23,9 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN,
-    SDL_SCANCODE_RIGHT, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_UP,
+    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT,
+    SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE,
+    SDL_SCANCODE_UP, SDL_SCANCODE_X,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -47,11 +49,14 @@ use crate::pack::Pack;
 use crate::player;
 use crate::rdt;
 use crate::render::{self, Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh};
+use crate::save;
 use crate::scd;
 use crate::sfx;
 use crate::state::{Image, RoomId, RoomState};
+use crate::text::Text;
 use crate::tim;
 use crate::transition::{self, DoorStepper};
+use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 
 const WIDTH: i32 = 320;
 const HEIGHT: i32 = 240;
@@ -113,80 +118,22 @@ impl Drop for SurfaceHandle {
 /// opens audio.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
     let pack = Pack::open(pack)?;
-    let mut loaded = load_room(&pack, id)?;
-    let mut game = game::GameState::new(id, &loaded.room);
-    let mut player_state = player::spawn(id, &loaded.room);
-    game.sync_entity_from_player(&player_state);
-
-    if capture.is_some() {
-        unsafe {
-            SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
-            SDL_SetHint(SDL_HINT_RENDER_DRIVER, c"software".as_ptr());
-        }
-    }
-
-    unsafe { SDL_SetMainReady() };
-    if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
-        bail!("SDL_Init failed: {}", sdl_error());
-    }
-    let _sdl = SdlHandle;
-
-    let title = window_title(
-        &loaded.id.room3(),
-        loaded.room.current_cut,
-        loaded.room.cuts.len(),
-    )?;
-    let window = unsafe {
-        SDL_CreateWindow(
-            title.as_ptr(),
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
-            SDL_WindowFlags::default(),
-        )
-    };
-    if window.is_null() {
-        bail!("SDL_CreateWindow failed: {}", sdl_error());
-    }
-    let _window = WindowHandle(window);
-
-    let renderer = unsafe { SDL_CreateRenderer(window, std::ptr::null()) };
-    if renderer.is_null() {
-        bail!("SDL_CreateRenderer failed: {}", sdl_error());
-    }
-    let _renderer = RendererHandle(renderer);
-    let _ = unsafe { SDL_SetRenderVSync(renderer, 1) };
-
-    let texture = unsafe {
-        SDL_CreateTexture(
-            renderer,
-            SDL_PIXELFORMAT_ABGR8888,
-            SDL_TEXTUREACCESS_STREAMING,
-            WIDTH,
-            HEIGHT,
-        )
-    };
-    if texture.is_null() {
-        bail!("SDL_CreateTexture failed: {}", sdl_error());
-    }
-    let _texture = TextureHandle(texture);
-
-    if !unsafe { SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE) } {
-        bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
-    }
-    if !unsafe { SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST) } {
-        bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
-    }
-    if !unsafe { SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255) } {
-        bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
-    }
-
-    let mut framebuffer = Framebuffer::new();
-    let mut masks = MaskCache::default();
 
     if let Some(capture_path) = capture {
+        let mut loaded = load_room(&pack, id)?;
+        let mut game = game::GameState::new(id, &loaded.room);
+        let player_state = player::spawn(id, &loaded.room);
+        game.sync_entity_from_player(&player_state);
         run_room_init(&loaded, &mut game);
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, None);
+        let title = window_title(
+            &loaded.id.room3(),
+            loaded.room.current_cut,
+            loaded.room.cuts.len(),
+        );
+        let display = Display::new(&title, true)?;
+        let mut framebuffer = Framebuffer::new();
         render_frame(
             &mut framebuffer,
             &pack,
@@ -194,58 +141,944 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
             &loaded.room,
             &player_state,
             loaded.player_assets.as_ref(),
-            &mut masks,
+            &mut MaskCache::default(),
         );
-        present(renderer, texture, &framebuffer)?;
-        capture_frame(renderer, capture_path)?;
-        return Ok(());
+        display.present(&framebuffer)?;
+        return display.capture(capture_path);
     }
 
-    let mut music = start_audio(&mut loaded);
-    let mut sfx_cache = SfxCache::default();
+    let mut session = GameSession::from_room(&pack, id)?;
+    let title = window_title(
+        &session.loaded.id.room3(),
+        session.loaded.room.current_cut,
+        session.loaded.room.cuts.len(),
+    );
+    let display = Display::new(&title, false)?;
+    session.start_audio();
+    run_session_loop(&pack, &mut session, &display)
+}
 
+/// The interactive gameplay loop shared by `--room` and the app's Play mode.
+fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -> Result<()> {
+    let mut framebuffer = Framebuffer::new();
+    let mut edges = InputEdges::default();
+    let mut event = SDL_Event::default();
+    let mut last_ticks = unsafe { SDL_GetTicks() };
+    let mut accumulator = 0.0f64;
     loop {
-        match run_gameplay(
-            &pack,
-            &mut loaded,
-            &mut game,
-            &mut player_state,
-            window,
-            renderer,
-            texture,
-            &mut masks,
-            &mut sfx_cache,
-            &mut music,
-        )? {
-            GameplayEnd::Quit => return Ok(()),
-            GameplayEnd::Transition(session) => {
-                if let Flow::Quit = run_transition(
-                    &pack,
-                    *session,
-                    &mut game,
-                    &mut player_state,
-                    &mut loaded,
-                    renderer,
-                    texture,
-                    &mut sfx_cache,
-                    &mut music,
-                )? {
-                    return Ok(());
+        let mut cut_delta = 0i32;
+        let mut any_key = false;
+        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
+            return Ok(());
+        }
+        let _ = edges.read(any_key);
+        if cut_delta != 0 {
+            session.step_camera_cut(cut_delta);
+        }
+        session.update_window_title(display.window)?;
+
+        let now = unsafe { SDL_GetTicks() };
+        accumulator += now.saturating_sub(last_ticks) as f64;
+        last_ticks = now;
+        if accumulator > 250.0 {
+            accumulator = 250.0;
+        }
+        let (input, action) = read_input();
+        while accumulator >= TICK_MS {
+            if session.transition_finished {
+                accumulator = 0.0;
+                break;
+            }
+            if session.transition.is_some() {
+                session.tick_transition(pack, action || input.run);
+            } else {
+                session.tick(pack, input, action)?;
+                if session.transition.is_some() {
+                    // The original drops the remainder of the frame's time
+                    // when a door hands control to its transition phase.
+                    accumulator = 0.0;
+                    break;
+                }
+            }
+            accumulator -= TICK_MS;
+        }
+
+        // The pass that ends a transition is drawn once before teardown.
+        session.render(pack);
+        framebuffer.copy_from(session.frame());
+        display.present(&framebuffer)?;
+        display.show()?;
+        if session.transition_finished {
+            session.finish_transition(pack);
+        }
+        session.update_audio();
+    }
+}
+
+/// The SDL window, renderer and streaming texture every screen shares.
+///
+/// The guards are declared before the raw pointers so the texture, renderer,
+/// window and SDL tear down in that order.
+struct Display {
+    _texture: TextureHandle,
+    _renderer: RendererHandle,
+    _window: WindowHandle,
+    _sdl: SdlHandle,
+    texture: *mut SDL_Texture,
+    renderer: *mut SDL_Renderer,
+    window: *mut SDL_Window,
+}
+
+impl Display {
+    /// Open the 960x720 window; `capture` selects SDL's offscreen software
+    /// driver for headless captures.
+    fn new(title: &str, capture: bool) -> Result<Self> {
+        if capture {
+            unsafe {
+                SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
+                SDL_SetHint(SDL_HINT_RENDER_DRIVER, c"software".as_ptr());
+            }
+        }
+
+        unsafe { SDL_SetMainReady() };
+        if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
+            bail!("SDL_Init failed: {}", sdl_error());
+        }
+        let sdl = SdlHandle;
+
+        let title = CString::new(title).context("window title contains a NUL byte")?;
+        let window = unsafe {
+            SDL_CreateWindow(
+                title.as_ptr(),
+                WINDOW_WIDTH,
+                WINDOW_HEIGHT,
+                SDL_WindowFlags::default(),
+            )
+        };
+        if window.is_null() {
+            bail!("SDL_CreateWindow failed: {}", sdl_error());
+        }
+        let window = WindowHandle(window);
+
+        let renderer = unsafe { SDL_CreateRenderer(window.0, std::ptr::null()) };
+        if renderer.is_null() {
+            bail!("SDL_CreateRenderer failed: {}", sdl_error());
+        }
+        let renderer = RendererHandle(renderer);
+        let _ = unsafe { SDL_SetRenderVSync(renderer.0, 1) };
+
+        let texture = unsafe {
+            SDL_CreateTexture(
+                renderer.0,
+                SDL_PIXELFORMAT_ABGR8888,
+                SDL_TEXTUREACCESS_STREAMING,
+                WIDTH,
+                HEIGHT,
+            )
+        };
+        if texture.is_null() {
+            bail!("SDL_CreateTexture failed: {}", sdl_error());
+        }
+        let texture = TextureHandle(texture);
+
+        if !unsafe { SDL_SetTextureBlendMode(texture.0, SDL_BLENDMODE_NONE) } {
+            bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
+        }
+        if !unsafe { SDL_SetTextureScaleMode(texture.0, SDL_SCALEMODE_NEAREST) } {
+            bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
+        }
+        if !unsafe { SDL_SetRenderDrawColor(renderer.0, 0, 0, 0, 255) } {
+            bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
+        }
+
+        Ok(Self {
+            texture: texture.0,
+            renderer: renderer.0,
+            window: window.0,
+            _texture: texture,
+            _renderer: renderer,
+            _window: window,
+            _sdl: sdl,
+        })
+    }
+
+    /// Upload the framebuffer and draw it scaled to the window.
+    fn present(&self, framebuffer: &Framebuffer) -> Result<()> {
+        present(self.renderer, self.texture, framebuffer)
+    }
+
+    /// Flip the drawn backbuffer to the screen.
+    fn show(&self) -> Result<()> {
+        if !unsafe { SDL_RenderPresent(self.renderer) } {
+            bail!("SDL_RenderPresent failed: {}", sdl_error());
+        }
+        Ok(())
+    }
+
+    /// Read the drawn frame back and write it as a BMP.
+    fn capture(&self, path: &Path) -> Result<()> {
+        capture_frame(self.renderer, path)
+    }
+}
+
+/// One gameplay session: the loaded room, game state, player and VMs.
+///
+/// `--room` builds one through [`GameSession::from_room`] and the app's Play
+/// mode through [`GameSession::new`] or [`GameSession::from_save`]. The engine
+/// drives it one fixed tick at a time and renders through the session's own
+/// framebuffer, so a gameplay modal can freeze the room and still show the
+/// last frame underneath.
+struct GameSession {
+    loaded: LoadedRoom,
+    game: game::GameState,
+    player: player::PlayerState,
+    command_vm: scd::vm::CommandVm,
+    event_vm: scd::vm::EventVm,
+    masks: MaskCache,
+    sfx_cache: SfxCache,
+    music: Option<Mixer>,
+    framebuffer: Framebuffer,
+    titled_cut: usize,
+    transition: Option<TransitionMode>,
+    transition_finished: bool,
+    /// Gameplay modal hook.
+    ///
+    /// A gameplay agent (message window, inventory, item viewer) installs a
+    /// boxed [`ui::Screen`] here. While one is present the engine must not
+    /// call [`GameSession::tick`]: the room stays frozen, the modal advances
+    /// through its own [`ui::Screen::update`], and the app draws the last
+    /// gameplay frame from [`GameSession::frame`] underneath before calling
+    /// the modal's draw and applying its [`ui::Screen::fade`] overlay. A modal
+    /// closes by reporting [`ScreenAction::Resume`].
+    modal: Option<Box<dyn ui::Screen>>,
+}
+
+/// New-game start position X (the original's `InitPlayerData`).
+pub const NEW_GAME_POS_X: i32 = 17000;
+/// New-game start position Z.
+pub const NEW_GAME_POS_Z: i32 = 5000;
+/// New-game facing angle.
+pub const NEW_GAME_ANGLE: u16 = 3072;
+/// New-game starting health: Chris then Jill.
+pub const NEW_GAME_HEALTH: [i16; 2] = [140, 96];
+/// The shipped 32-byte room-items flag pattern: bit set = item still there.
+pub const NEW_GAME_ROOM_ITEMS: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0xBF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+];
+/// Item id of the combat knife.
+const ITEM_KNIFE: u8 = 0x01;
+/// Item id of the Beretta (Jill's starting handgun).
+const ITEM_BERETTA: u8 = 0x02;
+/// Item id of the first-aid spray.
+const ITEM_FIRST_AID_SPRAY: u8 = 0x41;
+
+impl GameSession {
+    /// A new game as `character` (`0` Chris, `1` Jill): stage 1 room 0 with
+    /// the original's start position, health, items and room-item flags, then
+    /// the room init/main/event VMs.
+    fn new(pack: &Pack, character: u8) -> Result<Self> {
+        let character = character & 1;
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: character,
+        };
+        let loaded = load_room(pack, id)?;
+        let mut game = game::GameState::new(id, &loaded.room);
+        seed_new_game(&mut game, character);
+        let mut player_state = player::spawn(id, &loaded.room);
+        player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
+        player_state.angle = NEW_GAME_ANGLE;
+        game.sync_entity_from_player(&player_state);
+        Self::from_loaded(loaded, game, player_state)
+    }
+
+    /// Boot `id` directly, the `--room` path.
+    fn from_room(pack: &Pack, id: RoomId) -> Result<Self> {
+        let loaded = load_room(pack, id)?;
+        let mut game = game::GameState::new(id, &loaded.room);
+        let player_state = player::spawn(id, &loaded.room);
+        game.sync_entity_from_player(&player_state);
+        Self::from_loaded(loaded, game, player_state)
+    }
+
+    /// Continue from a parsed save: the block replaces the state, the saved
+    /// position and angle place the player and the saved room loads.
+    fn from_save(pack: &Pack, file: &save::SaveFile) -> Result<Self> {
+        let id = RoomId {
+            stage: file.stage,
+            room: file.room,
+            player_flag: file.character & 1,
+        };
+        let loaded = load_room(pack, id)?;
+        let mut game = game::GameState::new(id, &loaded.room);
+        file.apply_to(&mut game);
+        let mut player_state = player::spawn(id, &loaded.room);
+        player_state.pos = [
+            i32::from(file.pos_x),
+            player_state.pos[1],
+            i32::from(file.pos_z),
+        ];
+        player_state.angle = file.angle as u16 & 0x0FFF;
+        game.sync_entity_from_player(&player_state);
+        Self::from_loaded(loaded, game, player_state)
+    }
+
+    /// Assemble a session around already-built state and run the room boot.
+    fn from_loaded(
+        loaded: LoadedRoom,
+        game: game::GameState,
+        player_state: player::PlayerState,
+    ) -> Result<Self> {
+        let scripts = Rc::new(loaded.scripts.clone());
+        let command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+        let event_vm = scd::vm::EventVm::from_scripts(scripts);
+        let mut session = Self {
+            loaded,
+            game,
+            player: player_state,
+            command_vm,
+            event_vm,
+            masks: MaskCache::default(),
+            sfx_cache: SfxCache::default(),
+            music: None,
+            framebuffer: Framebuffer::new(),
+            titled_cut: usize::MAX,
+            transition: None,
+            transition_finished: false,
+            modal: None,
+        };
+        session.enter_room();
+        Ok(session)
+    }
+
+    /// Run the room boot: init script, queued events, the player mirror, mask
+    /// toggles and the camera zone scan.
+    fn enter_room(&mut self) {
+        {
+            let mut host = game::ScdGameHost::new(&mut self.game);
+            self.command_vm.run_init(&mut host);
+        }
+        start_pending_events(&mut self.game, &mut self.event_vm);
+        self.game.sync_player(&mut self.player);
+        drain_mask_toggles(&mut self.loaded.room, &mut self.game);
+        apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
+    }
+
+    /// One fixed 30 Hz tick: scripts, interaction, player movement, camera,
+    /// BGM/mask/footstep drains and a door transition request.
+    fn tick(&mut self, pack: &Pack, input: player::Input, action: bool) -> Result<()> {
+        let transition = tick_room(
+            &mut self.command_vm,
+            &mut self.event_vm,
+            RoomContext {
+                room: &mut self.loaded.room,
+                game: &mut self.game,
+                player: &mut self.player,
+                player_assets: self.loaded.player_assets.as_ref(),
+            },
+            input,
+            action,
+        );
+        apply_bgm_requests(
+            &mut self.music,
+            &mut self.game.room_bgm_requests,
+            pack,
+            self.loaded.id,
+        );
+        drain_mask_toggles(&mut self.loaded.room, &mut self.game);
+        play_footsteps(
+            &mut self.music,
+            &mut self.sfx_cache,
+            pack,
+            &self.loaded.room,
+            &mut self.player,
+        );
+        if let Some(transition) = transition {
+            let record = self.game.transition_door.take().unwrap_or_default();
+            self.transition = Some(start_transition(pack, &record, &transition)?);
+        }
+        Ok(())
+    }
+
+    /// Advance an active transition animation one fixed frame. The finished
+    /// flag is held until [`GameSession::finish_transition`] runs after the
+    /// frame was presented.
+    fn tick_transition(&mut self, pack: &Pack, skip: bool) {
+        let Some(mut session) = self.transition.take() else {
+            return;
+        };
+        let frame = session.transition.tick(skip);
+        session.frame = frame;
+        for effect in session.transition.stepper_mut().take_sfx() {
+            play_door_animation_sfx(
+                &mut self.music,
+                &mut self.sfx_cache,
+                pack,
+                &session.door,
+                effect,
+            );
+        }
+        for message in session.transition.stepper_mut().take_messages() {
+            apply_door_message(&mut self.game, message);
+        }
+        // The software mixer queues synchronously, so the VM's SFX op never
+        // has to wait.
+        session.transition.set_sound_busy(false);
+        self.transition_finished = frame.finished;
+        self.transition = Some(session);
+    }
+
+    /// Tear the finished transition down, swap the destination room in and
+    /// rebuild its scripts/VMs.
+    fn finish_transition(&mut self, pack: &Pack) {
+        let Some(mut session) = self.transition.take() else {
+            return;
+        };
+        finish_transition(
+            pack,
+            &mut session,
+            &mut self.game,
+            &mut self.player,
+            &mut self.loaded,
+            &mut self.music,
+            &mut self.sfx_cache,
+        );
+        self.transition_finished = false;
+        let scripts = Rc::new(self.loaded.scripts.clone());
+        self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+        self.event_vm = scd::vm::EventVm::from_scripts(scripts);
+        self.enter_room();
+    }
+
+    /// Render the current frame into the session framebuffer: a transition
+    /// frame while one runs, the gameplay scene otherwise.
+    fn render(&mut self, pack: &Pack) {
+        if let Some(transition) = &self.transition {
+            render_transition(&mut self.framebuffer, transition);
+            return;
+        }
+        render_frame(
+            &mut self.framebuffer,
+            pack,
+            self.loaded.id,
+            &self.loaded.room,
+            &self.player,
+            self.loaded.player_assets.as_ref(),
+            &mut self.masks,
+        );
+    }
+
+    /// The last rendered frame; gameplay modals draw over it.
+    fn frame(&self) -> &Framebuffer {
+        &self.framebuffer
+    }
+
+    /// Install a gameplay modal screen; the room freezes until it resumes.
+    ///
+    /// The message, inventory and item-view slices call this; the current
+    /// slices only exercise the hook through the tests.
+    #[allow(dead_code)]
+    fn open_modal(&mut self, screen: Box<dyn ui::Screen>) {
+        self.modal = Some(screen);
+    }
+
+    /// Step the camera cut with the debug shift+`,`/`.` keys.
+    fn step_camera_cut(&mut self, delta: i32) {
+        let count = self.loaded.room.cuts.len();
+        if count == 0 {
+            return;
+        }
+        self.loaded.room.current_cut =
+            (self.loaded.room.current_cut as i32 + delta).rem_euclid(count as i32) as usize;
+        self.game.camera.current_cut = self.loaded.room.current_cut;
+    }
+
+    /// Refresh the window title when the active cut changed.
+    fn update_window_title(&mut self, window: *mut SDL_Window) -> Result<()> {
+        update_window_title(window, &self.loaded, &mut self.titled_cut)
+    }
+
+    /// Open the audio device and start the room's track, if not already open.
+    fn start_audio(&mut self) {
+        if self.music.is_none() {
+            self.music = start_audio(&mut self.loaded);
+        }
+    }
+
+    /// Feed the mixer's streaming voices.
+    fn update_audio(&mut self) {
+        if let Some(mixer) = &mut self.music {
+            mixer.update();
+        }
+    }
+}
+
+/// Apply the shipped new-game state: health, room-item flags, save counter
+/// and starting inventory (knife, spray, and Jill's Beretta with 15 rounds).
+fn seed_new_game(game: &mut game::GameState, character: u8) {
+    let character = character & 1;
+    game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
+    game.max_health = NEW_GAME_HEALTH[usize::from(character)];
+    game.health_status = 0x10;
+    game.flags[7]
+        .bytes_mut()
+        .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    game.state_bytes[usize::from(game::STATE_BYTE_SAVES)] = 0;
+    game.state_bytes[0x24..0x28].fill(0);
+    game.add_item(ITEM_KNIFE, 0);
+    if character == 1 {
+        game.add_item(ITEM_BERETTA, 15);
+    }
+    game.add_item(ITEM_FIRST_AID_SPRAY, 1);
+}
+
+/// Which screen `--ui` boots or the app opens first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppBoot {
+    /// The title screen.
+    Title,
+    /// The character-selection screen.
+    CharSelect,
+    /// The load-screen picker.
+    SaveLoad,
+    /// A new game as the character (`0` Chris, `1` Jill).
+    NewGame(u8),
+}
+
+/// The app's current screen.
+enum Mode {
+    Title(ui::title::TitleScreen),
+    Select(ui::char_select::CharSelectScreen),
+    Load(ui::save_load::SaveLoadScreen),
+    Play(Box<GameSession>),
+}
+
+/// The mode machine: one screen at a time, with the pack and decoded shared
+/// assets owned here.
+struct App {
+    pack: Pack,
+    save_dir: PathBuf,
+    font: Option<font::Font>,
+    text: Text,
+    mode: Mode,
+    framebuffer: Framebuffer,
+    ticks: u64,
+    /// Whether entering a game opens the audio device; captures leave it off.
+    audio: bool,
+}
+
+/// How one app tick ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppFlow {
+    Continue,
+    Quit,
+}
+
+impl App {
+    /// Open the pack's shared assets; the mode machine starts on the title.
+    /// `audio` opens the mixer when a game session starts.
+    fn new(pack: Pack, save_dir: PathBuf, audio: bool) -> Self {
+        let font = match pack.read("font/font.tim") {
+            Ok(bytes) => match tim::decode_4bpp(bytes) {
+                Ok(texture) => Some(font::Font::new(texture)),
+                Err(err) => {
+                    eprintln!("warning: invalid font/font.tim: {err:#}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+        let text = Text::load(&pack);
+        Self {
+            pack,
+            save_dir,
+            font,
+            text,
+            mode: Mode::Title(ui::title::TitleScreen::new()),
+            framebuffer: Framebuffer::new(),
+            ticks: 0,
+            audio,
+        }
+    }
+
+    /// Build the shared screen context.
+    fn context(&self) -> UiContext<'_> {
+        UiContext {
+            pack: &self.pack,
+            save_dir: &self.save_dir,
+            font: self.font.as_ref(),
+            text: Some(&self.text),
+            ticks: self.ticks,
+        }
+    }
+
+    /// Open the boot screen.
+    fn boot(&mut self, boot: AppBoot) -> Result<()> {
+        match boot {
+            AppBoot::Title => self.open_title(),
+            AppBoot::CharSelect => self.open_select(),
+            AppBoot::SaveLoad => self.open_load(),
+            AppBoot::NewGame(character) => {
+                let session = GameSession::new(&self.pack, character)?;
+                self.start_session(session);
+                Ok(())
+            }
+        }
+    }
+
+    /// Open the title screen.
+    fn open_title(&mut self) -> Result<()> {
+        let mut screen = ui::title::TitleScreen::new();
+        screen.open(&mut self.context())?;
+        self.mode = Mode::Title(screen);
+        Ok(())
+    }
+
+    /// Open the character-selection screen.
+    fn open_select(&mut self) -> Result<()> {
+        let mut screen = ui::char_select::CharSelectScreen::new();
+        screen.open(&mut self.context())?;
+        self.mode = Mode::Select(screen);
+        Ok(())
+    }
+
+    /// Open the load-screen picker.
+    fn open_load(&mut self) -> Result<()> {
+        let mut screen = ui::save_load::SaveLoadScreen::new();
+        screen.open(&mut self.context())?;
+        self.mode = Mode::Load(screen);
+        Ok(())
+    }
+
+    /// Enter a gameplay session, opening audio on the interactive path.
+    fn start_session(&mut self, mut session: GameSession) {
+        if self.audio {
+            session.start_audio();
+        }
+        self.mode = Mode::Play(Box::new(session));
+    }
+
+    /// Apply a completed screen action.
+    fn apply(&mut self, action: ScreenAction) -> Result<AppFlow> {
+        match action {
+            ScreenAction::CharSelect => self.open_select()?,
+            ScreenAction::SaveLoad => self.open_load()?,
+            ScreenAction::NewGame { character } => {
+                let session = GameSession::new(&self.pack, character)?;
+                self.start_session(session);
+            }
+            ScreenAction::LoadGame { slot } => {
+                let file = save::load(&self.save_dir, slot)?;
+                let session = GameSession::from_save(&self.pack, &file)?;
+                self.start_session(session);
+            }
+            ScreenAction::Title => self.open_title()?,
+            ScreenAction::Resume => {
+                if let Mode::Play(session) = &mut self.mode {
+                    session.modal = None;
+                }
+            }
+            ScreenAction::Quit => return Ok(AppFlow::Quit),
+        }
+        Ok(AppFlow::Continue)
+    }
+
+    /// One app tick: advance the active screen, or the room when playing.
+    fn update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
+        self.ticks = self.ticks.saturating_add(1);
+        let result = self.screen_update(ui);
+        if let ScreenResult::Done(action) = result {
+            return self.apply(action);
+        }
+        self.play_update(ui, input, action)
+    }
+
+    /// Advance the title/select/load screen; Play reports `Continue` here.
+    fn screen_update(&mut self, ui: UiInput) -> ScreenResult {
+        let App {
+            pack,
+            save_dir,
+            font,
+            text,
+            mode,
+            ticks,
+            ..
+        } = self;
+        let cx = UiContext {
+            pack,
+            save_dir,
+            font: font.as_ref(),
+            text: Some(text),
+            ticks: *ticks,
+        };
+        match mode {
+            Mode::Title(screen) => screen.update(&cx, ui),
+            Mode::Select(screen) => screen.update(&cx, ui),
+            Mode::Load(screen) => screen.update(&cx, ui),
+            Mode::Play(_) => ScreenResult::Continue,
+        }
+    }
+
+    /// Tick the gameplay session or its modal.
+    fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
+        let App {
+            pack,
+            save_dir,
+            font,
+            text,
+            mode,
+            ticks,
+            ..
+        } = self;
+        let Mode::Play(session) = mode else {
+            return Ok(AppFlow::Continue);
+        };
+        if let Some(modal) = session.modal.as_mut() {
+            let cx = UiContext {
+                pack,
+                save_dir,
+                font: font.as_ref(),
+                text: Some(text),
+                ticks: *ticks,
+            };
+            match modal.update(&cx, ui) {
+                ScreenResult::Done(ScreenAction::Resume) => session.modal = None,
+                ScreenResult::Done(ScreenAction::Quit) => return Ok(AppFlow::Quit),
+                _ => {}
+            }
+        } else if !session.transition_finished {
+            if session.transition.is_some() {
+                session.tick_transition(pack, action || input.run);
+            } else {
+                session.tick(pack, input, action)?;
+            }
+        }
+        Ok(AppFlow::Continue)
+    }
+
+    /// Draw the active screen into the app framebuffer.
+    fn draw(&mut self) {
+        let App {
+            pack,
+            save_dir,
+            font,
+            text,
+            mode,
+            framebuffer,
+            ticks,
+            ..
+        } = self;
+        match mode {
+            Mode::Title(screen) => {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: *ticks,
+                };
+                screen.draw(&cx, framebuffer);
+                framebuffer.fade_to_black(screen.fade());
+            }
+            Mode::Select(screen) => {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: *ticks,
+                };
+                screen.draw(&cx, framebuffer);
+                framebuffer.fade_to_black(screen.fade());
+            }
+            Mode::Load(screen) => {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: *ticks,
+                };
+                screen.draw(&cx, framebuffer);
+                framebuffer.fade_to_black(screen.fade());
+            }
+            Mode::Play(session) => {
+                if session.modal.is_none() {
+                    session.render(pack);
+                }
+                framebuffer.copy_from(session.frame());
+                if let Some(modal) = session.modal.as_mut() {
+                    let cx = UiContext {
+                        pack,
+                        save_dir,
+                        font: font.as_ref(),
+                        text: Some(text),
+                        ticks: *ticks,
+                    };
+                    modal.draw(&cx, framebuffer);
+                    let fade = modal.fade();
+                    framebuffer.fade_to_black(fade);
                 }
             }
         }
+    }
+
+    /// The app framebuffer.
+    fn frame(&self) -> &Framebuffer {
+        &self.framebuffer
+    }
+
+    /// Step the camera cut when playing.
+    fn step_camera_cut(&mut self, delta: i32) {
+        if let Mode::Play(session) = &mut self.mode {
+            session.step_camera_cut(delta);
+        }
+    }
+
+    /// Refresh the window title when playing.
+    fn update_window_title(&mut self, window: *mut SDL_Window) -> Result<()> {
+        if let Mode::Play(session) = &mut self.mode {
+            session.update_window_title(window)?;
+        }
+        Ok(())
+    }
+
+    /// After presenting: tear down a finished transition and feed the mixer.
+    fn post_present(&mut self) {
+        if let Mode::Play(session) = &mut self.mode {
+            if session.transition_finished {
+                session.finish_transition(&self.pack);
+            }
+            session.update_audio();
+        }
+    }
+
+    /// Run `count` ticks without input, for deterministic captures.
+    fn settle(&mut self, count: u32) -> Result<()> {
+        for _ in 0..count {
+            self.update(UiInput::default(), player::Input::default(), false)?;
+        }
+        Ok(())
+    }
+
+    /// Write the current app frame as a BMP.
+    fn capture(&self, path: &Path) -> Result<()> {
+        bmp::encode(
+            &Image {
+                width: self.framebuffer.width,
+                height: self.framebuffer.height,
+                rgba: self.framebuffer.rgba.clone(),
+            },
+            path,
+        )
     }
 }
 
 /// Boot one UI screen directly instead of a room.
 ///
-/// The only screen for now is `font`: the decoded font sheet with a sample of
-/// plain, extended and tinted text. `capture` renders one deterministic frame
-/// offscreen; otherwise the window stays up until the user quits.
+/// `font` renders the decoded font sheet with sample text; `title`, `select`
+/// and `game` boot the app screens, and `load` the load picker. `capture`
+/// renders one deterministic frame and exits; otherwise the window stays up
+/// until the user quits.
 pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
-    match screen {
-        "font" => run_font_ui(pack, capture),
-        other => bail!("unknown --ui screen `{other}`; expected `font`"),
+    let save_dir = save::default_save_dir_for_pack(pack);
+    run_ui_with_options(pack, screen, capture, &save_dir, 0)
+}
+
+/// [`run_ui`] with an explicit save directory and character digit.
+pub fn run_ui_with_options(
+    pack: &Path,
+    screen: &str,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    character: u8,
+) -> Result<()> {
+    let boot = match screen {
+        "font" => return run_font_ui(pack, capture),
+        "title" => AppBoot::Title,
+        "select" => AppBoot::CharSelect,
+        "load" => AppBoot::SaveLoad,
+        "game" => AppBoot::NewGame(character & 1),
+        other => {
+            bail!(
+                "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game` or `load`"
+            )
+        }
+    };
+
+    if let Some(capture_path) = capture {
+        let pack = Pack::open(pack)?;
+        let mut app = App::new(pack, save_dir.to_path_buf(), false);
+        match boot {
+            AppBoot::Title => {
+                // Reach the option menu, then let the fade settle.
+                app.open_title()?;
+                app.update(
+                    UiInput {
+                        any: true,
+                        ..UiInput::default()
+                    },
+                    player::Input::default(),
+                    false,
+                )?;
+                app.settle(48)?;
+            }
+            AppBoot::CharSelect => {
+                app.open_select()?;
+                app.settle(48)?;
+            }
+            AppBoot::SaveLoad => {
+                app.open_load()?;
+                app.settle(48)?;
+            }
+            AppBoot::NewGame(character) => {
+                let session = GameSession::new(&app.pack, character)?;
+                app.start_session(session);
+            }
+        }
+        app.draw();
+        return app.capture(capture_path);
+    }
+
+    let pack = Pack::open(pack)?;
+    let mut app = App::new(pack, save_dir.to_path_buf(), true);
+    app.boot(boot)?;
+    let display = Display::new("Arklay", false)?;
+    let mut edges = InputEdges::default();
+    let mut event = SDL_Event::default();
+    let mut last_ticks = unsafe { SDL_GetTicks() };
+    let mut accumulator = 0.0f64;
+    loop {
+        let mut cut_delta = 0i32;
+        let mut any_key = false;
+        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
+            return Ok(());
+        }
+        let ui = edges.read(any_key);
+        if cut_delta != 0 {
+            app.step_camera_cut(cut_delta);
+        }
+        app.update_window_title(display.window)?;
+
+        let now = unsafe { SDL_GetTicks() };
+        accumulator += now.saturating_sub(last_ticks) as f64;
+        last_ticks = now;
+        if accumulator > 250.0 {
+            accumulator = 250.0;
+        }
+        let (input, action) = read_input();
+        while accumulator >= TICK_MS {
+            if let AppFlow::Quit = app.update(ui, input, action)? {
+                return Ok(());
+            }
+            accumulator -= TICK_MS;
+        }
+        app.draw();
+        display.present(app.frame())?;
+        display.show()?;
+        app.post_present();
     }
 }
 
@@ -326,8 +1159,9 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>) -> Result<()> {
 
     let mut event = SDL_Event::default();
     let mut cut_delta = 0i32;
+    let mut any_key = false;
     loop {
-        if poll_events(&mut event, &mut cut_delta) {
+        if poll_events(&mut event, &mut cut_delta, &mut any_key) {
             return Ok(());
         }
         present(renderer, texture, &framebuffer)?;
@@ -426,20 +1260,6 @@ const SAMPLE_KANJI_BOTTOM: &[u8] = &[0xFA, 0, 0xFA, 18, 0xFA, 36, 0xFA, 54, 0x01
 const SAMPLE_SPACING: &[u8] = &[
     0x0C, 0xFF, 0x0C, 0xFF, 0x0C, 0x00, 0x0D, 0xFB, 0xFB, 0x0E, 0x01,
 ];
-
-/// How a phase ended.
-enum Flow {
-    /// The user asked to quit.
-    Quit,
-    /// The engine should keep running (the phase completed).
-    Continue,
-}
-
-/// How the gameplay phase ended.
-enum GameplayEnd {
-    Quit,
-    Transition(Box<TransitionMode>),
-}
 
 /// A running door transition.
 ///
@@ -567,187 +1387,6 @@ impl DoorStepper for DoorAnimation {
     fn set_sound_busy(&mut self, busy: bool) {
         if let Some(vm) = self.vm.as_mut() {
             vm.set_sound_busy(busy);
-        }
-    }
-}
-
-/// Run the gameplay phase until a door requests a transition or the user
-/// quits. Runs the room's init script and owns the per-room VMs.
-#[allow(clippy::too_many_arguments)]
-fn run_gameplay(
-    pack: &Pack,
-    loaded: &mut LoadedRoom,
-    game: &mut game::GameState,
-    player_state: &mut player::PlayerState,
-    window: *mut SDL_Window,
-    renderer: *mut SDL_Renderer,
-    texture: *mut SDL_Texture,
-    masks: &mut MaskCache,
-    sfx_cache: &mut SfxCache,
-    music: &mut Option<Mixer>,
-) -> Result<GameplayEnd> {
-    let scripts = &loaded.scripts;
-    let mut command_vm = scd::vm::CommandVm::new(scripts);
-    let mut event_vm = scd::vm::EventVm::new(scripts);
-    {
-        let mut host = game::ScdGameHost::new(game);
-        command_vm.run_init(&mut host);
-    }
-    start_pending_events(game, &mut event_vm);
-    // The init script can move the player entity; mirror that before the
-    // camera zone scan, as the original's room_set does.
-    game.sync_player(player_state);
-    drain_mask_toggles(&mut loaded.room, game);
-    apply_camera(&mut loaded.room, game, Some(player_state.pos));
-    // Force one title refresh on room entry.
-    let mut titled_cut = usize::MAX;
-    update_window_title(window, loaded, &mut titled_cut)?;
-
-    let mut framebuffer = Framebuffer::new();
-    let mut event = SDL_Event::default();
-    let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut accumulator = 0.0f64;
-    loop {
-        let mut cut_delta = 0i32;
-        if poll_events(&mut event, &mut cut_delta) {
-            return Ok(GameplayEnd::Quit);
-        }
-        if cut_delta != 0 {
-            let count = loaded.room.cuts.len();
-            loaded.room.current_cut =
-                (loaded.room.current_cut as i32 + cut_delta).rem_euclid(count as i32) as usize;
-            game.camera.current_cut = loaded.room.current_cut;
-            update_window_title(window, loaded, &mut titled_cut)?;
-        }
-
-        let now = unsafe { SDL_GetTicks() };
-        accumulator += now.saturating_sub(last_ticks) as f64;
-        last_ticks = now;
-        // Avoid a burst of catch-up ticks after a stall (window drag, debugger).
-        if accumulator > 250.0 {
-            accumulator = 250.0;
-        }
-        let (input, action) = read_input();
-        while accumulator >= TICK_MS {
-            let transition = tick_room(
-                &mut command_vm,
-                &mut event_vm,
-                RoomContext {
-                    room: &mut loaded.room,
-                    game,
-                    player: player_state,
-                    player_assets: loaded.player_assets.as_ref(),
-                },
-                input,
-                action,
-            );
-            apply_bgm_requests(music, &mut game.room_bgm_requests, pack, loaded.id);
-            drain_mask_toggles(&mut loaded.room, game);
-            play_footsteps(music, sfx_cache, pack, &loaded.room, player_state);
-            accumulator -= TICK_MS;
-            if let Some(transition) = transition {
-                let record = game.transition_door.take().unwrap_or_default();
-                let session = start_transition(pack, &record, &transition)?;
-                return Ok(GameplayEnd::Transition(Box::new(session)));
-            }
-        }
-
-        render_frame(
-            &mut framebuffer,
-            pack,
-            loaded.id,
-            &loaded.room,
-            player_state,
-            loaded.player_assets.as_ref(),
-            masks,
-        );
-        present(renderer, texture, &framebuffer)?;
-        if let Some(mixer) = music {
-            mixer.update();
-        }
-        if !unsafe { SDL_RenderPresent(renderer) } {
-            bail!("SDL_RenderPresent failed: {}", sdl_error());
-        }
-    }
-}
-
-/// Run the transition phase: tick the animation timeline, render its frames
-/// (or black), and swap the destination room in when it finishes.
-#[allow(clippy::too_many_arguments)]
-fn run_transition(
-    pack: &Pack,
-    mut session: TransitionMode,
-    game: &mut game::GameState,
-    player_state: &mut player::PlayerState,
-    loaded: &mut LoadedRoom,
-    renderer: *mut SDL_Renderer,
-    texture: *mut SDL_Texture,
-    sfx_cache: &mut SfxCache,
-    music: &mut Option<Mixer>,
-) -> Result<Flow> {
-    let mut framebuffer = Framebuffer::new();
-    let mut event = SDL_Event::default();
-    let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut accumulator = 0.0f64;
-    loop {
-        let mut ignored = 0i32;
-        if poll_events(&mut event, &mut ignored) {
-            return Ok(Flow::Quit);
-        }
-
-        let now = unsafe { SDL_GetTicks() };
-        accumulator += now.saturating_sub(last_ticks) as f64;
-        last_ticks = now;
-        if accumulator > 250.0 {
-            accumulator = 250.0;
-        }
-        let (input, action) = read_input();
-        // The original tests pad bits 0xC0, the confirm (Cross) and run/cancel
-        // (Circle) buttons, on the animation's frame counter past ten. The
-        // engine's confirm key is `action` and its run modifier is `run`, so
-        // those two map the byte. The engine passes the live held state, not
-        // the original's rising edge.
-        let skip = action || input.run;
-        let mut finished = false;
-        while accumulator >= TICK_MS {
-            session.frame = session.transition.tick(skip);
-            for effect in session.transition.stepper_mut().take_sfx() {
-                play_door_animation_sfx(music, sfx_cache, pack, &session.door, effect);
-            }
-            for message in session.transition.stepper_mut().take_messages() {
-                apply_door_message(game, message);
-            }
-            // The software mixer queues synchronously, so the VM's SFX op
-            // never has to wait.
-            session.transition.set_sound_busy(false);
-            accumulator -= TICK_MS;
-            if session.frame.finished {
-                finished = true;
-                break;
-            }
-        }
-
-        // The pass that ended the animation is drawn once before teardown, so
-        // the leading black passes the original ran are never dropped.
-        render_transition(&mut framebuffer, &session);
-        present(renderer, texture, &framebuffer)?;
-        if let Some(mixer) = music {
-            mixer.update();
-        }
-        if !unsafe { SDL_RenderPresent(renderer) } {
-            bail!("SDL_RenderPresent failed: {}", sdl_error());
-        }
-        if finished {
-            finish_transition(
-                pack,
-                &mut session,
-                game,
-                player_state,
-                loaded,
-                music,
-                sfx_cache,
-            );
-            return Ok(Flow::Continue);
         }
     }
 }
@@ -1194,8 +1833,9 @@ fn play_footsteps(
 }
 
 /// Poll every queued SDL event, reporting whether the user quit and
-/// accumulating the shift+`,`/`.` camera-cut step.
-fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32) -> bool {
+/// accumulating the shift+`,`/`.` camera-cut step. A non-repeat key-down also
+/// sets `any_key`, the UI screens' "any button" edge.
+fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32, any_key: &mut bool) -> bool {
     let mut quit = false;
     while unsafe { SDL_PollEvent(event) } {
         let kind = unsafe { event.r#type };
@@ -1204,6 +1844,9 @@ fn poll_events(event: &mut SDL_Event, cut_delta: &mut i32) -> bool {
         } else if kind == SDL_EVENT_KEY_DOWN {
             let key = unsafe { event.key.key };
             let modifiers = unsafe { event.key.r#mod };
+            if !unsafe { event.key.repeat } {
+                *any_key = true;
+            }
             if key == SDLK_ESCAPE {
                 quit = true;
             } else if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
@@ -1341,7 +1984,7 @@ fn run_room_init(loaded: &LoadedRoom, game: &mut game::GameState) {
 }
 
 /// Start every event script requested by `evt_exec` in the command scripts.
-fn start_pending_events(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm<'_>) {
+fn start_pending_events(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm) {
     for (slot, event) in game.pending_events.drain(..) {
         event_vm.start(usize::from(slot), event);
     }
@@ -1358,8 +2001,8 @@ struct RoomContext<'a> {
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
 /// Returns the door transition the tick requested, if any.
 fn tick_room(
-    command_vm: &mut scd::vm::CommandVm<'_>,
-    event_vm: &mut scd::vm::EventVm<'_>,
+    command_vm: &mut scd::vm::CommandVm,
+    event_vm: &mut scd::vm::EventVm,
     context: RoomContext<'_>,
     input: player::Input,
     action: bool,
@@ -1438,11 +2081,12 @@ fn update_window_title(
         return Ok(());
     }
     *titled_cut = loaded.room.current_cut;
-    let title = window_title(
+    let title = CString::new(window_title(
         &loaded.id.room3(),
         loaded.room.current_cut,
         loaded.room.cuts.len(),
-    )?;
+    ))
+    .context("window title contains a NUL byte")?;
     if !unsafe { SDL_SetWindowTitle(window, title.as_ptr()) } {
         bail!("SDL_SetWindowTitle failed: {}", sdl_error());
     }
@@ -1481,6 +2125,62 @@ fn apply_bgm_requests(
         } else if let Some(player) = music {
             player.stop();
         }
+    }
+}
+
+/// One frame of level-triggered UI keys.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Keys {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    confirm: bool,
+    cancel: bool,
+}
+
+/// Read the UI keys from the current keyboard state.
+fn read_keys() -> Keys {
+    let mut count = 0i32;
+    let keys = unsafe { SDL_GetKeyboardState(&mut count) };
+    let down = |scancode: sdl3_sys::scancode::SDL_Scancode| {
+        let index = scancode.0;
+        index >= 0 && index < count && !keys.is_null() && unsafe { *keys.add(index as usize) }
+    };
+    Keys {
+        up: down(SDL_SCANCODE_UP),
+        down: down(SDL_SCANCODE_DOWN),
+        left: down(SDL_SCANCODE_LEFT),
+        right: down(SDL_SCANCODE_RIGHT),
+        confirm: down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN),
+        cancel: down(SDL_SCANCODE_X) || down(SDL_SCANCODE_BACKSPACE),
+    }
+}
+
+/// Turn the level-triggered keys into the screens' edge-triggered input.
+///
+/// `any_key` comes from the SDL event queue (a non-repeat key-down), so F-keys
+/// and other unbound keys still open the title menu.
+#[derive(Default)]
+struct InputEdges {
+    previous: Keys,
+}
+
+impl InputEdges {
+    /// Read the current keys and report which went down since the last call.
+    fn read(&mut self, any_key: bool) -> UiInput {
+        let keys = read_keys();
+        let input = UiInput {
+            up: keys.up && !self.previous.up,
+            down: keys.down && !self.previous.down,
+            left: keys.left && !self.previous.left,
+            right: keys.right && !self.previous.right,
+            confirm: keys.confirm && !self.previous.confirm,
+            cancel: keys.cancel && !self.previous.cancel,
+            any: any_key || (keys.confirm && !self.previous.confirm),
+        };
+        self.previous = keys;
+        input
     }
 }
 
@@ -1716,9 +2416,8 @@ fn sdl_error() -> String {
         .into_owned()
 }
 
-fn window_title(room: &str, cut: usize, count: usize) -> Result<CString> {
-    CString::new(format!("Arklay - room {room} cut {cut}/{}", count - 1))
-        .context("window title contains a NUL byte")
+fn window_title(room: &str, cut: usize, count: usize) -> String {
+    format!("Arklay - room {room} cut {cut}/{}", count - 1)
 }
 
 fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
@@ -2788,5 +3487,447 @@ mod tests {
             (WIDTH as u32, HEIGHT as u32)
         );
         assert!(non_black_pixels(&decoded) > 5000);
+    }
+
+    /// A one-room pack with both character variants of RDT 100. Title and
+    /// select art are intentionally absent: the screens log and continue.
+    fn new_game_pack(dir: &TempDir) -> PathBuf {
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        for player_flag in 0..=1u8 {
+            let id = RoomId {
+                stage: 1,
+                room: 0,
+                player_flag,
+            };
+            writer
+                .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+                .unwrap();
+        }
+        writer
+            .add(
+                &RoomId {
+                    stage: 1,
+                    room: 0,
+                    player_flag: 0,
+                }
+                .cut_entry(0),
+                bmp_bytes.clone(),
+            )
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        pack_path
+    }
+
+    fn confirm_input() -> UiInput {
+        UiInput {
+            any: true,
+            confirm: true,
+            ..UiInput::default()
+        }
+    }
+
+    /// Drive `app` until `done` is true, feeding one confirm per tick.
+    fn run_until(app: &mut App, ticks: u32, done: impl Fn(&App) -> bool) -> bool {
+        for _ in 0..ticks {
+            app.update(confirm_input(), player::Input::default(), false)
+                .unwrap();
+            if done(app) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn app_boots_title_and_transitions_into_a_new_game() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        app.boot(AppBoot::Title).unwrap();
+        assert!(matches!(app.mode, Mode::Title(_)));
+
+        assert!(
+            run_until(&mut app, 256, |app| matches!(app.mode, Mode::Select(_))),
+            "the title never opened character select"
+        );
+        assert!(
+            run_until(&mut app, 256, |app| matches!(app.mode, Mode::Play(_))),
+            "character select never started the new game"
+        );
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert_eq!(
+            session.game.id,
+            RoomId {
+                stage: 1,
+                room: 0,
+                player_flag: 0
+            }
+        );
+        assert_eq!(session.game.entities[0].health, NEW_GAME_HEALTH[0]);
+    }
+
+    #[test]
+    fn app_title_load_opens_the_picker_and_loads_a_save() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let mut file = save::SaveFile {
+            stage: 1,
+            room: 0,
+            character: 0,
+            health: 77,
+            pos_x: 1234,
+            pos_z: 5678,
+            angle: 1024,
+            ..save::SaveFile::default()
+        };
+        file.player_slots[0] = game::InventoryItem {
+            id: 0x41,
+            quantity: 1,
+        };
+        file.total_held = 1;
+        save::save(&saves, 0, &file).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, saves, false);
+        app.boot(AppBoot::Title).unwrap();
+
+        // With a save present the title starts on LOAD GAME.
+        app.update(confirm_input(), player::Input::default(), false)
+            .unwrap();
+        let Mode::Title(screen) = &app.mode else {
+            panic!("expected the title");
+        };
+        assert!(screen.load_enabled());
+        assert_eq!(screen.selection(), 2);
+
+        assert!(
+            run_until(&mut app, 256, |app| matches!(app.mode, Mode::Load(_))),
+            "the title never opened the load picker"
+        );
+        assert!(
+            run_until(&mut app, 256, |app| matches!(app.mode, Mode::Play(_))),
+            "the load picker never started the game"
+        );
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert_eq!(session.game.entities[0].health, 77);
+        assert_eq!(session.player.pos, [1234, 0, 5678]);
+        assert_eq!(session.player.angle, 1024);
+    }
+
+    /// A modal that counts its updates and draws nothing.
+    struct CountingModal {
+        updates: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+
+    impl Screen for CountingModal {
+        fn open(&mut self, _cx: &mut UiContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn update(&mut self, _cx: &UiContext<'_>, _input: UiInput) -> ScreenResult {
+            self.updates.set(self.updates.get() + 1);
+            ScreenResult::Continue
+        }
+
+        fn draw(&mut self, _cx: &UiContext<'_>, _framebuffer: &mut Framebuffer) {}
+    }
+
+    #[test]
+    fn a_modal_freezes_the_room_tick() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        app.boot(AppBoot::NewGame(0)).unwrap();
+
+        let updates = std::rc::Rc::new(std::cell::Cell::new(0));
+        let before = match &app.mode {
+            Mode::Play(session) => session.game.frame,
+            _ => panic!("expected a play mode"),
+        };
+        {
+            let Mode::Play(session) = &mut app.mode else {
+                unreachable!();
+            };
+            session.open_modal(Box::new(CountingModal {
+                updates: std::rc::Rc::clone(&updates),
+            }));
+        }
+
+        app.update(UiInput::default(), player::Input::default(), false)
+            .unwrap();
+
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert_eq!(session.game.frame, before, "the room tick must stay frozen");
+        assert_eq!(updates.get(), 1, "the modal must advance each tick");
+    }
+
+    #[test]
+    fn session_transition_swaps_rooms() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(&a.rdt_entry(), synthetic_rdt(&door_init()))
+            .unwrap();
+        writer
+            .add(&b.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, a).unwrap();
+        session.player.pos = [-450, 0, 250];
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+
+        for _ in 0..10 {
+            session.tick(&pack, player::Input::default(), true).unwrap();
+            if session.transition.is_some() {
+                break;
+            }
+        }
+        assert!(
+            session.transition.is_some(),
+            "the door never requested a transition"
+        );
+
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, false);
+            if session.transition_finished {
+                break;
+            }
+        }
+        assert!(session.transition_finished, "the transition never finished");
+        // The finished frame is rendered before teardown, as the loops do.
+        session.render(&pack);
+        session.finish_transition(&pack);
+
+        assert_eq!(session.loaded.id, b);
+        assert_eq!(session.game.id, b);
+        assert_eq!(session.player.pos, [555, 0, 666]);
+        assert_eq!(session.player.angle, 1024);
+        assert!(session.game.doors[0].is_none(), "the door table is rebuilt");
+        assert!(!session.transition_finished);
+        assert!(session.transition.is_none());
+    }
+
+    #[test]
+    fn new_game_state_matches_the_shipped_start() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+
+        for character in 0..=1u8 {
+            let session = GameSession::new(&pack, character).unwrap();
+            assert_eq!(
+                session.game.id,
+                RoomId {
+                    stage: 1,
+                    room: 0,
+                    player_flag: character
+                }
+            );
+            assert_eq!(session.player.pos, [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z]);
+            assert_eq!(session.player.angle, NEW_GAME_ANGLE);
+            assert_eq!(
+                session.game.entities[0].health,
+                NEW_GAME_HEALTH[usize::from(character)]
+            );
+            assert_eq!(
+                session.game.max_health,
+                NEW_GAME_HEALTH[usize::from(character)]
+            );
+            assert_eq!(session.game.flags[7].bytes(), &NEW_GAME_ROOM_ITEMS);
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
+                0
+            );
+            assert_eq!(&session.game.state_bytes[0x24..0x28], &[0; 4]);
+            let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
+            if character == 0 {
+                assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
+            } else {
+                assert_eq!(ids, [ITEM_KNIFE, ITEM_BERETTA, ITEM_FIRST_AID_SPRAY]);
+                assert_eq!(session.game.item_count(ITEM_BERETTA), 15);
+            }
+            assert_eq!(session.game.item_count(ITEM_FIRST_AID_SPRAY), 1);
+        }
+    }
+
+    /// The real pack must boot each new game into room 100 with the shipped
+    /// inventory, health and room-item flags.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_new_game_lands_in_room_100_for_both_characters() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        for character in 0..=1u8 {
+            let session = GameSession::new(&pack, character).unwrap();
+            assert_eq!(session.loaded.id.room3(), "100");
+            assert_eq!(
+                session.game.id,
+                RoomId {
+                    stage: 1,
+                    room: 0,
+                    player_flag: character
+                }
+            );
+            assert_eq!(session.player.pos, [17000, 0, 5000]);
+            assert_eq!(session.player.angle, 3072);
+            assert_eq!(
+                session.game.entities[0].health,
+                NEW_GAME_HEALTH[usize::from(character)]
+            );
+            assert_eq!(session.game.flags[7].bytes(), &NEW_GAME_ROOM_ITEMS);
+            let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
+            if character == 0 {
+                assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
+            } else {
+                assert_eq!(ids, [ITEM_KNIFE, ITEM_BERETTA, ITEM_FIRST_AID_SPRAY]);
+            }
+        }
+    }
+
+    /// A save written from one session must continue through `from_save`.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_load_continues_a_save_into_gameplay() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let mut session = GameSession::new(&pack, 0).unwrap();
+        session.game.entities[0].health = 88;
+        session.game.entities[0].pos = [12000, 0, 3300];
+        session.game.entities[0].angle = 512;
+        session.game.add_item(0x0F, 30);
+        session.player.pos = [12000, 0, 3300];
+        session.player.angle = 512;
+
+        let dir = TempDir::new();
+        let saves = dir.0.join("saves");
+        let card = pack.read(save::SAVE_PREFIX_ENTRY).unwrap();
+        let file = save::SaveFile::from_state_with_prefix(&session.game, card).unwrap();
+        save::save(&saves, 3, &file).unwrap();
+
+        let parsed = save::load(&saves, 3).unwrap();
+        let continued = GameSession::from_save(&pack, &parsed).unwrap();
+        assert_eq!(continued.game.id, session.game.id);
+        assert_eq!(continued.game.entities[0].health, 88);
+        assert_eq!(continued.player.pos, [12000, 0, 3300]);
+        assert_eq!(continued.player.angle, 512);
+        assert_eq!(continued.game.item_count(0x0F), 30);
+        assert!(
+            continued
+                .game
+                .inventory
+                .iter()
+                .any(|slot| slot.id == ITEM_KNIFE)
+        );
+        assert_eq!(
+            continued.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
+            0
+        );
+    }
+
+    /// Two `--ui title` captures must be byte-identical.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_title_capture_is_deterministic() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let saves = dir.0.join("saves");
+        let first_path = dir.0.join("title_a.bmp");
+        let second_path = dir.0.join("title_b.bmp");
+
+        run_ui_with_options(Path::new(&path), "title", Some(&first_path), &saves, 0).unwrap();
+        run_ui_with_options(Path::new(&path), "title", Some(&second_path), &saves, 0).unwrap();
+
+        let first = std::fs::read(&first_path).unwrap();
+        let second = std::fs::read(&second_path).unwrap();
+        assert_eq!(first, second, "two title captures differ");
+        let decoded = bmp::decode(&first).unwrap();
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (WIDTH as u32, HEIGHT as u32)
+        );
+        assert!(non_black_pixels(&decoded) > 5000);
+        assert_eq!(fnv1a(&first), fnv1a(&second));
+    }
+
+    /// Two `--ui select` captures must be byte-identical.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_select_capture_is_deterministic() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let saves = dir.0.join("saves");
+        let first_path = dir.0.join("select_a.bmp");
+        let second_path = dir.0.join("select_b.bmp");
+
+        run_ui_with_options(Path::new(&path), "select", Some(&first_path), &saves, 0).unwrap();
+        run_ui_with_options(Path::new(&path), "select", Some(&second_path), &saves, 0).unwrap();
+
+        let first = std::fs::read(&first_path).unwrap();
+        let second = std::fs::read(&second_path).unwrap();
+        assert_eq!(first, second, "two select captures differ");
+        let decoded = bmp::decode(&first).unwrap();
+        assert!(non_black_pixels(&decoded) > 5000);
+    }
+
+    /// The new-game boot frame capture must be deterministic.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_new_game_capture_is_deterministic() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let saves = dir.0.join("saves");
+        let first_path = dir.0.join("game_a.bmp");
+        let second_path = dir.0.join("game_b.bmp");
+
+        run_ui_with_options(Path::new(&path), "game", Some(&first_path), &saves, 0).unwrap();
+        run_ui_with_options(Path::new(&path), "game", Some(&second_path), &saves, 0).unwrap();
+
+        let first = std::fs::read(&first_path).unwrap();
+        let second = std::fs::read(&second_path).unwrap();
+        assert_eq!(first, second, "two new-game captures differ");
+        let decoded = bmp::decode(&first).unwrap();
+        assert!(
+            non_black_pixels(&decoded) > 2000,
+            "the new-game frame is mostly black"
+        );
     }
 }

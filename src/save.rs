@@ -407,6 +407,15 @@ pub fn default_save_dir() -> PathBuf {
     PathBuf::from(DEFAULT_SAVE_DIR)
 }
 
+/// The default save directory: `saves/` beside `pack`, or `saves/` in the
+/// working directory when the pack path has no parent.
+pub fn default_save_dir_for_pack(pack: &Path) -> PathBuf {
+    match pack.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(DEFAULT_SAVE_DIR),
+        _ => PathBuf::from(DEFAULT_SAVE_DIR),
+    }
+}
+
 /// Header fields the save/load screen shows on a slot row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveSlotInfo {
@@ -711,6 +720,14 @@ mod tests {
             Path::new("saves").join("savedat3.dat")
         );
         assert_eq!(default_save_dir(), PathBuf::from("saves"));
+        assert_eq!(
+            default_save_dir_for_pack(Path::new("/games/re1.akpak")),
+            Path::new("/games/saves")
+        );
+        assert_eq!(
+            default_save_dir_for_pack(Path::new("re1.akpak")),
+            Path::new("saves")
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
     player: u8,
 
-    /// UI screen to boot straight into instead of a room, e.g. `font`
+    /// UI screen to boot straight into instead of a room:
+    /// `title`, `select`, `game`, `load` or `font`
     #[arg(
         long,
         value_name = "SCREEN",
@@ -35,6 +36,10 @@ struct Cli {
         conflicts_with = "room"
     )]
     ui: Option<String>,
+
+    /// Directory holding `savedat*.dat` (default: `saves/` beside the pack)
+    #[arg(long, value_name = "DIR", requires = "pack")]
+    save_dir: Option<PathBuf>,
 
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
@@ -205,14 +210,30 @@ fn main() -> Result<()> {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
+            let save_dir = cli
+                .save_dir
+                .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
             if let Some(screen) = cli.ui {
-                return arklay::engine::run_ui(&pack, &screen, cli.capture.as_deref());
+                return arklay::engine::run_ui_with_options(
+                    &pack,
+                    &screen,
+                    cli.capture.as_deref(),
+                    &save_dir,
+                    cli.player,
+                );
             }
-            let Some(room) = cli.room else {
-                bail!("--room is required when launching a pack (or use --ui)");
-            };
-            let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
-            arklay::engine::run(&pack, id, cli.capture.as_deref())
+            if let Some(room) = cli.room {
+                let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
+                return arklay::engine::run(&pack, id, cli.capture.as_deref());
+            }
+            // No room and no `--ui`: boot the title screen, the app root.
+            arklay::engine::run_ui_with_options(
+                &pack,
+                "title",
+                cli.capture.as_deref(),
+                &save_dir,
+                cli.player,
+            )
         }
     }
 }

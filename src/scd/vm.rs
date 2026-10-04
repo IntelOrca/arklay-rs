@@ -1,6 +1,7 @@
 //! The two SCD interpreters: the command VM (init/main) and the event VM.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::{Block, Decoded, Insn, Operand, Scripts};
@@ -16,20 +17,29 @@ const SLOT_COUNT: usize = 8;
 const MAX_STEPS: usize = 100_000;
 
 /// Command-VM state: runs init once and main every tick.
-pub struct CommandVm<'a> {
-    scripts: &'a Scripts,
-    insns: HashMap<usize, &'a Insn>,
+///
+/// The VM owns a reference-counted copy of the scripts, so a session can keep
+/// it alive without borrowing the room loader; the per-instruction map holds
+/// clones so the run loop never re-borrows the script while stepping.
+pub struct CommandVm {
+    scripts: Rc<Scripts>,
+    insns: HashMap<usize, Rc<Insn>>,
     branch_stack: [usize; BRANCH_STACK_SIZE],
     depth: usize,
     pc: usize,
 }
 
-impl<'a> CommandVm<'a> {
-    pub fn new(scripts: &'a Scripts) -> Self {
+impl CommandVm {
+    pub fn new(scripts: &Scripts) -> Self {
+        Self::from_scripts(Rc::new(scripts.clone()))
+    }
+
+    /// Build a VM sharing an already-parsed script set.
+    pub fn from_scripts(scripts: Rc<Scripts>) -> Self {
         let mut insns = HashMap::new();
         for block in scripts.init.iter().chain(scripts.main.iter()) {
             for insn in &block.insns {
-                insns.insert(insn.offset, insn);
+                insns.insert(insn.offset, Rc::new(insn.clone()));
             }
         }
         Self {
@@ -43,17 +53,17 @@ impl<'a> CommandVm<'a> {
 
     /// Run all init blocks once.
     pub fn run_init(&mut self, host: &mut impl ScdHost) {
-        let scripts = self.scripts;
+        let scripts = Rc::clone(&self.scripts);
         self.run_blocks(&scripts.init, host);
     }
 
     /// Run all main blocks once (per frame).
     pub fn run_main(&mut self, host: &mut impl ScdHost) {
-        let scripts = self.scripts;
+        let scripts = Rc::clone(&self.scripts);
         self.run_blocks(&scripts.main, host);
     }
 
-    fn run_blocks(&mut self, blocks: &'a [Block], host: &mut impl ScdHost) {
+    fn run_blocks(&mut self, blocks: &[Block], host: &mut impl ScdHost) {
         self.depth = 0;
         for block in blocks {
             let Some(first) = block.insns.first() else {
@@ -67,9 +77,10 @@ impl<'a> CommandVm<'a> {
                     return;
                 }
                 steps += 1;
-                let Some(insn) = self.insns.get(&self.pc).copied() else {
+                let Some(insn) = self.insns.get(&self.pc).cloned() else {
                     return;
                 };
+                let insn = insn.as_ref();
                 let next = insn.offset + insn.bytes.len();
                 let mut block_done = false;
                 match &insn.decoded {
@@ -169,20 +180,28 @@ impl Default for EventSlot {
 }
 
 /// Event-VM state: eight cooperative slots.
-pub struct EventVm<'a> {
-    scripts: &'a Scripts,
-    insns: HashMap<usize, &'a Insn>,
-    payloads: HashMap<usize, Vec<&'a Insn>>,
+///
+/// Like [`CommandVm`] the event VM owns a reference-counted copy of its
+/// scripts so it can outlive the room-loading scope.
+pub struct EventVm {
+    scripts: Rc<Scripts>,
+    insns: HashMap<usize, Rc<Insn>>,
+    payloads: HashMap<usize, Vec<Rc<Insn>>>,
     slots: [EventSlot; SLOT_COUNT],
 }
 
-impl<'a> EventVm<'a> {
-    pub fn new(scripts: &'a Scripts) -> Self {
+impl EventVm {
+    pub fn new(scripts: &Scripts) -> Self {
+        Self::from_scripts(Rc::new(scripts.clone()))
+    }
+
+    /// Build a VM sharing an already-parsed script set.
+    pub fn from_scripts(scripts: Rc<Scripts>) -> Self {
         let mut insns = HashMap::new();
         let mut payloads = HashMap::new();
         for stream in &scripts.events {
             for insn in &stream.insns {
-                insns.insert(insn.offset, insn);
+                insns.insert(insn.offset, Rc::new(insn.clone()));
             }
             for (index, insn) in stream.insns.iter().enumerate() {
                 let Decoded::Event(op) = &insn.decoded else {
@@ -195,6 +214,7 @@ impl<'a> EventVm<'a> {
                 let payload = stream.insns[index + 1..]
                     .iter()
                     .take_while(|later| later.offset < end)
+                    .map(|insn| Rc::new(insn.clone()))
                     .collect();
                 payloads.insert(insn.offset, payload);
             }
@@ -272,10 +292,11 @@ impl<'a> EventVm<'a> {
     }
 
     fn step_slot(&mut self, index: usize, host: &mut impl ScdHost) -> bool {
-        let Some(insn) = self.insns.get(&self.slots[index].pc).copied() else {
+        let Some(insn) = self.insns.get(&self.slots[index].pc).cloned() else {
             self.slots[index].active = false;
             return false;
         };
+        let insn = insn.as_ref();
         let next = insn.offset + insn.bytes.len();
         match &insn.decoded {
             Decoded::Control(op) => match op.op {
@@ -529,7 +550,7 @@ impl<'a> EventVm<'a> {
     }
 
     /// Run one straight-line command block with the command VM's flow rules.
-    fn run_command_flow(&self, insns: &[&Insn], host: &mut impl ScdHost) {
+    fn run_command_flow(&self, insns: &[Rc<Insn>], host: &mut impl ScdHost) {
         let mut pc = 0usize;
         let mut branch_stack: Vec<usize> = Vec::new();
         let mut steps = 0usize;
@@ -538,7 +559,7 @@ impl<'a> EventVm<'a> {
             if steps > MAX_STEPS {
                 return;
             }
-            let insn = insns[pc];
+            let insn = insns[pc].as_ref();
             let Decoded::Command(op) = &insn.decoded else {
                 pc += 1;
                 continue;
@@ -584,7 +605,7 @@ impl<'a> EventVm<'a> {
         }
     }
 
-    fn index_of(&self, insns: &[&Insn], offset: usize) -> Option<usize> {
+    fn index_of(&self, insns: &[Rc<Insn>], offset: usize) -> Option<usize> {
         insns.iter().position(|insn| insn.offset == offset)
     }
 
@@ -618,9 +639,9 @@ impl<'a> EventVm<'a> {
     }
 
     fn eval_condition_at(&self, pc: usize, host: &mut impl ScdHost) -> bool {
-        match self.insns.get(&pc).copied() {
+        match self.insns.get(&pc).cloned() {
             Some(insn) => match &insn.decoded {
-                Decoded::Command(op) => eval_condition(host, insn, op),
+                Decoded::Command(op) => eval_condition(host, insn.as_ref(), op),
                 _ => false,
             },
             None => false,

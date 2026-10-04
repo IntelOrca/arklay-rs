@@ -33,8 +33,12 @@ cargo run -- extract re1.akpak --out extracted/
 # Launch room 100 as player 0 (RDT 1000)
 cargo run -- re1.akpak --room 100 --player 0
 
+# Boot the title screen (or --ui title|select|game|load|font)
+cargo run -- re1.akpak
+
 # Headless capture (no display)
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
+cargo run -- re1.akpak --ui title --capture title.bmp
 ```
 
 `convert-game` and `extract` report progress on stderr per phase (RDTs,
@@ -49,9 +53,16 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 
 | Key | Action |
 | --- | --- |
+| Arrow keys | Move / menu selection |
+| `Space`, `Return` | Confirm / action |
+| `X`, `Backspace` | Cancel (character select, load screen) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
 | `Esc` | Quit |
+
+Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
+pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
+refused.
 
 ## License
 

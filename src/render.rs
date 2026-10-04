@@ -175,11 +175,11 @@ pub fn pending_sprite_depth(brightness: u8) -> u32 {
 
 /// The original's brightness scale: 0 and 2 are the same full-brightness
 /// render, anything else is `brightness * 255 / 30` clamped to 255.
-fn brightness_scale(brightness: u8) -> u32 {
+fn brightness_scale(brightness: u8) -> u8 {
     if brightness == 0 || brightness == 2 {
         255
     } else {
-        (u32::from(brightness) * 255 / 30).min(255)
+        (u32::from(brightness) * 255 / 30).min(255) as u8
     }
 }
 
@@ -236,10 +236,34 @@ impl Framebuffer {
         brightness: u8,
         tint: Tint,
     ) {
+        self.draw_indexed_sprite_scaled(
+            texture,
+            src,
+            dst,
+            clut_row,
+            brightness_scale(brightness),
+            tint,
+        );
+    }
+
+    /// Draw one indexed sprite with a direct `0..=255` colour multiplier.
+    ///
+    /// Unlike [`Framebuffer::draw_indexed_sprite`] the scale is not the font's
+    /// `0..=30` brightness: `0` is black and `255` is full, which is what the
+    /// screens need for fades.
+    pub fn draw_indexed_sprite_scaled(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        scale: u8,
+        tint: Tint,
+    ) {
         if texture.width == 0 || texture.height == 0 {
             return;
         }
-        let scale = brightness_scale(brightness);
+        let scale = u32::from(scale);
         let tint = tint.rgb();
         self.draw_sprite(src, dst, |u, v| {
             if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
@@ -278,10 +302,24 @@ impl Framebuffer {
         dst: [i32; 4],
         brightness: u8,
     ) {
+        self.draw_rgba_sprite_scaled(image, src, dst, brightness_scale(brightness));
+    }
+
+    /// Draw one RGBA sprite with a direct `0..=255` colour multiplier.
+    ///
+    /// Like [`Framebuffer::draw_indexed_sprite_scaled`], `0` is black rather
+    /// than the font's full-brightness zero.
+    pub fn draw_rgba_sprite_scaled(
+        &mut self,
+        image: &Image,
+        src: [i32; 4],
+        dst: [i32; 4],
+        scale: u8,
+    ) {
         if image.width == 0 || image.height == 0 {
             return;
         }
-        let scale = brightness_scale(brightness);
+        let scale = u32::from(scale);
         self.draw_sprite(src, dst, |u, v| {
             if u < 0 || v < 0 || u >= image.width as i32 || v >= image.height as i32 {
                 return None;
@@ -298,6 +336,82 @@ impl Framebuffer {
                 texel[3],
             ])
         });
+    }
+
+    /// Copy another 320x240 framebuffer over this one.
+    pub fn copy_from(&mut self, other: &Framebuffer) {
+        if self.width == other.width
+            && self.height == other.height
+            && self.rgba.len() == other.rgba.len()
+        {
+            self.rgba.copy_from_slice(&other.rgba);
+        }
+    }
+
+    /// Blend the whole frame towards black by `alpha`/255.
+    ///
+    /// This is the screens' fade overlay: `0` leaves the frame untouched and
+    /// `255` paints it black. Alpha is preserved.
+    pub fn fade_to_black(&mut self, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            for pixel in self.rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(0);
+            }
+            return;
+        }
+        let keep = u32::from(255 - alpha);
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                *channel = (u32::from(*channel) * keep / 255) as u8;
+            }
+        }
+    }
+
+    /// Blend a rectangle towards black by `alpha`/255, clipped to the frame.
+    pub fn blend_black_rect(&mut self, dst: [i32; 4], alpha: u8) {
+        let [x, y, width, height] = dst;
+        if width <= 0 || height <= 0 || alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(dst, [0, 0, 0, 255]);
+            return;
+        }
+        let start_x = x.max(0) as u32;
+        let start_y = y.max(0) as u32;
+        let end_x = x.saturating_add(width).min(self.width as i32).max(0) as u32;
+        let end_y = y.saturating_add(height).min(self.height as i32).max(0) as u32;
+        let keep = u32::from(255 - alpha);
+        for row in start_y..end_y {
+            for column in start_x..end_x {
+                let offset = (row as usize * self.width as usize + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    for channel in &mut pixel[..3] {
+                        *channel = (u32::from(*channel) * keep / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fill a rectangle with `color`, clipped to the framebuffer.
+    pub fn fill_rect(&mut self, dst: [i32; 4], color: [u8; 4]) {
+        let [x, y, width, height] = dst;
+        let start_x = x.max(0) as u32;
+        let start_y = y.max(0) as u32;
+        let end_x = x.saturating_add(width).min(self.width as i32).max(0) as u32;
+        let end_y = y.saturating_add(height).min(self.height as i32).max(0) as u32;
+        for row in start_y..end_y {
+            for column in start_x..end_x {
+                let offset = (row as usize * self.width as usize + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    pixel.copy_from_slice(&color);
+                }
+            }
+        }
     }
 
     /// Draw a pending list far-to-near.
