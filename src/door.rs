@@ -54,6 +54,17 @@ pub fn type_name(door_type: u8) -> &'static str {
         .unwrap_or(DOOR_TYPE_NAMES[0])
 }
 
+/// Whether the door-type byte selects a stairwell (`kai01`-`kai04`) or ladder
+/// (`lad00`/`lad01`) animation.
+pub fn is_stair_type(door_type: u8) -> bool {
+    (0x16..=0x1B).contains(&door_type)
+}
+
+/// Whether the door-type byte selects a ladder (`lad00`/`lad01`).
+pub fn is_ladder_type(door_type: u8) -> bool {
+    (0x1A..=0x1B).contains(&door_type)
+}
+
 /// One script from the file's pointer table.
 ///
 /// `bytes` is the raw bytecode, starting at the script's first opcode and

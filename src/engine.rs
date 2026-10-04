@@ -681,10 +681,14 @@ fn finish_transition(
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
     player_state.angle = session.door.next_angle as u16 & 0x0FFF;
+    // `enter_room` clears the source room's stair state and `spawn` starts the
+    // fresh player with a clean climb, so the destination cannot inherit a
+    // suspended collision pass.
     // A door arrival can sit inside a collision volume the collision pass
-    // cannot clear (the stair/ladder doors rely on a stair behaviour that
-    // suspends the boundary pass, which this engine does not model yet).
-    // A wedged spawn is moved clear so it cannot start stuck.
+    // cannot clear. The original places the record's point raw and lets the
+    // next frame's collision pass push it out; this engine models the
+    // stair/ladder climb (which suspends that pass) only while the animation
+    // runs, so a wedged arrival is still moved clear as a fallback.
     let raw = player_state.pos;
     player_state.pos = player::free_spawn(
         &loaded.room,
@@ -1178,13 +1182,8 @@ fn tick_room(
         event_vm.step(&mut host);
     }
     // Scripts may have moved the player entity directly (dir_set, actor
-    // motion); mirror that onto the visible player before interaction and
-    // physics run.
+    // motion); mirror that onto the visible player before physics run.
     context.game.sync_player(context.player);
-    {
-        let mut host = game::ScdGameHost::new(context.game);
-        host.interact(context.player.pos, context.player.angle, action);
-    }
     context.game.advance_frame();
     if let Some(assets) = context.player_assets {
         player::update(
@@ -1196,6 +1195,14 @@ fn tick_room(
         );
     }
     context.game.sync_entity_from_player(context.player);
+    // The original runs the room action probe after the player's movement, so
+    // `stairs_height_update` measures the frame's final position and the climb
+    // behaviour starts from where the player actually is.
+    {
+        let mut host = game::ScdGameHost::new(context.game);
+        host.interact(context.player.pos, context.player.angle, action);
+    }
+    context.game.apply_stair_state(context.player);
     apply_camera(context.room, context.game, Some(context.player.pos));
     context.game.transition.take()
 }
@@ -2013,6 +2020,64 @@ mod tests {
             player::camera_for_position(&loaded.room, 0, player_state.pos)
         );
         assert_eq!(game.camera.current_cut, loaded.room.current_cut);
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn tick_room_ramps_the_player_up_the_lab_stairway() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("40D0").unwrap();
+        let mut loaded = load_room(&pack, id).unwrap();
+        let mut game = game::GameState::new(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
+        let scripts = &loaded.scripts;
+        let mut command_vm = scd::vm::CommandVm::new(scripts);
+        let mut event_vm = scd::vm::EventVm::new(scripts);
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_init(&mut host);
+        }
+
+        // On the lab stairway's clear lane, walking west up the ramp.
+        player_state.pos = [24000, 0, 3600];
+        player_state.angle = 0x800;
+        game.sync_entity_from_player(&player_state);
+        let start = player_state.pos;
+        for _ in 0..30 {
+            tick_room(
+                &mut command_vm,
+                &mut event_vm,
+                RoomContext {
+                    room: &mut loaded.room,
+                    game: &mut game,
+                    player: &mut player_state,
+                    player_assets: loaded.player_assets.as_ref(),
+                },
+                player::Input {
+                    up: true,
+                    ..player::Input::default()
+                },
+                false,
+            );
+        }
+        assert!(
+            player_state.pos[0] < start[0],
+            "the tick loop did not walk the ramp: {start:?} -> {:?}",
+            player_state.pos
+        );
+        assert!(
+            player_state.pos[1] > start[1] + 300,
+            "the tick loop did not ramp the height: {start:?} -> {:?}",
+            player_state.pos
+        );
+        assert_eq!(
+            game.entities[0].pos[1], player_state.pos[1],
+            "the entity height is not synced from the stair state"
+        );
+        assert_eq!(player_state.stairs.height, game.stair_height);
     }
 
     #[test]

@@ -2,8 +2,9 @@
 //!
 //! This mirrors the original engine's fixed 30 Hz player step using the EMD/EMW
 //! body clips: idle settle and breathe, walk, turn in place, backward walk and
-//! run. The player lives on the room's XZ plane; the room collision path never
-//! changes Y, so the spawn height is kept for the whole room.
+//! run. The room collision path never changes Y; the only height changes come
+//! from the stair state the room scripts drive ([`StairState`]), which either
+//! holds the ramp height or suspends collision while a stair/ladder climb runs.
 //!
 //! The original's slow-motion modifier halves the walk speed and holds each
 //! locomotion frame for an extra tick while a room flag is set. No state
@@ -105,6 +106,30 @@ pub struct Footstep {
     pub sound_type: u8,
 }
 
+/// Stair/ladder movement state driven by the room scripts.
+///
+/// `stairs_height_update` supplies the ground height for the tick;
+/// `set_stairs_zone` and stair doors latch an entry whose climb behaviour
+/// suspends the room collision pass and holds the facing towards the target
+/// until the player reaches it or the room changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StairState {
+    /// Height the active ramp holds at the player's position, applied after
+    /// this tick's movement. `None` when no ramp contains the player.
+    pub height: Option<i32>,
+    /// A `set_stairs_zone` entry is latched.
+    pub in_zone: bool,
+    /// The entry's ladder variant (`zoneFlags` bit `0x10`).
+    pub ladder: bool,
+    /// Ladder base latched by the entry.
+    pub base: [u16; 2],
+    /// The stair/ladder climb behaviour owns the tick: the collision boundary
+    /// pass is suspended and the facing is held towards the climb target.
+    pub climbing: bool,
+    /// Facing held while `climbing`.
+    pub locked_angle: u16,
+}
+
 /// Which model file's keyframes drive the current clip.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClipSource {
@@ -134,6 +159,8 @@ pub struct PlayerState {
     pub idle_phase: u8,
     /// Ticks spent in the idle behavior.
     pub idle_ticks: u32,
+    /// Stair/ladder state set by the room's action probes.
+    pub stairs: StairState,
     /// Footstep events emitted since the last [`PlayerState::take_footsteps`].
     footsteps: Vec<Footstep>,
 }
@@ -161,6 +188,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         behavior: BEHAVIOR_IDLE,
         idle_phase: 0,
         idle_ticks: 0,
+        stairs: StairState::default(),
         footsteps: Vec::new(),
     }
 }
@@ -184,7 +212,13 @@ pub fn update(
         player.set_clip(entry_clip_source(behavior), entry_clip(behavior));
     }
 
-    player.angle = turned_angle(player.angle, behavior, input);
+    // The stair/ladder climb behaviour locks the facing towards its target;
+    // otherwise the input steers the walk as usual.
+    player.angle = if player.stairs.climbing {
+        player.stairs.locked_angle & 0x0FFF
+    } else {
+        turned_angle(player.angle, behavior, input)
+    };
 
     let speed = match behavior {
         BEHAVIOR_WALK => walk_speed(player.radius, player.anim.frame),
@@ -202,7 +236,17 @@ pub fn update(
     let prev = player.pos;
     let (dx, dz) = rotate_speed(player.angle, offset, speed);
     let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
-    player.pos = resolve_collision(&room.collision, prev, proposed, player.radius);
+    // The climb behaviour suspends the collision boundary pass, exactly like
+    // the original's `update_player_anim` does for action behaviour 0x11.
+    player.pos = if player.stairs.climbing {
+        proposed
+    } else {
+        resolve_collision(&room.collision, prev, proposed, player.radius)
+    };
+    // `stairs_height_update` owns the player's height on the ramp.
+    if let Some(height) = player.stairs.height {
+        player.pos[1] = height;
+    }
 
     if behavior == BEHAVIOR_IDLE {
         player.idle_ticks = player.idle_ticks.saturating_add(1);
@@ -313,9 +357,10 @@ pub fn position_blocked(room: &RoomState, pos: [i32; 3], radius: i32) -> bool {
 /// gameplay tick performs the same push. A point that pass cannot clear (both
 /// exit pushes point back into the record, or overlapping records wedge it)
 /// would leave the player stuck, so it is moved to the nearest position
-/// outside every blocking record. The original never needs this because its
-/// stair/ladder behaviour suspends the boundary pass, which this engine does
-/// not model yet.
+/// outside every blocking record. The original lets the stair/ladder climb
+/// carry the player through such a volume, but its climb ends when the room
+/// loads, so this fallback stays for arrivals the first collision pass cannot
+/// clear.
 ///
 /// The search walks eight directions outward from the entry facing (so a tie
 /// at one distance prefers straight ahead) in [`SPAWN_SEARCH_STEP`] rings up
@@ -764,6 +809,7 @@ mod tests {
             behavior: BEHAVIOR_IDLE,
             idle_phase: 0,
             idle_ticks: 0,
+            stairs: StairState::default(),
             footsteps: Vec::new(),
         }
     }
@@ -1067,6 +1113,100 @@ mod tests {
         let dz = free[2] - pos[2];
         // The +x face is 522 units away; the ring grid finds it within a step.
         assert!(dx * dx + dz * dz <= 600 * 600, "moved too far: {free:?}");
+    }
+
+    #[test]
+    fn stair_height_is_applied_after_movement() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut player = player_at(0, 0);
+        player.stairs.height = Some(777);
+        step(
+            &mut player,
+            &room,
+            &clips,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+        );
+        assert_eq!(player.pos[1], 777, "the ramp owns Y");
+        assert!(player.pos[0] > 0, "the walk still advances on the XZ plane");
+    }
+
+    #[test]
+    fn climb_suspends_collision_and_locks_the_facing() {
+        // A solid rectangle whose grown bounds start at x = 1578.
+        let room = room_with_quadrant(rect(4000, 2000, 2000, 0, 1));
+        let clips = clips();
+        let mut player = player_at(1500, 1000);
+        assert!(!position_blocked(&room, player.pos, player.radius));
+
+        player.stairs.climbing = true;
+        player.stairs.locked_angle = 0;
+        for _ in 0..10 {
+            step(
+                &mut player,
+                &room,
+                &clips,
+                Input {
+                    up: true,
+                    left: true,
+                    ..Input::default()
+                },
+            );
+        }
+        assert!(
+            player.pos[0] > 2000,
+            "collision was not suspended: {:?}",
+            player.pos
+        );
+        assert!(
+            position_blocked(&room, player.pos, player.radius),
+            "the climb should have carried the player into the wall volume"
+        );
+        assert_eq!(player.angle, 0, "the climb holds the locked facing");
+    }
+
+    #[test]
+    fn releasing_the_climb_restores_collision() {
+        let room = room_with_quadrant(rect(4000, 2000, 2000, 0, 1));
+        let clips = clips();
+        let mut player = player_at(1500, 1000);
+        player.stairs.climbing = true;
+        player.stairs.locked_angle = 0;
+        for _ in 0..8 {
+            step(
+                &mut player,
+                &room,
+                &clips,
+                Input {
+                    up: true,
+                    ..Input::default()
+                },
+            );
+        }
+        let inside = player.pos;
+        assert!(position_blocked(&room, inside, player.radius));
+
+        player.stairs.climbing = false;
+        for _ in 0..5 {
+            step(
+                &mut player,
+                &room,
+                &clips,
+                Input {
+                    up: true,
+                    ..Input::default()
+                },
+            );
+        }
+        assert!(
+            player.pos[0] <= inside[0],
+            "collision should stop the player once the climb releases: {:?}",
+            player.pos
+        );
+        assert!(!position_blocked(&room, player.pos, player.radius));
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub mod rdt;
 pub mod render;
 pub mod scd;
 pub mod sfx;
+pub mod stairs;
 pub mod state;
 pub mod tim;
 pub mod tmd;
