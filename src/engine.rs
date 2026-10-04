@@ -54,6 +54,7 @@ use crate::render::{self, Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh};
 use crate::save;
 use crate::scd;
 use crate::sfx;
+use crate::shadow;
 use crate::state::{Image, RoomId, RoomState};
 use crate::text::Text;
 use crate::tim;
@@ -148,6 +149,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
             &player_state,
             loaded.player_assets.as_ref(),
             &mut MaskCache::default(),
+            &mut ShadowCache::default(),
         );
         display.present(&framebuffer)?;
         return display.capture(capture_path);
@@ -351,6 +353,7 @@ struct GameSession {
     command_vm: scd::vm::CommandVm,
     event_vm: scd::vm::EventVm,
     masks: MaskCache,
+    shadows: ShadowCache,
     sfx_cache: SfxCache,
     music: Option<Mixer>,
     /// Decoded pack text tables (messages, item names, descriptions).
@@ -515,6 +518,7 @@ impl GameSession {
             command_vm,
             event_vm,
             masks: MaskCache::default(),
+            shadows: ShadowCache::default(),
             sfx_cache: SfxCache::default(),
             music: None,
             text: Text::load(pack),
@@ -1060,6 +1064,7 @@ impl GameSession {
                 &self.player,
                 self.loaded.player_assets.as_ref(),
                 &mut self.masks,
+                &mut self.shadows,
             );
         }
         if self.menu.is_some() {
@@ -2373,6 +2378,7 @@ pub fn simulate_door(
         &player_state,
         loaded.player_assets.as_ref(),
         &mut MaskCache::default(),
+        &mut ShadowCache::default(),
     );
     let gameplay_frame = Image {
         width: gameplay.width,
@@ -2719,6 +2725,34 @@ impl MaskCache {
     }
 }
 
+/// The shared player-shadow coverage page, decoded from the pack once.
+///
+/// Unlike the mask pages this page is camera-independent, so it is cached for
+/// the whole session; a pack without the entry simply never draws a shadow.
+#[derive(Default)]
+struct ShadowCache {
+    page: Option<Image>,
+    attempted: bool,
+}
+
+impl ShadowCache {
+    /// The baked shadow page, loading `shadow/kage.tim` on first use.
+    fn page_for(&mut self, pack: &Pack) -> Option<&Image> {
+        if !self.attempted {
+            self.attempted = true;
+            if let Ok(bytes) = pack.read(shadow::KAGE_ENTRY) {
+                match shadow::decode(bytes) {
+                    Ok(image) => self.page = Some(image),
+                    Err(err) => {
+                        eprintln!("warning: invalid {}: {err:#}", shadow::KAGE_ENTRY);
+                    }
+                }
+            }
+        }
+        self.page.as_ref()
+    }
+}
+
 /// Everything loaded for one room, so a transition can load the next room with
 /// the same code path as the initial load.
 struct LoadedRoom {
@@ -3027,11 +3061,14 @@ struct PlayerAssets {
     emw: crate::model::Emw,
 }
 
-/// Draw one gameplay frame: the cut background, the player model and the
-/// camera's room-mask layer, depth-sorted together.
+/// Draw one gameplay frame: the cut background, the player model, the player's
+/// ground shadow and the camera's room-mask layer, depth-sorted together.
 ///
-/// The mask page is loaded lazily from the pack and cached per camera. A room
-/// without a page (or a camera without mask sprites) draws without the layer.
+/// The mask page is loaded lazily from the pack and cached per camera; the
+/// shadow page is cached for the whole session. A room without a page (or a
+/// camera without mask sprites) draws without the layer, and a frame whose
+/// shadow is skipped (see [`shadow::visible`]) draws without the quad.
+#[allow(clippy::too_many_arguments)]
 fn render_frame(
     framebuffer: &mut Framebuffer,
     pack: &Pack,
@@ -3040,6 +3077,7 @@ fn render_frame(
     player_state: &player::PlayerState,
     assets: Option<&PlayerAssets>,
     masks: &mut MaskCache,
+    shadows: &mut ShadowCache,
 ) {
     let Some(cut) = room.cuts.get(room.current_cut) else {
         framebuffer.clear();
@@ -3061,11 +3099,27 @@ fn render_frame(
         active: cut.mask_active,
     });
 
+    // The shadow rests on the player's floor height and is skipped unless the
+    // player is in the current camera's zone (or the room forces it on).
+    let shadow_texture = shadows.page_for(pack);
+    let shadow = shadow_texture.and_then(|texture| {
+        shadow::visible(id, room, room.current_cut, player_state).then(|| render::Shadow {
+            texture,
+            pos: player_state.pos,
+            angle: player_state.angle,
+            half_x: shadow::PLAYER_HALF_X,
+            half_z: shadow::PLAYER_HALF_Z,
+            lift: shadow::offset_y(id, room.current_cut),
+            tint: shadow::billboard_tint(shadow::PLAYER_COLOR),
+        })
+    });
+
     let Some(assets) = assets else {
         render::draw_gameplay_scene(
             framebuffer,
             cut.background.as_ref(),
             None,
+            shadow.as_ref(),
             &camera,
             &lighting,
             layer.as_ref(),
@@ -3082,6 +3136,7 @@ fn render_frame(
             framebuffer,
             cut.background.as_ref(),
             None,
+            shadow.as_ref(),
             &camera,
             &lighting,
             layer.as_ref(),
@@ -3099,6 +3154,7 @@ fn render_frame(
         framebuffer,
         cut.background.as_ref(),
         Some(&player),
+        shadow.as_ref(),
         &camera,
         &lighting,
         layer.as_ref(),
@@ -3462,6 +3518,7 @@ mod tests {
         let assets = load_player_assets(&pack, id).expect("player assets");
         let mut player_state = player::spawn(id, &room);
         let mut masks = MaskCache::default();
+        let mut shadows = ShadowCache::default();
 
         let mut idle = Framebuffer::new();
         render_frame(
@@ -3472,6 +3529,7 @@ mod tests {
             &player_state,
             Some(&assets),
             &mut masks,
+            &mut shadows,
         );
 
         let input = player::Input {
@@ -3496,6 +3554,7 @@ mod tests {
             &player_state,
             Some(&assets),
             &mut masks,
+            &mut shadows,
         );
 
         let changed = idle
@@ -4162,6 +4221,7 @@ mod tests {
             &mut masked,
             cut.background.as_ref(),
             Some(&player),
+            None,
             &camera,
             &lighting,
             Some(&layer),
@@ -4171,6 +4231,7 @@ mod tests {
             &mut plain,
             cut.background.as_ref(),
             Some(&player),
+            None,
             &camera,
             &lighting,
             None,

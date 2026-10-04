@@ -5,8 +5,9 @@
 //! every `ROOM####.RDT`, converts the camera backgrounds of every distinct
 //! room once, converts the room mask pages of every camera that has sprite
 //! groups, copies the door animations named by the door type table, copies the
-//! `BGM_*.WAV` music files, the 68 named sound effects and the four player
-//! models plus the two no-weapon locomotion clips. Stages 6 and 7 reuse the
+//! `BGM_*.WAV` music files, the 68 named sound effects, the four player
+//! models plus the two no-weapon locomotion clips, and the `KAGE.TIM`
+//! player-shadow coverage page. Stages 6 and 7 reuse the
 //! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
 //! by 5.
 
@@ -156,6 +157,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
+    let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
     let (text_count, text_bytes) = copy_text(exe.as_deref(), &mut writer, &mut progress)?;
     let (ivm_count, ivm_bytes) = copy_item_models(item_m2.as_deref(), &mut writer, &mut progress)?;
     let (file_count, file_bytes) = copy_file_art(item_m2.as_deref(), &mut writer, &mut progress)?;
@@ -174,6 +176,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
     println!("item: {item_count} entries, {item_bytes} bytes");
     println!("data: {data_count} entries, {data_bytes} bytes");
+    println!("shadow: {shadow_count} entries, {shadow_bytes} bytes");
     println!("text: {text_count} entries, {text_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
@@ -201,6 +204,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         + ui_count
         + item_count
         + data_count
+        + shadow_count
         + font_count
         + text_count
         + ivm_count
@@ -500,6 +504,29 @@ fn copy_bio_card(
     Ok((1, bytes))
 }
 
+/// Add the raw `KAGE.TIM` player-shadow coverage page.
+///
+/// The page is copied raw: its palette's red channel is the coverage ramp the
+/// renderer bakes into the texel alpha at load time.
+fn copy_shadow(
+    data: &DataPlan,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(source) = &data.shadow else {
+        return Ok((0, 0));
+    };
+    let raw = fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
+    let bytes = raw.len();
+    progress.begin("shadow", 1, "files");
+    writer
+        .add(crate::shadow::KAGE_ENTRY, raw)
+        .with_context(|| format!("failed to add {}", crate::shadow::KAGE_ENTRY))?;
+    progress.advance(crate::shadow::KAGE_ENTRY);
+    progress.end_phase();
+    Ok((1, bytes))
+}
+
 /// Convert one UI asset to its pack bytes.
 fn convert_ui_asset(kind: UiKind, raw: &[u8]) -> Result<Vec<u8>> {
     match kind {
@@ -590,6 +617,8 @@ const BIO_CARD_ENTRY: &str = "data/bio_card.dat";
 const BIO_CARD_FILE: &str = "BIO_CARD.DAT";
 /// Shipped name of the item-icon palette TIM.
 const STATUS_FILE: &str = "STATUS.TIM";
+/// Shipped name of the player-shadow coverage TIM.
+const KAGE_FILE: &str = "KAGE.TIM";
 
 /// How one `DATA` UI asset becomes its pack bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -635,6 +664,8 @@ struct DataPlan {
     palette: Option<PathBuf>,
     /// `BIO_CARD.DAT`.
     bio_card: Option<PathBuf>,
+    /// `KAGE.TIM`, the player shadow's coverage page.
+    shadow: Option<PathBuf>,
     /// Non-fatal problems found while resolving these inputs.
     warnings: Vec<String>,
 }
@@ -686,9 +717,10 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     let Some(dir) = data else {
         return Ok(DataPlan {
             warnings: vec![format!(
-                "no data directory found; {} UI art file(s), {} item atlas(es) and {BIO_CARD_ENTRY} will be missing",
+                "no data directory found; {} UI art file(s), {} item atlas(es), {} and {BIO_CARD_ENTRY} will be missing",
                 UI_ASSETS.len(),
-                ITEM_ASSETS.len()
+                ITEM_ASSETS.len(),
+                crate::shadow::KAGE_ENTRY
             )],
             ..DataPlan::default()
         });
@@ -733,6 +765,7 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     }
 
     plan.bio_card = index.get(&BIO_CARD_FILE.to_ascii_lowercase()).cloned();
+    plan.shadow = index.get(&KAGE_FILE.to_ascii_lowercase()).cloned();
 
     if !missing_ui.is_empty() {
         plan.warnings.push(format!(
@@ -750,6 +783,12 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     }
     if plan.bio_card.is_none() {
         plan.warnings.push(format!("missing {BIO_CARD_ENTRY}"));
+    }
+    if plan.shadow.is_none() {
+        plan.warnings.push(format!(
+            "missing {KAGE_FILE}; {} will be absent and no player shadow will draw",
+            crate::shadow::KAGE_ENTRY
+        ));
     }
     Ok(plan)
 }
@@ -2332,6 +2371,7 @@ mod tests {
         assert_eq!(plan.items.len(), 1, "only ITEM_ALL.PIX is present");
         assert!(plan.palette.is_some());
         assert!(plan.bio_card.is_some());
+        assert!(plan.shadow.is_none());
         assert_eq!(plan.ui.len(), 1, "STATUS.TIM is also a raw UI entry");
         assert_eq!(
             plan.warnings
@@ -2348,6 +2388,13 @@ mod tests {
                 .filter(|warning| warning.contains("item art"))
                 .count(),
             1,
+            "{:?}",
+            plan.warnings
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains(crate::shadow::KAGE_ENTRY)),
             "{:?}",
             plan.warnings
         );
@@ -2394,6 +2441,7 @@ mod tests {
         )
         .unwrap();
         fs::write(data.join("BIO_CARD.DAT"), vec![0u8; 0x41C]).unwrap();
+        fs::write(data.join("KAGE.TIM"), b"KAGE.TIM").unwrap();
         for (_, file, kind) in UI_ASSETS {
             if file.eq_ignore_ascii_case(STATUS_FILE) {
                 continue;
@@ -2415,7 +2463,12 @@ mod tests {
         assert_eq!(count("ui/"), UI_ASSETS.len());
         assert_eq!(count("item/"), 1);
         assert_eq!(count("data/"), 1);
+        assert_eq!(count("shadow/"), 1);
         assert_eq!(pack.read("data/bio_card.dat").unwrap().len(), 0x41C);
+        assert_eq!(
+            pack.read(crate::shadow::KAGE_ENTRY).unwrap(),
+            b"KAGE.TIM".as_slice()
+        );
         assert_eq!(
             pack.read("ui/statface.tim").unwrap(),
             b"STATFACE.TIM".as_slice()
@@ -2479,6 +2532,7 @@ mod tests {
         assert_eq!(plan.ui.len(), UI_ASSETS.len());
         assert_eq!(plan.items.len(), ITEM_ASSETS.len());
         assert!(plan.bio_card.is_some());
+        assert!(plan.shadow.is_some());
 
         // The same conversion the pack writer performs, checked for counts.
         let mut writer = PackWriter::new();
@@ -2486,11 +2540,17 @@ mod tests {
         let (ui_count, _) = copy_ui_art(&plan, &mut writer, &mut progress).unwrap();
         let (item_count, _) = copy_item_art(&plan, &mut writer, &mut progress).unwrap();
         let (data_count, _) = copy_bio_card(&plan, &mut writer, &mut progress).unwrap();
+        let (shadow_count, _) = copy_shadow(&plan, &mut writer, &mut progress).unwrap();
         assert_eq!(ui_count, UI_ASSETS.len());
         assert_eq!(item_count, ITEM_ASSETS.len());
         assert_eq!(data_count, 1);
+        assert_eq!(shadow_count, 1);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert_eq!(pack.read(BIO_CARD_ENTRY).unwrap().len(), 0x41C);
+        assert_eq!(
+            pack.read(crate::shadow::KAGE_ENTRY).unwrap(),
+            fs::read(plan.shadow.as_ref().unwrap()).unwrap()
+        );
         for asset in &plan.ui {
             assert!(pack.contains(asset.entry), "{}", asset.entry);
         }

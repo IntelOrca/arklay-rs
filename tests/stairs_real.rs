@@ -370,6 +370,7 @@ fn capture_player_partway_up_the_lab_stairway() {
         &mut framebuffer,
         cut.background.as_ref(),
         Some(&mesh),
+        None,
         &camera,
         &lighting,
         None,

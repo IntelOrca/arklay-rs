@@ -24,6 +24,7 @@ pub mod render;
 pub mod save;
 pub mod scd;
 pub mod sfx;
+pub mod shadow;
 pub mod stairs;
 pub mod state;
 pub mod text;
