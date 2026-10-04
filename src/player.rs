@@ -22,8 +22,12 @@ const BREATHE_IN_CLIP: usize = 0;
 const BREATHE_CLIP: usize = 1;
 /// EMW clip 2: the walk cycle, also used for turning in place.
 const WALK_CLIP: usize = 2;
-/// EMW clip 3: the backward walk and the run.
-const LOCOMOTION_CLIP: usize = 3;
+/// EMW clip 3: the run.
+const RUN_CLIP: usize = 3;
+/// EMD clip 3: the backward walk. The original plays it from the body model,
+/// not the no-weapon EMW, and only falls back to EMD clip 2 while an enemy is
+/// in view (this engine has no enemy visibility test yet).
+const BACK_CLIP: usize = 3;
 
 /// Ticks the settle pose is held before the breathe transition begins.
 const IDLE_SETTLE_TICKS: u32 = 100;
@@ -263,7 +267,8 @@ fn behavior_for(input: Input) -> u8 {
 fn entry_clip(behavior: u8) -> usize {
     match behavior {
         BEHAVIOR_WALK | BEHAVIOR_TURN => WALK_CLIP,
-        BEHAVIOR_BACK | BEHAVIOR_RUN => LOCOMOTION_CLIP,
+        BEHAVIOR_BACK => BACK_CLIP,
+        BEHAVIOR_RUN => RUN_CLIP,
         _ => SETTLE_CLIP,
     }
 }
@@ -271,7 +276,7 @@ fn entry_clip(behavior: u8) -> usize {
 /// Which file the entry clip of a behavior lives in.
 fn entry_clip_source(behavior: u8) -> ClipSource {
     match behavior {
-        BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_BACK | BEHAVIOR_RUN => ClipSource::Emw,
+        BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_RUN => ClipSource::Emw,
         _ => ClipSource::Emd,
     }
 }
@@ -866,7 +871,8 @@ mod tests {
             },
         );
         assert_eq!(player.behavior, BEHAVIOR_RUN);
-        assert_eq!(player.anim.clip, LOCOMOTION_CLIP);
+        assert_eq!(player.anim.clip, RUN_CLIP);
+        assert_eq!(player.clip_source, ClipSource::Emw);
 
         step(
             &mut player,
@@ -878,7 +884,8 @@ mod tests {
             },
         );
         assert_eq!(player.behavior, BEHAVIOR_BACK);
-        assert_eq!(player.anim.clip, LOCOMOTION_CLIP);
+        assert_eq!(player.anim.clip, BACK_CLIP);
+        assert_eq!(player.clip_source, ClipSource::Emd);
 
         step(
             &mut player,
@@ -1016,7 +1023,7 @@ mod tests {
                 },
             );
         }
-        let frame = player.anim.frame;
+        let frame = player.anim.display_frame;
 
         step(
             &mut player,
@@ -1031,7 +1038,7 @@ mod tests {
 
         assert_eq!(player.behavior, BEHAVIOR_WALK);
         assert_eq!(player.anim.clip, WALK_CLIP);
-        assert_eq!(player.anim.frame, frame + 1);
+        assert_eq!(player.anim.display_frame, frame + 1);
     }
 
     #[test]

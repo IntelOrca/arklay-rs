@@ -391,32 +391,60 @@ struct Triangle {
     palette_row: usize,
 }
 
+/// Rotate `vector` by `rotation` and negate the resulting Y.
+///
+/// This is the Y-sign conjugation `D * R * D` (with `D = diag(1, -1, 1)`) the
+/// PS1 matrix pipeline builds into every product: the game's joint matrices
+/// rotate Y-negated vectors and negate Y again on the way out, which flips the
+/// apparent sign of pitch and roll. Applying the matrices without it mirrors
+/// every limb that pitches or rolls.
+fn conjugate_rotate(rotation: &[[i32; 3]; 3], vector: [i32; 3]) -> [i32; 3] {
+    let v = [
+        i128::from(vector[0]),
+        -i128::from(vector[1]),
+        i128::from(vector[2]),
+    ];
+    std::array::from_fn(|row| {
+        let r = rotation[row];
+        let mut sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
+        if row == 1 {
+            sum = -sum;
+        }
+        clamp_i32(sum)
+    })
+}
+
 /// Transform a vertex by a joint's 4.12 rotation and translation.
+///
+/// The joint matrices follow the game's convention; a room-space point maps
+/// through `D * R * D * v + t`.
 fn fixed_mul(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     let v = [
         i128::from(vertex[0]),
-        i128::from(vertex[1]),
+        -i128::from(vertex[1]),
         i128::from(vertex[2]),
     ];
     std::array::from_fn(|row| {
         let r = joint.r[row];
         let sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
-        clamp_i32((sum >> FIXED_BITS) + i128::from(joint.t[row]))
+        let mut scaled = (sum + ((sum >> 127) & i128::from(0xFFF))) >> FIXED_BITS;
+        if row == 1 {
+            scaled = -scaled;
+        }
+        clamp_i32(scaled + i128::from(joint.t[row]))
     })
 }
 
 /// Rotate a normal by a joint's 4.12 rotation, ignoring the translation.
 fn rotate(joint: &anim::Mat4x3, normal: [i16; 3]) -> [i32; 3] {
-    let n = [
-        i128::from(normal[0]),
-        i128::from(normal[1]),
-        i128::from(normal[2]),
-    ];
-    std::array::from_fn(|row| {
-        let r = joint.r[row];
-        let sum = i128::from(r[0]) * n[0] + i128::from(r[1]) * n[1] + i128::from(r[2]) * n[2];
-        clamp_i32(sum)
-    })
+    conjugate_rotate(
+        &joint.r,
+        [
+            i32::from(normal[0]),
+            i32::from(normal[1]),
+            i32::from(normal[2]),
+        ],
+    )
 }
 
 /// Round a real quantity to the 4.12 fixed-point representation.
@@ -771,5 +799,59 @@ mod tests {
             .count();
         println!("CHAR11 non-black pixels: {visible}");
         assert!(visible > 1000, "model is not visible: {visible} pixels");
+    }
+
+    #[test]
+    fn fixed_mul_uses_the_ps1_y_sign_conjugation() {
+        // RotMatrix(0x400, 0, 0) is [[4095, 0, 0], [0, 0, 4095], [0, -4095, 0]].
+        let joint = anim::Mat4x3 {
+            r: [[4095, 0, 0], [0, 0, 4095], [0, -4095, 0]],
+            t: [10, 20, 30],
+        };
+
+        // The vertex's Y is negated before the rotation and the rotation's Y
+        // negated again before the translation is added, so the pitched joint
+        // maps +Z to -Y (a plain product would map it to +Y).
+        assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn real_walk_pose_matches_the_original_projection() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let data = std::fs::read(format!("{root}/JPN/ENEMY/CHAR11.EMD")).unwrap();
+        let emd = crate::emd::parse(&data).unwrap();
+
+        // CHAR11 keyframe 55 (a walk pose), entity at (5000, 0, 5000) facing
+        // yaw 0, projected through ROOM1001 cut 0 (pos 3960,-3132,11538,
+        // look-at 5274,-2430,5652, fov 221). The expected screen pixels are
+        // the original's own pipeline output.
+        let entity = anim::entity_matrix([5000, 0, 5000], 0);
+        let joints = anim::joint_matrices(&emd.skeleton, &emd.keyframes[55], &entity);
+        let camera = Camera::from_cut(&Cut {
+            pos: [3960, -3132, 11538],
+            look_at: [5274, -2430, 5652],
+            fov: 221,
+            ..Cut::default()
+        });
+
+        let expected = [
+            (0usize, 0usize, 169i32, 137i32),
+            (0, 1, 168, 138),
+            (0, 2, 177, 138),
+            (0, 3, 173, 127),
+            (9, 0, 172, 137),
+            (14, 3, 173, 143),
+        ];
+        for (object, vertex, expected_x, expected_y) in expected {
+            let world = fixed_mul(&joints[object], emd.mesh.objects[object].vertices[vertex]);
+            let screen = camera.project(world).unwrap();
+            assert!(
+                (screen[0] - expected_x).abs() <= 1 && (screen[1] - expected_y).abs() <= 1,
+                "object {object} vertex {vertex}: got {screen:?}, expected ({expected_x}, {expected_y})"
+            );
+        }
     }
 }

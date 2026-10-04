@@ -123,23 +123,32 @@ pub fn joint_matrices(
 /// Angular step of the game's trig tables: `2*pi / 4096`.
 const ANGLE_STEP: f64 = 0.0015339807880859375;
 
-/// The game's sine table: 4096 entries of `sin(angle * 2*pi/4096)` at 14-bit
-/// amplitude, saturated to `[-0x3FFF, 0x3FFF]` so an exact +1.0 does not wrap
-/// to the signed minimum.
+/// Build one 14-bit trig table, truncating the `f64` product toward zero and
+/// saturating an exact `+/-1.0` so it never wraps to the signed minimum.
+fn trig_table(function: fn(f64) -> f64) -> [i32; 4096] {
+    let mut table = [0i32; 4096];
+    for (index, entry) in table.iter_mut().enumerate() {
+        let angle = (index as f64) * ANGLE_STEP;
+        *entry = ((function(angle) * 16384.0) as i32).clamp(-0x3FFF, 0x3FFF);
+    }
+    table
+}
+
+/// The game's sine table: 4096 entries at 14-bit amplitude.
 ///
-/// Deviation: the game truncates the `f64` product toward zero; this rounds to
-/// nearest, so entries whose fractional part is at least 0.5 differ by one.
-/// Entry count, amplitude, saturation and the 4096-per-turn angle unit match.
+/// The game keeps sine and cosine as two independently built tables, so this
+/// does too: `sin(angle + 0x400)` and `cos(angle)` can differ by one entry
+/// after truncation, and the joint chain would amplify that into a visible
+/// mismatch.
 fn sin_table() -> &'static [i32; 4096] {
     static TABLE: OnceLock<[i32; 4096]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0i32; 4096];
-        for (index, entry) in table.iter_mut().enumerate() {
-            let angle = (index as f64) * ANGLE_STEP;
-            *entry = ((angle.sin() * 16384.0).round() as i32).clamp(-0x3FFF, 0x3FFF);
-        }
-        table
-    })
+    TABLE.get_or_init(|| trig_table(f64::sin))
+}
+
+/// The game's cosine table, built exactly like the sine table.
+fn cos_table() -> &'static [i32; 4096] {
+    static TABLE: OnceLock<[i32; 4096]> = OnceLock::new();
+    TABLE.get_or_init(|| trig_table(f64::cos))
 }
 
 /// 14-bit sine of a 12-bit angle (angles wrap modulo 0x1000).
@@ -147,9 +156,9 @@ fn sin14(angle: i32) -> i32 {
     sin_table()[(angle & 0x0FFF) as usize]
 }
 
-/// 14-bit cosine of a 12-bit angle: the sine table a quarter turn ahead.
+/// 14-bit cosine of a 12-bit angle.
 fn cos14(angle: i32) -> i32 {
-    sin14(angle + 0x400)
+    cos_table()[(angle & 0x0FFF) as usize]
 }
 
 /// `(a * b) >> 14` for two 14-bit values, truncated toward zero.
@@ -203,8 +212,15 @@ fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
     matrix
 }
 
-/// `a * b` for two [`Mat4x3`] values: rotation matrix product and
-/// `a.r * b.t + a.t` translation, every 4.12 product truncated toward zero.
+/// `a * b` for two [`Mat4x3`] values: rotation matrix product and the game's
+/// conjugated translation, every 4.12 product truncated toward zero.
+///
+/// The game composes the translation with the PS1 Y-sign convention:
+/// `t = D * (a.r * (D * b.t)) + a.t` where `D = diag(1, -1, 1)`. Only the
+/// Y-sign conjugation around the rotation differs from a plain product, and it
+/// matters for every pitched or rolled joint: with a plain product the child
+/// translations come out mirrored, which visibly throws limbs to the wrong
+/// side.
 fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
     let mut r = [[0i32; 3]; 3];
     for (i, row) in r.iter_mut().enumerate() {
@@ -217,13 +233,18 @@ fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
         }
     }
 
+    let source = [b.t[0], b.t[1].wrapping_neg(), b.t[2]];
     let mut t = [0i32; 3];
-    for (i, value) in t.iter_mut().enumerate() {
-        let mut sum = i64::from(a.t[i]);
-        for k in 0..3 {
-            sum += mul12(a.r[i][k], b.t[k]);
+    for (row, value) in a.r.iter().zip(t.iter_mut()) {
+        let mut sum = 0i64;
+        for (element, &input) in row.iter().zip(&source) {
+            sum += mul12(*element, input);
         }
         *value = sum as i32;
+    }
+    t[1] = t[1].wrapping_neg();
+    for (value, parent) in t.iter_mut().zip(a.t) {
+        *value = value.wrapping_add(parent);
     }
 
     Mat4x3 { r, t }
@@ -231,14 +252,16 @@ fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
 
 /// Clip playback state. One `update` is one 30 Hz tick.
 ///
-/// `frame` is the index of the next frame to display: the pose for a tick is
-/// [`AnimPlayer::keyframe_index`] taken before that tick's
-/// [`AnimPlayer::update`], matching the order the game applies a frame and
-/// then advances.
+/// `frame` is the index of the next frame the game applies and
+/// `display_frame` is the frame currently shown. They agree on a tick that
+/// consumes a frame; while a frame is held by its timing the display stays on
+/// the frame applied last and `frame` has already moved past it, matching the
+/// game's order (compute speed from the pending frame, apply it, advance).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnimPlayer {
     pub clip: usize,
     pub frame: usize,
+    pub display_frame: usize,
     pub timing: u16,
 }
 
@@ -248,6 +271,7 @@ impl AnimPlayer {
         Self {
             clip,
             frame: 0,
+            display_frame: 0,
             timing: 0,
         }
     }
@@ -256,25 +280,27 @@ impl AnimPlayer {
     pub fn set_clip(&mut self, clip: usize) {
         self.clip = clip;
         self.frame = 0;
+        self.display_frame = 0;
         self.timing = 0;
     }
 
-    /// Keyframe of the current clip frame, or 0 when the clip or frame is out
-    /// of range.
+    /// Keyframe of the displayed clip frame, or 0 when the clip or frame is
+    /// out of range.
     pub fn keyframe_index(&self, clips: &[model::Clip]) -> usize {
         clips
             .get(self.clip)
-            .and_then(|clip| clip.frames.get(self.frame))
+            .and_then(|clip| clip.frames.get(self.display_frame))
             .map_or(0, |frame| usize::from(frame.keyframe))
     }
 
     /// Advance one tick and report whether the clip just completed.
     ///
     /// If `timing > 1` it is decremented and the frame is held. Otherwise the
-    /// frame is consumed: its timing is reloaded and the frame index advances;
-    /// passing the last frame wraps to 0 and returns true. A frame whose
-    /// timing is 1 therefore advances every tick. An out-of-range clip or an
-    /// empty frame list resets the player and returns false.
+    /// frame is consumed: it becomes the displayed frame, its timing is
+    /// reloaded and the frame index advances; passing the last frame wraps to
+    /// 0 and returns true. A frame whose timing is 1 therefore advances every
+    /// tick. An out-of-range clip or an empty frame list resets the player and
+    /// returns false.
     pub fn update(&mut self, clips: &[model::Clip]) -> bool {
         if self.timing > 1 {
             self.timing -= 1;
@@ -283,11 +309,13 @@ impl AnimPlayer {
 
         let Some(clip) = clips.get(self.clip) else {
             self.frame = 0;
+            self.display_frame = 0;
             self.timing = 0;
             return false;
         };
         if clip.frames.is_empty() {
             self.frame = 0;
+            self.display_frame = 0;
             self.timing = 0;
             return false;
         }
@@ -297,6 +325,7 @@ impl AnimPlayer {
         } else {
             0
         };
+        self.display_frame = index;
         self.timing = clip.frames[index].timing;
         self.frame = index + 1;
         if self.frame >= clip.frames.len() {
@@ -495,6 +524,26 @@ mod tests {
     }
 
     #[test]
+    fn displayed_frame_holds_for_the_frame_timing() {
+        // Frame 0 has timing 3, frame 1 timing 1: the game shows frame 0 on
+        // the first three ticks and frame 1 on the fourth, then wraps.
+        let clips = vec![timing_clip(&[3, 1])];
+        let mut player = AnimPlayer::new(0);
+
+        assert!(!player.update(&clips));
+        assert_eq!(
+            (player.display_frame, player.frame, player.timing),
+            (0, 1, 3)
+        );
+        assert!(!player.update(&clips));
+        assert_eq!((player.display_frame, player.timing), (0, 2));
+        assert!(!player.update(&clips));
+        assert_eq!((player.display_frame, player.timing), (0, 1));
+        assert!(player.update(&clips));
+        assert_eq!((player.display_frame, player.frame), (1, 0));
+    }
+
+    #[test]
     fn anim_timing_one_advances_every_tick_and_wraps() {
         let clips = vec![timing_clip(&[1, 1, 1])];
         let mut player = AnimPlayer::new(0);
@@ -539,11 +588,11 @@ mod tests {
         let mut player = AnimPlayer::new(0);
 
         assert_eq!(player.keyframe_index(&clips), 7);
-        player.frame = 1;
+        player.display_frame = 1;
         assert_eq!(player.keyframe_index(&clips), 9);
-        player.frame = 5;
+        player.display_frame = 5;
         assert_eq!(player.keyframe_index(&clips), 0);
-        player.frame = 0;
+        player.display_frame = 0;
         player.clip = 3;
         assert_eq!(player.keyframe_index(&clips), 0);
     }
@@ -563,5 +612,154 @@ mod tests {
         player.timing = 0;
         assert!(!player.update(&clips));
         assert_eq!(player.frame, 0);
+    }
+
+    #[test]
+    fn compose_translation_uses_the_y_sign_conjugation() {
+        // A pitched parent: RotMatrix(0x200, 0, 0) is
+        // [[4095, 0, 0], [0, 2896, 2896], [0, -2896, 2896]].
+        let parent = Mat4x3 {
+            r: [[4095, 0, 0], [0, 2896, 2896], [0, -2896, 2896]],
+            t: [0, 0, 0],
+        };
+        let child = Mat4x3 {
+            r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            t: [100, 200, 300],
+        };
+
+        let world = compose(&parent, &child);
+
+        // The child translation is Y-negated, rotated by the parent, and the
+        // result's Y negated again before the parent translation is added.
+        assert_eq!(world.t, [99, -71, 353]);
+        assert_eq!(world.r, parent.r);
+    }
+
+    #[test]
+    fn compose_keeps_yaw_only_translations_unchanged() {
+        // A yaw parent commutes with the Y-sign conjugation, so the plain and
+        // conjugated products agree exactly.
+        let parent = Mat4x3 {
+            r: [[0, 0, 4095], [0, 4095, 0], [-4095, 0, 0]],
+            t: [7, 8, 9],
+        };
+        let child = Mat4x3 {
+            r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            t: [100, 200, 300],
+        };
+
+        let world = compose(&parent, &child);
+
+        assert_eq!(world.t, [306, 207, -90]);
+    }
+
+    /// FNV-1a hash over every joint matrix the real player model produces.
+    fn joint_matrix_hash(skeleton: &Skeleton, keyframes: &[Keyframe]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for keyframe in keyframes {
+            for angle in [0u16, 0x123, 0x800, 0xC00] {
+                let entity = entity_matrix([0, 0, 0], angle);
+                for matrix in joint_matrices(skeleton, keyframe, &entity) {
+                    for row in &matrix.r {
+                        for &value in row {
+                            for byte in value.to_le_bytes() {
+                                hash ^= u64::from(byte);
+                                hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                            }
+                        }
+                    }
+                    for value in matrix.t {
+                        for byte in value.to_le_bytes() {
+                            hash ^= u64::from(byte);
+                            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+                        }
+                    }
+                }
+            }
+        }
+        hash
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn real_keyframes_match_the_original_joint_matrices() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let data = std::fs::read(format!("{root}/JPN/ENEMY/CHAR11.EMD")).unwrap();
+        let emd = crate::emd::parse(&data).unwrap();
+
+        // Full matrices of keyframe 0 at yaw 0, as the original computes them.
+        let expected: [([[i32; 3]; 3], [i32; 3]); 15] = [
+            (
+                [[4093, -118, 0], [118, 4093, 0], [0, 0, 4094]],
+                [0, -1707, 0],
+            ),
+            (
+                [[4042, 652, 0], [-652, 4042, 0], [0, 0, 4093]],
+                [-36, -2324, 0],
+            ),
+            ([[4092, 82, 0], [-82, 4092, 0], [0, 0, 4093]], [0, -1707, 0]),
+            (
+                [[4088, 199, -2], [-199, 4087, -99], [-1, 99, 4091]],
+                [-25, -1509, 165],
+            ),
+            (
+                [[4091, 36, 16], [-37, 4083, 252], [-9, -251, 4083]],
+                [-64, -909, 141],
+            ),
+            (
+                [[4031, 36, -692], [-40, 4089, -24], [695, 31, 4029]],
+                [-91, -104, 188],
+            ),
+            (
+                [[4088, 199, -1], [-199, 4087, -55], [0, 55, 4092]],
+                [-25, -1509, -135],
+            ),
+            (
+                [[4091, 80, -8], [-80, 4084, -234], [5, 234, 4085]],
+                [-74, -909, -144],
+            ),
+            (
+                [[4058, 79, 517], [-87, 4089, 63], [-514, -73, 4057]],
+                [-99, -104, -192],
+            ),
+            (
+                [[4073, 396, -54], [-399, 4044, -488], [5, 492, 4063]],
+                [-51, -2281, 275],
+            ),
+            (
+                [[3914, -1177, -161], [1171, 3917, -170], [200, 119, 4084]],
+                [-98, -1858, 288],
+            ),
+            (
+                [[3895, -1164, 440], [1186, 3910, -170], [-376, 290, 4062]],
+                [24, -1489, 330],
+            ),
+            (
+                [[4088, 215, 26], [-217, 4045, 588], [3, -588, 4051]],
+                [-52, -2270, -265],
+            ),
+            (
+                [[3992, -880, 165], [879, 3995, 43], [-173, -4, 4088]],
+                [-72, -1867, -274],
+            ),
+            (
+                [[3979, -878, -343], [883, 3993, 45], [322, -114, 4076]],
+                [15, -1520, -318],
+            ),
+        ];
+        let world = joint_matrices(&emd.skeleton, &emd.keyframes[0], &entity_matrix([0; 3], 0));
+        assert_eq!(world.len(), expected.len());
+        for (index, (matrix, (r, t))) in world.iter().zip(expected).enumerate() {
+            assert_eq!(matrix.r, r, "joint {index} rotation");
+            assert_eq!(matrix.t, t, "joint {index} translation");
+        }
+
+        // And a golden hash over every keyframe at four yaws.
+        assert_eq!(
+            joint_matrix_hash(&emd.skeleton, &emd.keyframes),
+            10_834_008_723_141_415_800
+        );
     }
 }
