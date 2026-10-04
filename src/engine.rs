@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
@@ -359,6 +360,8 @@ struct GameSession {
     masks: MaskCache,
     shadows: ShadowCache,
     sfx_cache: SfxCache,
+    /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
+    npc_models: EntityModelCache,
     music: Option<Mixer>,
     /// Decoded pack text tables (messages, item names, descriptions).
     text: Text,
@@ -524,6 +527,7 @@ impl GameSession {
             masks: MaskCache::default(),
             shadows: ShadowCache::default(),
             sfx_cache: SfxCache::default(),
+            npc_models: EntityModelCache::default(),
             music: None,
             text: Text::load(pack),
             font,
@@ -546,6 +550,16 @@ impl GameSession {
         };
         session.enter_room();
         Ok(session)
+    }
+
+    /// The parsed EMD model for character `id`, loading `npc/{id:02x}.emd`
+    /// from the pack on first use.
+    ///
+    /// A missing or invalid model is remembered and logged once; the caller
+    /// keeps the entity but draws it without a mesh.
+    #[allow(dead_code)] // wired into the render path by the next slice
+    fn npc_model(&mut self, pack: &Pack, id: u8) -> Option<Arc<Emd>> {
+        self.npc_models.get(pack, id)
     }
 
     /// Run the room boot: init script, queued events, the player mirror, mask
@@ -2767,6 +2781,56 @@ impl ShadowCache {
     }
 }
 
+/// Parsed NPC (scripted character) models, keyed by entity id.
+///
+/// The cache loads `npc/{id:02x}.emd` from the pack on first use and keeps the
+/// parsed model for the rest of the session, so every entity with the same id
+/// shares one copy. A missing or invalid entry is logged once and remembered
+/// as absent: the character still exists and animates, it just has no mesh to
+/// draw.
+#[derive(Default)]
+struct EntityModelCache {
+    models: HashMap<u8, Arc<Emd>>,
+    missing: HashSet<u8>,
+}
+
+impl EntityModelCache {
+    /// The parsed model for character `id`, loading it from the pack on first
+    /// use. Ids outside the character range yield `None` without a warning.
+    fn get(&mut self, pack: &Pack, id: u8) -> Option<Arc<Emd>> {
+        if let Some(model) = self.models.get(&id) {
+            return Some(Arc::clone(model));
+        }
+        if self.missing.contains(&id) {
+            return None;
+        }
+        let Some(path) = crate::npc::model_path(id) else {
+            self.missing.insert(id);
+            return None;
+        };
+        let bytes = match pack.read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                eprintln!("warning: missing NPC model {path}: {err}");
+                self.missing.insert(id);
+                return None;
+            }
+        };
+        match emd::parse(bytes) {
+            Ok(model) => {
+                let model = Arc::new(model);
+                self.models.insert(id, Arc::clone(&model));
+                Some(model)
+            }
+            Err(err) => {
+                eprintln!("warning: invalid NPC model {path}: {err:#}");
+                self.missing.insert(id);
+                None
+            }
+        }
+    }
+}
+
 /// Everything loaded for one room, so a transition can load the next room with
 /// the same code path as the initial load.
 struct LoadedRoom {
@@ -4063,6 +4127,50 @@ mod tests {
 
         assert_eq!(room.cuts[0].mask_active, 0b0001_0101);
         assert!(game.mask_toggles.is_empty());
+    }
+
+    #[test]
+    fn entity_model_cache_remembers_missing_and_invalid_models() {
+        let mut writer = PackWriter::new();
+        writer.add("npc/23.emd", b"not-an-emd".to_vec()).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let mut cache = EntityModelCache::default();
+        // An absent entry yields None and is remembered so the pack is only
+        // read once.
+        assert!(cache.get(&pack, 0x20).is_none());
+        assert!(cache.get(&pack, 0x20).is_none());
+        assert!(cache.missing.contains(&0x20));
+        // A present but invalid entry yields None too.
+        assert!(cache.get(&pack, 0x23).is_none());
+        assert!(cache.missing.contains(&0x23));
+        // Ids outside the character range have no model path and no warning.
+        assert!(cache.get(&pack, 0x1F).is_none());
+        assert!(cache.get(&pack, 0xFF).is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_pack_npc_models_load_through_the_cache() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let mut cache = EntityModelCache::default();
+
+        for id in crate::npc::FIRST_ID..=crate::npc::LAST_ID {
+            let model = cache
+                .get(&pack, id)
+                .unwrap_or_else(|| panic!("npc/{id:02x}.emd missing from the pack"));
+            assert_eq!(model.skeleton.relative.len(), 15, "npc/{id:02x}.emd joints");
+            assert!(!model.mesh.objects.is_empty(), "npc/{id:02x}.emd mesh");
+        }
+
+        // A second request returns the same parsed model, not a re-parse.
+        let first = cache.get(&pack, 0x23).unwrap();
+        let second = cache.get(&pack, 0x23).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(cache.get(&pack, 0x1F).is_none());
     }
 
     #[test]

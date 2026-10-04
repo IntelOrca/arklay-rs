@@ -6,8 +6,9 @@
 //! room once, converts the room mask pages of every camera that has sprite
 //! groups, copies the door animations named by the door type table, copies the
 //! `BGM_*.WAV` music files, the 68 named sound effects, the four player
-//! models plus the two no-weapon locomotion clips, and the `KAGE.TIM`
-//! player-shadow coverage page. Stages 6 and 7 reuse the
+//! models plus the two no-weapon locomotion clips, the fifteen scripted
+//! character (NPC) models, and the `KAGE.TIM` player-shadow coverage page.
+//! Stages 6 and 7 reuse the
 //! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
 //! by 5.
 
@@ -21,6 +22,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::items;
 use crate::model::Texture8;
 use crate::music;
+use crate::npc;
 use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
 use crate::sfx;
@@ -61,6 +63,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         item_m1,
         item_m2,
         players,
+        npc,
         roommask,
         data,
         font,
@@ -153,6 +156,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
+    let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress)?;
     let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress)?;
@@ -172,6 +176,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     println!("se: {se_count} entries, {se_bytes} bytes");
     println!("door: {door_count} entries, {door_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
+    println!("npc: {npc_count} entries, {npc_bytes} bytes");
     println!("font: {font_count} entries, {font_bytes} bytes");
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
     println!("item: {item_count} entries, {item_bytes} bytes");
@@ -201,6 +206,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         + se_count
         + door_count
         + player_count
+        + npc_count
         + ui_count
         + item_count
         + data_count
@@ -409,6 +415,34 @@ fn copy_players(
     for asset in players {
         let data = fs::read(&asset.source)
             .with_context(|| format!("failed to read {}", asset.source.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&asset.entry, data)
+            .with_context(|| format!("failed to add {}", asset.entry))?;
+        progress.advance(&asset.entry);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
+/// Add every resolved scripted-character (NPC) model to the pack raw.
+fn copy_npc_models(
+    assets: &[NpcAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    progress.begin("npc", assets.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for asset in assets {
+        let data = fs::read(&asset.source).with_context(|| {
+            format!(
+                "failed to read NPC model {:#04x} ({})",
+                asset.id,
+                asset.source.display()
+            )
+        })?;
         bytes += data.len();
         count += 1;
         writer
@@ -1379,6 +1413,17 @@ struct PlayerAsset {
     source: PathBuf,
 }
 
+/// One scripted-character (NPC) model resolved to its pack entry.
+#[derive(Debug)]
+struct NpcAsset {
+    /// Entity id (`0x20..=0x2E`).
+    id: u8,
+    /// Pack entry, e.g. `npc/23.emd`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
 /// One room mask page resolved to its pack entry.
 #[derive(Debug)]
 struct RoomMask {
@@ -1411,6 +1456,8 @@ struct Plan {
     item_m1: Option<PathBuf>,
     item_m2: Option<PathBuf>,
     players: Vec<PlayerAsset>,
+    /// The fifteen scripted-character models, resolved by entity id.
+    npc: Vec<NpcAsset>,
     roommask: Vec<RoomMask>,
     /// Resolved `DATA` UI, item and save-prefix assets.
     data: DataPlan,
@@ -1422,6 +1469,8 @@ struct Plan {
 
 /// Discover, enumerate, and validate every conversion input.
 fn build_plan(root: &Path) -> Result<Plan> {
+    let layout = discover_layout(root)?;
+    let (npc, npc_warnings) = resolve_npc_assets(&layout)?;
     let Layout {
         stages,
         sound,
@@ -1431,7 +1480,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         item_m1,
         data,
         item_m2,
-    } = discover_layout(root)?;
+    } = layout;
     // The font is optional and only diagnosable when the install actually has
     // a DATA directory; a missing DATA root is not reported so partial trees
     // stay warning-free.
@@ -1555,6 +1604,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
     }
 
     warnings.extend(data.warnings.iter().cloned());
+    warnings.extend(npc_warnings);
     if let Some(font_warning) = font_warning {
         warnings.push(font_warning);
     }
@@ -1564,11 +1614,55 @@ fn build_plan(root: &Path) -> Result<Plan> {
         item_m1,
         item_m2,
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
+        npc,
         roommask,
         data,
         font,
         warnings,
     })
+}
+
+/// Resolve the fifteen scripted-character models (`ENEMY/EM1020.EMD` ..
+/// `ENEMY/EM102E.EMD`) by entity id.
+///
+/// Unlike the player models, a missing NPC model is an optional-category
+/// warning: the affected characters stay present but invisible instead of
+/// failing the conversion, so the unresolved files are reported together.
+fn resolve_npc_assets(layout: &Layout) -> Result<(Vec<NpcAsset>, Vec<String>)> {
+    let index = layout.enemy.as_deref().map(index_dir).transpose()?;
+
+    let mut assets = Vec::new();
+    let mut missing = Vec::new();
+    for id in npc::FIRST_ID..=npc::LAST_ID {
+        let file = format!("em10{id:02x}.emd");
+        match index.as_ref().and_then(|index| index.get(&file)) {
+            Some(source) => assets.push(NpcAsset {
+                id,
+                entry: npc::model_path(id)
+                    .expect("every character id maps to a pack path")
+                    .to_string(),
+                source: source.clone(),
+            }),
+            None => missing.push(format!("ENEMY/EM10{id:02X}.EMD")),
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if !missing.is_empty() {
+        if layout.enemy.is_none() {
+            warnings.push(format!(
+                "no enemy directory found; {} NPC model(s) will be missing",
+                missing.len()
+            ));
+        } else {
+            warnings.push(format!(
+                "missing {} NPC model file(s): {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok((assets, warnings))
 }
 
 /// Resolve the four player models (`ENEMY/Char10..13.EMD`) and the two
@@ -1738,6 +1832,20 @@ mod tests {
         fs::write(enemy.join("char13.emd"), b"emd3").unwrap();
         fs::write(players.join("W00.EMW"), b"emw0").unwrap();
         fs::write(players.join("w10.emw"), b"emw1").unwrap();
+    }
+
+    /// The fifteen scripted-character models, with names like the shipped
+    /// install.
+    fn write_npc_files(root: &Path) {
+        let enemy = root.join("ENEMY");
+        fs::create_dir_all(&enemy).unwrap();
+        for id in npc::FIRST_ID..=npc::LAST_ID {
+            fs::write(
+                enemy.join(format!("EM10{id:02X}.EMD")),
+                format!("npc-{id:02x}"),
+            )
+            .unwrap();
+        }
     }
 
     /// Every `.dor` the door type table names, with mixed-case names like the
@@ -1939,6 +2047,76 @@ mod tests {
     }
 
     #[test]
+    fn resolves_and_packs_npc_models_case_insensitively() {
+        let root = TempDir::new("npc-models");
+        make_stage_dirs(&root.path);
+        write_npc_files(&root.path);
+        // Ship a mixed-case name; the resolver must match it.
+        fs::rename(
+            root.path.join("ENEMY/EM1023.EMD"),
+            root.path.join("ENEMY/Em1023.emd"),
+        )
+        .unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert_eq!(plan.npc.len(), 15);
+        for (offset, asset) in plan.npc.iter().enumerate() {
+            let id = npc::FIRST_ID + offset as u8;
+            assert_eq!(asset.id, id);
+            assert_eq!(asset.entry, format!("npc/{id:02x}.emd"));
+        }
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("npc/"), 15);
+        assert_eq!(pack.read("npc/23.emd").unwrap(), b"npc-23");
+    }
+
+    #[test]
+    fn missing_npc_models_warn_once_without_failing() {
+        let root = TempDir::new("missing-npc");
+        make_stage_dirs(&root.path);
+
+        // No NPC files at all: one aggregated warning, and the conversion
+        // still succeeds with no `npc/` entries.
+        let plan = build_plan(&root.path).unwrap();
+        assert!(plan.npc.is_empty());
+        let warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("NPC model"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(warnings[0].contains("15 NPC model"), "{:?}", warnings);
+        assert!(warnings[0].contains("ENEMY/EM1020.EMD"), "{:?}", warnings);
+        assert!(warnings[0].contains("ENEMY/EM102E.EMD"), "{:?}", warnings);
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        assert!(!pack.paths().any(|path| path.starts_with("npc/")));
+
+        // Present files resolve; only the missing two are named.
+        write_npc_files(&root.path);
+        fs::remove_file(root.path.join("ENEMY/EM1022.EMD")).unwrap();
+        fs::remove_file(root.path.join("ENEMY/EM102E.EMD")).unwrap();
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.npc.len(), 13);
+        let warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("NPC model"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(warnings[0].contains("ENEMY/EM1022.EMD"), "{:?}", warnings);
+        assert!(warnings[0].contains("ENEMY/EM102E.EMD"), "{:?}", warnings);
+        assert!(!warnings[0].contains("EM1020.EMD"), "{:?}", warnings);
+    }
+
+    #[test]
     fn parses_rdt_ids_from_file_names() {
         let id = rdt_id_from_file_name("ROOM1001.RDT").unwrap().unwrap();
         assert_eq!(id, RoomId::parse("1001").unwrap());
@@ -2047,6 +2225,7 @@ mod tests {
     fn converts_synthetic_game_and_dedupes_variants() {
         let root = TempDir::new("synthetic-full");
         make_stage_dirs(&root.path);
+        write_npc_files(&root.path);
         let pak = camera_pak();
 
         fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
@@ -2084,6 +2263,9 @@ mod tests {
 
         assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
         assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
+        // The NPC phase copies the fifteen character models raw, lower-cased.
+        assert_eq!(pack.read("npc/20.emd").unwrap(), b"npc-20");
+        assert_eq!(pack.read("npc/2e.emd").unwrap(), b"npc-2e");
 
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("room/"), 3);
@@ -2093,6 +2275,7 @@ mod tests {
         assert_eq!(count("se/"), 68);
         assert_eq!(count("door/"), 34);
         assert_eq!(count("player/"), 6);
+        assert_eq!(count("npc/"), 15);
         assert_eq!(
             pack.paths()
                 .filter(|path| path.starts_with("player/") && path.ends_with(".emd"))
@@ -3004,6 +3187,9 @@ mod tests {
         assert_eq!(count("bgm/"), 61);
         assert_eq!(count("se/"), 68);
         assert_eq!(count("door/"), 34);
+        assert_eq!(count("npc/"), 15);
+        assert!(pack.contains("npc/20.emd"));
+        assert!(pack.contains("npc/2e.emd"));
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
         assert!(pack.contains("roommask/100_000.bmp"));
@@ -3037,6 +3223,97 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn real_npc_models_convert_and_parse() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let layout = discover_layout(&root).unwrap();
+        let (assets, warnings) = resolve_npc_assets(&layout).unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(assets.len(), 15);
+        assert_eq!(
+            assets.iter().map(|asset| asset.id).collect::<Vec<_>>(),
+            (npc::FIRST_ID..=npc::LAST_ID).collect::<Vec<_>>()
+        );
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new();
+        let (count, bytes) = copy_npc_models(&assets, &mut writer, &mut progress).unwrap();
+
+        assert_eq!(count, 15);
+        assert_eq!(bytes, 2_295_340, "total NPC model bytes");
+        let size_of = |id: u8| {
+            let asset = assets.iter().find(|asset| asset.id == id).unwrap();
+            fs::metadata(&asset.source).unwrap().len() as usize
+        };
+        assert_eq!(size_of(0x29), 93_636, "the devoured corpse is the smallest");
+        assert_eq!(size_of(0x22), 210_216, "Barry is the largest");
+
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let entries: Vec<&str> = pack
+            .paths()
+            .filter(|path| path.starts_with("npc/"))
+            .collect();
+        assert_eq!(entries.len(), 15, "{entries:?}");
+
+        for asset in &assets {
+            let data = pack.read(&asset.entry).unwrap();
+            let emd =
+                crate::emd::parse(data).unwrap_or_else(|err| panic!("{}: {err:#}", asset.entry));
+            let prims: usize = emd
+                .mesh
+                .objects
+                .iter()
+                .map(|object| object.prims.len())
+                .sum();
+            let expected_clips = match asset.id {
+                0x25 | 0x26 | 0x29 => 1,
+                0x27 => 3,
+                0x28 => 4,
+                _ => emd.clips.len(),
+            };
+            println!(
+                "{} (id {:#04x}): {} object(s), {} clip(s), {} keyframe(s), {prims} primitive(s), {} bytes",
+                asset.entry,
+                asset.id,
+                emd.mesh.objects.len(),
+                emd.clips.len(),
+                emd.keyframes.len(),
+                data.len()
+            );
+            assert_eq!(emd.clips.len(), expected_clips, "{} clips", asset.entry);
+            assert!(
+                (15..=16).contains(&emd.mesh.objects.len()),
+                "{} objects",
+                asset.entry
+            );
+            assert_eq!(emd.skeleton.relative.len(), 15, "{} joints", asset.entry);
+            assert_eq!(
+                emd.skeleton.children.len(),
+                15,
+                "{} child lists",
+                asset.entry
+            );
+            assert!((1..=65).contains(&emd.clips.len()), "{} clips", asset.entry);
+            assert!(
+                (2..=1032).contains(&emd.keyframes.len()),
+                "{} keyframes",
+                asset.entry
+            );
+            assert_eq!(
+                (emd.texture.width, emd.texture.height),
+                (256, 256),
+                "{} texture",
+                asset.entry
+            );
+            assert!((670..=700).contains(&prims), "{} primitives", asset.entry);
+        }
     }
 
     #[test]

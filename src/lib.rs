@@ -16,6 +16,7 @@ pub mod mask;
 pub mod message;
 pub mod model;
 pub mod music;
+pub mod npc;
 pub mod pack;
 pub mod player;
 pub mod progress;
