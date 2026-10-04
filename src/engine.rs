@@ -2353,6 +2353,7 @@ mod tests {
         let source = RoomId::parse("1001").unwrap();
         // Captures persist under the test temp directory for inspection.
         let dir = std::env::temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
 
         let first = simulate_door(&pack, source, 0, Some(&dir)).unwrap();
         let first_mid_bytes = std::fs::read(dir.join("transition_mid.bmp")).unwrap();

@@ -271,6 +271,7 @@ fn door00_mid_animation_frame_renders_non_black_and_stable() {
         rgba: first.rgba,
     };
     let path = std::env::temp_dir().join("door00_frame20.bmp");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("create temp dir");
     arklay::bmp::encode(&image, &path).expect("write BMP");
     println!("wrote {}", path.display());
     assert!(path.is_file());

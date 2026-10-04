@@ -643,6 +643,7 @@ mod tests {
             "arklay-pack-{}-write-then-open.akpak",
             std::process::id()
         ));
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
         let mut writer = PackWriter::new();
         writer.add("a.bin", vec![7, 8, 9]).unwrap();
         writer.write(&path).unwrap();

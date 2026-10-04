@@ -185,6 +185,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     );
 
     let capture = std::env::temp_dir().join("mask_room1000_frame.bmp");
+    std::fs::create_dir_all(capture.parent().unwrap()).expect("create temp dir");
     let image = arklay::state::Image {
         width: framebuffer.width,
         height: framebuffer.height,
@@ -289,6 +290,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     );
 
     let plain_capture = std::env::temp_dir().join("mask_room1000_plain.bmp");
+    std::fs::create_dir_all(plain_capture.parent().unwrap()).expect("create temp dir");
     let image = arklay::state::Image {
         width: plain.width,
         height: plain.height,
@@ -297,6 +299,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     bmp::encode(&image, &plain_capture).expect("write the plain capture");
 
     let masked_capture = std::env::temp_dir().join("mask_room1000_player.bmp");
+    std::fs::create_dir_all(masked_capture.parent().unwrap()).expect("create temp dir");
     let image = arklay::state::Image {
         width: masked.width,
         height: masked.height,

@@ -327,7 +327,10 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("arklay-bmp-{}-{name}.bmp", std::process::id()))
+        let path =
+            std::env::temp_dir().join(format!("arklay-bmp-{}-{name}.bmp", std::process::id()));
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        path
     }
 
     fn pixel_offset(data: &[u8]) -> usize {
