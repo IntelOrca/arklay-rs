@@ -421,7 +421,12 @@ pub fn walks_forward(id: RoomId, camera: usize) -> bool {
         .any(|&(row, flags)| usize::from(row) == room && flags & (1 << camera) != 0)
 }
 
-/// A per-entry override on top of the shared bias record.
+/// A per-entry rule on top of the shared bias record.
+///
+/// The original's backward walk carries a handful of hand-tuned per-overlay
+/// offsets that the shared record cannot express. The depth offsets matter to
+/// this engine even though sprites are drawn opaque and unshaded, because the
+/// fixed 550 key depends on the depth being exactly zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaskEntryOverride {
     /// The entry is never drawn on this camera.
@@ -430,10 +435,15 @@ pub enum MaskEntryOverride {
     FixedFade(i32),
     /// Added to the computed fade value before bucketing.
     FadeOffset(i32),
+    /// The depth subtracts this fixed constant instead of the record's
+    /// `depth_bias`.
+    DepthBias(i16),
+    /// The depth subtracts the record's `depth_bias` plus this constant.
+    DepthExtra(i16),
+    /// Both a depth extra and a fade offset together.
+    DepthExtraAndFade { depth: i16, fade: i32 },
 }
 
-/// Room table index of stage 3 room 02 (the falls).
-const ROOM_FALLS: usize = 66;
 /// Room table index of stage 3 room 0B (the boulder passage).
 const ROOM_BOULDER_PASSAGE: usize = 75;
 /// Room table index of stage 4 room 0E (the water tank).
@@ -444,56 +454,107 @@ const ROOM_SECURITY_ROOM: usize = 111;
 /// The hand-tuned per-entry overrides of the rooms that need them.
 ///
 /// `index` is the sprite's position in the flattened table, matching the
-/// submission entry order. Only overrides that change ordering or visibility
-/// are listed; the few records that adjust brightness alone have no effect on
-/// this engine's opaque, unshaded mask quads.
+/// submission entry order. The falls room's forward-branch entry-18 offset is
+/// deliberately absent: it only applies on the forward walk, and that room's
+/// path flags never select the forward walk, so it is unreachable in the
+/// shipped data.
 pub fn mask_override(id: RoomId, camera: usize, index: usize) -> Option<MaskEntryOverride> {
     match (room_table_index(id), camera, index) {
-        (ROOM_FALLS, 0, 18) => Some(MaskEntryOverride::FadeOffset(200)),
         (ROOM_BOULDER_PASSAGE, 5, 25 | 26) => Some(MaskEntryOverride::Hidden),
         (ROOM_WATER_TANK, 1, 11) => Some(MaskEntryOverride::FixedFade(0x4B0)),
+        (ROOM_WATER_TANK, 1, 9) => Some(MaskEntryOverride::DepthBias(0x5A)),
+        (ROOM_WATER_TANK, 3, 7) => Some(MaskEntryOverride::DepthBias(0x4B)),
+        (ROOM_WATER_TANK, 3, 9) => Some(MaskEntryOverride::DepthBias(0x3D)),
+        (ROOM_WATER_TANK, 3, 31 | 32) => Some(MaskEntryOverride::DepthBias(0x3C)),
         (ROOM_WATER_TANK, 3, 33) => Some(MaskEntryOverride::Hidden),
         (ROOM_WATER_TANK, 2, 28) => Some(MaskEntryOverride::Hidden),
-        (ROOM_SECURITY_ROOM, _, 34..=52) => Some(MaskEntryOverride::FadeOffset(if index == 49 {
-            0x23
-        } else {
-            0x46
-        })),
+        (ROOM_SECURITY_ROOM, _, 34..=52) => Some(MaskEntryOverride::DepthExtraAndFade {
+            depth: 0x352,
+            fade: if index == 49 { 0x23 } else { 0x46 },
+        }),
+        (ROOM_SECURITY_ROOM, 0, 54) => Some(MaskEntryOverride::DepthExtra(0x12C)),
         _ => None,
     }
 }
 
-/// The far-to-near draw key for one mask sprite, given the camera's fade bias.
+/// The sprite's brightness key: `pos_data >> 2`, clamped once the word leaves
+/// the ordering table's 12-bit range.
 ///
-/// Larger keys are farther away. The fade value is clamped at zero and rounded
-/// down to an ordering bucket of four; the original substitutes a fixed 550
-/// key when the computed key is zero, which is preserved here.
-pub fn mask_depth_key(pos_data: u16, fade_bias: i32) -> u32 {
-    key_from_fade(i32::from(pos_data) - fade_bias)
+/// The bound test is on `pos_data & 0xfffc`, so the bottom two bits never push
+/// an otherwise in-range word over the clamp.
+fn brightness_key(pos_data: u16) -> i16 {
+    if pos_data & 0xfffc < 0x1000 {
+        (pos_data >> 2) as i16
+    } else {
+        0x3ff
+    }
+}
+
+/// The far-to-near draw key for one mask sprite, given the camera's record.
+///
+/// Larger keys are farther away. The original's `AddSprite` picks its fixed
+/// 550 slot from the sprite's *brightness*, not its fade:
+///
+/// ```text
+/// depth = pinned ? record.depth_bias : brightness(pos_data) - record.depth_bias
+/// key   = (depth == 0) ? 550 : (clamp(fade, 0) & ~3) * 16
+/// ```
+///
+/// so a sprite whose brightness equals the record's bias exactly is pinned to
+/// 550 whatever fade it carries, while a non-zero depth with a negative fade
+/// lands on key 0, the nearest slot.
+pub fn mask_depth_key(pos_data: u16, record: DepthBias) -> u32 {
+    let brightness = brightness_key(pos_data);
+    let depth = if record.pinned {
+        i32::from(record.depth_bias)
+    } else {
+        i32::from(brightness) - i32::from(record.depth_bias)
+    };
+    key_from_depth_and_fade(depth as i16, i32::from(pos_data) - record.fade_bias)
 }
 
 /// The key for one entry of a camera's table: the shared bias, the room's
-/// per-entry override and the zero-key rule. `None` means the entry is hidden.
+/// per-entry override and the zero-depth rule. `None` means the entry is
+/// hidden.
 pub fn mask_sprite_key(
     id: RoomId,
     camera: usize,
     index: usize,
     sprite: &MaskSprite,
 ) -> Option<u32> {
-    let fade_bias = depth_bias(id, camera).fade_bias;
-    match mask_override(id, camera, index) {
-        Some(MaskEntryOverride::Hidden) => None,
-        Some(MaskEntryOverride::FixedFade(fade)) => Some(key_from_fade(fade)),
-        Some(MaskEntryOverride::FadeOffset(offset)) => Some(key_from_fade(
-            i32::from(sprite.pos_data) - fade_bias + offset,
-        )),
-        None => Some(mask_depth_key(sprite.pos_data, fade_bias)),
-    }
+    let record = depth_bias(id, camera);
+    let brightness = i32::from(brightness_key(sprite.pos_data));
+    let base_depth = if record.pinned {
+        i32::from(record.depth_bias)
+    } else {
+        brightness - i32::from(record.depth_bias)
+    };
+    let base_fade = i32::from(sprite.pos_data) - record.fade_bias;
+
+    let (depth, fade) = match mask_override(id, camera, index) {
+        Some(MaskEntryOverride::Hidden) => return None,
+        Some(MaskEntryOverride::FixedFade(value)) => (base_depth, value),
+        Some(MaskEntryOverride::FadeOffset(offset)) => (base_depth, base_fade + offset),
+        Some(MaskEntryOverride::DepthBias(value)) => (brightness - i32::from(value), base_fade),
+        Some(MaskEntryOverride::DepthExtra(extra)) => (base_depth - i32::from(extra), base_fade),
+        Some(MaskEntryOverride::DepthExtraAndFade { depth, fade }) => {
+            (base_depth - i32::from(depth), base_fade + fade)
+        }
+        None => (base_depth, base_fade),
+    };
+    Some(key_from_depth_and_fade(depth as i16, fade))
 }
 
-fn key_from_fade(fade: i32) -> u32 {
-    let bucket = fade.max(0) & !3;
-    if bucket == 0 { 550 } else { bucket as u32 * 16 }
+/// The `AddSprite` ordering key: the fixed 550 slot when the depth is exactly
+/// zero, otherwise the fade clamped at zero, rounded down to a bucket of four
+/// and scaled by sixteen.
+fn key_from_depth_and_fade(depth: i16, fade: i32) -> u32 {
+    if depth == 0 {
+        550
+    } else {
+        let bucket = if fade < 0 { 0 } else { fade & !3 };
+        (bucket as u32).wrapping_mul(16)
+    }
 }
 
 /// The flattened indices of a camera's sprites in submission order.
@@ -733,39 +794,105 @@ mod tests {
 
     #[test]
     fn depth_key_buckets_and_clamps() {
-        assert_eq!(mask_depth_key(0, 0), 550);
-        assert_eq!(mask_depth_key(3, 0), 550);
-        assert_eq!(mask_depth_key(4, 0), 64);
-        assert_eq!(mask_depth_key(7, 0), 64);
-        assert_eq!(mask_depth_key(8, 0), 128);
-        assert_eq!(mask_depth_key(380, 0), 6080);
-        // A fade that goes negative clamps to the zero key.
-        assert_eq!(mask_depth_key(5, 100), 550);
-        assert_eq!(mask_depth_key(100, 19), 1280);
+        let default = DepthBias::default();
+        assert_eq!(mask_depth_key(0, default), 550);
+        assert_eq!(mask_depth_key(3, default), 550);
+        assert_eq!(mask_depth_key(4, default), 64);
+        assert_eq!(mask_depth_key(7, default), 64);
+        assert_eq!(mask_depth_key(8, default), 128);
+        assert_eq!(mask_depth_key(380, default), 6080);
+        // A non-zero depth with a fade that goes negative lands on the nearest
+        // slot 0; the 550 rule keys on the depth, not the fade.
+        assert_eq!(
+            mask_depth_key(
+                5,
+                DepthBias {
+                    fade_bias: 100,
+                    ..default
+                }
+            ),
+            0
+        );
+        assert_eq!(
+            mask_depth_key(
+                100,
+                DepthBias {
+                    fade_bias: 19,
+                    ..default
+                }
+            ),
+            1280
+        );
+        // A zero depth takes 550 even when the fade bucket is non-zero.
+        assert_eq!(
+            mask_depth_key(
+                0,
+                DepthBias {
+                    fade_bias: -100,
+                    ..default
+                }
+            ),
+            550
+        );
+    }
+
+    #[test]
+    fn pinned_records_share_the_fixed_key() {
+        // ROOM3020/3021 camera 6 uses the one pinned record: every sprite's
+        // depth is the record's own bias (zero), so all take the 550 slot.
+        let pinned = depth_bias(room(3, 2), 6);
+        assert!(pinned.pinned);
+        for pos_data in [0, 4, 400, 0x4000] {
+            assert_eq!(
+                mask_sprite_key(room(3, 2), 6, 0, &sprite(pos_data)),
+                Some(550),
+                "pos_data {pos_data}"
+            );
+        }
     }
 
     #[test]
     fn sprite_keys_apply_the_room_overrides() {
-        // The falls camera 0 pushes entry 18 two hundred units back.
-        assert_eq!(
-            mask_sprite_key(room(3, 2), 0, 18, &sprite(100)),
-            Some(mask_depth_key(300, 0))
-        );
-        // The water tank camera 1 entry 11 has a fixed fade.
+        // The water tank camera 1 entry 11 has a fixed fade and the record's
+        // depth.
         assert_eq!(
             mask_sprite_key(room(4, 0x0E), 1, 11, &sprite(100)),
-            Some(key_from_fade(0x4B0))
+            Some(key_from_depth_and_fade(25, 0x4B0))
         );
-        // The security room offsets its run of overlays.
-        let fade_bias = depth_bias(room(4, 0x0F), 1).fade_bias;
+        // The water tank's hand-tuned depth entries replace the record bias.
+        assert_eq!(
+            mask_sprite_key(room(4, 0x0E), 1, 9, &sprite(100)),
+            Some(key_from_depth_and_fade(25 - 0x5A, 100))
+        );
+        // The security room pulls its run of overlays back by 0x352 and
+        // offsets the fade.
+        let record = depth_bias(room(4, 0x0F), 1);
         assert_eq!(
             mask_sprite_key(room(4, 0x0F), 1, 40, &sprite(100)),
-            Some(mask_depth_key(100 + 0x46, fade_bias))
+            Some(key_from_depth_and_fade(
+                (25 - i32::from(record.depth_bias) - 0x352) as i16,
+                100 - record.fade_bias + 0x46,
+            ))
         );
-        let fade_bias = depth_bias(room(4, 0x0F), 2).fade_bias;
+        let record = depth_bias(room(4, 0x0F), 2);
         assert_eq!(
             mask_sprite_key(room(4, 0x0F), 2, 49, &sprite(100)),
-            Some(mask_depth_key(100 + 0x23, fade_bias))
+            Some(key_from_depth_and_fade(
+                (25 - i32::from(record.depth_bias) - 0x352) as i16,
+                100 - record.fade_bias + 0x23,
+            ))
+        );
+    }
+
+    #[test]
+    fn the_falls_entry_18_override_is_unreachable() {
+        // The falls room never walks its entries forward, so the original's
+        // forward-only +200 offset on entry 18 is dead code.
+        assert!(!walks_forward(room(3, 2), 0));
+        assert_eq!(mask_override(room(3, 2), 0, 18), None);
+        assert_eq!(
+            mask_sprite_key(room(3, 2), 0, 18, &sprite(100)),
+            Some(key_from_depth_and_fade(25, 100))
         );
     }
 
@@ -846,7 +973,7 @@ mod tests {
         ];
 
         order_far_to_near(&mut items, |item| match item {
-            SceneItem::Mask(pos_data) => mask_depth_key(*pos_data, 0),
+            SceneItem::Mask(pos_data) => mask_depth_key(*pos_data, DepthBias::default()),
             SceneItem::Player { view_z } => *view_z,
         });
 

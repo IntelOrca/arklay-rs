@@ -15,6 +15,11 @@
 //! * `ORDER_SETUP` resets the order's local matrix to the exact 4.12 identity
 //!   and, when bit `0x80` of the flags high byte is set, clones the referenced
 //!   TMD object so `VERT_SET`/`VERT_ADD` writes stay per-order.
+//! * `VERT_ADD` writes through the order's resolved model pointer, but the
+//!   original's `VERT_SET` writes its three shorts into the order entry's own
+//!   model-pointer field, not the model. This port treats both as mesh-vertex
+//!   writes: the pointer field has no meaningful value to store, and no
+//!   shipped script uses `VERT_SET`.
 //! * The camera is the two points written by `CAM_MATRIX` (from and to), with
 //!   focal length `0x101`; the screen is black for the first three frames and
 //!   phase 2 holds for five extra frames.
@@ -118,6 +123,10 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VertexWrite {
     /// `VERT_SET`: the vertex was overwritten.
+    ///
+    /// The original writes these three shorts over the order entry's model
+    /// pointer instead of the mesh; this port deliberately redirects the write
+    /// to the order's mesh copy. See [`Vm::write_vertex`].
     Set {
         /// Order slot.
         order: u8,
@@ -884,9 +893,14 @@ impl Vm {
     /// Apply a `VERT_SET`/`VERT_ADD` write to the order's own mesh copy.
     ///
     /// `VERT_ADD` is the one the shipped data uses (ELE03's cage doors nudge
-    /// individual vertices); `VERT_SET` is kept for completeness. The original
-    /// resolves each order to a private TMD copy at `ORDER_SETUP`, so writes
-    /// never leak between panels.
+    /// individual vertices) and matches the original by writing through the
+    /// order's resolved model pointer. The original's `VERT_SET` instead
+    /// writes the three shorts over the order entry's model-pointer field at
+    /// `+0x7C`, outside the model; this port deliberately applies it to the
+    /// mesh vertex to keep the opcode usable and symmetric with `VERT_ADD`.
+    /// No shipped script emits `VERT_SET`, so the deviation is unobservable in
+    /// the shipped corpus. The original resolves each order to a private TMD
+    /// copy at `ORDER_SETUP`, so writes never leak between panels.
     fn write_vertex(&mut self, op: &[u8; 14], set: bool) {
         let order = usize::from(op[1]);
         let vertex = usize::from(op[2]);
@@ -1329,6 +1343,8 @@ mod tests {
 
     #[test]
     fn vert_set_and_add_write_the_order_mesh_copy() {
+        // VERT_SET's original target is the order's model-pointer field; this
+        // port redirects it to the vertex, so both ops land on the mesh copy.
         let script = vec![
             0x10, 0x00, 0x00, 0xFF, 0x00, 0x80, // ORDER_SETUP 0 model 0, draw only
             0x1D, 0x00, 0x01, 0x00, 0x0A, 0x00, 0x14, 0x00, 0x1E,

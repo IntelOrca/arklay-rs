@@ -5,12 +5,13 @@
 //!
 //! * the first three animation frames are drawn fully black (the destination
 //!   room loads behind them); the phase-2 hold freezes the frame counter, so
-//!   the black covers the hold too;
-//! * phase 2 holds for five extra frames (the "door fully open" beat);
+//!   the black covers the hold too, but a script that reaches `END` stops the
+//!   timeline at the end of that pass: an immediate `END` exits after one
+//!   black frame, without the hold;
 //! * the animation's fade ops set a counter/state pair that the transition
 //!   accumulates once per tick into the full-screen overlay;
-//! * a d-pad direction or action button held after frame 10 skips the rest of
-//!   the animation immediately;
+//! * the confirm (Cross) or run/cancel (Circle) button held after frame 10
+//!   skips the rest of the animation immediately;
 //! * gameplay input stays locked until the animation finishes.
 //!
 //! [`DoorStepper`] is the seam between this timeline and the `.dor`
@@ -348,10 +349,10 @@ impl<S: DoorStepper> Transition<S> {
 
     /// Advance one 30 Hz tick.
     ///
-    /// `skip_held` is the engine's d-pad-direction/action-button state; the
-    /// transition only acts on it once the animation is past
-    /// [`SKIP_AFTER_FRAME`]. The returned frame is the one to render this
-    /// tick; when `finished` is set, render it once and then tear down.
+    /// `skip_held` is the engine's confirm/cancel pad state; the transition
+    /// only acts on it once the animation is past [`SKIP_AFTER_FRAME`]. The
+    /// returned frame is the one to render this tick; when `finished` is set,
+    /// render it once and then tear down.
     pub fn tick(&mut self, skip_held: bool) -> TransitionFrame {
         if self.finished {
             return self.output();
@@ -370,26 +371,27 @@ impl<S: DoorStepper> Transition<S> {
         let overlay = self.fade.overlay();
         let black = frame < BLACK_FRAMES || raw.black;
 
-        if skip_held && frame > SKIP_AFTER_FRAME {
+        // The pass that reaches `END` is the last one the original runs: it is
+        // drawn, then the loop exits, skipping the phase-2 hold and the
+        // frame-counter increment. A held-input skip ends the timeline the same
+        // way.
+        if raw.done {
+            self.finished = true;
+        } else if skip_held && frame > SKIP_AFTER_FRAME {
             self.stepper.finish();
             self.finished = true;
         }
 
-        // Phase 2 holds for five extra frames with the frame counter frozen.
-        if self.phase == 2 && self.hold < PHASE2_HOLD_FRAMES {
-            self.hold += 1;
-        } else {
-            self.hold = 0;
-            self.phase += 1;
-            self.frame += 1;
-        }
-
-        if !self.finished
-            && raw.done
-            && self.frame >= BLACK_FRAMES
-            && !(self.phase == 2 && self.hold < PHASE2_HOLD_FRAMES)
-        {
-            self.finished = true;
+        if !self.finished {
+            // Phase 2 holds for five extra frames with the frame counter
+            // frozen.
+            if self.phase == 2 && self.hold < PHASE2_HOLD_FRAMES {
+                self.hold += 1;
+            } else {
+                self.hold = 0;
+                self.phase += 1;
+                self.frame += 1;
+            }
         }
 
         self.fade.tick();
@@ -654,15 +656,36 @@ mod tests {
     }
 
     #[test]
-    fn done_animation_waits_out_the_black_frames_and_hold() {
+    fn an_immediate_end_finishes_after_one_black_frame() {
         let mut transition = transition();
         transition.stepper_mut().next.done = true;
 
-        let frames: Vec<TransitionFrame> = (0..8).map(|_| transition.tick(false)).collect();
+        let frame = transition.tick(false);
+        assert!(frame.finished);
+        assert!(frame.black, "pass 0 is one of the black frames");
+        assert_eq!(frame.frame, 0);
+        assert!(!transition.input_locked());
 
-        assert!(frames[..7].iter().all(|frame| !frame.finished));
-        assert!(frames[7].finished);
-        assert!(frames.iter().all(|frame| frame.black));
+        // A finished timeline stops stepping the animation.
+        let steps = transition.stepper().steps;
+        assert!(transition.tick(false).finished);
+        assert_eq!(transition.stepper().steps, steps);
+    }
+
+    #[test]
+    fn an_end_after_the_black_frames_finishes_on_that_pass() {
+        let mut transition = transition();
+        // Ticks 1..=12 return frames 0, 1, 2, then the hold's five 2s, then
+        // 3..=6; the next pass is frame 7.
+        for _ in 0..12 {
+            assert!(!transition.tick(false).finished);
+        }
+        transition.stepper_mut().next.done = true;
+
+        let frame = transition.tick(false);
+        assert!(frame.finished);
+        assert_eq!(frame.frame, 7);
+        assert!(!frame.black, "passes past the third are not black");
     }
 
     #[test]

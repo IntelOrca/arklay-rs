@@ -509,9 +509,13 @@ fn run_transition(
             accumulator = 250.0;
         }
         let (input, action) = read_input();
-        // A held d-pad direction or action key skips the rest of the animation
-        // once the timeline is past its first ten frames.
-        let skip = input.up || input.down || input.left || input.right || action;
+        // The original tests pad bits 0xC0, the confirm (Cross) and run/cancel
+        // (Circle) buttons, on the animation's frame counter past ten. The
+        // engine's confirm key is `action` and its run modifier is `run`, so
+        // those two map the byte. The engine passes the live held state, not
+        // the original's rising edge.
+        let skip = action || input.run;
+        let mut finished = false;
         while accumulator >= TICK_MS {
             session.frame = session.transition.tick(skip);
             for effect in session.transition.stepper_mut().take_sfx() {
@@ -525,19 +529,13 @@ fn run_transition(
             session.transition.set_sound_busy(false);
             accumulator -= TICK_MS;
             if session.frame.finished {
-                finish_transition(
-                    pack,
-                    &mut session,
-                    game,
-                    player_state,
-                    loaded,
-                    music,
-                    sfx_cache,
-                );
-                return Ok(Flow::Continue);
+                finished = true;
+                break;
             }
         }
 
+        // The pass that ended the animation is drawn once before teardown, so
+        // the leading black passes the original ran are never dropped.
         render_transition(&mut framebuffer, &session);
         present(renderer, texture, &framebuffer)?;
         if let Some(mixer) = music {
@@ -545,6 +543,18 @@ fn run_transition(
         }
         if !unsafe { SDL_RenderPresent(renderer) } {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
+        }
+        if finished {
+            finish_transition(
+                pack,
+                &mut session,
+                game,
+                player_state,
+                loaded,
+                music,
+                sfx_cache,
+            );
+            return Ok(Flow::Continue);
         }
     }
 }

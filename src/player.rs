@@ -4,6 +4,11 @@
 //! body clips: idle settle and breathe, walk, turn in place, backward walk and
 //! run. The player lives on the room's XZ plane; the room collision path never
 //! changes Y, so the spawn height is kept for the whole room.
+//!
+//! The original's slow-motion modifier halves the walk speed and holds each
+//! locomotion frame for an extra tick while a room flag is set. No state
+//! source sets that flag in this engine yet, so the port always runs at full
+//! speed and the modifier's doubled footstep cadence is not modelled.
 
 use crate::anim::AnimPlayer;
 use crate::model::Clip;
@@ -199,7 +204,6 @@ pub fn update(
     let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
     player.pos = resolve_collision(&room.collision, prev, proposed, player.radius);
 
-    let frame_before = player.anim.display_frame;
     if behavior == BEHAVIOR_IDLE {
         player.idle_ticks = player.idle_ticks.saturating_add(1);
         match player.idle_phase {
@@ -223,7 +227,7 @@ pub fn update(
     } else {
         player.advance(emd_clips, emw_clips);
     }
-    player.emit_footsteps(behavior, frame_before);
+    player.emit_footsteps(behavior);
 }
 
 impl PlayerState {
@@ -239,10 +243,13 @@ impl PlayerState {
         }
     }
 
-    /// Emit a footstep when this tick applied a contact frame of a walk, turn
-    /// or run clip. The original fires on frames `0x08` and `0x16`, once per
-    /// contact even when the frame is held for more than one tick.
-    fn emit_footsteps(&mut self, behavior: u8, frame_before: usize) {
+    /// Emit a footstep when the displayed frame of a walk, turn or run clip is
+    /// a contact frame.
+    ///
+    /// The original tests frames `0x08` and `0x16` on every frame rather than
+    /// on the transition into them, so a contact frame held by its timing
+    /// re-fires each tick it is displayed.
+    fn emit_footsteps(&mut self, behavior: u8) {
         if self.clip_source != ClipSource::Emw
             || !matches!(behavior, BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_RUN)
         {
@@ -250,7 +257,7 @@ impl PlayerState {
         }
 
         let frame = self.anim.display_frame;
-        if frame != frame_before && (frame == 0x08 || frame == 0x16) {
+        if frame == 0x08 || frame == 0x16 {
             self.footsteps.push(Footstep {
                 pos: self.pos,
                 frame: frame as u8,
@@ -1222,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_contact_frame_emits_one_footstep() {
+    fn a_held_contact_frame_repeats_its_footstep() {
         let room = RoomState::default();
         let mut clips = clips();
         clips[WALK_CLIP].frames[0x08].timing = 2;
@@ -1232,16 +1239,7 @@ mod tests {
             ..Input::default()
         };
 
-        let mut events = Vec::new();
-        for _ in 0..30 {
-            step(&mut player, &room, &clips, input);
-            events.extend(player.take_footsteps());
-        }
-        assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].frame, 0x08);
-
-        // Run again and check the tick that holds frame 0x08 emits nothing.
-        let mut player = player_at(1000, 1000);
+        // Advance to the tick that first applies contact frame 0x08.
         let mut ticks = 0;
         loop {
             step(&mut player, &room, &clips, input);
@@ -1253,10 +1251,15 @@ mod tests {
             ticks += 1;
             assert!(ticks < 30, "the 0x08 contact frame was never applied");
         }
+
+        // The next tick holds the same frame and must fire again.
         step(&mut player, &room, &clips, input);
-        assert!(
-            player.take_footsteps().is_empty(),
-            "the held contact frame repeated its footstep"
-        );
+        let held = player.take_footsteps();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].frame, 0x08);
+
+        // Once the clip moves on, the held frame stops firing.
+        step(&mut player, &room, &clips, input);
+        assert!(player.take_footsteps().is_empty(), "still on the contact");
     }
 }

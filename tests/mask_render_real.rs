@@ -5,7 +5,9 @@
 //!
 //! The pack must have been built after the room-mask converter landed
 //! (`cargo run --release -- convert-game <install> --out target/tmp-test/game.akpak`);
-//! the test skips with a message when `roommask/100_000.bmp` is absent.
+//! a pack that is missing `roommask/100_000.bmp` fails the test, so a stale
+//! pack cannot silently hide a regression. Only an unset `ARKLAY_RE1_PACK`
+//! skips.
 //!
 //! The player is a world-space stand-in posed through the real camera: a
 //! screen-facing triangle behind the group-1 pillar of ROOM1000 cut 0. Real
@@ -108,10 +110,9 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let entry = id.roommask_entry(0);
-    let Ok(page_bytes) = pack.read(&entry) else {
-        eprintln!("skipping: `{path}` has no {entry} (reconvert the pack)");
-        return;
-    };
+    let page_bytes = pack
+        .read(&entry)
+        .unwrap_or_else(|err| panic!("pack `{path}` has no {entry}: {err} (reconvert the pack)"));
     let page = bmp::decode(page_bytes).unwrap();
 
     // The first group-1 sprite is the pillar top at screen (9, 73): 8x40,
@@ -221,10 +222,9 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let mask_entry = id.roommask_entry(0);
-    let Ok(page_bytes) = pack.read(&mask_entry) else {
-        eprintln!("skipping: `{path}` has no {mask_entry} (reconvert the pack)");
-        return;
-    };
+    let page_bytes = pack.read(&mask_entry).unwrap_or_else(|err| {
+        panic!("pack `{path}` has no {mask_entry}: {err} (reconvert the pack)")
+    });
     let background = bmp::decode(pack.read(&id.cut_entry(0)).unwrap()).unwrap();
     let page = bmp::decode(page_bytes).unwrap();
     let emd = arklay::emd::parse(pack.read("player/00.emd").unwrap()).unwrap();

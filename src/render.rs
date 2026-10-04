@@ -18,8 +18,9 @@
 //!   `fade << 4`, so the two keys are directly comparable without any extra
 //!   scaling. This engine sorts on integer keys, so the mean is rounded to the
 //!   nearest unit; a triangle whose rounded key equals a mask's key ties with
-//!   it and, like every tie, keeps submission order (masks are submitted
-//!   before player triangles, so the nearer player paints last).
+//!   it, and the original flushes only *strictly* farther masks before a
+//!   triangle, so equal-depth masks are submitted after player triangles here
+//!   too and win the tie.
 //!
 //! A [`MaskLayer`] carries the camera's decoded `roommask/{room}_{cam}.bmp`
 //! page and its [`Cut`]; a later engine step only has to load and decode that
@@ -408,12 +409,14 @@ impl<'a> MaskLayer<'a> {
 
 /// Draw one gameplay frame: the background, then the depth-sorted scene list.
 ///
-/// Masks are submitted first, in [`mask::mask_submission_order`] (the order the
-/// original paints equal-key sprites in), followed by the player's triangles
-/// pre-sorted far-to-near so their exact depth order survives the integer
-/// keys. [`mask::order_far_to_near`] is the stable sort; equal keys therefore
-/// keep this submission order. Inactive groups and hidden entries never reach
-/// the list.
+/// The player's triangles are submitted first, pre-sorted far-to-near so their
+/// exact depth order survives the integer keys, then the masks in
+/// [`mask::mask_submission_order`] (the order the original paints equal-key
+/// sprites in). [`mask::order_far_to_near`] is the stable sort, so equal keys
+/// keep this submission order: a mask whose key ties a triangle follows it and
+/// paints over the player, which is how the original's strictly-farther mask
+/// flush resolves the tie. Inactive groups and hidden entries never reach the
+/// list.
 pub fn draw_gameplay_scene(
     framebuffer: &mut Framebuffer,
     background: Option<&Image>,
@@ -428,9 +431,6 @@ pub fn draw_gameplay_scene(
     }
 
     let mut items = Vec::new();
-    if let Some(layer) = mask_layer {
-        collect_masks(layer, &mut items);
-    }
 
     let mut triangles = Vec::new();
     if let Some(player) = player {
@@ -442,6 +442,10 @@ pub fn draw_gameplay_scene(
     // the stable sort keeps this far-to-near order for those ties.
     triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
     items.extend(triangles.into_iter().map(SceneItem::Triangle));
+
+    if let Some(layer) = mask_layer {
+        collect_masks(layer, &mut items);
+    }
 
     mask::order_far_to_near(&mut items, SceneItem::key);
 
@@ -456,8 +460,8 @@ pub fn draw_gameplay_scene(
 /// first.
 ///
 /// [`mask::mask_sprite_key`] folds together the shared per-(room, camera) bias
-/// record, the room's per-entry overrides and the zero-key rule (a computed
-/// brightness key of zero sorts at the fixed key 550).
+/// record, the room's per-entry overrides and the zero-depth rule (a computed
+/// brightness depth of exactly zero sorts at the fixed key 550).
 fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem>) {
     for index in mask::mask_submission_order(layer.room, layer.camera, layer.cut.masks.len()) {
         let Some(sprite) = layer.cut.masks.get(index) else {
@@ -954,8 +958,9 @@ mod tests {
         }
     }
 
-    fn mesh(reversed: bool) -> Tmd {
-        let mut vertices = vec![[0i16, 0, 1000], [0, 1000, 1000], [1000, 0, 1000]];
+    /// The standard screen-facing triangle, its plane at view-space Z `z`.
+    fn mesh_at(z: i16, reversed: bool) -> Tmd {
+        let mut vertices = vec![[0i16, 0, z], [0, 1000, z], [1000, 0, z]];
         if reversed {
             vertices.swap(1, 2);
         }
@@ -972,6 +977,10 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn mesh(reversed: bool) -> Tmd {
+        mesh_at(1000, reversed)
     }
 
     fn render_triangle(reversed: bool) -> Framebuffer {
@@ -1285,10 +1294,11 @@ mod tests {
     }
 
     #[test]
-    fn scene_list_is_stable_and_submits_masks_before_triangles() {
+    fn scene_list_is_stable_and_puts_equal_depth_masks_after_triangles() {
         // Room 100 walks its entries backwards, so the sprites are submitted
         // 2, 1, 0. Sprite 0 carries the far key; sprites 1 and 2 tie with the
-        // triangle at 64.
+        // triangle at 64. The triangle is submitted first, as the gameplay
+        // path does, so on a tie the masks paint over the player.
         let cut = Cut {
             masks: vec![
                 mask_sprite((0, 0), 100, 1),
@@ -1301,9 +1311,8 @@ mod tests {
         let page = solid_image(1, 1, [1, 2, 3, 255]);
         let layer = MaskLayer::new(room(), 0, &cut, &page);
 
-        let mut items = Vec::new();
+        let mut items = vec![scene_triangle(64)];
         collect_masks(&layer, &mut items);
-        items.push(scene_triangle(64));
         mask::order_far_to_near(&mut items, SceneItem::key);
 
         let order: Vec<(u32, Option<(i32, i32)>)> = items
@@ -1317,9 +1326,9 @@ mod tests {
             order,
             vec![
                 (1600, Some((0, 0))),
+                (64, None),
                 (64, Some((2, 0))),
                 (64, Some((1, 0))),
-                (64, None),
             ]
         );
     }
@@ -1366,6 +1375,10 @@ mod tests {
     /// and the standard triangle (mean depth 1000, covering pixel 180,100).
     /// The mask's page texel (10, 10) is distinct from the rest of the page.
     fn interleaved_frame(mask_pos_data: u16) -> Framebuffer {
+        interleaved_frame_with(mask_pos_data, &mesh(false))
+    }
+
+    fn interleaved_frame_with(mask_pos_data: u16, mesh: &Tmd) -> Framebuffer {
         let cut = Cut {
             masks: vec![crate::mask::MaskSprite {
                 uv: (0, 0),
@@ -1384,11 +1397,10 @@ mod tests {
         let layer = MaskLayer::new(room(), 0, &cut, &page);
 
         let background = solid_image(320, 240, [7, 8, 9, 255]);
-        let mesh = mesh(false);
         let joints = [identity()];
         let texture = solid_texture([10, 20, 30, 255]);
         let player = PlayerMesh {
-            mesh: &mesh,
+            mesh,
             texture: &texture,
             joints: &joints,
         };
@@ -1416,6 +1428,16 @@ mod tests {
         assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [10, 20, 30, 255]);
         // Neither item covers this background pixel.
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn equal_depth_mask_paints_over_the_player() {
+        // Mask pos_data 64 gives brightness 16, depth 16 and fade 64, so its
+        // key is 1024. A player triangle with mean view-space Z 1024 produces
+        // the same integer key; the original flushes only strictly-farther
+        // masks before a triangle, so the mask is drawn after it and wins.
+        let framebuffer = interleaved_frame_with(64, &mesh_at(1024, false));
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 8, 7, 255]);
     }
 
     #[test]

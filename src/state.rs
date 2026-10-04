@@ -298,18 +298,22 @@ impl RoomState {
     /// The packed footstep zone value for `(x, z)`: the surface type in the
     /// high byte and the sound offset for that surface in the low byte.
     ///
-    /// The scan wraps around the 16-bit coordinate space and stops after 256
-    /// entries. A room whose last zone is not a catch-all would otherwise run
-    /// the scan past the table; returning `None` keeps that contained.
+    /// The bounds test is the original's 32-bit unsigned subtraction: the
+    /// sign-extended position minus the zero-extended base, compared against
+    /// the width. It therefore does not wrap at 16 bits - a position below a
+    /// base produces a huge value and falls through to the next zone. The scan
+    /// stops after 256 entries; a room whose last zone is not a catch-all
+    /// would otherwise run past the table, and returning `None` keeps that
+    /// contained.
     pub fn footstep_zone(&self, x: i32, z: i32) -> Option<u16> {
-        let x = x as u16;
-        let z = z as u16;
+        let x = x as u32;
+        let z = z as u32;
         self.footstep_zones
             .iter()
             .take(256)
             .find(|zone| {
-                x.wrapping_sub(zone.base_x) < zone.width
-                    && z.wrapping_sub(zone.base_z) < zone.height
+                x.wrapping_sub(u32::from(zone.base_x)) < u32::from(zone.width)
+                    && z.wrapping_sub(u32::from(zone.base_z)) < u32::from(zone.height)
             })
             .map(|zone| ((zone.height >> 8) << 8) | (zone.sound_data & 0xFF))
     }
@@ -422,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn footstep_zone_wraps_the_coordinate_space() {
+    fn footstep_zone_does_not_wrap_the_coordinate_space() {
         let room = RoomState {
             footstep_zones: vec![
                 FootstepZone {
@@ -443,10 +447,14 @@ mod tests {
             ..RoomState::default()
         };
 
-        // 0x0010 - 0xFF00 wraps to 0x0110, inside the 0x0200-wide zone. The
-        // packed result keeps the height's high byte and the low sound byte.
-        assert_eq!(room.footstep_zone(0x10, 0x08), Some(0x45));
-        assert_eq!(room.footstep_zone(0, 0), Some(0x45));
+        // A position inside the first zone matches it; the packed result keeps
+        // the height's high byte and the low sound byte.
+        assert_eq!(room.footstep_zone(0xFF00, 0xFFF0), Some(0x45));
+        assert_eq!(room.footstep_zone(0xFF10, 0xFFF5), Some(0x45));
+        // 0x0010 - 0xFF00 is a huge unsigned 32-bit value, not a 16-bit wrap
+        // back to 0x0110, so the catch-all zone wins instead.
+        assert_eq!(room.footstep_zone(0x10, 0x08), Some(0x7F00));
+        assert_eq!(room.footstep_zone(0, 0), Some(0x7F00));
         assert_eq!(room.footstep_zone(0x1000, 0x1000), Some(0x7F00));
         assert_eq!(room.footstep_zone(0x7FE3, 0x7FEB), Some(0x7F00));
     }
