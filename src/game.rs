@@ -85,6 +85,17 @@ pub const ENTITY_COUNT: usize = 32;
 /// `selected_entity` value when the event pointed at something this slice does
 /// not model as an entity (object models and item models).
 pub const ENTITY_NONE: u8 = u8::MAX;
+/// `status_flags` bit 0: the entity is active/visible.
+pub const ENTITY_STATUS_ACTIVE: u8 = 0x01;
+/// Flag bank holding the `enemy` guard bits (`g_EnemiesFlags`).
+pub const BANK_ENEMIES: u8 = 3;
+/// Collision radius the `enemy` spawn gives an entity before its own init
+/// overrides it.
+pub const DEFAULT_ENEMY_RADIUS: i16 = 422;
+/// First entity id that is a scripted character.
+pub const CHARACTER_ID_MIN: u8 = 0x20;
+/// Last entity id that is a scripted character.
+pub const CHARACTER_ID_MAX: u8 = 0x2E;
 /// Default per-tick yaw step of an `act_motion` instruction.
 const MOTION_DEFAULT_STEP: u8 = 0xC0;
 /// Default per-tick pitch step of an `act_motion` instruction.
@@ -553,6 +564,8 @@ pub struct RoomInteraction {
 /// a sign-extended byte into that same word, so it is kept as one u16.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Entity {
+    /// Entity type id; `0x20..=0x2E` are scripted characters.
+    pub id: u8,
     /// Room position.
     pub pos: [i32; 3],
     /// 12-bit yaw.
@@ -561,16 +574,28 @@ pub struct Entity {
     pub pitch: u16,
     /// Rotation Z, the companion of `pitch` in the rotation SVECTOR.
     pub roll: u16,
+    /// Entity status flags; bit 0 is active/visible.
+    pub status_flags: u8,
+    /// The spawn record's behaviour/weapon selector.
+    pub behavior_flags: u8,
     /// Animation behavior byte (`action_behavior`).
-    pub behavior: u8,
+    pub action_behavior: u8,
     /// Animation action state byte.
     pub action_state: u8,
-    /// Animation id.
-    pub anim: u16,
-    /// Scripted animation frame id.
-    pub anim_frame: u8,
-    /// Whether the slot is spawned.
-    pub active: bool,
+    /// EDD clip id published by the driver.
+    pub animation_id: u8,
+    /// Scripted animation frame id published by the driver.
+    pub animation_frame_id: u8,
+    /// Hold counter of the animation clock (`timing_control`).
+    pub timing_control: u8,
+    /// Animation blend step (`blend_counter`).
+    pub blend_counter: u8,
+    /// This tick's walk speed.
+    pub move_speed_current: u16,
+    /// SCD animation timer (frames).
+    pub scd_timer: u16,
+    /// SCD animation parameter.
+    pub scd_anim_param: u8,
     /// `scd_entity_flags`, OR/SET/XORed by `act_flag_op`.
     pub flags: u16,
     /// Per-tick translation from the tween `tw_set_pos` instruction.
@@ -590,12 +615,6 @@ pub struct Entity {
     pub unk_c6: u16,
     /// Animation position offset Z.
     pub unk_c8: u16,
-    /// SCD animation parameter.
-    pub anim_param: u8,
-    /// SCD animation timer.
-    pub timer: u16,
-    /// Animation frame blend counter.
-    pub blend: u8,
     /// Look-at control byte set by `act_motion`.
     pub look_at_flags: u8,
     /// Look-at target position; for an entity target this is refreshed every
@@ -604,15 +623,52 @@ pub struct Entity {
     /// Entity slot this entity is moving toward, when the target is an entity.
     pub target_entity: Option<u8>,
     /// Per-tick yaw step of the active `act_motion`.
-    pub step: u8,
+    pub look_at_yaw_step: u8,
     /// Per-tick pitch step of the active `act_motion`.
-    pub pitch_step: u8,
+    pub look_at_pitch_step: u8,
     /// Interaction/zone state bits (`zone_flags` in the original entity):
     /// `0x01` inside the current camera zone, `0x10` door swings the other way
     /// or ladder variant, `0x20` inside a stairs/ladder/door zone, `0x40` door
     /// direction modifier, `0x80` grabbed. `set_stairs_zone` raises `0x20`
     /// (and `0x10` for the ladder variant).
     pub zone_flags: u8,
+    /// Scenario variant packed by the `enemy` spawn: the slot nibble, the
+    /// record's selector high nibble and the force-init bit.
+    pub variant: u8,
+    /// Room event index to raise when the entity dies.
+    pub death_event_id: u8,
+    /// Collision radius in room units.
+    pub sca_radius: i16,
+    /// Whether the entity has entered a camera switch zone (behaviour
+    /// scratch).
+    pub has_enter_switch_zone: u8,
+    /// Direction the entity is attacking towards (behaviour scratch).
+    pub attacking_direction: u8,
+    /// Movement direction-control flags (behaviour scratch).
+    pub dir_control_flags: u8,
+    /// Texture bank the model uses.
+    pub tex_bank: u8,
+    /// Action sequence counter/timer (behaviour scratch).
+    pub seq_counter: u8,
+    /// Turn delta accumulated by the walk behaviours.
+    pub angle_turn_delta: u8,
+    /// Effect countdown (footsteps/blood) for the current movement.
+    pub move_timer: u8,
+    /// Whether a walk behaviour is moving the entity.
+    pub is_moving: u8,
+    /// Maximum steps of the current movement sequence.
+    pub move_max_steps: u8,
+    /// Blood-splatter flag (behaviour scratch).
+    pub splatter_flag: u8,
+    /// Signed rotation speed for bobbing/weaving.
+    pub bob_speed: u8,
+    /// Waypoint X the pathfind behaviours steer at.
+    pub player_pos_x: i16,
+    /// Waypoint Z the pathfind behaviours steer at.
+    pub player_pos_z: i16,
+    /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
+    /// joint `i`'s flag bit.
+    pub joint_flags: u16,
 }
 
 impl Entity {
@@ -636,13 +692,27 @@ impl Entity {
         self.state_field = (self.state_field & 0x00FF) | (u16::from(ignore) << 8);
     }
 
+    /// Whether the entity's active/visible status bit is set.
+    pub fn active(&self) -> bool {
+        self.status_flags & ENTITY_STATUS_ACTIVE != 0
+    }
+
+    /// Raise or clear the active/visible status bit.
+    pub fn set_active(&mut self, active: bool) {
+        if active {
+            self.status_flags |= ENTITY_STATUS_ACTIVE;
+        } else {
+            self.status_flags &= !ENTITY_STATUS_ACTIVE;
+        }
+    }
+
     /// `tw_set_field`: store one byte of the entity state block at 0x84 plus
     /// `offset`. Returns `false` for an offset with no modelled field.
     fn set_state_byte(&mut self, offset: u8, value: u8) -> bool {
         match offset {
             0 => self.set_state(value),
             1 => self.set_ignore(value),
-            2 => self.behavior = value,
+            2 => self.action_behavior = value,
             3 => self.action_state = value,
             4 => self.health = (self.health & !0x00FF) | i16::from(value),
             5 => self.health = (self.health & 0x00FF) | (i16::from(value) << 8),
@@ -703,6 +773,10 @@ pub struct GameState {
     pub ladder_down: bool,
     /// Scripted entities; slot 0 is the player.
     pub entities: [Entity; ENTITY_COUNT],
+    /// Number of character entity slots an `enemy` spawn has allocated.
+    pub enemy_count: u8,
+    /// The `behavior_flags` read by the last `get_eml_state`.
+    pub last_enemy_flags: u8,
     /// Entity slot the current event operates on, or [`ENTITY_NONE`].
     pub selected_entity: u8,
     /// The last item picked up by any path.
@@ -745,7 +819,7 @@ pub struct GameState {
 /// The initial entity array: only the player slot is spawned.
 fn initial_entities() -> [Entity; ENTITY_COUNT] {
     let mut entities = [Entity::default(); ENTITY_COUNT];
-    entities[0].active = true;
+    entities[0].set_active(true);
     entities
 }
 
@@ -772,6 +846,8 @@ impl Default for GameState {
             stair_climb: false,
             ladder_down: false,
             entities: initial_entities(),
+            enemy_count: 0,
+            last_enemy_flags: 0,
             selected_entity: 0,
             last_picked_item: None,
             last_used_item: None,
@@ -946,6 +1022,149 @@ impl GameState {
         self.entity_mut(self.selected_entity)
     }
 
+    /// `enemy` (0x1B): allocate or re-initialise one character slot from the
+    /// 22-byte record. Returns whether an entity was initialised.
+    ///
+    /// Operand layout (byte offsets from the opcode): `+1` id, `+2`
+    /// behaviour/weapon selector, `+3` guard bit, `+4` force-init, `+5` SCA
+    /// hit words, `+6` rotation X, `+8` yaw, `+10` rotation Z, `+12`/`+14`/
+    /// `+16` X/Y/Z, `+18` slot low nibble, `+19` animation id, `+20`
+    /// animation frame, `+21` variant high nibble.
+    ///
+    /// A guard bit other than `0xFF` skips the whole record when the bank-3
+    /// bit is already set. Without force-init an occupied slot is left alone.
+    /// Ids outside `0x20..=0x2E` are parsed by the reader but allocate nothing
+    /// this milestone.
+    pub fn spawn_enemy(&mut self, operands: &[Operand]) -> bool {
+        let guard = operand_u8(operands, 2);
+        if guard != 0xFF && self.flags[usize::from(BANK_ENEMIES)].bit(guard) {
+            return false;
+        }
+        let id = operand_u8(operands, 0);
+        if !(CHARACTER_ID_MIN..=CHARACTER_ID_MAX).contains(&id) {
+            return false;
+        }
+        let slot = 1 + usize::from(operand_u8(operands, 11) & 0x0F);
+        let force_init = operand_u8(operands, 3) != 0;
+        let occupied = self.entities[slot].active();
+        if occupied && !force_init {
+            return false;
+        }
+
+        let entity = &mut self.entities[slot];
+        entity.id = id;
+        entity.set_active(true);
+        entity.behavior_flags = operand_u8(operands, 1);
+        entity.pitch = operand_i16(operands, 5) as u16;
+        entity.angle = operand_u16(operands, 6);
+        entity.roll = operand_u16(operands, 7);
+        // The record's X and Z are zero-extended, Y is sign-extended.
+        entity.pos = [
+            i32::from(operand_u16(operands, 8)),
+            i32::from(operand_i16(operands, 9)),
+            i32::from(operand_u16(operands, 10)),
+        ];
+        entity.animation_id = operand_u8(operands, 12);
+        entity.animation_frame_id = operand_u8(operands, 13);
+        entity.timing_control = 1;
+        entity.set_state(0);
+        entity.set_ignore(0);
+        entity.action_behavior = 0;
+        entity.action_state = 0;
+        entity.hit_state = 0;
+        entity.look_at_flags = 0;
+        entity.death_event_id = operand_u8(operands, 2);
+        entity.variant = (operand_u8(operands, 11) & 0x0F)
+            | ((operand_u8(operands, 14) & 0x0F) << 4)
+            | if force_init { 0x80 } else { 0 };
+        entity.sca_radius = DEFAULT_ENEMY_RADIUS;
+        if !occupied {
+            self.enemy_count = self.enemy_count.saturating_add(1);
+        }
+        true
+    }
+
+    /// `eml_state` (0x28): change one property of the enemy named by
+    /// `operands[1]`. An unknown sub-command or slot is inert; the reader
+    /// stops the stream before an unknown sub-command is ever decoded.
+    pub fn apply_eml_state(&mut self, operands: &[Operand]) {
+        let Some(slot) = operand_u8(operands, 1)
+            .checked_add(1)
+            .filter(|slot| usize::from(*slot) < ENTITY_COUNT)
+        else {
+            return;
+        };
+        let sub_command = operand_u8(operands, 2);
+        let param = operand_u16(operands, 3);
+        let entity = &mut self.entities[usize::from(slot)];
+        match sub_command {
+            0 => entity.behavior_flags = param as u8,
+            1 => {
+                entity.set_state(2);
+                entity.set_ignore(0);
+                entity.action_behavior = 0;
+                entity.action_state = 0;
+                entity.health = param as i16;
+                entity.hit_state = operand_u8(operands, 4);
+            }
+            2 => {
+                entity.action_behavior = param as u8;
+                entity.action_state = 0;
+            }
+            3 => {
+                let mode = (param >> 8) as u8;
+                let value = param as u8;
+                match mode {
+                    0 => entity.status_flags = value,
+                    1 => entity.status_flags |= value,
+                    2 => entity.status_flags ^= value,
+                    _ => {}
+                }
+            }
+            5 => entity.angle = param,
+            6 => entity.blend_counter = 0,
+            8 => {
+                entity.set_state(9);
+                entity.set_ignore(0);
+                entity.action_behavior = 0;
+                entity.action_state = 0;
+            }
+            9 => entity.joint_flags ^= param,
+            10 => entity.action_state = param as u8,
+            _ => {}
+        }
+    }
+
+    /// `get_eml_state` (0x39): copy an enemy's `behavior_flags` into the byte
+    /// scripts read back. An out-of-range slot leaves the byte untouched.
+    pub fn read_enemy_flags(&mut self, index: u8) {
+        if let Some(slot) = index
+            .checked_add(1)
+            .filter(|slot| usize::from(*slot) < ENTITY_COUNT)
+        {
+            self.last_enemy_flags = self.entities[usize::from(slot)].behavior_flags;
+        }
+    }
+
+    /// One native update per active entity slot (1..), called after the event
+    /// VM and before the player's physics mirror. A displayed message that
+    /// masks the control bit pauses the entities with the room. This slice
+    /// only walks and marks the active slots; the character driver replaces
+    /// the body in a later slice. Returns the number of slots visited.
+    pub fn tick_entities(&mut self, _room: &RoomState) -> usize {
+        if self.message_locks_controls() {
+            return 0;
+        }
+        let mut updated = 0;
+        for entity in &mut self.entities[1..] {
+            if entity.active() {
+                entity.status_flags |= ENTITY_STATUS_ACTIVE;
+                updated += 1;
+            }
+        }
+        updated
+    }
+
     /// Mirror entity 0 into the engine's player state when the scripts moved
     /// it, leaving the player alone otherwise. Called after the scripts run
     /// each tick so `dir_set` and actor motions move the visible player.
@@ -973,7 +1192,7 @@ impl GameState {
     pub fn reset_tween_entity(&mut self) {
         if let Some(entity) = self.selected_entity_mut() {
             entity.set_ignore(2);
-            entity.behavior = 0;
+            entity.action_behavior = 0;
             entity.action_state = 0;
         }
     }
@@ -1001,7 +1220,7 @@ impl GameState {
             "act_idle" => {
                 if let Some(entity) = self.selected_entity_mut() {
                     entity.state_field = 1;
-                    entity.behavior = 0;
+                    entity.action_behavior = 0;
                     entity.action_state = 0;
                     entity.hit_state = 0;
                 }
@@ -1014,12 +1233,12 @@ impl GameState {
                     let word2 = operand_u16(operands, 2);
                     entity.set_state(8);
                     entity.set_ignore(0);
-                    entity.behavior = word0 as u8;
+                    entity.action_behavior = word0 as u8;
                     entity.action_state = 0;
                     entity.unk_c6 = (word0 >> 8) | ((word1 as u8 as u16) << 8);
                     entity.unk_c8 = (word1 >> 8) | ((word2 as u8 as u16) << 8);
-                    entity.anim_param = (word2 >> 8) as u8;
-                    entity.timer = 0x28;
+                    entity.scd_anim_param = (word2 >> 8) as u8;
+                    entity.scd_timer = 0x28;
                     entity.flags = 0;
                 }
                 StepResult::Continue
@@ -1030,12 +1249,12 @@ impl GameState {
                         | (u16::from(operand_u8(operands, 2)) << 8);
                     entity.set_state(8);
                     entity.set_ignore(0);
-                    entity.behavior = 1;
+                    entity.action_behavior = 1;
                     entity.action_state = 0;
-                    entity.anim = u16::from(operand_u8(operands, 0));
-                    entity.anim_param = operand_u8(operands, 1);
+                    entity.animation_id = operand_u8(operands, 0);
+                    entity.scd_anim_param = operand_u8(operands, 1);
                     entity.flags = (anim_data >> 6) & 0x3FC;
-                    entity.timer = 0;
+                    entity.scd_timer = 0;
                 }
                 StepResult::Continue
             }
@@ -1043,11 +1262,11 @@ impl GameState {
                 if let Some(entity) = self.selected_entity_mut() {
                     entity.set_state(8);
                     entity.set_ignore(0);
-                    entity.behavior = operand_u8(operands, 0);
+                    entity.action_behavior = operand_u8(operands, 0);
                     entity.action_state = 0;
-                    entity.anim = u16::from(operand_u8(operands, 1));
-                    entity.anim_param = operand_u8(operands, 2);
-                    entity.timer = 0;
+                    entity.animation_id = operand_u8(operands, 1);
+                    entity.scd_anim_param = operand_u8(operands, 2);
+                    entity.scd_timer = 0;
                     entity.flags = 0;
                 }
                 StepResult::Continue
@@ -1067,15 +1286,15 @@ impl GameState {
             }
             "act_param_set" => {
                 if let Some(entity) = self.selected_entity_mut() {
-                    entity.timer =
+                    entity.scd_timer =
                         (operand_u16(operands, 0) >> 8) | (u16::from(operand_u8(operands, 1)) << 8);
                 }
                 StepResult::Continue
             }
             "act_action_a" | "act_action_b" => {
                 if let Some(entity) = self.selected_entity_mut() {
-                    entity.anim_frame = operand_u8(operands, 0);
-                    entity.blend = if entity.flags & 0x20 != 0 { 0 } else { 7 };
+                    entity.animation_frame_id = operand_u8(operands, 0);
+                    entity.blend_counter = if entity.flags & 0x20 != 0 { 0 } else { 7 };
                     entity.action_state = 1;
                 }
                 StepResult::Continue
@@ -1150,8 +1369,8 @@ impl GameState {
             return StepResult::Placeholder;
         };
         entity.look_at_flags = flags;
-        entity.step = yaw_step;
-        entity.pitch_step = pitch_step;
+        entity.look_at_yaw_step = yaw_step;
+        entity.look_at_pitch_step = pitch_step;
         entity.target = target;
         entity.target_entity = target_entity;
 
@@ -1292,6 +1511,7 @@ impl GameState {
         let player_entity = self.entities[0];
         self.entities = initial_entities();
         self.entities[0] = player_entity;
+        self.enemy_count = 0;
         self.selected_entity = 0;
         self.transition = None;
         self.transition_door = None;
@@ -2822,6 +3042,21 @@ impl ScdHost for ScdGameHost<'_> {
 
     fn on_enemy(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
+            // enemy: the 22-byte character spawn record.
+            0x1B => {
+                self.state.spawn_enemy(operands);
+                StepResult::Continue
+            }
+            // eml_state: the multi-subcommand enemy property setter.
+            0x28 => {
+                self.state.apply_eml_state(operands);
+                StepResult::Continue
+            }
+            // get_eml_state: read the enemy's behaviour_flags back.
+            0x39 => {
+                self.state.read_enemy_flags(operand_u8(operands, 0));
+                StepResult::Continue
+            }
             // pos_set: enemyIdx, position.pad, yaw, roll, x, y, z.
             0x21 => {
                 let index = operand_u8(operands, 0);
@@ -2835,7 +3070,7 @@ impl ScdHost for ScdGameHost<'_> {
                     entity.angle = operand_i16(operands, 2) as u16 & 0x0FFF;
                     entity.roll = operand_i16(operands, 3) as u16;
                     entity.flags &= 0xFFF3;
-                    entity.active = true;
+                    entity.set_active(true);
                 }
                 StepResult::Continue
             }
@@ -2865,7 +3100,7 @@ impl ScdHost for ScdGameHost<'_> {
                 entity.angle = operand_i16(operands, 2) as u16 & 0x0FFF;
                 entity.move_speed[0] = operand_i16(operands, 3);
                 entity.flags &= 0xFFF3;
-                entity.active = true;
+                entity.set_active(true);
                 StepResult::Continue
             }
             // spd_add: signed byte added to the player posY.
@@ -3660,10 +3895,6 @@ mod tests {
         {
             let mut host = ScdGameHost::new(&mut state);
             assert_eq!(
-                host.on_enemy(op(0x1B), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
                 host.on_player(op(0x2B), &operands(&[0])),
                 StepResult::Placeholder
             );
@@ -3673,10 +3904,6 @@ mod tests {
             );
             assert_eq!(
                 host.on_effect(op(0x2A), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
-                host.on_misc(op(0x28), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -3696,12 +3923,10 @@ mod tests {
                 StepResult::Placeholder
             );
         }
-        assert_eq!(state.placeholders.len(), 9);
-        assert_eq!(state.placeholders[&0x1B], 1);
+        assert_eq!(state.placeholders.len(), 7);
         assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x1F], 1);
         assert_eq!(state.placeholders[&0x2A], 1);
-        assert_eq!(state.placeholders[&0x28], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x40], 1);
         assert_eq!(state.placeholders[&0x27], 1);
@@ -3794,7 +4019,268 @@ mod tests {
         }
         assert_eq!(state.entities[0].pos, [6800, 0, 9000]);
         assert_eq!(state.entities[0].angle, 2048);
-        assert!(state.entities[0].active);
+        assert!(state.entities[0].active());
+    }
+
+    /// Operand list of an `enemy` (0x1B) spawn record, in signature order.
+    fn enemy_record(id: u8, behavior: u8, guard: u8, force: u8, slot: u8) -> Vec<Operand> {
+        operands(&[
+            i64::from(id),
+            i64::from(behavior),
+            i64::from(guard),
+            i64::from(force),
+            2,    // SCA hit words
+            7,    // rotation X
+            2220, // yaw
+            9,    // rotation Z
+            7280, // X
+            0,    // Y
+            3920, // Z
+            i64::from(slot),
+            0x10, // animation id
+            0x0C, // animation frame
+            3,    // variant high nibble
+        ])
+    }
+
+    #[test]
+    fn enemy_spawn_initialises_the_character_slot() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 1, 0)),
+            StepResult::Continue
+        );
+        let entity = host.state().entity(1).expect("enemy slot 0 -> entity 1");
+        assert_eq!(entity.id, 0x23);
+        assert_eq!(entity.behavior_flags, 0x06);
+        assert!(entity.active());
+        assert_eq!(entity.pos, [7280, 0, 3920]);
+        assert_eq!(entity.pitch, 7);
+        assert_eq!(entity.angle, 2220);
+        assert_eq!(entity.roll, 9);
+        assert_eq!(entity.animation_id, 0x10);
+        assert_eq!(entity.animation_frame_id, 0x0C);
+        assert_eq!(entity.timing_control, 1);
+        assert_eq!(entity.death_event_id, 0xFF);
+        assert_eq!(entity.variant, 0x30 | 0x80);
+        assert_eq!(entity.sca_radius, DEFAULT_ENEMY_RADIUS);
+        assert_eq!(entity.state(), 0);
+        assert_eq!(entity.ignore(), 0);
+        assert_eq!(entity.action_behavior, 0);
+        assert_eq!(entity.action_state, 0);
+        assert_eq!(entity.hit_state, 0);
+        assert_eq!(entity.look_at_flags, 0);
+        assert_eq!(host.state().enemy_count, 1);
+    }
+
+    #[test]
+    fn enemy_spawn_zero_extends_xz_and_sign_extends_y() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        // X and Z are unsigned operands; Y is signed.
+        let record = operands(&[0x23, 0, 0xFF, 1, 0, 0, 0, 0, -1, -1, -32768, 0, 0, 0, 0]);
+        assert_eq!(host.on_enemy(op(0x1B), &record), StepResult::Continue);
+        assert_eq!(host.state().entities[1].pos, [0xFFFF, -1, 0x8000]);
+    }
+
+    #[test]
+    fn enemy_guard_bit_skips_the_record() {
+        let mut state = game();
+        state.flags[usize::from(BANK_ENEMIES)].apply(5, 0);
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 5, 1, 0)),
+            StepResult::Continue
+        );
+        assert!(!host.state().entities[1].active());
+        assert_eq!(host.state().enemy_count, 0);
+    }
+
+    #[test]
+    fn enemy_guard_ff_ignores_the_enemy_bank() {
+        let mut state = game();
+        state.flags[usize::from(BANK_ENEMIES)].apply(5, 0);
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 1, 0)),
+            StepResult::Continue
+        );
+        assert!(host.state().entities[1].active());
+        assert_eq!(host.state().enemy_count, 1);
+    }
+
+    #[test]
+    fn enemy_spawn_keeps_an_occupied_slot_without_force_init() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 1, 0));
+        host.on_enemy(op(0x1B), &enemy_record(0x27, 0x02, 0xFF, 0, 0));
+        let entity = host.state().entities[1];
+        assert_eq!(entity.id, 0x23, "the occupied slot keeps its entity");
+        assert_eq!(entity.behavior_flags, 0x06);
+        assert_eq!(host.state().enemy_count, 1);
+    }
+
+    #[test]
+    fn enemy_force_init_reinitialises_an_occupied_slot() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 1, 0));
+        host.on_enemy(op(0x1B), &enemy_record(0x27, 0x02, 0xFF, 1, 0));
+        let entity = host.state().entities[1];
+        assert_eq!(entity.id, 0x27);
+        assert_eq!(entity.behavior_flags, 0x02);
+        assert_eq!(host.state().enemy_count, 1, "re-init does not double count");
+    }
+
+    #[test]
+    fn enemy_slot_nibble_selects_the_entity_and_counts_allocations() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_enemy(op(0x1B), &enemy_record(0x23, 0, 0xFF, 1, 0));
+        host.on_enemy(op(0x1B), &enemy_record(0x27, 0, 0xFF, 1, 3));
+        assert!(host.state().entities[1].active());
+        assert!(host.state().entities[4].active());
+        assert_eq!(host.state().enemy_count, 2);
+    }
+
+    #[test]
+    fn enemy_monster_ids_allocate_nothing() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        for id in [0x00, 0x11, 0x15, 0x16, 0x1F, 0x2F] {
+            assert_eq!(
+                host.on_enemy(op(0x1B), &enemy_record(id, 0, 0xFF, 1, 0)),
+                StepResult::Continue
+            );
+        }
+        assert!(
+            host.state().entities[1..]
+                .iter()
+                .all(|entity| !entity.active())
+        );
+        assert_eq!(host.state().enemy_count, 0);
+    }
+
+    #[test]
+    fn eml_state_writes_behaviour_and_action_fields() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        let op = op(0x28);
+        // Sub 0: behavior_flags.
+        assert_eq!(
+            host.on_enemy(op, &operands(&[0, 0, 0, 0x42, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().entities[1].behavior_flags, 0x42);
+        // Sub 2: action_behavior, clearing action_state.
+        host.state_mut().entities[1].action_state = 7;
+        host.on_enemy(op, &operands(&[0, 0, 2, 0x35, 0]));
+        assert_eq!(host.state().entities[1].action_behavior, 0x35);
+        assert_eq!(host.state().entities[1].action_state, 0);
+        // Sub 10: action_state.
+        host.on_enemy(op, &operands(&[0, 0, 10, 3, 0]));
+        assert_eq!(host.state().entities[1].action_state, 3);
+        // Sub 1: state 2 with health and hit state.
+        host.state_mut().entities[1].set_state(8);
+        host.state_mut().entities[1].set_ignore(4);
+        host.on_enemy(op, &operands(&[0, 0, 1, 96, 5]));
+        let entity = host.state().entities[1];
+        assert_eq!(entity.state(), 2);
+        assert_eq!(entity.ignore(), 0);
+        assert_eq!(entity.health, 96);
+        assert_eq!(entity.hit_state, 5);
+        assert_eq!(entity.action_behavior, 0);
+        assert_eq!(entity.action_state, 0);
+    }
+
+    #[test]
+    fn eml_state_status_flags_modes() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        let op = op(0x28);
+        // The high byte selects write (0), OR (1) or XOR (2); the low byte is
+        // the value.
+        host.on_enemy(op, &operands(&[0, 0, 3, 0x0003, 0]));
+        assert_eq!(host.state().entities[1].status_flags, 0x03);
+        host.on_enemy(op, &operands(&[0, 0, 3, 0x0104, 0]));
+        assert_eq!(host.state().entities[1].status_flags, 0x07);
+        host.on_enemy(op, &operands(&[0, 0, 3, 0x0202, 0]));
+        assert_eq!(host.state().entities[1].status_flags, 0x05);
+        host.on_enemy(op, &operands(&[0, 0, 3, 0x0908, 0]));
+        assert_eq!(host.state().entities[1].status_flags, 0x05);
+    }
+
+    #[test]
+    fn eml_state_yaw_blend_follow_state_and_joints() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        let op = op(0x28);
+        // Sub 5: yaw.
+        host.on_enemy(op, &operands(&[0, 0, 5, 0x0ABC, 0]));
+        assert_eq!(host.state().entities[1].angle, 0x0ABC);
+        // Sub 6: blend counter cleared.
+        host.state_mut().entities[1].blend_counter = 9;
+        host.on_enemy(op, &operands(&[0, 0, 6, 0, 0]));
+        assert_eq!(host.state().entities[1].blend_counter, 0);
+        // Sub 8: the follow state entry.
+        host.state_mut().entities[1].set_state(1);
+        host.state_mut().entities[1].set_ignore(3);
+        host.state_mut().entities[1].action_behavior = 5;
+        host.state_mut().entities[1].action_state = 5;
+        host.on_enemy(op, &operands(&[0, 0, 8, 0, 0]));
+        let entity = host.state().entities[1];
+        assert_eq!(entity.state(), 9);
+        assert_eq!(entity.ignore(), 0);
+        assert_eq!(entity.action_behavior, 0);
+        assert_eq!(entity.action_state, 0);
+        // Sub 9: joint flags XOR.
+        host.state_mut().entities[1].joint_flags = 0x0005;
+        host.on_enemy(op, &operands(&[0, 0, 9, 0x0003, 0]));
+        assert_eq!(host.state().entities[1].joint_flags, 0x0006);
+    }
+
+    #[test]
+    fn eml_state_ignores_unknown_slots_and_subcommands() {
+        let mut state = game();
+        state.entities[1].behavior_flags = 3;
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_enemy(op(0x28), &operands(&[0, 0, 4, 0, 0]));
+        host.on_enemy(op(0x28), &operands(&[0, 0xFE, 0, 0, 0]));
+        assert_eq!(host.state().entities[1].behavior_flags, 3);
+    }
+
+    #[test]
+    fn tick_entities_walks_active_slots_and_freezes_with_a_message() {
+        let mut state = game();
+        state.entities[1].set_active(true);
+        state.entities[3].set_active(true);
+        let room = RoomState::default();
+        assert_eq!(state.tick_entities(&room), 2);
+        assert!(state.entities[1].active());
+        assert!(state.entities[3].active());
+
+        // A message whose pause word masks the control bit pauses the room,
+        // so the entity tick must not run behind the window.
+        state.show_message(1, MESSAGE_FLAG_CONTROLS);
+        assert!(state.message_locks_controls());
+        assert_eq!(state.tick_entities(&room), 0);
+    }
+
+    #[test]
+    fn get_eml_state_reads_the_behavior_flags() {
+        let mut state = game();
+        state.entities[2].behavior_flags = 0x5A;
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_enemy(op(0x39), &operands(&[1])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().last_enemy_flags, 0x5A);
+        // An out-of-range enemy index leaves the byte alone.
+        host.on_enemy(op(0x39), &operands(&[0x7F]));
+        assert_eq!(host.state().last_enemy_flags, 0x5A);
     }
 
     #[test]
@@ -3920,20 +4406,20 @@ mod tests {
         assert_eq!(entity.health, 96);
         assert_eq!(entity.selector, 3);
         assert_eq!(entity.hit_state, 7);
-        assert_eq!(entity.behavior, 4);
+        assert_eq!(entity.action_behavior, 4);
     }
 
     #[test]
     fn tween_begin_resets_the_selected_entity() {
         let mut state = game();
-        state.entities[0].behavior = 4;
+        state.entities[0].action_behavior = 4;
         state.entities[0].action_state = 9;
         {
             let mut host = ScdGameHost::new(&mut state);
             let op = event_top_op(0x02).unwrap();
             assert_eq!(host.on_misc(op, &operands(&[])), StepResult::Continue);
         }
-        assert_eq!(state.entities[0].behavior, 0);
+        assert_eq!(state.entities[0].action_behavior, 0);
         assert_eq!(state.entities[0].action_state, 0);
         assert_eq!(state.entities[0].ignore(), 2);
     }
