@@ -81,6 +81,10 @@ pub enum MenuInput {
     Confirm,
     /// Cancel / start key.
     Cancel,
+    /// L1 / previous page; only the item box uses it.
+    PageLeft,
+    /// R1 / next page; only the item box uses it.
+    PageRight,
 }
 
 /// What a handled input asks the integration layer to do.
@@ -219,6 +223,25 @@ impl MainMenu {
         }
     }
 
+    /// Move the cursor to the next top tab and return its cursor value. The
+    /// cycle is map (0) -> file (2) -> radio (4) -> exit (6) -> map; the radio
+    /// tab is skipped while the player does not carry the radio. Landing on a
+    /// tab clears the item selection, exactly like walking there with the pad.
+    pub fn cycle_tab(&mut self, game: &mut GameState, has_radio: bool) -> u8 {
+        let mut next = if layout::is_tab(self.cursor) {
+            (self.cursor + 2) & 7
+        } else {
+            0
+        };
+        if next == 4 && !has_radio {
+            next = 6;
+        }
+        self.cursor = next;
+        self.mode = MenuMode::Navigation;
+        self.refresh_selection(game);
+        next
+    }
+
     /// Handle one input, mutating `game` where the action takes effect.
     pub fn handle_input(&mut self, game: &mut GameState, input: MenuInput) -> MenuEvent {
         match self.mode {
@@ -246,6 +269,7 @@ impl MainMenu {
                 MenuEvent::None
             }
             MenuInput::Cancel => MenuEvent::Close,
+            MenuInput::PageLeft | MenuInput::PageRight => MenuEvent::None,
             MenuInput::Confirm => {
                 if layout::is_tab(self.cursor) {
                     return if self.cursor == 6 {
@@ -280,7 +304,9 @@ impl MainMenu {
                 self.action = (self.action + 1) % 3;
                 MenuEvent::None
             }
-            MenuInput::Left | MenuInput::Right => MenuEvent::None,
+            MenuInput::Left | MenuInput::Right | MenuInput::PageLeft | MenuInput::PageRight => {
+                MenuEvent::None
+            }
             MenuInput::Confirm => self.apply_action(game),
         }
     }
@@ -337,6 +363,7 @@ impl MainMenu {
                 self.move_cursor = layout::move_sideways(self.move_cursor);
                 MenuEvent::None
             }
+            MenuInput::PageLeft | MenuInput::PageRight => MenuEvent::None,
             MenuInput::Up => {
                 self.move_cursor = layout::move_up(self.move_cursor, self.slots);
                 MenuEvent::None

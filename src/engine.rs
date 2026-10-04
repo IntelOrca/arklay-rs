@@ -23,9 +23,9 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT,
-    SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE,
-    SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
+    SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
+    SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -57,6 +57,8 @@ use crate::state::{Image, RoomId, RoomState};
 use crate::text::Text;
 use crate::tim;
 use crate::transition::{self, DoorStepper};
+use crate::ui::file::{FileAssets, FileEvent, FileScreen};
+use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 
@@ -330,13 +332,16 @@ impl Display {
 /// drives it one fixed tick at a time and renders through the session's own
 /// framebuffer, so a gameplay modal can freeze the room and still show the
 /// last frame underneath.
-/// The message window and the inventory menu are **not** driven through the
-/// [`ui::Screen`] modal hook: the message is part of [`game::GameState`] and
-/// keeps running on the gameplay tick, while the menu freezes the room but
-/// keeps drawing the last gameplay frame, reads its art from the session and
-/// mutates the same `GameState`. The boxed modal hook is kept for screens
-/// that own all of their state (the item viewer); it still freezes the room
-/// and draws over the last gameplay frame exactly as before.
+/// The message window, the inventory menu, the item box and the FILE tab are
+/// **not** driven through the [`ui::Screen`] modal hook: the message is part
+/// of [`game::GameState`] and keeps running on the gameplay tick, while the
+/// others freeze the room but keep drawing the last gameplay frame, read
+/// their art from the session and mutate the same `GameState`. The item box is
+/// opened by a room `item_box` action and shares the inventory panel the menu
+/// draws underneath it; the FILE tab is opened from the menu's top tab row
+/// (the Tab key cycles it). The boxed modal hook is kept for screens that own
+/// all of their state (the item viewer); it still freezes the room and draws
+/// over the last gameplay frame exactly as before.
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -358,6 +363,16 @@ struct GameSession {
     /// The paused inventory/status menu; the room tick is frozen while it is
     /// up and the last gameplay frame stays under it.
     menu: Option<MainMenu>,
+    /// The item-box overlay opened by a room `item_box` action. It shares the
+    /// session's state and draws over the inventory panel the menu underneath
+    /// provides; the room stays frozen while it is up.
+    item_box: Option<ItemBox>,
+    /// Item-box art, loaded on the first open.
+    item_box_assets: Option<ItemBoxAssets>,
+    /// The FILE tab selector/reader; the room stays frozen while it is up.
+    file: Option<FileScreen>,
+    /// FILE tab art, loaded on the first open.
+    file_assets: Option<FileAssets>,
     framebuffer: Framebuffer,
     titled_cut: usize,
     transition: Option<TransitionMode>,
@@ -399,6 +414,8 @@ const ITEM_GREEN_HERB: u8 = 0x44;
 const ITEM_HANDGUN_AMMO: u8 = 0x0B;
 /// Item id of the sword key, added by the deterministic menu capture.
 const ITEM_SWORD_KEY: u8 = 0x33;
+/// Item id of the communication radio (the radio tab's used item).
+const ITEM_COMM_RADIO: u8 = 0x4D;
 
 impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): stage 1 room 0 with
@@ -488,6 +505,10 @@ impl GameSession {
             menu_assets: None,
             menu_assets_loaded: false,
             menu: None,
+            item_box: None,
+            item_box_assets: None,
+            file: None,
+            file_assets: None,
             framebuffer: Framebuffer::new(),
             titled_cut: usize::MAX,
             transition: None,
@@ -523,7 +544,7 @@ impl GameSession {
     /// the room stays frozen and the same input drives the menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
         if self.menu.is_some() {
-            self.tick_menu(ui, input, action);
+            self.tick_menu(pack, ui, input, action);
             return Ok(());
         }
 
@@ -563,6 +584,13 @@ impl GameSession {
             input,
             action,
         );
+        // A room `item_box` action opened this tick raises the overlay. The
+        // interaction is consumed so the next probe has to fire again.
+        let item_box_fired = self
+            .game
+            .last_interaction
+            .take()
+            .is_some_and(|interaction| interaction.kind == game::RoomActionKind::ItemBox);
         apply_bgm_requests(
             &mut self.music,
             &mut self.game.room_bgm_requests,
@@ -580,6 +608,8 @@ impl GameSession {
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
             self.transition = Some(start_transition(pack, &record, &transition)?);
+        } else if item_box_fired && !self.game.message.active {
+            self.open_item_box(pack);
         }
         Ok(())
     }
@@ -605,6 +635,29 @@ impl GameSession {
         self.game.add_item(ITEM_SWORD_KEY, 1);
     }
 
+    /// Seed the deterministic item-box capture: a mixed box plus the menu
+    /// capture's inventory.
+    fn seed_item_box_capture(&mut self) {
+        let slots: [(usize, u8, u8); 5] = [
+            (0, ITEM_HANDGUN_AMMO, 30),
+            (1, ITEM_FIRST_AID_SPRAY, 1),
+            (2, ITEM_GREEN_HERB, 1),
+            (5, ITEM_SWORD_KEY, 1),
+            (47, 0x02, 15),
+        ];
+        for (slot, id, quantity) in slots {
+            self.game.item_box[slot] = game::InventoryItem { id, quantity };
+        }
+    }
+
+    /// Seed the deterministic FILE capture: every document collected, so both
+    /// books list their slots.
+    fn seed_file_capture(&mut self) {
+        for index in 0..game::FILE_COUNT as u8 {
+            self.game.set_file_collected(index, true);
+        }
+    }
+
     /// Open the pause menu over the current inventory: the room freezes, the
     /// last gameplay frame stays underneath and messages switch to the menu
     /// line until it closes.
@@ -627,8 +680,9 @@ impl GameSession {
     }
 
     /// One frozen tick of the pause menu. A message owns the input while it is
-    /// up; otherwise one pad edge reaches the menu and its event is consumed.
-    fn tick_menu(&mut self, ui: UiInput, input: player::Input, action: bool) {
+    /// up; the item-box overlay and the FILE tab then own the pad, and
+    /// otherwise one pad edge reaches the menu and its event is consumed.
+    fn tick_menu(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) {
         let message_was_up = self.game.message.active;
         self.game.update_message(
             MessageInput {
@@ -642,10 +696,57 @@ impl GameSession {
         if message_was_up || self.game.message.active {
             return;
         }
+
+        // The item-box overlay is a sub-screen of the inventory panel: it
+        // freezes the room with the menu open underneath.
+        if self.item_box.is_some() {
+            if let Some(item_box) = self.item_box.as_mut() {
+                item_box.tick();
+            }
+            let Some(event_input) = menu_input(ui) else {
+                return;
+            };
+            let event = self
+                .item_box
+                .as_mut()
+                .map(|item_box| item_box.handle_input(&mut self.game, event_input));
+            if event == Some(ItemBoxEvent::Close) {
+                self.item_box = None;
+                self.close_menu();
+            }
+            return;
+        }
+
+        // The FILE tab returns to the inventory on close.
+        if self.file.is_some() {
+            if let Some(file) = self.file.as_mut() {
+                file.tick();
+            }
+            let Some(event_input) = menu_input(ui) else {
+                return;
+            };
+            let event = self
+                .file
+                .as_mut()
+                .map(|file| file.handle_input(&mut self.game, event_input));
+            if event == Some(FileEvent::Close) {
+                self.file = None;
+            }
+            return;
+        }
+
+        let has_radio = self.game.has_radio();
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
         menu.tick(&mut self.game);
+        // START (Tab) cycles the top tabs while the menu is open; the file
+        // tab opens the document selector.
+        if ui.start {
+            let cursor = menu.cycle_tab(&mut self.game, has_radio);
+            self.handle_tab(pack, cursor);
+            return;
+        }
         let Some(event_input) = menu_input(ui) else {
             return;
         };
@@ -657,10 +758,78 @@ impl GameSession {
             // The item viewer is the next slice's screen; consume the CHECK
             // event and stay on the inventory for now.
             MenuEvent::ViewItem(_) => {}
-            // The map/file/radio tabs need no engine action and the next
-            // frame redraws after a Changed event.
-            MenuEvent::Tab(_) | MenuEvent::Changed => {}
+            MenuEvent::Tab(cursor) => self.handle_tab(pack, cursor),
+            MenuEvent::Changed => {}
         }
+    }
+
+    /// Run the action of a selected top tab.
+    ///
+    /// The map tab (cursor 0) is out of M6 scope and inert. The file tab
+    /// (cursor 2) opens the document selector/reader. The radio tab (cursor 4)
+    /// uses the carried radio when its scenario flag is up: the used-item byte
+    /// 0x4D reaches the room scripts and the menu closes, as the original's
+    /// radio tab does; without the radio the tab is inert.
+    fn handle_tab(&mut self, pack: &Pack, cursor: u8) {
+        match cursor {
+            0 => {}
+            2 => self.open_file(pack),
+            4 => {
+                if self.game.has_radio() {
+                    self.game.record_used_item(ITEM_COMM_RADIO);
+                    self.close_menu();
+                }
+            }
+            _ => self.close_menu(),
+        }
+    }
+
+    /// Load the item-box art once; a missing sheet is logged and leaves the
+    /// overlay frame blank.
+    fn ensure_item_box_assets(&mut self, pack: &Pack) {
+        if self.item_box_assets.is_some() {
+            return;
+        }
+        match ItemBoxAssets::load(pack) {
+            Ok(assets) => self.item_box_assets = Some(assets),
+            Err(err) => eprintln!("warning: item-box art unavailable: {err:#}"),
+        }
+    }
+
+    /// Load the FILE tab art once; a missing TIM is logged and leaves that
+    /// layer blank.
+    fn ensure_file_assets(&mut self, pack: &Pack) {
+        if self.file_assets.is_some() {
+            return;
+        }
+        match FileAssets::load(pack) {
+            Ok(assets) => self.file_assets = Some(assets),
+            Err(err) => eprintln!("warning: FILE tab art unavailable: {err:#}"),
+        }
+    }
+
+    /// Open the item box over the frozen inventory panel.
+    fn open_item_box(&mut self, pack: &Pack) {
+        if self.item_box.is_some() {
+            return;
+        }
+        self.ensure_item_box_assets(pack);
+        self.open_menu(pack);
+        let mut item_box = ItemBox::default();
+        item_box.open(&self.game);
+        self.item_box = Some(item_box);
+    }
+
+    /// Open the FILE tab selector over the frozen inventory panel.
+    fn open_file(&mut self, pack: &Pack) {
+        if self.file.is_some() {
+            return;
+        }
+        self.ensure_file_assets(pack);
+        self.open_menu(pack);
+        let mut file = FileScreen::default();
+        file.open(&self.game);
+        self.file = Some(file);
     }
 
     /// Advance an active transition animation one fixed frame. The finished
@@ -741,6 +910,34 @@ impl GameSession {
             self.ensure_menu_assets(pack);
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw(&mut self.framebuffer, assets, &self.text, &self.game);
+            }
+        }
+        if self.item_box.is_some() {
+            self.ensure_item_box_assets(pack);
+            if let (Some(item_box), Some(item_box_assets), Some(menu_assets)) =
+                (&self.item_box, &self.item_box_assets, &self.menu_assets)
+            {
+                item_box.draw(
+                    &mut self.framebuffer,
+                    item_box_assets,
+                    menu_assets,
+                    &self.text,
+                    &self.game,
+                );
+            }
+        }
+        if self.file.is_some() {
+            self.ensure_file_assets(pack);
+            if let (Some(file), Some(file_assets), Some(menu_assets)) =
+                (&self.file, &self.file_assets, &self.menu_assets)
+            {
+                file.draw(
+                    &mut self.framebuffer,
+                    file_assets,
+                    menu_assets,
+                    &self.text,
+                    &self.game,
+                );
             }
         }
         if let Some(font) = &self.font {
@@ -828,6 +1025,10 @@ pub enum AppBoot {
     NewGame(u8),
     /// The pause menu over the deterministic capture room.
     Menu,
+    /// The item box over the deterministic capture room.
+    ItemBox,
+    /// The FILE tab over the deterministic capture room.
+    File,
 }
 
 /// The room `--ui menu` and its capture boot into, with the known capture
@@ -836,6 +1037,10 @@ pub const MENU_ROOM: &str = "1001";
 
 /// Fixed ticks the headless menu capture settles before the frame is drawn.
 const MENU_CAPTURE_TICKS: u32 = 30;
+/// Fixed ticks the headless item-box capture settles before the frame.
+const ITEM_BOX_CAPTURE_TICKS: u32 = 30;
+/// Fixed ticks the headless FILE capture settles before the frame.
+const FILE_CAPTURE_TICKS: u32 = 30;
 
 /// The app's current screen.
 enum Mode {
@@ -916,6 +1121,8 @@ impl App {
                 Ok(())
             }
             AppBoot::Menu => self.open_menu(),
+            AppBoot::ItemBox => self.open_item_box_capture(),
+            AppBoot::File => self.open_file_capture(),
         }
     }
 
@@ -958,6 +1165,29 @@ impl App {
         let mut session = GameSession::from_room(&self.pack, id)?;
         session.seed_menu_capture();
         session.open_menu(&self.pack);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the item-box capture over [`MENU_ROOM`]: the known inventory plus
+    /// a few box slots, with the box overlay already open.
+    fn open_item_box_capture(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id)?;
+        session.seed_menu_capture();
+        session.seed_item_box_capture();
+        session.open_item_box(&self.pack);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the FILE tab capture over [`MENU_ROOM`] with a known set of
+    /// collected documents.
+    fn open_file_capture(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id)?;
+        session.seed_file_capture();
+        session.open_file(&self.pack);
         self.start_session(session);
         Ok(())
     }
@@ -1205,10 +1435,12 @@ pub fn run_ui_with_options(
         "load" => AppBoot::SaveLoad,
         "game" => AppBoot::NewGame(character & 1),
         "menu" => AppBoot::Menu,
+        "box" | "itembox" => AppBoot::ItemBox,
+        "file" => AppBoot::File,
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu` or `load`"
+                 `menu`, `box`, `file` or `load`"
             )
         }
     };
@@ -1245,6 +1477,14 @@ pub fn run_ui_with_options(
             AppBoot::Menu => {
                 app.open_menu()?;
                 app.settle(MENU_CAPTURE_TICKS)?;
+            }
+            AppBoot::ItemBox => {
+                app.open_item_box_capture()?;
+                app.settle(ITEM_BOX_CAPTURE_TICKS)?;
+            }
+            AppBoot::File => {
+                app.open_file_capture()?;
+                app.settle(FILE_CAPTURE_TICKS)?;
             }
         }
         app.draw();
@@ -2350,6 +2590,10 @@ struct Keys {
     right: bool,
     confirm: bool,
     cancel: bool,
+    /// L1, the item box's previous-page key (`[`).
+    page_left: bool,
+    /// R1, the item box's next-page key (`]`).
+    page_right: bool,
     /// START, the gameplay pause menu (Tab).
     start: bool,
 }
@@ -2369,6 +2613,8 @@ fn read_keys() -> Keys {
         right: down(SDL_SCANCODE_RIGHT),
         confirm: down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN),
         cancel: down(SDL_SCANCODE_X) || down(SDL_SCANCODE_BACKSPACE),
+        page_left: down(SDL_SCANCODE_LEFTBRACKET),
+        page_right: down(SDL_SCANCODE_RIGHTBRACKET),
         start: down(SDL_SCANCODE_TAB),
     }
 }
@@ -2384,6 +2630,10 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
         Some(MenuInput::Left)
     } else if ui.right {
         Some(MenuInput::Right)
+    } else if ui.page_left {
+        Some(MenuInput::PageLeft)
+    } else if ui.page_right {
+        Some(MenuInput::PageRight)
     } else if ui.confirm {
         Some(MenuInput::Confirm)
     } else if ui.cancel {
@@ -2413,6 +2663,8 @@ impl InputEdges {
             right: keys.right && !self.previous.right,
             confirm: keys.confirm && !self.previous.confirm,
             cancel: keys.cancel && !self.previous.cancel,
+            page_left: keys.page_left && !self.previous.page_left,
+            page_right: keys.page_right && !self.previous.page_right,
             start: keys.start && !self.previous.start,
             any: any_key || (keys.confirm && !self.previous.confirm),
         };
@@ -4159,6 +4411,179 @@ mod tests {
             session.game.room_actions[3].is_none(),
             "the action is consumed"
         );
+    }
+
+    #[test]
+    fn a_room_item_box_action_opens_the_box_and_freezes_the_room() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        session.game.add_item(ITEM_FIRST_AID_SPRAY, 1);
+
+        // An item box action probing the player position.
+        session.game.room_actions[2] = Some(game::RoomAction {
+            slot: 2,
+            kind: game::RoomActionKind::ItemBox,
+            zone: [0, 0, 100, 100],
+            sce: 8,
+            handler: 8,
+            flags: 0x41,
+            params: [0; 8],
+            room_items_flag: 0xFF,
+        });
+        let before = session.game.frame;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(session.item_box.is_some(), "the box opened");
+        assert!(session.menu.is_some(), "the inventory panel is underneath");
+
+        // Confirm arms the swap, confirm again deposits the spray.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.game.item_box[0].id, ITEM_FIRST_AID_SPRAY);
+        assert!(session.game.inventory.is_empty());
+        assert_eq!(session.game.frame, before + 1, "the room stayed frozen");
+
+        // Cancel closes the box and the menu; the room resumes.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.item_box.is_none());
+        assert!(session.menu.is_none());
+        let frozen = session.game.frame;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.frame, frozen + 1, "the room resumed");
+    }
+
+    #[test]
+    fn tab_cycles_the_menu_tabs_and_the_file_tab_lists_documents() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        session.game.set_file_collected(0x0F, true);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_some());
+
+        // The first Tab lands on the map tab, which is inert.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.file.is_none());
+
+        // The second Tab reaches the file tab and opens the selector on the
+        // collected document.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        let file = session.file.as_ref().expect("the file tab opened");
+        assert_eq!(file.slot, 0);
+        assert!(session.menu.is_some(), "the menu stays open underneath");
+
+        // Confirm opens the reader; cancel returns to the selector and a
+        // second cancel closes only the tab.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            session.file.as_ref().unwrap().mode,
+            crate::ui::file::FileMode::Reader
+        );
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            session.file.as_ref().unwrap().mode,
+            crate::ui::file::FileMode::List
+        );
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.file.is_none());
+        assert!(session.menu.is_some(), "the inventory menu remains");
     }
 
     #[test]

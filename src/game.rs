@@ -67,6 +67,17 @@ pub const INVENTORY_SLOTS_CHRIS: usize = 6;
 pub const INVENTORY_SLOTS_JILL: usize = 8;
 /// Item box slots stored in the save block.
 pub const ITEM_BOX_SLOTS: usize = 48;
+/// First document item id; ids here are the FILE tab's list entries.
+pub const FILE_ITEM_MIN: u8 = 0x5F;
+/// Last document item id.
+pub const FILE_ITEM_MAX: u8 = 0x6E;
+/// Number of collectable documents (the FILE-collected bit block).
+pub const FILE_COUNT: usize = 16;
+/// Flag bank holding the visited-room, map and file bit blocks
+/// (`g_RoomFlags` in the original).
+pub const BANK_ROOM_FLAGS: u8 = 8;
+/// First file-collected bit in the room-flags bank: `0x82 + (item - 0x5F)`.
+pub const ROOM_FLAG_FILE_BASE: u8 = 0x82;
 /// Number of room action slots the game state tracks.
 pub const ROOM_ACTION_SLOTS: usize = 20;
 /// Entity slots: 0 is the player, 1.. are enemies and scripted objects.
@@ -267,6 +278,15 @@ impl Default for InventoryItem {
     fn default() -> Self {
         Self { id: 0, quantity: 0 }
     }
+}
+
+/// The FILE-tab list index of a document item id (`0x5F..=0x6E`), or `None`
+/// for anything that is not a document. The index addresses the room-flags
+/// file bits at [`ROOM_FLAG_FILE_BASE`].
+pub fn file_index(item: u8) -> Option<u8> {
+    (FILE_ITEM_MIN..=FILE_ITEM_MAX)
+        .contains(&item)
+        .then(|| item - FILE_ITEM_MIN)
 }
 
 /// Result of a menu USE action on an inventory item.
@@ -1377,11 +1397,114 @@ impl GameState {
         (self.item_count(search), count)
     }
 
+    /// Whether document `index` (`0..16`) has been collected: the room-flags
+    /// bit `0x82 + index`, raised by the pickup and read by the FILE tab.
+    pub fn file_collected(&self, index: u8) -> bool {
+        self.flags[usize::from(BANK_ROOM_FLAGS)].bit(ROOM_FLAG_FILE_BASE.wrapping_add(index))
+    }
+
+    /// Set or clear the FILE-collected bit of document `index`.
+    pub fn set_file_collected(&mut self, index: u8, value: bool) {
+        let mode = if value { 0 } else { 1 };
+        self.flags[usize::from(BANK_ROOM_FLAGS)]
+            .apply(ROOM_FLAG_FILE_BASE.wrapping_add(index), mode);
+    }
+
+    /// Whether document item `item` has been collected; non-document ids are
+    /// always `false`.
+    pub fn document_collected(&self, item: u8) -> bool {
+        file_index(item).is_some_and(|index| self.file_collected(index))
+    }
+
+    /// The item-box confirm action: move the whole inventory stack at
+    /// `player_slot` into box slot `box_slot` and bring the box stack back.
+    ///
+    /// The original swaps the two raw slots directly. With the dense inventory
+    /// a withdrawn stack merges into an existing stack of the same stackable
+    /// item (up to `items::ITEM_QUANTITY_CAP`) instead of leaving a duplicate,
+    /// and a deposited stack frees its slot. The equipped marker is cleared
+    /// when the swap takes the equipped item away and no copy remains.
+    ///
+    /// Returns whether anything moved.
+    pub fn item_box_swap(&mut self, box_slot: usize, player_slot: usize) -> bool {
+        if box_slot >= ITEM_BOX_SLOTS {
+            return false;
+        }
+        let box_item = self.item_box[box_slot];
+        let player_item = self.inventory.get(player_slot).copied().unwrap_or_default();
+        if box_item.id == 0 && player_item.id == 0 {
+            return false;
+        }
+
+        // Deposit: the player stack takes the box slot.
+        self.item_box[box_slot] = player_item;
+
+        // Withdraw: merge a stackable into an existing stack, otherwise place
+        // it in the vacated player slot.
+        let merge_target = if box_item.id != 0 && items::is_stackable(box_item.id) {
+            self.inventory
+                .iter()
+                .enumerate()
+                .find(|(index, stack)| *index != player_slot && stack.id == box_item.id)
+                .map(|(index, _)| index)
+        } else {
+            None
+        };
+        match merge_target {
+            Some(target) => {
+                let total =
+                    u16::from(self.inventory[target].quantity) + u16::from(box_item.quantity);
+                let cap = u16::from(items::ITEM_QUANTITY_CAP);
+                if total <= cap {
+                    self.inventory[target].quantity = total as u8;
+                    if player_slot < self.inventory.len() {
+                        self.inventory.remove(player_slot);
+                    }
+                } else {
+                    // The merge overflows the cap: keep the remainder as its
+                    // own stack in the vacated player slot.
+                    self.inventory[target].quantity = cap as u8;
+                    let spill = InventoryItem {
+                        id: box_item.id,
+                        quantity: (total - cap) as u8,
+                    };
+                    if player_slot < self.inventory.len() {
+                        self.inventory[player_slot] = spill;
+                    } else {
+                        self.inventory.push(spill);
+                    }
+                }
+            }
+            None => {
+                if box_item.id != 0 {
+                    if player_slot < self.inventory.len() {
+                        self.inventory[player_slot] = box_item;
+                    } else {
+                        self.inventory.push(box_item);
+                    }
+                } else if player_slot < self.inventory.len() {
+                    self.inventory.remove(player_slot);
+                }
+            }
+        }
+        self.rebuild_slots();
+        if self.equipped.is_some_and(|item| !self.has_item(item)) {
+            self.set_equipped(None);
+        }
+        true
+    }
+
     /// Write the health-status byte and mirror it into the BioCard state byte
     /// the scripts read with `cmpb` 50.
     pub fn set_health_status(&mut self, status: u8) {
         self.health_status = status;
         self.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)] = status;
+    }
+
+    /// Whether the player carries the radio (scenario bank 0, bit `0x7F`),
+    /// which enables the pause menu's radio tab.
+    pub fn has_radio(&self) -> bool {
+        self.flags[usize::from(BANK_SCENARIO)].bit(SCENARIO_FLAG_HAS_RADIO)
     }
 
     /// The per-item use flag (`g_itemUseFlags` bank 9) of `item`. Key, special
@@ -1856,6 +1979,11 @@ impl GameState {
         // come back when the room is re-entered.
         if action.room_items_flag != 0xFF {
             self.apply_flag(7, action.room_items_flag, 0);
+        }
+        // A document pickup raises its FILE-collected bit (bank 8,
+        // `0x82 + (item - 0x5F)`) so the FILE tab lists it.
+        if let Some(index) = file_index(item) {
+            self.apply_flag(BANK_ROOM_FLAGS, ROOM_FLAG_FILE_BASE.wrapping_add(index), 0);
         }
         self.room_actions[usize::from(slot)] = None;
         self.doors[usize::from(slot)] = None;
@@ -4590,6 +4718,135 @@ mod tests {
         assert_eq!(chris.inventory_capacity(), INVENTORY_SLOTS_CHRIS);
         let jill = game();
         assert_eq!(jill.inventory_capacity(), INVENTORY_SLOTS_JILL);
+    }
+
+    #[test]
+    fn document_flags_live_at_the_file_bit_base() {
+        assert_eq!(file_index(0x5E), None);
+        assert_eq!(file_index(0x5F), Some(0));
+        assert_eq!(file_index(0x6E), Some(15));
+        assert_eq!(file_index(0x6F), None);
+
+        let mut state = game();
+        for index in 0..FILE_COUNT as u8 {
+            assert!(!state.file_collected(index), "bit {index} starts clear");
+        }
+        state.set_file_collected(0, true);
+        state.set_file_collected(15, true);
+        assert!(state.file_collected(0));
+        assert!(!state.file_collected(1));
+        assert!(state.file_collected(15));
+        // The bits are the room-flags bank's 0x82 block: 0x82 and 0x91.
+        assert!(state.flags[usize::from(BANK_ROOM_FLAGS)].bit(0x82));
+        assert!(state.flags[usize::from(BANK_ROOM_FLAGS)].bit(0x91));
+        assert!(state.document_collected(0x5F));
+        assert!(!state.document_collected(0x60));
+        assert!(!state.document_collected(1));
+
+        state.set_file_collected(0, false);
+        assert!(!state.file_collected(0));
+        assert!(!state.flags[usize::from(BANK_ROOM_FLAGS)].bit(0x82));
+    }
+
+    #[test]
+    fn a_document_pickup_raises_its_file_flag_but_other_items_do_not() {
+        let mut state = game();
+        let action = item_action(3, 0x60, 1, [0, 0, 100, 100]);
+        state.room_actions[3] = Some(action);
+        state.pick_up(3);
+        assert!(state.file_collected(1));
+        assert_eq!(state.last_picked_item, Some(0x60));
+
+        // A non-document pickup leaves the whole file block clear.
+        let action = item_action(4, 0x41, 1, [0, 0, 100, 100]);
+        state.room_actions[4] = Some(action);
+        state.pick_up(4);
+        assert!(state.file_collected(1), "the earlier bit stays");
+        for index in 0..FILE_COUNT as u8 {
+            if index != 1 {
+                assert!(!state.file_collected(index));
+            }
+        }
+    }
+
+    #[test]
+    fn item_box_swap_deposits_withdraws_and_clears_equipped() {
+        let mut state = game();
+        state.add_item(0x41, 1); // spray, not stackable
+        state.set_equipped(Some(0x41));
+
+        // Deposit the spray into box slot 5.
+        assert!(state.item_box_swap(5, 0));
+        assert!(state.inventory.is_empty());
+        assert_eq!(
+            state.item_box[5],
+            InventoryItem {
+                id: 0x41,
+                quantity: 1
+            }
+        );
+        assert_eq!(state.equipped, None, "the equipped item left the inventory");
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_EQUIPPED)], 0);
+
+        // Withdraw it back into the (now empty) slot.
+        assert!(state.item_box_swap(5, 0));
+        assert_eq!(state.inventory.len(), 1);
+        assert_eq!(state.inventory[0].id, 0x41);
+        assert_eq!(state.item_box[5].id, 0);
+
+        // An empty-to-empty swap is a no-op.
+        assert!(!state.item_box_swap(6, 5));
+    }
+
+    #[test]
+    fn item_box_swap_merges_withdrawn_stackables_into_an_existing_stack() {
+        let mut state = game();
+        state.add_item(1, 1); // knife in slot 0
+        state.add_item(0x0B, 10); // handgun ammo in slot 1
+        state.item_box[0] = InventoryItem {
+            id: 0x0B,
+            quantity: 20,
+        };
+
+        // Deposit the knife from slot 0 and withdraw the ammo, which must
+        // merge into the existing ammo stack rather than leaving a duplicate.
+        assert!(state.item_box_swap(0, 0));
+        assert_eq!(state.item_box[0].id, 1);
+        assert_eq!(state.item_count(0x0B), 30);
+        assert_eq!(
+            state.inventory.len(),
+            1,
+            "the withdrawn stack merged into the existing one"
+        );
+        assert_eq!(state.inventory[0].id, 0x0B);
+        assert_eq!(state.inventory[0].quantity, 30);
+    }
+
+    #[test]
+    fn an_item_box_merge_that_overflows_the_cap_spills_into_the_player_slot() {
+        let mut state = game();
+        state.add_item(1, 1); // knife in slot 0
+        state.add_item(0x0B, 0xF0); // ammo in slot 1
+        state.item_box[0] = InventoryItem {
+            id: 0x0B,
+            quantity: 0xF0,
+        };
+
+        assert!(state.item_box_swap(0, 0));
+        assert_eq!(state.item_box[0].id, 1, "the knife was deposited");
+        assert_eq!(state.inventory.len(), 2);
+        let ammo: u32 = state.item_count(0x0B);
+        assert_eq!(ammo, 0xF0 + 0xF0, "no rounds are lost");
+        assert_eq!(
+            state.inventory[1].quantity,
+            items::ITEM_QUANTITY_CAP,
+            "the existing stack caps first"
+        );
+        assert_eq!(
+            state.inventory[0].quantity,
+            (0xF0u16 + 0xF0 - u16::from(items::ITEM_QUANTITY_CAP)) as u8,
+            "the remainder spills into the vacated slot"
+        );
     }
 
     #[test]

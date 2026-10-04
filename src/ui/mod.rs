@@ -14,6 +14,8 @@
 //! explicitly by the session.
 
 pub mod char_select;
+pub mod file;
+pub mod item_box;
 pub mod layout;
 pub mod main_menu;
 pub mod save_load;
@@ -44,6 +46,10 @@ pub struct UiInput {
     pub confirm: bool,
     /// Cancel (X or Backspace).
     pub cancel: bool,
+    /// L1 (`[`): pages the item box back.
+    pub page_left: bool,
+    /// R1 (`]`): pages the item box forward.
+    pub page_right: bool,
     /// START (Tab): opens the gameplay pause menu.
     pub start: bool,
     /// Any key went down this tick.
