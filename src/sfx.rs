@@ -575,6 +575,129 @@ pub fn footstep_sound(
     room_sound(room_row(room.stage, room.room), usize::from(index))
 }
 
+/// 12-bit XZ angle from `(from_x, from_z)` to `(to_x, to_z)`.
+///
+/// The original's `CalculateAngleBetweenPointsXZ`: the difference is taken in
+/// wrapping 16-bit arithmetic, the slope is `dz * 4096 / dx`, and the
+/// resulting quadrant angle is negated modulo 0x1000.
+pub fn angle_between_xz(from_x: i32, from_z: i32, to_x: i32, to_z: i32) -> u16 {
+    let dx = (to_x as i16).wrapping_sub(from_x as i16);
+    let dz = (to_z as i16).wrapping_sub(from_z as i16);
+    if dx != 0 {
+        let slope = (i32::from(dz) * 4096) / i32::from(dx);
+        let angle = (f64::from(slope) / 4096.0).atan() * (2048.0 / std::f64::consts::PI);
+        let quadrant = if dx < 0 { 0x800 } else { 0 };
+        return ((-(quadrant + angle as i32)) as u32 & 0x0FFF) as u16;
+    }
+    ((if dz > 0 { 0x800 } else { 0 }) + 0x400) as u16
+}
+
+/// Integer square root with the original GTE routine's truncation.
+fn integer_sqrt(value: i32) -> i32 {
+    if value <= 0 {
+        0
+    } else {
+        (f64::from(value)).sqrt() as i32
+    }
+}
+
+/// The original's `Calc3DSndPan`: stereo pan bytes `(left, right)` for a sound
+/// at `sound` heard from the camera at `from` looking at `to`.
+///
+/// Both bytes are in `0x1E..=0x7F`; equal bytes mean centred. Distance
+/// attenuates both channels by `dist3D / 500` while a wider angle pulls the
+/// near channel down towards `0x1E`.
+pub fn scene_pan(from: [i32; 3], to: [i32; 3], sound: [i32; 3]) -> (u8, u8) {
+    let dx = i32::from((from[0] as i16).wrapping_sub(sound[0] as i16));
+    let dz = i32::from((from[2] as i16).wrapping_sub(sound[2] as i16));
+    let horiz_dist = integer_sqrt(dx * dx + dz * dz);
+    let dy = from[1] - sound[1];
+    let dist3d = integer_sqrt(horiz_dist * horiz_dist + dy * dy);
+
+    let angle_to_sound = angle_between_xz(from[0], from[2], sound[0], sound[2]);
+    let angle_to_target = angle_between_xz(from[0], from[2], to[0], to[2]);
+    let angle_diff = angle_to_sound.wrapping_sub(angle_to_target) & 0x0FFF;
+
+    let mut left = 0x7Fu16;
+    let mut right = 0x7Fu16;
+    if angle_diff != 0 && angle_diff != 0x1000 && angle_diff != 0x800 {
+        let is_right = angle_diff < 0x801;
+        let mut abs_angle = if is_right {
+            angle_diff
+        } else {
+            (!angle_diff) & 0x7FF
+        };
+        if abs_angle > 0x400 {
+            abs_angle = !abs_angle;
+        }
+        if abs_angle & 0x7FF > 0x40 {
+            let divisor = dist3d / 2000 + 0x18;
+            let pan_offset = i32::from((abs_angle & 0x7FF) as i16) / divisor;
+            let right_pan = (pan_offset + 0x7F).clamp(0, 0x7F);
+            let mut left_pan = 0x7F - pan_offset;
+            if left_pan < 0x1E {
+                left_pan = 0x1E;
+            }
+            if is_right {
+                right = right_pan as u16;
+                left = left_pan as u16;
+            } else {
+                right = left_pan as u16;
+                left = right_pan as u16;
+            }
+        }
+    }
+
+    // Attenuate both channels by distance, wrapping/truncating like the
+    // original's unsigned-short arithmetic, then clamp and mask.
+    let attenuation = (dist3d / -500) as u16;
+    left = left.wrapping_add(attenuation);
+    right = right.wrapping_add(attenuation);
+    if left < 0x1E {
+        left = 0x1E;
+    }
+    if right < 0x1E {
+        right = 0x1E;
+    }
+    ((left & 0x7F) as u8, (right & 0x7F) as u8)
+}
+
+/// The original's `CalcPanVolume`: DirectSound attenuation in hundredths of a
+/// decibel for a `(left, right)` pan pair. The average of the two channels is
+/// scaled `* 18` with the `-0x8E4` bias; the low-average branch uses the
+/// `* 0x103 - 10000` curve.
+pub fn pan_volume(left: u8, right: u8) -> i32 {
+    let avg = (i32::from(left) + i32::from(right)) / 2;
+    if avg < 0x20 {
+        avg * 0x103 - 10000
+    } else {
+        avg * 0x12 - 0x8E4
+    }
+}
+
+/// Linear mixer amplitude for DirectSound millibels: `10^(vol / 2000)`.
+pub fn volume_gain(millibels: i32) -> f32 {
+    10f32.powf(millibels as f32 / 2000.0)
+}
+
+/// Mixer pan in `-1..=1` for a `(left, right)` pan pair.
+///
+/// The original feeds `(right - left) * 0x4E` to DirectSound, whose pan range
+/// is `-10000..=10000`.
+pub fn pan_position(left: u8, right: u8) -> f32 {
+    ((i32::from(right) - i32::from(left)) as f32 * 0x4E as f32 / 10000.0).clamp(-1.0, 1.0)
+}
+
+/// The gain and stereo pan for a one-shot at `sound` heard from the camera
+/// `from`/`to`, composed exactly like `Calc3DSndPan` + `CalcPanVolume`.
+pub fn sound_gain_pan(from: [i32; 3], to: [i32; 3], sound: [i32; 3]) -> (f32, f32) {
+    let (left, right) = scene_pan(from, to, sound);
+    (
+        volume_gain(pan_volume(left, right)),
+        pan_position(left, right),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,6 +783,64 @@ mod tests {
             footstep_sound(&room, [4850, 0, 4950], MAX_ENTITY_SOUND_TYPE, false),
             None
         );
+    }
+
+    #[test]
+    fn angle_between_points_matches_the_original_quadrants() {
+        // Along +X is angle 0, -Z is 0x400, -X is 0x800, +Z is 0xC00
+        // (increasing yaw turns towards -Z).
+        assert_eq!(angle_between_xz(0, 0, 100, 0), 0x000);
+        assert_eq!(angle_between_xz(0, 0, 0, -100), 0x400);
+        assert_eq!(angle_between_xz(0, 0, -100, 0), 0x800);
+        assert_eq!(angle_between_xz(0, 0, 0, 100), 0xC00);
+    }
+
+    #[test]
+    fn scene_pan_centres_sounds_on_the_look_axis() {
+        // A sound straight ahead behind the camera distance attenuates both
+        // channels equally by dist/500 (1000 units -> -2).
+        assert_eq!(scene_pan([0, 0, 0], [1000, 0, 0], [1000, 0, 0]), (125, 125));
+        // At the camera itself the angle is degenerate (0x400) and the pan
+        // lands on the original's fallback: the right channel is pulled down.
+        assert_eq!(scene_pan([0, 0, 0], [1000, 0, 0], [0, 0, 0]), (85, 127));
+    }
+
+    #[test]
+    fn scene_pan_offsets_a_wide_angle_and_wraps_distance() {
+        // 90 degrees off the look axis at 2000 units: pan offset 40 with a
+        // 4-unit distance attenuation.
+        assert_eq!(scene_pan([0, 0, 0], [1000, 0, 0], [0, 0, 2000]), (123, 83));
+        // Far away the angle offset is 26 and the distance attenuation 60:
+        // (127 - 60, 101 - 60).
+        let (left, right) = scene_pan([0, 0, 0], [1000, 0, 0], [0, 0, 30000]);
+        assert_eq!((left, right), (67, 41));
+    }
+
+    #[test]
+    fn pan_volume_and_gain_follow_the_millibel_curves() {
+        // Centre at zero distance: avg 0x7F -> 0x7F * 18 - 0x8E4 = 10 mB.
+        assert_eq!(pan_volume(0x7F, 0x7F), 10);
+        assert!((volume_gain(10) - 1.0115795).abs() < 1e-6);
+        // The low-average branch: avg 0x1F -> 0x1F * 0x103 - 10000.
+        assert_eq!(pan_volume(0x1F, 0x1F), 0x1F * 0x103 - 10000);
+        // The formula bottoms out at -10000 mB; the mixer's floor is silence.
+        assert_eq!(volume_gain(-10000), 1e-5);
+        assert_eq!(volume_gain(0), 1.0);
+    }
+
+    #[test]
+    fn pan_position_scales_the_channel_difference() {
+        assert_eq!(pan_position(0x7F, 0x7F), 0.0);
+        // (right - left) * 0x4E / 10000 = 97 * 78 / 10000.
+        assert!((pan_position(0x1E, 0x7F) - 0.7566).abs() < 1e-4);
+        assert!((pan_position(0x7F, 0x1E) + 0.7566).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sound_gain_pan_composes_both_curves() {
+        let (gain, pan) = sound_gain_pan([0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
+        assert!((gain - volume_gain(pan_volume(125, 125))).abs() < 1e-6);
+        assert_eq!(pan, 0.0);
     }
 
     #[test]

@@ -374,6 +374,25 @@ impl Vm {
         self.state = 0;
     }
 
+    /// A render snapshot of the current animation state, without advancing it.
+    ///
+    /// Unlike the frame returned by [`Vm::step`] this frame carries no pending
+    /// sounds, messages or vertex writes: the per-order mesh copies already
+    /// hold every applied write, and the queues were drained by the step that
+    /// produced them. The transition engine renders through this after ticking.
+    pub fn frame(&self) -> Frame<'_> {
+        let done = self.state & 1 == 0;
+        self.build(
+            done,
+            self.frame,
+            self.phase,
+            self.hold,
+            std::array::from_fn(|_| Vec::new()),
+            Vec::new(),
+            Vec::new(),
+        )
+    }
+
     /// Whether the animation has ended.
     pub fn is_done(&self) -> bool {
         self.state & 1 == 0
@@ -428,9 +447,26 @@ impl Vm {
     }
 
     fn snapshot(&mut self, done: bool, frame: u32, phase: i16, hold: u8) -> Frame<'_> {
+        let writes = std::array::from_fn(|index| std::mem::take(&mut self.orders[index].writes));
+        let sfx = std::mem::take(&mut self.sfx);
+        let messages = std::mem::take(&mut self.messages);
+        self.build(done, frame, phase, hold, writes, sfx, messages)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        &self,
+        done: bool,
+        frame: u32,
+        phase: i16,
+        hold: u8,
+        mut writes: [Vec<VertexWrite>; ORDER_COUNT],
+        sfx: Vec<Sfx>,
+        messages: Vec<Message>,
+    ) -> Frame<'_> {
         let worlds = compose_worlds(&self.orders);
         let mut orders = Vec::with_capacity(ORDER_COUNT);
-        for (index, state) in self.orders.iter_mut().enumerate() {
+        for (index, state) in self.orders.iter().enumerate() {
             orders.push(OrderFrame {
                 flags: state.flags,
                 model: state.model,
@@ -442,15 +478,15 @@ impl Vm {
                 velocity: state.velocity,
                 rot_velocity: state.rot_velocity,
                 mesh: state.mesh.as_ref(),
-                vertex_writes: std::mem::take(&mut state.writes),
+                vertex_writes: std::mem::take(&mut writes[index]),
             });
         }
         Frame {
             camera: self.camera,
             fade: self.fade,
             orders,
-            sfx: std::mem::take(&mut self.sfx),
-            messages: std::mem::take(&mut self.messages),
+            sfx,
+            messages,
             done,
             phase,
             frame,
@@ -1477,6 +1513,38 @@ mod tests {
             },
         );
         assert_eq!(vm.byte_var(3), 1);
+    }
+
+    #[test]
+    fn frame_snapshots_without_advancing_or_draining() {
+        let script = vec![
+            0x10, 0x00, 0x00, 0xFF, 0x00, 0x80, // ORDER_SETUP 0 model 0, draw only
+            0x15, 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, // ORDER_POS (1,2,3)
+            0x20, 0x00, 0x01, 0x00, // SFX
+            0x03, 0x00, // YIELD
+            0x00, 0x00, // END
+        ];
+        let dor = dor_with(vec![script]);
+        let mut vm = run(&dor, DoorParams::default());
+        let stepped = vm.step();
+        assert_eq!(stepped.orders[0].local.t, [1, 2, 3]);
+        assert_eq!(stepped.sfx.len(), 1);
+        let stepped_frame = stepped.frame;
+        let stepped_phase = stepped.phase;
+        drop(stepped);
+
+        // The read-only snapshot repeats the post-step counters and orders,
+        // its queues are empty, and a second step still advances normally.
+        let snapshot = vm.frame();
+        assert_eq!(snapshot.frame, stepped_frame + 1);
+        assert_eq!(snapshot.phase, stepped_phase + 1);
+        assert!(snapshot.sfx.is_empty());
+        assert!(snapshot.messages.is_empty());
+        assert_eq!(snapshot.orders[0].local.t, [1, 2, 3]);
+        assert_eq!(snapshot.orders[0].vertex_writes.len(), 0);
+        drop(snapshot);
+
+        assert_eq!(vm.step().frame, stepped_frame + 1);
     }
 
     #[test]

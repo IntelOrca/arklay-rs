@@ -40,7 +40,7 @@ pub enum WavFormat {
 }
 
 /// Parsed WAV file: source format plus the raw `data` chunk bytes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wav {
     /// Sample format taken from the `fmt ` chunk.
     pub format: WavFormat,

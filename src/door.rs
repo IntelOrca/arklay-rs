@@ -31,6 +31,29 @@ pub const ORDER_COUNT: usize = 12;
 /// Sanity bound on the number of scripts in the NULL-terminated table.
 const MAX_SCRIPTS: usize = 0x100;
 
+/// `.dor` file stem for each door-type byte, `0x00..=0x21`.
+///
+/// The record byte `+0x0A` selects the animation: plain doors `00`-`0E`,
+/// the monitor and elevator cages, the four stairwells, the two ladders and
+/// the key-hole door variants. Types `>= 0x22` fall back to `door00`.
+static DOOR_TYPE_NAMES: [&str; 0x22] = [
+    "door00", "door01", "door02", "door03", "door04", "door05", "door06", "door07", "door08",
+    "door09", "door10", "door11", "door12", "door13", "door14", "mon", "ele03", "ele01", "ele01a",
+    "ele01b", "ele02", "ele04", "kai01", "kai03", "kai02", "kai04", "lad00", "lad01", "door00k",
+    "door01k", "door03k", "door05k", "door06k", "door15",
+];
+
+/// The pack entry stem (`door/{name}.dor`) for a door-type byte.
+///
+/// Values outside the shipped table use `door00`, matching the original's
+/// default animation selection.
+pub fn type_name(door_type: u8) -> &'static str {
+    DOOR_TYPE_NAMES
+        .get(usize::from(door_type))
+        .copied()
+        .unwrap_or(DOOR_TYPE_NAMES[0])
+}
+
 /// One script from the file's pointer table.
 ///
 /// `bytes` is the raw bytecode, starting at the script's first opcode and
@@ -290,6 +313,43 @@ mod tests {
             data[at..at + 4].copy_from_slice(&offset.to_le_bytes());
         }
         data
+    }
+
+    #[test]
+    fn door_type_table_maps_every_shipped_kind() {
+        assert_eq!(type_name(0x00), "door00");
+        assert_eq!(type_name(0x0E), "door14");
+        assert_eq!(type_name(0x0F), "mon");
+        for (byte, name) in [
+            (0x10, "ele03"),
+            (0x11, "ele01"),
+            (0x12, "ele01a"),
+            (0x13, "ele01b"),
+            (0x14, "ele02"),
+            (0x15, "ele04"),
+            (0x16, "kai01"),
+            (0x17, "kai03"),
+            (0x18, "kai02"),
+            (0x19, "kai04"),
+            (0x1A, "lad00"),
+            (0x1B, "lad01"),
+            (0x1C, "door00k"),
+            (0x1D, "door01k"),
+            (0x1E, "door03k"),
+            (0x1F, "door05k"),
+            (0x20, "door06k"),
+            (0x21, "door15"),
+            (0x22, "door00"),
+            (0xFF, "door00"),
+        ] {
+            assert_eq!(type_name(byte), name, "door type {byte:#04x}");
+        }
+
+        // The shipped table has one distinct stem per animated kind.
+        let mut names: Vec<&str> = (0..=0x21).map(type_name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 34);
     }
 
     #[test]

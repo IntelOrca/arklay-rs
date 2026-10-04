@@ -1,12 +1,14 @@
 //! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
-//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound` and `objspr`
-//! (case-insensitively, up to two levels below the root), stores every
-//! `ROOM####.RDT`, converts the camera backgrounds of every distinct room
-//! once, converts the room mask pages of every camera that has sprite groups,
-//! copies the `BGM_*.WAV` music files and the four player models plus
-//! the two no-weapon locomotion clips. Stages 6 and 7 reuse the backgrounds
-//! and mask pages of STAGE1/STAGE2 with the stage digit reduced by 5.
+//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound`, `objspr` and
+//! `ITEM_M1` (case-insensitively, up to two levels below the root), stores
+//! every `ROOM####.RDT`, converts the camera backgrounds of every distinct
+//! room once, converts the room mask pages of every camera that has sprite
+//! groups, copies the door animations named by the door type table, copies the
+//! `BGM_*.WAV` music files, the 68 named sound effects and the four player
+//! models plus the two no-weapon locomotion clips. Stages 6 and 7 reuse the
+//! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
+//! by 5.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
@@ -20,7 +22,7 @@ use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
 use crate::sfx;
 use crate::state::RoomId;
-use crate::{bmp, lzw, rdt, tim};
+use crate::{bmp, door, lzw, rdt, tim};
 
 /// How many directory levels below the root are searched for the stage and
 /// `sound` directories.
@@ -43,6 +45,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     let Plan {
         rooms,
         sound,
+        item_m1,
         players,
         roommask,
         warnings,
@@ -115,6 +118,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
 
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
+    let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
@@ -125,6 +129,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     println!("roommask: {mask_count} entries, {mask_bytes} bytes");
     println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
     println!("se: {se_count} entries, {se_bytes} bytes");
+    println!("door: {door_count} entries, {door_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
 
     let pack_bytes = writer.to_bytes()?;
@@ -140,7 +145,8 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     drop(file);
     progress.end_phase();
 
-    let entries = rdt_count + cut_count + mask_count + bgm_count + se_count + player_count;
+    let entries =
+        rdt_count + cut_count + mask_count + bgm_count + se_count + door_count + player_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -277,6 +283,58 @@ fn copy_se(
     Ok((count, bytes))
 }
 
+/// Add every door animation named by the door type table.
+///
+/// The pack stores `door/{stem}.dor` (the stems are already lower-case); the
+/// install's `ITEM_M1` file names are matched case-insensitively and copied
+/// raw. Every type byte `0x00..=0x21` names a distinct `.dor`; higher bytes
+/// reuse `door00`, so they add no extra file.
+fn copy_doors(
+    item_m1: &Option<PathBuf>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(dir) = item_m1 else {
+        return Ok((0, 0));
+    };
+
+    let index = index_dir(dir)?;
+    let mut files = Vec::new();
+    let mut missing = Vec::new();
+    for door_type in 0..=0x21u8 {
+        let name = door::type_name(door_type);
+        let file = format!("{name}.dor");
+        match index.get(&file) {
+            Some(path) => files.push((format!("door/{file}"), path.clone())),
+            None => missing.push(format!("{}.DOR", name.to_ascii_uppercase())),
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "missing {} door animation file(s) in {}: {}",
+            missing.len(),
+            dir.display(),
+            missing.join(", ")
+        );
+    }
+
+    progress.begin("door", files.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (path, source) in files {
+        let data =
+            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&path, data)
+            .with_context(|| format!("failed to add {path}"))?;
+        progress.advance(&path);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
 /// Add every resolved player model and locomotion clip to the pack.
 fn copy_players(
     players: &[PlayerAsset],
@@ -300,8 +358,8 @@ fn copy_players(
     Ok((count, bytes))
 }
 
-/// Stage, sound, enemy-model, player and room-mask directory roots discovered
-/// under the conversion root.
+/// Stage, sound, enemy-model, player, room-mask and door-art directory roots
+/// discovered under the conversion root.
 #[derive(Debug)]
 struct Layout {
     stages: BTreeMap<u8, PathBuf>,
@@ -309,10 +367,11 @@ struct Layout {
     enemy: Option<PathBuf>,
     players: Option<PathBuf>,
     objspr: Option<PathBuf>,
+    item_m1: Option<PathBuf>,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
-/// `enemy`, `players` and `objspr`.
+/// `enemy`, `players`, `objspr` and `ITEM_M1`.
 fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
@@ -320,6 +379,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut enemy = None;
     let mut players = None;
     let mut objspr = None;
+    let mut item_m1 = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -333,6 +393,8 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 players = Some(dir.clone());
             } else if objspr.is_none() && name.eq_ignore_ascii_case("objspr") {
                 objspr = Some(dir.clone());
+            } else if item_m1.is_none() && name.eq_ignore_ascii_case("item_m1") {
+                item_m1 = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -364,6 +426,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         enemy,
         players,
         objspr,
+        item_m1,
     })
 }
 
@@ -421,6 +484,7 @@ struct Room {
 struct Plan {
     rooms: Vec<Room>,
     sound: Option<PathBuf>,
+    item_m1: Option<PathBuf>,
     players: Vec<PlayerAsset>,
     roommask: Vec<RoomMask>,
     /// Non-fatal problems found while resolving optional inputs.
@@ -435,6 +499,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         enemy,
         players,
         objspr,
+        item_m1,
     } = discover_layout(root)?;
     let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
 
@@ -547,6 +612,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
     Ok(Plan {
         rooms: rooms.into_values().collect(),
         sound,
+        item_m1,
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
         roommask,
         warnings,
@@ -714,6 +780,21 @@ mod tests {
         fs::write(players.join("w10.emw"), b"emw1").unwrap();
     }
 
+    /// Every `.dor` the door type table names, with mixed-case names like the
+    /// shipped install.
+    fn write_door_files(root: &Path) {
+        let item_m1 = root.join("ITEM_M1");
+        fs::create_dir_all(&item_m1).unwrap();
+        for door_type in 0..=0x21u8 {
+            let name = door::type_name(door_type);
+            fs::write(
+                item_m1.join(format!("{}.DOR", name.to_ascii_uppercase())),
+                format!("dor-{name}").as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
     /// Every sound effect the room tables name, as mixed-case files like the
     /// shipped install.
     fn write_se_files(root: &Path) {
@@ -844,6 +925,7 @@ mod tests {
         fs::create_dir_all(root.path.join("install/EnEmY")).unwrap();
         fs::create_dir_all(root.path.join("pLaYeRs")).unwrap();
         fs::create_dir_all(root.path.join("install/ObJsPr")).unwrap();
+        fs::create_dir_all(root.path.join("install/ItEm_M1")).unwrap();
 
         let layout = discover_layout(&root.path).unwrap();
 
@@ -854,6 +936,7 @@ mod tests {
         assert_eq!(layout.enemy.unwrap(), root.path.join("install/EnEmY"));
         assert_eq!(layout.players.unwrap(), root.path.join("pLaYeRs"));
         assert_eq!(layout.objspr.unwrap(), root.path.join("install/ObJsPr"));
+        assert_eq!(layout.item_m1.unwrap(), root.path.join("install/ItEm_M1"));
     }
 
     #[test]
@@ -1015,6 +1098,7 @@ mod tests {
         fs::write(root.path.join("sound/BGM_02.WAV"), b"wav02").unwrap();
         fs::write(root.path.join("sound/not_bgm.wav"), b"other").unwrap();
         write_se_files(&root.path);
+        write_door_files(&root.path);
 
         let out = root.path.join("out.akpak");
         convert_game(&root.path, &out).unwrap();
@@ -1032,6 +1116,10 @@ mod tests {
         assert!(pack.contains("se/ft_wda.wav"));
         assert_eq!(pack.read("se/ft_wda.wav").unwrap(), b"ft_wdA");
 
+        assert_eq!(pack.read("door/door00.dor").unwrap(), b"dor-door00");
+        assert_eq!(pack.read("door/kai03.dor").unwrap(), b"dor-kai03");
+        assert_eq!(pack.read("door/lad01.dor").unwrap(), b"dor-lad01");
+
         assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
         assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
 
@@ -1041,6 +1129,7 @@ mod tests {
         assert_eq!(count("roommask/"), 0);
         assert_eq!(count("bgm/"), 3);
         assert_eq!(count("se/"), 68);
+        assert_eq!(count("door/"), 34);
         assert_eq!(count("player/"), 6);
         assert_eq!(
             pack.paths()
@@ -1086,6 +1175,73 @@ mod tests {
         assert_eq!((image.width, image.height), (16, 8));
         let direct = bmp::encode_texture8_to_vec(&decoded).unwrap();
         assert_eq!(image.rgba, bmp::decode(&direct).unwrap().rgba);
+    }
+
+    #[test]
+    fn converts_door_art_from_item_m1_case_insensitively() {
+        let root = TempDir::new("doors");
+        make_stage_dirs(&root.path);
+        write_door_files(&root.path);
+        // Rename a couple of files to mixed case like the shipped install.
+        fs::rename(
+            root.path.join("ITEM_M1/ELE01.DOR"),
+            root.path.join("ITEM_M1/Ele01.dor"),
+        )
+        .unwrap();
+        fs::rename(
+            root.path.join("ITEM_M1/MON.DOR"),
+            root.path.join("ITEM_M1/mon.dor"),
+        )
+        .unwrap();
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("door/"), 34);
+        assert_eq!(pack.read("door/ele01.dor").unwrap(), b"dor-ele01");
+        assert_eq!(pack.read("door/mon.dor").unwrap(), b"dor-mon");
+        // Every door type byte maps to a distinct pack entry.
+        let mut entries: Vec<&str> = pack
+            .paths()
+            .filter(|path| path.starts_with("door/"))
+            .collect();
+        entries.sort_unstable();
+        entries.dedup();
+        assert_eq!(entries.len(), 34);
+    }
+
+    #[test]
+    fn missing_door_files_are_aggregated() {
+        let root = TempDir::new("missing-doors");
+        make_stage_dirs(&root.path);
+        write_door_files(&root.path);
+        fs::remove_file(root.path.join("ITEM_M1/MON.DOR")).unwrap();
+        fs::remove_file(root.path.join("ITEM_M1/KAI04.DOR")).unwrap();
+
+        let message = convert_game(&root.path, &root.path.join("out.akpak"))
+            .unwrap_err()
+            .to_string();
+
+        assert!(message.contains("MON.DOR"), "{message}");
+        assert!(message.contains("KAI04.DOR"), "{message}");
+        assert!(!message.contains("DOOR00.DOR"), "{message}");
+        assert!(!root.path.join("out.akpak").exists());
+    }
+
+    #[test]
+    fn a_missing_item_m1_directory_packs_no_doors() {
+        let root = TempDir::new("no-doors");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("door/"), 0);
     }
 
     #[test]
@@ -1192,12 +1348,23 @@ mod tests {
         assert_eq!(count("roommask/"), 601);
         assert_eq!(count("bgm/"), 61);
         assert_eq!(count("se/"), 68);
+        assert_eq!(count("door/"), 34);
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
         assert!(pack.contains("roommask/100_000.bmp"));
         assert!(pack.contains("bgm/013.wav"));
         assert!(pack.contains("se/ft_wda.wav"));
         assert!(pack.contains("se/dr_wd01.wav"));
+        assert!(pack.contains("door/door00.dor"));
+        assert!(pack.contains("door/ele01a.dor"));
+        assert!(pack.contains("door/kai02.dor"));
+        assert!(pack.contains("door/door06k.dor"));
+
+        // Door art is a raw copy of the matched, case-insensitive source.
+        assert_eq!(
+            pack.read("door/door00.dor").unwrap(),
+            std::fs::read(root.join("JPN/ITEM_M1/door00.dor")).unwrap()
+        );
 
         // The converted page must be exactly the `objspr` pak decode.
         let pak = std::fs::read(root.join("JPN/objspr/OSP00000.pak")).unwrap();

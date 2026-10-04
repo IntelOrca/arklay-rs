@@ -296,7 +296,7 @@ impl RoomAction {
 /// instruction operands: zone x/z/width/depth, door direction, sfx, door type,
 /// camera byte, lock descriptor, destination, entry position, entry angle,
 /// required item and probe flags.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Door {
     /// Room action slot.
     pub slot: u8,
@@ -339,6 +339,20 @@ pub struct RoomTransition {
     pub pos: [i32; 3],
     /// Player spawn facing in the target room.
     pub angle: u16,
+}
+
+/// A mask-group visibility change requested by `aot_switch` (SCD 0x25).
+///
+/// The engine applies pending toggles to the current camera cut's
+/// [`MaskLayer`](crate::render::MaskLayer) bits after the scripts run; a new
+/// camera reload starts from the cut's own all-active bits, matching the
+/// original's per-camera sprite table rebuild.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MaskToggle {
+    /// One-based mask group id.
+    pub group: u8,
+    /// Whether the group should be visible.
+    pub active: bool,
 }
 
 /// One interaction recorded by the room action layer for tests.
@@ -493,6 +507,11 @@ pub struct GameState {
     pub equipped: Option<u8>,
     /// A room change requested by a door.
     pub transition: Option<RoomTransition>,
+    /// The record that requested the pending [`GameState::transition`], so the
+    /// engine can play its animation without re-probing the action table.
+    pub transition_door: Option<Door>,
+    /// Mask-group toggles requested by `aot_switch`, consumed by the engine.
+    pub mask_toggles: Vec<MaskToggle>,
     /// Item ids picked up this room, in order, for tests.
     pub item_events: Vec<u8>,
     /// The last placeholder interaction recorded by the action layer.
@@ -533,6 +552,8 @@ impl Default for GameState {
             last_used_item: None,
             equipped: None,
             transition: None,
+            transition_door: None,
+            mask_toggles: Vec::new(),
             item_events: Vec::new(),
             last_interaction: None,
             frame: 0,
@@ -1013,6 +1034,8 @@ impl GameState {
         self.entities[0] = player_entity;
         self.selected_entity = 0;
         self.transition = None;
+        self.transition_door = None;
+        self.mask_toggles.clear();
         self.message = MessageState::default();
         self.camera = CameraState::default();
         self.last_interaction = None;
@@ -1257,26 +1280,34 @@ impl GameState {
 
     /// Arm the transition described by `door`, decoding the destination's
     /// stage change when the room byte is `>= 0x20`.
+    ///
+    /// Camera-only doors (record byte `+0x0B` bit `0x80`) keep the current room
+    /// as the target: the transition re-aims the camera without a reload.
     fn begin_transition(&mut self, door: &Door) -> bool {
-        let dest = door.next_room;
-        if dest == 0xFF {
-            return false;
-        }
-        let target = if dest < 0x20 {
-            RoomId {
-                stage: self.id.stage,
-                room: dest,
-                player_flag: self.id.player_flag,
-            }
+        let camera_only = door.camera & 0x80 != 0;
+        let target = if camera_only {
+            self.id
         } else {
-            let mut stage = (dest >> 5) - 1;
-            if stage < 2 && self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_STAGE_VARIANT, false) {
-                stage += 5;
+            let dest = door.next_room;
+            if dest == 0xFF {
+                return false;
             }
-            RoomId {
-                stage: stage + 1,
-                room: dest & 0x1F,
-                player_flag: self.id.player_flag,
+            if dest < 0x20 {
+                RoomId {
+                    stage: self.id.stage,
+                    room: dest,
+                    player_flag: self.id.player_flag,
+                }
+            } else {
+                let mut stage = (dest >> 5) - 1;
+                if stage < 2 && self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_STAGE_VARIANT, false) {
+                    stage += 5;
+                }
+                RoomId {
+                    stage: stage + 1,
+                    room: dest & 0x1F,
+                    player_flag: self.id.player_flag,
+                }
             }
         };
         self.transition = Some(RoomTransition {
@@ -1284,6 +1315,7 @@ impl GameState {
             pos: door.next_pos,
             angle: door.next_angle as u16 & 0x0FFF,
         });
+        self.transition_door = Some(*door);
         true
     }
 
@@ -1782,6 +1814,16 @@ impl ScdHost for ScdGameHost<'_> {
 
     fn on_misc(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.mnemonic {
+            // `aot_switch` (0x25): pad, sprite group id, disable flag. A zero
+            // disable byte enables the group, anything else hides it. The
+            // engine applies the queued toggles to the current camera cut.
+            "aot_switch" => {
+                self.state.mask_toggles.push(MaskToggle {
+                    group: operand_u8(operands, 1),
+                    active: operand_u8(operands, 2) == 0,
+                });
+                StepResult::Continue
+            }
             "evt_work_set" => {
                 self.state
                     .select_entity(operand_u8(operands, 0), operand_u8(operands, 1));
@@ -2236,7 +2278,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_misc(op(0x25), &operands(&[0])),
+                host.on_misc(op(0x28), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -2261,11 +2303,61 @@ mod tests {
         assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x1F], 1);
         assert_eq!(state.placeholders[&0x2A], 1);
-        assert_eq!(state.placeholders[&0x25], 1);
+        assert_eq!(state.placeholders[&0x28], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x40], 1);
         assert_eq!(state.placeholders[&0x27], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
+    }
+
+    #[test]
+    fn aot_switch_queues_mask_group_toggles() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        // `aot_switch(pad, group, disable)`: a zero high byte enables.
+        assert_eq!(
+            host.on_misc(op(0x25), &operands(&[0, 3, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(op(0x25), &operands(&[0xAA, 7, 1])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_misc(op(0x25), &operands(&[0, 0, 0])),
+            StepResult::Continue
+        );
+        assert!(host.state().placeholders.is_empty());
+        assert_eq!(
+            state.mask_toggles,
+            [
+                MaskToggle {
+                    group: 3,
+                    active: true
+                },
+                MaskToggle {
+                    group: 7,
+                    active: false
+                },
+                MaskToggle {
+                    group: 0,
+                    active: true
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn camera_only_door_keeps_the_current_room_as_target() {
+        let mut state = game();
+        let mut door = door(0x41, 0);
+        door.camera = 0x80 | 2;
+        state.room_actions[0] = Some(door_action(door));
+        state.doors[0] = Some(door);
+        state.interact([-550, 0, 50], 0, true);
+        let transition = state.transition.expect("camera-only transition");
+        assert_eq!(transition.target, state.id);
+        assert_eq!(state.transition_door.unwrap().camera, 0x80 | 2);
     }
 
     #[test]
