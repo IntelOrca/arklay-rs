@@ -30,6 +30,8 @@ const COLLISION_SLOT: usize = 1;
 const WALK_ZONES_SLOT: usize = 4;
 /// Pointer slot of the footstep sound zone table.
 const FOOTSTEP_SLOT: usize = 5;
+/// Pointer slot of the room message block (`RDT+0x74`).
+const MESSAGE_SLOT: usize = 11;
 /// Offset of the camera records within an RDT file.
 const CAMERAS_OFFSET: usize = 0x94;
 /// Number of little-endian `i32` fields in one camera record.
@@ -67,6 +69,7 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
     let walk_zones = parse_walk_zones(data, pointers[WALK_ZONES_SLOT])?;
     let footstep_zones =
         parse_footstep_zones(data, pointers[FOOTSTEP_SLOT], pointers[FOOTSTEP_SLOT + 1])?;
+    let messages = parse_messages(data, &pointers)?;
 
     Ok(RoomState {
         stage: id.stage,
@@ -80,6 +83,7 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         zones,
         walk_zones,
         footstep_zones,
+        messages,
     })
 }
 
@@ -355,6 +359,57 @@ fn parse_footstep_zones(data: &[u8], pointer: u32, next: u32) -> Result<Vec<Foot
         });
     }
     Ok(zones)
+}
+
+/// Parse the room message block at the `RDT+0x74` pointer, if the RDT has one.
+///
+/// The block is a `u16` offset table followed by the encoded message streams;
+/// it has no explicit length, so it ends at the next section pointer that
+/// follows it (or at the end of the file). Message ids are looked up in
+/// [`RoomState::message`], which the original indexes unchecked; this parser
+/// keeps the whole block and the lookup bounds-checks it.
+fn parse_messages(data: &[u8], pointers: &[u32; POINTER_COUNT]) -> Result<Option<Vec<u8>>> {
+    let pointer = pointers[MESSAGE_SLOT];
+    if pointer == 0 {
+        return Ok(None);
+    }
+
+    let base = pointer as usize;
+    if base >= data.len() {
+        bail!(
+            "message pointer 0x{pointer:x} is out of bounds for the {}-byte RDT",
+            data.len()
+        );
+    }
+
+    let end = pointers
+        .iter()
+        .map(|&value| value as usize)
+        .filter(|&value| value > base && value <= data.len())
+        .min()
+        .unwrap_or(data.len());
+
+    Ok(Some(data[base..end].to_vec()))
+}
+
+impl RoomState {
+    /// The encoded bytes of room message `id`, masking the id to the low six
+    /// bits exactly like the original's `msg_id & 0x3F`.
+    ///
+    /// The slice runs to the end of the message block: the message state
+    /// machine stops at the `0x01` terminator and reads the action byte after
+    /// it. Bit `0x40` selects the global table instead of the room table; call
+    /// [`crate::text::Text::message`] to resolve both cases.
+    pub fn message(&self, id: u16) -> Option<&[u8]> {
+        let block = self.messages.as_deref()?;
+        let index = usize::from(id & 0x3F) * 2;
+        let raw = block.get(index..index + 2)?;
+        let offset = usize::from(u16::from_le_bytes([raw[0], raw[1]]));
+        if offset == 0 || offset > block.len() {
+            return None;
+        }
+        block.get(offset..)
+    }
 }
 
 /// Parse one 44-byte camera record and its mask table.
@@ -918,6 +973,84 @@ mod tests {
         push_walk_zone(&mut data, [0, 0, 10, 10], 0, 0);
 
         assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn parses_room_message_block_and_looks_up_ids() {
+        let mut data = build_rdt(0, &[]);
+        let base = data.len();
+        set_ptr(&mut data, MESSAGE_SLOT, base);
+        let messages: [&[u8]; 3] = [
+            &[0x0C, 0x0D, 0x01, 0x00],
+            &[0x05, 0x01, 0x0C, 0x03, 0x02, 0x08, 0x01, 0x30],
+            &[0x0C, 0x01, 0x00],
+        ];
+        let mut block = Vec::new();
+        let mut offset = (messages.len() * 2) as u16;
+        for message in messages {
+            block.extend_from_slice(&offset.to_le_bytes());
+            offset += message.len() as u16;
+        }
+        for message in messages {
+            block.extend_from_slice(message);
+        }
+        data.extend_from_slice(&block);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.messages.as_deref(), Some(block.as_slice()));
+        assert!(state.message(0).unwrap().starts_with(messages[0]));
+        assert!(state.message(1).unwrap().starts_with(messages[1]));
+        // The last message's slice runs to the end of the block.
+        assert_eq!(state.message(2).unwrap(), messages[2]);
+        // Only the low six bits are the table index.
+        assert_eq!(state.message(0x40).unwrap(), state.message(0).unwrap());
+        // An offset that lands outside the block is refused.
+        assert!(state.message(3).is_none());
+        assert!(state.message(0x3F).is_none());
+    }
+
+    #[test]
+    fn no_message_pointer_means_no_messages() {
+        let data = build_rdt(0, &[]);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert!(state.messages.is_none());
+        assert!(state.message(0).is_none());
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_message_pointer() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len() + 4;
+        set_ptr(&mut data, MESSAGE_SLOT, offset);
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn parses_real_room_messages() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        for name in ["ROOM1000.RDT", "ROOM1001.RDT"] {
+            let path = Path::new(&root).join("JPN/STAGE1").join(name);
+            let data = std::fs::read(&path)
+                .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+            let room = name.trim_end_matches(".RDT").trim_start_matches("ROOM");
+            let state = parse(&data, RoomId::parse(room).unwrap()).unwrap();
+
+            let block = state.messages.as_deref().expect("no message block");
+            assert_eq!(block.len(), 1928, "{name}");
+            let message = state.message(0).expect("message 0 missing");
+            assert_eq!(&message[..4], &[0x04, 0x00, 0x02, 0x00], "{name}");
+            assert!(
+                message.iter().take(256).any(|&byte| byte == 0x01),
+                "{name}: message 0 has no terminator"
+            );
+        }
     }
 
     #[test]

@@ -45,6 +45,11 @@ enum Command {
         /// Output pack path
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
+
+        /// Game executable holding the text tables (default: a `Bio.exe`
+        /// discovered under the root)
+        #[arg(long, value_name = "EXE")]
+        exe: Option<PathBuf>,
     },
 
     /// Extract every entry of a game pack into a directory
@@ -179,7 +184,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::ConvertGame { root, out }) => arklay::convert::convert_game(&root, &out),
+        Some(Command::ConvertGame { root, out, exe }) => {
+            arklay::convert::convert_game_with_exe(&root, &out, exe.as_deref())
+        }
         Some(Command::Extract { pack, out }) => extract_pack(&pack, &out),
         Some(Command::List { pack }) => list_pack(&pack),
         Some(Command::Scd { action }) => match action {

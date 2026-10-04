@@ -292,6 +292,9 @@ pub struct RoomState {
     pub walk_zones: Vec<WalkZone>,
     /// Footstep sound zones, in file order.
     pub footstep_zones: Vec<FootstepZone>,
+    /// Raw RDT message block: a `u16` offset table followed by the encoded
+    /// message streams. Absent when the RDT has no message pointer.
+    pub messages: Option<Vec<u8>>,
 }
 
 impl RoomState {
