@@ -12,7 +12,10 @@
 //! later without changing the mode machine.
 
 pub mod char_select;
+pub mod layout;
+pub mod main_menu;
 pub mod save_load;
+pub mod status;
 pub mod title;
 
 use std::path::Path;

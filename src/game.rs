@@ -136,6 +136,28 @@ const HANDLER_STAIRS_HEIGHT: u8 = 0x11;
 const MSF_MENU_GOT_ITEM: u8 = 21;
 /// `main_state_flags` bit 0x800, toggled by `give_item` (item viewer).
 const MSF_MENU_ITEM_VIEW: u8 = 20;
+/// Flag bank holding the per-frame item-use flags (`g_itemUseFlags`).
+pub const BANK_ITEM_USE: u8 = 9;
+/// Scenario flag raised by the chemical combine effect.
+pub const SCENARIO_FLAG_CHEMICAL_COMBINE: u8 = 0x16;
+/// Scenario-2 flag cleared when a `0x10` cure removes the poison bit `0x20`.
+pub const SCENARIO2_FLAG_YAWN_POISONED: u8 = 0x43;
+/// Item-use flag bit of the red book.
+pub const ITEM_RED_BOOK_FLAG: u8 = 0x23;
+/// Item id of the red book.
+pub const ITEM_RED_BOOK: u8 = 0x3E;
+/// First herb id (`red herb`); the herb range is `0x43..=0x4B`.
+pub const HERB_MIN: u8 = 0x43;
+/// Last herb id (`mixed herbs`).
+pub const HERB_MAX: u8 = 0x4B;
+/// First chemical id (`empty bottle`).
+pub const CHEMICAL_MIN: u8 = 0x13;
+/// Last chemical id.
+pub const CHEMICAL_MAX: u8 = 0x1A;
+/// Stage id of the guardhouse (1-based).
+pub const STAGE_GUARDHOUSE: u8 = 3;
+/// Room id of the drug storehouse in the guardhouse.
+pub const ROOM_DRUG_STOREHOUSE: u8 = 9;
 
 /// One MSB-first flag bank.
 ///
@@ -238,6 +260,37 @@ impl Default for InventoryItem {
     fn default() -> Self {
         Self { id: 0, quantity: 0 }
     }
+}
+
+/// Result of a menu USE action on an inventory item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UseResult {
+    /// The item was used. A heal reports what the EKG flush should show.
+    Used {
+        /// Health was restored.
+        healed: bool,
+        /// A poison status was cured.
+        cured: bool,
+    },
+    /// The item has no effect in the current state; the menu shows the
+    /// category's refusal message and does not consume it.
+    Unusable,
+}
+
+/// Result of a menu MOVE/combine attempt between two inventory slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CombineResult {
+    /// The two items do not mix.
+    NoRecipe,
+    /// Chemicals can only be mixed in the guardhouse drug store.
+    NeedsDrugStore,
+    /// The recipe was applied.
+    Applied {
+        /// The recipe was a herb combination (needs the `0xF5` message).
+        herb: bool,
+        /// The recipe set the chemical-combine scenario flag.
+        chemical: bool,
+    },
 }
 
 /// A BGM request queued for the engine to apply.
@@ -735,8 +788,9 @@ impl GameState {
     ///
     /// Index [`STATE_BYTE_ROOM_CAMERA`] is the live camera id, so writing it
     /// also moves [`GameState::camera`]; index [`STATE_BYTE_MENU_CHOICE`] is
-    /// the window's menu-choice byte and index [`STATE_BYTE_SELECTED_ITEM`] the
-    /// item name substitution reads, so both stay mirrored.
+    /// the window's menu-choice byte, index [`STATE_BYTE_SELECTED_ITEM`] the
+    /// item name substitution reads, and [`STATE_BYTE_HEALTH_STATUS`] mirrors
+    /// into [`GameState::health_status`].
     pub fn set_byte(&mut self, index: u8, value: u8) {
         if index == STATE_BYTE_ROOM_CAMERA {
             self.camera.current_cut = usize::from(value);
@@ -746,6 +800,9 @@ impl GameState {
         }
         if index == STATE_BYTE_SELECTED_ITEM {
             self.selected_item = (value != 0).then_some(value);
+        }
+        if index == STATE_BYTE_HEALTH_STATUS {
+            self.health_status = value;
         }
         if let Some(slot) = self.state_bytes.get_mut(usize::from(index)) {
             *slot = value;
@@ -1297,6 +1354,215 @@ impl GameState {
             .filter(|stack| stack.id == search)
             .count() as u32;
         (self.item_count(search), count)
+    }
+
+    /// Write the health-status byte and mirror it into the BioCard state byte
+    /// the scripts read with `cmpb` 50.
+    pub fn set_health_status(&mut self, status: u8) {
+        self.health_status = status;
+        self.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)] = status;
+    }
+
+    /// The per-item use flag (`g_itemUseFlags` bank 9) of `item`. Key, special
+    /// and chemical items are only usable while their flag is re-armed by the
+    /// room scripts.
+    pub fn item_use_flag(&self, item: u8) -> bool {
+        self.flags[usize::from(BANK_ITEM_USE)].bit(item.wrapping_sub(0x1B))
+    }
+
+    /// Set or clear `item`'s per-item use flag.
+    pub fn set_item_use_flag(&mut self, item: u8, value: bool) {
+        let mode = if value { 0 } else { 1 };
+        self.flags[usize::from(BANK_ITEM_USE)].apply(item.wrapping_sub(0x1B), mode);
+    }
+
+    /// Whether the current room is the guardhouse drug store, where chemicals
+    /// may be combined.
+    pub fn is_drug_store(&self) -> bool {
+        self.id.stage == STAGE_GUARDHOUSE && self.id.room == ROOM_DRUG_STOREHOUSE
+    }
+
+    /// Apply the menu USE action for `item`, exactly as the original's
+    /// category dispatch does:
+    ///
+    /// - heal items run the heal table and update health/status;
+    /// - key, special and chemical items need their per-item use flag;
+    /// - books only accept the red book, with flag bit `0x23`;
+    /// - weapons, ammo, the empty bottle and unusable ids do nothing.
+    ///
+    /// It never consumes the item; the caller records and decrements it.
+    pub fn use_item(&mut self, item: u8) -> UseResult {
+        match items::use_category(item) {
+            items::UseCategory::Heal => {
+                let effect = items::heal_effect(item);
+                let health = self.entities[0].health;
+                let max = self.max_health;
+                let mut healed = false;
+                if health < max {
+                    let raised = items::healed_health(effect.amount, health, max);
+                    if raised != health {
+                        self.entities[0].health = raised;
+                        healed = true;
+                    }
+                }
+                let mut cured = false;
+                if effect.cure != items::StatusCure::None && self.health_status & 0x22 != 0 {
+                    let cleared = items::cured_status(effect.cure, self.health_status);
+                    if cleared != self.health_status {
+                        if effect.cure == items::StatusCure::Poison20 {
+                            self.apply_flag(1, SCENARIO2_FLAG_YAWN_POISONED, 1);
+                        }
+                        self.set_health_status(cleared);
+                        cured = true;
+                    }
+                }
+                if healed || cured {
+                    UseResult::Used { healed, cured }
+                } else {
+                    UseResult::Unusable
+                }
+            }
+            items::UseCategory::Chemicals
+            | items::UseCategory::Special
+            | items::UseCategory::Keys => {
+                if self.item_use_flag(item) {
+                    UseResult::Used {
+                        healed: false,
+                        cured: false,
+                    }
+                } else {
+                    UseResult::Unusable
+                }
+            }
+            items::UseCategory::Books => {
+                if item == ITEM_RED_BOOK
+                    && self.flags[usize::from(BANK_ITEM_USE)].bit(ITEM_RED_BOOK_FLAG)
+                {
+                    UseResult::Used {
+                        healed: false,
+                        cured: false,
+                    }
+                } else {
+                    UseResult::Unusable
+                }
+            }
+            items::UseCategory::Always => UseResult::Used {
+                healed: false,
+                cured: false,
+            },
+            _ => UseResult::Unusable,
+        }
+    }
+
+    /// Apply the menu MOVE/combine between the cursor and target slots.
+    ///
+    /// The cursor item's combine table selects the recipe; `new_cursor` and
+    /// `new_target` replace the slot ids first and then the record's effect
+    /// (ammo transfer, quantity merge, chemical flag) rearranges quantities.
+    /// Empty slots are compacted afterwards.
+    pub fn combine_slots(&mut self, cursor_slot: usize, target_slot: usize) -> CombineResult {
+        if cursor_slot == target_slot {
+            return CombineResult::NoRecipe;
+        }
+        let Some(cursor) = self.inventory.get(cursor_slot).copied() else {
+            return CombineResult::NoRecipe;
+        };
+        let Some(target) = self.inventory.get(target_slot).copied() else {
+            return CombineResult::NoRecipe;
+        };
+        if cursor.id == 0 || target.id == 0 {
+            return CombineResult::NoRecipe;
+        }
+        let Some(record) = items::combine(cursor.id, target.id) else {
+            return CombineResult::NoRecipe;
+        };
+        if (CHEMICAL_MIN..=CHEMICAL_MAX).contains(&cursor.id) && !self.is_drug_store() {
+            return CombineResult::NeedsDrugStore;
+        }
+        let herb = (HERB_MIN..=HERB_MAX).contains(&cursor.id);
+        self.inventory[cursor_slot].id = record.new_cursor;
+        self.inventory[target_slot].id = record.new_target;
+        if record.new_target == 0 {
+            self.inventory[target_slot].quantity = 0;
+        }
+        self.apply_combine_effect(cursor_slot, target_slot, record.effect);
+        self.rebuild_slots();
+        if self.equipped.is_some_and(|item| !self.has_item(item)) {
+            self.set_equipped(None);
+        }
+        CombineResult::Applied {
+            herb,
+            chemical: record.effect == 4,
+        }
+    }
+
+    /// The combine record's effect byte: 1/2 ammo transfer with the cursor /
+    /// other slot winning, 3 quantity merge (cap `0xFA`), 4 chemical flag,
+    /// 5 mode only, 6/7 one-way ammo transfer.
+    fn apply_combine_effect(&mut self, cursor_slot: usize, target_slot: usize, effect: u8) {
+        let cursor = self.inventory[cursor_slot];
+        let target = self.inventory[target_slot];
+        match effect {
+            1 => {
+                let sum = u16::from(target.quantity) + (u16::from(cursor.quantity) & 0x7F);
+                let max = u16::from(items::max_quantity(cursor.id));
+                if max < sum {
+                    self.inventory[cursor_slot].quantity = max as u8;
+                    self.inventory[target_slot].quantity = (sum as u8).wrapping_sub(max as u8);
+                } else {
+                    self.inventory[cursor_slot].quantity = sum as u8;
+                    self.inventory[target_slot] = InventoryItem::default();
+                }
+            }
+            2 => {
+                let sum = u16::from(cursor.quantity) + (u16::from(target.quantity) & 0x7F);
+                let max = u16::from(items::max_quantity(target.id));
+                if max < sum {
+                    self.inventory[target_slot].quantity = max as u8;
+                    self.inventory[cursor_slot].quantity = (sum as u8).wrapping_sub(max as u8);
+                } else {
+                    self.inventory[target_slot].quantity = sum as u8;
+                    self.inventory[cursor_slot] = InventoryItem::default();
+                }
+            }
+            3 => {
+                let sum = u16::from(cursor.quantity) + u16::from(target.quantity);
+                if sum > u16::from(items::ITEM_QUANTITY_CAP) {
+                    self.inventory[cursor_slot].quantity = items::ITEM_QUANTITY_CAP;
+                    self.inventory[target_slot].quantity = (sum as u8).wrapping_add(6);
+                } else {
+                    self.inventory[cursor_slot].quantity = sum as u8;
+                    self.inventory[target_slot] = InventoryItem::default();
+                }
+            }
+            4 => {
+                self.apply_flag(0, SCENARIO_FLAG_CHEMICAL_COMBINE, 0);
+            }
+            5 => {}
+            6 => {
+                let other = target.quantity;
+                let max = items::max_quantity(cursor.id);
+                if max < other {
+                    self.inventory[cursor_slot].quantity = max;
+                    self.inventory[target_slot].quantity = other - max;
+                } else {
+                    self.inventory[cursor_slot].quantity = other;
+                    self.inventory[target_slot] = InventoryItem::default();
+                }
+            }
+            7 => {
+                let other = cursor.quantity;
+                let max = items::max_quantity(target.id);
+                if max < other {
+                    self.inventory[target_slot].quantity = max;
+                    self.inventory[cursor_slot].quantity = other - max;
+                } else {
+                    self.inventory[target_slot].quantity = other;
+                    self.inventory[cursor_slot] = InventoryItem::default();
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Drop the stair/ladder state (room change and transition teardown).
@@ -4207,6 +4473,135 @@ mod tests {
         assert_eq!(chris.inventory_capacity(), INVENTORY_SLOTS_CHRIS);
         let jill = game();
         assert_eq!(jill.inventory_capacity(), INVENTORY_SLOTS_JILL);
+    }
+
+    #[test]
+    fn menu_use_applies_heals_cures_and_health_status_mirroring() {
+        let mut state = game();
+        state.max_health = 96;
+        state.entities[0].health = 20;
+        assert_eq!(
+            state.use_item(0x44),
+            UseResult::Used {
+                healed: true,
+                cured: false
+            }
+        );
+        assert_eq!(state.entities[0].health, 20 + 96 / 3);
+        // A spray at full health does nothing and stays in the inventory.
+        state.entities[0].health = 96;
+        assert_eq!(state.use_item(0x41), UseResult::Unusable);
+
+        // Poison cures clear their bit and reach the BioCard byte.
+        state.set_health_status(0x22);
+        assert_eq!(
+            state.use_item(0x45),
+            UseResult::Used {
+                healed: false,
+                cured: true
+            }
+        );
+        assert_eq!(state.health_status, 0x20);
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)],
+            0x20
+        );
+
+        // The serum clears the 0x20 poison and the scenario-2 marker.
+        state.set_health_status(0x22);
+        state.apply_flag(1, SCENARIO2_FLAG_YAWN_POISONED, 0);
+        assert_eq!(
+            state.use_item(0x42),
+            UseResult::Used {
+                healed: false,
+                cured: true
+            }
+        );
+        assert_eq!(state.health_status, 0x02);
+        assert!(!state.flag_test(1, SCENARIO2_FLAG_YAWN_POISONED, false));
+
+        // setb on the health-status byte mirrors into the field too.
+        state.set_byte(STATE_BYTE_HEALTH_STATUS, 0x10);
+        assert_eq!(state.health_status, 0x10);
+    }
+
+    #[test]
+    fn menu_use_flags_gate_keys_and_the_red_book() {
+        let mut state = game();
+        assert_eq!(state.use_item(0x33), UseResult::Unusable);
+        assert_eq!(state.use_item(0x3E), UseResult::Unusable);
+        assert!(!state.item_use_flag(0x33));
+
+        state.set_item_use_flag(0x33, true);
+        assert!(state.item_use_flag(0x33));
+        assert_eq!(
+            state.use_item(0x33),
+            UseResult::Used {
+                healed: false,
+                cured: false
+            }
+        );
+
+        // Only the red book passes the flag check; the other books do not.
+        state.set_item_use_flag(0x3E, true);
+        assert_eq!(
+            state.use_item(0x3E),
+            UseResult::Used {
+                healed: false,
+                cured: false
+            }
+        );
+        assert_eq!(state.use_item(0x40), UseResult::Unusable);
+        assert_eq!(state.use_item(1), UseResult::Unusable, "weapons never use");
+    }
+
+    #[test]
+    fn combine_effects_transfer_ammo_and_merge_quantities() {
+        // Effect 1: the gun takes the clip's rounds up to its maximum.
+        let mut state = game();
+        state.add_item(0x02, 1);
+        state.add_item(0x0B, 30);
+        assert!(matches!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied { .. }
+        ));
+        assert_eq!(state.inventory[0].quantity, 15);
+        assert_eq!(state.inventory[1].quantity, 16);
+
+        // Effect 2: the clip's table takes the gun's rounds instead.
+        let mut state = game();
+        state.add_item(0x0B, 20);
+        state.add_item(0x02, 7);
+        assert!(matches!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied { .. }
+        ));
+        assert_eq!(state.inventory[0].id, 0x0B);
+        // The target (Beretta) fills to its maximum, 20 + 7 - 15 stay.
+        assert_eq!(state.inventory[0].quantity, 20 + 7 - 15);
+        assert_eq!(state.inventory[1].quantity, 15);
+
+        // The chemical flag effect.
+        let mut state = game();
+        state.id = RoomId::parse("309").unwrap();
+        state.add_item(0x15, 1);
+        state.add_item(0x18, 1);
+        assert_eq!(
+            state.combine_slots(0, 1),
+            CombineResult::Applied {
+                herb: false,
+                chemical: true
+            }
+        );
+        assert!(state.flag_test(0, SCENARIO_FLAG_CHEMICAL_COMBINE, false));
+
+        // Outside the drug store the same recipe is refused untouched.
+        let mut state = game();
+        state.add_item(0x15, 1);
+        state.add_item(0x18, 1);
+        assert_eq!(state.combine_slots(0, 1), CombineResult::NeedsDrugStore);
+        assert_eq!(state.inventory[0].id, 0x15);
+        assert_eq!(state.inventory[1].id, 0x18);
     }
 
     #[test]
