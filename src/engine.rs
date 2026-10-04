@@ -261,8 +261,6 @@ struct TransitionMode {
     door: game::Door,
     /// Destination room (camera-only transitions keep the current room).
     target: RoomId,
-    /// Entry camera byte, low six bits of record `+0x0B`.
-    entry_camera: u8,
     /// Record bit `0x80`: re-aim without reloading or moving the player.
     camera_only: bool,
     /// Record bit `0x40`: suppress the post-load door sound.
@@ -404,8 +402,11 @@ fn run_gameplay(
         command_vm.run_init(&mut host);
     }
     start_pending_events(game, &mut event_vm);
+    // The init script can move the player entity; mirror that before the
+    // camera zone scan, as the original's room_set does.
+    game.sync_player(player_state);
     drain_mask_toggles(&mut loaded.room, game);
-    apply_camera(&mut loaded.room, game, None);
+    apply_camera(&mut loaded.room, game, Some(player_state.pos));
     // Force one title refresh on room entry.
     let mut titled_cut = usize::MAX;
     update_window_title(window, loaded, &mut titled_cut)?;
@@ -579,7 +580,6 @@ fn start_transition(
         transition: transition::Transition::new(animation),
         door: *record,
         target: transition.target,
-        entry_camera,
         camera_only,
         silent,
         destination,
@@ -665,11 +665,11 @@ fn finish_transition(
         if !session.silent {
             play_room_sfx(music, sfx_cache, pack, session.door.sfx, 1);
         }
-        let entry = usize::from(session.entry_camera);
-        if entry < loaded.room.cuts.len() {
-            loaded.room.current_cut = entry;
-            game.camera.current_cut = entry;
-        }
+        // The original re-tests the current camera's switch zones in place
+        // (room_transition_load's camera-only branch calls
+        // check_camera_switch(1)); the record's entry camera only feeds the
+        // .dor animation and is not itself a room cut.
+        apply_camera(&mut loaded.room, game, Some(player_state.pos));
         return;
     }
 
@@ -681,17 +681,32 @@ fn finish_transition(
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
     player_state.angle = session.door.next_angle as u16 & 0x0FFF;
+    // A door arrival can sit inside a collision volume the collision pass
+    // cannot clear (the stair/ladder doors rely on a stair behaviour that
+    // suspends the boundary pass, which this engine does not model yet).
+    // A wedged spawn is moved clear so it cannot start stuck.
+    let raw = player_state.pos;
+    player_state.pos = player::free_spawn(
+        &loaded.room,
+        player_state.pos,
+        player_state.angle,
+        player_state.radius,
+    );
+    if player_state.pos != raw {
+        eprintln!(
+            "warning: door spawn {raw:?} is inside collision; placed at {:?}",
+            player_state.pos
+        );
+    }
     game.sync_entity_from_player(player_state);
 
-    // Seed the entry camera when the record names a real cut, then let the
-    // destination's switch zones pick the final camera from the player's
-    // position (a freshly loaded room starts at cut 0 in the original).
-    let entry = usize::from(session.entry_camera);
-    if entry < loaded.room.cuts.len() {
-        loaded.room.current_cut = entry;
-        game.camera.current_cut = entry;
-    }
-    apply_camera(&mut loaded.room, game, Some(player_state.pos));
+    // A freshly loaded room starts at cut 0. The switch-zone scan runs in the
+    // gameplay phase after the destination's init (the original's room_set
+    // runs the init script before check_camera_switch), because the init can
+    // move the player and lock the camera. The record's entry camera only
+    // feeds the .dor animation, so it must not seed the room camera.
+    loaded.room.current_cut = 0;
+    game.camera.current_cut = 0;
 
     match (music.as_mut(), loaded.music.take()) {
         (Some(mixer), Some(wav)) => {
@@ -731,6 +746,8 @@ pub struct SimulatedDoor {
     pub mid_frame: Option<Image>,
     /// Index into [`SimulatedDoor::timeline`] of `mid_frame`.
     pub mid_index: Option<usize>,
+    /// The destination's first gameplay frame after teardown.
+    pub gameplay_frame: Image,
 }
 
 /// Drive a door transition headlessly: load `id`, trigger the door in `slot`,
@@ -738,7 +755,8 @@ pub struct SimulatedDoor {
 ///
 /// This is the deterministic seam the real-asset tests and capture tooling
 /// use; it renders every frame but opens no audio device. When `frame_dir` is
-/// set the first and the first non-black frame are written as BMPs.
+/// set the first, the first non-black and the first destination gameplay
+/// frame are written as BMPs.
 pub fn simulate_door(
     pack: &Pack,
     id: RoomId,
@@ -822,6 +840,32 @@ pub fn simulate_door(
         &mut sfx_cache,
     );
 
+    // The engine runs the destination's init when gameplay resumes; run it
+    // here too so the captured frame matches the first rendered frame (mask
+    // groups, camera locks and scripted entity moves included).
+    run_room_init(&loaded, &mut game);
+    game.sync_player(&mut player_state);
+    drain_mask_toggles(&mut loaded.room, &mut game);
+    apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+
+    // The destination's first gameplay frame, drawn from the placed player and
+    // the zone-selected cut, exactly as the engine's render loop would.
+    let mut gameplay = Framebuffer::new();
+    render_frame(
+        &mut gameplay,
+        pack,
+        loaded.id,
+        &loaded.room,
+        &player_state,
+        loaded.player_assets.as_ref(),
+        &mut MaskCache::default(),
+    );
+    let gameplay_frame = Image {
+        width: gameplay.width,
+        height: gameplay.height,
+        rgba: gameplay.rgba,
+    };
+
     if let Some(dir) = frame_dir {
         if let Some(image) = &first_frame {
             let path = dir.join("transition_frame0.bmp");
@@ -833,6 +877,9 @@ pub fn simulate_door(
             bmp::encode(image, &path)
                 .with_context(|| format!("failed to write {}", path.display()))?;
         }
+        let path = dir.join("destination_frame0.bmp");
+        bmp::encode(&gameplay_frame, &path)
+            .with_context(|| format!("failed to write {}", path.display()))?;
     }
 
     Ok(SimulatedDoor {
@@ -845,6 +892,7 @@ pub fn simulate_door(
         first_frame: first_frame.unwrap_or_default(),
         mid_frame,
         mid_index,
+        gameplay_frame,
     })
 }
 
@@ -1168,6 +1216,12 @@ fn enter_transition(
     *player_state = player::spawn(transition.target, &loaded.room);
     player_state.pos = transition.pos;
     player_state.angle = transition.angle;
+    player_state.pos = player::free_spawn(
+        &loaded.room,
+        player_state.pos,
+        player_state.angle,
+        player_state.radius,
+    );
     game.sync_entity_from_player(player_state);
     // Place the destination camera before the first frame is drawn; the
     // original runs the zone switch during the transition load.

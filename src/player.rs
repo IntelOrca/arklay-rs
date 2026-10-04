@@ -272,6 +272,94 @@ impl PlayerState {
     }
 }
 
+/// Search step of [`free_spawn`], in room units.
+const SPAWN_SEARCH_STEP: i32 = 16;
+/// Farthest [`free_spawn`] searches from the requested spawn.
+const SPAWN_SEARCH_LIMIT: i32 = 4096;
+
+/// The eight grid directions, clockwise from `+X` (the engine's angle 0).
+const SPAWN_DIRECTIONS: [[i32; 2]; 8] = [
+    [1, 0],
+    [1, -1],
+    [0, -1],
+    [-1, -1],
+    [-1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+];
+
+/// Whether the collision resolver would push a body of `radius` at `pos`.
+///
+/// Shape 4 records are soft zones and shapes 0/2 have no handler, so neither
+/// blocks. A shape 1/5 rectangle blocks whenever the grown box contains the
+/// point; a shape 3 circle only when it actually overlaps (its grown box
+/// corner does not push).
+pub fn position_blocked(room: &RoomState, pos: [i32; 3], radius: i32) -> bool {
+    room.collision
+        .records(pos[0], pos[2])
+        .iter()
+        .any(|rect| match rect.kind & 0xFF {
+            1 | 5 => classify(pos[0], pos[2], rect, radius).is_some(),
+            3 => circle_overlap(rect, pos[0], pos[2], radius).is_some(),
+            _ => false,
+        })
+}
+
+/// Move a transition spawn out of the collision volume it landed in.
+///
+/// A door arrival can legitimately sit inside a collision record. When the
+/// idle collision pass clears the point the raw arrival is kept - the first
+/// gameplay tick performs the same push. A point that pass cannot clear (both
+/// exit pushes point back into the record, or overlapping records wedge it)
+/// would leave the player stuck, so it is moved to the nearest position
+/// outside every blocking record. The original never needs this because its
+/// stair/ladder behaviour suspends the boundary pass, which this engine does
+/// not model yet.
+///
+/// The search walks eight directions outward from the entry facing (so a tie
+/// at one distance prefers straight ahead) in [`SPAWN_SEARCH_STEP`] rings up
+/// to [`SPAWN_SEARCH_LIMIT`]. A free position is returned unchanged, as is a
+/// position with no free spot within the limit.
+pub fn free_spawn(room: &RoomState, pos: [i32; 3], angle: u16, radius: i32) -> [i32; 3] {
+    if !position_blocked(room, pos, radius) {
+        return pos;
+    }
+    // An idle collision pass that already frees the point is fine: the first
+    // gameplay tick runs the same push, so the raw arrival is left in place.
+    let resolved = resolve_collision(&room.collision, pos, pos, radius);
+    if !position_blocked(room, resolved, radius) {
+        return pos;
+    }
+
+    let directions = SPAWN_DIRECTIONS.len();
+    let facing = usize::from((angle & 0x0FFF) / 0x200) % directions;
+    for ring in 1..=(SPAWN_SEARCH_LIMIT / SPAWN_SEARCH_STEP) {
+        let mut best: Option<([i32; 3], i64)> = None;
+        for step in 0..directions {
+            let [dx, dz] = SPAWN_DIRECTIONS[(facing + step) % directions];
+            let candidate = [
+                pos[0] + dx * ring * SPAWN_SEARCH_STEP,
+                pos[1],
+                pos[2] + dz * ring * SPAWN_SEARCH_STEP,
+            ];
+            if position_blocked(room, candidate, radius) {
+                continue;
+            }
+            let ddx = i64::from(candidate[0] - pos[0]);
+            let ddz = i64::from(candidate[2] - pos[2]);
+            let distance = ddx * ddx + ddz * ddz;
+            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+                best = Some((candidate, distance));
+            }
+        }
+        if let Some((candidate, _)) = best {
+            return candidate;
+        }
+    }
+    pos
+}
+
 /// Pick the camera cut for the player position: find the zone group whose
 /// header `cam_from` equals `current`, then the first following zone with the
 /// same `cam_from` whose quad contains the player; return its `cam_to` when it
@@ -558,22 +646,37 @@ fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i
     }
 }
 
-/// Shapes 3: push the entity out of a circular obstacle whose radius is the
-/// record's X half-width plus the entity radius, centred on the box centre.
-fn push_circle(rect: &CollisionRect, pos: &mut [i32; 3], radius: i32) {
+/// A shape 3 circle's overlap with a point: `(penetration, dx, dz, dist)`.
+///
+/// The circle's radius is the record's X half-width plus the entity radius and
+/// its centre is the box centre. `None` when the point does not overlap, i.e.
+/// when the push would be smaller than one unit. `dist` may be zero at the
+/// exact centre.
+fn circle_overlap(
+    rect: &CollisionRect,
+    x: i32,
+    z: i32,
+    radius: i32,
+) -> Option<(i32, i32, i32, i32)> {
     let extent = (u32::from(rect.x_max))
         .wrapping_sub(u32::from(rect.x_min))
         .wrapping_add((radius as u32).wrapping_mul(2));
     let reach = (extent as i32) / 2;
 
-    let dz = (pos[2] - i32::from(rect.z_min) - reach) + radius;
-    let dx = (pos[0] - i32::from(rect.x_min) - reach) + radius;
+    let dz = (z - i32::from(rect.z_min) - reach) + radius;
+    let dx = (x - i32::from(rect.x_min) - reach) + radius;
     let dist = integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
 
     let penetration = reach - dist;
-    if penetration < 1 {
+    (penetration >= 1).then_some((penetration, dx, dz, dist))
+}
+
+/// Shapes 3: push the entity out of a circular obstacle whose radius is the
+/// record's X half-width plus the entity radius, centred on the box centre.
+fn push_circle(rect: &CollisionRect, pos: &mut [i32; 3], radius: i32) {
+    let Some((penetration, dx, dz, dist)) = circle_overlap(rect, pos[0], pos[2], radius) else {
         return;
-    }
+    };
     if dist == 0 {
         pos[0] += penetration;
         return;
@@ -900,6 +1003,70 @@ mod tests {
         assert_eq!(camera_for_position(&room, 1, [50, 0, 50]), 2);
         // No group for cut 2 at all: the current cut is kept.
         assert_eq!(camera_for_position(&room, 2, [50, 0, 50]), 2);
+    }
+
+    #[test]
+    fn position_blocked_sees_shape_rects_and_ignores_soft_zones() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(rect(2000, 2000, 1180, 0, 1));
+        room.collision.quadrants[0].push(CollisionRect {
+            kind: 4,
+            ..rect(10000, 10000, 0, 0, 4)
+        });
+
+        assert!(position_blocked(&room, [1500, 0, 1000], CHRIS_RADIUS));
+        // The soft zone covers the point but never pushes.
+        assert!(!position_blocked(&room, [5000, 0, 5000], CHRIS_RADIUS));
+        // Outside the grown rectangle.
+        assert!(!position_blocked(&room, [500, 0, 1000], CHRIS_RADIUS));
+    }
+
+    #[test]
+    fn position_blocked_ignores_a_circle_box_corner() {
+        let room = room_with_quadrant(rect(2000, 2000, 1180, 0, 3));
+
+        // Inside the grown box but far outside the circle: no push.
+        assert!(!position_blocked(&room, [800, 0, 2000], CHRIS_RADIUS));
+        // The circle centre: pushed.
+        assert!(position_blocked(&room, [1590, 0, 410], CHRIS_RADIUS));
+    }
+
+    #[test]
+    fn free_spawn_leaves_a_clear_position_alone() {
+        let room = RoomState::default();
+        assert_eq!(
+            free_spawn(&room, [1000, 5, 1000], 0, CHRIS_RADIUS),
+            [1000, 5, 1000]
+        );
+    }
+
+    #[test]
+    fn free_spawn_leaves_an_idle_cleared_spawn_alone() {
+        // Near the low faces the idle push exits the box, so the first
+        // gameplay tick frees the spawn without help.
+        let room = room_with_quadrant(rect(2000, 2000, 1180, 0, 1));
+        let pos = [1500, 0, 1000];
+        assert!(position_blocked(&room, pos, CHRIS_RADIUS));
+
+        assert_eq!(free_spawn(&room, pos, 0, CHRIS_RADIUS), pos);
+    }
+
+    #[test]
+    fn free_spawn_escapes_a_wedged_corner() {
+        // Near the high faces both pushes point further in, so the idle pass
+        // reverts and the player would never get out.
+        let room = room_with_quadrant(rect(2000, 2000, 0, 0, 1));
+        let pos = [1900, 0, 1900];
+        assert!(position_blocked(&room, pos, CHRIS_RADIUS));
+
+        let free = free_spawn(&room, pos, 0, CHRIS_RADIUS);
+
+        assert!(!position_blocked(&room, free, CHRIS_RADIUS));
+        assert_eq!(free[1], 0, "the spawn height is preserved");
+        let dx = free[0] - pos[0];
+        let dz = free[2] - pos[2];
+        // The +x face is 522 units away; the ring grid finds it within a step.
+        assert!(dx * dx + dz * dz <= 600 * 600, "moved too far: {free:?}");
     }
 
     #[test]
