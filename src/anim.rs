@@ -264,20 +264,26 @@ pub struct AnimPlayer {
     pub frame: usize,
     pub display_frame: usize,
     pub timing: u16,
+    /// Reverse playback: the display frame indexes the clip backwards. The
+    /// frame counter still walks forward and wraps at the same place, matching
+    /// the game's reverse `Joint_move`, which reads frame `count - 1 - frame`.
+    pub reverse: bool,
 }
 
 impl AnimPlayer {
-    /// Start clip `clip` on its first frame with no hold left.
+    /// Start clip `clip` on its first frame with no hold left, forwards.
     pub fn new(clip: usize) -> Self {
         Self {
             clip,
             frame: 0,
             display_frame: 0,
             timing: 0,
+            reverse: false,
         }
     }
 
-    /// Switch clips and restart playback from frame 0.
+    /// Switch clips and restart playback from frame 0. The direction is left
+    /// alone; callers that need reverse set it explicitly.
     pub fn set_clip(&mut self, clip: usize) {
         self.clip = clip;
         self.frame = 0;
@@ -285,12 +291,24 @@ impl AnimPlayer {
         self.timing = 0;
     }
 
+    /// The clip frame whose data is applied for logical frame `index`, or
+    /// `None` when the clip or index is out of range.
+    fn data_frame(&self, clip: &model::Clip, index: usize) -> Option<model::ClipFrame> {
+        if self.reverse {
+            clip.frames
+                .get(clip.frames.len().checked_sub(1 + index)?)
+                .copied()
+        } else {
+            clip.frames.get(index).copied()
+        }
+    }
+
     /// Keyframe of the displayed clip frame, or 0 when the clip or frame is
     /// out of range.
     pub fn keyframe_index(&self, clips: &[model::Clip]) -> usize {
         clips
             .get(self.clip)
-            .and_then(|clip| clip.frames.get(self.display_frame))
+            .and_then(|clip| self.data_frame(clip, self.display_frame))
             .map_or(0, |frame| usize::from(frame.keyframe))
     }
 
@@ -301,7 +319,9 @@ impl AnimPlayer {
     /// reloaded and the frame index advances; passing the last frame wraps to
     /// 0 and returns true. A frame whose timing is 1 therefore advances every
     /// tick. An out-of-range clip or an empty frame list resets the player and
-    /// returns false.
+    /// returns false. With [`AnimPlayer::reverse`] the displayed frame's data
+    /// (keyframe and timing) comes from the end of the clip while the counter
+    /// still runs forwards.
     pub fn update(&mut self, clips: &[model::Clip]) -> bool {
         if self.timing > 1 {
             self.timing -= 1;
@@ -327,7 +347,12 @@ impl AnimPlayer {
             0
         };
         self.display_frame = index;
-        self.timing = clip.frames[index].timing;
+        let data = if self.reverse {
+            clip.frames[clip.frames.len() - 1 - index]
+        } else {
+            clip.frames[index]
+        };
+        self.timing = data.timing;
         self.frame = index + 1;
         if self.frame >= clip.frames.len() {
             self.frame = 0;

@@ -505,7 +505,15 @@ impl Framebuffer {
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
         for (object, joint) in mesh.objects.iter().zip(joints) {
-            collect_triangles(object, joint, camera, Some(lighting), true, &mut triangles);
+            collect_triangles(
+                object,
+                joint,
+                camera,
+                Some(lighting),
+                true,
+                0,
+                &mut triangles,
+            );
         }
         self.rasterize_triangles(texture, triangles);
     }
@@ -539,7 +547,7 @@ impl Framebuffer {
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
         for (object, joint) in objects {
-            collect_triangles(object, joint, camera, None, false, &mut triangles);
+            collect_triangles(object, joint, camera, None, false, 0, &mut triangles);
         }
         self.rasterize_triangles(texture, triangles);
     }
@@ -659,11 +667,11 @@ impl Framebuffer {
         }
     }
 
-    /// Paint a sorted scene list: triangles share one texture page, mask
-    /// sprites the camera's mask page and shadows the baked shadow mask.
+    /// Paint a sorted scene list: each triangle selects its own texture page,
+    /// mask sprites the camera's mask page and shadows the baked shadow mask.
     fn draw_scene(
         &mut self,
-        texture: Option<&Texture8>,
+        textures: &[&Texture8],
         page: Option<&Image>,
         shadow_texture: Option<&Image>,
         items: &[SceneItem],
@@ -676,7 +684,7 @@ impl Framebuffer {
                     }
                 }
                 SceneItem::Triangle(triangle) => {
-                    if let Some(texture) = texture {
+                    if let Some(texture) = textures.get(triangle.texture) {
                         self.rasterize(texture, triangle);
                     }
                 }
@@ -908,9 +916,9 @@ pub fn draw_fade_overlay(framebuffer: &mut Framebuffer, fade: &crate::door::vm::
     }
 }
 
-/// A posed player model ready to be interleaved with a room's mask layer.
+/// A posed entity model ready to be interleaved with a room's mask layer.
 #[derive(Debug, Clone, Copy)]
-pub struct PlayerMesh<'a> {
+pub struct EntityMesh<'a> {
     /// The TMD mesh to draw.
     pub mesh: &'a Tmd,
     /// The mesh's texture page.
@@ -982,18 +990,20 @@ impl<'a> MaskLayer<'a> {
 
 /// Draw one gameplay frame: the background, then the depth-sorted scene list.
 ///
-/// The ground shadow is submitted first, then the player's triangles
-/// pre-sorted far-to-near so their exact depth order survives the integer
-/// keys, then the masks in [`mask::mask_submission_order`] (the order the
-/// original paints equal-key sprites in). [`mask::order_far_to_near`] is the
-/// stable sort, so equal keys keep this submission order: a mask whose key
-/// ties a triangle follows it and paints over the player, which is how the
-/// original's strictly-farther mask flush resolves the tie. Inactive groups
-/// and hidden entries never reach the list.
+/// The ground shadow is submitted first, then the meshes' triangles collected
+/// in slice order and pre-sorted far-to-near with a stable sort, then the
+/// masks in [`mask::mask_submission_order`] (the order the original paints
+/// equal-key sprites in). [`mask::order_far_to_near`] is the stable sort, so
+/// equal keys keep this submission order: the caller places the player mesh
+/// first and the NPC meshes in entity-slot order, and a mask whose key ties a
+/// triangle follows it and paints over the model, which is how the original's
+/// strictly-farther mask flush resolves the tie. Inactive groups and hidden
+/// entries never reach the list. Each triangle keeps the index of its mesh's
+/// texture page.
 pub fn draw_gameplay_scene(
     framebuffer: &mut Framebuffer,
     background: Option<&Image>,
-    player: Option<&PlayerMesh<'_>>,
+    meshes: &[EntityMesh<'_>],
     shadow: Option<&Shadow<'_>>,
     camera: &Camera,
     lighting: &Lighting,
@@ -1006,7 +1016,7 @@ pub fn draw_gameplay_scene(
 
     let mut items = Vec::new();
 
-    // The shadow is submitted before the model, so a mask or triangle whose
+    // The shadow is submitted before the models, so a mask or triangle whose
     // rounded key ties it wins the tie the way the original's later
     // submission into the shared ordering table does.
     if let Some(shadow) = shadow {
@@ -1014,13 +1024,21 @@ pub fn draw_gameplay_scene(
     }
 
     let mut triangles = Vec::new();
-    if let Some(player) = player {
-        for (object, joint) in player.mesh.objects.iter().zip(player.joints) {
-            collect_triangles(object, joint, camera, Some(lighting), true, &mut triangles);
+    for (texture, mesh) in meshes.iter().enumerate() {
+        for (object, joint) in mesh.mesh.objects.iter().zip(mesh.joints) {
+            collect_triangles(
+                object,
+                joint,
+                camera,
+                Some(lighting),
+                true,
+                texture,
+                &mut triangles,
+            );
         }
     }
     // The integer scene key can tie triangles that are less than a unit apart;
-    // the stable sort keeps this far-to-near order for those ties.
+    // the stable sort keeps this submission order for those ties.
     triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
     items.extend(triangles.into_iter().map(SceneItem::Triangle));
 
@@ -1030,8 +1048,9 @@ pub fn draw_gameplay_scene(
 
     mask::order_far_to_near(&mut items, SceneItem::key);
 
+    let textures: Vec<&Texture8> = meshes.iter().map(|mesh| mesh.texture).collect();
     framebuffer.draw_scene(
-        player.map(|player| player.texture),
+        &textures,
         mask_layer.map(|layer| layer.page),
         shadow.map(|shadow| shadow.texture),
         &items,
@@ -1285,6 +1304,8 @@ struct Triangle {
     depth: f64,
     /// Painter's key shared with the mask sprites; see [`triangle_depth_key`].
     key: u32,
+    /// Index of the mesh's texture page in the frame's texture list.
+    texture: usize,
     palette_row: usize,
     cull: bool,
     /// A solid gouraud colour; `None` samples the texture instead.
@@ -1367,12 +1388,14 @@ fn triangle_depth_key(depth: f64) -> u32 {
 /// palette row and paged UVs); `None` is the full-bright door path (white
 /// shade, palette row 0, direct UVs). `cull` drops back-facing triangles; the
 /// door path disables it because the original renders with culling off.
+/// `texture` is the page index every emitted triangle samples.
 fn collect_triangles(
     object: &TmdObject,
     joint: &anim::Mat4x3,
     camera: &Camera,
     lighting: Option<&Lighting>,
     cull: bool,
+    texture: usize,
     triangles: &mut Vec<Triangle>,
 ) {
     let vertices: Vec<[i32; 3]> = object
@@ -1457,6 +1480,7 @@ fn collect_triangles(
             raster,
             depth,
             key: triangle_depth_key(depth),
+            texture,
             palette_row,
             cull,
             flat: None,
@@ -1535,6 +1559,7 @@ fn collect_ivm_triangles(
                 raster,
                 depth,
                 key: triangle_depth_key(depth),
+                texture: 0,
                 palette_row: 0,
                 cull: false,
                 flat,
@@ -2070,6 +2095,7 @@ mod tests {
             }),
             depth: f64::from(key),
             key,
+            texture: 0,
             palette_row: 0,
             cull: false,
             flat: None,
@@ -2089,6 +2115,74 @@ mod tests {
         assert_eq!(triangle_depth_key(6080.4), 6080);
         assert_eq!(triangle_depth_key(6080.5), 6081);
         assert_eq!(triangle_depth_key(f64::INFINITY), u32::MAX);
+    }
+
+    #[test]
+    fn two_mesh_ties_keep_submission_order_and_masks_paint_last() {
+        // Both meshes carry the same triangle at the same depth. The stable
+        // far-to-near sort must keep the slice order, so the second mesh's
+        // green texture paints over the first's red.
+        let red = solid_texture([255, 0, 0, 255]);
+        let green = solid_texture([0, 255, 0, 255]);
+        let mesh0 = mesh_at(1024, false);
+        let mesh1 = mesh_at(1024, false);
+        let joints = [identity()];
+        let meshes = [
+            EntityMesh {
+                mesh: &mesh0,
+                texture: &red,
+                joints: &joints,
+            },
+            EntityMesh {
+                mesh: &mesh1,
+                texture: &green,
+                joints: &joints,
+            },
+        ];
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+
+        let mut tied = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut tied,
+            None,
+            &meshes,
+            None,
+            &straight_camera(),
+            &lighting,
+            None,
+        );
+        assert_eq!(framebuffer_pixel(&tied, 180, 100), [0, 255, 0, 255]);
+
+        // A mask whose rounded key also ties both triangles is collected after
+        // them, so it wins the tie and samples its own page.
+        let cut = Cut {
+            masks: vec![crate::mask::MaskSprite {
+                uv: (0, 0),
+                pos: (170, 90),
+                size: (20, 20),
+                pos_data: 64,
+                flags: 0,
+                group: 1,
+            }],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        let page = solid_image(20, 20, [9, 8, 7, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+        let mut masked = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut masked,
+            None,
+            &meshes,
+            None,
+            &straight_camera(),
+            &lighting,
+            Some(&layer),
+        );
+        assert_eq!(framebuffer_pixel(&masked, 180, 100), [9, 8, 7, 255]);
     }
 
     #[test]
@@ -2198,11 +2292,11 @@ mod tests {
         let background = solid_image(320, 240, [7, 8, 9, 255]);
         let joints = [identity()];
         let texture = solid_texture([10, 20, 30, 255]);
-        let player = PlayerMesh {
+        let entities = [EntityMesh {
             mesh,
             texture: &texture,
             joints: &joints,
-        };
+        }];
         let lighting = Lighting {
             ambient: [4095; 3],
             lights: [Light::default(); 3],
@@ -2212,7 +2306,7 @@ mod tests {
         draw_gameplay_scene(
             &mut framebuffer,
             Some(&background),
-            Some(&player),
+            &entities,
             None,
             &straight_camera(),
             &lighting,
@@ -2296,7 +2390,7 @@ mod tests {
         draw_gameplay_scene(
             &mut framebuffer,
             None,
-            None,
+            &[],
             None,
             &straight_camera(),
             &lighting,
@@ -2340,7 +2434,7 @@ mod tests {
         draw_gameplay_scene(
             &mut framebuffer,
             Some(&background),
-            None,
+            &[],
             None,
             &straight_camera(),
             &lighting,
@@ -2764,7 +2858,7 @@ mod tests {
         draw_gameplay_scene(
             &mut with,
             Some(&background),
-            None,
+            &[],
             Some(&shadow),
             &camera,
             &lighting,
@@ -2774,7 +2868,7 @@ mod tests {
         draw_gameplay_scene(
             &mut without,
             Some(&background),
-            None,
+            &[],
             None,
             &camera,
             &lighting,

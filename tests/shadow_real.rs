@@ -19,7 +19,7 @@ use arklay::emd;
 use arklay::pack::Pack;
 use arklay::player;
 use arklay::rdt;
-use arklay::render::{self, Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh};
+use arklay::render::{self, Camera, EntityMesh, Framebuffer, Lighting, MaskLayer};
 use arklay::shadow;
 use arklay::state::{Image, RoomId};
 
@@ -96,11 +96,11 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     let keyframe = player_state.anim.keyframe_index(&emd.clips);
     let entity = anim::entity_matrix(player_state.pos, player_state.angle);
     let joints = anim::joint_matrices(&emd.skeleton, &emd.keyframes[keyframe], &entity);
-    let player = PlayerMesh {
+    let entities = [EntityMesh {
         mesh: &emd.mesh,
         texture: &emd.texture,
         joints: &joints,
-    };
+    }];
 
     let background = bmp::decode(pack.read(&id.cut_entry(camera_index)).unwrap()).unwrap();
     let page = if cut.masks.is_empty() || cut.mask_active == 0 {
@@ -124,7 +124,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     render::draw_gameplay_scene(
         &mut with,
         Some(&background),
-        Some(&player),
+        &entities,
         Some(&shadow),
         &camera,
         &lighting,
@@ -134,7 +134,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     render::draw_gameplay_scene(
         &mut again,
         Some(&background),
-        Some(&player),
+        &entities,
         Some(&shadow),
         &camera,
         &lighting,
@@ -146,7 +146,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     render::draw_gameplay_scene(
         &mut without,
         Some(&background),
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,

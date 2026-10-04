@@ -22,7 +22,7 @@ use arklay::mask;
 use arklay::model::{Texture8, Tmd, TmdObject, TmdPrim};
 use arklay::pack::Pack;
 use arklay::rdt;
-use arklay::render::{Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh, draw_gameplay_scene};
+use arklay::render::{Camera, EntityMesh, Framebuffer, Lighting, MaskLayer, draw_gameplay_scene};
 use arklay::state::{Light, RoomId};
 
 /// The player stand-in's flat texture colour.
@@ -149,11 +149,11 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
         t: [0, 0, 0],
     }];
     let texture = player_texture();
-    let player = PlayerMesh {
+    let entities = [EntityMesh {
         mesh: &mesh,
         texture: &texture,
         joints: &joints,
-    };
+    }];
 
     // Only group 1 is active, so no other overlay interferes.
     let mut active = 0u32;
@@ -170,7 +170,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     draw_gameplay_scene(
         &mut framebuffer,
         None,
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,
@@ -204,7 +204,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     draw_gameplay_scene(
         &mut framebuffer,
         None,
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,
@@ -244,11 +244,11 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     let entity = anim::entity_matrix(player_state.pos, player_state.angle);
     let joints = anim::joint_matrices(&emd.skeleton, &emd.keyframes[keyframe], &entity);
     let texture = &emd.texture;
-    let player = PlayerMesh {
+    let entities = [EntityMesh {
         mesh: &emd.mesh,
         texture,
         joints: &joints,
-    };
+    }];
 
     let camera = Camera::from_cut(cut);
     let lighting = Lighting::from_room(&room);
@@ -258,7 +258,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     draw_gameplay_scene(
         &mut plain,
         Some(&background),
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,
@@ -268,7 +268,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     draw_gameplay_scene(
         &mut masked,
         Some(&background),
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,
@@ -278,7 +278,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     draw_gameplay_scene(
         &mut again,
         Some(&background),
-        Some(&player),
+        &entities,
         None,
         &camera,
         &lighting,

@@ -134,6 +134,10 @@ const MSF_MENU_KEY_DEPLETED: u8 = 18;
 /// masked out of [`GameState::message_flags`] while it is displayed; when the
 /// bit is clear the original blanks the player's d-pad for the frame.
 pub const MESSAGE_FLAG_CONTROLS: u16 = 0x100;
+/// `g_message_flags` bit 1: entities may think. This is a different bit from
+/// [`MESSAGE_FLAG_CONTROLS`]: a pause word can freeze the characters without
+/// locking the player (and vice versa), so the entity tick gates on this one.
+pub const MESSAGE_FLAG_ENTITIES: u16 = 0x002;
 /// The original's gameplay seed for `g_message_flags` (`game_loop` writes
 /// `0xFD3F` when it (re)enters the play state).
 pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
@@ -773,6 +777,10 @@ pub struct GameState {
     pub ladder_down: bool,
     /// Scripted entities; slot 0 is the player.
     pub entities: [Entity; ENTITY_COUNT],
+    /// Per-slot animation clocks for the scripted entities, parallel to
+    /// [`GameState::entities`]. The entity words stay authoritative; the clock
+    /// remembers which frame the pose shows for the renderer.
+    pub entity_anims: [crate::npc::EntityAnim; ENTITY_COUNT],
     /// Number of character entity slots an `enemy` spawn has allocated.
     pub enemy_count: u8,
     /// The `behavior_flags` read by the last `get_eml_state`.
@@ -846,6 +854,7 @@ impl Default for GameState {
             stair_climb: false,
             ladder_down: false,
             entities: initial_entities(),
+            entity_anims: std::array::from_fn(|_| crate::npc::EntityAnim::default()),
             enemy_count: 0,
             last_enemy_flags: 0,
             selected_entity: 0,
@@ -1148,21 +1157,20 @@ impl GameState {
 
     /// One native update per active entity slot (1..), called after the event
     /// VM and before the player's physics mirror. A displayed message that
-    /// masks the control bit pauses the entities with the room. This slice
-    /// only walks and marks the active slots; the character driver replaces
-    /// the body in a later slice. Returns the number of slots visited.
-    pub fn tick_entities(&mut self, _room: &RoomState) -> usize {
-        if self.message_locks_controls() {
+    /// masks the entity-think bit pauses the characters with the room; that is
+    /// a different bit from the player-control one, so the gate is
+    /// [`GameState::message_freezes_entities`]. Returns the number of slots
+    /// visited.
+    pub fn tick_entities(
+        &mut self,
+        room: &RoomState,
+        models: &mut crate::npc::EntityModelCache,
+        pack: &crate::pack::Pack,
+    ) -> usize {
+        if self.message_freezes_entities() {
             return 0;
         }
-        let mut updated = 0;
-        for entity in &mut self.entities[1..] {
-            if entity.active() {
-                entity.status_flags |= ENTITY_STATUS_ACTIVE;
-                updated += 1;
-            }
-        }
-        updated
+        crate::npc::update_all(self, room, models, pack)
     }
 
     /// Mirror entity 0 into the engine's player state when the scripts moved
@@ -1511,6 +1519,7 @@ impl GameState {
         let player_entity = self.entities[0];
         self.entities = initial_entities();
         self.entities[0] = player_entity;
+        self.entity_anims = std::array::from_fn(|_| crate::npc::EntityAnim::default());
         self.enemy_count = 0;
         self.selected_entity = 0;
         self.transition = None;
@@ -2509,6 +2518,15 @@ impl GameState {
     /// tick, exactly like the original's blanked d-pad word.
     pub fn message_locks_controls(&self) -> bool {
         self.message_flags & MESSAGE_FLAG_CONTROLS == 0
+    }
+
+    /// Whether the displayed message's pause word masked the entity-think bit,
+    /// so the scripted characters freeze with the window. The original gates
+    /// `character_npc_update` on this bit, not on the player-control one: a
+    /// pause word can hold the characters while the player stays free, or the
+    /// other way around.
+    pub fn message_freezes_entities(&self) -> bool {
+        self.message_flags & MESSAGE_FLAG_ENTITIES == 0
     }
 
     /// Request a message and arm the room action its post-action pickup takes.
@@ -4257,15 +4275,27 @@ mod tests {
         state.entities[1].set_active(true);
         state.entities[3].set_active(true);
         let room = RoomState::default();
-        assert_eq!(state.tick_entities(&room), 2);
+        let pack =
+            crate::pack::Pack::from_bytes(crate::pack::PackWriter::new().to_bytes().unwrap())
+                .unwrap();
+        let mut models = crate::npc::EntityModelCache::default();
+        assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
         assert!(state.entities[1].active());
         assert!(state.entities[3].active());
 
-        // A message whose pause word masks the control bit pauses the room,
-        // so the entity tick must not run behind the window.
+        // A message whose pause word masks the entity-think bit freezes the
+        // characters, and the entity tick must not run behind the window.
+        state.show_message(1, MESSAGE_FLAG_ENTITIES);
+        assert!(state.message_freezes_entities());
+        assert_eq!(state.tick_entities(&room, &mut models, &pack), 0);
+
+        // The player-control bit is a different one: a message that only masks
+        // it keeps the characters running.
+        state.cancel_message();
         state.show_message(1, MESSAGE_FLAG_CONTROLS);
         assert!(state.message_locks_controls());
-        assert_eq!(state.tick_entities(&room), 0);
+        assert!(!state.message_freezes_entities());
+        assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
     }
 
     #[test]

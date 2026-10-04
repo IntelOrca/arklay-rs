@@ -21,7 +21,7 @@ use arklay::game::{GameState, RoomActionKind, ScdGameHost};
 use arklay::pack::Pack;
 use arklay::player::{self, ClipSource, Input, PlayerState};
 use arklay::rdt;
-use arklay::render::{self, Camera, Framebuffer, Lighting, PlayerMesh};
+use arklay::render::{self, Camera, EntityMesh, Framebuffer, Lighting};
 use arklay::scd::vm::CommandVm;
 use arklay::state::{Image, RoomId, RoomState};
 
@@ -360,16 +360,16 @@ fn capture_player_partway_up_the_lab_stairway() {
     };
     let keyframe = &keyframes[player.anim.keyframe_index(clips)];
     let joints = anim::joint_matrices(&emd.skeleton, keyframe, &entity);
-    let mesh = PlayerMesh {
+    let entities = [EntityMesh {
         mesh: &emd.mesh,
         texture: &emd.texture,
         joints: &joints,
-    };
+    }];
     let mut framebuffer = Framebuffer::new();
     render::draw_gameplay_scene(
         &mut framebuffer,
         cut.background.as_ref(),
-        Some(&mesh),
+        &entities,
         None,
         &camera,
         &lighting,

@@ -51,10 +51,11 @@ use crate::mask;
 use crate::message::MessageInput;
 use crate::model::Emd;
 use crate::music;
+use crate::npc;
 use crate::pack::Pack;
 use crate::player;
 use crate::rdt;
-use crate::render::{self, Camera, Framebuffer, Lighting, MaskLayer, PlayerMesh};
+use crate::render::{self, Camera, EntityMesh, Framebuffer, Lighting, MaskLayer};
 use crate::save;
 use crate::scd;
 use crate::sfx;
@@ -145,13 +146,16 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         );
         let display = Display::new(&title, true)?;
         let mut framebuffer = Framebuffer::new();
+        let mut npc_models = npc::EntityModelCache::default();
         render_frame(
             &mut framebuffer,
             &pack,
             loaded.id,
             &loaded.room,
             &player_state,
+            &game,
             loaded.player_assets.as_ref(),
+            &mut npc_models,
             &mut MaskCache::default(),
             &mut ShadowCache::default(),
         );
@@ -361,7 +365,7 @@ struct GameSession {
     shadows: ShadowCache,
     sfx_cache: SfxCache,
     /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
-    npc_models: EntityModelCache,
+    npc_models: npc::EntityModelCache,
     music: Option<Mixer>,
     /// Decoded pack text tables (messages, item names, descriptions).
     text: Text,
@@ -527,7 +531,7 @@ impl GameSession {
             masks: MaskCache::default(),
             shadows: ShadowCache::default(),
             sfx_cache: SfxCache::default(),
-            npc_models: EntityModelCache::default(),
+            npc_models: npc::EntityModelCache::default(),
             music: None,
             text: Text::load(pack),
             font,
@@ -645,6 +649,8 @@ impl GameSession {
                 game: &mut self.game,
                 player: &mut self.player,
                 player_assets: self.loaded.player_assets.as_ref(),
+                pack,
+                npc_models: &mut self.npc_models,
             },
             input,
             action,
@@ -1080,7 +1086,9 @@ impl GameSession {
                 self.loaded.id,
                 &self.loaded.room,
                 &self.player,
+                &self.game,
                 self.loaded.player_assets.as_ref(),
+                &mut self.npc_models,
                 &mut self.masks,
                 &mut self.shadows,
             );
@@ -2386,13 +2394,16 @@ pub fn simulate_door(
     // The destination's first gameplay frame, drawn from the placed player and
     // the zone-selected cut, exactly as the engine's render loop would.
     let mut gameplay = Framebuffer::new();
+    let mut npc_models = npc::EntityModelCache::default();
     render_frame(
         &mut gameplay,
         pack,
         loaded.id,
         &loaded.room,
         &player_state,
+        &game,
         loaded.player_assets.as_ref(),
+        &mut npc_models,
         &mut MaskCache::default(),
         &mut ShadowCache::default(),
     );
@@ -2429,6 +2440,168 @@ pub fn simulate_door(
         mid_frame,
         mid_index,
         gameplay_frame,
+    })
+}
+
+/// The result of [`simulate_room`]: the state after a fixed number of ticks
+/// and the final rendered frame, plus an entity-less baseline of the same
+/// state for capture comparisons.
+pub struct SimulatedRoom {
+    /// Room that was simulated.
+    pub id: RoomId,
+    /// Loaded room after the ticks.
+    pub room: RoomState,
+    /// Game state after the ticks.
+    pub game: game::GameState,
+    /// Player after the ticks.
+    pub player: player::PlayerState,
+    /// The final gameplay frame with the player and every visible character.
+    pub frame: Image,
+    /// The final state rendered with every character slot deactivated, so a
+    /// test can assert the characters actually painted something.
+    pub baseline: Image,
+}
+
+/// Drive a room headlessly for `ticks` fixed ticks and render the final frame.
+///
+/// This is the deterministic capture seam the real-asset tests use, mirroring
+/// [`simulate_door`]: it boots the room's init script, runs the main/event
+/// scripts and the native entity driver with `input` held, and renders the
+/// final state twice (once normally, once with the character slots hidden).
+/// Opening a door is not driven here; a scene that requests one keeps its
+/// gameplay frame.
+pub fn simulate_room(
+    pack: &Pack,
+    id: RoomId,
+    ticks: usize,
+    input: player::Input,
+) -> Result<SimulatedRoom> {
+    let loaded = load_room(pack, id)?;
+    let mut game = game::GameState::new(id, &loaded.room);
+    let player_state = player::spawn(id, &loaded.room);
+    game.sync_entity_from_player(&player_state);
+    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+}
+
+/// Drive the new-game start (stage 1 room 0) headlessly: the original's start
+/// position, facing and seed, then the same init/ticks/render path as
+/// [`simulate_room`]. `character` selects Chris (0) or Jill (1).
+pub fn simulate_new_game(
+    pack: &Pack,
+    character: u8,
+    ticks: usize,
+    input: player::Input,
+) -> Result<SimulatedRoom> {
+    let character = character & 1;
+    let id = RoomId {
+        stage: 1,
+        room: 0,
+        player_flag: character,
+    };
+    let loaded = load_room(pack, id)?;
+    let mut game = game::GameState::new(id, &loaded.room);
+    seed_new_game(&mut game, character);
+    let mut player_state = player::spawn(id, &loaded.room);
+    player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
+    player_state.angle = NEW_GAME_ANGLE;
+    game.sync_entity_from_player(&player_state);
+    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+}
+
+/// The shared body of [`simulate_room`] and [`simulate_new_game`].
+fn simulate_loaded(
+    pack: &Pack,
+    mut loaded: LoadedRoom,
+    mut game: game::GameState,
+    mut player_state: player::PlayerState,
+    ticks: usize,
+    input: player::Input,
+) -> Result<SimulatedRoom> {
+    let id = loaded.id;
+    run_room_init(&loaded, &mut game);
+    drain_mask_toggles(&mut loaded.room, &mut game);
+    apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+
+    let scripts = Rc::new(loaded.scripts.clone());
+    let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+    let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
+    let mut masks = MaskCache::default();
+    let mut shadows = ShadowCache::default();
+    let mut npc_models = npc::EntityModelCache::default();
+    let mut framebuffer = Framebuffer::new();
+
+    for _ in 0..ticks {
+        tick_room(
+            &mut command_vm,
+            &mut event_vm,
+            RoomContext {
+                room: &mut loaded.room,
+                game: &mut game,
+                player: &mut player_state,
+                player_assets: loaded.player_assets.as_ref(),
+                pack,
+                npc_models: &mut npc_models,
+            },
+            input,
+            false,
+        );
+        drain_mask_toggles(&mut loaded.room, &mut game);
+    }
+
+    render_frame(
+        &mut framebuffer,
+        pack,
+        id,
+        &loaded.room,
+        &player_state,
+        &game,
+        loaded.player_assets.as_ref(),
+        &mut npc_models,
+        &mut masks,
+        &mut shadows,
+    );
+    let frame = Image {
+        width: framebuffer.width,
+        height: framebuffer.height,
+        rgba: framebuffer.rgba.clone(),
+    };
+
+    let active: Vec<bool> = game.entities[1..]
+        .iter()
+        .map(game::Entity::active)
+        .collect();
+    for entity in &mut game.entities[1..] {
+        entity.set_active(false);
+    }
+    let mut baseline_framebuffer = Framebuffer::new();
+    render_frame(
+        &mut baseline_framebuffer,
+        pack,
+        id,
+        &loaded.room,
+        &player_state,
+        &game,
+        loaded.player_assets.as_ref(),
+        &mut npc_models,
+        &mut masks,
+        &mut shadows,
+    );
+    let baseline = Image {
+        width: baseline_framebuffer.width,
+        height: baseline_framebuffer.height,
+        rgba: baseline_framebuffer.rgba.clone(),
+    };
+    for (entity, was_active) in game.entities[1..].iter_mut().zip(active) {
+        entity.set_active(was_active);
+    }
+
+    Ok(SimulatedRoom {
+        id,
+        room: loaded.room,
+        game,
+        player: player_state,
+        frame,
+        baseline,
     })
 }
 
@@ -2781,56 +2954,6 @@ impl ShadowCache {
     }
 }
 
-/// Parsed NPC (scripted character) models, keyed by entity id.
-///
-/// The cache loads `npc/{id:02x}.emd` from the pack on first use and keeps the
-/// parsed model for the rest of the session, so every entity with the same id
-/// shares one copy. A missing or invalid entry is logged once and remembered
-/// as absent: the character still exists and animates, it just has no mesh to
-/// draw.
-#[derive(Default)]
-struct EntityModelCache {
-    models: HashMap<u8, Arc<Emd>>,
-    missing: HashSet<u8>,
-}
-
-impl EntityModelCache {
-    /// The parsed model for character `id`, loading it from the pack on first
-    /// use. Ids outside the character range yield `None` without a warning.
-    fn get(&mut self, pack: &Pack, id: u8) -> Option<Arc<Emd>> {
-        if let Some(model) = self.models.get(&id) {
-            return Some(Arc::clone(model));
-        }
-        if self.missing.contains(&id) {
-            return None;
-        }
-        let Some(path) = crate::npc::model_path(id) else {
-            self.missing.insert(id);
-            return None;
-        };
-        let bytes = match pack.read(path) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                eprintln!("warning: missing NPC model {path}: {err}");
-                self.missing.insert(id);
-                return None;
-            }
-        };
-        match emd::parse(bytes) {
-            Ok(model) => {
-                let model = Arc::new(model);
-                self.models.insert(id, Arc::clone(&model));
-                Some(model)
-            }
-            Err(err) => {
-                eprintln!("warning: invalid NPC model {path}: {err:#}");
-                self.missing.insert(id);
-                None
-            }
-        }
-    }
-}
-
 /// Everything loaded for one room, so a transition can load the next room with
 /// the same code path as the initial load.
 struct LoadedRoom {
@@ -2888,6 +3011,10 @@ struct RoomContext<'a> {
     game: &'a mut game::GameState,
     player: &'a mut player::PlayerState,
     player_assets: Option<&'a PlayerAssets>,
+    /// Pack the NPC model cache reads from.
+    pack: &'a Pack,
+    /// Parsed NPC models, shared with the renderer.
+    npc_models: &'a mut npc::EntityModelCache,
 }
 
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
@@ -2911,6 +3038,11 @@ fn tick_room(
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
     }
+    // The scripted characters think after the event scripts and before the
+    // player's physics, exactly like the original's `update_entities`.
+    context
+        .game
+        .tick_entities(context.room, context.npc_models, context.pack);
     // Scripts may have moved the player entity directly (dir_set, actor
     // motion); mirror that onto the visible player before physics run.
     context.game.sync_player(context.player);
@@ -3189,13 +3321,15 @@ struct PlayerAssets {
     emw: crate::model::Emw,
 }
 
-/// Draw one gameplay frame: the cut background, the player model, the player's
-/// ground shadow and the camera's room-mask layer, depth-sorted together.
+/// Draw one gameplay frame: the cut background, the player model, one mesh per
+/// active scripted character visible in the current cut, the player's ground
+/// shadow and the camera's room-mask layer, depth-sorted together.
 ///
-/// The mask page is loaded lazily from the pack and cached per camera; the
-/// shadow page is cached for the whole session. A room without a page (or a
-/// camera without mask sprites) draws without the layer, and a frame whose
-/// shadow is skipped (see [`shadow::visible`]) draws without the quad.
+/// The meshes are submitted in entity-slot order with the player first; the
+/// shared far-to-near sort is stable, so equal-depth triangles keep that
+/// submission order (and the player keeps its own exact order). Characters
+/// outside the current camera's switch zone are culled; the mask page and the
+/// shadow page are loaded lazily and cached.
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     framebuffer: &mut Framebuffer,
@@ -3203,7 +3337,9 @@ fn render_frame(
     id: RoomId,
     room: &RoomState,
     player_state: &player::PlayerState,
+    game: &game::GameState,
     assets: Option<&PlayerAssets>,
+    npc_models: &mut npc::EntityModelCache,
     masks: &mut MaskCache,
     shadows: &mut ShadowCache,
 ) {
@@ -3242,46 +3378,62 @@ fn render_frame(
         })
     });
 
-    let Some(assets) = assets else {
-        render::draw_gameplay_scene(
-            framebuffer,
-            cut.background.as_ref(),
-            None,
-            shadow.as_ref(),
-            &camera,
-            &lighting,
-            layer.as_ref(),
-        );
-        return;
-    };
-    let (keyframes, clips) = match player_state.clip_source {
-        player::ClipSource::Emd => (&assets.emd.keyframes, &assets.emd.clips),
-        player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
-    };
-    let keyframe_index = player_state.anim.keyframe_index(clips);
-    let Some(keyframe) = keyframes.get(keyframe_index) else {
-        render::draw_gameplay_scene(
-            framebuffer,
-            cut.background.as_ref(),
-            None,
-            shadow.as_ref(),
-            &camera,
-            &lighting,
-            layer.as_ref(),
-        );
-        return;
-    };
-    let entity = anim::entity_matrix(player_state.pos, player_state.angle);
-    let joints = anim::joint_matrices(&assets.emd.skeleton, keyframe, &entity);
-    let player = PlayerMesh {
-        mesh: &assets.emd.mesh,
-        texture: &assets.emd.texture,
-        joints: &joints,
-    };
+    let player_joints = assets.and_then(|assets| {
+        let (keyframes, clips) = match player_state.clip_source {
+            player::ClipSource::Emd => (&assets.emd.keyframes, &assets.emd.clips),
+            player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
+        };
+        let keyframe = keyframes.get(player_state.anim.keyframe_index(clips))?;
+        let entity = anim::entity_matrix(player_state.pos, player_state.angle);
+        Some(anim::joint_matrices(
+            &assets.emd.skeleton,
+            keyframe,
+            &entity,
+        ))
+    });
+
+    // The parsed NPC models are held in `models` so the mesh references built
+    // below stay alive for the draw call.
+    let mut models: Vec<Arc<Emd>> = Vec::new();
+    let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    for slot in 1..game::ENTITY_COUNT {
+        let entity = &game.entities[slot];
+        if !entity.active() || !npc::in_camera_zone(room, room.current_cut, entity.pos) {
+            continue;
+        }
+        let Some(model) = npc_models.get(pack, entity.id) else {
+            continue;
+        };
+        let keyframe_index = game.entity_anims[slot].keyframe_index(entity, &model.clips);
+        let Some(keyframe) = model.keyframes.get(keyframe_index) else {
+            continue;
+        };
+        let entity_matrix = anim::entity_matrix(entity.pos, entity.angle);
+        let joints = anim::joint_matrices(&model.skeleton, keyframe, &entity_matrix);
+        models.push(model);
+        npc_joints.push(joints);
+    }
+
+    let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(1 + models.len());
+    if let (Some(assets), Some(joints)) = (assets, &player_joints) {
+        meshes.push(EntityMesh {
+            mesh: &assets.emd.mesh,
+            texture: &assets.emd.texture,
+            joints,
+        });
+    }
+    for (model, joints) in models.iter().zip(&npc_joints) {
+        meshes.push(EntityMesh {
+            mesh: &model.mesh,
+            texture: &model.texture,
+            joints,
+        });
+    }
+
     render::draw_gameplay_scene(
         framebuffer,
         cut.background.as_ref(),
-        Some(&player),
+        &meshes,
         shadow.as_ref(),
         &camera,
         &lighting,
@@ -3647,6 +3799,7 @@ mod tests {
         let mut player_state = player::spawn(id, &room);
         let mut masks = MaskCache::default();
         let mut shadows = ShadowCache::default();
+        let mut npc_models = npc::EntityModelCache::default();
 
         let mut idle = Framebuffer::new();
         render_frame(
@@ -3655,7 +3808,9 @@ mod tests {
             id,
             &room,
             &player_state,
+            &game::GameState::new(id, &room),
             Some(&assets),
+            &mut npc_models,
             &mut masks,
             &mut shadows,
         );
@@ -3680,7 +3835,9 @@ mod tests {
             id,
             &room,
             &player_state,
+            &game::GameState::new(id, &room),
             Some(&assets),
+            &mut npc_models,
             &mut masks,
             &mut shadows,
         );
@@ -3821,6 +3978,7 @@ mod tests {
             }
             assert!(game.doors[0].is_some(), "init should register the door");
 
+            let mut npc_models = npc::EntityModelCache::default();
             let idle = tick_room(
                 &mut command_vm,
                 &mut event_vm,
@@ -3829,6 +3987,8 @@ mod tests {
                     game: &mut game,
                     player: &mut player_state,
                     player_assets: None,
+                    pack: &pack,
+                    npc_models: &mut npc_models,
                 },
                 player::Input::default(),
                 false,
@@ -3842,6 +4002,8 @@ mod tests {
                     game: &mut game,
                     player: &mut player_state,
                     player_assets: None,
+                    pack: &pack,
+                    npc_models: &mut npc_models,
                 },
                 player::Input::default(),
                 true,
@@ -3948,6 +4110,7 @@ mod tests {
         player_state.angle = 0x800;
         game.sync_entity_from_player(&player_state);
         let start = player_state.pos;
+        let mut npc_models = npc::EntityModelCache::default();
         for _ in 0..30 {
             tick_room(
                 &mut command_vm,
@@ -3957,6 +4120,8 @@ mod tests {
                     game: &mut game,
                     player: &mut player_state,
                     player_assets: loaded.player_assets.as_ref(),
+                    pack: &pack,
+                    npc_models: &mut npc_models,
                 },
                 player::Input {
                     up: true,
@@ -4135,7 +4300,7 @@ mod tests {
         writer.add("npc/23.emd", b"not-an-emd".to_vec()).unwrap();
         let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
 
-        let mut cache = EntityModelCache::default();
+        let mut cache = npc::EntityModelCache::default();
         // An absent entry yields None and is remembered so the pack is only
         // read once.
         assert!(cache.get(&pack, 0x20).is_none());
@@ -4156,7 +4321,7 @@ mod tests {
             return;
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
-        let mut cache = EntityModelCache::default();
+        let mut cache = npc::EntityModelCache::default();
 
         for id in crate::npc::FIRST_ID..=crate::npc::LAST_ID {
             let model = cache
@@ -4373,11 +4538,11 @@ mod tests {
         let keyframe = &keyframes[player_state.anim.keyframe_index(clips)];
         let entity = anim::entity_matrix(player_state.pos, player_state.angle);
         let joints = anim::joint_matrices(&assets.emd.skeleton, keyframe, &entity);
-        let player = PlayerMesh {
+        let entities = [EntityMesh {
             mesh: &assets.emd.mesh,
             texture: &assets.emd.texture,
             joints: &joints,
-        };
+        }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
         let page = bmp::decode_mask(pack.read(&id.roommask_entry(0)).unwrap()).unwrap();
@@ -4392,7 +4557,7 @@ mod tests {
         render::draw_gameplay_scene(
             &mut masked,
             cut.background.as_ref(),
-            Some(&player),
+            &entities,
             None,
             &camera,
             &lighting,
@@ -4402,7 +4567,7 @@ mod tests {
         render::draw_gameplay_scene(
             &mut plain,
             cut.background.as_ref(),
-            Some(&player),
+            &entities,
             None,
             &camera,
             &lighting,
