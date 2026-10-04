@@ -1,13 +1,35 @@
-//! Deterministic software rasterizer for the player model.
+//! Deterministic software rasterizer for the player model and room masks.
 //!
 //! [`Framebuffer::draw_model`] transforms a TMD mesh by the per-joint 4.12
 //! matrices, shades the vertices with the room lighting, sorts the triangles
 //! back-to-front and rasterizes them into the RGBA8 buffer. Nothing here uses
 //! SDL; the engine owns presentation and only uploads [`Framebuffer::rgba`].
+//!
+//! [`draw_gameplay_scene`] is the full gameplay path. It blits the camera's
+//! background and then paints one stable far-to-near list mixing the camera's
+//! mask sprites (from a [`MaskLayer`]) with the player's triangles, so the
+//! character passes behind foreground pillars:
+//!
+//! - A mask sprite's key is [`crate::mask::mask_sprite_key`]: the shared
+//!   per-(room, camera) bias, the hand-tuned per-entry overrides and the
+//!   `pos_data`-derived ordering-table key.
+//! - A player triangle's key is its mean view-space Z. The original's
+//!   ordering table takes an entity at `z >> 4` and stores a mask at
+//!   `fade << 4`, so the two keys are directly comparable without any extra
+//!   scaling. This engine sorts on integer keys, so the mean is rounded to the
+//!   nearest unit; a triangle whose rounded key equals a mask's key ties with
+//!   it and, like every tie, keeps submission order (masks are submitted
+//!   before player triangles, so the nearer player paints last).
+//!
+//! A [`MaskLayer`] carries the camera's decoded `roommask/{room}_{cam}.bmp`
+//! page and its [`Cut`]; a later engine step only has to load and decode that
+//! page, then pass the layer to [`draw_gameplay_scene`]. [`Framebuffer::draw_model`]
+//! remains the plain player-only path used by the tests and the non-mask case.
 
 use crate::anim;
+use crate::mask;
 use crate::model::{Texture8, Tmd, TmdObject};
-use crate::state::{Cut, Image, Light, RoomState};
+use crate::state::{Cut, Image, Light, RoomId, RoomState};
 
 /// Default framebuffer width in pixels.
 const WIDTH: u32 = 320;
@@ -217,6 +239,80 @@ impl Framebuffer {
             }
         }
     }
+
+    /// Paint a sorted scene list: triangles share one texture page, mask
+    /// sprites sample the camera's decoded mask page.
+    fn draw_scene(
+        &mut self,
+        texture: Option<&Texture8>,
+        page: Option<&Image>,
+        items: &[SceneItem],
+    ) {
+        for item in items {
+            match item {
+                SceneItem::Triangle(triangle) => {
+                    if let Some(texture) = texture {
+                        self.rasterize(texture, triangle);
+                    }
+                }
+                SceneItem::Mask(quad) => {
+                    if let Some(page) = page {
+                        self.rasterize_mask(page, quad);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Rasterize one mask sprite: opaque, unshaded, nearest-sampled, clipped
+    /// to the framebuffer. The sprite's size equals its sampled region, so
+    /// every screen pixel maps to exactly one page texel.
+    fn rasterize_mask(&mut self, page: &Image, quad: &MaskQuad) {
+        if page.width == 0 || page.height == 0 || quad.size.0 == 0 || quad.size.1 == 0 {
+            return;
+        }
+
+        let x0 = i64::from(quad.pos.0);
+        let y0 = i64::from(quad.pos.1);
+        let start_x = x0.max(0);
+        let start_y = y0.max(0);
+        let end_x = (x0 + i64::from(quad.size.0)).min(i64::from(self.width));
+        let end_y = (y0 + i64::from(quad.size.1)).min(i64::from(self.height));
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+
+        let page_width = i64::from(page.width);
+        let page_height = i64::from(page.height);
+        let u0 = i64::from(quad.uv.0);
+        let v0 = i64::from(quad.uv.1);
+        let source_stride = page.width as usize * 4;
+        let target_stride = self.width as usize * 4;
+        for y in start_y..end_y {
+            let texel_y = v0 + (y - y0);
+            if !(0..page_height).contains(&texel_y) {
+                continue;
+            }
+            for x in start_x..end_x {
+                let texel_x = u0 + (x - x0);
+                if !(0..page_width).contains(&texel_x) {
+                    continue;
+                }
+                let source = texel_y as usize * source_stride + texel_x as usize * 4;
+                let target = y as usize * target_stride + x as usize * 4;
+                let (Some(texel), Some(slot)) = (
+                    page.rgba.get(source..source + 4),
+                    self.rgba.get_mut(target..target + 4),
+                ) else {
+                    continue;
+                };
+                slot[0] = texel[0];
+                slot[1] = texel[1];
+                slot[2] = texel[2];
+                slot[3] = 255;
+            }
+        }
+    }
 }
 
 /// Draw one frame of a parsed door animation over black.
@@ -263,6 +359,122 @@ pub fn draw_fade_overlay(framebuffer: &mut Framebuffer, fade: &crate::door::vm::
             *channel =
                 ((u32::from(*channel) * (255 - alpha) + u32::from(target) * alpha) / 255) as u8;
         }
+    }
+}
+
+/// A posed player model ready to be interleaved with a room's mask layer.
+#[derive(Debug, Clone, Copy)]
+pub struct PlayerMesh<'a> {
+    /// The TMD mesh to draw.
+    pub mesh: &'a Tmd,
+    /// The mesh's texture page.
+    pub texture: &'a Texture8,
+    /// One 4.12 joint matrix per mesh object, in object order.
+    pub joints: &'a [anim::Mat4x3],
+}
+
+/// One camera's room-mask layer: its decoded page plus the ordering inputs.
+///
+/// The engine loads the camera's `roommask/{room}_{camera:03}.bmp` entry from
+/// the pack, decodes it with [`crate::bmp::decode`] and pairs it with the
+/// camera's [`Cut`]. [`MaskLayer::new`] starts from the cut's own
+/// `mask_active` bits; a script toggle can pass an updated `active` instead.
+#[derive(Debug, Clone, Copy)]
+pub struct MaskLayer<'a> {
+    /// Room identity, used to select the per-(room, camera) ordering records.
+    pub room: RoomId,
+    /// Camera index within the room.
+    pub camera: usize,
+    /// The camera's parsed cut, carrying its mask sprites in file order.
+    pub cut: &'a Cut,
+    /// The decoded mask page; sprite UVs index it directly.
+    pub page: &'a Image,
+    /// Visibility bits, one per one-based group id.
+    pub active: u32,
+}
+
+impl<'a> MaskLayer<'a> {
+    /// A layer whose active bits start at the cut's own `mask_active`.
+    pub fn new(room: RoomId, camera: usize, cut: &'a Cut, page: &'a Image) -> Self {
+        Self {
+            room,
+            camera,
+            cut,
+            page,
+            active: cut.mask_active,
+        }
+    }
+}
+
+/// Draw one gameplay frame: the background, then the depth-sorted scene list.
+///
+/// Masks are submitted first, in [`mask::mask_submission_order`] (the order the
+/// original paints equal-key sprites in), followed by the player's triangles
+/// pre-sorted far-to-near so their exact depth order survives the integer
+/// keys. [`mask::order_far_to_near`] is the stable sort; equal keys therefore
+/// keep this submission order. Inactive groups and hidden entries never reach
+/// the list.
+pub fn draw_gameplay_scene(
+    framebuffer: &mut Framebuffer,
+    background: Option<&Image>,
+    player: Option<&PlayerMesh<'_>>,
+    camera: &Camera,
+    lighting: &Lighting,
+    mask_layer: Option<&MaskLayer<'_>>,
+) {
+    framebuffer.clear();
+    if let Some(background) = background {
+        framebuffer.blit(background);
+    }
+
+    let mut items = Vec::new();
+    if let Some(layer) = mask_layer {
+        collect_masks(layer, &mut items);
+    }
+
+    let mut triangles = Vec::new();
+    if let Some(player) = player {
+        for (object, joint) in player.mesh.objects.iter().zip(player.joints) {
+            collect_triangles(object, joint, camera, Some(lighting), true, &mut triangles);
+        }
+    }
+    // The integer scene key can tie triangles that are less than a unit apart;
+    // the stable sort keeps this far-to-near order for those ties.
+    triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+    items.extend(triangles.into_iter().map(SceneItem::Triangle));
+
+    mask::order_far_to_near(&mut items, SceneItem::key);
+
+    framebuffer.draw_scene(
+        player.map(|player| player.texture),
+        mask_layer.map(|layer| layer.page),
+        &items,
+    );
+}
+
+/// Append a layer's active mask sprites to `items`, farthest submission
+/// first.
+///
+/// [`mask::mask_sprite_key`] folds together the shared per-(room, camera) bias
+/// record, the room's per-entry overrides and the zero-key rule (a computed
+/// brightness key of zero sorts at the fixed key 550).
+fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem>) {
+    for index in mask::mask_submission_order(layer.room, layer.camera, layer.cut.masks.len()) {
+        let Some(sprite) = layer.cut.masks.get(index) else {
+            continue;
+        };
+        if !mask::group_active(layer.active, sprite.group) {
+            continue;
+        }
+        let Some(key) = mask::mask_sprite_key(layer.room, layer.camera, index, sprite) else {
+            continue;
+        };
+        items.push(SceneItem::Mask(MaskQuad {
+            key,
+            uv: (u32::from(sprite.uv.0), u32::from(sprite.uv.1)),
+            pos: sprite.pos,
+            size: (u32::from(sprite.size.0), u32::from(sprite.size.1)),
+        }));
     }
 }
 
@@ -393,8 +605,55 @@ struct RasterVertex {
 struct Triangle {
     raster: [RasterVertex; 3],
     depth: f64,
+    /// Painter's key shared with the mask sprites; see [`triangle_depth_key`].
+    key: u32,
     palette_row: usize,
     cull: bool,
+}
+
+/// One mask sprite of a camera's page, ready for rasterization.
+#[derive(Debug, Clone, Copy)]
+struct MaskQuad {
+    /// Painter's key from [`mask::mask_sprite_key`].
+    key: u32,
+    /// Top-left texel of the sprite in the page bitmap.
+    uv: (u32, u32),
+    /// Top-left screen pixel.
+    pos: (i32, i32),
+    /// Sprite size in pixels; equals the sampled region, so sampling is 1:1.
+    size: (u32, u32),
+}
+
+/// One item of a frame's painter's list.
+enum SceneItem {
+    Mask(MaskQuad),
+    Triangle(Triangle),
+}
+
+impl SceneItem {
+    /// The item's far-to-near key; larger keys are farther away.
+    fn key(&self) -> u32 {
+        match self {
+            SceneItem::Mask(quad) => quad.key,
+            SceneItem::Triangle(triangle) => triangle.key,
+        }
+    }
+}
+
+/// The painter's key of one player triangle: its mean view-space Z.
+///
+/// The key needs no scaling to sit next to [`mask::mask_sprite_key`]: the
+/// original submits an overlay at `fade << 4` and a triangle enters the same
+/// ordering table at `mean_z >> 4`, which is exactly the port's
+/// `OT index * 16` depth-sort scale. This engine sorts on integer keys, so the
+/// mean is rounded to the nearest unit; negative depths cannot reach here (the
+/// near plane drops them), but clamp anyway so a key can never wrap.
+fn triangle_depth_key(depth: f64) -> u32 {
+    if depth <= 0.0 {
+        0
+    } else {
+        depth.round() as u32
+    }
 }
 
 /// Project and shade one TMD object into `triangles`.
@@ -488,9 +747,11 @@ fn collect_triangles(
             }
         });
 
+        let depth = (depth0 + depth1 + depth2) / 3.0;
         triangles.push(Triangle {
             raster,
-            depth: (depth0 + depth1 + depth2) / 3.0,
+            depth,
+            key: triangle_depth_key(depth),
             palette_row,
             cull,
         });
@@ -959,5 +1220,271 @@ mod tests {
                 "object {object} vertex {vertex}: got {screen:?}, expected ({expected_x}, {expected_y})"
             );
         }
+    }
+
+    fn room() -> RoomId {
+        RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        }
+    }
+
+    fn solid_image(width: u32, height: u32, color: [u8; 4]) -> Image {
+        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..width * height {
+            rgba.extend_from_slice(&color);
+        }
+        Image {
+            width,
+            height,
+            rgba,
+        }
+    }
+
+    fn mask_sprite(pos: (i32, i32), pos_data: u16, group: u8) -> crate::mask::MaskSprite {
+        crate::mask::MaskSprite {
+            uv: (0, 0),
+            pos,
+            size: (1, 1),
+            pos_data,
+            flags: 0,
+            group,
+        }
+    }
+
+    fn scene_triangle(key: u32) -> SceneItem {
+        SceneItem::Triangle(Triangle {
+            raster: std::array::from_fn(|_| RasterVertex {
+                position: [0.0; 2],
+                inv_z: 1.0,
+                u: 0.0,
+                v: 0.0,
+                shade: [0.0; 3],
+            }),
+            depth: f64::from(key),
+            key,
+            palette_row: 0,
+            cull: false,
+        })
+    }
+
+    fn framebuffer_pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * framebuffer.width as usize + x) * 4;
+        framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn triangle_keys_use_the_mask_ordering_table_scale() {
+        assert_eq!(triangle_depth_key(-5.0), 0);
+        assert_eq!(triangle_depth_key(0.0), 0);
+        assert_eq!(triangle_depth_key(6080.0), 6080);
+        assert_eq!(triangle_depth_key(6080.4), 6080);
+        assert_eq!(triangle_depth_key(6080.5), 6081);
+        assert_eq!(triangle_depth_key(f64::INFINITY), u32::MAX);
+    }
+
+    #[test]
+    fn scene_list_is_stable_and_submits_masks_before_triangles() {
+        // Room 100 walks its entries backwards, so the sprites are submitted
+        // 2, 1, 0. Sprite 0 carries the far key; sprites 1 and 2 tie with the
+        // triangle at 64.
+        let cut = Cut {
+            masks: vec![
+                mask_sprite((0, 0), 100, 1),
+                mask_sprite((1, 0), 4, 1),
+                mask_sprite((2, 0), 7, 1),
+            ],
+            mask_active: 0b111,
+            ..Cut::default()
+        };
+        let page = solid_image(1, 1, [1, 2, 3, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+
+        let mut items = Vec::new();
+        collect_masks(&layer, &mut items);
+        items.push(scene_triangle(64));
+        mask::order_far_to_near(&mut items, SceneItem::key);
+
+        let order: Vec<(u32, Option<(i32, i32)>)> = items
+            .iter()
+            .map(|item| match item {
+                SceneItem::Mask(quad) => (quad.key, Some(quad.pos)),
+                SceneItem::Triangle(triangle) => (triangle.key, None),
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (1600, Some((0, 0))),
+                (64, Some((2, 0))),
+                (64, Some((1, 0))),
+                (64, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn mask_layer_skips_inactive_groups() {
+        let cut = Cut {
+            masks: vec![mask_sprite((0, 0), 100, 1), mask_sprite((1, 0), 200, 2)],
+            mask_active: 0b01,
+            ..Cut::default()
+        };
+        let page = solid_image(1, 1, [1, 2, 3, 255]);
+        let mut items = Vec::new();
+        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), &mut items);
+        assert!(matches!(&items[..], [SceneItem::Mask(quad)] if quad.pos == (0, 0)));
+
+        // Activating group 2 adds its sprite; deactivating group 1 hides the
+        // first one again.
+        let mut active = cut.mask_active;
+        mask::set_group_active(&mut active, 2, true);
+        let mut items = Vec::new();
+        collect_masks(
+            &MaskLayer {
+                active,
+                ..MaskLayer::new(room(), 0, &cut, &page)
+            },
+            &mut items,
+        );
+        assert_eq!(items.len(), 2);
+
+        mask::set_group_active(&mut active, 1, false);
+        let mut items = Vec::new();
+        collect_masks(
+            &MaskLayer {
+                active,
+                ..MaskLayer::new(room(), 0, &cut, &page)
+            },
+            &mut items,
+        );
+        assert!(matches!(&items[..], [SceneItem::Mask(quad)] if quad.pos == (1, 0)));
+    }
+
+    /// Render the synthetic frame: a background, a 20x20 mask at (170, 90)
+    /// and the standard triangle (mean depth 1000, covering pixel 180,100).
+    /// The mask's page texel (10, 10) is distinct from the rest of the page.
+    fn interleaved_frame(mask_pos_data: u16) -> Framebuffer {
+        let cut = Cut {
+            masks: vec![crate::mask::MaskSprite {
+                uv: (0, 0),
+                pos: (170, 90),
+                size: (20, 20),
+                pos_data: mask_pos_data,
+                flags: 0,
+                group: 1,
+            }],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        let mut page = solid_image(20, 20, [1, 2, 3, 255]);
+        let texel = (10 * 20 + 10) * 4;
+        page.rgba[texel..texel + 4].copy_from_slice(&[9, 8, 7, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+
+        let background = solid_image(320, 240, [7, 8, 9, 255]);
+        let mesh = mesh(false);
+        let joints = [identity()];
+        let texture = solid_texture([10, 20, 30, 255]);
+        let player = PlayerMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+        };
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            Some(&background),
+            Some(&player),
+            &straight_camera(),
+            &lighting,
+            Some(&layer),
+        );
+        framebuffer
+    }
+
+    #[test]
+    fn near_player_paints_over_a_far_mask() {
+        // Mask key 6080 is behind the triangle's key of 1000.
+        let framebuffer = interleaved_frame(380);
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [10, 20, 30, 255]);
+        // Neither item covers this background pixel.
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn near_mask_occludes_the_player_and_samples_the_page_texel() {
+        // Mask key 64 is in front of the triangle's key of 1000; the pixel
+        // must sample page texel (10, 10), not the page's common colour.
+        let framebuffer = interleaved_frame(4);
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 8, 7, 255]);
+        // A triangle pixel outside the 20x20 mask keeps the player colour.
+        assert_eq!(framebuffer_pixel(&framebuffer, 220, 110), [10, 20, 30, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
+    }
+
+    #[test]
+    fn zero_key_masks_sort_at_the_550_quirk() {
+        // pos_data 0 computes a zero key, which the original draws at the
+        // fixed 550 slot: still in front of the triangle's 1000.
+        let framebuffer = interleaved_frame(0);
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 8, 7, 255]);
+
+        let cut = Cut {
+            masks: vec![mask_sprite((0, 0), 0, 1)],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        let page = solid_image(1, 1, [1, 2, 3, 255]);
+        let mut items = Vec::new();
+        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), &mut items);
+        assert!(matches!(&items[0], SceneItem::Mask(quad) if quad.key == 550));
+    }
+
+    #[test]
+    fn mask_sprites_clip_to_the_framebuffer() {
+        let cut = Cut {
+            masks: vec![crate::mask::MaskSprite {
+                uv: (0, 0),
+                pos: (-5, -5),
+                size: (10, 10),
+                pos_data: 4,
+                flags: 0,
+                group: 1,
+            }],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        let mut page = solid_image(10, 10, [1, 2, 3, 255]);
+        let texel = (5 * 10 + 5) * 4;
+        page.rgba[texel..texel + 4].copy_from_slice(&[9, 9, 9, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            None,
+            &straight_camera(),
+            &lighting,
+            Some(&layer),
+        );
+
+        // Screen (0, 0) is the sprite's top-left pixel and maps to page
+        // texel (5, 5); the sprite ends at screen (4, 4).
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [9, 9, 9, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 4, 4), [1, 2, 3, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 5, 4), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 319, 239), [0, 0, 0, 0]);
     }
 }
