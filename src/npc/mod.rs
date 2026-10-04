@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::emd;
-use crate::game::{ENTITY_COUNT, ENTITY_STATUS_ACTIVE, Entity, GameState};
+use crate::game::{ENTITY_COUNT, ENTITY_STATUS_ACTIVE, GameState};
 use crate::model::{Clip, Emd};
 use crate::pack::Pack;
 use crate::state::RoomState;
@@ -19,6 +19,8 @@ use crate::state::RoomState;
 pub mod anim;
 pub mod data;
 pub mod idle;
+pub mod scd;
+pub mod walk;
 
 pub use anim::EntityAnim;
 pub use data::{
@@ -107,10 +109,7 @@ pub fn update_all(
         let target = live_look_at_target(game, slot);
         let model = models.get(pack, game.entities[slot].id);
         let clips: &[Clip] = model.as_ref().map_or(&[], |model| &model.clips);
-        {
-            let (entities, clocks) = (&mut game.entities, &mut game.entity_anims);
-            update_entity(&mut entities[slot], &mut clocks[slot], room, clips, target);
-        }
+        update_entity(game, slot, room, clips, target);
         updated += 1;
     }
     updated
@@ -118,40 +117,56 @@ pub fn update_all(
 
 /// One entity's driver tick: the state dispatch plus the shared tail.
 ///
-/// State 0 is the spawn init, state 1 the idle behaviours; states 8 (scripted
-/// action) and 9 (follow) have their handlers in later slices and stay inert
-/// here. `clips` are the entity's EMD animation clips and `look_at_target` the
-/// live position an entity-target `act_motion` is aiming at, when one is set.
+/// State 0 is the spawn init, state 1 the idle behaviours, state 8 the
+/// scripted-action handlers and state 9 the follow driver (slice 5). `clips`
+/// are the entity's EMD animation clips and `look_at_target` the live position
+/// an entity-target `act_motion` is aiming at, when one is set.
 pub fn update_entity(
-    entity: &mut Entity,
-    clock: &mut EntityAnim,
+    game: &mut GameState,
+    slot: usize,
     room: &RoomState,
     clips: &[Clip],
     look_at_target: Option<[i32; 3]>,
 ) {
-    let advance = match entity.state() {
+    let advance = match game.entities[slot].state() {
         0 => {
-            idle::init(entity, clock, clips);
+            idle::init(
+                &mut game.entities[slot],
+                &mut game.entity_anims[slot],
+                clips,
+            );
             false
         }
-        1 => idle::update(entity, clock, clips),
-        // The scripted-action (8) and follow (9) drivers land in later slices;
-        // the slots stay inert so their scripts can still select the entities.
-        8 | 9 => false,
+        1 => idle::update(
+            &mut game.entities[slot],
+            &mut game.entity_anims[slot],
+            clips,
+        ),
+        8 => {
+            scd::update(game, slot, room, clips);
+            false
+        }
+        // The follow driver lands in the next slice; the slots stay inert so
+        // their scripts can still select the entities.
+        9 => false,
         _ => false,
     };
     if advance {
-        clock.advance(entity, clips, false, IDLE_BLEND_STEP);
+        game.entity_anims[slot].advance(&mut game.entities[slot], clips, false, IDLE_BLEND_STEP);
     }
 
     // Common tail. The look-at slew itself belongs to the action/walk layer;
     // the target an `act_motion` latched is already refreshed from its live
     // entity here.
     if let Some(target) = look_at_target {
-        entity.target = target;
+        game.entities[slot].target = target;
     }
-    entity.has_enter_switch_zone = u8::from(in_camera_zone(room, room.current_cut, entity.pos));
-    entity.status_flags |= ENTITY_STATUS_ACTIVE;
+    game.entities[slot].has_enter_switch_zone = u8::from(in_camera_zone(
+        room,
+        room.current_cut,
+        game.entities[slot].pos,
+    ));
+    game.entities[slot].status_flags |= ENTITY_STATUS_ACTIVE;
 }
 
 /// Whether `pos` lies inside the current camera's switch zone.

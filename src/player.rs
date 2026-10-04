@@ -595,7 +595,7 @@ pub fn reach_offset(angle: u16) -> (i32, i32) {
 /// toward -Z. The fixed-point pipeline is the original's: the 14-bit trig
 /// values build a 4.12 matrix element, and the matrix-vector product is
 /// truncated back down by 12.
-fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
+pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
     let angle = angle.wrapping_add(offset) & 0x0FFF;
     let m00 = cos14(angle) >> 2;
     let m20 = (-sin14(angle)) >> 2;

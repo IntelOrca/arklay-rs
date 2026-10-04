@@ -89,6 +89,9 @@ pub const ENTITY_NONE: u8 = u8::MAX;
 pub const ENTITY_STATUS_ACTIVE: u8 = 0x01;
 /// Flag bank holding the `enemy` guard bits (`g_EnemiesFlags`).
 pub const BANK_ENEMIES: u8 = 3;
+/// Flag bank holding the system flags (`g_SysFlags`). The state-8 handlers
+/// raise their completion bits here for the event scripts' `bit_test`s.
+pub const BANK_SYSTEM: u8 = 4;
 /// Collision radius the `enemy` spawn gives an entity before its own init
 /// overrides it.
 pub const DEFAULT_ENEMY_RADIUS: i16 = 422;
@@ -100,6 +103,13 @@ pub const CHARACTER_ID_MAX: u8 = 0x2E;
 const MOTION_DEFAULT_STEP: u8 = 0xC0;
 /// Default per-tick pitch step of an `act_motion` instruction.
 const MOTION_DEFAULT_PITCH_STEP: u8 = 0x40;
+/// Monster animation remap pairs used by `act_action_a`: `(action_state base,
+/// animation id)` indexed by the incoming animation id. Characters never take
+/// this path; monster entities stay inert this milestone, but the table is
+/// kept for the opcode's byte-for-byte behaviour.
+const SCD_ANIM_REMAP: [u8; 32] = [
+    0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 1, 0, 1, 1, 1, 2, 1, 3, 1, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
 /// Placeholder message id displayed by a door that refuses to open.
 pub const LOCKED_MESSAGE: u8 = 200;
 /// Message shown while a key turns in a lock.
@@ -545,6 +555,16 @@ pub struct MaskToggle {
     pub active: bool,
 }
 
+/// One 3D entity sound cue queued by an NPC handler (the original's
+/// `PlayEntitySnd`), already resolved to a room sound name and position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntitySound {
+    /// Room sound name resolved from the footstep zone.
+    pub name: &'static str,
+    /// World position the sound plays at.
+    pub pos: [i32; 3],
+}
+
 /// One interaction recorded by the room action layer for tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomInteraction {
@@ -615,10 +635,18 @@ pub struct Entity {
     pub selector: u16,
     /// Health word written by `tw_set_sel` selector 3 and `tw_set_field`.
     pub health: i16,
-    /// Animation position offsets (`unk_c6`/`unk_c8`).
+    /// Animation position offsets (`unk_c6`/`unk_c8`); the state-8 walk
+    /// handlers steer at this pair.
     pub unk_c6: u16,
     /// Animation position offset Z.
     pub unk_c8: u16,
+    /// Collision callback flags (`collisionFlags`). `act_anim_seq` clears or
+    /// sets bit 7; the state-8 walk handlers keep their behaviour running on
+    /// arrival while it is set.
+    pub collision_flags: u8,
+    /// 16-bit frame/phase counter at entity +0xC4 (`action_ticks_counter`):
+    /// the state-8 hold counter and the walk deceleration phase count.
+    pub action_ticks_counter: u16,
     /// Look-at control byte set by `act_motion`.
     pub look_at_flags: u8,
     /// Look-at target position; for an entity target this is refreshed every
@@ -818,10 +846,16 @@ pub struct GameState {
     pub frame: u64,
     /// Call counts of opcodes whose systems do not exist yet.
     pub placeholders: BTreeMap<u8, u64>,
+    /// Call counts of state-8 handlers that stay placeholders (the fire
+    /// behaviour, `action_behavior` 8).
+    pub npc_placeholders: BTreeMap<u8, u64>,
     /// BGM requests produced by the scripts.
     pub room_bgm_requests: Vec<BgmRequest>,
     /// Event scripts requested by `evt_exec`, consumed by the engine's event VM.
     pub pending_events: Vec<(u8, u8)>,
+    /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
+    /// engine's mixer.
+    pub entity_sounds: Vec<EntitySound>,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -873,8 +907,10 @@ impl Default for GameState {
             last_interaction: None,
             frame: 0,
             placeholders: BTreeMap::new(),
+            npc_placeholders: BTreeMap::new(),
             room_bgm_requests: Vec::new(),
             pending_events: Vec::new(),
+            entity_sounds: Vec::new(),
         }
     }
 }
@@ -1082,6 +1118,7 @@ impl GameState {
         entity.action_state = 0;
         entity.hit_state = 0;
         entity.look_at_flags = 0;
+        entity.collision_flags = 0;
         entity.death_event_id = operand_u8(operands, 2);
         entity.variant = (operand_u8(operands, 11) & 0x0F)
             | ((operand_u8(operands, 14) & 0x0F) << 4)
@@ -1236,13 +1273,25 @@ impl GameState {
             }
             "act_anim_seq" => {
                 if let Some(entity) = self.selected_entity_mut() {
+                    // Operand 0 is the word at script +1: its low byte is the
+                    // behaviour and its bit 4 selects the collision-flag path.
                     let word0 = operand_u16(operands, 0);
                     let word1 = operand_u16(operands, 1);
                     let word2 = operand_u16(operands, 2);
+                    let behavior = word0 as u8;
                     entity.set_state(8);
                     entity.set_ignore(0);
-                    entity.action_behavior = word0 as u8;
-                    entity.action_state = 0;
+                    if behavior & 0x10 == 0 {
+                        entity.action_behavior = behavior;
+                        entity.action_state = 0;
+                        entity.collision_flags &= 0x7F;
+                    } else if entity.collision_flags & 0x80 == 0 {
+                        entity.action_behavior = behavior & 0x0F;
+                        entity.action_state = 0;
+                        entity.collision_flags |= 0x80;
+                    } else {
+                        entity.action_behavior = behavior & 0x0F;
+                    }
                     entity.unk_c6 = (word0 >> 8) | ((word1 as u8 as u16) << 8);
                     entity.unk_c8 = (word1 >> 8) | ((word2 as u8 as u16) << 8);
                     entity.scd_anim_param = (word2 >> 8) as u8;
@@ -1299,11 +1348,41 @@ impl GameState {
                 }
                 StepResult::Continue
             }
-            "act_action_a" | "act_action_b" => {
+            "act_action_a" => {
                 if let Some(entity) = self.selected_entity_mut() {
                     entity.animation_frame_id = operand_u8(operands, 0);
-                    entity.blend_counter = if entity.flags & 0x20 != 0 { 0 } else { 7 };
-                    entity.action_state = 1;
+                    entity.timing_control = 0;
+                    entity.blend_counter = 7;
+                    entity.move_speed_current = 0;
+                    if entity.flags & 0x20 != 0 {
+                        entity.blend_counter = 0;
+                    }
+                    if entity.id < CHARACTER_ID_MIN {
+                        // Monster ids remap the clip through the original's
+                        // (action_state base, animation id) pair table; ids
+                        // above 0x0F park in action state 3.
+                        if entity.animation_id > 0x0F {
+                            entity.action_state = 3;
+                        } else {
+                            let pair = usize::from(entity.animation_id) * 2;
+                            entity.action_state = SCD_ANIM_REMAP[pair].wrapping_add(1);
+                            entity.animation_id = SCD_ANIM_REMAP[pair + 1];
+                        }
+                    } else {
+                        entity.action_state = 1;
+                    }
+                }
+                StepResult::Continue
+            }
+            "act_action_b" => {
+                if let Some(entity) = self.selected_entity_mut() {
+                    entity.animation_frame_id = operand_u8(operands, 0);
+                    entity.timing_control = 0;
+                    entity.blend_counter = 7;
+                    entity.move_speed_current = 0;
+                    if entity.flags & 0x20 != 0 {
+                        entity.blend_counter = 0;
+                    }
                 }
                 StepResult::Continue
             }
@@ -1314,16 +1393,17 @@ impl GameState {
         }
     }
 
-    /// One actor motion instruction. While the target is out of reach the
-    /// result is `Yield`, so the event VM re-runs the instruction next tick;
-    /// on arrival the result is `Finished` and the actor state ends.
+    /// One actor motion instruction: record the look-at target and step sizes
+    /// and return, exactly like the original's state-1 handler. The actor run
+    /// never blocks on the motion; the native state-8/9 driver owns the facing
+    /// and movement.
     ///
-    /// Convention: the entity turns toward the target by at most the yaw step
-    /// and translates by that same step along the target direction, on the XZ
-    /// plane. The step is the low byte of the word at instruction offset +8
-    /// (default 0xC0); the high byte is the pitch step (default 0x40). Flag
-    /// 0x20 wraps negative target coordinates by +0x1000 before use, and flag
-    /// set `0x93` targets another entity instead of a fixed point.
+    /// Flag low nibble zero records only `lookAtFlags`. Otherwise the step is
+    /// the word at instruction offset +8: its low byte the yaw step (default
+    /// 0xC0), its high byte the pitch step (default 0x40). Flag `0x20` wraps
+    /// negative target X/Y by +0x1000 before use, and the exact flag byte
+    /// `0x93` names a live target (type 0 player, 1 enemy `index`, 2 object
+    /// model, 3 item model) instead of a position.
     fn apply_act_motion(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         let flags = operand_u8(operands, 0);
         let step_word =
@@ -1337,26 +1417,17 @@ impl GameState {
             step => step,
         };
 
-        if flags & 0x0F == 0 {
-            if let Some(entity) = self.selected_entity_mut() {
-                entity.look_at_flags = flags;
-            }
-            return StepResult::Continue;
-        }
-
-        let target_entity = if flags == 0x93 {
-            let Some(slot) = motion_target_slot(operand_u8(operands, 1), operand_i16(operands, 2))
-            else {
-                self.record_placeholder(op.op);
-                return StepResult::Placeholder;
-            };
-            Some(slot)
-        } else {
-            None
-        };
-        let target = match target_entity {
-            Some(slot) => self.entities[usize::from(slot)].pos,
-            None => {
+        let mut target = None;
+        let mut target_entity = None;
+        if flags & 0x0F != 0 {
+            if flags == 0x93 {
+                // The selector is the word at +2 and the index the signed word
+                // at +4. Object and item models have no entity this milestone,
+                // so only the player and enemy targets latch a live slot.
+                target_entity =
+                    motion_target_slot(operand_u8(operands, 1), operand_i16(operands, 2));
+                target = target_entity.map(|slot| self.entities[usize::from(slot)].pos);
+            } else {
                 let mut x = i32::from(operand_i16(operands, 1));
                 let mut y = i32::from(operand_i16(operands, 2));
                 let z = i32::from(operand_i16(operands, 3));
@@ -1368,36 +1439,25 @@ impl GameState {
                         y += 0x1000;
                     }
                 }
-                [x, y, z]
+                target = Some([x, y, z]);
             }
-        };
+        }
 
         let Some(entity) = self.selected_entity_mut() else {
             self.record_placeholder(op.op);
             return StepResult::Placeholder;
         };
         entity.look_at_flags = flags;
-        entity.look_at_yaw_step = yaw_step;
-        entity.look_at_pitch_step = pitch_step;
-        entity.target = target;
-        entity.target_entity = target_entity;
-
-        let dx = target[0] - entity.pos[0];
-        let dz = target[2] - entity.pos[2];
-        let step = i32::from(yaw_step);
-        let distance = xz_distance(dx, dz);
-        if distance <= step {
-            entity.pos[0] = target[0];
-            entity.pos[2] = target[2];
-            entity.target_entity = None;
-            // Arrival does not leave the actor state; only act_reset/act_end do.
+        if flags & 0x0F == 0 {
             return StepResult::Continue;
         }
-        let target_angle = angle_between(entity.pos, target);
-        entity.angle = rotate_toward(entity.angle, target_angle, u16::from(yaw_step));
-        entity.pos[0] += step * dx / distance;
-        entity.pos[2] += step * dz / distance;
-        StepResult::Yield
+        entity.look_at_yaw_step = yaw_step;
+        entity.look_at_pitch_step = pitch_step;
+        if let Some(target) = target {
+            entity.target = target;
+        }
+        entity.target_entity = target_entity;
+        StepResult::Continue
     }
 
     /// Apply one tween sub-ISA instruction to the selected entity. The tween
@@ -1542,6 +1602,7 @@ impl GameState {
         self.last_interaction = None;
         self.room_bgm_requests.clear();
         self.pending_events.clear();
+        self.entity_sounds.clear();
     }
 
     /// The number of inventory slots the current character uses.
@@ -3228,13 +3289,6 @@ fn motion_target_slot(entity_type: u8, index: i16) -> Option<u8> {
     }
 }
 
-/// Distance between two XZ offsets, rounded down.
-fn xz_distance(dx: i32, dz: i32) -> i32 {
-    let dx = i64::from(dx);
-    let dz = i64::from(dz);
-    ((dx * dx + dz * dz) as f64).sqrt() as i32
-}
-
 /// 12-bit angle from `from` to `to` on the XZ plane. Angle 0 faces +X and
 /// increasing yaw turns towards -Z, the engine's movement convention.
 fn angle_between(from: [i32; 3], to: [i32; 3]) -> u16 {
@@ -3247,21 +3301,6 @@ fn angle_between(from: [i32; 3], to: [i32; 3]) -> u16 {
         return ((-(quadrant + angle as i32)) as u32 & 0x0FFF) as u16;
     }
     ((if dz > 0 { 0x800 } else { 0 }) + 0x400) as u16
-}
-
-/// Step `angle` toward `target` by at most `step`, using unsigned 12-bit
-/// angle arithmetic: snap when the remaining turn is under two steps,
-/// otherwise take one step in the shorter direction.
-fn rotate_toward(angle: u16, target: u16, step: u16) -> u16 {
-    let delta = step.wrapping_sub(angle).wrapping_add(target) & 0x0FFF;
-    if i32::from(delta) < i32::from(step as i16) * 2 {
-        return target & 0x0FFF;
-    }
-    let mut turned = angle.wrapping_sub(step) & 0x0FFF;
-    if delta < 0x801 {
-        turned = turned.wrapping_add(step.wrapping_mul(2)) & 0x0FFF;
-    }
-    turned
 }
 
 fn condition_result(value: bool) -> StepResult {
@@ -4313,36 +4352,83 @@ mod tests {
         assert_eq!(host.state().last_enemy_flags, 0x5A);
     }
 
+    /// Decode one actor instruction from its exact bytes, wrapped in the
+    /// `evt_actor_begin`/`act_end`/`evt_finish` scaffolding the event stream
+    /// needs, and return the decoded actor instruction.
+    fn actor_bytes(bytes: &[u8]) -> Insn {
+        let mut data = vec![0x01];
+        data.extend_from_slice(bytes);
+        data.extend_from_slice(&[0x8B, 0xFF]);
+        let (insns, trailing) = crate::scd::reader::decode_event_stream(&data, 0, data.len());
+        assert!(trailing.is_empty(), "fixture left trailing bytes");
+        assert_eq!(insns[1].bytes, bytes, "fixture decoded the wrong width");
+        insns[1].clone()
+    }
+
+    /// Feed one decoded actor instruction to the host.
+    fn dispatch_actor(host: &mut ScdGameHost<'_>, insn: &Insn) -> StepResult {
+        let Decoded::Actor(op) = insn.decoded else {
+            panic!("fixture is not an actor instruction");
+        };
+        host.on_misc(op, &insn.operands)
+    }
+
     #[test]
-    fn actor_motion_walks_the_entity_and_ends_the_state() {
-        let scripts = event_scripts(vec![vec![
-            event_insn(0x1000, event_top_op(0x01).unwrap(), 1, &[]),
-            actor_insn(0x1001, actor_op(0x81).unwrap(), 10, &[1, 100, 0, 0, 10, 0]),
-            control_insn(0x100B, event_control_op(0xFF).unwrap(), 1, &[]),
-        ]]);
+    fn actor_motion_byte_fixture_records_the_target_and_steps() {
         let mut state = game();
-        let mut vm = EventVm::new(&scripts);
-        vm.start(0, 0);
-        for _ in 0..20 {
-            let mut host = ScdGameHost::new(&mut state);
-            vm.step(&mut host);
-        }
-        assert_eq!(vm.active_slots(), 0);
-        assert_eq!(state.entities[0].pos, [100, 0, 0]);
-        assert_eq!(state.entities[0].target_entity, None);
+        state.selected_entity = 0;
+        state.entities[0].pos = [10, 0, 20];
+        let mut host = ScdGameHost::new(&mut state);
+        // flags 0x13 (yaw+pitch, position mode), target (1000, -2, 0x500),
+        // yaw step 0x28, pitch step 0x14.
+        let insn = actor_bytes(&[0x81, 0x13, 0xE8, 0x03, 0xFE, 0xFF, 0x00, 0x05, 0x28, 0x14]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.pos, [10, 0, 20], "the actor run never moves");
+        assert_eq!(entity.look_at_flags, 0x13);
+        assert_eq!(entity.target, [1000, -2, 0x500]);
+        assert_eq!(entity.target_entity, None);
+        assert_eq!(entity.look_at_yaw_step, 0x28);
+        assert_eq!(entity.look_at_pitch_step, 0x14);
+    }
+
+    #[test]
+    fn actor_motion_defaults_the_steps_and_keeps_the_flags_byte() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].look_at_flags = 0x10;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x81, 0x11, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.target, [100, 0, 0]);
+        assert_eq!(entity.look_at_yaw_step, 0xC0);
+        assert_eq!(entity.look_at_pitch_step, 0x40);
+    }
+
+    #[test]
+    fn actor_motion_zero_low_nibble_records_only_flags() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].target = [7, 8, 9];
+        state.entities[0].look_at_yaw_step = 0x55;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x81, 0x10]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.look_at_flags, 0x10);
+        assert_eq!(entity.target, [7, 8, 9], "no target without a low nibble");
+        assert_eq!(entity.look_at_yaw_step, 0x55);
     }
 
     #[test]
     fn actor_motion_wraps_negative_coordinates() {
         let mut state = game();
         state.selected_entity = 0;
-        let op = actor_op(0x81).unwrap();
         let mut host = ScdGameHost::new(&mut state);
-        // flags 0x21: motion plus the +0x1000 wrap for negative x/y.
-        assert_eq!(
-            host.on_misc(op, &operands(&[0x21, -100, -200, 0, 4, 0])),
-            StepResult::Yield
-        );
+        // flags 0x33: yaw+pitch plus the +0x1000 wrap for negative x/y.
+        let insn = actor_bytes(&[0x81, 0x33, 0x9C, 0xFF, 0x38, 0xFF, 0x00, 0x00, 0x20, 0x20]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
         assert_eq!(
             host.state().entities[0].target,
             [0x1000 - 100, 0x1000 - 200, 0]
@@ -4355,14 +4441,184 @@ mod tests {
         state.selected_entity = 0;
         state.entities[1].pos = [50, 0, 0];
         let mut host = ScdGameHost::new(&mut state);
-        let op = actor_op(0x81).unwrap();
         // flags 0x93: target entity type 1, index 0.
-        assert_eq!(
-            host.on_misc(op, &operands(&[0x93, 1, 0, 0, 4, 0])),
-            StepResult::Yield
-        );
+        let insn = actor_bytes(&[0x81, 0x93, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
         assert_eq!(host.state().entities[0].target, [50, 0, 0]);
         assert_eq!(host.state().entities[0].target_entity, Some(1));
+    }
+
+    #[test]
+    fn actor_run_completes_in_one_tick() {
+        // A whole actor run: motion, animation and end. The VM must execute
+        // every opcode in a single step, exactly like the original.
+        let scripts = event_scripts(vec![vec![
+            event_insn(0x1000, event_top_op(0x01).unwrap(), 1, &[]),
+            actor_insn(
+                0x1001,
+                actor_op(0x81).unwrap(),
+                10,
+                &[0x13, 100, 0, 0, 0, 0],
+            ),
+            actor_insn(0x100B, actor_op(0x85).unwrap(), 4, &[7, 0x10, 0x21]),
+            actor_insn(0x100F, actor_op(0x8B).unwrap(), 1, &[]),
+            control_insn(0x1010, event_control_op(0xFF).unwrap(), 1, &[]),
+        ]]);
+        let mut state = game();
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        let mut host = ScdGameHost::new(&mut state);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0, "the actor run completed in one tick");
+        let entity = state.entities[0];
+        assert_eq!(entity.target, [100, 0, 0]);
+        assert_eq!(entity.state(), 8);
+        assert_eq!(entity.action_behavior, 7);
+        assert_eq!(entity.animation_id, 0x10);
+        assert_eq!(entity.scd_anim_param, 0x21);
+    }
+
+    #[test]
+    fn act_anim_seq_byte_fixture_maps_behavior_target_and_param() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].collision_flags = 0x80;
+        let mut host = ScdGameHost::new(&mut state);
+        // ROOM20D0's Richard walk: behaviour 3, target (7380, 2440), param 0x21.
+        let insn = actor_bytes(&[0x83, 0x03, 0xD4, 0x1C, 0x88, 0x09, 0x21]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.state(), 8);
+        assert_eq!(entity.ignore(), 0);
+        assert_eq!(entity.action_behavior, 3);
+        assert_eq!(entity.action_state, 0);
+        assert_eq!(entity.unk_c6, 0x1CD4);
+        assert_eq!(entity.unk_c8, 0x0988);
+        assert_eq!(entity.scd_anim_param, 0x21);
+        assert_eq!(entity.scd_timer, 0x28);
+        assert_eq!(entity.flags, 0);
+        assert_eq!(
+            entity.collision_flags, 0,
+            "bit 7 is cleared when bit 4 is off"
+        );
+    }
+
+    #[test]
+    fn act_anim_seq_collision_flag_paths() {
+        // Behaviour bit 4 set with the collision flag clear: set it and mask
+        // the behaviour to its low nibble.
+        let mut state = game();
+        state.selected_entity = 0;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x83, 0x13, 0xD4, 0x1C, 0x88, 0x09, 0x21]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        assert_eq!(state.entities[0].action_behavior, 3);
+        assert_eq!(state.entities[0].collision_flags, 0x80);
+
+        // Already set: keep it and leave action_state untouched.
+        state.entities[0].action_state = 5;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x83, 0x13, 0xD4, 0x1C, 0x88, 0x09, 0x21]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        assert_eq!(state.entities[0].action_behavior, 3);
+        assert_eq!(state.entities[0].collision_flags, 0x80);
+        assert_eq!(state.entities[0].action_state, 5);
+    }
+
+    #[test]
+    fn act_anim_flags_byte_fixture_maps_id_param_and_flags() {
+        let mut state = game();
+        state.selected_entity = 0;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x84, 0x20, 0x21, 0x02]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.state(), 8);
+        assert_eq!(entity.action_behavior, 1);
+        assert_eq!(entity.action_state, 0);
+        assert_eq!(entity.animation_id, 0x20);
+        assert_eq!(entity.scd_anim_param, 0x21);
+        assert_eq!(entity.flags, 8);
+        assert_eq!(entity.scd_timer, 0);
+    }
+
+    #[test]
+    fn act_anim_set_byte_fixture_maps_behavior_id_and_param() {
+        let mut state = game();
+        state.selected_entity = 0;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x85, 0x07, 0x10, 0x21]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.state(), 8);
+        assert_eq!(entity.action_behavior, 7);
+        assert_eq!(entity.action_state, 0);
+        assert_eq!(entity.animation_id, 0x10);
+        assert_eq!(entity.scd_anim_param, 0x21);
+        assert_eq!(entity.scd_timer, 0);
+        assert_eq!(entity.flags, 0);
+    }
+
+    #[test]
+    fn act_param_set_byte_fixture_writes_the_timer() {
+        let mut state = game();
+        state.selected_entity = 0;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x88, 0x00, 0x34, 0x12]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        assert_eq!(host.state().entities[0].scd_timer, 0x1234);
+    }
+
+    #[test]
+    fn act_action_a_byte_fixture_maps_frame_blend_and_state() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].id = 0x27;
+        state.entities[0].flags = 0x20;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x89, 0x0F]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.animation_frame_id, 0x0F);
+        assert_eq!(entity.timing_control, 0);
+        assert_eq!(entity.blend_counter, 0, "flag 0x20 zeroes the blend");
+        assert_eq!(entity.move_speed_current, 0);
+        assert_eq!(entity.action_state, 1, "characters take the simple path");
+
+        // Monster ids remap the animation through the pair table.
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].id = 0x05;
+        state.entities[0].animation_id = 5;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x89, 0x0F]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        assert_eq!(state.entities[0].action_state, 2);
+        assert_eq!(state.entities[0].animation_id, 0);
+
+        // An id above 0x0F parks in action state 3.
+        state.entities[0].animation_id = 0x10;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x89, 0x0F]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        assert_eq!(state.entities[0].action_state, 3);
+    }
+
+    #[test]
+    fn act_action_b_byte_fixture_never_touches_action_state() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].id = 0x27;
+        state.entities[0].action_state = 2;
+        let mut host = ScdGameHost::new(&mut state);
+        let insn = actor_bytes(&[0x8A, 0x16]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.animation_frame_id, 0x16);
+        assert_eq!(entity.timing_control, 0);
+        assert_eq!(entity.blend_counter, 7);
+        assert_eq!(entity.move_speed_current, 0);
+        assert_eq!(entity.action_state, 2, "0x8A leaves the action state alone");
     }
 
     #[test]
@@ -4476,15 +4732,6 @@ mod tests {
         assert_eq!(angle_between([0, 0, 0], [0, 0, -100]), 0x400);
         assert_eq!(angle_between([0, 0, 0], [0, 0, 100]), 0xC00);
         assert_eq!(angle_between([50, 0, 50], [50, 0, 50]), 0x400);
-
-        assert_eq!(rotate_toward(0, 0x400, 0x100), 0x100);
-        assert_eq!(rotate_toward(0x400, 0, 0x100), 0x300);
-        assert_eq!(rotate_toward(0, 0xC00, 0x100), 0xF00);
-        let mut angle = 0x3F0;
-        for _ in 0..4 {
-            angle = rotate_toward(angle, 0, 0x100);
-        }
-        assert_eq!(angle, 0);
     }
 
     fn item_action(slot: u8, item: u8, quantity: u8, zone: [i16; 4]) -> RoomAction {
