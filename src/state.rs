@@ -219,6 +219,16 @@ impl Zone {
     }
 }
 
+/// One footstep sound zone from the RDT's `.flr` table.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FootstepZone {
+    pub base_x: u16,
+    pub base_z: u16,
+    pub width: u16,
+    pub height: u16,
+    pub sound_data: u16,
+}
+
 /// One walkable zone used by NPC navigation.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WalkZone {
@@ -280,6 +290,29 @@ pub struct RoomState {
     pub zones: Vec<Zone>,
     /// Walkable zones for NPC navigation.
     pub walk_zones: Vec<WalkZone>,
+    /// Footstep sound zones, in file order.
+    pub footstep_zones: Vec<FootstepZone>,
+}
+
+impl RoomState {
+    /// The packed footstep zone value for `(x, z)`: the surface type in the
+    /// high byte and the sound offset for that surface in the low byte.
+    ///
+    /// The scan wraps around the 16-bit coordinate space and stops after 256
+    /// entries. A room whose last zone is not a catch-all would otherwise run
+    /// the scan past the table; returning `None` keeps that contained.
+    pub fn footstep_zone(&self, x: i32, z: i32) -> Option<u16> {
+        let x = x as u16;
+        let z = z as u16;
+        self.footstep_zones
+            .iter()
+            .take(256)
+            .find(|zone| {
+                x.wrapping_sub(zone.base_x) < zone.width
+                    && z.wrapping_sub(zone.base_z) < zone.height
+            })
+            .map(|zone| ((zone.height >> 8) << 8) | (zone.sound_data & 0xFF))
+    }
 }
 
 #[cfg(test)]
@@ -386,5 +419,56 @@ mod tests {
         assert!(RoomId::parse("1FF").is_err());
         assert!(RoomId::parse("1X0").is_err());
         assert!(RoomId::from_room_and_player("1001", 0).is_err());
+    }
+
+    #[test]
+    fn footstep_zone_wraps_the_coordinate_space() {
+        let room = RoomState {
+            footstep_zones: vec![
+                FootstepZone {
+                    base_x: 0xFF00,
+                    base_z: 0xFFF0,
+                    width: 0x0200,
+                    height: 0x0020,
+                    sound_data: 0x2D45,
+                },
+                FootstepZone {
+                    base_x: 0,
+                    base_z: 0,
+                    width: 0x7FE4,
+                    height: 0x7FEC,
+                    sound_data: 0,
+                },
+            ],
+            ..RoomState::default()
+        };
+
+        // 0x0010 - 0xFF00 wraps to 0x0110, inside the 0x0200-wide zone. The
+        // packed result keeps the height's high byte and the low sound byte.
+        assert_eq!(room.footstep_zone(0x10, 0x08), Some(0x45));
+        assert_eq!(room.footstep_zone(0, 0), Some(0x45));
+        assert_eq!(room.footstep_zone(0x1000, 0x1000), Some(0x7F00));
+        assert_eq!(room.footstep_zone(0x7FE3, 0x7FEB), Some(0x7F00));
+    }
+
+    #[test]
+    fn footstep_zone_stops_after_256_entries() {
+        let room = RoomState {
+            footstep_zones: (0..300)
+                .map(|index| FootstepZone {
+                    base_x: 1000 + index,
+                    base_z: 1000 + index,
+                    width: 1,
+                    height: 1,
+                    sound_data: index,
+                })
+                .collect(),
+            ..RoomState::default()
+        };
+
+        assert_eq!(room.footstep_zone(1000, 1000), Some(0));
+        assert_eq!(room.footstep_zone(1255, 1255), Some(255));
+        assert_eq!(room.footstep_zone(1299, 1299), None);
+        assert_eq!(RoomState::default().footstep_zone(0, 0), None);
     }
 }

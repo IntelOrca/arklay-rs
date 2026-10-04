@@ -7,7 +7,7 @@
 use anyhow::{Context, Result, bail};
 
 use crate::mask;
-pub use crate::state::{Collision, CollisionRect, Light, WalkZone, Zone};
+pub use crate::state::{Collision, CollisionRect, FootstepZone, Light, WalkZone, Zone};
 use crate::state::{Cut, RoomId, RoomState};
 
 /// Offset of the ambient light color within an RDT file.
@@ -28,6 +28,8 @@ const CAMERA_ZONES_SLOT: usize = 0;
 const COLLISION_SLOT: usize = 1;
 /// Pointer slot of the walkable zone table.
 const WALK_ZONES_SLOT: usize = 4;
+/// Pointer slot of the footstep sound zone table.
+const FOOTSTEP_SLOT: usize = 5;
 /// Offset of the camera records within an RDT file.
 const CAMERAS_OFFSET: usize = 0x94;
 /// Number of little-endian `i32` fields in one camera record.
@@ -42,6 +44,10 @@ const COLLISION_HEADER_SIZE: usize = 0x18;
 const COLLISION_RECORD_SIZE: usize = 0xC;
 /// Size in bytes of one walkable zone record.
 const WALK_ZONE_SIZE: usize = 0xC;
+/// Size in bytes of the footstep zone table header.
+const FOOTSTEP_HEADER_SIZE: usize = 2;
+/// Size in bytes of one footstep sound zone record.
+const FOOTSTEP_ZONE_SIZE: usize = 10;
 
 /// Parse an RDT file into internal room state.
 pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
@@ -59,6 +65,8 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
     let collision = parse_collision(data, pointers[COLLISION_SLOT])?;
     let zones = parse_zones(data, pointers[CAMERA_ZONES_SLOT])?;
     let walk_zones = parse_walk_zones(data, pointers[WALK_ZONES_SLOT])?;
+    let footstep_zones =
+        parse_footstep_zones(data, pointers[FOOTSTEP_SLOT], pointers[FOOTSTEP_SLOT + 1])?;
 
     Ok(RoomState {
         stage: id.stage,
@@ -71,6 +79,7 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         collision,
         zones,
         walk_zones,
+        footstep_zones,
     })
 }
 
@@ -305,6 +314,49 @@ fn parse_walk_zones(data: &[u8], pointer: u32) -> Result<Vec<WalkZone>> {
     Ok(walk_zones)
 }
 
+/// Parse the footstep sound zone table at `pointer`, if it has one.
+///
+/// The table starts with a `u16` header and has no terminator, so its length
+/// comes from `next`, the pointer of the following section. When that pointer
+/// is missing or not after the table, the remainder of the file is used.
+fn parse_footstep_zones(data: &[u8], pointer: u32, next: u32) -> Result<Vec<FootstepZone>> {
+    if pointer == 0 {
+        return Ok(Vec::new());
+    }
+
+    let base = pointer as usize;
+    let start = base
+        .checked_add(FOOTSTEP_HEADER_SIZE)
+        .filter(|&end| end <= data.len())
+        .with_context(|| {
+            format!(
+                "footstep zone pointer 0x{pointer:x} is out of bounds for the {}-byte RDT",
+                data.len()
+            )
+        })?;
+
+    let next = next as usize;
+    let end = if next > start && next <= data.len() {
+        next
+    } else {
+        data.len()
+    };
+
+    let count = (end - start) / FOOTSTEP_ZONE_SIZE;
+    let mut zones = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = start + index * FOOTSTEP_ZONE_SIZE;
+        zones.push(FootstepZone {
+            base_x: u16_at(data, offset)?,
+            base_z: u16_at(data, offset + 2)?,
+            width: u16_at(data, offset + 4)?,
+            height: u16_at(data, offset + 6)?,
+            sound_data: u16_at(data, offset + 8)?,
+        });
+    }
+    Ok(zones)
+}
+
 /// Parse one 44-byte camera record and its mask table.
 ///
 /// Fields 0 and 1 are direct file offsets to the camera's mask sprite table
@@ -448,6 +500,66 @@ mod tests {
         data.extend_from_slice(&flags.to_le_bytes());
     }
 
+    fn push_footstep_zone(data: &mut Vec<u8>, record: [u16; 5]) {
+        for value in record {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn parses_footstep_zones_until_the_next_section() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, FOOTSTEP_SLOT, offset);
+        data.extend_from_slice(&1u16.to_le_bytes());
+        push_footstep_zone(&mut data, [900, 1100, 8700, 9800, 45]);
+        push_footstep_zone(&mut data, [0x7FE4, 0x7FEC, 0x7FE4, 0x7FEC, 0]);
+        let next = data.len();
+        set_ptr(&mut data, FOOTSTEP_SLOT + 1, next);
+        data.extend_from_slice(&[0xAB; 7]);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.footstep_zones.len(), 2);
+        assert_eq!(state.footstep_zones[0].base_x, 900);
+        assert_eq!(state.footstep_zones[0].sound_data, 45);
+        assert_eq!(state.footstep_zones[1].width, 0x7FE4);
+        assert_eq!(state.footstep_zone(4850, 4950), Some((38 << 8) | 45));
+        assert_eq!(state.footstep_zone(40000, 40000), Some(0x7F00));
+    }
+
+    #[test]
+    fn footstep_zones_fall_back_to_the_file_end() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, FOOTSTEP_SLOT, offset);
+        data.extend_from_slice(&0u16.to_le_bytes());
+        push_footstep_zone(&mut data, [1, 2, 3, 4, 5]);
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.footstep_zones.len(), 1);
+        assert_eq!(state.footstep_zones[0].base_z, 2);
+        assert_eq!(state.footstep_zone(1, 2), Some(5));
+    }
+
+    #[test]
+    fn no_footstep_pointer_means_no_zones() {
+        let data = build_rdt(0, &[]);
+        let state = parse(&data, ROOM_ID).unwrap();
+        assert!(state.footstep_zones.is_empty());
+        assert_eq!(state.footstep_zone(0, 0), None);
+    }
+
+    #[test]
+    fn rejects_out_of_bounds_footstep_pointer() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len() + 4;
+        set_ptr(&mut data, FOOTSTEP_SLOT, offset);
+
+        assert!(parse(&data, ROOM_ID).is_err());
+    }
+
     #[test]
     fn parses_two_camera_records() {
         let first = [0, 0, 13, 14, 15, 16, 17, 18, 19, 20, 21];
@@ -579,6 +691,7 @@ mod tests {
         assert!(state.collision.quadrants.iter().all(Vec::is_empty));
         assert!(state.zones.is_empty());
         assert!(state.walk_zones.is_empty());
+        assert!(state.footstep_zones.is_empty());
     }
 
     #[test]
@@ -867,6 +980,15 @@ mod tests {
         assert_eq!(zone.flags, 0);
         assert!(zone.contains(1700, 1800));
         assert!(!zone.contains(8000, 8100));
+
+        assert_eq!(state.footstep_zones.len(), 1);
+        let zone = state.footstep_zones[0];
+        assert_eq!(
+            (zone.base_x, zone.base_z, zone.width, zone.height),
+            (900, 1100, 8700, 9800)
+        );
+        assert_eq!(zone.sound_data, 45);
+        assert_eq!(state.footstep_zone(4850, 4950), Some((38 << 8) | 45));
     }
 
     #[test]

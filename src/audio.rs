@@ -1,23 +1,34 @@
-//! WAV parsing and looping music playback through SDL3.
+//! WAV parsing and a software mixer feeding one SDL3 stream.
 //!
-//! [`MusicPlayer`] owns the only SDL audio stream in the engine. It opens a
-//! default playback device, feeds a whole WAV `data` chunk to SDL, and
-//! re-queues that buffer whenever the stream runs low, matching the original
-//! whole-buffer loop. Every `sdl3_sys::audio` call is confined to this module.
+//! [`Mixer`] owns the only SDL audio stream in the engine. Every source is
+//! converted to 16-bit signed mono at 22050 Hz on load (8-bit samples are
+//! upsampled, other rates are linearly resampled). Each [`Mixer::update`]
+//! renders and queues interleaved stereo samples: one looping BGM voice plus a
+//! pool of one-shot voices, each with its own gain and pan. A missing device or
+//! a failed SDL call leaves the engine silent, never fatal.
 
-use std::ffi::{CStr, c_int};
+use std::ffi::c_int;
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
 
 use sdl3_sys::audio::{
-    SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_S16LE, SDL_AUDIO_U8, SDL_AudioSpec,
-    SDL_AudioStream, SDL_ClearAudioStream, SDL_DestroyAudioStream, SDL_GetAudioStreamQueued,
+    SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_S16LE, SDL_AudioSpec, SDL_AudioStream,
+    SDL_ClearAudioStream, SDL_DestroyAudioStream, SDL_GetAudioStreamQueued,
     SDL_OpenAudioDeviceStream, SDL_PutAudioStreamData, SDL_ResumeAudioStreamDevice,
-    SDL_SetAudioStreamFormat, SDL_SetAudioStreamGain,
 };
-use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::init::{SDL_INIT_AUDIO, SDL_InitSubSystem};
+
+/// Sample rate of every mixer voice and of the output stream.
+pub const SAMPLE_RATE: u32 = 22050;
+/// Maximum number of one-shot voices mixed at once.
+pub const MAX_SFX_VOICES: usize = 16;
+/// Frames the mixer keeps queued ahead of the device.
+const TARGET_QUEUED_FRAMES: usize = 2048;
+/// Upper bound on the frames rendered in one `update`.
+const MAX_RENDER_FRAMES: usize = 8192;
+/// Bytes per output frame: two 16-bit channels.
+const BYTES_PER_FRAME: usize = 4;
 
 /// PCM sample format of a parsed WAV file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,29 +149,213 @@ fn chunk_label(id: &[u8]) -> String {
     String::from_utf8_lossy(id).into_owned()
 }
 
-/// A looping music player backed by a single SDL audio stream.
-pub struct MusicPlayer {
-    stream: *mut SDL_AudioStream,
-    pcm: Vec<u8>,
-    gain: f32,
-    playing: bool,
+/// Convert a parsed WAV to signed 16-bit mono at [`SAMPLE_RATE`].
+///
+/// 8-bit unsigned samples are centered and scaled up by 8 bits; 16-bit
+/// samples are read little-endian. Multi-channel data is averaged down to
+/// mono, and any other sample rate is linearly resampled.
+fn to_mono(wav: &Wav) -> Vec<i16> {
+    let mut mono: Vec<i16> = match wav.format {
+        WavFormat::U8 => wav
+            .data
+            .iter()
+            .map(|&byte| (i16::from(byte) - 128) << 8)
+            .collect(),
+        WavFormat::S16Le => wav
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes(*chunk))
+            .collect(),
+    };
+
+    if wav.channels > 1 {
+        let channels = usize::from(wav.channels);
+        mono = mono
+            .chunks(channels)
+            .map(|frame| {
+                let sum: i32 = frame.iter().map(|&sample| i32::from(sample)).sum();
+                (sum / channels as i32) as i16
+            })
+            .collect();
+    }
+
+    if wav.sample_rate != SAMPLE_RATE {
+        mono = resample_linear(&mono, wav.sample_rate, SAMPLE_RATE);
+    }
+    mono
 }
 
-impl MusicPlayer {
+/// Linearly resample `input` from `from` Hz to `to` Hz.
+fn resample_linear(input: &[i16], from: u32, to: u32) -> Vec<i16> {
+    if input.is_empty() || from == 0 || to == 0 || from == to {
+        return input.to_vec();
+    }
+
+    let out_len = (input.len() as u64 * u64::from(to) / u64::from(from)) as usize;
+    (0..out_len)
+        .map(|index| {
+            let position = index as f64 * f64::from(from) / f64::from(to);
+            let base = position.floor() as usize;
+            let fraction = (position - base as f64) as f32;
+            let a = f32::from(input[base.min(input.len() - 1)]);
+            let b = f32::from(input[(base + 1).min(input.len() - 1)]);
+            (a + (b - a) * fraction) as i16
+        })
+        .collect()
+}
+
+/// Constant-power left and right gains for `pan`, where -1 is hard left, 1 is
+/// hard right and 0 is centered.
+fn pan_gains(pan: f32) -> (f32, f32) {
+    let pan = pan.clamp(-1.0, 1.0);
+    (((1.0 - pan) * 0.5).sqrt(), ((1.0 + pan) * 0.5).sqrt())
+}
+
+/// One playing buffer with its mix parameters.
+#[derive(Clone, Debug)]
+struct Voice {
+    pcm: Vec<i16>,
+    pos: usize,
+    gain: f32,
+    pan: f32,
+    looping: bool,
+}
+
+impl Voice {
+    fn new(pcm: Vec<i16>, gain: f32, pan: f32, looping: bool) -> Self {
+        Self {
+            pcm,
+            pos: 0,
+            gain,
+            pan,
+            looping,
+        }
+    }
+
+    /// Whether a one-shot voice has played its whole buffer.
+    fn finished(&self) -> bool {
+        !self.looping && self.pos >= self.pcm.len()
+    }
+}
+
+/// Device-independent mixer state: the voices and their mix parameters.
+struct MixState {
+    bgm: Option<Voice>,
+    bgm_gain: f32,
+    sfx: Vec<Voice>,
+}
+
+impl MixState {
+    fn new() -> Self {
+        Self {
+            bgm: None,
+            bgm_gain: 1.0,
+            sfx: Vec::new(),
+        }
+    }
+
+    /// Replace the BGM voice with `pcm`, keeping the current BGM volume.
+    fn play_bgm(&mut self, pcm: Vec<i16>) {
+        self.bgm = (!pcm.is_empty()).then(|| Voice::new(pcm, 1.0, 0.0, true));
+    }
+
+    fn stop_bgm(&mut self) {
+        self.bgm = None;
+    }
+
+    fn set_bgm_volume(&mut self, gain: f32) {
+        self.bgm_gain = gain.max(0.0);
+    }
+
+    /// Start a one-shot voice. When the pool is full the voice that has played
+    /// the most of its buffer is stolen.
+    fn play_sfx(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
+        if pcm.is_empty() {
+            return;
+        }
+        if self.sfx.len() >= MAX_SFX_VOICES
+            && let Some((index, _)) = self
+                .sfx
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, voice)| voice.pos)
+        {
+            self.sfx.remove(index);
+        }
+        self.sfx.push(Voice::new(pcm, gain.max(0.0), pan, false));
+    }
+
+    fn is_silent(&self) -> bool {
+        self.bgm.is_none() && self.sfx.is_empty()
+    }
+
+    /// Mix `frames` stereo frames and append them to `out`.
+    fn render(&mut self, frames: usize, out: &mut Vec<u8>) {
+        for _ in 0..frames {
+            let mut left = 0.0f32;
+            let mut right = 0.0f32;
+
+            if let Some(bgm) = &mut self.bgm
+                && bgm.pos < bgm.pcm.len()
+            {
+                let sample = f32::from(bgm.pcm[bgm.pos]) * self.bgm_gain;
+                let (l, r) = pan_gains(bgm.pan);
+                left += sample * l;
+                right += sample * r;
+                bgm.pos += 1;
+                if bgm.looping && bgm.pos >= bgm.pcm.len() {
+                    bgm.pos = 0;
+                }
+            }
+            if self.bgm.as_ref().is_some_and(Voice::finished) {
+                self.bgm = None;
+            }
+
+            for voice in &mut self.sfx {
+                if voice.pos >= voice.pcm.len() {
+                    continue;
+                }
+                let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
+                let (l, r) = pan_gains(voice.pan);
+                left += sample * l;
+                right += sample * r;
+                voice.pos += 1;
+            }
+            self.sfx.retain(|voice| !voice.finished());
+
+            push_sample(out, left);
+            push_sample(out, right);
+        }
+    }
+}
+
+/// Clamp and append one mixed sample as little-endian signed 16-bit.
+fn push_sample(out: &mut Vec<u8>, sample: f32) {
+    let sample = sample.clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+    out.extend_from_slice(&sample.to_le_bytes());
+}
+
+/// A software mixer backed by a single SDL audio stream.
+pub struct Mixer {
+    stream: *mut SDL_AudioStream,
+    state: MixState,
+}
+
+impl Mixer {
     /// Initialize SDL audio and open a default playback device.
     ///
     /// Returns `None` when the audio subsystem or a default playback device
-    /// cannot be opened; audio is optional and a failure is never fatal. The
-    /// device opens paused and [`MusicPlayer::play`] resumes it once a buffer
-    /// has been queued.
-    pub fn open() -> Option<MusicPlayer> {
+    /// cannot be opened; audio is optional and a failure is never fatal.
+    pub fn open() -> Option<Mixer> {
         if !unsafe { SDL_InitSubSystem(SDL_INIT_AUDIO) } {
             return None;
         }
         let spec = SDL_AudioSpec {
-            format: SDL_AUDIO_U8,
-            channels: 1,
-            freq: 22050,
+            format: SDL_AUDIO_S16LE,
+            channels: 2,
+            freq: SAMPLE_RATE as c_int,
         };
         let stream = unsafe {
             SDL_OpenAudioDeviceStream(
@@ -173,103 +368,102 @@ impl MusicPlayer {
         if stream.is_null() {
             return None;
         }
-        Some(MusicPlayer {
+        Some(Mixer {
             stream,
-            pcm: Vec::new(),
-            gain: 1.0,
-            playing: false,
+            state: MixState::new(),
         })
     }
 
-    /// Replace the current track with `wav` and start or restart playback.
-    ///
-    /// The stream's source format is set from the WAV header, so SDL does any
-    /// conversion to the device format; the bytes are never converted here.
-    pub fn play(&mut self, wav: Wav) -> Result<()> {
-        let spec = SDL_AudioSpec {
-            format: match wav.format {
-                WavFormat::U8 => SDL_AUDIO_U8,
-                WavFormat::S16Le => SDL_AUDIO_S16LE,
-            },
-            channels: c_int::from(wav.channels),
-            freq: c_int::try_from(wav.sample_rate)
-                .context("WAV sample rate does not fit in an SDL audio spec")?,
-        };
-        if !unsafe { SDL_SetAudioStreamFormat(self.stream, &spec, ptr::null()) } {
-            bail!("SDL_SetAudioStreamFormat failed: {}", sdl_error());
-        }
+    /// Replace the looping BGM track and start playing it.
+    pub fn play_bgm(&mut self, wav: Wav) -> Result<()> {
+        self.state.stop_bgm();
         if !unsafe { SDL_ClearAudioStream(self.stream) } {
-            bail!("SDL_ClearAudioStream failed: {}", sdl_error());
+            bail!("SDL_ClearAudioStream failed");
         }
-        self.pcm = wav.data;
-        self.push_buffer()?;
-        self.playing = true;
-        if !unsafe { SDL_ResumeAudioStreamDevice(self.stream) } {
-            bail!("SDL_ResumeAudioStreamDevice failed: {}", sdl_error());
-        }
-        self.set_volume(self.gain);
+        self.state.play_bgm(to_mono(&wav));
+        self.resume();
+        self.update();
         Ok(())
     }
 
-    /// Keep the loop fed; call once per frame.
-    ///
-    /// When less than one buffer is queued, the whole buffer is queued again,
-    /// so playback loops seamlessly and the queue oscillates between roughly
-    /// one and two buffers. No-op when nothing is playing.
+    /// Stop the BGM voice and clear anything still queued.
+    pub fn stop_bgm(&mut self) {
+        self.state.stop_bgm();
+        let _ = unsafe { SDL_ClearAudioStream(self.stream) };
+    }
+
+    /// Set the BGM gain; negative values are clamped to zero.
+    pub fn set_bgm_volume(&mut self, gain: f32) {
+        self.state.set_bgm_volume(gain);
+    }
+
+    /// Start a one-shot voice with `gain` and `pan` (-1 left, 1 right).
+    pub fn play_sfx(&mut self, wav: Wav, gain: f32, pan: f32) {
+        self.state.play_sfx(to_mono(&wav), gain, pan);
+        self.resume();
+        self.update();
+    }
+
+    /// Render and queue enough samples to keep the device fed; call once per
+    /// frame. A no-op when no voice is active.
     pub fn update(&mut self) {
-        if !self.playing || self.pcm.is_empty() {
+        if self.state.is_silent() {
             return;
         }
-        let Ok(len) = c_int::try_from(self.pcm.len()) else {
+        let queued = unsafe { SDL_GetAudioStreamQueued(self.stream) };
+        if queued < 0 {
+            return;
+        }
+        let queued_frames = queued as usize / BYTES_PER_FRAME;
+        let frames = TARGET_QUEUED_FRAMES
+            .saturating_sub(queued_frames)
+            .min(MAX_RENDER_FRAMES);
+        if frames == 0 {
+            return;
+        }
+
+        let mut pcm = Vec::with_capacity(frames * BYTES_PER_FRAME);
+        self.state.render(frames, &mut pcm);
+        let Ok(len) = c_int::try_from(pcm.len()) else {
             return;
         };
-        let queued = unsafe { SDL_GetAudioStreamQueued(self.stream) };
-        if queued >= 0 && queued < len {
-            let _ = self.push_buffer();
-        }
+        let _ = unsafe { SDL_PutAudioStreamData(self.stream, pcm.as_ptr().cast(), len) };
     }
 
-    /// Clear the stream and mark the player as stopped.
-    pub fn stop(&mut self) {
-        let _ = unsafe { SDL_ClearAudioStream(self.stream) };
-        self.pcm.clear();
-        self.playing = false;
-    }
-
-    /// Set the stream gain; negative values are clamped to zero.
-    pub fn set_volume(&mut self, gain: f32) {
-        let gain = gain.max(0.0);
-        self.gain = gain;
-        let _ = unsafe { SDL_SetAudioStreamGain(self.stream, gain) };
-    }
-
-    /// Whether a track is currently loaded and playing.
+    /// Whether a BGM track is loaded and playing.
     pub fn is_playing(&self) -> bool {
-        self.playing
+        self.state.bgm.is_some()
     }
 
-    /// Queue one copy of the stored buffer.
-    fn push_buffer(&mut self) -> Result<()> {
-        let len = c_int::try_from(self.pcm.len()).context("music buffer is too large for SDL")?;
-        if !unsafe { SDL_PutAudioStreamData(self.stream, self.pcm.as_ptr().cast(), len) } {
-            bail!("SDL_PutAudioStreamData failed: {}", sdl_error());
-        }
-        Ok(())
+    /// Alias for [`Mixer::play_bgm`], kept for the engine's music path.
+    pub fn play(&mut self, wav: Wav) -> Result<()> {
+        self.play_bgm(wav)
+    }
+
+    /// Alias for [`Mixer::stop_bgm`].
+    pub fn stop(&mut self) {
+        self.stop_bgm();
+    }
+
+    /// Alias for [`Mixer::set_bgm_volume`].
+    pub fn set_volume(&mut self, gain: f32) {
+        self.set_bgm_volume(gain);
+    }
+
+    /// Resume the device, ignoring failure: audio is best-effort.
+    fn resume(&self) {
+        let _ = unsafe { SDL_ResumeAudioStreamDevice(self.stream) };
     }
 }
 
-impl Drop for MusicPlayer {
+impl Drop for Mixer {
     fn drop(&mut self) {
         unsafe { SDL_DestroyAudioStream(self.stream) };
     }
 }
 
-/// Copy SDL's current error string.
-fn sdl_error() -> String {
-    unsafe { CStr::from_ptr(SDL_GetError()) }
-        .to_string_lossy()
-        .into_owned()
-}
+/// Compatibility alias for the engine's music path.
+pub type MusicPlayer = Mixer;
 
 #[cfg(test)]
 mod tests {
@@ -321,6 +515,22 @@ mod tests {
 
     fn parse_body(body: &[u8]) -> String {
         parse_wav(&riff(body)).unwrap_err().to_string()
+    }
+
+    fn s16_bytes(samples: &[i16]) -> Vec<u8> {
+        samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect()
+    }
+
+    fn out_samples(bytes: &[u8]) -> Vec<i16> {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes(*chunk))
+            .collect()
     }
 
     #[test]
@@ -441,21 +651,160 @@ mod tests {
     }
 
     #[test]
+    fn mixer_upsamples_u8_to_s16() {
+        let wav = parse_wav(&wav_bytes(WavFormat::U8, 1, 22050, &[0, 128, 255])).unwrap();
+        assert_eq!(to_mono(&wav), vec![-32768, 0, 32512]);
+    }
+
+    #[test]
+    fn mixer_averages_channels_to_mono() {
+        let data = s16_bytes(&[1000, 3000, -1000, -3000]);
+        let wav = parse_wav(&wav_bytes(WavFormat::S16Le, 2, 22050, &data)).unwrap();
+        assert_eq!(to_mono(&wav), vec![2000, -2000]);
+    }
+
+    #[test]
+    fn mixer_resamples_44100_to_22050() {
+        let data = s16_bytes(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        let wav = parse_wav(&wav_bytes(WavFormat::S16Le, 1, 44100, &data)).unwrap();
+        assert_eq!(to_mono(&wav), vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn mixer_pan_is_constant_power() {
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+        let (left, right) = pan_gains(0.0);
+        assert!((left - center).abs() < 1e-6, "{left}");
+        assert!((right - center).abs() < 1e-6, "{right}");
+
+        assert_eq!(pan_gains(-1.0), (1.0, 0.0));
+        assert_eq!(pan_gains(1.0), (0.0, 1.0));
+        assert_eq!(pan_gains(-2.0), (1.0, 0.0));
+        assert_eq!(pan_gains(2.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn mixer_applies_gain_and_pan() {
+        let mut state = MixState::new();
+        state.play_bgm(vec![1000, 1000]);
+        state.set_bgm_volume(0.5);
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        let expected = (1000.0 * 0.5 * std::f32::consts::FRAC_1_SQRT_2) as i16;
+        assert_eq!(out_samples(&out), vec![expected, expected]);
+    }
+
+    #[test]
+    fn mixer_bgm_loops_its_whole_buffer() {
+        let mut state = MixState::new();
+        state.play_bgm(vec![100, -100, 50]);
+        assert!(!state.is_silent());
+
+        let mut out = Vec::new();
+        state.render(3, &mut out);
+        assert_eq!(out_samples(&out), vec![70, 70, -70, -70, 35, 35]);
+        assert!(state.bgm.is_some());
+        assert_eq!(state.bgm.as_ref().unwrap().pos, 0);
+
+        state.stop_bgm();
+        assert!(state.is_silent());
+    }
+
+    #[test]
+    fn mixer_one_shots_expire() {
+        let mut state = MixState::new();
+        state.play_sfx(vec![100, 200], 1.0, 0.0);
+        assert_eq!(state.sfx.len(), 1);
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(state.sfx.len(), 1);
+        state.render(1, &mut out);
+        assert!(state.sfx.is_empty());
+        assert!(state.is_silent());
+
+        // Rendering after expiry is a silent no-op.
+        let mut out = Vec::new();
+        state.render(2, &mut out);
+        assert_eq!(out_samples(&out), vec![0; 4]);
+    }
+
+    #[test]
+    fn mixer_steals_the_most_played_voice() {
+        let mut state = MixState::new();
+        for index in 0..MAX_SFX_VOICES {
+            state.play_sfx(vec![index as i16; 8], 1.0, 0.0);
+        }
+        assert_eq!(state.sfx.len(), MAX_SFX_VOICES);
+
+        let mut out = Vec::new();
+        state.render(3, &mut out);
+        assert!(state.sfx.iter().all(|voice| voice.pos == 3));
+
+        state.play_sfx(vec![999; 8], 1.0, 0.0);
+        assert_eq!(state.sfx.len(), MAX_SFX_VOICES);
+        assert_eq!(state.sfx.last().unwrap().pcm[0], 999);
+        assert!(!state.sfx.iter().any(|voice| voice.pcm[0] == 15));
+    }
+
+    #[test]
+    fn mixer_empty_sources_are_ignored() {
+        let mut state = MixState::new();
+        state.play_bgm(Vec::new());
+        state.play_sfx(Vec::new(), 1.0, 0.0);
+        assert!(state.is_silent());
+    }
+
+    #[test]
     #[ignore = "requires an audio device or SDL dummy driver"]
     fn dummy_driver_plays_loops_and_stops() {
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
-        let mut player = MusicPlayer::open().expect("dummy audio device should open");
+        let mut player = Mixer::open().expect("dummy audio device should open");
 
         let data: Vec<u8> = (0..2205).map(|i| (i % 251) as u8).collect();
         let wav = parse_wav(&wav_bytes(WavFormat::U8, 1, 22050, &data)).unwrap();
-        player.play(wav).unwrap();
+        player.play_bgm(wav).unwrap();
         assert!(player.is_playing());
         assert!(unsafe { SDL_GetAudioStreamQueued(player.stream) } > 0);
 
         player.update();
         player.update();
-        player.set_volume(0.5);
-        player.stop();
+        player.set_bgm_volume(0.5);
+
+        let sfx = parse_wav(&wav_bytes(WavFormat::S16Le, 1, 22050, &[0u8; 64])).unwrap();
+        player.play_sfx(sfx, 0.25, 0.5);
+        player.update();
+
+        player.stop_bgm();
         assert!(!player.is_playing());
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn real_footstep_wav_parses_and_plays() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let sound = std::path::Path::new(&root).join("JPN/sound");
+        let entry = std::fs::read_dir(&sound)
+            .unwrap_or_else(|error| panic!("failed to list {}: {error}", sound.display()))
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("ft_wda.wav")
+            })
+            .unwrap_or_else(|| panic!("no ft_wdA.wav in {}", sound.display()));
+        let wav = parse_wav(&std::fs::read(entry.path()).unwrap()).unwrap();
+        assert_eq!(wav.sample_rate, SAMPLE_RATE);
+        assert!(wav.channels >= 1);
+
+        let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
+        let mut player = Mixer::open().expect("dummy audio device should open");
+        player.play_sfx(wav, 1.0, 0.0);
+        player.update();
+        player.update();
     }
 }

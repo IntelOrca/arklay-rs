@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::music;
 use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
+use crate::sfx;
 use crate::state::RoomId;
 use crate::{bmp, lzw, rdt, tim};
 
@@ -113,6 +114,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     progress.end_phase();
 
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
+    let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
@@ -122,6 +124,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
     println!("roommask: {mask_count} entries, {mask_bytes} bytes");
     println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
+    println!("se: {se_count} entries, {se_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
 
     let pack_bytes = writer.to_bytes()?;
@@ -137,7 +140,7 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     drop(file);
     progress.end_phase();
 
-    let entries = rdt_count + cut_count + mask_count + bgm_count + player_count;
+    let entries = rdt_count + cut_count + mask_count + bgm_count + se_count + player_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -209,6 +212,55 @@ fn copy_music(
     }
 
     progress.begin("bgm", files.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (path, source) in files {
+        let data =
+            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&path, data)
+            .with_context(|| format!("failed to add {path}"))?;
+        progress.advance(&path);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
+/// Add every sound effect named by the room sound tables.
+///
+/// The pack stores the canonical names lowercased (`se/ft_wda.wav`); the
+/// install's file names are matched case-insensitively and copied raw.
+fn copy_se(
+    sound: &Option<PathBuf>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(sound) = sound else {
+        return Ok((0, 0));
+    };
+
+    let index = index_dir(sound)?;
+    let mut files = Vec::new();
+    let mut missing = Vec::new();
+    for name in sfx::SE_NAMES {
+        let file = format!("{}.wav", name.to_ascii_lowercase());
+        match index.get(&file) {
+            Some(path) => files.push((format!("se/{file}"), path.clone())),
+            None => missing.push(format!("{}.WAV", name.to_ascii_uppercase())),
+        }
+    }
+    if !missing.is_empty() {
+        bail!(
+            "missing {} sound effect file(s) in {}: {}",
+            missing.len(),
+            sound.display(),
+            missing.join(", ")
+        );
+    }
+
+    progress.begin("se", files.len() as u64, "files");
     let mut count = 0usize;
     let mut bytes = 0usize;
     for (path, source) in files {
@@ -662,6 +714,20 @@ mod tests {
         fs::write(players.join("w10.emw"), b"emw1").unwrap();
     }
 
+    /// Every sound effect the room tables name, as mixed-case files like the
+    /// shipped install.
+    fn write_se_files(root: &Path) {
+        let sound = root.join("sound");
+        fs::create_dir_all(&sound).unwrap();
+        for name in sfx::SE_NAMES {
+            fs::write(
+                sound.join(format!("{}.WAV", name.to_ascii_uppercase())),
+                name.as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
     /// A minimal RDT with `cameras` zeroed camera records.
     fn rdt_bytes(cameras: u8) -> Vec<u8> {
         let mut data = vec![0u8; RDT_HEADER_LEN + RDT_CAMERA_LEN * usize::from(cameras)];
@@ -948,6 +1014,7 @@ mod tests {
         fs::write(root.path.join("sound/bgm_24a.wav"), b"wav24a").unwrap();
         fs::write(root.path.join("sound/BGM_02.WAV"), b"wav02").unwrap();
         fs::write(root.path.join("sound/not_bgm.wav"), b"other").unwrap();
+        write_se_files(&root.path);
 
         let out = root.path.join("out.akpak");
         convert_game(&root.path, &out).unwrap();
@@ -962,6 +1029,8 @@ mod tests {
         assert!(pack.contains("bgm/024_00.wav"));
         assert!(pack.contains("bgm/002.wav"));
         assert!(!pack.contains("bgm/000.wav"));
+        assert!(pack.contains("se/ft_wda.wav"));
+        assert_eq!(pack.read("se/ft_wda.wav").unwrap(), b"ft_wdA");
 
         assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
         assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
@@ -971,6 +1040,7 @@ mod tests {
         assert_eq!(count("roomcut/"), 2);
         assert_eq!(count("roommask/"), 0);
         assert_eq!(count("bgm/"), 3);
+        assert_eq!(count("se/"), 68);
         assert_eq!(count("player/"), 6);
         assert_eq!(
             pack.paths()
@@ -1121,10 +1191,13 @@ mod tests {
         // reuse the stage 1/2 pages.
         assert_eq!(count("roommask/"), 601);
         assert_eq!(count("bgm/"), 61);
+        assert_eq!(count("se/"), 68);
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
         assert!(pack.contains("roommask/100_000.bmp"));
         assert!(pack.contains("bgm/013.wav"));
+        assert!(pack.contains("se/ft_wda.wav"));
+        assert!(pack.contains("se/dr_wd01.wav"));
 
         // The converted page must be exactly the `objspr` pak decode.
         let pak = std::fs::read(root.join("JPN/objspr/OSP00000.pak")).unwrap();

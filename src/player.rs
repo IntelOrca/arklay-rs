@@ -88,6 +88,18 @@ pub struct Input {
     pub run: bool,
 }
 
+/// A footstep sound request emitted when a locomotion clip applies a contact
+/// frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Footstep {
+    /// Player position when the contact frame was applied.
+    pub pos: [i32; 3],
+    /// The contact frame: `0x08` or `0x16`.
+    pub frame: u8,
+    /// Entity sound type; walking, turning and running all use type 0.
+    pub sound_type: u8,
+}
+
 /// Which model file's keyframes drive the current clip.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ClipSource {
@@ -117,6 +129,8 @@ pub struct PlayerState {
     pub idle_phase: u8,
     /// Ticks spent in the idle behavior.
     pub idle_ticks: u32,
+    /// Footstep events emitted since the last [`PlayerState::take_footsteps`].
+    footsteps: Vec<Footstep>,
 }
 
 /// Spawn in the middle of the first walkable zone (or the origin when none).
@@ -142,6 +156,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         behavior: BEHAVIOR_IDLE,
         idle_phase: 0,
         idle_ticks: 0,
+        footsteps: Vec::new(),
     }
 }
 
@@ -184,6 +199,7 @@ pub fn update(
     let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
     player.pos = resolve_collision(&room.collision, prev, proposed, player.radius);
 
+    let frame_before = player.anim.display_frame;
     if behavior == BEHAVIOR_IDLE {
         player.idle_ticks = player.idle_ticks.saturating_add(1);
         match player.idle_phase {
@@ -207,6 +223,7 @@ pub fn update(
     } else {
         player.advance(emd_clips, emw_clips);
     }
+    player.emit_footsteps(behavior, frame_before);
 }
 
 impl PlayerState {
@@ -220,6 +237,31 @@ impl PlayerState {
             ClipSource::Emd => self.anim.update(emd_clips),
             ClipSource::Emw => self.anim.update(emw_clips),
         }
+    }
+
+    /// Emit a footstep when this tick applied a contact frame of a walk, turn
+    /// or run clip. The original fires on frames `0x08` and `0x16`, once per
+    /// contact even when the frame is held for more than one tick.
+    fn emit_footsteps(&mut self, behavior: u8, frame_before: usize) {
+        if self.clip_source != ClipSource::Emw
+            || !matches!(behavior, BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_RUN)
+        {
+            return;
+        }
+
+        let frame = self.anim.display_frame;
+        if frame != frame_before && (frame == 0x08 || frame == 0x16) {
+            self.footsteps.push(Footstep {
+                pos: self.pos,
+                frame: frame as u8,
+                sound_type: 0,
+            });
+        }
+    }
+
+    /// Drain the footstep events emitted since the last call.
+    pub fn take_footsteps(&mut self) -> Vec<Footstep> {
+        std::mem::take(&mut self.footsteps)
     }
 }
 
@@ -612,6 +654,7 @@ mod tests {
             behavior: BEHAVIOR_IDLE,
             idle_phase: 0,
             idle_ticks: 0,
+            footsteps: Vec::new(),
         }
     }
 
@@ -1089,5 +1132,131 @@ mod tests {
         );
         assert_eq!(jill.pos, [0, 0, 0]);
         assert_eq!(jill.radius, JILL_RADIUS);
+    }
+
+    fn step_events(
+        player: &mut PlayerState,
+        room: &RoomState,
+        clips: &[Clip],
+        input: Input,
+        ticks: usize,
+    ) -> Vec<Footstep> {
+        let mut events = Vec::new();
+        for _ in 0..ticks {
+            step(player, room, clips, input);
+            events.extend(player.take_footsteps());
+        }
+        events
+    }
+
+    #[test]
+    fn walking_emits_footsteps_on_contact_frames() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut player = player_at(1000, 1000);
+        let input = Input {
+            up: true,
+            ..Input::default()
+        };
+
+        let events = step_events(&mut player, &room, &clips, input, 30);
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x08);
+        assert_eq!(events[1].frame, 0x16);
+        assert!(events.iter().all(|event| event.sound_type == 0));
+        assert!(events.iter().all(|event| event.pos[1] == 0));
+    }
+
+    #[test]
+    fn turning_and_running_emit_footsteps() {
+        let room = RoomState::default();
+        let clips = clips();
+
+        let mut turning = player_at(1000, 1000);
+        let events = step_events(
+            &mut turning,
+            &room,
+            &clips,
+            Input {
+                left: true,
+                ..Input::default()
+            },
+            30,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x08);
+        assert_eq!(events[1].frame, 0x16);
+
+        let mut running = player_at(1000, 1000);
+        let events = step_events(
+            &mut running,
+            &room,
+            &clips,
+            Input {
+                up: true,
+                run: true,
+                ..Input::default()
+            },
+            30,
+        );
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x08);
+        assert_eq!(events[1].frame, 0x16);
+    }
+
+    #[test]
+    fn backward_walk_does_not_emit_footsteps() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut player = player_at(1000, 1000);
+        let input = Input {
+            down: true,
+            ..Input::default()
+        };
+
+        let events = step_events(&mut player, &room, &clips, input, 30);
+
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(player.clip_source, ClipSource::Emd);
+    }
+
+    #[test]
+    fn a_held_contact_frame_emits_one_footstep() {
+        let room = RoomState::default();
+        let mut clips = clips();
+        clips[WALK_CLIP].frames[0x08].timing = 2;
+        let mut player = player_at(1000, 1000);
+        let input = Input {
+            up: true,
+            ..Input::default()
+        };
+
+        let mut events = Vec::new();
+        for _ in 0..30 {
+            step(&mut player, &room, &clips, input);
+            events.extend(player.take_footsteps());
+        }
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x08);
+
+        // Run again and check the tick that holds frame 0x08 emits nothing.
+        let mut player = player_at(1000, 1000);
+        let mut ticks = 0;
+        loop {
+            step(&mut player, &room, &clips, input);
+            let taken = player.take_footsteps();
+            if !taken.is_empty() {
+                assert_eq!(taken[0].frame, 0x08);
+                break;
+            }
+            ticks += 1;
+            assert!(ticks < 30, "the 0x08 contact frame was never applied");
+        }
+        step(&mut player, &room, &clips, input);
+        assert!(
+            player.take_footsteps().is_empty(),
+            "the held contact frame repeated its footstep"
+        );
     }
 }
