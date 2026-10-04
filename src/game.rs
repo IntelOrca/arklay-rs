@@ -8,10 +8,12 @@
 //!
 //! The room action table is the interaction layer: scripts register zones with
 //! `door_aot_set`, `aot_set` and `item_aot_set`, and each tick the engine hands
-//! the player position and the action key to [`GameState::interact`]. Items and
-//! doors act for real; the menu-driven kinds record a placeholder interaction.
-//! Entities, models and effects stay recorded placeholders until their systems
-//! exist.
+//! the player position and facing to [`GameState::interact`]. Entries are probed
+//! with the original's masks: walk-in zones fire every frame, action-key zones
+//! only while the key is held, at a point 600 units in front of the player.
+//! Items and doors act for real; the menu-driven kinds record a placeholder
+//! interaction. Entities, models and effects stay recorded placeholders until
+//! their systems exist.
 
 use std::collections::BTreeMap;
 
@@ -42,6 +44,26 @@ const MOTION_DEFAULT_STEP: u8 = 0xC0;
 const MOTION_DEFAULT_PITCH_STEP: u8 = 0x40;
 /// Placeholder message id displayed by a door that refuses to open.
 pub const LOCKED_MESSAGE: u8 = 200;
+/// Message shown while a key turns in a lock.
+const MESSAGE_KEY_TURN: u8 = 0xC3;
+/// Message shown by a `0xFE` door (only opens from the far side).
+const MESSAGE_OTHER_SIDE: u8 = 0xD4;
+/// Message shown by a door locked for good (`0xFF` key).
+const MESSAGE_LOCKED_KEY: u8 = 0xD3;
+/// Message shown when Jill has no lockpick for a sword-key lock.
+const MESSAGE_NO_LOCKPICK: u8 = 0xD5;
+/// Message shown by a door restricted to the other character.
+const MESSAGE_WRONG_CHARACTER: u8 = 0xD6;
+/// Item id of the sword key, which Jill may replace with her lockpick.
+const ITEM_SWORD_KEY: u8 = 0x33;
+/// Scenario flag raised when Jill has the lockpick.
+const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
+/// Scenario flag selecting the second-visit stage variants.
+const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
+/// Scenario/state flag bank index.
+const BANK_SCENARIO: u8 = 0;
+/// Door lock flag bank index.
+const BANK_LOCKS: u8 = 2;
 /// `room_check_actions` index of the item pickup handler.
 const HANDLER_ITEM: u8 = 4;
 /// `room_check_actions` index of the key-pickup handler.
@@ -205,7 +227,8 @@ impl RoomActionKind {
 ///
 /// `params` is opaque per kind:
 /// - generic actions keep `[handler, flags, word0 (LE), word1, word2]`;
-/// - doors keep `[lock, next_room, key, sub_type, open, pad0, latch, door_type]`;
+/// - doors keep `[lock, next_room, key, sub_type, direction, sfx, door_type,
+///   camera]`;
 /// - items keep `[item, quantity, model, sca_parent, x (LE), z (LE)]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RoomAction {
@@ -268,24 +291,42 @@ impl RoomAction {
 }
 
 /// A door record built by `door_aot_set`.
+///
+/// Field order mirrors the 24-byte record the original stores from the
+/// instruction operands: zone x/z/width/depth, door direction, sfx, door type,
+/// camera byte, lock descriptor, destination, entry position, entry angle,
+/// required item and probe flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Door {
     /// Room action slot.
     pub slot: u8,
     /// Interaction box: `x`, `z`, `width`, `depth`.
     pub zone: [i16; 4],
-    /// Room number within the current stage the door leads to.
-    pub next_room: u8,
-    /// Spawn position in the target room.
-    pub next_pos: [i16; 3],
-    /// Spawn facing in the target room.
-    pub next_angle: i16,
+    /// Door direction byte; selects the opening animation arm.
+    pub direction: u8,
+    /// Door sound effect id.
+    pub sfx: u8,
+    /// Door type: indexes the animation data (stairs, elevators, doors...).
+    pub door_type: u8,
+    /// Entry camera byte: bit `0x80` camera-only, bit `0x40` silent, low six
+    /// bits the animation's entry camera.
+    pub camera: u8,
     /// Lock descriptor: bit `0x80` start locked, bit `0x40` one character,
     /// low six bits the lock flag index in bank 2.
     pub lock: u8,
+    /// Room number within the destination stage; values `>= 0x20` also change
+    /// stage.
+    pub next_room: u8,
+    /// Spawn position in the target room: X and Z are zero-extended room
+    /// coordinates, Y is a signed height.
+    pub next_pos: [i32; 3],
+    /// Spawn facing in the target room.
+    pub next_angle: i16,
     /// Item needed to open the door.
     pub key: u8,
-    /// Sub-type byte (the door entry's probe flags).
+    /// Probe flag byte: bit `0x80` needs the action key, bit `0x40` probes the
+    /// player position instead of the forward reach point, low bits select
+    /// which per-frame probe masks can fire it.
     pub sub_type: u8,
 }
 
@@ -1031,18 +1072,36 @@ impl GameState {
         (self.item_count(search), count)
     }
 
-    /// Probe the room action table for `pos`; only acts when the action key is
-    /// held. Item and door actions act for real, the menu-driven kinds record a
-    /// placeholder interaction.
-    pub fn interact(&mut self, pos: [i32; 3], action: bool) {
-        if !action {
-            return;
-        }
+    /// Probe the room action table for the player at `pos` facing `angle`.
+    ///
+    /// Mirrors the original's two probes: entries without probe bit `0x80` are
+    /// tested every frame when their low flag bits intersect the frame masks
+    /// (`1` and `4`), and entries with `0x80` only when the action key is held
+    /// and their bit `0x01` is set. Probe bit `0x40` tests the player position
+    /// itself; otherwise a point 600 units in front is tested. Only the first
+    /// action-key entry that matches fires, as in the original. Item and door
+    /// actions act for real, the menu-driven kinds record a placeholder.
+    pub fn interact(&mut self, pos: [i32; 3], angle: u16, action: bool) {
+        let (dx, dz) = crate::player::reach_offset(angle);
+        let reach = [pos[0] + dx, pos[1], pos[2] + dz];
+        let mut action_fired = false;
         for slot in 0..ROOM_ACTION_SLOTS {
             let Some(room_action) = self.room_actions[slot] else {
                 continue;
             };
-            if room_action.handler == 0 || !room_action.contains(pos[0], pos[2]) {
+            if room_action.handler == 0 {
+                continue;
+            }
+            let flags = room_action.flags;
+            if flags & 0x80 != 0 {
+                if !action || flags & 0x01 == 0 || action_fired {
+                    continue;
+                }
+            } else if flags & 0x01 == 0 && flags & 0x04 == 0 {
+                continue;
+            }
+            let probe = if flags & 0x40 != 0 { pos } else { reach };
+            if !room_action.contains(probe[0], probe[2]) {
                 continue;
             }
             match room_action.kind {
@@ -1052,17 +1111,20 @@ impl GameState {
                 RoomActionKind::Item => {
                     self.pick_up(room_action.slot);
                 }
+                RoomActionKind::Event => {
+                    self.start_room_event(room_action.slot);
+                }
                 RoomActionKind::Message => {
                     let id = room_action.param_word(0);
                     self.show_message(id as u8, room_action.param_word(1));
                     self.record_interaction(room_action.slot, room_action.kind, Some(id));
                 }
-                RoomActionKind::ItemBox
-                | RoomActionKind::Event
-                | RoomActionKind::Typewriter
-                | RoomActionKind::Other => {
+                RoomActionKind::ItemBox | RoomActionKind::Typewriter | RoomActionKind::Other => {
                     self.record_interaction(room_action.slot, room_action.kind, None);
                 }
+            }
+            if flags & 0x80 != 0 {
+                action_fired = true;
             }
             if self.transition.is_some() {
                 break;
@@ -1090,12 +1152,31 @@ impl GameState {
                 self.record_interaction(slot, RoomActionKind::Message, Some(id));
                 true
             }
-            HANDLER_ITEMBOX | HANDLER_EVENT | HANDLER_TYPEWRITER => {
+            HANDLER_EVENT => self.start_room_event(slot),
+            HANDLER_ITEMBOX | HANDLER_TYPEWRITER => {
                 self.record_interaction(slot, action.kind, None);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Start the event script named by a room-event action (handler 9).
+    ///
+    /// The action's first word is the requested event slot (`>= 8` means "any
+    /// free slot") and its second word the event index, matching the original's
+    /// `ScdEventEntry_Create(entry[2], entry[4])`.
+    pub fn start_room_event(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.handler != HANDLER_EVENT {
+            return false;
+        }
+        let event_slot = action.params[2];
+        let event = action.params[4];
+        self.pending_events.push((event_slot, event));
+        true
     }
 
     /// Pick up the item action in `slot`: add to the inventory, record it and
@@ -1121,45 +1202,89 @@ impl GameState {
         true
     }
 
-    /// Run the door in `slot`: transition when open, otherwise show the locked
-    /// placeholder. Uses the lock flag bank (bank 2) as the original does.
+    /// Run the door in `slot`, with the original's full interaction flow:
+    /// character restriction, lock flag, required key (with Jill's lockpick
+    /// substituting for the sword key) and the special `0xFE`/`0xFF` keys.
+    ///
+    /// A key turn only raises the lock flag and plays the message; the door
+    /// transitions on the next probe, exactly as in the original. Returns
+    /// whether a room transition was requested.
     pub fn try_door(&mut self, slot: u8) -> bool {
         let Some(door) = self.doors.get(usize::from(slot)).copied().flatten() else {
             return false;
         };
-        if self.door_locked(&door) {
-            self.show_message(LOCKED_MESSAGE, 0xFF);
+        // Some doors are barred to one of the two characters.
+        if door.lock & 0x40 != 0 && self.id.player_flag & 1 == 1 {
+            self.show_message(MESSAGE_WRONG_CHARACTER, 0xFF);
             return false;
         }
-        if door.next_room == 0xFF || door.next_room > RoomId::MAX_ROOM {
+        // Unlocked outright, or its lock flag is already raised.
+        if door.lock & 0x80 == 0 || self.flag_test(BANK_LOCKS, door.lock & 0x3F, false) {
+            return self.begin_transition(&door);
+        }
+        let need = door.key;
+        if need == 0xFE {
+            // Opens from the far side: show the message, then raise the flag so
+            // the next probe walks through.
+            self.show_message(MESSAGE_OTHER_SIDE, 0xFF);
+            self.apply_flag(BANK_LOCKS, door.lock & 0x3F, 0);
             return false;
         }
-        self.transition = Some(RoomTransition {
-            target: RoomId {
+        if need == 0xFF {
+            self.show_message(MESSAGE_LOCKED_KEY, 0xFF);
+            return false;
+        }
+        if need == ITEM_SWORD_KEY && self.id.player_flag & 1 == 1 {
+            // Jill substitutes her lockpick for the sword key, but only once
+            // she has picked it up.
+            if !self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, false) {
+                self.show_message(MESSAGE_NO_LOCKPICK, 0xFF);
+                return false;
+            }
+        } else if !self.has_item(need) {
+            // "It's locked": keyed message indexed from the sword key.
+            let index = need.wrapping_sub(ITEM_SWORD_KEY).min(10);
+            self.show_message(LOCKED_MESSAGE.saturating_add(index), 0xFF);
+            return false;
+        } else {
+            // The key is consumed by the turn.
+            self.remove_item(need);
+        }
+        self.show_message(MESSAGE_KEY_TURN, 0xFF);
+        self.apply_flag(BANK_LOCKS, door.lock & 0x3F, 0);
+        false
+    }
+
+    /// Arm the transition described by `door`, decoding the destination's
+    /// stage change when the room byte is `>= 0x20`.
+    fn begin_transition(&mut self, door: &Door) -> bool {
+        let dest = door.next_room;
+        if dest == 0xFF {
+            return false;
+        }
+        let target = if dest < 0x20 {
+            RoomId {
                 stage: self.id.stage,
-                room: door.next_room,
+                room: dest,
                 player_flag: self.id.player_flag,
-            },
-            pos: [
-                i32::from(door.next_pos[0]),
-                i32::from(door.next_pos[1]),
-                i32::from(door.next_pos[2]),
-            ],
+            }
+        } else {
+            let mut stage = (dest >> 5) - 1;
+            if stage < 2 && self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_STAGE_VARIANT, false) {
+                stage += 5;
+            }
+            RoomId {
+                stage: stage + 1,
+                room: dest & 0x1F,
+                player_flag: self.id.player_flag,
+            }
+        };
+        self.transition = Some(RoomTransition {
+            target,
+            pos: door.next_pos,
             angle: door.next_angle as u16 & 0x0FFF,
         });
         true
-    }
-
-    fn door_locked(&self, door: &Door) -> bool {
-        match door.lock {
-            // UNLOCKED, LOCK and LOCKED key states: `LOCK` needs the matching
-            // key item, which the inventory key system does not model yet.
-            0 => false,
-            0xFE | 0xFF => true,
-            // Any other value is a lock flag index: the door is open once the
-            // flag has been set (the scripts set it after using the key).
-            lock => !self.flag_test(2, lock & 0x3F, false),
-        }
     }
 
     fn show_message(&mut self, id: u8, pause: u16) {
@@ -1213,10 +1338,11 @@ impl<'a> ScdGameHost<'a> {
         self.state
     }
 
-    /// The engine's interaction check: probe the room action table at `pos`
-    /// when the action key is held.
-    pub fn interact(&mut self, pos: [i32; 3], action: bool) {
-        self.state.interact(pos, action);
+    /// The engine's interaction check: probe the room action table for the
+    /// player at `pos` facing `angle`; only entries matching the original's
+    /// probe masks act.
+    pub fn interact(&mut self, pos: [i32; 3], angle: u16, action: bool) {
+        self.state.interact(pos, angle, action);
     }
 
     fn placeholder(&mut self, op: &Op) -> StepResult {
@@ -1375,11 +1501,16 @@ impl ScdHost for ScdGameHost<'_> {
                 let door = Door {
                     slot,
                     zone,
+                    direction: operand_u8(operands, 5),
+                    sfx: operand_u8(operands, 6),
+                    door_type: operand_u8(operands, 7),
+                    camera: operand_u8(operands, 8),
                     next_room: operand_u8(operands, 10),
+                    // The original zero-extends X and Z and sign-extends Y.
                     next_pos: [
-                        operand_i16(operands, 11),
-                        operand_i16(operands, 12),
-                        operand_i16(operands, 13),
+                        i32::from(operand_i16(operands, 11) as u16),
+                        i32::from(operand_i16(operands, 12)),
+                        i32::from(operand_i16(operands, 13) as u16),
                     ],
                     next_angle: operand_i16(operands, 14),
                     lock: operand_u8(operands, 9),
@@ -1445,6 +1576,7 @@ impl ScdHost for ScdGameHost<'_> {
                 {
                     action.handler = handler;
                     action.flags = flags;
+                    action.kind = RoomActionKind::from_sce(handler);
                     action.params = action_params(handler, flags, operands, 3);
                 }
                 StepResult::Continue
@@ -1461,9 +1593,18 @@ impl ScdHost for ScdGameHost<'_> {
                 {
                     action.handler = handler;
                     action.flags = flags;
+                    action.kind = RoomActionKind::from_sce(handler);
                     action.params[0] = handler;
                     action.params[1] = flags;
                 }
+                StepResult::Continue
+            }
+            // `evt_exec`: queue an event script. The event VM starts it on the
+            // next tick, exactly like the original's `cmd_scd_event_create`.
+            0x14 => {
+                let slot = operand_u8(operands, 1);
+                let event = operand_u8(operands, 2);
+                self.state.pending_events.push((slot, event));
                 StepResult::Continue
             }
             0x24 => {
@@ -1652,17 +1793,7 @@ impl ScdHost for ScdGameHost<'_> {
             }
             mnemonic if mnemonic.starts_with("act_") => self.state.apply_actor_op(op, operands),
             mnemonic if mnemonic.starts_with("tw_") => self.state.apply_tween_op(op, operands),
-            // evt_exec: pad, slot, script index. `slot` 8 or more means "first
-            // free slot"; the engine maps that when it starts the event.
-            _ => match op.op {
-                0x14 => {
-                    let slot = operand_u8(operands, 1);
-                    let event = operand_u8(operands, 2);
-                    self.state.pending_events.push((slot, event));
-                    StepResult::Continue
-                }
-                _ => self.placeholder(op),
-            },
+            _ => self.placeholder(op),
         }
     }
 
@@ -2389,6 +2520,10 @@ mod tests {
         Door {
             slot: 0,
             zone: [0, 0, 100, 100],
+            direction: 0,
+            sfx: 0,
+            door_type: 0,
+            camera: 0,
             next_room,
             next_pos: [555, 0, 666],
             next_angle: 1024,
@@ -2516,15 +2651,31 @@ mod tests {
     }
 
     #[test]
+    fn aot_reset_to_event_queues_the_script() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_room_action(op(0x0D), &operands(&[0, 0, 0, 10, 10, 9, 0xC1, 9, 7, 0]));
+            host.on_room_action(op(0x12), &operands(&[0, 9, 0xC1, 9, 7, 0]));
+        }
+        let action = state.room_actions[0].expect("event action");
+        assert_eq!(action.kind, RoomActionKind::Event);
+        state.interact([5, 0, 5], 0, true);
+        assert_eq!(state.pending_events, vec![(9, 7)]);
+    }
+
+    #[test]
     fn picked_up_items_stay_taken() {
         let mut state = game();
-        let item_operands = [3, 0, 0, 100, 100, 0x42, 1, 1, 0xFF, 50, 0, 50, 0, 23, 0, 0];
+        let item_operands = [
+            3, 0, 0, 100, 100, 0x42, 1, 1, 0xFF, 50, 0, 50, 0, 23, 0x81, 0,
+        ];
         {
             let mut host = ScdGameHost::new(&mut state);
             host.on_item(op(0x18), &operands(&item_operands));
         }
         assert!(state.room_actions[3].is_some());
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.last_picked_item, Some(0x42));
         assert!(
             state.flag_test(7, 23, false),
@@ -2571,13 +2722,26 @@ mod tests {
         state.room_actions[0] = Some(item_action(0, 10, 3, [0, 0, 100, 100]));
         state.room_actions[1] = Some(item_action(1, 10, 2, [0, 0, 100, 100]));
 
-        state.interact([50, 0, 50], false);
+        state.interact([-550, 0, 50], 0, false);
         assert!(
             state.inventory.is_empty(),
             "no pickup without the action key"
         );
 
-        state.interact([50, 0, 50], true);
+        // Action-key entries fire the first match only, as in the original;
+        // the next press reaches the second stack.
+        state.interact([-550, 0, 50], 0, true);
+        assert_eq!(
+            state.inventory,
+            vec![InventoryItem {
+                id: 10,
+                quantity: 3
+            }]
+        );
+        assert_eq!(state.last_picked_item, Some(10));
+        assert_eq!(state.item_events, vec![10]);
+
+        state.interact([-550, 0, 50], 0, true);
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
@@ -2585,11 +2749,10 @@ mod tests {
                 quantity: 5
             }]
         );
-        assert_eq!(state.last_picked_item, Some(10));
         assert_eq!(state.item_events, vec![10, 10]);
         assert!(state.room_actions.iter().all(Option::is_none));
 
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert_eq!(
             state.inventory[0].quantity, 5,
             "consumed actions do not fire again"
@@ -2609,7 +2772,7 @@ mod tests {
             params: [0; 8],
             room_items_flag: 0xFF,
         });
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert!(state.inventory.is_empty());
         assert_eq!(
             state.last_interaction,
@@ -2634,7 +2797,7 @@ mod tests {
             params: [HANDLER_MESSAGE, 0x81, 170, 0, 79, 0, 0, 0],
             room_items_flag: 0xFF,
         });
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.message.id, Some(170));
         assert_eq!(state.message.pause, 79);
         assert!(state.message.active);
@@ -2649,26 +2812,36 @@ mod tests {
     }
 
     #[test]
-    fn locked_door_blocks_and_unlock_opens_it() {
-        let unlock = 0x80 | 5;
+    fn locked_door_needs_the_key_and_unlocks_for_good() {
         let mut state = game();
-        state.room_actions[0] = Some(door_action(door(1, unlock)));
-        state.doors[0] = Some(door(1, unlock));
+        let mut locked = door(1, 0x80 | 5);
+        locked.key = 0x34;
+        state.room_actions[0] = Some(door_action(locked));
+        state.doors[0] = Some(locked);
 
-        state.interact([50, 0, 50], true);
+        // Without the key: "it's locked" (message 200 + key index).
+        state.interact([-550, 0, 50], 0, true);
         assert!(state.transition.is_none());
-        assert_eq!(state.message.id, Some(LOCKED_MESSAGE));
+        assert_eq!(state.message.id, Some(LOCKED_MESSAGE + 1));
         assert!(state.message.active);
 
-        assert!(state.apply_flag(2, 5, 0));
-        state.interact([50, 0, 50], true);
+        // With the key: the key turns, is consumed and raises the lock flag.
+        state.add_item(0x34, 1);
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(0xC3));
+        assert!(!state.has_item(0x34), "the key is consumed by the turn");
+        assert!(state.flag_test(2, 5, false));
+
+        // The next probe walks through.
+        state.interact([-550, 0, 50], 0, true);
         assert_eq!(
             state.transition,
             Some(RoomTransition {
                 target: RoomId {
-                    stage: state.id.stage,
+                    stage: 1,
                     room: 1,
-                    player_flag: state.id.player_flag,
+                    player_flag: 1,
                 },
                 pos: [555, 0, 666],
                 angle: 1024,
@@ -2677,14 +2850,157 @@ mod tests {
     }
 
     #[test]
+    fn door_lock_flag_already_set_opens_without_a_key() {
+        let mut state = game();
+        let locked = door(1, 0x80 | 5);
+        state.room_actions[0] = Some(door_action(locked));
+        state.doors[0] = Some(locked);
+
+        assert!(state.apply_flag(2, 5, 0));
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_some());
+    }
+
+    #[test]
+    fn unlocked_door_with_a_character_restriction() {
+        // Lock byte 0x40: bit 7 clear, so the door is not locked, but only
+        // Chris may use it. The old code treated the low bits as a lock flag.
+        let mut state = game();
+        let restricted = door(1, 0x40);
+        state.room_actions[0] = Some(door_action(restricted));
+        state.doors[0] = Some(restricted);
+
+        // Jill (player flag 1) is turned away.
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(0xD6));
+
+        // Chris walks through.
+        state.id.player_flag = 0;
+        state.transition = None;
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_some());
+    }
+
+    #[test]
+    fn sword_key_lock_accepts_jills_lockpick() {
+        let mut state = game();
+        let mut locked = door(1, 0x80 | 7);
+        locked.key = ITEM_SWORD_KEY;
+        state.room_actions[0] = Some(door_action(locked));
+        state.doors[0] = Some(locked);
+
+        // Jill without the lockpick: the special "no lockpick" message.
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(0xD5));
+
+        // With the scenario flag: the lock turns without an inventory item.
+        assert!(state.apply_flag(0, SCENARIO_FLAG_HAS_LOCKPICK, 0));
+        state.interact([-550, 0, 50], 0, true);
+        assert_eq!(state.message.id, Some(0xC3));
+        assert!(state.flag_test(2, 7, false));
+    }
+
+    #[test]
+    fn other_side_key_unlocks_on_the_first_probe() {
+        let mut state = game();
+        let mut locked = door(1, 0x80 | 9);
+        locked.key = 0xFE;
+        state.room_actions[0] = Some(door_action(locked));
+        state.doors[0] = Some(locked);
+
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(0xD4));
+        assert!(state.flag_test(2, 9, false));
+
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_some());
+    }
+
+    #[test]
+    fn dead_key_door_stays_locked() {
+        let mut state = game();
+        let mut locked = door(1, 0x80 | 9);
+        locked.key = 0xFF;
+        state.room_actions[0] = Some(door_action(locked));
+        state.doors[0] = Some(locked);
+
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+        assert_eq!(state.message.id, Some(MESSAGE_LOCKED_KEY));
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_none());
+    }
+
+    #[test]
     fn unlocked_door_transitions_without_a_flag() {
         let mut state = game();
         state.room_actions[0] = Some(door_action(door(0x1F, 0)));
         state.doors[0] = Some(door(0x1F, 0));
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         let transition = state.transition.expect("transition");
         assert_eq!(transition.target.room, 0x1F);
         assert_eq!(transition.pos, [555, 0, 666]);
+    }
+
+    #[test]
+    fn cross_stage_door_destination_encoding() {
+        let mut state = game();
+        // 0x41 = stage index (0x41 >> 5) - 1 = 1 -> stage 2, room 1.
+        state.room_actions[0] = Some(door_action(door(0x41, 0)));
+        state.doors[0] = Some(door(0x41, 0));
+        state.interact([-550, 0, 50], 0, true);
+        let target = state.transition.expect("transition").target;
+        assert_eq!(target.stage, 2);
+        assert_eq!(target.room, 1);
+
+        // With the stage-variant scenario flag, a stage 0/1 destination maps to
+        // the +5 return variants: 0x20 -> stage index 5 -> stage digit 6.
+        let mut state = game();
+        assert!(state.apply_flag(0, SCENARIO_FLAG_STAGE_VARIANT, 0));
+        state.room_actions[0] = Some(door_action(door(0x20, 0)));
+        state.doors[0] = Some(door(0x20, 0));
+        state.interact([-550, 0, 50], 0, true);
+        let target = state.transition.expect("transition").target;
+        assert_eq!(target.stage, 6);
+        assert_eq!(target.room, 0);
+    }
+
+    #[test]
+    fn door_probe_flags_select_the_trigger() {
+        // 0x41: probed every frame at the player position, no action key.
+        let mut state = game();
+        let mut auto = door(1, 0);
+        auto.sub_type = 0x41;
+        state.room_actions[0] = Some(door_action(auto));
+        state.doors[0] = Some(auto);
+        state.interact([50, 0, 50], 0, false);
+        assert!(state.transition.is_some(), "0x41 doors trigger on walk-in");
+
+        // 0xC1: action key, player position (not the reach point).
+        let mut state = game();
+        let mut pos_key = door(1, 0);
+        pos_key.sub_type = 0xC1;
+        state.room_actions[0] = Some(door_action(pos_key));
+        state.doors[0] = Some(pos_key);
+        state.interact([-550, 0, 50], 0, true);
+        assert!(
+            state.transition.is_none(),
+            "the player, not the reach point, must be in the zone"
+        );
+        state.interact([50, 0, 50], 0, true);
+        assert!(state.transition.is_some());
+
+        // 0x00: neither probe fires it.
+        let mut state = game();
+        let mut dead = door(1, 0);
+        dead.sub_type = 0x00;
+        state.room_actions[0] = Some(door_action(dead));
+        state.doors[0] = Some(dead);
+        state.interact([50, 0, 50], 0, true);
+        assert!(state.transition.is_none());
     }
 
     #[test]
@@ -2692,7 +3008,7 @@ mod tests {
         let mut state = game();
         state.room_actions[0] = Some(door_action(door(0xFF, 0)));
         state.doors[0] = Some(door(0xFF, 0));
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert!(state.transition.is_none());
         assert_eq!(state.message.id, None);
     }
@@ -2702,7 +3018,7 @@ mod tests {
         let mut state = game();
         state.room_actions[1] = Some(item_action(1, 7, 1, [0, 0, 100, 100]));
         state.room_actions[1].as_mut().unwrap().handler = 0;
-        state.interact([50, 0, 50], true);
+        state.interact([-550, 0, 50], 0, true);
         assert!(state.inventory.is_empty());
 
         assert!(!state.run_room_action(1, 0));

@@ -48,6 +48,9 @@ const RUN_TURN: u16 = 0x30;
 /// Yaw offset that makes the backward walk face away from the movement.
 const BACK_OFFSET: u16 = 0x800;
 
+/// Distance of the room-action reach probe in front of the player.
+pub const REACH_DISTANCE: i32 = 600;
+
 /// 18-unit skin added to the entity radius for rectangle pushes.
 const COLLISION_SKIN: i16 = 0x12;
 /// The single-axis push test accepts a correction of at most 400 units, which
@@ -323,6 +326,15 @@ fn walk_speed(radius: i32, frame: usize) -> i32 {
         speed -= i32::from(table[3]);
     }
     speed
+}
+
+/// The room-action reach probe offset: 600 units along the facing direction.
+///
+/// The original tests interaction zones against a point this far in front of
+/// the player (`update_player_position`), so a door or item triggers while the
+/// player is still short of its box.
+pub fn reach_offset(angle: u16) -> (i32, i32) {
+    rotate_speed(angle, 0, REACH_DISTANCE)
 }
 
 /// Rotate `(speed, 0, 0)` by `angle + offset` about Y and return `(dx, dz)`.

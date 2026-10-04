@@ -391,7 +391,7 @@ fn tick_room(
     context.game.sync_player(context.player);
     {
         let mut host = game::ScdGameHost::new(context.game);
-        host.interact(context.player.pos, action);
+        host.interact(context.player.pos, context.player.angle, action);
     }
     context.game.advance_frame();
     if let Some(assets) = context.player_assets {
@@ -418,12 +418,15 @@ fn enter_transition(
     player_state: &mut player::PlayerState,
     transition: &game::RoomTransition,
 ) -> Result<LoadedRoom> {
-    let loaded = load_room(pack, transition.target)?;
+    let mut loaded = load_room(pack, transition.target)?;
     game.enter_room(transition.target, &loaded.room);
     *player_state = player::spawn(transition.target, &loaded.room);
     player_state.pos = transition.pos;
     player_state.angle = transition.angle;
     game.sync_entity_from_player(player_state);
+    // Place the destination camera before the first frame is drawn; the
+    // original runs the zone switch during the transition load.
+    apply_camera(&mut loaded.room, game, Some(player_state.pos));
     Ok(loaded)
 }
 
@@ -792,7 +795,7 @@ mod tests {
         data
     }
 
-    /// `door_aot_set(0, 100, 200, 300, 400, ..., RDT_001, 555, 0, 666, 1024, 0, 0)`.
+    /// `door_aot_set(0, 100, 200, 300, 400, ..., RDT_001, 555, 0, 666, 1024, 0, 0x81)`.
     fn door_init() -> Vec<u8> {
         let mut body = vec![0x0C, 0x00];
         for value in [100i16, 200, 300, 400] {
@@ -803,8 +806,8 @@ mod tests {
         for value in [555i16, 0, 666, 1024] {
             body.extend_from_slice(&value.to_le_bytes());
         }
-        body.extend_from_slice(&[0, 0]);
-        body.extend_from_slice(&[0x00, 0x00]);
+        // Required item 0, probe flags 0x81 (action key, forward reach probe).
+        body.extend_from_slice(&[0, 0x81]);
         body
     }
 
@@ -981,7 +984,10 @@ mod tests {
         assert_eq!(loaded.id, a);
         let mut game = game::GameState::new(a, &loaded.room);
         let mut player_state = player::spawn(a, &loaded.room);
-        player_state.pos = [150, 0, 250];
+        // The door's probe point is 600 units ahead of the player (facing +X),
+        // so stand short of the zone and let the reach point land inside it.
+        player_state.pos = [-450, 0, 250];
+        player_state.angle = 0;
         game.sync_entity_from_player(&player_state);
 
         let transition = {
@@ -1036,6 +1042,65 @@ mod tests {
         assert_eq!(player_state.angle, 1024);
         assert!(game.doors[0].is_none());
         assert!(game.room_actions[0].is_none());
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_stairwell_door_loads_its_destination_room() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("1060").unwrap();
+        let mut loaded = load_room(&pack, id).unwrap();
+        let mut game = game::GameState::new(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
+        {
+            let scripts = &loaded.scripts;
+            let mut command_vm = scd::vm::CommandVm::new(scripts);
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_init(&mut host);
+        }
+
+        // Stand short of the stairwell door so the reach probe lands in it.
+        let door = game.doors[4].expect("stair door");
+        let center = [
+            i32::from(door.zone[0]) + i32::from(door.zone[2]) / 2,
+            0,
+            i32::from(door.zone[1]) + i32::from(door.zone[3]) / 2,
+        ];
+        let (dx, dz) = player::reach_offset(0);
+        player_state.pos = [center[0] - dx, 0, center[2] - dz];
+        player_state.angle = 0;
+        game.sync_entity_from_player(&player_state);
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            host.interact(player_state.pos, player_state.angle, true);
+        }
+        let transition = game.transition.take().expect("stair transition");
+        assert_eq!(
+            transition.target,
+            RoomId {
+                stage: 2,
+                room: 3,
+                player_flag: 0
+            }
+        );
+
+        loaded = enter_transition(&pack, &mut game, &mut player_state, &transition).unwrap();
+        assert_eq!(loaded.id.stage, 2);
+        assert_eq!(loaded.id.room, 3);
+        assert_eq!(game.id, transition.target);
+        assert_eq!(player_state.pos, [17100, 0, 25300]);
+        assert_eq!(player_state.angle, 3072);
+        assert!(!loaded.room.cuts.is_empty(), "destination cameras loaded");
+        // The entry camera comes from the destination's switch zones, applied
+        // during the transition load.
+        assert_eq!(
+            loaded.room.current_cut,
+            player::camera_for_position(&loaded.room, 0, player_state.pos)
+        );
+        assert_eq!(game.camera.current_cut, loaded.room.current_cut);
     }
 
     #[test]
