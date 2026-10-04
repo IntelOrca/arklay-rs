@@ -16,6 +16,7 @@
 pub mod char_select;
 pub mod file;
 pub mod item_box;
+pub mod item_view;
 pub mod layout;
 pub mod main_menu;
 pub mod save_load;

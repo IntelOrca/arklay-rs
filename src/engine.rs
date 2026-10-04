@@ -679,6 +679,20 @@ impl GameSession {
         self.game.message_menu = false;
     }
 
+    /// Open the item viewer as a gameplay modal over the frozen menu.
+    ///
+    /// The menu stays up underneath and the room stays frozen; leaving the
+    /// viewer through [`ScreenAction::Resume`] returns to the menu unchanged.
+    /// The frozen frame is painted here so booting straight into the viewer
+    /// (`--ui view`) shows the menu under the model exactly like the
+    /// interactive CHECK path.
+    fn open_item_view(&mut self, pack: &Pack, item: u8) {
+        self.render(pack);
+        let mut screen = ui::item_view::ItemViewScreen::new(item);
+        screen.open_with(pack, &self.text);
+        self.open_modal(Box::new(screen));
+    }
+
     /// One frozen tick of the pause menu. A message owns the input while it is
     /// up; the item-box overlay and the FILE tab then own the pad, and
     /// otherwise one pad edge reaches the menu and its event is consumed.
@@ -755,9 +769,8 @@ impl GameSession {
             MenuEvent::None => {}
             MenuEvent::Close => self.close_menu(),
             MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
-            // The item viewer is the next slice's screen; consume the CHECK
-            // event and stay on the inventory for now.
-            MenuEvent::ViewItem(_) => {}
+            // CHECK opens the item viewer over the frozen menu.
+            MenuEvent::ViewItem(item) => self.open_item_view(pack, item),
             MenuEvent::Tab(cursor) => self.handle_tab(pack, cursor),
             MenuEvent::Changed => {}
         }
@@ -957,7 +970,6 @@ impl GameSession {
     /// This hook is for screens that own all of their state (the item
     /// viewer); the message window and pause menu are handled explicitly in
     /// [`GameSession::tick`] because they share [`game::GameState`].
-    #[allow(dead_code)]
     fn open_modal(&mut self, screen: Box<dyn ui::Screen>) {
         self.modal = Some(screen);
     }
@@ -1029,6 +1041,8 @@ pub enum AppBoot {
     ItemBox,
     /// The FILE tab over the deterministic capture room.
     File,
+    /// The item viewer over the deterministic capture room's combat knife.
+    View,
 }
 
 /// The room `--ui menu` and its capture boot into, with the known capture
@@ -1123,6 +1137,7 @@ impl App {
             AppBoot::Menu => self.open_menu(),
             AppBoot::ItemBox => self.open_item_box_capture(),
             AppBoot::File => self.open_file_capture(),
+            AppBoot::View => self.open_view(),
         }
     }
 
@@ -1188,6 +1203,19 @@ impl App {
         let mut session = GameSession::from_room(&self.pack, id)?;
         session.seed_file_capture();
         session.open_file(&self.pack);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the item viewer over the [`MENU_ROOM`] capture inventory with the
+    /// combat knife examined, the deterministic `--ui view` path.
+    fn open_view(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id)?;
+        session.seed_menu_capture();
+        session.game.add_item(ITEM_KNIFE, 0);
+        session.open_menu(&self.pack);
+        session.open_item_view(&self.pack, ITEM_KNIFE);
         self.start_session(session);
         Ok(())
     }
@@ -1411,10 +1439,11 @@ impl App {
 /// Boot one UI screen directly instead of a room.
 ///
 /// `font` renders the decoded font sheet with sample text; `title`, `select`,
-/// `game` and `load` boot the app screens, and `menu` boots the pause menu
-/// over [`MENU_ROOM`] with the deterministic capture inventory. `capture`
-/// renders one deterministic frame and exits; otherwise the window stays up
-/// until the user quits.
+/// `game` and `load` boot the app screens, `menu` boots the pause menu over
+/// [`MENU_ROOM`] with the deterministic capture inventory, and `view` boots
+/// the item viewer over that same inventory with the combat knife examined.
+/// `capture` renders one deterministic frame and exits; otherwise the window
+/// stays up until the user quits.
 pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     run_ui_with_options(pack, screen, capture, &save_dir, 0)
@@ -1437,10 +1466,11 @@ pub fn run_ui_with_options(
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
         "file" => AppBoot::File,
+        "view" => AppBoot::View,
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu`, `box`, `file` or `load`"
+                 `menu`, `box`, `file`, `view` or `load`"
             )
         }
     };
@@ -1485,6 +1515,10 @@ pub fn run_ui_with_options(
             AppBoot::File => {
                 app.open_file_capture()?;
                 app.settle(FILE_CAPTURE_TICKS)?;
+            }
+            AppBoot::View => {
+                app.open_view()?;
+                app.settle(MENU_CAPTURE_TICKS)?;
             }
         }
         app.draw();
@@ -4358,6 +4392,78 @@ mod tests {
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert_eq!(session.game.frame, before + 1, "the room resumes");
+    }
+
+    #[test]
+    fn check_opens_the_item_viewer_modal_and_resume_returns_to_the_menu() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        session.game.add_item(ITEM_KNIFE, 0);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_some());
+
+        // Slot 0 holds the knife: confirm opens the action submenu, down
+        // selects CHECK, confirm installs the viewer.
+        for ui in [
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                down: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+        ] {
+            session
+                .tick(&pack, ui, player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.modal.is_some(), "CHECK installs the item viewer");
+        assert!(session.menu.is_some(), "the menu stays underneath");
+        let frozen = session.game.frame;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.frame, frozen, "the room stays frozen");
+
+        // The modal owns the input from here: cancel reports Resume, which the
+        // app applies by dropping the modal and returning to the menu.
+        let mut modal = session.modal.take().unwrap();
+        let cx = UiContext {
+            pack: &pack,
+            save_dir: Path::new("."),
+            font: None,
+            text: Some(&session.text),
+            ticks: 0,
+        };
+        assert_eq!(
+            modal.update(
+                &cx,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            ScreenResult::Done(ScreenAction::Resume)
+        );
+        assert!(session.menu.is_some(), "resuming lands back on the menu");
     }
 
     #[test]

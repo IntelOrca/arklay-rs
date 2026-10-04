@@ -25,7 +25,9 @@
 //! A [`MaskLayer`] carries the camera's decoded `roommask/{room}_{cam}.bmp`
 //! page and its [`Cut`]; a later engine step only has to load and decode that
 //! page, then pass the layer to [`draw_gameplay_scene`]. [`Framebuffer::draw_model`]
-//! remains the plain player-only path used by the tests and the non-mask case.
+//! remains the plain player-only path used by the tests and the non-mask case,
+//! and [`Framebuffer::draw_ivm_unlit`] is the item viewer's full-bright path
+//! over an `.ivm` mesh and its own texture page.
 
 use crate::anim;
 use crate::mask;
@@ -542,6 +544,27 @@ impl Framebuffer {
         self.rasterize_triangles(texture, triangles);
     }
 
+    /// Draw an item-view (`.ivm`) model full-bright: the item viewer's path.
+    ///
+    /// The item mesh keeps its own texture page (one 256-colour CLUT row, so
+    /// every polygon samples row 0 with direct UVs) and is drawn with backface
+    /// culling disabled, like the door path. Quads split into two fan
+    /// triangles; untextured gouraud polygons paint their packet colour as a
+    /// solid triangle. One matrix per object, in object order, supplies the
+    /// viewer's turntable rotation and distance.
+    pub fn draw_ivm_unlit(
+        &mut self,
+        ivm: &crate::ivm::Ivm,
+        joints: &[anim::Mat4x3],
+        camera: &Camera,
+    ) {
+        let mut triangles: Vec<Triangle> = Vec::new();
+        for (object, joint) in ivm.objects.iter().zip(joints) {
+            collect_ivm_triangles(object, joint, camera, &mut triangles);
+        }
+        self.rasterize_triangles(&ivm.texture, triangles);
+    }
+
     fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
         triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
         for triangle in &triangles {
@@ -598,17 +621,24 @@ impl Framebuffer {
                 let v =
                     (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
                         / inv_z;
-                let Some(texel_u) = wrap_texel(u, texture.width) else {
-                    continue;
+                // An untextured gouraud polygon keeps its packet colour; every
+                // other polygon samples the texture page through its row.
+                let color = match triangle.flat {
+                    Some(flat) => [flat[0], flat[1], flat[2], 255],
+                    None => {
+                        let Some(texel_u) = wrap_texel(u, texture.width) else {
+                            continue;
+                        };
+                        let Some(texel_v) = wrap_texel(v, texture.height) else {
+                            continue;
+                        };
+                        let index = texel_v as usize * texture.width as usize + texel_u as usize;
+                        let Some(&palette_index) = texture.indices.get(index) else {
+                            continue;
+                        };
+                        texture.palette(triangle.palette_row, palette_index)
+                    }
                 };
-                let Some(texel_v) = wrap_texel(v, texture.height) else {
-                    continue;
-                };
-                let index = texel_v as usize * texture.width as usize + texel_u as usize;
-                let Some(&palette_index) = texture.indices.get(index) else {
-                    continue;
-                };
-                let color = texture.palette(triangle.palette_row, palette_index);
 
                 let shade = [
                     weight0 * a.shade[0] + weight1 * b.shade[0] + weight2 * c.shade[0],
@@ -1007,6 +1037,8 @@ struct Triangle {
     key: u32,
     palette_row: usize,
     cull: bool,
+    /// A solid gouraud colour; `None` samples the texture instead.
+    flat: Option<[u8; 3]>,
 }
 
 /// One mask sprite of a camera's page, ready for rasterization.
@@ -1152,7 +1184,87 @@ fn collect_triangles(
             key: triangle_depth_key(depth),
             palette_row,
             cull,
+            flat: None,
         });
+    }
+}
+
+/// Project and full-bright-shade one `.ivm` object into `triangles`.
+///
+/// Item prims carry their own vertex and normal pools like TMD objects but a
+/// richer packet set: textured triangles and quads (quads fan-split into two
+/// triangles), flat textured triangles, and untextured gouraud triangles whose
+/// packet colour is rasterized as a solid. The viewer draws with culling off
+/// and a single palette row, so every corner shades white and samples row 0.
+fn collect_ivm_triangles(
+    object: &crate::ivm::IvmObject,
+    joint: &anim::Mat4x3,
+    camera: &Camera,
+    triangles: &mut Vec<Triangle>,
+) {
+    let vertices: Vec<[i32; 3]> = object
+        .vertices
+        .iter()
+        .map(|vertex| fixed_mul(joint, *vertex))
+        .collect();
+
+    for prim in &object.prims {
+        let order: &[usize] = if prim.vertex_count == 4 {
+            &[0, 1, 2, 0, 2, 3]
+        } else {
+            &[0, 1, 2]
+        };
+        let flat = match prim.kind {
+            crate::ivm::IvmPrimKind::Gouraud => Some(prim.color),
+            _ => None,
+        };
+        for corners in order.as_chunks::<3>().0 {
+            let (i0, i1, i2) = (corners[0], corners[1], corners[2]);
+            let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
+                vertices.get(usize::from(prim.vertices[i0])),
+                vertices.get(usize::from(prim.vertices[i1])),
+                vertices.get(usize::from(prim.vertices[i2])),
+            ) else {
+                continue;
+            };
+            let (Some(screen0), Some(screen1), Some(screen2)) = (
+                camera.project(*vertex0),
+                camera.project(*vertex1),
+                camera.project(*vertex2),
+            ) else {
+                continue;
+            };
+
+            let depth0 = f64::from(camera.view_position(*vertex0)[2]);
+            let depth1 = f64::from(camera.view_position(*vertex1)[2]);
+            let depth2 = f64::from(camera.view_position(*vertex2)[2]);
+
+            let corner_data = [
+                (screen0, depth0, i0),
+                (screen1, depth1, i1),
+                (screen2, depth2, i2),
+            ];
+            let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
+                let (screen, depth, index) = corner_data[corner];
+                RasterVertex {
+                    position: [f64::from(screen[0]), f64::from(screen[1])],
+                    inv_z: 1.0 / depth,
+                    u: f64::from(prim.uv[index][0]),
+                    v: f64::from(prim.uv[index][1]),
+                    shade: [CHANNEL_MAX; 3],
+                }
+            });
+
+            let depth = (depth0 + depth1 + depth2) / 3.0;
+            triangles.push(Triangle {
+                raster,
+                depth,
+                key: triangle_depth_key(depth),
+                palette_row: 0,
+                cull: false,
+                flat,
+            });
+        }
     }
 }
 
@@ -1669,6 +1781,7 @@ mod tests {
             key,
             palette_row: 0,
             cull: false,
+            flat: None,
         })
     }
 

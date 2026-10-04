@@ -28,7 +28,8 @@ struct Cli {
     player: u8,
 
     /// UI screen to boot straight into instead of a room:
-    /// `title`, `select`, `game`, `menu`, `box`, `file`, `load` or `font`
+    /// `title`, `select`, `game`, `menu`, `box`, `file`, `view`, `load` or
+    /// `font`
     #[arg(
         long,
         value_name = "SCREEN",
