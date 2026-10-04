@@ -13,6 +13,7 @@ pub mod items;
 pub mod ivm;
 pub mod lzw;
 pub mod mask;
+pub mod message;
 pub mod model;
 pub mod music;
 pub mod pack;

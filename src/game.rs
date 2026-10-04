@@ -18,12 +18,14 @@
 use std::collections::BTreeMap;
 
 use crate::items;
+use crate::message::{MessageAction, MessageInput, MessageWindow};
 use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::Operand;
 use crate::scd::opcode::Op;
 use crate::stairs::{self, StairEntryState, StairZones};
 use crate::state::{RoomId, RoomState};
+use crate::text::Text;
 
 /// Number of flag banks the scripts can address.
 pub const FLAG_BANK_COUNT: usize = 10;
@@ -90,8 +92,22 @@ const MESSAGE_NO_LOCKPICK: u8 = 0xD5;
 const MESSAGE_WRONG_CHARACTER: u8 = 0xD6;
 /// Item id of the sword key, which Jill may replace with her lockpick.
 const ITEM_SWORD_KEY: u8 = 0x33;
+/// Item id of the lockpick, which the use action never consumes.
+const ITEM_LOCK_PICK: u8 = 0x31;
+/// First ammunition item id; anything below it is a weapon.
+const ITEM_CLIP: u8 = 0x0B;
+/// First door-key item id for the depletion rule.
+const ITEM_OIL: u8 = 0x32;
+/// Last door-key item id for the depletion rule.
+const ITEM_DESK_KEY: u8 = 0x3D;
+/// The radio is not an inventory item; taking it raises a scenario flag.
+const ITEM_COMM_RADIO: u8 = 0x4D;
+/// Scenario flag raised when the radio is taken.
+const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 /// Scenario flag raised when Jill has the lockpick.
 const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
+/// `main_state_flags` bit `0x2000`: the selected key was used up.
+const MSF_MENU_KEY_DEPLETED: u8 = 18;
 /// Scenario flag selecting the second-visit stage variants.
 const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
 /// Scenario/state flag bank index.
@@ -197,17 +213,6 @@ pub struct CameraState {
     pub saved_cut: Option<usize>,
     /// Whether the scripts own the cut instead of the position zones.
     pub locked: bool,
-}
-
-/// The message currently being displayed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct MessageState {
-    /// Message table id, or `None` when no message was requested.
-    pub id: Option<u8>,
-    /// Pause word passed with the message.
-    pub pause: u16,
-    /// Whether a message is being displayed.
-    pub active: bool,
 }
 
 /// BGM channel state.
@@ -554,8 +559,13 @@ pub struct GameState {
     pub state_words: [u16; STATE_WORDS],
     /// Camera cut state.
     pub camera: CameraState,
+    /// The room action slot a confirmed message's post-action pickup refers
+    /// to (the original's `g_pRoomActionEntry`).
+    pub message_item_slot: Option<u8>,
+    /// The window draws its text on the menu line while the pause menu is up.
+    pub message_menu: bool,
     /// Message state.
-    pub message: MessageState,
+    pub message: MessageWindow,
     /// BGM state.
     pub bgm: BgmState,
     /// The player's inventory.
@@ -629,7 +639,9 @@ impl Default for GameState {
             state_bytes: [0; STATE_BYTES],
             state_words: [0; STATE_WORDS],
             camera: CameraState::default(),
-            message: MessageState::default(),
+            message_item_slot: None,
+            message_menu: false,
+            message: MessageWindow::default(),
             bgm: BgmState::default(),
             inventory: Vec::new(),
             room_actions: [None; ROOM_ACTION_SLOTS],
@@ -722,10 +734,18 @@ impl GameState {
     /// Write one `setb` state byte. Out-of-range indices are dropped.
     ///
     /// Index [`STATE_BYTE_ROOM_CAMERA`] is the live camera id, so writing it
-    /// also moves [`GameState::camera`].
+    /// also moves [`GameState::camera`]; index [`STATE_BYTE_MENU_CHOICE`] is
+    /// the window's menu-choice byte and index [`STATE_BYTE_SELECTED_ITEM`] the
+    /// item name substitution reads, so both stay mirrored.
     pub fn set_byte(&mut self, index: u8, value: u8) {
         if index == STATE_BYTE_ROOM_CAMERA {
             self.camera.current_cut = usize::from(value);
+        }
+        if index == STATE_BYTE_MENU_CHOICE {
+            self.message.set_menu_choice_id(value);
+        }
+        if index == STATE_BYTE_SELECTED_ITEM {
+            self.selected_item = (value != 0).then_some(value);
         }
         if let Some(slot) = self.state_bytes.get_mut(usize::from(index)) {
             *slot = value;
@@ -1148,7 +1168,13 @@ impl GameState {
         self.transition = None;
         self.transition_door = None;
         self.mask_toggles.clear();
-        self.message = MessageState::default();
+        // The BioCard menu-choice byte survives a room load; only its active
+        // bit is dropped with the message that set it.
+        self.message = MessageWindow::default();
+        let choice = self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] & 0x7F;
+        self.message.set_menu_choice_id(choice);
+        self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = choice;
+        self.message_item_slot = None;
         self.camera = CameraState::default();
         self.last_interaction = None;
         self.room_bgm_requests.clear();
@@ -1661,12 +1687,145 @@ impl GameState {
         true
     }
 
-    fn show_message(&mut self, id: u8, pause: u16) {
-        self.message = MessageState {
-            id: Some(id),
-            pause,
-            active: true,
+    /// Request a message by id, exactly like the original's
+    /// `set_message_display`: refused while one is already up. The encoded
+    /// bytes are resolved by [`GameState::update_message`], once the engine
+    /// hands over the room and text tables.
+    pub fn show_message(&mut self, id: u8, pause: u16) {
+        if self.message.request(id, pause, self.message_menu) {
+            self.sync_message_choice();
+        }
+    }
+
+    /// Request a message and arm the room action its post-action pickup takes.
+    pub fn show_message_for_action(&mut self, slot: u8, id: u8, pause: u16) {
+        self.message_item_slot = Some(slot);
+        self.show_message(id, pause);
+    }
+
+    /// Drop any displayed message and release the scripts' menu-choice byte.
+    pub fn cancel_message(&mut self) {
+        self.message = MessageWindow::default();
+        self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = 0;
+    }
+
+    /// Mirror the window's menu-choice byte into the BioCard state byte the
+    /// scripts observe with `cmpb 5`.
+    pub fn sync_message_choice(&mut self) {
+        let choice = self.message.menu_choice_id();
+        self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = choice;
+    }
+
+    /// Drive the message window one fixed tick and run what it asks for.
+    ///
+    /// The engine calls this once per tick with the held inputs, then draws
+    /// with [`crate::message::MessageWindow::draw`] after the gameplay scene
+    /// and before fades. Room and global messages are resolved through
+    /// [`Text::message`], so a missing global table just reads empty.
+    pub fn update_message(&mut self, input: MessageInput, room: &RoomState, text: &Text) {
+        // The engine's door-animation adapter writes the window's fields
+        // directly; arm that request before looking its bytes up.
+        if self.message.active
+            && !self.message.has_source()
+            && self.message.phase() == crate::message::MessagePhase::Idle
+            && self.message.menu_choice_id() & 0x80 == 0
+            && let Some(id) = self.message.id
+        {
+            let pause = self.message.pause;
+            self.message.request(id, pause, self.message_menu);
+        }
+        if let Some(id) = self.message.id
+            && self.message.active
+            && !self.message.has_source()
+        {
+            let bytes = text.message(room, u16::from(id)).unwrap_or(&[]).to_vec();
+            self.message.feed_source(&bytes);
+        }
+        let selected = self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)];
+        self.message.update(input, text, selected);
+        let pause = self.message.pause;
+        for action in self.message.take_actions() {
+            match action {
+                MessageAction::Chain(id) => self.show_message(id, pause),
+                MessageAction::TakeItem => {
+                    self.take_message_item();
+                }
+                MessageAction::UseSelectedItem => self.use_selected_item(),
+                MessageAction::DiscardSelectedItem => self.discard_selected_item(),
+            }
+        }
+        self.sync_message_choice();
+    }
+
+    /// Post-action 0: award the armed room action's item, or the radio's
+    /// scenario flag. Returns whether anything was taken.
+    pub fn take_message_item(&mut self) -> bool {
+        let Some(slot) = self.message_item_slot.take() else {
+            return false;
         };
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        if action.item_id() == ITEM_COMM_RADIO {
+            self.apply_flag(BANK_SCENARIO, SCENARIO_FLAG_HAS_RADIO, 0);
+            self.room_actions[usize::from(slot)] = None;
+            self.doors[usize::from(slot)] = None;
+            return true;
+        }
+        self.pick_up(slot)
+    }
+
+    /// Post-action 1: the original's `use_room_action_item`. The lockpick is
+    /// exempt, weapons are unequipped and removed, and consumables lose one
+    /// unit; a door key that hits zero raises the key-depleted flag and stays
+    /// in the inventory as an empty stack.
+    pub fn use_selected_item(&mut self) {
+        let Some(item) = self.selected_item else {
+            return;
+        };
+        self.record_used_item(item);
+        if item == ITEM_LOCK_PICK {
+            return;
+        }
+        let Some(index) = self.inventory.iter().position(|stack| stack.id == item) else {
+            return;
+        };
+        if item < ITEM_CLIP {
+            if self.equipped == Some(item) {
+                self.set_equipped(None);
+            }
+            self.inventory.remove(index);
+            self.rebuild_slots();
+            return;
+        }
+        let quantity = self.inventory[index].quantity;
+        if quantity == 0 {
+            return;
+        }
+        self.inventory[index].quantity = quantity - 1;
+        if quantity - 1 == 0 {
+            if item > ITEM_OIL && item < ITEM_DESK_KEY {
+                self.apply_flag(5, MSF_MENU_KEY_DEPLETED, 0);
+                return;
+            }
+            self.inventory.remove(index);
+            self.rebuild_slots();
+        }
+    }
+
+    /// Post-action 2: drop the selected item's whole stack. The original only
+    /// reaches this from script data; there is no player-facing discard.
+    pub fn discard_selected_item(&mut self) {
+        let Some(item) = self.selected_item else {
+            return;
+        };
+        if let Some(index) = self.inventory.iter().position(|stack| stack.id == item) {
+            self.inventory.remove(index);
+            self.rebuild_slots();
+        }
     }
 
     fn record_interaction(&mut self, slot: u8, kind: RoomActionKind, message: Option<u16>) {
@@ -1857,9 +2016,8 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_message(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x0B => {
-                self.state.message.id = Some(operand_u8(operands, 0));
-                self.state.message.pause = operand_u16(operands, 1);
-                self.state.message.active = true;
+                self.state
+                    .show_message(operand_u8(operands, 0), operand_u16(operands, 1));
                 StepResult::Continue
             }
             _ => self.placeholder(op),
@@ -2530,15 +2688,230 @@ mod tests {
             assert_eq!(host.state().message.id, Some(170));
             assert_eq!(host.state().message.pause, 79);
             assert!(host.state().message.active);
+            assert_eq!(host.state().message.menu_choice_id(), 0x80);
         }
         assert_eq!(
-            state.message,
-            MessageState {
-                id: Some(170),
-                pause: 79,
-                active: true,
-            }
+            state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)],
+            0x80,
+            "the scripts observe the window through cmpb 5"
         );
+    }
+
+    /// Encode room messages in the RDT block format: a `u16` offset table
+    /// followed by the streams.
+    fn room_message_block(messages: &[&[u8]]) -> Vec<u8> {
+        let mut block = Vec::new();
+        let mut offset = (messages.len() * 2) as u16;
+        for message in messages {
+            block.extend_from_slice(&offset.to_le_bytes());
+            offset += message.len() as u16;
+        }
+        for message in messages {
+            block.extend_from_slice(message);
+        }
+        block
+    }
+
+    fn room_with_messages(messages: &[&[u8]]) -> RoomState {
+        RoomState {
+            messages: Some(room_message_block(messages)),
+            ..RoomState::default()
+        }
+    }
+
+    /// Drive a room message to the yes/no prompt and confirm it.
+    fn confirm_yes_no(state: &mut GameState, room: &RoomState) {
+        let text = Text::default();
+        for _ in 0..2_000 {
+            state.update_message(MessageInput::default(), room, &text);
+            if state.message.phase() == crate::message::MessagePhase::YesNo {
+                break;
+            }
+        }
+        assert_eq!(
+            state.message.phase(),
+            crate::message::MessagePhase::YesNo,
+            "message never reached the yes/no prompt"
+        );
+        state.update_message(
+            MessageInput {
+                action: true,
+                ..MessageInput::default()
+            },
+            room,
+            &text,
+        );
+    }
+
+    #[test]
+    fn update_message_resolves_room_bytes_and_releases_cmpb_five() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x01, 0x00]]);
+        state.show_message(0, 7);
+        assert!(state.message.active);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0x80);
+        assert!(state.compare_byte(STATE_BYTE_MENU_CHOICE, 0, 0x80));
+
+        let text = Text::default();
+        for _ in 0..2 {
+            state.update_message(MessageInput::default(), &room, &text);
+        }
+        assert_eq!(
+            state.message.phase(),
+            crate::message::MessagePhase::WaitInput
+        );
+        assert!(state.compare_byte(STATE_BYTE_MENU_CHOICE, 0, 0x80));
+
+        state.update_message(
+            MessageInput {
+                action: true,
+                ..MessageInput::default()
+            },
+            &room,
+            &text,
+        );
+        assert!(!state.message.active);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0);
+        assert!(state.compare_byte(STATE_BYTE_MENU_CHOICE, 0, 0));
+    }
+
+    #[test]
+    fn show_message_refuses_while_one_is_up() {
+        let mut state = game();
+        state.show_message(0xAA, 1);
+        state.show_message(0xBB, 2);
+        assert_eq!(state.message.id, Some(0xAA));
+        assert_eq!(state.message.pause, 1);
+    }
+
+    #[test]
+    fn door_adapter_direct_fields_are_armed_by_update() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x01, 0x00]]);
+        // The door-animation adapter writes the window fields directly.
+        state.message.id = Some(0);
+        state.message.pause = 0xFE;
+        state.message.active = true;
+        state.update_message(MessageInput::default(), &room, &Text::default());
+        assert_eq!(
+            state.message.phase(),
+            crate::message::MessagePhase::Reveal,
+            "the direct request armed and revealed a character"
+        );
+        assert_eq!(state.message.pause, 0xFE);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0x80);
+    }
+
+    #[test]
+    fn script_setb_five_feeds_the_window_and_six_the_selected_item() {
+        let mut state = game();
+        state.set_byte(STATE_BYTE_MENU_CHOICE, 0x81);
+        assert_eq!(state.message.menu_choice_id(), 0x81);
+        state.set_byte(STATE_BYTE_SELECTED_ITEM, 0x41);
+        assert_eq!(state.selected_item, Some(0x41));
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
+            0x41
+        );
+    }
+
+    #[test]
+    fn message_use_action_consumes_the_selected_item() {
+        let room = room_with_messages(&[&[0x0C, 0x08, 0x00, 0x0A, 0x01]]);
+
+        // A consumable loses one unit.
+        let mut state = game();
+        state.add_item(0x0B, 2);
+        state.select_item(Some(0x0B));
+        state.show_message(0, 0);
+        confirm_yes_no(&mut state, &room);
+        assert_eq!(state.item_count(0x0B), 1);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)], 0x0B);
+        assert_eq!(state.last_used_item, Some(0x0B));
+
+        // A weapon is unequipped and removed.
+        let mut state = game();
+        state.add_item(1, 1);
+        state.set_equipped(Some(1));
+        state.select_item(Some(1));
+        state.show_message(0, 0);
+        confirm_yes_no(&mut state, &room);
+        assert!(!state.has_item(1));
+        assert_eq!(state.equipped, None);
+
+        // The lockpick is never consumed.
+        let mut state = game();
+        state.add_item(ITEM_LOCK_PICK, 1);
+        state.select_item(Some(ITEM_LOCK_PICK));
+        state.show_message(0, 0);
+        confirm_yes_no(&mut state, &room);
+        assert!(state.has_item(ITEM_LOCK_PICK));
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)],
+            ITEM_LOCK_PICK
+        );
+
+        // A door key that hits zero raises the depletion flag and stays as an
+        // empty stack.
+        let mut state = game();
+        state.add_item(0x35, 1);
+        state.select_item(Some(0x35));
+        state.show_message(0, 0);
+        confirm_yes_no(&mut state, &room);
+        assert!(!state.has_item(0x35));
+        assert!(
+            state
+                .inventory
+                .iter()
+                .any(|stack| stack.id == 0x35 && stack.quantity == 0)
+        );
+        assert!(state.flags[5].bit(MSF_MENU_KEY_DEPLETED));
+    }
+
+    #[test]
+    fn message_yes_no_post_action_two_discards_the_stack() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x08, 0x00, 0x0A, 0x02]]);
+        state.add_item(0x0B, 3);
+        state.select_item(Some(0x0B));
+        state.show_message(0, 0);
+        confirm_yes_no(&mut state, &room);
+        assert!(!state.has_item(0x0B));
+    }
+
+    #[test]
+    fn message_chain_starts_the_next_id() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x08, 0x00, 0x09, 0x01], &[0x0D, 0x01, 0x00]]);
+        state.show_message(0, 5);
+        confirm_yes_no(&mut state, &room);
+        assert_eq!(state.message.id, Some(1));
+        assert!(state.message.active);
+        assert_eq!(state.message.pause, 5, "the chain keeps the pause word");
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0x80);
+    }
+
+    #[test]
+    fn message_take_item_picks_up_the_armed_action() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x08, 0x00, 0x0A, 0x00]]);
+        state.room_actions[3] = Some(item_action(3, 0x41, 1, [0, 0, 100, 100]));
+        state.show_message_for_action(3, 0, 0xFF);
+        confirm_yes_no(&mut state, &room);
+        assert!(state.has_item(0x41));
+        assert!(state.room_actions[3].is_none(), "the action is consumed");
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0x41);
+    }
+
+    #[test]
+    fn message_take_item_radio_raises_the_scenario_flag() {
+        let mut state = game();
+        let room = room_with_messages(&[&[0x0C, 0x08, 0x00, 0x0A, 0x00]]);
+        state.room_actions[3] = Some(item_action(3, ITEM_COMM_RADIO, 1, [0, 0, 100, 100]));
+        state.show_message_for_action(3, 0, 0xFF);
+        confirm_yes_no(&mut state, &room);
+        assert!(state.flag_test(0, SCENARIO_FLAG_HAS_RADIO, false));
+        assert!(!state.has_item(ITEM_COMM_RADIO));
     }
 
     #[test]
@@ -3405,6 +3778,9 @@ mod tests {
         assert!(state.message.active);
 
         // With the key: the key turns, is consumed and raises the lock flag.
+        // (The locked message must be read first: a live window refuses the
+        // next prompt, exactly like the original's set_message_display.)
+        state.cancel_message();
         state.add_item(0x34, 1);
         state.interact([-550, 0, 50], 0, true);
         assert!(state.transition.is_none());
@@ -3413,6 +3789,7 @@ mod tests {
         assert!(state.flag_test(2, 5, false));
 
         // The next probe walks through.
+        state.cancel_message();
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(
             state.transition,
@@ -3475,6 +3852,7 @@ mod tests {
         assert_eq!(state.message.id, Some(0xD5));
 
         // With the scenario flag: the lock turns without an inventory item.
+        state.cancel_message();
         assert!(state.apply_flag(0, SCENARIO_FLAG_HAS_LOCKPICK, 0));
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.message.id, Some(0xC3));

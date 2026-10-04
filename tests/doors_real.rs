@@ -193,6 +193,9 @@ fn key_locked_door_needs_and_consumes_its_key() {
     assert_eq!(state.message.id, Some(201));
     assert!(!state.flag_test(2, 0x0A, false));
 
+    // A live window refuses the next prompt, so the message is read first.
+    state.cancel_message();
+
     // With the key: the lock turns, the key is consumed and the flag is set.
     state.add_item(0x34, 1);
     assert!(
@@ -204,6 +207,7 @@ fn key_locked_door_needs_and_consumes_its_key() {
     assert!(state.flag_test(2, 0x0A, false));
 
     // The next probe walks through.
+    state.cancel_message();
     let transition = press(&mut state, 1).expect("unlocked transition");
     assert_eq!(transition.target.room, 2);
     assert_eq!(transition.pos, [3400, 0, 9200]);
@@ -261,7 +265,9 @@ fn event_payload_rearms_the_door_with_an_auto_probe() {
     };
     // ROOM4060: init registers slot 2 as a tiny action-key zone; action slot 5
     // starts event 4, which schedules event 5; that payload re-registers slot 2
-    // with a large walk-in zone (probe 0x41) that leads to room 40D.
+    // with a large walk-in zone (probe 0x41) that leads to room 40D. The event
+    // shows prompts and gates on the message byte (`cmpb 5`), so the player
+    // dismissing each one is simulated by clearing the window each tick.
     let (_, _, scripts, mut state) = load_room(&root, "4060");
     let mut event_vm = EventVm::new(&scripts);
     event_vm.start(0, 4);
@@ -273,6 +279,7 @@ fn event_payload_rearms_the_door_with_an_auto_probe() {
         for (slot, event) in std::mem::take(&mut state.pending_events) {
             event_vm.start(usize::from(slot), event);
         }
+        state.cancel_message();
         state.advance_frame();
         if state.doors[2].is_some_and(|door| door.sub_type == 0x41) {
             break;
