@@ -108,6 +108,13 @@ const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
 /// `main_state_flags` bit `0x2000`: the selected key was used up.
 const MSF_MENU_KEY_DEPLETED: u8 = 18;
+/// `g_message_flags` bit 8: gameplay control. A message's pause word is
+/// masked out of [`GameState::message_flags`] while it is displayed; when the
+/// bit is clear the original blanks the player's d-pad for the frame.
+pub const MESSAGE_FLAG_CONTROLS: u16 = 0x100;
+/// The original's gameplay seed for `g_message_flags` (`game_loop` writes
+/// `0xFD3F` when it (re)enters the play state).
+pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
 /// Scenario flag selecting the second-visit stage variants.
 const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
 /// Scenario/state flag bank index.
@@ -617,6 +624,13 @@ pub struct GameState {
     pub message_item_slot: Option<u8>,
     /// The window draws its text on the menu line while the pause menu is up.
     pub message_menu: bool,
+    /// The original's `g_message_flags`: [`GameState::show_message`] masks the
+    /// request's pause word into it and the dismissal restores the captured
+    /// backup. [`MESSAGE_FLAG_CONTROLS`] clear means the room tick must ignore
+    /// the player's movement and action input.
+    pub message_flags: u16,
+    /// The `message_flags` captured when the active message was requested.
+    message_flags_backup: u16,
     /// Message state.
     pub message: MessageWindow,
     /// BGM state.
@@ -694,6 +708,8 @@ impl Default for GameState {
             camera: CameraState::default(),
             message_item_slot: None,
             message_menu: false,
+            message_flags: MESSAGE_FLAGS_INITIAL,
+            message_flags_backup: MESSAGE_FLAGS_INITIAL,
             message: MessageWindow::default(),
             bgm: BgmState::default(),
             inventory: Vec::new(),
@@ -1225,13 +1241,18 @@ impl GameState {
         self.transition = None;
         self.transition_door = None;
         self.mask_toggles.clear();
-        // The BioCard menu-choice byte survives a room load; only its active
-        // bit is dropped with the message that set it.
-        self.message = MessageWindow::default();
-        let choice = self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] & 0x7F;
-        self.message.set_menu_choice_id(choice);
-        self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = choice;
-        self.message_item_slot = None;
+        // A door-animation message is applied while the transition runs and
+        // must survive the destination's room boot, so an active window is
+        // kept; otherwise the message resets and only the BioCard menu-choice
+        // byte's low bit survives.
+        if !self.message.active {
+            self.message = MessageWindow::default();
+            let choice = self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] & 0x7F;
+            self.message.set_menu_choice_id(choice);
+            self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = choice;
+            self.message_item_slot = None;
+            self.message_flags = MESSAGE_FLAGS_INITIAL;
+        }
         self.camera = CameraState::default();
         self.last_interaction = None;
         self.room_bgm_requests.clear();
@@ -1954,13 +1975,33 @@ impl GameState {
     }
 
     /// Request a message by id, exactly like the original's
-    /// `set_message_display`: refused while one is already up. The encoded
-    /// bytes are resolved by [`GameState::update_message`], once the engine
-    /// hands over the room and text tables.
+    /// `set_message_display`: refused while one is already up. On success the
+    /// pause word is masked out of [`GameState::message_flags`] and restored
+    /// when the window dismisses. The encoded bytes are resolved by
+    /// [`GameState::update_message`], once the engine hands over the room and
+    /// text tables.
     pub fn show_message(&mut self, id: u8, pause: u16) {
-        if self.message.request(id, pause, self.message_menu) {
+        if self.begin_message(id, pause) {
             self.sync_message_choice();
         }
+    }
+
+    /// The request head shared by [`GameState::show_message`] and the
+    /// door-animation adapter armed in [`GameState::update_message`].
+    fn begin_message(&mut self, id: u8, pause: u16) -> bool {
+        if !self.message.request(id, pause, self.message_menu) {
+            return false;
+        }
+        self.message_flags_backup = self.message_flags;
+        self.message_flags &= !pause;
+        true
+    }
+
+    /// Whether the displayed message's pause word masked the control bit, so
+    /// the engine must ignore the player's movement and action input for this
+    /// tick, exactly like the original's blanked d-pad word.
+    pub fn message_locks_controls(&self) -> bool {
+        self.message_flags & MESSAGE_FLAG_CONTROLS == 0
     }
 
     /// Request a message and arm the room action its post-action pickup takes.
@@ -1969,8 +2010,12 @@ impl GameState {
         self.show_message(id, pause);
     }
 
-    /// Drop any displayed message and release the scripts' menu-choice byte.
+    /// Drop any displayed message, restore the paused flags and release the
+    /// scripts' menu-choice byte.
     pub fn cancel_message(&mut self) {
+        if self.message.active {
+            self.message_flags = self.message_flags_backup;
+        }
         self.message = MessageWindow::default();
         self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = 0;
     }
@@ -1998,8 +2043,9 @@ impl GameState {
             && let Some(id) = self.message.id
         {
             let pause = self.message.pause;
-            self.message.request(id, pause, self.message_menu);
+            self.begin_message(id, pause);
         }
+        let was_active = self.message.active;
         if let Some(id) = self.message.id
             && self.message.active
             && !self.message.has_source()
@@ -2009,6 +2055,11 @@ impl GameState {
         }
         let selected = self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)];
         self.message.update(input, text, selected);
+        // A dismissal (input, timer or an empty source) releases the pause
+        // mask before any replacement the post-actions request.
+        if was_active && !self.message.active {
+            self.message_flags = self.message_flags_backup;
+        }
         let pause = self.message.pause;
         for action in self.message.take_actions() {
             match action {
@@ -3048,6 +3099,72 @@ mod tests {
         state.show_message(0xBB, 2);
         assert_eq!(state.message.id, Some(0xAA));
         assert_eq!(state.message.pause, 1);
+    }
+
+    #[test]
+    fn message_pause_word_masks_and_restores_the_control_flags() {
+        let room = room_with_messages(&[&[0x0C, 0x01, 0x00]]);
+        let text = Text::default();
+        let mut state = game();
+        assert!(!state.message_locks_controls());
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
+
+        // 0x145 includes the control bit: movement locks until the window
+        // dismisses, then the flags are restored.
+        state.show_message(0, 0x145);
+        assert!(state.message_locks_controls());
+        assert_eq!(state.message_flags & MESSAGE_FLAG_CONTROLS, 0);
+        for _ in 0..4 {
+            state.update_message(MessageInput::default(), &room, &text);
+        }
+        assert_eq!(
+            state.message.phase(),
+            crate::message::MessagePhase::WaitInput
+        );
+        state.update_message(MessageInput::default(), &room, &text);
+        state.update_message(
+            MessageInput {
+                action: true,
+                ..MessageInput::default()
+            },
+            &room,
+            &text,
+        );
+        assert!(!state.message.active);
+        assert!(!state.message_locks_controls());
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
+
+        // 0xFF only masks the low byte, so the control bit stays set, and a
+        // zero pause word changes nothing at all.
+        state.show_message(0, 0xFF);
+        assert!(!state.message_locks_controls());
+        assert_eq!(
+            state.message_flags & MESSAGE_FLAG_CONTROLS,
+            MESSAGE_FLAG_CONTROLS
+        );
+        state.cancel_message();
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
+        state.show_message(0, 0);
+        assert!(!state.message_locks_controls());
+    }
+
+    #[test]
+    fn enter_room_keeps_an_active_door_message() {
+        let mut state = game();
+        state.show_message(0x40, 0xFF);
+        assert!(state.message.active);
+        state.enter_room(RoomId::parse("1010").unwrap(), &RoomState::default());
+        assert!(
+            state.message.active,
+            "a door-animation message survives the room swap"
+        );
+        assert_eq!(state.message.id, Some(0x40));
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0x80);
+
+        state.cancel_message();
+        state.enter_room(RoomId::parse("1011").unwrap(), &RoomState::default());
+        assert!(!state.message.active);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)], 0);
     }
 
     #[test]

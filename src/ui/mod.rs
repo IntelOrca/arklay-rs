@@ -6,10 +6,12 @@
 //! reports a completed interaction through [`ScreenResult`]. The app reacts to
 //! [`ScreenAction`] values by switching modes.
 //!
-//! The same contract serves gameplay modals: [`crate::engine::GameSession`]
+//! The same contract also serves gameplay modals: [`crate::engine::GameSession`]
 //! owns an optional boxed screen and freezes the room tick while one is
-//! installed, so the message window, inventory and item viewer can plug in
-//! later without changing the mode machine.
+//! installed, so screens that own all of their state (the item viewer) plug in
+//! without changing the mode machine. The message window and pause menu are
+//! not [`Screen`]s: they share [`crate::game::GameState`] and are driven
+//! explicitly by the session.
 
 pub mod char_select;
 pub mod layout;
@@ -42,6 +44,8 @@ pub struct UiInput {
     pub confirm: bool,
     /// Cancel (X or Backspace).
     pub cancel: bool,
+    /// START (Tab): opens the gameplay pause menu.
+    pub start: bool,
     /// Any key went down this tick.
     pub any: bool,
 }

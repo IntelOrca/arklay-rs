@@ -25,7 +25,7 @@ use sdl3_sys::render::{
 use sdl3_sys::scancode::{
     SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LSHIFT,
     SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE,
-    SDL_SCANCODE_UP, SDL_SCANCODE_X,
+    SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -43,6 +43,7 @@ use crate::emd;
 use crate::font;
 use crate::game;
 use crate::mask;
+use crate::message::MessageInput;
 use crate::model::Emd;
 use crate::music;
 use crate::pack::Pack;
@@ -56,6 +57,7 @@ use crate::state::{Image, RoomId, RoomState};
 use crate::text::Text;
 use crate::tim;
 use crate::transition::{self, DoorStepper};
+use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 
 const WIDTH: i32 = 320;
@@ -171,7 +173,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         if poll_events(&mut event, &mut cut_delta, &mut any_key) {
             return Ok(());
         }
-        let _ = edges.read(any_key);
+        let ui = edges.read(any_key);
         if cut_delta != 0 {
             session.step_camera_cut(cut_delta);
         }
@@ -192,7 +194,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
             if session.transition.is_some() {
                 session.tick_transition(pack, action || input.run);
             } else {
-                session.tick(pack, input, action)?;
+                session.tick(pack, ui, input, action)?;
                 if session.transition.is_some() {
                     // The original drops the remainder of the frame's time
                     // when a door hands control to its transition phase.
@@ -328,6 +330,13 @@ impl Display {
 /// drives it one fixed tick at a time and renders through the session's own
 /// framebuffer, so a gameplay modal can freeze the room and still show the
 /// last frame underneath.
+/// The message window and the inventory menu are **not** driven through the
+/// [`ui::Screen`] modal hook: the message is part of [`game::GameState`] and
+/// keeps running on the gameplay tick, while the menu freezes the room but
+/// keeps drawing the last gameplay frame, reads its art from the session and
+/// mutates the same `GameState`. The boxed modal hook is kept for screens
+/// that own all of their state (the item viewer); it still freezes the room
+/// and draws over the last gameplay frame exactly as before.
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -337,15 +346,27 @@ struct GameSession {
     masks: MaskCache,
     sfx_cache: SfxCache,
     music: Option<Mixer>,
+    /// Decoded pack text tables (messages, item names, descriptions).
+    text: Text,
+    /// Decoded glyph sheet for the message window; absent packs cannot draw
+    /// messages but still run their state machine.
+    font: Option<font::Font>,
+    /// Pause-menu art, loaded once on the first START.
+    menu_assets: Option<MenuAssets>,
+    /// Whether the one-time menu-asset load has been attempted.
+    menu_assets_loaded: bool,
+    /// The paused inventory/status menu; the room tick is frozen while it is
+    /// up and the last gameplay frame stays under it.
+    menu: Option<MainMenu>,
     framebuffer: Framebuffer,
     titled_cut: usize,
     transition: Option<TransitionMode>,
     transition_finished: bool,
     /// Gameplay modal hook.
     ///
-    /// A gameplay agent (message window, inventory, item viewer) installs a
-    /// boxed [`ui::Screen`] here. While one is present the engine must not
-    /// call [`GameSession::tick`]: the room stays frozen, the modal advances
+    /// A gameplay agent (the item viewer) installs a boxed [`ui::Screen`]
+    /// here. While one is present the engine must not call
+    /// [`GameSession::tick`]: the room stays frozen, the modal advances
     /// through its own [`ui::Screen::update`], and the app draws the last
     /// gameplay frame from [`GameSession::frame`] underneath before calling
     /// the modal's draw and applying its [`ui::Screen::fade`] overlay. A modal
@@ -372,6 +393,12 @@ const ITEM_KNIFE: u8 = 0x01;
 const ITEM_BERETTA: u8 = 0x02;
 /// Item id of the first-aid spray.
 const ITEM_FIRST_AID_SPRAY: u8 = 0x41;
+/// Item id of the green herb, added by the deterministic menu capture.
+const ITEM_GREEN_HERB: u8 = 0x44;
+/// Item id of handgun ammunition, added by the deterministic menu capture.
+const ITEM_HANDGUN_AMMO: u8 = 0x0B;
+/// Item id of the sword key, added by the deterministic menu capture.
+const ITEM_SWORD_KEY: u8 = 0x33;
 
 impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): stage 1 room 0 with
@@ -391,7 +418,7 @@ impl GameSession {
         player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
         player_state.angle = NEW_GAME_ANGLE;
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state)
     }
 
     /// Boot `id` directly, the `--room` path.
@@ -400,7 +427,7 @@ impl GameSession {
         let mut game = game::GameState::new(id, &loaded.room);
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state)
     }
 
     /// Continue from a parsed save: the block replaces the state, the saved
@@ -422,11 +449,12 @@ impl GameSession {
         ];
         player_state.angle = file.angle as u16 & 0x0FFF;
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(loaded, game, player_state)
+        Self::from_loaded(pack, loaded, game, player_state)
     }
 
     /// Assemble a session around already-built state and run the room boot.
     fn from_loaded(
+        pack: &Pack,
         loaded: LoadedRoom,
         game: game::GameState,
         player_state: player::PlayerState,
@@ -434,6 +462,18 @@ impl GameSession {
         let scripts = Rc::new(loaded.scripts.clone());
         let command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         let event_vm = scd::vm::EventVm::from_scripts(scripts);
+        // The message window's glyph sheet is optional: a pack without one
+        // still runs the state machine and simply draws nothing.
+        let font = match pack.read("font/font.tim") {
+            Ok(bytes) => match tim::decode_4bpp(bytes) {
+                Ok(texture) => Some(font::Font::new(texture)),
+                Err(err) => {
+                    eprintln!("warning: invalid font/font.tim: {err:#}");
+                    None
+                }
+            },
+            Err(_) => None,
+        };
         let mut session = Self {
             loaded,
             game,
@@ -443,6 +483,11 @@ impl GameSession {
             masks: MaskCache::default(),
             sfx_cache: SfxCache::default(),
             music: None,
+            text: Text::load(pack),
+            font,
+            menu_assets: None,
+            menu_assets_loaded: false,
+            menu: None,
             framebuffer: Framebuffer::new(),
             titled_cut: usize::MAX,
             transition: None,
@@ -466,9 +511,46 @@ impl GameSession {
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
     }
 
-    /// One fixed 30 Hz tick: scripts, interaction, player movement, camera,
-    /// BGM/mask/footstep drains and a door transition request.
-    fn tick(&mut self, pack: &Pack, input: player::Input, action: bool) -> Result<()> {
+    /// One fixed 30 Hz tick: message window, scripts, interaction, player
+    /// movement, camera, BGM/mask/footstep drains and a door transition
+    /// request.
+    ///
+    /// The message window advances first so its yes/no post-actions (item
+    /// pickup and use) reach the state before the room scripts run. While it
+    /// masks the control bit the player's movement and action input are
+    /// blanked, exactly like the original's cleared d-pad word. START then
+    /// opens the pause menu instead of ticking the room; while the menu is up
+    /// the room stays frozen and the same input drives the menu.
+    fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        if self.menu.is_some() {
+            self.tick_menu(ui, input, action);
+            return Ok(());
+        }
+
+        let was_locked = self.game.message_locks_controls();
+        self.game.update_message(
+            MessageInput {
+                action,
+                left: input.left,
+                right: input.right,
+            },
+            &self.loaded.room,
+            &self.text,
+        );
+
+        if ui.start && !self.game.message.active {
+            self.open_menu(pack);
+            return Ok(());
+        }
+
+        // A paused message ignores the player this tick; the press that
+        // dismissed it is spent on the window rather than the room.
+        let (input, action) = if was_locked {
+            (player::Input::default(), false)
+        } else {
+            (input, action)
+        };
+
         let transition = tick_room(
             &mut self.command_vm,
             &mut self.event_vm,
@@ -500,6 +582,85 @@ impl GameSession {
             self.transition = Some(start_transition(pack, &record, &transition)?);
         }
         Ok(())
+    }
+
+    /// The lazily loaded pause-menu art; a missing or invalid sheet is logged
+    /// once and leaves the menu blank but functional.
+    fn ensure_menu_assets(&mut self, pack: &Pack) {
+        if self.menu_assets_loaded {
+            return;
+        }
+        self.menu_assets_loaded = true;
+        match MenuAssets::load(pack) {
+            Ok(assets) => self.menu_assets = Some(assets),
+            Err(err) => eprintln!("warning: pause-menu art unavailable: {err:#}"),
+        }
+    }
+
+    /// Add the known inventory `--ui menu` captures draw: the room boot's
+    /// items plus a green herb, a handgun clip and the sword key.
+    fn seed_menu_capture(&mut self) {
+        self.game.add_item(ITEM_GREEN_HERB, 1);
+        self.game.add_item(ITEM_HANDGUN_AMMO, 30);
+        self.game.add_item(ITEM_SWORD_KEY, 1);
+    }
+
+    /// Open the pause menu over the current inventory: the room freezes, the
+    /// last gameplay frame stays underneath and messages switch to the menu
+    /// line until it closes.
+    fn open_menu(&mut self, pack: &Pack) {
+        if self.menu.is_some() {
+            return;
+        }
+        self.ensure_menu_assets(pack);
+        self.render(pack);
+        let mut menu = MainMenu::new(self.game.inventory_capacity());
+        menu.open(&mut self.game);
+        self.game.message_menu = true;
+        self.menu = Some(menu);
+    }
+
+    /// Close the pause menu and unfreeze the room.
+    fn close_menu(&mut self) {
+        self.menu = None;
+        self.game.message_menu = false;
+    }
+
+    /// One frozen tick of the pause menu. A message owns the input while it is
+    /// up; otherwise one pad edge reaches the menu and its event is consumed.
+    fn tick_menu(&mut self, ui: UiInput, input: player::Input, action: bool) {
+        let message_was_up = self.game.message.active;
+        self.game.update_message(
+            MessageInput {
+                action,
+                left: input.left,
+                right: input.right,
+            },
+            &self.loaded.room,
+            &self.text,
+        );
+        if message_was_up || self.game.message.active {
+            return;
+        }
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        menu.tick(&mut self.game);
+        let Some(event_input) = menu_input(ui) else {
+            return;
+        };
+        let event = menu.handle_input(&mut self.game, event_input);
+        match event {
+            MenuEvent::None => {}
+            MenuEvent::Close => self.close_menu(),
+            MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
+            // The item viewer is the next slice's screen; consume the CHECK
+            // event and stay on the inventory for now.
+            MenuEvent::ViewItem(_) => {}
+            // The map/file/radio tabs need no engine action and the next
+            // frame redraws after a Changed event.
+            MenuEvent::Tab(_) | MenuEvent::Changed => {}
+        }
     }
 
     /// Advance an active transition animation one fixed frame. The finished
@@ -553,21 +714,40 @@ impl GameSession {
     }
 
     /// Render the current frame into the session framebuffer: a transition
-    /// frame while one runs, the gameplay scene otherwise.
+    /// frame while one runs, the gameplay scene otherwise, with the pause
+    /// menu and then the message window drawn on top. The message is painted
+    /// after the scene (and outside the transition path) so it is never
+    /// covered by the menu and never dimmed by a fade or door overlay.
     fn render(&mut self, pack: &Pack) {
         if let Some(transition) = &self.transition {
             render_transition(&mut self.framebuffer, transition);
             return;
         }
-        render_frame(
-            &mut self.framebuffer,
-            pack,
-            self.loaded.id,
-            &self.loaded.room,
-            &self.player,
-            self.loaded.player_assets.as_ref(),
-            &mut self.masks,
-        );
+        // While the menu is up the room is frozen: keep the frame it was
+        // opened over instead of re-rendering the scene, then draw the menu
+        // and the window over it.
+        if self.menu.is_none() {
+            render_frame(
+                &mut self.framebuffer,
+                pack,
+                self.loaded.id,
+                &self.loaded.room,
+                &self.player,
+                self.loaded.player_assets.as_ref(),
+                &mut self.masks,
+            );
+        }
+        if self.menu.is_some() {
+            self.ensure_menu_assets(pack);
+            if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
+                menu.draw(&mut self.framebuffer, assets, &self.text, &self.game);
+            }
+        }
+        if let Some(font) = &self.font {
+            self.game
+                .message
+                .draw(&mut self.framebuffer, font, &self.text);
+        }
     }
 
     /// The last rendered frame; gameplay modals draw over it.
@@ -577,8 +757,9 @@ impl GameSession {
 
     /// Install a gameplay modal screen; the room freezes until it resumes.
     ///
-    /// The message, inventory and item-view slices call this; the current
-    /// slices only exercise the hook through the tests.
+    /// This hook is for screens that own all of their state (the item
+    /// viewer); the message window and pause menu are handled explicitly in
+    /// [`GameSession::tick`] because they share [`game::GameState`].
     #[allow(dead_code)]
     fn open_modal(&mut self, screen: Box<dyn ui::Screen>) {
         self.modal = Some(screen);
@@ -645,7 +826,16 @@ pub enum AppBoot {
     SaveLoad,
     /// A new game as the character (`0` Chris, `1` Jill).
     NewGame(u8),
+    /// The pause menu over the deterministic capture room.
+    Menu,
 }
+
+/// The room `--ui menu` and its capture boot into, with the known capture
+/// inventory added on top of the room boot.
+pub const MENU_ROOM: &str = "1001";
+
+/// Fixed ticks the headless menu capture settles before the frame is drawn.
+const MENU_CAPTURE_TICKS: u32 = 30;
 
 /// The app's current screen.
 enum Mode {
@@ -725,6 +915,7 @@ impl App {
                 self.start_session(session);
                 Ok(())
             }
+            AppBoot::Menu => self.open_menu(),
         }
     }
 
@@ -758,6 +949,17 @@ impl App {
             session.start_audio();
         }
         self.mode = Mode::Play(Box::new(session));
+    }
+
+    /// Boot the pause-menu session over [`MENU_ROOM`] with the deterministic
+    /// capture inventory and the menu already open.
+    fn open_menu(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id)?;
+        session.seed_menu_capture();
+        session.open_menu(&self.pack);
+        self.start_session(session);
+        Ok(())
     }
 
     /// Apply a completed screen action.
@@ -852,7 +1054,7 @@ impl App {
             if session.transition.is_some() {
                 session.tick_transition(pack, action || input.run);
             } else {
-                session.tick(pack, input, action)?;
+                session.tick(pack, ui, input, action)?;
             }
         }
         Ok(AppFlow::Continue)
@@ -978,8 +1180,9 @@ impl App {
 
 /// Boot one UI screen directly instead of a room.
 ///
-/// `font` renders the decoded font sheet with sample text; `title`, `select`
-/// and `game` boot the app screens, and `load` the load picker. `capture`
+/// `font` renders the decoded font sheet with sample text; `title`, `select`,
+/// `game` and `load` boot the app screens, and `menu` boots the pause menu
+/// over [`MENU_ROOM`] with the deterministic capture inventory. `capture`
 /// renders one deterministic frame and exits; otherwise the window stays up
 /// until the user quits.
 pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
@@ -1001,9 +1204,11 @@ pub fn run_ui_with_options(
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
         "game" => AppBoot::NewGame(character & 1),
+        "menu" => AppBoot::Menu,
         other => {
             bail!(
-                "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game` or `load`"
+                "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
+                 `menu` or `load`"
             )
         }
     };
@@ -1036,6 +1241,10 @@ pub fn run_ui_with_options(
             AppBoot::NewGame(character) => {
                 let session = GameSession::new(&app.pack, character)?;
                 app.start_session(session);
+            }
+            AppBoot::Menu => {
+                app.open_menu()?;
+                app.settle(MENU_CAPTURE_TICKS)?;
             }
         }
         app.draw();
@@ -1743,10 +1952,14 @@ fn drain_mask_toggles(room: &mut RoomState, game: &mut game::GameState) {
 }
 
 /// Apply a door animation message to the game's message state.
+///
+/// It goes through the same request path as every other message, so a window
+/// that is already displaying is refused rather than clobbered, and the pause
+/// word masks the control flags exactly as the original's
+/// `set_message_display` does. `update_message` resolves the encoded bytes on
+/// the next gameplay tick (or after the transition).
 fn apply_door_message(game: &mut game::GameState, message: door::vm::Message) {
-    game.message.id = Some(message.id);
-    game.message.pause = message.value;
-    game.message.active = true;
+    game.show_message(message.id, message.value);
 }
 
 /// Play the room-SFX `slot` (0 open, 1 close) of the door's SFX pair.
@@ -2137,6 +2350,8 @@ struct Keys {
     right: bool,
     confirm: bool,
     cancel: bool,
+    /// START, the gameplay pause menu (Tab).
+    start: bool,
 }
 
 /// Read the UI keys from the current keyboard state.
@@ -2154,6 +2369,27 @@ fn read_keys() -> Keys {
         right: down(SDL_SCANCODE_RIGHT),
         confirm: down(SDL_SCANCODE_SPACE) || down(SDL_SCANCODE_RETURN),
         cancel: down(SDL_SCANCODE_X) || down(SDL_SCANCODE_BACKSPACE),
+        start: down(SDL_SCANCODE_TAB),
+    }
+}
+
+/// Map one frame of edge-triggered pad input to the single inventory menu
+/// input it represents; the original pad reports one new button per frame.
+fn menu_input(ui: UiInput) -> Option<MenuInput> {
+    if ui.up {
+        Some(MenuInput::Up)
+    } else if ui.down {
+        Some(MenuInput::Down)
+    } else if ui.left {
+        Some(MenuInput::Left)
+    } else if ui.right {
+        Some(MenuInput::Right)
+    } else if ui.confirm {
+        Some(MenuInput::Confirm)
+    } else if ui.cancel {
+        Some(MenuInput::Cancel)
+    } else {
+        None
     }
 }
 
@@ -2177,6 +2413,7 @@ impl InputEdges {
             right: keys.right && !self.previous.right,
             confirm: keys.confirm && !self.previous.confirm,
             cancel: keys.cancel && !self.previous.cancel,
+            start: keys.start && !self.previous.start,
             any: any_key || (keys.confirm && !self.previous.confirm),
         };
         self.previous = keys;
@@ -3706,7 +3943,9 @@ mod tests {
         session.game.sync_entity_from_player(&session.player);
 
         for _ in 0..10 {
-            session.tick(&pack, player::Input::default(), true).unwrap();
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), true)
+                .unwrap();
             if session.transition.is_some() {
                 break;
             }
@@ -3734,6 +3973,274 @@ mod tests {
         assert!(session.game.doors[0].is_none(), "the door table is rebuilt");
         assert!(!session.transition_finished);
         assert!(session.transition.is_none());
+    }
+
+    /// A pack with one synthetic room, its cut background and a 64-entry
+    /// global message table whose entries all wait for input.
+    fn message_pack(dir: &TempDir) -> PathBuf {
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut messages: Vec<Option<Vec<u8>>> =
+            (0..64).map(|_| Some(vec![0x0C, 0x01, 0x00])).collect();
+        // Index 63 is the yes/no take-item stream used by the post-action
+        // test: "A" then confirm -> case 10 action 0, with the trailing `0x01`
+        // the text-table scanner needs.
+        messages[63] = Some(vec![0x0C, 0x08, 0x00, 0x0A, 0x00, 0x01, 0x00]);
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer
+            .add("text/messages.bin", crate::text::encode_table(&messages))
+            .unwrap();
+        for table in [
+            "text/names.bin",
+            "text/unknown.bin",
+            "text/idesc.bin",
+            "text/save.bin",
+        ] {
+            writer.add(table, crate::text::encode_table(&[])).unwrap();
+        }
+        writer.write(&pack_path).unwrap();
+        pack_path
+    }
+
+    #[test]
+    fn a_paused_message_ignores_player_input_until_dismissed() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        // Global id 0x40 with a pause word that masks the control bit.
+        session.game.show_message(0x40, 0x145);
+        assert!(session.game.message_locks_controls());
+
+        let before = session.game.frame;
+        let movement = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        for _ in 0..4 {
+            session
+                .tick(&pack, UiInput::default(), movement, false)
+                .unwrap();
+        }
+        assert_eq!(session.game.frame, before + 4, "the room tick continues");
+        assert!(session.game.message.active);
+        assert!(
+            session.game.message_locks_controls(),
+            "the held movement never reached the room tick"
+        );
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert!(!session.game.message.active, "the action key dismissed it");
+        assert!(!session.game.message_locks_controls());
+    }
+
+    #[test]
+    fn start_opens_the_menu_freezes_the_room_and_cancel_resumes() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        let before = session.game.frame;
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_some(), "START opens the menu");
+        assert!(session.game.message_menu, "menu messages use the menu line");
+        assert_eq!(session.game.frame, before, "the menu froze the room");
+
+        for _ in 0..5 {
+            session
+                .tick(
+                    &pack,
+                    UiInput::default(),
+                    player::Input {
+                        up: true,
+                        ..player::Input::default()
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(session.game.frame, before, "the room stays frozen");
+        assert!(session.menu.is_some());
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_none(), "X closes the menu");
+        assert!(!session.game.message_menu);
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.frame, before + 1, "the room resumes");
+    }
+
+    #[test]
+    fn a_confirmed_message_pickup_reaches_the_session_state() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        // A room item action armed behind a yes/no message; the zone sits far
+        // from the spawn so the action key cannot fire it directly.
+        session.game.room_actions[3] = Some(game::RoomAction {
+            slot: 3,
+            kind: game::RoomActionKind::Item,
+            zone: [10000, 10000, 100, 100],
+            sce: 4,
+            handler: 4,
+            flags: 0x81,
+            room_items_flag: 0xFF,
+            params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
+        });
+        // Global id 0x7f (index 63) is the yes/no pickup stream.
+        session.game.show_message_for_action(3, 0x7F, 0xFF);
+        assert!(session.game.message.active);
+
+        for _ in 0..600 {
+            if session.game.message.phase() == crate::message::MessagePhase::YesNo {
+                break;
+            }
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(
+            session.game.message.phase(),
+            crate::message::MessagePhase::YesNo
+        );
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert!(!session.game.message.active);
+        assert!(
+            session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "the post-action pickup reached the session"
+        );
+        assert!(
+            session.game.room_actions[3].is_none(),
+            "the action is consumed"
+        );
+    }
+
+    #[test]
+    fn start_is_refused_while_a_message_is_displayed() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+
+        session.game.show_message(0x40, 0);
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_none(), "START waits for the message");
+        assert!(session.game.message.active);
+    }
+
+    #[test]
+    fn a_menu_refusal_message_routes_through_the_window_with_menu_rules() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, RoomId::parse("100").unwrap()).unwrap();
+        // At full health the green herb's USE is refused; the menu reports
+        // the refusal as 0xf7 + the heal category (7).
+        session.game.add_item(ITEM_GREEN_HERB, 1);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_some());
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.game.message.active, "the refusal message opened");
+        assert_eq!(session.game.message.id, Some(0xFE));
+        assert!(session.game.message.uses_menu_position());
+        assert_eq!(session.game.message.pause, 0, "menu messages never pause");
+        assert!(session.game.message_menu);
+
+        // The room stays frozen with the message up and the text resolves.
+        let frozen = session.game.frame;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.frame, frozen);
+        assert!(session.game.message.has_source());
     }
 
     #[test]
@@ -3854,6 +4361,65 @@ mod tests {
         assert_eq!(
             continued.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
             0
+        );
+    }
+
+    /// The real locked door's message renders through the session's own
+    /// framebuffer over the frozen room.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_locked_door_message_draws_in_the_session() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("1010").unwrap();
+        let mut session = GameSession::from_room(&pack, id).unwrap();
+
+        // Stand in the key door's zone with no key: the next ticks request and
+        // resolve its locked message without the player moving.
+        let door = session.game.doors[1].expect("ROOM1010's key door");
+        let center_x = i32::from(door.zone[0]) + i32::from(door.zone[2]) / 2;
+        let center_z = i32::from(door.zone[1]) + i32::from(door.zone[3]) / 2;
+        let (dx, dz) = player::reach_offset(0);
+        session.player.pos = [center_x - dx, 0, center_z - dz];
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+        // Freeze the frame before the message exists; the tick loop below does
+        // not render, so it still holds this scene when the window is drawn.
+        session.render(&pack);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert_eq!(session.game.message.id, Some(201));
+        for _ in 0..600 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.game.message.has_source() {
+                break;
+            }
+        }
+        assert!(session.game.message.has_source());
+
+        // Draw the resolved window with the session's own font and tables over
+        // the frozen gameplay frame, exactly as `GameSession::render` does.
+        let font = session.font.as_ref().expect("the real pack carries a font");
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.copy_from(session.frame());
+        let before = framebuffer.rgba.clone();
+        session
+            .game
+            .message
+            .draw(&mut framebuffer, font, &session.text);
+        let changed = before
+            .iter()
+            .zip(&framebuffer.rgba)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(
+            changed > 100,
+            "the locked door message drew only {changed} session pixels"
         );
     }
 

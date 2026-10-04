@@ -10,24 +10,23 @@
 //!
 //! # Engine hook
 //!
-//! The engine worktree owns `src/ui/mod.rs` and `engine.rs`. To register this
-//! screen:
+//! [`crate::engine::GameSession`] handles this screen explicitly (it is not a
+//! [`crate::ui::Screen`] modal, because it mutates the session's
+//! [`GameState`] and shares its message window):
 //!
-//! 1. load [`MenuAssets`] once per game session (`MenuAssets::load(pack)`),
-//!    alongside `Text::load(pack)`;
-//! 2. keep `Option<MainMenu>` in the session; on START, freeze room ticks and
-//!    open with [`MainMenu::open`];
-//! 3. each frozen frame map the pad to [`MenuInput`], call
-//!    [`MainMenu::handle_input`] and consume the [`MenuEvent`] (close the
-//!    screen, start the message window, or hand `ViewItem` to slice 7);
-//! 4. blit the last gameplay frame, call [`MainMenu::draw`], then draw the
-//!    message window and the fade overlay on top;
-//! 5. drop the menu and unfreeze when `handle_input` returns
-//!    [`MenuEvent::Close`].
+//! 1. [`MenuAssets`] load lazily on the first START, once per session;
+//! 2. START freezes the room tick and opens [`MainMenu`] over the last
+//!    gameplay frame, with the game's message window switched to the menu
+//!    line;
+//! 3. each frozen frame maps one pad edge to [`MenuInput`], calls
+//!    [`MainMenu::handle_input`] and consumes the [`MenuEvent`]: `Close`
+//!    unfreezes, `Message` starts a menu-paused window, `ViewItem` is a
+//!    stub until the viewer slice, and `Tab`/`Changed` just redraw;
+//! 4. the session draws the frozen frame, then the menu, then the message
+//!    window over both.
 //!
-//! `--ui menu` can boot straight into a frozen room, set a known inventory and
-//! call [`MainMenu::draw`] once for captures; the screen has no SDL
-//! dependency.
+//! `--ui menu` boots straight into this state over room 1001 with a known
+//! inventory; the screen has no SDL dependency.
 
 use anyhow::{Context, Result};
 

@@ -49,7 +49,7 @@
 //! once per fixed tick, feeding the held keys the same way the room tick does:
 //!
 //! ```ignore
-//! // In the gameplay tick, after the room scripts and player movement:
+//! // In the gameplay tick, before the room scripts and player movement:
 //! game.update_message(
 //!     MessageInput { action, left: input.left, right: input.right },
 //!     &room,
@@ -61,10 +61,15 @@
 //! game.message.draw(&mut framebuffer, &font, &text);
 //! ```
 //!
-//! The door-animation adapter may keep writing `id`/`pause`/`active` directly;
-//! `update_message` turns that into a request before resolving the bytes.
-//! Requesting a second message while one is up is refused, exactly like the
-//! original's `set_message_display`.
+//! [`crate::game::GameState::show_message`] masks the request's pause word out
+//! of [`crate::game::GameState::message_flags`]; while that masks the control
+//! bit, [`crate::game::GameState::message_locks_controls`] is true and the
+//! engine blanks the player's movement and action input for the tick (the
+//! original's cleared d-pad word). Dismissal restores the captured flags.
+//! The door-animation adapter arms its message through `show_message` too, so
+//! an already-displaying window is refused rather than clobbered. Requesting
+//! a second message while one is up is refused, exactly like the original's
+//! `set_message_display`.
 
 use crate::font::Font;
 use crate::items;
@@ -270,6 +275,12 @@ impl MessageWindow {
     /// The current phase.
     pub fn phase(&self) -> MessagePhase {
         self.phase
+    }
+
+    /// Whether the window was requested by the pause menu: its text draws on
+    /// the menu line and its reveal runs at half speed.
+    pub fn uses_menu_position(&self) -> bool {
+        self.menu
     }
 
     /// Request a message: the original's `set_message_display` head.
