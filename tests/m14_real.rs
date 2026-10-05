@@ -1,10 +1,13 @@
-//! M14 real-asset tests: the AVI demuxer and the Cinepak decoder.
+//! M14 real-asset tests: the AVI demuxer, the Cinepak decoder, the movie pack
+//! and the playback session.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
 //!  ARKLAY_MOVIE_GOLDEN=... cargo test --test m14_real -- --ignored --nocapture`
 //!
-//! The integer-pixel comparison needs `ARKLAY_MOVIE_GOLDEN`, a directory of
+//! The playback tests additionally need the film pack: `ARKLAY_RE1_MOVIE`, or
+//! a sibling `<pack stem>.movie.akpak` next to `ARKLAY_RE1_PACK`. The
+//! integer-pixel comparison needs `ARKLAY_MOVIE_GOLDEN`, a directory of
 //! sampled BMPs and a `hashes_crc32.txt` produced by an independent decoder
 //! (never committed); without it the tests still decode the whole corpus and
 //! check determinism. Only an unset environment skips; a partial
@@ -12,11 +15,17 @@
 
 mod common;
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use arklay::avi::Avi;
 use arklay::cinepak::Decoder;
+use arklay::convert::{MoviePackOptions, VoicePackOptions, convert_game_with_packs};
+use arklay::movie::{self, MovieSession, MovieTick};
+use arklay::pack::Pack;
+use arklay::scd::ir::Decoded;
+use arklay::scd::reader;
 
 /// `(basename, video frames, audio chunks)` for all 27 shipped films.
 const FILMS: &[(&str, usize, usize)] = &[
@@ -76,6 +85,41 @@ fn golden_dir() -> Option<PathBuf> {
         dir.display()
     );
     Some(dir)
+}
+
+/// The converted film pack: `ARKLAY_RE1_MOVIE`, or the sibling
+/// `<pack stem>.movie.akpak` beside `ARKLAY_RE1_PACK`.
+fn real_movie_pack(pack_path: &Path) -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ARKLAY_RE1_MOVIE") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "ARKLAY_RE1_MOVIE is set but {} is not a file",
+            path.display()
+        );
+        return Some(path);
+    }
+    let stem = pack_path.file_stem()?.to_str()?;
+    let sibling = pack_path.with_file_name(format!("{stem}.movie.akpak"));
+    sibling.is_file().then_some(sibling)
+}
+
+/// A self-deleting temporary directory unique to this process and label.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(label: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("arklay-m14-{}-{label}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 /// CRC-32 (IEEE) over the packed RGB canvas, shared with the golden
@@ -225,4 +269,350 @@ fn decoded_frames_match_the_independent_goldens() {
         }
     }
     assert_eq!(matched, TOTAL_FRAMES);
+}
+
+/// The film ids the shipped room scripts request through `movie_on` (0x29):
+/// ids 3-9 and 11-13 across 19 sites.
+const MOVIE_SITE_IDS: &[u8] = &[3, 4, 5, 6, 7, 8, 9, 11, 12, 13];
+
+#[test]
+#[ignore = "requires a converted movie pack"]
+fn pj_prologue_cut_resumes_at_the_second_cut_point() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let pack = Pack::open(&movie_path).unwrap();
+
+    // Chris plays the whole 2261-frame intro.
+    let chris = MovieSession::open(&pack, 1, 0).unwrap();
+    assert_eq!(chris.frame_count(), 2261);
+    assert_eq!(chris.avi_frame_index(), 0);
+
+    // Jill presents up to the frame before the cut (AVI 1777), then the next
+    // advance resumes at the second cut point (AVI 1885).
+    let mut jill = MovieSession::open(&pack, 1, 1).unwrap();
+    assert_eq!(jill.frame_count(), 2261 - (1885 - 1778));
+    let mut ticks = 0;
+    while jill.frame_index() < 1777 {
+        match jill.tick(0, None) {
+            MovieTick::Waiting | MovieTick::Advanced => {}
+            MovieTick::Finished | MovieTick::Skipped => panic!("the cut film ended early"),
+        }
+        ticks += 1;
+        assert!(ticks < 6000, "the film never reached the cut");
+    }
+    assert_eq!(jill.avi_frame_index(), 1777);
+    loop {
+        match jill.tick(0, None) {
+            MovieTick::Advanced => break,
+            MovieTick::Waiting => {}
+            MovieTick::Finished | MovieTick::Skipped => panic!("the cut film ended early"),
+        }
+    }
+    assert_eq!(jill.frame_index(), 1778);
+    assert_eq!(jill.avi_frame_index(), 1885);
+    // The audio clock counts kept frames only: kept 1778 is 107 frames short
+    // of its raw AVI clock.
+    assert_eq!(jill.samples_before(1778), 1778 * 2205);
+    println!(
+        "pj cut: {} kept frames, resumed at AVI 1885 after {ticks} ticks",
+        jill.frame_count()
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation and a converted movie pack"]
+fn every_shipped_movie_on_site_resolves_to_a_packed_film() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let pack = Pack::open(&movie_path).unwrap();
+
+    let mut sites = 0usize;
+    let mut ids = HashSet::new();
+    let mut missing = Vec::new();
+    for stage in 1..=7u8 {
+        let dir = root.join("JPN").join(format!("STAGE{stage}"));
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(digits) = name
+                .to_ascii_lowercase()
+                .strip_prefix("room")
+                .and_then(|name| name.strip_suffix(".rdt"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let bytes = fs::read(entry.path()).unwrap();
+            let Ok(scripts) = reader::parse(&bytes) else {
+                continue;
+            };
+            for insn in scripts
+                .init
+                .iter()
+                .flat_map(|block| block.insns.iter())
+                .chain(scripts.main.iter().flat_map(|block| block.insns.iter()))
+                .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+            {
+                let Decoded::Command(op) = insn.decoded else {
+                    continue;
+                };
+                if op.op != 0x29 {
+                    continue;
+                }
+                // The reader decodes `movie_on`'s one-byte `u` operand as the
+                // high byte of the original's id word, which is the id.
+                let id = insn.operands.first().map_or(0, |operand| operand.value) as u8;
+                match movie::name(id) {
+                    Some(name) if pack.contains(&movie::pack_path(name)) => {
+                        sites += 1;
+                        ids.insert(id);
+                    }
+                    Some(name) => missing.push(format!(
+                        "{} (room {digits} movie_on {id})",
+                        movie::pack_path(name)
+                    )),
+                    None => missing.push(format!("null id {id} (room {digits})")),
+                }
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "unresolved movie_on site(s): {missing:?}"
+    );
+    assert_eq!(sites, 19, "the shipped corpus has 19 movie_on sites");
+    let expected: HashSet<u8> = MOVIE_SITE_IDS.iter().copied().collect();
+    assert_eq!(ids, expected, "the shipped movie_on ids changed");
+    println!("resolved {sites} movie_on sites: {ids:?}");
+}
+
+/// The film table ids the shipped install packs (every named film but the
+/// absent Virgin logo).
+#[test]
+#[ignore = "requires a converted movie pack"]
+fn the_movie_pack_carries_the_shipped_films() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let pack = Pack::open(&movie_path).unwrap();
+    let mut expected = 0usize;
+    for id in 0..=28u8 {
+        let Some(name) = movie::name(id) else {
+            continue;
+        };
+        let entry = movie::pack_path(name);
+        if name == "vlogo" {
+            assert!(!pack.contains(&entry), "vlogo is absent from this install");
+            continue;
+        }
+        expected += 1;
+        assert!(pack.contains(&entry), "missing {entry}");
+    }
+    assert_eq!(expected, 27, "27 named films ship in this install");
+    assert_eq!(
+        pack.paths()
+            .filter(|path| path.starts_with("movie/"))
+            .count(),
+        27
+    );
+    let bytes: u64 = pack
+        .paths()
+        .filter(|path| path.starts_with("movie/"))
+        .map(|path| pack.read(path).unwrap().len() as u64)
+        .sum();
+    assert_eq!(bytes, TOTAL_BYTES);
+    println!("movie pack: {} entries, {bytes} bytes", pack.len());
+}
+
+/// Decode one whole film through the session clock and return the per-frame
+/// RGBA hashes in presentation order.
+fn session_hashes(pack: &Pack, id: u8, character: u8) -> Vec<u32> {
+    let mut session = MovieSession::open(pack, id, character).unwrap();
+    let mut hashes = vec![crc32(session.frame_rgba())];
+    loop {
+        match session.tick(0, None) {
+            MovieTick::Advanced => hashes.push(crc32(session.frame_rgba())),
+            MovieTick::Waiting => {}
+            MovieTick::Finished | MovieTick::Skipped => break,
+        }
+    }
+    hashes
+}
+
+#[test]
+#[ignore = "requires a converted movie pack"]
+fn a_full_film_decodes_to_its_frame_count_with_a_stable_hash() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let pack = Pack::open(&movie_path).unwrap();
+    for (id, frames) in [(23u8, 76usize), (4, 147)] {
+        let first = session_hashes(&pack, id, 0);
+        assert_eq!(first.len(), frames, "film id {id}");
+        let second = session_hashes(&pack, id, 0);
+        assert_eq!(
+            first, second,
+            "film id {id} decoded differently on a second pass"
+        );
+        println!(
+            "film id {id}: {frames} frames, last hash {:08x}",
+            first[frames - 1]
+        );
+    }
+    // The 44100 Hz 8-bit logo is converted to the mixer's rate, so its audio
+    // clock stays 2205 samples per 10 fps frame.
+    let avi = parse_film(&root, "capcom");
+    assert_eq!(avi.samples_per_frame(), 4410);
+    let session = MovieSession::open(&pack, 23, 0).unwrap();
+    assert_eq!(session.samples_per_frame(), 2205);
+}
+
+#[test]
+#[ignore = "requires a converted movie pack; writes ~50 MiB of film audio"]
+fn a_short_audio_film_pads_silence_without_stalling() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let pack = Pack::open(&movie_path).unwrap();
+    // `dm7` ships 60 audio chunks for 67 video frames.
+    let mut session = MovieSession::open(&pack, 7, 0).unwrap();
+    assert_eq!(session.frame_count(), 67);
+    let mut samples = session.take_audio().len();
+    let mut guard = 0;
+    loop {
+        match session.tick(0, None) {
+            MovieTick::Waiting => {}
+            MovieTick::Advanced => {}
+            MovieTick::Finished | MovieTick::Skipped => break,
+        }
+        samples += session.take_audio().len();
+        guard += 1;
+        assert!(guard < 1000, "the short-audio film stalled");
+    }
+    assert_eq!(
+        samples,
+        67 * 2205 * 2,
+        "every frame queues one frame of audio"
+    );
+}
+
+#[test]
+#[ignore = "requires a converted movie pack and SDL's offscreen driver"]
+fn standalone_fmv_capture_is_deterministic_and_not_blank() {
+    use std::process::Command;
+
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let Some(movie_path) = real_movie_pack(&pack_path) else {
+        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
+        return;
+    };
+    let dir = TempDir::new("fmv");
+    let first = dir.0.join("first.bmp");
+    let second = dir.0.join("second.bmp");
+    // The current test binary carries no `arklay` CLI, so shell out to the
+    // built binary: `--fmv 23 --ticks 6 --capture` is frame 2 of the Capcom
+    // logo, the same bytes every run.
+    let binary = env!("CARGO_BIN_EXE_arklay");
+    for path in [&first, &second] {
+        let status = Command::new(binary)
+            .args([
+                pack_path.to_str().unwrap(),
+                "--movie",
+                movie_path.to_str().unwrap(),
+                "--fmv",
+                "23",
+                "--ticks",
+                "6",
+                "--capture",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run the arklay binary");
+        assert!(status.success(), "standalone --fmv capture failed");
+    }
+    assert_eq!(
+        fs::read(&first).unwrap(),
+        fs::read(&second).unwrap(),
+        "--fmv captures differ between runs"
+    );
+    let image = arklay::bmp::decode(&fs::read(&first).unwrap()).unwrap();
+    assert_eq!((image.width, image.height), (320, 240));
+    assert!(
+        image
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+        "the Capcom logo frame is blank"
+    );
+    println!(
+        "--fmv 23 capture: {} bytes",
+        fs::metadata(&first).unwrap().len()
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation; writes ~660 MiB"]
+fn conversion_writes_the_shipped_movie_pack() {
+    let Some((root, _pack)) = common::asset_env() else {
+        return;
+    };
+    let dir = TempDir::new("convert");
+    let main_out = dir.0.join("re1.akpak");
+    let movie_out = dir.0.join("re1.movie.akpak");
+    convert_game_with_packs(
+        &root,
+        &main_out,
+        None,
+        0,
+        &VoicePackOptions::Skip,
+        &MoviePackOptions::Sibling(Some(movie_out.clone())),
+    )
+    .unwrap();
+
+    let pack = Pack::open(&movie_out).unwrap();
+    assert_eq!(pack.len(), 27, "one entry per shipped film");
+    let bytes: u64 = pack.entries().map(|entry| entry.size() as u64).sum();
+    assert_eq!(bytes, TOTAL_BYTES);
+    for &(name, _, _) in FILMS {
+        assert!(pack.contains(&movie::pack_path(name)), "missing {name}");
+    }
+    assert!(!pack.contains("movie/vlogo.avi"));
+    let main = Pack::open(&main_out).unwrap();
+    assert!(!main.paths().any(|path| path.starts_with("movie/")));
+    println!(
+        "movie pack: {} entries, {bytes} bytes; main pack {} entries",
+        pack.len(),
+        main.len()
+    );
 }

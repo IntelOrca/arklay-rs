@@ -19,6 +19,7 @@ pub mod lzw;
 pub mod mask;
 pub mod message;
 pub mod model;
+pub mod movie;
 pub mod music;
 pub mod npc;
 pub mod objects;

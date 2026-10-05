@@ -1,17 +1,16 @@
 //! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
 //! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound`, `objspr`,
-//! `ITEM_M1`, `effspr` and `DATA` (case-insensitively, up to two levels below
-//! the root), stores every `ROOM####.RDT`, converts the camera backgrounds of
-//! every distinct room once, converts the room mask pages of every camera that
-//! has sprite groups, copies the door animations named by the door type table,
-//! copies the `BGM_*.WAV` music files, the 68 named sound effects, the four
-//! player models plus the two no-weapon locomotion clips, the fifteen scripted
-//! character (NPC) models, the 33 effect-sheet TIMs, the `core00`
-//! weapon-effect metadata and the `KAGE.TIM` player-shadow coverage page.
-//! Stages 6 and 7 reuse the
-//! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
-//! by 5.
+//! `ITEM_M1`, `effspr`, `voice`, `movie` and `DATA` (case-insensitively, up to
+//! two levels below the root), stores every `ROOM####.RDT`, converts the camera
+//! backgrounds of every distinct room once, converts the room mask pages of
+//! every camera that has sprite groups, copies the door animations named by the
+//! door type table, copies the `BGM_*.WAV` music files, the 68 named sound
+//! effects, the four player models plus the two no-weapon locomotion clips,
+//! the fifteen scripted character (NPC) models, the 33 effect-sheet TIMs, the
+//! `core00` weapon-effect metadata and the `KAGE.TIM` player-shadow coverage
+//! page. Stages 6 and 7 reuse the backgrounds and mask pages of STAGE1/STAGE2
+//! with the stage digit reduced by 5.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -24,6 +23,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::items;
 use crate::model::Texture8;
+use crate::movie;
 use crate::music;
 use crate::npc;
 use crate::pack::PackWriter;
@@ -220,6 +220,34 @@ pub fn voice_pack_path(out: &Path) -> PathBuf {
     out.with_file_name(format!("{stem}.voice.akpak"))
 }
 
+/// How `convert-game` distributes the referenced film AVIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoviePackOptions {
+    /// Write a second v1 pack (default: `<out stem>.movie.akpak`, or the
+    /// given explicit path).
+    Sibling(Option<PathBuf>),
+    /// Embed the film entries in the main pack for a single-file install
+    /// (~630 MiB).
+    Embed,
+    /// Do not pack film at all.
+    Skip,
+}
+
+impl Default for MoviePackOptions {
+    fn default() -> Self {
+        Self::Sibling(None)
+    }
+}
+
+/// The default sibling movie-pack path for a main pack: `<stem>.movie.akpak`.
+pub fn movie_pack_path(out: &Path) -> PathBuf {
+    let stem = out
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("re1");
+    out.with_file_name(format!("{stem}.movie.akpak"))
+}
+
 /// Like [`convert_game_with_exe`], but with an explicit worker count.
 ///
 /// A `jobs` of `0` selects one worker per available CPU, and the output is
@@ -233,13 +261,33 @@ pub fn convert_game_with_options(
     convert_game_with_voice(root, out, exe, jobs, &VoicePackOptions::default())
 }
 
-/// [`convert_game_with_options`] with the voice-pack distribution selected.
+/// [`convert_game_with_options`] with the voice-pack distribution selected and
+/// the default movie-pack distribution.
 pub fn convert_game_with_voice(
     root: &Path,
     out: &Path,
     exe: Option<&Path>,
     jobs: usize,
     voice_options: &VoicePackOptions,
+) -> Result<()> {
+    convert_game_with_packs(
+        root,
+        out,
+        exe,
+        jobs,
+        voice_options,
+        &MoviePackOptions::default(),
+    )
+}
+
+/// [`convert_game_with_voice`] with both optional pack distributions selected.
+pub fn convert_game_with_packs(
+    root: &Path,
+    out: &Path,
+    exe: Option<&Path>,
+    jobs: usize,
+    voice_options: &VoicePackOptions,
+    movie_options: &MoviePackOptions,
 ) -> Result<()> {
     let jobs = worker_count(jobs);
     let mut progress = Progress::new();
@@ -257,6 +305,8 @@ pub fn convert_game_with_voice(
         voice,
         voice_unreferenced,
         voice_dir_found,
+        movie,
+        movie_dir_found,
         mut warnings,
     } = build_plan_with_progress(root, jobs, &mut progress)?;
     let exe = match exe {
@@ -284,6 +334,13 @@ pub fn convert_game_with_voice(
         println!(
             "warning: no voice directory found; {} voice line(s) will be missing",
             voice::referenced_names().len()
+        );
+    }
+    let movie_enabled = !matches!(movie_options, MoviePackOptions::Skip);
+    if movie_enabled && !movie_dir_found {
+        println!(
+            "warning: no movie directory found; {} film(s) will be missing",
+            movie::name_count()
         );
     }
 
@@ -403,10 +460,9 @@ pub fn convert_game_with_voice(
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress, jobs)?;
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress, jobs)?;
     // TODO(parity): (conversion) the original installs more than this pack
-    // carries: the FMV AVIs and the held-weapon TMDs under
-    // `players/ws*.tmd`. Those systems are unimplemented, so the conversion is
-    // complete only for the modelled categories; add their copy phases when
-    // the runtime grows them.
+    // carries: the held-weapon TMDs under `players/ws*.tmd`. Those systems are
+    // unimplemented, so the conversion is complete only for the modelled
+    // categories; add their copy phase when the runtime grows them.
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress, jobs)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress, jobs)?;
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress, jobs)?;
@@ -451,6 +507,33 @@ pub fn convert_game_with_voice(
         )
     };
 
+    // Film follows the same contract: `--with-movie` embeds the raw AVIs in
+    // the main pack, the default writes the secondary `<stem>.movie.akpak`.
+    let embed_movie =
+        movie_enabled && matches!(movie_options, MoviePackOptions::Embed) && !movie.is_empty();
+    let (movie_count, movie_bytes, movie_note) = if !movie_enabled || movie.is_empty() {
+        (0, 0, String::new())
+    } else if embed_movie {
+        let (count, bytes) = copy_movies(&movie, &mut writer, &mut progress, jobs)?;
+        (count, bytes, " (embedded)".to_string())
+    } else {
+        let path = match movie_options {
+            MoviePackOptions::Sibling(Some(path)) => path.clone(),
+            _ => movie_pack_path(out),
+        };
+        let mut movie_writer = PackWriter::new();
+        let (count, bytes) = copy_movies(&movie, &mut movie_writer, &mut progress, jobs)?;
+        let movie_size = movie_writer.pack_size()?;
+        movie_writer
+            .write(&path)
+            .with_context(|| format!("failed to write movie pack {}", path.display()))?;
+        (
+            count,
+            bytes,
+            format!(" -> {} ({movie_size} bytes)", path.display()),
+        )
+    };
+
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
         println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
     }
@@ -481,6 +564,9 @@ pub fn convert_game_with_voice(
                 voice_unreferenced.join(", ")
             );
         }
+    }
+    if movie_enabled {
+        println!("movie: {movie_count} entries, {movie_bytes} bytes{movie_note}");
     }
 
     // Stream the pack straight to disk: the entry data is already in memory,
@@ -520,7 +606,8 @@ pub fn convert_game_with_voice(
         + text_count
         + ivm_count
         + file_count
-        + if embed_voice { voice_count } else { 0 };
+        + if embed_voice { voice_count } else { 0 }
+        + if embed_movie { movie_count } else { 0 };
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -650,6 +737,21 @@ fn copy_voice(
         .map(|asset| (asset.entry.clone(), asset.source.clone()))
         .collect();
     copy_raw_files(files, "voice", writer, progress, jobs)
+}
+
+/// Add every resolved film AVI to the pack verbatim, under its canonical
+/// `movie/{name}.avi` entry.
+fn copy_movies(
+    assets: &[MovieAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    let files = assets
+        .iter()
+        .map(|asset| (asset.entry.clone(), asset.source.clone()))
+        .collect();
+    copy_raw_files(files, "movie", writer, progress, jobs)
 }
 
 /// Add every door animation named by the door type table.
@@ -1621,8 +1723,8 @@ fn copy_font(
     Ok((1, bytes))
 }
 
-/// Stage, sound, enemy-model, player, room-mask, door-art, data and item-view
-/// directory roots discovered under the conversion root.
+/// Stage, sound, enemy-model, player, room-mask, door-art, data, item-view and
+/// film directory roots discovered under the conversion root.
 #[derive(Debug)]
 struct Layout {
     stages: BTreeMap<u8, PathBuf>,
@@ -1635,11 +1737,12 @@ struct Layout {
     item_m2: Option<PathBuf>,
     effspr: Option<PathBuf>,
     voice: Option<PathBuf>,
+    movie: Option<PathBuf>,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
-/// `enemy`, `players`, `objspr`, `ITEM_M1`, `ITEM_M2`, `data`, `effspr` and
-/// `voice`.
+/// `enemy`, `players`, `objspr`, `ITEM_M1`, `ITEM_M2`, `data`, `effspr`,
+/// `voice` and `movie`.
 fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
@@ -1652,6 +1755,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut item_m2 = None;
     let mut effspr = None;
     let mut voice = None;
+    let mut movie = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -1675,6 +1779,8 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 effspr = Some(dir.clone());
             } else if voice.is_none() && name.eq_ignore_ascii_case("voice") {
                 voice = Some(dir.clone());
+            } else if movie.is_none() && name.eq_ignore_ascii_case("movie") {
+                movie = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -1711,6 +1817,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         item_m2,
         effspr,
         voice,
+        movie,
     })
 }
 
@@ -1781,6 +1888,15 @@ struct VoiceAsset {
     source: PathBuf,
 }
 
+/// One film AVI resolved to its pack entry.
+#[derive(Debug)]
+struct MovieAsset {
+    /// Pack entry, e.g. `movie/pj.avi`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
 /// One effect-sheet TIM resolved to its pack entry.
 #[derive(Debug)]
 struct EffectSheet {
@@ -1837,6 +1953,10 @@ struct Plan {
     voice_unreferenced: Vec<String>,
     /// Whether the install has a `voice` directory at all.
     voice_dir_found: bool,
+    /// The named film AVIs (table ids 0..=28), resolved case-insensitively.
+    movie: Vec<MovieAsset>,
+    /// Whether the install has a `movie` directory at all.
+    movie_dir_found: bool,
     /// Non-fatal problems found while resolving optional inputs.
     warnings: Vec<String>,
 }
@@ -1863,6 +1983,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         item_m2,
         effspr,
         voice: voice_dir,
+        movie: movie_dir,
     } = layout;
     // The font is optional and only diagnosable when the install actually has
     // a DATA directory; a missing DATA root is not reported so partial trees
@@ -2071,6 +2192,37 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         }
     }
 
+    // Film is the second optional pack: each table id 0..=28 is resolved
+    // case-insensitively (the null id 10 is skipped) and the missing names are
+    // aggregated into one warning. A missing `movie` directory is only
+    // reported by the conversion summary, like the other optional categories.
+    let movie_index = movie_dir.as_deref().map(index_dir).transpose()?;
+    let mut movie_assets = Vec::new();
+    if let (Some(dir), Some(index)) = (movie_dir.as_deref(), movie_index.as_ref()) {
+        let mut missing_movies = Vec::new();
+        for id in 0..=28u8 {
+            let Some(name) = movie::name(id) else {
+                continue;
+            };
+            let file = format!("{name}.avi");
+            match index.get(&file) {
+                Some(source) => movie_assets.push(MovieAsset {
+                    entry: movie::pack_path(name),
+                    source: source.clone(),
+                }),
+                None => missing_movies.push(format!("{}.AVI", name.to_ascii_uppercase())),
+            }
+        }
+        if !missing_movies.is_empty() {
+            warnings.push(format!(
+                "missing {} film file(s) in {}: {}",
+                missing_movies.len(),
+                dir.display(),
+                missing_movies.join(", ")
+            ));
+        }
+    }
+
     warnings.extend(data.warnings.iter().cloned());
     warnings.extend(npc_warnings);
     if let Some(font_warning) = font_warning {
@@ -2090,6 +2242,8 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         voice: voice_assets,
         voice_unreferenced,
         voice_dir_found: voice_dir.is_some(),
+        movie: movie_assets,
+        movie_dir_found: movie_dir.is_some(),
         warnings,
     })
 }
@@ -2959,6 +3113,133 @@ mod tests {
             .collect();
         assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
         assert!(warnings[0].contains("V104_00.WAV"), "{:?}", warnings);
+    }
+
+    #[test]
+    fn movie_pack_paths_derive_from_the_main_pack() {
+        assert_eq!(
+            movie_pack_path(Path::new("/games/re1.akpak")),
+            PathBuf::from("/games/re1.movie.akpak")
+        );
+        assert_eq!(
+            movie_pack_path(Path::new("re1")),
+            PathBuf::from("re1.movie.akpak")
+        );
+        assert_eq!(MoviePackOptions::default(), MoviePackOptions::Sibling(None));
+        assert_ne!(MoviePackOptions::default(), MoviePackOptions::Skip);
+    }
+
+    #[test]
+    fn resolves_movie_files_and_warns_for_missing() {
+        let root = TempDir::new("movie-plan");
+        make_stage_dirs(&root.path);
+        // Case-insensitive directory and file names, like the shipped tree.
+        let movie = root.path.join("MOVIE");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("PJ.AVI"), b"pj").unwrap();
+        fs::write(movie.join("oj.avi"), b"oj").unwrap();
+
+        let layout = discover_layout(&root.path).unwrap();
+        assert_eq!(layout.movie.as_deref(), Some(movie.as_path()));
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.movie.len(), 2);
+        assert!(plan.movie.iter().any(|asset| asset.entry == "movie/pj.avi"));
+        assert!(plan.movie.iter().any(|asset| asset.entry == "movie/oj.avi"));
+        assert!(plan.movie_dir_found);
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("film file"))
+            .expect("aggregated missing-film warning");
+        assert!(warning.contains("26 film file"), "{warning}");
+        assert!(warning.contains("VLOGO.AVI"), "{warning}");
+
+        // Without a movie directory no warning is raised here; the conversion
+        // summary reports the whole missing category instead.
+        fs::remove_dir_all(&movie).unwrap();
+        let plan = build_plan(&root.path).unwrap();
+        assert!(plan.movie.is_empty());
+        assert!(!plan.movie_dir_found);
+        assert!(!plan.warnings.iter().any(|w| w.contains("film file")));
+    }
+
+    #[test]
+    fn converts_movies_into_a_sibling_pack_and_embedded() {
+        let root = TempDir::new("movie-pack");
+        make_stage_dirs(&root.path);
+        write_npc_files(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), camera_pak()).unwrap();
+        fs::create_dir_all(root.path.join("sound")).unwrap();
+        write_se_files(&root.path);
+        write_door_files(&root.path);
+        let movie = root.path.join("movie");
+        fs::create_dir_all(&movie).unwrap();
+        fs::write(movie.join("oj.avi"), b"movie-oj").unwrap();
+        fs::write(movie.join("capcom.AVI"), b"movie-capcom").unwrap();
+
+        // Default sibling: a second plain v1 pack beside the main one.
+        let out = root.path.join("out.akpak");
+        let movie_out = root.path.join("out.movie.akpak");
+        convert_game_with_packs(
+            &root.path,
+            &out,
+            None,
+            1,
+            &VoicePackOptions::Skip,
+            &MoviePackOptions::Sibling(None),
+        )
+        .unwrap();
+        let film_pack = crate::pack::Pack::open(&movie_out).unwrap();
+        assert_eq!(film_pack.len(), 2);
+        assert_eq!(film_pack.read("movie/oj.avi").unwrap(), b"movie-oj");
+        assert_eq!(film_pack.read("movie/capcom.avi").unwrap(), b"movie-capcom");
+        let main = crate::pack::Pack::open(&out).unwrap();
+        assert!(!main.paths().any(|path| path.starts_with("movie/")));
+
+        // An explicit sibling path is honoured.
+        let explicit = root.path.join("explicit.movie.akpak");
+        convert_game_with_packs(
+            &root.path,
+            &out,
+            None,
+            1,
+            &VoicePackOptions::Skip,
+            &MoviePackOptions::Sibling(Some(explicit.clone())),
+        )
+        .unwrap();
+        assert!(explicit.is_file());
+
+        // Embed: the entries move into the main pack, no sibling is written.
+        let out = root.path.join("embed.akpak");
+        convert_game_with_packs(
+            &root.path,
+            &out,
+            None,
+            1,
+            &VoicePackOptions::Skip,
+            &MoviePackOptions::Embed,
+        )
+        .unwrap();
+        let main = crate::pack::Pack::open(&out).unwrap();
+        assert_eq!(main.read("movie/oj.avi").unwrap(), b"movie-oj");
+        assert!(!root.path.join("embed.movie.akpak").exists());
+
+        // Skip: no film entries anywhere.
+        let out = root.path.join("skip.akpak");
+        convert_game_with_packs(
+            &root.path,
+            &out,
+            None,
+            1,
+            &VoicePackOptions::Skip,
+            &MoviePackOptions::Skip,
+        )
+        .unwrap();
+        let main = crate::pack::Pack::open(&out).unwrap();
+        assert!(!main.paths().any(|path| path.starts_with("movie/")));
+        assert!(!root.path.join("skip.movie.akpak").exists());
     }
 
     #[test]

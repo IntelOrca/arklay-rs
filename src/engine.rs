@@ -83,6 +83,7 @@ use crate::items;
 use crate::mask;
 use crate::message::MessageInput;
 use crate::model::Emd;
+use crate::movie::{MovieSession, MovieTick};
 use crate::npc;
 use crate::objects;
 use crate::pack::Pack;
@@ -173,7 +174,8 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 ///
 /// `voice` overrides the sibling `<pack stem>.voice.akpak` discovery; a path
 /// that does not exist logs a warning and leaves voice lines skipped. The
-/// voice pack is consulted only by the voice and BGM audio loaders.
+/// voice pack is consulted only by the voice and BGM audio loaders. The movie
+/// pack is auto-discovered like the voice one.
 pub fn run_with_voice(
     pack: &Path,
     id: RoomId,
@@ -181,8 +183,25 @@ pub fn run_with_voice(
     ticks: u32,
     voice: Option<&Path>,
 ) -> Result<()> {
+    run_with_voice_and_movie(pack, id, capture, ticks, voice, None)
+}
+
+/// [`run_with_voice`] with an explicit movie-pack path.
+///
+/// `movie` overrides the sibling `<pack stem>.movie.akpak` discovery; a path
+/// that does not exist logs a warning and leaves every film request a graceful
+/// advance. The movie pack is consulted only by the film loader.
+pub fn run_with_voice_and_movie(
+    pack: &Path,
+    id: RoomId,
+    capture: Option<&Path>,
+    ticks: u32,
+    voice: Option<&Path>,
+    movie: Option<&Path>,
+) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let voice_path = voice_pack_path(pack, voice);
+    let movie_path = movie_pack_path(pack, movie);
     let pack = Pack::open(pack)?;
 
     if let Some(capture_path) = capture {
@@ -268,7 +287,8 @@ pub fn run_with_voice(
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
-    session.audio_packs = AudioPacks::new(voice_path);
+    session.voice_pack = AuxiliaryPack::new(voice_path);
+    session.movie_pack = AuxiliaryPack::new(movie_path);
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
@@ -475,7 +495,13 @@ struct GameSession {
     /// Decoded voice-line cache plus the one-slot pending request.
     voice_cache: VoiceCache,
     /// The main pack plus the lazily opened optional voice pack.
-    audio_packs: AudioPacks,
+    voice_pack: AuxiliaryPack,
+    /// The lazily opened optional movie pack.
+    movie_pack: AuxiliaryPack,
+    /// The in-game film currently holding the room, if any. While it is set
+    /// only the film advances; scripts, entities, effects and the player are
+    /// frozen.
+    movie: Option<MovieSession>,
     /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
     npc_models: npc::EntityModelCache,
     music: Option<Mixer>,
@@ -648,7 +674,9 @@ impl GameSession {
             sfx_cache: SfxCache::default(),
             bgm_cache: bgm::BgmCache::default(),
             voice_cache: VoiceCache::default(),
-            audio_packs: AudioPacks::default(),
+            voice_pack: AuxiliaryPack::default(),
+            movie_pack: AuxiliaryPack::default(),
+            movie: None,
             npc_models: npc::EntityModelCache::default(),
             music: None,
             text: Text::load(pack),
@@ -693,7 +721,7 @@ impl GameSession {
         // script (so a `room_bgm_state_set` it performs is visible) and after the
         // room's data is loaded.
         bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
-        let auxiliary = self.audio_packs.voice();
+        let auxiliary = self.voice_pack.open("voice");
         bgm::apply_live(
             &mut self.music,
             &mut self.game,
@@ -714,6 +742,13 @@ impl GameSession {
     /// opens the pause menu instead of ticking the room; while the menu is up
     /// the room stays frozen and the same input drives the menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        // A film owns the tick while it plays: the room's scripts, entities,
+        // effects and the player stay frozen, exactly like the original's
+        // main-loop jump.
+        if self.movie.is_some() {
+            self.tick_movie(ui, input);
+            return Ok(());
+        }
         if self.save_screen.is_some() {
             self.tick_save_screen(pack, ui);
             return Ok(());
@@ -807,14 +842,14 @@ impl GameSession {
             &mut self.game,
             &mut self.bgm_cache,
             pack,
-            self.audio_packs.voice(),
+            self.voice_pack.open("voice"),
         );
         tick_voice(
             &mut self.music,
             &mut self.voice_cache,
             &mut self.game,
             pack,
-            self.audio_packs.voice(),
+            self.voice_pack.open("voice"),
         );
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         // `MSF2_EFFECT_ZONE` (the second dword of main-state flag bank 5) is
@@ -853,6 +888,54 @@ impl GameSession {
         } else if self.game.take_itembox_open() {
             self.open_item_box(pack);
         }
+        Ok(())
+    }
+
+    /// One frozen tick of the active film: advance it against the mixer's
+    /// audio-led clock (or the fixed tick when no device is open), queue the
+    /// frame of audio it produces and resume the room when it ends.
+    fn tick_movie(&mut self, ui: UiInput, input: player::Input) {
+        let consumed = self
+            .music
+            .as_ref()
+            .filter(|mixer| !mixer.is_dummy())
+            .map(Mixer::movie_samples_consumed);
+        let Some(session) = self.movie.as_mut() else {
+            return;
+        };
+        let tick = session.tick(movie_buttons(ui, input), consumed);
+        let audio = session.take_audio();
+        if !audio.is_empty()
+            && let Some(mixer) = &mut self.music
+        {
+            mixer.load_movie_audio(audio);
+        }
+        if matches!(tick, MovieTick::Finished | MovieTick::Skipped) {
+            self.movie = None;
+            if let Some(mixer) = &mut self.music {
+                mixer.stop_movie_audio();
+                mixer.resume_game_sounds();
+            }
+        }
+    }
+
+    /// Start `id`'s film over the frozen room: pause the game sounds, queue the
+    /// film's opening audio and show its first frame. Called by the film
+    /// request hand-off once the scripts raise one.
+    #[allow(dead_code)]
+    fn start_movie(&mut self, pack: &Pack, id: u8, character: u8) -> Result<()> {
+        if self.movie.is_some() {
+            return Ok(());
+        }
+        let mut session = {
+            let source = self.movie_pack.open("movie").unwrap_or(pack);
+            MovieSession::open(source, id, character)?
+        };
+        if let Some(mixer) = &mut self.music {
+            mixer.pause_game_sounds();
+            mixer.load_movie_audio(session.take_audio());
+        }
+        self.movie = Some(session);
         Ok(())
     }
 
@@ -1252,6 +1335,11 @@ impl GameSession {
     /// after the scene (and outside the transition path) so it is never
     /// covered by the menu and never dimmed by a fade or door overlay.
     fn render(&mut self, pack: &Pack) {
+        if let Some(movie) = &self.movie {
+            let rgba = movie.frame_rgba();
+            self.framebuffer.rgba.copy_from_slice(rgba);
+            return;
+        }
         if let Some(transition) = &self.transition {
             render_transition(&mut self.framebuffer, transition);
             return;
@@ -1383,7 +1471,7 @@ impl GameSession {
             &mut self.game,
             &mut self.bgm_cache,
             pack,
-            self.audio_packs.voice(),
+            self.voice_pack.open("voice"),
         );
     }
 
@@ -1490,15 +1578,29 @@ enum Mode {
     Select(ui::char_select::CharSelectScreen),
     Load(Box<ui::save_load::SaveLoadScreen>),
     Play(Box<GameSession>),
+    /// A film owns the whole app until it ends.
+    Movie(Box<MovieSession>),
 }
 
 /// The mode machine: one screen at a time, with the pack and decoded shared
 /// assets owned here.
+/// A film an app screen queued: the session plus the action to apply when it
+/// finishes (`None` for the standalone `--fmv` playback, which quits).
+struct PendingMovie {
+    session: MovieSession,
+    action: Option<ScreenAction>,
+}
+
 struct App {
     pack: Pack,
     save_dir: PathBuf,
     /// The optional voice pack path, attached to every gameplay session.
     voice_path: Option<PathBuf>,
+    /// The optional movie pack path, attached to films and game sessions.
+    movie_path: Option<PathBuf>,
+    /// The lazily opened movie pack (or the main pack when a film is embedded
+    /// and no sibling exists).
+    movie_pack: AuxiliaryPack,
     font: Option<font::Font>,
     text: Text,
     mode: Mode,
@@ -1510,6 +1612,14 @@ struct App {
     /// and audio-less runs stay silent. Gameplay sessions own a separate
     /// mixer; UI cues never share it.
     ui_music: Option<Mixer>,
+    /// The app-level film's mixer, opened when a queued film starts and only
+    /// on the interactive path; a dummy device is treated as absent so films
+    /// pace on the fixed tick.
+    movie_music: Option<Mixer>,
+    /// The action to apply when the active app film finishes.
+    movie_action: Option<ScreenAction>,
+    /// A film waiting to start on the next tick.
+    pending_movie: Option<PendingMovie>,
     /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
     ui_sfx_cache: SfxCache,
 }
@@ -1523,8 +1633,14 @@ enum AppFlow {
 
 impl App {
     /// Open the pack's shared assets; the mode machine starts on the title.
-    /// `audio` opens the mixer when a game session starts.
-    fn new(pack: Pack, save_dir: PathBuf, voice_path: Option<PathBuf>, audio: bool) -> Self {
+    /// `audio` opens the mixer when a game session or film starts.
+    fn new(
+        pack: Pack,
+        save_dir: PathBuf,
+        voice_path: Option<PathBuf>,
+        movie_path: Option<PathBuf>,
+        audio: bool,
+    ) -> Self {
         let font = match pack.read("font/font.tim") {
             Ok(bytes) => match tim::decode_4bpp(bytes) {
                 Ok(texture) => Some(font::Font::new(texture)),
@@ -1540,6 +1656,8 @@ impl App {
             pack,
             save_dir,
             voice_path,
+            movie_pack: AuxiliaryPack::new(movie_path.clone()),
+            movie_path,
             font,
             text,
             mode: Mode::Title(ui::title::TitleScreen::new()),
@@ -1547,7 +1665,58 @@ impl App {
             ticks: 0,
             audio,
             ui_music: None,
+            movie_music: None,
+            movie_action: None,
+            pending_movie: None,
             ui_sfx_cache: SfxCache::default(),
+        }
+    }
+
+    /// Queue `session` to play before the app continues; `action` is applied
+    /// when it finishes. The session starts on the next app tick.
+    fn queue_movie(&mut self, session: MovieSession, action: Option<ScreenAction>) {
+        self.pending_movie = Some(PendingMovie { session, action });
+    }
+
+    /// Start a queued film: open the film mixer on the interactive path, queue
+    /// its opening audio and enter [`Mode::Movie`].
+    fn install_movie(&mut self, pending: PendingMovie) {
+        let mut session = pending.session;
+        if self.audio && self.movie_music.is_none() {
+            self.movie_music = Mixer::open().filter(|mixer| !mixer.is_dummy());
+        }
+        if let Some(mixer) = &mut self.movie_music {
+            mixer.load_movie_audio(session.take_audio());
+        }
+        self.movie_action = pending.action;
+        self.mode = Mode::Movie(Box::new(session));
+    }
+
+    /// One tick of the active film. When it ends, the queued action runs (or
+    /// the app quits for a standalone `--fmv`).
+    fn tick_movie(&mut self, ui: UiInput, input: player::Input) -> Result<AppFlow> {
+        let consumed = self.movie_music.as_ref().map(Mixer::movie_samples_consumed);
+        let Mode::Movie(session) = &mut self.mode else {
+            return Ok(AppFlow::Continue);
+        };
+        let tick = session.tick(movie_buttons(ui, input), consumed);
+        let audio = session.take_audio();
+        if !audio.is_empty()
+            && let Some(mixer) = &mut self.movie_music
+        {
+            mixer.load_movie_audio(audio);
+        }
+        if !matches!(tick, MovieTick::Finished | MovieTick::Skipped) {
+            return Ok(AppFlow::Continue);
+        }
+        if let Some(mixer) = &mut self.movie_music {
+            mixer.stop_movie_audio();
+            mixer.resume_game_sounds();
+        }
+        let action = self.movie_action.take();
+        match action {
+            Some(action) => self.apply(action),
+            None => Ok(AppFlow::Quit),
         }
     }
 
@@ -1639,7 +1808,8 @@ impl App {
 
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
-        session.audio_packs = AudioPacks::new(self.voice_path.clone());
+        session.voice_pack = AuxiliaryPack::new(self.voice_path.clone());
+        session.movie_pack = AuxiliaryPack::new(self.movie_path.clone());
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -1731,9 +1901,19 @@ impl App {
         Ok(AppFlow::Continue)
     }
 
-    /// One app tick: advance the active screen, or the room when playing.
+    /// One app tick: start a queued film, advance the active film, or advance
+    /// the active screen/room.
     fn update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         self.ticks = self.ticks.saturating_add(1);
+        // A queued film takes over on the next tick; the tick that starts it
+        // shows frame 0 without advancing it.
+        if let Some(pending) = self.pending_movie.take() {
+            self.install_movie(pending);
+            return Ok(AppFlow::Continue);
+        }
+        if matches!(self.mode, Mode::Movie(_)) {
+            return self.tick_movie(ui, input);
+        }
         let result = self.screen_update(ui);
         if let ScreenResult::Done(action) = result {
             return self.apply(action);
@@ -1765,7 +1945,7 @@ impl App {
                 Mode::Title(screen) => screen.update(&cx, ui),
                 Mode::Select(screen) => screen.update(&cx, ui),
                 Mode::Load(screen) => screen.update(&cx, ui),
-                Mode::Play(_) => ScreenResult::Continue,
+                Mode::Play(_) | Mode::Movie(_) => ScreenResult::Continue,
             };
             (result, cx.cues.into_inner())
         };
@@ -1884,6 +2064,9 @@ impl App {
                     framebuffer.fade_to_black(fade);
                 }
             }
+            Mode::Movie(session) => {
+                framebuffer.rgba.copy_from_slice(session.frame_rgba());
+            }
         }
     }
 
@@ -1915,8 +2098,12 @@ impl App {
             }
             session.update_audio();
         }
-        // The UI screens' cue mixer streams independently of the gameplay one.
+        // The UI screens' cue mixer streams independently of the gameplay one;
+        // the app-level film mixer streams while a queued film runs.
         if let Some(mixer) = &mut self.ui_music {
+            mixer.update();
+        }
+        if let Some(mixer) = &mut self.movie_music {
             mixer.update();
         }
     }
@@ -1975,7 +2162,21 @@ pub fn run_ui_with_voice(
     character: u8,
     voice: Option<&Path>,
 ) -> Result<()> {
+    run_ui_with_voice_and_movie(pack, screen, capture, save_dir, character, voice, None)
+}
+
+/// [`run_ui_with_voice`] with an explicit movie-pack path.
+pub fn run_ui_with_voice_and_movie(
+    pack: &Path,
+    screen: &str,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    character: u8,
+    voice: Option<&Path>,
+    movie: Option<&Path>,
+) -> Result<()> {
     let voice_path = voice_pack_path(pack, voice);
+    let movie_path = movie_pack_path(pack, movie);
     let boot = match screen {
         "font" => return run_font_ui(pack, capture),
         "title" => AppBoot::Title,
@@ -1997,7 +2198,13 @@ pub fn run_ui_with_voice(
 
     if let Some(capture_path) = capture {
         let pack = Pack::open(pack)?;
-        let mut app = App::new(pack, save_dir.to_path_buf(), voice_path.clone(), false);
+        let mut app = App::new(
+            pack,
+            save_dir.to_path_buf(),
+            voice_path.clone(),
+            movie_path.clone(),
+            false,
+        );
         match boot {
             AppBoot::Title => {
                 // Reach the option menu, then let the fade settle.
@@ -2045,14 +2252,24 @@ pub fn run_ui_with_voice(
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
         }
+        // A queued film is drained, never played, on the capture path: the
+        // frames stay deterministic and audio-free.
+        app.pending_movie = None;
         app.draw();
         return app.capture(capture_path);
     }
 
     let pack = Pack::open(pack)?;
-    let mut app = App::new(pack, save_dir.to_path_buf(), voice_path, true);
+    let mut app = App::new(pack, save_dir.to_path_buf(), voice_path, movie_path, true);
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
+    run_app_loop(&mut app, &display)
+}
+
+/// The interactive app loop shared by `--ui` and the standalone `--fmv`
+/// playback: fixed 30 Hz ticks from the latched input, then one presented
+/// frame.
+fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
@@ -2085,6 +2302,57 @@ pub fn run_ui_with_voice(
         display.show()?;
         app.post_present();
     }
+}
+
+/// Play one film standalone, the `--fmv` debug path.
+///
+/// The sibling `<pack stem>.movie.akpak` (or the explicit `--movie` pack, or
+/// the main pack when the films are embedded) supplies the AVI. A capture
+/// never opens audio: it advances `ticks` fixed 30 Hz ticks, draws the current
+/// frame and writes it, so the BMP is deterministic. Interactive playback uses
+/// the app's mode machine, so a real device drives the audio-led clock, a
+/// skippable film ends on a button and the app quits when the film finishes.
+pub fn run_fmv(
+    pack: &Path,
+    movie: Option<&Path>,
+    id: u8,
+    character: u8,
+    capture: Option<&Path>,
+    ticks: u32,
+) -> Result<()> {
+    let movie_path = movie_pack_path(pack, movie);
+    let save_dir = save::default_save_dir_for_pack(pack);
+    if let Some(capture_path) = capture {
+        let pack = Pack::open(pack)?;
+        let film_pack = match &movie_path {
+            Some(path) => Some(
+                Pack::open(path)
+                    .with_context(|| format!("failed to open movie pack {}", path.display()))?,
+            ),
+            None => None,
+        };
+        let source = film_pack.as_ref().unwrap_or(&pack);
+        let mut session = MovieSession::open(source, id, character)?;
+        for _ in 0..ticks {
+            // Audio-free: the fixed 30 Hz tick is the clock.
+            session.tick(0, None);
+        }
+        let display = Display::new("Arklay - fmv", true)?;
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.rgba.copy_from_slice(session.frame_rgba());
+        display.present(&framebuffer)?;
+        return display.capture(capture_path);
+    }
+
+    let pack = Pack::open(pack)?;
+    let mut app = App::new(pack, save_dir, None, movie_path, true);
+    let session = {
+        let source = app.movie_pack.open("movie").unwrap_or(&app.pack);
+        MovieSession::open(source, id, character)?
+    };
+    app.queue_movie(session, None);
+    let display = Display::new("Arklay", false)?;
+    run_app_loop(&mut app, &display)
 }
 
 /// The `--ui font` screen.
@@ -3434,16 +3702,15 @@ impl SfxCache {
     }
 }
 
-/// The main pack plus the optional voice pack, opened lazily on the first
-/// voice or BGM read. A run without a voice pack never touches the file.
+/// A lazily opened optional pack (the voice pack, the movie pack).
 #[derive(Default)]
-struct AudioPacks {
+struct AuxiliaryPack {
     path: Option<PathBuf>,
     pack: Option<Pack>,
     attempted: bool,
 }
 
-impl AudioPacks {
+impl AuxiliaryPack {
     fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
@@ -3452,16 +3719,16 @@ impl AudioPacks {
         }
     }
 
-    /// The voice pack, opening it on first use. A failure is reported once and
-    /// leaves the fallback read absent.
-    fn voice(&mut self) -> Option<&Pack> {
+    /// The pack, opened on first use. A failure is reported once with `label`
+    /// and leaves the pack absent, so its lookups fall back to the main pack.
+    fn open(&mut self, label: &str) -> Option<&Pack> {
         if !self.attempted {
             self.attempted = true;
             if let Some(path) = &self.path {
                 match Pack::open(path) {
                     Ok(pack) => self.pack = Some(pack),
                     Err(err) => eprintln!(
-                        "warning: failed to open voice pack {}: {err:#}",
+                        "warning: failed to open {label} pack {}: {err:#}",
                         path.display()
                     ),
                 }
@@ -3487,6 +3754,52 @@ fn voice_pack_path(main: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
     let stem = main.file_stem()?.to_str()?;
     let candidate = main.with_file_name(format!("{stem}.voice.akpak"));
     candidate.is_file().then_some(candidate)
+}
+
+/// The discovered or explicit movie pack: `<pack stem>.movie.akpak` beside the
+/// main pack.
+fn movie_pack_path(main: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        eprintln!(
+            "warning: movie pack {} does not exist; films will be skipped",
+            path.display()
+        );
+        return None;
+    }
+    let stem = main.file_stem()?.to_str()?;
+    let candidate = main.with_file_name(format!("{stem}.movie.akpak"));
+    candidate.is_file().then_some(candidate)
+}
+
+/// One tick's pad word for the film skip check: the accept buttons become a
+/// non-zero bit, so an unmasked edge ends a skippable film.
+fn movie_buttons(ui: UiInput, input: player::Input) -> u16 {
+    let mut word = 0u16;
+    if ui.confirm || input.action_pressed {
+        word |= 0x0001;
+    }
+    if ui.cancel {
+        word |= 0x0002;
+    }
+    if ui.start {
+        word |= 0x0008;
+    }
+    if ui.up {
+        word |= 0x0010;
+    }
+    if ui.down {
+        word |= 0x0020;
+    }
+    if ui.left {
+        word |= 0x0040;
+    }
+    if ui.right {
+        word |= 0x0080;
+    }
+    word
 }
 
 /// Decoded voice-line cache plus the one-slot pending request the scripts
@@ -4985,6 +5298,25 @@ mod tests {
         assert_eq!(voice_pack_path(&main, Some(&sibling)), Some(sibling));
         assert_eq!(
             voice_pack_path(&main, Some(&dir.0.join("absent.akpak"))),
+            None
+        );
+    }
+
+    #[test]
+    fn movie_pack_path_auto_discovers_the_sibling_and_honours_the_override() {
+        let dir = TempDir::new();
+        let main = dir.0.join("re1.akpak");
+        std::fs::write(&main, b"pack").unwrap();
+        // No sibling yet: the film loader falls back to the main pack.
+        assert_eq!(movie_pack_path(&main, None), None);
+        let sibling = dir.0.join("re1.movie.akpak");
+        std::fs::write(&sibling, b"movie").unwrap();
+        assert_eq!(movie_pack_path(&main, None), Some(sibling.clone()));
+        // An explicit path wins, and a missing one resolves to nothing (with
+        // a warning on stderr).
+        assert_eq!(movie_pack_path(&main, Some(&sibling)), Some(sibling));
+        assert_eq!(
+            movie_pack_path(&main, Some(&dir.0.join("absent.akpak"))),
             None
         );
     }
@@ -7150,7 +7482,7 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, dir.0.join("saves"), None, false);
+        let mut app = App::new(pack, dir.0.join("saves"), None, None, false);
         app.boot(AppBoot::Title).unwrap();
         assert!(matches!(app.mode, Mode::Title(_)));
 
@@ -7200,7 +7532,7 @@ mod tests {
         save::save(&saves, 0, &file).unwrap();
 
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, saves, None, false);
+        let mut app = App::new(pack, saves, None, None, false);
         app.boot(AppBoot::Title).unwrap();
 
         // With a save present the title starts on LOAD GAME.
@@ -7255,7 +7587,7 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, dir.0.join("saves"), None, false);
+        let mut app = App::new(pack, dir.0.join("saves"), None, None, false);
         app.boot(AppBoot::NewGame(0)).unwrap();
 
         let updates = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -7715,6 +8047,52 @@ mod tests {
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert_eq!(session.game.frame, before + 1, "the room resumes");
+    }
+
+    #[test]
+    fn a_film_freezes_the_room_and_resumes_when_it_ends() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("100").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer
+            .add("movie/oj.avi", crate::movie::test_avi(30))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        session.start_movie(&pack, 0, 0).unwrap();
+        assert!(session.movie.is_some());
+        let before = session.game.frame;
+        // 30 frames at 10 fps take 90 fixed ticks, and none of them may reach
+        // the room's scripts, entities, effects or player.
+        let mut ticks = 0;
+        while session.movie.is_some() {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            ticks += 1;
+            assert_eq!(session.game.frame, before, "the film froze the room");
+            assert!(ticks < 200, "the film never ended");
+        }
+        assert_eq!(ticks, 90, "30 frames at 10 fps take 90 ticks");
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(
+            session.game.frame,
+            before + 1,
+            "the room resumed after the film"
+        );
     }
 
     #[test]

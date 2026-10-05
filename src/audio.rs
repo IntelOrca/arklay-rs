@@ -17,7 +17,7 @@
 //! the 16-bit rail, matching the hardware sum the original mixer relies on. A
 //! missing device or a failed SDL call leaves the engine silent, never fatal.
 
-use std::ffi::c_int;
+use std::ffi::{CStr, c_int};
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
@@ -25,7 +25,8 @@ use anyhow::{Context, Result, bail};
 use sdl3_sys::audio::{
     SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_S16LE, SDL_AudioSpec, SDL_AudioStream,
     SDL_ClearAudioStream, SDL_DestroyAudioStream, SDL_GetAudioStreamQueued,
-    SDL_OpenAudioDeviceStream, SDL_PutAudioStreamData, SDL_ResumeAudioStreamDevice,
+    SDL_GetCurrentAudioDriver, SDL_OpenAudioDeviceStream, SDL_PutAudioStreamData,
+    SDL_ResumeAudioStreamDevice,
 };
 use sdl3_sys::init::{SDL_INIT_AUDIO, SDL_InitSubSystem};
 
@@ -287,6 +288,21 @@ impl BgmChannel {
     }
 }
 
+/// One playing film-audio track: interleaved stereo s16 at the mixer's rate,
+/// its play offset in stereo frames and how many frames it has rendered.
+///
+/// The movie loader appends one frame of film audio at a time; the counter is
+/// the audio-led playback clock, so it counts only frames the mixer actually
+/// rendered (silence after the queued tail does not advance it).
+#[derive(Clone, Debug)]
+struct MovieAudio {
+    pcm: Vec<i16>,
+    /// Play offset in stereo frames.
+    pos: usize,
+    /// Stereo frames rendered since the track was loaded.
+    consumed: u64,
+}
+
 /// Device-independent mixer state: the BGM banks, the voice channel, the
 /// one-shot pool and their mix parameters.
 ///
@@ -299,6 +315,11 @@ pub(crate) struct MixState {
     voice_finished: bool,
     sfx: Vec<Voice>,
     next_sfx_seq: u64,
+    /// The film's stereo audio, mixed alongside the game sounds.
+    movie: Option<MovieAudio>,
+    /// True while a film holds the game sounds: BGM, voice and one-shots are
+    /// skipped but keep their buffers and positions; the film still renders.
+    game_paused: bool,
 }
 
 impl MixState {
@@ -309,6 +330,8 @@ impl MixState {
             voice_finished: false,
             sfx: Vec::new(),
             next_sfx_seq: 0,
+            movie: None,
+            game_paused: false,
         }
     }
 
@@ -450,7 +473,57 @@ impl MixState {
             .any(|channel| channel.playing)
     }
 
+    /// Queue one film-audio chunk, starting the movie channel on the first
+    /// call. Chunks are appended in stream order.
+    pub(crate) fn load_movie_audio(&mut self, pcm: Vec<i16>) {
+        if pcm.is_empty() {
+            return;
+        }
+        match &mut self.movie {
+            Some(movie) => movie.pcm.extend_from_slice(&pcm),
+            None => {
+                self.movie = Some(MovieAudio {
+                    pcm,
+                    pos: 0,
+                    consumed: 0,
+                });
+            }
+        }
+    }
+
+    /// Stereo frames the movie channel has rendered, the audio-led film clock.
+    pub(crate) fn movie_samples_consumed(&self) -> u64 {
+        self.movie.as_ref().map_or(0, |movie| movie.consumed)
+    }
+
+    /// Whether a film-audio buffer is loaded.
+    pub(crate) fn movie_active(&self) -> bool {
+        self.movie.is_some()
+    }
+
+    /// Drop the film-audio buffer and its counter.
+    pub(crate) fn stop_movie_audio(&mut self) {
+        self.movie = None;
+    }
+
+    /// Suspend the game sounds (BGM, voice, one-shots) for a film, keeping
+    /// every buffer and position so playback resumes where it stopped.
+    pub(crate) fn pause_game_sounds(&mut self) {
+        self.game_paused = true;
+    }
+
+    /// Undo [`MixState::pause_game_sounds`].
+    pub(crate) fn resume_game_sounds(&mut self) {
+        self.game_paused = false;
+    }
+
     fn is_silent(&self) -> bool {
+        if self.movie.is_some() {
+            return false;
+        }
+        if self.game_paused {
+            return true;
+        }
         !self.bgm_any_playing() && self.voice.is_none() && self.sfx.is_empty()
     }
 
@@ -458,65 +531,78 @@ impl MixState {
     ///
     /// Voices are summed without a per-voice headroom term; each sample is
     /// saturated by [`push_sample`], which is how the original's hardware mixer
-    /// handles overlapping banks.
+    /// handles overlapping banks. A paused mixer skips the game sounds but
+    /// still renders the film.
     pub(crate) fn render(&mut self, frames: usize, out: &mut Vec<u8>) {
         for _ in 0..frames {
             let mut left = 0.0f32;
             let mut right = 0.0f32;
 
-            for channel in self.bgm_channels.iter_mut().flatten() {
-                if !channel.playing {
-                    continue;
-                }
-                if channel.pos >= channel.pcm.len() {
-                    if channel.looping {
-                        channel.pos = 0;
-                    } else {
-                        channel.playing = false;
+            if !self.game_paused {
+                for channel in self.bgm_channels.iter_mut().flatten() {
+                    if !channel.playing {
                         continue;
                     }
-                }
-                let sample = f32::from(channel.pcm[channel.pos]) * channel.gain;
-                let (l, r) = pan_gains(channel.pan);
-                left += sample * l;
-                right += sample * r;
-                channel.pos += 1;
-                if channel.pos >= channel.pcm.len() {
-                    if channel.looping {
-                        channel.pos = 0;
-                    } else {
-                        channel.playing = false;
+                    if channel.pos >= channel.pcm.len() {
+                        if channel.looping {
+                            channel.pos = 0;
+                        } else {
+                            channel.playing = false;
+                            continue;
+                        }
+                    }
+                    let sample = f32::from(channel.pcm[channel.pos]) * channel.gain;
+                    let (l, r) = pan_gains(channel.pan);
+                    left += sample * l;
+                    right += sample * r;
+                    channel.pos += 1;
+                    if channel.pos >= channel.pcm.len() {
+                        if channel.looping {
+                            channel.pos = 0;
+                        } else {
+                            channel.playing = false;
+                        }
                     }
                 }
+
+                if let Some(voice) = &mut self.voice
+                    && voice.pos < voice.pcm.len()
+                {
+                    let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
+                    let (l, r) = pan_gains(voice.pan);
+                    left += sample * l;
+                    right += sample * r;
+                    voice.pos += 1;
+                    if voice.pos >= voice.pcm.len() {
+                        self.voice_finished = true;
+                    }
+                }
+                if self.voice_finished {
+                    self.voice = None;
+                }
+
+                for voice in &mut self.sfx {
+                    if voice.pos >= voice.pcm.len() {
+                        continue;
+                    }
+                    let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
+                    let (l, r) = pan_gains(voice.pan);
+                    left += sample * l;
+                    right += sample * r;
+                    voice.pos += 1;
+                }
+                self.sfx.retain(|voice| !voice.finished());
             }
 
-            if let Some(voice) = &mut self.voice
-                && voice.pos < voice.pcm.len()
-            {
-                let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
-                let (l, r) = pan_gains(voice.pan);
-                left += sample * l;
-                right += sample * r;
-                voice.pos += 1;
-                if voice.pos >= voice.pcm.len() {
-                    self.voice_finished = true;
+            if let Some(movie) = &mut self.movie {
+                let samples = movie.pcm.len() / 2;
+                if movie.pos < samples {
+                    left += f32::from(movie.pcm[movie.pos * 2]);
+                    right += f32::from(movie.pcm[movie.pos * 2 + 1]);
+                    movie.pos += 1;
+                    movie.consumed += 1;
                 }
             }
-            if self.voice_finished {
-                self.voice = None;
-            }
-
-            for voice in &mut self.sfx {
-                if voice.pos >= voice.pcm.len() {
-                    continue;
-                }
-                let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
-                let (l, r) = pan_gains(voice.pan);
-                left += sample * l;
-                right += sample * r;
-                voice.pos += 1;
-            }
-            self.sfx.retain(|voice| !voice.finished());
 
             push_sample(out, left);
             push_sample(out, right);
@@ -688,6 +774,49 @@ impl Mixer {
         self.state.play_sfx(to_mono(&wav), gain, pan);
         self.resume();
         self.update();
+    }
+
+    /// Append one film-audio chunk (interleaved stereo s16 at
+    /// [`SAMPLE_RATE`]), starting the movie channel on the first call.
+    pub fn load_movie_audio(&mut self, pcm: Vec<i16>) {
+        self.state.load_movie_audio(pcm);
+        self.resume();
+    }
+
+    /// Stereo frames the movie channel has rendered, the audio-led film clock.
+    pub fn movie_samples_consumed(&self) -> u64 {
+        self.state.movie_samples_consumed()
+    }
+
+    /// Whether a film-audio buffer is loaded.
+    pub fn movie_active(&self) -> bool {
+        self.state.movie_active()
+    }
+
+    /// Drop the film-audio buffer and its counter.
+    pub fn stop_movie_audio(&mut self) {
+        self.state.stop_movie_audio();
+    }
+
+    /// Suspend the game sounds while a film plays, keeping every position.
+    pub fn pause_game_sounds(&mut self) {
+        self.state.pause_game_sounds();
+    }
+
+    /// Resume the game sounds after a film.
+    pub fn resume_game_sounds(&mut self) {
+        self.state.resume_game_sounds();
+    }
+
+    /// Whether SDL selected the silent dummy driver, whose stream is never
+    /// consumed: the engine then treats the run as device-less and paces films
+    /// with the fixed 30 Hz tick.
+    pub fn is_dummy(&self) -> bool {
+        let driver = unsafe { SDL_GetCurrentAudioDriver() };
+        if driver.is_null() {
+            return false;
+        }
+        unsafe { CStr::from_ptr(driver) }.to_bytes() == b"dummy"
     }
 
     /// Render and queue enough samples to keep the device fed; call once per
@@ -1024,6 +1153,60 @@ mod tests {
         let mut out = Vec::new();
         state.render(2, &mut out);
         assert_eq!(out_samples(&out), vec![0; 4]);
+    }
+
+    #[test]
+    fn mixer_movie_channel_renders_and_counts() {
+        let mut state = MixState::new();
+        assert!(!state.movie_active());
+        state.load_movie_audio(vec![1000, -1000, 2000, -2000]);
+        assert!(state.movie_active());
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![1000, -1000]);
+        assert_eq!(state.movie_samples_consumed(), 1);
+
+        // The counter stops at the queued tail instead of counting silence.
+        state.render(5, &mut out);
+        assert_eq!(state.movie_samples_consumed(), 2);
+        state.load_movie_audio(vec![300, 400]);
+        state.render(1, &mut out);
+        assert_eq!(state.movie_samples_consumed(), 3);
+        assert_eq!(out_samples(&out)[out_samples(&out).len() - 2..], [300, 400]);
+
+        state.stop_movie_audio();
+        assert!(!state.movie_active());
+        assert_eq!(state.movie_samples_consumed(), 0);
+    }
+
+    #[test]
+    fn mixer_movie_sums_with_game_sounds_and_pause_keeps_them() {
+        let mut state = MixState::new();
+        state.play_bgm_channel(0, vec![100, 200, 300, 400], true);
+        state.load_movie_audio(vec![1000, 1000, 2000, 2000]);
+
+        // Unpaused: the looping BGM and the film sum.
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        let bgm = (100.0 * center) as i16;
+        assert_eq!(out_samples(&out), vec![1000 + bgm, 1000 + bgm]);
+
+        // Pausing skips the BGM and still renders the film; the bank keeps its
+        // position so a resume continues exactly where it stopped.
+        state.pause_game_sounds();
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![2000, 2000]);
+        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 1);
+
+        state.resume_game_sounds();
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        let expected = (200.0 * center) as i16;
+        assert_eq!(out_samples(&out), vec![expected, expected]);
+        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 2);
     }
 
     #[test]
