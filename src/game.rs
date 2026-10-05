@@ -124,6 +124,12 @@ const SCD_ANIM_REMAP: [u8; 32] = [
 pub const LOCKED_MESSAGE: u8 = 200;
 /// Message shown while a key turns in a lock.
 const MESSAGE_KEY_TURN: u8 = 0xC3;
+/// Message shown when the masked character id 3 (Rebecca) examines a desk.
+const MESSAGE_DESK_CHARACTER: u8 = 0xD7;
+/// Message shown by a locked desk without the desk key or Jill's lockpick.
+const MESSAGE_DESK_LOCKED: u8 = 0xD8;
+/// Prompt shown by a locked desk when the key or lockpick is held.
+const MESSAGE_DESK_PROMPT: u8 = 0xD9;
 /// Message shown by a `0xFE` door (only opens from the far side).
 const MESSAGE_OTHER_SIDE: u8 = 0xD4;
 /// Message shown by a door locked for good (`0xFF` key).
@@ -136,6 +142,10 @@ const MESSAGE_WRONG_CHARACTER: u8 = 0xD6;
 const ITEM_SWORD_KEY: u8 = 0x33;
 /// Item id of the lockpick, which the use action never consumes.
 const ITEM_LOCK_PICK: u8 = 0x31;
+/// Global SE the unlocked desk lid plays.
+const SE_DESK_OPEN: u16 = 0x24;
+/// Global SE a confirmed key turn plays.
+const SE_DESK_UNLOCK: u16 = 0x26;
 /// First ammunition item id; anything below it is a weapon.
 const ITEM_CLIP: u8 = 0x0B;
 /// First door-key item id for the depletion rule.
@@ -210,6 +220,14 @@ const HANDLER_STAIRS_ZONE: u8 = 0x0C;
 const HANDLER_STAIRS_HEIGHT: u8 = 0x11;
 /// `room_check_actions` index of the document (set_room_event_flag) handler.
 const HANDLER_DOCUMENT: u8 = 0x0D;
+/// `room_check_actions` index of the desk interaction handler.
+const HANDLER_DESK: u8 = 0x0E;
+/// `main_state_flags` bit 0x4000: a script-only bit outside the menu-mode
+/// ladder (the original's `MSF_SCRIPT_ONLY_14`), still part of the pending
+/// menu field the desk gate tests.
+const MSF_SCRIPT_ONLY_14: u8 = 17;
+/// `main_state_flags` bit 0x100: the pick-up screen is pending.
+const MSF_PICKUP_SCREEN: u8 = 23;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
 const MSF_MENU_GOT_ITEM: u8 = 21;
 /// `main_state_flags` bit 0x800, toggled by `give_item` (item viewer).
@@ -259,6 +277,12 @@ pub const CHEMICAL_MAX: u8 = 0x1A;
 pub const STAGE_GUARDHOUSE: u8 = 3;
 /// Room id of the drug storehouse in the guardhouse.
 pub const ROOM_DRUG_STOREHOUSE: u8 = 9;
+/// 1-based stage digit of the guardhouse (the original's 0-indexed stage 3),
+/// used by the desk flow's save-room reset.
+const GUARDHOUSE_STAGE: u8 = 4;
+/// The guardhouse save room (the original's `ROOM_003`, 0x0A), where Jill's
+/// first playthrough resets the desk flow.
+const ROOM_GUARDHOUSE_SAVE: u8 = 0x0A;
 
 /// The character's maximum health: Chris (0) 140, Jill (1) 96. The original
 /// derives it as `140 - 44 * (id & 1)` on both the new-game and continue paths.
@@ -397,6 +421,22 @@ pub struct ItemBoxFlow {
     pub menu_open: bool,
 }
 
+/// The desk flow (`g_desk_check_state` and its scratch).
+///
+/// States: `0` idle, `1`/`2` the locked key prompt, `3` the prompt's yes/no
+/// answer, `4` the camera restore and model close, `5` the take-item step,
+/// `6..=35` the camera-pan countdown (state 35 is its first tick).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DeskFlow {
+    /// `g_desk_check_state`.
+    pub state: u8,
+    /// The latched desk action slot (`g_pRoomActionEntry`).
+    pub action: Option<u8>,
+    /// The camera cut the unlocked desk saved before cutting to its close-up
+    /// (the original's `g_cutId`).
+    pub saved_camera: Option<usize>,
+}
+
 /// BGM channel state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BgmState {
@@ -486,6 +526,8 @@ pub enum RoomActionKind {
     Message,
     /// A typewriter (`SCE_TYPEWRITER`).
     Typewriter,
+    /// A desk (`SCE_HIKIDASHI`).
+    Desk,
     /// A stair/ladder entry registered by `set_stairs_zone` (handler `0x0C`).
     StairsZone,
     /// A Y ramp registered by `stairs_height_update` (handler `0x11`).
@@ -504,6 +546,7 @@ impl RoomActionKind {
             HANDLER_EVENT => Self::Event,
             HANDLER_MESSAGE => Self::Message,
             HANDLER_TYPEWRITER => Self::Typewriter,
+            HANDLER_DESK => Self::Desk,
             HANDLER_STAIRS_ZONE => Self::StairsZone,
             HANDLER_STAIRS_HEIGHT => Self::StairsHeight,
             _ => Self::Other,
@@ -986,8 +1029,9 @@ pub struct GameState {
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
     /// Global one-shot SE ids queued by the script handlers (the item-box lid
-    /// plays `0x20`). The port has no pack mapping for the global SE bank in
-    /// this slice; the engine drains the queue (documented).
+    /// plays `0x20`, the desk lid `0x24` and its key turn `0x26`). The port
+    /// has no pack mapping for the global SE bank in this slice; the engine
+    /// drains the queue (documented).
     pub sfx_requests: Vec<u16>,
     /// Per-frame random seed the NPC look-at scheduling reads. The original
     /// reseeds its global from `rand()` at the top of every gameplay frame;
@@ -1018,6 +1062,8 @@ pub struct GameState {
     pub mirror: MirrorState,
     /// The item-box lid flow.
     pub itembox: ItemBoxFlow,
+    /// The desk interaction flow.
+    pub desk: DeskFlow,
     /// Per-joint colour multiplier of the player model (`objs_hide` sets it
     /// dark red; default white).
     pub player_tint: [u8; 3],
@@ -1109,6 +1155,7 @@ impl Default for GameState {
             object_push: false,
             mirror: MirrorState::default(),
             itembox: ItemBoxFlow::default(),
+            desk: DeskFlow::default(),
             player_tint: [255; 3],
             room_effects: Rc::new(effects::RoomEffects::default()),
             weapon_effects: effects::WeaponEffects::default(),
@@ -1937,6 +1984,7 @@ impl GameState {
         self.flags[5].clear_room_reset_bits();
         self.mirror = MirrorState::default();
         self.itembox = ItemBoxFlow::default();
+        self.desk = DeskFlow::default();
         self.object_push = false;
         self.flags[5].apply(MSF_OBJECT_PUSH, 1);
         self.resolve_room_effects(room);
@@ -2836,6 +2884,9 @@ impl GameState {
                 self.open_itembox(room_action.slot);
                 self.record_interaction(room_action.slot, room_action.kind, None);
             }
+            RoomActionKind::Desk => {
+                self.check_desk(room_action.slot);
+            }
             RoomActionKind::Typewriter | RoomActionKind::Other => {
                 self.record_interaction(room_action.slot, room_action.kind, None);
             }
@@ -2989,6 +3040,191 @@ impl GameState {
         self.flags[5].apply(MSF_MENU_MODE_ITEMBOX, 1);
         if self.itembox.state != 0 {
             self.itembox.state = 4;
+        }
+    }
+
+    /// Whether any menu mode is pending: the original's main-state bits 8-14
+    /// (`MSF_MENU_PENDING`, the whole byte-1 menu field). Any of them blocks a
+    /// new desk interaction.
+    pub fn menu_pending(&self) -> bool {
+        (MSF_SCRIPT_ONLY_14..=MSF_PICKUP_SCREEN).any(|sel| self.flags[5].bit(sel))
+    }
+
+    /// The item action a desk action opens. The desk's second word is the room
+    /// action slot of the `item_aot_set` entry that registered the same item
+    /// pair; that entry carries the room-items bit, the model and the award.
+    fn desk_item_action(&self, desk_slot: u8) -> Option<RoomAction> {
+        let desk = self
+            .room_actions
+            .get(usize::from(desk_slot))
+            .copied()
+            .flatten()?;
+        let item_slot = desk.param_word(1) as u8;
+        self.room_actions
+            .get(usize::from(item_slot))
+            .copied()
+            .flatten()
+            .filter(|action| action.kind == RoomActionKind::Item)
+    }
+
+    /// The inventory item a desk key turn uses: Jill's lockpick when the
+    /// scenario flag is set, otherwise the desk key.
+    fn desk_key_item(&self) -> u8 {
+        if self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, false) {
+            ITEM_LOCK_PICK
+        } else {
+            ITEM_DESK_KEY
+        }
+    }
+
+    /// `check_desk` (handler 0x0E): the desk interaction.
+    ///
+    /// Gated on the desk flow being idle, no menu mode pending and the message
+    /// window being idle (the port's stand-in for the original's message-ready
+    /// flag, exactly like [`GameState::open_itembox`]). The desk's first word
+    /// is the LocksFlags bit, its second the room action slot of the
+    /// `item_aot_set` edge it opens and its third the close-up camera. The
+    /// player's being-attacked flag has no analogue yet (no enemies or damage),
+    /// so that gate is always open.
+    pub fn check_desk(&mut self, slot: u8) -> bool {
+        if self.desk.state != 0 || self.message.active || self.message_menu || self.menu_pending() {
+            return false;
+        }
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Desk {
+            return false;
+        }
+        let Some(item_action) = self.desk_item_action(slot) else {
+            return false;
+        };
+        if !self.room_item_present(item_action.room_items_flag) {
+            return false;
+        }
+        // The original's masked character test turns id 3 (Rebecca) away.
+        if self.id.player_flag & 3 == 3 {
+            self.show_message(MESSAGE_DESK_CHARACTER, 0xFF);
+            self.record_interaction(
+                slot,
+                RoomActionKind::Desk,
+                Some(u16::from(MESSAGE_DESK_CHARACTER)),
+            );
+            return true;
+        }
+        if !self.flag_test(BANK_LOCKS, action.param_word(0) as u8, false) {
+            // Locked: the desk key or Jill's lockpick is required. With either
+            // the key prompt arms; without, the "locked" message plays.
+            if !self.has_item(ITEM_DESK_KEY)
+                && !self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, false)
+            {
+                self.show_message(MESSAGE_DESK_LOCKED, 0xFF);
+                self.record_interaction(
+                    slot,
+                    RoomActionKind::Desk,
+                    Some(u16::from(MESSAGE_DESK_LOCKED)),
+                );
+                return true;
+            }
+            self.desk.action = Some(slot);
+            self.desk.state = 1;
+            return true;
+        }
+        // Unlocked: mark the item model opened, play the lid SE, cut to the
+        // desk camera and start the pan countdown (state 35). The original
+        // clears the ready bits so the same probe cannot re-arm this frame.
+        self.desk.action = Some(slot);
+        if let Some(record) = self.items.record_mut(usize::from(item_action.item_model())) {
+            record.flag |= 1;
+        }
+        self.sfx_requests.push(SE_DESK_OPEN);
+        self.desk.saved_camera = Some(self.camera.current_cut);
+        self.set_camera_cut(usize::from(action.param_word(2) as u8));
+        self.message_flags &= !0x0045;
+        self.desk.state = 35;
+        self.record_interaction(slot, RoomActionKind::Desk, None);
+        true
+    }
+
+    /// Per-frame `check_desk_state`: the locked key prompt, its yes/no answer,
+    /// the camera restore and the pan countdown.
+    ///
+    /// # Documented deviation
+    ///
+    /// State 5 opens the original's take-item viewer over the desk; the port
+    /// arms the desk's item action and awards it immediately through the
+    /// existing message-post-action path instead.
+    pub fn check_desk_state(&mut self) {
+        // The guardhouse save room restarts the flow for Jill's first
+        // playthrough, so a desk can never be left mid-state across the save.
+        if self.id.stage == GUARDHOUSE_STAGE
+            && self.id.room == ROOM_GUARDHOUSE_SAVE
+            && self.id.player_flag & 3 == 1
+            && !self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_SECOND_PLAYTHROUGH, false)
+        {
+            self.desk.state = 0;
+        }
+        match self.desk.state {
+            0 => {}
+            1 | 2 => {
+                // The prompt names the key the turn will use.
+                self.select_item(Some(self.desk_key_item()));
+                self.show_message(MESSAGE_DESK_PROMPT, 0xFF);
+                self.desk.state = 3;
+            }
+            3 => {
+                if !self.message.active {
+                    if self.message.menu_choice_id() & 1 == 0 {
+                        // Yes: raise the lock bit, play the key turn and show
+                        // the "you used the item" message. No just closes.
+                        let lock_bit = self
+                            .desk
+                            .action
+                            .and_then(|slot| self.room_actions.get(usize::from(slot)))
+                            .and_then(|action| action.as_ref())
+                            .map(|action| action.param_word(0) as u8);
+                        if let Some(lock_bit) = lock_bit {
+                            self.apply_flag(BANK_LOCKS, lock_bit, 0);
+                        }
+                        self.sfx_requests.push(SE_DESK_UNLOCK);
+                        self.select_item(Some(self.desk_key_item()));
+                        self.show_message(MESSAGE_KEY_TURN, 0xFF);
+                    }
+                    self.desk.state = 0;
+                }
+            }
+            4 => {
+                if let Some(camera) = self.desk.saved_camera.take() {
+                    self.set_camera_cut(camera);
+                }
+                let model = self
+                    .desk
+                    .action
+                    .and_then(|slot| self.desk_item_action(slot))
+                    .map(|item| usize::from(item.item_model()));
+                if let Some(record) = model.and_then(|model| self.items.record_mut(model)) {
+                    record.flag &= !1;
+                }
+                self.desk.state = 0;
+            }
+            5 => {
+                // Arm the desk's item action so the shared award path consumes
+                // it and tears its model, sparkle and room-items bit down.
+                if let Some(item) = self
+                    .desk
+                    .action
+                    .and_then(|slot| self.desk_item_action(slot))
+                {
+                    self.message_item_slot = Some(item.slot);
+                    self.take_message_item();
+                }
+                self.desk.state = 4;
+            }
+            state => {
+                // States 6..=35 (and any stray value): the camera pan counts
+                // down one per frame; 35 falls through into the first step.
+                self.desk.state = state - 1;
+            }
         }
     }
 
@@ -3218,6 +3454,7 @@ impl GameState {
                 taken
             }
             HANDLER_FLAG_BANK_SET => self.flag_bank_set(slot),
+            HANDLER_DESK if action.kind == RoomActionKind::Desk => self.check_desk(slot),
             HANDLER_MESSAGE => {
                 let id = action.param_word(0);
                 self.show_message(id as u8, action.param_word(1));
@@ -6559,7 +6796,7 @@ mod tests {
 
     #[test]
     fn aot_set_classifies_the_sce_byte() {
-        let cases: [(u8, RoomActionKind); 10] = [
+        let cases: [(u8, RoomActionKind); 11] = [
             (1, RoomActionKind::Door),
             (2, RoomActionKind::Message),
             (4, RoomActionKind::Item),
@@ -6567,6 +6804,7 @@ mod tests {
             (9, RoomActionKind::Event),
             (10, RoomActionKind::Other),
             (12, RoomActionKind::StairsZone),
+            (14, RoomActionKind::Desk),
             (15, RoomActionKind::Item),
             (16, RoomActionKind::Typewriter),
             (17, RoomActionKind::StairsHeight),
@@ -6853,6 +7091,9 @@ mod tests {
         state.flags[5].apply(0x3E, 0);
         state.itembox.state = 2;
         state.itembox.cover = Some(0);
+        state.desk.state = 35;
+        state.desk.action = Some(3);
+        state.desk.saved_camera = Some(2);
         state.object_push = true;
         state.flags[5].apply(MSF_OBJECT_PUSH, 0);
 
@@ -6872,6 +7113,7 @@ mod tests {
         assert!(!state.mirror_axis_x());
         assert_eq!(state.mirror, MirrorState::default());
         assert_eq!(state.itembox, ItemBoxFlow::default());
+        assert_eq!(state.desk, DeskFlow::default());
         assert!(!state.object_push);
         assert!(!state.flags[5].bit(MSF_OBJECT_PUSH));
     }
@@ -7343,6 +7585,255 @@ mod tests {
                 .all(|record| *record == crate::objects::ItemRecord::default())
         );
         assert!(state.item_palette_edits.is_empty());
+    }
+
+    /// A room with one item pair and a locked desk in slot 0 whose item edge
+    /// is slot 1. The desk's first word is lock bit 5, its second the item
+    /// action slot and its third camera cut 3.
+    fn desk_game() -> GameState {
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            let mut values = item_values(0x0C, 0, 0xFF, [10, -20, 30]);
+            values[0] = 1;
+            host.on_item(op(0x18), &operands(&values));
+            host.on_room_action(
+                op(0x0D),
+                &operands(&[0, 0, 0, 100, 100, 0x0E, 0x81, 5, 1, 3]),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn aot_set_classifies_the_desk_handler() {
+        let state = desk_game();
+        assert_eq!(state.room_actions[0].unwrap().kind, RoomActionKind::Desk);
+        assert_eq!(state.room_actions[0].unwrap().handler, HANDLER_DESK);
+    }
+
+    #[test]
+    fn desk_gates_on_its_flow_the_menu_field_and_the_message_window() {
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+
+        // Every bit of the pending menu field blocks the interaction.
+        for sel in MSF_SCRIPT_ONLY_14..=MSF_PICKUP_SCREEN {
+            state.flags[5] = FlagBank::default();
+            state.flags[5].apply(sel, 0);
+            assert!(state.menu_pending(), "sel {sel}");
+            assert!(!state.check_desk(0), "sel {sel}");
+            assert_eq!(state.desk.state, 0);
+        }
+        state.flags[5] = FlagBank::default();
+
+        // An active message window or an open pause menu blocks it too.
+        state.message.active = true;
+        assert!(!state.check_desk(0));
+        state.message.active = false;
+        state.message_menu = true;
+        assert!(!state.check_desk(0));
+        state.message_menu = false;
+
+        // A desk already mid-flow ignores a second probe.
+        state.desk.state = 3;
+        assert!(!state.check_desk(0));
+        state.desk.state = 0;
+
+        // With the key held the prompt arms.
+        assert!(state.check_desk(0));
+        assert_eq!(state.desk.state, 1);
+        assert_eq!(state.desk.action, Some(0));
+    }
+
+    #[test]
+    fn desk_refuses_when_its_room_item_is_already_taken() {
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        state.mark_item_taken(1);
+        assert!(!state.check_desk(0));
+        assert_eq!(state.desk.state, 0);
+        assert!(state.message.id.is_none());
+    }
+
+    #[test]
+    fn desk_turns_away_the_masked_character_id() {
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        state.id.player_flag = 3;
+        assert!(state.check_desk(0));
+        assert_eq!(state.message.id, Some(MESSAGE_DESK_CHARACTER));
+        assert_eq!(state.desk.state, 0);
+        state.cancel_message();
+
+        // The two PC characters are not turned away: with the key the prompt
+        // arms for both.
+        for player_flag in [0, 1] {
+            state.id.player_flag = player_flag;
+            state.message = MessageWindow::default();
+            assert!(state.check_desk(0), "player {player_flag}");
+            assert_eq!(state.desk.state, 1, "player {player_flag}");
+            assert_eq!(state.desk.action, Some(0));
+            state.desk = DeskFlow::default();
+        }
+    }
+
+    #[test]
+    fn desk_locked_refuses_without_the_key_or_lockpick() {
+        let mut state = desk_game();
+        assert!(state.check_desk(0));
+        assert_eq!(state.message.id, Some(MESSAGE_DESK_LOCKED));
+        assert_eq!(state.desk.state, 0);
+        state.cancel_message();
+
+        // Jill's lockpick scenario flag substitutes for the desk key.
+        state.apply_flag(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, 0);
+        assert!(state.check_desk(0));
+        assert_eq!(state.desk.state, 1);
+    }
+
+    #[test]
+    fn desk_prompt_names_the_selected_key() {
+        // The desk key path.
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        state.check_desk(0);
+        state.check_desk_state();
+        assert_eq!(state.message.id, Some(MESSAGE_DESK_PROMPT));
+        assert_eq!(state.desk.state, 3);
+        assert_eq!(state.selected_item, Some(ITEM_DESK_KEY));
+
+        // The lockpick path, and state 2 behaves like state 1.
+        let mut state = desk_game();
+        state.apply_flag(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, 0);
+        state.desk.action = Some(0);
+        state.desk.state = 2;
+        state.check_desk_state();
+        assert_eq!(state.message.id, Some(MESSAGE_DESK_PROMPT));
+        assert_eq!(state.selected_item, Some(ITEM_LOCK_PICK));
+        assert_eq!(state.desk.state, 3);
+    }
+
+    #[test]
+    fn desk_key_turn_unlocks_on_yes_and_closes_on_no() {
+        // Yes: raise the lock bit, play the key-turn SE and show 0xC3.
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        state.check_desk(0);
+        state.check_desk_state();
+        // Dismissed as the yes/no window leaves it: bit 7 clear, answer bit 0.
+        state.message.active = false;
+        state.message.set_menu_choice_id(0);
+        state.check_desk_state();
+        assert!(state.flag_test(BANK_LOCKS, 5, false), "the lock bit is set");
+        assert_eq!(state.message.id, Some(MESSAGE_KEY_TURN));
+        assert_eq!(state.sfx_requests, vec![SE_DESK_UNLOCK]);
+        assert_eq!(state.desk.state, 0);
+
+        // No: close without touching the lock or the SE queue.
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        state.check_desk(0);
+        state.check_desk_state();
+        state.message.active = false;
+        state.message.set_menu_choice_id(1);
+        state.check_desk_state();
+        assert!(!state.flag_test(BANK_LOCKS, 5, false));
+        assert_ne!(state.message.id, Some(MESSAGE_KEY_TURN));
+        assert!(state.sfx_requests.is_empty());
+        assert_eq!(state.desk.state, 0);
+    }
+
+    #[test]
+    fn desk_unlocked_open_marks_the_model_cuts_and_counts_the_pan() {
+        let mut state = desk_game();
+        state.apply_flag(BANK_LOCKS, 5, 0);
+        state.set_camera_cut(1);
+        assert!(state.check_desk(0));
+        assert_eq!(state.desk.state, 35);
+        assert_eq!(state.camera.current_cut, 3, "the desk camera wins");
+        assert_eq!(state.desk.saved_camera, Some(1));
+        assert_eq!(state.sfx_requests, vec![SE_DESK_OPEN]);
+        assert_eq!(state.items.record(0).unwrap().flag & 1, 1, "model opened");
+
+        // 35 counts down to 5 over 30 frames, then state 5 awards through the
+        // shared pick-up path and state 4 restores the camera and closes the
+        // model.
+        for _ in 0..30 {
+            state.check_desk_state();
+        }
+        assert_eq!(state.desk.state, 5);
+        assert!(state.inventory.is_empty(), "no award before state 5");
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 4);
+        assert_eq!(state.inventory.len(), 1);
+        assert_eq!(state.inventory[0].id, 0x0C);
+        assert_eq!(state.inventory[0].quantity, 1);
+        assert!(!state.room_item_present(1), "the room-items bit is cleared");
+        assert!(state.room_actions[1].is_none(), "the item edge is consumed");
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 0);
+        assert_eq!(state.camera.current_cut, 1, "the room camera returns");
+        assert_eq!(state.items.record(0).unwrap().flag & 1, 0);
+    }
+
+    #[test]
+    fn desk_state_4_restores_the_camera_and_closes_the_model() {
+        let mut state = desk_game();
+        state.items.record_mut(0).unwrap().flag = 1;
+        state.set_camera_cut(3);
+        state.desk.state = 4;
+        state.desk.action = Some(0);
+        state.desk.saved_camera = Some(2);
+        state.check_desk_state();
+        assert_eq!(state.camera.current_cut, 2);
+        assert_eq!(state.desk.state, 0);
+        assert_eq!(state.items.record(0).unwrap().flag & 1, 0);
+    }
+
+    #[test]
+    fn desk_guardhouse_save_room_resets_jills_first_playthrough() {
+        let mut state = desk_game();
+        state.id = RoomId {
+            stage: GUARDHOUSE_STAGE,
+            room: ROOM_GUARDHOUSE_SAVE,
+            player_flag: 1,
+        };
+        state.desk.state = 35;
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 0, "Jill's first playthrough resets it");
+
+        // A second playthrough runs the countdown.
+        state.apply_flag(BANK_SCENARIO, SCENARIO_FLAG_SECOND_PLAYTHROUGH, 0);
+        state.desk.state = 35;
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 34);
+
+        // Chris is never reset, nor is another room.
+        state.flags[0].apply(SCENARIO_FLAG_SECOND_PLAYTHROUGH, 1);
+        state.id.player_flag = 0;
+        state.desk.state = 35;
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 34);
+        state.id.room = 0x0B;
+        state.desk.state = 35;
+        state.check_desk_state();
+        assert_eq!(state.desk.state, 34);
+    }
+
+    #[test]
+    fn desk_action_key_probe_arms_the_flow() {
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        // The reach probe lands 600 units along +X, inside the desk box.
+        state.interact([-500, 0, 50], 0, true);
+        assert_eq!(state.desk.state, 1);
+
+        // The direct `room_action` opcode path arms the same flow.
+        let mut state = desk_game();
+        state.add_item(ITEM_DESK_KEY, 1);
+        assert!(state.run_room_action(0, HANDLER_DESK));
+        assert_eq!(state.desk.state, 1);
     }
 
     /// Install one single-frame `0x0B` sparkle sprite on `depth` with the
@@ -8760,6 +9251,13 @@ mod tests {
         let scripts = crate::scd::reader::parse(&data).unwrap();
 
         let mut state = GameState::new(id, &room);
+        // The new-game room-items bank ("still here") registers the item
+        // edges; the second-playthrough flag keeps ROOM1001's ink ribbon,
+        // which Jill's first playthrough skips.
+        state.flags[7]
+            .bytes_mut()
+            .copy_from_slice(&crate::engine::NEW_GAME_ROOM_ITEMS);
+        state.apply_flag(BANK_SCENARIO, SCENARIO_FLAG_SECOND_PLAYTHROUGH, 0);
         {
             let mut command_vm = crate::scd::vm::CommandVm::new(&scripts);
             let mut host = ScdGameHost::new(&mut state);

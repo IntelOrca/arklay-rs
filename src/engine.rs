@@ -1,14 +1,18 @@
 //! Engine entry point: open a pack, load a room, simulate and display it.
 //!
-//! # M11 deviations
+//! # Documented deviations
 //!
-//! The world-interaction milestone leaves these deliberate gaps:
-//! - item models (`objtbl_b_set` table 1 and `eml_rot`'s item selector) stay
-//!   typed no-ops, so scripted pick-up models are invisible, and the courtyard
-//!   heliport's item-model Z shift has no item models to move (the object side
-//!   of the same shift is ported);
-//! - mirrored effect billboards are not drawn: the mirror pass reflects the
-//!   player/NPC joint meshes only;
+//! The world-item milestone leaves these deliberate gaps:
+//! - no pick-up viewer: `give_item` (0x2D), the ordinary pick-up handler and
+//!   the desk's take-item state award on the interaction frame, and the
+//!   original's menu mode-3/4 item viewer and key-item list screen stay absent;
+//! - no map tab: a map pick-up raises its RoomFlags owned bit, but
+//!   `ITEM_M2`'s `MAP*.TIM` pages and `Map_blue.tim` stay unpacked and the map
+//!   screen is untouched;
+//! - the crank hex's (item 0x1E) texture-dirty write has no analogue in the
+//!   port's direct-decode design and is a no-op;
+//! - no mirror reflection of item meshes or sparkle billboards: the M11 mirror
+//!   pass reflects the player/NPC joint meshes only;
 //! - per-texel PSX semi-transparency is absent; a primitive carrying the ABE
 //!   bit uses the flat half blend the effect path already uses;
 //! - the original's stage-5 texture-bank and palette overrides are documented
@@ -20,8 +24,9 @@
 //! - the original's fixed ordering-table depths (the flooded guardhouse and
 //!   courtyard water rooms, the 1F right-stairs objects with type < 2, and the
 //!   2F study/front-lesson open lid at slot 0x33) are not modelled: the port
-//!   orders every object triangle by its mean view Z in the shared sort;
-//! - object collision and floor probes keep the record's local matrix
+//!   orders every object and item triangle by its mean view Z in the shared
+//!   stable sort;
+//! - object and item collision and floor probes keep the record's local matrix
 //!   translation, exactly like the original's `update_room_objects` helpers;
 //!   only rendering, the camera-switch cull and effect attach compose the SCA
 //!   parent chain.
@@ -3616,8 +3621,10 @@ fn tick_room(
     // The original zeroes the per-frame item-use flag bank at the top of every
     // game frame, before the room scripts decide what is usable this frame.
     context.game.clear_item_use_flags();
-    // The item-box lid ramps before the scripts run (the original's
-    // `check_itembox_state` is the first gameplay call each frame).
+    // The desk flow and the item-box lid ramp before the scripts run (the
+    // original's `check_desk_state`/`check_itembox_state` are the first
+    // gameplay calls each frame).
+    context.game.check_desk_state();
     context.game.check_itembox_state();
     {
         let mut host = game::ScdGameHost::new(context.game);
@@ -3748,13 +3755,17 @@ fn update_window_title(
 /// Apply the SCD camera state to the room.
 ///
 /// When the scripts hold the camera lock, their cut wins; otherwise the M2 zone
-/// switching picks the cut from the player position. `None` keeps the current
-/// cut when no position is available yet (room load and capture).
+/// switching picks the cut from the player position. The zone walk starts from
+/// the game's current cut, not the room's: a script (`setb 2`) or handler
+/// (`check_desk`) that selects a cut mid-tick is the original's
+/// `g_roomCameraId` write, and the zone scan has to start from it for the
+/// camera-zone walk to re-home there. `None` keeps the current cut when no
+/// position is available yet (room load and capture).
 fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i32; 3]>) {
     let selected = if game.camera.locked && game.camera.current_cut < room.cuts.len() {
         game.camera.current_cut
     } else if let Some(pos) = pos {
-        player::camera_for_position(room, room.current_cut, pos)
+        player::camera_for_position(room, game.camera.current_cut, pos)
     } else {
         room.current_cut
     };
@@ -5006,6 +5017,13 @@ mod tests {
         let scripts = scd::reader::parse(rdt_bytes).unwrap();
 
         let mut game = game::GameState::new(id, &room);
+        // The new-game room-items bank registers the item edges; the
+        // second-playthrough flag keeps ROOM1001's ink ribbon, which Jill's
+        // first playthrough skips.
+        game.flags[7]
+            .bytes_mut()
+            .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+        game.apply_flag(0, 0x7B, 0);
         let mut command_vm = scd::vm::CommandVm::new(&scripts);
         let mut event_vm = scd::vm::EventVm::new(&scripts);
         {
@@ -5150,6 +5168,165 @@ mod tests {
         assert_eq!(player_state.angle, 1024);
         assert!(game.doors[0].is_none());
         assert!(game.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn tick_room_steps_the_desk_countdown_before_the_scripts() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut loaded = load_room(&pack, id).unwrap();
+        let mut game = game::GameState::new(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
+        // The desk sits mid-pan; the empty script cannot advance it.
+        game.desk.state = 35;
+        {
+            let scripts = &loaded.scripts;
+            let mut command_vm = scd::vm::CommandVm::new(scripts);
+            let mut event_vm = scd::vm::EventVm::new(scripts);
+            let mut npc_models = npc::EntityModelCache::default();
+            for _ in 0..2 {
+                tick_room(
+                    &mut command_vm,
+                    &mut event_vm,
+                    RoomContext {
+                        room: &mut loaded.room,
+                        game: &mut game,
+                        player: &mut player_state,
+                        player_assets: None,
+                        pack: &pack,
+                        npc_models: &mut npc_models,
+                    },
+                    player::Input::default(),
+                );
+            }
+        }
+        assert_eq!(game.desk.state, 33, "the per-frame desk state machine ran");
+    }
+
+    #[test]
+    fn apply_camera_starts_the_zone_walk_from_the_games_cut() {
+        use crate::state::{Cut, Zone};
+
+        let mut room = RoomState {
+            cuts: vec![Cut::default(); 3],
+            ..RoomState::default()
+        };
+        // A camera-0 group header plus one switch zone under cut 0.
+        room.zones = vec![
+            Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0; 2]; 4],
+            },
+            Zone {
+                cam_to: 1,
+                cam_from: 0,
+                corners: [[0, 0], [0, 100], [100, 100], [100, 0]],
+            },
+        ];
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut game = game::GameState::new(id, &room);
+
+        // A script (`setb 2`) or the desk selected cut 2 this tick while the
+        // room still carries its previous cut. The walk must start from the
+        // game's cut so the camera-0 switch zone cannot pull it back.
+        game.set_camera_cut(2);
+        assert_eq!(room.current_cut, 0, "the room is on its previous cut");
+        apply_camera(&mut room, &mut game, Some([50, 0, 50]));
+        assert_eq!(game.camera.current_cut, 2, "the mid-tick cut survives");
+        assert_eq!(room.current_cut, 2);
+
+        // From cut 0 the same position follows the switch zone.
+        room.current_cut = 0;
+        game.set_camera_cut(0);
+        apply_camera(&mut room, &mut game, Some([50, 0, 50]));
+        assert_eq!(game.camera.current_cut, 1, "the zone switch still works");
+    }
+
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_room_401_desk_cut_survives_the_zone_scan() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let id = RoomId::parse("4010").unwrap();
+        let mut loaded = load_room(&pack, id).unwrap();
+        let mut game = game::GameState::new(id, &loaded.room);
+        // The new-game room-items bank registers the desk's item edge.
+        game.flags[7]
+            .bytes_mut()
+            .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+        let mut player_state = player::spawn(id, &loaded.room);
+        // Stand in front of the desk, facing -Z so the reach lands in its zone.
+        player_state.pos = [10100, 0, 11950];
+        player_state.angle = 0x400;
+        game.sync_entity_from_player(&player_state);
+        {
+            let scripts = &loaded.scripts;
+            let mut command_vm = scd::vm::CommandVm::new(scripts);
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_init(&mut host);
+        }
+        assert_eq!(
+            game.room_actions
+                .iter()
+                .flatten()
+                .filter(|action| action.kind == game::RoomActionKind::Desk)
+                .count(),
+            1,
+            "ROOM4010 registers its desk"
+        );
+        // Unlock the desk and hold the key: the action probe opens it.
+        game.apply_flag(2, 0x21, 0);
+        game.add_item(0x3D, 1);
+
+        let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
+        let mut event_vm = scd::vm::EventVm::new(&loaded.scripts);
+        let mut npc_models = npc::EntityModelCache::default();
+        tick_room(
+            &mut command_vm,
+            &mut event_vm,
+            RoomContext {
+                room: &mut loaded.room,
+                game: &mut game,
+                player: &mut player_state,
+                player_assets: None,
+                pack: &pack,
+                npc_models: &mut npc_models,
+            },
+            player::Input {
+                action_pressed: true,
+                action_held: true,
+                ..player::Input::default()
+            },
+        );
+        assert_eq!(game.desk.state, 35, "the action probe opened the desk");
+        assert_eq!(game.camera.current_cut, 3, "the desk cut is selected");
+        assert_eq!(
+            loaded.room.current_cut, 3,
+            "the desk cut survived the frame's zone scan"
+        );
+        assert_eq!(game.sfx_requests, vec![0x24]);
     }
 
     #[test]
@@ -7358,7 +7535,17 @@ mod tests {
                 session.game.entities[0].health,
                 NEW_GAME_HEALTH[usize::from(character)]
             );
-            assert_eq!(session.game.flags[7].bytes(), &NEW_GAME_ROOM_ITEMS);
+            // Jill's first playthrough clears the ink-ribbon build's
+            // room-items bit (ROOM1001's 0x16, shared with the sword key in
+            // the Chris variant), exactly like the original's skip.
+            let mut expected_items = game::FlagBank::new();
+            expected_items
+                .bytes_mut()
+                .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+            if character == 1 {
+                expected_items.apply(0x16, 1);
+            }
+            assert_eq!(session.game.flags[7].bytes(), expected_items.bytes());
             let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
             if character == 0 {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
