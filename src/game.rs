@@ -838,6 +838,11 @@ pub struct GameState {
     pub last_used_item: Option<u8>,
     /// The item currently equipped.
     pub equipped: Option<u8>,
+    /// The player's `PlayerEntity` flags byte (offset 0x00): the aim
+    /// direction (`0x20` up, `0x40` neutral, `0x80` down) and the animation
+    /// state bits. Combat does not raise the aim bits yet, so this stays `0`;
+    /// the effect flag-stage behaviours latch it for their follow-on phases.
+    pub player_flags: u8,
     /// The item the inventory cursor last selected.
     pub selected_item: Option<u8>,
     /// The player's maximum health (`max_health >> 2` drives the EKG colour).
@@ -941,6 +946,7 @@ impl Default for GameState {
             last_picked_item: None,
             last_used_item: None,
             equipped: None,
+            player_flags: 0,
             selected_item: None,
             max_health: 0,
             health_status: 0,
@@ -1012,13 +1018,15 @@ impl GameState {
         self.room_effects = Rc::new(resolved);
     }
 
-    /// Install the global weapon-FX metadata loaded from the pack and re-pack
-    /// the current room's sprite records.
+    /// Install the global weapon-FX metadata loaded from the pack.
+    ///
+    /// The room's sprite records must then be repacked once against the
+    /// installed table with [`GameState::resolve_room_effects`], which always
+    /// starts from the freshly parsed room effects. Repacking the current
+    /// [`GameState::room_effects`] here would bias their UV V bytes a second
+    /// time (the records are already packed once by [`GameState::new`]).
     pub fn set_weapon_effects(&mut self, weapon: effects::WeaponEffects) {
         self.weapon_effects = weapon;
-        let mut resolved = (*self.room_effects).clone();
-        effects::pages::pack(&self.weapon_effects, &mut resolved);
-        self.room_effects = Rc::new(resolved);
     }
 
     /// Store the current room camera id in both the camera state and the
@@ -1364,6 +1372,14 @@ impl GameState {
     /// frame.
     pub fn tick_effects(&mut self, room: &RoomState) {
         effects::behaviour::update(self, room);
+    }
+
+    /// Recompute every live slot's stored screen/depth under the room's
+    /// current camera, without advancing behaviours or velocity. Called after
+    /// a camera-zone switch so this frame's billboards match the camera the
+    /// renderer draws (see `tick_room`).
+    pub fn reproject_effects(&mut self, room: &RoomState) {
+        effects::behaviour::reproject(self, room);
     }
 
     /// Mirror entity 0 into the engine's player state when the scripts moved
@@ -4534,6 +4550,60 @@ mod tests {
         // only thing that writes effect header flags.
         assert_eq!(state.effects.slot(63).unwrap().flags(), before);
         assert_eq!(state.effects.active_count(), 1);
+    }
+
+    #[test]
+    fn weapon_install_packs_the_room_sprites_once() {
+        use crate::effects::fixtures;
+        use crate::effects::room::{TimGeometry, UvRecord, WeaponEffects};
+
+        let mut room = crate::state::RoomState::default();
+        room.effects.index[0] = 3;
+        let mut sprite = fixtures::sprite(3, std::array::from_fn(|_| Vec::new()));
+        sprite.geometry = TimGeometry {
+            width: 64,
+            height: 40,
+            clut_rows: 2,
+        };
+        sprite.info.uvs = vec![UvRecord {
+            u: 8,
+            v: 12,
+            pivot_x: 64,
+            pivot_y: 64,
+        }];
+        room.effects.sprites.push(sprite);
+
+        let mut weapon = WeaponEffects::default();
+        weapon.index[0] = 9;
+        let mut weapon_sprite = fixtures::sprite(9, std::array::from_fn(|_| Vec::new()));
+        weapon_sprite.geometry = TimGeometry {
+            width: 128,
+            height: 50,
+            clut_rows: 3,
+        };
+        weapon.sprites.push(weapon_sprite);
+
+        let mut expected = room.effects.clone();
+        crate::effects::pages::pack(&weapon, &mut expected);
+
+        let id = crate::state::RoomId::parse("1010").unwrap();
+        let mut state = GameState::new(id, &room);
+        let packed_by_new = (*state.room_effects).clone();
+        state.set_weapon_effects(weapon);
+        assert_eq!(
+            (*state.room_effects).clone(),
+            packed_by_new,
+            "installing the weapon table must not re-pack the room records"
+        );
+        state.resolve_room_effects(&room);
+        assert_eq!(
+            (*state.room_effects).clone(),
+            expected,
+            "resolve_room_effects must re-pack from the fresh room data once"
+        );
+        assert_eq!(state.room_effects.sprites[0].info.page_id, 0x18);
+        assert_eq!(state.room_effects.sprites[0].info.page_v, 50);
+        assert_eq!(state.room_effects.sprites[0].info.uvs[0].v, 62);
     }
 
     #[test]

@@ -209,17 +209,28 @@ pub fn weapon_sheet_region(slot: usize) -> Option<(u8, u16)> {
 ///
 /// `depth_slot` is the packed page id minus [`PAGE_BIAS`]; the record scan
 /// reproduces the original's one-sided `band_v < start_v + len` test in table
-/// order, so a V below a record's start still selects it.
+/// order, so a V below a record's start still selects it. When every band ends
+/// below `band_v` the original wraps back to the slot's first record, which
+/// this returns too; only an out-of-range slot yields `None`.
 pub fn blend_record(depth_slot: usize, band_v: u8) -> Option<(u8, u8, u8, u8)> {
     let start = usize::from(*EFFECT_BLEND_START.get(depth_slot)?);
     let count = usize::from(*EFFECT_BLEND_COUNT.get(depth_slot)?);
+    let mut selected = None;
     for row in EFFECT_BLEND_TABLE.iter().skip(start).take(count) {
         let (start_v, len, mode, color) = (row[0], row[1], row[2], row[3]);
         if u16::from(band_v) < u16::from(start_v) + u16::from(len) {
-            return Some((mode, color, start_v, len));
+            selected = Some((mode, color, start_v, len));
+            break;
         }
     }
-    None
+    // The original wraps `i` back to 0 when every band ends below `band_v`,
+    // so a valid slot always selects its first record instead of skipping the
+    // sprite.
+    selected.or_else(|| {
+        EFFECT_BLEND_TABLE
+            .get(start)
+            .map(|row| (row[2], row[3], row[0], row[1]))
+    })
 }
 
 /// The camera light record used to shade effects in `(stage, room, camera)`.
@@ -1051,7 +1062,9 @@ mod tests {
         // still matches the row; the band end is the cull.
         assert_eq!(blend_record(31, 0x02), Some((0x00, 0x3B, 0x03, 0xF0)));
         assert_eq!(blend_record(31, 0xF2), Some((0x00, 0x3B, 0x03, 0xF0)));
-        assert_eq!(blend_record(31, 0xF3), None);
+        // Past every band the scan wraps to the slot's first record.
+        assert_eq!(blend_record(31, 0xF3), Some((0x00, 0x3B, 0x03, 0xF0)));
+        assert_eq!(blend_record(31, 0xFF), Some((0x00, 0x3B, 0x03, 0xF0)));
         assert_eq!(blend_record(32, 0), None);
     }
 

@@ -522,14 +522,16 @@ fn project(camera: &Camera, fov: i32, world: [i32; 3]) -> (i16, i16, i32) {
     (screen_x as i16, screen_y as i16, depth >> 2)
 }
 
-/// Integrate the velocity header through the yaw and attach transform, project
-/// the result, and accumulate this tick's velocity deltas.
-fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, running: bool) {
-    let Some(effect) = game.effects.slot(index).copied() else {
-        return;
-    };
+/// Compute the slot's world position and projection under `camera`, returning
+/// the updated record. `None` when the slot's header does not carry the
+/// transform bit, in which case it is not projected at all.
+///
+/// The type-1 rows re-copy the attach transform first, matching the original's
+/// per-tick refresh; the returned record carries the refreshed transform so
+/// callers can store it.
+fn projected(game: &GameState, camera: &Camera, fov: i32, effect: &Effect) -> Option<Effect> {
     if effect.flags() & 0x0002 == 0 {
-        return;
+        return None;
     }
 
     let rotated = yaw_rotate(effect.yaw, effect.rot_speed);
@@ -539,7 +541,7 @@ fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, runn
         rotated[2].wrapping_add(effect.local_offset[2]),
     ];
 
-    let mut e = effect;
+    let mut e = *effect;
     if e.active == 1 {
         e.transform = attach_matrix(game, e.attach);
         e.sprite_offset = attach_translation(game, e.attach);
@@ -562,6 +564,18 @@ fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, runn
     e.screen = [screen_x, screen_y];
     e.proj_depth = depth;
     e.depth_scaled = ((depth as u16) << 2) as i16;
+    Some(e)
+}
+
+/// Integrate the velocity header through the yaw and attach transform, project
+/// the result, and accumulate this tick's velocity deltas.
+fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, running: bool) {
+    let Some(effect) = game.effects.slot(index).copied() else {
+        return;
+    };
+    let Some(mut e) = projected(game, camera, fov, &effect) else {
+        return;
+    };
 
     if running {
         let velocity = [h16(&e, 4), h16(&e, 6), h16(&e, 8)];
@@ -575,6 +589,30 @@ fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, runn
 
     if let Some(slot) = game.effects.slot_mut(index) {
         *slot = e;
+    }
+}
+
+/// Re-project every live slot under the room's current camera without
+/// advancing behaviours or velocity. The camera-zone scan runs after
+/// [`update`] in the room tick, so this restores a consistent frame when the
+/// cut moved.
+pub fn reproject(game: &mut GameState, room: &RoomState) {
+    let Some(cut) = room.cuts.get(room.current_cut) else {
+        return;
+    };
+    let camera = Camera::from_cut(cut);
+    for index in (0..EFFECT_POOL_SIZE).rev() {
+        let Some(effect) = game.effects.slot(index).copied() else {
+            continue;
+        };
+        if effect.anim_id == 0 {
+            continue;
+        }
+        if let Some(updated) = projected(game, &camera, cut.fov, &effect)
+            && let Some(slot) = game.effects.slot_mut(index)
+        {
+            *slot = updated;
+        }
     }
 }
 
@@ -1103,8 +1141,9 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
         // Latch the player's state into the header after the phase timer.
         40 => {
             refresh_phase(game, index);
+            let flags = game.player_flags;
             if let Some(slot) = game.effects.slot_mut(index) {
-                slot.header[2] = 0;
+                slot.header[2] = flags;
             }
         }
         // Random flip bits, then jump to the behaviour named by the header.
@@ -1122,9 +1161,11 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
             let state = game.effects.slot(index).map_or(3, |e| e.header[3]);
             match state {
                 0 => {
+                    let flags = game.player_flags;
+                    let weapon = game.equipped.unwrap_or(0);
                     if let Some(slot) = game.effects.slot_mut(index) {
-                        slot.header[0] = 0;
-                        slot.header[1] = 0;
+                        slot.header[0] = flags;
+                        slot.header[1] = weapon;
                         slot.header[3] += 1;
                     }
                 }
@@ -1383,8 +1424,9 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
         // Auto-aim flash: the phase timer with the aim state latched.
         58 => {
             refresh_phase(game, index);
+            let autoaim = autoaim_flags(game);
             if let Some(slot) = game.effects.slot_mut(index) {
-                slot.header[2] = 0;
+                slot.header[2] = autoaim;
             }
         }
         // Dual shot: fire one or two type-5 billboards.
@@ -1424,6 +1466,17 @@ fn refresh_phase(game: &mut GameState, index: usize) {
     } else if let Some(effect) = game.effects.slot_mut(index) {
         effect.header[3] -= 1;
     }
+}
+
+/// The original's `weapon_autoaim_check() & 3` latch value: the low two bits
+/// of the equipped weapon's ammo count.
+///
+/// `weapon_autoaim_check` tops empty special weapons back up to counts that
+/// are all multiples of four (the flamethrower returns its raw count), so the
+/// low two bits equal the carried quantity's. Combat does not exist yet, so
+/// the refill side effects are not applied here.
+fn autoaim_flags(game: &GameState) -> u8 {
+    game.equipped.map_or(0, |item| game.item_count(item) as u8) & 3
 }
 
 /// Ground-contact splat shared by behaviours 21 and 22.
@@ -1526,6 +1579,9 @@ fn clone(game: &mut GameState, index: usize) {
         anim_id: next.anim_id(),
         update_id: next.update_id(),
         active: next.initial_type(),
+        // The original copies the whole 24-byte block over the record,
+        // light factor included, so the clone keeps the next phase's scale.
+        light_factor: next.light(),
         yaw: next.yaw(),
         frame_entry: 0,
         frame_index: first.uv_index,
@@ -2128,5 +2184,128 @@ mod tests {
         // spread factor flips sign.
         assert_eq!(effect.header[3], (((0x23 - low) * 2) / -3) as u8);
         assert_eq!(effect.header[2], 3u8.wrapping_neg());
+    }
+
+    #[test]
+    fn clone_copies_the_next_blocks_light_factor() {
+        let first = raw_block(18, 0);
+        let mut second = raw_block(1, 0);
+        second[3] = 0x2A; // the next phase's authored light
+        let mut game = game_with_row(&[first, second]);
+        let source = spawn(&mut game, 0, [0, 0, 0], 0, 0);
+        run(&mut game, &room());
+        assert_eq!(
+            game.effects.slot(usize::from(source)).unwrap().anim_id,
+            1,
+            "the source retires to the inert behaviour"
+        );
+        let clone = game
+            .effects
+            .active()
+            .find(|(index, _)| *index != usize::from(source))
+            .expect("the clone claimed a slot")
+            .1;
+        assert_eq!(clone.anim_id, 1);
+        assert_eq!(
+            clone.light_factor, 0x2A,
+            "the clone must inherit the next block's light factor"
+        );
+    }
+
+    #[test]
+    fn timer_flags_latches_the_player_flags() {
+        let mut game = game_with_row(&[raw_block(40, 0)]);
+        game.player_flags = 0x60;
+        let slot = spawn(&mut game, 0, [0, 0, 0], 0, 0);
+        run(&mut game, &room());
+        assert_eq!(
+            game.effects.slot(usize::from(slot)).unwrap().header[2],
+            0x60
+        );
+    }
+
+    #[test]
+    fn weapon_charge_latches_the_player_flags_and_equipped_item() {
+        let mut game = game_with_row(&[raw_block(42, 0)]);
+        game.player_flags = 0x60;
+        game.equipped = Some(0x0B);
+        let slot = spawn(&mut game, 0, [0, 0, 0], 0, 0);
+        run(&mut game, &room());
+        let effect = game.effects.slot(usize::from(slot)).unwrap();
+        assert_eq!(effect.header[0], 0x60);
+        assert_eq!(effect.header[1], 0x0B);
+        assert_eq!(effect.header[3], 1);
+    }
+
+    #[test]
+    fn autoaim_flash_latches_the_ammo_low_bits() {
+        let mut game = game_with_row(&[raw_block(58, 0)]);
+        game.equipped = Some(0x0B);
+        game.add_item(0x0B, 7);
+        let slot = spawn(&mut game, 0, [0, 0, 0], 0, 0);
+        run(&mut game, &room());
+        assert_eq!(
+            game.effects.slot(usize::from(slot)).unwrap().header[2],
+            7 & 3
+        );
+
+        let mut empty = game_with_row(&[raw_block(58, 0)]);
+        empty.equipped = Some(0x0B);
+        let slot = spawn(&mut empty, 0, [0, 0, 0], 0, 0);
+        run(&mut empty, &room());
+        assert_eq!(empty.effects.slot(usize::from(slot)).unwrap().header[2], 0);
+    }
+
+    #[test]
+    fn every_implemented_id_dispatches_without_a_placeholder() {
+        for id in 0..=63u8 {
+            let mut game = game_with_row(&[raw_block(id, 0)]);
+            let slot = spawn(&mut game, 0, [0, 0, 0], 0, 0);
+            run(&mut game, &room());
+            let counted = game.effect_placeholder_hits[usize::from(id)] > 0;
+            assert_eq!(counted, !implemented(id), "behaviour {id} tier mismatch");
+            assert!(
+                game.effects.slot(usize::from(slot)).is_some(),
+                "behaviour {id} left no slot"
+            );
+        }
+    }
+
+    #[test]
+    fn reproject_rebuilds_the_screen_under_the_new_camera() {
+        let mut room = RoomState {
+            cuts: vec![
+                Cut {
+                    index: 0,
+                    pos: [0, 0, 0],
+                    look_at: [0, 0, 1000],
+                    fov: 200,
+                    ..Cut::default()
+                },
+                Cut {
+                    index: 1,
+                    pos: [2000, 0, 0],
+                    look_at: [2000, 0, 1000],
+                    fov: 200,
+                    ..Cut::default()
+                },
+            ],
+            ..RoomState::default()
+        };
+        let mut bytes = raw_block(1, 0);
+        bytes[14] = 0x02; // transform bit, so the slot projects
+        let mut game = game_with_row(&[bytes]);
+        let slot = spawn(&mut game, 0, [1000, 0, 500], 0, 0);
+        run(&mut game, &room);
+        let before = game.effects.slot(usize::from(slot)).unwrap().screen;
+
+        room.current_cut = 1;
+        let camera = Camera::from_cut(&room.cuts[1]);
+        let expected = project(&camera, room.cuts[1].fov, [1000, 0, 500]);
+        reproject(&mut game, &room);
+
+        let effect = game.effects.slot(usize::from(slot)).unwrap();
+        assert_eq!(effect.screen, [expected.0, expected.1]);
+        assert_ne!(effect.screen, before, "the cut move must change the screen");
     }
 }

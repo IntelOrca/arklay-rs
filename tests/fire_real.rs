@@ -278,8 +278,8 @@ fn real_room1051_capture_shows_the_muzzle_pixels() {
     let without = engine::render_game_frame(&pack, id, &room, &cleared, &sim.player).unwrap();
     let painted = changed_pixels(&with, &without);
     assert!(
-        painted > 0,
-        "the muzzle/shell billboards painted {painted} pixels"
+        painted >= 8,
+        "the muzzle/shell billboards painted only {painted} pixels"
     );
 
     // The paint must sit around the character's projected position, not at the
@@ -298,8 +298,8 @@ fn real_room1051_capture_shows_the_muzzle_pixels() {
         }
     }
     assert!(
-        nearby > 0,
-        "the fire paint is not near the character ({nearby} pixels in the window)"
+        nearby >= 8 && nearby * 2 >= painted,
+        "the fire paint must sit around the character ({nearby} of {painted} pixels in the window)"
     );
 }
 

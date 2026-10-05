@@ -3465,6 +3465,11 @@ fn new_game_state(pack: &Pack, id: RoomId, room: &RoomState) -> game::GameState 
         }
     }
     game.set_weapon_effects(weapon);
+    // Pack the room's sprites once against the installed weapon sheets. The
+    // `GameState::new` pass above used the empty default table, so resolving
+    // from the freshly parsed room data here leaves the UV V bias applied
+    // exactly once.
+    game.resolve_room_effects(room);
     game
 }
 
@@ -3546,7 +3551,15 @@ fn tick_room(
         host.interact(context.player.pos, context.player.angle, action);
     }
     context.game.apply_stair_state(context.player);
+    // The effects projected above under the pre-switch camera. If the zone
+    // scan moved the cut, recompute their stored screen/depth so the frame
+    // renders billboards against the camera it draws; without this the first
+    // frame after a switch shows the old projection.
+    let previous_cut = context.room.current_cut;
     apply_camera(context.room, context.game, Some(context.player.pos));
+    if context.room.current_cut != previous_cut {
+        context.game.reproject_effects(context.room);
+    }
     context.game.transition.take()
 }
 

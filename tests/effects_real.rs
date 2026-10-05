@@ -88,6 +88,33 @@ fn real_room_effect_pages_pack_inside_the_loaded_page_count() {
     }
 }
 
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_weapon_install_packs_each_room_once() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    // The engine boot installs the global weapon sheets and then resolves the
+    // room effects once. A second packing pass would bias every room sprite's
+    // UV V byte again, so both rooms must equal a single `pack` over the
+    // freshly parsed records.
+    let pack = Pack::open(&pack_path).unwrap();
+    let weapon = effects::WeaponEffects::load(&pack);
+    for name in ["1010", "1080"] {
+        let id = RoomId::parse(name).unwrap();
+        let sim =
+            arklay::engine::simulate_room(&pack, id, 0, arklay::player::Input::default()).unwrap();
+        let data = std::fs::read(root.join(format!("JPN/STAGE1/ROOM{name}.RDT"))).unwrap();
+        let state = arklay::rdt::parse(&data, id).unwrap();
+        let mut expected = state.effects.clone();
+        effects::pages::pack(&weapon, &mut expected);
+        assert_eq!(
+            *sim.game.room_effects, expected,
+            "ROOM{name} must be packed exactly once with the weapon sheets installed"
+        );
+    }
+}
+
 // ============================================================================
 // M10 slices 3-4: the corpus lifecycle audit and the effect captures.
 //
@@ -234,7 +261,44 @@ fn real_effect_corpus_600_ticks_has_no_placeholders() {
                 .filter(|(_, count)| **count > 0)
                 .collect::<Vec<_>>()
         );
+        // The packed sprite placements must stay inside the four pages the
+        // runtime loads, and inside the page's 256 rows except for a
+        // full-page TIM the cursor's overflow reset cannot fit. A second
+        // packing pass would push the UV V bytes out of range, so this also
+        // guards the boot path against re-packing.
+        for sprite in &sim.game.room_effects.sprites {
+            if sprite.geometry.height == 0 && sprite.geometry.clut_rows == 0 {
+                continue;
+            }
+            assert!(
+                sprite.info.page_index() < 4,
+                "ROOM{name} sprite {} packed onto page {}",
+                sprite.index,
+                sprite.info.page_index()
+            );
+            if sprite.geometry.height < 256 {
+                assert!(
+                    u16::from(sprite.info.page_v) + sprite.geometry.height <= 256,
+                    "ROOM{name} sprite {} art region runs past the page",
+                    sprite.index
+                );
+            }
+        }
         for (_, effect) in sim.game.effects.active() {
+            // A live room sprite's stored V is page-absolute, so its frame art
+            // must stay inside the 256-row page. A second packing pass would
+            // push it past the page for some rooms.
+            if let Some(index) = effect.sprite
+                && sim.game.room_effects.sprite(index).is_some()
+            {
+                assert!(
+                    u16::from(effect.uv[1]) + u16::from(effect.size[1]) <= 256,
+                    "ROOM{name} effect {} V {} + height {} runs past the page",
+                    effect.effect_type,
+                    effect.uv[1],
+                    effect.size[1]
+                );
+            }
             assert!(
                 arklay::effects::behaviour::implemented(effect.anim_id),
                 "ROOM{name} slot is running placeholder anim {}",
