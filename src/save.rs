@@ -159,6 +159,14 @@ impl Default for SaveFile {
 impl SaveFile {
     /// Capture a game state. The bio-card prefix stays zero until
     /// [`SaveFile::set_prefix`] or [`SaveFile::from_state_with_prefix`].
+    ///
+    /// TODO(parity): (save) the original memcpy's the whole 0x41C BioCard block,
+    /// so BioCard 0x208..0x20F (specialRoomLightR, characterModelId,
+    /// scdLastEnemyFlags, bulletEffectId, pickupQtyA/B/C) and the 0x214..0x223
+    /// state words (fading state, special-room light, randSeed, countdown timer,
+    /// health copy, held/pressed d-pad) round-trip through the slot; this layout
+    /// drops them, so a reload loses e.g. the remembered pick-up quantities
+    /// opcode 0x4C moves.
     pub fn from_state(state: &GameState) -> Self {
         // BioCard 0x224 is the play-timer snapshot the original mirrors every
         // frame; it lives in the state byte image.
@@ -273,6 +281,9 @@ impl SaveFile {
             .filter(|stack| stack.id != 0)
             .collect();
         state.item_box = self.item_box;
+        // TODO(parity): (save/audio) `room_bgm` is captured from a constant and
+        // never restored here, so a load does not rebuild the per-room BGM table
+        // the original writes back from the block.
 
         state.state_bytes = [0; STATE_BYTES];
         state.state_bytes[0] = self.stage;

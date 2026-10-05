@@ -932,6 +932,11 @@ impl Default for GameState {
 /// One 16-bit xorshift step: the deterministic stand-in for the original's
 /// per-frame `rand()` reseed. The zero state is remapped so the sequence never
 /// sticks.
+///
+/// TODO(parity): (scripting) the original stores the frame's `rand()` value in
+/// the BioCard randSeed word (state word 3) that scripts roll dice with via
+/// `cmpw 3`; the stand-in seed never reaches `state_words`, so those scripts
+/// always compare against zero.
 fn next_random(seed: u16) -> u16 {
     let mut x = seed;
     x ^= x << 7;
@@ -1008,6 +1013,12 @@ impl GameState {
     /// the window's menu-choice byte, index [`STATE_BYTE_SELECTED_ITEM`] the
     /// item name substitution reads, and [`STATE_BYTE_HEALTH_STATUS`] mirrors
     /// into [`GameState::health_status`].
+    ///
+    /// TODO(parity): (scripting) the original's `setb` indexes the whole BioCard
+    /// unchecked, so scripts writing indices past the state block (57 and 82
+    /// occur in shipped rooms) alias scenarioFlags2; this drops out-of-range
+    /// indices, and in-range ones (e.g. 57) do not reach the flag banks at all.
+    /// The same unbounded-index rule applies to `setw`/`cmpb`/`cmpw`.
     pub fn set_byte(&mut self, index: u8, value: u8) {
         if index == STATE_BYTE_ROOM_CAMERA {
             self.camera.current_cut = usize::from(value);
@@ -1125,6 +1136,9 @@ impl GameState {
         let slot = 1 + usize::from(operand_u8(operands, 11) & 0x0F);
         let force_init = operand_u8(operands, 3) != 0;
         let occupied = self.entities[slot].active();
+        // TODO(parity): (scripting) without the force-init byte the original still
+        // re-initialises an occupied slot when no saved enemy state matches
+        // (FUN_0048f330); this always leaves the occupied slot untouched.
         if occupied && !force_init {
             return false;
         }
@@ -1237,6 +1251,10 @@ impl GameState {
         models: &mut crate::npc::EntityModelCache,
         pack: &crate::pack::Pack,
     ) -> usize {
+        // TODO(parity): (gameplay) monster ids 0x00..=0x1F allocate no entity at
+        // all and the state-8 weapon-fire handler is inert (counted in
+        // `npc_placeholders`); rooms that spawn enemies stay empty and a script
+        // waiting on the fire completion bit can stall.
         // The original reseeds its random seed from `rand()` at the top of
         // every gameplay frame, before any entity thinks; the look-at
         // scheduling reads the frame's value.
@@ -1607,6 +1625,9 @@ impl GameState {
     /// not. The player entity slot survives; the other entity slots reset. The
     /// identity bytes are reseeded from the new room.
     pub fn enter_room(&mut self, id: RoomId, _room: &RoomState) {
+        // TODO(parity): (scripting) the original's `room_state_reset` also clears
+        // pickedItemId, usedItemId, fwdPosActionId and g_SysFlags[1] on a room
+        // change; this keeps the previous room's picked/used item and probe bytes.
         self.id = id;
         self.state_bytes[0] = id.stage;
         self.state_bytes[1] = id.room;
@@ -1718,6 +1739,11 @@ impl GameState {
     }
 
     /// Whether at least one `item` is held.
+    ///
+    /// TODO(parity): (scripting) the original's `item_ck`/`get_item_slot` scans
+    /// slot ids regardless of quantity, so the starting knife (id 1, quantity 0)
+    /// counts as held; requiring `quantity > 0` here makes `testitem`/`item_ck`
+    /// for the knife (and any other zero-quantity stack) report false.
     pub fn has_item(&self, item: u8) -> bool {
         self.inventory
             .iter()
@@ -1827,6 +1853,11 @@ impl GameState {
 
     /// `ck_item_count`: no item family table exists yet, so only the exact item
     /// id is matched. Returns the summed quantity and the matching stack count.
+    ///
+    /// TODO(parity): (scripting) the original's search id selects an item GROUP
+    /// (0x0A any, 0x0B item 2, 0x0C item 3, 0x0D items 4/5, 0x0F item 6,
+    /// 0x10..=0x12 items 7/8/9), not an exact item id; only exact ids are summed
+    /// here, so group counts read 0.
     pub fn item_family_total(&self, search: u8) -> (u32, u32) {
         let count = self
             .inventory
@@ -1863,6 +1894,11 @@ impl GameState {
     /// item (up to `items::ITEM_QUANTITY_CAP`) instead of leaving a duplicate,
     /// and a deposited stack frees its slot. The equipped marker is cleared
     /// when the swap takes the equipped item away and no copy remains.
+    ///
+    /// TODO(parity): (inventory) the original swaps the two raw slots verbatim,
+    /// so the withdrawn stack always lands in the vacated player slot and box
+    /// slot counts stay one-for-one; the merge/spill here can combine stacks the
+    /// original would keep separate.
     ///
     /// Returns whether anything moved.
     pub fn item_box_swap(&mut self, box_slot: usize, player_slot: usize) -> bool {
@@ -2081,6 +2117,10 @@ impl GameState {
     /// `new_target` replace the slot ids first and then the record's effect
     /// (ammo transfer, quantity merge, chemical flag) rearranges quantities.
     /// Empty slots are compacted afterwards.
+    ///
+    /// TODO(parity): (ui) two herbs (0x43..=0x4B) with no recipe return the
+    /// original's distinct "cannot combine" result (message 0xF6); this reports
+    /// `NoRecipe`.
     pub fn combine_slots(&mut self, cursor_slot: usize, target_slot: usize) -> CombineResult {
         if cursor_slot == target_slot {
             return CombineResult::NoRecipe;
@@ -2254,6 +2294,11 @@ impl GameState {
     /// ladder base in `unk_c6`/`unk_c8`, toggles the entry's own low word so a
     /// two-way ladder flips ends, and raises the ladder-down state. The
     /// stair/ladder climb behaviour starts from here.
+    ///
+    /// TODO(parity): (gameplay) the original starts an eight-state climb
+    /// behaviour (walk-up, turn, climb anim 0x33/0x35 with step sounds and a
+    /// camera effect, then descent/step-back states); this latches a target and
+    /// holds the facing until the player is within 900 units.
     fn apply_stairs_zone(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -2313,6 +2358,12 @@ impl GameState {
     /// action-key entry that matches fires, as in the original. Item and door
     /// actions act for real, stair zones drive the player's height and climb
     /// state, the menu-driven kinds record a placeholder.
+    ///
+    /// TODO(parity): (scripting) the original probes bit-0 entries every frame
+    /// (mask 1) and bit-2 entries only from the collision pass (mask 4); this
+    /// merges both masks into one walk, so a bit-2-only zone can fire from the
+    /// player probe. Handlers 5/6 (`check_door`/`check_door_side`), which latch
+    /// the approach side into zone flags for the door animation, are also not run.
     pub fn interact(&mut self, pos: [i32; 3], angle: u16, action: bool) {
         // The live action table is the stair-zone store; rebuilding it here
         // also picks up `aot_reset`/`aot_on` edits and the entry's own toggled
@@ -2401,6 +2452,11 @@ impl GameState {
     /// Handler `0` and any unimplemented handler are inert. Item handlers pick
     /// the action up, the door handler transitions, the message handler shows
     /// its message, and the menu-driven handlers record a placeholder.
+    ///
+    /// TODO(parity): (scripting) handlers 3 include_key, 7 flag_bank_set,
+    /// 0x0B room_action_effect (dust), 0x0D set_room_event_flag and 0x0E
+    /// check_desk are not run at all; a script that gates progress on
+    /// `flag_bank_set` or the desk flow does nothing.
     pub fn run_room_action(&mut self, slot: u8, handler: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -2447,6 +2503,12 @@ impl GameState {
 
     /// Pick up the item action in `slot`: add to the inventory, record it and
     /// consume the action.
+    ///
+    /// TODO(parity): (progression) map item models use handler 0x0F in the
+    /// original: `pickup_key_event` raises the map's RoomFlags bit
+    /// (0x7C + id - 0x4E) and does NOT put the map in the inventory; here every
+    /// item model becomes an inventory stack and the map-seen bit is never set.
+    /// Document pickups also use their own handler (0x0D) and record byte.
     pub fn pick_up(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -2482,6 +2544,11 @@ impl GameState {
     /// A key turn only raises the lock flag and plays the message; the door
     /// transitions on the next probe, exactly as in the original. Returns
     /// whether a room transition was requested.
+    ///
+    /// TODO(parity): (gameplay/audio) the original plays the locked/key-turn
+    /// sound effects and defers consuming the key to `check_event_item_usage`
+    /// once the prompt message is dismissed; here the key is removed immediately
+    /// and no door sound is queued.
     pub fn try_door(&mut self, slot: u8) -> bool {
         let Some(door) = self.doors.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -2682,6 +2749,10 @@ impl GameState {
         // A dismissal (input, timer or an empty source) releases the pause
         // mask before any replacement the post-actions request.
         if was_active && !self.message.active {
+            // TODO(parity): (input) the original also blanks the held and
+            // previous-held d-pad bits on a state 5/6 dismissal unless
+            // message_flags bit 0 is set; only the action press is swallowed
+            // here, so a direction held through the dismissal resumes at once.
             self.message_flags = self.message_flags_backup;
         }
         let pause = self.message.pause;
@@ -2859,6 +2930,10 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_flow(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x0E | 0x32 => StepResult::Continue,
+            // TODO(parity): (scripting) the original compares against a byte
+            // whose "nothing used/picked" value is 0, so `testitem 0` /
+            // `testpickup 0` are true when no item has been used/picked yet;
+            // `Option`-based matching here makes those always false.
             0x10 => {
                 let item = operand_u8(operands, 0);
                 condition_result(self.state.last_used_item == Some(item))
@@ -2876,6 +2951,10 @@ impl ScdHost for ScdGameHost<'_> {
                 let (total, stacks) = self.state.item_family_total(search);
                 condition_result(stacks > 0 && compare(mode, i64::from(total), i64::from(value)))
             }
+            // TODO(parity): (scripting) conditions 0x38 dpad test, 0x3C player
+            // distance, 0x3F player direction and 0x50 costume variant report
+            // false here (recorded placeholders), so scripts using them always
+            // take the else branch.
             _ => self.placeholder(op),
         }
     }
@@ -2949,6 +3028,12 @@ impl ScdHost for ScdGameHost<'_> {
             }
             // This slice maps 0x1C to the equipped item test alongside 0x1D;
             // the real 0x1C (room light fade setup) stays unimplemented.
+            //
+            // TODO(parity): (scripting) 0x1C is the original's
+            // `room_light_fade_set` (writes specialRoomLightR and the light
+            // state/delta words), not an equipped-item condition; 0x3A
+            // cut_zone_set, 0x40 light_param_set and 0x46 room_lights_set are
+            // also placeholders.
             0x1C => self.equipped_test(operands),
             _ => self.placeholder(op),
         }
@@ -2961,6 +3046,9 @@ impl ScdHost for ScdGameHost<'_> {
                     .show_message(operand_u8(operands, 0), operand_u16(operands, 1));
                 StepResult::Continue
             }
+            // TODO(parity): (scripting) 0x1E voice play (which raises the
+            // voice-playing bit event scripts wait on) and 0x29 FMV request stay
+            // placeholders.
             _ => self.placeholder(op),
         }
     }
@@ -3093,6 +3181,10 @@ impl ScdHost for ScdGameHost<'_> {
                 let slot = operand_u8(operands, 0);
                 let handler = operand_u8(operands, 1);
                 self.state.run_room_action(slot, handler);
+                // TODO(parity): (scripting/gameplay) the original only arms the
+                // room action here (MSF_MENU_MODE_GOT_ITEM + toggled ITEM_VIEW)
+                // and awards the item when the item-viewer flow closes; this
+                // awards it immediately and never opens the "got item" viewer.
                 if self
                     .state
                     .room_actions
@@ -3107,6 +3199,8 @@ impl ScdHost for ScdGameHost<'_> {
                 self.state.apply_flag(5, MSF_MENU_ITEM_VIEW, 2);
                 StepResult::Finished
             }
+            // TODO(parity): (scripting) 0x44 scd_event_kill (deactivate an event
+            // slot) stays a placeholder.
             _ => self.placeholder(op),
         }
     }
@@ -3114,6 +3208,12 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_item(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x18 => {
+                // TODO(parity): (scripting) the original maps item-model ids
+                // 0x4E..=0x53 to the key-pickup handler (0x0F) and documents to
+                // 0x0D, skips an ink-ribbon model on Jill's first playthrough,
+                // and masks the +0x18 flags word it writes back; this always
+                // registers an ordinary item pickup (HANDLER_ITEM). The record's
+                // Y coordinate is dropped too.
                 // Byte layout: slot/rot, zone x4, item type, entry flags, model
                 // index, sca parent, model xyz, anim, roomItems flag, entry
                 // flags, flags word.
@@ -3147,11 +3247,17 @@ impl ScdHost for ScdGameHost<'_> {
                 self.store_action(action);
                 StepResult::Continue
             }
+            // TODO(parity): (gameplay) 0x2C is the original's `item_remove`, which
+            // clears the WHOLE slot holding the item and rearranges the
+            // inventory; `remove_item` here only takes one unit off the stack.
             0x2C => {
                 let removed = self.state.remove_item(operand_u8(operands, 0));
                 condition_result(removed)
             }
             0x1C => self.equipped_test(operands),
+            // TODO(parity): (scripting) 0x19 model_flag_set and 0x4C
+            // item_record_transfer (moves a pick-up quantity between a room
+            // action record and the BioCard bytes 0x20C..0x20E) stay placeholders.
             0x4C => self.placeholder(op),
             _ => self.placeholder(op),
         }
@@ -3226,14 +3332,29 @@ impl ScdHost for ScdGameHost<'_> {
                 entity.pos[1] = entity.pos[1].wrapping_add(i32::from(operand_i8(operands, 0)));
                 StepResult::Continue
             }
+            // TODO(parity): (scripting) 0x2B attack_anim_set, 0x33
+            // player_prop_set (clear equip, attacked/stunned animation, flags,
+            // health-status and joint writes) and 0x4D player_joint_tint stay
+            // placeholders.
             _ => self.placeholder(op),
         }
     }
 
+    /// TODO(parity): (scripting) the whole object-model class is inert: 0x1F
+    /// omodel_set, 0x30 boundary_set, 0x34 model_tint_set, 0x35 obj_flag_set,
+    /// 0x36 obj_field_test, 0x3B obj_rotation_set and 0x47 obj_transform_set
+    /// only record a placeholder, so scripted furniture movement, model
+    /// visibility flags and object-field conditions do nothing, and the
+    /// climbable/pushable object probe (flag 0x40 omodels) has no table to
+    /// search.
     fn on_model(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
         self.placeholder(op)
     }
 
+    /// TODO(parity): (gameplay/visual) the whole effect pool is inert: 0x2A
+    /// effect_spawn and 0x3D bullet_effect_spawn, the clears 0x3E/0x42/0x48 and
+    /// 0x4E effect_flags_modify only record placeholders, so muzzle flashes,
+    /// blood and dust never appear and scripts waiting on effect state stall.
     fn on_effect(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
         self.placeholder(op)
     }
@@ -3252,6 +3373,9 @@ impl ScdHost for ScdGameHost<'_> {
                 });
                 StepResult::Continue
             }
+            // TODO(parity): (audio) the original only stops the channel when its
+            // BGM-state bit was set (and resets its volume); this always clears
+            // the bit and queues a stop.
             0x16 => {
                 let channel = operand_u8(operands, 0);
                 self.state.bgm.state &= !channel_bit(channel);
@@ -3264,10 +3388,17 @@ impl ScdHost for ScdGameHost<'_> {
                 });
                 StepResult::Continue
             }
+            // TODO(parity): (audio) 0x37 writes the live BGM channel byte, but
+            // the original stores into the per-stage/room BGM table
+            // `g_roomBgmState[stage*32 + room]` (BioCard 0x33C); scripts that set
+            // a room's track this way change nothing here.
             0x37 => {
                 self.state.bgm.state = operand_u8(operands, 2);
                 StepResult::Continue
             }
+            // TODO(parity): (audio) 0x17 3D SE, 0x27 sound fade, 0x2F pan/volume,
+            // 0x43 volume ramp and 0x4A/0x4B BGM bank shift/restore stay
+            // placeholders.
             _ => self.placeholder(op),
         }
     }
@@ -3295,6 +3426,10 @@ impl ScdHost for ScdGameHost<'_> {
             }
             mnemonic if mnemonic.starts_with("act_") => self.state.apply_actor_op(op, operands),
             mnemonic if mnemonic.starts_with("tw_") => self.state.apply_tween_op(op, operands),
+            // TODO(parity): (scripting) 0x0F mirror_set and 0x4F costume
+            // variant set stay placeholders, and `evt_work_set` types 2/3
+            // (object/item models) select no entity, so actor/tween ops aimed
+            // at them do nothing.
             _ => self.placeholder(op),
         }
     }

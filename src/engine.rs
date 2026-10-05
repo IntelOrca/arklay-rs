@@ -617,6 +617,10 @@ impl GameSession {
 
         let was_active = self.game.message.active;
         let was_locked = self.game.message_locks_controls();
+        // TODO(parity): (scripting) the original advances the message window in
+        // `main_loop` AFTER the game task (script/entity) pass; this window (and
+        // its pickup/use post-actions) runs first, so state it changes is visible
+        // to the same frame's scripts.
         self.game.update_message(
             MessageInput {
                 action,
@@ -3208,6 +3212,12 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
 }
 
 /// Apply the room's queued BGM requests; the engine plays one track at a time.
+///
+/// TODO(parity): (audio) the original keeps three independent BGM channel
+/// handles (`g_SndBank`) that `bgm_play`/`bgm_stop` address per script channel
+/// and re-derives from the per-room `g_roomBgmState` table; this engine plays or
+/// stops the single room track, so channel 1/2 requests and per-room BGM state
+/// are collapsed and `bgm_stop` on one channel stops everything.
 fn apply_bgm_requests(
     music: &mut Option<MusicPlayer>,
     requests: &mut Vec<game::BgmRequest>,
