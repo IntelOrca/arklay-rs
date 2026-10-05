@@ -355,7 +355,7 @@ fn capture_player_partway_up_the_lab_stairway() {
     let lighting = Lighting::from_room(&room);
     let entity = anim::entity_matrix(player.pos, player.angle);
     let (keyframes, clips) = match player.clip_source {
-        ClipSource::Emd => (&emd.keyframes, &emd.clips),
+        ClipSource::Emd | ClipSource::Room => (&emd.keyframes, &emd.clips),
         ClipSource::Emw => (&emw.keyframes, &emw.clips),
     };
     let keyframe = &keyframes[player.anim.keyframe_index(clips)];
@@ -364,6 +364,8 @@ fn capture_player_partway_up_the_lab_stairway() {
         mesh: &emd.mesh,
         texture: &emd.texture,
         joints: &joints,
+        tint: [255; 3],
+        hidden_joints: 0,
     }];
     let mut framebuffer = Framebuffer::new();
     render::draw_gameplay_scene(

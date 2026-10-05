@@ -12,9 +12,16 @@
 //! Every declared omodel slot owns one [`ObjectRecord`]. The `obj` opcode
 //! builds a record (its 28-byte operand block is mapped field for field),
 //! `objtbl_b_set` writes its flag byte, `ck_anim` compares its push counter,
-//! `eml_rot`/`eml_pos` write its rotation and position, and the renderer
-//! composes its world matrix. Item-model records are not built this
-//! milestone; the item-table selectors are typed no-ops.
+//! `eml_rot`/`eml_pos` write its rotation and position, `model_op` accumulates
+//! its colour tint, and the renderer composes its world matrix. Item-model
+//! records are not built this milestone; the item-table selectors are typed
+//! no-ops.
+//!
+//! This module also owns the three entity/object box tests the room-object
+//! pass is built on: [`chk_entity_slide`] (resolve an actor against a record),
+//! [`chk_obj_slide`] (shove a record out of another) and
+//! [`chk_pl_reach_entity`] (the 470-unit reach box), plus the
+//! [`check_climb_object`] scan and its mid-climb verification.
 
 use anyhow::{Context, Result, bail};
 
@@ -167,6 +174,20 @@ impl ObjectRecord {
     /// Whether the active/drawn flag is set.
     pub fn active(&self) -> bool {
         self.flag & OBJECT_FLAG_ACTIVE != 0
+    }
+
+    /// The per-channel RGB multiplier the renderer applies to this object's
+    /// shaded triangles.
+    ///
+    /// The record stores signed deltas accumulated by `model_op` variant 0 and
+    /// the luminance light scale; the original keeps these as float multipliers
+    /// on the model object, this port folds both into one 0..=255 channel
+    /// multiplier (8/unit). The default (no tint, no scale) is white.
+    pub fn shade(&self) -> [u8; 3] {
+        self.tint.map(|delta| {
+            let value = 255 + 8 * (i32::from(self.light_scale) + i32::from(delta));
+            value.clamp(0, 255) as u8
+        })
     }
 }
 
@@ -413,6 +434,258 @@ pub fn rebuild(object: &ObjectRecord, lighting: &Lighting) -> Mat4x3 {
         r: rotation(object),
         t: object.pos,
     }
+}
+
+/// Player SCA height for the 422-unit body radius (Chris, 0x05FA).
+pub const CHRIS_HEIGHT: i16 = 0x05FA;
+/// Player SCA height for the 372-unit body radius (Jill, 0x0546).
+pub const JILL_HEIGHT: i16 = 0x0546;
+/// The object reach box of `ChkPlReachEntity`: 470 units in front of the
+/// player along the current facing.
+pub const OBJECT_REACH_DISTANCE: i32 = 470;
+
+/// The player SCA height matching a collision radius. The two shipped player
+/// records pair radius 422 with height 1530 and radius 372 with height 1350.
+pub fn player_height(radius: i32) -> i16 {
+    if radius == crate::player::CHRIS_RADIUS {
+        CHRIS_HEIGHT
+    } else {
+        JILL_HEIGHT
+    }
+}
+
+/// The entity-side collision description `ChkEntitySlide` reads.
+///
+/// The original reaches through the SCA info (+4) for the radius (short 5) and
+/// height (short 4) and through the rotated part list (+8) for the part
+/// offsets. The player's single part carries `[0, -height, 0]`, exactly the
+/// shipped record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityCollision {
+    /// Entity flag byte; bit `0x08` disables the entity's collision.
+    pub flag: u8,
+    /// SCA radius, the horizontal half-extent contribution.
+    pub radius: i16,
+    /// SCA height, the vertical half-extent contribution.
+    pub height: i16,
+    /// World-space part offsets.
+    pub offsets: [i32; 3],
+}
+
+impl EntityCollision {
+    /// The player's collision record at `radius`.
+    pub fn player(radius: i32) -> Self {
+        let height = player_height(radius);
+        Self {
+            flag: 0,
+            radius: radius as i16,
+            height,
+            offsets: [0, -i32::from(height), 0],
+        }
+    }
+}
+
+/// `ChkEntitySlide` (0x00474330): resolve `ent_pos` against one object along
+/// the shallower penetration axis.
+///
+/// `move_object` selects the mode: `false` pushes the entity out of the object
+/// (the response that makes furniture solid), `true` moves the object out of
+/// the entity and reports how many axes were moved. The object records have a
+/// single collision part, so the original's part walk is one iteration.
+pub fn chk_entity_slide(
+    ent_pos: &mut [i32; 3],
+    ent: EntityCollision,
+    obj: &mut ObjectRecord,
+    move_object: bool,
+) -> u8 {
+    if ent.flag & 0x08 != 0 {
+        return 0;
+    }
+    if obj.flag & OBJECT_FLAG_INTANGIBLE != 0 {
+        return 0;
+    }
+
+    let mut moved = 0u8;
+    let obj_x = obj.pos[0];
+    let obj_y = obj.pos[1];
+    let obj_z = obj.pos[2];
+
+    let dx = (obj_x - ent.offsets[0]) - ent_pos[0];
+    let dy = (obj_y - ent.offsets[1]) - ent_pos[1];
+    let dz = (obj_z - ent.offsets[2]) - ent_pos[2];
+
+    let ext_x = i32::from(obj.half_extents[0]) + i32::from(ent.radius);
+    let ext_y = i32::from(obj.half_extents[1]) + i32::from(ent.height);
+    let ext_z = i32::from(obj.half_extents[2]) + i32::from(ent.radius);
+
+    // The unsigned-wrap containment test accepts both sides of the box.
+    if (dx.wrapping_add(ext_x) as u32) <= (ext_x.wrapping_mul(2)) as u32
+        && (dy.wrapping_add(ext_y) as u32) <= (ext_y.wrapping_mul(2)) as u32
+        && (dz.wrapping_add(ext_z) as u32) <= (ext_z.wrapping_mul(2)) as u32
+    {
+        // Escape along whichever axis has the shallower penetration.
+        let cross_x = ext_x.wrapping_mul(dz);
+        let cross_z = ext_z.wrapping_mul(dx);
+        if cross_x.unsigned_abs() < cross_z.unsigned_abs() {
+            let push = if move_object {
+                if dx < 0 { -ext_x } else { ext_x }
+            } else if dx >= 0 {
+                -ext_x
+            } else {
+                ext_x
+            };
+            if move_object {
+                moved += 1;
+                // The entity's own X half-extent is zero for the player.
+                obj.pos[0] = ent_pos[0] + push;
+            } else {
+                ent_pos[0] = obj_x + push;
+            }
+        } else {
+            let push = if move_object {
+                if dz < 0 { -ext_z } else { ext_z }
+            } else if dz >= 0 {
+                -ext_z
+            } else {
+                ext_z
+            };
+            if move_object {
+                moved += 1;
+                obj.pos[2] = ent_pos[2] + push;
+            } else {
+                ent_pos[2] = obj_z + push;
+            }
+        }
+    }
+
+    moved
+}
+
+/// `ChkObjSlide` (0x00474500): shove `other` out of `mover` along the shallower
+/// axis, X/Z only. Both records' `0x08` no-collision bits veto. The pushed
+/// object parks one unit clear of the touching distance.
+pub fn chk_obj_slide(mover: &ObjectRecord, other: &mut ObjectRecord) -> bool {
+    if (other.flag | mover.flag) & OBJECT_FLAG_NO_COLLISION != 0 {
+        return false;
+    }
+
+    let dx = other.pos[0] - mover.pos[0];
+    let dz = other.pos[2] - mover.pos[2];
+    let ext_x = i32::from(other.half_extents[0]) + i32::from(mover.half_extents[0]);
+    let ext_z = i32::from(other.half_extents[2]) + i32::from(mover.half_extents[2]);
+
+    if (dx.wrapping_add(ext_x) as u32) > (ext_x.wrapping_mul(2)) as u32 {
+        return false;
+    }
+    if (dz.wrapping_add(ext_z) as u32) > (ext_z.wrapping_mul(2)) as u32 {
+        return false;
+    }
+
+    if ext_x.wrapping_mul(dz).unsigned_abs() < ext_z.wrapping_mul(dx).unsigned_abs() {
+        let place = if dx < 0 { -1 - ext_x } else { ext_x + 1 };
+        other.pos[0] = mover.pos[0] + place;
+    } else {
+        let place = if dz < 0 { -1 - ext_z } else { ext_z + 1 };
+        other.pos[2] = mover.pos[2] + place;
+    }
+    true
+}
+
+/// 16-bit truncating absolute value, the original's `(ushort)` arithmetic.
+fn abs16(value: i32) -> u16 {
+    let sign = value >> 31;
+    ((value ^ sign) - sign) as u16
+}
+
+/// `ChkPlReachEntity` (0x00474A20): is `obj` inside the 470-unit reach box in
+/// front of the player?
+///
+/// Returns the (possibly side-zeroed) probe point when it is, `None` otherwise.
+/// The two 16-bit comparisons are transcribed exactly: they are unsigned tests
+/// of `extent*2` against a signed probe offset, which wrap for probes far to
+/// the left. The returned point has the axis nearer the object zeroed, the
+/// original's side scratch.
+pub fn chk_pl_reach_entity(
+    player_pos: [i32; 3],
+    angle: u16,
+    obj: &ObjectRecord,
+) -> Option<[i32; 2]> {
+    let (dx, dz) = crate::player::rotate_speed(angle, 0, OBJECT_REACH_DISTANCE);
+    let mut probe = [
+        dx + i32::from(player_pos[0] as i16),
+        dz + i32::from(player_pos[2] as i16),
+    ];
+    let ext_x = i32::from(obj.half_extents[0] as i16);
+    let ext_z = i32::from(obj.half_extents[2] as i16);
+
+    if (ext_x.wrapping_mul(2) as u32) < (ext_x - obj.pos[0] + probe[0]) as u32 {
+        return None;
+    }
+    if (ext_z.wrapping_mul(2) as u32) < (probe[1] - obj.pos[2] + ext_z) as u32 {
+        return None;
+    }
+    if probe[1].abs() < probe[0].abs() {
+        probe[1] = 0;
+    } else {
+        probe[0] = 0;
+    }
+    Some(probe)
+}
+
+/// The `check_climb_object` scan result: the slot of the first climbable record
+/// accepted from the last built one down, and the side `attackDirection` the
+/// facing picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClimbCandidate {
+    /// Object slot the candidate occupies.
+    pub slot: usize,
+    /// `-1` or `1`, from the facing's half-turn bit.
+    pub attack_direction: i8,
+}
+
+/// `check_climb_object` (0x00474930) when msf bit 7 is clear: walk the built
+/// records from the last down to the first, keeping the first with flag `0x40`
+/// that the reach box accepts and whose yaw is within 299/4096 of the player's
+/// facing on either wrap side.
+pub fn check_climb_object(
+    objects: &ObjectTable,
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Option<ClimbCandidate> {
+    let built = usize::from(objects.built).min(objects.records.len());
+    for slot in (0..built).rev() {
+        let record = &objects.records[slot];
+        if record.flag & OBJECT_FLAG_CLIMBABLE == 0 {
+            continue;
+        }
+        if chk_pl_reach_entity(player_pos, player_angle, record).is_none() {
+            continue;
+        }
+        let angle_diff =
+            i32::from((player_angle.wrapping_add(0x800)) & 0x0FFF) - i32::from(record.rotation[1]);
+        let diff = abs16(angle_diff);
+        if 299 < diff && diff < 0xED5 {
+            continue;
+        }
+        return Some(ClimbCandidate {
+            slot,
+            attack_direction: if (player_angle.wrapping_add(0x200) & 0x800) == 0 {
+                -1
+            } else {
+                1
+            },
+        });
+    }
+    None
+}
+
+/// The `check_climb_object` verification branch: with msf bit 7 raised, does
+/// the player still face the latched record? `true` settles the climb onto the
+/// return side (clear the bit, raise `zoneFlags` `0x10`); `false` cancels.
+pub fn verify_climb_object(record: &ObjectRecord, player_angle: u16) -> bool {
+    let angle_diff = i32::from(player_angle as i16) - i32::from(record.rotation[1]);
+    let diff = abs16(angle_diff);
+    !(299 < diff && diff < 0xED5)
 }
 
 /// One queued `inst_cfg` (0x30) collision-boundary rewrite.
@@ -846,6 +1119,218 @@ mod tests {
         assert_eq!(room.lights[0], crate::state::Light::default());
 
         assert!(!light_edit(&operands(&[4, 0, 0, 0, 0, 0, 0, 0])).apply(&mut room));
+    }
+
+    fn collision_record(pos: [i32; 3], extents: [u16; 3]) -> ObjectRecord {
+        ObjectRecord {
+            flag: OBJECT_FLAG_ACTIVE,
+            pos,
+            half_extents: extents,
+            ..ObjectRecord::default()
+        }
+    }
+
+    #[test]
+    fn chk_entity_slide_pushes_the_entity_out_on_the_shallow_axis() {
+        // Object centre 100 to the right, X extents sum 200 and Z sum 300: the
+        // overlap is shallower on X, so the entity exits on X to the left.
+        let mut obj = collision_record([500, 0, 0], [100, 100, 150]);
+        let ent = EntityCollision {
+            flag: 0,
+            radius: 100,
+            height: 500,
+            offsets: [0, -500, 0],
+        };
+        let mut pos = [400, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        // The entity exits to objX - extX = 300.
+        assert_eq!(pos, [300, 0, 0]);
+        assert_eq!(obj.pos, [500, 0, 0], "mode 0 never moves the object");
+
+        let mut pos = [400, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, true), 1);
+        // entX + extX = 400 + 200 = 600.
+        assert_eq!(obj.pos, [600, 0, 0]);
+        assert_eq!(pos, [400, 0, 0], "mode 1 leaves the entity alone");
+    }
+
+    #[test]
+    fn chk_entity_slide_resolves_along_z_when_z_is_shallower() {
+        // dx = 300, dz = 10; extX = 200, extZ = 150. |extX*dz| = 2000 <
+        // |extZ*dx| = 45000, so the shallower axis is X again. Swap to make Z
+        // shallow: dx = 10, dz = 140 with extX = 300, extZ = 150.
+        let mut obj = collision_record([10, 0, 140], [200, 100, 100]);
+        let ent = EntityCollision {
+            flag: 0,
+            radius: 100,
+            height: 100,
+            offsets: [0, -100, 0],
+        };
+        let mut pos = [0, 0, 0];
+        // |extX*dz| = 300*140 = 42000, |extZ*dx| = 200*10 = 2000 -> Z axis.
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        // objZ - extZ = 140 - 200 = -60.
+        assert_eq!(pos, [0, 0, -60]);
+    }
+
+    #[test]
+    fn chk_entity_slide_honours_the_flag_bits_and_y_extent() {
+        let mut obj = collision_record([100, 0, 0], [100, 100, 100]);
+        let mut pos = [100, 0, 0];
+        let mut ent = EntityCollision {
+            flag: 0x08,
+            radius: 50,
+            height: 1234,
+            offsets: [0, -1234, 0],
+        };
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        assert_eq!(pos, [100, 0, 0], "a collision-disabled entity never moves");
+
+        ent.flag = 0;
+        obj.flag |= OBJECT_FLAG_INTANGIBLE;
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        obj.flag &= !OBJECT_FLAG_INTANGIBLE;
+
+        // The entity's Y offset lifts the tested centre by its height: with
+        // the object 2000 above the entity the boxes miss, without the offset
+        // they overlap.
+        obj.pos = [100, 1200, 0];
+        pos = [0, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        assert_eq!(pos, [0, 0, 0], "the height offset lifts the test clear");
+        ent.offsets = [0, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
+        assert_ne!(pos, [0, 0, 0], "without the offset the boxes overlap");
+    }
+
+    #[test]
+    fn chk_obj_slide_parks_the_other_object_one_unit_clear() {
+        let mover = collision_record([0, 0, 0], [100, 100, 100]);
+        let mut other = collision_record([150, 0, 0], [100, 100, 100]);
+        // extX = 200; dx = 150 inside; |extX*dz| = 0 < |extZ*dx| = 30000 -> X.
+        assert!(chk_obj_slide(&mover, &mut other));
+        assert_eq!(other.pos[0], 201, "dx >= 0 parks at extX + 1");
+
+        let mover = collision_record([0, 0, 0], [100, 100, 100]);
+        let mut other = collision_record([-150, 0, 0], [100, 100, 100]);
+        assert!(chk_obj_slide(&mover, &mut other));
+        assert_eq!(other.pos[0], -201, "dx < 0 parks at -1 - extX");
+
+        // Z axis when X is not penetrating.
+        let mover = collision_record([0, 0, 0], [100, 100, 100]);
+        let mut other = collision_record([0, 0, 150], [100, 100, 100]);
+        assert!(chk_obj_slide(&mover, &mut other));
+        assert_eq!(other.pos[2], 201);
+
+        // The 0x08 bit on either record vetoes.
+        let mut mover = collision_record([0, 0, 0], [100, 100, 100]);
+        mover.flag |= OBJECT_FLAG_NO_COLLISION;
+        let mut other = collision_record([0, 0, 0], [100, 100, 100]);
+        assert!(!chk_obj_slide(&mover, &mut other));
+        assert_eq!(other.pos, [0, 0, 0]);
+
+        // Outside the box: no shove.
+        let mover = collision_record([0, 0, 0], [10, 10, 10]);
+        let mut other = collision_record([1000, 0, 0], [10, 10, 10]);
+        assert!(!chk_obj_slide(&mover, &mut other));
+    }
+
+    #[test]
+    fn chk_pl_reach_entity_uses_the_470_unit_box_and_side_scratch() {
+        let obj = collision_record([400, 0, 0], [100, 100, 100]);
+        let probe = chk_pl_reach_entity([0, 0, 0], 0, &obj).unwrap();
+        // The probe is (470, 0) and the larger axis zeroes: z stays 0.
+        assert_eq!(probe, [469, 0]);
+
+        // Behind the player the first test wraps out.
+        let behind = collision_record([-600, 0, 0], [100, 100, 100]);
+        assert!(chk_pl_reach_entity([0, 0, 0], 0, &behind).is_none());
+
+        // Farther than the reach plus the extent.
+        let far = collision_record([700, 0, 0], [100, 100, 100]);
+        assert!(chk_pl_reach_entity([0, 0, 0], 0, &far).is_none());
+
+        // Straight behind the player (0x400 faces -Z): X is zeroed.
+        let north = collision_record([0, 0, -400], [50, 100, 100]);
+        let probe = chk_pl_reach_entity([0, 0, 0], 0x400, &north).unwrap();
+        assert_eq!(probe, [0, -470]);
+
+        // A diagonal probe keeps only its dominant axis (X here).
+        let diagonal = collision_record([400, 0, -100], [100, 100, 100]);
+        let probe = chk_pl_reach_entity([0, 0, 0], 0x100, &diagonal).unwrap();
+        assert_eq!(probe[1], 0);
+        assert!(probe[0] > 400, "x probe {probe:?}");
+    }
+
+    #[test]
+    fn check_climb_object_scans_backwards_and_checks_the_yaw_window() {
+        let mut objects = ObjectTable::new(3);
+        // Slot 1 is climbable; slot 2 is not active.
+        objects.records[1] = collision_record([400, 0, 0], [100, 100, 100]);
+        objects.records[1].flag |= OBJECT_FLAG_CLIMBABLE;
+        objects.records[1].rotation[1] = 0x800;
+        objects.records[0] = collision_record([400, 0, 0], [100, 100, 100]);
+        objects.records[0].flag |= OBJECT_FLAG_CLIMBABLE;
+        objects.records[0].rotation[1] = 0x800;
+        objects.built = 2;
+
+        let candidate = check_climb_object(&objects, [0, 0, 0], 0).unwrap();
+        assert_eq!(candidate.slot, 1, "the scan keeps the last built record");
+        assert_eq!(candidate.attack_direction, -1, "angle + 0x200 bit clear");
+
+        // Within the +299 window the last record still wins.
+        objects.records[1].rotation[1] = 0x800 + 299;
+        assert_eq!(check_climb_object(&objects, [0, 0, 0], 0).unwrap().slot, 1);
+        objects.records[1].rotation[1] = 0x800 + 300;
+        assert_eq!(
+            check_climb_object(&objects, [0, 0, 0], 0).unwrap().slot,
+            0,
+            "300/4096 is outside the window"
+        );
+
+        // The far wrap side: exactly 0xED5 is accepted.
+        objects.records[1].rotation[1] = (0x800 + 0xED5) as i16;
+        assert!(check_climb_object(&objects, [0, 0, 0], 0).is_some());
+        objects.records[1].rotation[1] = (0x800 + 0xED5 - 1) as i16;
+        assert_eq!(
+            check_climb_object(&objects, [0, 0, 0], 0).unwrap().slot,
+            0,
+            "0xED4 is inside the window"
+        );
+
+        // A non-climbable nearer record is skipped.
+        objects.records[1].flag &= !OBJECT_FLAG_CLIMBABLE;
+        assert_eq!(check_climb_object(&objects, [0, 0, 0], 0).unwrap().slot, 0);
+
+        // Attack direction flips with the facing's half-turn bit. The scan
+        // compares the facing turned by 0x800 with the object's yaw, so a
+        // player at 0x800 matches yaw 0.
+        objects.records[0].pos = [-400, 0, 0];
+        objects.records[0].rotation[1] = 0;
+        let candidate = check_climb_object(&objects, [0, 0, 0], 0x800).unwrap();
+        assert_eq!(candidate.attack_direction, 1);
+    }
+
+    #[test]
+    fn verify_climb_object_cancels_on_drift() {
+        let mut record = collision_record([400, 0, 0], [100, 100, 100]);
+        record.rotation[1] = 0x100;
+        assert!(verify_climb_object(&record, 0x100));
+        assert!(verify_climb_object(&record, 0x100 + 0xED5));
+        assert!(!verify_climb_object(&record, 0x100 + 300));
+        assert!(!verify_climb_object(&record, 0x100u16.wrapping_sub(300)));
+    }
+
+    #[test]
+    fn object_shade_defaults_to_white_and_applies_deltas() {
+        let mut record = collision_record([0, 0, 0], [1, 1, 1]);
+        assert_eq!(record.shade(), [255, 255, 255]);
+        record.tint = [-1, -1, -1];
+        assert_eq!(record.shade(), [247, 247, 247]);
+        record.light_scale = -4;
+        assert_eq!(record.shade(), [215, 215, 215]);
+        record.tint = [-128, 0, 127];
+        assert_eq!(record.shade(), [0, 223, 255]);
     }
 
     #[test]

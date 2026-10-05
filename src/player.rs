@@ -19,6 +19,16 @@
 //! `0x08`/`0x16` with the "A" footstep. The run cycle is both shorter and has
 //! its contacts closer together, so running produces more footfalls per second
 //! than walking.
+//!
+//! Two locked action behaviours sit on top of the locomotion machine:
+//! [`LockedAction::Push`] plays the room animation pair's `0x30` wind-up and
+//! `0x31` push loop while the object pass keeps raising the push bit, and
+//! [`LockedAction::Vault`] runs the `0x33`/`0x35` climb-over clip and the
+//! `0x73A`/`0x708` warp. Both are selected outside this module (the action
+//! press and the push bit are read by [`crate::game::GameState::tick_objects`])
+//! and their one-shot sounds are drained through [`PlayerState::take_sounds`].
+//! A room without the embedded animation pair falls back to a short wind-up
+//! and the warp (documented on the behaviour functions).
 
 use crate::anim::AnimPlayer;
 use crate::model::Clip;
@@ -99,6 +109,11 @@ const JILL_FOOTFALL: [u8; 4] = [0x14, 0x16, 0x0F, 0x0F];
 const ANGLE_STEP: f64 = 0.0015339807880859375;
 
 /// Keyboard state for one tick.
+///
+/// `action_held` and `action_pressed` mirror the original's action button
+/// (D-pad `0x80`): the held level gates the action-key room probe, while the
+/// press edge starts the climb scan. The engine already computes both around
+/// the message window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Input {
     pub up: bool,
@@ -106,6 +121,8 @@ pub struct Input {
     pub left: bool,
     pub right: bool,
     pub run: bool,
+    pub action_held: bool,
+    pub action_pressed: bool,
 }
 
 /// A footstep sound request emitted when a locomotion clip is about to apply
@@ -198,6 +215,57 @@ pub enum ClipSource {
     Emd,
     /// The no-weapon EMW (breathe, walk, turn, back, run).
     Emw,
+    /// The RDT-embedded room player-animation pair (push, vault, ladders).
+    Room,
+}
+
+/// Room-animation clip of the push wind-up (the original's `attackAnim 0x30`).
+pub const PUSH_CLIP: usize = 0x30;
+/// Room-animation clip of the push loop (`attackAnim 0x31`, one past the
+/// wind-up: the behaviour increments the id when the wind-up completes).
+pub const PUSH_LOOP_CLIP: usize = 0x31;
+/// Room-animation clip of the vault's plain approach (`attackAnim 0x33`).
+pub const VAULT_CLIP_PLAIN: usize = 0x33;
+/// Room-animation clip of the vault's return side (`attackAnim 0x35`).
+pub const VAULT_CLIP_RETURN: usize = 0x35;
+/// Forward speed of the push behaviour while the clip is below frame `0x10`.
+pub const PUSH_SPEED: i32 = 0x32;
+/// Vault displacement along the approach side (X is negated for the vault).
+pub const VAULT_SIDE: i32 = 0x73A;
+/// Vault displacement on the Y axis (negated on the approach side).
+pub const VAULT_ACROSS: i32 = 0x708;
+/// Grunt SE of a push against a model without bit `0x40`.
+pub const SE_PUSH_GRUNT: u16 = 0x16;
+/// Grunt SE of a push against a model with bit `0x40` (the heavy grunt).
+pub const SE_PUSH_GRUNT_HEAVY: u16 = 0x17;
+/// SE played at the vault clip's cue frames.
+pub const SE_VAULT_STEP: u16 = 0x23;
+/// Sentinel sound id for the entity footstep path (the original's
+/// `PlayEntitySnd(0)`).
+pub const SE_FOOTSTEP: u16 = 0;
+
+/// A one-shot player sound request (the original's `Play3DSnd` and
+/// `PlayEntitySnd` calls in the action behaviours). The engine resolves
+/// [`SE_FOOTSTEP`] through the room's footstep zones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayerSound {
+    /// Global SE id, or [`SE_FOOTSTEP`].
+    pub id: u16,
+    /// World position the sound plays at.
+    pub pos: [i32; 3],
+}
+
+/// A locked action behaviour selected outside the locomotion machine.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LockedAction {
+    /// Normal control.
+    #[default]
+    None,
+    /// `action_behavior 0x10`: the push animation (`attackAnim 0x30`).
+    Push,
+    /// `action_behavior 0x0a` with msf bit 7 raised: the vault into a
+    /// climbable object (clips `0x33`/`0x35` and the `0x73A`/`0x708` warp).
+    Vault,
 }
 
 /// The moving player: position, facing, collision radius and animation.
@@ -221,6 +289,34 @@ pub struct PlayerState {
     pub idle_ticks: u32,
     /// Stair/ladder state set by the room's action probes.
     pub stairs: StairState,
+    /// The locked action behaviour owning the tick, if any.
+    pub locked: LockedAction,
+    /// Action state byte of the locked behaviour.
+    pub action_state: u8,
+    /// The push bit (msf `0x40`) raised by `tick_objects` last tick. The
+    /// behaviour starts the tick after the bit is raised, the original's
+    /// one-frame hand-off.
+    pub object_push: bool,
+    /// The climb/vault transition bit (msf `0x80`): raised by the climb scan,
+    /// cleared when the vault settles.
+    pub vault_bit: bool,
+    /// `zoneFlags` bit `0x10` for the current vault: the return side.
+    pub vault_return: bool,
+    /// Slot of the object the push probe last held, for the grunt SE.
+    pub push_object: Option<u8>,
+    /// Slot of the climb candidate latched by `check_climb_object`.
+    pub climb_object: Option<u8>,
+    /// Whether the pushed object's model byte carries the heavy-grunt `0x40`.
+    pub push_heavy: bool,
+    /// `attackDirection` of the latched climb candidate (`-1`/`1`).
+    pub attack_direction: i8,
+    /// `move_speed_current`, used by the push and vault state machines.
+    pub move_speed_current: u16,
+    /// The last tick's input; `tick_objects` reads the action edges from here.
+    pub input: Input,
+    /// One-shot sound requests emitted since the last
+    /// [`PlayerState::take_sounds`].
+    sounds: Vec<PlayerSound>,
     /// Footstep events emitted since the last [`PlayerState::take_footsteps`].
     footsteps: Vec<Footstep>,
 }
@@ -249,6 +345,18 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         idle_phase: 0,
         idle_ticks: 0,
         stairs: StairState::default(),
+        locked: LockedAction::None,
+        action_state: 0,
+        object_push: false,
+        vault_bit: false,
+        vault_return: false,
+        push_object: None,
+        climb_object: None,
+        push_heavy: false,
+        attack_direction: 0,
+        move_speed_current: 0,
+        input: Input::default(),
+        sounds: Vec::new(),
         footsteps: Vec::new(),
     }
 }
@@ -264,6 +372,33 @@ pub fn update(
     emw_clips: &[Clip],
     input: Input,
 ) {
+    update_with_room(player, room, emd_clips, emw_clips, &[], input);
+}
+
+/// [`update`] with the room's own player-animation clips (RDT pointer slots
+/// 9/10) available to the locked action behaviours. A room without the pair
+/// falls back: the push still winds up and releases, the vault skips straight
+/// to its warp.
+pub fn update_with_room(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+    input: Input,
+) {
+    player.input = input;
+    // The push bit raised by `tick_objects` last tick forces the push
+    // behaviour this tick, the original's one-frame hand-off.
+    if player.object_push && player.locked == LockedAction::None {
+        player.locked = LockedAction::Push;
+        player.action_state = 0;
+    }
+    if player.locked != LockedAction::None {
+        update_locked(player, room, emd_clips, emw_clips, room_clips);
+        return;
+    }
+
     let behavior = behavior_for(input);
     if behavior != player.behavior {
         player.behavior = behavior;
@@ -290,7 +425,7 @@ pub fn update(
     // The original checks the pending animation frame and plays the footstep
     // before `Joint_move` applies it and before the tick's movement, so the
     // sound uses the pre-move position.
-    player.emit_footsteps(behavior, emd_clips, emw_clips);
+    player.emit_footsteps(behavior, emd_clips, emw_clips, room_clips);
 
     let offset = if behavior == BEHAVIOR_BACK {
         BACK_OFFSET
@@ -317,24 +452,24 @@ pub fn update(
         player.idle_ticks = player.idle_ticks.saturating_add(1);
         match player.idle_phase {
             0 => {
-                player.advance(emd_clips, emw_clips);
+                player.advance(emd_clips, emw_clips, room_clips);
                 if player.idle_ticks >= IDLE_SETTLE_TICKS {
                     player.idle_phase = 1;
                     player.set_clip(ClipSource::Emw, BREATHE_IN_CLIP);
                 }
             }
             1 => {
-                if player.advance(emd_clips, emw_clips) {
+                if player.advance(emd_clips, emw_clips, room_clips) {
                     player.idle_phase = 2;
                     player.set_clip(ClipSource::Emw, BREATHE_CLIP);
                 }
             }
             _ => {
-                player.advance(emd_clips, emw_clips);
+                player.advance(emd_clips, emw_clips, room_clips);
             }
         }
     } else {
-        player.advance(emd_clips, emw_clips);
+        player.advance(emd_clips, emw_clips, room_clips);
     }
 }
 
@@ -344,10 +479,11 @@ impl PlayerState {
         self.anim.set_clip(clip);
     }
 
-    fn advance(&mut self, emd_clips: &[Clip], emw_clips: &[Clip]) -> bool {
+    fn advance(&mut self, emd_clips: &[Clip], emw_clips: &[Clip], room_clips: &[Clip]) -> bool {
         match self.clip_source {
             ClipSource::Emd => self.anim.update(emd_clips),
             ClipSource::Emw => self.anim.update(emw_clips),
+            ClipSource::Room => self.anim.update(room_clips),
         }
     }
 
@@ -360,7 +496,13 @@ impl PlayerState {
     /// reached with the previous frame still held fires on each held tick
     /// until it is applied - both behaviours fall out of checking the pending
     /// frame here.
-    fn emit_footsteps(&mut self, behavior: u8, emd_clips: &[Clip], emw_clips: &[Clip]) {
+    fn emit_footsteps(
+        &mut self,
+        behavior: u8,
+        emd_clips: &[Clip],
+        emw_clips: &[Clip],
+        room_clips: &[Clip],
+    ) {
         let Some(rule) = footstep_rule(behavior) else {
             return;
         };
@@ -371,6 +513,7 @@ impl PlayerState {
         let clips = match rule.source {
             ClipSource::Emd => emd_clips,
             ClipSource::Emw => emw_clips,
+            ClipSource::Room => room_clips,
         };
         let Some(clip) = clips.get(rule.clip) else {
             return;
@@ -388,6 +531,238 @@ impl PlayerState {
     /// Drain the footstep events emitted since the last call.
     pub fn take_footsteps(&mut self) -> Vec<Footstep> {
         std::mem::take(&mut self.footsteps)
+    }
+
+    /// Drain the one-shot sound requests emitted since the last call.
+    pub fn take_sounds(&mut self) -> Vec<PlayerSound> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    /// Queue a one-shot sound at the player's current position.
+    fn queue_sound(&mut self, id: u16) {
+        self.sounds.push(PlayerSound { id, pos: self.pos });
+    }
+
+    /// Move the locked behaviour's forward step with the room collision pass.
+    fn locked_step(&mut self, room: &RoomState, speed: i32) {
+        let (dx, dz) = rotate_speed(self.angle, 0, speed);
+        let prev = self.pos;
+        let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
+        self.pos = resolve_collision(&room.collision, prev, proposed, self.radius);
+    }
+}
+
+/// Run the locked action behaviour that owns this tick.
+///
+/// The push keeps the room collision pass (the original only suspends it for
+/// the ladder/stairs behaviour); the vault suspends it, because its warp moves
+/// the player across the object's volume.
+fn update_locked(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    match player.locked {
+        LockedAction::Push => update_push(player, room, emd_clips, emw_clips, room_clips),
+        LockedAction::Vault => update_vault(player, emd_clips, emw_clips, room_clips),
+        LockedAction::None => {}
+    }
+}
+
+/// `player_behavior_10_push` (0x00457230): wind-up, the forward creep while the
+/// push bit stays raised, then release.
+///
+/// The clip's frame 1 plays the grunt whose id depends on the pushed object's
+/// model byte. A room without the clip still winds up (one tick) and releases
+/// the moment the push bit drops.
+#[allow(clippy::collapsible_match)]
+fn update_push(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    let windup = room_clips
+        .get(PUSH_CLIP)
+        .is_some_and(|clip| !clip.frames.is_empty());
+    let looping = room_clips
+        .get(PUSH_LOOP_CLIP)
+        .is_some_and(|clip| !clip.frames.is_empty());
+    match player.action_state {
+        0 => {
+            player.set_clip(ClipSource::Room, PUSH_CLIP);
+            player.move_speed_current = 0;
+            player.action_state = 1;
+        }
+        1 => {
+            if !windup || player.advance(emd_clips, emw_clips, room_clips) {
+                player.set_clip(ClipSource::Room, PUSH_LOOP_CLIP);
+                player.action_state = 2;
+                player.move_speed_current = 0;
+            }
+        }
+        2 => {
+            if looping {
+                player.advance(emd_clips, emw_clips, room_clips);
+            }
+            if player.anim.display_frame < 0x10 && player.object_push {
+                player.move_speed_current = PUSH_SPEED as u16;
+                player.locked_step(room, PUSH_SPEED);
+            }
+            if player.anim.display_frame == 1 {
+                let id = if player.push_heavy {
+                    SE_PUSH_GRUNT_HEAVY
+                } else {
+                    SE_PUSH_GRUNT
+                };
+                player.queue_sound(id);
+                return;
+            }
+            if !player.object_push {
+                player.anim.frame = 0;
+                player.anim.display_frame = 0;
+                player.anim.timing = 0;
+                player.move_speed_current = 0;
+                player.action_state = 3;
+            }
+        }
+        3 => {
+            if !looping || player.advance(emd_clips, emw_clips, room_clips) {
+                // Back to normal control; the message flag the original
+                // returns is represented by the port's own message state.
+                player.locked = LockedAction::None;
+                player.action_state = 0;
+                player.push_object = None;
+                player.enter_idle();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `player_door_open_sequence` (0x00457390) with msf bit 7 raised: the vault
+/// into a climbable object.
+///
+/// State 0 turns the player square with `(angle & 0x3FC) >> 2` per tick; state
+/// 1 picks clip `0x33`/`0x35`; state 2 runs it with the SE schedule; state 3
+/// warps `0x73A` along the approach side and `0x708` vertically.
+fn update_vault(
+    player: &mut PlayerState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    match player.action_state {
+        0 => {
+            player.move_speed_current = 0;
+            player.anim.frame = 0;
+            player.anim.display_frame = 0;
+            player.anim.timing = 0;
+            let angle = player.angle & 0x0FFF;
+            let step = (angle & 0x3FC) >> 2;
+            player.angle = if angle & 0x200 != 0 {
+                angle.wrapping_add(step)
+            } else {
+                angle.wrapping_sub(step)
+            } & 0x0FFF;
+            if player.angle & 0x3E0 != 0 {
+                return;
+            }
+            player.action_state = 1;
+        }
+        1 => {
+            let clip = if player.vault_return {
+                VAULT_CLIP_RETURN
+            } else {
+                VAULT_CLIP_PLAIN
+            };
+            player.set_clip(ClipSource::Room, clip);
+            player.move_speed_current = 0;
+            player.action_state = 2;
+        }
+        _ => {}
+    }
+
+    if player.action_state == 2 {
+        if !player.vault_clip_present(room_clips) {
+            // A room without the climb clips cannot play the animation; the
+            // warp still runs so the vault lands (documented fallback).
+            player.action_state = 3;
+        } else {
+            let frame = player.anim.display_frame as i32;
+            let mut speed = i32::from(player.move_speed_current as i16);
+            if speed * 15 - frame == -0xC {
+                player.queue_sound(SE_VAULT_STEP);
+                speed += 1;
+            }
+            if speed == 3 {
+                speed = 7;
+            }
+            if speed == 7 && frame == 0x35 {
+                player.queue_sound(SE_VAULT_STEP);
+            }
+            if player.vault_return && speed == 2 {
+                speed = 5;
+            }
+            if speed > 4 && speed * 9 - frame == 1 {
+                speed = 6;
+                player.queue_sound(SE_FOOTSTEP);
+            }
+            player.move_speed_current = speed as u16;
+            if player.advance(emd_clips, emw_clips, room_clips) {
+                player.action_state = 3;
+            }
+        }
+    }
+
+    if player.action_state == 3 {
+        player.warp_through_object();
+    }
+}
+
+impl PlayerState {
+    /// Whether the vault's selected room clip exists and has frames.
+    fn vault_clip_present(&self, room_clips: &[Clip]) -> bool {
+        room_clips
+            .get(self.anim.clip)
+            .is_some_and(|clip| !clip.frames.is_empty())
+    }
+
+    /// The vault's warp: `0x73A` sideways (X for an X-facing approach, Z
+    /// otherwise, negated for the vault), `0x708` vertically (positive on the
+    /// return side). The transition bit and the return-side flag are consumed
+    /// and control returns to the locomotion machine.
+    fn warp_through_object(&mut self) {
+        let dir = i32::from(self.attack_direction);
+        let sideways = self.angle & 0x400 != 0;
+        let (x, z) = if sideways {
+            (0, dir * VAULT_SIDE)
+        } else {
+            (-(dir * VAULT_SIDE), 0)
+        };
+        let y = if self.vault_return {
+            VAULT_ACROSS
+        } else {
+            -VAULT_ACROSS
+        };
+        self.pos = [self.pos[0] + x, self.pos[1] + y, self.pos[2] + z];
+        self.vault_bit = false;
+        self.vault_return = false;
+        self.locked = LockedAction::None;
+        self.action_state = 0;
+        self.move_speed_current = 0;
+        self.enter_idle();
+    }
+
+    /// Return the visible player to the idle stance after a locked behaviour.
+    fn enter_idle(&mut self) {
+        self.behavior = BEHAVIOR_IDLE;
+        self.idle_phase = 0;
+        self.idle_ticks = 0;
+        self.set_clip(ClipSource::Emd, SETTLE_CLIP);
     }
 }
 
@@ -885,6 +1260,18 @@ mod tests {
             idle_phase: 0,
             idle_ticks: 0,
             stairs: StairState::default(),
+            locked: LockedAction::None,
+            action_state: 0,
+            object_push: false,
+            vault_bit: false,
+            vault_return: false,
+            push_object: None,
+            climb_object: None,
+            push_heavy: false,
+            attack_direction: 0,
+            move_speed_current: 0,
+            input: Input::default(),
+            sounds: Vec::new(),
             footsteps: Vec::new(),
         }
     }
@@ -1764,6 +2151,234 @@ mod tests {
             }
         }
         log
+    }
+
+    /// A room clip set with the given clips placed at their indices.
+    fn room_clips(entries: &[(usize, usize)]) -> Vec<Clip> {
+        let count = entries
+            .iter()
+            .map(|&(index, _)| index + 1)
+            .max()
+            .unwrap_or(0);
+        let mut clips = vec![clip(0); count];
+        for &(index, frames) in entries {
+            clips[index] = clip(frames);
+        }
+        clips
+    }
+
+    #[test]
+    fn push_winds_up_grunts_moves_and_releases() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        let room_clips = room_clips(&[(PUSH_CLIP, 2), (PUSH_LOOP_CLIP, 4)]);
+        let mut player = player_at(1000, 1000);
+        player.locked = LockedAction::Push;
+        player.object_push = true;
+        player.push_heavy = false;
+
+        // Wind up through clip 0x30, then run clip 0x31; the grunt lands on
+        // the loop's frame 1.
+        let mut sounds = Vec::new();
+        for _ in 0..20 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emw,
+                &room_clips,
+                Input::default(),
+            );
+            sounds.extend(player.take_sounds().into_iter().map(|sound| sound.id));
+            if sounds.contains(&SE_PUSH_GRUNT) {
+                break;
+            }
+        }
+        assert!(
+            sounds.contains(&SE_PUSH_GRUNT),
+            "grunt not queued: {sounds:?}"
+        );
+        assert_eq!(player.clip_source, ClipSource::Room);
+        assert_eq!(player.anim.clip, PUSH_LOOP_CLIP);
+        assert!(player.pos[0] > 1000, "push did not move the player");
+
+        // The bit drops: the release state runs, then control returns.
+        player.object_push = false;
+        let mut released = false;
+        for _ in 0..12 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emw,
+                &room_clips,
+                Input::default(),
+            );
+            if player.locked == LockedAction::None {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "the push never released");
+        assert_eq!(player.clip_source, ClipSource::Emd);
+        assert_eq!(player.anim.clip, SETTLE_CLIP);
+    }
+
+    #[test]
+    fn push_without_the_room_clip_still_releases() {
+        let room = RoomState::default();
+        let emd = clips();
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Push;
+        player.object_push = true;
+        update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
+        assert_eq!(player.action_state, 1);
+        update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
+        assert_eq!(player.action_state, 2, "the missing clip skips the wind-up");
+        player.object_push = false;
+        update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
+        assert_eq!(player.action_state, 3);
+        update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
+        assert_eq!(player.locked, LockedAction::None);
+    }
+
+    #[test]
+    fn push_heavy_uses_the_other_grunt() {
+        let room = RoomState::default();
+        let emd = clips();
+        let room_clips = room_clips(&[(PUSH_CLIP, 1), (PUSH_LOOP_CLIP, 3)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Push;
+        player.object_push = true;
+        player.push_heavy = true;
+        let mut grunts = Vec::new();
+        for _ in 0..20 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            grunts.extend(player.take_sounds().into_iter().map(|sound| sound.id));
+            if grunts.contains(&SE_PUSH_GRUNT_HEAVY) {
+                break;
+            }
+        }
+        assert!(grunts.contains(&SE_PUSH_GRUNT_HEAVY), "{grunts:?}");
+        assert!(!grunts.contains(&SE_PUSH_GRUNT), "{grunts:?}");
+    }
+
+    #[test]
+    fn vault_turns_runs_its_cues_and_warps() {
+        let room = RoomState::default();
+        let emd = clips();
+        let room_clips = room_clips(&[(VAULT_CLIP_PLAIN, 54)]);
+        let mut player = player_at(1000, 1000);
+        player.angle = 0x123;
+        player.locked = LockedAction::Vault;
+        player.vault_bit = true;
+        player.attack_direction = -1;
+
+        let mut sounds = Vec::new();
+        let mut warped = None;
+        for tick in 0..200 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            sounds.extend(player.take_sounds().into_iter().map(|sound| sound.id));
+            if player.locked == LockedAction::None {
+                warped = Some(tick);
+                break;
+            }
+        }
+
+        assert!(warped.is_some(), "the vault never completed");
+        // The warp: dir -1, X not sideways -> X = -(-0x73A), Y = -0x708.
+        assert_eq!(player.pos, [1000 + VAULT_SIDE, -VAULT_ACROSS, 1000]);
+        assert!(
+            sounds.iter().filter(|id| **id == SE_VAULT_STEP).count() >= 2,
+            "vault cues missing: {sounds:?}"
+        );
+        assert!(!player.vault_bit, "the vault must clear the transition bit");
+        assert_eq!(player.clip_source, ClipSource::Emd);
+    }
+
+    #[test]
+    fn vault_return_side_uses_the_other_clip_and_mirrors_z() {
+        let room = RoomState::default();
+        let emd = clips();
+        let room_clips = room_clips(&[(VAULT_CLIP_RETURN, 4)]);
+        let mut player = player_at(0, 0);
+        player.angle = 0x400;
+        player.locked = LockedAction::Vault;
+        player.vault_bit = true;
+        player.vault_return = true;
+        player.attack_direction = 1;
+        for _ in 0..30 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+        // Sideways (angle bit 0x400): Z = dir * 0x73A; the return side flips Y.
+        assert_eq!(player.pos, [0, VAULT_ACROSS, VAULT_SIDE]);
+    }
+
+    #[test]
+    fn vault_without_the_room_clip_still_warps() {
+        let room = RoomState::default();
+        let emd = clips();
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Vault;
+        player.vault_bit = true;
+        player.attack_direction = -1;
+        for _ in 0..10 {
+            update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.pos, [VAULT_SIDE, -VAULT_ACROSS, 0]);
+    }
+
+    #[test]
+    fn a_locked_push_does_not_read_locomotion_input() {
+        let room = RoomState::default();
+        let emd = clips();
+        let room_clips = room_clips(&[(PUSH_CLIP, 10)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Push;
+        player.object_push = true;
+        // Walking input must not switch the clip back to the EMW walk.
+        update_with_room(
+            &mut player,
+            &room,
+            &emd,
+            &emd,
+            &room_clips,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+        );
+        assert_eq!(player.clip_source, ClipSource::Room);
+        assert_eq!(player.anim.clip, PUSH_CLIP);
     }
 
     #[test]

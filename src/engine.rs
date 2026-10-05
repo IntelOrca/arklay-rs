@@ -687,12 +687,10 @@ impl GameSession {
             input,
             action,
         );
-        // A room `item_box` action opened this tick raises the overlay; a
-        // typewriter runs its save prompt. The interaction is consumed so the
-        // next probe has to fire again.
+        // A typewriter runs its save prompt; the item-box overlay opens when
+        // the lid has settled (`MSF_MENU_MODE_ITEMBOX`). The interaction is
+        // consumed so the next probe has to fire again.
         let interaction = self.game.last_interaction.take();
-        let item_box_fired = interaction
-            .is_some_and(|interaction| interaction.kind == game::RoomActionKind::ItemBox);
         let typewriter_fired = interaction
             .is_some_and(|interaction| interaction.kind == game::RoomActionKind::Typewriter);
         if typewriter_fired {
@@ -719,10 +717,19 @@ impl GameSession {
             &self.loaded.room,
             &mut self.game.entity_sounds,
         );
+        play_player_sounds(
+            &mut self.music,
+            &mut self.sfx_cache,
+            pack,
+            &self.loaded.room,
+            &mut self.player,
+        );
+        // The global SE bank (the lid's `0x20`) has no pack mapping yet.
+        self.game.sfx_requests.clear();
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
             self.transition = Some(start_transition(pack, &record, &transition)?);
-        } else if item_box_fired && !self.game.message.active {
+        } else if self.game.take_itembox_open() {
             self.open_item_box(pack);
         }
         Ok(())
@@ -937,6 +944,9 @@ impl GameSession {
             if event == Some(ItemBoxEvent::Close) {
                 self.item_box = None;
                 self.close_menu();
+                // The original restores the lid angle (state 4) once the box
+                // menu is closed.
+                self.game.reset_itembox();
             }
             return;
         }
@@ -2915,6 +2925,46 @@ fn play_footsteps(
     }
 }
 
+/// Consume the tick's locked-behaviour sound cues.
+///
+/// `SE_FOOTSTEP` resolves through the same room footstep path as the walk;
+/// the global `Play3DSnd` ids (the push grunt and the vault cue) have no pack
+/// mapping in this slice and are drained without a voice.
+fn play_player_sounds(
+    music: &mut Option<Mixer>,
+    cache: &mut SfxCache,
+    pack: &Pack,
+    room: &RoomState,
+    player_state: &mut player::PlayerState,
+) {
+    let sounds = player_state.take_sounds();
+    if sounds.is_empty() {
+        return;
+    }
+    let Some(mixer) = music.as_mut() else {
+        return;
+    };
+    let Some(cut) = room.cuts.get(room.current_cut) else {
+        return;
+    };
+    for sound in sounds {
+        // TODO(parity): (audio) the grunt (`0x16`/`0x17`) and vault (`0x23`)
+        // ids address the original's global SE bank, which the pack does not
+        // carry; only the entity footstep resolves.
+        if sound.id != player::SE_FOOTSTEP {
+            continue;
+        }
+        let Some(name) = sfx::footstep_sound(room, sound.pos, 0, false) else {
+            continue;
+        };
+        let Some(wav) = cache.load(pack, name) else {
+            continue;
+        };
+        let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
+        mixer.play_sfx(wav, gain, pan);
+    }
+}
+
 /// Consume the tick's NPC sound cues: resolve each queued room sound and play
 /// it as a 3D one-shot through the mixer with the entity's own pan and volume.
 /// The queue is always drained so an absent mixer or camera does not let it
@@ -3518,6 +3568,9 @@ fn tick_room(
     // The original zeroes the per-frame item-use flag bank at the top of every
     // game frame, before the room scripts decide what is usable this frame.
     context.game.clear_item_use_flags();
+    // The item-box lid ramps before the scripts run (the original's
+    // `check_itembox_state` is the first gameplay call each frame).
+    context.game.check_itembox_state();
     {
         let mut host = game::ScdGameHost::new(context.game);
         command_vm.run_main(&mut host);
@@ -3541,11 +3594,18 @@ fn tick_room(
     context.game.sync_player(context.player);
     context.game.advance_frame();
     if let Some(assets) = context.player_assets {
-        player::update(
+        let room_clips = context
+            .room
+            .room_anim
+            .as_ref()
+            .map(|anim| anim.clips.as_slice())
+            .unwrap_or(&[]);
+        player::update_with_room(
             context.player,
             context.room,
             &assets.emd.clips,
             &assets.emw.clips,
+            room_clips,
             input,
         );
     }
@@ -3561,6 +3621,10 @@ fn tick_room(
         let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, context.player.angle, action);
     }
+    // The room objects run after the player's physics and the player-side
+    // probe: the push probe, the object-side action probe and the climb scan
+    // all read the frame's final player state.
+    context.game.tick_objects(context.room, context.player);
     context.game.apply_stair_state(context.player);
     // The effects projected above under the pre-switch camera. If the zone
     // scan moved the cut, recompute their stored screen/depth so the frame
@@ -3785,6 +3849,8 @@ impl InputState {
                 left: active & KEY_LEFT != 0,
                 right: active & KEY_RIGHT != 0,
                 run: active & KEY_RUN != 0,
+                action_held: active & KEY_CONFIRM != 0,
+                action_pressed: pressed & KEY_CONFIRM != 0,
             },
             action: active & KEY_CONFIRM != 0,
             ui: UiInput {
@@ -3940,23 +4006,40 @@ fn render_frame(
     // the path-trail/severed-limb steps); this engine poses and draws every
     // joint unconditionally.
     let player_joints = assets.and_then(|assets| {
-        let (keyframes, clips) = match player_state.clip_source {
-            player::ClipSource::Emd => (&assets.emd.keyframes, &assets.emd.clips),
-            player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
+        // The room's own animation pair drives the push/vault/ladder poses; a
+        // room without it falls back to the EMD settle stance (documented).
+        let (skeleton, keyframes, clips) = match player_state.clip_source {
+            player::ClipSource::Emd => (
+                &assets.emd.skeleton,
+                &assets.emd.keyframes,
+                &assets.emd.clips,
+            ),
+            player::ClipSource::Emw => (
+                &assets.emd.skeleton,
+                &assets.emw.keyframes,
+                &assets.emw.clips,
+            ),
+            player::ClipSource::Room => match &room.room_anim {
+                Some(anim) if !anim.clips.is_empty() => {
+                    (&anim.skeleton, &anim.keyframes, &anim.clips)
+                }
+                _ => (
+                    &assets.emd.skeleton,
+                    &assets.emd.keyframes,
+                    &assets.emd.clips,
+                ),
+            },
         };
         let keyframe = keyframes.get(player_state.anim.keyframe_index(clips))?;
         let entity = anim::entity_matrix(player_state.pos, player_state.angle);
-        Some(anim::joint_matrices(
-            &assets.emd.skeleton,
-            keyframe,
-            &entity,
-        ))
+        Some(anim::joint_matrices(skeleton, keyframe, &entity))
     });
 
     // The parsed NPC models are held in `models` so the mesh references built
     // below stay alive for the draw call.
     let mut models: Vec<Arc<Emd>> = Vec::new();
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    let mut npc_slots: Vec<usize> = Vec::new();
     // TODO(parity): (UI) the original queues a fade sprite (ground shadow) for
     // every character inside its camera switch zone, with the per-character
     // tint/quad from `npc::data::character_init`; the port draws only the
@@ -3977,6 +4060,7 @@ fn render_frame(
         let joints = anim::joint_matrices(&model.skeleton, keyframe, &entity_matrix);
         models.push(model);
         npc_joints.push(joints);
+        npc_slots.push(slot);
     }
 
     // The room's object models are submitted before the NPC and player meshes:
@@ -3988,23 +4072,34 @@ fn render_frame(
         object_joints.push(vec![objects::rebuild(record, &lighting)]);
     }
 
-    // TODO(parity): (visual) the original applies each object's runtime colour
-    // scale and background blend weight (scripted model tints, the death-wound
-    // tint, semi-transparent records); `EntityMesh` carries neither, so every
-    // character draws untinted and opaque.
+    // TODO(parity): (visual) the original applies each record's background
+    // blend weight and semi-transparency; `EntityMesh` carries only the RGB
+    // multiplier and the joint draw gate, so records blend opaquely.
     let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(visible.len() + 1 + models.len());
-    for ((asset, _), joints) in visible.iter().zip(&object_joints) {
+    for ((asset, record), joints) in visible.iter().zip(&object_joints) {
         meshes.push(EntityMesh {
             mesh: &asset.model,
             texture: &asset.texture,
             joints,
+            tint: record.shade(),
+            hidden_joints: 0,
         });
     }
-    for (model, joints) in models.iter().zip(&npc_joints) {
+    // The NPC joint gates pair with `models`/`npc_joints`, which are built in
+    // entity-slot order; the slots are recorded alongside them by re-walking.
+    let mut npc_slots = Vec::new();
+    for slot in 1..game::ENTITY_COUNT {
+        if game.entities[slot].active() && npc_models.get(pack, game.entities[slot].id).is_some() {
+            npc_slots.push(slot);
+        }
+    }
+    for ((slot, model), joints) in npc_slots.iter().zip(models.iter()).zip(&npc_joints) {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
+            tint: [255; 3],
+            hidden_joints: u32::from(game.entities[*slot].joint_flags),
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -4012,6 +4107,8 @@ fn render_frame(
             mesh: &assets.emd.mesh,
             texture: &assets.emd.texture,
             joints,
+            tint: game.player_tint,
+            hidden_joints: u32::from(game.entities[0].joint_flags),
         });
     }
 
@@ -4024,6 +4121,16 @@ fn render_frame(
         pages: &page_refs,
         quads: &quads,
     };
+    // The mirror pass runs only while the room script enables it; the reflected
+    // camera and per-joint visibility close over the room mirror's geometry.
+    let mirror = game.mirror_enabled().then(|| render::MirrorPass {
+        axis_x: game.mirror_axis_x(),
+        plane: i32::from(game.mirror.plane),
+        extent_min: game.mirror.extent_min,
+        extent_max: game.mirror.extent_max,
+        camera_pos: cut.pos,
+        camera: camera.mirrored(game.mirror_axis_x(), i32::from(game.mirror.plane)),
+    });
     render::draw_gameplay_scene_with_effects(
         framebuffer,
         cut.background.as_ref(),
@@ -4033,6 +4140,7 @@ fn render_frame(
         &lighting,
         layer.as_ref(),
         Some(&effect_layer),
+        mirror.as_ref(),
     );
 }
 
@@ -5189,7 +5297,9 @@ mod tests {
         assert!(!cut.masks.is_empty(), "room 1000 cut 0 has mask sprites");
         let assets = loaded.player_assets.as_ref().expect("player assets");
         let (keyframes, clips) = match player_state.clip_source {
-            player::ClipSource::Emd => (&assets.emd.keyframes, &assets.emd.clips),
+            player::ClipSource::Emd | player::ClipSource::Room => {
+                (&assets.emd.keyframes, &assets.emd.clips)
+            }
             player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
         };
         let keyframe = &keyframes[player_state.anim.keyframe_index(clips)];
@@ -5199,6 +5309,8 @@ mod tests {
             mesh: &assets.emd.mesh,
             texture: &assets.emd.texture,
             joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
@@ -6442,12 +6554,27 @@ mod tests {
             params: [0; 8],
             room_items_flag: 0xFF,
         });
-        let before = session.game.frame;
-        session
-            .tick(&pack, UiInput::default(), player::Input::default(), false)
-            .unwrap();
+        // The handler arms the lid; the ramp settles before the UI opens.
+        for _ in 0..80 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.item_box.is_some() {
+                break;
+            }
+        }
         assert!(session.item_box.is_some(), "the box opened");
         assert!(session.menu.is_some(), "the inventory panel is underneath");
+        assert!(
+            session
+                .game
+                .objects
+                .records
+                .iter()
+                .all(|record| record.rotation[2] < 0),
+            "the lid record ramped open"
+        );
+        let before = session.game.frame;
 
         // Confirm arms the swap, confirm again deposits the spray.
         session
@@ -6474,7 +6601,7 @@ mod tests {
             .unwrap();
         assert_eq!(session.game.item_box[0].id, ITEM_FIRST_AID_SPRAY);
         assert!(session.game.inventory.is_empty());
-        assert_eq!(session.game.frame, before + 1, "the room stayed frozen");
+        assert_eq!(session.game.frame, before, "the room stayed frozen");
 
         // Cancel closes the box and the menu; the room resumes.
         session

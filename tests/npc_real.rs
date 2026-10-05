@@ -153,6 +153,8 @@ fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [u
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
+            tint: [255; 3],
+            hidden_joints: 0,
         })
         .collect();
 

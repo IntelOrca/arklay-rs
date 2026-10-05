@@ -313,6 +313,11 @@ pub struct RoomState {
     /// Non-fatal problems from parsing the embedded model pairs: one entry
     /// per malformed (never per null) pair.
     pub model_warnings: Vec<String>,
+    /// The RDT-embedded room player-animation pair (pointer slots 9/10): the
+    /// push/vault/ladder clips the action behaviours play. `None` when the RDT
+    /// declares no pair or it fails to parse; behaviours then fall back to the
+    /// no-op stance.
+    pub room_anim: Option<crate::model::RoomAnim>,
 }
 
 impl RoomState {

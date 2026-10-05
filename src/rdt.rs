@@ -35,6 +35,10 @@ const ITEM_MODELS_SLOT: usize = 3;
 const WALK_ZONES_SLOT: usize = 4;
 /// Pointer slot of the footstep sound zone table.
 const FOOTSTEP_SLOT: usize = 5;
+/// Pointer slot of the room player-animation header (EMR, `RDT+0x6C`).
+const PLAYER_ANIM_HEADER_SLOT: usize = 9;
+/// Pointer slot of the room player-animation base (EDD, `RDT+0x70`).
+const PLAYER_ANIM_BASE_SLOT: usize = 10;
 /// Pointer slot of the room message block (`RDT+0x74`).
 const MESSAGE_SLOT: usize = 11;
 /// Pointer slot of the effect sprite index table (`RDT+0x7C`).
@@ -97,6 +101,9 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
     let (item_models, item_warnings) =
         crate::objects::parse_assets(data, pointers[ITEM_MODELS_SLOT], item_count);
     model_warnings.extend(item_warnings);
+    // The room's player-animation pair is tolerant too: a room without one, or
+    // with a damaged one, plays the no-op stance instead of failing the load.
+    let room_anim = parse_room_anim(data, &pointers);
 
     Ok(RoomState {
         stage: id.stage,
@@ -117,7 +124,35 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         object_models,
         item_models,
         model_warnings,
+        room_anim,
     })
+}
+
+/// Parse the RDT's player-animation pair against its next-section bound.
+///
+/// Returns `None` when either pointer is null or the pair fails to parse; the
+/// bound is the first declared section pointer after the animation base, or the
+/// end of the file when none follows.
+fn parse_room_anim(data: &[u8], pointers: &[u32; POINTER_COUNT]) -> Option<crate::model::RoomAnim> {
+    let header = pointers[PLAYER_ANIM_HEADER_SLOT];
+    let base = pointers[PLAYER_ANIM_BASE_SLOT];
+    if header == 0 || base == 0 {
+        return None;
+    }
+    let bound = pointers
+        .iter()
+        .skip(PLAYER_ANIM_BASE_SLOT + 1)
+        .copied()
+        .filter(|pointer| *pointer > base)
+        .min()
+        .unwrap_or(data.len() as u32);
+    match crate::emd::parse_room_anim(data, header, base, bound) {
+        Ok(anim) => Some(anim),
+        Err(error) => {
+            eprintln!("warning: invalid room player animation pair: {error:#}");
+            None
+        }
+    }
 }
 
 /// Parse the camera records, one per cut.

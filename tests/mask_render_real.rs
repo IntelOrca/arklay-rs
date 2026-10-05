@@ -156,6 +156,8 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
         mesh: &mesh,
         texture: &texture,
         joints: &joints,
+        tint: [255; 3],
+        hidden_joints: 0,
     }];
 
     // Only group 1 is active, so no other overlay interferes.
@@ -251,6 +253,8 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
         mesh: &emd.mesh,
         texture,
         joints: &joints,
+        tint: [255; 3],
+        hidden_joints: 0,
     }];
 
     let camera = Camera::from_cut(cut);

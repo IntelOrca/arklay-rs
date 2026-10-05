@@ -193,6 +193,16 @@ const HANDLER_STAIRS_HEIGHT: u8 = 0x11;
 const MSF_MENU_GOT_ITEM: u8 = 21;
 /// `main_state_flags` bit 0x800, toggled by `give_item` (item viewer).
 const MSF_MENU_ITEM_VIEW: u8 = 20;
+/// `main_state_flags` bit 0x1000: the item-box menu may open (the lid settled).
+const MSF_MENU_MODE_ITEMBOX: u8 = 19;
+/// `main_state_flags` bit 0x80: the climb/vault transition is latched.
+const MSF_DOOR_TRANSITION: u8 = 24;
+/// `main_state_flags` bit 0x40: `update_room_objects` is pushing an object.
+const MSF_OBJECT_PUSH: u8 = 25;
+/// `main_state_flags` bit 1: the mirror plane is `X = k` (else `Z = k`).
+const MSF_MIRROR_PLANE_X: u8 = 30;
+/// `main_state_flags` bit 0: the mirror pass is enabled.
+const MSF_MIRROR_ENABLE: u8 = 31;
 /// Flag bank holding the per-frame item-use flags (`g_itemUseFlags`).
 pub const BANK_ITEM_USE: u8 = 9;
 /// Scenario flag raised by the chemical combine effect.
@@ -308,6 +318,48 @@ pub struct CameraState {
     pub saved_cut: Option<usize>,
     /// Whether the scripts own the cut instead of the position zones.
     pub locked: bool,
+}
+
+/// The room mirror configured by `scene_setup` (0x0F).
+///
+/// The plane and extent live here; the enable and axis bits live in flag bank 5
+/// (`main_state_flags`) because the original lets a plain `set` turn the pass
+/// on after a mode-0 `scene_setup` has stored the geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MirrorState {
+    /// Extent minimum along the plane's cross axis.
+    pub extent_min: u16,
+    /// Extent maximum along the plane's cross axis.
+    pub extent_max: u16,
+    /// The plane coordinate: `Z = plane` or `X = plane` by axis.
+    pub plane: u16,
+}
+
+impl MirrorState {
+    /// Whether the pass runs: flag bank 5 bit 0 (`MSF_MIRROR_ENABLE`).
+    pub fn enabled(&self, flags: &[FlagBank; FLAG_BANK_COUNT]) -> bool {
+        flags[5].bit(MSF_MIRROR_ENABLE)
+    }
+
+    /// Whether the plane is `X = plane` (bit 1) rather than `Z = plane`.
+    pub fn axis_x(&self, flags: &[FlagBank; FLAG_BANK_COUNT]) -> bool {
+        flags[5].bit(MSF_MIRROR_PLANE_X)
+    }
+}
+
+/// The item-box lid flow (`g_itembox_state` and its scratch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ItemBoxFlow {
+    /// `0` idle, `1` armed, `2` opening, `3` settling, `4` restore.
+    pub state: u8,
+    /// Travel accumulator the lid step adds to.
+    pub open_timer: u16,
+    /// Accumulator growth (`1` opening, `-1` easing back).
+    pub counter_increase: i16,
+    /// Object slot of the latched lid.
+    pub cover: Option<usize>,
+    /// `MSF_MENU_MODE_ITEMBOX` was raised and the UI has not opened yet.
+    pub menu_open: bool,
 }
 
 /// BGM channel state.
@@ -880,6 +932,10 @@ pub struct GameState {
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
+    /// Global one-shot SE ids queued by the script handlers (the item-box lid
+    /// plays `0x20`). The port has no pack mapping for the global SE bank in
+    /// this slice; the engine drains the queue (documented).
+    pub sfx_requests: Vec<u16>,
     /// Per-frame random seed the NPC look-at scheduling reads. The original
     /// reseeds its global from `rand()` at the top of every gameplay frame;
     /// the port advances a deterministic xorshift so headless runs repeat.
@@ -895,6 +951,16 @@ pub struct GameState {
     /// Queued `obj_xfm` light rewrites, applied by the engine's room tick
     /// before lighting is read.
     pub light_edits: Vec<LightEdit>,
+    /// `main_state_flags` bit 6: `tick_objects` is pushing an object this
+    /// frame. The push behaviour starts the tick after it is raised.
+    pub object_push: bool,
+    /// The room mirror's geometry (enable/axis live in flag bank 5).
+    pub mirror: MirrorState,
+    /// The item-box lid flow.
+    pub itembox: ItemBoxFlow,
+    /// Per-joint colour multiplier of the player model (`objs_hide` sets it
+    /// dark red; default white).
+    pub player_tint: [u8; 3],
     /// The current room's effect sprite metadata, re-resolved and page-packed
     /// on room entry (the original's room effect init). Shared so
     /// [`ScdGameHost::on_effect`] can pass it to [`effects::create`] while the
@@ -973,11 +1039,16 @@ impl Default for GameState {
             room_bgm_requests: Vec::new(),
             pending_events: Vec::new(),
             entity_sounds: Vec::new(),
+            sfx_requests: Vec::new(),
             rand_seed: RAND_SEED_INITIAL,
             effects: effects::EffectPool::new(),
             objects: ObjectTable::default(),
             collision_edits: Vec::new(),
             light_edits: Vec::new(),
+            object_push: false,
+            mirror: MirrorState::default(),
+            itembox: ItemBoxFlow::default(),
+            player_tint: [255; 3],
             room_effects: Rc::new(effects::RoomEffects::default()),
             weapon_effects: effects::WeaponEffects::default(),
             effect_missing_logged: BTreeSet::new(),
@@ -2564,6 +2635,27 @@ impl GameState {
             }
         }
 
+        self.probe_actions(pos, angle, 1, pos, action);
+    }
+
+    /// One `update_player_position` walk with an explicit frame mask.
+    ///
+    /// `mask` is the original's entry-flag selector: the player's own pass uses
+    /// `1`, the object-side pass `update_room_objects` runs uses `4`. Entries
+    /// with flag bit `0x80` are action-key entries and belong to
+    /// `check_action_object`: they only fire while `action` is held, only when
+    /// their flag bit 0 is set, and only the first matching one fires. All
+    /// other matching entries dispatch (the original walks the whole table).
+    /// `entity_pos` is the position a `0x40` entry probes; the reach probe is
+    /// always built from the player's facing.
+    fn probe_actions(
+        &mut self,
+        pos: [i32; 3],
+        angle: u16,
+        mask: u8,
+        entity_pos: [i32; 3],
+        action: bool,
+    ) {
         let (dx, dz) = crate::player::reach_offset(angle);
         let reach = [pos[0] + dx, pos[1], pos[2] + dz];
         let mut action_fired = false;
@@ -2579,10 +2671,10 @@ impl GameState {
                 if !action || flags & 0x01 == 0 || action_fired {
                     continue;
                 }
-            } else if flags & 0x01 == 0 && flags & 0x04 == 0 {
+            } else if flags & mask == 0 {
                 continue;
             }
-            let probe = if flags & 0x40 != 0 { pos } else { reach };
+            let probe = if flags & 0x40 != 0 { entity_pos } else { reach };
             if !room_action.contains(probe[0], probe[2]) {
                 continue;
             }
@@ -2595,31 +2687,7 @@ impl GameState {
             } else {
                 self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = hit;
             }
-            match room_action.kind {
-                RoomActionKind::Door => {
-                    self.try_door(room_action.slot);
-                }
-                RoomActionKind::Item => {
-                    self.pick_up(room_action.slot);
-                }
-                RoomActionKind::Event => {
-                    self.start_room_event(room_action.slot);
-                }
-                RoomActionKind::Message => {
-                    let id = room_action.param_word(0);
-                    self.show_message(id as u8, room_action.param_word(1));
-                    self.record_interaction(room_action.slot, room_action.kind, Some(id));
-                }
-                RoomActionKind::StairsHeight => {
-                    self.apply_stairs_height(room_action.slot, pos[0], pos[2]);
-                }
-                RoomActionKind::StairsZone => {
-                    self.apply_stairs_zone(room_action.slot);
-                }
-                RoomActionKind::ItemBox | RoomActionKind::Typewriter | RoomActionKind::Other => {
-                    self.record_interaction(room_action.slot, room_action.kind, None);
-                }
-            }
+            self.fire_room_action(room_action, pos);
             if flags & 0x80 != 0 {
                 action_fired = true;
             }
@@ -2627,6 +2695,381 @@ impl GameState {
                 break;
             }
         }
+    }
+
+    /// Dispatch one matched room action to its handler.
+    fn fire_room_action(&mut self, room_action: RoomAction, pos: [i32; 3]) {
+        match room_action.kind {
+            RoomActionKind::Door => {
+                self.try_door(room_action.slot);
+            }
+            RoomActionKind::Item => {
+                self.pick_up(room_action.slot);
+            }
+            RoomActionKind::Event => {
+                self.start_room_event(room_action.slot);
+            }
+            RoomActionKind::Message => {
+                let id = room_action.param_word(0);
+                self.show_message(id as u8, room_action.param_word(1));
+                self.record_interaction(room_action.slot, room_action.kind, Some(id));
+            }
+            RoomActionKind::StairsHeight => {
+                self.apply_stairs_height(room_action.slot, pos[0], pos[2]);
+            }
+            RoomActionKind::StairsZone => {
+                self.apply_stairs_zone(room_action.slot);
+            }
+            RoomActionKind::ItemBox => {
+                self.open_itembox(room_action.slot);
+                self.record_interaction(room_action.slot, room_action.kind, None);
+            }
+            RoomActionKind::Typewriter | RoomActionKind::Other => {
+                self.record_interaction(room_action.slot, room_action.kind, None);
+            }
+        }
+    }
+
+    /// `scene_setup` (0x0F): store the mirror geometry and write the enable /
+    /// axis bits into the main-state flag bank. A mode-0 command stores the
+    /// extent but leaves the pass disabled; the plane-X rooms enable it later
+    /// with a plain `set`.
+    ///
+    /// The original also re-runs the player joint setup and allocates the
+    /// mirrored joint copies here; the port allocates nothing and the renderer
+    /// builds the reflected camera and visibility per frame.
+    pub fn scene_setup(&mut self, operands: &[Operand]) {
+        let flags = operand_u8(operands, 0);
+        self.mirror.extent_min = operand_u16(operands, 1);
+        self.mirror.extent_max = operand_u16(operands, 2);
+        self.mirror.plane = operand_u16(operands, 3);
+        self.flags[5].apply(MSF_MIRROR_ENABLE, if flags & 1 != 0 { 0 } else { 1 });
+        self.flags[5].apply(MSF_MIRROR_PLANE_X, if flags & 2 != 0 { 0 } else { 1 });
+    }
+
+    /// Whether the mirror pass runs (flag bank 5 bit 0).
+    pub fn mirror_enabled(&self) -> bool {
+        self.mirror.enabled(&self.flags)
+    }
+
+    /// Whether the mirror plane is `X = plane` rather than `Z = plane`.
+    pub fn mirror_axis_x(&self) -> bool {
+        self.mirror.axis_x(&self.flags)
+    }
+
+    /// `model_op` (0x34) variant 0: accumulate a colour tint on one omodel.
+    ///
+    /// The bias operand's bit 7 (after the original's `- 0x80` rebase) selects
+    /// the object table and indexes it; the three signed operands are the
+    /// deltas. They accumulate on the record's per-channel deltas (clamped to
+    /// `[-31, 31]`); when all three agree the change is pure luminance and is
+    /// stored as the record's light scale instead. Variants 1/2 only retarget a
+    /// texture-queue entry, which this port does not model, and the enemy
+    /// branch is inert with no enemies.
+    pub fn model_tint(&mut self, operands: &[Operand]) {
+        let variant = operand_u8(operands, 0);
+        if variant != 0 {
+            return;
+        }
+        let selector = operand_u8(operands, 1).wrapping_sub(0x80);
+        if selector & 0x80 == 0 {
+            return;
+        }
+        let Some(record) = self.objects.records.get_mut(usize::from(selector & 0x7F)) else {
+            return;
+        };
+        let deltas = [
+            operand_i8(operands, 4),
+            operand_i8(operands, 5),
+            operand_i8(operands, 6),
+        ];
+        let mut accumulated = [0i16; 3];
+        for (slot, (tint, delta)) in accumulated.iter_mut().zip(record.tint.iter().zip(deltas)) {
+            *slot = (i16::from(*tint) + i16::from(delta)).clamp(-31, 31);
+        }
+        if accumulated[0] == accumulated[1] && accumulated[0] == accumulated[2] {
+            record.light_scale = accumulated[0];
+        } else {
+            record.tint = accumulated.map(|value| value as i8);
+        }
+    }
+
+    /// `objs_hide` (0x4D): tint every player joint dark red. The original also
+    /// repeats the tint on the mirror joint copies; the port's mirror pass
+    /// draws the same mesh, so it follows automatically.
+    pub fn player_joint_tint(&mut self) {
+        self.player_tint = [0x30, 0, 0];
+    }
+
+    /// `open_itembox` (handler 8): gate and arm the lid.
+    ///
+    /// The port's "message system ready" test is the message window being idle
+    /// (the original checks `g_message_flags` bit 0x40, which its message
+    /// system maintains outside this path). The lid record is latched from the
+    /// action record's +4 word.
+    pub fn open_itembox(&mut self, slot: u8) -> bool {
+        if self.itembox.state != 0 || self.message.active || self.message_menu {
+            return false;
+        }
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        self.itembox.state = 1;
+        self.itembox.cover = Some(usize::from(action.param_word(1)));
+        self.itembox.menu_open = false;
+        // The original clears bits 0, 2 and 6 so the same probe cannot re-arm,
+        // and plays global SE 0x20.
+        self.message_flags &= !0x0045;
+        self.sfx_requests.push(0x20);
+        true
+    }
+
+    /// Per-frame `check_itembox_state`: ramp the lid open past -199, ease the
+    /// accumulator back down, then raise `MSF_MENU_MODE_ITEMBOX` on settle.
+    pub fn check_itembox_state(&mut self) {
+        match self.itembox.state {
+            1 => {
+                self.itembox.open_timer = 1;
+                self.itembox.counter_increase = 1;
+                self.itembox.state = 2;
+                self.itembox_tick_lid();
+            }
+            2 => self.itembox_tick_lid(),
+            3 => {
+                let timer = self.itembox.open_timer as i16;
+                if let Some(record) = self.itembox_cover_mut() {
+                    record.rotation[2] = record.rotation[2].wrapping_sub(timer);
+                }
+                self.itembox.open_timer = self
+                    .itembox
+                    .open_timer
+                    .wrapping_add(self.itembox.counter_increase as u16);
+                if (self.itembox.open_timer as i16) < 1 {
+                    // Lid settled: the box menu may open.
+                    self.flags[5].apply(MSF_MENU_MODE_ITEMBOX, 0);
+                    self.itembox.menu_open = true;
+                    self.message_flags |= 0x0045;
+                    self.itembox.state = 4;
+                }
+            }
+            4 => {
+                self.itembox.state = 0;
+                if let Some(record) = self.itembox_cover_mut() {
+                    record.rotation[2] = 0;
+                }
+                self.itembox.cover = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// State 2 of the lid flow: swing the lid further and grow the step. A
+    /// missing lid record skips the swing but still runs the state machine.
+    fn itembox_tick_lid(&mut self) {
+        let timer = self.itembox.open_timer as i16;
+        let angle = match self.itembox_cover_mut() {
+            Some(record) => {
+                record.rotation[2] = record.rotation[2].wrapping_sub(timer);
+                record.rotation[2]
+            }
+            None => -200,
+        };
+        if angle < -199 {
+            self.itembox.state = 3;
+            self.itembox.counter_increase = -1;
+        }
+        self.itembox.open_timer = self
+            .itembox
+            .open_timer
+            .wrapping_add(self.itembox.counter_increase as u16);
+    }
+
+    fn itembox_cover_mut(&mut self) -> Option<&mut crate::objects::ObjectRecord> {
+        let cover = self.itembox.cover?;
+        self.objects.records.get_mut(cover)
+    }
+
+    /// Take the "open the item-box UI" edge raised when the lid settled.
+    pub fn take_itembox_open(&mut self) -> bool {
+        std::mem::take(&mut self.itembox.menu_open)
+    }
+
+    /// The item-box UI closed: run state 4 (restore the lid angle) next tick
+    /// and drop the menu-mode flag.
+    pub fn reset_itembox(&mut self) {
+        self.flags[5].apply(MSF_MENU_MODE_ITEMBOX, 1);
+        if self.itembox.state != 0 {
+            self.itembox.state = 4;
+        }
+    }
+
+    /// `update_room_objects` (0x00474090): one pass over the built omodel
+    /// records, run each tick after the player's physics and the player-side
+    /// probe.
+    ///
+    /// The pass resolves active entities (a no-op with no enemies), runs the
+    /// push probe (box overlap + forward held + the 470-unit reach box), starts
+    /// a push on the ninth consecutive frame unless a veto fires, resolves the
+    /// player out of the object (what makes objects solid), commits a moved
+    /// object and shoves whatever it ran into, then runs the object-side
+    /// room-action probe (mask 4).
+    pub fn tick_objects(&mut self, room: &RoomState, player: &mut PlayerState) {
+        use crate::objects;
+
+        // The action press drives `check_climb_object` exactly where the
+        // original's input path calls it. A second press mid-climb verifies
+        // the facing: settling flips the vault to the return side.
+        if player.input.action_pressed {
+            if player.vault_bit {
+                let facing = player
+                    .climb_object
+                    .and_then(|slot| self.objects.record(usize::from(slot)))
+                    .is_some_and(|record| objects::verify_climb_object(record, player.angle));
+                if facing {
+                    player.vault_bit = false;
+                    player.vault_return = true;
+                    self.entities[0].zone_flags |= 0x10;
+                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
+                }
+            } else if let Some(candidate) =
+                objects::check_climb_object(&self.objects, player.pos, player.angle)
+            {
+                player.vault_bit = true;
+                player.climb_object = Some(candidate.slot as u8);
+                player.attack_direction = candidate.attack_direction;
+                player.locked = crate::player::LockedAction::Vault;
+                player.action_state = 0;
+                player.move_speed_current = 0;
+                self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
+            }
+        }
+
+        let was_pushing = self.object_push;
+        let mut push_started = false;
+        let slot_count = self.objects.records.len();
+        for index in 0..slot_count {
+            let mut record = self.objects.records[index];
+            if !record.active() {
+                continue;
+            }
+            let saved = record.pos;
+
+            // 2. the push probe.
+            let ent_ext = objects::EntityCollision::player(player.radius);
+            let mut player_pos = player.pos;
+            let moved = objects::chk_entity_slide(&mut player_pos, ent_ext, &mut record, true);
+            let reach = objects::chk_pl_reach_entity(player.pos, player.angle, &record);
+            if moved == 0 || !player.input.up || reach.is_none() {
+                record.push_counter = 0;
+            } else {
+                record.push_counter = record.push_counter.wrapping_add(1);
+                player.push_object = Some(index as u8);
+                player.push_heavy = record.model & 0x40 != 0;
+            }
+
+            // 3. start the push on the ninth frame.
+            let mut restore_position = true;
+            if record.flag & objects::OBJECT_FLAG_NOT_PUSHABLE == 0 && record.push_counter == 9 {
+                if self.object_floor_probe(room, &record) {
+                    // Parked at 10: a blocked object cannot re-trigger.
+                    record.push_counter = 10;
+                } else {
+                    push_started = true;
+                    record.push_counter = 8;
+                    player.angle = player.angle.wrapping_add(0x200) & 0xC00;
+
+                    // Another object in the way vetoes the whole push.
+                    let mut vetoed = false;
+                    for other_index in 0..slot_count {
+                        if other_index == index || !self.objects.records[other_index].active() {
+                            continue;
+                        }
+                        let mover = self.objects.records[other_index];
+                        if objects::chk_obj_slide(&mover, &mut record) {
+                            record.push_counter = 10;
+                            vetoed = true;
+                            break;
+                        }
+                    }
+
+                    if !vetoed && was_pushing && player.locked == crate::player::LockedAction::Push
+                    {
+                        // The animation is already running: keep the probe's
+                        // displacement, which is what slides the object.
+                        restore_position = false;
+                    }
+                }
+            }
+            if restore_position {
+                record.pos = saved;
+            }
+
+            // 4. resolve the player out of the object.
+            let mut resolved = player.pos;
+            objects::chk_entity_slide(&mut resolved, ent_ext, &mut record, false);
+            player.pos = resolved;
+
+            // 5. commit the moved object and shove whatever it ran into.
+            if i32::from(record.committed[0]) != record.pos[0]
+                || i32::from(record.committed[2]) != record.pos[2]
+            {
+                for other_index in 0..slot_count {
+                    if other_index == index || !self.objects.records[other_index].active() {
+                        continue;
+                    }
+                    let mut other = self.objects.records[other_index];
+                    if objects::chk_obj_slide(&record, &mut other) {
+                        self.objects.records[other_index] = other;
+                    }
+                }
+                record.committed[0] = record.pos[0] as i16;
+                record.committed[2] = record.pos[2] as i16;
+            }
+
+            self.objects.records[index] = record;
+            // 6. the object-side room-action probe (mask 4).
+            self.probe_actions(player.pos, player.angle, 4, record.pos, false);
+        }
+
+        // The enemy loops of the original are no-ops here: no enemy slot is
+        // ever active, so the entity-slot pass and the enemy destination veto
+        // never run.
+        self.object_push = push_started;
+        self.flags[5].apply(MSF_OBJECT_PUSH, if push_started { 0 } else { 1 });
+        if !push_started && was_pushing {
+            // The push just ended; the push behaviour watches the bit drop to
+            // run its release state, and the original returns the message flag.
+            self.message_flags |= 0x0040;
+        }
+        player.object_push = push_started;
+    }
+
+    /// The object's own floor probe: either declared boundary endpoint inside a
+    /// blocking collision record. Flag bit `0x04` skips the probe (objects that
+    /// cannot leave their footprint).
+    ///
+    /// # Documented deviation
+    ///
+    /// The original's two-point probe pushes the object out of the boundary
+    /// along the way and reports whether an end is still stuck; this port tests
+    /// the endpoints with the same classification the player resolver uses, so
+    /// the object is vetoed slightly earlier and never displaced by the probe.
+    fn object_floor_probe(&self, room: &RoomState, record: &crate::objects::ObjectRecord) -> bool {
+        if record.flag & crate::objects::OBJECT_FLAG_SKIP_FLOOR_PROBE != 0 {
+            return false;
+        }
+        let rotation = crate::anim::rotation_matrix(0, i32::from(record.rotation[1]), 0);
+        for probe in record.probe {
+            let x = i64::from(probe[0] as i16);
+            let z = i64::from(probe[1] as i16);
+            let wx = ((i64::from(rotation[0][0]) * x + i64::from(rotation[0][2]) * z) >> 12) as i32;
+            let wz = ((i64::from(rotation[2][0]) * x + i64::from(rotation[2][2]) * z) >> 12) as i32;
+            let point = [record.pos[0] + wx, record.pos[1], record.pos[2] + wz];
+            if crate::player::position_blocked(room, point, i32::from(record.radius)) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Run one room action handler by index, as `aot_on` and `give_item` do.
@@ -2657,7 +3100,12 @@ impl GameState {
             HANDLER_EVENT => self.start_room_event(slot),
             HANDLER_STAIRS_ZONE => self.fire_stairs_zone(slot),
             HANDLER_STAIRS_HEIGHT => self.fire_stairs_height(slot),
-            HANDLER_ITEMBOX | HANDLER_TYPEWRITER => {
+            HANDLER_ITEMBOX => {
+                self.open_itembox(slot);
+                self.record_interaction(slot, action.kind, None);
+                true
+            }
+            HANDLER_TYPEWRITER => {
                 self.record_interaction(slot, action.kind, None);
                 true
             }
@@ -3527,6 +3975,11 @@ impl ScdHost for ScdGameHost<'_> {
                 entity.pos[1] = entity.pos[1].wrapping_add(i32::from(operand_i8(operands, 0)));
                 StepResult::Continue
             }
+            // objs_hide: the player joint tint.
+            0x4D => {
+                self.state.player_joint_tint();
+                StepResult::Continue
+            }
             // TODO(parity): (scripting) 0x2B attack_anim_set, 0x33
             // player_prop_set (clear equip, attacked/stunned animation, flags,
             // health-status and joint writes) and 0x4D player_joint_tint stay
@@ -3569,6 +4022,11 @@ impl ScdHost for ScdGameHost<'_> {
             // `eml_pos` (0x47): the object index is the first operand byte.
             0x47 => {
                 self.state.objects.transform(operands);
+                StepResult::Continue
+            }
+            // `model_op` (0x34): object colour tints.
+            0x34 => {
+                self.state.model_tint(operands);
                 StepResult::Continue
             }
             _ => self.placeholder(op),
@@ -3699,6 +4157,10 @@ impl ScdHost for ScdGameHost<'_> {
                     group: operand_u8(operands, 1),
                     active: operand_u8(operands, 2) == 0,
                 });
+                StepResult::Continue
+            }
+            "scene_setup" => {
+                self.state.scene_setup(operands);
                 StepResult::Continue
             }
             "evt_work_set" => {
@@ -4604,7 +5066,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_model(op(0x34), &operands(&[0])),
+                host.on_item(op(0x19), &operands(&[0, 0, 0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -4626,7 +5088,7 @@ mod tests {
         }
         assert_eq!(state.placeholders.len(), 6);
         assert_eq!(state.placeholders[&0x2B], 1);
-        assert_eq!(state.placeholders[&0x34], 1);
+        assert_eq!(state.placeholders[&0x19], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x3A], 1);
         assert_eq!(state.placeholders[&0x27], 1);
@@ -7198,5 +7660,339 @@ mod tests {
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
         state.increment_saves();
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
+    }
+
+    // ------------------------------------------------------------------
+    // Pushables, climbables and the item-box lid.
+    // ------------------------------------------------------------------
+
+    fn object_record(pos: [i32; 3], extents: [u16; 3]) -> crate::objects::ObjectRecord {
+        crate::objects::ObjectRecord {
+            flag: crate::objects::OBJECT_FLAG_ACTIVE,
+            pos,
+            committed: [pos[0] as i16, pos[1] as i16, pos[2] as i16],
+            half_extents: extents,
+            radius: 100,
+            ..crate::objects::ObjectRecord::default()
+        }
+    }
+
+    fn pushed_game(records: Vec<crate::objects::ObjectRecord>) -> GameState {
+        let mut state = game();
+        state.objects.records = records;
+        state.objects.built = state.objects.records.len() as u8;
+        state
+    }
+
+    fn push_player() -> PlayerState {
+        let mut player =
+            crate::player::spawn(RoomId::parse("1000").unwrap(), &RoomState::default());
+        player.pos = [0, 0, 0];
+        player.angle = 0;
+        player.input.up = true;
+        player
+    }
+
+    #[test]
+    fn the_push_probe_counts_nine_frames_then_raises_the_bit() {
+        let room = RoomState::default();
+        let mut state = pushed_game(vec![object_record([500, 0, 0], [100, 100, 100])]);
+        let mut player = push_player();
+
+        for tick in 1..=8 {
+            state.tick_objects(&room, &mut player);
+            assert_eq!(
+                state.objects.records[0].push_counter, tick,
+                "counter at tick {tick}"
+            );
+            assert!(!state.object_push);
+        }
+        state.tick_objects(&room, &mut player);
+        assert!(
+            state.object_push,
+            "the push bit is raised on the ninth frame"
+        );
+        assert_eq!(state.objects.records[0].push_counter, 8);
+        assert!(state.flags[5].bit(MSF_OBJECT_PUSH));
+        // The player-facing snap and the resolve out of the object.
+        assert_eq!(player.angle, 0, "(0 + 0x200) & 0xC00 = 0");
+        assert_eq!(player.pos[0], -22, "resolved to objX - extX");
+
+        // Releasing forward clears the counter and the bit.
+        player.input.up = false;
+        state.tick_objects(&room, &mut player);
+        assert_eq!(state.objects.records[0].push_counter, 0);
+        assert!(!state.object_push);
+        assert!(!state.flags[5].bit(MSF_OBJECT_PUSH));
+    }
+
+    #[test]
+    fn the_floor_probe_parks_the_counter_and_vetoes_the_push() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(crate::state::CollisionRect {
+            x_max: 3000,
+            z_max: 3000,
+            x_min: 500,
+            z_min: 0,
+            kind: 1,
+            flags: 0x300,
+        });
+        // The object's first probe endpoint sits inside the wall.
+        let mut record = object_record([500, 0, 0], [100, 100, 100]);
+        record.probe = [[0, 0], [0, 0]];
+        record.radius = 100;
+        let mut state = pushed_game(vec![record]);
+        let mut player = push_player();
+
+        for _ in 0..9 {
+            state.tick_objects(&room, &mut player);
+        }
+        assert!(!state.object_push, "a blocked object cannot start a push");
+        assert_eq!(state.objects.records[0].push_counter, 10);
+        assert_eq!(state.objects.records[0].pos, [500, 0, 0]);
+
+        // A record with the skip bit ignores the wall.
+        state.objects.records[0].flag |= crate::objects::OBJECT_FLAG_SKIP_FLOOR_PROBE;
+        state.objects.records[0].push_counter = 0;
+        for _ in 0..9 {
+            state.tick_objects(&room, &mut player);
+        }
+        assert!(state.object_push);
+    }
+
+    #[test]
+    fn a_second_object_in_the_way_vetoes_the_push() {
+        let room = RoomState::default();
+        let other = object_record([560, 0, 0], [100, 100, 100]);
+        let mut state = pushed_game(vec![object_record([500, 0, 0], [100, 100, 100]), other]);
+        let mut player = push_player();
+        for _ in 0..9 {
+            state.tick_objects(&room, &mut player);
+        }
+        assert_eq!(state.objects.records[0].push_counter, 10);
+        assert_eq!(
+            state.objects.records[0].pos,
+            [500, 0, 0],
+            "the push honoured the veto"
+        );
+        // The original raises the bit for the frame the push start began on,
+        // then the parked counter (11) drops it again.
+        state.tick_objects(&room, &mut player);
+        assert!(!state.object_push, "the parked counter ended the push");
+    }
+
+    #[test]
+    fn the_object_probe_runs_the_mask_four_actions() {
+        let room = RoomState::default();
+        let mut state = pushed_game(vec![object_record([2000, 0, 0], [100, 100, 100])]);
+        // A message action with only flag bit 2 set, over the player's reach.
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::Message,
+            zone: [400, 0, 200, 200],
+            sce: HANDLER_MESSAGE,
+            handler: HANDLER_MESSAGE,
+            flags: 0x04,
+            params: [2, 0, 7, 0, 0, 0, 0, 0],
+            room_items_flag: 0xFF,
+        });
+        let mut player = push_player();
+        player.pos = [0, 0, 0];
+        player.angle = 0;
+        state.tick_objects(&room, &mut player);
+        let fired = state.last_interaction;
+        assert_eq!(
+            fired.map(|interaction| interaction.kind),
+            Some(RoomActionKind::Message),
+            "the object-side pass fires mask-4 entries"
+        );
+
+        // The player's own pass (mask 1) must not fire the mask-4 entry.
+        let mut state = pushed_game(vec![object_record([2000, 0, 0], [100, 100, 100])]);
+        state.room_actions = [None; ROOM_ACTION_SLOTS];
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::Message,
+            zone: [400, 0, 200, 200],
+            sce: HANDLER_MESSAGE,
+            handler: HANDLER_MESSAGE,
+            flags: 0x04,
+            params: [2, 0, 7, 0, 0, 0, 0, 0],
+            room_items_flag: 0xFF,
+        });
+        let player = push_player();
+        state.interact(player.pos, player.angle, false);
+        assert!(state.last_interaction.is_none(), "mask 1 ignores bit 2");
+    }
+
+    #[test]
+    fn a_push_beyond_nine_frames_moves_the_object_once_the_animation_runs() {
+        // The player walks into the object; with the push behaviour running
+        // the probe's displacement is kept and the object slides.
+        let room = RoomState::default();
+        let mut state = pushed_game(vec![object_record([500, 0, 0], [100, 100, 100])]);
+        let mut player = push_player();
+        for _ in 0..9 {
+            state.tick_objects(&room, &mut player);
+        }
+        assert!(state.object_push);
+        player.locked = crate::player::LockedAction::Push;
+        player.object_push = true;
+        for _ in 0..5 {
+            player.pos[0] += 40;
+            state.tick_objects(&room, &mut player);
+        }
+        assert!(
+            state.objects.records[0].pos[0] > 500,
+            "the shelf slid to {}",
+            state.objects.records[0].pos[0]
+        );
+        assert_eq!(
+            state.objects.records[0].committed[0] as i32,
+            state.objects.records[0].pos[0]
+        );
+    }
+
+    #[test]
+    fn the_climb_scan_latches_a_vault_and_the_second_press_flips_the_side() {
+        let room = RoomState::default();
+        let mut record = object_record([400, 0, 0], [100, 100, 100]);
+        record.flag |= crate::objects::OBJECT_FLAG_CLIMBABLE;
+        record.rotation[1] = 0x800;
+        let mut state = pushed_game(vec![record]);
+        let mut player = push_player();
+        player.input.action_pressed = true;
+
+        state.tick_objects(&room, &mut player);
+        assert!(player.vault_bit);
+        assert_eq!(player.locked, crate::player::LockedAction::Vault);
+        assert_eq!(player.attack_direction, -1);
+        assert!(state.flags[5].bit(MSF_DOOR_TRANSITION));
+
+        // A second press with the player turned onto the object's facing
+        // settles onto the return side.
+        player.angle = 0x800;
+        player.input.action_pressed = true;
+        state.tick_objects(&room, &mut player);
+        assert!(!player.vault_bit);
+        assert!(player.vault_return);
+        assert_eq!(state.entities[0].zone_flags & 0x10, 0x10);
+        assert!(!state.flags[5].bit(MSF_DOOR_TRANSITION));
+    }
+
+    #[test]
+    fn the_item_box_lid_ramps_settles_and_resets() {
+        let mut state = pushed_game(vec![object_record([0, 0, 0], [10, 10, 10])]);
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::ItemBox,
+            zone: [0, 0, 0, 0],
+            sce: HANDLER_ITEMBOX,
+            handler: HANDLER_ITEMBOX,
+            flags: 0x01,
+            params: [HANDLER_ITEMBOX, 0x01, 0, 0, 0, 0, 0, 0],
+            room_items_flag: 0xFF,
+        });
+        // params word 1 (entry +4) is the lid slot: bytes 4/5.
+        state.room_actions[0].as_mut().unwrap().params[4] = 0;
+
+        assert!(state.open_itembox(0));
+        assert_eq!(state.itembox.state, 1);
+        assert!(
+            !state.open_itembox(0),
+            "the box cannot re-arm while opening"
+        );
+
+        let mut minimum = 0;
+        let mut settled = None;
+        for tick in 0..80 {
+            state.check_itembox_state();
+            minimum = minimum.min(state.objects.records[0].rotation[2]);
+            if state.take_itembox_open() {
+                settled = Some(tick);
+                break;
+            }
+        }
+        assert!(minimum < -199, "the lid only reached {minimum}");
+        assert!(settled.is_some(), "the lid never settled");
+        assert!(state.flags[5].bit(MSF_MENU_MODE_ITEMBOX));
+
+        // The UI closes: state 4 restores the angle and drops the flag.
+        state.reset_itembox();
+        assert_eq!(state.itembox.state, 4);
+        state.check_itembox_state();
+        assert_eq!(state.objects.records[0].rotation[2], 0);
+        assert_eq!(state.itembox.state, 0);
+        assert!(!state.flags[5].bit(MSF_MENU_MODE_ITEMBOX));
+    }
+
+    #[test]
+    fn the_item_box_gate_refuses_while_a_message_is_up() {
+        let mut state = pushed_game(vec![]);
+        state.show_message(1, 0);
+        assert!(!state.open_itembox(0));
+        state.message.active = false;
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::ItemBox,
+            zone: [0, 0, 0, 0],
+            sce: HANDLER_ITEMBOX,
+            handler: HANDLER_ITEMBOX,
+            flags: 0x01,
+            params: [0; 8],
+            room_items_flag: 0xFF,
+        });
+        assert!(state.open_itembox(0));
+    }
+
+    #[test]
+    fn model_op_accumulates_luminance_and_colour_tints() {
+        let mut state = pushed_game(vec![object_record([0, 0, 0], [1, 1, 1])]);
+        // selector byte 0 -> p6 = 0x80 -> omodel slot 0; deltas -1,-1,-1.
+        state.model_tint(&operands(&[0, 0x00, 0x01, 0x01, 0xFF, 0xFF, 0xFF]));
+        assert_eq!(state.objects.records[0].light_scale, -1);
+        assert_eq!(
+            state.objects.records[0].tint, [0; 3],
+            "luminance keeps the tint"
+        );
+        assert_eq!(state.objects.records[0].shade(), [247, 247, 247]);
+
+        // A counter-tint with unequal deltas lands on the channels.
+        state.model_tint(&operands(&[0, 0x00, 0, 0, 0x05, 0xFB, 0xFF]));
+        assert_eq!(state.objects.records[0].tint, [5, -5, -1]);
+        assert_eq!(state.objects.records[0].light_scale, -1);
+
+        // Variants 1/2 and the enemy selector are inert.
+        let before = state.objects.records[0];
+        state.model_tint(&operands(&[1, 0x00, 0, 0, 1, 2, 3]));
+        state.model_tint(&operands(&[0, 0x80, 0, 0, 1, 2, 3]));
+        assert_eq!(state.objects.records[0], before);
+    }
+
+    #[test]
+    fn scene_setup_stores_the_mirror_and_writes_the_flag_bits() {
+        let mut state = game();
+        // Plane Z = 5700, span 4100..10000, enabled: room 1120's command.
+        state.scene_setup(&operands(&[0x01, 4100, 10000, 5700]));
+        assert_eq!(state.mirror.extent_min, 4100);
+        assert_eq!(state.mirror.extent_max, 10000);
+        assert_eq!(state.mirror.plane, 5700);
+        assert!(state.mirror_enabled());
+        assert!(!state.mirror_axis_x());
+
+        // Plane X stored disabled; a later plain set enables it.
+        state.scene_setup(&operands(&[0x02, 4000, 6300, 12500]));
+        assert!(!state.mirror_enabled(), "mode 0 leaves the pass disabled");
+        assert!(state.mirror_axis_x());
+        assert!(state.flags[5].apply(MSF_MIRROR_ENABLE, 0));
+        assert!(state.mirror_enabled());
+    }
+
+    #[test]
+    fn objs_hide_tints_the_player_dark_red() {
+        let mut state = game();
+        assert_eq!(state.player_tint, [255, 255, 255]);
+        state.player_joint_tint();
+        assert_eq!(state.player_tint, [0x30, 0, 0]);
     }
 }

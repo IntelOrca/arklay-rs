@@ -2,6 +2,8 @@
 //! embedded TMD/TIM pairs, build ROOM107's objects from its init script, and
 //! follow an effect attached to an object through its transform.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use arklay::state::RoomId;
@@ -265,6 +267,8 @@ fn room_107_objects_render() {
                 mesh: &asset.model,
                 texture: &asset.texture,
                 joints,
+                tint: [255; 3],
+                hidden_joints: 0,
             })
             .collect();
         let mut framebuffer = Framebuffer::new();
@@ -284,6 +288,422 @@ fn room_107_objects_render() {
         );
     }
     assert!(drew_a_cut, "no camera cut sees an object");
+}
+
+/// The eight compass offsets a push approach is tried from.
+const APPROACHES: [[i32; 2]; 8] = [
+    [1, 0],
+    [1, -1],
+    [0, -1],
+    [-1, -1],
+    [-1, 0],
+    [-1, 1],
+    [0, 1],
+    [1, 1],
+];
+
+/// A player placed `distance` from `target` on approach `direction`, facing it.
+fn player_facing(
+    id: RoomId,
+    room: &arklay::state::RoomState,
+    target: [i32; 3],
+    direction: [i32; 2],
+    distance: i32,
+) -> arklay::player::PlayerState {
+    let mut player = arklay::player::spawn(id, room);
+    player.pos = [
+        target[0] - direction[0] * distance,
+        0,
+        target[2] - direction[1] * distance,
+    ];
+    player.angle =
+        arklay::sfx::angle_between_xz(player.pos[0], player.pos[2], target[0], target[2]);
+    player
+}
+
+/// One engine-ordered gameplay tick with the object pass.
+fn object_tick(
+    player: &mut arklay::player::PlayerState,
+    room: &arklay::state::RoomState,
+    game: &mut game::GameState,
+    input: arklay::player::Input,
+) {
+    let room_clips = room
+        .room_anim
+        .as_ref()
+        .map(|anim| anim.clips.as_slice())
+        .unwrap_or(&[]);
+    arklay::player::update_with_room(player, room, &[], &[], room_clips, input);
+    game.sync_entity_from_player(player);
+    game.tick_objects(room, player);
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_107_shelf_slides_and_wedges_against_the_wall() {
+    let Some(root) = root() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE1/ROOM1070.RDT");
+    let id = RoomId::parse("1070").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    assert!(room.room_anim.is_some(), "ROOM107 room animation pair");
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+
+    let shelf_slot = (0..game.objects.records.len())
+        .find(|&slot| {
+            let record = game.objects.record(slot).unwrap();
+            record.active()
+                && record.flag & objects::OBJECT_FLAG_NOT_PUSHABLE == 0
+                && record.flag & objects::OBJECT_FLAG_CLIMBABLE == 0
+        })
+        .expect("ROOM107 declares a pushable shelf");
+    let shelf = *game.objects.record(shelf_slot).unwrap();
+    let radius = arklay::player::spawn(id, &room).radius;
+    let distance = radius + i32::from(shelf.half_extents[0].max(shelf.half_extents[2])) + 80;
+    let input = arklay::player::Input {
+        up: true,
+        ..arklay::player::Input::default()
+    };
+
+    // Try every approach: some sides face a wall or the object's own probe
+    // veto, so only the open side can start a real push.
+    let mut best: Option<([i32; 2], i32)> = None;
+    for direction in APPROACHES {
+        let mut player = player_facing(id, &room, shelf.pos, direction, distance);
+        let mut state = game.clone();
+        for _ in 0..180 {
+            object_tick(&mut player, &room, &mut state, input);
+        }
+        let moved = state.objects.records[shelf_slot].pos[0] - shelf.pos[0];
+        let moved_z = state.objects.records[shelf_slot].pos[2] - shelf.pos[2];
+        let travelled = (moved * moved + moved_z * moved_z).abs();
+        if best.is_none_or(|(_, best)| travelled > best) {
+            best = Some((direction, travelled));
+        }
+    }
+    let (direction, travelled) = best.unwrap();
+    assert!(travelled > 0, "no approach moved the shelf");
+
+    // Push from the open side for a long run: the shelf slides, then wedges
+    // and stays put while the player keeps leaning in.
+    let mut player = player_facing(id, &room, shelf.pos, direction, distance);
+    let mut state = game.clone();
+    let mut last = shelf.pos;
+    let mut stopped_at = None;
+    for tick in 0..3000 {
+        object_tick(&mut player, &room, &mut state, input);
+        let current = state.objects.records[shelf_slot].pos;
+        if tick % 200 == 0 && tick > 400 && current == last {
+            stopped_at = Some(tick);
+            break;
+        }
+        if tick % 200 == 0 {
+            last = current;
+        }
+    }
+    let final_pos = state.objects.records[shelf_slot].pos;
+    let dx = final_pos[0] - shelf.pos[0];
+    let dz = final_pos[2] - shelf.pos[2];
+    let total = ((dx * dx + dz * dz) as f64).sqrt();
+    println!(
+        "shelf {shelf_slot} pushed from {direction:?}: {shelf:?} -> {final_pos:?} ({total} units, stopped {stopped_at:?})"
+    );
+    assert!(total > 100.0, "the shelf barely moved: {total}");
+    assert!(stopped_at.is_some(), "the shelf never wedged");
+
+    // The player stays outside the shelf's box (the mode-0 resolve).
+    let record = state.objects.records[shelf_slot];
+    let ext = i32::from(record.half_extents[0]) + radius;
+    assert!(
+        (player.pos[0] - final_pos[0]).abs() > ext - 40
+            || (player.pos[2] - final_pos[2]).abs() > ext - 40,
+        "the player is inside the shelf: player {:?}, shelf {final_pos:?}",
+        player.pos
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_107_vault_lands_the_player_on_the_far_side() {
+    let Some(root) = root() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE1/ROOM1070.RDT");
+    let id = RoomId::parse("1070").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+    let ladder_slot = (0..game.objects.records.len())
+        .find(|&slot| game.objects.record(slot).unwrap().flag & objects::OBJECT_FLAG_CLIMBABLE != 0)
+        .expect("ROOM107 declares a climbable ladder");
+    let ladder = *game.objects.record(ladder_slot).unwrap();
+
+    // The scan compares `(facing + 0x800)` with the object's yaw, so approach
+    // from the side the record faces and stop inside the reach box.
+    let angle = (ladder.rotation[1].wrapping_sub(0x800) as u16) & 0x0FFF;
+    let radians = f64::from(angle) * std::f64::consts::TAU / 4096.0;
+    let reach = 300 + i32::from(ladder.half_extents[0]);
+    let mut player = arklay::player::spawn(id, &room);
+    player.angle = angle;
+    player.pos = [
+        ladder.pos[0] - (radians.cos() * f64::from(reach)) as i32,
+        0,
+        ladder.pos[2] + (radians.sin() * f64::from(reach)) as i32,
+    ];
+    // Press action: the climb scan latches the vault.
+    object_tick(
+        &mut player,
+        &room,
+        &mut game,
+        arklay::player::Input {
+            action_pressed: true,
+            action_held: true,
+            ..arklay::player::Input::default()
+        },
+    );
+    assert!(
+        player.vault_bit,
+        "the climb scan rejected slot {ladder_slot} at {:?} angle {angle:#x}",
+        player.pos
+    );
+    assert_eq!(player.locked, arklay::player::LockedAction::Vault);
+    let start = player.pos;
+
+    for _ in 0..2000 {
+        object_tick(
+            &mut player,
+            &room,
+            &mut game,
+            arklay::player::Input::default(),
+        );
+        if player.locked == arklay::player::LockedAction::None {
+            break;
+        }
+    }
+    assert_eq!(
+        player.locked,
+        arklay::player::LockedAction::None,
+        "vault stuck"
+    );
+    let dx = player.pos[0] - start[0];
+    let dz = player.pos[2] - start[2];
+    println!("vault {:?} -> {:?}", start, player.pos);
+    assert!(
+        dx.abs().max(dz.abs()) >= 0x73A - 1,
+        "the vault did not cross the object: {start:?} -> {:?}",
+        player.pos
+    );
+    assert_eq!(player.pos[1], -0x708, "the vault's vertical warp");
+}
+
+/// Build the player's posed mesh from the shipped character model, or `None`
+/// when the install does not carry it.
+fn player_mesh(
+    root: &Path,
+    id: RoomId,
+    room: &arklay::state::RoomState,
+) -> Option<(arklay::model::Emd, Vec<arklay::anim::Mat4x3>)> {
+    let path = ["JPN/ENEMY/Char10.emd", "JPN/ENEMY/CHAR10.EMD"]
+        .iter()
+        .map(|relative| root.join(relative))
+        .find(|path| path.is_file())?;
+    let emd = arklay::emd::parse(&std::fs::read(path).ok()?).ok()?;
+    let player = arklay::player::spawn(id, room);
+    let keyframe = emd.keyframes.get(player.anim.keyframe_index(&emd.clips))?;
+    let entity = arklay::anim::entity_matrix(player.pos, player.angle);
+    let joints = arklay::anim::joint_matrices(&emd.skeleton, keyframe, &entity);
+    Some((emd, joints))
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_112_mirror_shows_the_player_and_culls_outside_the_extent() {
+    use arklay::render::{Camera, Lighting, MirrorPass};
+
+    let Some((root, _)) = common::asset_env() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE1/ROOM1120.RDT");
+    let id = RoomId::parse("1120").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut state = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut state);
+        vm.run_init(&mut host);
+    }
+    assert!(state.mirror_enabled(), "ROOM112 enables the mirror");
+    assert!(!state.mirror_axis_x(), "the ROOM112 mirror is plane Z");
+    assert_eq!(state.mirror.plane, 5700);
+    assert_eq!(state.mirror.extent_min, 4100);
+    assert_eq!(state.mirror.extent_max, 10000);
+    let _ = Lighting::from_room(&room);
+
+    let Some((emd, _)) = player_mesh(&root, id, &room) else {
+        return;
+    };
+    let keyframe = emd
+        .keyframes
+        .get(
+            arklay::player::spawn(id, &room)
+                .anim
+                .keyframe_index(&emd.clips),
+        )
+        .unwrap();
+    let cut = room.cuts.get(room.current_cut).unwrap();
+    let camera = Camera::from_cut(cut);
+    let mirror = MirrorPass {
+        axis_x: state.mirror_axis_x(),
+        plane: i32::from(state.mirror.plane),
+        extent_min: state.mirror.extent_min,
+        extent_max: state.mirror.extent_max,
+        camera_pos: cut.pos,
+        camera: camera.mirrored(state.mirror_axis_x(), i32::from(state.mirror.plane)),
+    };
+
+    // A joint close to the plane inside the span reflects and the mirrored
+    // camera projects it; one whose crossing leaves the span is culled.
+    let inside = [7000, 0, 5690];
+    let inside_joints = arklay::anim::joint_matrices(
+        &emd.skeleton,
+        keyframe,
+        &arklay::anim::entity_matrix(inside, 0),
+    );
+    assert!(
+        mirror.joint_visible(inside_joints[0].t),
+        "inside joint not visible"
+    );
+    assert!(
+        mirror.camera.project(inside_joints[0].t).is_some(),
+        "mirrored camera drops the joint"
+    );
+
+    let outside = [1000, 0, 3000];
+    let outside_joints = arklay::anim::joint_matrices(
+        &emd.skeleton,
+        keyframe,
+        &arklay::anim::entity_matrix(outside, 0),
+    );
+    assert!(
+        !mirror.joint_visible(outside_joints[0].t),
+        "outside joint reflected"
+    );
+    assert!(
+        arklay::render::mirror_point_visible(
+            false,
+            5700,
+            state.mirror.extent_min,
+            state.mirror.extent_max,
+            cut.pos,
+            outside_joints[0].t,
+        )
+        .is_none()
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_30b_objs_hide_darkens_the_player() {
+    use std::rc::Rc;
+
+    let Some(root) = root() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE3/ROOM30B0.RDT");
+    let id = RoomId::parse("30B0").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    let mut command_vm = scd::vm::CommandVm::new(&scripts);
+    let mut event_vm = scd::vm::EventVm::from_scripts(Rc::new(scripts));
+    {
+        let mut host = game::ScdGameHost::new(&mut game);
+        command_vm.run_init(&mut host);
+    }
+    // Event script 4 is the cutscene that calls `objs_hide`; start it on slot
+    // 0 directly rather than waiting for the in-game trigger (the script kills
+    // slots 1, 2, 5 and 6, so it must not run on one of those).
+    event_vm.start(0, 4);
+
+    for _ in 0..3000 {
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_main(&mut host);
+        }
+        for (slot, event) in game.pending_events.drain(..) {
+            event_vm.start(usize::from(slot), event);
+        }
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            event_vm.step(&mut host);
+        }
+        game.advance_frame();
+        if game.player_tint != [255; 3] {
+            break;
+        }
+    }
+    assert_eq!(
+        game.player_tint,
+        [0x30, 0, 0],
+        "ROOM30B's objs_hide did not run"
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_1000_item_box_lid_swings_and_settles() {
+    let Some(root) = root() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE1/ROOM1000.RDT");
+    let id = RoomId::parse("1000").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut state = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut state);
+        vm.run_init(&mut host);
+    }
+    let slot = (0..state.room_actions.len())
+        .find(|&slot| {
+            state.room_actions[slot]
+                .is_some_and(|action| action.kind == game::RoomActionKind::ItemBox)
+        })
+        .expect("ROOM100 declares an item-box action");
+
+    assert!(state.open_itembox(slot as u8));
+    let cover = state.itembox.cover.unwrap();
+    let mut minimum = 0;
+    let mut opened = false;
+    for _ in 0..80 {
+        state.check_itembox_state();
+        minimum = minimum.min(state.objects.records[cover].rotation[2]);
+        if state.take_itembox_open() {
+            opened = true;
+            break;
+        }
+    }
+    println!("item-box lid {cover} reached {minimum}");
+    assert!(minimum < -199, "the lid never passed -199");
+    assert!(opened, "the box menu never became ready");
+
+    state.reset_itembox();
+    state.check_itembox_state();
+    assert_eq!(state.objects.records[cover].rotation[2], 0);
 }
 
 #[test]

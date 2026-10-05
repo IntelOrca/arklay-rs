@@ -104,6 +104,17 @@ pub struct Emd {
     pub texture: Texture8,
 }
 
+/// The RDT-embedded player animation pair (pointer slots 9 and 10): an EMR
+/// armature/keyframe header plus an EDD clip table. The clips are the
+/// room-specific push, vault and ladder motions the original drives with
+/// `Joint_move` through `jointMoveData2`/`jointMoveData3`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoomAnim {
+    pub skeleton: Skeleton,
+    pub keyframes: Vec<Keyframe>,
+    pub clips: Vec<Clip>,
+}
+
 /// A no-weapon EMW animation + mesh file. The EMW carries its own armature and
 /// keyframes; its locomotion clips drive the same 15-joint skeleton as the EMD.
 #[derive(Debug, Clone, PartialEq, Eq)]

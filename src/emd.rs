@@ -94,6 +94,42 @@ pub fn parse_emw(data: &[u8]) -> Result<Emw> {
     })
 }
 
+/// Parse the RDT-embedded room player-animation pair.
+///
+/// `header` is RDT pointer slot 9 (the EMR armature/keyframe header) and `base`
+/// slot 10 (the EDD clip table); `bound` is the next section's pointer, which
+/// limits the clip table exactly the way the EMD directory does. The parser is
+/// the same skeleton/keyframe/clip code the EMD/EMW paths use, so a room whose
+/// clips are empty (most rooms) parses to an empty clip list and a caller can
+/// fall back to the no-op stance.
+pub fn parse_room_anim(
+    data: &[u8],
+    header: u32,
+    base: u32,
+    bound: u32,
+) -> Result<crate::model::RoomAnim> {
+    let header = header as usize;
+    let base = base as usize;
+    let bound = bound as usize;
+    if header == 0 || base == 0 {
+        bail!("room animation pair has a null pointer");
+    }
+    if header > base || base > bound || bound > data.len() {
+        bail!(
+            "room animation offsets are out of order: header 0x{header:X}, base 0x{base:X}, bound 0x{bound:X}"
+        );
+    }
+
+    let skeleton = parse_skeleton(data, header, base)?;
+    let keyframes = parse_keyframes(data, header, base)?;
+    let clips = parse_clips(data, base, bound)?;
+    Ok(crate::model::RoomAnim {
+        skeleton,
+        keyframes,
+        clips,
+    })
+}
+
 fn check_order(directory: &[usize], directory_start: usize, kind: &str) -> Result<()> {
     let mut previous = 0;
     for offset in directory.iter().chain(std::iter::once(&directory_start)) {
@@ -508,6 +544,43 @@ mod tests {
         );
         assert_eq!(emw.mesh.objects.len(), 1);
         assert_eq!(emw.mesh.objects[0].prims.len(), 1);
+    }
+
+    #[test]
+    fn parses_a_room_animation_pair() {
+        // A non-null header offset, then the EDD table, bounded by the file end.
+        let mut data = vec![0u8; 0x10];
+        let header = data.len();
+        data.extend_from_slice(&minimal_emr());
+        let base = data.len();
+        data.extend_from_slice(&minimal_edd());
+
+        let anim = parse_room_anim(&data, header as u32, base as u32, data.len() as u32).unwrap();
+        assert_eq!(anim.skeleton.relative, [[1, 2, 3], [4, 5, 6]]);
+        assert_eq!(anim.keyframes.len(), 1);
+        assert_eq!(anim.clips.len(), 1);
+        assert_eq!(
+            anim.clips[0].frames,
+            [ClipFrame {
+                keyframe: 0,
+                timing: 7
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_a_room_animation_pair_out_of_bounds() {
+        let mut data = vec![0u8; 0x10];
+        let header = data.len();
+        data.extend_from_slice(&minimal_emr());
+        let base = data.len();
+        data.extend_from_slice(&minimal_edd());
+        // The bound runs past the file.
+        assert!(parse_room_anim(&data, header as u32, base as u32, 0x1000).is_err());
+        // A null half.
+        assert!(parse_room_anim(&data, 0, base as u32, data.len() as u32).is_err());
+        // A base before the header is refused.
+        assert!(parse_room_anim(&data, base as u32, header as u32, data.len() as u32).is_err());
     }
 
     #[test]

@@ -520,6 +520,7 @@ impl Framebuffer {
                 Some(lighting),
                 true,
                 0,
+                [255; 3],
                 &mut triangles,
             );
         }
@@ -558,7 +559,16 @@ impl Framebuffer {
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
         for (object, joint) in objects {
-            collect_triangles(object, joint, camera, None, false, 0, &mut triangles);
+            collect_triangles(
+                object,
+                joint,
+                camera,
+                None,
+                false,
+                0,
+                [255; 3],
+                &mut triangles,
+            );
         }
         self.rasterize_triangles(texture, triangles);
     }
@@ -1019,6 +1029,20 @@ pub struct EntityMesh<'a> {
     pub texture: &'a Texture8,
     /// One 4.12 joint matrix per mesh object, in object order.
     pub joints: &'a [anim::Mat4x3],
+    /// Per-channel RGB multiplier applied to every shaded triangle (default
+    /// white); the shared plumbing for `model_op` and `objs_hide`.
+    pub tint: [u8; 3],
+    /// Joint draw gate: bit `i` set means joint `i` is hidden and never draws
+    /// (not even in the mirror copy), the port's stand-in for the joint flag
+    /// byte's bit 0.
+    pub hidden_joints: u32,
+}
+
+impl EntityMesh<'_> {
+    /// Whether joint `index` draws.
+    fn joint_visible(&self, index: usize) -> bool {
+        index < 32 && self.hidden_joints & (1 << index) == 0
+    }
 }
 
 /// A ground shadow ready to be interleaved with the masks and the model.
@@ -1113,6 +1137,7 @@ pub fn draw_gameplay_scene(
         lighting,
         mask_layer,
         None,
+        None,
     );
 }
 
@@ -1121,6 +1146,11 @@ pub fn draw_gameplay_scene(
 /// The effect quads are submitted after the masks (the original's `update_2d_effects`
 /// runs after the entity pass), so at an exact key tie an effect paints over a
 /// mask or triangle submitted earlier in the frame.
+///
+/// `mirror` appends the entity meshes' mirrored triangles, drawn through the
+/// reflected camera and visibility-tested joint by joint, after the primary
+/// pass (the original's second submission). Hidden joints never draw and never
+/// reach the mirror copy.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_gameplay_scene_with_effects(
     framebuffer: &mut Framebuffer,
@@ -1131,6 +1161,7 @@ pub fn draw_gameplay_scene_with_effects(
     lighting: &Lighting,
     mask_layer: Option<&MaskLayer<'_>>,
     effect_layer: Option<&EffectLayer<'_>>,
+    mirror: Option<&MirrorPass>,
 ) {
     framebuffer.clear();
     if let Some(background) = background {
@@ -1152,7 +1183,10 @@ pub fn draw_gameplay_scene_with_effects(
 
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
-        for (object, joint) in mesh.mesh.objects.iter().zip(mesh.joints) {
+        for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
+            if !mesh.joint_visible(index) {
+                continue;
+            }
             collect_triangles(
                 object,
                 joint,
@@ -1160,8 +1194,35 @@ pub fn draw_gameplay_scene_with_effects(
                 Some(lighting),
                 true,
                 texture,
+                mesh.tint,
                 &mut triangles,
             );
+        }
+    }
+    // The mirror copy is drawn through the reflected camera and submitted
+    // after the primary pass; the stable sort keeps it after the live entity
+    // at equal depth.
+    if let Some(mirror) = mirror {
+        for (texture, mesh) in meshes.iter().enumerate() {
+            for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
+                if !mesh.joint_visible(index) || !mirror.joint_visible(joint.t) {
+                    continue;
+                }
+                // The mirrored X scale reverses screen-space winding, so the
+                // usual back-face test would drop every front face; the
+                // reflection is submitted unculled (the original culls with
+                // the flipped scale baked into its projection).
+                collect_triangles(
+                    object,
+                    joint,
+                    &mirror.camera,
+                    Some(lighting),
+                    false,
+                    texture,
+                    mesh.tint,
+                    &mut triangles,
+                );
+            }
         }
     }
     // The integer scene key can tie triangles that are less than a unit apart;
@@ -1316,11 +1377,18 @@ fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camer
 
 /// A cut camera: a 4.12 view rotation, a world-unit translation and the cut's
 /// focal length in pixels.
+///
+/// `from` and `look_at` are the source points the matrix was built from; the
+/// mirror pass needs them to rebuild the view from reflected points rather
+/// than composing a reflection into the matrix (the game rebuilds the camera
+/// from a reflected record and only then flips its X scale).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Camera {
     pub view: [[i32; 3]; 3],
     pub trans: [i32; 3],
     pub fov: i32,
+    pub from: [i32; 3],
+    pub look_at: [i32; 3],
 }
 
 impl Camera {
@@ -1336,6 +1404,7 @@ impl Camera {
         // applies the cut's roll and the subpixel screen-shake offset; this
         // f64, round-to-nearest camera ignores roll and shake, so projected
         // pixels can differ by a unit and shake is absent.
+        let (source_from, source_to) = (from, to);
         let from = [f64::from(from[0]), f64::from(from[1]), f64::from(from[2])];
         let to = [f64::from(to[0]), f64::from(to[1]), f64::from(to[2])];
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
@@ -1376,13 +1445,40 @@ impl Camera {
                 / 4096.0)
                 .round() as i32
         });
-        Self { view, trans, fov }
+        Self {
+            view,
+            trans,
+            fov,
+            from: source_from,
+            look_at: source_to,
+        }
     }
 
     /// Build the view rotation and translation from the cut's position and
     /// look-at point. The focal length is `cut.fov`.
     pub fn from_cut(cut: &Cut) -> Self {
         Self::from_points(cut.pos, cut.look_at, cut.fov)
+    }
+
+    /// The camera reflected about a room mirror plane, with the handedness
+    /// flip the original applies after rebuilding the view.
+    ///
+    /// `axis_x` selects the plane `X = plane` (the X pair is folded) rather
+    /// than `Z = plane` (the Z pair); `plane` is `g_mirrorPlaneCoord`. The view
+    /// matrix's X scale is negated to undo the reflection's handedness.
+    pub fn mirrored(&self, axis_x: bool, plane: i32) -> Camera {
+        let fold = plane.wrapping_mul(2);
+        let mirror = |point: [i32; 3]| {
+            if axis_x {
+                [fold.wrapping_sub(point[0]), point[1], point[2]]
+            } else {
+                [point[0], point[1], fold.wrapping_sub(point[2])]
+            }
+        };
+        let mut camera = Camera::from_points(mirror(self.from), mirror(self.look_at), self.fov);
+        camera.view[0] = camera.view[0].map(|entry| -entry);
+        camera.trans[0] = -camera.trans[0];
+        camera
     }
 
     /// Project a world-space point to screen pixels.
@@ -1413,6 +1509,82 @@ impl Camera {
                 + i128::from(r[2]) * i128::from(world[2]);
             clamp_i32((sum >> FIXED_BITS) + i128::from(self.trans[row]))
         })
+    }
+}
+
+/// The mirror visibility probe.
+///
+/// `axis_x` selects the plane `X = plane` (else `Z = plane`), `plane` is the
+/// plane coordinate and the extents bound the crossing coordinate along the
+/// other axis. Returns the crossing coordinate when the camera and the point
+/// lie on the same side of the plane and the camera-to-point segment crosses
+/// the plane inside the mirror's extent, `None` otherwise.
+pub fn mirror_point_visible(
+    axis_x: bool,
+    plane: i32,
+    extent_min: u16,
+    extent_max: u16,
+    camera: [i32; 3],
+    point: [i32; 3],
+) -> Option<i32> {
+    let plane_coord = |p: [i32; 3]| {
+        if axis_x { (p[0], p[2]) } else { (p[2], p[0]) }
+    };
+    let (point_plane, point_cross) = plane_coord(point);
+    let (camera_plane, camera_cross) = plane_coord(camera);
+
+    // The camera and the point must lie on the same side of the plane.
+    if ((camera_plane - plane) ^ (point_plane - plane)) & i32::MIN != 0 {
+        return None;
+    }
+
+    let denominator = point_plane
+        .wrapping_sub(plane.wrapping_mul(2))
+        .wrapping_add(camera_plane);
+    if denominator == 0 {
+        return None;
+    }
+    let product = (point_cross - camera_cross).wrapping_mul(camera_plane.wrapping_sub(plane));
+    let crossing = camera_cross.wrapping_add(product / denominator);
+    let span = u32::from(extent_max).wrapping_sub(u32::from(extent_min));
+    if (crossing as u32).wrapping_sub(u32::from(extent_min)) < span {
+        Some(crossing)
+    } else {
+        None
+    }
+}
+
+/// One frame's mirror pass: the reflected camera plus the mirror geometry
+/// needed to test each entity joint for visibility.
+#[derive(Debug, Clone, Copy)]
+pub struct MirrorPass {
+    /// The plane is `X = plane` (else `Z = plane`).
+    pub axis_x: bool,
+    /// The plane coordinate.
+    pub plane: i32,
+    /// Extent minimum along the cross axis.
+    pub extent_min: u16,
+    /// Extent maximum along the cross axis.
+    pub extent_max: u16,
+    /// The camera's world position (the original tests against the camera
+    /// record's eye).
+    pub camera_pos: [i32; 3],
+    /// The reflected camera the reflection is drawn through.
+    pub camera: Camera,
+}
+
+impl MirrorPass {
+    /// Whether a joint at `pos` is visible in this mirror.
+    pub fn joint_visible(&self, pos: [i32; 3]) -> bool {
+        mirror_point_visible(
+            self.axis_x,
+            self.plane,
+            self.extent_min,
+            self.extent_max,
+            self.camera_pos,
+            pos,
+        )
+        .is_some()
     }
 }
 
@@ -1575,7 +1747,9 @@ fn triangle_depth_key(depth: f64) -> u32 {
 /// palette row and paged UVs); `None` is the full-bright door path (white
 /// shade, palette row 0, direct UVs). `cull` drops back-facing triangles; the
 /// door path disables it because the original renders with culling off.
-/// `texture` is the page index every emitted triangle samples.
+/// `texture` is the page index every emitted triangle samples. `tint` is the
+/// per-channel RGB multiplier applied when the triangle is shaded.
+#[allow(clippy::too_many_arguments)]
 fn collect_triangles(
     object: &TmdObject,
     joint: &anim::Mat4x3,
@@ -1583,6 +1757,7 @@ fn collect_triangles(
     lighting: Option<&Lighting>,
     cull: bool,
     texture: usize,
+    tint: [u8; 3],
     triangles: &mut Vec<Triangle>,
 ) {
     let vertices: Vec<[i32; 3]> = object
@@ -1676,7 +1851,14 @@ fn collect_triangles(
                 u: f64::from(uv[0]) + page_x,
                 v: f64::from(uv[1]) + page_y,
                 shade: match lighting {
-                    Some(lighting) => shade_vertex(&normal, *vertex, lighting),
+                    Some(lighting) => {
+                        let shade = shade_vertex(&normal, *vertex, lighting);
+                        [
+                            shade[0] * f64::from(tint[0]) / CHANNEL_MAX,
+                            shade[1] * f64::from(tint[1]) / CHANNEL_MAX,
+                            shade[2] * f64::from(tint[2]) / CHANNEL_MAX,
+                        ]
+                    }
                     None => [CHANNEL_MAX; 3],
                 },
             }
@@ -1991,6 +2173,8 @@ mod tests {
             view: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
             trans: [0, 0, 0],
             fov: 200,
+            from: [0, 0, 0],
+            look_at: [100, 0, 0],
         }
     }
 
@@ -2362,11 +2546,15 @@ mod tests {
                 mesh: &mesh0,
                 texture: &red,
                 joints: &joints,
+                tint: [255; 3],
+                hidden_joints: 0,
             },
             EntityMesh {
                 mesh: &mesh1,
                 texture: &green,
                 joints: &joints,
+                tint: [255; 3],
+                hidden_joints: 0,
             },
         ];
         let lighting = Lighting {
@@ -2527,6 +2715,8 @@ mod tests {
             mesh,
             texture: &texture,
             joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
         }];
         let lighting = Lighting {
             ambient: [4095; 3],
@@ -3171,6 +3361,7 @@ mod tests {
             &lighting,
             None,
             Some(&layer),
+            None,
         );
     }
 
@@ -3248,6 +3439,8 @@ mod tests {
             mesh: &mesh,
             texture: &texture,
             joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
         }];
         let camera = straight_camera();
         let lighting = Lighting {
@@ -3270,7 +3463,177 @@ mod tests {
             &lighting,
             None,
             Some(&layer),
+            None,
         );
         assert_eq!(framebuffer_pixel(&framebuffer, 160, 130), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn mirror_point_visible_checks_the_sides_and_the_extent() {
+        // Plane Z = 100, camera at z = 200. A point on the camera's side
+        // (z > 100) reflects; one behind the plane does not.
+        let camera = [0, 0, 200];
+        // crossing x = x_point * (camera_plane - plane) / ((point-camera planes))
+        // = 15000 * 100 / 300 = 5000.
+        assert_eq!(
+            mirror_point_visible(false, 100, 4000, 6300, camera, [15000, 0, 300]),
+            Some(5000)
+        );
+        assert!(mirror_point_visible(false, 100, 4000, 6300, camera, [15000, 0, 50]).is_none());
+        // Crossings outside the span are culled, and the bounds are exclusive.
+        assert!(mirror_point_visible(false, 100, 4000, 6300, camera, [3000, 0, 300]).is_none());
+        assert!(mirror_point_visible(false, 100, 4000, 6300, camera, [18900, 0, 300]).is_none());
+        assert_eq!(
+            mirror_point_visible(false, 100, 4000, 6300, camera, [12000, 0, 300]),
+            Some(4000)
+        );
+
+        // Plane X = 12500 (axis 1): the plane coordinate is x, the cross
+        // coordinate z. The camera at x = 13000; crossings scale by 500/2000.
+        let camera = [13000, 0, 0];
+        assert_eq!(
+            mirror_point_visible(true, 12500, 4000, 6300, camera, [14000, 0, 24000]),
+            Some(6000)
+        );
+        assert!(mirror_point_visible(true, 12500, 4000, 6300, camera, [12000, 0, 24000]).is_none());
+        assert!(mirror_point_visible(true, 12500, 4000, 6300, camera, [14000, 0, 4000]).is_none());
+    }
+
+    #[test]
+    fn a_mirrored_camera_reflects_the_eye_and_negates_the_x_scale() {
+        let cut = Cut {
+            pos: [0, 0, 1000],
+            look_at: [0, 0, 0],
+            fov: 200,
+            ..Cut::default()
+        };
+        let camera = Camera::from_cut(&cut);
+        let mirrored = camera.mirrored(false, 0);
+        // The eye and the look-at are folded about the plane.
+        assert_eq!(mirrored.from, [0, 0, -1000]);
+        assert_eq!(mirrored.look_at, [0, 0, 0]);
+        // The rebuilt reflection already flips the right and forward axes; the
+        // X-scale negation restores the right row and flips forward back, so
+        // the reflection projects with the live camera's orientation.
+        assert_eq!(mirrored.view[0], camera.view[0]);
+        assert_eq!(mirrored.view[1], camera.view[1]);
+        assert_eq!(mirrored.view[2], camera.view[2].map(|entry| -entry));
+
+        // Axis X folds the X pair.
+        let mirrored = camera.mirrored(true, 500);
+        assert_eq!(mirrored.from, [1000, 0, 1000]);
+        assert_eq!(mirrored.look_at, [1000, 0, 0]);
+    }
+
+    #[test]
+    fn hidden_joints_never_draw_and_never_mirror() {
+        let texture = solid_texture([10, 20, 30, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let camera = straight_camera();
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+
+        // The triangle's only joint is hidden: the scene list is empty.
+        let hidden = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0b1,
+        }];
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            &hidden,
+            None,
+            &camera,
+            &lighting,
+            None,
+        );
+        assert!(
+            framebuffer
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[..3] == [0, 0, 0]),
+            "a hidden joint drew"
+        );
+
+        // The same mesh with the gate clear paints.
+        let visible = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
+        }];
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            &visible,
+            None,
+            &camera,
+            &lighting,
+            None,
+        );
+        assert_ne!(framebuffer_pixel(&framebuffer, 200, 100), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn the_mirror_pass_culls_a_joint_behind_the_camera_and_outside_the_extent() {
+        let camera = [0, 0, 200];
+        let pass = MirrorPass {
+            axis_x: false,
+            plane: 100,
+            extent_min: 0,
+            extent_max: 7000,
+            camera_pos: camera,
+            camera: straight_camera().mirrored(false, 100),
+        };
+        // Same side of the plane and inside the extent.
+        assert!(pass.joint_visible([5000, 0, 150]));
+        // Behind the plane: no reflection.
+        assert!(!pass.joint_visible([5000, 0, 50]));
+        // Outside the mirror's span (the crossing lands past extent_max).
+        assert!(!pass.joint_visible([12000, 0, 150]));
+    }
+
+    #[test]
+    fn the_mesh_tint_multiplies_the_shaded_triangle() {
+        // The standard white-shaded triangle with a half tint paints grey.
+        let texture = solid_texture([255, 255, 255, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let camera = straight_camera();
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+        let tinted = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [128, 128, 128],
+            hidden_joints: 0,
+        }];
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            &tinted,
+            None,
+            &camera,
+            &lighting,
+            None,
+        );
+        // (200, 40) lies inside mesh_at's screen triangle.
+        let pixel = framebuffer_pixel(&framebuffer, 200, 40);
+        assert!(pixel[0] > 100 && pixel[0] < 160, "{pixel:?}");
     }
 }
