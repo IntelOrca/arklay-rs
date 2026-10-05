@@ -13,10 +13,18 @@
 //! - **Monsters are invisible.** Entity ids `0x00..=0x1F` (and the DC-only ids)
 //!   allocate no entity at all, so rooms that spawn zombies alongside a
 //!   character look emptier than the original until the enemy milestone.
-//! - **State-8 handler 08 is inert.** The weapon-fire behaviour has no weapon
-//!   TMDs, muzzle flash or effects, so a scene that waits on its completion
-//!   flag can stall (never crash); the handler is counted in
-//!   [`crate::game::GameState::npc_placeholders`].
+//! - **Weapon-joint spawns use the entity matrix.** Handler 08's muzzle and
+//!   secondary flash live in the weapon hand's joint space in the original
+//!   (`joints + 0x70C`); the port has no game-layer joint matrices, so it
+//!   attaches them to the character's entity matrix with the original
+//!   per-frame offsets. The death blood sheets use the same approximation, so
+//!   the paint pivots around the body instead of the exact hand/wound.
+//! - **Flamethrower cues are timing-only.** The two looping enemy-bank 3D cues
+//!   (ids `0x1E`/`0x1F`) have no packed WAV, so handler 08 reproduces their
+//!   countdown loop but queues no audio.
+//! - **No combat.** Behaviours 10, 37, 43 and 45 stay counted placeholders and
+//!   no shipped script or effect animation reaches them; the corpus audit locks
+//!   that. There is no damage, health or hit reaction.
 //! - **NPC shadows are not drawn.** The per-character tint and shadow geometry
 //!   are tabulated by [`data::character_init`], but the renderer still draws
 //!   only the player's shadow; the NPC fade-sprite pass is a slice-6 stretch
@@ -168,12 +176,16 @@ pub fn update_entity(
             );
             false
         }
-        1 => idle::update(
-            &mut game.entities[slot],
-            &mut game.entity_anims[slot],
-            clips,
-            room,
-        ),
+        1 => {
+            let (advance, spawns) = idle::update(
+                &mut game.entities[slot],
+                &mut game.entity_anims[slot],
+                clips,
+                room,
+            );
+            idle::apply_spawns(game, slot, spawns);
+            advance
+        }
         8 => {
             scd::update(game, slot, room, clips);
             false

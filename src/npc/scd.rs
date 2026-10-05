@@ -11,22 +11,113 @@
 //!   to it, trim the speed on the footfall frames and finish in range;
 //! - 04/05: walk backwards to the target at the fast/slow pace;
 //! - 06: turn in place;
-//! - 08: the weapon-fire behaviour stays a recorded placeholder this
-//!   milestone (no weapon TMDs, effects or muzzle flashes). An out-of-range
-//!   `action_behavior` (>= 11) is a NULL table slot in the original and is
-//!   recorded in the same placeholder map instead of dispatching.
+//! - 08: the weapon-fire behaviour: play the scripted clip, spawn the muzzle
+//!   flash, the ejected shell and the secondary flash on their trigger frames
+//!   (the flamethrower instead sprays a type-0x0C billboard every sixth frame
+//!   with a looping sound-cue countdown and a per-frame yaw sweep), then raise
+//!   the completion flag the script waits on. An out-of-range `action_behavior`
+//!   (>= 11) is a NULL table slot in the original and is recorded in the
+//!   placeholder map instead of dispatching.
 //!
 //! Completion is signalled the way the scripts wait for it: the handler raises
 //! `scd_anim_param` in the system flag bank, and the event script's `bit_test`
 //! proceeds. A handler that finishes clears `action_behavior`/`action_state`
 //! unless the `act_anim_seq` collision flag bit 7 asks it to keep running.
 
+use std::rc::Rc;
+
+use crate::effects::{self, Attach};
 use crate::game::{BANK_SYSTEM, Entity, EntitySound, FlagBank, GameState};
 use crate::model::Clip;
 use crate::state::RoomState;
 
 use super::anim::EntityAnim;
 use super::walk;
+
+/// One weapon-FX spawn record: the animation frame that triggers the spawn,
+/// the billboard type and depth group, and the local offset in the character's
+/// weapon-joint (or own-matrix) space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FireFx {
+    /// `animation_frame_id` that fires this record (`0x63` = never).
+    frame: u8,
+    /// Billboard effect type.
+    effect_type: u8,
+    /// Depth group.
+    depth: u8,
+    /// Local offset X.
+    x: i16,
+    /// Local offset Y.
+    y: i16,
+    /// Local offset Z.
+    z: i16,
+}
+
+/// The frame a disabled fire record uses: no shipped animation reaches it.
+const FIRE_FX_DISABLED: u8 = 0x63;
+
+/// Muzzle-flash table (record index = `behavior_flags - 2`), spawned in the
+/// weapon hand's space.
+#[rustfmt::skip]
+const FIRE_FX_MUZZLE: [FireFx; 14] = [
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x00, x:  110, y:  540, z:   0 },
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x01, x:  640, y: 1110, z:   0 },
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x02, x:  160, y:  610, z:   0 },
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x0A, x:  160, y:  610, z:   0 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:    0, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x07, x:  400, y:  660, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x07, x:  400, y:  660, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x07, x:  400, y:  660, z:   0 },
+    FireFx { frame: 0x01, effect_type: 0x0B, depth: 0x09, x: -190, y: 1020, z:  90 },
+    FireFx { frame: 0x01, effect_type: 0x0B, depth: 0x09, x: -190, y: 1020, z: -60 },
+    FireFx { frame: 0x01, effect_type: 0x0B, depth: 0x09, x:  -60, y: 1040, z:  90 },
+    FireFx { frame: 0x01, effect_type: 0x0B, depth: 0x09, x:  -60, y: 1040, z: -60 },
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x00, x:  110, y:  540, z:   0 },
+    FireFx { frame: 0x01, effect_type: 0x11, depth: 0x00, x:  600, y: 1370, z:   0 },
+];
+
+/// Ejected-shell/smoke table, spawned in the character's own matrix.
+#[rustfmt::skip]
+const FIRE_FX_SHELL: [FireFx; 14] = [
+    FireFx { frame: 0x03, effect_type: 0x05, depth: 0x00, x:  370, y: -2870, z: -220 },
+    FireFx { frame: 0x19, effect_type: 0x05, depth: 0x09, x:  360, y: -2050, z: -440 },
+    FireFx { frame: FIRE_FX_DISABLED, effect_type: 0x00, depth: 0x00, x: 0, y: 0, z: 0 },
+    FireFx { frame: FIRE_FX_DISABLED, effect_type: 0x00, depth: 0x00, x: 0, y: 0, z: 0 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:     0, z:    0 },
+    FireFx { frame: FIRE_FX_DISABLED, effect_type: 0x00, depth: 0x00, x: 0, y: 0, z: 0 },
+    FireFx { frame: FIRE_FX_DISABLED, effect_type: 0x00, depth: 0x00, x: 0, y: 0, z: 0 },
+    FireFx { frame: FIRE_FX_DISABLED, effect_type: 0x00, depth: 0x00, x: 0, y: 0, z: 0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x: 1400, y: -2800, z: -300 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:     0, z:    0 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:     0, z:    0 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:     0, z:    0 },
+    FireFx { frame: 0x03, effect_type: 0x05, depth: 0x00, x:  250, y: -1900, z: -250 },
+    FireFx { frame: 0x03, effect_type: 0x05, depth: 0x00, x:  250, y: -1900, z: -250 },
+];
+
+/// Secondary-flash table, spawned in the weapon hand's space.
+#[rustfmt::skip]
+const FIRE_FX_FLASH2: [FireFx; 14] = [
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  110, y:  500, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  640, y: 1060, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  160, y:  610, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  160, y:  610, z:   0 },
+    FireFx { frame: 0x00, effect_type: 0x00, depth: 0x00, x:    0, y:    0, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  640, y: 1060, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  640, y: 1060, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  640, y: 1060, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x02, x:  430, y: -830, z:  90 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x02, x:  430, y: -830, z: -60 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x02, x:  570, y: -810, z:  90 },
+    FireFx { frame: 0x02, effect_type: 0x08, depth: 0x02, x:  570, y: -810, z: -60 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  110, y:  500, z:   0 },
+    FireFx { frame: 0x02, effect_type: 0x09, depth: 0x0B, x:  640, y: 1500, z:   0 },
+];
+
+/// The flamethrower's spray offset in the weapon hand's space.
+const FLAME_OFFSET: [i32; 3] = [0x21C, 0x4EC, 0];
+/// The flamethrower's sound-cue interval.
+const FLAME_CUE_TICKS: u16 = 0x0F;
 
 /// Dispatch one state-8 tick for entity `slot`. The original runs the
 /// behaviour handler and then runs it a second time when `scd_entity_flags`
@@ -55,6 +146,12 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
 /// Run one behaviour handler with the entity, its clock, the system flag bank
 /// and the entity sound queue split out of the game state.
 fn run(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip], behavior: u8) {
+    // The fire handler needs the whole game state (the effect pool, the room
+    // and weapon sprite metadata), so it runs before the field split.
+    if behavior == 8 {
+        handler_08(game, slot, room, clips);
+        return;
+    }
     let GameState {
         entities,
         entity_anims,
@@ -75,18 +172,12 @@ fn run(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip], beha
         5 => handler_05(entity, clock, clips, room, system, entity_sounds),
         6 => handler_06(entity, clock, clips, system),
         7 => handler_07(entity, clock, clips, system),
-        8 => {
-            // TODO(parity): (gameplay) the fire behaviour is inert: the
-            // original plays the scripted animation, spawns the muzzle/shell
-            // billboards on their trigger frames, tags them with the weapon id
-            // and raises the completion flag (with the flamethrower states 4/5
-            // doing a looping spray and yaw sweep). A scene that waits on the
-            // flag can stall forever; only the placeholder count is recorded.
-            *npc_placeholders.entry(8).or_insert(0) += 1;
-        }
         9 => handler_09(entity, clock, clips, system),
         10 => handler_10(entity, clock, clips, system),
-        _ => {}
+        _ => {
+            // The dispatch above handles 8 and `update` refuses >= 11.
+            *npc_placeholders.entry(behavior).or_insert(0) += 1;
+        }
     }
 }
 
@@ -513,9 +604,203 @@ fn handler_10(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], syste
     entity.action_state = entity.action_state.wrapping_add(u8::from(done));
 }
 
+/// Behaviour 8: the weapon-fire handler.
+///
+/// The weapon selector is the spawn record's `behavior_flags - 2`. States 0/1
+/// play the scripted clip and spawn the muzzle flash, the ejected shell and
+/// the secondary flash from the three per-weapon trigger tables; state 2
+/// raises `scd_anim_param` in the system bank, which is the flag a waiting
+/// `dountil` loop tests; weapon id 3 skips the shot effects and plays
+/// animation 0x17 straight into the flamethrower states 4/5 (a type-0x0C
+/// billboard every sixth frame, a sound-cue countdown and a per-frame yaw
+/// sweep).
+///
+/// # Documented deviations
+///
+/// The gunfire spawns live in the character's weapon-hand joint space in the
+/// original (`joints + 0x70C` for the muzzle and secondary flash, the entity's
+/// own matrix for the shell). This port has no per-joint matrices at the game
+/// layer, so both resolve to the character's entity matrix
+/// ([`Attach::Entity`]) - the same approximation the effect engine's attach
+/// seam documents. The per-frame offsets are the original's, so the flash
+/// pivots around the character's origin instead of the raised hand.
+///
+/// The flamethrower's two looping 3D sound cues (enemy bank ids 0x1E and
+/// 0x1F) are not queued: the pack ships no enemy sound bank, so only the cue
+/// timing is modelled.
+fn handler_08(game: &mut GameState, slot: usize, _room: &RoomState, clips: &[Clip]) {
+    let state = game.entities[slot].action_state;
+    let weapon = game.entities[slot].behavior_flags.wrapping_sub(2);
+    match state {
+        0 => {
+            {
+                let entity = &mut game.entities[slot];
+                entity.animation_frame_id = 0;
+                entity.timing_control = 0;
+                entity.action_state = 1;
+                entity.blend_counter = 3;
+                if weapon == 3 {
+                    entity.action_state = 3;
+                    entity.animation_id = 0x17;
+                }
+            }
+            if weapon != 3 {
+                fire_fx_spawns(game, slot, weapon);
+            }
+            fire_play_anim(game, slot, clips);
+        }
+        1 => {
+            fire_fx_spawns(game, slot, weapon);
+            fire_play_anim(game, slot, clips);
+        }
+        2 => {
+            let entity = game.entities[slot];
+            let system = &mut game.flags[usize::from(BANK_SYSTEM)];
+            raise(system, &entity);
+        }
+        3 => fire_play_anim(game, slot, clips),
+        4 => {
+            {
+                let entity = &mut game.entities[slot];
+                entity.action_state = 5;
+                entity.timing_control = 0;
+                entity.animation_id = 0x14;
+                entity.blend_counter = 3;
+                entity.action_ticks_counter = FLAME_CUE_TICKS;
+            }
+            fire_flame_step(game, slot, clips);
+        }
+        5 => fire_flame_step(game, slot, clips),
+        _ => {}
+    }
+}
+
+/// Spawn the weapon's muzzle flash, ejected shell and secondary flash for the
+/// current animation frame, exactly in the original's order. The returned
+/// shell/flash slots get the weapon id copied into their animation header, the
+/// tag the behaviours read.
+fn fire_fx_spawns(game: &mut GameState, slot: usize, weapon: u8) {
+    if usize::from(weapon) >= FIRE_FX_MUZZLE.len() {
+        // The original indexes the tables with a raw byte and never bounds it;
+        // a weapon id this high means `behavior_flags` was never initialised.
+        return;
+    }
+    let entity = game.entities[slot];
+    let frame = entity.animation_frame_id;
+    let attach = Attach::Entity(slot as u8);
+    let room_effects = Rc::clone(&game.room_effects);
+    let row = FIRE_FX_MUZZLE[usize::from(weapon)];
+
+    if frame == row.frame {
+        let pos = [i32::from(row.x), i32::from(row.y), i32::from(row.z)];
+        effects::create_attached(
+            game,
+            &room_effects,
+            row.effect_type,
+            row.depth,
+            attach,
+            pos,
+            0,
+            0,
+        );
+        if weapon == 2 {
+            effects::create_attached(
+                game,
+                &room_effects,
+                0x11,
+                0x03,
+                attach,
+                [0x96, 0x17C, 0],
+                0,
+                0,
+            );
+        }
+    }
+
+    let row = FIRE_FX_SHELL[usize::from(weapon)];
+    if frame == row.frame {
+        // Odd-id characters lift the shell by 300, scaled by (1 - weapon) -
+        // negative for weapon >= 2, exactly the original's signed arithmetic.
+        let lift = i32::from(entity.id & 1) * (1 - i32::from(weapon)) * 300;
+        let pos = [i32::from(row.x), lift + i32::from(row.y), i32::from(row.z)];
+        let yaw = if weapon == 8 { 0 } else { 0x555 };
+        if let Some(child) = effects::create_attached(
+            game,
+            &room_effects,
+            row.effect_type,
+            row.depth,
+            attach,
+            pos,
+            yaw,
+            0,
+        ) {
+            fire_fx_tag(game, child, 3, weapon);
+        }
+    }
+
+    let row = FIRE_FX_FLASH2[usize::from(weapon)];
+    if frame == row.frame {
+        let pos = [i32::from(row.x), i32::from(row.y), i32::from(row.z)];
+        if let Some(child) = effects::create_attached(
+            game,
+            &room_effects,
+            row.effect_type,
+            row.depth,
+            attach,
+            pos,
+            0,
+            0,
+        ) {
+            fire_fx_tag(game, child, 0, weapon);
+        }
+    }
+}
+
+/// Copy the weapon id into one header byte of a spawned slot (the original's
+/// `fire_fx_tag`). A full pool never yields a slot, so no stray write occurs.
+fn fire_fx_tag(game: &mut GameState, slot: u8, field: usize, weapon: u8) {
+    if let Some(effect) = game.effects.slot_mut(usize::from(slot))
+        && let Some(byte) = effect.header.get_mut(field)
+    {
+        *byte = weapon;
+    }
+}
+
+/// The shared animation step of states 0/1/3: `Joint_move(0, ..., 0x400)` and
+/// add the completion result to the action state.
+fn fire_play_anim(game: &mut GameState, slot: usize, clips: &[Clip]) {
+    let (entities, anims) = (&mut game.entities, &mut game.entity_anims);
+    let done = anims[slot].advance(&mut entities[slot], clips, false, 0x400);
+    let entity = &mut entities[slot];
+    entity.action_state = entity.action_state.wrapping_add(u8::from(done));
+}
+
+/// State 5: spray a type-0x0C billboard every sixth frame, count the looping
+/// sound cue down, advance the clip and sweep the yaw by `scd_timer`.
+fn fire_flame_step(game: &mut GameState, slot: usize, clips: &[Clip]) {
+    if game.entities[slot].animation_frame_id.is_multiple_of(6) {
+        let attach = Attach::Entity(slot as u8);
+        let room_effects = Rc::clone(&game.room_effects);
+        effects::create_attached(game, &room_effects, 0x0C, 0, attach, FLAME_OFFSET, 0, 0);
+    }
+    let ticks = game.entities[slot].action_ticks_counter;
+    game.entities[slot].action_ticks_counter = ticks.wrapping_sub(1);
+    if ticks == 0 {
+        game.entities[slot].action_ticks_counter = FLAME_CUE_TICKS;
+        // TODO(parity): (audio) the original queues the two flamethrower 3D
+        // cues here (enemy bank ids 0x1E/0x1F); the pack ships no enemy sound
+        // bank, so the cue reload is modelled and the audio is deferred.
+    }
+    let (entities, anims) = (&mut game.entities, &mut game.entity_anims);
+    anims[slot].advance(&mut entities[slot], clips, false, 0x400);
+    let entity = &mut entities[slot];
+    entity.angle = entity.angle.wrapping_add(entity.scd_timer);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::fixtures::{block, sprite};
     use crate::game::Entity;
     use crate::model::ClipFrame;
 
@@ -537,10 +822,28 @@ mod tests {
         vec![clip(1, 0); 0x30]
     }
 
+    /// One frame per tick for every clip the fire handler plays.
+    fn fire_clips() -> Vec<Clip> {
+        vec![clip(0x40, 1); 0x30]
+    }
+
     fn game_with(entity: Entity) -> GameState {
         let mut game = GameState::default();
         game.entities[1] = entity;
         game.entities[1].set_active(true);
+        game
+    }
+
+    /// A game with the six weapon effect sprites the fire tables reference,
+    /// each carrying a full eight-row animation table.
+    fn fire_game(entity: Entity) -> GameState {
+        let mut game = game_with(entity);
+        for index in [0u8, 5, 8, 9, 11, 12, 17] {
+            game.weapon_effects.sprites.push(sprite(
+                index,
+                std::array::from_fn(|_| vec![vec![block(1, 0, 0)]]),
+            ));
+        }
         game
     }
 
@@ -788,19 +1091,279 @@ mod tests {
     }
 
     #[test]
-    fn handler_08_is_a_recorded_placeholder() {
-        let mut game = game_with(state8(8));
-        update(&mut game, 1, &RoomState::default(), &clips());
-        assert_eq!(game.npc_placeholders.get(&8), Some(&1));
+    fn handler_08_bounds_and_empty_rows() {
+        assert_eq!(FIRE_FX_MUZZLE.len(), 14);
+        assert_eq!(FIRE_FX_SHELL.len(), 14);
+        assert_eq!(FIRE_FX_FLASH2.len(), 14);
+        // Weapon 2 (Barry): the muzzle at frame 1, the special depth-3 extra,
+        // the disabled shell and the frame-2 secondary flash.
+        assert_eq!(
+            FIRE_FX_MUZZLE[2],
+            FireFx {
+                frame: 1,
+                effect_type: 0x11,
+                depth: 2,
+                x: 160,
+                y: 610,
+                z: 0
+            }
+        );
+        assert_eq!(
+            FIRE_FX_SHELL[0],
+            FireFx {
+                frame: 3,
+                effect_type: 0x05,
+                depth: 0,
+                x: 370,
+                y: -2870,
+                z: -220
+            }
+        );
+        assert_eq!(
+            FIRE_FX_SHELL[1],
+            FireFx {
+                frame: 0x19,
+                effect_type: 0x05,
+                depth: 9,
+                x: 360,
+                y: -2050,
+                z: -440
+            }
+        );
+        assert_eq!(FIRE_FX_SHELL[2].frame, FIRE_FX_DISABLED);
+        assert_eq!(
+            FIRE_FX_FLASH2[8],
+            FireFx {
+                frame: 2,
+                effect_type: 0x08,
+                depth: 2,
+                x: 430,
+                y: -830,
+                z: 90
+            }
+        );
+        assert_eq!(
+            FIRE_FX_FLASH2[13],
+            FireFx {
+                frame: 2,
+                effect_type: 0x09,
+                depth: 0x0B,
+                x: 640,
+                y: 1500,
+                z: 0
+            }
+        );
+
+        // A weapon id past the tables spawns nothing (the original's
+        // unbounded index is reported by the port instead of read).
+        let mut entity = Entity {
+            id: 0x27,
+            behavior_flags: 200,
+            action_behavior: 8,
+            scd_anim_param: 0x21,
+            ..Entity::default()
+        };
+        entity.animation_id = 0x11;
+        let mut game = fire_game(entity);
+        update(&mut game, 1, &RoomState::default(), &fire_clips());
+        assert_eq!(game.effects.active_count(), 0);
     }
 
     #[test]
-    fn state8_double_step_runs_the_handler_twice() {
-        let mut entity = state8(8);
-        entity.flags = 2;
-        let mut game = game_with(entity);
+    fn handler_08_spawns_the_muzzle_and_secondary_flash_on_their_frames() {
+        // Barry's record: behavior_flags 4 -> weapon 2.
+        let mut entity = Entity {
+            id: 0x22,
+            behavior_flags: 4,
+            action_behavior: 8,
+            scd_anim_param: 0x21,
+            animation_id: 0x11,
+            ..Entity::default()
+        };
+        entity.set_active(true);
+        let mut game = fire_game(entity);
+        let room = RoomState::default();
+        let clips = fire_clips();
+
+        // Frame 0: nothing fires; the clock publishes frame 1.
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(game.effects.active_count(), 0);
+        assert_eq!(game.entities[1].animation_frame_id, 1);
+
+        // Frame 1: the muzzle flash (depth 2) and the weapon-2 extra (depth 3).
+        update(&mut game, 1, &room, &clips);
+        let spawned: Vec<(u8, u8)> = game
+            .effects
+            .active()
+            .map(|(_, effect)| (effect.effect_type, effect.depth_group))
+            .collect();
+        assert_eq!(spawned, vec![(0x11, 3), (0x11, 2)], "two muzzle slots");
+        assert_eq!(game.entities[1].animation_frame_id, 2);
+
+        // Frame 2: the secondary flash, tagged header[0] with the weapon id.
+        update(&mut game, 1, &room, &clips);
+        let flash = game
+            .effects
+            .active()
+            .find(|(_, effect)| effect.effect_type == 9)
+            .expect("the secondary flash spawned");
+        assert_eq!(flash.1.depth_group, 0x0B);
+        assert_eq!(flash.1.header[0], 2);
+        assert_eq!(flash.1.attach, effects::Attach::Entity(1));
+
+        // The clip runs out, state 2 raises the wait bit on the next tick.
+        for _ in 0..0x80 {
+            if game.entities[1].action_state == 2 {
+                break;
+            }
+            update(&mut game, 1, &room, &clips);
+        }
+        assert_eq!(game.entities[1].action_state, 2);
+        update(&mut game, 1, &room, &clips);
+        assert!(system_bit(&game, 0x21), "the script's wait bit is raised");
+    }
+
+    #[test]
+    fn handler_08_shell_tag_and_lift_match_the_record() {
+        // Weapon 0 with an odd id: the shell lifts by 300.
+        let entity = Entity {
+            id: 0x27,
+            behavior_flags: 2,
+            action_behavior: 8,
+            scd_anim_param: 0x21,
+            animation_id: 0x11,
+            ..Entity::default()
+        };
+        let mut game = fire_game(entity);
+        let room = RoomState::default();
+        let clips = fire_clips();
+
+        for _ in 0..4 {
+            update(&mut game, 1, &room, &clips);
+        }
+        let shell = game
+            .effects
+            .active()
+            .find(|(_, effect)| effect.effect_type == 5)
+            .expect("the shell spawned on frame 3");
+        assert_eq!(shell.1.depth_group, 0);
+        assert_eq!(shell.1.local_offset, [370, -2570, -220], "lifted by 300");
+        assert_eq!(shell.1.yaw, 0x555, "the non-weapon-8 shell yaw");
+        assert_eq!(shell.1.header[3], 0, "tagged with the weapon id");
+    }
+
+    #[test]
+    fn handler_08_state2_raises_the_completion_flag() {
+        let entity = Entity {
+            id: 0x22,
+            behavior_flags: 4,
+            action_behavior: 8,
+            action_state: 2,
+            scd_anim_param: 0x21,
+            ..Entity::default()
+        };
+        let mut game = fire_game(entity);
+        update(&mut game, 1, &RoomState::default(), &fire_clips());
+        assert!(system_bit(&game, 0x21));
+        assert_eq!(game.entities[1].action_behavior, 8, "state 2 never clears");
+    }
+
+    #[test]
+    fn handler_08_weapon3_plays_0x17_without_effects_into_the_flame_loop() {
+        // Weapon 3 (behavior_flags 5) is the flamethrower: no shot effects.
+        let entity = Entity {
+            id: 0x2b,
+            behavior_flags: 5,
+            action_behavior: 8,
+            scd_anim_param: 0x21,
+            ..Entity::default()
+        };
+        let mut game = fire_game(entity);
+        let room = RoomState::default();
+        let clips = fire_clips();
+
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(game.entities[1].action_state, 3);
+        assert_eq!(game.entities[1].animation_id, 0x17);
+        assert_eq!(game.effects.active_count(), 0, "no shot effects");
+
+        // Run out the 0x17 clip: state 4 sets up 0x14 and sprays frame 0.
+        for _ in 0..0x40 {
+            if game.entities[1].action_state == 5 {
+                break;
+            }
+            update(&mut game, 1, &room, &clips);
+        }
+        assert_eq!(game.entities[1].action_state, 5);
+        assert_eq!(game.entities[1].animation_id, 0x14);
+        assert!(
+            game.effects
+                .active()
+                .any(|(_, effect)| effect.effect_type == 0x0C),
+            "the flamethrower spray spawned"
+        );
+        assert_eq!(game.entities[1].action_ticks_counter, 0x0E);
+    }
+
+    #[test]
+    fn handler_08_flame_loop_spawns_every_sixth_frame_and_sweeps_the_yaw() {
+        let entity = Entity {
+            id: 0x2b,
+            behavior_flags: 5,
+            action_behavior: 8,
+            action_state: 5,
+            animation_id: 0x14,
+            animation_frame_id: 0,
+            action_ticks_counter: 0x0F,
+            scd_timer: 0x10,
+            scd_anim_param: 0x21,
+            ..Entity::default()
+        };
+        let mut game = fire_game(entity);
+        let room = RoomState::default();
+        let clips = fire_clips();
+
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(game.effects.active_count(), 1, "frame 0 sprays");
+        assert_eq!(game.entities[1].action_ticks_counter, 0x0E);
+        assert_eq!(game.entities[1].angle, 0x10, "the yaw swept");
+
+        // Frames 1..5 do not spray; frame 6 does.
+        for _ in 0..5 {
+            update(&mut game, 1, &room, &clips);
+        }
+        assert_eq!(game.entities[1].animation_frame_id, 6);
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(game.effects.active_count(), 2, "frame 6 sprays again");
+
+        // The cue countdown reloads at zero without touching the loop.
+        {
+            let entity = &mut game.entities[1];
+            entity.action_ticks_counter = 0;
+        }
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(game.entities[1].action_ticks_counter, FLAME_CUE_TICKS);
+        assert_eq!(game.entities[1].action_state, 5, "the loop never exits");
+    }
+
+    #[test]
+    fn handler_08_double_step_runs_the_handler_twice() {
+        // A one-frame clip: the first run completes the animation into state
+        // 2 and the second run raises the flag in the same tick.
+        let mut entity = Entity {
+            id: 0x22,
+            behavior_flags: 4,
+            action_behavior: 8,
+            scd_anim_param: 0x21,
+            animation_id: 0x11,
+            flags: 2,
+            ..Entity::default()
+        };
+        entity.set_active(true);
+        let mut game = fire_game(entity);
         update(&mut game, 1, &RoomState::default(), &clips());
-        assert_eq!(game.npc_placeholders.get(&8), Some(&2));
+        assert!(system_bit(&game, 0x21), "the second run raised the bit");
+        assert!(game.npc_placeholders.is_empty());
     }
 
     #[test]

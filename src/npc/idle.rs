@@ -3,10 +3,9 @@
 //! The idle handlers run before the shared animation advance in
 //! [`super::update_entity`]: the ones that animate return `true` and let the
 //! common tail advance the clock, while the ones that need the completion
-//! result advance it themselves and return `false`. Behaviours that only exist
-//! to spawn effects (the blood of the two death behaviours) keep their
-//! animation state machine but leave the effect calls to the milestone that
-//! adds them.
+//! result advance it themselves and return `false`. Handlers that spawn
+//! effects return the spawn requests and [`super::update_entity`] applies them
+//! to the effect pool once the entity borrow has ended.
 //!
 //! Behaviour 1 walks along its reversed facing (the original's
 //! `Add_speedXZ(0x800)` moves by `move_speed_current` at yaw + 0x800) until the
@@ -14,7 +13,17 @@
 //! the walk layer's collision-resolved [`super::walk::advance_xz`]. The voice
 //! cue the original plays on the hit is out of M9 scope (no voice), so only the
 //! animation state advances.
+//!
+//! Behaviours 2 and 3 are the two scripted deaths. Their type-0 blood sprays
+//! now go into the effect pool: the port approximates the original's dead-move
+//! joint matrices with the character's own matrix and keeps the recorded
+//! vertical offsets, so the sheets pivot around the body instead of the exact
+//! wound. The joint tints, the wet sound cue and the ground-pool grow stay
+//! deferred.
 
+use std::rc::Rc;
+
+use crate::effects::Attach;
 use crate::game::{Entity, FLAG_BANK_COUNT, FlagBank};
 use crate::model::Clip;
 use crate::state::{RoomId, RoomState};
@@ -22,6 +31,45 @@ use crate::state::{RoomId, RoomState};
 use super::anim::EntityAnim;
 use super::data::{self, IdleBehavior};
 use super::walk;
+
+/// One billboard spawn requested by an idle handler. The caller attaches it to
+/// the entity's own matrix (the original spawns the death blood in the
+/// character's matrix space).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectSpawn {
+    /// Billboard effect type (`0` = blood).
+    pub effect_type: u8,
+    /// Depth group.
+    pub depth: u8,
+    /// Local offset in the character's matrix space.
+    pub pos: [i32; 3],
+    /// Yaw added to the animation block's yaw.
+    pub yaw: i16,
+    /// Spawn light factor (`0` keeps the block's authored factor).
+    pub light: u8,
+}
+
+/// Apply an idle handler's spawn requests to the effect pool, attached to the
+/// requesting entity's own matrix.
+pub fn apply_spawns(game: &mut crate::game::GameState, slot: usize, spawns: Vec<EffectSpawn>) {
+    if spawns.is_empty() {
+        return;
+    }
+    let room_effects = Rc::clone(&game.room_effects);
+    let attach = Attach::Entity(slot as u8);
+    for spawn in spawns {
+        crate::effects::create_attached(
+            game,
+            &room_effects,
+            spawn.effect_type,
+            spawn.depth,
+            attach,
+            spawn.pos,
+            spawn.yaw,
+            spawn.light,
+        );
+    }
+}
 
 /// The blend step the state-0 init poses with (the original's `0x400`).
 const INIT_BLEND_STEP: u16 = 0x400;
@@ -103,30 +151,32 @@ fn apply_pose_variant(entity: &mut Entity, flags: &[FlagBank; FLAG_BANK_COUNT], 
 
 /// One state-1 tick. Returns whether the common tail should advance the
 /// animation clock (the handlers that need the completion result advance it
-/// themselves and return `false`).
+/// themselves and return `false`) and the billboard spawn requests.
 pub fn update(
     entity: &mut Entity,
     clock: &mut EntityAnim,
     clips: &[Clip],
     room: &RoomState,
-) -> bool {
-    match data::idle_behavior(entity.action_behavior) {
+) -> (bool, Vec<EffectSpawn>) {
+    let mut spawns = Vec::new();
+    let advance = match data::idle_behavior(entity.action_behavior) {
         IdleBehavior::ById => behavior_by_id(entity),
         IdleBehavior::Walk01 => {
             walk_01(entity, clock, clips, room);
             false
         }
         IdleBehavior::Walk02 => {
-            walk_02(entity, clock, clips);
+            walk_02(entity, clock, clips, &mut spawns);
             false
         }
         IdleBehavior::Walk03 => {
-            walk_03(entity, clock, clips);
+            walk_03(entity, clock, clips, &mut spawns);
             false
         }
         IdleBehavior::PlayAnim => play_anim(entity),
         IdleBehavior::Nop => false,
-    }
+    };
+    (advance, spawns)
 }
 
 /// Behaviour 0: re-dispatch on the entity id. The corpse props land on the
@@ -207,16 +257,20 @@ fn walk_01_knock(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     entity.action_state = entity.action_state.wrapping_add(u8::from(done));
 }
 
-/// Behaviour 2: the scripted death. Only the animation state machine runs; the
-/// blood billboards, the death timer and the ground-pool grow are effects and
-/// stay absent. The state stops at 2 once the clip completes.
+/// Behaviour 2: the scripted death. The state machine runs the animation and
+/// emits the type-0 blood sprays; the joint tints and the wet sound cue stay
+/// deferred.
 ///
-/// TODO(parity): (gameplay) the original also arms death_timer 0xB4, raises
-/// joint-1's flag, sprays type-0 blood billboards for the first ten frames,
-/// tints three joints on frame 3, plays the wet sound on frame 0x2A and grows
-/// a ground pool for 30 frames; the port parks in the pool state with no
-/// effect or timer.
-fn walk_02(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// The original sprays two depth-3 sheets in the dead-move space on entry and
+/// one depth-0 sheet per frame for the first ten frames, pivoted 0x898 below
+/// the body. The port keeps the offsets but resolves the space to the
+/// character's own matrix.
+fn walk_02(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    spawns: &mut Vec<EffectSpawn>,
+) {
     match entity.action_state {
         0 => {
             entity.action_state = 1;
@@ -224,29 +278,59 @@ fn walk_02(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
             entity.timing_control = 0;
             entity.animation_id = 0x33;
             entity.blend_counter = 3;
-            walk_02_step(entity, clock, clips);
+            spawns.push(EffectSpawn {
+                effect_type: 0,
+                depth: 3,
+                pos: [0, 0, 0],
+                yaw: 0,
+                light: 0,
+            });
+            spawns.push(EffectSpawn {
+                effect_type: 0,
+                depth: 3,
+                pos: [0, 0, 0],
+                yaw: 0,
+                light: 0,
+            });
+            walk_02_step(entity, clock, clips, spawns);
         }
-        1 => walk_02_step(entity, clock, clips),
+        1 => walk_02_step(entity, clock, clips, spawns),
         _ => {}
     }
 }
 
-/// Behaviour 2's shared state 0/1 body: advance and move to the (inert) pool
-/// state on completion.
-fn walk_02_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// Behaviour 2's shared state 0/1 body: spray the first ten frames, advance
+/// and move to the inert pool state on completion.
+fn walk_02_step(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    spawns: &mut Vec<EffectSpawn>,
+) {
+    if entity.animation_frame_id < 10 {
+        spawns.push(EffectSpawn {
+            effect_type: 0,
+            depth: 0,
+            pos: [0, -0x898, 0],
+            yaw: 0,
+            light: 0,
+        });
+    }
     let done = clock.advance(entity, clips, false, IDLE_BLEND_STEP);
     entity.action_state = entity.action_state.wrapping_add(u8::from(done));
 }
 
 /// Behaviour 3: the bleeding-out death. The animation plays to completion,
-/// then the character clears status bit 1 and drops to health -1. The 250-tick
-/// billboard grow is an effect and stays absent, so state 2 parks.
-///
-/// TODO(parity): (gameplay) the original seeds the facing from enemy 1, tints
-/// five joints on frame 8, sprays blood before frame 9 and after frame 0x5F,
-/// runs the vertex-animation pass and shrinks/grows the billboard over the
-/// 250-tick timer; none of that is modelled.
-fn walk_03(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// then the character clears status bit 1 and drops to health -1. The type-0
+/// blood sheets spray before frame 9 (pivot 0x5DC below the body) and after
+/// frame 0x5F; the joint tints, vertex animation and the 250-tick ground-pool
+/// grow stay deferred.
+fn walk_03(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    spawns: &mut Vec<EffectSpawn>,
+) {
     match entity.action_state {
         0 => {
             entity.action_state = 1;
@@ -256,9 +340,9 @@ fn walk_03(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
             entity.blend_counter = 0;
             entity.hit_state = 0x80;
             entity.status_flags |= 6;
-            walk_03_step(entity, clock, clips);
+            walk_03_step(entity, clock, clips, spawns);
         }
-        1 => walk_03_step(entity, clock, clips),
+        1 => walk_03_step(entity, clock, clips, spawns),
         2 => {
             entity.status_flags &= !2;
             entity.health = -1;
@@ -267,9 +351,33 @@ fn walk_03(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     }
 }
 
-/// Behaviour 3's shared state 0/1 body: advance and move to the park state on
-/// completion.
-fn walk_03_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// Behaviour 3's shared state 0/1 body: spray, advance and move to the park
+/// state on completion.
+fn walk_03_step(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    spawns: &mut Vec<EffectSpawn>,
+) {
+    let frame = entity.animation_frame_id;
+    if frame < 9 {
+        spawns.push(EffectSpawn {
+            effect_type: 0,
+            depth: 0,
+            pos: [0, -0x5DC, 0],
+            yaw: 0,
+            light: 0,
+        });
+    }
+    if frame > 0x5F {
+        spawns.push(EffectSpawn {
+            effect_type: 0,
+            depth: 0,
+            pos: [0, 0, 0],
+            yaw: 0,
+            light: 0,
+        });
+    }
     let done = clock.advance(entity, clips, false, IDLE_BLEND_STEP);
     entity.action_state = entity.action_state.wrapping_add(u8::from(done));
 }
@@ -305,6 +413,12 @@ mod tests {
                 },
             ],
         }]
+    }
+
+    /// The advance half of [`super::update`], for tests that do not inspect
+    /// the spawn requests.
+    fn tick(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) -> bool {
+        update(entity, clock, clips, room).0
     }
 
     #[test]
@@ -498,7 +612,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        update(&mut walker, &mut clock, &clips(), &room);
+        tick(&mut walker, &mut clock, &clips(), &room);
         assert_eq!(walker.action_state, 1);
         assert_eq!(
             walker.pos,
@@ -509,7 +623,7 @@ mod tests {
         // The next tick trims 15 off the speed (frame 1) and steps 985, which
         // would cross into the wall at x=1000: the move is rolled back and the
         // knock state is entered.
-        update(&mut walker, &mut clock, &clips(), &room);
+        tick(&mut walker, &mut clock, &clips(), &room);
         assert_eq!(walker.action_state, 2);
         assert_eq!(walker.pos, [1500, 0, 500], "the blocked move rolled back");
     }
@@ -528,7 +642,7 @@ mod tests {
         };
         let mut clock = EntityAnim::default();
 
-        assert!(update(
+        assert!(tick(
             &mut entity,
             &mut clock,
             &clips(),
@@ -543,7 +657,7 @@ mod tests {
         // The common tail advances the rewound clip.
         clock.advance(&mut entity, &clips(), false, IDLE_BLEND_STEP);
         assert_eq!(clock.display_frame(), 0);
-        assert!(update(
+        assert!(tick(
             &mut entity,
             &mut clock,
             &clips(),
@@ -560,7 +674,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips(),
@@ -577,7 +691,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(
+        assert!(!tick(
             &mut living,
             &mut clock,
             &clips(),
@@ -592,7 +706,7 @@ mod tests {
             animation_id: 4,
             ..Entity::default()
         };
-        assert!(update(
+        assert!(tick(
             &mut corpse,
             &mut clock,
             &clips(),
@@ -612,7 +726,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips(),
@@ -646,7 +760,7 @@ mod tests {
 
         // The setup call rewinds to frame 0, sets the starting speed and
         // advances once.
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips,
@@ -658,7 +772,7 @@ mod tests {
         assert_eq!(clock.display_frame(), 0);
 
         // The second call trims frame 1's 15 from the speed.
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips,
@@ -689,7 +803,7 @@ mod tests {
         };
         // The one-frame clip completes in the setup call, so the death
         // animation parks in its (effect-only) pool state.
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips,
@@ -702,7 +816,7 @@ mod tests {
             action_behavior: 3,
             ..Entity::default()
         };
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips,
@@ -715,7 +829,7 @@ mod tests {
 
         // State 2 clears status bit 1 and forces health -1.
         entity.health = 40;
-        assert!(!update(
+        assert!(!tick(
             &mut entity,
             &mut clock,
             &clips,
@@ -723,5 +837,122 @@ mod tests {
         ));
         assert_eq!(entity.status_flags & 2, 0);
         assert_eq!(entity.health, -1);
+    }
+
+    #[test]
+    fn death_behaviours_emit_the_type_zero_blood_spawns() {
+        let instant = ClipFrame {
+            keyframe: 0,
+            timing: 0,
+        };
+        let mut clips = vec![Clip::default(); 0x34];
+        clips[0x30] = Clip {
+            frames: vec![instant],
+        };
+        clips[0x33] = Clip {
+            frames: vec![instant],
+        };
+
+        // Behaviour 2 state 0: two depth-3 sheets on entry plus the frame-0
+        // body-height spray.
+        let mut entity = Entity {
+            id: 0x27,
+            action_behavior: 2,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        assert_eq!(spawns.len(), 3);
+        let sheet = EffectSpawn {
+            effect_type: 0,
+            depth: 3,
+            pos: [0, 0, 0],
+            yaw: 0,
+            light: 0,
+        };
+        assert_eq!((spawns[0], spawns[1]), (sheet, sheet));
+        assert_eq!(
+            spawns[2],
+            EffectSpawn {
+                effect_type: 0,
+                depth: 0,
+                pos: [0, -0x898, 0],
+                yaw: 0,
+                light: 0,
+            }
+        );
+
+        // Behaviour 3: the pre-frame-9 spray uses the lower pivot, and the
+        // after-frame-0x5F spray drops back to the body.
+        let mut entity = Entity {
+            id: 0x27,
+            action_behavior: 3,
+            action_state: 1,
+            animation_id: 0x30,
+            animation_frame_id: 0x60,
+            timing_control: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        assert_eq!(
+            spawns,
+            vec![EffectSpawn {
+                effect_type: 0,
+                depth: 0,
+                pos: [0, 0, 0],
+                yaw: 0,
+                light: 0,
+            }]
+        );
+
+        let mut entity = Entity {
+            id: 0x27,
+            action_behavior: 3,
+            action_state: 1,
+            animation_id: 0x30,
+            animation_frame_id: 8,
+            timing_control: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        assert_eq!(
+            spawns,
+            vec![EffectSpawn {
+                effect_type: 0,
+                depth: 0,
+                pos: [0, -0x5DC, 0],
+                yaw: 0,
+                light: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn apply_spawns_creates_pool_slots_attached_to_the_entity() {
+        use crate::effects::fixtures::{block, sprite};
+        let mut game = crate::game::GameState::default();
+        game.entities[1].pos = [100, 0, 200];
+        game.weapon_effects.sprites.push(sprite(
+            0,
+            std::array::from_fn(|_| vec![vec![block(1, 0, 0)]]),
+        ));
+        apply_spawns(
+            &mut game,
+            1,
+            vec![EffectSpawn {
+                effect_type: 0,
+                depth: 0,
+                pos: [0, -0x5DC, 0],
+                yaw: 0,
+                light: 0,
+            }],
+        );
+        assert_eq!(game.effects.active_count(), 1);
+        let (_, effect) = game.effects.active().next().unwrap();
+        assert_eq!(effect.effect_type, 0);
+        assert_eq!(effect.depth_group, 0);
+        assert_eq!(effect.attach, Attach::Entity(1));
     }
 }

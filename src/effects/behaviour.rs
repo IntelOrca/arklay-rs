@@ -300,30 +300,51 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
     std::array::from_fn(|index| matrix.r[index / 3][index % 3] as i16)
 }
 
-/// Re-copy the attach transform into the slot (`type == 1` refresh).
+/// The translation of the slot's attach target.
+///
+/// The original copies the parent's full `MATRIX` over the slot while `type`
+/// is 1; its translation lands in the sprite-offset fields and is added back
+/// after the rotation, so an effect attached to a character is positioned
+/// relative to that character, not the world origin.
+fn attach_translation(game: &GameState, attach: Attach) -> [i32; 3] {
+    match attach {
+        Attach::Identity | Attach::Omodel(_) => [0, 0, 0],
+        Attach::Player => game.entities[0].pos,
+        Attach::Entity(slot) => game
+            .entities
+            .get(usize::from(slot))
+            .map_or([0, 0, 0], |entity| entity.pos),
+    }
+}
+
+/// Re-copy the attach transform into the slot (`type == 1` refresh),
+/// translation included.
 fn refresh_transform(game: &mut GameState, index: usize) {
     let Some(effect) = game.effects.slot(index).copied() else {
         return;
     };
     let matrix = attach_matrix(game, effect.attach);
+    let translation = attach_translation(game, effect.attach);
     if let Some(slot) = game.effects.slot_mut(index) {
         slot.transform = matrix;
+        slot.sprite_offset = translation;
     }
 }
 
 /// The shared tail of the wobble behaviours: switch to the fire behaviour in
 /// its inert pose.
 fn switch_to_wobble_phase(game: &mut GameState, index: usize) {
-    let transform = game
-        .effects
-        .slot(index)
-        .map(|e| attach_matrix(game, e.attach))
-        .unwrap_or(IDENTITY_MATRIX);
+    let Some(effect) = game.effects.slot(index).copied() else {
+        return;
+    };
+    let transform = attach_matrix(game, effect.attach);
+    let translation = attach_translation(game, effect.attach);
     if let Some(slot) = game.effects.slot_mut(index) {
         slot.anim_id = 0x11;
         slot.header[3] = 0;
         slot.active = 2;
         slot.transform = transform;
+        slot.sprite_offset = translation;
     }
 }
 
@@ -521,6 +542,7 @@ fn integrate(game: &mut GameState, camera: &Camera, fov: i32, index: usize, runn
     let mut e = effect;
     if e.active == 1 {
         e.transform = attach_matrix(game, e.attach);
+        e.sprite_offset = attach_translation(game, e.attach);
     }
     let transformed = apply_matrix(&e.transform, local);
     let mut world = [
@@ -761,6 +783,7 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
             let light = effect.light_factor;
             let yaw = effect.yaw;
             let transform = attach_matrix(game, effect.attach);
+            let translation = attach_translation(game, effect.attach);
             let Some(slot) = game.effects.slot_mut(index) else {
                 return;
             };
@@ -776,6 +799,7 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
             slot.header[3] = phase;
             slot.light_factor = light;
             slot.transform = transform;
+            slot.sprite_offset = translation;
         }
         // Spawner: clone itself at its local offset, then advance.
         12 => {
@@ -1034,11 +1058,13 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
                 .copied()
                 .unwrap_or(0);
             let transform = attach_matrix(game, effect.attach);
+            let translation = attach_translation(game, effect.attach);
             if let Some(slot) = game.effects.slot_mut(index) {
                 slot.update_id = 1;
                 slot.active = 2;
                 slot.light_factor = light;
                 slot.transform = transform;
+                slot.sprite_offset = translation;
             }
         }
         // Paired timers: kill on one count, re-spawn on the other.
@@ -1109,10 +1135,12 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
                         .map(|e| e.attach)
                         .unwrap_or_default();
                     let transform = attach_matrix(game, attach);
+                    let translation = attach_translation(game, attach);
                     if let Some(slot) = game.effects.slot_mut(index) {
                         slot.active = 2;
                         slot.header[3] += 1;
                         slot.transform = transform;
+                        slot.sprite_offset = translation;
                     }
                 }
                 2 => {
@@ -1262,8 +1290,10 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
                 .map(|e| e.attach)
                 .unwrap_or_default();
             let transform = attach_matrix(game, attach);
+            let translation = attach_translation(game, attach);
             if let Some(slot) = game.effects.slot_mut(index) {
                 slot.transform = transform;
+                slot.sprite_offset = translation;
                 slot.active = 2;
                 slot.anim_id = 5;
             }
@@ -1587,8 +1617,10 @@ fn muzzle_phases(game: &mut GameState, index: usize) {
                 .map(|e| e.attach)
                 .unwrap_or_default();
             let transform = attach_matrix(game, attach);
+            let translation = attach_translation(game, attach);
             if let Some(slot) = game.effects.slot_mut(index) {
                 slot.transform = transform;
+                slot.sprite_offset = translation;
                 slot.active = 2;
                 slot.header[1] = 2;
                 slot.header[0] = 2;

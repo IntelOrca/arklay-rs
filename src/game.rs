@@ -863,9 +863,9 @@ pub struct GameState {
     pub frame: u64,
     /// Call counts of opcodes whose systems do not exist yet.
     pub placeholders: BTreeMap<u8, u64>,
-    /// Call counts of state-8 handlers that stay placeholders: the fire
-    /// behaviour (`action_behavior` 8) and any out-of-range behaviour the
-    /// original would have dispatched through a NULL table slot.
+    /// Call counts of state-8 handlers with no implementation: any
+    /// out-of-range behaviour the original would have dispatched through a
+    /// NULL table slot. Behaviour 8 (weapon fire) now dispatches for real.
     pub npc_placeholders: BTreeMap<u8, u64>,
     /// BGM requests produced by the scripts.
     pub room_bgm_requests: Vec<BgmRequest>,
@@ -1335,9 +1335,10 @@ impl GameState {
         pack: &crate::pack::Pack,
     ) -> usize {
         // TODO(parity): (gameplay) monster ids 0x00..=0x1F allocate no entity at
-        // all and the state-8 weapon-fire handler is inert (counted in
-        // `npc_placeholders`); rooms that spawn enemies stay empty and a script
-        // waiting on the fire completion bit can stall.
+        // all, so rooms that spawn zombies alongside a character stay empty and
+        // their scripts' `get_eml_state`/`eml_state` on those slots are inert.
+        // The state-8 weapon-fire handler dispatches for real and releases the
+        // scenes that wait on it.
         // The original reseeds its random seed from `rand()` at the top of
         // every gameplay frame, before any entity thinks; the look-at
         // scheduling reads the frame's value.
@@ -4513,6 +4514,50 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn aot_switch_never_touches_the_effect_pool() {
+        let mut state = effect_game();
+        let room_effects = std::rc::Rc::clone(&state.room_effects);
+        crate::effects::create(&mut state, &room_effects, 9, 0, 0, [0, 0, 0], 0, 0);
+        assert_eq!(state.effects.active_count(), 1);
+        let before = state.effects.slot(63).unwrap().flags();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_misc(op(0x25), &operands(&[0, 3, 1])),
+                StepResult::Continue
+            );
+        }
+        // The mask switch only queues a toggle; the `mass_mask` opcode is the
+        // only thing that writes effect header flags.
+        assert_eq!(state.effects.slot(63).unwrap().flags(), before);
+        assert_eq!(state.effects.active_count(), 1);
+    }
+
+    #[test]
+    fn enter_room_clears_the_effect_pool() {
+        use crate::state::RoomId;
+        let mut state = effect_game();
+        let room_effects = std::rc::Rc::clone(&state.room_effects);
+        crate::effects::create(&mut state, &room_effects, 9, 0, 0, [0, 0, 0], 0, 0);
+        assert_eq!(state.effects.active_count(), 1);
+        state.enter_room(
+            RoomId::parse("1020").unwrap(),
+            &crate::state::RoomState::default(),
+        );
+        assert_eq!(
+            state.effects.active_count(),
+            0,
+            "no slot leaks across a door"
+        );
+        assert_eq!(
+            state.effects.free_slots(),
+            crate::effects::EFFECT_POOL_SIZE as u8
+        );
+        assert_eq!(state.last_tracked_effect, None);
+        assert!(state.effect_missing_logged.is_empty());
     }
 
     #[test]

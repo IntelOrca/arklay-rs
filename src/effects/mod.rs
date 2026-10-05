@@ -22,6 +22,27 @@
 //! Slice 4's presentation lives in [`crate::render`] (`EffectQuad`,
 //! `rasterize_effect` and `draw_gameplay_scene_with_effects`) and in the
 //! engine's `EffectPageCache`/quad builder.
+//!
+//! # Documented deviations (slice 6)
+//!
+//! - **Omodel attach identity.** Parent selectors `>= 0x80` (object models)
+//!   resolve to the identity transform because the object-model class does not
+//!   exist yet ([`pool::Attach::Omodel`]); the seam is the single
+//!   [`behaviour`] attach resolution, ready for the object class.
+//! - **Inert combat behaviours.** Behaviour ids 10, 37, 43 and 45 stay counted
+//!   placeholders by design (bullet/rocket/flame combat); the corpus audit
+//!   proves no shipped script or sprite animation reaches them. Every other
+//!   entry has an implementation or a shared helper.
+//! - **Unreached special cases.** The static tables carry the original's
+//!   stage-specific quirks (the stage-4 fixed-depth lab camera and the stage-5
+//!   lesson-room V remap are noted at their render sites); no shipped room
+//!   exercises them in the M10 acceptance captures. A full pool makes a spawn
+//!   return `None` (the original's `0xFF` sentinel), and an undeclared type is
+//!   skipped with a one-shot log instead of the original's NULL read.
+//! - **Deterministic RNG.** Behaviour draws use [`crate::game::GameState::rand_seed`],
+//!   a fixed-seed xorshift advanced once per gameplay frame, not the platform
+//!   `rand()`; the effect trajectories are repeatable but need not match the
+//!   original's per-frame values.
 
 pub mod behaviour;
 #[cfg(test)]
