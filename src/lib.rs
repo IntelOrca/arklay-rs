@@ -18,6 +18,7 @@ pub mod message;
 pub mod model;
 pub mod music;
 pub mod npc;
+pub mod objects;
 pub mod pack;
 pub mod player;
 pub mod progress;

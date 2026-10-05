@@ -24,6 +24,7 @@ use std::rc::Rc;
 use crate::effects;
 use crate::items;
 use crate::message::{MessageAction, MessageInput, MessageWindow};
+use crate::objects::{CollisionEdit, LightEdit, ObjectTable};
 use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::Operand;
@@ -885,6 +886,15 @@ pub struct GameState {
     pub rand_seed: u16,
     /// The effect pool (64 slots).
     pub effects: effects::EffectPool,
+    /// The room's runtime object-model records, one per declared omodel slot;
+    /// rebuilt by the init script and cleared on room entry.
+    pub objects: ObjectTable,
+    /// Queued `inst_cfg` collision-boundary rewrites, applied by the engine's
+    /// room tick before physics and cleared with it.
+    pub collision_edits: Vec<CollisionEdit>,
+    /// Queued `obj_xfm` light rewrites, applied by the engine's room tick
+    /// before lighting is read.
+    pub light_edits: Vec<LightEdit>,
     /// The current room's effect sprite metadata, re-resolved and page-packed
     /// on room entry (the original's room effect init). Shared so
     /// [`ScdGameHost::on_effect`] can pass it to [`effects::create`] while the
@@ -965,6 +975,9 @@ impl Default for GameState {
             entity_sounds: Vec::new(),
             rand_seed: RAND_SEED_INITIAL,
             effects: effects::EffectPool::new(),
+            objects: ObjectTable::default(),
+            collision_edits: Vec::new(),
+            light_edits: Vec::new(),
             room_effects: Rc::new(effects::RoomEffects::default()),
             weapon_effects: effects::WeaponEffects::default(),
             effect_missing_logged: BTreeSet::new(),
@@ -1007,6 +1020,7 @@ impl GameState {
         // so a state built without `seed_new_game` still has a real maximum.
         state.max_health = character_max_health(id.player_flag);
         state.resolve_room_effects(room);
+        state.objects.reset(usize::from(room.omodel_slot_count));
         state
     }
 
@@ -1755,6 +1769,9 @@ impl GameState {
         self.effects.clear();
         self.last_tracked_effect = None;
         self.effect_missing_logged.clear();
+        self.objects.reset(usize::from(room.omodel_slot_count));
+        self.collision_edits.clear();
+        self.light_edits.clear();
         self.resolve_room_effects(room);
         self.id = id;
         self.state_bytes[0] = id.stage;
@@ -1790,6 +1807,43 @@ impl GameState {
         self.room_bgm_requests.clear();
         self.pending_events.clear();
         self.entity_sounds.clear();
+    }
+
+    /// Apply every queued `inst_cfg`/`obj_xfm` rewrite to the live room.
+    ///
+    /// The original scripts mutate the loaded RDT bytes in place; the engine
+    /// calls this at the point the scripted write becomes visible: right after
+    /// the command/event scripts run and before player physics and lighting.
+    pub fn apply_room_edits(&mut self, room: &mut RoomState) {
+        for edit in self.collision_edits.drain(..) {
+            edit.apply(room);
+        }
+        for edit in self.light_edits.drain(..) {
+            edit.apply(room);
+        }
+    }
+
+    /// `ck_counter` (0x3C): whether the player is within `max_dist` of the
+    /// selected target.
+    ///
+    /// Target types: `0` enemy `spec >> 8` (the port's entity slot `+ 1`),
+    /// `1` omodel `spec >> 8`; `2` names the item-model table and is a typed
+    /// no-op this milestone. Any other type reports false.
+    pub fn distance_test(&self, target_spec: u16, max_dist: u16) -> bool {
+        let target = match target_spec & 0xFF {
+            0 => self
+                .entities
+                .get(usize::from(target_spec >> 8) + 1)
+                .map(|entity| entity.pos),
+            1 => self
+                .objects
+                .record(usize::from(target_spec >> 8))
+                .map(|record| record.pos),
+            _ => None,
+        };
+        target.is_some_and(|target| {
+            crate::objects::within_distance(self.entities[0].pos, target, max_dist)
+        })
     }
 
     /// The number of inventory slots the current character uses.
@@ -3079,10 +3133,16 @@ impl ScdHost for ScdGameHost<'_> {
                 let (total, stacks) = self.state.item_family_total(search);
                 condition_result(stacks > 0 && compare(mode, i64::from(total), i64::from(value)))
             }
-            // TODO(parity): (scripting) conditions 0x38 dpad test, 0x3C player
-            // distance, 0x3F player direction and 0x50 costume variant report
-            // false here (recorded placeholders), so scripts using them always
-            // take the else branch.
+            // `ck_counter` (0x3C): the player's XZ distance to an enemy or
+            // object model against the maximum.
+            0x3C => {
+                let target = operand_u16(operands, 1);
+                let max_dist = operand_u16(operands, 2);
+                condition_result(self.state.distance_test(target, max_dist))
+            }
+            // TODO(parity): (scripting) conditions 0x38 dpad test, 0x3F player
+            // direction and 0x50 costume variant report false here (recorded
+            // placeholders), so scripts using them always take the else branch.
             _ => self.placeholder(op),
         }
     }
@@ -3159,10 +3219,17 @@ impl ScdHost for ScdGameHost<'_> {
             //
             // TODO(parity): (scripting) 0x1C is the original's
             // `room_light_fade_set` (writes specialRoomLightR and the light
-            // state/delta words), not an equipped-item condition; 0x3A
-            // cut_zone_set, 0x40 light_param_set and 0x46 room_lights_set are
-            // also placeholders.
+            // state/delta words) and 0x3A cut_zone_set/0x46 room_lights_set
+            // are still placeholders.
             0x1C => self.equipped_test(operands),
+            // `obj_xfm` (0x40): the host cannot borrow the room, so the
+            // light rewrite is queued and applied by the room tick.
+            0x40 => {
+                self.state
+                    .light_edits
+                    .push(crate::objects::light_edit(operands));
+                StepResult::Continue
+            }
             _ => self.placeholder(op),
         }
     }
@@ -3468,15 +3535,44 @@ impl ScdHost for ScdGameHost<'_> {
         }
     }
 
-    /// TODO(parity): (scripting) the whole object-model class is inert: 0x1F
-    /// omodel_set, 0x30 boundary_set, 0x34 model_tint_set, 0x35 obj_flag_set,
-    /// 0x36 obj_field_test, 0x3B obj_rotation_set and 0x47 obj_transform_set
-    /// only record a placeholder, so scripted furniture movement, model
-    /// visibility flags and object-field conditions do nothing, and the
-    /// climbable/pushable object probe (flag 0x40 omodels) has no table to
-    /// search.
-    fn on_model(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
-        self.placeholder(op)
+    /// The object-model opcodes: build, flag write, counter compare and the
+    /// two transform setters. The `obj` record layout and every room/slot
+    /// positional override live in [`crate::objects::ObjectTable::build`].
+    ///
+    /// TODO(parity): (scripting) 0x34 model_op (object/model tints) is the
+    /// slice-4 opcode; it stays a placeholder here.
+    fn on_model(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.op {
+            0x1F => {
+                self.state.objects.build(operands, self.state.id);
+                StepResult::Continue
+            }
+            // `inst_cfg` (0x30): queue the collision-boundary rewrite; the
+            // room tick applies it before physics.
+            0x30 => {
+                self.state
+                    .collision_edits
+                    .push(crate::objects::collision_edit(operands));
+                StepResult::Continue
+            }
+            0x35 => {
+                self.state.objects.set_flag(operands, self.state.id);
+                StepResult::Continue
+            }
+            // `ck_anim` (0x36): compare the record's push counter.
+            0x36 => condition_result(self.state.objects.compare_counter(operands)),
+            // `eml_rot` (0x3B): item-model selectors are a typed no-op.
+            0x3B => {
+                self.state.objects.rotate(operands);
+                StepResult::Continue
+            }
+            // `eml_pos` (0x47): the object index is the first operand byte.
+            0x47 => {
+                self.state.objects.transform(operands);
+                StepResult::Continue
+            }
+            _ => self.placeholder(op),
+        }
     }
 
     /// The six effect opcodes: spawn, tracked spawn, the two typed clears, the
@@ -4309,6 +4405,195 @@ mod tests {
         assert!(host.state().placeholders.is_empty());
     }
 
+    /// A state with `slots` declared omodel records.
+    fn object_game(slots: u8) -> GameState {
+        let room = RoomState {
+            omodel_slot_count: slots,
+            ..RoomState::default()
+        };
+        GameState::new(RoomId::parse("1001").unwrap(), &room)
+    }
+
+    /// The 23 decoded `obj` operand bytes for slot 0.
+    fn obj_values() -> Vec<i64> {
+        let mut values = vec![0, 0x41, 0xFF, 100, -200, 300, 0x1234];
+        values.extend([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        values.extend([0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]);
+        values
+    }
+
+    #[test]
+    fn obj_handler_builds_the_record_and_counts() {
+        let mut state = object_game(2);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_model(op(0x1F), &operands(&obj_values())),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().objects.built, 1);
+            let record = host.state().objects.record(0).unwrap();
+            assert_eq!(record.flag, 0x41);
+            assert_eq!(record.model, 0);
+            assert_eq!(record.parent, 0xFF);
+            assert_eq!(record.pos, [100, -200, 300]);
+            assert_eq!(record.committed, [100, -200, 300]);
+            assert_eq!(record.entry_flags, 0x1234);
+            assert_eq!(record.rotation, [0, 0x1234, 0]);
+            assert_eq!(record.probe, [[0x2211, 0x4433], [0x6655, 0x8877]]);
+            assert_eq!(record.radius, 0xAA99);
+            assert_eq!(record.half_extents, [0xEEDD, 0xCCBB, 0x00FF]);
+            assert_eq!(record.asset, Some(0));
+        }
+        assert!(state.placeholders.is_empty());
+    }
+
+    #[test]
+    fn objtbl_and_ck_anim_handlers_route_through_the_host() {
+        let mut state = object_game(4);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_model(op(0x1F), &operands(&obj_values()));
+            // objtbl_b_set table 0 writes the flag byte.
+            assert_eq!(
+                host.on_model(op(0x35), &operands(&[0, 0, 0x80])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().objects.record(0).unwrap().flag, 0x80);
+            // ck_anim compares the push counter.
+            host.state_mut().objects.record_mut(0).unwrap().push_counter = 7;
+            assert_eq!(
+                host.on_model(op(0x36), &operands(&[0, 0, 7])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.on_model(op(0x36), &operands(&[0, 0, 8])),
+                StepResult::Finished
+            );
+        }
+        assert!(state.placeholders.is_empty());
+    }
+
+    #[test]
+    fn eml_rot_and_eml_pos_handlers_write_the_record() {
+        let mut state = object_game(2);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_model(op(0x1F), &operands(&obj_values()));
+            // eml_rot: selector 0x80 names omodel 0; rotates X and Z.
+            assert_eq!(
+                host.on_model(op(0x3B), &operands(&[0x80, 0x1111, 0x2222])),
+                StepResult::Continue
+            );
+            let record = host.state().objects.record(0).unwrap();
+            assert_eq!(record.rotation, [0x1111, 0x1234, 0x2222]);
+            // A selector below 0x8000 names the item table; a typed no-op.
+            assert_eq!(
+                host.on_model(op(0x3B), &operands(&[1, 0x3333, 0x4444])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.state().objects.record(0).unwrap().rotation,
+                [0x1111, 0x1234, 0x2222]
+            );
+            // eml_pos: the object index is the first operand byte.
+            assert_eq!(
+                host.on_model(op(0x47), &operands(&[0, 0x10, -0x20, 0x30, -1, 2, -3])),
+                StepResult::Continue
+            );
+            let record = host.state().objects.record(0).unwrap();
+            assert_eq!(record.rotation, [0x10, -0x20, 0x30]);
+            assert_eq!(record.pos, [-1, 2, -3]);
+            assert_eq!(record.committed, [-1, 2, -3]);
+        }
+        assert!(state.placeholders.is_empty());
+    }
+
+    #[test]
+    fn inst_cfg_queues_and_applies_a_collision_edit() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[2].push(crate::state::CollisionRect {
+            x_max: 1,
+            z_max: 2,
+            x_min: 3,
+            z_min: 4,
+            kind: 5,
+            flags: 0xF000,
+        });
+        let mut state = object_game(0);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_model(op(0x30), &operands(&[2, 0, 0x05, 0x11, 0x22, 0x33, 0x44])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().collision_edits.len(), 1);
+        }
+        state.apply_room_edits(&mut room);
+        let record = room.collision.quadrants[2][0];
+        assert_eq!(
+            (record.x_min, record.z_min, record.x_max, record.z_max),
+            (0x11, 0x22, 0x33, 0x44)
+        );
+        assert_eq!(record.flags, 0xF500);
+        assert!(state.collision_edits.is_empty());
+    }
+
+    #[test]
+    fn obj_xfm_queues_and_applies_a_light_edit() {
+        let mut room = RoomState::default();
+        let mut state = object_game(0);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_camera(op(0x40), &operands(&[2, 100, -200, 300, 1, 2, 3, 4])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().light_edits.len(), 1);
+        }
+        state.apply_room_edits(&mut room);
+        let light = room.lights[2];
+        assert_eq!(light.pos, [100, -200, 300]);
+        assert_eq!(light.color, [1, 2, 3]);
+        assert_eq!(light.kind, 4);
+        assert!(state.light_edits.is_empty());
+    }
+
+    #[test]
+    fn ck_counter_tests_the_omodel_and_enemy_distance() {
+        let mut state = object_game(1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_model(op(0x1F), &operands(&obj_values()));
+            // The record sits at (100, -200, 300); the player at the origin.
+            let exact = ((100f64 * 100.0 + 300f64 * 300.0).sqrt()) as u16;
+            assert_eq!(
+                host.on_flow(op(0x3C), &operands(&[0, 1, i64::from(exact) + 1])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.on_flow(op(0x3C), &operands(&[0, 1, i64::from(exact) - 1])),
+                StepResult::Finished
+            );
+            // Type 2 is the item-model table; a typed no-op.
+            assert_eq!(
+                host.on_flow(op(0x3C), &operands(&[0, 2, 1000])),
+                StepResult::Finished
+            );
+            // Type 0 names enemy slot `index + 1`.
+            host.state_mut().entities[1].pos = [0, 0, 5];
+            assert_eq!(
+                host.on_flow(op(0x3C), &operands(&[0, 0, 10])),
+                StepResult::Continue
+            );
+            host.state_mut().entities[1].pos = [0, 0, 500];
+            assert_eq!(
+                host.on_flow(op(0x3C), &operands(&[0, 0, 10])),
+                StepResult::Finished
+            );
+        }
+    }
+
     #[test]
     fn unimplemented_classes_record_placeholder_counts() {
         let mut state = game();
@@ -4319,7 +4604,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_model(op(0x1F), &operands(&[0])),
+                host.on_model(op(0x34), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -4327,7 +4612,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_camera(op(0x40), &operands(&[0])),
+                host.on_camera(op(0x3A), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -4341,9 +4626,9 @@ mod tests {
         }
         assert_eq!(state.placeholders.len(), 6);
         assert_eq!(state.placeholders[&0x2B], 1);
-        assert_eq!(state.placeholders[&0x1F], 1);
+        assert_eq!(state.placeholders[&0x34], 1);
         assert_eq!(state.placeholders[&0x29], 1);
-        assert_eq!(state.placeholders[&0x40], 1);
+        assert_eq!(state.placeholders[&0x3A], 1);
         assert_eq!(state.placeholders[&0x27], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
     }

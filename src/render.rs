@@ -664,13 +664,22 @@ impl Framebuffer {
                     weight0 * a.shade[1] + weight1 * b.shade[1] + weight2 * c.shade[1],
                     weight0 * a.shade[2] + weight1 * b.shade[2] + weight2 * c.shade[2],
                 ];
-                let pixel = [
+                let mut pixel = [
                     channel(color[0], shade[0]),
                     channel(color[1], shade[1]),
                     channel(color[2], shade[2]),
                     255,
                 ];
                 let offset = (y as usize * width + x as usize) * 4;
+                // A packet carrying the ABE command bit uses the effect path's
+                // flat half blend (the documented fallback for per-texel STP).
+                if triangle.blend
+                    && let Some(dst) = self.rgba.get(offset..offset + 4)
+                {
+                    for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
+                        *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
+                    }
+                }
                 if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
                     slot.copy_from_slice(&pixel);
                 }
@@ -1445,6 +1454,9 @@ struct Triangle {
     cull: bool,
     /// A solid gouraud colour; `None` samples the texture instead.
     flat: Option<[u8; 3]>,
+    /// The packet's semi-transparency bit: rasterize with the flat half blend
+    /// the effect path uses (the documented fallback for per-texel STP).
+    blend: bool,
 }
 
 /// One projected shadow vertex: screen position, inverse view Z and the
@@ -1595,12 +1607,23 @@ fn collect_triangles(
         let normal0 = normals.get(usize::from(prim.normals[0])).copied().flatten();
         let normal1 = normals.get(usize::from(prim.normals[1])).copied().flatten();
         let normal2 = normals.get(usize::from(prim.normals[2])).copied().flatten();
-        // TODO(parity): (visual) a corner whose stored normal is zero length is
-        // dropped here; the original substitutes the primitive's first vertex
-        // normal for it (flat shading) and still draws the packet.
-        if lighting.is_some() && (normal0.is_none() || normal1.is_none() || normal2.is_none()) {
-            continue;
+        // A corner whose stored normal is zero length borrows the primitive's
+        // first real normal (flat shading) instead of dropping the packet; the
+        // original substitutes and still draws it. A packet with no normal at
+        // all is dropped.
+        let mut corners_normals = [normal0, normal1, normal2];
+        if lighting.is_some() {
+            let substitute = corners_normals.iter().flatten().next().copied();
+            let Some(substitute) = substitute else {
+                continue;
+            };
+            for normal in &mut corners_normals {
+                if normal.is_none() {
+                    *normal = Some(substitute);
+                }
+            }
         }
+        let [normal0, normal1, normal2] = corners_normals;
         let (Some(screen0), Some(screen1), Some(screen2)) = (
             camera.project(*vertex0),
             camera.project(*vertex1),
@@ -1667,7 +1690,9 @@ fn collect_triangles(
             texture,
             palette_row,
             cull,
-            flat: None,
+            // An untextured packet paints its flat colour.
+            flat: prim.flat_color,
+            blend: prim.blend,
         });
     }
 }
@@ -1754,6 +1779,7 @@ fn collect_ivm_triangles(
                 palette_row: 0,
                 cull: false,
                 flat,
+                blend: false,
             });
         }
     }
@@ -1993,6 +2019,9 @@ mod tests {
                     uv: [[0, 0]; 3],
                     clut: 0x7800,
                     tsb: 0x80,
+                    textured: true,
+                    blend: false,
+                    flat_color: None,
                 }],
             }],
         }
@@ -2296,6 +2325,7 @@ mod tests {
             palette_row: 0,
             cull: false,
             flat: None,
+            blend: false,
         })
     }
 

@@ -53,6 +53,7 @@ use crate::message::MessageInput;
 use crate::model::Emd;
 use crate::music;
 use crate::npc;
+use crate::objects;
 use crate::pack::Pack;
 use crate::player;
 use crate::rdt;
@@ -141,7 +142,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         let mut game = new_game_state(&pack, id, &loaded.room);
         let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
-        run_room_init(&loaded, &mut game);
+        run_room_init(&mut loaded, &mut game);
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
 
@@ -600,6 +601,7 @@ impl GameSession {
             self.command_vm.run_init(&mut host);
         }
         start_pending_events(&mut self.game, &mut self.event_vm);
+        self.game.apply_room_edits(&mut self.loaded.room);
         self.game.sync_player(&mut self.player);
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
@@ -2350,7 +2352,7 @@ pub fn simulate_door(
     let mut loaded = load_room(pack, id)?;
     let mut game = new_game_state(pack, id, &loaded.room);
     let mut player_state = player::spawn(id, &loaded.room);
-    run_room_init(&loaded, &mut game);
+    run_room_init(&mut loaded, &mut game);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, None);
 
@@ -2427,7 +2429,7 @@ pub fn simulate_door(
     // The engine runs the destination's init when gameplay resumes; run it
     // here too so the captured frame matches the first rendered frame (mask
     // groups, camera locks and scripted entity moves included).
-    run_room_init(&loaded, &mut game);
+    run_room_init(&mut loaded, &mut game);
     game.sync_player(&mut player_state);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
@@ -2616,7 +2618,7 @@ fn simulate_loaded(
     input: player::Input,
 ) -> Result<SimulatedRoom> {
     let id = loaded.id;
-    run_room_init(&loaded, &mut game);
+    run_room_init(&mut loaded, &mut game);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
 
@@ -3430,6 +3432,9 @@ struct LoadedRoom {
 fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
     let rdt_bytes = pack.read(&id.rdt_entry())?;
     let mut room = rdt::parse(rdt_bytes, id)?;
+    for warning in &room.model_warnings {
+        eprintln!("warning: {}: {warning}", id.rdt_entry());
+    }
     if room.cuts.is_empty() {
         bail!("room {} has no camera cuts", id.room3());
     }
@@ -3473,11 +3478,13 @@ fn new_game_state(pack: &Pack, id: RoomId, room: &RoomState) -> game::GameState 
     game
 }
 
-/// Run a room's init script against `game`.
-fn run_room_init(loaded: &LoadedRoom, game: &mut game::GameState) {
+/// Run a room's init script against `game`, then apply the room edits it
+/// queued (`inst_cfg`/`obj_xfm`) before anything reads the room.
+fn run_room_init(loaded: &mut LoadedRoom, game: &mut game::GameState) {
     let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
     let mut host = game::ScdGameHost::new(game);
     command_vm.run_init(&mut host);
+    game.apply_room_edits(&mut loaded.room);
 }
 
 /// Start every event script requested by `evt_exec` in the command scripts.
@@ -3520,6 +3527,10 @@ fn tick_room(
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
     }
+    // Scripted room writes (`inst_cfg` collision boxes, `obj_xfm` lights)
+    // become visible here, before the player's physics and before the
+    // renderer reads the lighting.
+    context.game.apply_room_edits(context.room);
     // The scripted characters think after the event scripts and before the
     // player's physics, exactly like the original's `update_entities`.
     context
@@ -3822,6 +3833,41 @@ struct PlayerAssets {
     emw: crate::model::Emw,
 }
 
+/// The room objects to submit for `camera`, in declared slot order.
+///
+/// A record is visible while its active bit is set, its declared pair decoded
+/// into the room's asset table, and its switch-zone probe point inside the
+/// current camera's zone. The original walks `g_omodel_table` in order and
+/// culls each record with `is_entity_in_switch_zone(record + 0x54)`; the port
+/// uses the record's live position as that probe point.
+fn visible_objects<'a>(
+    room: &'a RoomState,
+    objects: &'a objects::ObjectTable,
+    camera: usize,
+) -> Vec<(&'a objects::ObjectAsset, &'a objects::ObjectRecord)> {
+    let mut visible = Vec::new();
+    for record in &objects.records {
+        if !record.active() {
+            continue;
+        }
+        let Some(slot) = record.asset else {
+            continue;
+        };
+        let Some(asset) = room
+            .object_models
+            .iter()
+            .find(|asset| asset.pair_index == usize::from(slot))
+        else {
+            continue;
+        };
+        if !npc::in_camera_zone(room, camera, record.pos) {
+            continue;
+        }
+        visible.push((asset, record));
+    }
+    visible
+}
+
 /// Draw one gameplay frame: the cut background, one mesh per active scripted
 /// character, the player model, the player's ground shadow and the camera's
 /// room-mask layer, depth-sorted together.
@@ -3933,11 +3979,27 @@ fn render_frame(
         npc_joints.push(joints);
     }
 
+    // The room's object models are submitted before the NPC and player meshes:
+    // the shared far-to-near sort is stable, so equal-depth triangles keep the
+    // original's room-object-under-character tie order.
+    let visible = visible_objects(room, &game.objects, room.current_cut);
+    let mut object_joints: Vec<Vec<anim::Mat4x3>> = Vec::with_capacity(visible.len());
+    for (_, record) in &visible {
+        object_joints.push(vec![objects::rebuild(record, &lighting)]);
+    }
+
     // TODO(parity): (visual) the original applies each object's runtime colour
     // scale and background blend weight (scripted model tints, the death-wound
     // tint, semi-transparent records); `EntityMesh` carries neither, so every
     // character draws untinted and opaque.
-    let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(1 + models.len());
+    let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(visible.len() + 1 + models.len());
+    for ((asset, _), joints) in visible.iter().zip(&object_joints) {
+        meshes.push(EntityMesh {
+            mesh: &asset.model,
+            texture: &asset.texture,
+            joints,
+        });
+    }
     for (model, joints) in models.iter().zip(&npc_joints) {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -4197,6 +4259,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn visible_objects_filters_active_zone_and_asset_in_slot_order() {
+        use crate::objects::{OBJECT_FLAG_ACTIVE, ObjectAsset, ObjectTable};
+
+        let asset = |pair: usize| ObjectAsset {
+            pair_index: pair,
+            model: crate::model::Tmd::default(),
+            texture: crate::model::Texture8 {
+                width: 0,
+                height: 0,
+                indices: Vec::new(),
+                palettes: Vec::new(),
+            },
+        };
+        let room = RoomState {
+            object_models: vec![asset(0), asset(1), asset(2)],
+            zones: vec![crate::state::Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0, 0], [0, 1000], [1000, 1000], [1000, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let mut objects = ObjectTable::new(3);
+        // Slot 0 is inactive, slot 1 is active inside the zone and slot 2 is
+        // active but outside it.
+        {
+            let record = objects.record_mut(0).unwrap();
+            record.flag = 0;
+            record.asset = Some(0);
+        }
+        {
+            let record = objects.record_mut(1).unwrap();
+            record.flag = OBJECT_FLAG_ACTIVE;
+            record.asset = Some(1);
+            record.pos = [500, 0, 500];
+        }
+        {
+            let record = objects.record_mut(2).unwrap();
+            record.flag = OBJECT_FLAG_ACTIVE;
+            record.asset = Some(2);
+            record.pos = [5000, 0, 5000];
+        }
+
+        let visible = visible_objects(&room, &objects, 0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.pair_index, 1);
+        assert_eq!(visible[0].1, objects.record(1).unwrap());
+
+        // A record whose declared pair failed to decode is skipped.
+        objects.record_mut(1).unwrap().asset = Some(9);
+        assert!(visible_objects(&room, &objects, 0).is_empty());
+
+        // A camera with no zone keeps every record out.
+        objects.record_mut(1).unwrap().asset = Some(1);
+        assert!(visible_objects(&room, &objects, 3).is_empty());
+    }
+
     /// One block plus the terminator, packed as an SCD procedure container.
     fn container(blocks: &[&[u8]]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -4443,8 +4563,9 @@ mod tests {
 
         assert_eq!(game.frame, 10);
         assert!(
-            !game.placeholders.is_empty(),
-            "unimplemented opcodes should be recorded"
+            game.placeholders.is_empty(),
+            "the implemented opcode set must not record placeholders: {:?}",
+            game.placeholders
         );
         assert_eq!(
             game.room_actions[0].map(|action| action.kind),
@@ -5058,7 +5179,7 @@ mod tests {
         // cut has no mask sprites, so compare a masked cut's render instead.
         let mut loaded = load_room(&pack, id).unwrap();
         let mut game = game::GameState::new(id, &loaded.room);
-        run_room_init(&loaded, &mut game);
+        run_room_init(&mut loaded, &mut game);
         apply_camera(&mut loaded.room, &mut game, None);
         assert_eq!(loaded.room.current_cut, 2, "init selects camera 2");
         assert!(loaded.room.cuts[2].masks.is_empty());

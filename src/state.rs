@@ -278,6 +278,11 @@ pub struct RoomState {
     pub stage: u8,
     pub room: u8,
     pub player_flag: u8,
+    /// Declared omodel pair count from header byte `0x02`; also the number of
+    /// runtime object records the room's init script may build.
+    pub omodel_slot_count: u8,
+    /// Declared item-model pair count from header byte `0x03`.
+    pub item_count: u8,
     pub cuts: Vec<Cut>,
     pub current_cut: usize,
     /// Ambient light color, 12-bit per channel.
@@ -298,6 +303,16 @@ pub struct RoomState {
     /// The room's declared effect sprites, parsed from RDT header pointer
     /// slots 13/14/15. Empty when the room declares none.
     pub effects: crate::effects::RoomEffects,
+    /// Declared omodel `{TMD, TIM}` pairs (header byte `0x02`), parsed from
+    /// pointer slot 2. Malformed pairs are skipped; the source pair index is
+    /// kept on each asset.
+    pub object_models: Vec<crate::objects::ObjectAsset>,
+    /// Declared item-model `{TMD, TIM}` pairs (header byte `0x03`), parsed
+    /// from pointer slot 3. Item models stay unbuilt this milestone.
+    pub item_models: Vec<crate::objects::ObjectAsset>,
+    /// Non-fatal problems from parsing the embedded model pairs: one entry
+    /// per malformed (never per null) pair.
+    pub model_warnings: Vec<String>,
 }
 
 impl RoomState {

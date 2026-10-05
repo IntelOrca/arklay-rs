@@ -83,6 +83,9 @@ fn player_triangle(camera: &Camera, corners: [(f64, f64); 3], depth: f64) -> Tmd
                 uv: [[0, 0]; 3],
                 clut: 0x7800,
                 tsb: 0x80,
+                textured: true,
+                blend: false,
+                flat_color: None,
             }],
         }],
     }

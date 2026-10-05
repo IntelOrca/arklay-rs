@@ -1,0 +1,857 @@
+//! Room object models: the embedded RDT TMD/TIM pair table, the runtime
+//! object records the SCD `obj`/`eml_*` opcodes drive, and the transform the
+//! renderer and the effect attach seam read.
+//!
+//! The RDT header holds two flat arrays of 8-byte `{TMD*, TIM*}` pairs:
+//! pointer slot 2 `object_models` with its count in header byte `0x02`, and
+//! slot 3 `item_models` with its count in byte `0x03`. Both TMD and TIM
+//! pointers are relative to the RDT start and either half may be null. The
+//! parse is tolerant the way [`crate::effects::RoomEffects::parse`] is: a
+//! malformed pair is skipped with a warning and never fails the room.
+//!
+//! Every declared omodel slot owns one [`ObjectRecord`]. The `obj` opcode
+//! builds a record (its 28-byte operand block is mapped field for field),
+//! `objtbl_b_set` writes its flag byte, `ck_anim` compares its push counter,
+//! `eml_rot`/`eml_pos` write its rotation and position, and the renderer
+//! composes its world matrix. Item-model records are not built this
+//! milestone; the item-table selectors are typed no-ops.
+
+use anyhow::{Context, Result, bail};
+
+use crate::anim::{self, Mat4x3};
+use crate::model::{Texture8, Tmd};
+use crate::render::Lighting;
+use crate::scd::ir::Operand;
+use crate::state::{RoomId, RoomState};
+use crate::tim;
+use crate::tmd;
+
+/// Object flag bit `0x01`: active and drawn.
+pub const OBJECT_FLAG_ACTIVE: u8 = 0x01;
+/// Object flag bit `0x02`: intangible (never collides).
+pub const OBJECT_FLAG_INTANGIBLE: u8 = 0x02;
+/// Object flag bit `0x04`: the object's own floor probe is skipped.
+pub const OBJECT_FLAG_SKIP_FLOOR_PROBE: u8 = 0x04;
+/// Object flag bit `0x08`: no collision.
+pub const OBJECT_FLAG_NO_COLLISION: u8 = 0x08;
+/// Object flag bit `0x20`: not pushable.
+pub const OBJECT_FLAG_NOT_PUSHABLE: u8 = 0x20;
+/// Object flag bit `0x40`: climbable.
+pub const OBJECT_FLAG_CLIMBABLE: u8 = 0x40;
+
+/// One embedded `{TMD, TIM}` pair, decoded at room load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectAsset {
+    /// The pair's index in the declared table; the SCD `obj` slot selects it.
+    pub pair_index: usize,
+    /// The parsed single-object TMD mesh.
+    pub model: Tmd,
+    /// The decoded 8bpp texture.
+    pub texture: Texture8,
+}
+
+/// Parse a flat `{TMD*, TIM*}` pair table.
+///
+/// `pointer` is the RDT header slot, `count` its declared pair count. Returns
+/// the successfully decoded assets (each keeping its source pair index) and
+/// one warning per skipped pair. A zero pointer or count declares no assets.
+pub fn parse_assets(data: &[u8], pointer: u32, count: u8) -> (Vec<ObjectAsset>, Vec<String>) {
+    let mut assets = Vec::new();
+    let mut warnings = Vec::new();
+    if pointer == 0 || count == 0 {
+        return (assets, warnings);
+    }
+    let base = pointer as usize;
+    for pair in 0..usize::from(count) {
+        let at = base + pair * 8;
+        let read = |field: usize| -> Result<u32> {
+            let bytes = data
+                .get(at + field * 4..at + field * 4 + 4)
+                .with_context(|| {
+                    format!(
+                        "model pair {pair} at 0x{at:x} is out of bounds for the {}-byte RDT",
+                        data.len()
+                    )
+                })?;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+        };
+        let (tmd_pointer, tim_pointer) = match (read(0), read(1)) {
+            (Ok(tmd), Ok(tim)) => (tmd, tim),
+            (Err(error), _) | (_, Err(error)) => {
+                warnings.push(format!("model pair {pair}: {error:#}"));
+                continue;
+            }
+        };
+        // Either half may be null; a pair with no mesh is declared but
+        // unbuilt, not malformed.
+        if tmd_pointer == 0 || tim_pointer == 0 {
+            continue;
+        }
+        let parsed = (|| -> Result<ObjectAsset> {
+            let model_bytes = data
+                .get(tmd_pointer as usize..)
+                .with_context(|| format!("TMD pointer 0x{tmd_pointer:x} is out of bounds"))?;
+            let magic = u32::from_le_bytes(
+                model_bytes
+                    .get(..4)
+                    .context("TMD is truncated")?
+                    .try_into()
+                    .unwrap(),
+            );
+            if magic != 0x41 {
+                bail!("bad TMD magic 0x{magic:08X}");
+            }
+            let model = tmd::parse(model_bytes)?;
+            let texture_bytes = data
+                .get(tim_pointer as usize..)
+                .with_context(|| format!("TIM pointer 0x{tim_pointer:x} is out of bounds"))?;
+            let texture = tim::decode_8bpp(texture_bytes)?;
+            Ok(ObjectAsset {
+                pair_index: pair,
+                model,
+                texture,
+            })
+        })();
+        match parsed {
+            Ok(asset) => assets.push(asset),
+            Err(error) => warnings.push(format!("model pair {pair}: {error:#}")),
+        }
+    }
+    (assets, warnings)
+}
+
+/// One runtime object record. The original reuses a 0xA4-byte `Entity` head
+/// for these; the port keeps a named struct with only the fields the opcodes
+/// and the collision helpers address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectRecord {
+    /// Flag byte (record +0): the `OBJECT_FLAG_*` bits.
+    pub flag: u8,
+    /// Model byte (record +1): the RDT pair slot plus the push-grunt `0x40`
+    /// bit; the texture-queue `0x80` bit is dropped.
+    pub model: u8,
+    /// Entry flags word (record +0x7E, same value as the initial yaw).
+    pub entry_flags: u16,
+    /// SCA parent selector (record +0x64): `0xFE` player, `0xFF` none,
+    /// `< 0x80` another object, else enemy `& 0x7F`.
+    pub parent: u8,
+    /// Live 32-bit position (record +0x34).
+    pub pos: [i32; 3],
+    /// Last committed 16-bit position (record +0x6C), written by the push
+    /// helpers.
+    pub committed: [i16; 3],
+    /// Rotation SVECTOR (record +0x72).
+    pub rotation: [i16; 3],
+    /// The rotation copy the push rollback reads (record +0x78).
+    pub rotation_rollback: [i16; 3],
+    /// Collision half-extents X/Y/Z (record +0x8A/+0x8C/+0x8E).
+    pub half_extents: [u16; 3],
+    /// The entity-side extent word (record +0x90, the second Y copy).
+    pub extent_word: u16,
+    /// The entity-side radius word (record +0x92).
+    pub radius: u16,
+    /// The two floor-probe X/Z endpoints (record +0x94..+0xA0).
+    pub probe: [[u16; 2]; 2],
+    /// The push-hold counter (record +0x86), compared by `ck_anim`.
+    pub push_counter: u16,
+    /// Index of the bound asset in [`crate::state::RoomState::object_models`];
+    /// `None` when the pair had no mesh.
+    pub asset: Option<u8>,
+    /// Per-channel tint multipliers accumulated by `model_op` (slice 4).
+    pub tint: [i8; 3],
+    /// The luminance light scale stored by `model_op` (slice 4).
+    pub light_scale: i16,
+}
+
+impl ObjectRecord {
+    /// Whether the active/drawn flag is set.
+    pub fn active(&self) -> bool {
+        self.flag & OBJECT_FLAG_ACTIVE != 0
+    }
+}
+
+/// One record per declared omodel slot plus the `obj` build counter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ObjectTable {
+    /// The declared omodel records; `obj` slots past the end are ignored.
+    pub records: Vec<ObjectRecord>,
+    /// `g_omodelCount`: how many `obj` calls have built a record.
+    pub built: u8,
+}
+
+impl ObjectTable {
+    /// An empty table for `slot_count` declared omodel slots.
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            records: vec![ObjectRecord::default(); slot_count],
+            built: 0,
+        }
+    }
+
+    /// Room entry: drop every record and the build counter, then size the
+    /// table to the new room's declared slot count.
+    pub fn reset(&mut self, slot_count: usize) {
+        self.records.clear();
+        self.records.resize(slot_count, ObjectRecord::default());
+        self.built = 0;
+    }
+
+    /// One record by slot.
+    pub fn record(&self, index: usize) -> Option<&ObjectRecord> {
+        self.records.get(index)
+    }
+
+    /// One record by slot, mutably.
+    pub fn record_mut(&mut self, index: usize) -> Option<&mut ObjectRecord> {
+        self.records.get_mut(index)
+    }
+
+    /// `obj` (0x1F): build the slot named by the model byte's low six bits.
+    ///
+    /// The 28-byte operand record maps field for field: `+1` the model byte
+    /// (bit `0x40` is kept for the push grunt, bit `0x80` queued the original's
+    /// texture processing), `+2` the flag byte, `+3` the SCA parent, `+4..+9`
+    /// the s16 X/Y/Z position (written to both the 32-bit live position and the
+    /// 16-bit committed copy), `+10` the entry-flags word (also the record's
+    /// initial yaw), `+12..+19` the two floor-probe X/Z endpoints, `+20` the
+    /// entity-side radius word and `+22..+27` the half extents and their second
+    /// Y copy.
+    ///
+    /// # Documented no-ops
+    ///
+    /// The original's stage-5 texture-bank overrides, greenhouse/front-lesson
+    /// palette fix-ups, the `0x40000000`/`0x40000040` SCA scale word and the
+    /// `0x80` texture-queue request have no analogue in the per-model texture
+    /// design and are not ported (the model byte keeps both flag bits so the
+    /// push grunt still reads `0x40`). The room/slot positional overrides are
+    /// transcribed by [`apply_position_overrides`].
+    ///
+    /// Returns whether a record was written; a slot past the declared table
+    /// is ignored (the original would run off the loaded record block).
+    pub fn build(&mut self, operands: &[Operand], id: RoomId) -> bool {
+        let slot = usize::from(operand_u8(operands, 0) & 0x3F);
+        let Some(_) = self.records.get(slot) else {
+            return false;
+        };
+
+        let entry = operand_u16(operands, 6);
+        let mut pos = [
+            i32::from(operand_i16(operands, 3)),
+            i32::from(operand_i16(operands, 4)),
+            i32::from(operand_i16(operands, 5)),
+        ];
+        // Room/slot positional overrides. The original transcribes these as
+        // stage/room special cases around the generic load.
+        apply_position_overrides(&mut pos, slot, id);
+
+        let record = &mut self.records[slot];
+        *record = ObjectRecord {
+            flag: operand_u8(operands, 1),
+            model: operand_u8(operands, 0) & 0x7F,
+            entry_flags: entry,
+            parent: operand_u8(operands, 2),
+            pos,
+            committed: [pos[0] as i16, pos[1] as i16, pos[2] as i16],
+            rotation: [0, entry as i16, 0],
+            rotation_rollback: [0, entry as i16, 0],
+            half_extents: [
+                operand_word(operands, 19),
+                operand_word(operands, 17),
+                operand_word(operands, 21),
+            ],
+            extent_word: operand_word(operands, 17),
+            radius: operand_word(operands, 15),
+            probe: [
+                [operand_word(operands, 7), operand_word(operands, 9)],
+                [operand_word(operands, 11), operand_word(operands, 13)],
+            ],
+            push_counter: 0,
+            asset: Some(slot as u8),
+            tint: [0; 3],
+            light_scale: 0,
+        };
+        self.built = self.built.wrapping_add(1);
+        true
+    }
+
+    /// `objtbl_b_set` (0x35): write byte 0 of an omodel or item model.
+    ///
+    /// The water-tank-entry special case forces object 5 to zero regardless
+    /// of the table selector. Item-model writes are a typed no-op this
+    /// milestone.
+    pub fn set_flag(&mut self, operands: &[Operand], id: RoomId) -> bool {
+        let table = operand_u8(operands, 0);
+        let index = operand_u8(operands, 1);
+        let value = operand_u8(operands, 2);
+        if id.stage == 4 && id.room == 0x0D && index & 0x3F == 5 {
+            if let Some(record) = self.records.get_mut(usize::from(index)) {
+                record.flag = 0;
+            }
+            return true;
+        }
+        if table == 0
+            && let Some(record) = self.records.get_mut(usize::from(index))
+        {
+            record.flag = value;
+            return true;
+        }
+        false
+    }
+
+    /// `ck_anim` (0x36): compare an object's push counter.
+    ///
+    /// Mode 0 `==`, 1 `>`, 2 `>=`, 3 `<`, 4 `<=`, 5 `!=`; any other mode (and
+    /// a missing record) reports false.
+    pub fn compare_counter(&self, operands: &[Operand]) -> bool {
+        let index = usize::from(operand_u8(operands, 0));
+        let mode = operand_u8(operands, 1);
+        let value = u16::from(operand_u8(operands, 2));
+        let Some(record) = self.records.get(index) else {
+            return false;
+        };
+        let field = record.push_counter;
+        match mode {
+            0 => field == value,
+            1 => field > value,
+            2 => field >= value,
+            3 => field < value,
+            4 => field <= value,
+            5 => field != value,
+            _ => false,
+        }
+    }
+
+    /// `eml_rot` (0x3B): write rotation X/Z when the selected record is
+    /// active. Selectors below `0x8000` name the item-model table and are a
+    /// typed no-op this milestone.
+    pub fn rotate(&mut self, operands: &[Operand]) -> bool {
+        let selector = (u16::from(operand_u8(operands, 0)) << 8) | 0x3B;
+        if selector < 0x8000 {
+            return false;
+        }
+        let index = usize::from(operand_u8(operands, 0) & 0x7F);
+        let Some(record) = self.records.get_mut(index) else {
+            return false;
+        };
+        if record.flag == 0 {
+            return false;
+        }
+        record.rotation[0] = operand_i16(operands, 1);
+        record.rotation[2] = operand_i16(operands, 2);
+        true
+    }
+
+    /// `eml_pos` (0x47): set rotation X/Y/Z and position (both the 16- and
+    /// 32-bit copies). The object index is the high byte of the first operand
+    /// word; the low byte is the opcode itself.
+    pub fn transform(&mut self, operands: &[Operand]) -> bool {
+        let index = usize::from(operand_u8(operands, 0));
+        let Some(record) = self.records.get_mut(index) else {
+            return false;
+        };
+        let rotation = [
+            operand_i16(operands, 1),
+            operand_i16(operands, 2),
+            operand_i16(operands, 3),
+        ];
+        let pos = [
+            i32::from(operand_i16(operands, 4)),
+            i32::from(operand_i16(operands, 5)),
+            i32::from(operand_i16(operands, 6)),
+        ];
+        record.rotation = rotation;
+        record.pos = pos;
+        record.committed = [pos[0] as i16, pos[1] as i16, pos[2] as i16];
+        true
+    }
+}
+
+/// The `obj` stage/room positional special cases.
+fn apply_position_overrides(pos: &mut [i32; 3], slot: usize, id: RoomId) {
+    // Front lesson room (stages 2F and their return): slot 0 shifts Z by
+    // +10, slot 1 by -0x28.
+    if id.stage % 5 == 2 && id.room == 0x0B {
+        match slot {
+            0 => pos[2] += 10,
+            1 => pos[2] -= 0x28,
+            _ => {}
+        }
+    }
+    // Guardhouse save room slot 0.
+    if id.stage == 4 && id.room == 0x03 && slot == 0 {
+        pos[0] += 0x1E;
+        pos[1] -= 10;
+        pos[2] += 0x82;
+    }
+    // Security room slot 0.
+    if id.stage == 4 && id.room == 0x0F && slot == 0 {
+        pos[1] -= 0x15E;
+    }
+    // Dining room slot 1, Jill's RDT variant.
+    if id.stage == 1 && id.room == 0x05 && id.player_flag == 1 && slot == 1 {
+        pos[1] = -5;
+    }
+}
+
+/// The object's 4.12 rotation matrix.
+pub fn rotation(object: &ObjectRecord) -> [[i32; 3]; 3] {
+    anim::rotation_matrix(
+        i32::from(object.rotation[0]),
+        i32::from(object.rotation[1]),
+        i32::from(object.rotation[2]),
+    )
+}
+
+/// Compose the object's world matrix: its SVECTOR rotation and its live
+/// 32-bit position.
+///
+/// `lighting` is accepted for the per-object shading the object render path
+/// will consume (slice 4); the matrix itself is lighting-independent.
+pub fn rebuild(object: &ObjectRecord, lighting: &Lighting) -> Mat4x3 {
+    let _ = lighting;
+    Mat4x3 {
+        r: rotation(object),
+        t: object.pos,
+    }
+}
+
+/// One queued `inst_cfg` (0x30) collision-boundary rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CollisionEdit {
+    /// Quadrant list (`0..4`).
+    pub list: u8,
+    /// Record index within the list.
+    pub index: u8,
+    /// The flag nibble patch; zero leaves the record's flags alone.
+    pub flags: u8,
+    /// The four box words in opcode order: `z`, `w`, `x`, `y`.
+    pub zone: [u16; 4],
+}
+
+impl CollisionEdit {
+    /// Apply the rewrite to the room's collision table.
+    pub fn apply(&self, room: &mut RoomState) -> bool {
+        let Some(quadrant) = room.collision.quadrants.get_mut(usize::from(self.list)) else {
+            return false;
+        };
+        let Some(record) = quadrant.get_mut(usize::from(self.index)) else {
+            return false;
+        };
+        record.x_min = self.zone[0];
+        record.z_min = self.zone[1];
+        record.x_max = self.zone[2];
+        record.z_max = self.zone[3];
+        if self.flags != 0 {
+            record.flags = (record.flags & 0xF0FF) | ((u16::from(self.flags) & 0x000F) << 8);
+        }
+        true
+    }
+}
+
+/// Build a collision edit from the `inst_cfg` operand bytes.
+///
+/// Operands: `+1` list, `+2` record index, `+3` flag nibble, then four `u16`
+/// box words `z`, `w`, `x`, `y`.
+pub fn collision_edit(operands: &[Operand]) -> CollisionEdit {
+    CollisionEdit {
+        list: operand_u8(operands, 0),
+        index: operand_u8(operands, 1),
+        flags: operand_u8(operands, 2),
+        zone: [
+            operand_u16(operands, 3),
+            operand_u16(operands, 4),
+            operand_u16(operands, 5),
+            operand_u16(operands, 6),
+        ],
+    }
+}
+
+/// One queued `obj_xfm` (0x40) light rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightEdit {
+    /// Index into the room's three lights.
+    pub index: u8,
+    /// The seven `s16` fields.
+    pub fields: [i16; 7],
+}
+
+impl LightEdit {
+    /// Apply the rewrite to the room's light table.
+    ///
+    /// The original writes seven 32-bit fields into a wider runtime light
+    /// record; the port's `Light` is the 0x14-byte RDT record, so the three
+    /// position components take the first three fields and the remaining
+    /// four map to the colour bytes and the type word (the record has no
+    /// separate field for the last value).
+    pub fn apply(&self, room: &mut RoomState) -> bool {
+        let Some(light) = room.lights.get_mut(usize::from(self.index)) else {
+            return false;
+        };
+        light.pos = [
+            i32::from(self.fields[0]),
+            i32::from(self.fields[1]),
+            i32::from(self.fields[2]),
+        ];
+        light.color = [
+            self.fields[3] as u8,
+            self.fields[4] as u8,
+            self.fields[5] as u8,
+        ];
+        light.kind = self.fields[6] as u16;
+        true
+    }
+}
+
+/// Build a light edit from the `obj_xfm` operand bytes.
+///
+/// Operands: `+1` light index, then seven `s16` fields.
+pub fn light_edit(operands: &[Operand]) -> LightEdit {
+    LightEdit {
+        index: operand_u8(operands, 0),
+        fields: [
+            operand_i16(operands, 1),
+            operand_i16(operands, 2),
+            operand_i16(operands, 3),
+            operand_i16(operands, 4),
+            operand_i16(operands, 5),
+            operand_i16(operands, 6),
+            operand_i16(operands, 7),
+        ],
+    }
+}
+
+/// The XZ distance test behind `ck_counter` (0x3C): `sqrt(dx^2 + dz^2)` is
+/// within `max_dist`.
+pub fn within_distance(player: [i32; 3], target: [i32; 3], max_dist: u16) -> bool {
+    let dx = i64::from(player[0]) - i64::from(target[0]);
+    let dz = i64::from(player[2]) - i64::from(target[2]);
+    let distance = ((dx * dx + dz * dz) as f64).sqrt() as u32;
+    distance <= u32::from(max_dist)
+}
+
+fn operand_u8(operands: &[Operand], index: usize) -> u8 {
+    operands.get(index).map_or(0, |operand| operand.value as u8)
+}
+
+fn operand_i16(operands: &[Operand], index: usize) -> i16 {
+    operands
+        .get(index)
+        .map_or(0, |operand| operand.value as i16)
+}
+
+fn operand_u16(operands: &[Operand], index: usize) -> u16 {
+    operands
+        .get(index)
+        .map_or(0, |operand| operand.value as u16)
+}
+
+/// Read a `u16` from two consecutive single-byte operands.
+fn operand_word(operands: &[Operand], index: usize) -> u16 {
+    u16::from(operand_u8(operands, index)) | (u16::from(operand_u8(operands, index + 1)) << 8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn operands(values: &[i64]) -> Vec<Operand> {
+        values
+            .iter()
+            .map(|&value| Operand {
+                value,
+                target: None,
+            })
+            .collect()
+    }
+
+    /// The 23 decoded operand bytes of one `obj` record.
+    fn obj_operands(model: u8, flag: u8, parent: u8) -> Vec<Operand> {
+        let mut values = vec![
+            i64::from(model),
+            i64::from(flag),
+            i64::from(parent),
+            100,    // X
+            -200,   // Y
+            300,    // Z
+            0x1234, // entry flags
+        ];
+        values.extend([0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+        values.extend([0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]);
+        operands(&values)
+    }
+
+    fn table(slots: usize) -> ObjectTable {
+        ObjectTable::new(slots)
+    }
+
+    #[test]
+    fn object_table_records_one_row_per_declared_slot_and_clears() {
+        let mut objects = table(3);
+        assert_eq!(objects.records.len(), 3);
+        assert_eq!(objects.built, 0);
+
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        assert!(objects.build(&obj_operands(1, OBJECT_FLAG_ACTIVE, 0xFF), id));
+        assert_eq!(objects.built, 1);
+
+        objects.reset(5);
+        assert_eq!(objects.records.len(), 5);
+        assert_eq!(objects.built, 0);
+        assert!(
+            objects
+                .records
+                .iter()
+                .all(|record| *record == ObjectRecord::default())
+        );
+    }
+
+    #[test]
+    fn obj_maps_every_operand_field() {
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut objects = table(2);
+        // Slot 1, push-grunt bit 0x40 set, texture bit 0x80 set.
+        let model = 0x80 | 0x40 | 1;
+        assert!(objects.build(&obj_operands(model, 0x05, 0xFE), id));
+
+        let record = objects.record(1).unwrap();
+        assert_eq!(record.model, 0x40 | 1);
+        assert_eq!(record.flag, 0x05);
+        assert_eq!(record.parent, 0xFE);
+        assert_eq!(record.pos, [100, -200, 300]);
+        assert_eq!(record.committed, [100, -200, 300]);
+        assert_eq!(record.entry_flags, 0x1234);
+        assert_eq!(record.rotation, [0, 0x1234, 0]);
+        assert_eq!(record.rotation_rollback, [0, 0x1234, 0]);
+        assert_eq!(record.probe, [[0x2211, 0x4433], [0x6655, 0x8877]]);
+        assert_eq!(record.radius, 0xAA99);
+        assert_eq!(record.half_extents, [0xEEDD, 0xCCBB, 0x00FF]);
+        assert_eq!(record.extent_word, 0xCCBB);
+        assert_eq!(record.asset, Some(1));
+        assert_eq!(record.push_counter, 0);
+        assert_eq!(record.tint, [0; 3]);
+        assert_eq!(record.light_scale, 0);
+        assert_eq!(objects.record(0).unwrap(), &ObjectRecord::default());
+    }
+
+    #[test]
+    fn obj_ignores_out_of_range_slots_without_counting() {
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut objects = table(2);
+        assert!(!objects.build(&obj_operands(0x3F, 1, 0), id));
+        assert_eq!(objects.built, 0);
+        assert!(objects.build(&obj_operands(1, 1, 0), id));
+        assert_eq!(objects.built, 1);
+    }
+
+    #[test]
+    fn obj_position_overrides_match_the_room_slots() {
+        let build = |stage: u8, room: u8, player_flag: u8, slot: u8| {
+            let id = RoomId {
+                stage,
+                room,
+                player_flag,
+            };
+            let mut objects = table(2);
+            let mut values = vec![i64::from(slot), 1, 0xFF, 100, -200, 300, 0];
+            values.extend([0; 16]);
+            assert!(objects.build(&operands(&values), id));
+            objects.record(usize::from(slot)).unwrap().pos
+        };
+
+        assert_eq!(build(4, 0x03, 0, 0), [100 + 0x1E, -210, 300 + 0x82]);
+        assert_eq!(build(4, 0x03, 0, 1), [100, -200, 300]);
+        assert_eq!(build(4, 0x0F, 0, 0), [100, -200 - 0x15E, 300]);
+        assert_eq!(build(1, 0x05, 1, 1), [100, -5, 300]);
+        assert_eq!(build(1, 0x05, 0, 1), [100, -200, 300]);
+        assert_eq!(build(2, 0x0B, 0, 0), [100, -200, 310]);
+        assert_eq!(build(2, 0x0B, 0, 1), [100, -200, 300 - 0x28]);
+        assert_eq!(build(7, 0x0B, 0, 0), [100, -200, 310]);
+    }
+
+    #[test]
+    fn objtbl_b_set_writes_the_flag_byte_and_special_cases_the_water_tank() {
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut objects = table(6);
+        objects.record_mut(0).unwrap().flag = 0x01;
+        assert!(objects.set_flag(&operands(&[0, 0, 0x80]), id));
+        assert_eq!(objects.record(0).unwrap().flag, 0x80);
+        // Item table (1) is a typed no-op.
+        assert!(!objects.set_flag(&operands(&[1, 0, 0x40]), id));
+        assert_eq!(objects.record(0).unwrap().flag, 0x80);
+        // An unknown table is a no-op too.
+        assert!(!objects.set_flag(&operands(&[2, 0, 0]), id));
+
+        let water_tank = RoomId {
+            stage: 4,
+            room: 0x0D,
+            player_flag: 0,
+        };
+        assert!(objects.set_flag(&operands(&[0, 5, 0x40]), water_tank));
+        assert_eq!(objects.record(5).unwrap().flag, 0);
+        // The same write outside the water tank applies the value.
+        assert!(objects.set_flag(&operands(&[0, 5, 0x40]), id));
+        assert_eq!(objects.record(5).unwrap().flag, 0x40);
+    }
+
+    #[test]
+    fn ck_anim_compares_every_mode() {
+        let mut objects = table(1);
+        objects.record_mut(0).unwrap().push_counter = 10;
+        let check = |mode: i64, value: i64| objects.compare_counter(&operands(&[0, mode, value]));
+
+        assert!(check(0, 10));
+        assert!(!check(0, 11));
+        assert!(check(1, 9));
+        assert!(!check(1, 10));
+        assert!(check(2, 10));
+        assert!(!check(2, 11));
+        assert!(check(3, 11));
+        assert!(!check(3, 10));
+        assert!(check(4, 10));
+        assert!(!check(4, 9));
+        assert!(check(5, 9));
+        assert!(!check(5, 10));
+        assert!(!check(6, 10));
+        assert!(!objects.compare_counter(&operands(&[1, 0, 10])));
+    }
+
+    #[test]
+    fn eml_rot_writes_only_an_active_record() {
+        let mut objects = table(2);
+        objects.record_mut(1).unwrap().flag = 1;
+        objects.record_mut(1).unwrap().rotation = [1, 2, 3];
+
+        assert!(objects.rotate(&operands(&[0x80 | 1, 0x1111, 0x2222])));
+        assert_eq!(objects.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+
+        // An inactive record keeps its rotation.
+        assert!(!objects.rotate(&operands(&[0x80, 0x3333, 0x4444])));
+        assert_eq!(objects.record(0).unwrap().rotation, [0, 0, 0]);
+
+        // A selector below 0x8000 names the item table; a typed no-op.
+        assert!(!objects.rotate(&operands(&[1, 0x5555, 0x6666])));
+        assert_eq!(objects.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+    }
+
+    #[test]
+    fn eml_pos_reads_the_index_from_the_first_operand_byte() {
+        let mut objects = table(2);
+        objects.record_mut(1).unwrap().flag = 0;
+        assert!(objects.transform(&operands(&[1, 0x10, -0x20, 0x30, -100, 200, -300])));
+        let record = objects.record(1).unwrap();
+        assert_eq!(record.rotation, [0x10, -0x20, 0x30]);
+        assert_eq!(record.pos, [-100, 200, -300]);
+        assert_eq!(record.committed, [-100, 200, -300]);
+        // The rotation is written even on an inactive record.
+        assert_eq!(objects.record(1).unwrap().flag, 0);
+    }
+
+    #[test]
+    fn rebuild_composes_rotation_and_position() {
+        let mut objects = table(1);
+        objects.record_mut(0).unwrap().pos = [10, 20, 30];
+        objects.record_mut(0).unwrap().rotation = [0, 0, 0];
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [crate::state::Light::default(); 3],
+        };
+        let matrix = rebuild(objects.record(0).unwrap(), &lighting);
+        assert_eq!(matrix.t, [10, 20, 30]);
+        // The trig tables saturate, so a zero triple is near-identity.
+        assert_eq!(matrix.r[0][0], 4095);
+        assert_eq!(matrix.r[1][1], 4095);
+        assert_eq!(matrix.r[2][2], 4095);
+    }
+
+    #[test]
+    fn collision_edit_rewrites_the_box_and_flag_nibble() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(crate::state::CollisionRect {
+            x_max: 1,
+            z_max: 2,
+            x_min: 3,
+            z_min: 4,
+            kind: 5,
+            flags: 0xF123,
+        });
+        let edit = collision_edit(&operands(&[0, 0, 0x05, 0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(
+            edit,
+            CollisionEdit {
+                list: 0,
+                index: 0,
+                flags: 0x05,
+                zone: [0x11, 0x22, 0x33, 0x44],
+            }
+        );
+        assert!(edit.apply(&mut room));
+        let record = &room.collision.quadrants[0][0];
+        assert_eq!(record.x_min, 0x11);
+        assert_eq!(record.z_min, 0x22);
+        assert_eq!(record.x_max, 0x33);
+        assert_eq!(record.z_max, 0x44);
+        assert_eq!(record.flags, 0xF523);
+
+        // A zero flag byte leaves the flags alone.
+        let edit = collision_edit(&operands(&[0, 0, 0, 1, 2, 3, 4]));
+        assert!(edit.apply(&mut room));
+        assert_eq!(room.collision.quadrants[0][0].flags, 0xF523);
+
+        // Out-of-range targets are refused.
+        let edit = collision_edit(&operands(&[0, 9, 0, 0, 0, 0, 0]));
+        assert!(!edit.apply(&mut room));
+        let edit = collision_edit(&operands(&[4, 0, 0, 0, 0, 0, 0]));
+        assert!(!edit.apply(&mut room));
+    }
+
+    #[test]
+    fn light_edit_rewrites_the_selected_light() {
+        let mut room = RoomState::default();
+        room.lights[1] = crate::state::Light {
+            pos: [1, 2, 3],
+            color: [4, 5, 6],
+            kind: 7,
+            radius: 8,
+        };
+        let edit = light_edit(&operands(&[1, 100, -200, 300, 0x44, 0x55, 0x66, 0x77]));
+        assert_eq!(
+            edit,
+            LightEdit {
+                index: 1,
+                fields: [100, -200, 300, 0x44, 0x55, 0x66, 0x77],
+            }
+        );
+        assert!(edit.apply(&mut room));
+        let light = room.lights[1];
+        assert_eq!(light.pos, [100, -200, 300]);
+        assert_eq!(light.color, [0x44, 0x55, 0x66]);
+        assert_eq!(light.kind, 0x77);
+        assert_eq!(light.radius, 8);
+        assert_eq!(room.lights[0], crate::state::Light::default());
+
+        assert!(!light_edit(&operands(&[4, 0, 0, 0, 0, 0, 0, 0])).apply(&mut room));
+    }
+
+    #[test]
+    fn within_distance_uses_xz_only() {
+        assert!(within_distance([0, 0, 0], [3, 1000, 4], 5));
+        assert!(!within_distance([0, 0, 0], [3, 0, 4], 4));
+        assert!(within_distance([-3, 0, -4], [0, 0, 0], 5));
+    }
+}

@@ -289,7 +289,19 @@ fn kill(game: &mut GameState, index: usize) {
 /// The rotation matrix of the slot's attach target.
 fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
     let entity = match attach {
-        Attach::Identity | Attach::Omodel(_) => return IDENTITY_MATRIX,
+        Attach::Identity => return IDENTITY_MATRIX,
+        Attach::Omodel(index) => {
+            // A missing or inactive object keeps the identity fallback.
+            let Some(object) = game
+                .objects
+                .record(usize::from(index))
+                .filter(|object| object.active())
+            else {
+                return IDENTITY_MATRIX;
+            };
+            let matrix = crate::objects::rotation(object);
+            return std::array::from_fn(|slot| matrix[slot / 3][slot % 3] as i16);
+        }
         Attach::Player => &game.entities[0],
         Attach::Entity(slot) => match game.entities.get(usize::from(slot)) {
             Some(entity) => entity,
@@ -305,10 +317,16 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
 /// The original copies the parent's full `MATRIX` over the slot while `type`
 /// is 1; its translation lands in the sprite-offset fields and is added back
 /// after the rotation, so an effect attached to a character is positioned
-/// relative to that character, not the world origin.
+/// relative to that character, not the world origin. An object model resolves
+/// to its composed world position exactly like a character.
 fn attach_translation(game: &GameState, attach: Attach) -> [i32; 3] {
     match attach {
-        Attach::Identity | Attach::Omodel(_) => [0, 0, 0],
+        Attach::Identity => [0, 0, 0],
+        Attach::Omodel(index) => game
+            .objects
+            .record(usize::from(index))
+            .filter(|object| object.active())
+            .map_or([0, 0, 0], |object| object.pos),
         Attach::Player => game.entities[0].pos,
         Attach::Entity(slot) => game
             .entities
@@ -1823,6 +1841,36 @@ mod tests {
 
     fn run(game: &mut GameState, room: &RoomState) {
         update(game, room);
+    }
+
+    #[test]
+    fn omodel_attach_resolves_to_the_object_transform() {
+        let mut game = GameState::default();
+        game.objects.reset(1);
+        {
+            let record = game.objects.record_mut(0).unwrap();
+            record.flag = crate::objects::OBJECT_FLAG_ACTIVE;
+            record.pos = [100, 200, 300];
+            record.rotation = [0, 0x400, 0];
+        }
+        let record = *game.objects.record(0).unwrap();
+        let expected = crate::objects::rotation(&record);
+        let matrix = attach_matrix(&game, Attach::Omodel(0));
+        assert_eq!(
+            matrix,
+            std::array::from_fn(|slot| expected[slot / 3][slot % 3] as i16)
+        );
+        assert_eq!(
+            attach_translation(&game, Attach::Omodel(0)),
+            [100, 200, 300]
+        );
+
+        // An inactive or missing object keeps the identity fallback.
+        game.objects.record_mut(0).unwrap().flag = 0;
+        assert_eq!(attach_matrix(&game, Attach::Omodel(0)), IDENTITY_MATRIX);
+        assert_eq!(attach_translation(&game, Attach::Omodel(0)), [0, 0, 0]);
+        assert_eq!(attach_matrix(&game, Attach::Omodel(9)), IDENTITY_MATRIX);
+        assert_eq!(attach_translation(&game, Attach::Omodel(9)), [0, 0, 0]);
     }
 
     #[test]

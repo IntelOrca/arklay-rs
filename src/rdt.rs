@@ -27,6 +27,10 @@ const POINTER_COUNT: usize = 19;
 const CAMERA_ZONES_SLOT: usize = 0;
 /// Pointer slot of the collision boundary table.
 const COLLISION_SLOT: usize = 1;
+/// Pointer slot of the omodel `{TMD*, TIM*}` pair table.
+const OBJECT_MODELS_SLOT: usize = 2;
+/// Pointer slot of the item-model `{TMD*, TIM*}` pair table (`0x58`).
+const ITEM_MODELS_SLOT: usize = 3;
 /// Pointer slot of the walkable zone table.
 const WALK_ZONES_SLOT: usize = 4;
 /// Pointer slot of the footstep sound zone table.
@@ -66,6 +70,8 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
             data.len()
         );
     };
+    let omodel_slot_count = data.get(0x02).copied().unwrap_or(0);
+    let item_count = data.get(0x03).copied().unwrap_or(0);
 
     let cuts = parse_cameras(data, cameras_count)?;
     let ambient = parse_ambient(data)?;
@@ -83,11 +89,21 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         pointers[EFFECT_INFO_SLOT],
         pointers[EFFECT_TIM_SLOT],
     );
+    // The embedded model pairs are tolerant like the effect tables: a
+    // malformed pair is skipped with a warning, a null half is simply
+    // unbuilt, and a damaged model never fails the room.
+    let (object_models, mut model_warnings) =
+        crate::objects::parse_assets(data, pointers[OBJECT_MODELS_SLOT], omodel_slot_count);
+    let (item_models, item_warnings) =
+        crate::objects::parse_assets(data, pointers[ITEM_MODELS_SLOT], item_count);
+    model_warnings.extend(item_warnings);
 
     Ok(RoomState {
         stage: id.stage,
         room: id.room,
         player_flag: id.player_flag,
+        omodel_slot_count,
+        item_count,
         cuts,
         current_cut: 0,
         ambient,
@@ -98,6 +114,9 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         footstep_zones,
         messages,
         effects,
+        object_models,
+        item_models,
+        model_warnings,
     })
 }
 
@@ -987,6 +1006,141 @@ mod tests {
         push_walk_zone(&mut data, [0, 0, 10, 10], 0, 0);
 
         assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    /// Minimal one-object TMD: 12-byte header plus one zeroed descriptor.
+    fn empty_tmd() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x41u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[0u8; 28]);
+        data
+    }
+
+    /// Minimal 8bpp single-CLUT-row TIM: 2x1 pixels, one 256-entry row.
+    fn tiny_tim() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x10u32.to_le_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&(12u32 + 256 * 2).to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&256u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        for entry in 0..256u16 {
+            data.extend_from_slice(&(entry & 0x7FFF).to_le_bytes());
+        }
+        data.extend_from_slice(&14u32.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&[0, 0]);
+        data
+    }
+
+    #[test]
+    fn parses_embedded_omodel_and_item_pairs() {
+        let mut data = build_rdt(0, &[]);
+        // Omodel slot 0 and item slot 0 both point at appended art, with the
+        // source pair index preserved.
+        data[0x02] = 1;
+        data[0x03] = 1;
+        let omodel_table = data.len();
+        set_ptr(&mut data, OBJECT_MODELS_SLOT, omodel_table);
+        let tmd_offset = data.len() as u32 + 8;
+        data.extend_from_slice(&tmd_offset.to_le_bytes());
+        let tim_offset = tmd_offset + empty_tmd().len() as u32;
+        data.extend_from_slice(&tim_offset.to_le_bytes());
+        data.extend_from_slice(&empty_tmd());
+        data.extend_from_slice(&tiny_tim());
+
+        let item_table = data.len();
+        set_ptr(&mut data, ITEM_MODELS_SLOT, item_table);
+        let tmd_offset = data.len() as u32 + 8;
+        data.extend_from_slice(&tmd_offset.to_le_bytes());
+        let tim_offset = tmd_offset + empty_tmd().len() as u32;
+        data.extend_from_slice(&tim_offset.to_le_bytes());
+        data.extend_from_slice(&empty_tmd());
+        data.extend_from_slice(&tiny_tim());
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.omodel_slot_count, 1);
+        assert_eq!(state.item_count, 1);
+        assert!(
+            state.model_warnings.is_empty(),
+            "{:?}",
+            state.model_warnings
+        );
+        assert_eq!(state.object_models.len(), 1);
+        assert_eq!(state.object_models[0].pair_index, 0);
+        assert_eq!(state.object_models[0].model.objects.len(), 1);
+        assert_eq!(state.object_models[0].texture.width, 2);
+        assert_eq!(state.object_models[0].texture.height, 1);
+        assert_eq!(state.item_models.len(), 1);
+        assert_eq!(state.item_models[0].pair_index, 0);
+    }
+
+    #[test]
+    fn skips_a_malformed_pair_and_counts_it() {
+        let mut data = build_rdt(0, &[]);
+        data[0x02] = 2;
+        let table = data.len();
+        set_ptr(&mut data, OBJECT_MODELS_SLOT, table);
+        // Two pointer slots, then the first pair's art and the second pair's
+        // (malformed) art.
+        data.extend_from_slice(&[0u8; 16]);
+        let first_tmd = data.len() as u32;
+        data.extend_from_slice(&empty_tmd());
+        let first_tim = data.len() as u32;
+        data.extend_from_slice(&tiny_tim());
+        let second_tmd = data.len() as u32;
+        data.extend_from_slice(&empty_tmd());
+        let second_tim = data.len() as u32;
+        data.extend_from_slice(&tiny_tim());
+        let entries = [(first_tmd, first_tim), (second_tmd, second_tim)];
+        for (index, entry) in entries.iter().enumerate() {
+            let at = table + index * 8;
+            data[at..at + 4].copy_from_slice(&entry.0.to_le_bytes());
+            data[at + 4..at + 8].copy_from_slice(&entry.1.to_le_bytes());
+        }
+        // The second TMD has bad magic.
+        let second = second_tmd as usize;
+        data[second..second + 4].copy_from_slice(&0u32.to_le_bytes());
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert_eq!(state.object_models.len(), 1);
+        assert_eq!(state.object_models[0].pair_index, 0);
+        assert_eq!(state.model_warnings.len(), 1);
+        assert!(state.model_warnings[0].contains("pair 1"));
+    }
+
+    #[test]
+    fn null_pair_halves_are_declared_but_unbuilt_and_never_warn() {
+        let mut data = build_rdt(0, &[]);
+        data[0x02] = 3;
+        let table = data.len();
+        set_ptr(&mut data, OBJECT_MODELS_SLOT, table);
+        // Pair 0: null TMD; pair 1: null TIM; pair 2: out-of-bounds pointer.
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        data.extend_from_slice(&1u32.to_le_bytes());
+
+        let state = parse(&data, ROOM_ID).unwrap();
+
+        assert!(state.object_models.is_empty());
+        assert_eq!(state.model_warnings.len(), 1);
+        assert!(
+            state.model_warnings[0].contains("pair 2"),
+            "{:?}",
+            state.model_warnings
+        );
     }
 
     #[test]

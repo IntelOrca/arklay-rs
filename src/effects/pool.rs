@@ -88,13 +88,9 @@ impl EffectBlock {
 ///
 /// `parent` 0 is the identity transform, 1 the player, `2..=0x7F` entity slot
 /// `parent - 1` in this port's entity array (the original's enemy index
-/// `parent - 2`) and `>= 0x80` an object model `parent & 0x7F`.
-///
-/// # Documented deviation
-///
-/// Object models do not exist this milestone, so [`Attach::Omodel`] resolves
-/// to the identity transform. The object class can fill the seam later without
-/// touching the pool.
+/// `parent - 2`) and `>= 0x80` an object model `parent & 0x7F`. An object
+/// model resolves to its composed rotation and world position; a missing or
+/// inactive object falls back to the identity transform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Attach {
     /// Identity transform (parent 0).
@@ -104,7 +100,7 @@ pub enum Attach {
     Player,
     /// A scripted entity slot (parent `2..=0x7F`, stored as `parent - 1`).
     Entity(u8),
-    /// An object model (parent `>= 0x80`, id `parent & 0x7F`; identity).
+    /// An object model (parent `>= 0x80`, id `parent & 0x7F`).
     Omodel(u8),
 }
 

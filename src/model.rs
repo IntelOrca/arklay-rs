@@ -8,10 +8,12 @@
 /// normalizes its CLUT rows to this stride.
 pub const PALETTE_ROW_LEN: usize = 256;
 
-/// One textured, Gouraud-shaded triangle packet from a TMD primitive list.
+/// One triangle packet from a TMD primitive list.
 ///
 /// Vertex and normal fields are indices into the owning [`TmdObject`]'s
-/// `vertices` and `normals`. `uv[i]` is `[u, v]` for vertex `i`.
+/// `vertices` and `normals`. `uv[i]` is `[u, v]` for vertex `i`. The embedded
+/// RDT models use six packet commands; a textured gouraud quad is split into
+/// two of these triangles at parse time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmdPrim {
     pub vertices: [u16; 3],
@@ -19,6 +21,14 @@ pub struct TmdPrim {
     pub uv: [[u8; 2]; 3],
     pub clut: u16,
     pub tsb: u16,
+    /// Whether the primitive samples the texture page. An untextured packet
+    /// (`0x30000406`) paints [`TmdPrim::flat_color`] instead.
+    pub textured: bool,
+    /// The packet's semi-transparency command bit (`0x36000609`). The
+    /// renderer's fallback is a flat half blend.
+    pub blend: bool,
+    /// The packet colour of an untextured packet, `None` when textured.
+    pub flat_color: Option<[u8; 3]>,
 }
 
 /// A TMD object: one vertex pool, one normal pool and the primitives using them.

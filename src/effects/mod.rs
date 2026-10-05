@@ -25,10 +25,10 @@
 //!
 //! # Documented deviations (slice 6)
 //!
-//! - **Omodel attach identity.** Parent selectors `>= 0x80` (object models)
-//!   resolve to the identity transform because the object-model class does not
-//!   exist yet ([`pool::Attach::Omodel`]); the seam is the single
-//!   [`behaviour`] attach resolution, ready for the object class.
+//! - **Omodel attach.** Parent selectors `>= 0x80` (object models) resolve
+//!   through [`pool::Attach::Omodel`] to the object's composed rotation and
+//!   world position; a missing or inactive object keeps the identity
+//!   fallback.
 //! - **Inert combat behaviours.** Behaviour ids 10, 37, 43 and 45 stay counted
 //!   placeholders by design (bullet/rocket/flame combat); the corpus audit
 //!   proves no shipped script or sprite animation reaches them. Every other
