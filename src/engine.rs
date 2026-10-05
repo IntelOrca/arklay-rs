@@ -31,7 +31,7 @@
 //!   only rendering, the camera-switch cull and effect attach compose the SCA
 //!   parent chain.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -77,6 +77,7 @@ use crate::bmp;
 use crate::door;
 use crate::effects;
 use crate::emd;
+use crate::ending;
 use crate::font;
 use crate::game;
 use crate::items;
@@ -114,6 +115,14 @@ const WINDOW_HEIGHT: i32 = HEIGHT * SCALE;
 const PIXEL_PITCH: i32 = WIDTH * 4;
 /// Fixed simulation step in milliseconds (30 Hz, the original frame rate).
 const TICK_MS: f64 = 1000.0 / 30.0;
+/// The absent Virgin logo the boot sequence requests first.
+const BOOT_VLOGO_ID: u8 = 28;
+/// The Capcom logo the boot sequence requests after the Virgin logo.
+const BOOT_CAPCOM_ID: u8 = 23;
+/// The opening film the title requests on its first entry per process.
+const TITLE_OPENING_ID: u8 = 0;
+/// The prologue film the character confirm requests before a new game.
+const PROLOGUE_ID: u8 = 1;
 
 struct SdlHandle;
 
@@ -259,6 +268,9 @@ pub fn run_with_voice_and_movie(
                 let choice = game.message.menu_choice_id();
                 game.message.set_menu_choice_id(choice & 0x7F);
                 drain_mask_toggles(&mut loaded.room, &mut game);
+                // A capture never plays a film: the request is taken and
+                // dropped so a `movie_on` cannot stall the headless run.
+                game.take_fmv_request();
             }
         }
 
@@ -882,9 +894,16 @@ impl GameSession {
         );
         // The global SE bank (the lid's `0x20`) has no pack mapping yet.
         self.game.sfx_requests.clear();
+        // A script's `movie_on` request takes over after this tick: the film
+        // owns the next tick and the game sounds pause until it ends. A
+        // pending door transition wins and leaves the request for after it.
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
             self.transition = Some(start_transition(pack, &record, &transition)?);
+        } else if let Some(id) = self.game.take_fmv_request() {
+            if let Err(err) = self.start_movie(pack, id, self.game.id.player_flag) {
+                eprintln!("warning: film id {id} unavailable: {err:#}");
+            }
         } else if self.game.take_itembox_open() {
             self.open_item_box(pack);
         }
@@ -922,7 +941,6 @@ impl GameSession {
     /// Start `id`'s film over the frozen room: pause the game sounds, queue the
     /// film's opening audio and show its first frame. Called by the film
     /// request hand-off once the scripts raise one.
-    #[allow(dead_code)]
     fn start_movie(&mut self, pack: &Pack, id: u8, character: u8) -> Result<()> {
         if self.movie.is_some() {
             return Ok(());
@@ -1539,6 +1557,10 @@ fn seed_new_game(game: &mut game::GameState, character: u8) {
 /// Which screen `--ui` boots or the app opens first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppBoot {
+    /// The interactive root boot: the Virgin logo (28, absent from this
+    /// install), the Capcom logo (23), then the title with its once-per-process
+    /// opening film. Captures and `--ui` boots use [`AppBoot::Title`] instead.
+    Boot,
     /// The title screen.
     Title,
     /// The character-selection screen.
@@ -1620,6 +1642,25 @@ struct App {
     movie_action: Option<ScreenAction>,
     /// A film waiting to start on the next tick.
     pending_movie: Option<PendingMovie>,
+    /// Films queued to play back to back, with `(id, character)`; the chain's
+    /// last film is followed by [`App::chain_action`] (or a quit when `None`).
+    film_chain: VecDeque<(u8, u8)>,
+    /// The action applied when [`App::film_chain`] drains.
+    chain_action: Option<ScreenAction>,
+    /// Whether a film chain is active: a finishing film advances the chain
+    /// instead of applying `movie_action`.
+    chain_active: bool,
+    /// Whether the automatic opening/intro films may queue. True only on the
+    /// interactive root boot; captures, `--ui` and `--ending` leave it off so
+    /// their frames stay deterministic.
+    films: bool,
+    /// Whether the title's opening film (id 0) has been queued once.
+    opening_played: bool,
+    /// Whether the prologue film (id 1) is playing for a pending new game:
+    /// the follow-up `NewGame` action then builds the session instead of
+    /// queueing the film again. A later confirm queues the prologue anew,
+    /// exactly like the original.
+    prologue_pending: bool,
     /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
     ui_sfx_cache: SfxCache,
 }
@@ -1668,6 +1709,12 @@ impl App {
             movie_music: None,
             movie_action: None,
             pending_movie: None,
+            film_chain: VecDeque::new(),
+            chain_action: None,
+            chain_active: false,
+            films: false,
+            opening_played: false,
+            prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
         }
     }
@@ -1676,6 +1723,48 @@ impl App {
     /// when it finishes. The session starts on the next app tick.
     fn queue_movie(&mut self, session: MovieSession, action: Option<ScreenAction>) {
         self.pending_movie = Some(PendingMovie { session, action });
+    }
+
+    /// Open film `id` from the movie pack (or the main pack when the films are
+    /// embedded and no sibling pack exists).
+    fn open_movie(&mut self, id: u8, character: u8) -> Result<MovieSession> {
+        let source = self.movie_pack.open("movie").unwrap_or(&self.pack);
+        MovieSession::open(source, id, character)
+    }
+
+    /// Play `films` back to back, then apply `action` (`None` quits the app).
+    ///
+    /// A film that cannot be opened is logged and skipped, so a missing movie
+    /// pack or the absent Virgin logo never stalls the chain. The first film
+    /// starts on the next app tick.
+    fn play_film_chain(
+        &mut self,
+        films: Vec<(u8, u8)>,
+        action: Option<ScreenAction>,
+    ) -> Result<AppFlow> {
+        self.film_chain = films.into();
+        self.chain_action = action;
+        self.chain_active = true;
+        self.advance_chain()
+    }
+
+    /// Start the next film of the active chain; when the chain is exhausted,
+    /// apply its action or quit.
+    fn advance_chain(&mut self) -> Result<AppFlow> {
+        while let Some((id, character)) = self.film_chain.pop_front() {
+            match self.open_movie(id, character) {
+                Ok(session) => {
+                    self.queue_movie(session, None);
+                    return Ok(AppFlow::Continue);
+                }
+                Err(err) => eprintln!("warning: film id {id} unavailable: {err:#}"),
+            }
+        }
+        self.chain_active = false;
+        match self.chain_action.take() {
+            Some(action) => self.apply(action),
+            None => Ok(AppFlow::Quit),
+        }
     }
 
     /// Start a queued film: open the film mixer on the interactive path, queue
@@ -1712,6 +1801,9 @@ impl App {
         if let Some(mixer) = &mut self.movie_music {
             mixer.stop_movie_audio();
             mixer.resume_game_sounds();
+        }
+        if self.chain_active {
+            return self.advance_chain();
         }
         let action = self.movie_action.take();
         match action {
@@ -1766,6 +1858,7 @@ impl App {
     /// Open the boot screen.
     fn boot(&mut self, boot: AppBoot) -> Result<()> {
         match boot {
+            AppBoot::Boot => self.play_boot(),
             AppBoot::Title => self.open_title(),
             AppBoot::CharSelect => self.open_select(),
             AppBoot::SaveLoad => self.open_load(),
@@ -1782,11 +1875,30 @@ impl App {
         }
     }
 
-    /// Open the title screen.
+    /// The interactive root boot: enable the automatic films and queue the
+    /// two logos, then the title (which queues its opening film).
+    fn play_boot(&mut self) -> Result<()> {
+        self.films = true;
+        self.play_film_chain(
+            vec![(BOOT_VLOGO_ID, 0), (BOOT_CAPCOM_ID, 0)],
+            Some(ScreenAction::Title),
+        )?;
+        Ok(())
+    }
+
+    /// Open the title screen. On the interactive root boot the first entry
+    /// also queues the opening film (id 0) exactly once per process.
     fn open_title(&mut self) -> Result<()> {
         let mut screen = ui::title::TitleScreen::new();
         screen.open(&mut self.context())?;
         self.mode = Mode::Title(screen);
+        if self.films && !self.opening_played {
+            self.opening_played = true;
+            match self.open_movie(TITLE_OPENING_ID, 0) {
+                Ok(session) => self.queue_movie(session, Some(ScreenAction::Title)),
+                Err(err) => eprintln!("warning: opening film unavailable: {err:#}"),
+            }
+        }
         Ok(())
     }
 
@@ -1882,8 +1994,28 @@ impl App {
             ScreenAction::CharSelect => self.open_select()?,
             ScreenAction::SaveLoad => self.open_load()?,
             ScreenAction::NewGame { character } => {
-                let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                self.start_session(session);
+                // The interactive root boot plays the prologue film (id 1)
+                // with the chosen character before the session is built. The
+                // film's follow-up action comes back here and builds the
+                // session; a missing film falls through directly.
+                if self.films && !self.prologue_pending {
+                    self.prologue_pending = true;
+                    match self.open_movie(PROLOGUE_ID, character) {
+                        Ok(session) => {
+                            self.queue_movie(session, Some(ScreenAction::NewGame { character }))
+                        }
+                        Err(err) => {
+                            eprintln!("warning: intro film unavailable: {err:#}");
+                            self.prologue_pending = false;
+                            let session = GameSession::new(&self.pack, character, &self.save_dir)?;
+                            self.start_session(session);
+                        }
+                    }
+                } else {
+                    self.prologue_pending = false;
+                    let session = GameSession::new(&self.pack, character, &self.save_dir)?;
+                    self.start_session(session);
+                }
             }
             ScreenAction::LoadGame { slot } => {
                 let file = save::load(&self.save_dir, slot)?;
@@ -2175,8 +2307,6 @@ pub fn run_ui_with_voice_and_movie(
     voice: Option<&Path>,
     movie: Option<&Path>,
 ) -> Result<()> {
-    let voice_path = voice_pack_path(pack, voice);
-    let movie_path = movie_pack_path(pack, movie);
     let boot = match screen {
         "font" => return run_font_ui(pack, capture),
         "title" => AppBoot::Title,
@@ -2195,6 +2325,33 @@ pub fn run_ui_with_voice_and_movie(
             )
         }
     };
+    run_ui_impl(pack, boot, capture, save_dir, voice, movie)
+}
+
+/// The interactive root boot: the two logos, the title's opening film and the
+/// character confirm's prologue, then the chosen game. A capture boots the
+/// title directly and skips every automatic film, exactly like `--ui title`.
+pub fn run_root_with_voice_and_movie(
+    pack: &Path,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    voice: Option<&Path>,
+    movie: Option<&Path>,
+) -> Result<()> {
+    run_ui_impl(pack, AppBoot::Boot, capture, save_dir, voice, movie)
+}
+
+/// The shared body of the `--ui` boot and the interactive root boot.
+fn run_ui_impl(
+    pack: &Path,
+    boot: AppBoot,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    voice: Option<&Path>,
+    movie: Option<&Path>,
+) -> Result<()> {
+    let voice_path = voice_pack_path(pack, voice);
+    let movie_path = movie_pack_path(pack, movie);
 
     if let Some(capture_path) = capture {
         let pack = Pack::open(pack)?;
@@ -2206,7 +2363,8 @@ pub fn run_ui_with_voice_and_movie(
             false,
         );
         match boot {
-            AppBoot::Title => {
+            // A root-boot capture is the title capture: no automatic films.
+            AppBoot::Boot | AppBoot::Title => {
                 // Reach the option menu, then let the fade settle.
                 app.open_title()?;
                 app.update(
@@ -2352,6 +2510,44 @@ pub fn run_fmv(
     };
     app.queue_movie(session, None);
     let display = Display::new("Arklay", false)?;
+    run_app_loop(&mut app, &display)
+}
+
+/// Play one ending chain (`id` 1-7) through the app's film mode, the
+/// `--ending` debug path.
+///
+/// The chain is [`crate::ending::chain`] for a first playthrough without the
+/// infinite launcher: the pre-ending film, the row's ending film, the
+/// congratulations film and, for the first three rows, the staff roll. A
+/// capture advances `ticks` fixed 30 Hz ticks over the chain and writes the
+/// current frame; interactive playback quits when the chain ends. The RESULT
+/// screen, the epilogue and the next-cycle save are not part of this path.
+pub fn run_ending(
+    pack: &Path,
+    movie: Option<&Path>,
+    id: u8,
+    character: u8,
+    capture: Option<&Path>,
+    ticks: u32,
+) -> Result<()> {
+    let films = ending::chain(id, character, false, false);
+    if films.is_empty() {
+        bail!("ending id {id} is outside 1-7");
+    }
+    let movie_path = movie_pack_path(pack, movie);
+    let save_dir = save::default_save_dir_for_pack(pack);
+    let pack = Pack::open(pack)?;
+    let mut app = App::new(pack, save_dir, None, movie_path, capture.is_none());
+    let chain: Vec<(u8, u8)> = films.iter().map(|&film| (film, character)).collect();
+    if app.play_film_chain(chain, None)? == AppFlow::Quit {
+        bail!("no ending film could be opened; is the movie pack present?");
+    }
+    if let Some(capture_path) = capture {
+        app.settle(ticks)?;
+        app.draw();
+        return app.capture(capture_path);
+    }
+    let display = Display::new("Arklay - ending", false)?;
     run_app_loop(&mut app, &display)
 }
 
@@ -3080,6 +3276,44 @@ pub fn simulate_room_seeded(
     simulate_loaded(pack, loaded, game, player_state, ticks, move |_| input)
 }
 
+/// [`simulate_room_seeded`] with the film hand-off live.
+///
+/// This is the real-asset seam for the `movie_on` handshake: a request opens a
+/// session from `movie_pack` and the film freezes the room until it ends,
+/// exactly like the engine's gameplay tick. The returned [`MovieHandoff`]
+/// records the requested/played ids and the BGM state around the films; a run
+/// whose `movie_pack` lacks a requested film drains the request instead.
+#[allow(clippy::too_many_arguments)]
+pub fn simulate_room_with_movie(
+    pack: &Pack,
+    movie_pack: &Pack,
+    id: RoomId,
+    flags: &[(u8, u8)],
+    ticks: usize,
+    input: impl FnMut(usize) -> player::Input,
+) -> Result<SimulatedMovie> {
+    let loaded = load_room(pack, id)?;
+    let mut game = new_game_state(pack, id, &loaded.room);
+    seed_room_items(&mut game);
+    for &(bank, bit) in flags {
+        game.apply_flag(bank, bit, 0);
+    }
+    let player_state = player::spawn(id, &loaded.room);
+    game.sync_entity_from_player(&player_state);
+    let mut handoff = MovieHandoff::default();
+    let room = simulate_loaded_with(
+        pack,
+        Some(movie_pack),
+        loaded,
+        game,
+        player_state,
+        ticks,
+        input,
+        &mut handoff,
+    )?;
+    Ok(SimulatedMovie { room, handoff })
+}
+
 /// Render one gameplay frame from an already-built state.
 ///
 /// This is the headless capture seam for effect probes: tests can tick a state
@@ -3141,14 +3375,68 @@ pub fn simulate_new_game(
     simulate_loaded(pack, loaded, game, player_state, ticks, move |_| input)
 }
 
+/// Film hand-off audit for [`simulate_room_with_movie`].
+#[derive(Debug, Default, Clone)]
+pub struct MovieHandoff {
+    /// Film ids the scripts requested, in order.
+    pub requested: Vec<u8>,
+    /// Films that opened and played to completion.
+    pub played: Vec<u8>,
+    /// `game.bgm` when the first film started.
+    pub bgm_at_start: Option<game::BgmState>,
+    /// `game.bgm` when the last film ended.
+    pub bgm_at_end: Option<game::BgmState>,
+}
+
+/// The result of [`simulate_room_with_movie`]: the room after the ticks plus
+/// the film hand-off audit.
+pub struct SimulatedMovie {
+    /// The room after the ticks.
+    pub room: SimulatedRoom,
+    /// The film requests the scripts raised and the films that played.
+    pub handoff: MovieHandoff,
+}
+
 /// The shared body of [`simulate_room`] and [`simulate_new_game`].
+///
+/// A headless run drains every film request: the request slot is taken and
+/// dropped so a `movie_on` can never stall the simulation. The movie-aware
+/// variant is [`simulate_room_with_movie`].
 fn simulate_loaded(
     pack: &Pack,
+    loaded: LoadedRoom,
+    game: game::GameState,
+    player_state: player::PlayerState,
+    ticks: usize,
+    input: impl FnMut(usize) -> player::Input,
+) -> Result<SimulatedRoom> {
+    let mut audit = MovieHandoff::default();
+    simulate_loaded_with(
+        pack,
+        None,
+        loaded,
+        game,
+        player_state,
+        ticks,
+        input,
+        &mut audit,
+    )
+}
+
+/// [`simulate_loaded`] with the film hand-off live: a request opens a session
+/// from `movie_pack` (when given) and the film freezes the room exactly like
+/// the engine's gameplay tick. `audit` records the requests and the BGM state
+/// around the films.
+#[allow(clippy::too_many_arguments)]
+fn simulate_loaded_with(
+    pack: &Pack,
+    movie_pack: Option<&Pack>,
     mut loaded: LoadedRoom,
     mut game: game::GameState,
     mut player_state: player::PlayerState,
     ticks: usize,
     mut input: impl FnMut(usize) -> player::Input,
+    audit: &mut MovieHandoff,
 ) -> Result<SimulatedRoom> {
     let id = loaded.id;
     run_room_init(&mut loaded, &mut game);
@@ -3173,8 +3461,20 @@ fn simulate_loaded(
     let mut bgm_cache = bgm::BgmCache::default();
     let mut snd3d_cache = SfxCache::default();
     let mut no_mixer: Option<Mixer> = None;
+    let mut film: Option<MovieSession> = None;
 
     for tick in 0..ticks {
+        // A film owns the tick while it plays: the room's scripts, entities,
+        // effects and the player stay frozen.
+        if let Some(session) = film.as_mut() {
+            session.tick(0, None);
+            if session.finished() {
+                audit.played.push(session.id());
+                audit.bgm_at_end = Some(game.bgm);
+                film = None;
+            }
+            continue;
+        }
         tick_room(
             &mut command_vm,
             &mut event_vm,
@@ -3202,6 +3502,17 @@ fn simulate_loaded(
         let choice = game.message.menu_choice_id();
         game.message.set_menu_choice_id(choice & 0x7F);
         drain_mask_toggles(&mut loaded.room, &mut game);
+        // A script's `movie_on` takes over the next tick. A run without a
+        // movie pack takes and drops the request, so it never stalls.
+        if let Some(request) = game.take_fmv_request() {
+            audit.requested.push(request);
+            if let Some(source) = movie_pack
+                && let Ok(session) = MovieSession::open(source, request, game.id.player_flag)
+            {
+                audit.bgm_at_start.get_or_insert(game.bgm);
+                film = Some(session);
+            }
+        }
     }
 
     render_frame(
@@ -8092,6 +8403,262 @@ mod tests {
             session.game.frame,
             before + 1,
             "the room resumed after the film"
+        );
+    }
+
+    /// Open a dummy-driver mixer, or `None` when no audio device exists.
+    fn dummy_mixer() -> Option<Mixer> {
+        let _ = unsafe {
+            sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
+        };
+        Mixer::open()
+    }
+
+    #[test]
+    fn a_movie_on_request_starts_the_film_and_resumes_the_sounds() {
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping film hand-off test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        // The init script's bytes: `movie_on 3` then `end`.
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x29, 0x03, 0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer
+            .add("movie/dm3.avi", crate::movie::test_avi(30))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+        session.music = Some(mixer);
+        // A recognizable BGM state the film must not disturb.
+        session.game.bgm = game::BgmState {
+            state: 0x24,
+            target: 0x24,
+            ..game::BgmState::default()
+        };
+        let bgm = session.game.bgm;
+
+        assert_eq!(
+            session.game.fmv.request,
+            Some(3),
+            "the init queued the film"
+        );
+        assert!(session.game.fmv_requested());
+        assert_eq!(session.game.fmv.taken, 0);
+
+        // The first tick runs the room, then the hand-off takes the request
+        // and pauses the game sounds.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.movie.as_ref().map(MovieSession::id), Some(3));
+        assert!(
+            session.music.as_ref().unwrap().game_sounds_paused(),
+            "the film pauses the game sounds"
+        );
+        assert_eq!(session.game.fmv.request, None);
+        assert!(!session.game.fmv_requested());
+        assert_eq!(session.game.fmv.taken, 1);
+        let before = session.game.frame;
+
+        // The film owns every tick until it finishes.
+        let mut ticks = 0;
+        while session.movie.is_some() {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            ticks += 1;
+            assert_eq!(session.game.frame, before, "the film froze the room");
+            assert!(ticks < 200, "the film never ended");
+        }
+        assert!(
+            !session.music.as_ref().unwrap().game_sounds_paused(),
+            "the sounds resume when the film ends"
+        );
+        assert_eq!(session.game.bgm, bgm, "the BGM state survives the film");
+
+        // The room continues on the next tick.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.frame, before + 1);
+        assert!(session.movie.is_none(), "the film is not restarted");
+    }
+
+    #[test]
+    fn a_film_request_without_a_film_drains_and_never_stalls() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x29, 0x03, 0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+
+        for _ in 0..3 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.movie.is_none(), "the missing film never starts");
+        assert_eq!(session.game.fmv.taken, 1, "the request was drained");
+        assert_eq!(session.game.frame, 3, "the room kept ticking");
+    }
+
+    /// A pack carrying a room and one synthetic film per `(id, name)` entry.
+    fn film_pack(dir: &TempDir, films: &[(u8, &str)]) -> Pack {
+        let pack_path = dir.0.join("films.akpak");
+        let id = RoomId::parse("1001").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        for &(film_id, name) in films {
+            let _ = film_id;
+            writer
+                .add(&crate::movie::pack_path(name), crate::movie::test_avi(30))
+                .unwrap();
+        }
+        writer.write(&pack_path).unwrap();
+        Pack::open(&pack_path).unwrap()
+    }
+
+    /// Run the app until `predicate` holds, returning the film ids seen in
+    /// order. Panics after 4000 ticks.
+    fn run_app_until(app: &mut App, mut predicate: impl FnMut(&App) -> bool) -> Vec<u8> {
+        let mut seen: Vec<u8> = Vec::new();
+        for _ in 0..4000 {
+            app.update(UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if let Mode::Movie(session) = &app.mode
+                && seen.last() != Some(&session.id())
+            {
+                seen.push(session.id());
+            }
+            if predicate(app) {
+                return seen;
+            }
+        }
+        panic!("the app never reached the expected mode");
+    }
+
+    #[test]
+    fn the_boot_queue_plays_the_logos_then_the_title_opening_once() {
+        let dir = TempDir::new();
+        let pack = film_pack(&dir, &[(28, "vlogo"), (23, "capcom"), (0, "oj")]);
+        let mut app = App::new(pack, dir.0.clone(), None, None, false);
+        app.boot(AppBoot::Boot).unwrap();
+
+        // The logos play in order, then the title opens and queues its film.
+        let seen = run_app_until(&mut app, |app| matches!(app.mode, Mode::Title(_)));
+        assert_eq!(seen, vec![28, 23], "the logos play in boot order");
+        let pending = app.pending_movie.as_ref().expect("the title opening film");
+        assert_eq!(pending.session.id(), 0);
+
+        // The opening film finishes and reopens the title without requeueing.
+        let seen = run_app_until(&mut app, |app| {
+            matches!(app.mode, Mode::Title(_)) && app.pending_movie.is_none()
+        });
+        assert_eq!(seen, vec![0], "the opening film played once");
+        assert!(app.pending_movie.is_none());
+
+        // A later title entry never replays it.
+        app.open_title().unwrap();
+        assert!(app.pending_movie.is_none(), "id 0 is once per process");
+        assert!(app.opening_played);
+    }
+
+    #[test]
+    fn the_boot_queue_skips_the_absent_virgin_logo() {
+        let dir = TempDir::new();
+        // The shipped JPN install has no `vlogo.avi`.
+        let pack = film_pack(&dir, &[(23, "capcom"), (0, "oj")]);
+        let mut app = App::new(pack, dir.0.clone(), None, None, false);
+        app.boot(AppBoot::Boot).unwrap();
+        let seen = run_app_until(&mut app, |app| matches!(app.mode, Mode::Title(_)));
+        assert_eq!(seen, vec![23], "the missing logo is skipped");
+        assert_eq!(
+            app.pending_movie
+                .as_ref()
+                .map(|pending| pending.session.id()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_title_capture_queues_no_films() {
+        let dir = TempDir::new();
+        let pack = film_pack(&dir, &[(0, "oj"), (1, "pj")]);
+        let mut app = App::new(pack, dir.0.clone(), None, None, false);
+        // Captures and `--ui` boots leave the automatic films off.
+        app.boot(AppBoot::Title).unwrap();
+        assert!(app.pending_movie.is_none());
+        assert!(matches!(app.mode, Mode::Title(_)));
+        assert!(!app.films);
+    }
+
+    #[test]
+    fn the_character_confirm_queues_the_intro_with_the_character() {
+        let dir = TempDir::new();
+        let pack = film_pack(&dir, &[(1, "pj")]);
+        let mut app = App::new(pack, dir.0.clone(), None, None, false);
+        app.films = true;
+        app.apply(ScreenAction::NewGame { character: 1 }).unwrap();
+        let pending = app.pending_movie.as_ref().expect("the intro film");
+        assert_eq!(pending.session.id(), 1);
+        assert_eq!(pending.session.character(), 1, "the chosen character");
+        assert_eq!(pending.action, Some(ScreenAction::NewGame { character: 1 }));
+        assert!(matches!(app.mode, Mode::Title(_)), "the session waits");
+
+        // The intro finishes and the NewGame action builds the session.
+        run_app_until(&mut app, |app| matches!(app.mode, Mode::Play(_)));
+        let Mode::Play(session) = &app.mode else {
+            unreachable!();
+        };
+        assert_eq!(session.game.id.player_flag, 1, "Jill's session");
+        assert!(!app.prologue_pending);
+
+        // A later confirm queues the prologue again, like the original.
+        app.films = true;
+        app.apply(ScreenAction::NewGame { character: 0 }).unwrap();
+        let pending = app.pending_movie.as_ref().expect("a second intro film");
+        assert_eq!(pending.session.id(), 1);
+        assert_eq!(pending.session.character(), 0);
+    }
+
+    #[test]
+    fn an_ending_chain_plays_every_film_and_skips_missing_ones() {
+        let dir = TempDir::new();
+        let pack = film_pack(
+            &dir,
+            &[(14, "dme"), (15, "ed1"), (27, "staf_b"), (22, "ed8")],
+        );
+        let mut app = App::new(pack, dir.0.clone(), None, None, false);
+        // The null id 10 sits in the middle: it is skipped, not fatal.
+        app.play_film_chain(vec![(14, 0), (10, 0), (15, 0), (27, 0), (22, 0)], None)
+            .unwrap();
+        let seen = run_app_until(&mut app, |app| !app.chain_active);
+        assert_eq!(seen, vec![14, 15, 27, 22], "the chain order");
+        assert!(!app.chain_active);
+        // The last film is still presented; the next tick quits.
+        assert_eq!(
+            app.update(UiInput::default(), player::Input::default(), false)
+                .unwrap(),
+            AppFlow::Quit
         );
     }
 

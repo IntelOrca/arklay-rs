@@ -60,16 +60,27 @@ struct Cli {
         long,
         value_name = "ID",
         requires = "pack",
-        conflicts_with_all = ["room", "ui"]
+        conflicts_with_all = ["room", "ui", "ending"]
     )]
     fmv: Option<u8>,
 
-    /// Character for the `--fmv` prologue cut (0 Chris, 1 Jill)
+    /// Play ending row `ID` (1-7) as its film chain and exit; with `--capture`
+    /// the frame after `--ticks` fixed ticks is written headlessly
+    #[arg(
+        long,
+        value_name = "ID",
+        requires = "pack",
+        conflicts_with_all = ["room", "ui"],
+        value_parser = clap::value_parser!(u8).range(1..=7)
+    )]
+    ending: Option<u8>,
+
+    /// Character for the `--fmv` prologue cut and the `--ending` chain
+    /// (0 Chris, 1 Jill)
     #[arg(
         long,
         value_name = "N",
         default_value_t = 0,
-        requires = "fmv",
         value_parser = clap::value_parser!(u8).range(0..=1)
     )]
     character: u8,
@@ -320,6 +331,16 @@ fn main() -> Result<()> {
             let save_dir = cli
                 .save_dir
                 .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
+            if let Some(id) = cli.ending {
+                return arklay::engine::run_ending(
+                    &pack,
+                    cli.movie.as_deref(),
+                    id,
+                    cli.character,
+                    cli.capture.as_deref(),
+                    cli.ticks,
+                );
+            }
             if let Some(id) = cli.fmv {
                 return arklay::engine::run_fmv(
                     &pack,
@@ -352,13 +373,13 @@ fn main() -> Result<()> {
                     cli.movie.as_deref(),
                 );
             }
-            // No room and no `--ui`: boot the title screen, the app root.
-            arklay::engine::run_ui_with_voice_and_movie(
+            // No room and no `--ui`: boot the app root, whose interactive run
+            // plays the logos, the title opening and the select prologue. A
+            // capture still boots the title directly and plays no films.
+            arklay::engine::run_root_with_voice_and_movie(
                 &pack,
-                "title",
                 cli.capture.as_deref(),
                 &save_dir,
-                cli.player,
                 cli.voice.as_deref(),
                 cli.movie.as_deref(),
             )

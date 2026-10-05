@@ -147,6 +147,11 @@ pub enum MovieTick {
 /// One film being played: the demuxed file, the Cinepak canvas, the audio queue
 /// and the skip state.
 pub struct MovieSession {
+    /// The film's table id.
+    id: u8,
+    /// The character the session opened for (0 Chris, 1 Jill); selects the
+    /// prologue cut and travels with the session for chain reporting.
+    character: u8,
     avi: Avi,
     decoder: Decoder,
     /// The RGBA scratch [`MovieSession::frame_rgba`] hands out.
@@ -226,6 +231,8 @@ impl MovieSession {
         let samples_per_frame = avi.samples_per_frame() as u64 * u64::from(SAMPLE_RATE)
             / u64::from(format.audio.sample_rate.max(1));
         let mut session = MovieSession {
+            id,
+            character: character & 1,
             avi,
             decoder: Decoder::new(320, 240),
             rgba: vec![0u8; 320 * 240 * 4],
@@ -364,6 +371,16 @@ impl MovieSession {
     /// The presented frame as 320x240 RGBA8, refreshed on every advance.
     pub fn frame_rgba(&self) -> &[u8] {
         &self.rgba
+    }
+
+    /// The film's table id.
+    pub fn id(&self) -> u8 {
+        self.id
+    }
+
+    /// The character the session opened for (0 Chris, 1 Jill).
+    pub fn character(&self) -> u8 {
+        self.character
     }
 
     /// The presented kept frame index (0 after [`MovieSession::open`]).

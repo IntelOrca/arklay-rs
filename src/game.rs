@@ -25,6 +25,7 @@ use std::rc::Rc;
 use crate::effects;
 use crate::items;
 use crate::message::{MessageAction, MessageInput, MessageWindow};
+use crate::movie;
 use crate::music;
 use crate::objects::{self, CollisionEdit, LightEdit, ObjectTable};
 use crate::player::PlayerState;
@@ -237,6 +238,10 @@ const MSF_SCRIPT_ONLY_14: u8 = 17;
 /// playing and an event script's F7 wait must hold. The mask is bit 17 of the
 /// first dword, i.e. selector 14 in the MSB-first flag bank.
 pub const MSF_VOICE_PLAYING: u8 = 14;
+/// `main_state_flags` bit 0x40000 (`MSF_FMV_REQUEST`): a `movie_on` request
+/// is pending and the engine's gameplay tick must take it. The mask is bit 18
+/// of the first dword, i.e. selector 13 in the MSB-first flag bank.
+pub const MSF_FMV_REQUEST: u8 = 13;
 /// `main_state_flags` bit 0x100: the pick-up screen is pending.
 const MSF_PICKUP_SCREEN: u8 = 23;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
@@ -647,6 +652,19 @@ pub struct VoiceState {
     /// Names that resolved to nothing (empty record or out-of-range id), kept
     /// so the corpus audit can report the hardening path.
     pub misses: u64,
+}
+
+/// Film state behind the `movie_on` request handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FmvState {
+    /// The most recent film the script asked for; the engine's gameplay tick
+    /// takes it on the next tick and installs the session.
+    pub request: Option<u8>,
+    /// Ids rejected by the 0-28 range and null-id check, kept so the corpus
+    /// audit can report the hardening path.
+    pub misses: u64,
+    /// Requests the engine (or a headless capture drain) has taken.
+    pub taken: u64,
 }
 
 /// One inventory stack.
@@ -1157,6 +1175,8 @@ pub struct GameState {
     pub room_bgm: [u8; ROOM_BGM_LEN],
     /// Voice-line state behind the `voice_play` wait handshake.
     pub voice: VoiceState,
+    /// Film state behind the `movie_on` request handshake.
+    pub fmv: FmvState,
     /// The player's inventory.
     pub inventory: Vec<InventoryItem>,
     /// The room's action table.
@@ -1333,6 +1353,7 @@ impl Default for GameState {
             bgm: BgmState::default(),
             room_bgm: [0; ROOM_BGM_LEN],
             voice: VoiceState::default(),
+            fmv: FmvState::default(),
             inventory: Vec::new(),
             room_actions: [None; ROOM_ACTION_SLOTS],
             doors: [None; ROOM_ACTION_SLOTS],
@@ -1498,6 +1519,24 @@ impl GameState {
     /// type-2/`bgm_stop_all` stop ran).
     pub fn clear_voice_playing(&mut self) {
         self.apply_flag(5, MSF_VOICE_PLAYING, 1);
+    }
+
+    /// Whether a film request is pending (`MSF_FMV_REQUEST` in flag bank 5).
+    pub fn fmv_requested(&self) -> bool {
+        self.flags[5].bit(MSF_FMV_REQUEST)
+    }
+
+    /// Take the pending film request, clearing the request bit.
+    ///
+    /// The engine's gameplay tick is the single consumer; a headless capture
+    /// loop takes and drops the request so a film can never stall the run.
+    pub fn take_fmv_request(&mut self) -> Option<u8> {
+        let id = self.fmv.request.take();
+        if id.is_some() {
+            self.apply_flag(5, MSF_FMV_REQUEST, 1);
+            self.fmv.taken += 1;
+        }
+        id
     }
 
     /// Whether a bank-7 room-items bit marks its item as still in the room.
@@ -4466,7 +4505,21 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // TODO(parity): (scripting) 0x29 FMV request stays a placeholder.
+            // `movie_on` (0x29, the original's `cmd_fmv_set`): queue a film and
+            // raise the request bit the engine consumes on the next tick. The
+            // reader decodes the one-byte operand (the original reads the
+            // operand word's high byte); ids outside 0-28 and the null id 10
+            // are counted misses so a bad script cannot deadlock the room.
+            0x29 => {
+                let id = operand_u8(operands, 0);
+                if movie::name(id).is_some() {
+                    self.state.fmv.request = Some(id);
+                    self.state.apply_flag(5, MSF_FMV_REQUEST, 0);
+                } else {
+                    self.state.fmv.misses += 1;
+                }
+                StepResult::Continue
+            }
             _ => self.placeholder(op),
         }
     }
@@ -6476,10 +6529,6 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_message(op(0x29), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
                 host.on_camera(op(0x3A), &operands(&[0])),
                 StepResult::Placeholder
             );
@@ -6492,12 +6541,85 @@ mod tests {
                 StepResult::Placeholder
             );
         }
-        assert_eq!(state.placeholders.len(), 5);
+        assert_eq!(state.placeholders.len(), 4);
         assert_eq!(state.placeholders[&0x2B], 1);
-        assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x3A], 1);
         assert_eq!(state.placeholders[&0x26], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
+    }
+
+    #[test]
+    fn movie_on_parses_the_one_byte_id_and_raises_the_request_bit() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_message(op(0x29), &operands(&[3])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.fmv.request, Some(3));
+        assert!(state.fmv_requested(), "the film request bit is raised");
+        assert_eq!(state.fmv.misses, 0);
+        assert_eq!(state.fmv.taken, 0);
+
+        // The one-shot take clears both the slot and the bit.
+        assert_eq!(state.take_fmv_request(), Some(3));
+        assert_eq!(state.fmv.request, None);
+        assert!(!state.fmv_requested());
+        assert_eq!(state.fmv.taken, 1);
+        assert_eq!(state.take_fmv_request(), None);
+        assert_eq!(state.fmv.taken, 1);
+    }
+
+    #[test]
+    fn movie_on_accepts_every_named_id_and_rejects_the_rest() {
+        for id in 0..=28u8 {
+            let mut state = game();
+            let expected = id != 10;
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                assert_eq!(
+                    host.on_message(op(0x29), &operands(&[i64::from(id)])),
+                    StepResult::Continue
+                );
+            }
+            if expected {
+                assert_eq!(state.fmv.request, Some(id), "id {id} is named");
+                assert!(state.fmv_requested());
+                assert_eq!(state.fmv.misses, 0);
+            } else {
+                assert_eq!(state.fmv.request, None, "id {id} is the null entry");
+                assert!(!state.fmv_requested());
+                assert_eq!(state.fmv.misses, 1);
+            }
+        }
+
+        for id in [29u8, 30, 255] {
+            let mut state = game();
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                assert_eq!(
+                    host.on_message(op(0x29), &operands(&[i64::from(id)])),
+                    StepResult::Continue
+                );
+            }
+            assert_eq!(state.fmv.request, None, "id {id} is out of range");
+            assert!(!state.fmv_requested());
+            assert_eq!(state.fmv.misses, 1);
+        }
+    }
+
+    #[test]
+    fn a_second_movie_on_replaces_the_pending_request() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_message(op(0x29), &operands(&[5]));
+            host.on_message(op(0x29), &operands(&[12]));
+        }
+        assert_eq!(state.fmv.request, Some(12), "one request slot");
+        assert_eq!(state.fmv.misses, 0);
     }
 
     /// A state with one weapon effect sprite (type 9, one block per depth row).

@@ -10,6 +10,7 @@ pub mod convert;
 pub mod door;
 pub mod effects;
 pub mod emd;
+pub mod ending;
 pub mod engine;
 pub mod font;
 pub mod game;

@@ -808,6 +808,13 @@ impl Mixer {
         self.state.resume_game_sounds();
     }
 
+    /// Whether the game sounds are suspended for a film. Test seam for the
+    /// engine's film hand-off.
+    #[cfg(test)]
+    pub(crate) fn game_sounds_paused(&self) -> bool {
+        self.state.game_paused
+    }
+
     /// Whether SDL selected the silent dummy driver, whose stream is never
     /// consumed: the engine then treats the run as device-less and paces films
     /// with the fixed 30 Hz tick.

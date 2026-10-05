@@ -674,6 +674,27 @@ mod tests {
     }
 
     #[test]
+    fn movie_on_decodes_its_one_byte_operand() {
+        // The shipped site's bytes: `29 03` is movie_on 3; the trailing `00`
+        // is the next opcode, not part of the operand.
+        let body = bytes(&[0x29, 0x03, 0x00, 0x00]);
+        let mut builder = RdtBuilder::new();
+        builder.push_section(INIT_SLOT_OFFSET, &container(&[&body]));
+        builder.push_section(MAIN_SLOT_OFFSET, &container(&[]));
+        builder.push_section(EVENT_SLOT_OFFSET, &event_table(&[]));
+        let data = builder.finish_with_event_sentinel();
+
+        let scripts = parse(&data).unwrap();
+        let block = &scripts.init[0];
+        assert_eq!(block.insns.len(), 2);
+        assert_eq!(block.insns[0].op, 0x29);
+        assert_eq!(block.insns[0].bytes, [0x29, 0x03]);
+        assert_eq!(block.insns[0].operands.len(), 1);
+        assert_eq!(block.insns[0].operands[0].value, 3);
+        assert_eq!(block.insns[1].op, 0x00);
+    }
+
+    #[test]
     fn unknown_command_opcode_stops_the_block() {
         let body = bytes(&[0x0E, 0x00, 0xEE, 0x01, 0x02, 0x03]);
         let mut builder = RdtBuilder::new();
