@@ -43,6 +43,7 @@ use crate::anim;
 use crate::audio::{self, Mixer, MusicPlayer};
 use crate::bmp;
 use crate::door;
+use crate::effects;
 use crate::emd;
 use crate::font;
 use crate::game;
@@ -135,7 +136,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 
     if let Some(capture_path) = capture {
         let mut loaded = load_room(&pack, id)?;
-        let mut game = game::GameState::new(id, &loaded.room);
+        let mut game = new_game_state(&pack, id, &loaded.room);
         let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         run_room_init(&loaded, &mut game);
@@ -489,7 +490,7 @@ impl GameSession {
             player_flag: character,
         };
         let loaded = load_room(pack, id)?;
-        let mut game = game::GameState::new(id, &loaded.room);
+        let mut game = new_game_state(pack, id, &loaded.room);
         seed_new_game(&mut game, character);
         let mut player_state = player::spawn(id, &loaded.room);
         player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
@@ -501,7 +502,7 @@ impl GameSession {
     /// Boot `id` directly, the `--room` path.
     fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Self> {
         let loaded = load_room(pack, id)?;
-        let mut game = game::GameState::new(id, &loaded.room);
+        let mut game = new_game_state(pack, id, &loaded.room);
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
@@ -516,7 +517,7 @@ impl GameSession {
             player_flag: file.character & 1,
         };
         let loaded = load_room(pack, id)?;
-        let mut game = game::GameState::new(id, &loaded.room);
+        let mut game = new_game_state(pack, id, &loaded.room);
         file.apply_to(&mut game);
         let mut player_state = player::spawn(id, &loaded.room);
         player_state.pos = [
@@ -2341,7 +2342,7 @@ pub fn simulate_door(
     frame_dir: Option<&Path>,
 ) -> Result<SimulatedDoor> {
     let mut loaded = load_room(pack, id)?;
-    let mut game = game::GameState::new(id, &loaded.room);
+    let mut game = new_game_state(pack, id, &loaded.room);
     let mut player_state = player::spawn(id, &loaded.room);
     run_room_init(&loaded, &mut game);
     drain_mask_toggles(&mut loaded.room, &mut game);
@@ -2511,7 +2512,7 @@ pub fn simulate_room(
     input: player::Input,
 ) -> Result<SimulatedRoom> {
     let loaded = load_room(pack, id)?;
-    let mut game = game::GameState::new(id, &loaded.room);
+    let mut game = new_game_state(pack, id, &loaded.room);
     let player_state = player::spawn(id, &loaded.room);
     game.sync_entity_from_player(&player_state);
     simulate_loaded(pack, loaded, game, player_state, ticks, input)
@@ -2528,7 +2529,7 @@ pub fn simulate_room_seeded(
     input: player::Input,
 ) -> Result<SimulatedRoom> {
     let loaded = load_room(pack, id)?;
-    let mut game = game::GameState::new(id, &loaded.room);
+    let mut game = new_game_state(pack, id, &loaded.room);
     for &(bank, bit) in flags {
         game.apply_flag(bank, bit, 0);
     }
@@ -2553,7 +2554,7 @@ pub fn simulate_new_game(
         player_flag: character,
     };
     let loaded = load_room(pack, id)?;
-    let mut game = game::GameState::new(id, &loaded.room);
+    let mut game = new_game_state(pack, id, &loaded.room);
     seed_new_game(&mut game, character);
     let mut player_state = player::spawn(id, &loaded.room);
     player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
@@ -3073,6 +3074,22 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
         player_assets,
         music,
     })
+}
+
+/// Build a fresh game state for `id`/`room` with the pack's global weapon-FX
+/// metadata installed, so script effect spawns resolve both the room's
+/// declared sprites and the `core00` types.
+fn new_game_state(pack: &Pack, id: RoomId, room: &RoomState) -> game::GameState {
+    let mut game = game::GameState::new(id, room);
+    let weapon = effects::WeaponEffects::load(pack);
+    if pack.contains(effects::room::CORE_ESP_ENTRY) || pack.contains(effects::room::CORE_ETM_ENTRY)
+    {
+        for warning in &weapon.warnings {
+            eprintln!("warning: {warning}");
+        }
+    }
+    game.set_weapon_effects(weapon);
+    game
 }
 
 /// Run a room's init script against `game`.

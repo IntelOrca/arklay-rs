@@ -295,6 +295,9 @@ pub struct RoomState {
     /// Raw RDT message block: a `u16` offset table followed by the encoded
     /// message streams. Absent when the RDT has no message pointer.
     pub messages: Option<Vec<u8>>,
+    /// The room's declared effect sprites, parsed from RDT header pointer
+    /// slots 13/14/15. Empty when the room declares none.
+    pub effects: crate::effects::RoomEffects,
 }
 
 impl RoomState {

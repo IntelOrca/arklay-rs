@@ -5,6 +5,7 @@ pub mod audio;
 pub mod bmp;
 pub mod convert;
 pub mod door;
+pub mod effects;
 pub mod emd;
 pub mod engine;
 pub mod font;

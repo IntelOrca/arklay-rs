@@ -13,11 +13,15 @@
 //! only while the key is held, at a point 600 units in front of the player.
 //! Items and doors act for real; the menu-driven kinds record a placeholder
 //! interaction. The scripted characters (`0x20..=0x2E`) allocate entities,
-//! render and run their native driver; monsters still allocate nothing and
-//! effects stay recorded placeholders until their systems exist.
+//! render and run their native driver; monsters still allocate nothing. The
+//! six effect opcodes spawn into [`crate::effects::EffectPool`], resolving
+//! their sprite metadata from the room's RDT tables and the global weapon
+//! metadata.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 
+use crate::effects;
 use crate::items;
 use crate::message::{MessageAction, MessageInput, MessageWindow};
 use crate::player::PlayerState;
@@ -869,6 +873,22 @@ pub struct GameState {
     /// reseeds its global from `rand()` at the top of every gameplay frame;
     /// the port advances a deterministic xorshift so headless runs repeat.
     pub rand_seed: u16,
+    /// The effect pool (64 slots).
+    pub effects: effects::EffectPool,
+    /// The current room's effect sprite metadata, re-resolved and page-packed
+    /// on room entry (the original's room effect init). Shared so
+    /// [`ScdGameHost::on_effect`] can pass it to [`effects::create`] while the
+    /// pool is borrowed mutably.
+    pub room_effects: Rc<effects::RoomEffects>,
+    /// The global weapon-FX sprite metadata (`core00`), loaded once from the
+    /// pack.
+    pub weapon_effects: effects::WeaponEffects,
+    /// Effect types already logged as missing in the current room, so a script
+    /// spawning an undeclared type warns once.
+    pub effect_missing_logged: BTreeSet<u8>,
+    /// The last `effect_tracked` (0x3D) spawn's type and attach target, which
+    /// `effect_kill_a` (0x3E) clears.
+    pub last_tracked_effect: Option<(u8, effects::Attach)>,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -925,6 +945,11 @@ impl Default for GameState {
             pending_events: Vec::new(),
             entity_sounds: Vec::new(),
             rand_seed: RAND_SEED_INITIAL,
+            effects: effects::EffectPool::new(),
+            room_effects: Rc::new(effects::RoomEffects::default()),
+            weapon_effects: effects::WeaponEffects::default(),
+            effect_missing_logged: BTreeSet::new(),
+            last_tracked_effect: None,
         }
     }
 }
@@ -946,8 +971,9 @@ fn next_random(seed: u16) -> u16 {
 }
 
 impl GameState {
-    /// Create the state for `id`, seeding the identity bytes from the room id.
-    pub fn new(id: RoomId, _room: &RoomState) -> Self {
+    /// Create the state for `id`, seeding the identity bytes from the room id
+    /// and resolving the room's effect sprite metadata.
+    pub fn new(id: RoomId, room: &RoomState) -> Self {
         let mut state = Self {
             id,
             ..Self::default()
@@ -959,7 +985,25 @@ impl GameState {
         // InitializeGame derives the maximum from the character on every path,
         // so a state built without `seed_new_game` still has a real maximum.
         state.max_health = character_max_health(id.player_flag);
+        state.resolve_room_effects(room);
         state
+    }
+
+    /// Re-resolve the room's effect sprite metadata, re-running the two-pass
+    /// page packing (the original's room effect init).
+    pub fn resolve_room_effects(&mut self, room: &RoomState) {
+        let mut resolved = room.effects.clone();
+        effects::pages::pack(&self.weapon_effects, &mut resolved);
+        self.room_effects = Rc::new(resolved);
+    }
+
+    /// Install the global weapon-FX metadata loaded from the pack and re-pack
+    /// the current room's sprite records.
+    pub fn set_weapon_effects(&mut self, weapon: effects::WeaponEffects) {
+        self.weapon_effects = weapon;
+        let mut resolved = (*self.room_effects).clone();
+        effects::pages::pack(&self.weapon_effects, &mut resolved);
+        self.room_effects = Rc::new(resolved);
     }
 
     /// Store the current room camera id in both the camera state and the
@@ -1662,10 +1706,16 @@ impl GameState {
     /// change; the room action table, message, camera and per-room requests do
     /// not. The player entity slot survives; the other entity slots reset. The
     /// identity bytes are reseeded from the new room.
-    pub fn enter_room(&mut self, id: RoomId, _room: &RoomState) {
+    pub fn enter_room(&mut self, id: RoomId, room: &RoomState) {
         // TODO(parity): (scripting) the original's `room_state_reset` also clears
         // pickedItemId, usedItemId, fwdPosActionId and g_SysFlags[1] on a room
         // change; this keeps the previous room's picked/used item and probe bytes.
+        // The effect pool and the resolved sprite metadata reset with the room
+        // (the original's effect init), so no billboard leaks across a door.
+        self.effects.clear();
+        self.last_tracked_effect = None;
+        self.effect_missing_logged.clear();
+        self.resolve_room_effects(room);
         self.id = id;
         self.state_bytes[0] = id.stage;
         self.state_bytes[1] = id.room;
@@ -3389,12 +3439,69 @@ impl ScdHost for ScdGameHost<'_> {
         self.placeholder(op)
     }
 
-    /// TODO(parity): (gameplay/visual) the whole effect pool is inert: 0x2A
-    /// effect_spawn and 0x3D bullet_effect_spawn, the clears 0x3E/0x42/0x48 and
-    /// 0x4E effect_flags_modify only record placeholders, so muzzle flashes,
-    /// blood and dust never appear and scripts waiting on effect state stall.
-    fn on_effect(&mut self, op: &Op, _operands: &[Operand]) -> StepResult {
-        self.placeholder(op)
+    /// The six effect opcodes: spawn, tracked spawn, the two typed clears, the
+    /// pool clear and the mass header-flag modifier.
+    ///
+    /// `effect` (0x2A) reads signed positions; `effect_tracked` (0x3D) zero-
+    /// extends them and records the spawn for `effect_kill_a`. `effect_kill_b`
+    /// (0x42) compares only the low byte of its depth operand, and `mass_mask`
+    /// (0x4E) mode must be OR (0), AND-NOT (1) or XOR (2) to act.
+    fn on_effect(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        match op.op {
+            0x2A => {
+                let effect_type = operand_u8(operands, 0);
+                let depth = operand_u8(operands, 1);
+                let parent = operand_u8(operands, 2);
+                let pos = [
+                    i32::from(operand_i16(operands, 3)),
+                    i32::from(operand_i16(operands, 4)),
+                    i32::from(operand_i16(operands, 5)),
+                ];
+                let yaw = operand_i16(operands, 6);
+                let room = Rc::clone(&self.state.room_effects);
+                effects::create(self.state, &room, effect_type, depth, parent, pos, yaw, 0);
+                StepResult::Continue
+            }
+            0x3D => {
+                let effect_type = operand_u8(operands, 0);
+                let depth = operand_u8(operands, 1);
+                let parent = operand_u8(operands, 2);
+                let pos = [
+                    i32::from(operand_u16(operands, 3)),
+                    i32::from(operand_u16(operands, 4)),
+                    i32::from(operand_u16(operands, 5)),
+                ];
+                let yaw = operand_i16(operands, 6);
+                let room = Rc::clone(&self.state.room_effects);
+                effects::create(self.state, &room, effect_type, depth, parent, pos, yaw, 0);
+                self.state.last_tracked_effect =
+                    Some((effect_type, effects::Attach::from_parent(parent)));
+                StepResult::Continue
+            }
+            0x3E => {
+                if let Some((effect_type, attach)) = self.state.last_tracked_effect {
+                    self.state.effects.kill_matching_attach(effect_type, attach);
+                }
+                StepResult::Continue
+            }
+            0x42 => {
+                let effect_type = operand_u8(operands, 0);
+                let depth = (operand_u16(operands, 1) & 0xFF) as u8;
+                self.state.effects.kill_matching_depth(effect_type, depth);
+                StepResult::Continue
+            }
+            0x48 => {
+                self.state.effects.clear();
+                StepResult::Continue
+            }
+            0x4E => {
+                let mode = operand_u8(operands, 0);
+                let mask = operand_u16(operands, 1);
+                self.state.effects.modify_flags(mode, mask);
+                StepResult::Continue
+            }
+            _ => self.placeholder(op),
+        }
     }
 
     fn on_sound(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
@@ -4176,10 +4283,6 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_effect(op(0x2A), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
                 host.on_message(op(0x29), &operands(&[0])),
                 StepResult::Placeholder
             );
@@ -4196,14 +4299,160 @@ mod tests {
                 StepResult::Placeholder
             );
         }
-        assert_eq!(state.placeholders.len(), 7);
+        assert_eq!(state.placeholders.len(), 6);
         assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x1F], 1);
-        assert_eq!(state.placeholders[&0x2A], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x40], 1);
         assert_eq!(state.placeholders[&0x27], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
+    }
+
+    /// A state with one weapon effect sprite (type 9, one block per depth row).
+    fn effect_game() -> GameState {
+        let mut state = game();
+        let rows = std::array::from_fn(|_| vec![vec![crate::effects::fixtures::block(2, 0, 0)]]);
+        state
+            .weapon_effects
+            .sprites
+            .push(crate::effects::fixtures::sprite(9, rows));
+        state
+    }
+
+    #[test]
+    fn effect_opcodes_do_not_record_placeholders() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        for (opcode, args) in [
+            (0x2A, vec![9, 0, 0, 0, 0, 0, 0]),
+            (0x3D, vec![9, 0, 0, 0, 0, 0, 0]),
+            (0x3E, vec![0]),
+            (0x42, vec![9, 0]),
+            (0x48, vec![0]),
+            (0x4E, vec![0, 0]),
+        ] {
+            assert_eq!(
+                host.on_effect(op(opcode), &operands(&args)),
+                StepResult::Continue,
+                "opcode 0x{opcode:02X}"
+            );
+        }
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn effect_spawn_uses_signed_positions_and_the_attach_parent() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_effect(op(0x2A), &operands(&[9, 0, 3, -100, -200, -300, 0x0600])),
+            StepResult::Continue
+        );
+        let effect = host.state().effects.slot(63).unwrap();
+        assert_eq!(effect.effect_type, 9);
+        assert_eq!(effect.attach, effects::Attach::Entity(2));
+        assert_eq!(effect.local_offset, [-100, -200, -300]);
+        assert_eq!(effect.spawn_pos, [-100, -200, -300]);
+        assert_eq!(effect.yaw, 0x0600);
+        assert_eq!(effect.sprite, Some(9));
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn effect_tracked_zero_extends_positions_and_records_the_spawn() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_effect(op(0x3D), &operands(&[9, 0, 0, 0xFF9C, 0xFF38, 0xFED4, 0])),
+            StepResult::Continue
+        );
+        let effect = host.state().effects.slot(63).unwrap();
+        assert_eq!(effect.spawn_pos, [0xFF9C, 0xFF38, 0xFED4]);
+        assert_eq!(
+            host.state().last_tracked_effect,
+            Some((9, effects::Attach::Identity))
+        );
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn effect_kill_a_clears_the_last_tracked_type_and_attach() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_effect(op(0x3D), &operands(&[9, 0, 0, 1, 2, 3, 0]));
+        host.on_effect(op(0x3D), &operands(&[9, 0, 1, 4, 5, 6, 0]));
+        host.on_effect(op(0x2A), &operands(&[9, 0, 0, 7, 8, 9, 0]));
+        assert_eq!(host.state().effects.active_count(), 3);
+        assert_eq!(
+            host.on_effect(op(0x3E), &operands(&[0])),
+            StepResult::Continue
+        );
+        // The last tracked spawn attached to the player, so only it is freed.
+        assert_eq!(host.state().effects.active_count(), 2);
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn effect_kill_b_clears_type_and_low_depth_byte() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_effect(op(0x2A), &operands(&[9, 7, 0, 0, 0, 0, 0]));
+        host.on_effect(op(0x2A), &operands(&[9, 0x107, 0, 0, 0, 0, 0]));
+        host.on_effect(op(0x2A), &operands(&[9, 8, 0, 0, 0, 0, 0]));
+        assert_eq!(host.state().effects.active_count(), 3);
+        assert_eq!(
+            host.on_effect(op(0x42), &operands(&[9, 0x0207])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().effects.active_count(), 1);
+        let remaining: Vec<u8> = host
+            .state()
+            .effects
+            .active()
+            .map(|(_, effect)| effect.depth_group)
+            .collect();
+        assert_eq!(remaining, [8]);
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn effect_clear_frees_the_whole_pool() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        for _ in 0..3 {
+            host.on_effect(op(0x2A), &operands(&[9, 0, 0, 0, 0, 0, 0]));
+        }
+        assert_eq!(host.state().effects.active_count(), 3);
+        assert_eq!(
+            host.on_effect(op(0x48), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().effects.active_count(), 0);
+        assert_eq!(
+            host.state().effects.free_slots(),
+            effects::EFFECT_POOL_SIZE as u8
+        );
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
+    fn mass_mask_modes_write_the_header_flag_word() {
+        let mut state = effect_game();
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_effect(op(0x2A), &operands(&[9, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(
+            host.on_effect(op(0x4E), &operands(&[0, 0x0004])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().effects.slot(63).unwrap().flags(), 0x0004);
+        host.on_effect(op(0x4E), &operands(&[2, 0x0001]));
+        assert_eq!(host.state().effects.slot(63).unwrap().flags(), 0x0005);
+        host.on_effect(op(0x4E), &operands(&[1, 0x0004]));
+        assert_eq!(host.state().effects.slot(63).unwrap().flags(), 0x0001);
+        // Modes above 2 are inert.
+        host.on_effect(op(0x4E), &operands(&[3, 0xFFFF]));
+        assert_eq!(host.state().effects.slot(63).unwrap().flags(), 0x0001);
+        assert!(host.state().placeholders.is_empty());
     }
 
     #[test]

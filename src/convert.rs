@@ -1,13 +1,14 @@
 //! `convert-game`: migrate a full game installation into an `.akpak` pack.
 //!
-//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound`, `objspr` and
-//! `ITEM_M1` (case-insensitively, up to two levels below the root), stores
-//! every `ROOM####.RDT`, converts the camera backgrounds of every distinct
-//! room once, converts the room mask pages of every camera that has sprite
-//! groups, copies the door animations named by the door type table, copies the
-//! `BGM_*.WAV` music files, the 68 named sound effects, the four player
-//! models plus the two no-weapon locomotion clips, the fifteen scripted
-//! character (NPC) models, and the `KAGE.TIM` player-shadow coverage page.
+//! Discovers `STAGE1`..`STAGE7`, `ENEMY`, `PLAYERS`, `sound`, `objspr`,
+//! `ITEM_M1`, `effspr` and `DATA` (case-insensitively, up to two levels below
+//! the root), stores every `ROOM####.RDT`, converts the camera backgrounds of
+//! every distinct room once, converts the room mask pages of every camera that
+//! has sprite groups, copies the door animations named by the door type table,
+//! copies the `BGM_*.WAV` music files, the 68 named sound effects, the four
+//! player models plus the two no-weapon locomotion clips, the fifteen scripted
+//! character (NPC) models, the 33 effect-sheet TIMs, the `core00`
+//! weapon-effect metadata and the `KAGE.TIM` player-shadow coverage page.
 //! Stages 6 and 7 reuse the
 //! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
 //! by 5.
@@ -65,6 +66,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         players,
         npc,
         roommask,
+        effects,
         data,
         font,
         mut warnings,
@@ -156,17 +158,18 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
     // TODO(parity): (conversion) the original installs more than this pack
     // carries: the voice WAVs under `voice/` (the SCD 0x1E lines), the FMV
-    // AVIs, the room effect sheets (ESP/ESPTIM, `effspr`) and the held-weapon
-    // TMDs under `players/ws*.tmd`. Those systems are unimplemented, so the
-    // conversion is complete only for the modelled categories; add their
-    // copy phases when the runtime grows them.
+    // AVIs and the held-weapon TMDs under `players/ws*.tmd`. Those systems
+    // are unimplemented, so the conversion is complete only for the modelled
+    // categories; add their copy phases when the runtime grows them.
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress)?;
+    let (effect_count, effect_bytes) = copy_effect_sheets(&effects, &mut writer, &mut progress)?;
     let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
+    let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress)?;
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
     let (text_count, text_bytes) = copy_text(exe.as_deref(), &mut writer, &mut progress)?;
     let (ivm_count, ivm_bytes) = copy_item_models(item_m2.as_deref(), &mut writer, &mut progress)?;
@@ -183,10 +186,12 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     println!("door: {door_count} entries, {door_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
     println!("npc: {npc_count} entries, {npc_bytes} bytes");
+    println!("effspr: {effect_count} entries, {effect_bytes} bytes");
     println!("font: {font_count} entries, {font_bytes} bytes");
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
     println!("item: {item_count} entries, {item_bytes} bytes");
     println!("data: {data_count} entries, {data_bytes} bytes");
+    println!("core00: {core_count} entries, {core_bytes} bytes");
     println!("shadow: {shadow_count} entries, {shadow_bytes} bytes");
     println!("text: {text_count} entries, {text_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
@@ -213,9 +218,11 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         + door_count
         + player_count
         + npc_count
+        + effect_count
         + ui_count
         + item_count
         + data_count
+        + core_count
         + shadow_count
         + font_count
         + text_count
@@ -432,6 +439,40 @@ fn copy_players(
     Ok((count, bytes))
 }
 
+/// The 33 shipped effect-sheet names: `esp000`, `esp001` and `esp200`..`esp230`.
+///
+/// The room→sheet map references 31 of them; `esp221` and `esp224` ship
+/// unreferenced and are packed anyway.
+const EFFECT_SHEET_FILES: [&str; 33] = [
+    "esp000", "esp001", "esp200", "esp201", "esp202", "esp203", "esp204", "esp205", "esp206",
+    "esp207", "esp208", "esp209", "esp210", "esp211", "esp212", "esp213", "esp214", "esp215",
+    "esp216", "esp217", "esp218", "esp219", "esp220", "esp221", "esp222", "esp223", "esp224",
+    "esp225", "esp226", "esp227", "esp228", "esp229", "esp230",
+];
+
+/// Add every resolved effect-sheet TIM to the pack raw.
+fn copy_effect_sheets(
+    assets: &[EffectSheet],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    progress.begin("effspr", assets.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for asset in assets {
+        let data = fs::read(&asset.source)
+            .with_context(|| format!("failed to read effect sheet {}", asset.source.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&asset.entry, data)
+            .with_context(|| format!("failed to add {}", asset.entry))?;
+        progress.advance(&asset.entry);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
 /// Add every resolved scripted-character (NPC) model to the pack raw.
 fn copy_npc_models(
     assets: &[NpcAsset],
@@ -542,6 +583,39 @@ fn copy_bio_card(
     progress.advance(BIO_CARD_ENTRY);
     progress.end_phase();
     Ok((1, bytes))
+}
+
+/// Add the raw `CORE00.ESP`/`CORE00.ETM` weapon-effect metadata.
+///
+/// The runtime decodes both files itself; they are copied raw.
+fn copy_core_effects(
+    data: &DataPlan,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let mut resolved: Vec<(&str, &PathBuf)> = Vec::new();
+    if let Some(path) = &data.core_esp {
+        resolved.push((crate::effects::room::CORE_ESP_ENTRY, path));
+    }
+    if let Some(path) = &data.core_etm {
+        resolved.push((crate::effects::room::CORE_ETM_ENTRY, path));
+    }
+
+    progress.begin("core00", resolved.len() as u64, "files");
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, source) in resolved {
+        let raw =
+            fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
+        bytes += raw.len();
+        count += 1;
+        writer
+            .add(entry, raw)
+            .with_context(|| format!("failed to add {entry}"))?;
+        progress.advance(entry);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
 }
 
 /// Add the raw `KAGE.TIM` player-shadow coverage page.
@@ -706,6 +780,10 @@ struct DataPlan {
     bio_card: Option<PathBuf>,
     /// `KAGE.TIM`, the player shadow's coverage page.
     shadow: Option<PathBuf>,
+    /// `CORE00.ESP`, the global weapon-effect sprite metadata.
+    core_esp: Option<PathBuf>,
+    /// `CORE00.ETM`, the global weapon-effect art.
+    core_etm: Option<PathBuf>,
     /// Non-fatal problems found while resolving these inputs.
     warnings: Vec<String>,
 }
@@ -745,6 +823,11 @@ const UI_ASSETS: &[(&str, &str, UiKind)] = &[
     ("ui/sidekey3.bmp", "SIDEKEY3.TIM", UiKind::Tim16),
 ];
 
+/// The global weapon-effect metadata file names.
+const CORE_ESP_FILE: &str = "CORE00.ESP";
+/// The global weapon-effect art file name.
+const CORE_ETM_FILE: &str = "CORE00.ETM";
+
 /// The item atlas table: pack entry, shipped file name and row count.
 const ITEM_ASSETS: &[(&str, &str, usize)] = &[
     (items::ITEM_ALL_ENTRY, "ITEM_ALL.PIX", items::ITEM_ALL_ROWS),
@@ -757,10 +840,11 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     let Some(dir) = data else {
         return Ok(DataPlan {
             warnings: vec![format!(
-                "no data directory found; {} UI art file(s), {} item atlas(es), {} and {BIO_CARD_ENTRY} will be missing",
+                "no data directory found; {} UI art file(s), {} item atlas(es), {}, {} and {BIO_CARD_ENTRY} will be missing",
                 UI_ASSETS.len(),
                 ITEM_ASSETS.len(),
-                crate::shadow::KAGE_ENTRY
+                crate::shadow::KAGE_ENTRY,
+                crate::effects::room::CORE_ESP_ENTRY
             )],
             ..DataPlan::default()
         });
@@ -806,7 +890,19 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
 
     plan.bio_card = index.get(&BIO_CARD_FILE.to_ascii_lowercase()).cloned();
     plan.shadow = index.get(&KAGE_FILE.to_ascii_lowercase()).cloned();
+    plan.core_esp = index.get(&CORE_ESP_FILE.to_ascii_lowercase()).cloned();
+    plan.core_etm = index.get(&CORE_ETM_FILE.to_ascii_lowercase()).cloned();
 
+    if plan.core_esp.is_none() {
+        plan.warnings.push(format!(
+            "missing {CORE_ESP_FILE}; no weapon effects will draw"
+        ));
+    }
+    if plan.core_etm.is_none() {
+        plan.warnings.push(format!(
+            "missing {CORE_ETM_FILE}; weapon effect art will not decode"
+        ));
+    }
     if !missing_ui.is_empty() {
         plan.warnings.push(format!(
             "missing {} UI art file(s): {}",
@@ -1302,6 +1398,7 @@ struct Layout {
     item_m1: Option<PathBuf>,
     data: Option<PathBuf>,
     item_m2: Option<PathBuf>,
+    effspr: Option<PathBuf>,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
@@ -1316,6 +1413,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut item_m1 = None;
     let mut data = None;
     let mut item_m2 = None;
+    let mut effspr = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -1335,6 +1433,8 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 data = Some(dir.clone());
             } else if item_m2.is_none() && name.eq_ignore_ascii_case("item_m2") {
                 item_m2 = Some(dir.clone());
+            } else if effspr.is_none() && name.eq_ignore_ascii_case("effspr") {
+                effspr = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -1369,6 +1469,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         item_m1,
         data,
         item_m2,
+        effspr,
     })
 }
 
@@ -1430,6 +1531,15 @@ struct NpcAsset {
     source: PathBuf,
 }
 
+/// One effect-sheet TIM resolved to its pack entry.
+#[derive(Debug)]
+struct EffectSheet {
+    /// Pack entry, e.g. `effspr/esp000.tim`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
 /// One room mask page resolved to its pack entry.
 #[derive(Debug)]
 struct RoomMask {
@@ -1465,6 +1575,8 @@ struct Plan {
     /// The fifteen scripted-character models, resolved by entity id.
     npc: Vec<NpcAsset>,
     roommask: Vec<RoomMask>,
+    /// The 33 effect-sheet TIMs, resolved by shipped name.
+    effects: Vec<EffectSheet>,
     /// Resolved `DATA` UI, item and save-prefix assets.
     data: DataPlan,
     /// `DATA/FONT.TIM` to pack raw as `font/font.tim`.
@@ -1486,6 +1598,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         item_m1,
         data,
         item_m2,
+        effspr,
     } = layout;
     // The font is optional and only diagnosable when the install actually has
     // a DATA directory; a missing DATA root is not reported so partial trees
@@ -1593,7 +1706,37 @@ fn build_plan(root: &Path) -> Result<Plan> {
             }
         }
     }
+    // Effect sheets are optional like the mask pages: unresolved files are
+    // aggregated into one warning per category and never fail the conversion.
+    let effspr_index = effspr.as_deref().map(index_dir).transpose()?;
+    let mut effects = Vec::new();
+    let mut missing_effects = Vec::new();
+    for name in EFFECT_SHEET_FILES {
+        let file = format!("{name}.tim");
+        match effspr_index.as_ref().and_then(|index| index.get(&file)) {
+            Some(source) => effects.push(EffectSheet {
+                entry: format!("effspr/{file}"),
+                source: source.clone(),
+            }),
+            None => missing_effects.push(file.to_ascii_uppercase()),
+        }
+    }
+
     let mut warnings = Vec::new();
+    if !missing_effects.is_empty() {
+        if effspr.is_none() {
+            warnings.push(format!(
+                "no effspr directory found; {} effect sheet(s) will be missing",
+                missing_effects.len()
+            ));
+        } else {
+            warnings.push(format!(
+                "missing {} effect sheet(s): {}",
+                missing_effects.len(),
+                missing_effects.join(", ")
+            ));
+        }
+    }
     if !missing_masks.is_empty() {
         if objspr.is_none() {
             warnings.push(format!(
@@ -1622,6 +1765,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
         npc,
         roommask,
+        effects,
         data,
         font,
         warnings,
@@ -2001,6 +2145,7 @@ mod tests {
         fs::create_dir_all(root.path.join("install/ObJsPr")).unwrap();
         fs::create_dir_all(root.path.join("install/ItEm_M1")).unwrap();
         fs::create_dir_all(root.path.join("install/DaTa")).unwrap();
+        fs::create_dir_all(root.path.join("install/EffSpr")).unwrap();
 
         let layout = discover_layout(&root.path).unwrap();
 
@@ -2013,6 +2158,7 @@ mod tests {
         assert_eq!(layout.objspr.unwrap(), root.path.join("install/ObJsPr"));
         assert_eq!(layout.item_m1.unwrap(), root.path.join("install/ItEm_M1"));
         assert_eq!(layout.data.unwrap(), root.path.join("install/DaTa"));
+        assert_eq!(layout.effspr.unwrap(), root.path.join("install/EffSpr"));
     }
 
     #[test]
@@ -2079,6 +2225,147 @@ mod tests {
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("npc/"), 15);
         assert_eq!(pack.read("npc/23.emd").unwrap(), b"npc-23");
+    }
+
+    /// Write all 33 effect-sheet files under `EFFSPR` with mixed-case names.
+    fn write_effect_sheets(root: &Path) {
+        let dir = root.join("EFFSPR");
+        fs::create_dir_all(&dir).unwrap();
+        for name in EFFECT_SHEET_FILES {
+            fs::write(
+                dir.join(format!("{}.TIM", name.to_ascii_uppercase())),
+                name.as_bytes(),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn resolves_and_packs_effect_sheets_case_insensitively() {
+        let root = TempDir::new("effect-sheets");
+        make_stage_dirs(&root.path);
+        write_effect_sheets(&root.path);
+
+        let plan = build_plan(&root.path).unwrap();
+
+        assert_eq!(plan.effects.len(), EFFECT_SHEET_FILES.len());
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("effect sheet")),
+            "{:?}",
+            plan.warnings
+        );
+        for asset in &plan.effects {
+            assert!(asset.entry.starts_with("effspr/"), "{}", asset.entry);
+        }
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new();
+        let (count, bytes) = copy_effect_sheets(&plan.effects, &mut writer, &mut progress).unwrap();
+        assert_eq!(count, 33);
+        assert_eq!(
+            bytes,
+            EFFECT_SHEET_FILES.iter().map(|n| n.len()).sum::<usize>()
+        );
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        for name in EFFECT_SHEET_FILES {
+            assert!(
+                pack.contains(&format!("effspr/{name}.tim")),
+                "missing {name}"
+            );
+        }
+        assert_eq!(pack.read("effspr/esp224.tim").unwrap(), b"esp224");
+    }
+
+    #[test]
+    fn missing_effect_sheets_warn_once_without_failing() {
+        let root = TempDir::new("missing-effects");
+        make_stage_dirs(&root.path);
+
+        let plan = build_plan(&root.path).unwrap();
+        assert!(plan.effects.is_empty());
+        let warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("effect sheet"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(warnings[0].contains("33 effect sheet"), "{:?}", warnings);
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        assert!(!pack.paths().any(|path| path.starts_with("effspr/")));
+    }
+
+    #[test]
+    fn conversion_aggregates_missing_effect_sheets() {
+        let root = TempDir::new("partial-effects");
+        make_stage_dirs(&root.path);
+        write_effect_sheets(&root.path);
+        fs::remove_file(root.path.join("EFFSPR/ESP212.TIM")).unwrap();
+        fs::remove_file(root.path.join("EFFSPR/ESP224.TIM")).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.effects.len(), 31);
+        let warning = plan
+            .warnings
+            .iter()
+            .find(|warning| warning.contains("effect sheet"))
+            .expect("aggregated warning");
+        assert!(warning.contains("2 effect sheet"), "{warning}");
+        assert!(warning.contains("ESP212.TIM"), "{warning}");
+        assert!(warning.contains("ESP224.TIM"), "{warning}");
+    }
+
+    #[test]
+    fn converts_core00_effect_metadata() {
+        let root = TempDir::new("core00");
+        make_stage_dirs(&root.path);
+        let data = root.path.join("DATA");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("CORE00.ESP"), b"esp-bytes").unwrap();
+        fs::write(data.join("CORE00.ETM"), b"etm-bytes").unwrap();
+
+        let data_plan = resolve_data_assets(Some(&data)).unwrap();
+        assert!(data_plan.core_esp.is_some());
+        assert!(data_plan.core_etm.is_some());
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new();
+        let (count, bytes) = copy_core_effects(&data_plan, &mut writer, &mut progress).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(bytes, "esp-bytes".len() + "etm-bytes".len());
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            pack.read(crate::effects::room::CORE_ESP_ENTRY).unwrap(),
+            b"esp-bytes"
+        );
+        assert_eq!(
+            pack.read(crate::effects::room::CORE_ETM_ENTRY).unwrap(),
+            b"etm-bytes"
+        );
+    }
+
+    #[test]
+    fn missing_core00_files_warn_without_failing() {
+        let root = TempDir::new("core00-missing");
+        make_stage_dirs(&root.path);
+        let data = root.path.join("DATA");
+        fs::create_dir_all(&data).unwrap();
+
+        let plan = resolve_data_assets(Some(&data)).unwrap();
+        assert!(plan.core_esp.is_none());
+        assert!(plan.core_etm.is_none());
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("CORE00.ESP")),
+            "{:?}",
+            plan.warnings
+        );
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new();
+        let (count, _) = copy_core_effects(&plan, &mut writer, &mut progress).unwrap();
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -3194,8 +3481,66 @@ mod tests {
         assert_eq!(count("se/"), 68);
         assert_eq!(count("door/"), 34);
         assert_eq!(count("npc/"), 15);
+        assert_eq!(count("effspr/"), 33);
         assert!(pack.contains("npc/20.emd"));
         assert!(pack.contains("npc/2e.emd"));
+        assert!(pack.contains("effspr/esp000.tim"));
+        assert!(pack.contains("effspr/esp224.tim"));
+        assert!(pack.contains(crate::effects::room::CORE_ESP_ENTRY));
+        assert!(pack.contains(crate::effects::room::CORE_ETM_ENTRY));
+
+        // The global weapon effects parse into eight records with the shipped
+        // art geometry (heights and CLUT rows drive the room page cursor).
+        let weapon = crate::effects::WeaponEffects::load(&pack);
+        assert!(weapon.warnings.is_empty(), "{:?}", weapon.warnings);
+        assert_eq!(weapon.index, [5, 9, 12, 17, 0, 14, 8, 11]);
+        assert_eq!(weapon.sprites.len(), 8);
+        let geometry: Vec<(u16, u8)> = weapon
+            .sprites
+            .iter()
+            .map(|sprite| (sprite.geometry.height, sprite.geometry.clut_rows))
+            .collect();
+        assert_eq!(
+            geometry,
+            [
+                (64, 3),
+                (112, 4),
+                (64, 3),
+                (16, 2),
+                (24, 4),
+                (72, 1),
+                (24, 4),
+                (24, 4),
+            ]
+        );
+        assert!(weapon.sprites.iter().all(|sprite| sprite.tim.is_some()));
+
+        // The weapon pass's shared cursor must reproduce the fixed sheet
+        // regions the renderer indexes (page 0 V 0/64/176/240, page 1 V
+        // 3/27/99/123).
+        let mut cursor = crate::effects::pages::PackCursor::weapon_start();
+        let regions: Vec<(u8, u8)> = weapon
+            .sprites
+            .iter()
+            .map(|sprite| {
+                let placement =
+                    cursor.place(sprite.geometry.height, sprite.geometry.clut_rows.into());
+                (placement.page_index(), placement.v)
+            })
+            .collect();
+        assert_eq!(
+            regions,
+            [
+                (0, 0),
+                (0, 64),
+                (0, 176),
+                (0, 240),
+                (1, 3),
+                (1, 27),
+                (1, 99),
+                (1, 123)
+            ]
+        );
         assert!(pack.contains("room/1001.rdt"));
         assert!(pack.contains("roomcut/100_000.bmp"));
         assert!(pack.contains("roommask/100_000.bmp"));
@@ -3229,6 +3574,72 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn real_rdts_declare_404_parsed_effect_sprites() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root).join("JPN");
+        let mut declared = 0usize;
+        let mut rooms = 0usize;
+        for digit in 1..=RoomId::MAX_STAGE {
+            let dir = root.join(format!("STAGE{digit}"));
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut paths: Vec<PathBuf> = entries
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rdt"))
+                })
+                .collect();
+            paths.sort();
+            for path in paths {
+                let name = path
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_ascii_uppercase();
+                let room = name.trim_start_matches("ROOM");
+                let id = RoomId::parse(room).unwrap();
+                let data = fs::read(&path).unwrap();
+                let state = crate::rdt::parse(&data, id).unwrap();
+                if state.effects.sprites.is_empty() {
+                    continue;
+                }
+                rooms += 1;
+                declared += state.effects.sprites.len();
+                assert!(
+                    state.effects.warnings.is_empty(),
+                    "{}: {:?}",
+                    path.display(),
+                    state.effects.warnings
+                );
+                for sprite in &state.effects.sprites {
+                    assert_eq!(sprite.geometry.width, 256, "{}", path.display());
+                    assert!(
+                        (16..=256).contains(&sprite.geometry.height),
+                        "{}: height {}",
+                        path.display(),
+                        sprite.geometry.height
+                    );
+                    assert!(
+                        (1..=4).contains(&sprite.geometry.clut_rows),
+                        "{}: {} CLUT rows",
+                        path.display(),
+                        sprite.geometry.clut_rows
+                    );
+                    assert!(sprite.tim.is_some(), "{}", path.display());
+                }
+            }
+        }
+        assert_eq!(declared, 404);
+        assert_eq!(rooms, 186);
     }
 
     #[test]

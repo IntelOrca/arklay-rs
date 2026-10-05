@@ -2,7 +2,8 @@
 //!
 //! Reads the header pointers of an RDT file and everything gameplay needs:
 //! camera cuts, ambient and point lights, collision boundaries, camera switch
-//! zones and walkable zones.
+//! zones, walkable zones and the room's declared effect sprites (pointer slots
+//! 13/14/15).
 
 use anyhow::{Context, Result, bail};
 
@@ -32,6 +33,12 @@ const WALK_ZONES_SLOT: usize = 4;
 const FOOTSTEP_SLOT: usize = 5;
 /// Pointer slot of the room message block (`RDT+0x74`).
 const MESSAGE_SLOT: usize = 11;
+/// Pointer slot of the effect sprite index table (`RDT+0x7C`).
+pub const EFFECT_INDEX_SLOT: usize = 13;
+/// Pointer slot of the effect sprite-info offsets (`RDT+0x80`).
+pub const EFFECT_INFO_SLOT: usize = 14;
+/// Pointer slot of the effect sprite TIM offsets (`RDT+0x84`).
+pub const EFFECT_TIM_SLOT: usize = 15;
 /// Offset of the camera records within an RDT file.
 const CAMERAS_OFFSET: usize = 0x94;
 /// Number of little-endian `i32` fields in one camera record.
@@ -70,6 +77,12 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
     let footstep_zones =
         parse_footstep_zones(data, pointers[FOOTSTEP_SLOT], pointers[FOOTSTEP_SLOT + 1])?;
     let messages = parse_messages(data, &pointers)?;
+    let effects = crate::effects::RoomEffects::parse(
+        data,
+        pointers[EFFECT_INDEX_SLOT],
+        pointers[EFFECT_INFO_SLOT],
+        pointers[EFFECT_TIM_SLOT],
+    );
 
     Ok(RoomState {
         stage: id.stage,
@@ -84,6 +97,7 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         walk_zones,
         footstep_zones,
         messages,
+        effects,
     })
 }
 
