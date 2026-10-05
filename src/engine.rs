@@ -2,9 +2,11 @@
 //!
 //! # M11 deviations
 //!
-//! The world-interaction milestone leaves five deliberate gaps:
+//! The world-interaction milestone leaves these deliberate gaps:
 //! - item models (`objtbl_b_set` table 1 and `eml_rot`'s item selector) stay
-//!   typed no-ops, so scripted pick-up models are invisible;
+//!   typed no-ops, so scripted pick-up models are invisible, and the courtyard
+//!   heliport's item-model Z shift has no item models to move (the object side
+//!   of the same shift is ported);
 //! - mirrored effect billboards are not drawn: the mirror pass reflects the
 //!   player/NPC joint meshes only;
 //! - per-texel PSX semi-transparency is absent; a primitive carrying the ABE
@@ -14,7 +16,15 @@
 //!   is used everywhere;
 //! - the climb's camera screen-effect rectangles are recorded
 //!   ([`crate::player::ScreenEffect`]) but the camera-scroll consumer that
-//!   reads them is not ported.
+//!   reads them is not ported;
+//! - the original's fixed ordering-table depths (the flooded guardhouse and
+//!   courtyard water rooms, the 1F right-stairs objects with type < 2, and the
+//!   2F study/front-lesson open lid at slot 0x33) are not modelled: the port
+//!   orders every object triangle by its mean view Z in the shared sort;
+//! - object collision and floor probes keep the record's local matrix
+//!   translation, exactly like the original's `update_room_objects` helpers;
+//!   only rendering, the camera-switch cull and effect attach compose the SCA
+//!   parent chain.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
@@ -184,7 +194,6 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
                         npc_models: &mut npc_models,
                     },
                     player::Input::default(),
-                    false,
                 );
                 drain_mask_toggles(&mut loaded.room, &mut game);
             }
@@ -683,10 +692,10 @@ impl GameSession {
         } else if !action {
             self.swallow_action = false;
         }
-        let (input, action) = if was_locked || self.swallow_action {
-            (player::Input::default(), false)
+        let input = if was_locked || self.swallow_action {
+            player::Input::default()
         } else {
-            (input, action)
+            input
         };
 
         let transition = tick_room(
@@ -701,7 +710,6 @@ impl GameSession {
                 npc_models: &mut self.npc_models,
             },
             input,
-            action,
         );
         // A typewriter runs its save prompt; the item-box overlay opens when
         // the lid has settled (`MSF_MENU_MODE_ITEMBOX`). The interaction is
@@ -2546,6 +2554,19 @@ pub fn simulate_room(
     ticks: usize,
     input: player::Input,
 ) -> Result<SimulatedRoom> {
+    simulate_room_with_input(pack, id, ticks, move |_| input)
+}
+
+/// [`simulate_room`] with a per-tick input schedule.
+///
+/// The schedule is what lets the corpus audit drive action presses and walking
+/// without locking the player into one static input for the whole run.
+pub fn simulate_room_with_input(
+    pack: &Pack,
+    id: RoomId,
+    ticks: usize,
+    input: impl FnMut(usize) -> player::Input,
+) -> Result<SimulatedRoom> {
     let loaded = load_room(pack, id)?;
     let mut game = new_game_state(pack, id, &loaded.room);
     let player_state = player::spawn(id, &loaded.room);
@@ -2570,7 +2591,7 @@ pub fn simulate_room_seeded(
     }
     let player_state = player::spawn(id, &loaded.room);
     game.sync_entity_from_player(&player_state);
-    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+    simulate_loaded(pack, loaded, game, player_state, ticks, move |_| input)
 }
 
 /// Render one gameplay frame from an already-built state.
@@ -2631,7 +2652,7 @@ pub fn simulate_new_game(
     player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
     player_state.angle = NEW_GAME_ANGLE;
     game.sync_entity_from_player(&player_state);
-    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+    simulate_loaded(pack, loaded, game, player_state, ticks, move |_| input)
 }
 
 /// The shared body of [`simulate_room`] and [`simulate_new_game`].
@@ -2641,7 +2662,7 @@ fn simulate_loaded(
     mut game: game::GameState,
     mut player_state: player::PlayerState,
     ticks: usize,
-    input: player::Input,
+    mut input: impl FnMut(usize) -> player::Input,
 ) -> Result<SimulatedRoom> {
     let id = loaded.id;
     run_room_init(&mut loaded, &mut game);
@@ -2657,7 +2678,7 @@ fn simulate_loaded(
     let mut npc_models = npc::EntityModelCache::default();
     let mut framebuffer = Framebuffer::new();
 
-    for _ in 0..ticks {
+    for tick in 0..ticks {
         tick_room(
             &mut command_vm,
             &mut event_vm,
@@ -2669,8 +2690,7 @@ fn simulate_loaded(
                 pack,
                 npc_models: &mut npc_models,
             },
-            input,
-            false,
+            input(tick),
         );
         drain_mask_toggles(&mut loaded.room, &mut game);
     }
@@ -2791,7 +2811,12 @@ pub fn simulate_typewriter(
         session.player.pos = typewriter_pos;
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
-        session.tick(pack, UiInput::default(), player::Input::default(), pressed)?;
+        let input = player::Input {
+            action_held: true,
+            action_pressed: pressed,
+            ..player::Input::default()
+        };
+        session.tick(pack, UiInput::default(), input, pressed)?;
         pressed = !pressed;
     }
     if !prompted {
@@ -3576,12 +3601,17 @@ struct RoomContext<'a> {
 
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
 /// Returns the door transition the tick requested, if any.
+///
+/// The action-key room entries probe on the action-press edge carried by
+/// `input.action_pressed`, never on the held level: the original runs
+/// `check_action_object` from the newly-pressed branch of
+/// `player_input_to_behavior`, so holding the button cannot restart an event
+/// every tick.
 fn tick_room(
     command_vm: &mut scd::vm::CommandVm,
     event_vm: &mut scd::vm::EventVm,
     context: RoomContext<'_>,
     input: player::Input,
-    action: bool,
 ) -> Option<game::RoomTransition> {
     // The original zeroes the per-frame item-use flag bank at the top of every
     // game frame, before the room scripts decide what is usable this frame.
@@ -3640,7 +3670,8 @@ fn tick_room(
     // only the every-frame entries while the vault/push/ladder owns the tick.
     {
         let mut host = game::ScdGameHost::new(context.game);
-        let probe_action = action && context.player.locked == player::LockedAction::None;
+        let probe_action =
+            input.action_pressed && context.player.locked == player::LockedAction::None;
         host.interact(context.player.pos, context.player.angle, probe_action);
     }
     // The room objects run after the player's physics and the player-side
@@ -3648,6 +3679,9 @@ fn tick_room(
     // all read the frame's final player state.
     context.game.tick_objects(context.room, context.player);
     context.game.apply_stair_state(context.player);
+    // The climb's camera-scroll consumer is not ported; drop the queued
+    // screen-effect rectangles each tick so the list cannot grow unbounded.
+    context.player.take_screen_effects();
     // The effects projected above under the pre-switch camera. If the zone
     // scan moved the cut, recompute their stored screen/depth so the frame
     // renders billboards against the camera it draws; without this the first
@@ -3932,28 +3966,82 @@ fn visible_objects<'a>(
     room: &'a RoomState,
     objects: &'a objects::ObjectTable,
     camera: usize,
-) -> Vec<(&'a objects::ObjectAsset, &'a objects::ObjectRecord)> {
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Vec<(
+    &'a objects::ObjectAsset,
+    &'a objects::ObjectRecord,
+    anim::Mat4x3,
+)> {
     let mut visible = Vec::new();
-    for record in &objects.records {
+    for (slot, record) in objects.records.iter().enumerate() {
         if !record.active() {
             continue;
         }
-        let Some(slot) = record.asset else {
+        let Some(asset) = record.asset.and_then(|pair| {
+            room.object_models
+                .iter()
+                .find(|asset| asset.pair_index == usize::from(pair))
+        }) else {
             continue;
         };
-        let Some(asset) = room
-            .object_models
-            .iter()
-            .find(|asset| asset.pair_index == usize::from(slot))
-        else {
-            continue;
-        };
-        if !npc::in_camera_zone(room, camera, record.pos) {
+        // The camera-switch cull uses the composed world translation, the
+        // original's `is_entity_in_switch_zone(record + 0x54)`.
+        let mut world = objects::world_matrix(objects, slot, player_pos, player_angle);
+        if !npc::in_camera_zone(room, camera, world.t) {
             continue;
         }
-        visible.push((asset, record));
+        if object_render_skipped(room, camera, record) {
+            continue;
+        }
+        // The courtyard heliport's display items 1-4 sit 1000 units further
+        // along the view axis (the original bumps the composed local matrix
+        // Z before submission; the cull above used the unshifted position).
+        if room.stage == 3 && room.room == 0x03 && (1..5).contains(&(record.model & 0x3F)) {
+            world.t[2] += 1000;
+        }
+        visible.push((asset, record, world));
     }
     visible
+}
+
+/// The per-room object render suppressions the original applies in
+/// `RoomObjectRender`.
+///
+/// These are stand-in records the scripts keep for interaction while the
+/// visible model lives elsewhere (mirror/door frames), plus the boulder that
+/// is dropped once it rolls within ~3600 units of the camera. The stage
+/// folding uses the port's 1-based stage digit.
+fn object_render_skipped(room: &RoomState, camera: usize, record: &objects::ObjectRecord) -> bool {
+    let model = record.model & 0x3F;
+    // Guardhouse 002's mirror stand-in on camera 4.
+    if room.stage == 4 && room.room == 0x06 && camera == 4 && model == 0 {
+        return true;
+    }
+    // The lab B3 private room's switch/door stand-in on cameras 0 and 4.
+    if room.stage == 5 && room.room == 0x0A && (camera == 0 || camera == 4) && model == 0 {
+        return true;
+    }
+    // The mansion 1F trap room's roof stand-in, at its shipped position only.
+    if room.stage % 5 == 1
+        && room.room == 0x15
+        && camera == 0
+        && model == 0
+        && record.pos == [0x12FC, -0x2828, 0x12FC]
+    {
+        return true;
+    }
+    // The courtyard boulder passage drops the boulder model once it rolls
+    // within 0x7274 on X of the camera-3 eye.
+    if room.stage % 5 == 3
+        && room.room == 0x0F
+        && camera == 3
+        && model == 0
+        && record.pos[0] > 0x7274
+    {
+        return true;
+    }
+    false
 }
 
 /// Draw one gameplay frame: the cut background, one mesh per active scripted
@@ -4088,17 +4176,23 @@ fn render_frame(
     // The room's object models are submitted before the NPC and player meshes:
     // the shared far-to-near sort is stable, so equal-depth triangles keep the
     // original's room-object-under-character tie order.
-    let visible = visible_objects(room, &game.objects, room.current_cut);
+    let visible = visible_objects(
+        room,
+        &game.objects,
+        room.current_cut,
+        game.entities[0].pos,
+        game.entities[0].angle,
+    );
     let mut object_joints: Vec<Vec<anim::Mat4x3>> = Vec::with_capacity(visible.len());
-    for (_, record) in &visible {
-        object_joints.push(vec![objects::rebuild(record, &lighting)]);
+    for (_, _, world) in &visible {
+        object_joints.push(vec![*world]);
     }
 
     // TODO(parity): (visual) the original applies each record's background
     // blend weight and semi-transparency; `EntityMesh` carries only the RGB
     // multiplier and the joint draw gate, so records blend opaquely.
     let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(visible.len() + 1 + models.len());
-    for ((asset, record), joints) in visible.iter().zip(&object_joints) {
+    for ((asset, record, _), joints) in visible.iter().zip(&object_joints) {
         meshes.push(EntityMesh {
             mesh: &asset.model,
             texture: &asset.texture,
@@ -4107,14 +4201,9 @@ fn render_frame(
             hidden_joints: 0,
         });
     }
-    // The NPC joint gates pair with `models`/`npc_joints`, which are built in
-    // entity-slot order; the slots are recorded alongside them by re-walking.
-    let mut npc_slots = Vec::new();
-    for slot in 1..game::ENTITY_COUNT {
-        if game.entities[slot].active() && npc_models.get(pack, game.entities[slot].id).is_some() {
-            npc_slots.push(slot);
-        }
-    }
+    // The NPC joint gates pair with `models`/`npc_joints`/`npc_slots`, all
+    // built together in entity-slot order above; do not re-walk the slots,
+    // because a model whose keyframe lookup failed is absent from all three.
     for ((slot, model), joints) in npc_slots.iter().zip(models.iter()).zip(&npc_joints) {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -4162,6 +4251,7 @@ fn render_frame(
         &lighting,
         layer.as_ref(),
         Some(&effect_layer),
+        visible.len(),
         mirror.as_ref(),
     );
 }
@@ -4433,18 +4523,130 @@ mod tests {
             record.pos = [5000, 0, 5000];
         }
 
-        let visible = visible_objects(&room, &objects, 0);
+        let visible = visible_objects(&room, &objects, 0, [0, 0, 0], 0);
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].0.pair_index, 1);
         assert_eq!(visible[0].1, objects.record(1).unwrap());
+        assert_eq!(visible[0].2.t, [500, 0, 500]);
 
         // A record whose declared pair failed to decode is skipped.
         objects.record_mut(1).unwrap().asset = Some(9);
-        assert!(visible_objects(&room, &objects, 0).is_empty());
+        assert!(visible_objects(&room, &objects, 0, [0, 0, 0], 0).is_empty());
 
         // A camera with no zone keeps every record out.
         objects.record_mut(1).unwrap().asset = Some(1);
-        assert!(visible_objects(&room, &objects, 3).is_empty());
+        assert!(visible_objects(&room, &objects, 3, [0, 0, 0], 0).is_empty());
+    }
+
+    #[test]
+    fn object_render_suppressions_match_the_room_cases() {
+        use crate::objects::{OBJECT_FLAG_ACTIVE, ObjectRecord};
+
+        let record = |pos: [i32; 3]| ObjectRecord {
+            flag: OBJECT_FLAG_ACTIVE,
+            model: 0,
+            pos,
+            ..ObjectRecord::default()
+        };
+        let room = |stage: u8, room: u8| RoomState {
+            stage,
+            room,
+            ..RoomState::default()
+        };
+
+        // Guardhouse 002, camera 4, model type 0.
+        assert!(object_render_skipped(&room(4, 0x06), 4, &record([0, 0, 0])));
+        assert!(!object_render_skipped(
+            &room(4, 0x06),
+            3,
+            &record([0, 0, 0])
+        ));
+
+        // Lab B3 private room, cameras 0 and 4.
+        assert!(object_render_skipped(&room(5, 0x0A), 0, &record([0, 0, 0])));
+        assert!(object_render_skipped(&room(5, 0x0A), 4, &record([0, 0, 0])));
+        assert!(!object_render_skipped(
+            &room(5, 0x0B),
+            0,
+            &record([0, 0, 0])
+        ));
+
+        // Mansion 1F trap room, camera 0, only at the shipped position.
+        assert!(object_render_skipped(
+            &room(1, 0x15),
+            0,
+            &record([0x12FC, -0x2828, 0x12FC])
+        ));
+        assert!(!object_render_skipped(
+            &room(1, 0x15),
+            0,
+            &record([0, 0, 0])
+        ));
+
+        // Courtyard boulder passage, camera 3, once X passes 0x7274.
+        assert!(object_render_skipped(
+            &room(3, 0x0F),
+            3,
+            &record([0x7275, 0, 0])
+        ));
+        assert!(!object_render_skipped(
+            &room(3, 0x0F),
+            3,
+            &record([0x7274, 0, 0])
+        ));
+
+        // A type other than 0 is never suppressed by the stand-in rules.
+        let mut typed = record([0, 0, 0]);
+        typed.model = 1;
+        assert!(!object_render_skipped(&room(4, 0x06), 4, &typed));
+    }
+
+    #[test]
+    fn the_heliport_shifts_display_objects_along_the_view_axis() {
+        use crate::objects::{OBJECT_FLAG_ACTIVE, ObjectAsset, ObjectRecord, ObjectTable};
+
+        let asset = ObjectAsset {
+            pair_index: 0,
+            model: crate::model::Tmd::default(),
+            texture: crate::model::Texture8 {
+                width: 0,
+                height: 0,
+                indices: Vec::new(),
+                palettes: Vec::new(),
+            },
+        };
+        let room = RoomState {
+            stage: 3,
+            room: 0x03,
+            object_models: vec![asset],
+            zones: vec![crate::state::Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0, 0], [0, 1000], [1000, 1000], [1000, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let mut objects = ObjectTable::new(1);
+        let record = objects.record_mut(0).unwrap();
+        *record = ObjectRecord {
+            flag: OBJECT_FLAG_ACTIVE,
+            model: 1,
+            asset: Some(0),
+            pos: [500, 0, 500],
+            ..ObjectRecord::default()
+        };
+
+        let visible = visible_objects(&room, &objects, 0, [0, 0, 0], 0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].2.t, [500, 0, 1500], "display items move +Z");
+
+        // Type 0 (and out-of-range types) stay put.
+        objects.record_mut(0).unwrap().model = 0;
+        let visible = visible_objects(&room, &objects, 0, [0, 0, 0], 0);
+        assert_eq!(visible[0].2.t, [500, 0, 500]);
+        objects.record_mut(0).unwrap().model = 5;
+        let visible = visible_objects(&room, &objects, 0, [0, 0, 0], 0);
+        assert_eq!(visible[0].2.t, [500, 0, 500]);
     }
 
     /// One block plus the terminator, packed as an SCD procedure container.
@@ -4777,7 +4979,6 @@ mod tests {
                     npc_models: &mut npc_models,
                 },
                 player::Input::default(),
-                false,
             );
             assert!(idle.is_none(), "walking alone must not trigger the door");
             tick_room(
@@ -4791,8 +4992,11 @@ mod tests {
                     pack: &pack,
                     npc_models: &mut npc_models,
                 },
-                player::Input::default(),
-                true,
+                player::Input {
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
             )
             .expect("the action key should open the door")
         };
@@ -4913,7 +5117,6 @@ mod tests {
                     up: true,
                     ..player::Input::default()
                 },
-                false,
             );
         }
         assert!(
@@ -6075,7 +6278,16 @@ mod tests {
 
         for _ in 0..10 {
             session
-                .tick(&pack, UiInput::default(), player::Input::default(), true)
+                .tick(
+                    &pack,
+                    UiInput::default(),
+                    player::Input {
+                        action_pressed: true,
+                        action_held: true,
+                        ..player::Input::default()
+                    },
+                    true,
+                )
                 .unwrap();
             if session.transition.is_some() {
                 break;
@@ -6327,7 +6539,16 @@ mod tests {
 
         // The dismissing tick swallows the press.
         session
-            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
             .unwrap();
         assert!(!session.game.message.active);
         assert!(
@@ -6337,7 +6558,15 @@ mod tests {
 
         // The still-held key stays swallowed until it is released.
         session
-            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
             .unwrap();
         assert!(
             !session.game.has_item(ITEM_FIRST_AID_SPRAY),
@@ -6349,7 +6578,16 @@ mod tests {
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         session
-            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
             .unwrap();
         assert!(
             session.game.has_item(ITEM_FIRST_AID_SPRAY),
@@ -6601,7 +6839,16 @@ mod tests {
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         session
-            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
             .unwrap();
         assert!(!session.game.message.active);
         assert!(
@@ -7052,7 +7299,16 @@ mod tests {
         // not render, so it still holds this scene when the window is drawn.
         session.render(&pack);
         session
-            .tick(&pack, UiInput::default(), player::Input::default(), true)
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
             .unwrap();
         assert_eq!(session.game.message.id, Some(201));
         for _ in 0..600 {

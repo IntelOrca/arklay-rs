@@ -241,10 +241,9 @@ fn lab_ladder_zone_latches_flags_and_base() {
     assert_eq!(latched.slot, 2);
     assert!(latched.ladder);
     assert_eq!((latched.base_x, latched.base_z), (0x56EA, 0x2BD7));
-    // The variant bit survives; the object-side mask-4 pass clears the in-zone
-    // bit 0x20 after the decision, exactly like the original's per-object
-    // `update_player_position` walk.
-    assert_eq!(game.entities[0].zone_flags & 0x10, 0x10);
+    // The variant bit and the in-zone mark both survive: the object-side
+    // mask-4 pass clears the object record's own zone bit, not the player's.
+    assert_eq!(game.entities[0].zone_flags & 0x30, 0x30);
     assert_eq!(game.entities[0].unk_c6, 0x56EA);
     assert_eq!(game.entities[0].unk_c8, 0x2BD7);
     assert!(game.ladder_down(), "main_state_flags bit 4");

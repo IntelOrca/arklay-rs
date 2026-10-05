@@ -9,13 +9,15 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use arklay::engine::{simulate_room, simulate_room_seeded};
+use arklay::engine::{simulate_room, simulate_room_seeded, simulate_room_with_input};
 use arklay::pack::Pack;
 use arklay::player;
+use arklay::scd;
 use arklay::state::{RoomId, RoomState};
 
 /// The opcodes M11 implements. A placeholder hit for any of these would mean a
-/// shipped script reached an opcode the milestone claims to handle.
+/// shipped script reached an opcode the milestone claims to handle, and every
+/// entry must appear in the shipped scripts or the check would be vacuous.
 const IMPLEMENTED_OPCODES: [u8; 13] = [
     0x0C, // set_stairs_zone
     0x0F, // scene_setup
@@ -31,6 +33,21 @@ const IMPLEMENTED_OPCODES: [u8; 13] = [
     0x47, // eml_pos
     0x4D, // objs_hide
 ];
+
+/// Every opcode byte that appears in one RDT's init, main or event scripts.
+fn script_opcodes(bytes: &[u8]) -> std::collections::BTreeSet<u8> {
+    let Ok(scripts) = scd::reader::parse(bytes) else {
+        return Default::default();
+    };
+    scripts
+        .init
+        .iter()
+        .chain(&scripts.main)
+        .flat_map(|block| block.insns.iter())
+        .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+        .map(|insn| insn.op)
+        .collect()
+}
 
 /// The union of every collision record's extents, when the room has any.
 fn collision_bounds(room: &RoomState) -> Option<([i32; 2], [i32; 2])> {
@@ -74,6 +91,7 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
     let mut simulated = 0usize;
     let mut object_rooms = 0usize;
     let mut animation_rooms = 0usize;
+    let mut corpus_ops: std::collections::BTreeSet<u8> = Default::default();
     for id in &ids {
         let Ok(sim) = simulate_room(&pack, *id, 300, player::Input::default()) else {
             // Stub rooms without camera cuts cannot load.
@@ -85,6 +103,9 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
         }
         if sim.room.room_anim.is_some() {
             animation_rooms += 1;
+        }
+        if let Ok(bytes) = pack.read(&id.rdt_entry()) {
+            corpus_ops.extend(script_opcodes(bytes));
         }
         let hits: Vec<(u8, u64)> = IMPLEMENTED_OPCODES
             .iter()
@@ -100,6 +121,31 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
         assert!(
             hits.is_empty(),
             "ROOM{id:?} dispatched implemented placeholders: {hits:?}"
+        );
+
+        // Action-only handlers live behind a 0x80 action-key probe; walk the
+        // room while pressing action periodically so those scripts run too.
+        let pressed = simulate_room_with_input(&pack, *id, 300, |tick| player::Input {
+            up: true,
+            action_pressed: tick % 15 == 0,
+            ..player::Input::default()
+        })
+        .expect("the action-drive pass runs wherever the idle pass did");
+        let hits: Vec<(u8, u64)> = IMPLEMENTED_OPCODES
+            .iter()
+            .filter_map(|op| {
+                pressed
+                    .game
+                    .placeholders
+                    .get(op)
+                    .copied()
+                    .map(|count| (*op, count))
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "ROOM{id:?} dispatched implemented placeholders on the action pass: {hits:?}"
         );
 
         // An `obj` operand is zero-extended on X/Z, so a built record must
@@ -142,6 +188,33 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
     assert!(
         animation_rooms > 300,
         "only {animation_rooms} rooms carry the player-animation pair"
+    );
+
+    // Every implemented opcode must really appear in the shipped scripts; an
+    // entry no room ever decodes would make its placeholder check vacuous.
+    for op in IMPLEMENTED_OPCODES {
+        assert!(
+            corpus_ops.contains(&op),
+            "implemented opcode {op:#04x} never appears in a shipped script; \
+             remove it from IMPLEMENTED_OPCODES"
+        );
+    }
+
+    // A room change clears the mirror the outgoing room armed (ROOM112
+    // enables it; the destination must not inherit the pass or its geometry).
+    let mirrored = simulate_room(
+        &pack,
+        RoomId::parse("1120").unwrap(),
+        1,
+        player::Input::default(),
+    )
+    .expect("ROOM112 loads");
+    assert!(mirrored.game.mirror_enabled(), "ROOM112 arms the mirror");
+    let mut carried = mirrored.game;
+    carried.enter_room(RoomId::parse("1140").unwrap(), &RoomState::default());
+    assert!(
+        !carried.mirror_enabled() && carried.mirror.plane == 0,
+        "the mirror leaked through the room change"
     );
 
     // Flag 47 enables ROOM3010's ladder zones; the audit must still run clean.

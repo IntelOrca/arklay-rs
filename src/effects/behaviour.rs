@@ -291,16 +291,23 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
     let entity = match attach {
         Attach::Identity => return IDENTITY_MATRIX,
         Attach::Omodel(index) => {
-            // A missing or inactive object keeps the identity fallback.
-            let Some(object) = game
+            // A missing or inactive object keeps the identity fallback. The
+            // object's transform is its composed SCA world matrix, so an
+            // effect attached to a child rides the parent chain.
+            if !game
                 .objects
                 .record(usize::from(index))
-                .filter(|object| object.active())
-            else {
+                .is_some_and(|object| object.active())
+            {
                 return IDENTITY_MATRIX;
-            };
-            let matrix = crate::objects::rotation(object);
-            return std::array::from_fn(|slot| matrix[slot / 3][slot % 3] as i16);
+            }
+            let world = crate::objects::world_matrix(
+                &game.objects,
+                usize::from(index),
+                game.entities[0].pos,
+                game.entities[0].angle,
+            );
+            return std::array::from_fn(|slot| world.r[slot / 3][slot % 3] as i16);
         }
         Attach::Player => &game.entities[0],
         Attach::Entity(slot) => match game.entities.get(usize::from(slot)) {
@@ -318,15 +325,27 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
 /// is 1; its translation lands in the sprite-offset fields and is added back
 /// after the rotation, so an effect attached to a character is positioned
 /// relative to that character, not the world origin. An object model resolves
-/// to its composed world position exactly like a character.
+/// to its composed world position through the SCA parent chain, exactly like a
+/// character.
 fn attach_translation(game: &GameState, attach: Attach) -> [i32; 3] {
     match attach {
         Attach::Identity => [0, 0, 0],
-        Attach::Omodel(index) => game
-            .objects
-            .record(usize::from(index))
-            .filter(|object| object.active())
-            .map_or([0, 0, 0], |object| object.pos),
+        Attach::Omodel(index) => {
+            if !game
+                .objects
+                .record(usize::from(index))
+                .is_some_and(|object| object.active())
+            {
+                return [0, 0, 0];
+            }
+            crate::objects::world_matrix(
+                &game.objects,
+                usize::from(index),
+                game.entities[0].pos,
+                game.entities[0].angle,
+            )
+            .t
+        }
         Attach::Player => game.entities[0].pos,
         Attach::Entity(slot) => game
             .entities

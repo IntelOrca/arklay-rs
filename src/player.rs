@@ -114,9 +114,9 @@ const ANGLE_STEP: f64 = 0.0015339807880859375;
 /// Keyboard state for one tick.
 ///
 /// `action_held` and `action_pressed` mirror the original's action button
-/// (D-pad `0x80`): the held level gates the action-key room probe, while the
-/// press edge starts the climb scan. The engine already computes both around
-/// the message window.
+/// (D-pad `0x80`): the press edge starts the climb scan and the action-key
+/// room probe, while the held level is what the message window sees. The
+/// engine already computes both around the message window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Input {
     pub up: bool,
@@ -695,18 +695,11 @@ fn update_push(
             if looping {
                 player.advance(emd_clips, emw_clips, room_clips);
             }
-            if player.anim.display_frame < 0x10 && player.object_push {
+            // The locomotion runs on every frame below 0x10, even the frame
+            // the push bit drops: the original tests the bit only afterwards.
+            if player.anim.display_frame < 0x10 {
                 player.move_speed_current = PUSH_SPEED as u16;
                 player.locked_step(room, PUSH_SPEED);
-            }
-            if player.anim.display_frame == 1 {
-                let id = if player.push_heavy {
-                    SE_PUSH_GRUNT_HEAVY
-                } else {
-                    SE_PUSH_GRUNT
-                };
-                player.queue_sound(id);
-                return;
             }
             if !player.object_push {
                 player.anim.frame = 0;
@@ -714,6 +707,13 @@ fn update_push(
                 player.anim.timing = 0;
                 player.move_speed_current = 0;
                 player.action_state = 3;
+            } else if player.anim.display_frame == 1 {
+                let id = if player.push_heavy {
+                    SE_PUSH_GRUNT_HEAVY
+                } else {
+                    SE_PUSH_GRUNT
+                };
+                player.queue_sound(id);
             }
         }
         3 => {
@@ -744,10 +744,12 @@ fn update_vault(
 ) {
     match player.action_state {
         0 => {
+            // The turn runs over the walk pose: the original selects
+            // `attackAnim` 2 (the unarmed walk clip) and resets the frame each
+            // tick, so the pose is the walk's first frame while the player
+            // squares up.
+            player.set_clip(ClipSource::Emw, WALK_CLIP);
             player.move_speed_current = 0;
-            player.anim.frame = 0;
-            player.anim.display_frame = 0;
-            player.anim.timing = 0;
             let angle = player.angle & 0x0FFF;
             let step = (angle & 0x3FC) >> 2;
             player.angle = if angle & 0x200 != 0 {
@@ -2609,6 +2611,31 @@ mod tests {
         );
         assert!(!player.vault_bit, "the vault must clear the transition bit");
         assert_eq!(player.clip_source, ClipSource::Emd);
+    }
+
+    #[test]
+    fn vault_state_zero_turns_over_the_walk_clip() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        let room_clips = room_clips(&[(VAULT_CLIP_PLAIN, 4)]);
+        let mut player = player_at(0, 0);
+        player.angle = 0x123;
+        player.locked = LockedAction::Vault;
+        player.vault_bit = true;
+
+        update_with_room(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &room_clips,
+            Input::default(),
+        );
+        assert_eq!(player.action_state, 0, "still squaring up");
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, WALK_CLIP);
+        assert_eq!(player.anim.display_frame, 0);
     }
 
     #[test]

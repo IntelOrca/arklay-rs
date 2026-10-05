@@ -182,6 +182,7 @@ fn decode_prim(
                 tsb: (w2 >> 16) as u16,
                 textured: true,
                 blend: command == GOURAUD_TEXTURED_TRIANGLE_BLEND,
+                raw_y: false,
                 flat_color: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
@@ -202,6 +203,7 @@ fn decode_prim(
                 tsb: (w2 >> 16) as u16,
                 textured: true,
                 blend: false,
+                raw_y: false,
                 flat_color: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
@@ -226,6 +228,7 @@ fn decode_prim(
                 tsb: (w2 >> 16) as u16,
                 textured: true,
                 blend: false,
+                raw_y: true,
                 flat_color: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
@@ -252,6 +255,7 @@ fn decode_prim(
                 tsb: 0,
                 textured: false,
                 blend: false,
+                raw_y: false,
                 flat_color: Some(colour),
             };
             check_prim(&prim, vertex_count, normals.len())?;
@@ -295,6 +299,7 @@ fn decode_prim(
                     tsb,
                     textured: true,
                     blend: false,
+                    raw_y: false,
                     flat_color: None,
                 };
                 check_prim(&prim, vertex_count, normals.len())?;
@@ -521,6 +526,7 @@ mod tests {
         assert_eq!(prim.normals, [4, 4, 4]);
         assert_eq!(prim.uv, [[8, 9], [1, 10], [2, 11]]);
         assert!(prim.textured);
+        assert!(prim.raw_y, "the 0x25010607 form carries unnegated Y");
     }
 
     #[test]

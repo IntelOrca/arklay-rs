@@ -130,7 +130,7 @@ pub fn parse_assets(data: &[u8], pointer: u32, count: u8) -> (Vec<ObjectAsset>, 
 /// One runtime object record. The original reuses a 0xA4-byte `Entity` head
 /// for these; the port keeps a named struct with only the fields the opcodes
 /// and the collision helpers address.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectRecord {
     /// Flag byte (record +0): the `OBJECT_FLAG_*` bits.
     pub flag: u8,
@@ -139,6 +139,10 @@ pub struct ObjectRecord {
     pub model: u8,
     /// Entry flags word (record +0x7E, same value as the initial yaw).
     pub entry_flags: u16,
+    /// Interaction/zone state byte (record +0x03, `has_enter_switch_zone`):
+    /// the mask-4 `update_player_position` pass clears its `0x20` bit on the
+    /// object record itself.
+    pub zone_flags: u8,
     /// SCA parent selector (record +0x64): `0xFE` player, `0xFF` none,
     /// `< 0x80` another object, else enemy `& 0x7F`.
     pub parent: u8,
@@ -170,12 +174,37 @@ pub struct ObjectRecord {
     pub light_scale: i16,
 }
 
+impl Default for ObjectRecord {
+    /// An unbuilt slot: inactive and unattached. `parent` defaults to `0xFF`
+    /// (no SCA parent) rather than a raw zero, which would name object slot 0.
+    fn default() -> Self {
+        Self {
+            flag: 0,
+            model: 0,
+            entry_flags: 0,
+            zone_flags: 0,
+            parent: 0xFF,
+            pos: [0; 3],
+            committed: [0; 3],
+            rotation: [0; 3],
+            rotation_rollback: [0; 3],
+            half_extents: [0; 3],
+            extent_word: 0,
+            radius: 0,
+            probe: [[0; 2]; 2],
+            push_counter: 0,
+            asset: None,
+            tint: [0; 3],
+            light_scale: 0,
+        }
+    }
+}
+
 impl ObjectRecord {
     /// Whether the active/drawn flag is set.
     pub fn active(&self) -> bool {
         self.flag & OBJECT_FLAG_ACTIVE != 0
     }
-
     /// The per-channel RGB multiplier the renderer applies to this object's
     /// shaded triangles.
     ///
@@ -270,6 +299,7 @@ impl ObjectTable {
             flag: operand_u8(operands, 1),
             model: operand_u8(operands, 0) & 0x7F,
             entry_flags: entry,
+            zone_flags: 0,
             parent: operand_u8(operands, 2),
             pos,
             committed: [pos[0] as i16, pos[1] as i16, pos[2] as i16],
@@ -434,6 +464,60 @@ pub fn rebuild(object: &ObjectRecord, lighting: &Lighting) -> Mat4x3 {
         r: rotation(object),
         t: object.pos,
     }
+}
+
+/// The composed world matrix of object `index`, walking its SCA parent chain.
+///
+/// The original composes the chain root-down (`world = parent.world * local`)
+/// before inverting the camera, so a child rides its parent's rotation and
+/// translation. Parent selectors: `0xFE` the player, `0xFF` none, `0x00..=0x7F`
+/// another object record and `0x80..=0xFD` an enemy slot (no enemy is ever
+/// built in this port, so that link contributes its parent's local matrix, the
+/// same fallback as a missing owner). The walk caps at 0x14 links exactly like
+/// the original, so a malformed cycle terminates.
+pub fn world_matrix(
+    table: &ObjectTable,
+    index: usize,
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Mat4x3 {
+    let mut chain: Vec<usize> = Vec::new();
+    let mut next = Some(index);
+    let mut root_parent = 0xFFu8;
+    while let Some(slot) = next {
+        if chain.len() >= 0x14 {
+            break;
+        }
+        let Some(record) = table.records.get(slot) else {
+            break;
+        };
+        chain.push(slot);
+        root_parent = record.parent;
+        next = match record.parent {
+            0x00..=0x7F => Some(usize::from(record.parent)),
+            _ => None,
+        };
+    }
+
+    let mut world = match root_parent {
+        0xFE => Some(crate::anim::entity_matrix(player_pos, player_angle)),
+        _ => None,
+    };
+    for &slot in chain.iter().rev() {
+        let record = &table.records[slot];
+        let local = Mat4x3 {
+            r: rotation(record),
+            t: record.pos,
+        };
+        world = Some(match world {
+            Some(parent) => crate::anim::compose(&parent, &local),
+            None => local,
+        });
+    }
+    world.unwrap_or(Mat4x3 {
+        r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+        t: [0, 0, 0],
+    })
 }
 
 /// Player SCA height for the 422-unit body radius (Chris, 0x05FA).
@@ -1050,6 +1134,35 @@ mod tests {
         assert_eq!(matrix.r[0][0], 4095);
         assert_eq!(matrix.r[1][1], 4095);
         assert_eq!(matrix.r[2][2], 4095);
+    }
+
+    #[test]
+    fn world_matrix_composes_the_sca_parent_chain() {
+        let mut objects = table(2);
+        // Slot 0 faces +90 degrees (0x400), so its +X axis points at -Z.
+        objects.record_mut(0).unwrap().pos = [100, 0, 0];
+        objects.record_mut(0).unwrap().rotation = [0, 0x400, 0];
+        objects.record_mut(1).unwrap().pos = [50, 0, 0];
+        objects.record_mut(1).unwrap().parent = 0x00;
+
+        let world = world_matrix(&objects, 1, [0, 0, 0], 0);
+        // The saturated trig tables give 49.98 -> 49, not exactly 50.
+        assert_eq!(world.t, [100, 0, -49]);
+        // The child inherits the parent's rotation (the 4.12 product truncates
+        // the saturated identity 4095 to 4094).
+        assert_eq!(world.r, [[0, 0, 4094], [0, 4094, 0], [-4094, 0, 0]]);
+
+        // A player parent resolves against the player's entity transform.
+        objects.record_mut(1).unwrap().parent = 0xFE;
+        objects.record_mut(1).unwrap().pos = [10, 0, 0];
+        let world = world_matrix(&objects, 1, [1000, 0, 2000], 0);
+        assert_eq!(world.t, [1009, 0, 2000]);
+
+        // No parent and a missing record both fall back to the local matrix.
+        objects.record_mut(1).unwrap().parent = 0xFF;
+        objects.record_mut(1).unwrap().pos = [7, 8, 9];
+        assert_eq!(world_matrix(&objects, 1, [0, 0, 0], 0).t, [7, 8, 9]);
+        assert_eq!(world_matrix(&objects, 9, [0, 0, 0], 0).t, [0, 0, 0]);
     }
 
     #[test]

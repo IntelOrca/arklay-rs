@@ -6,6 +6,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 
+use arklay::pack::Pack;
 use arklay::state::RoomId;
 use arklay::{game, objects, rdt, scd};
 
@@ -751,5 +752,459 @@ fn effect_attached_to_an_omodel_follows_its_transform() {
     assert_eq!(
         effect.sprite_offset, object.pos,
         "effect did not adopt the object's world position"
+    );
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_3031_obj_xfm_relights_the_room_and_the_capture() {
+    use std::rc::Rc;
+
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("3031").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let mut room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    let mut command_vm = scd::vm::CommandVm::new(&scripts);
+    let mut event_vm = scd::vm::EventVm::from_scripts(Rc::new(scripts));
+    {
+        let mut host = game::ScdGameHost::new(&mut game);
+        command_vm.run_init(&mut host);
+    }
+    let player = arklay::player::spawn(id, &room);
+    game.sync_entity_from_player(&player);
+
+    let before_lights = room.lights;
+    let before = arklay::engine::render_game_frame(&pack, id, &room, &game, &player).unwrap();
+
+    // Event 1A's first block rewrites all three lights; start it directly
+    // rather than waiting for the in-game trigger.
+    event_vm.start(0, 0x1A);
+    for _ in 0..3000 {
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            event_vm.step(&mut host);
+        }
+        game.apply_room_edits(&mut room);
+        if room.lights != before_lights {
+            break;
+        }
+    }
+    assert_ne!(room.lights, before_lights, "obj_xfm never rewrote a light");
+    println!("ROOM3031 lights {:?} -> {:?}", before_lights, room.lights);
+
+    let after = arklay::engine::render_game_frame(&pack, id, &room, &game, &player).unwrap();
+    let changed = before
+        .rgba
+        .iter()
+        .zip(&after.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(changed > 50, "the relit frame only changed {changed} bytes");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn parented_objects_compose_their_sca_chain() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("3100").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+
+    // ROOM310 carries a display object parented to the player; its world
+    // matrix must follow the player, not sit at the local offset.
+    let (slot, record) = game
+        .objects
+        .records
+        .iter()
+        .enumerate()
+        .find(|(_, record)| record.active() && record.parent == 0xFE)
+        .expect("ROOM310's player-parented object");
+    let local = record.pos;
+    let player_pos = [12345, 0, 6789];
+    let player_angle = 0;
+    let world = objects::world_matrix(&game.objects, slot, player_pos, player_angle);
+    let expected = [
+        player_pos[0] + local[0] * 4095 / 4096,
+        player_pos[1] + local[1] * 4095 / 4096,
+        player_pos[2] + local[2] * 4095 / 4096,
+    ];
+    assert_eq!(
+        world.t, expected,
+        "the player-parent chain was not composed"
+    );
+
+    // Moving the player moves the child; its local record is unchanged.
+    let moved = objects::world_matrix(&game.objects, slot, [20000, 0, 30000], player_angle);
+    assert_ne!(world.t, moved.t);
+    assert_eq!(game.objects.record(slot).unwrap().pos, local);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_305_inst_cfg_rewrites_the_collision() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("3050").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let before = rdt::parse(data, id).unwrap();
+    let sim = arklay::engine::simulate_room(&pack, id, 120, arklay::player::Input::default())
+        .expect("ROOM305 loads");
+
+    let mut changed = 0usize;
+    for (quadrant, (a, b)) in before
+        .collision
+        .quadrants
+        .iter()
+        .zip(sim.room.collision.quadrants.iter())
+        .enumerate()
+    {
+        for (index, (ra, rb)) in a.iter().zip(b.iter()).enumerate() {
+            if ra != rb {
+                changed += 1;
+                println!("q{quadrant} rec{index}: {ra:?} -> {rb:?}");
+            }
+        }
+    }
+    assert!(changed >= 5, "inst_cfg rewrote only {changed} records");
+    assert_eq!(
+        sim.room.collision.quadrants[0][4],
+        arklay::state::CollisionRect {
+            x_max: 2,
+            z_max: 2,
+            x_min: 0,
+            z_min: 0,
+            kind: 1,
+            flags: 768,
+        },
+        "the east-wing corridor wall collapsed"
+    );
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn pushed_object_capture_is_deterministic() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1070").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+
+    let build = |_pack: &Pack| {
+        let mut game = game::GameState::new(id, &room);
+        {
+            let mut vm = scd::vm::CommandVm::new(&scripts);
+            let mut host = game::ScdGameHost::new(&mut game);
+            vm.run_init(&mut host);
+        }
+        game
+    };
+    let game = build(&pack);
+    let shelf_slot = (0..game.objects.records.len())
+        .find(|&slot| {
+            let record = game.objects.record(slot).unwrap();
+            record.active()
+                && record.flag & objects::OBJECT_FLAG_NOT_PUSHABLE == 0
+                && record.flag & objects::OBJECT_FLAG_CLIMBABLE == 0
+        })
+        .expect("ROOM107 declares a pushable shelf");
+    let shelf = *game.objects.record(shelf_slot).unwrap();
+    let radius = arklay::player::spawn(id, &room).radius;
+    let distance = radius + i32::from(shelf.half_extents[0].max(shelf.half_extents[2])) + 80;
+    let input = arklay::player::Input {
+        up: true,
+        ..arklay::player::Input::default()
+    };
+
+    // Find the open approach, then push for 400 ticks.
+    let mut best: Option<([i32; 2], i32)> = None;
+    for direction in APPROACHES {
+        let mut player = player_facing(id, &room, shelf.pos, direction, distance);
+        let mut state = game.clone();
+        for _ in 0..180 {
+            object_tick(&mut player, &room, &mut state, input);
+        }
+        let moved = state.objects.records[shelf_slot].pos[0] - shelf.pos[0];
+        let moved_z = state.objects.records[shelf_slot].pos[2] - shelf.pos[2];
+        let travelled = (moved * moved + moved_z * moved_z).abs();
+        if best.is_none_or(|(_, best)| travelled > best) {
+            best = Some((direction, travelled));
+        }
+    }
+    let (direction, _) = best.unwrap();
+    let mut player = player_facing(id, &room, shelf.pos, direction, distance);
+    let mut state = game.clone();
+    for _ in 0..400 {
+        object_tick(&mut player, &room, &mut state, input);
+    }
+    assert_ne!(
+        state.objects.records[shelf_slot].pos, shelf.pos,
+        "the shelf did not move"
+    );
+
+    let frame = arklay::engine::render_game_frame(&pack, id, &room, &state, &player).unwrap();
+    assert!(
+        frame.rgba.chunks(4).any(|pixel| pixel[3] != 0),
+        "the pushed frame is blank"
+    );
+
+    // The same drive reaches the same pixels.
+    let mut repeat_game = build(&pack);
+    let mut repeat_player = player_facing(id, &room, shelf.pos, direction, distance);
+    for _ in 0..400 {
+        object_tick(&mut repeat_player, &room, &mut repeat_game, input);
+    }
+    let repeat =
+        arklay::engine::render_game_frame(&pack, id, &room, &repeat_game, &repeat_player).unwrap();
+    assert_eq!(
+        frame.rgba, repeat.rgba,
+        "the push capture is not deterministic"
+    );
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_112_mirror_renders_reflection_pixels() {
+    use arklay::render::{Camera, EntityMesh, Framebuffer, Lighting, MirrorPass};
+
+    let Some((root, _)) = common::asset_env() else {
+        return;
+    };
+    let data = jpn_rdt(&root, "JPN/STAGE1/ROOM1120.RDT");
+    let id = RoomId::parse("1120").unwrap();
+    let room = rdt::parse(&data, id).unwrap();
+    let scripts = scd::reader::parse(&data).unwrap();
+    let mut state = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut state);
+        vm.run_init(&mut host);
+    }
+    assert!(state.mirror_enabled());
+    let Some((emd, _)) = player_mesh(&root, id, &room) else {
+        return;
+    };
+    let keyframe = &emd.keyframes[0];
+    let joints = arklay::anim::joint_matrices(
+        &emd.skeleton,
+        keyframe,
+        &arklay::anim::entity_matrix([7000, 0, 5690], 0),
+    );
+    let meshes = [EntityMesh {
+        mesh: &emd.mesh,
+        texture: &emd.texture,
+        joints: &joints,
+        tint: [255; 3],
+        hidden_joints: 0,
+    }];
+    // A stand-in room-object mesh with a flat blue page: it sits before the
+    // entity meshes, so the mirror pass must never reflect it.
+    let blue = arklay::model::Texture8 {
+        width: 1,
+        height: 1,
+        indices: vec![0],
+        palettes: vec![[0, 0, 255, 255]],
+    };
+    let object_meshes = [
+        EntityMesh {
+            mesh: &emd.mesh,
+            texture: &blue,
+            joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
+        },
+        EntityMesh {
+            mesh: &emd.mesh,
+            texture: &emd.texture,
+            joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
+        },
+    ];
+
+    let lighting = Lighting::from_room(&room);
+    let mut found = false;
+    let mut drawn = 0usize;
+    for cut in &room.cuts {
+        let camera = Camera::from_cut(cut);
+        let mirror = MirrorPass {
+            axis_x: state.mirror_axis_x(),
+            plane: i32::from(state.mirror.plane),
+            extent_min: state.mirror.extent_min,
+            extent_max: state.mirror.extent_max,
+            camera_pos: cut.pos,
+            camera: camera.mirrored(state.mirror_axis_x(), i32::from(state.mirror.plane)),
+        };
+        let mut plain = Framebuffer::new();
+        arklay::render::draw_gameplay_scene(
+            &mut plain, None, &meshes, None, &camera, &lighting, None,
+        );
+        let mut reflected = Framebuffer::new();
+        arklay::render::draw_gameplay_scene_with_effects(
+            &mut reflected,
+            None,
+            &meshes,
+            None,
+            &camera,
+            &lighting,
+            None,
+            None,
+            0,
+            Some(&mirror),
+        );
+        let changed = plain
+            .rgba
+            .iter()
+            .zip(&reflected.rgba)
+            .filter(|(a, b)| a != b)
+            .count();
+
+        // The object-first partition: enabling the mirror must not change a
+        // single object pixel; only the entity copy may reflect.
+        let count_blue = |rgba: &[u8]| {
+            rgba.chunks(4)
+                .filter(|pixel| pixel[2] > 128 && pixel[0] < 64 && pixel[1] < 64)
+                .count()
+        };
+        let mut object_plain = Framebuffer::new();
+        arklay::render::draw_gameplay_scene_with_effects(
+            &mut object_plain,
+            None,
+            &object_meshes,
+            None,
+            &camera,
+            &lighting,
+            None,
+            None,
+            1,
+            None,
+        );
+        let mut object_reflected = Framebuffer::new();
+        arklay::render::draw_gameplay_scene_with_effects(
+            &mut object_reflected,
+            None,
+            &object_meshes,
+            None,
+            &camera,
+            &lighting,
+            None,
+            None,
+            1,
+            Some(&mirror),
+        );
+        assert_eq!(
+            count_blue(&object_plain.rgba),
+            count_blue(&object_reflected.rgba),
+            "the mirror pass reflected a room object"
+        );
+
+        if changed > 100 {
+            found = true;
+            drawn = changed;
+            break;
+        }
+    }
+    println!("ROOM112 mirror adds {drawn} bytes");
+    assert!(found, "no cut rendered the mirror reflection");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_30b_objs_hide_changes_the_rendered_tint() {
+    use std::rc::Rc;
+
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("30B0").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    let mut command_vm = scd::vm::CommandVm::new(&scripts);
+    let mut event_vm = scd::vm::EventVm::from_scripts(Rc::new(scripts));
+    {
+        let mut host = game::ScdGameHost::new(&mut game);
+        command_vm.run_init(&mut host);
+    }
+    event_vm.start(0, 4);
+    for _ in 0..3000 {
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            command_vm.run_main(&mut host);
+        }
+        for (slot, event) in game.pending_events.drain(..) {
+            event_vm.start(usize::from(slot), event);
+        }
+        {
+            let mut host = game::ScdGameHost::new(&mut game);
+            event_vm.step(&mut host);
+        }
+        game.advance_frame();
+        if game.player_tint != [255; 3] {
+            break;
+        }
+    }
+    assert_eq!(game.player_tint, [0x30, 0, 0], "objs_hide did not run");
+
+    let player = arklay::player::spawn(id, &room);
+    game.sync_entity_from_player(&player);
+
+    // Find a cut that draws the player, then compare the tinted and untinted
+    // frames there.
+    let mut best: Option<(usize, usize, Vec<u8>, Vec<u8>)> = None;
+    for cut in 0..room.cuts.len() {
+        let mut cut_room = room.clone();
+        cut_room.current_cut = cut;
+        let tinted =
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &game, &player).unwrap();
+        game.player_tint = [255; 3];
+        let plain =
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &game, &player).unwrap();
+        game.player_tint = [0x30, 0, 0];
+        let changed = plain
+            .rgba
+            .iter()
+            .zip(&tinted.rgba)
+            .filter(|(a, b)| a != b)
+            .count();
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_changed, ..)| changed > *best_changed)
+        {
+            best = Some((cut, changed, plain.rgba, tinted.rgba));
+        }
+    }
+    let (cut, changed, plain, tinted) = best.expect("no camera cut");
+    println!("ROOM30B cut {cut}: the objs_hide tint changes {changed} bytes");
+    assert!(changed > 50, "the tint changed only {changed} bytes");
+    let sum = |rgba: &[u8]| {
+        rgba.chunks(4)
+            .map(|pixel| u64::from(pixel[0]) + u64::from(pixel[1]) + u64::from(pixel[2]))
+            .sum::<u64>()
+    };
+    assert!(
+        sum(&tinted) < sum(&plain),
+        "the objs_hide tint must darken the frame"
     );
 }

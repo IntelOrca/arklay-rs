@@ -27,6 +27,10 @@ pub struct TmdPrim {
     /// The packet's semi-transparency command bit (`0x36000609`). The
     /// renderer's fallback is a flat half blend.
     pub blend: bool,
+    /// The packet stores its vertices with an unnegated Y (`0x25010607`). The
+    /// render path skips the standard Y conjugation for these vertices; every
+    /// other form negates Y like the PSX vertex reader does.
+    pub raw_y: bool,
     /// The packet colour of an untextured packet, `None` when textured.
     pub flat_color: Option<[u8; 3]>,
 }

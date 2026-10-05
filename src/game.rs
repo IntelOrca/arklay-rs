@@ -281,6 +281,17 @@ impl FlagBank {
         value & mask != 0
     }
 
+    /// Clear the low nibble of both main-state dwords, the original's room
+    /// reset (`g_main_state_flags &= ~MSF_ROOM_RESET_MASK` and the same mask
+    /// on `g_main_state_flags2`). The first dword drops the mirror enable/axis
+    /// bits and the two script-only bits; the second (bank 5 selector `0x20+`)
+    /// drops the effect-zone, screen-shake, screen-border and fade-depth bits.
+    /// The ladder, object-push and door-transition bits above them survive.
+    pub fn clear_room_reset_bits(&mut self) {
+        self.0[0] &= 0xF0;
+        self.0[4] &= 0xF0;
+    }
+
     /// Apply set (mode 0), clear (mode 1) or toggle (mode 2) to the bit
     /// selected by `sel`. Returns `false` for an unknown mode.
     pub fn apply(&mut self, sel: u8, mode: u8) -> bool {
@@ -1845,6 +1856,15 @@ impl GameState {
         self.objects.reset(usize::from(room.omodel_slot_count));
         self.collision_edits.clear();
         self.light_edits.clear();
+        // The original's `room_set` clears the low nibble of the main-state
+        // flags, so the mirror's enable/axis bits never survive a doorway; the
+        // mirror geometry, the item-box lid flow and the push latch reset with
+        // them so no per-room interaction leaks into the destination.
+        self.flags[5].clear_room_reset_bits();
+        self.mirror = MirrorState::default();
+        self.itembox = ItemBoxFlow::default();
+        self.object_push = false;
+        self.flags[5].apply(MSF_OBJECT_PUSH, 1);
         self.resolve_room_effects(room);
         self.id = id;
         self.state_bytes[0] = id.stage;
@@ -2610,26 +2630,31 @@ impl GameState {
     ///
     /// Mirrors the original's two probes: entries without probe bit `0x80` are
     /// tested every frame when their low flag bits intersect the frame masks
-    /// (`1` and `4`), and entries with `0x80` only when the action key is held
-    /// and their bit `0x01` is set. Probe bit `0x40` tests the player position
-    /// itself; otherwise a point 600 units in front is tested. Only the first
-    /// action-key entry that matches fires, as in the original. Item and door
-    /// actions act for real, a stair zone marks the player and raises the
-    /// ladder mode for the press handler in [`GameState::tick_objects`], and
-    /// the menu-driven kinds record a placeholder.
+    /// (`1` and `4`), and entries with `0x80` only on the action-press edge
+    /// (`action_press`) and when their bit `0x01` is set. Probe bit `0x40`
+    /// tests the player position itself; otherwise a point 600 units in front
+    /// is tested. Only the first action-key entry that matches fires, as in the
+    /// original. Item and door actions act for real, a stair zone marks the
+    /// player and raises the ladder mode for the press handler in
+    /// [`GameState::tick_objects`], and the menu-driven kinds record a
+    /// placeholder.
     ///
     /// TODO(parity): (scripting) the original probes bit-0 entries every frame
     /// (mask 1) and bit-2 entries only from the collision pass (mask 4); this
     /// merges both masks into one walk, so a bit-2-only zone can fire from the
     /// player probe. Handlers 5/6 (`check_door`/`check_door_side`), which latch
     /// the approach side into zone flags for the door animation, are also not run.
-    pub fn interact(&mut self, pos: [i32; 3], angle: u16, action: bool) {
+    pub fn interact(&mut self, pos: [i32; 3], angle: u16, action_press: bool) {
         // The live action table is the stair-zone store; rebuilding it here
         // also picks up `aot_reset`/`aot_on` edits and the entry's own toggled
         // word.
         self.stair_zones = StairZones::collect(&self.room_actions);
         self.stair_height = None;
-        self.probe_actions(pos, angle, 1, pos, action);
+        // The player-side `update_player_position` pass clears its own
+        // `has_enter_switch_zone` bit before the walk; `set_stairs_zone`
+        // re-raises it when a zone matches.
+        self.entities[0].zone_flags &= !0x20;
+        self.probe_actions(pos, angle, 1, pos, action_press);
     }
 
     /// One `update_player_position` walk with an explicit frame mask.
@@ -2637,23 +2662,21 @@ impl GameState {
     /// `mask` is the original's entry-flag selector: the player's own pass uses
     /// `1`, the object-side pass `update_room_objects` runs uses `4`. Entries
     /// with flag bit `0x80` are action-key entries and belong to
-    /// `check_action_object`: they only fire while `action` is held, only when
-    /// their flag bit 0 is set, and only the first matching one fires. All
-    /// other matching entries dispatch (the original walks the whole table).
-    /// `entity_pos` is the position a `0x40` entry probes; the reach probe is
-    /// always built from the player's facing.
+    /// `check_action_object`: they only fire on the action-press edge, only
+    /// when their flag bit 0 is set, and only the first matching one fires.
+    /// All other matching entries dispatch (the original walks the whole
+    /// table). `entity_pos` is the position a `0x40` entry probes; the reach
+    /// probe is always built from the player's facing. The caller clears the
+    /// probed entity's `has_enter_switch_zone` bit (the player for mask 1, the
+    /// object record for mask 4) before calling this.
     fn probe_actions(
         &mut self,
         pos: [i32; 3],
         angle: u16,
         mask: u8,
         entity_pos: [i32; 3],
-        action: bool,
+        action_press: bool,
     ) {
-        // The original clears the "action available" bit at the top of every
-        // `update_player_position` pass; `set_stairs_zone` re-raises it when a
-        // zone matches.
-        self.entities[0].zone_flags &= !0x20;
         let (dx, dz) = crate::player::reach_offset(angle);
         let reach = [pos[0] + dx, pos[1], pos[2] + dz];
         let mut action_fired = false;
@@ -2666,7 +2689,7 @@ impl GameState {
             }
             let flags = room_action.flags;
             if flags & 0x80 != 0 {
-                if !action || flags & 0x01 == 0 || action_fired {
+                if !action_press || flags & 0x01 == 0 || action_fired {
                     continue;
                 }
             } else if flags & mask == 0 {
@@ -2755,42 +2778,17 @@ impl GameState {
         self.mirror.axis_x(&self.flags)
     }
 
-    /// `model_op` (0x34) variant 0: accumulate a colour tint on one omodel.
+    /// `model_op` (0x34) variant 0: an audited no-op.
     ///
-    /// The bias operand's bit 7 (after the original's `- 0x80` rebase) selects
-    /// the object table and indexes it; the three signed operands are the
-    /// deltas. They accumulate on the record's per-channel deltas (clamped to
-    /// `[-31, 31]`); when all three agree the change is pure luminance and is
-    /// stored as the record's light scale instead. Variants 1/2 only retarget a
-    /// texture-queue entry, which this port does not model, and the enemy
-    /// branch is inert with no enemies.
-    pub fn model_tint(&mut self, operands: &[Operand]) {
-        let variant = operand_u8(operands, 0);
-        if variant != 0 {
-            return;
-        }
-        let selector = operand_u8(operands, 1).wrapping_sub(0x80);
-        if selector & 0x80 == 0 {
-            return;
-        }
-        let Some(record) = self.objects.records.get_mut(usize::from(selector & 0x7F)) else {
-            return;
-        };
-        let deltas = [
-            operand_i8(operands, 4),
-            operand_i8(operands, 5),
-            operand_i8(operands, 6),
-        ];
-        let mut accumulated = [0i16; 3];
-        for (slot, (tint, delta)) in accumulated.iter_mut().zip(record.tint.iter().zip(deltas)) {
-            *slot = (i16::from(*tint) + i16::from(delta)).clamp(-31, 31);
-        }
-        if accumulated[0] == accumulated[1] && accumulated[0] == accumulated[2] {
-            record.light_scale = accumulated[0];
-        } else {
-            record.tint = accumulated.map(|value| value as i8);
-        }
-    }
+    /// The original first rebases the selector operand by `-0x80` and scans
+    /// the four texture-queue entries for an id byte equal to the result; only
+    /// a match arms the entry and reaches the model mutation. Queue ids are
+    /// enemy model ids with bit 7 clear, while the object selector rebases to
+    /// a value with bit 7 set, so an object-targeted command never matches and
+    /// emits nothing. The port does not model the texture queue, and its enemy
+    /// branch has no entities to tint, so every variant is a no-op here.
+    /// Variants 1/2 only retarget a queue entry and were already inert.
+    pub fn model_tint(&mut self, _operands: &[Operand]) {}
 
     /// `objs_hide` (0x4D): tint every player joint dark red. The original also
     /// repeats the tint on the mirror joint copies; the port's mirror pass
@@ -2843,10 +2841,12 @@ impl GameState {
                     .open_timer
                     .wrapping_add(self.itembox.counter_increase as u16);
                 if (self.itembox.open_timer as i16) < 1 {
-                    // Lid settled: the box menu may open.
+                    // Lid settled: the box menu may open. The original
+                    // restores the whole ready word (`g_message_flags =
+                    // 0xffff`), not just the three bits the arm cleared.
                     self.flags[5].apply(MSF_MENU_MODE_ITEMBOX, 0);
                     self.itembox.menu_open = true;
-                    self.message_flags |= 0x0045;
+                    self.message_flags = 0xFFFF;
                     self.itembox.state = 4;
                 }
             }
@@ -2933,10 +2933,16 @@ impl GameState {
                     .and_then(|slot| self.objects.record(usize::from(slot)))
                     .is_some_and(|record| objects::verify_climb_object(record, player.angle));
                 if facing {
+                    // The verification branch clears the transition bit and
+                    // re-raises it through the input handler, which also
+                    // restarts the sequence on state 0; the return clip is
+                    // selected from zone flag 0x10 when state 1 runs.
                     player.vault_bit = false;
                     player.vault_return = true;
+                    player.action_state = 0;
+                    player.move_speed_current = 0;
                     self.entities[0].zone_flags |= 0x10;
-                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
+                    self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
                 }
             } else if player.locked == crate::player::LockedAction::None {
                 if let Some(candidate) =
@@ -3044,7 +3050,11 @@ impl GameState {
             }
 
             self.objects.records[index] = record;
-            // 6. the object-side room-action probe (mask 4).
+            // 6. the object-side room-action probe (mask 4). The original's
+            // `update_player_position` clears the passed entity's zone bit at
+            // the top of the pass; here the passed entity is the object record,
+            // not the player.
+            self.objects.records[index].zone_flags &= !0x20;
             self.probe_actions(player.pos, player.angle, 4, record.pos, false);
         }
 
@@ -4005,12 +4015,10 @@ impl ScdHost for ScdGameHost<'_> {
         }
     }
 
-    /// The object-model opcodes: build, flag write, counter compare and the
-    /// two transform setters. The `obj` record layout and every room/slot
-    /// positional override live in [`crate::objects::ObjectTable::build`].
-    ///
-    /// TODO(parity): (scripting) 0x34 model_op (object/model tints) is the
-    /// slice-4 opcode; it stays a placeholder here.
+    /// The object-model opcodes: build, flag write, counter compare, the two
+    /// transform setters and the gated-off model tint. The `obj` record layout
+    /// and every room/slot positional override live in
+    /// [`crate::objects::ObjectTable::build`].
     fn on_model(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x1F => {
@@ -4041,7 +4049,8 @@ impl ScdHost for ScdGameHost<'_> {
                 self.state.objects.transform(operands);
                 StepResult::Continue
             }
-            // `model_op` (0x34): object colour tints.
+            // `model_op` (0x34): every form is an audited no-op (the
+            // texture-queue gate never matches an object selector).
             0x34 => {
                 self.state.model_tint(operands);
                 StepResult::Continue
@@ -6520,6 +6529,44 @@ mod tests {
     }
 
     #[test]
+    fn enter_room_clears_the_room_reset_flags_and_interactions() {
+        let mut state = game();
+        // ROOM112's mirror and two script-only low-nibble bits, plus a live
+        // item-box flow and push latch from the outgoing room.
+        state.scene_setup(&operands(&[0x01, 4100, 10000, 5700]));
+        assert!(state.mirror_enabled());
+        assert_eq!(state.mirror.plane, 5700);
+        state.flags[5].apply(28, 0);
+        state.flags[5].apply(29, 0);
+        // The second main-state dword's low nibble (bank 5 selectors
+        // 0x3C..0x3F, e.g. the boulder screen shake) clears with it.
+        state.flags[5].apply(0x3E, 0);
+        state.itembox.state = 2;
+        state.itembox.cover = Some(0);
+        state.object_push = true;
+        state.flags[5].apply(MSF_OBJECT_PUSH, 0);
+
+        state.enter_room(RoomId::parse("1140").unwrap(), &RoomState::default());
+
+        assert_eq!(
+            state.flags[5].bytes()[0] & 0x0F,
+            0,
+            "room_set clears the main-state low nibble"
+        );
+        assert_eq!(
+            state.flags[5].bytes()[4] & 0x0F,
+            0,
+            "the second dword's low nibble clears too"
+        );
+        assert!(!state.mirror_enabled());
+        assert!(!state.mirror_axis_x());
+        assert_eq!(state.mirror, MirrorState::default());
+        assert_eq!(state.itembox, ItemBoxFlow::default());
+        assert!(!state.object_push);
+        assert!(!state.flags[5].bit(MSF_OBJECT_PUSH));
+    }
+
+    #[test]
     fn aot_reset_and_arm_update_existing_slots_only() {
         let mut state = game();
         {
@@ -6560,6 +6607,33 @@ mod tests {
         assert_eq!(action.kind, RoomActionKind::Event);
         state.interact([5, 0, 5], 0, true);
         assert_eq!(state.pending_events, vec![(9, 7)]);
+    }
+
+    #[test]
+    fn action_entries_fire_on_the_press_edge_never_while_held() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // Slot 0, handler 9, action-key forward probe.
+            host.on_room_action(
+                op(0x0D),
+                &operands(&[0, 0, 0, 2000, 2000, 9, 0x81, 9, 7, 0]),
+            );
+        }
+        state.entities[0].pos = [100, 0, 100];
+
+        // The press edge queues the event once.
+        state.interact(state.entities[0].pos, 0, true);
+        assert_eq!(state.pending_events, vec![(9, 7)]);
+        state.pending_events.clear();
+
+        // The same entry with the button held must not re-fire: the engine
+        // passes the press edge, not the held level.
+        state.interact(state.entities[0].pos, 0, false);
+        assert!(
+            state.pending_events.is_empty(),
+            "a held action re-triggered the event site"
+        );
     }
 
     #[test]
@@ -7955,6 +8029,26 @@ mod tests {
         let player = push_player();
         state.interact(player.pos, player.angle, false);
         assert!(state.last_interaction.is_none(), "mask 1 ignores bit 2");
+
+        // The mask-4 pass clears the object record's own zone bit, never the
+        // player's.
+        let room = RoomState::default();
+        let mut state = pushed_game(vec![object_record([0, 0, 0], [1, 1, 1])]);
+        state.entities[0].zone_flags = 0x20;
+        state.objects.records[0].zone_flags = 0x20;
+        let mut player = push_player();
+        player.pos = [0, 0, 0];
+        state.tick_objects(&room, &mut player);
+        assert_eq!(
+            state.entities[0].zone_flags & 0x20,
+            0x20,
+            "the object-side pass cleared the player's zone bit"
+        );
+        assert_eq!(
+            state.objects.records[0].zone_flags & 0x20,
+            0,
+            "the object's own zone bit must clear"
+        );
     }
 
     #[test]
@@ -8002,14 +8096,18 @@ mod tests {
         assert!(state.flags[5].bit(MSF_DOOR_TRANSITION));
 
         // A second press with the player turned onto the object's facing
-        // settles onto the return side.
+        // settles onto the return side and restarts the sequence.
         player.angle = 0x800;
         player.input.action_pressed = true;
         state.tick_objects(&room, &mut player);
         assert!(!player.vault_bit);
         assert!(player.vault_return);
+        assert_eq!(player.action_state, 0, "the sequence restarts");
         assert_eq!(state.entities[0].zone_flags & 0x10, 0x10);
-        assert!(!state.flags[5].bit(MSF_DOOR_TRANSITION));
+        assert!(
+            state.flags[5].bit(MSF_DOOR_TRANSITION),
+            "the transition bit is re-raised"
+        );
     }
 
     #[test]
@@ -8030,6 +8128,11 @@ mod tests {
 
         assert!(state.open_itembox(0));
         assert_eq!(state.itembox.state, 1);
+        assert_eq!(
+            state.message_flags,
+            MESSAGE_FLAGS_INITIAL & !0x0045,
+            "arming the lid clears the three bits"
+        );
         assert!(
             !state.open_itembox(0),
             "the box cannot re-arm while opening"
@@ -8048,6 +8151,10 @@ mod tests {
         assert!(minimum < -199, "the lid only reached {minimum}");
         assert!(settled.is_some(), "the lid never settled");
         assert!(state.flags[5].bit(MSF_MENU_MODE_ITEMBOX));
+        assert_eq!(
+            state.message_flags, 0xFFFF,
+            "the settle restores the whole ready word"
+        );
 
         // The UI closes: state 4 restores the angle and drops the flag.
         state.reset_itembox();
@@ -8078,27 +8185,16 @@ mod tests {
     }
 
     #[test]
-    fn model_op_accumulates_luminance_and_colour_tints() {
+    fn model_op_variant_zero_is_gated_off_for_objects() {
         let mut state = pushed_game(vec![object_record([0, 0, 0], [1, 1, 1])]);
-        // selector byte 0 -> p6 = 0x80 -> omodel slot 0; deltas -1,-1,-1.
+        // The object selector rebases to a value with bit 7 set, which the
+        // texture queue can never hold, so no object is tinted.
         state.model_tint(&operands(&[0, 0x00, 0x01, 0x01, 0xFF, 0xFF, 0xFF]));
-        assert_eq!(state.objects.records[0].light_scale, -1);
-        assert_eq!(
-            state.objects.records[0].tint, [0; 3],
-            "luminance keeps the tint"
-        );
-        assert_eq!(state.objects.records[0].shade(), [247, 247, 247]);
-
-        // A counter-tint with unequal deltas lands on the channels.
         state.model_tint(&operands(&[0, 0x00, 0, 0, 0x05, 0xFB, 0xFF]));
-        assert_eq!(state.objects.records[0].tint, [5, -5, -1]);
-        assert_eq!(state.objects.records[0].light_scale, -1);
-
-        // Variants 1/2 and the enemy selector are inert.
-        let before = state.objects.records[0];
         state.model_tint(&operands(&[1, 0x00, 0, 0, 1, 2, 3]));
-        state.model_tint(&operands(&[0, 0x80, 0, 0, 1, 2, 3]));
-        assert_eq!(state.objects.records[0], before);
+        assert_eq!(state.objects.records[0].tint, [0; 3]);
+        assert_eq!(state.objects.records[0].light_scale, 0);
+        assert_eq!(state.objects.records[0].shade(), [255, 255, 255]);
     }
 
     #[test]

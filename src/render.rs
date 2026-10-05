@@ -1137,6 +1137,7 @@ pub fn draw_gameplay_scene(
         lighting,
         mask_layer,
         None,
+        0,
         None,
     );
 }
@@ -1145,7 +1146,9 @@ pub fn draw_gameplay_scene(
 ///
 /// The effect quads are submitted after the masks (the original's `update_2d_effects`
 /// runs after the entity pass), so at an exact key tie an effect paints over a
-/// mask or triangle submitted earlier in the frame.
+/// mask or triangle submitted earlier in the frame. `mirror_from` is the first
+/// mesh index eligible for the mirror pass: the room object meshes come first
+/// and are never reflected.
 ///
 /// `mirror` appends the entity meshes' mirrored triangles, drawn through the
 /// reflected camera and visibility-tested joint by joint, after the primary
@@ -1161,6 +1164,7 @@ pub fn draw_gameplay_scene_with_effects(
     lighting: &Lighting,
     mask_layer: Option<&MaskLayer<'_>>,
     effect_layer: Option<&EffectLayer<'_>>,
+    mirror_from: usize,
     mirror: Option<&MirrorPass>,
 ) {
     framebuffer.clear();
@@ -1201,9 +1205,10 @@ pub fn draw_gameplay_scene_with_effects(
     }
     // The mirror copy is drawn through the reflected camera and submitted
     // after the primary pass; the stable sort keeps it after the live entity
-    // at equal depth.
+    // at equal depth. Only the entity meshes reflect: the original's mirror
+    // pass re-runs the character joints, never the room's own objects.
     if let Some(mirror) = mirror {
-        for (texture, mesh) in meshes.iter().enumerate() {
+        for (texture, mesh) in meshes.iter().enumerate().skip(mirror_from) {
             for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
                 if !mesh.joint_visible(index) || !mirror.joint_visible(joint.t) {
                     continue;
@@ -1765,6 +1770,9 @@ fn collect_triangles(
         .iter()
         .map(|vertex| fixed_mul(joint, *vertex))
         .collect();
+    // The raw-Y form's vertices skip the standard input Y negation; the pool
+    // is built lazily so the common path pays nothing.
+    let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
     let normals: Vec<Option<[f64; 3]>> = object
         .normals
         .iter()
@@ -1772,10 +1780,21 @@ fn collect_triangles(
         .collect();
 
     for prim in &object.prims {
+        let pool = if prim.raw_y {
+            raw_vertices.get_or_insert_with(|| {
+                object
+                    .vertices
+                    .iter()
+                    .map(|vertex| fixed_mul_raw_y(joint, *vertex))
+                    .collect()
+            })
+        } else {
+            &vertices
+        };
         let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
-            vertices.get(usize::from(prim.vertices[0])),
-            vertices.get(usize::from(prim.vertices[1])),
-            vertices.get(usize::from(prim.vertices[2])),
+            pool.get(usize::from(prim.vertices[0])),
+            pool.get(usize::from(prim.vertices[1])),
+            pool.get(usize::from(prim.vertices[2])),
         ) else {
             continue;
         };
@@ -2011,6 +2030,25 @@ fn fixed_mul(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
+/// [`fixed_mul`] for a `0x25010607` raw-Y packet: the PSX vertex reader for
+/// that form does not negate the stored Y, so neither does this.
+fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
+    let v = [
+        i128::from(vertex[0]),
+        i128::from(vertex[1]),
+        i128::from(vertex[2]),
+    ];
+    std::array::from_fn(|row| {
+        let r = joint.r[row];
+        let sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
+        let mut scaled = (sum + ((sum >> 127) & i128::from(0xFFF))) >> FIXED_BITS;
+        if row == 1 {
+            scaled = -scaled;
+        }
+        clamp_i32(scaled + i128::from(joint.t[row]))
+    })
+}
+
 /// Rotate a normal by a joint's 4.12 rotation, ignoring the translation.
 fn rotate(joint: &anim::Mat4x3, normal: [i16; 3]) -> [i32; 3] {
     conjugate_rotate(
@@ -2205,6 +2243,7 @@ mod tests {
                     tsb: 0x80,
                     textured: true,
                     blend: false,
+                    raw_y: false,
                     flat_color: None,
                 }],
             }],
@@ -2421,6 +2460,16 @@ mod tests {
         // negated again before the translation is added, so the pitched joint
         // maps +Z to -Y (a plain product would map it to +Y).
         assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
+
+        // The raw-Y form reads the stored Y as-is; for the same pitched joint
+        // a positive Y maps to -Z through the first row of the rotation.
+        assert_eq!(fixed_mul_raw_y(&joint, [0, 100, 0]), [10, 20, -69]);
+        // Zero Y is unaffected, so both forms agree on the rotation plane.
+        assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
+        assert_eq!(
+            fixed_mul_raw_y(&joint, [0, 0, 100]),
+            fixed_mul(&joint, [0, 0, 100])
+        );
     }
 
     #[test]
@@ -3361,6 +3410,7 @@ mod tests {
             &lighting,
             None,
             Some(&layer),
+            0,
             None,
         );
     }
@@ -3463,6 +3513,7 @@ mod tests {
             &lighting,
             None,
             Some(&layer),
+            0,
             None,
         );
         assert_eq!(framebuffer_pixel(&framebuffer, 160, 130), [255, 0, 0, 255]);
@@ -3602,6 +3653,55 @@ mod tests {
         assert!(!pass.joint_visible([5000, 0, 50]));
         // Outside the mirror's span (the crossing lands past extent_max).
         assert!(!pass.joint_visible([12000, 0, 150]));
+    }
+
+    #[test]
+    fn the_mirror_pass_never_reflects_meshes_before_the_partition() {
+        let texture = solid_texture([255, 0, 0, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let camera = straight_camera();
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+        let pass = MirrorPass {
+            axis_x: false,
+            plane: 0,
+            extent_min: 0,
+            extent_max: 7000,
+            camera_pos: [0, 0, 200],
+            camera: straight_camera().mirrored(false, 0),
+        };
+        let meshes = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            hidden_joints: 0,
+        }];
+
+        let render = |mirror_from: usize, mirror: Option<&MirrorPass>| {
+            let mut framebuffer = Framebuffer::new();
+            draw_gameplay_scene_with_effects(
+                &mut framebuffer,
+                None,
+                &meshes,
+                None,
+                &camera,
+                &lighting,
+                None,
+                None,
+                mirror_from,
+                mirror,
+            );
+            framebuffer.rgba
+        };
+        let primary = render(0, None);
+        // The mesh sits before the partition, so the only candidate is skipped
+        // and the frame matches the mirror-less one exactly; the real-asset
+        // ROOM112 test proves the same pass does draw an eligible entity.
+        assert_eq!(primary, render(1, Some(&pass)));
     }
 
     #[test]
