@@ -994,12 +994,13 @@ impl<'a> MaskLayer<'a> {
 /// in slice order and pre-sorted far-to-near with a stable sort, then the
 /// masks in [`mask::mask_submission_order`] (the order the original paints
 /// equal-key sprites in). [`mask::order_far_to_near`] is the stable sort, so
-/// equal keys keep this submission order: the caller places the player mesh
-/// first and the NPC meshes in entity-slot order, and a mask whose key ties a
-/// triangle follows it and paints over the model, which is how the original's
-/// strictly-farther mask flush resolves the tie. Inactive groups and hidden
-/// entries never reach the list. Each triangle keeps the index of its mesh's
-/// texture page.
+/// equal keys keep this submission order: the caller places the NPC meshes in
+/// entity-slot order and the player mesh last (the original queues the enemies
+/// before the player), so at an exact tie the player paints over an NPC, and a
+/// mask whose key ties a triangle follows it and paints over the model, which
+/// is how the original's strictly-farther mask flush resolves the tie.
+/// Inactive groups and hidden entries never reach the list. Each triangle
+/// keeps the index of its mesh's texture page.
 pub fn draw_gameplay_scene(
     framebuffer: &mut Framebuffer,
     background: Option<&Image>,
@@ -2121,7 +2122,10 @@ mod tests {
     fn two_mesh_ties_keep_submission_order_and_masks_paint_last() {
         // Both meshes carry the same triangle at the same depth. The stable
         // far-to-near sort must keep the slice order, so the second mesh's
-        // green texture paints over the first's red.
+        // green texture paints over the first's red. `engine::render_frame`
+        // relies on this: it submits the NPC meshes first and the player last,
+        // so at an exact tie the player wins, exactly like the original's
+        // entity-then-player render loop.
         let red = solid_texture([255, 0, 0, 255]);
         let green = solid_texture([0, 255, 0, 255]);
         let mesh0 = mesh_at(1024, false);

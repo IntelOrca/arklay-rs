@@ -14,8 +14,10 @@
 //! graph from the entity to the player. [`crossing_heading`] clamps the
 //! crossing into the shared corridor with two wall probes, and the four
 //! behaviours in [`update`] walk, run, pace or retreat on a distance ring.
-//! A character is pushed out of the player's radius after it moves; the player
-//! is never moved and no damage is transferred.
+//! A character is pushed out of the player's radius and out of every other
+//! active character's radius after it moves, exactly like the original's
+//! `ResolveEntityScaCollision` + `HandleEnemyPlayerCollisions` tail; the other
+//! entity is never moved and no damage is transferred.
 
 use std::collections::VecDeque;
 
@@ -548,11 +550,14 @@ fn choose_heading(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3]) -
 }
 
 /// The unsigned angular window test the follow behaviours use: the heading is
-/// within `half` of the entity's yaw. The original computes
-/// `(unsigned)(heading - angle + half) < half * 2` in int arithmetic.
+/// within `half` of the entity's yaw, boundaries included. The original
+/// computes `(unsigned)(heading - angle + half) < half * 2 + 1` in int
+/// arithmetic, so the exact `delta == half * 2` boundary passes: behaviour 1
+/// and behaviour 2's second test use `< 0x301` / `<= 0x400` for `half` 0x180 /
+/// 0x200, and behaviour 3 uses `< 0x401`.
 fn heading_within(angle: u16, heading: u16, half: i32) -> bool {
     let delta = i32::from(heading) - i32::from(angle) + half;
-    (0..half * 2).contains(&delta)
+    (0..=half * 2).contains(&delta)
 }
 
 /// `npc_walk_turn_toward_heading`: step the yaw toward the heading stored in
@@ -854,18 +859,45 @@ pub fn separate_from_player(
     entity: &mut Entity,
     player_pos: [i32; 3],
     player_radius: i32,
+    player_status: u8,
 ) {
-    // Status bit 1 is the original's deactivation bit; `ResolveEntityScaCollision`
-    // skips a pair when either side carries it (the lab power-room Wesker).
-    if entity.status_flags & 2 != 0 {
+    resolve_sca_collision(room, entity, player_pos, player_radius, player_status);
+}
+
+/// `ResolveEntityScaCollision` against another active character, the
+/// `HandleEnemyPlayerCollisions` pass the original's state-9 tail runs after
+/// the player pair: the character is pushed out of the other's radius and the
+/// other is never moved.
+pub fn separate_from_character(
+    room: &RoomState,
+    entity: &mut Entity,
+    other_pos: [i32; 3],
+    other_radius: i32,
+    other_status: u8,
+) {
+    resolve_sca_collision(room, entity, other_pos, other_radius, other_status);
+}
+
+/// The shared pair resolve. `entity` is the original's `entB` (the one pushed)
+/// and the other entity is `entA`; the original's guards are `entB->state == 4`
+/// (the eating/headless state) and status bit 1 on either side (the
+/// deactivation bit, e.g. the lab power-room Wesker).
+fn resolve_sca_collision(
+    room: &RoomState,
+    entity: &mut Entity,
+    other_pos: [i32; 3],
+    other_radius: i32,
+    other_status: u8,
+) {
+    if entity.state() == 4 || (entity.status_flags | other_status) & 2 != 0 {
         return;
     }
-    let dx = entity.pos[0] - player_pos[0];
-    let dz = entity.pos[2] - player_pos[2];
+    let dx = entity.pos[0] - other_pos[0];
+    let dz = entity.pos[2] - other_pos[2];
     let dist =
         ((i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz)) as f64).sqrt() as i32;
     let radius = i32::from(entity.sca_radius);
-    let penetration = player_radius + radius - (dist + 1);
+    let penetration = other_radius + radius - (dist + 1);
     if penetration <= 0 {
         return;
     }
@@ -916,6 +948,7 @@ fn player_radius(player_flag: u8) -> i32 {
 /// from the player.
 pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
     let player_pos = game.entities[0].pos;
+    let player_status = game.entities[0].status_flags;
     let player_radius = player_radius(game.id.player_flag);
     let seed = game.rand_seed;
 
@@ -925,6 +958,15 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         entity_sounds,
         ..
     } = game;
+    // The original's `HandleEnemyPlayerCollisions` scans the enemy list after
+    // the player pair; collect the other active characters' positions, radii
+    // and status flags before borrowing this slot mutably.
+    let others: Vec<([i32; 3], i32, u8)> = entities
+        .iter()
+        .enumerate()
+        .filter(|(index, other)| *index != 0 && *index != slot && other.status_flags != 0)
+        .map(|(_, other)| (other.pos, i32::from(other.sca_radius), other.status_flags))
+        .collect();
     let entity = &mut entities[slot];
     let clock = &mut entity_anims[slot];
 
@@ -948,7 +990,10 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     let done = clock.advance(entity, clips, reverse, blend_step);
     entity.attacking_direction = u8::from(done);
     walk_footstep_sound(entity_sounds, room, entity);
-    separate_from_player(room, entity, player_pos, player_radius);
+    separate_from_player(room, entity, player_pos, player_radius, player_status);
+    for (other_pos, other_radius, other_status) in others {
+        separate_from_character(room, entity, other_pos, other_radius, other_status);
+    }
 }
 
 #[cfg(test)]
@@ -1386,6 +1431,45 @@ mod tests {
     }
 
     #[test]
+    fn heading_window_includes_the_exact_boundary() {
+        // The original tests `< half * 2 + 1`, so `delta == half * 2` is
+        // inside for behaviour 1 (half 0x180), behaviour 2's second test and
+        // behaviour 3 (both 0x200).
+        assert!(heading_within(0, 0x180, 0x180));
+        assert!(heading_within(0, 0x200, 0x200));
+        assert!(!heading_within(0, 0x181, 0x180));
+        assert!(!heading_within(0, 0x201, 0x200));
+        // A negative delta wraps through the original's unsigned cast and
+        // fails, so a heading on the far side of zero does not pass.
+        assert!(!heading_within(0x200, 0xFFF, 0x200));
+    }
+
+    #[test]
+    fn face_and_retreat_walks_back_at_the_exact_window_boundary() {
+        let room = corridor();
+        let mut game = GameState::default();
+        // The player sits along heading 0x200 and the character's yaw is 0, so
+        // the window delta is exactly 0x200 + 0x200 = 0x400. The original's
+        // `< 0x401` includes it: the character backs away on animation 3.
+        game.entities[0].pos = [100, 0, -100];
+        game.entities[1] = Entity {
+            id: 0x23,
+            pos: [0, 0, 0],
+            angle: 0,
+            action_behavior: 3,
+            action_state: 1,
+            sca_radius: 100,
+            ..Entity::default()
+        };
+        game.entities[1].set_active(true);
+        update(&mut game, 1, &room, &[]);
+        assert_eq!(
+            game.entities[1].animation_id, 3,
+            "the exact 0x400 boundary takes the backward walk"
+        );
+    }
+
+    #[test]
     fn face_and_retreat_backs_away_from_the_player() {
         let room = corridor();
         let mut game = GameState::default();
@@ -1527,7 +1611,7 @@ mod tests {
         let room = corridor();
         let mut e = entity([1100, 0, 500], 0, 0);
         e.sca_radius = 100;
-        separate_from_player(&room, &mut e, [1000, 0, 500], 100);
+        separate_from_player(&room, &mut e, [1000, 0, 500], 100, 0);
         let dist = xz_distance_to(&e, [1000, 0, 500]);
         assert!(dist > 100, "pushed out of the overlap: {dist}");
     }
@@ -1546,12 +1630,89 @@ mod tests {
         });
         let mut e = entity([1050, 0, 300], 0, 0);
         e.sca_radius = 100;
-        separate_from_player(&room, &mut e, [1150, 0, 300], 100);
+        separate_from_player(&room, &mut e, [1150, 0, 300], 100, 0);
         assert!(
             !player::position_blocked(&room, e.pos, 100),
             "the push was rolled back instead of landing in the wall: {:?}",
             e.pos
         );
         assert_eq!(e.pos, [1050, 0, 300], "the blocked axis was dropped");
+    }
+
+    #[test]
+    fn separation_skips_state_4_and_deactivated_pairs() {
+        let room = corridor();
+
+        // entB (the character) in state 4 is the eating/headless skip.
+        let mut eating = entity([1050, 0, 300], 0, 0);
+        eating.sca_radius = 100;
+        eating.set_state(4);
+        separate_from_player(&room, &mut eating, [1150, 0, 300], 100, 0);
+        assert_eq!(eating.pos, [1050, 0, 300], "state 4 is skipped");
+
+        // Status bit 1 on the character skips the pair.
+        let mut deactivated = entity([1050, 0, 300], 0, 0);
+        deactivated.sca_radius = 100;
+        deactivated.status_flags |= 2;
+        separate_from_player(&room, &mut deactivated, [1150, 0, 300], 100, 0);
+        assert_eq!(
+            deactivated.pos,
+            [1050, 0, 300],
+            "the character's deactivation bit is skipped"
+        );
+
+        // Status bit 1 on the player skips the pair too.
+        let mut player_off = entity([1050, 0, 300], 0, 0);
+        player_off.sca_radius = 100;
+        separate_from_player(&room, &mut player_off, [1150, 0, 300], 100, 2);
+        assert_eq!(
+            player_off.pos,
+            [1050, 0, 300],
+            "the player's deactivation bit is skipped"
+        );
+    }
+
+    #[test]
+    fn separation_resolves_character_against_character() {
+        let room = corridor();
+        let mut e = entity([1050, 0, 300], 0, 0);
+        e.sca_radius = 100;
+        separate_from_character(&room, &mut e, [1150, 0, 300], 100, 0);
+        let dist = xz_distance_to(&e, [1150, 0, 300]);
+        assert!(dist > 100, "pushed out of the other character: {dist}");
+    }
+
+    #[test]
+    fn state9_tail_resolves_the_character_against_other_characters() {
+        let room = corridor();
+        let mut game = GameState::default();
+        // The player sits outside behaviour 0's swap ring, so only the
+        // character pair resolve can move the slot.
+        game.entities[0].pos = [2500, 0, 2500];
+        game.entities[1] = Entity {
+            id: 0x23,
+            pos: [1100, 0, 500],
+            action_behavior: 0,
+            sca_radius: 100,
+            ..Entity::default()
+        };
+        game.entities[1].set_active(true);
+        // Another active character overlapping slot 1 from the east; the tail
+        // must push slot 1 west, away from it.
+        game.entities[2] = Entity {
+            id: 0x27,
+            pos: [1200, 0, 500],
+            sca_radius: 100,
+            ..Entity::default()
+        };
+        game.entities[2].set_active(true);
+        update(&mut game, 1, &room, &[]);
+        let entity = game.entities[1];
+        assert!(
+            entity.pos[0] < 1100,
+            "the pair resolve pushed the character west: {:?}",
+            entity.pos
+        );
+        assert_eq!(entity.pos[2], 500);
     }
 }

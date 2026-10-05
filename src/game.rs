@@ -1102,9 +1102,17 @@ impl GameState {
     /// animation frame, `+21` variant high nibble.
     ///
     /// A guard bit other than `0xFF` skips the whole record when the bank-3
-    /// bit is already set. Without force-init an occupied slot is left alone.
-    /// Ids outside `0x20..=0x2E` are parsed by the reader but allocate nothing
-    /// this milestone.
+    /// bit is already set. Ids outside `0x20..=0x2E` are parsed by the reader
+    /// but allocate nothing this milestone.
+    ///
+    /// # Documented deviation
+    ///
+    /// The original's force-init byte also gates the `FUN_0048f330` saved-state
+    /// restore: without it, an occupied slot is only re-initialised when no
+    /// saved enemy state matches. The port has no enemy snapshot store yet, so
+    /// an occupied slot is left alone instead of being re-initialised. Every
+    /// shipped character record sets the force byte, so the corpus never
+    /// reaches this path.
     pub fn spawn_enemy(&mut self, operands: &[Operand]) -> bool {
         let guard = operand_u8(operands, 2);
         if guard != 0xFF && self.flags[usize::from(BANK_ENEMIES)].bit(guard) {
@@ -1279,12 +1287,13 @@ impl GameState {
         match op.mnemonic {
             "act_motion" | "act_motion_path" => self.apply_act_motion(op, operands),
             "act_nop" => StepResult::Continue,
-            "act_reset" | "act_end" => {
+            "act_reset" => {
                 if let Some(entity) = self.selected_entity_mut() {
                     entity.set_ignore(0);
                 }
                 StepResult::Continue
             }
+            "act_end" => StepResult::Continue,
             "act_motion_bitclr" => {
                 if let Some(entity) = self.selected_entity_mut() {
                     entity.look_at_flags &= !0x10;
@@ -4196,6 +4205,10 @@ mod tests {
         assert_eq!(host.state().enemy_count, 1);
     }
 
+    /// Documented deviation: the original's no-force path runs the saved-state
+    /// restore and re-initialises when it misses; the port has no snapshot
+    /// store, so it keeps the occupied slot. Every shipped character record
+    /// sets force, so the corpus never reaches this branch.
     #[test]
     fn enemy_spawn_keeps_an_occupied_slot_without_force_init() {
         let mut state = game();
@@ -4475,6 +4488,34 @@ mod tests {
         assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
         assert_eq!(host.state().entities[0].target, [50, 0, 0]);
         assert_eq!(host.state().entities[0].target_entity, Some(1));
+    }
+
+    #[test]
+    fn act_end_keeps_the_ignore_flag_while_act_reset_clears_it() {
+        let mut state = game();
+        state.selected_entity = 0;
+        state.entities[0].set_ignore(3);
+        let mut host = ScdGameHost::new(&mut state);
+
+        // 0x8B (act_end) leaves the flag alone; 0x80 (act_reset) clears it and
+        // falls through to the same state-exit path. Both exit the actor
+        // sub-ISA, so they are dispatched directly rather than through the
+        // byte-fixture helper.
+        let end = actor_op(0x8B).unwrap();
+        assert_eq!(host.on_misc(end, &[]), StepResult::Continue);
+        assert_eq!(
+            host.state().entities[0].ignore(),
+            3,
+            "act_end must not clear the ignore flag"
+        );
+
+        let reset = actor_op(0x80).unwrap();
+        assert_eq!(host.on_misc(reset, &[]), StepResult::Continue);
+        assert_eq!(
+            host.state().entities[0].ignore(),
+            0,
+            "act_reset clears the ignore flag"
+        );
     }
 
     #[test]

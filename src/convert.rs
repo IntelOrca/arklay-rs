@@ -3276,7 +3276,17 @@ mod tests {
                 0x25 | 0x26 | 0x29 => 1,
                 0x27 => 3,
                 0x28 => 4,
-                _ => emd.clips.len(),
+                0x20 => 53,
+                0x21 => 49,
+                0x22 => 59,
+                0x23 => 65,
+                0x24 => 64,
+                0x2A => 55,
+                0x2B => 49,
+                0x2C => 52,
+                0x2D => 59,
+                0x2E => 63,
+                other => panic!("unexpected character id {other:#04x}"),
             };
             println!(
                 "{} (id {:#04x}): {} object(s), {} clip(s), {} keyframe(s), {prims} primitive(s), {} bytes",
@@ -3300,7 +3310,6 @@ mod tests {
                 "{} child lists",
                 asset.entry
             );
-            assert!((1..=65).contains(&emd.clips.len()), "{} clips", asset.entry);
             assert!(
                 (2..=1032).contains(&emd.keyframes.len()),
                 "{} keyframes",

@@ -3391,15 +3391,19 @@ struct PlayerAssets {
     emw: crate::model::Emw,
 }
 
-/// Draw one gameplay frame: the cut background, the player model, one mesh per
-/// active scripted character visible in the current cut, the player's ground
-/// shadow and the camera's room-mask layer, depth-sorted together.
+/// Draw one gameplay frame: the cut background, one mesh per active scripted
+/// character, the player model, the player's ground shadow and the camera's
+/// room-mask layer, depth-sorted together.
 ///
-/// The meshes are submitted in entity-slot order with the player first; the
-/// shared far-to-near sort is stable, so equal-depth triangles keep that
-/// submission order (and the player keeps its own exact order). Characters
-/// outside the current camera's switch zone are culled; the mask page and the
-/// shadow page are loaded lazily and cached.
+/// Every active character is drawn, exactly like the original's entity render
+/// loop; the camera switch zone gates only the per-joint `0x74` draw flag and
+/// the character's own shadow (`has_enter_switch_zone`), never the whole
+/// entity, so a character outside the zone still paints when it projects on
+/// screen. The meshes are submitted in entity-slot order with the player last,
+/// because the original queues the enemies before the player; the shared
+/// far-to-near sort is stable, so equal-depth triangles keep that submission
+/// order and the player paints over an NPC at an exact tie. The mask page and
+/// the shadow page are loaded lazily and cached.
 #[allow(clippy::too_many_arguments)]
 fn render_frame(
     framebuffer: &mut Framebuffer,
@@ -3472,7 +3476,7 @@ fn render_frame(
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
-        if !entity.active() || !npc::in_camera_zone(room, room.current_cut, entity.pos) {
+        if !entity.active() {
             continue;
         }
         let Some(model) = npc_models.get(pack, entity.id) else {
@@ -3489,17 +3493,17 @@ fn render_frame(
     }
 
     let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(1 + models.len());
-    if let (Some(assets), Some(joints)) = (assets, &player_joints) {
-        meshes.push(EntityMesh {
-            mesh: &assets.emd.mesh,
-            texture: &assets.emd.texture,
-            joints,
-        });
-    }
     for (model, joints) in models.iter().zip(&npc_joints) {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
+            joints,
+        });
+    }
+    if let (Some(assets), Some(joints)) = (assets, &player_joints) {
+        meshes.push(EntityMesh {
+            mesh: &assets.emd.mesh,
+            texture: &assets.emd.texture,
             joints,
         });
     }

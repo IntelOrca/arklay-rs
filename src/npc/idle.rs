@@ -8,10 +8,12 @@
 //! animation state machine but leave the effect calls to the milestone that
 //! adds them.
 //!
-//! Behaviour 1 walks forward until the room collision probe fires, then plays
-//! the knock animation; the move uses the walk layer's collision-resolved
-//! [`super::walk::advance_xz`]. The voice cue the original plays on the hit is
-//! out of M9 scope (no voice), so only the animation state advances.
+//! Behaviour 1 walks along its reversed facing (the original's
+//! `Add_speedXZ(0x800)` moves by `move_speed_current` at yaw + 0x800) until the
+//! room collision probe fires, then plays the knock animation; the move uses
+//! the walk layer's collision-resolved [`super::walk::advance_xz`]. The voice
+//! cue the original plays on the hit is out of M9 scope (no voice), so only the
+//! animation state advances.
 
 use crate::game::{Entity, FLAG_BANK_COUNT, FlagBank};
 use crate::model::Clip;
@@ -179,14 +181,16 @@ fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &R
 }
 
 /// Behaviour 1, walking state: bleed 15 off the speed for every animation
-/// frame spent, advance the clip, then `Add_speedXZ(0x800)` along the facing.
-/// A move the room collision refuses (checked before the commit, the same
-/// rollback the original's probe performs) advances to the knock state.
+/// frame spent, advance the clip, then move by `move_speed_current` with the
+/// original's `Add_speedXZ(0x800)` (the movement angle is the yaw flipped 180
+/// degrees, so the character walks backwards along its facing). A move the
+/// room collision refuses (checked before the commit, the same rollback the
+/// original's probe performs) advances to the knock state.
 fn walk_01_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) {
     let trim = u16::from(entity.animation_frame_id) * 0xF;
     entity.move_speed_current = (entity.move_speed_current as i16).wrapping_sub(trim as i16) as u16;
     clock.advance(entity, clips, false, IDLE_BLEND_STEP);
-    if !walk::try_advance_xz(room, entity, 0, 0x800) {
+    if !walk::try_advance_xz(room, entity, 0x800, entity.move_speed_current as i16) {
         entity.action_state = 2;
     }
 }
@@ -442,8 +446,8 @@ mod tests {
         assert_eq!(rebecca.status_flags & 2, 0);
     }
 
-    /// A room whose east half (x >= 1000) is a wall, wide enough that the
-    /// behaviour's 0x800-unit step cannot jump clean over it.
+    /// A room whose low half (0 <= x <= 1000) is a wall, wide enough that the
+    /// behaviour's step cannot jump clean over it.
     fn blocked_room() -> RoomState {
         RoomState {
             collision: crate::state::Collision {
@@ -451,9 +455,9 @@ mod tests {
                 cell_z: 0,
                 quadrants: std::array::from_fn(|_| {
                     vec![crate::state::CollisionRect {
-                        x_max: 4000,
+                        x_max: 1000,
                         z_max: 2000,
-                        x_min: 1000,
+                        x_min: 0,
                         z_min: 0,
                         kind: 1,
                         flags: 0,
@@ -467,10 +471,11 @@ mod tests {
     #[test]
     fn idle_walk_01_moves_until_the_collision_probe_fires() {
         let room = blocked_room();
-        // Angle 0 walks +X; 0x800 units from x=-3000 lands free.
+        // `Add_speedXZ(0x800)` moves along yaw + 0x800, so angle 0 walks -X by
+        // the trimmed `move_speed_current`: 1000 on the setup tick.
         let mut walker = Entity {
             id: 0x27,
-            pos: [-3000, 0, 500],
+            pos: [2500, 0, 500],
             angle: 0,
             sca_radius: 100,
             action_behavior: 1,
@@ -479,27 +484,18 @@ mod tests {
         let mut clock = EntityAnim::default();
         update(&mut walker, &mut clock, &clips(), &room);
         assert_eq!(walker.action_state, 1);
-        assert!(
-            walker.pos[0] > -3000 + 2000,
-            "the walker stepped east to {:?}",
-            walker.pos
+        assert_eq!(
+            walker.pos,
+            [1500, 0, 500],
+            "the walker stepped 1000 units along the reversed facing"
         );
-        assert_eq!(walker.pos[2], 500, "the walk keeps its Z");
 
-        // From x=900 the same step would cross into the wall: the move is
-        // rolled back and the knock state is entered.
-        let mut knocker = Entity {
-            id: 0x27,
-            pos: [900, 0, 500],
-            angle: 0,
-            sca_radius: 100,
-            action_behavior: 1,
-            ..Entity::default()
-        };
-        let mut clock = EntityAnim::default();
-        update(&mut knocker, &mut clock, &clips(), &room);
-        assert_eq!(knocker.action_state, 2);
-        assert_eq!(knocker.pos, [900, 0, 500], "the blocked move rolled back");
+        // The next tick trims 15 off the speed (frame 1) and steps 985, which
+        // would cross into the wall at x=1000: the move is rolled back and the
+        // knock state is entered.
+        update(&mut walker, &mut clock, &clips(), &room);
+        assert_eq!(walker.action_state, 2);
+        assert_eq!(walker.pos, [1500, 0, 500], "the blocked move rolled back");
     }
 
     #[test]
