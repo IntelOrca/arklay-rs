@@ -4646,7 +4646,7 @@ mod tests {
     fn entity_sounds_drain_when_no_mixer_is_available() {
         let dir = TempDir::new();
         let path = dir.0.join("empty.akpak");
-        let mut writer = PackWriter::new();
+        let writer = PackWriter::new();
         writer.write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
 
