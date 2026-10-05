@@ -245,6 +245,8 @@ pub fn encode_to_vec(image: &Image) -> Result<Vec<u8>> {
 /// Encode an 8bpp indexed texture through its first CLUT row as a BMP.
 ///
 /// Mask pages carry one 256-colour CLUT row, so row 0 is the whole palette.
+/// The palette is rebuilt in first-use order exactly like the generic encoder,
+/// but a per-index lookup keeps the pixel pass free of colour hashing.
 pub fn encode_texture8_to_vec(texture: &Texture8) -> Result<Vec<u8>> {
     let width = texture.width as usize;
     let height = texture.height as usize;
@@ -258,15 +260,66 @@ pub fn encode_texture8_to_vec(texture: &Texture8) -> Result<Vec<u8>> {
         );
     }
 
-    let mut rgba = Vec::with_capacity(expected * 4);
+    let mut lut = [u16::MAX; 256];
+    let mut palette: Vec<[u8; 3]> = Vec::new();
+    let mut colors: HashMap<[u8; 3], u8> = HashMap::new();
     for &index in &texture.indices {
-        rgba.extend_from_slice(&texture.palette(0, index));
+        let slot = &mut lut[index as usize];
+        if *slot != u16::MAX {
+            continue;
+        }
+        let rgba = texture.palette(0, index);
+        let rgb = [rgba[0], rgba[1], rgba[2]];
+        let assigned = match colors.entry(rgb) {
+            Entry::Occupied(color) => *color.get(),
+            Entry::Vacant(color) => {
+                let assigned = palette.len() as u8;
+                color.insert(assigned);
+                palette.push(rgb);
+                assigned
+            }
+        };
+        *slot = u16::from(assigned);
     }
-    encode_to_vec(&Image {
-        width: texture.width,
-        height: texture.height,
-        rgba,
-    })
+    debug_assert!(palette.len() <= 256);
+
+    let palette_len = palette.len();
+    let row_bytes = width;
+    let row_stride = (row_bytes + 3) & !3;
+    let image_size = row_stride * height;
+    let pixel_offset = FILE_HEADER_LEN + DIB_HEADER_LEN + palette_len * 4;
+    let file_size = pixel_offset + image_size;
+
+    let mut out = Vec::with_capacity(file_size);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    out.extend_from_slice(&(DIB_HEADER_LEN as u32).to_le_bytes());
+    out.extend_from_slice(&(texture.width as i32).to_le_bytes());
+    out.extend_from_slice(&(texture.height as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&8u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&(image_size as u32).to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&0i32.to_le_bytes());
+    out.extend_from_slice(&(palette_len as u32).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    for rgb in &palette {
+        out.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
+    }
+
+    for y in (0..height).rev() {
+        let row = &texture.indices[y * width..(y + 1) * width];
+        for &index in row {
+            out.push(lut[index as usize] as u8);
+        }
+        out.resize(out.len() + (row_stride - row_bytes), 0);
+    }
+
+    Ok(out)
 }
 
 fn u16_at(data: &[u8], offset: usize) -> u16 {
