@@ -95,6 +95,9 @@ pub const BANK_SYSTEM: u8 = 4;
 /// Collision radius the `enemy` spawn gives an entity before its own init
 /// overrides it.
 pub const DEFAULT_ENEMY_RADIUS: i16 = 422;
+/// Seed the per-frame NPC random sequence starts from. Any non-zero value
+/// works; the sequence only has to be deterministic across runs.
+const RAND_SEED_INITIAL: u16 = 0xACE1;
 /// First entity id that is a scripted character.
 pub const CHARACTER_ID_MIN: u8 = 0x20;
 /// Last entity id that is a scripted character.
@@ -698,6 +701,10 @@ pub struct Entity {
     pub player_pos_x: i16,
     /// Waypoint Z the pathfind behaviours steer at.
     pub player_pos_z: i16,
+    /// 16-bit countdown at entity +0x176 (hit reaction / damage recovery). The
+    /// state-9 walk layer reuses the slot as the walk heading (the target yaw
+    /// of the current path step), exactly like the original.
+    pub reaction_timer: i16,
     /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
     /// joint `i`'s flag bit.
     pub joint_flags: u16,
@@ -856,6 +863,10 @@ pub struct GameState {
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
+    /// Per-frame random seed the NPC look-at scheduling reads. The original
+    /// reseeds its global from `rand()` at the top of every gameplay frame;
+    /// the port advances a deterministic xorshift so headless runs repeat.
+    pub rand_seed: u16,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -911,8 +922,20 @@ impl Default for GameState {
             room_bgm_requests: Vec::new(),
             pending_events: Vec::new(),
             entity_sounds: Vec::new(),
+            rand_seed: RAND_SEED_INITIAL,
         }
     }
+}
+
+/// One 16-bit xorshift step: the deterministic stand-in for the original's
+/// per-frame `rand()` reseed. The zero state is remapped so the sequence never
+/// sticks.
+fn next_random(seed: u16) -> u16 {
+    let mut x = seed;
+    x ^= x << 7;
+    x ^= x >> 9;
+    x ^= x << 8;
+    if x == 0 { 0xACE1 } else { x }
 }
 
 impl GameState {
@@ -1204,6 +1227,10 @@ impl GameState {
         models: &mut crate::npc::EntityModelCache,
         pack: &crate::pack::Pack,
     ) -> usize {
+        // The original reseeds its random seed from `rand()` at the top of
+        // every gameplay frame, before any entity thinks; the look-at
+        // scheduling reads the frame's value.
+        self.rand_seed = next_random(self.rand_seed);
         if self.message_freezes_entities() {
             return 0;
         }

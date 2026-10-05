@@ -680,6 +680,13 @@ impl GameSession {
             &self.loaded.room,
             &mut self.player,
         );
+        play_entity_sounds(
+            &mut self.music,
+            &mut self.sfx_cache,
+            pack,
+            &self.loaded.room,
+            &mut self.game.entity_sounds,
+        );
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
             self.transition = Some(start_transition(pack, &record, &transition)?);
@@ -2483,6 +2490,26 @@ pub fn simulate_room(
     simulate_loaded(pack, loaded, game, player_state, ticks, input)
 }
 
+/// [`simulate_room`] with flag bits set before the init script runs, for rooms
+/// whose characters and follow states are gated on story flags. Each entry is
+/// `(bank, bit)` and is OR-ed into the fresh state.
+pub fn simulate_room_seeded(
+    pack: &Pack,
+    id: RoomId,
+    flags: &[(u8, u8)],
+    ticks: usize,
+    input: player::Input,
+) -> Result<SimulatedRoom> {
+    let loaded = load_room(pack, id)?;
+    let mut game = game::GameState::new(id, &loaded.room);
+    for &(bank, bit) in flags {
+        game.apply_flag(bank, bit, 0);
+    }
+    let player_state = player::spawn(id, &loaded.room);
+    game.sync_entity_from_player(&player_state);
+    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+}
+
 /// Drive the new-game start (stage 1 room 0) headlessly: the original's start
 /// position, facing and seed, then the same init/ticks/render path as
 /// [`simulate_room`]. `character` selects Chris (0) or Jill (1).
@@ -2805,6 +2832,33 @@ fn play_footsteps(
             continue;
         };
         let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, footstep.pos);
+        mixer.play_sfx(wav, gain, pan);
+    }
+}
+
+/// Consume the tick's NPC sound cues: resolve each queued room sound and play
+/// it as a 3D one-shot through the mixer with the entity's own pan and volume.
+/// The queue is always drained so an absent mixer or camera does not let it
+/// grow without bound.
+fn play_entity_sounds(
+    music: &mut Option<Mixer>,
+    cache: &mut SfxCache,
+    pack: &Pack,
+    room: &RoomState,
+    sounds: &mut Vec<game::EntitySound>,
+) {
+    if sounds.is_empty() {
+        return;
+    }
+    let (Some(mixer), Some(cut)) = (music.as_mut(), room.cuts.get(room.current_cut)) else {
+        sounds.clear();
+        return;
+    };
+    for sound in sounds.drain(..) {
+        let Some(wav) = cache.load(pack, sound.name) else {
+            continue;
+        };
+        let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
         mixer.play_sfx(wav, gain, pan);
     }
 }
@@ -4586,6 +4640,28 @@ mod tests {
             changed > 500,
             "the mask layer repainted only {changed} pixels"
         );
+    }
+
+    #[test]
+    fn entity_sounds_drain_when_no_mixer_is_available() {
+        let dir = TempDir::new();
+        let path = dir.0.join("empty.akpak");
+        let mut writer = PackWriter::new();
+        writer.write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+
+        let mut sounds = vec![game::EntitySound {
+            name: "ft_wdA",
+            pos: [0, 0, 0],
+        }];
+        play_entity_sounds(
+            &mut None,
+            &mut SfxCache::default(),
+            &pack,
+            &RoomState::default(),
+            &mut sounds,
+        );
+        assert!(sounds.is_empty(), "an absent mixer still drains the queue");
     }
 
     #[test]

@@ -118,7 +118,7 @@ pub fn update_all(
 /// One entity's driver tick: the state dispatch plus the shared tail.
 ///
 /// State 0 is the spawn init, state 1 the idle behaviours, state 8 the
-/// scripted-action handlers and state 9 the follow driver (slice 5). `clips`
+/// scripted-action handlers and state 9 the follow/pathfind driver. `clips`
 /// are the entity's EMD animation clips and `look_at_target` the live position
 /// an entity-target `act_motion` is aiming at, when one is set.
 pub fn update_entity(
@@ -146,9 +146,10 @@ pub fn update_entity(
             scd::update(game, slot, room, clips);
             false
         }
-        // The follow driver lands in the next slice; the slots stay inert so
-        // their scripts can still select the entities.
-        9 => false,
+        9 => {
+            walk::update(game, slot, room, clips);
+            false
+        }
         _ => false,
     };
     if advance {
