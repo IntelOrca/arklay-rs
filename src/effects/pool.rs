@@ -11,15 +11,20 @@ use crate::game::GameState;
 /// Number of effect slots in the pool.
 pub const EFFECT_POOL_SIZE: usize = 64;
 
+/// Number of entries in the effect behaviour dispatch table.
+pub const EFFECT_BEHAVIOR_COUNT: usize = 64;
+
 /// Size in bytes of one animation behaviour block.
 pub const EFFECT_BLOCK_LEN: usize = 24;
 
 /// One 24-byte animation behaviour block copied from a sprite's animation data.
 ///
-/// The block doubles as the slot's animation header and phase timer: bytes 0-3
-/// are the behaviour ids and the phase counter, bytes 4-9 the per-frame
-/// velocity deltas, bytes 10-11 the flag word, bytes 12-17 the position
-/// accumulators and bytes 18-23 the yaw plus the two rotation speeds.
+/// The block doubles as the slot's animation header and phase timer. Bytes 0-3
+/// are the two behaviour ids, the copied billboard type and the light factor;
+/// bytes 4-7 are the four phase parameters (`anim_header[0..4]`); bytes 8-13
+/// are the three per-frame velocity deltas; bytes 14-15 are the header flag
+/// word; bytes 16-21 the three position accumulators and bytes 22-23 the yaw
+/// added to the spawn yaw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EffectBlock(pub [u8; EFFECT_BLOCK_LEN]);
 
@@ -39,47 +44,42 @@ impl EffectBlock {
         self.0[2]
     }
 
-    /// The copied phase/light header byte.
-    pub fn phase(&self) -> u8 {
+    /// The copied spawn light factor at block offset 3.
+    pub fn light(&self) -> u8 {
         self.0[3]
     }
 
-    /// The three signed per-frame velocity deltas at block offsets 4/6/8.
+    /// The three signed per-frame velocity deltas at block offsets 8/10/12.
     pub fn velocity(&self) -> [i16; 3] {
         [
-            read_i16(&self.0, 4),
-            read_i16(&self.0, 6),
             read_i16(&self.0, 8),
+            read_i16(&self.0, 10),
+            read_i16(&self.0, 12),
         ]
     }
 
-    /// The header flag word at block offset 10 (the slot's effect+0x0E word).
+    /// The header flag word at block offset 14.
     pub fn flags(&self) -> u16 {
-        u16::from_le_bytes([self.0[10], self.0[11]])
+        u16::from_le_bytes([self.0[14], self.0[15]])
     }
 
-    /// Overwrite the header flag word at block offset 10.
+    /// Overwrite the header flag word at block offset 14.
     pub fn set_flags(&mut self, flags: u16) {
-        self.0[10..12].copy_from_slice(&flags.to_le_bytes());
+        self.0[14..16].copy_from_slice(&flags.to_le_bytes());
     }
 
-    /// The three signed position accumulators at block offsets 12/14/16.
+    /// The three signed position accumulators at block offsets 16/18/20.
     pub fn accumulators(&self) -> [i16; 3] {
         [
-            read_i16(&self.0, 12),
-            read_i16(&self.0, 14),
             read_i16(&self.0, 16),
+            read_i16(&self.0, 18),
+            read_i16(&self.0, 20),
         ]
     }
 
     /// The signed yaw added to the spawn yaw when the slot is created.
     pub fn yaw(&self) -> i16 {
-        read_i16(&self.0, 18)
-    }
-
-    /// The two signed rotation speeds at block offsets 20 and 22.
-    pub fn rot_speed(&self) -> [i16; 2] {
-        [read_i16(&self.0, 20), read_i16(&self.0, 22)]
+        read_i16(&self.0, 22)
     }
 }
 
@@ -129,9 +129,11 @@ pub struct Effect {
     pub update_id: u8,
     /// 0x02 Billboard type; `1` while the effect is live.
     pub active: u8,
-    /// 0x03 Light factor (0 unless the spawn passed one).
+    /// 0x03 Light factor: the spawn argument when non-zero, otherwise the
+    /// animation block's authored factor.
     pub light_factor: u8,
-    /// 0x04 Animation header: the first 18 bytes of the copied 24-byte block.
+    /// 0x04 Animation header: bytes 4..22 of the copied 24-byte block, i.e.
+    /// the original's `effect+0x04` header window.
     pub header: [u8; 18],
     /// 0x16 Yaw, the block yaw plus the spawn yaw.
     pub yaw: i16,
@@ -160,6 +162,13 @@ pub struct Effect {
     pub sprite_offset: [i32; 3],
     /// 0x50 Projected depth from the last update.
     pub proj_depth: i32,
+    /// Projected screen position from the last update (the original's packed
+    /// `local_1c` pair).
+    pub screen: [i16; 2],
+    /// Current UV record: `u`, `v`, `pivot_x`, `pivot_y`.
+    pub uv: [u8; 4],
+    /// Current frame entry's billboard texel size (`width`, `height`).
+    pub size: [u8; 2],
     /// 0x54 Full-precision spawn position.
     pub spawn_pos: [i32; 3],
     /// 0x60 Fourth spawn-position word.
@@ -342,9 +351,9 @@ impl EffectPool {
 /// of that row, from the last frame down to the first, each initialised from
 /// the frame's first 24-byte behaviour block. `parent` selects the attach
 /// transform ([`Attach::from_parent`]); `yaw` is added to each block's yaw and
-/// `light` becomes the slot's light factor, zero included (the original keeps
-/// the stale factor of a reclaimed slot when the argument is zero; the port
-/// zeroes it for determinism).
+/// `light` overwrites the block's own light factor only when it is non-zero,
+/// exactly like the original (a script spawn passes zero and keeps the
+/// animation data's authored brightness).
 ///
 /// Returns the slot allocated for the row's first (current) frame, or `None`
 /// when the sprite, the row or the pool was empty.
@@ -355,6 +364,34 @@ pub fn create(
     effect_type: u8,
     depth: u8,
     parent: u8,
+    pos: [i32; 3],
+    yaw: i16,
+    light: u8,
+) -> Option<u8> {
+    create_attached(
+        game,
+        room,
+        effect_type,
+        depth,
+        Attach::from_parent(parent),
+        pos,
+        yaw,
+        light,
+    )
+}
+
+/// Spawn an effect attached to an already-resolved transform.
+///
+/// This is the behaviour-spawn entry point: the original passes the parent
+/// slot's sprite matrix (`spriteInfo`) to the spawn helper, not the script
+/// operand, so a child inherits its parent's attach target.
+#[allow(clippy::too_many_arguments)] // the spawn operand signature is fixed
+pub fn create_attached(
+    game: &mut GameState,
+    room: &RoomEffects,
+    effect_type: u8,
+    depth: u8,
+    attach: Attach,
     pos: [i32; 3],
     yaw: i16,
     light: u8,
@@ -385,8 +422,13 @@ pub fn create(
         return None;
     }
 
-    let attach = Attach::from_parent(parent);
     let frame0 = sprite.info.frames.first().copied().unwrap_or_default();
+    let uv = sprite
+        .info
+        .uvs
+        .get(usize::from(frame0.uv_index))
+        .copied()
+        .unwrap_or_default();
     let mut current = None;
     for (index, frame) in frames.iter().enumerate().rev() {
         let Some(block) = frame.blocks.first() else {
@@ -401,11 +443,10 @@ pub fn create(
         effect.anim_id = block.anim_id();
         effect.update_id = block.update_id();
         effect.active = 1;
-        effect.light_factor = light;
-        effect.header.copy_from_slice(&block.0[..18]);
+        effect.light_factor = if light != 0 { light } else { block.light() };
+        effect.header.copy_from_slice(&block.0[4..22]);
         effect.yaw = block.yaw().wrapping_add(yaw);
-        let rot_speed = block.rot_speed();
-        effect.rot_speed = [rot_speed[0], rot_speed[1], 0];
+        effect.rot_speed = [0, 0, 0];
         effect.frame_delay = frame0.delay;
         effect.frame_index = frame0.uv_index;
         effect.effect_type = effect_type;
@@ -418,6 +459,9 @@ pub fn create(
         effect.anim_depth = depth as u8;
         effect.anim_frame = index as u8;
         effect.anim_block = 0;
+        effect.uv = [uv.u, uv.v, uv.pivot_x, uv.pivot_y];
+        effect.size = [frame0.width, frame0.height];
+        effect.screen = [0, 0];
         current = Some(slot as u8);
     }
     current
@@ -536,13 +580,11 @@ mod tests {
     fn create_copies_the_header_and_spawn_fields() {
         let mut game = GameState::default();
         let room = RoomEffects::default();
-        let mut raw = block(2, 5, 100);
-        raw[3] = 25;
-        raw[4..6].copy_from_slice(&7i16.to_le_bytes());
-        raw[10..12].copy_from_slice(&0x0002u16.to_le_bytes());
-        raw[12..14].copy_from_slice(&11i16.to_le_bytes());
-        raw[20..22].copy_from_slice(&33i16.to_le_bytes());
-        raw[22..24].copy_from_slice(&44i16.to_le_bytes());
+        let mut raw = block(2, 5, 44);
+        raw[4] = 25;
+        raw[8..10].copy_from_slice(&7i16.to_le_bytes());
+        raw[14..16].copy_from_slice(&0x0002u16.to_le_bytes());
+        raw[16..18].copy_from_slice(&11i16.to_le_bytes());
         game.weapon_effects
             .sprites
             .push(sprite(9, std::array::from_fn(|_| vec![vec![raw]])));
@@ -552,11 +594,15 @@ mod tests {
         assert_eq!(effect.update_id, 5);
         assert_eq!(effect.active, 1);
         assert_eq!(effect.light_factor, 77);
-        assert_eq!(&effect.header[..4], &[2, 5, 0, 25]);
-        assert_eq!(effect.yaw, 1636);
-        assert_eq!(effect.rot_speed, [33, 44, 0]);
+        assert_eq!(effect.header[..4], [25, 0, 0, 0]);
+        assert_eq!(effect.header[4..6], 7i16.to_le_bytes());
+        assert_eq!(effect.header[12..14], 11i16.to_le_bytes());
+        assert_eq!(effect.yaw, 1580);
+        assert_eq!(effect.rot_speed, [0, 0, 0]);
         assert_eq!(effect.frame_delay, 4);
         assert_eq!(effect.frame_index, 0);
+        assert_eq!(effect.uv, [16, 32, 64, 64]);
+        assert_eq!(effect.size, [16, 16]);
         assert_eq!(effect.effect_type, 9);
         assert_eq!(effect.depth_group, 6);
         assert_eq!(effect.local_offset, [4420, -2500, 3800]);
@@ -575,10 +621,14 @@ mod tests {
             FrameEntry {
                 uv_index: 3,
                 delay: 5,
+                width: 24,
+                height: 32,
             },
             FrameEntry {
                 uv_index: 9,
                 delay: 0xFF,
+                width: 8,
+                height: 8,
             },
         ];
         let room = RoomEffects::default();
@@ -587,14 +637,17 @@ mod tests {
         assert_eq!(effect.frame_entry, 0);
         assert_eq!(effect.frame_index, 3);
         assert_eq!(effect.frame_delay, 5);
+        assert_eq!(effect.size, [24, 32]);
     }
 
     #[test]
-    fn create_zero_light_keeps_a_zero_factor() {
-        let mut game = game_with_weapon(9, std::array::from_fn(|_| vec![vec![block(2, 0, 0)]]));
+    fn create_zero_light_keeps_the_block_light() {
+        let mut raw = block(2, 0, 0);
+        raw[3] = 25;
+        let mut game = game_with_weapon(9, std::array::from_fn(|_| vec![vec![raw]]));
         let room = RoomEffects::default();
         create(&mut game, &room, 9, 0, 0, [0, 0, 0], 0, 0).unwrap();
-        assert_eq!(game.effects.slot(63).unwrap().light_factor, 0);
+        assert_eq!(game.effects.slot(63).unwrap().light_factor, 25);
     }
 
     #[test]

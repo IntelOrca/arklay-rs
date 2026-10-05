@@ -26,12 +26,19 @@ pub const EFFECT_SPRITE_SLOTS: usize = 8;
 const FREE_SPRITE: u8 = 0xFF;
 
 /// One entry of a sprite's frame table.
+///
+/// A frame entry also carries the billboard's texel size: the renderer reads
+/// `width`/`height` off the current entry, not off the UV record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FrameEntry {
-    /// Index into the sprite's UV records.
+    /// Index into the sprite's UV records, or a frame-table index on a jump.
     pub uv_index: u8,
     /// Frames to hold this entry, or `0xFF` for a jump.
     pub delay: u8,
+    /// Billboard width in texels.
+    pub width: u8,
+    /// Billboard height in texels.
+    pub height: u8,
 }
 
 /// One UV record: the texture rectangle origin plus its pivot within the
@@ -333,6 +340,8 @@ fn parse_sprite(data: &[u8], index: u8, offset: usize, tim: &[u8]) -> Result<Eff
         frames.push(FrameEntry {
             uv_index: raw[0],
             delay: raw[1],
+            width: raw[2],
+            height: raw[3],
         });
         cursor += 4;
     }
@@ -506,7 +515,7 @@ mod tests {
         let mut bytes = [0u8; 24];
         bytes[0] = anim_id;
         bytes[1] = update_id;
-        bytes[18..20].copy_from_slice(&yaw.to_le_bytes());
+        bytes[22..24].copy_from_slice(&yaw.to_le_bytes());
         bytes
     }
 
@@ -558,11 +567,15 @@ mod tests {
             [
                 FrameEntry {
                     uv_index: 0,
-                    delay: 3
+                    delay: 3,
+                    width: 0,
+                    height: 0,
                 },
                 FrameEntry {
                     uv_index: 1,
-                    delay: 0xFF
+                    delay: 0xFF,
+                    width: 0,
+                    height: 0,
                 },
             ]
         );

@@ -56,7 +56,9 @@ use crate::npc;
 use crate::pack::Pack;
 use crate::player;
 use crate::rdt;
-use crate::render::{self, Camera, EntityMesh, Framebuffer, Lighting, MaskLayer};
+use crate::render::{
+    self, Camera, EffectLayer, EffectQuad, EntityMesh, Framebuffer, Lighting, MaskLayer,
+};
 use crate::save;
 use crate::scd;
 use crate::sfx;
@@ -189,6 +191,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
             &mut npc_models,
             &mut MaskCache::default(),
             &mut ShadowCache::default(),
+            &mut EffectPageCache::default(),
         );
         display.present(&framebuffer)?;
         return display.capture(capture_path);
@@ -394,6 +397,7 @@ struct GameSession {
     event_vm: scd::vm::EventVm,
     masks: MaskCache,
     shadows: ShadowCache,
+    effect_pages: EffectPageCache,
     sfx_cache: SfxCache,
     /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
     npc_models: npc::EntityModelCache,
@@ -561,6 +565,7 @@ impl GameSession {
             event_vm,
             masks: MaskCache::default(),
             shadows: ShadowCache::default(),
+            effect_pages: EffectPageCache::default(),
             sfx_cache: SfxCache::default(),
             npc_models: npc::EntityModelCache::default(),
             music: None,
@@ -1126,6 +1131,7 @@ impl GameSession {
                 &mut self.npc_models,
                 &mut self.masks,
                 &mut self.shadows,
+                &mut self.effect_pages,
             );
         }
         if self.menu.is_some() {
@@ -2441,6 +2447,7 @@ pub fn simulate_door(
         &mut npc_models,
         &mut MaskCache::default(),
         &mut ShadowCache::default(),
+        &mut EffectPageCache::default(),
     );
     let gameplay_frame = Image {
         width: gameplay.width,
@@ -2538,6 +2545,42 @@ pub fn simulate_room_seeded(
     simulate_loaded(pack, loaded, game, player_state, ticks, input)
 }
 
+/// Render one gameplay frame from an already-built state.
+///
+/// This is the headless capture seam for effect probes: tests can tick a state
+/// by hand (create effects, step [`game::GameState::tick_effects`]) and render
+/// it without rebuilding the room. Player and NPC models are loaded from the
+/// pack when present.
+pub fn render_game_frame(
+    pack: &Pack,
+    id: RoomId,
+    room: &RoomState,
+    game: &game::GameState,
+    player_state: &player::PlayerState,
+) -> Result<Image> {
+    let assets = load_player_assets(pack, id);
+    let mut npc_models = npc::EntityModelCache::default();
+    let mut framebuffer = Framebuffer::new();
+    render_frame(
+        &mut framebuffer,
+        pack,
+        id,
+        room,
+        player_state,
+        game,
+        assets.as_ref(),
+        &mut npc_models,
+        &mut MaskCache::default(),
+        &mut ShadowCache::default(),
+        &mut EffectPageCache::default(),
+    );
+    Ok(Image {
+        width: framebuffer.width,
+        height: framebuffer.height,
+        rgba: framebuffer.rgba,
+    })
+}
+
 /// Drive the new-game start (stage 1 room 0) headlessly: the original's start
 /// position, facing and seed, then the same init/ticks/render path as
 /// [`simulate_room`]. `character` selects Chris (0) or Jill (1).
@@ -2582,6 +2625,7 @@ fn simulate_loaded(
     let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
     let mut masks = MaskCache::default();
     let mut shadows = ShadowCache::default();
+    let mut effect_pages = EffectPageCache::default();
     let mut npc_models = npc::EntityModelCache::default();
     let mut framebuffer = Framebuffer::new();
 
@@ -2614,6 +2658,7 @@ fn simulate_loaded(
         &mut npc_models,
         &mut masks,
         &mut shadows,
+        &mut effect_pages,
     );
     let frame = Image {
         width: framebuffer.width,
@@ -2640,6 +2685,7 @@ fn simulate_loaded(
         &mut npc_models,
         &mut masks,
         &mut shadows,
+        &mut effect_pages,
     );
     let baseline = Image {
         width: baseline_framebuffer.width,
@@ -3039,6 +3085,336 @@ impl ShadowCache {
     }
 }
 
+/// The decoded effect texture pages of one room.
+///
+/// `base` holds the four sheet files (`esp000` plus the room's up to three
+/// `esp2xx` variants) with the room's embedded sprite TIMs composited at their
+/// packed positions. `variants` holds the CLUT-row variants (`page * 3 +
+/// (row - 1)`) baked from those same TIMs.
+#[derive(Default)]
+struct EffectPages {
+    base: [Option<Image>; 4],
+    variants: [Option<Image>; 12],
+}
+
+/// Decoded effect pages for the current room, keyed by room id.
+///
+/// Unlike [`MaskCache`] this cache composites on load: the four sheet files
+/// are decoded once and every declared sprite's embedded TIM is blitted over
+/// its packed page and V offset, so sampling a page-absolute UV reads the
+/// room's own art.
+#[derive(Default)]
+struct EffectPageCache {
+    room: Option<RoomId>,
+    pages: EffectPages,
+}
+
+impl EffectPageCache {
+    /// The room's pages, rebuilding them when the room changes.
+    fn pages_for(&mut self, pack: &Pack, id: RoomId, room: &effects::RoomEffects) -> &EffectPages {
+        if self.room != Some(id) {
+            self.room = Some(id);
+            self.pages = build_effect_pages(pack, id, room);
+        }
+        &self.pages
+    }
+}
+
+/// A transparent 256x256 page buffer.
+fn transparent_effect_page() -> Image {
+    Image {
+        width: 256,
+        height: 256,
+        rgba: vec![0; 256 * 256 * 4],
+    }
+}
+
+/// Convert a decoded indexed sheet into an RGBA page with texture entry zero
+/// transparent.
+fn effect_page_image(texture: &crate::model::Texture8) -> Image {
+    let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
+    for &index in &texture.indices {
+        if index == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let texel = texture.palette(0, index);
+            rgba.extend_from_slice(&[texel[0], texel[1], texel[2], 255]);
+        }
+    }
+    Image {
+        width: texture.width,
+        height: texture.height,
+        rgba,
+    }
+}
+
+/// Blit one room sprite's embedded TIM into a page at `(0, v)` using palette
+/// row `row`; entry zero stays transparent.
+fn blit_effect_sprite(page: &mut Image, texture: &crate::model::Texture8, v: u32, row: usize) {
+    let Some(width) = usize::try_from(texture.width).ok() else {
+        return;
+    };
+    if width == 0 || texture.height == 0 {
+        return;
+    }
+    for y in 0..texture.height {
+        let target_y = v + y;
+        if target_y >= page.height {
+            break;
+        }
+        for x in 0..width {
+            let Some(&index) = texture.indices.get(y as usize * width + x) else {
+                continue;
+            };
+            if index == 0 {
+                continue;
+            }
+            let texel = texture.palette(row, index);
+            let target = ((target_y * page.width) as usize + x) * 4;
+            if let Some(pixel) = page.rgba.get_mut(target..target + 4) {
+                pixel.copy_from_slice(&[texel[0], texel[1], texel[2], 255]);
+            }
+        }
+    }
+}
+
+/// Decode and composite the room's effect pages.
+fn build_effect_pages(pack: &Pack, id: RoomId, room: &effects::RoomEffects) -> EffectPages {
+    let stage = usize::from(id.stage_index());
+    let room_byte = usize::from(id.room);
+    let mut pages = EffectPages::default();
+
+    for page in 0..4 {
+        let Some(name) = effects::pages::room_effect_sheet(stage, room_byte, page) else {
+            continue;
+        };
+        let path = format!("effspr/{name}.tim");
+        let Ok(bytes) = pack.read(&path) else {
+            continue;
+        };
+        match tim::decode_8bpp(bytes) {
+            Ok(texture) => pages.base[page] = Some(effect_page_image(&texture)),
+            Err(err) => eprintln!("warning: invalid effect page {path}: {err:#}"),
+        }
+    }
+
+    for sprite in &room.sprites {
+        let page = usize::from(sprite.info.page_index());
+        if page >= 4 {
+            continue;
+        }
+        let Some(texture) = &sprite.tim else {
+            continue;
+        };
+        if texture.width == 0 || texture.height == 0 {
+            continue;
+        }
+        let v = u32::from(sprite.info.page_v);
+        let base = pages.base[page].get_or_insert_with(transparent_effect_page);
+        blit_effect_sprite(base, texture, v, 0);
+        for row in 1..=3u8 {
+            if sprite.geometry.clut_rows <= row {
+                break;
+            }
+            let index = page * 3 + usize::from(row - 1);
+            let variant = pages.variants[index].get_or_insert_with(transparent_effect_page);
+            blit_effect_sprite(variant, texture, v, usize::from(row));
+        }
+    }
+
+    pages
+}
+
+/// The guardhouse rooms that force every effect blend opaque.
+const GUARDHOUSE_FORCED_OPAQUE_ROOMS: [u8; 3] = [0x0E, 0x0F, 0x11];
+/// Stage digit of the laboratory (the main-lab camera-5 quirk).
+const STAGE_DIGIT_LABORATORY: u8 = 5;
+/// Room byte of the laboratory's main hall.
+const ROOM_MAIN_LAB: u8 = 0x13;
+/// Stage digit of the second mansion return (the lesson-room V remap).
+const STAGE_DIGIT_MANSION_RETURN_2F: u8 = 7;
+/// Room byte of the lesson room.
+const ROOM_LESSON: u8 = 0x0C;
+
+/// Build this frame's effect billboards from the live pool.
+///
+/// Slots are visited 63 down to 0, the original's submission order, so equal
+/// depth keys resolve in the stable sort exactly like the original's ordering
+/// table.
+fn build_effect_quads(
+    game: &game::GameState,
+    room: &RoomState,
+    id: RoomId,
+    camera: &Camera,
+    pages: &EffectPages,
+) -> Vec<EffectQuad> {
+    let mut quads = Vec::new();
+    let stage = usize::from(id.stage_index());
+    let folded = if stage > 4 { stage - 5 } else { stage };
+    let lesson_room = id.stage == STAGE_DIGIT_MANSION_RETURN_2F && id.room == ROOM_LESSON;
+    let lab_special =
+        id.stage == STAGE_DIGIT_LABORATORY && id.room == ROOM_MAIN_LAB && room.current_cut == 5;
+
+    for index in (0..effects::EFFECT_POOL_SIZE).rev() {
+        let Some(effect) = game.effects.slot(index) else {
+            continue;
+        };
+        if effect.anim_id == 0 || effects::behaviour::hidden(effect) {
+            continue;
+        }
+        if (effect.proj_depth as u32) & 0xFFFFFFF0 > effects::behaviour::PROJECTED_DEPTH_CULL as u32
+        {
+            continue;
+        }
+        if !effects::behaviour::in_switch_zone(
+            room,
+            room.current_cut,
+            i32::from(effect.pos[0]),
+            i32::from(effect.pos[2]),
+        ) {
+            continue;
+        }
+        let Some(sprite_type) = effect.sprite else {
+            continue;
+        };
+        let room_sprite = game.room_effects.sprite(sprite_type);
+        let (sprite, page, region_v, room_art) = if let Some(sprite) = room_sprite {
+            (sprite, usize::from(sprite.info.page_index()), 0u32, true)
+        } else if let Some(sprite) = game.weapon_effects.sprite(sprite_type) {
+            let Some(slot) = game.weapon_effects.slot_of(sprite_type) else {
+                continue;
+            };
+            let Some((page, region_v)) = effects::pages::weapon_sheet_region(slot) else {
+                continue;
+            };
+            (sprite, usize::from(page), u32::from(region_v), false)
+        } else {
+            continue;
+        };
+        if page >= 4 {
+            continue;
+        }
+
+        let mut tint = usize::from(effect.depth_group >> 3);
+        let mut tex_v = u32::from(effect.uv[1]) + region_v;
+        if lesson_room
+            && matches!(tint, 1 | 2)
+            && tex_v > 0x1A
+            && tex_v + u32::from(effect.size[1]) < 99
+        {
+            tex_v += 0x7B;
+            tint = 0;
+        }
+        let tex_v = tex_v as u8;
+
+        let Some(sheet) =
+            effects::pages::room_effect_sheet_index(stage, usize::from(id.room), page)
+        else {
+            continue;
+        };
+        let Some((mut blend, color_idx, _, _)) =
+            effects::pages::blend_record(usize::from(sheet), tex_v)
+        else {
+            continue;
+        };
+        if id.stage == 4 && GUARDHOUSE_FORCED_OPAQUE_ROOMS.contains(&id.room) {
+            blend = 0;
+        }
+
+        let Some(record) = effects::pages::EFFECT_COLOR_RECORDS.get(usize::from(color_idx)) else {
+            continue;
+        };
+        let level = if record.count <= tint { 0 } else { tint };
+        let tint = if room_art {
+            [0xFF, 0xFF, 0xFF]
+        } else {
+            record.level(level)
+        };
+
+        let Some(quad_page) = select_effect_page(pages, page, room_art, sprite, effect.depth_group)
+        else {
+            continue;
+        };
+        let width = u32::from(effect.size[0]);
+        let height = u32::from(effect.size[1]);
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let light_value = u32::try_from(camera.fov).unwrap_or(0);
+        let product = light_value
+            .wrapping_mul(u32::from(effect.light_factor))
+            .wrapping_mul(width)
+            .wrapping_mul(0x100);
+        let divisor = u32::from(effect.depth_scaled as u16) + 1;
+        let scale = product / divisor.max(1);
+        let scale = if scale >= 0x8000 {
+            -0x8000
+        } else {
+            scale as i32
+        };
+
+        // The UV record's pivot is authored as a centre offset; the original
+        // turns it into a top-left distance with `0x80 - pivot`.
+        let pivot_x = 0x80 - i32::from(effect.uv[2]);
+        let pivot_y = 0x80 - i32::from(effect.uv[3]);
+        let left = i32::from(effect.screen[0]) - sar12(pivot_x * scale);
+        let top = i32::from(effect.screen[1]) - sar12(pivot_y * scale);
+        let right = i32::from(effect.screen[0]) + sar12((width as i32 - pivot_x) * scale);
+        let bottom = i32::from(effect.screen[1]) + sar12((height as i32 - pivot_y) * scale);
+
+        let light_record =
+            effects::pages::camera_light_record(folded, usize::from(id.room), room.current_cut);
+        let scale_y = if lab_special {
+            0
+        } else {
+            i32::from(light_record[1])
+        };
+        let key = ((effect.proj_depth as u32) >> 4)
+            .wrapping_mul(0x40)
+            .wrapping_sub(scale_y as u32);
+
+        quads.push(EffectQuad {
+            key,
+            page: quad_page,
+            uv: [effect.uv[0], tex_v, effect.uv[2], effect.uv[3]],
+            source: effect.size,
+            pos: [left, top],
+            size: [right - left, bottom - top],
+            tint,
+            blend,
+        });
+    }
+    quads
+}
+
+/// `(value + correction) >> 12`, truncating toward zero.
+fn sar12(value: i32) -> i32 {
+    (value + ((value >> 31) & 0xFFF)) >> 12
+}
+
+/// The layer page index for a billboard, applying the room CLUT-row variant
+/// redirect and its row-by-row fallback.
+fn select_effect_page(
+    pages: &EffectPages,
+    page: usize,
+    room_art: bool,
+    sprite: &effects::EffectSprite,
+    depth_group: u8,
+) -> Option<usize> {
+    if room_art && sprite.geometry.clut_rows > 1 {
+        let rows = usize::from(sprite.geometry.clut_rows);
+        let mut row = usize::from(depth_group >> 3).min(rows - 1).min(3);
+        while row > 1 && pages.variants[page * 3 + (row - 1)].is_none() {
+            row -= 1;
+        }
+        if row > 0 && pages.variants[page * 3 + (row - 1)].is_some() {
+            return Some(4 + page * 3 + (row - 1));
+        }
+    }
+    pages.base[page].as_ref().map(|_| page)
+}
+
 /// Everything loaded for one room, so a transition can load the next room with
 /// the same code path as the initial load.
 struct LoadedRoom {
@@ -3158,6 +3534,10 @@ fn tick_room(
         );
     }
     context.game.sync_entity_from_player(context.player);
+    // The effects run after the player's physics and before the action probe,
+    // so a script that spawns this frame animates this frame and a dust effect
+    // the probe spawns does too.
+    context.game.tick_effects(context.room);
     // The original runs the room action probe after the player's movement, so
     // `stairs_height_update` measures the frame's final position and the climb
     // behaviour starts from where the player actually is.
@@ -3454,6 +3834,7 @@ fn render_frame(
     npc_models: &mut npc::EntityModelCache,
     masks: &mut MaskCache,
     shadows: &mut ShadowCache,
+    effect_cache: &mut EffectPageCache,
 ) {
     let Some(cut) = room.cuts.get(room.current_cut) else {
         framebuffer.clear();
@@ -3559,7 +3940,16 @@ fn render_frame(
         });
     }
 
-    render::draw_gameplay_scene(
+    let pages = effect_cache.pages_for(pack, id, &game.room_effects);
+    let quads = build_effect_quads(game, room, id, &camera, pages);
+    let mut page_refs: Vec<Option<&Image>> = Vec::with_capacity(16);
+    page_refs.extend(pages.base.iter().map(Option::as_ref));
+    page_refs.extend(pages.variants.iter().map(Option::as_ref));
+    let effect_layer = EffectLayer {
+        pages: &page_refs,
+        quads: &quads,
+    };
+    render::draw_gameplay_scene_with_effects(
         framebuffer,
         cut.background.as_ref(),
         &meshes,
@@ -3567,6 +3957,7 @@ fn render_frame(
         &camera,
         &lighting,
         layer.as_ref(),
+        Some(&effect_layer),
     );
 }
 
@@ -3942,6 +4333,7 @@ mod tests {
             &mut npc_models,
             &mut masks,
             &mut shadows,
+            &mut EffectPageCache::default(),
         );
 
         let input = player::Input {
@@ -3969,6 +4361,7 @@ mod tests {
             &mut npc_models,
             &mut masks,
             &mut shadows,
+            &mut EffectPageCache::default(),
         );
 
         let changed = idle
@@ -6423,5 +6816,119 @@ mod tests {
             non_black_pixels(&decoded) > 2000,
             "the new-game frame is mostly black"
         );
+    }
+    fn effect_test_room() -> RoomState {
+        RoomState {
+            cuts: vec![crate::state::Cut {
+                index: 0,
+                pos: [0, 0, 0],
+                look_at: [0, 0, 1000],
+                fov: 200,
+                ..crate::state::Cut::default()
+            }],
+            zones: vec![crate::state::Zone {
+                cam_from: 0,
+                cam_to: 0,
+                corners: [[0, 0], [0, 2000], [2000, 2000], [2000, 0]],
+            }],
+            ..RoomState::default()
+        }
+    }
+
+    fn effect_test_pages() -> EffectPages {
+        let mut pages = EffectPages::default();
+        pages.base[0] = Some(solid_effect_page());
+        pages.base[1] = Some(solid_effect_page());
+        pages
+    }
+
+    fn solid_effect_page() -> Image {
+        Image {
+            width: 256,
+            height: 256,
+            rgba: vec![7; 256 * 256 * 4],
+        }
+    }
+
+    #[test]
+    fn effect_quads_apply_scale_tint_and_the_depth_cull() {
+        let id = RoomId::parse("1000").unwrap();
+        let room = effect_test_room();
+        let mut game = game::GameState::new(id, &room);
+        let mut block = crate::effects::fixtures::block(1, 0, 0);
+        block[14] = 0x02; // transform bit, so the position integrates
+        let mut weapon =
+            crate::effects::fixtures::sprite(9, std::array::from_fn(|_| vec![vec![block]]));
+        weapon.info.frames[0].width = 128;
+        weapon.info.frames[0].height = 128;
+        weapon.info.uvs[0].pivot_x = 64;
+        weapon.info.uvs[0].pivot_y = 64;
+        game.weapon_effects.index[1] = 9;
+        game.weapon_effects.sprites.push(weapon);
+
+        let room_effects = Rc::clone(&game.room_effects);
+        crate::effects::create(&mut game, &room_effects, 9, 8, 0, [100, 0, 1000], 0, 1).unwrap();
+        crate::effects::create(&mut game, &room_effects, 9, 8, 0, [100, 0, 300_000], 0, 1).unwrap();
+        game.tick_effects(&room);
+
+        let camera = Camera::from_cut(&room.cuts[0]);
+        let pages = effect_test_pages();
+        let quads = build_effect_quads(&game, &room, id, &camera, &pages);
+
+        assert_eq!(quads.len(), 1, "the far effect must be culled");
+        let quad = &quads[0];
+        // depth = 250, key = (250 >> 4) * 0x40 = 960.
+        assert_eq!(quad.key, 960);
+        // scale = 200 * 1 * 128 * 256 / (1000 + 1) = 6548 -> 204 px wide.
+        assert_eq!(quad.size, [204, 204]);
+        assert_eq!(quad.pos, [78, 18]);
+        // depth_group 8 -> tint level 1 of colour record 1.
+        assert_eq!(quad.tint, [0xB2, 0xB2, 0xB2]);
+    }
+
+    #[test]
+    fn room_sprites_keep_their_authored_palette() {
+        let id = RoomId::parse("1000").unwrap();
+        let room = effect_test_room();
+        let mut game = game::GameState::new(id, &room);
+        let mut room_effects = crate::effects::RoomEffects::default();
+        let mut block = crate::effects::fixtures::block(1, 0, 0);
+        block[14] = 0x02;
+        let mut sprite =
+            crate::effects::fixtures::sprite(38, std::array::from_fn(|_| vec![vec![block]]));
+        sprite.info.page_id = 0x18 + 1;
+        sprite.info.page_v = 10;
+        sprite.info.uvs[0].v = 10;
+        room_effects.index[0] = 38;
+        room_effects.sprites.push(sprite);
+        game.room_effects = Rc::new(room_effects);
+
+        let room_effects = Rc::clone(&game.room_effects);
+        crate::effects::create(&mut game, &room_effects, 38, 8, 0, [100, 0, 1000], 0, 1).unwrap();
+        game.tick_effects(&room);
+
+        let camera = Camera::from_cut(&room.cuts[0]);
+        let quads = build_effect_quads(&game, &room, id, &camera, &effect_test_pages());
+        assert_eq!(quads.len(), 1);
+        assert_eq!(quads[0].page, 1);
+        assert_eq!(quads[0].tint, [0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn variant_rows_redirect_and_fall_back() {
+        let mut sprite = crate::effects::fixtures::sprite(38, std::array::from_fn(|_| Vec::new()));
+        sprite.geometry.clut_rows = 3;
+        let mut pages = EffectPages::default();
+        pages.base[1] = Some(transparent_effect_page());
+        pages.variants[3 + 1] = Some(transparent_effect_page());
+
+        // Tint 3 clamps to the last row (2) and redirects to that variant.
+        assert_eq!(select_effect_page(&pages, 1, true, &sprite, 24), Some(8));
+        // Tint 2 uses its own baked row.
+        assert_eq!(select_effect_page(&pages, 1, true, &sprite, 16), Some(8));
+        // Tint 1 has no baked row and falls back to the base page.
+        assert_eq!(select_effect_page(&pages, 1, true, &sprite, 8), Some(1));
+        // Weapon art never redirects.
+        assert_eq!(select_effect_page(&pages, 1, false, &sprite, 24), Some(1));
     }
 }

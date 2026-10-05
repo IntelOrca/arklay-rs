@@ -181,12 +181,19 @@ pub fn pack(weapon: &WeaponEffects, room: &mut RoomEffects) -> PackCursor {
 /// `stage` is the zero-based stage id and `room` the room byte; `page` is the
 /// zero-based effspr page index (0-3).
 pub fn room_effect_sheet(stage: usize, room: usize, page: usize) -> Option<&'static str> {
+    let name = room_effect_sheet_index(stage, room, page)?;
+    EFFECT_SHEET_NAMES.get(usize::from(name)).copied()
+}
+
+/// The effect-sheet name index for `(stage, room, page)`, which also selects
+/// the blend record slot for a sprite packed on that page.
+pub fn room_effect_sheet_index(stage: usize, room: usize, page: usize) -> Option<u8> {
     let row = ROOM_EFFECT_SHEETS.get(stage.checked_mul(32)?.checked_add(room)?)?;
     let name = row.get(page)?;
     if *name == 0xFF {
         return None;
     }
-    EFFECT_SHEET_NAMES.get(usize::from(*name)).copied()
+    Some(*name)
 }
 
 /// The fixed `(page, V)` region of weapon sheet `slot` (`0..8`).

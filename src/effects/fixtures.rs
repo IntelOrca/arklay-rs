@@ -21,7 +21,7 @@ pub fn block(anim_id: u8, update_id: u8, yaw: i16) -> [u8; 24] {
     let mut bytes = [0u8; 24];
     bytes[0] = anim_id;
     bytes[1] = update_id;
-    bytes[18..20].copy_from_slice(&yaw.to_le_bytes());
+    bytes[22..24].copy_from_slice(&yaw.to_le_bytes());
     bytes
 }
 
@@ -45,6 +45,8 @@ pub fn sprite_from_rows(index: u8, depth_frames: [Vec<AnimFrame>; 8]) -> EffectS
             frames: vec![FrameEntry {
                 uv_index: 0,
                 delay: 4,
+                width: 16,
+                height: 16,
             }],
             uvs: vec![UvRecord {
                 u: 16,

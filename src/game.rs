@@ -156,6 +156,11 @@ pub const MESSAGE_FLAG_CONTROLS: u16 = 0x100;
 /// [`MESSAGE_FLAG_CONTROLS`]: a pause word can freeze the characters without
 /// locking the player (and vice versa), so the entity tick gates on this one.
 pub const MESSAGE_FLAG_ENTITIES: u16 = 0x002;
+/// `g_message_flags` bit 3: effects update. The per-slot behaviour dispatch,
+/// velocity integration and sprite animation all pause while a message's pause
+/// word masks this bit; the billboards themselves stay on screen at their last
+/// pose.
+pub const MESSAGE_FLAG_EFFECTS: u16 = 0x008;
 /// The original's gameplay seed for `g_message_flags` (`game_loop` writes
 /// `0xFD3F` when it (re)enters the play state).
 pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
@@ -889,6 +894,14 @@ pub struct GameState {
     /// The last `effect_tracked` (0x3D) spawn's type and attach target, which
     /// `effect_kill_a` (0x3E) clears.
     pub last_tracked_effect: Option<(u8, effects::Attach)>,
+    /// Call counts of effect behaviour ids with no implementation yet, indexed
+    /// by the behaviour table entry. The corpus audit asserts every count is
+    /// zero for the ids the shipped data can reach.
+    pub effect_placeholder_hits: [u32; effects::EFFECT_BEHAVIOR_COUNT],
+    /// Pool slot spawned by the last `spawn_from_header` behaviour, or `None`
+    /// when the spawn failed. The floor-splash behaviour reads it to merge its
+    /// light factor into the child.
+    pub last_effect_spawn: Option<u8>,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -950,6 +963,8 @@ impl Default for GameState {
             weapon_effects: effects::WeaponEffects::default(),
             effect_missing_logged: BTreeSet::new(),
             last_tracked_effect: None,
+            effect_placeholder_hits: [0; effects::EFFECT_BEHAVIOR_COUNT],
+            last_effect_spawn: None,
         }
     }
 }
@@ -1340,6 +1355,14 @@ impl GameState {
             return 0;
         }
         crate::npc::update_all(self, room, models, pack)
+    }
+
+    /// One tick of the effect pool: behaviours, velocity integration, sprite
+    /// animation and projection. Called after the entity/player update, before
+    /// the room action probe, so an effect spawned this frame animates this
+    /// frame.
+    pub fn tick_effects(&mut self, room: &RoomState) {
+        effects::behaviour::update(self, room);
     }
 
     /// Mirror entity 0 into the engine's player state when the scripts moved

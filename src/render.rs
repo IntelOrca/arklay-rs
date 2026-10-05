@@ -24,10 +24,13 @@
 //!
 //! A [`MaskLayer`] carries the camera's decoded `roommask/{room}_{cam}.bmp`
 //! page and its [`Cut`]; a later engine step only has to load and decode that
-//! page, then pass the layer to [`draw_gameplay_scene`]. [`Framebuffer::draw_model`]
-//! remains the plain player-only path used by the tests and the non-mask case,
-//! and [`Framebuffer::draw_ivm_unlit`] is the item viewer's full-bright path
-//! over an `.ivm` mesh and its own texture page.
+//! page, then pass the layer to [`draw_gameplay_scene`]. An [`EffectLayer`]
+//! carries the room's composited effect pages and this frame's
+//! [`EffectQuad`]s, submitted after the masks so an exact key tie paints the
+//! billboard over the model. [`Framebuffer::draw_model`] remains the plain
+//! player-only path used by the tests and the non-mask case, and
+//! [`Framebuffer::draw_ivm_unlit`] is the item viewer's full-bright path over
+//! an `.ivm` mesh and its own texture page.
 
 use crate::anim;
 use crate::mask;
@@ -676,12 +679,14 @@ impl Framebuffer {
     }
 
     /// Paint a sorted scene list: each triangle selects its own texture page,
-    /// mask sprites the camera's mask page and shadows the baked shadow mask.
+    /// mask sprites the camera's mask page, shadows the baked shadow mask and
+    /// effects the room's decoded effect pages.
     fn draw_scene(
         &mut self,
         textures: &[&Texture8],
         page: Option<&Image>,
         shadow_texture: Option<&Image>,
+        effect_pages: &[Option<&Image>],
         items: &[SceneItem],
     ) {
         for item in items {
@@ -699,6 +704,11 @@ impl Framebuffer {
                 SceneItem::Mask(quad) => {
                     if let Some(page) = page {
                         self.rasterize_mask(page, quad);
+                    }
+                }
+                SceneItem::Effect(quad) => {
+                    if let Some(page) = effect_pages.get(quad.page).copied().flatten() {
+                        self.rasterize_effect(page, quad);
                     }
                 }
             }
@@ -875,6 +885,73 @@ impl Framebuffer {
             }
         }
     }
+
+    /// Rasterize one effect billboard: nearest-sampled, clipped to the
+    /// framebuffer, with texture-entry-zero transparent (the page's zero
+    /// alpha), an RGB multiply from the spawn's tint record and a half blend
+    /// when the blend record calls for one.
+    fn rasterize_effect(&mut self, page: &Image, quad: &EffectQuad) {
+        if page.width == 0 || page.height == 0 || quad.size[0] <= 0 || quad.size[1] <= 0 {
+            return;
+        }
+
+        let x0 = i64::from(quad.pos[0]);
+        let y0 = i64::from(quad.pos[1]);
+        let start_x = x0.max(0);
+        let start_y = y0.max(0);
+        let end_x = (x0 + i64::from(quad.size[0])).min(i64::from(self.width));
+        let end_y = (y0 + i64::from(quad.size[1])).min(i64::from(self.height));
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+
+        let page_width = page.width as usize;
+        let u0 = i64::from(quad.uv[0]);
+        let v0 = i64::from(quad.uv[1]);
+        let source_w = i64::from(quad.source[0].max(1));
+        let source_h = i64::from(quad.source[1].max(1));
+        let target_w = i64::from(quad.size[0]);
+        let target_h = i64::from(quad.size[1]);
+        let half = quad.blend & 0x80 != 0;
+        let target_stride = self.width as usize;
+
+        for y in start_y..end_y {
+            let texel_y = v0 + (y - y0) * source_h / target_h;
+            if !(0..i64::from(page.height)).contains(&texel_y) {
+                continue;
+            }
+            for x in start_x..end_x {
+                let texel_x = u0 + (x - x0) * source_w / target_w;
+                if !(0..i64::from(page.width)).contains(&texel_x) {
+                    continue;
+                }
+                let source = texel_y as usize * page_width * 4 + texel_x as usize * 4;
+                let target = y as usize * target_stride * 4 + x as usize * 4;
+                let (Some(texel), Some(slot)) = (
+                    page.rgba.get(source..source + 4),
+                    self.rgba.get_mut(target..target + 4),
+                ) else {
+                    continue;
+                };
+                if texel[3] == 0 {
+                    continue;
+                }
+                let tinted = [
+                    (u32::from(texel[0]) * u32::from(quad.tint[0]) / 255) as u8,
+                    (u32::from(texel[1]) * u32::from(quad.tint[1]) / 255) as u8,
+                    (u32::from(texel[2]) * u32::from(quad.tint[2]) / 255) as u8,
+                ];
+                if half {
+                    for (channel, &source) in slot[..3].iter_mut().zip(&tinted) {
+                        *channel = ((u32::from(*channel) + u32::from(source)) / 2) as u8;
+                    }
+                } else {
+                    slot[..3].copy_from_slice(&tinted);
+                }
+                slot[3] = 255;
+            }
+        }
+    }
 }
 
 /// Draw one frame of a parsed door animation over black.
@@ -1018,6 +1095,34 @@ pub fn draw_gameplay_scene(
     lighting: &Lighting,
     mask_layer: Option<&MaskLayer<'_>>,
 ) {
+    draw_gameplay_scene_with_effects(
+        framebuffer,
+        background,
+        meshes,
+        shadow,
+        camera,
+        lighting,
+        mask_layer,
+        None,
+    );
+}
+
+/// [`draw_gameplay_scene`] with the room's effect billboards interleaved.
+///
+/// The effect quads are submitted after the masks (the original's `update_2d_effects`
+/// runs after the entity pass), so at an exact key tie an effect paints over a
+/// mask or triangle submitted earlier in the frame.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_gameplay_scene_with_effects(
+    framebuffer: &mut Framebuffer,
+    background: Option<&Image>,
+    meshes: &[EntityMesh<'_>],
+    shadow: Option<&Shadow<'_>>,
+    camera: &Camera,
+    lighting: &Lighting,
+    mask_layer: Option<&MaskLayer<'_>>,
+    effect_layer: Option<&EffectLayer<'_>>,
+) {
     framebuffer.clear();
     if let Some(background) = background {
         // TODO(parity): (visual) the original draws the cut as the display
@@ -1059,13 +1164,21 @@ pub fn draw_gameplay_scene(
         collect_masks(layer, &mut items);
     }
 
+    if let Some(layer) = effect_layer {
+        items.extend(layer.quads.iter().copied().map(SceneItem::Effect));
+    }
+
     mask::order_far_to_near(&mut items, SceneItem::key);
 
     let textures: Vec<&Texture8> = meshes.iter().map(|mesh| mesh.texture).collect();
+    let effect_pages: Vec<Option<&Image>> = effect_layer
+        .map(|layer| layer.pages.to_vec())
+        .unwrap_or_default();
     framebuffer.draw_scene(
         &textures,
         mask_layer.map(|layer| layer.page),
         shadow.map(|shadow| shadow.texture),
+        &effect_pages,
         &items,
     );
 }
@@ -1370,11 +1483,50 @@ struct MaskQuad {
     size: (u32, u32),
 }
 
+/// One decoded effect billboard, ready for rasterization.
+///
+/// The page index selects an entry of [`EffectLayer::pages`]; the UV rect is in
+/// page texels; `source` is the billboard's unscaled texel size and `size` its
+/// projected screen size, so nearest sampling maps the frame across the quad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectQuad {
+    /// Painter's key: `(proj_depth >> 4) * 0x40 - scale_y`.
+    pub key: u32,
+    /// Index into the frame's effect-page list.
+    pub page: usize,
+    /// `[u, v, pivot_x, pivot_y]` in page texels.
+    pub uv: [u8; 4],
+    /// Unscaled billboard texel size.
+    pub source: [u8; 2],
+    /// Top-left screen pixel after the pivot scale.
+    pub pos: [i32; 2],
+    /// Scaled screen size in pixels.
+    pub size: [i32; 2],
+    /// Per-channel tint record multiplier.
+    pub tint: [u8; 3],
+    /// `0x00` opaque or `0x80` half blend.
+    pub blend: u8,
+}
+
+/// The effect pages of one frame plus the billboards that sample them.
+///
+/// `pages` holds the four base texture pages followed by the variant CLUT-row
+/// pages (`4 + page * 3 + (row - 1)`); [`EffectQuad::page`] indexes it.
+#[derive(Debug, Clone, Copy)]
+pub struct EffectLayer<'a> {
+    /// Decoded effect texture pages; a missing entry is a page this room does
+    /// not have art for.
+    pub pages: &'a [Option<&'a Image>],
+    /// This frame's live billboards, in pool submission order.
+    pub quads: &'a [EffectQuad],
+}
+
 /// One item of a frame's painter's list.
 enum SceneItem {
     Shadow(ShadowPoly),
     Mask(MaskQuad),
     Triangle(Triangle),
+    Effect(EffectQuad),
 }
 
 impl SceneItem {
@@ -1384,6 +1536,7 @@ impl SceneItem {
             SceneItem::Shadow(poly) => poly.key,
             SceneItem::Mask(quad) => quad.key,
             SceneItem::Triangle(triangle) => triangle.key,
+            SceneItem::Effect(quad) => quad.key,
         }
     }
 }
@@ -2260,6 +2413,7 @@ mod tests {
                 SceneItem::Mask(quad) => (quad.key, Some(quad.pos)),
                 SceneItem::Triangle(triangle) => (triangle.key, None),
                 SceneItem::Shadow(poly) => (poly.key, None),
+                SceneItem::Effect(quad) => (quad.key, Some((quad.pos[0], quad.pos[1]))),
             })
             .collect();
         assert_eq!(
@@ -2934,5 +3088,159 @@ mod tests {
         let center = camera.project([0, 0, 1000]).unwrap();
         let pixel = framebuffer_pixel(&with, center[0] as usize, center[1] as usize);
         assert_eq!(pixel, [100, 100, 100, 255]);
+    }
+    fn effect_image(pixels: &[[u8; 4]]) -> Image {
+        Image {
+            width: 2,
+            height: 2,
+            rgba: pixels.concat(),
+        }
+    }
+
+    fn effect_quad(
+        page: usize,
+        pos: [i32; 2],
+        size: [i32; 2],
+        tint: [u8; 3],
+        blend: u8,
+    ) -> EffectQuad {
+        EffectQuad {
+            key: 500,
+            page,
+            uv: [0, 0, 0, 0],
+            source: [2, 2],
+            pos,
+            size,
+            tint,
+            blend,
+        }
+    }
+
+    fn draw_effects(
+        framebuffer: &mut Framebuffer,
+        background: &Image,
+        page: &Image,
+        quads: &[EffectQuad],
+    ) {
+        let camera = straight_camera();
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+        let pages = [Some(page)];
+        let layer = EffectLayer {
+            pages: &pages,
+            quads,
+        };
+        draw_gameplay_scene_with_effects(
+            framebuffer,
+            Some(background),
+            &[],
+            None,
+            &camera,
+            &lighting,
+            None,
+            Some(&layer),
+        );
+    }
+
+    #[test]
+    fn effect_quads_are_opaque_and_entry_zero_is_transparent() {
+        let page = effect_image(&[[255, 0, 0, 255], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]);
+        let background = solid_image(320, 240, [10, 20, 30, 255]);
+        let quad = effect_quad(0, [10, 10], [4, 4], [255, 255, 255], 0);
+        let mut framebuffer = Framebuffer::new();
+        draw_effects(&mut framebuffer, &background, &page, &[quad]);
+
+        assert_eq!(framebuffer_pixel(&framebuffer, 10, 10), [255, 0, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 12, 10), [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn effect_quads_half_blend_and_multiply_the_tint() {
+        let page = effect_image(&[[255, 255, 255, 255]; 4]);
+        let background = solid_image(320, 240, [100, 100, 100, 255]);
+        let quad = effect_quad(0, [0, 0], [4, 4], [255, 255, 255], 0x80);
+        let mut framebuffer = Framebuffer::new();
+        draw_effects(&mut framebuffer, &background, &page, &[quad]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [177, 177, 177, 255]);
+
+        let quad = effect_quad(0, [0, 0], [4, 4], [128, 255, 0], 0);
+        let mut framebuffer = Framebuffer::new();
+        draw_effects(&mut framebuffer, &background, &page, &[quad]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [128, 255, 0, 255]);
+    }
+
+    #[test]
+    fn effect_quad_pivot_offsets_the_scaled_rectangle() {
+        let page = effect_image(&[[9, 9, 9, 255]; 4]);
+        let background = solid_image(320, 240, [0, 0, 0, 255]);
+        // Pivot the 2x2 source at its bottom-right, scaled to 8x8: the quad
+        // runs from (-8, -8) to (0, 0) of the pivot point.
+        let mut quad = effect_quad(0, [0, 0], [8, 8], [255, 255, 255], 0);
+        quad.uv = [0, 0, 2, 2];
+        quad.pos = [100 - 8, 100 - 8];
+        let mut framebuffer = Framebuffer::new();
+        draw_effects(&mut framebuffer, &background, &page, &[quad]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 99, 99), [9, 9, 9, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 92, 92), [9, 9, 9, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 100, 100), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn effect_ties_paint_over_masks_and_entities() {
+        // A mask and an effect with the same key keep their submission order
+        // through the stable sort, and the effect was submitted last.
+        let mask_page = solid_image(1, 1, [0, 0, 255, 255]);
+        let effect_page = effect_image(&[[255, 0, 0, 255]; 4]);
+        let mask = SceneItem::Mask(MaskQuad {
+            key: 500,
+            uv: (0, 0),
+            pos: (10, 10),
+            size: (1, 1),
+        });
+        let effect = SceneItem::Effect(effect_quad(0, [10, 10], [4, 4], [255, 255, 255], 0));
+        let mut items = vec![mask, effect];
+        mask::order_far_to_near(&mut items, SceneItem::key);
+        assert!(matches!(items[0], SceneItem::Mask(_)));
+        assert!(matches!(items[1], SceneItem::Effect(_)));
+
+        let mut framebuffer = Framebuffer::new();
+        let effect_pages = [Some(&effect_page)];
+        framebuffer.draw_scene(&[], Some(&mask_page), None, &effect_pages, &items);
+        assert_eq!(framebuffer_pixel(&framebuffer, 10, 10), [255, 0, 0, 255]);
+
+        // The same effect against a real entity triangle at the same key.
+        let texture = solid_texture([0, 0, 255, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let meshes = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+        }];
+        let camera = straight_camera();
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+        let pages = [Some(&effect_page)];
+        let quads = [effect_quad(0, [160, 120], [200, 200], [255, 255, 255], 0)];
+        let layer = EffectLayer {
+            pages: &pages,
+            quads: &quads,
+        };
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene_with_effects(
+            &mut framebuffer,
+            None,
+            &meshes,
+            None,
+            &camera,
+            &lighting,
+            None,
+            Some(&layer),
+        );
+        assert_eq!(framebuffer_pixel(&framebuffer, 160, 130), [255, 0, 0, 255]);
     }
 }

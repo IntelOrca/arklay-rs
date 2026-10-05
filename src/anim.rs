@@ -152,12 +152,12 @@ fn cos_table() -> &'static [i32; 4096] {
 }
 
 /// 14-bit sine of a 12-bit angle (angles wrap modulo 0x1000).
-fn sin14(angle: i32) -> i32 {
+pub(crate) fn sin14(angle: i32) -> i32 {
     sin_table()[(angle & 0x0FFF) as usize]
 }
 
 /// 14-bit cosine of a 12-bit angle.
-fn cos14(angle: i32) -> i32 {
+pub(crate) fn cos14(angle: i32) -> i32 {
     cos_table()[(angle & 0x0FFF) as usize]
 }
 

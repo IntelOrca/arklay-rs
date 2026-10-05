@@ -14,7 +14,16 @@
 //! parses `data/core00.esp`/`core00.etm`; [`pages`] reproduces the original's
 //! two-pass texture-page packing and carries the executable's static blend,
 //! tint, camera-light and room→sheet tables.
+//!
+//! Slice 3 adds [`behaviour::update`]: the per-tick walk over the 64 slots,
+//! the tiered behaviour dispatch table, the velocity integration, the sprite
+//! animation stepping and the projection the renderer consumes.
+//!
+//! Slice 4's presentation lives in [`crate::render`] (`EffectQuad`,
+//! `rasterize_effect` and `draw_gameplay_scene_with_effects`) and in the
+//! engine's `EffectPageCache`/quad builder.
 
+pub mod behaviour;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod pages;
@@ -22,6 +31,7 @@ pub mod pool;
 pub mod room;
 
 pub use pool::{
-    Attach, EFFECT_BLOCK_LEN, EFFECT_POOL_SIZE, Effect, EffectBlock, EffectPool, create,
+    Attach, EFFECT_BEHAVIOR_COUNT, EFFECT_BLOCK_LEN, EFFECT_POOL_SIZE, Effect, EffectBlock,
+    EffectPool, create, create_attached,
 };
 pub use room::{EffectSprite, RoomEffects, SpriteAnimation, SpriteInfo, WeaponEffects};

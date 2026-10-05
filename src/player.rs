@@ -702,7 +702,7 @@ fn classify(x: i32, z: i32, rect: &CollisionRect, radius: i32) -> Option<u16> {
 }
 
 /// Signed 32-bit box test: true when the point lies outside the grown bounds.
-fn point_outside(x: i32, z: i32, x_hi: i32, z_hi: i32, x_lo: i32, z_lo: i32) -> bool {
+pub(crate) fn point_outside(x: i32, z: i32, x_hi: i32, z_hi: i32, x_lo: i32, z_lo: i32) -> bool {
     let a = x.wrapping_sub(x_lo);
     let b = x_hi.wrapping_sub(x);
     let c = z.wrapping_sub(z_lo);
