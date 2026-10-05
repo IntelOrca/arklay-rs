@@ -3,16 +3,19 @@
 //! [`Mixer`] owns the only SDL audio stream in the engine. Every source is
 //! converted to 16-bit signed mono at 22050 Hz on load (8-bit samples are
 //! upsampled, other rates are linearly resampled). Each [`Mixer::update`]
-//! renders and queues interleaved stereo samples: one looping BGM voice plus a
-//! pool of one-shot voices, each with its own gain and pan.
+//! renders and queues interleaved stereo samples: three independently
+//! controlled BGM channels, one dedicated voice (dialogue) channel and a pool
+//! of one-shot voices, each with its own gain and pan.
 //!
 //! Starting a one-shot never replaces or restarts an existing voice: a new
 //! [`Voice`] is appended, including when the source buffer is already playing,
 //! so several copies of the same WAV (a run's overlapping footsteps) mix
-//! together. Voices are summed as 32-bit floats and each output sample is
-//! saturated to the 16-bit rail, matching the hardware sum the original mixer
-//! relies on. A missing device or a failed SDL call leaves the engine silent,
-//! never fatal.
+//! together. The BGM channels and the voice channel each hold one buffer: a
+//! load replaces it, a stop rewinds it and keeps it loaded, and a restart
+//! begins it again from sample 0, matching the original's fixed bank set.
+//! Voices are summed as 32-bit floats and each output sample is saturated to
+//! the 16-bit rail, matching the hardware sum the original mixer relies on. A
+//! missing device or a failed SDL call leaves the engine silent, never fatal.
 
 use std::ffi::c_int;
 use std::ptr;
@@ -255,14 +258,45 @@ impl Voice {
     }
 }
 
-/// Device-independent mixer state: the voices and their mix parameters.
+/// One of the three BGM banks: a loaded buffer, its mix parameters and
+/// whether it is currently sounding.
+///
+/// `playing` separates "loaded but silent" (the original's `setSndStop`, or a
+/// bank whose enable bit is clear) from "sounding"; the buffer stays loaded
+/// either way so a later restart needs no reload.
+#[derive(Clone, Debug)]
+pub(crate) struct BgmChannel {
+    pcm: Vec<i16>,
+    pos: usize,
+    gain: f32,
+    pan: f32,
+    looping: bool,
+    playing: bool,
+}
+
+impl BgmChannel {
+    fn new(pcm: Vec<i16>, looping: bool) -> Self {
+        Self {
+            pcm,
+            pos: 0,
+            gain: 1.0,
+            pan: 0.0,
+            looping,
+            playing: true,
+        }
+    }
+}
+
+/// Device-independent mixer state: the BGM banks, the voice channel, the
+/// one-shot pool and their mix parameters.
 ///
 /// Visible to the crate so behaviour tests can drive the mixer without an SDL
 /// device. Every one-shot start appends a voice, so the same source may be
 /// sounding many times over.
 pub(crate) struct MixState {
-    bgm: Option<Voice>,
-    bgm_gain: f32,
+    bgm_channels: [Option<BgmChannel>; 3],
+    voice: Option<Voice>,
+    voice_finished: bool,
     sfx: Vec<Voice>,
     next_sfx_seq: u64,
 }
@@ -270,12 +304,16 @@ pub(crate) struct MixState {
 impl MixState {
     pub(crate) fn new() -> Self {
         Self {
-            bgm: None,
-            bgm_gain: 1.0,
+            bgm_channels: [None, None, None],
+            voice: None,
+            voice_finished: false,
             sfx: Vec::new(),
             next_sfx_seq: 0,
         }
     }
+
+    /// Number of BGM channel slots (the original's `g_SndBank`).
+    pub(crate) const BGM_CHANNELS: usize = 3;
 
     /// Number of one-shot voices currently sounding.
     #[cfg(test)]
@@ -283,17 +321,94 @@ impl MixState {
         self.sfx.len()
     }
 
-    /// Replace the BGM voice with `pcm`, keeping the current BGM volume.
-    fn play_bgm(&mut self, pcm: Vec<i16>) {
-        self.bgm = (!pcm.is_empty()).then(|| Voice::new(pcm, 1.0, 0.0, true, 0));
+    /// Load `pcm` into BGM channel `index`, replacing any loaded bank. The
+    /// channel is left stopped; the caller starts it with
+    /// [`MixState::restart_bgm_channel`] or [`MixState::play_bgm_channel`].
+    pub(crate) fn load_bgm_channel(&mut self, index: usize, pcm: Vec<i16>, looping: bool) {
+        if index >= Self::BGM_CHANNELS {
+            return;
+        }
+        self.bgm_channels[index] = (!pcm.is_empty()).then(|| BgmChannel::new(pcm, looping));
     }
 
-    fn stop_bgm(&mut self) {
-        self.bgm = None;
+    /// Load `pcm` into BGM channel `index` and start it from sample 0.
+    fn play_bgm_channel(&mut self, index: usize, pcm: Vec<i16>, looping: bool) {
+        self.load_bgm_channel(index, pcm, looping);
+        self.restart_bgm_channel(index);
     }
 
-    fn set_bgm_volume(&mut self, gain: f32) {
-        self.bgm_gain = gain.max(0.0);
+    /// Stop BGM channel `index`, rewinding it and keeping its buffer loaded.
+    pub(crate) fn stop_bgm_channel(&mut self, index: usize) {
+        if let Some(channel) = self.bgm_channels.get_mut(index).and_then(Option::as_mut) {
+            channel.playing = false;
+            channel.pos = 0;
+        }
+    }
+
+    /// Start BGM channel `index` from sample 0 (the original's `SetSndSlot`).
+    /// A channel with no loaded buffer is a no-op.
+    pub(crate) fn restart_bgm_channel(&mut self, index: usize) {
+        if let Some(channel) = self.bgm_channels.get_mut(index).and_then(Option::as_mut) {
+            channel.playing = true;
+            channel.pos = 0;
+        }
+    }
+
+    /// Set BGM channel `index`'s gain; negative values are clamped to zero.
+    pub(crate) fn set_bgm_channel_volume(&mut self, index: usize, gain: f32) {
+        if let Some(channel) = self.bgm_channels.get_mut(index).and_then(Option::as_mut) {
+            channel.gain = gain.max(0.0);
+        }
+    }
+
+    /// Set BGM channel `index`'s pan (-1 left, 1 right).
+    pub(crate) fn set_bgm_channel_pan(&mut self, index: usize, pan: f32) {
+        if let Some(channel) = self.bgm_channels.get_mut(index).and_then(Option::as_mut) {
+            channel.pan = pan.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Whether BGM channel `index` has a loaded buffer.
+    #[cfg(test)]
+    pub(crate) fn bgm_channel_loaded(&self, index: usize) -> bool {
+        self.bgm_channels.get(index).is_some_and(Option::is_some)
+    }
+
+    /// Whether BGM channel `index` is currently sounding.
+    pub(crate) fn bgm_channel_playing(&self, index: usize) -> bool {
+        self.bgm_channels
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|channel| channel.playing)
+    }
+
+    /// Drop every BGM bank and its buffer.
+    pub(crate) fn stop_all_bgm(&mut self) {
+        self.bgm_channels = [None, None, None];
+    }
+
+    /// Replace the voice (dialogue) buffer and start it from sample 0.
+    pub(crate) fn play_voice(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
+        self.voice_finished = false;
+        self.voice = (!pcm.is_empty()).then(|| Voice::new(pcm, gain.max(0.0), pan, false, 0));
+    }
+
+    /// Stop the voice channel and clear its finished report.
+    pub(crate) fn stop_voice(&mut self) {
+        self.voice = None;
+        self.voice_finished = false;
+    }
+
+    /// Whether the voice channel has a buffer loaded.
+    pub(crate) fn voice_playing(&self) -> bool {
+        self.voice.is_some()
+    }
+
+    /// Whether the voice channel has played a buffer to its end since the last
+    /// [`MixState::play_voice`] or [`MixState::stop_voice`]. The flag is sticky
+    /// until then, so the engine cannot miss a completion between ticks.
+    pub(crate) fn voice_finished(&self) -> bool {
+        self.voice_finished
     }
 
     /// Start a one-shot voice.
@@ -328,8 +443,15 @@ impl MixState {
             .push(Voice::new(pcm, gain.max(0.0), pan, false, seq));
     }
 
+    fn bgm_any_playing(&self) -> bool {
+        self.bgm_channels
+            .iter()
+            .flatten()
+            .any(|channel| channel.playing)
+    }
+
     fn is_silent(&self) -> bool {
-        self.bgm.is_none() && self.sfx.is_empty()
+        !self.bgm_any_playing() && self.voice.is_none() && self.sfx.is_empty()
     }
 
     /// Mix `frames` stereo frames and append them to `out`.
@@ -342,20 +464,46 @@ impl MixState {
             let mut left = 0.0f32;
             let mut right = 0.0f32;
 
-            if let Some(bgm) = &mut self.bgm
-                && bgm.pos < bgm.pcm.len()
-            {
-                let sample = f32::from(bgm.pcm[bgm.pos]) * self.bgm_gain;
-                let (l, r) = pan_gains(bgm.pan);
+            for channel in self.bgm_channels.iter_mut().flatten() {
+                if !channel.playing {
+                    continue;
+                }
+                if channel.pos >= channel.pcm.len() {
+                    if channel.looping {
+                        channel.pos = 0;
+                    } else {
+                        channel.playing = false;
+                        continue;
+                    }
+                }
+                let sample = f32::from(channel.pcm[channel.pos]) * channel.gain;
+                let (l, r) = pan_gains(channel.pan);
                 left += sample * l;
                 right += sample * r;
-                bgm.pos += 1;
-                if bgm.looping && bgm.pos >= bgm.pcm.len() {
-                    bgm.pos = 0;
+                channel.pos += 1;
+                if channel.pos >= channel.pcm.len() {
+                    if channel.looping {
+                        channel.pos = 0;
+                    } else {
+                        channel.playing = false;
+                    }
                 }
             }
-            if self.bgm.as_ref().is_some_and(Voice::finished) {
-                self.bgm = None;
+
+            if let Some(voice) = &mut self.voice
+                && voice.pos < voice.pcm.len()
+            {
+                let sample = f32::from(voice.pcm[voice.pos]) * voice.gain;
+                let (l, r) = pan_gains(voice.pan);
+                left += sample * l;
+                right += sample * r;
+                voice.pos += 1;
+                if voice.pos >= voice.pcm.len() {
+                    self.voice_finished = true;
+                }
+            }
+            if self.voice_finished {
+                self.voice = None;
             }
 
             for voice in &mut self.sfx {
@@ -373,6 +521,21 @@ impl MixState {
             push_sample(out, left);
             push_sample(out, right);
         }
+    }
+
+    /// Legacy single-track start: load channel 0 and start it.
+    fn play_bgm(&mut self, pcm: Vec<i16>) {
+        self.play_bgm_channel(0, pcm, true);
+    }
+
+    /// Legacy single-track stop: stop channel 0, keeping its buffer loaded.
+    fn stop_bgm(&mut self) {
+        self.stop_bgm_channel(0);
+    }
+
+    /// Legacy single-track volume: channel 0's gain.
+    fn set_bgm_volume(&mut self, gain: f32) {
+        self.set_bgm_channel_volume(0, gain);
     }
 }
 
@@ -419,7 +582,58 @@ impl Mixer {
         })
     }
 
-    /// Replace the looping BGM track and start playing it.
+    /// Load `wav` into BGM channel `index` and start it from sample 0.
+    ///
+    /// The stream is fed on the next [`Mixer::update`], so the caller can set
+    /// the channel's volume and pan before the first samples are rendered (a
+    /// bank that loads muted must not leak a full-gain burst).
+    pub fn play_bgm_channel(&mut self, index: usize, wav: Wav) {
+        self.state.load_bgm_channel(index, to_mono(&wav), true);
+        self.state.restart_bgm_channel(index);
+        self.resume();
+    }
+
+    /// Load `wav` into BGM channel `index` without starting it.
+    pub fn load_bgm_channel(&mut self, index: usize, wav: Wav) {
+        self.state.load_bgm_channel(index, to_mono(&wav), true);
+        self.resume();
+    }
+
+    /// Stop BGM channel `index`, rewinding it and keeping its buffer loaded.
+    pub fn stop_bgm_channel(&mut self, index: usize) {
+        self.state.stop_bgm_channel(index);
+    }
+
+    /// Start BGM channel `index` from sample 0.
+    pub fn restart_bgm_channel(&mut self, index: usize) {
+        self.state.restart_bgm_channel(index);
+        self.resume();
+    }
+
+    /// Set BGM channel `index`'s gain; negative values are clamped to zero.
+    pub fn set_bgm_channel_volume(&mut self, index: usize, gain: f32) {
+        self.state.set_bgm_channel_volume(index, gain);
+    }
+
+    /// Set BGM channel `index`'s pan (-1 left, 1 right).
+    pub fn set_bgm_channel_pan(&mut self, index: usize, pan: f32) {
+        self.state.set_bgm_channel_pan(index, pan);
+    }
+
+    /// Whether BGM channel `index` is currently sounding.
+    pub fn bgm_channel_playing(&self, index: usize) -> bool {
+        self.state.bgm_channel_playing(index)
+    }
+
+    /// Stop and drop every BGM channel.
+    pub fn stop_all_bgm(&mut self) {
+        self.state.stop_all_bgm();
+    }
+
+    /// Replace the looping BGM track and start it on channel 0.
+    ///
+    /// This is the legacy single-track entry point; it still clears the
+    /// queued stream so a fresh track starts clean, exactly as M5 left it.
     pub fn play_bgm(&mut self, wav: Wav) -> Result<()> {
         self.state.stop_bgm();
         if !unsafe { SDL_ClearAudioStream(self.stream) } {
@@ -431,15 +645,36 @@ impl Mixer {
         Ok(())
     }
 
-    /// Stop the BGM voice and clear anything still queued.
+    /// Stop channel 0 and clear anything still queued.
     pub fn stop_bgm(&mut self) {
         self.state.stop_bgm();
         let _ = unsafe { SDL_ClearAudioStream(self.stream) };
     }
 
-    /// Set the BGM gain; negative values are clamped to zero.
+    /// Set channel 0's gain; negative values are clamped to zero.
     pub fn set_bgm_volume(&mut self, gain: f32) {
         self.state.set_bgm_volume(gain);
+    }
+
+    /// Replace the voice (dialogue) buffer and start it from sample 0.
+    pub fn play_voice(&mut self, wav: Wav, gain: f32, pan: f32) {
+        self.state.play_voice(to_mono(&wav), gain, pan);
+        self.resume();
+    }
+
+    /// Stop the voice channel.
+    pub fn stop_voice(&mut self) {
+        self.state.stop_voice();
+    }
+
+    /// Whether the voice channel has a buffer loaded.
+    pub fn voice_playing(&self) -> bool {
+        self.state.voice_playing()
+    }
+
+    /// Whether the voice channel has played its buffer to the end.
+    pub fn voice_finished(&self) -> bool {
+        self.state.voice_finished()
     }
 
     /// Start a one-shot voice with `gain` and `pan` (-1 left, 1 right).
@@ -475,9 +710,9 @@ impl Mixer {
         let _ = unsafe { SDL_PutAudioStreamData(self.stream, pcm.as_ptr().cast(), len) };
     }
 
-    /// Whether a BGM track is loaded and playing.
+    /// Whether BGM channel 0 is currently sounding.
     pub fn is_playing(&self) -> bool {
-        self.state.bgm.is_some()
+        self.state.bgm_channel_playing(0)
     }
 
     /// Alias for [`Mixer::play_bgm`], kept for the engine's music path.
@@ -749,10 +984,12 @@ mod tests {
         let mut out = Vec::new();
         state.render(3, &mut out);
         assert_eq!(out_samples(&out), vec![70, 70, -70, -70, 35, 35]);
-        assert!(state.bgm.is_some());
-        assert_eq!(state.bgm.as_ref().unwrap().pos, 0);
+        assert!(state.bgm_channel_loaded(0));
+        assert!(state.bgm_channel_playing(0));
+        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 0);
 
         state.stop_bgm();
+        assert!(!state.bgm_channel_playing(0));
         assert!(state.is_silent());
     }
 
@@ -878,12 +1115,12 @@ mod tests {
         let mut out = Vec::new();
         state.render(1, &mut out);
         assert_eq!(out_samples(&out), vec![expected, expected]);
-        assert!(state.bgm.is_some(), "the BGM voice was dropped");
+        assert!(state.bgm_channel_playing(0), "the BGM channel was dropped");
         assert_eq!(state.active_sfx(), 2);
 
         // Render past the BGM buffer and the one-shots: the loop survives.
         state.render(64, &mut out);
-        assert!(state.bgm.is_some());
+        assert!(state.bgm_channel_playing(0));
         assert_eq!(state.active_sfx(), 0);
         assert!(!state.is_silent());
     }
@@ -959,5 +1196,121 @@ mod tests {
         player.play_sfx(wav, 1.0, 0.0);
         player.update();
         player.update();
+    }
+
+    #[test]
+    fn mixer_bgm_channels_are_independent() {
+        let mut state = MixState::new();
+        state.play_bgm_channel(0, vec![1000, 1000], true);
+        state.play_bgm_channel(2, vec![1000, 1000], true);
+        assert!(state.bgm_channel_playing(0));
+        assert!(!state.bgm_channel_playing(1));
+        assert!(state.bgm_channel_playing(2));
+
+        state.set_bgm_channel_volume(1, 0.25);
+        assert!(
+            !state.bgm_channel_playing(1),
+            "volume does not start a bank"
+        );
+
+        state.stop_bgm_channel(0);
+        state.set_bgm_channel_volume(2, 0.5);
+        state.set_bgm_channel_pan(2, 1.0);
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        // Only channel 2 sounds: half gain, hard right.
+        assert_eq!(out_samples(&out), vec![0, 500]);
+        assert!(state.bgm_channel_loaded(0), "stop keeps the buffer loaded");
+    }
+
+    #[test]
+    fn mixer_bgm_restart_seeks_to_sample_zero() {
+        let mut state = MixState::new();
+        state.play_bgm_channel(0, vec![100, 200, 300], false);
+        let mut out = Vec::new();
+        state.render(2, &mut out);
+        assert_eq!(out_samples(&out).len(), 4);
+
+        state.restart_bgm_channel(0);
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+        let expected = (100.0 * center) as i16;
+        assert_eq!(out_samples(&out), vec![expected, expected]);
+
+        // A non-looping bank stops itself at the end but stays loaded.
+        state.render(4, &mut out);
+        assert!(!state.bgm_channel_playing(0));
+        assert!(state.bgm_channel_loaded(0));
+        state.restart_bgm_channel(0);
+        assert!(state.bgm_channel_playing(0));
+    }
+
+    #[test]
+    fn mixer_stop_all_bgm_drops_every_bank() {
+        let mut state = MixState::new();
+        for index in 0..MixState::BGM_CHANNELS {
+            state.play_bgm_channel(index, vec![100, 100], true);
+        }
+        assert!(state.bgm_any_playing());
+        state.stop_all_bgm();
+        for index in 0..MixState::BGM_CHANNELS {
+            assert!(!state.bgm_channel_loaded(index));
+            assert!(!state.bgm_channel_playing(index));
+        }
+        assert!(state.is_silent());
+    }
+
+    #[test]
+    fn mixer_voice_replaces_and_reports_finish() {
+        let mut state = MixState::new();
+        state.play_voice(vec![100, 200], 1.0, 0.0);
+        assert!(state.voice_playing());
+        assert!(!state.voice_finished());
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert!(state.voice_playing());
+        assert!(!state.voice_finished());
+        state.render(1, &mut out);
+        assert!(!state.voice_playing());
+        assert!(state.voice_finished());
+
+        // The finish report is sticky until the next play or stop.
+        state.render(4, &mut out);
+        assert!(state.voice_finished());
+
+        // A replacement restarts the buffer and clears the report.
+        state.play_voice(vec![7, 8], 1.0, 0.0);
+        assert!(state.voice_playing());
+        assert!(!state.voice_finished());
+        state.stop_voice();
+        assert!(!state.voice_playing());
+        assert!(!state.voice_finished());
+    }
+
+    #[test]
+    fn mixer_voice_mixes_with_bgm_and_one_shots() {
+        let mut state = MixState::new();
+        state.play_bgm(vec![100, 100]);
+        state.play_voice(vec![1000, 1000], 1.0, -1.0);
+        state.play_sfx(vec![1000, 1000], 1.0, 1.0);
+
+        let center = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        let left = (100.0 * center + 1000.0) as i16;
+        let right = (100.0 * center + 1000.0) as i16;
+        let samples = out_samples(&out);
+        assert!(
+            (i32::from(samples[0]) - i32::from(left)).abs() <= 1,
+            "{samples:?}"
+        );
+        assert!(
+            (i32::from(samples[1]) - i32::from(right)).abs() <= 1,
+            "{samples:?}"
+        );
+        assert!(state.voice_playing());
     }
 }

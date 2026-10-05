@@ -688,6 +688,11 @@ pub fn pan_position(left: u8, right: u8) -> f32 {
     ((i32::from(right) - i32::from(left)) as f32 * 0x4E as f32 / 10000.0).clamp(-1.0, 1.0)
 }
 
+/// Mixer pan in `-1..=1` for a raw DirectSound pan (`(right - left) * 0x4E`).
+pub fn pan_from_raw(pan: i32) -> f32 {
+    (pan as f32 / 10000.0).clamp(-1.0, 1.0)
+}
+
 /// The gain and stereo pan for a one-shot at `sound` heard from the camera
 /// `from`/`to`, composed exactly like `Calc3DSndPan` + `CalcPanVolume`.
 pub fn sound_gain_pan(from: [i32; 3], to: [i32; 3], sound: [i32; 3]) -> (f32, f32) {

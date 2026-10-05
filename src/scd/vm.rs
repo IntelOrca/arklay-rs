@@ -306,9 +306,17 @@ impl EventVm {
                     true
                 }
                 0xF7 => {
-                    let depth = self.slots[index].depth;
-                    self.slots[index].depth = depth.saturating_sub(1);
-                    self.slots[index].pc = next;
+                    // The voice/message wait: while the host reports a line
+                    // playing (or a menu choice pending) the slot yields for
+                    // the frame and `pc` stays on the wait, so the next frame
+                    // re-tests it. Otherwise the wait is consumed: advance and
+                    // release the depth F6 pushed (the same push/pop pair the
+                    // original's fall-through performs in one pass).
+                    if !host.script_waiting() {
+                        let depth = self.slots[index].depth;
+                        self.slots[index].depth = depth.saturating_sub(1);
+                        self.slots[index].pc = next;
+                    }
                     false
                 }
                 0xF8 => {
@@ -1027,6 +1035,8 @@ mod tests {
         flag_calls: Vec<(u8, u8, bool)>,
         flag_results: VecDeque<bool>,
         results: VecDeque<StepResult>,
+        /// The predicate the F7 wait polls.
+        waiting: bool,
     }
 
     impl RecordingHost {
@@ -1065,6 +1075,10 @@ mod tests {
         fn flag_test(&mut self, bank: u8, bit: u8, expected: bool) -> bool {
             self.flag_calls.push((bank, bit, expected));
             self.flag_results.pop_front().unwrap_or(false)
+        }
+
+        fn script_waiting(&mut self) -> bool {
+            self.waiting
         }
     }
 
@@ -1620,6 +1634,66 @@ mod tests {
         assert_eq!(vm.active_slots(), 1);
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
+    }
+
+    #[test]
+    fn event_wait_holds_pc_while_the_predicate_is_true() {
+        let scripts = event_scripts(vec![vec![
+            control(0xA300, &EVT_PUSH_COND, 1, Vec::new()),
+            control(0xA301, &EVT_SKIP_IF, 1, Vec::new()),
+            event(0xA302, &EVT_WORK_SET, 3, vec![value(0), value(0)]),
+            control(0xA305, &EVT_FINISH, 1, Vec::new()),
+        ]]);
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        let mut host = RecordingHost {
+            waiting: true,
+            ..RecordingHost::default()
+        };
+        // F6 pushes and F7 holds: the wait leaves the pc on the F7 and the
+        // body never runs while the predicate stays true.
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        assert!(host.class_names("misc").is_empty());
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        assert!(host.class_names("misc").is_empty());
+
+        // The predicate clears: the same F7 consumes the depth F6 pushed and
+        // yields once more, then the next frame runs the body to the finish.
+        host.waiting = false;
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        assert!(host.class_names("misc").is_empty());
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(host.class_names("misc"), vec!["evt_work_set"]);
+    }
+
+    #[test]
+    fn event_wait_without_push_advances_after_the_last_body_instruction() {
+        // A wait that is not preceded by F6 still yields while held and then
+        // advances past the body exactly once when it clears.
+        let scripts = event_scripts(vec![vec![
+            control(0xA400, &EVT_SKIP_IF, 1, Vec::new()),
+            event(0xA401, &EVT_WORK_SET, 3, vec![value(0), value(0)]),
+            control(0xA404, &EVT_FINISH, 1, Vec::new()),
+        ]]);
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        let mut host = RecordingHost {
+            waiting: true,
+            ..RecordingHost::default()
+        };
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        assert!(host.class_names("misc").is_empty());
+        host.waiting = false;
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0);
+        assert_eq!(host.class_names("misc"), vec!["evt_work_set"]);
     }
 
     #[test]

@@ -71,7 +71,8 @@ use sdl3_sys::video::{
 };
 
 use crate::anim;
-use crate::audio::{self, Mixer, MusicPlayer};
+use crate::audio::{self, Mixer};
+use crate::bgm;
 use crate::bmp;
 use crate::door;
 use crate::effects;
@@ -82,7 +83,6 @@ use crate::items;
 use crate::mask;
 use crate::message::MessageInput;
 use crate::model::Emd;
-use crate::music;
 use crate::npc;
 use crate::objects;
 use crate::pack::Pack;
@@ -103,6 +103,7 @@ use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use crate::voice;
 
 const WIDTH: i32 = 320;
 const HEIGHT: i32 = 240;
@@ -165,7 +166,23 @@ impl Drop for SurfaceHandle {
 /// is drawn, so a scripted NPC scene can be captured without a display; the
 /// same deterministic path [`simulate_room`] uses is taken, audio-free.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Result<()> {
+    run_with_voice(pack, id, capture, ticks, None)
+}
+
+/// [`run`] with an explicit voice-pack path.
+///
+/// `voice` overrides the sibling `<pack stem>.voice.akpak` discovery; a path
+/// that does not exist logs a warning and leaves voice lines skipped. The
+/// voice pack is consulted only by the voice and BGM audio loaders.
+pub fn run_with_voice(
+    pack: &Path,
+    id: RoomId,
+    capture: Option<&Path>,
+    ticks: u32,
+    voice: Option<&Path>,
+) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
+    let voice_path = voice_pack_path(pack, voice);
     let pack = Pack::open(pack)?;
 
     if let Some(capture_path) = capture {
@@ -177,12 +194,17 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         run_room_init(&mut loaded, &mut game);
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+        bgm::update_room_bgm(&mut game, id, None);
 
         let mut npc_models = npc::EntityModelCache::default();
         if ticks > 0 {
             let scripts = Rc::new(loaded.scripts.clone());
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
             let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
+            // Captures stay audio-free: every `xa_on` wait is released as soon
+            // as it is raised, so the frames match the audio-less corpus runs.
+            let mut voice_cache = VoiceCache::default();
+            let mut no_mixer: Option<Mixer> = None;
             for _ in 0..ticks {
                 // TODO(parity): (harness) the transition tick_room returns is
                 // discarded here, so a scripted scene that opens a door during
@@ -201,6 +223,12 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
                     },
                     player::Input::default(),
                 );
+                tick_voice(&mut no_mixer, &mut voice_cache, &mut game, &pack, None);
+                // No input is fed headlessly, so release a message's menu
+                // choice the way an auto-confirm would; the F7 wait must not
+                // outlive the frame that raised it.
+                let choice = game.message.menu_choice_id();
+                game.message.set_menu_choice_id(choice & 0x7F);
                 drain_mask_toggles(&mut loaded.room, &mut game);
             }
         }
@@ -230,13 +258,14 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
+    session.audio_packs = AudioPacks::new(voice_path);
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
         session.loaded.room.cuts.len(),
     );
     let display = Display::new(&title, false)?;
-    session.start_audio();
+    session.start_audio(&pack);
     run_session_loop(&pack, &mut session, &display)
 }
 
@@ -431,6 +460,12 @@ struct GameSession {
     shadows: ShadowCache,
     effect_pages: EffectPageCache,
     sfx_cache: SfxCache,
+    /// Decoded BGM wav cache, one entry per group track.
+    bgm_cache: bgm::BgmCache,
+    /// Decoded voice-line cache plus the one-slot pending request.
+    voice_cache: VoiceCache,
+    /// The main pack plus the lazily opened optional voice pack.
+    audio_packs: AudioPacks,
     /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
     npc_models: npc::EntityModelCache,
     music: Option<Mixer>,
@@ -601,6 +636,9 @@ impl GameSession {
             shadows: ShadowCache::default(),
             effect_pages: EffectPageCache::default(),
             sfx_cache: SfxCache::default(),
+            bgm_cache: bgm::BgmCache::default(),
+            voice_cache: VoiceCache::default(),
+            audio_packs: AudioPacks::default(),
             npc_models: npc::EntityModelCache::default(),
             music: None,
             text: Text::load(pack),
@@ -622,13 +660,16 @@ impl GameSession {
             viewed_item: None,
             swallow_action: false,
         };
-        session.enter_room();
+        session.enter_room(pack, None);
         Ok(session)
     }
 
     /// Run the room boot: init script, queued events, the player mirror, mask
-    /// toggles and the camera zone scan.
-    fn enter_room(&mut self) {
+    /// toggles, the camera zone scan and the per-room BGM handoff.
+    ///
+    /// `from` is the room the player came from, used by the BGM state machine
+    /// to resolve the outgoing group; `None` for a direct boot or save load.
+    fn enter_room(&mut self, pack: &Pack, from: Option<RoomId>) {
         {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.command_vm.run_init(&mut host);
@@ -638,6 +679,18 @@ impl GameSession {
         self.game.sync_player(&mut self.player);
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
+        // The original runs `update_room_bgm` after the destination's init
+        // script (so a `tbl37_set` it performs is visible) and after the
+        // room's data is loaded.
+        bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
+        let auxiliary = self.audio_packs.voice();
+        bgm::apply_live(
+            &mut self.music,
+            &mut self.game,
+            &mut self.bgm_cache,
+            pack,
+            auxiliary,
+        );
     }
 
     /// One fixed 30 Hz tick: message window, scripts, interaction, player
@@ -728,11 +781,21 @@ impl GameSession {
         if typewriter_fired {
             self.game.check_typewriter();
         }
-        apply_bgm_requests(
+        // The scripts have had their say: reconcile the three BGM channels and
+        // start any queued voice line whose wait flag is set.
+        bgm::apply_live(
             &mut self.music,
-            &mut self.game.room_bgm_requests,
+            &mut self.game,
+            &mut self.bgm_cache,
             pack,
-            self.loaded.id,
+            self.audio_packs.voice(),
+        );
+        tick_voice(
+            &mut self.music,
+            &mut self.voice_cache,
+            &mut self.game,
+            pack,
+            self.audio_packs.voice(),
         );
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         play_footsteps(
@@ -1134,6 +1197,9 @@ impl GameSession {
         let Some(mut session) = self.transition.take() else {
             return;
         };
+        // The BGM state machine needs the source room to resolve the outgoing
+        // group for a same-group toggle (`g_AttractMode_RoomCameraId`).
+        let from = self.loaded.id;
         finish_transition(
             pack,
             &mut session,
@@ -1147,7 +1213,7 @@ impl GameSession {
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
-        self.enter_room();
+        self.enter_room(pack, Some(from));
     }
 
     /// Render the current frame into the session framebuffer: a transition
@@ -1272,11 +1338,22 @@ impl GameSession {
         update_window_title(window, &self.loaded, &mut self.titled_cut)
     }
 
-    /// Open the audio device and start the room's track, if not already open.
-    fn start_audio(&mut self) {
+    /// Open the audio device and load the room's BGM banks, if not already
+    /// open. A missing device logs a warning and leaves the engine silent.
+    fn start_audio(&mut self, pack: &Pack) {
         if self.music.is_none() {
-            self.music = start_audio(&mut self.loaded);
+            self.music = Mixer::open();
+            if self.music.is_none() {
+                eprintln!("warning: no audio device; continuing without sound");
+            }
         }
+        bgm::apply_live(
+            &mut self.music,
+            &mut self.game,
+            &mut self.bgm_cache,
+            pack,
+            self.audio_packs.voice(),
+        );
     }
 
     /// Feed the mixer's streaming voices.
@@ -1370,6 +1447,8 @@ enum Mode {
 struct App {
     pack: Pack,
     save_dir: PathBuf,
+    /// The optional voice pack path, attached to every gameplay session.
+    voice_path: Option<PathBuf>,
     font: Option<font::Font>,
     text: Text,
     mode: Mode,
@@ -1389,7 +1468,7 @@ enum AppFlow {
 impl App {
     /// Open the pack's shared assets; the mode machine starts on the title.
     /// `audio` opens the mixer when a game session starts.
-    fn new(pack: Pack, save_dir: PathBuf, audio: bool) -> Self {
+    fn new(pack: Pack, save_dir: PathBuf, voice_path: Option<PathBuf>, audio: bool) -> Self {
         let font = match pack.read("font/font.tim") {
             Ok(bytes) => match tim::decode_4bpp(bytes) {
                 Ok(texture) => Some(font::Font::new(texture)),
@@ -1404,6 +1483,7 @@ impl App {
         Self {
             pack,
             save_dir,
+            voice_path,
             font,
             text,
             mode: Mode::Title(ui::title::TitleScreen::new()),
@@ -1469,8 +1549,9 @@ impl App {
 
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
+        session.audio_packs = AudioPacks::new(self.voice_path.clone());
         if self.audio {
-            session.start_audio();
+            session.start_audio(&self.pack);
         }
         self.mode = Mode::Play(Box::new(session));
     }
@@ -1772,6 +1853,19 @@ pub fn run_ui_with_options(
     save_dir: &Path,
     character: u8,
 ) -> Result<()> {
+    run_ui_with_voice(pack, screen, capture, save_dir, character, None)
+}
+
+/// [`run_ui_with_options`] with an explicit voice-pack path.
+pub fn run_ui_with_voice(
+    pack: &Path,
+    screen: &str,
+    capture: Option<&Path>,
+    save_dir: &Path,
+    character: u8,
+    voice: Option<&Path>,
+) -> Result<()> {
+    let voice_path = voice_pack_path(pack, voice);
     let boot = match screen {
         "font" => return run_font_ui(pack, capture),
         "title" => AppBoot::Title,
@@ -1793,7 +1887,7 @@ pub fn run_ui_with_options(
 
     if let Some(capture_path) = capture {
         let pack = Pack::open(pack)?;
-        let mut app = App::new(pack, save_dir.to_path_buf(), false);
+        let mut app = App::new(pack, save_dir.to_path_buf(), voice_path.clone(), false);
         match boot {
             AppBoot::Title => {
                 // Reach the option menu, then let the fade settle.
@@ -1846,7 +1940,7 @@ pub fn run_ui_with_options(
     }
 
     let pack = Pack::open(pack)?;
-    let mut app = App::new(pack, save_dir.to_path_buf(), true);
+    let mut app = App::new(pack, save_dir.to_path_buf(), voice_path, true);
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
     let mut input = InputState::default();
@@ -2283,7 +2377,10 @@ fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
 }
 
 /// Tear the transition down: play the door's close SE (unless suppressed),
-/// swap in the destination room, place the player and restart the BGM.
+/// swap in the destination room and place the player.
+///
+/// The BGM handoff runs later, in [`GameSession::enter_room`], after the
+/// destination's init script has had its say (the original's ordering).
 fn finish_transition(
     pack: &Pack,
     session: &mut TransitionMode,
@@ -2344,18 +2441,6 @@ fn finish_transition(
     loaded.room.current_cut = 0;
     game.camera.current_cut = 0;
 
-    match (music.as_mut(), loaded.music.take()) {
-        (Some(mixer), Some(wav)) => {
-            if let Err(err) = mixer.play_bgm(wav) {
-                eprintln!("warning: failed to start music: {err:#}");
-            }
-        }
-        (Some(mixer), None) => mixer.stop_bgm(),
-        (None, _) => {}
-    }
-
-    // The close SE goes last: starting the destination BGM clears the mixer's
-    // queued samples, which would otherwise swallow the door sound.
     if !session.silent {
         play_room_sfx(music, sfx_cache, pack, session.door.sfx, 1);
     }
@@ -2686,6 +2771,9 @@ fn simulate_loaded(
     run_room_init(&mut loaded, &mut game);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+    // Match the engine's room boot: the per-room BGM state machine runs after
+    // the init script, so a headless run sees the same channel state.
+    bgm::update_room_bgm(&mut game, id, None);
 
     let scripts = Rc::new(loaded.scripts.clone());
     let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -2695,6 +2783,9 @@ fn simulate_loaded(
     let mut effect_pages = EffectPageCache::default();
     let mut npc_models = npc::EntityModelCache::default();
     let mut framebuffer = Framebuffer::new();
+    // Headless runs have no device: a voice wait clears the tick it is raised.
+    let mut voice_cache = VoiceCache::default();
+    let mut no_mixer: Option<Mixer> = None;
 
     for tick in 0..ticks {
         tick_room(
@@ -2710,6 +2801,11 @@ fn simulate_loaded(
             },
             input(tick),
         );
+        tick_voice(&mut no_mixer, &mut voice_cache, &mut game, pack, None);
+        // Headless runs feed no input; release a message's menu choice the way
+        // an auto-confirm would so a script's F7 cannot stall on it.
+        let choice = game.message.menu_choice_id();
+        game.message.set_menu_choice_id(choice & 0x7F);
         drain_mask_toggles(&mut loaded.room, &mut game);
     }
 
@@ -3132,6 +3228,170 @@ impl SfxCache {
     }
 }
 
+/// The main pack plus the optional voice pack, opened lazily on the first
+/// voice or BGM read. A run without a voice pack never touches the file.
+#[derive(Default)]
+struct AudioPacks {
+    path: Option<PathBuf>,
+    pack: Option<Pack>,
+    attempted: bool,
+}
+
+impl AudioPacks {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            pack: None,
+            attempted: false,
+        }
+    }
+
+    /// The voice pack, opening it on first use. A failure is reported once and
+    /// leaves the fallback read absent.
+    fn voice(&mut self) -> Option<&Pack> {
+        if !self.attempted {
+            self.attempted = true;
+            if let Some(path) = &self.path {
+                match Pack::open(path) {
+                    Ok(pack) => self.pack = Some(pack),
+                    Err(err) => eprintln!(
+                        "warning: failed to open voice pack {}: {err:#}",
+                        path.display()
+                    ),
+                }
+            }
+        }
+        self.pack.as_ref()
+    }
+}
+
+/// The discovered or explicit voice pack: `<pack stem>.voice.akpak` beside the
+/// main pack.
+fn voice_pack_path(main: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+        eprintln!(
+            "warning: voice pack {} does not exist; voice lines will be skipped",
+            path.display()
+        );
+        return None;
+    }
+    let stem = main.file_stem()?.to_str()?;
+    let candidate = main.with_file_name(format!("{stem}.voice.akpak"));
+    candidate.is_file().then_some(candidate)
+}
+
+/// Decoded voice-line cache plus the one-slot pending request the scripts
+/// queue while a line is already sounding.
+#[derive(Default)]
+struct VoiceCache {
+    wavs: HashMap<String, audio::Wav>,
+    missing: HashSet<String>,
+    /// The newest request the engine has not started yet.
+    pending: Option<game::VoiceRequest>,
+    /// The mixer's voice channel is held by a line this cache started.
+    active: bool,
+}
+
+impl VoiceCache {
+    /// Load and parse `voice/{name}.wav`, falling back to the voice pack.
+    fn load(&mut self, pack: &Pack, auxiliary: Option<&Pack>, name: &str) -> Option<audio::Wav> {
+        let path = voice::pack_path(name);
+        if let Some(wav) = self.wavs.get(&path) {
+            return Some(wav.clone());
+        }
+        if self.missing.contains(&path) {
+            return None;
+        }
+        let bytes = match pack.read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(_) => auxiliary.and_then(|auxiliary| auxiliary.read(&path).ok()),
+        };
+        let Some(bytes) = bytes else {
+            eprintln!("warning: missing voice line {path}");
+            self.missing.insert(path);
+            return None;
+        };
+        match audio::parse_wav(bytes) {
+            Ok(wav) => {
+                self.wavs.insert(path, wav.clone());
+                Some(wav)
+            }
+            Err(err) => {
+                eprintln!("warning: invalid voice line {path}: {err:#}");
+                self.missing.insert(path);
+                None
+            }
+        }
+    }
+}
+
+/// One tick's voice handshake: queue the script's request, clear the wait flag
+/// when the active line ends, and start a pending line when the channel frees
+/// up.
+///
+/// With no audio device the flag is cleared every tick, so a headless run
+/// (`--capture`, the corpus audit) advances its scripts immediately instead of
+/// hanging on F7. A name that resolves but cannot be read clears the flag the
+/// same way (the documented hardening).
+fn tick_voice(
+    music: &mut Option<Mixer>,
+    cache: &mut VoiceCache,
+    game: &mut game::GameState,
+    pack: &Pack,
+    auxiliary: Option<&Pack>,
+) {
+    let Some(mixer) = music.as_mut() else {
+        game.voice.request = None;
+        cache.pending = None;
+        cache.active = false;
+        game.voice.stop_requested = false;
+        game.clear_voice_playing();
+        return;
+    };
+
+    // A stop first drops whatever was pending or sounding; a line the script
+    // queued after the stop (same tick) is taken below and survives.
+    if game.voice.stop_requested {
+        game.voice.stop_requested = false;
+        mixer.stop_voice();
+        cache.pending = None;
+        cache.active = false;
+        game.clear_voice_playing();
+    }
+    if let Some(request) = game.voice.request.take() {
+        cache.pending = Some(request);
+    }
+
+    if cache.active && !mixer.voice_playing() {
+        cache.active = false;
+        game.clear_voice_playing();
+    }
+
+    if !cache.active
+        && !mixer.voice_playing()
+        && let Some(request) = cache.pending.take()
+    {
+        match cache.load(pack, auxiliary, request.name) {
+            Some(wav) => {
+                let gain = sfx::volume_gain(request.volume);
+                let pan = sfx::pan_from_raw(request.pan);
+                mixer.play_voice(wav, gain, pan);
+                cache.active = true;
+                game.set_voice_playing();
+            }
+            None => {
+                // The line resolved by name but its file is absent: count the
+                // miss and release the wait so the script cannot deadlock.
+                game.voice.misses += 1;
+                game.clear_voice_playing();
+            }
+        }
+    }
+}
+
 /// Decoded room-mask pages for the current room, keyed by camera.
 #[derive(Default)]
 struct MaskCache {
@@ -3535,11 +3795,10 @@ struct LoadedRoom {
     room: RoomState,
     scripts: scd::ir::Scripts,
     player_assets: Option<PlayerAssets>,
-    music: Option<audio::Wav>,
 }
 
-/// Load `id` from `pack`: RDT, camera backgrounds, SCD scripts, player assets
-/// and the room's primary music track.
+/// Load `id` from `pack`: RDT, camera backgrounds, SCD scripts and player
+/// assets.
 fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
     let rdt_bytes = pack.read(&id.rdt_entry())?;
     let mut room = rdt::parse(rdt_bytes, id)?;
@@ -3558,13 +3817,11 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
     }
     let scripts = scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?;
     let player_assets = load_player_assets(pack, id);
-    let music = load_room_music(pack, id);
     Ok(LoadedRoom {
         id,
         room,
         scripts,
         player_assets,
-        music,
     })
 }
 
@@ -3784,31 +4041,6 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
     };
     game.camera.current_cut = selected;
     room.current_cut = selected;
-}
-
-/// Apply the room's queued BGM requests; the engine plays one track at a time.
-///
-/// TODO(parity): (audio) the original keeps three independent BGM channel
-/// handles (`g_SndBank`) that `bgm_play`/`bgm_stop` address per script channel,
-/// re-derives them from the per-room `g_roomBgmState` table, fades old banks
-/// out, handles the restart/reload state types (bits 6-7) and applies the
-/// per-channel volume opcodes. This engine plays or stops the single room
-/// track, so channel 1/2 requests, fades and per-room BGM state are collapsed.
-fn apply_bgm_requests(
-    music: &mut Option<MusicPlayer>,
-    requests: &mut Vec<game::BgmRequest>,
-    pack: &Pack,
-    id: RoomId,
-) {
-    for request in requests.drain(..) {
-        if request.start {
-            if !music.as_ref().is_some_and(MusicPlayer::is_playing) {
-                *music = start_music(load_room_music(pack, id));
-            }
-        } else if let Some(player) = music {
-            player.stop();
-        }
-    }
 }
 
 /// One bit per physical key the engine maps.
@@ -4411,10 +4643,13 @@ fn load_player_assets(pack: &Pack, id: RoomId) -> Option<PlayerAssets> {
     Some(PlayerAssets { emd, emw })
 }
 
-/// Load the room's primary music track from the pack, if the table names one.
+/// Load the room's shipped primary track from the pack, if the table names
+/// one. Kept as the M5 real-pack check for the raw `bgm/` entries; the
+/// running engine goes through [`bgm::BgmCache`] instead.
+#[cfg(test)]
 fn load_room_music(pack: &Pack, id: RoomId) -> Option<audio::Wav> {
-    let (name, _looping) = music::primary_track(id)?;
-    let path = music::pack_path(name)?;
+    let (name, _looping) = crate::music::primary_track(id)?;
+    let path = crate::music::pack_path(name)?;
     match pack.read(&path) {
         Ok(bytes) => match audio::parse_wav(bytes) {
             Ok(wav) => Some(wav),
@@ -4428,45 +4663,6 @@ fn load_room_music(pack: &Pack, id: RoomId) -> Option<audio::Wav> {
             None
         }
     }
-}
-
-/// Open the audio device and start looping `wav`, if one was loaded.
-///
-/// Audio is best-effort: a missing device or an SDL failure logs a warning and
-/// the engine keeps running silently.
-fn start_music(wav: Option<audio::Wav>) -> Option<MusicPlayer> {
-    let wav = wav?;
-    let mut player = match MusicPlayer::open() {
-        Some(player) => player,
-        None => {
-            eprintln!("warning: no audio device; continuing without music");
-            return None;
-        }
-    };
-    if let Err(err) = player.play(wav) {
-        eprintln!("warning: failed to start music: {err:#}");
-        return None;
-    }
-    Some(player)
-}
-
-/// Open the audio device and start the room's music if it has any.
-///
-/// Unlike [`start_music`] this always opens the mixer, so one-shot sound
-/// effects (footsteps, door SEs) still play in rooms without a primary track.
-/// Audio stays best-effort: a missing device logs a warning and the engine
-/// runs silently.
-fn start_audio(loaded: &mut LoadedRoom) -> Option<Mixer> {
-    let Some(mut mixer) = MusicPlayer::open() else {
-        eprintln!("warning: no audio device; continuing without sound");
-        return None;
-    };
-    if let Some(wav) = loaded.music.take()
-        && let Err(err) = mixer.play_bgm(wav)
-    {
-        eprintln!("warning: failed to start music: {err:#}");
-    }
-    Some(mixer)
 }
 
 fn sdl_error() -> String {
@@ -5049,7 +5245,13 @@ mod tests {
             1,
             "the character byte carries the player flag"
         );
-        assert_eq!(game.bgm.state, 0x09, "init should write the BGM state");
+        // ROOM1001's init writes its per-room BGM row; the live state byte is
+        // not touched by `tbl37_set`.
+        assert_eq!(game.room_bgm[0], 0x09, "init should write the BGM table");
+        assert_eq!(
+            game.bgm.state, 0xFF,
+            "nothing is playing before the handoff"
+        );
         assert!(!game.camera.locked);
 
         for _ in 0..10 {
@@ -5081,7 +5283,11 @@ mod tests {
         assert_eq!(game.message.id, None);
         assert_eq!(game.message.pause, 0);
         assert!(!game.message.active);
-        assert_eq!(game.room_bgm_requests, Vec::new());
+        assert!(
+            game.placeholders.is_empty(),
+            "ROOM1001's init must run without placeholders: {:?}",
+            game.placeholders
+        );
     }
 
     #[test]
@@ -6437,7 +6643,7 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, dir.0.join("saves"), false);
+        let mut app = App::new(pack, dir.0.join("saves"), None, false);
         app.boot(AppBoot::Title).unwrap();
         assert!(matches!(app.mode, Mode::Title(_)));
 
@@ -6487,7 +6693,7 @@ mod tests {
         save::save(&saves, 0, &file).unwrap();
 
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, saves, false);
+        let mut app = App::new(pack, saves, None, false);
         app.boot(AppBoot::Title).unwrap();
 
         // With a save present the title starts on LOAD GAME.
@@ -6542,7 +6748,7 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, dir.0.join("saves"), false);
+        let mut app = App::new(pack, dir.0.join("saves"), None, false);
         app.boot(AppBoot::NewGame(0)).unwrap();
 
         let updates = std::rc::Rc::new(std::cell::Cell::new(0));

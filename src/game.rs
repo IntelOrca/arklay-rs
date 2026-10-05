@@ -3,8 +3,9 @@
 //! The command and event VMs dispatch every observable effect to
 //! [`ScdGameHost`], which owns this milestone's state: the flag banks and
 //! BioCard-like state block that conditions read, the camera cut and lock, the
-//! active message, the room's BGM requests, the inventory and the room action
-//! table (doors, item pickups, item boxes, events and typewriters).
+//! active message, the per-room BGM state and its three channel banks, the
+//! voice-line wait, the inventory and the room action table (doors, item
+//! pickups, item boxes, events and typewriters).
 //!
 //! The room action table is the interaction layer: scripts register zones with
 //! `door_aot_set`, `aot_set` and `item_aot_set`, and each tick the engine hands
@@ -24,6 +25,7 @@ use std::rc::Rc;
 use crate::effects;
 use crate::items;
 use crate::message::{MessageAction, MessageInput, MessageWindow};
+use crate::music;
 use crate::objects::{self, CollisionEdit, LightEdit, ObjectTable};
 use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
@@ -32,6 +34,7 @@ use crate::scd::opcode::Op;
 use crate::stairs::{self, StairEntryState, StairZones};
 use crate::state::{RoomId, RoomState};
 use crate::text::Text;
+use crate::voice;
 
 /// Number of flag banks the scripts can address.
 pub const FLAG_BANK_COUNT: usize = 10;
@@ -224,8 +227,13 @@ const HANDLER_DOCUMENT: u8 = 0x0D;
 const HANDLER_DESK: u8 = 0x0E;
 /// `main_state_flags` bit 0x4000: a script-only bit outside the menu-mode
 /// ladder (the original's `MSF_SCRIPT_ONLY_14`), still part of the pending
-/// menu field the desk gate tests.
+/// menu field the desk gate tests. Selector 17 is mask bit 14 of the first
+/// dword because the bank stores bits MSB-first.
 const MSF_SCRIPT_ONLY_14: u8 = 17;
+/// `main_state_flags` bit 0x20000 (`MSF_VOICE_PLAYING`): a voice line is
+/// playing and an event script's F7 wait must hold. The mask is bit 17 of the
+/// first dword, i.e. selector 14 in the MSB-first flag bank.
+pub const MSF_VOICE_PLAYING: u8 = 14;
 /// `main_state_flags` bit 0x100: the pick-up screen is pending.
 const MSF_PICKUP_SCREEN: u8 = 23;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
@@ -461,13 +469,82 @@ pub struct DeskFlow {
     pub saved_camera: Option<usize>,
 }
 
-/// BGM channel state.
+/// One of the three BGM channel banks (`g_SndBank[i]`).
+///
+/// The game host owns the loaded-bank records; the engine's mixer is synced to
+/// them after every script tick. `restart` and `pending_load` are the edges the
+/// engine consumes when it reconciles the mixer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BgmChannelState {
+    /// Loaded track basename (a `GROUP_TRACKS` entry), `None` when no bank is
+    /// loaded.
+    pub name: Option<&'static str>,
+    /// Whole-buffer loop flag from `GROUP_LOOPS`.
+    pub looping: bool,
+    /// DirectSound millibel volume; the three muted seeds start at -9999 and
+    /// a stopped channel resets to -1, matching the original.
+    pub volume: i32,
+    /// DirectSound pan (`(right - left) * 0x4E`), 0 centred.
+    pub pan: i32,
+    /// A script (`bgm_play`/`bgm_restore`) asked for a restart from sample 0.
+    pub restart: bool,
+    /// The engine has not loaded this bank into its mixer yet.
+    pub pending_load: bool,
+}
+
+/// BGM state: the live state byte and the three channel banks.
+///
+/// The per-room target table lives in [`GameState::room_bgm`]; `state` is the
+/// live `g_BGM_STATE` the original shifts with `0x4A`/`0x4B`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BgmState {
-    /// The BGM state byte (`1 << (channel + 3)` per playing channel).
-    pub state: u8,
-    /// Whether each of the three BGM channels is playing.
-    pub channels: [bool; 3],
+    /// The live BGM state word: channel enable bits 3-5 and the load/restart
+    /// type in bits 6-7. `0xFF` means nothing is playing. It is a word, not a
+    /// byte, because `bgm_stop_all`/`bgm_restore` shift the saved mask through
+    /// the high byte exactly like the original's 32-bit `g_BGM_STATE`.
+    pub state: u16,
+    /// The three loaded channel banks.
+    pub channels: [BgmChannelState; 3],
+}
+
+impl Default for BgmState {
+    /// The reset value: `g_BGM_STATE` starts `0xFF` (nothing playing) with
+    /// every bank empty.
+    fn default() -> Self {
+        Self {
+            state: 0xFF,
+            channels: [BgmChannelState::default(); 3],
+        }
+    }
+}
+
+/// Bytes of the per-stage/room BGM state table (7 stages x 32 rooms).
+pub const ROOM_BGM_LEN: usize = 224;
+
+/// A voice line queued by `xa_on` (0x1E) for the engine's voice cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceRequest {
+    /// Voice basename resolved from the stage row, e.g. `V004_00`.
+    pub name: &'static str,
+    /// DirectSound millibel volume (0 full, -300 for the stage-1 id `0x33`
+    /// quirk).
+    pub volume: i32,
+    /// DirectSound pan, 0 centred (the original's default for a line).
+    pub pan: i32,
+}
+
+/// Voice-line state: the pending request and the miss audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VoiceState {
+    /// The most recent line the script asked for; the engine takes it on the
+    /// next tick and holds it until the voice channel frees up.
+    pub request: Option<VoiceRequest>,
+    /// The script (`xa_on` type 2) or `bgm_stop_all` asked the engine to stop
+    /// the active line.
+    pub stop_requested: bool,
+    /// Names that resolved to nothing (empty record or out-of-range id), kept
+    /// so the corpus audit can report the hardening path.
+    pub misses: u64,
 }
 
 /// One inventory stack.
@@ -524,15 +601,6 @@ pub enum CombineResult {
         /// The recipe set the chemical-combine scenario flag.
         chemical: bool,
     },
-}
-
-/// A BGM request queued for the engine to apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BgmRequest {
-    /// BGM channel the request targets.
-    pub channel: u8,
-    /// `true` starts the room track, `false` stops it.
-    pub start: bool,
 }
 
 /// What a room action does when the player triggers it.
@@ -976,6 +1044,12 @@ pub struct GameState {
     pub message: MessageWindow,
     /// BGM state.
     pub bgm: BgmState,
+    /// The per-stage/room BGM state table (BioCard 0x33C, `g_roomBgmState`).
+    /// Seeded from [`music::ROOM_STATE`] on a new game and restored from a
+    /// save; `tbl37_set` writes it at `stage0 * 32 + room`.
+    pub room_bgm: [u8; ROOM_BGM_LEN],
+    /// Voice-line state behind the `xa_on` wait handshake.
+    pub voice: VoiceState,
     /// The player's inventory.
     pub inventory: Vec<InventoryItem>,
     /// The room's action table.
@@ -1045,8 +1119,6 @@ pub struct GameState {
     /// out-of-range behaviour the original would have dispatched through a
     /// NULL table slot. Behaviour 8 (weapon fire) now dispatches for real.
     pub npc_placeholders: BTreeMap<u8, u64>,
-    /// BGM requests produced by the scripts.
-    pub room_bgm_requests: Vec<BgmRequest>,
     /// Event scripts requested by `evt_exec`, consumed by the engine's event VM.
     pub pending_events: Vec<(u8, u8)>,
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
@@ -1136,6 +1208,8 @@ impl Default for GameState {
             message_flags_backup: MESSAGE_FLAGS_INITIAL,
             message: MessageWindow::default(),
             bgm: BgmState::default(),
+            room_bgm: [0; ROOM_BGM_LEN],
+            voice: VoiceState::default(),
             inventory: Vec::new(),
             room_actions: [None; ROOM_ACTION_SLOTS],
             doors: [None; ROOM_ACTION_SLOTS],
@@ -1165,7 +1239,6 @@ impl Default for GameState {
             frame: 0,
             placeholders: BTreeMap::new(),
             npc_placeholders: BTreeMap::new(),
-            room_bgm_requests: Vec::new(),
             pending_events: Vec::new(),
             entity_sounds: Vec::new(),
             sfx_requests: Vec::new(),
@@ -1218,6 +1291,9 @@ impl GameState {
         state.state_bytes[0] = id.stage;
         state.state_bytes[1] = id.room;
         state.set_camera_cut(0);
+        // A new game starts from the shipped 224-byte per-room BGM table
+        // (BioCard 0x33C); a save load replaces it from the block.
+        state.room_bgm = music::ROOM_STATE;
         state.state_bytes[STATE_BYTE_CHARACTER as usize] = id.player_flag & 1;
         // InitializeGame derives the maximum from the character on every path,
         // so a state built without `seed_new_game` still has a real maximum.
@@ -1269,6 +1345,32 @@ impl GameState {
             Some(bank) => bank.apply(sel, mode),
             None => false,
         }
+    }
+
+    /// Whether a voice line is playing (`MSF_VOICE_PLAYING` in flag bank 5).
+    ///
+    /// The `xa_on` handler raises the bit when a line is requested and the
+    /// engine clears it when the mixer reports the line finished; the event
+    /// VM's F7 wait polls this through [`GameState::script_waiting`].
+    pub fn voice_playing(&self) -> bool {
+        self.flags[5].bit(MSF_VOICE_PLAYING)
+    }
+
+    /// The event VM's F7 wait predicate: hold the frame while a voice line
+    /// plays or a message menu choice (`0x80`) is pending.
+    pub fn script_waiting(&self) -> bool {
+        self.voice_playing() || (self.message.menu_choice_id() & 0x80) != 0
+    }
+
+    /// Raise the voice-playing bit (a line was accepted for playback).
+    pub fn set_voice_playing(&mut self) {
+        self.apply_flag(5, MSF_VOICE_PLAYING, 0);
+    }
+
+    /// Clear the voice-playing bit (the line finished, failed to load, or a
+    /// type-2/`bgm_stop_all` stop ran).
+    pub fn clear_voice_playing(&mut self) {
+        self.apply_flag(5, MSF_VOICE_PLAYING, 1);
     }
 
     /// Whether a bank-7 room-items bit marks its item as still in the room.
@@ -2043,7 +2145,6 @@ impl GameState {
         self.camera = CameraState::default();
         self.typewriter = TypewriterFlow::Idle;
         self.last_interaction = None;
-        self.room_bgm_requests.clear();
         self.pending_events.clear();
         self.entity_sounds.clear();
     }
@@ -4172,9 +4273,46 @@ impl ScdHost for ScdGameHost<'_> {
                     .show_message(operand_u8(operands, 0), operand_u16(operands, 1));
                 StepResult::Continue
             }
-            // TODO(parity): (scripting) 0x1E voice play (which raises the
-            // voice-playing bit event scripts wait on) and 0x29 FMV request stay
-            // placeholders.
+            // `xa_on` / `voice_play` (0x1E): type 1 queues a voice line, type 2
+            // stops the active one. Every shipped site is type 1; the type-2
+            // path is kept for completeness and for a host-driven stop.
+            0x1E => {
+                let kind = operand_u8(operands, 0);
+                let id = operand_u16(operands, 1);
+                match kind {
+                    1 => {
+                        // The stage tables are 0-based; `id` indexes the row.
+                        let stage = self.state.id.stage.saturating_sub(1);
+                        match voice::name(stage, id) {
+                            Some(name) => {
+                                // The one mixed-well-down line: stage 1 (the
+                                // 1F/2F mansion tables' stage 0) id 0x33.
+                                let volume = if stage == 0 && id == 0x33 { -300 } else { 0 };
+                                self.state.voice.request = Some(VoiceRequest {
+                                    name,
+                                    volume,
+                                    pan: 0,
+                                });
+                                self.state.set_voice_playing();
+                            }
+                            // Hardening: an empty record or an out-of-range id
+                            // records the miss and never raises the wait bit, so
+                            // a package without the line cannot deadlock a
+                            // script on F7.
+                            None => self.state.voice.misses += 1,
+                        }
+                    }
+                    2 => {
+                        self.state.voice.request = None;
+                        self.state.voice.stop_requested = true;
+                        self.state.clear_voice_playing();
+                    }
+                    // Unknown types consume the opcode and do nothing.
+                    _ => {}
+                }
+                StepResult::Continue
+            }
+            // TODO(parity): (scripting) 0x29 FMV request stays a placeholder.
             _ => self.placeholder(op),
         }
     }
@@ -4661,50 +4799,75 @@ impl ScdHost for ScdGameHost<'_> {
     }
 
     fn on_sound(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
-        // TODO(parity): (audio) the sound commands the port does not model fall
-        // through to `placeholder`: 0x2F se_volume (per-channel pan/volume),
-        // 0x43 se_rate (volume ramp), and 0x4A/0x4B bgm_bank_down/up. The
-        // original applies each to the live DirectSound bank immediately, so
-        // scripted fades and channel mixing are missing here.
+        // TODO(parity): (audio) the remaining sound commands fall through to
+        // `placeholder`: 0x17 se_play_3d, 0x27 snd_fadeout, 0x2F se_volume and
+        // 0x43 se_rate (slices 3/4). The original applies each to the live
+        // DirectSound bank immediately, so scripted fades and 3D dispatch are
+        // missing here.
         match op.op {
+            // `bgm_play`: `operand` is the channel; start the loaded bank (a
+            // no-op bank is loaded) and set its enable bit.
             0x15 => {
                 let channel = operand_u8(operands, 0);
-                self.state.bgm.state |= channel_bit(channel);
-                if let Some(flag) = self.state.bgm.channels.get_mut(usize::from(channel)) {
-                    *flag = true;
+                if let Some(bank) = self.state.bgm.channels.get_mut(usize::from(channel))
+                    && bank.name.is_some()
+                {
+                    bank.restart = true;
                 }
-                self.state.room_bgm_requests.push(BgmRequest {
-                    channel,
-                    start: true,
-                });
+                self.state.bgm.state |= u16::from(channel_bit(channel));
                 StepResult::Continue
             }
-            // TODO(parity): (audio) the original only stops the channel when its
-            // BGM-state bit was set (and resets its volume); this always clears
-            // the bit and queues a stop.
+            // `bgm_stop`: only acts when the channel's bit was set; stops and
+            // resets its volume (`-1`), exactly like the original.
             0x16 => {
                 let channel = operand_u8(operands, 0);
-                self.state.bgm.state &= !channel_bit(channel);
-                if let Some(flag) = self.state.bgm.channels.get_mut(usize::from(channel)) {
-                    *flag = false;
+                let bit = u16::from(channel_bit(channel));
+                if self.state.bgm.state & bit != 0 {
+                    if let Some(bank) = self.state.bgm.channels.get_mut(usize::from(channel)) {
+                        bank.restart = false;
+                        bank.volume = -1;
+                    }
+                    self.state.bgm.state &= !bit;
                 }
-                self.state.room_bgm_requests.push(BgmRequest {
-                    channel,
-                    start: false,
-                });
                 StepResult::Continue
             }
-            // TODO(parity): (audio) 0x37 writes the live BGM channel byte, but
-            // the original stores into the per-stage/room BGM table
-            // `g_roomBgmState[stage*32 + room]` (BioCard 0x33C); scripts that set
-            // a room's track this way change nothing here.
+            // `tbl37_set`: write the per-stage/room BGM state table, not the
+            // live byte. Operands are stage (0-based), room and value.
             0x37 => {
-                self.state.bgm.state = operand_u8(operands, 2);
+                let stage = usize::from(operand_u8(operands, 0));
+                let room = usize::from(operand_u8(operands, 1));
+                let value = operand_u8(operands, 2);
+                if let Some(slot) = self.state.room_bgm.get_mut(stage * 32 + room) {
+                    *slot = value;
+                }
                 StepResult::Continue
             }
-            // TODO(parity): (audio) 0x17 3D SE, 0x27 sound fade, 0x2F pan/volume,
-            // 0x43 volume ramp and 0x4A/0x4B BGM bank shift/restore stay
-            // placeholders.
+            // `bgm_restore`: shift the saved channel mask back down and
+            // restart every channel whose bit is set again.
+            0x4A => {
+                self.state.bgm.state >>= 8;
+                for index in 0..BGM_CHANNELS {
+                    if self.state.bgm.state & (8u16 << index) != 0
+                        && let Some(bank) = self.state.bgm.channels.get_mut(index)
+                        && bank.name.is_some()
+                    {
+                        bank.restart = true;
+                    }
+                }
+                StepResult::Continue
+            }
+            // `bgm_stop_all`: stop all three banks and the voice, then save the
+            // live channel mask in the high byte.
+            0x4B => {
+                for bank in &mut self.state.bgm.channels {
+                    bank.restart = false;
+                }
+                self.state.bgm.state <<= 8;
+                self.state.voice.request = None;
+                self.state.voice.stop_requested = true;
+                self.state.clear_voice_playing();
+                StepResult::Continue
+            }
             _ => self.placeholder(op),
         }
     }
@@ -4751,7 +4914,14 @@ impl ScdHost for ScdGameHost<'_> {
     fn flag_test(&mut self, bank: u8, bit: u8, expected: bool) -> bool {
         self.state.flag_test(bank, bit, expected)
     }
+
+    fn script_waiting(&mut self) -> bool {
+        self.state.script_waiting()
+    }
 }
+
+/// The original's three BGM channel banks (`g_SndBank`).
+pub const BGM_CHANNELS: usize = 3;
 
 /// The BGM state bit for `channel`, or zero when the channel is out of range.
 fn channel_bit(channel: u8) -> u8 {
@@ -5373,8 +5543,14 @@ mod tests {
     }
 
     #[test]
-    fn bgm_play_and_stop_update_bits_and_queue_requests() {
+    fn bgm_play_and_stop_set_bits_and_restart_loaded_banks() {
         let mut state = game();
+        // Nothing is playing yet, so the enable bits start clear (the reset
+        // value 0xFF marks "no music" as a whole, not an all-bits mask).
+        state.bgm.state = 0;
+        // A loaded bank on channels 0 and 2; channel 1 is empty.
+        state.bgm.channels[0].name = Some("Bgm_13");
+        state.bgm.channels[2].name = Some("Se_42");
         {
             let mut host = ScdGameHost::new(&mut state);
             assert_eq!(
@@ -5385,46 +5561,188 @@ mod tests {
                 host.on_sound(op(0x15), &operands(&[2])),
                 StepResult::Continue
             );
-            assert!(host.state().bgm.channels[0]);
-            assert!(!host.state().bgm.channels[1]);
-            assert!(host.state().bgm.channels[2]);
+            assert!(host.state().bgm.channels[0].restart);
+            assert!(!host.state().bgm.channels[1].restart, "no bank loaded");
+            assert!(host.state().bgm.channels[2].restart);
             assert_eq!(host.state().bgm.state, 0x08 | 0x20);
 
+            // A stop only acts when the bit was set, resets the volume and
+            // clears the restart edge.
             assert_eq!(
                 host.on_sound(op(0x16), &operands(&[0])),
                 StepResult::Continue
             );
-            assert!(!host.state().bgm.channels[0]);
+            assert_eq!(host.state().bgm.state, 0x20);
+            assert_eq!(host.state().bgm.channels[0].volume, -1);
+            assert!(!host.state().bgm.channels[0].restart);
+            // Channel 1's bit was never set: the stop is a no-op.
+            assert_eq!(
+                host.on_sound(op(0x16), &operands(&[1])),
+                StepResult::Continue
+            );
             assert_eq!(host.state().bgm.state, 0x20);
         }
+    }
+
+    #[test]
+    fn bgm_bank_shifts_save_and_restore_the_mask() {
+        let mut state = game();
+        state.bgm.channels[0].name = Some("Bgm_13");
+        state.bgm.state = 0x08 | 0x20;
+        let mut host = ScdGameHost::new(&mut state);
+        // 0x4B stops everything and shifts the mask into the high byte.
         assert_eq!(
-            state.room_bgm_requests,
-            vec![
-                BgmRequest {
-                    channel: 0,
-                    start: true,
-                },
-                BgmRequest {
-                    channel: 2,
-                    start: true,
-                },
-                BgmRequest {
-                    channel: 0,
-                    start: false,
-                },
-            ]
+            host.on_sound(op(0x4B), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().bgm.state, (0x08 | 0x20) << 8);
+        // 0x4A shifts it back and restarts the channels whose bits survive.
+        assert_eq!(
+            host.on_sound(op(0x4A), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().bgm.state, 0x08 | 0x20);
+        assert!(host.state().bgm.channels[0].restart);
+    }
+
+    #[test]
+    fn room_bgm_state_writes_the_per_room_table() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        // stage 1 (0-based), room 0x0F, value 0x40.
+        assert_eq!(
+            host.on_sound(op(0x37), &operands(&[1, 0x0F, 0x40])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().room_bgm[32 + 0x0F], 0x40);
+        assert_eq!(
+            host.state().bgm.state,
+            0xFF,
+            "0x37 never touches the live byte"
         );
     }
 
     #[test]
-    fn room_bgm_state_writes_the_state_byte() {
+    fn xa_on_type_one_queues_a_line_and_raises_the_wait_bit() {
         let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_message(op(0x1E), &operands(&[1, 9])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.state().voice.request,
+                Some(VoiceRequest {
+                    name: "V004_00",
+                    volume: 0,
+                    pan: 0,
+                })
+            );
+            assert!(host.state().voice_playing());
+            assert_eq!(host.state().voice.misses, 0);
+        }
+    }
+
+    #[test]
+    fn xa_on_resolves_each_stage_to_its_row() {
+        let cases: [(&str, u16, &str); 5] = [
+            ("1000", 0, "V001_00"),
+            ("2000", 0, "V104_00"),
+            ("3000", 0, "V00D_00"),
+            ("4000", 0, "V109_00"),
+            ("5000", 0, "VA09_00"),
+        ];
+        for (room, id, expected) in cases {
+            let id_room = RoomId::parse(room).unwrap();
+            let mut state = GameState::new(id_room, &RoomState::default());
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_message(op(0x1E), &operands(&[1, i64::from(id)]));
+            assert_eq!(
+                host.state().voice.request.map(|request| request.name),
+                Some(expected),
+                "room {room} id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn xa_on_stage_one_id_0x33_is_mixed_down() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_message(op(0x1E), &operands(&[1, 0x33]));
+            assert_eq!(host.state().voice.request.unwrap().volume, -300);
+        }
+        // The quirk only covers the mansion 1F/2F row (0-based stage 0).
+        let mut state = GameState::new(RoomId::parse("2000").unwrap(), &RoomState::default());
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_message(op(0x1E), &operands(&[1, 0x33]));
+        assert_eq!(host.state().voice.request.unwrap().volume, 0);
+    }
+
+    #[test]
+    fn xa_on_empty_records_and_out_of_range_ids_never_raise_the_bit() {
+        // 0-based stage 4 (the guardhouse table) id 181 is an empty record.
+        let id = RoomId {
+            stage: 5,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut state = GameState::new(id, &RoomState::default());
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_message(op(0x1E), &operands(&[1, 181]));
+            host.on_message(op(0x1E), &operands(&[1, 9999]));
+            assert!(host.state().voice.request.is_none());
+            assert!(!host.state().voice_playing(), "the wait bit stays clear");
+            assert_eq!(host.state().voice.misses, 2);
+        }
+    }
+
+    #[test]
+    fn xa_on_type_two_stops_and_clears_the_wait() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_message(op(0x1E), &operands(&[1, 9]));
+            assert!(host.state().voice_playing());
+            assert_eq!(
+                host.on_message(op(0x1E), &operands(&[2, 0])),
+                StepResult::Continue
+            );
+            assert!(host.state().voice.request.is_none());
+            assert!(host.state().voice.stop_requested);
+            assert!(!host.state().voice_playing());
+        }
+    }
+
+    #[test]
+    fn xa_on_unknown_types_are_inert() {
+        let mut state = game();
+        let before = state.voice;
         let mut host = ScdGameHost::new(&mut state);
         assert_eq!(
-            host.on_sound(op(0x37), &operands(&[0, 0, 0x40])),
+            host.on_message(op(0x1E), &operands(&[3, 9])),
             StepResult::Continue
         );
-        assert_eq!(host.state().bgm.state, 0x40);
+        assert_eq!(host.state().voice, before);
+        assert!(!host.state().voice_playing());
+    }
+
+    #[test]
+    fn script_waiting_follows_the_voice_flag_and_menu_choice() {
+        let mut state = game();
+        assert!(!state.script_waiting());
+        state.set_voice_playing();
+        assert!(state.script_waiting());
+        state.clear_voice_playing();
+        state.message.set_menu_choice_id(0x80);
+        assert!(state.script_waiting());
+        state.message.set_menu_choice_id(0x81);
+        assert!(state.script_waiting());
+        state.message.set_menu_choice_id(0x01);
+        assert!(!state.script_waiting());
     }
 
     #[test]

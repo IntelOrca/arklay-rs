@@ -2,6 +2,7 @@
 
 pub mod anim;
 pub mod audio;
+pub mod bgm;
 pub mod bmp;
 pub mod convert;
 pub mod door;
@@ -35,3 +36,4 @@ pub mod tim;
 pub mod tmd;
 pub mod transition;
 pub mod ui;
+pub mod voice;

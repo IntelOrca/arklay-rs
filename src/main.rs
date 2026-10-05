@@ -42,6 +42,12 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "pack")]
     save_dir: Option<PathBuf>,
 
+    /// Voice pack (`voice/*.wav`); defaults to the sibling
+    /// `<pack stem>.voice.akpak` when present. A run without one skips every
+    /// voice line and never waits on F7.
+    #[arg(long, value_name = "PATH", requires = "pack")]
+    voice: Option<PathBuf>,
+
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
@@ -80,6 +86,19 @@ enum Command {
         /// Number of worker threads (default: one per available CPU)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
         jobs: Option<u16>,
+
+        /// Write the voice WAVs to a second pack
+        /// (default `<out stem>.voice.akpak`)
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["no_voice", "with_voice"])]
+        voice_out: Option<PathBuf>,
+
+        /// Skip the voice pack entirely
+        #[arg(long, conflicts_with = "with_voice")]
+        no_voice: bool,
+
+        /// Embed the voice WAVs in the main pack instead of a second pack
+        #[arg(long)]
+        with_voice: bool,
     },
 
     /// Extract every entry of a game pack into a directory
@@ -219,12 +238,25 @@ fn main() -> Result<()> {
             out,
             exe,
             jobs,
-        }) => arklay::convert::convert_game_with_options(
-            &root,
-            &out,
-            exe.as_deref(),
-            jobs.map_or(0, usize::from),
-        ),
+            voice_out,
+            no_voice,
+            with_voice,
+        }) => {
+            let voice = if no_voice {
+                arklay::convert::VoicePackOptions::Skip
+            } else if with_voice {
+                arklay::convert::VoicePackOptions::Embed
+            } else {
+                arklay::convert::VoicePackOptions::Sibling(voice_out)
+            };
+            arklay::convert::convert_game_with_voice(
+                &root,
+                &out,
+                exe.as_deref(),
+                jobs.map_or(0, usize::from),
+                &voice,
+            )
+        }
         Some(Command::Extract { pack, out }) => extract_pack(&pack, &out),
         Some(Command::List { pack }) => list_pack(&pack),
         Some(Command::Scd { action }) => match action {
@@ -238,25 +270,33 @@ fn main() -> Result<()> {
                 .save_dir
                 .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
             if let Some(screen) = cli.ui {
-                return arklay::engine::run_ui_with_options(
+                return arklay::engine::run_ui_with_voice(
                     &pack,
                     &screen,
                     cli.capture.as_deref(),
                     &save_dir,
                     cli.player,
+                    cli.voice.as_deref(),
                 );
             }
             if let Some(room) = cli.room {
                 let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
-                return arklay::engine::run(&pack, id, cli.capture.as_deref(), cli.ticks);
+                return arklay::engine::run_with_voice(
+                    &pack,
+                    id,
+                    cli.capture.as_deref(),
+                    cli.ticks,
+                    cli.voice.as_deref(),
+                );
             }
             // No room and no `--ui`: boot the title screen, the app root.
-            arklay::engine::run_ui_with_options(
+            arklay::engine::run_ui_with_voice(
                 &pack,
                 "title",
                 cli.capture.as_deref(),
                 &save_dir,
                 cli.player,
+                cli.voice.as_deref(),
             )
         }
     }

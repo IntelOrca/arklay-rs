@@ -84,6 +84,12 @@ impl FireScene {
         if self.game.message.active {
             self.game.cancel_message();
         }
+        // The harness has no mixer, so release the voice wait the same way the
+        // engine's device-less tick does; a cutscene line must not stall the
+        // scene on an F7 that no audio device will ever clear.
+        self.game.voice.request = None;
+        self.game.voice.stop_requested = false;
+        self.game.clear_voice_playing();
         self.game.apply_flag(BANK_SYSTEM, 0x20, 0);
         // The private engine camera pass: a scripted cut lock selects the cut
         // the effect zone test reads.

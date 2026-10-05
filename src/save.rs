@@ -19,13 +19,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::game::{
-    CameraState, FLAG_BANK_COUNT, FlagBank, GameState, ITEM_BOX_SLOTS, InventoryItem,
+    BgmState, CameraState, FLAG_BANK_COUNT, FlagBank, GameState, ITEM_BOX_SLOTS, InventoryItem,
     STATE_BYTE_CHARACTER, STATE_BYTE_CUT, STATE_BYTE_ENT_ACTION, STATE_BYTE_EQUIPPED,
     STATE_BYTE_FWD_ACTION, STATE_BYTE_HEALTH_STATUS, STATE_BYTE_MENU_CHOICE,
     STATE_BYTE_PICKED_ITEM, STATE_BYTE_ROOM_CAMERA, STATE_BYTE_SAVES, STATE_BYTE_SELECTED_ITEM,
-    STATE_BYTE_TOTAL_HELD, STATE_BYTE_USED_ITEM, STATE_BYTES, character_max_health,
+    STATE_BYTE_TOTAL_HELD, STATE_BYTE_USED_ITEM, STATE_BYTES, VoiceState, character_max_health,
 };
-use crate::music;
 use crate::state::RoomId;
 
 /// Bytes in one save block.
@@ -37,7 +36,7 @@ pub const PREFIX_LEN: usize = 0x200;
 /// Number of save slots.
 pub const SAVE_SLOT_COUNT: usize = 8;
 /// Bytes of room-BGM state at the end of the layout.
-pub const ROOM_BGM_LEN: usize = 224;
+pub const ROOM_BGM_LEN: usize = crate::game::ROOM_BGM_LEN;
 /// Player inventory slots in the block (Chris uses 6, Jill 8).
 pub const PLAYER_SLOT_COUNT: usize = 12;
 /// Default save directory beside the pack.
@@ -198,7 +197,7 @@ impl SaveFile {
             health_status: state.health_status,
             examined: state.examined_flags(),
             item_box: state.item_box,
-            room_bgm: music::ROOM_STATE,
+            room_bgm: state.room_bgm,
             ..Self::default()
         };
         file.scenario.copy_from_slice(&state.flags[0].bytes()[..16]);
@@ -281,9 +280,12 @@ impl SaveFile {
             .filter(|stack| stack.id != 0)
             .collect();
         state.item_box = self.item_box;
-        // TODO(parity): (save/audio) `room_bgm` is captured from a constant and
-        // never restored here, so a load does not rebuild the per-room BGM table
-        // the original writes back from the block.
+        // The per-room BGM table round-trips through the block; the live state
+        // byte is not saved, so it resets to the nothing-playing value and the
+        // destination room's entry rebuilds the channels on load.
+        state.room_bgm = self.room_bgm;
+        state.bgm = BgmState::default();
+        state.voice = VoiceState::default();
 
         state.state_bytes = [0; STATE_BYTES];
         state.state_bytes[0] = self.stage;
@@ -734,6 +736,24 @@ mod tests {
             );
         }
         assert_eq!(SaveFile::from_state(&restored), file);
+    }
+
+    #[test]
+    fn room_bgm_table_round_trips_the_live_table() {
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        // A script's `tbl37_set` write must survive the block, not the shipped
+        // constant.
+        state.room_bgm[7] = 0x40;
+        let file = SaveFile::from_state(&state);
+        assert_eq!(file.room_bgm[7], 0x40);
+
+        let parsed = SaveFile::from_bytes(&file.to_bytes()).unwrap();
+        let mut restored = GameState::default();
+        parsed.apply_to(&mut restored);
+        assert_eq!(restored.room_bgm, state.room_bgm);
+        // The live state byte is not in the block; it resets so the room entry
+        // rebuilds the channels from the table.
+        assert_eq!(restored.bgm.state, 0xFF);
     }
 
     #[test]

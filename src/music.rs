@@ -407,11 +407,12 @@ pub const ROOM_STATE: [u8; 224] = [
     0xFF, // stage 6
 ];
 
-/// BGM group selected for `id` by the remembered state byte, if any.
-pub fn group_for(id: RoomId) -> Option<u8> {
-    let stage = usize::from(id.stage.checked_sub(1)?);
-    let room = usize::from(id.room);
-    let state = *ROOM_STATE.get(stage * 32 + room)?;
+/// BGM group selected by `state` for the room at 0-based `stage` and `room`.
+///
+/// `state & 7` picks the four-group row entry; `0xFF` (and a `0xFF` entry)
+/// means no music. A `0xFF` state is checked first because its low bits would
+/// otherwise read past the row's four entries.
+pub fn group_for(stage: usize, room: usize, state: u8) -> Option<u8> {
     if state == 0xFF {
         return None;
     }
@@ -435,17 +436,18 @@ pub fn tracks_for(group: u8) -> Vec<(&'static str, bool)> {
         .collect()
 }
 
-/// The first non-null track of the group selected for `id`.
+/// The first non-null track of the group selected for `id`'s shipped state.
 ///
-/// TODO(parity): (audio) the original loads up to three group channels and
-/// starts each one whose state bit 3-5 is set, then crossfades and handles the
-/// restart/reload state types (bits 6-7), the three tracks it loads muted for
-/// later SCD volume opcodes (Se_01, Se_4d, Se_42) and per-track pan/volume.
-/// The port plays only the first channel, at full volume, with no fade or
-/// restart handling, so multi-channel scenes (e.g. the underground cutscene's
-/// dialogue track) are silent and transitions cut abruptly.
+/// This is the M5 single-track view, kept for the pack-loading check; the
+/// running engine goes through [`crate::bgm::update_room_bgm`], which loads all
+/// three channels and follows the restart/reload state types.
 pub fn primary_track(id: RoomId) -> Option<(&'static str, bool)> {
-    tracks_for(group_for(id)?).into_iter().next()
+    let stage = usize::from(id.stage.checked_sub(1)?);
+    let room = usize::from(id.room);
+    let state = *ROOM_STATE.get(stage * 32 + room)?;
+    tracks_for(group_for(stage, room, state)?)
+        .into_iter()
+        .next()
 }
 
 /// Pack path for a BGM basename or file name, e.g. `Bgm_13` or `BGM_13.WAV`.
@@ -522,26 +524,45 @@ mod tests {
         RoomId::parse(text).unwrap()
     }
 
+    /// The shipped state byte for `id` resolved to its group.
+    fn room_group(id: RoomId) -> Option<u8> {
+        let stage = usize::from(id.stage.checked_sub(1)?);
+        let room = usize::from(id.room);
+        group_for(stage, room, ROOM_STATE[stage * 32 + room])
+    }
+
     #[test]
     fn save_room_plays_bgm_13() {
         let room = id("1001");
-        assert_eq!(group_for(room), Some(0x0B));
+        assert_eq!(room_group(room), Some(0x0B));
         assert_eq!(primary_track(room), Some(("Bgm_13", true)));
         assert_eq!(pack_path("Bgm_13"), Some("bgm/013.wav".to_owned()));
     }
 
     #[test]
     fn groups_match_known_rooms() {
-        assert_eq!(group_for(id("1000")), Some(0x0B));
-        assert_eq!(group_for(id("1040")), Some(0x00));
-        assert_eq!(group_for(id("10A0")), None);
-        assert_eq!(group_for(id("2040")), Some(0x07));
-        assert_eq!(group_for(id("3000")), Some(0x24));
-        assert_eq!(group_for(id("2170")), None);
-        assert_eq!(group_for(id("6000")), Some(0x0F));
+        assert_eq!(room_group(id("1000")), Some(0x0B));
+        assert_eq!(room_group(id("1040")), Some(0x00));
+        assert_eq!(room_group(id("10A0")), None);
+        assert_eq!(room_group(id("2040")), Some(0x07));
+        assert_eq!(room_group(id("3000")), Some(0x24));
+        assert_eq!(room_group(id("2170")), None);
+        assert_eq!(room_group(id("6000")), Some(0x0F));
         assert_eq!(primary_track(id("6000")), Some(("Bgm_31", true)));
-        assert_eq!(group_for(id("7000")), Some(0x37));
+        assert_eq!(room_group(id("7000")), Some(0x37));
         assert_eq!(primary_track(id("7000")), Some(("Se_59", false)));
+    }
+
+    #[test]
+    fn group_lookup_takes_the_state_byte() {
+        // Room 1000's row entry 0 is Bgm_13's group; the shipped state 0x40
+        // selects it because 0x40 & 7 == 0.
+        assert_eq!(ROOM_GROUPS[0][0][0], 0x0B);
+        assert_eq!(group_for(0, 0, 0x40), Some(0x0B));
+        assert_eq!(group_for(0, 0, 0xFF), None);
+        // Same room, different low bits select a different entry.
+        assert_eq!(group_for(0, 0, 0x41), Some(0x0F));
+        assert_eq!(group_for(7, 0, 0x40), None, "there is no stage 8");
     }
 
     #[test]

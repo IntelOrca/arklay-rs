@@ -72,6 +72,13 @@ pub trait ScdHost {
         StepResult::Placeholder
     }
 
+    /// Whether an event script's F7 wait (`evt_skip_if`) must hold this frame:
+    /// a voice line is playing or a message menu choice awaits an answer.
+    /// Defaults to false so a host without audio or a message window advances.
+    fn script_waiting(&mut self) -> bool {
+        false
+    }
+
     fn on_misc(&mut self, _op: &Op, _operands: &[Operand]) -> StepResult {
         StepResult::Placeholder
     }

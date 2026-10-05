@@ -13,7 +13,7 @@
 //! backgrounds and mask pages of STAGE1/STAGE2 with the stage digit reduced
 //! by 5.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -31,6 +31,7 @@ use crate::progress::{Progress, format_duration};
 use crate::sfx;
 use crate::state::{Image, RoomId};
 use crate::text;
+use crate::voice;
 use crate::{bmp, door, lzw, rdt, tim};
 
 /// How many directory levels below the root are searched for the stage and
@@ -192,6 +193,33 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     convert_game_with_options(root, out, exe, 0)
 }
 
+/// How `convert-game` distributes the referenced voice WAVs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VoicePackOptions {
+    /// Write a second v1 pack (default: `<out stem>.voice.akpak`, or the
+    /// given explicit path).
+    Sibling(Option<PathBuf>),
+    /// Embed the voice entries in the main pack for a single-file install.
+    Embed,
+    /// Do not pack voice at all.
+    Skip,
+}
+
+impl Default for VoicePackOptions {
+    fn default() -> Self {
+        Self::Sibling(None)
+    }
+}
+
+/// The default sibling voice-pack path for a main pack: `<stem>.voice.akpak`.
+pub fn voice_pack_path(out: &Path) -> PathBuf {
+    let stem = out
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("re1");
+    out.with_file_name(format!("{stem}.voice.akpak"))
+}
+
 /// Like [`convert_game_with_exe`], but with an explicit worker count.
 ///
 /// A `jobs` of `0` selects one worker per available CPU, and the output is
@@ -201,6 +229,17 @@ pub fn convert_game_with_options(
     out: &Path,
     exe: Option<&Path>,
     jobs: usize,
+) -> Result<()> {
+    convert_game_with_voice(root, out, exe, jobs, &VoicePackOptions::default())
+}
+
+/// [`convert_game_with_options`] with the voice-pack distribution selected.
+pub fn convert_game_with_voice(
+    root: &Path,
+    out: &Path,
+    exe: Option<&Path>,
+    jobs: usize,
+    voice_options: &VoicePackOptions,
 ) -> Result<()> {
     let jobs = worker_count(jobs);
     let mut progress = Progress::new();
@@ -215,6 +254,9 @@ pub fn convert_game_with_options(
         effects,
         data,
         font,
+        voice,
+        voice_unreferenced,
+        voice_dir_found,
         mut warnings,
     } = build_plan_with_progress(root, jobs, &mut progress)?;
     let exe = match exe {
@@ -236,6 +278,13 @@ pub fn convert_game_with_options(
     };
     for warning in &warnings {
         println!("warning: {warning}");
+    }
+    let voice_enabled = !matches!(voice_options, VoicePackOptions::Skip);
+    if voice_enabled && !voice_dir_found {
+        println!(
+            "warning: no voice directory found; {} voice line(s) will be missing",
+            voice::referenced_names().len()
+        );
     }
 
     let mut writer = PackWriter::new();
@@ -354,10 +403,10 @@ pub fn convert_game_with_options(
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress, jobs)?;
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress, jobs)?;
     // TODO(parity): (conversion) the original installs more than this pack
-    // carries: the voice WAVs under `voice/` (the SCD 0x1E lines), the FMV
-    // AVIs and the held-weapon TMDs under `players/ws*.tmd`. Those systems
-    // are unimplemented, so the conversion is complete only for the modelled
-    // categories; add their copy phases when the runtime grows them.
+    // carries: the FMV AVIs and the held-weapon TMDs under
+    // `players/ws*.tmd`. Those systems are unimplemented, so the conversion is
+    // complete only for the modelled categories; add their copy phases when
+    // the runtime grows them.
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress, jobs)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress, jobs)?;
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress, jobs)?;
@@ -374,6 +423,33 @@ pub fn convert_game_with_options(
         copy_item_models(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
     let (file_count, file_bytes) =
         copy_file_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
+
+    // Voice: `--with-voice` embeds the entries in the main pack; the default
+    // writes a second plain v1 pack now, before the main pack streams.
+    let embed_voice =
+        voice_enabled && matches!(voice_options, VoicePackOptions::Embed) && !voice.is_empty();
+    let (voice_count, voice_bytes, voice_note) = if !voice_enabled || voice.is_empty() {
+        (0, 0, String::new())
+    } else if embed_voice {
+        let (count, bytes) = copy_voice(&voice, &mut writer, &mut progress, jobs)?;
+        (count, bytes, " (embedded)".to_string())
+    } else {
+        let path = match voice_options {
+            VoicePackOptions::Sibling(Some(path)) => path.clone(),
+            _ => voice_pack_path(out),
+        };
+        let mut voice_writer = PackWriter::new();
+        let (count, bytes) = copy_voice(&voice, &mut voice_writer, &mut progress, jobs)?;
+        let voice_size = voice_writer.pack_size()?;
+        voice_writer
+            .write(&path)
+            .with_context(|| format!("failed to write voice pack {}", path.display()))?;
+        (
+            count,
+            bytes,
+            format!(" -> {} ({voice_size} bytes)", path.display()),
+        )
+    };
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
         println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
@@ -396,6 +472,16 @@ pub fn convert_game_with_options(
     println!("text: {text_count} entries, {text_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
+    if voice_enabled {
+        println!("voice: {voice_count} entries, {voice_bytes} bytes{voice_note}");
+        if !voice_unreferenced.is_empty() {
+            println!(
+                "voice: {} unreferenced file(s) not packed: {}",
+                voice_unreferenced.len(),
+                voice_unreferenced.join(", ")
+            );
+        }
+    }
 
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
@@ -433,7 +519,8 @@ pub fn convert_game_with_options(
         + font_count
         + text_count
         + ivm_count
-        + file_count;
+        + file_count
+        + if embed_voice { voice_count } else { 0 };
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -542,6 +629,24 @@ fn copy_se(
     }
 
     copy_raw_files(files, "se", writer, progress, jobs)
+}
+
+/// Add every resolved voice WAV to the pack.
+///
+/// The entries are the referenced union of the per-stage name rows; the
+/// shipped-but-unreferenced files (`ANNOUNCE`, the `V111_*` group and the
+/// variants) are deliberately left out and listed in the summary.
+fn copy_voice(
+    assets: &[VoiceAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    let files = assets
+        .iter()
+        .map(|asset| (asset.entry.clone(), asset.source.clone()))
+        .collect();
+    copy_raw_files(files, "voice", writer, progress, jobs)
 }
 
 /// Add every door animation named by the door type table.
@@ -1526,10 +1631,12 @@ struct Layout {
     data: Option<PathBuf>,
     item_m2: Option<PathBuf>,
     effspr: Option<PathBuf>,
+    voice: Option<PathBuf>,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
-/// `enemy`, `players`, `objspr`, `ITEM_M1`, `ITEM_M2` and `data`.
+/// `enemy`, `players`, `objspr`, `ITEM_M1`, `ITEM_M2`, `data`, `effspr` and
+/// `voice`.
 fn discover_layout(root: &Path) -> Result<Layout> {
     let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
     let mut stages: BTreeMap<u8, PathBuf> = BTreeMap::new();
@@ -1541,6 +1648,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut data = None;
     let mut item_m2 = None;
     let mut effspr = None;
+    let mut voice = None;
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -1562,6 +1670,8 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 item_m2 = Some(dir.clone());
             } else if effspr.is_none() && name.eq_ignore_ascii_case("effspr") {
                 effspr = Some(dir.clone());
+            } else if voice.is_none() && name.eq_ignore_ascii_case("voice") {
+                voice = Some(dir.clone());
             }
         }
         if depth >= MAX_DEPTH {
@@ -1597,6 +1707,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         data,
         item_m2,
         effspr,
+        voice,
     })
 }
 
@@ -1658,6 +1769,15 @@ struct NpcAsset {
     source: PathBuf,
 }
 
+/// One voice WAV resolved to its pack entry.
+#[derive(Debug)]
+struct VoiceAsset {
+    /// Pack entry, e.g. `voice/v004_00.wav`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
 /// One effect-sheet TIM resolved to its pack entry.
 #[derive(Debug)]
 struct EffectSheet {
@@ -1708,6 +1828,12 @@ struct Plan {
     data: DataPlan,
     /// `DATA/FONT.TIM` to pack raw as `font/font.tim`.
     font: Option<PathBuf>,
+    /// The referenced voice WAVs (the union of the name rows).
+    voice: Vec<VoiceAsset>,
+    /// Shipped voice files no row references; listed in the summary.
+    voice_unreferenced: Vec<String>,
+    /// Whether the install has a `voice` directory at all.
+    voice_dir_found: bool,
     /// Non-fatal problems found while resolving optional inputs.
     warnings: Vec<String>,
 }
@@ -1733,6 +1859,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         data,
         item_m2,
         effspr,
+        voice: voice_dir,
     } = layout;
     // The font is optional and only diagnosable when the install actually has
     // a DATA directory; a missing DATA root is not reported so partial trees
@@ -1896,6 +2023,51 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         }
     }
 
+    // Voice is a second optional pack: every referenced name is resolved
+    // case-insensitively, missing files are aggregated into one warning, and
+    // the shipped-but-unreferenced files are listed in the summary. A missing
+    // `voice` directory is only reported by the conversion summary, so a
+    // partial tree stays warning-free like the other optional categories.
+    let voice_index = voice_dir.as_deref().map(index_dir).transpose()?;
+    let mut voice_assets = Vec::new();
+    let mut voice_unreferenced = Vec::new();
+    if let (Some(dir), Some(index)) = (voice_dir.as_deref(), voice_index.as_ref()) {
+        let referenced: HashSet<String> = voice::referenced_names()
+            .into_iter()
+            .map(|name| format!("{}.wav", name.to_ascii_lowercase()))
+            .collect();
+        let mut missing_voice = Vec::new();
+        for name in voice::referenced_names() {
+            let file = format!("{}.wav", name.to_ascii_lowercase());
+            match index.get(&file) {
+                Some(source) => voice_assets.push(VoiceAsset {
+                    entry: format!("voice/{file}"),
+                    source: source.clone(),
+                }),
+                None => missing_voice.push(format!("{}.WAV", name.to_ascii_uppercase())),
+            }
+        }
+        if !missing_voice.is_empty() {
+            warnings.push(format!(
+                "missing {} voice file(s) in {}: {}",
+                missing_voice.len(),
+                dir.display(),
+                missing_voice.join(", ")
+            ));
+        }
+        for entry in read_dir_sorted(dir)? {
+            let file = entry.file_name();
+            let Some(file) = file.to_str() else {
+                continue;
+            };
+            if file.to_ascii_lowercase().ends_with(".wav")
+                && !referenced.contains(&file.to_ascii_lowercase())
+            {
+                voice_unreferenced.push(file.to_owned());
+            }
+        }
+    }
+
     warnings.extend(data.warnings.iter().cloned());
     warnings.extend(npc_warnings);
     if let Some(font_warning) = font_warning {
@@ -1912,6 +2084,9 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         effects,
         data,
         font,
+        voice: voice_assets,
+        voice_unreferenced,
+        voice_dir_found: voice_dir.is_some(),
         warnings,
     })
 }
@@ -2729,6 +2904,92 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    fn resolves_voice_files_and_lists_unreferenced() {
+        let root = TempDir::new("voice-plan");
+        make_stage_dirs(&root.path);
+        // Case-insensitive directory and file names, like the shipped tree.
+        let voice = root.path.join("VOICE");
+        fs::create_dir_all(&voice).unwrap();
+        fs::write(voice.join("v001_00.wav"), b"a").unwrap();
+        fs::write(voice.join("V104_00.WAV"), b"bb").unwrap();
+        fs::write(voice.join("VB00_31A.wav"), b"ccc").unwrap();
+        fs::write(voice.join("ANNOUNCE.WAV"), b"dddd").unwrap();
+
+        let layout = discover_layout(&root.path).unwrap();
+        assert_eq!(layout.voice.as_deref(), Some(voice.as_path()));
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.voice.len(), 3);
+        assert!(
+            plan.voice
+                .iter()
+                .any(|asset| asset.entry == "voice/v001_00.wav")
+        );
+        assert!(
+            plan.voice
+                .iter()
+                .any(|asset| asset.entry == "voice/v104_00.wav")
+        );
+        // The 8-character `VB00_31a` record resolves to its lowercased file.
+        assert!(
+            plan.voice
+                .iter()
+                .any(|asset| asset.entry == "voice/vb00_31a.wav")
+        );
+        assert_eq!(plan.voice_unreferenced, vec!["ANNOUNCE.WAV".to_string()]);
+        assert!(plan.voice_dir_found);
+
+        // A missing referenced file aggregates into one warning.
+        fs::remove_file(voice.join("V104_00.WAV")).unwrap();
+        let plan = build_plan(&root.path).unwrap();
+        let warnings: Vec<&String> = plan
+            .warnings
+            .iter()
+            .filter(|warning| warning.contains("voice file"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(warnings[0].contains("V104_00.WAV"), "{:?}", warnings);
+    }
+
+    #[test]
+    fn converts_voice_into_a_sibling_pack_and_embedded() {
+        let root = TempDir::new("voice-pack");
+        make_stage_dirs(&root.path);
+        write_npc_files(&root.path);
+        let pak = camera_pak();
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), &pak).unwrap();
+        fs::create_dir_all(root.path.join("sound")).unwrap();
+        write_se_files(&root.path);
+        write_door_files(&root.path);
+        let voice = root.path.join("voice");
+        fs::create_dir_all(&voice).unwrap();
+        fs::write(voice.join("v001_00.wav"), b"voice-a").unwrap();
+        fs::write(voice.join("V104_00.WAV"), b"voice-bb").unwrap();
+        fs::write(voice.join("ANNOUNCE.WAV"), b"unused").unwrap();
+
+        // Default: a second plain v1 pack beside the main one.
+        let out = root.path.join("out.akpak");
+        let voice_out = root.path.join("out.voice.akpak");
+        convert_game_with_voice(&root.path, &out, None, 1, &VoicePackOptions::Sibling(None))
+            .unwrap();
+        let voice_pack = crate::pack::Pack::open(&voice_out).unwrap();
+        assert_eq!(voice_pack.len(), 2);
+        assert_eq!(voice_pack.read("voice/v001_00.wav").unwrap(), b"voice-a");
+        assert_eq!(voice_pack.read("voice/v104_00.wav").unwrap(), b"voice-bb");
+        let main = crate::pack::Pack::open(&out).unwrap();
+        assert!(!main.paths().any(|path| path.starts_with("voice/")));
+
+        // Embed: the entries move into the main pack, no sibling is written.
+        let out = root.path.join("embed.akpak");
+        convert_game_with_voice(&root.path, &out, None, 1, &VoicePackOptions::Embed).unwrap();
+        let main = crate::pack::Pack::open(&out).unwrap();
+        assert_eq!(main.read("voice/v001_00.wav").unwrap(), b"voice-a");
+        assert_eq!(main.read("voice/v104_00.wav").unwrap(), b"voice-bb");
+        assert!(!root.path.join("embed.voice.akpak").exists());
     }
 
     #[test]
