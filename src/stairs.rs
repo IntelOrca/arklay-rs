@@ -214,6 +214,7 @@ mod tests {
                 words[2] as u8,
                 (words[2] >> 8) as u8,
             ],
+            item_data: None,
             room_items_flag: 0xFF,
         }
     }

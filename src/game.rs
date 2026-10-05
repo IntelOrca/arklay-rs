@@ -24,7 +24,7 @@ use std::rc::Rc;
 use crate::effects;
 use crate::items;
 use crate::message::{MessageAction, MessageInput, MessageWindow};
-use crate::objects::{CollisionEdit, LightEdit, ObjectTable};
+use crate::objects::{self, CollisionEdit, LightEdit, ObjectTable};
 use crate::player::PlayerState;
 use crate::scd::host::{ScdHost, StepResult};
 use crate::scd::ir::Operand;
@@ -84,8 +84,9 @@ pub const FILE_COUNT: usize = 16;
 pub const BANK_ROOM_FLAGS: u8 = 8;
 /// First file-collected bit in the room-flags bank: `0x82 + (item - 0x5F)`.
 pub const ROOM_FLAG_FILE_BASE: u8 = 0x82;
-/// Number of room action slots the game state tracks.
-pub const ROOM_ACTION_SLOTS: usize = 20;
+/// Number of room action slots the game state tracks: the original's table is
+/// cleared over 288 bytes of 12-byte entries.
+pub const ROOM_ACTION_SLOTS: usize = 24;
 /// Entity slots: 0 is the player, 1.. are enemies and scripted objects.
 pub const ENTITY_COUNT: usize = 32;
 /// `selected_entity` value when the event pointed at something this slice does
@@ -151,6 +152,12 @@ const ITEM_MAP_LAST: u8 = 0x53;
 const ITEM_MAP_COURTYARD: u8 = 0x50;
 /// Item id of the guardhouse map, the other darkened pair.
 const ITEM_MAP_GUARDHOUSE: u8 = 0x52;
+/// First map-owned bit in the room-flags bank: `0x7C + (item - 0x4E)`.
+const ROOM_FLAG_MAP_BASE: u8 = 0x7C;
+/// Prompt message the include-key handler shows before the pickup.
+const MESSAGE_INCLUDE_KEY: u8 = 0xC1;
+/// Effect sprite the item build's `0x8000` flag spawns.
+const EFFECT_ITEM_SPARKLE: u8 = 0x0B;
 /// Scenario flag raised when the radio is taken.
 const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 /// Scenario flag raised when Jill has the lockpick.
@@ -181,6 +188,10 @@ const BANK_SCENARIO: u8 = 0;
 const BANK_LOCKS: u8 = 2;
 /// `room_check_actions` index of the item pickup handler.
 const HANDLER_ITEM: u8 = 4;
+/// `room_check_actions` index of the include-key prompt handler.
+const HANDLER_INCLUDE_KEY: u8 = 3;
+/// `room_check_actions` index of the flag-bank set/clear handler.
+const HANDLER_FLAG_BANK_SET: u8 = 7;
 /// `room_check_actions` index of the key-pickup handler.
 const HANDLER_PICKUP_KEY: u8 = 15;
 /// `room_check_actions` index of the door handler.
@@ -536,8 +547,18 @@ pub struct RoomAction {
     pub flags: u8,
     /// Raw parameter bytes.
     pub params: [u8; 8],
-    /// Bank-7 (room items) flag index used to remember a taken item; `0xFF`
-    /// when the action does not use one.
+    /// The retained `item_aot_set` operand block `[item, quantity, model,
+    /// parent, x (LE), z (LE)]`, `None` for actions that never built an item.
+    ///
+    /// The original keeps the entry's operand-record pointer at +8 across
+    /// `room_action_reset`, so an entry re-armed as an item handler still reads
+    /// the original item id, model and room-items flag; this field is that
+    /// pointer's content.
+    pub item_data: Option<[u8; 8]>,
+    /// Bank-7 (room items) selector the item action remembers as taken. Item
+    /// handlers read it (every value is a real bit, `0xFF` included); actions
+    /// that never built an item carry the `0xFF` default and no handler
+    /// touches it.
     pub room_items_flag: u8,
 }
 
@@ -557,26 +578,33 @@ impl RoomAction {
         u16::from_le_bytes([lo, hi])
     }
 
+    /// The item operand block: the retained `item_aot_set` data when present,
+    /// otherwise the current `params` (a hand-built item action).
+    pub fn item_operands(&self) -> [u8; 8] {
+        self.item_data.unwrap_or(self.params)
+    }
+
     /// Item id of an item action.
     pub fn item_id(&self) -> u8 {
-        self.params[0]
+        self.item_operands()[0]
     }
 
     /// Quantity of an item action.
     pub fn item_quantity(&self) -> u8 {
-        self.params[1]
+        self.item_operands()[1]
     }
 
     /// Model slot of an item action.
     pub fn item_model(&self) -> u8 {
-        self.params[2]
+        self.item_operands()[2]
     }
 
-    /// Item world position from the action's copied operands. The action drops
-    /// the record's Y; the built [`crate::objects::ItemRecord`] carries it.
+    /// Item world position from the item operands. The action drops the
+    /// record's Y; the built [`crate::objects::ItemRecord`] carries it.
     pub fn item_position(&self) -> [i16; 3] {
-        let x = i16::from_le_bytes([self.params[4], self.params[5]]);
-        let z = i16::from_le_bytes([self.params[6], self.params[7]]);
+        let operands = self.item_operands();
+        let x = i16::from_le_bytes([operands[4], operands[5]]);
+        let z = i16::from_le_bytes([operands[6], operands[7]]);
         [x, 0, z]
     }
 }
@@ -1174,21 +1202,18 @@ impl GameState {
 
     /// Whether a bank-7 room-items bit marks its item as still in the room.
     ///
-    /// TODO(parity): (gameplay) the original's bank starts at 0xFF ("bit set =
-    /// item still here") and a pick-up clears the bit; the port ships the
-    /// inverted convention (set = taken). M12 slice 4 flips it; this method and
-    /// [`Self::mark_item_taken`] are the seam and change polarity together.
+    /// The original's bank starts at 0xFF ("bit set = item still here", the
+    /// shipped `NEW_GAME_ROOM_ITEMS` pattern) and a pick-up clears the bit,
+    /// so a set bit registers the item action and builds a visible model.
+    /// Every selector value is a real bit, including `0xFF` (two shipped
+    /// builds use it).
     pub fn room_item_present(&self, flag: u8) -> bool {
-        flag != 0xFF && !self.flag_test(7, flag, false)
+        self.flag_test(7, flag, false)
     }
 
-    /// Mark a bank-7 room-items bit as taken; `0xFF` selects no bit.
+    /// Mark a bank-7 room-items bit as taken (clear it).
     pub fn mark_item_taken(&mut self, flag: u8) {
-        if flag != 0xFF {
-            // The current convention marks a taken item by setting the bit;
-            // slice 4 flips this mode to 1 with `room_item_present`.
-            self.apply_flag(7, flag, 0);
-        }
+        self.apply_flag(7, flag, 1);
     }
 
     /// The `cmpb` condition on `state_bytes[index]`.
@@ -2789,7 +2814,9 @@ impl GameState {
                 self.try_door(room_action.slot);
             }
             RoomActionKind::Item => {
-                self.pick_up(room_action.slot);
+                // Item actions dispatch by the handler `item_aot_set` derived
+                // (ordinary 4, map 0x0F, document 0x0D, include-key 3).
+                self.run_room_action(room_action.slot, room_action.handler);
             }
             RoomActionKind::Event => {
                 self.start_room_event(room_action.slot);
@@ -3169,19 +3196,28 @@ impl GameState {
     /// the action up, the door handler transitions, the message handler shows
     /// its message, and the menu-driven handlers record a placeholder.
     ///
-    /// TODO(parity): (scripting) handlers 3 include_key, 7 flag_bank_set,
-    /// 0x0B room_action_effect (dust), 0x0D set_room_event_flag and 0x0E
-    /// check_desk are not run at all; a script that gates progress on
-    /// `flag_bank_set` or the desk flow does nothing.
+    /// TODO(parity): (scripting) 0x0B room_action_effect (dust) and 0x0E
+    /// check_desk are not run at all; a script that gates progress on the desk
+    /// flow does nothing.
     pub fn run_room_action(&mut self, slot: u8, handler: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
         };
         match handler {
             HANDLER_DOOR => self.try_door(slot),
-            HANDLER_ITEM | HANDLER_PICKUP_KEY if action.kind == RoomActionKind::Item => {
-                self.pick_up(slot)
+            HANDLER_INCLUDE_KEY if action.kind == RoomActionKind::Item => self.include_key(slot),
+            HANDLER_ITEM if action.kind == RoomActionKind::Item => self.pick_up(slot),
+            HANDLER_PICKUP_KEY if action.kind == RoomActionKind::Item => self.pick_up_map(slot),
+            HANDLER_DOCUMENT if action.kind == RoomActionKind::Item => {
+                // The original only arms the entry here and returns 1 to select
+                // the reach animation; the item is awarded as the message chain
+                // completes. The port keeps its immediate-award deviation and
+                // records the reach-animation return as the interaction.
+                let taken = self.pick_up(slot);
+                self.record_interaction(slot, RoomActionKind::Item, None);
+                taken
             }
+            HANDLER_FLAG_BANK_SET => self.flag_bank_set(slot),
             HANDLER_MESSAGE => {
                 let id = action.param_word(0);
                 self.show_message(id as u8, action.param_word(1));
@@ -3222,14 +3258,13 @@ impl GameState {
         true
     }
 
-    /// Pick up the item action in `slot`: add to the inventory, record it and
-    /// consume the action.
+    /// Pick up the ordinary item action in `slot`: add it to the inventory,
+    /// record it and tear the model down.
     ///
-    /// TODO(parity): (progression) map item models use handler 0x0F in the
-    /// original: `pickup_key_event` raises the map's RoomFlags bit
-    /// (0x7C + id - 0x4E) and does NOT put the map in the inventory; here every
-    /// item model becomes an inventory stack and the map-seen bit is never set.
-    /// Document pickups also use their own handler (0x0D) and record byte.
+    /// This is the original's `room_event_item_pickup` body; maps take
+    /// [`Self::pick_up_map`] and documents reach the same award through
+    /// handler 0x0D. The radio keeps its scenario-flag path in
+    /// [`Self::take_message_item`].
     pub fn pick_up(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -3243,19 +3278,98 @@ impl GameState {
         // BioCard 0x213 (`pickedItemId`) is what the scripts test with cmpb 19.
         self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = item;
         self.item_events.push(item);
-        // Remember the pickup in the room items flag bank so the item does not
-        // come back when the room is re-entered.
-        if action.room_items_flag != 0xFF {
-            self.apply_flag(7, action.room_items_flag, 0);
-        }
         // A document pickup raises its FILE-collected bit (bank 8,
         // `0x82 + (item - 0x5F)`) so the FILE tab lists it.
         if let Some(index) = file_index(item) {
             self.apply_flag(BANK_ROOM_FLAGS, ROOM_FLAG_FILE_BASE.wrapping_add(index), 0);
         }
+        self.tear_down_item(slot, action);
+        true
+    }
+
+    /// The shared model/sparkle teardown of a pick-up (`room_event_item_pickup`
+    /// and `pickup_key_event`): free the record's sparkle slot, clear the
+    /// model's drawn byte, clear the room-items "still here" bit and consume
+    /// the action.
+    fn tear_down_item(&mut self, slot: u8, action: RoomAction) {
+        let model = usize::from(action.item_model());
+        let sparkle = self.items.record(model).map_or(0, |record| record.sparkle);
+        if sparkle != 0 {
+            self.effects.release(usize::from(sparkle));
+        }
+        if let Some(record) = self.items.record_mut(model) {
+            record.sparkle = 0;
+            record.flag = 0;
+        }
+        // Remember the pickup in the room-items flag bank so the item does not
+        // come back when the room is re-entered.
+        self.mark_item_taken(action.room_items_flag);
         self.room_actions[usize::from(slot)] = None;
         self.doors[usize::from(slot)] = None;
+    }
+
+    /// Pick up a map action (`pickup_key_event`, handler 0x0F): tear the model
+    /// down, raise the map's owned bit in the room-flags bank
+    /// (`0x7C + item - 0x4E`) and record the picked id. Maps never enter the
+    /// inventory.
+    pub fn pick_up_map(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        let item = action.item_id();
+        if (ITEM_MAP_FIRST..=ITEM_MAP_LAST).contains(&item) {
+            self.apply_flag(
+                BANK_ROOM_FLAGS,
+                ROOM_FLAG_MAP_BASE.wrapping_add(item - ITEM_MAP_FIRST),
+                0,
+            );
+        }
+        self.last_picked_item = Some(item);
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = item;
+        self.tear_down_item(slot, action);
         true
+    }
+
+    /// `include_key` (handler 3): show the key prompt unless the equipped item
+    /// already is the key the action needs. The prompt arms the action so its
+    /// post-action pickup runs.
+    pub fn include_key(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item || self.equipped == Some(action.item_id()) {
+            return false;
+        }
+        self.show_message_for_action(slot, MESSAGE_INCLUDE_KEY, 0xFF);
+        self.record_interaction(
+            slot,
+            RoomActionKind::Item,
+            Some(u16::from(MESSAGE_INCLUDE_KEY)),
+        );
+        true
+    }
+
+    /// `flag_bank_set` (handler 7): set or clear one bit of the selected flag
+    /// bank. The bank map is `0..=9` (the `set` opcode's banks), and banks 5
+    /// and 6 reach only their first dword, so the selector's high three bits
+    /// are dropped for them. The action's three words are the bank, the bit
+    /// and a nonzero sets / zero clears flag.
+    pub fn flag_bank_set(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        let bank = (action.param_word(0) as u8).min(BANK_ITEM_USE);
+        let bit = action.param_word(1) as u8;
+        let mode = if action.param_word(2) != 0 { 0 } else { 1 };
+        let sel = if bank == 5 || bank == 6 {
+            bit & 0x1F
+        } else {
+            bit
+        };
+        self.apply_flag(bank, sel, mode)
     }
 
     /// Run the door in `slot`, with the original's full interaction flow:
@@ -3824,6 +3938,7 @@ impl ScdHost for ScdGameHost<'_> {
                     handler: HANDLER_DOOR,
                     flags: door.sub_type,
                     room_items_flag: 0xFF,
+                    item_data: None,
                     params: [
                         door.lock,
                         door.next_room,
@@ -3858,6 +3973,7 @@ impl ScdHost for ScdGameHost<'_> {
                     handler,
                     flags,
                     params,
+                    item_data: None,
                     room_items_flag: 0xFF,
                 };
                 self.store_action(action);
@@ -3873,6 +3989,11 @@ impl ScdHost for ScdGameHost<'_> {
                     .get_mut(usize::from(slot))
                     .and_then(Option::as_mut)
                 {
+                    // The original rewrites the entry's bytes 0..7 but keeps the
+                    // operand-record pointer at +8, so the retained item
+                    // operands (`item_data`) survive a reset even when the
+                    // handler stops naming an item entry; room 300's map event
+                    // relies on that after the init re-arms slot 4 as an event.
                     action.handler = handler;
                     action.flags = flags;
                     action.kind = RoomActionKind::from_sce(handler);
@@ -3960,6 +4081,7 @@ impl ScdHost for ScdGameHost<'_> {
                 let x = operand_i16(operands, 9).to_le_bytes();
                 let z = operand_i16(operands, 11).to_le_bytes();
                 let room_items_flag = operand_u8(operands, 13);
+                let flags_word = operand_u16(operands, 15);
                 if item == items::ITEM_INK_RIBBONS
                     && self.state.id.player_flag & 3 == 1
                     && !self
@@ -3969,9 +4091,6 @@ impl ScdHost for ScdGameHost<'_> {
                     self.state.mark_item_taken(room_items_flag);
                     return StepResult::Continue;
                 }
-                // TODO(parity): (gameplay) M12 slice 4 flips bank 7 to the
-                // original's set = "still here"; until then the seam keeps the
-                // port's clear = present convention.
                 let present = self.state.room_item_present(room_items_flag);
                 let handler = if present { item_handler(item) } else { 0 };
                 // The record is built even when the flag marks it taken, so the
@@ -3988,6 +4107,33 @@ impl ScdHost for ScdGameHost<'_> {
                 {
                     self.state.item_palette_edits.push(model);
                 }
+                // The `0x8000` flag spawns the item's pick-up sparkle while the
+                // room-items bit still marks it present. Both of the original's
+                // paths land the sparkle on the item: unparented it spawns
+                // against the item's own matrix at (0, bias, 0), parented
+                // against the parent's with the local position plus the bias
+                // (equal to the item's composed frame at (0, bias, 0) for the
+                // item's Y-only model rotation). [`Attach::Item`] resolves that
+                // composed frame live, so the sparkle rides the item's parent
+                // chain even while the parent record is inactive.
+                if built && present && flags_word & 0x8000 != 0 {
+                    let bias = objects::sparkle_bias(flags_word);
+                    let room = Rc::clone(&self.state.room_effects);
+                    let sparkle = effects::create_attached(
+                        self.state,
+                        &room,
+                        EFFECT_ITEM_SPARKLE,
+                        objects::sparkle_effect_id(flags_word),
+                        effects::Attach::Item(model),
+                        [0, bias, 0],
+                        0,
+                        0,
+                    )
+                    .unwrap_or(0);
+                    if let Some(record) = self.state.items.record_mut(usize::from(model)) {
+                        record.sparkle = sparkle;
+                    }
+                }
                 if present {
                     let action = RoomAction {
                         slot,
@@ -4002,6 +4148,7 @@ impl ScdHost for ScdGameHost<'_> {
                         handler,
                         flags: operand_u8(operands, 14),
                         params: [item, quantity, model, parent, x[0], x[1], z[0], z[1]],
+                        item_data: Some([item, quantity, model, parent, x[0], x[1], z[0], z[1]]),
                         room_items_flag,
                     };
                     self.store_action(action);
@@ -4018,15 +4165,19 @@ impl ScdHost for ScdGameHost<'_> {
             0x1C => self.equipped_test(operands),
             // `model_flag_set` (0x19): write the item record's byte 0
             // wholesale. Every shipped write clears the record; clearing also
-            // frees the pick-up sparkle's handle (the pool free is slice 3).
+            // frees the pick-up sparkle's handle and zeroes it.
             0x19 => {
                 let index = usize::from(operand_u8(operands, 0));
                 let value = operand_u8(operands, 1);
+                let mut freed = 0;
                 if let Some(record) = self.state.items.record_mut(index) {
                     record.flag = value;
                     if value == 0 {
-                        record.sparkle = 0;
+                        freed = std::mem::take(&mut record.sparkle);
                     }
+                }
+                if freed != 0 {
+                    self.state.effects.release(usize::from(freed));
                 }
                 StepResult::Continue
             }
@@ -5034,7 +5185,11 @@ mod tests {
             item_count: slots,
             ..RoomState::default()
         };
-        GameState::new(RoomId::parse(room_id).unwrap(), &room)
+        let mut state = GameState::new(RoomId::parse(room_id).unwrap(), &room);
+        // The room-items bank ships all-set ("bit = item still here"); the
+        // fixtures' `item_values` blocks name flag bit 1, so seed it.
+        state.apply_flag(7, 1, 0);
+        state
     }
 
     /// The 16 decoded `item_aot_set` operands for slot 0 and `model`.
@@ -6303,6 +6458,7 @@ mod tests {
             handler: HANDLER_ITEM,
             flags: 0x81,
             params: [item, quantity, 1, 0xFF, 0, 0, 0, 0],
+            item_data: None,
             room_items_flag: 0xFF,
         }
     }
@@ -6315,6 +6471,7 @@ mod tests {
             sce: HANDLER_DOOR,
             handler: HANDLER_DOOR,
             flags: door.sub_type,
+            item_data: None,
             room_items_flag: 0xFF,
             params: [
                 door.lock,
@@ -6356,6 +6513,7 @@ mod tests {
             handler: 1,
             flags: 0,
             params: [0; 8],
+            item_data: None,
             room_items_flag: 0xFF,
         };
         assert!(action.contains(100, 200));
@@ -6762,6 +6920,30 @@ mod tests {
     }
 
     #[test]
+    fn aot_reset_keeps_an_items_operands_and_room_flag() {
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x50, 0, 0xFF, [1, 2, 3])));
+            // The init re-arms the slot as an event, then the map event resets
+            // it back to the key-pickup handler and runs it. The original keeps
+            // the operand-record pointer at +8 across both writes.
+            host.on_room_action(op(0x12), &operands(&[0, 9, 0x81, 2, 2, 0]));
+            assert_eq!(
+                host.state().room_actions[0].unwrap().kind,
+                RoomActionKind::Event
+            );
+            host.on_room_action(op(0x12), &operands(&[0, 0x0F, 0x81, 0, 0, 0]));
+            host.on_room_action(op(0x24), &operands(&[0, 0x0F, 0]));
+        }
+        assert_eq!(state.last_picked_item, Some(0x50));
+        assert!(state.inventory.is_empty(), "maps are never awarded");
+        assert!(state.flags[8].bit(ROOM_FLAG_MAP_BASE + 2));
+        assert!(!state.room_item_present(1));
+        assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
     fn action_entries_fire_on_the_press_edge_never_while_held() {
         let mut state = game();
         {
@@ -6791,6 +6973,8 @@ mod tests {
     #[test]
     fn picked_up_items_stay_taken() {
         let mut state = game();
+        // The new-game room-items bank has the bit set ("still here").
+        state.apply_flag(7, 23, 0);
         let item_operands = [
             3, 0, 0, 100, 100, 0x42, 1, 1, 0xFF, 50, 0, 50, 0, 23, 0x81, 0,
         ];
@@ -6802,8 +6986,8 @@ mod tests {
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.last_picked_item, Some(0x42));
         assert!(
-            state.flag_test(7, 23, false),
-            "a pickup must set its room-items flag"
+            !state.room_item_present(23),
+            "a pickup must clear its room-items flag"
         );
 
         // Re-running the init script must not bring the item back.
@@ -6822,6 +7006,7 @@ mod tests {
             ..RoomState::default()
         };
         let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
+        state.apply_flag(7, 22, 0);
         {
             let mut host = ScdGameHost::new(&mut state);
             assert_eq!(
@@ -7087,7 +7272,7 @@ mod tests {
             );
             assert_eq!(host.state().items.record(0).unwrap().flag, 0x80);
         }
-        // Clearing frees the record's sparkle handle (the pool free is slice 3).
+        // Clearing frees the record's sparkle handle and zeroes it.
         state.items.record_mut(0).unwrap().sparkle = 7;
         {
             let mut host = ScdGameHost::new(&mut state);
@@ -7160,6 +7345,401 @@ mod tests {
         assert!(state.item_palette_edits.is_empty());
     }
 
+    /// Install one single-frame `0x0B` sparkle sprite on `depth` with the
+    /// transform flag set, so a tick projects the spawn.
+    fn install_sparkle_sprite(state: &mut GameState, depth: u8) {
+        use crate::effects::fixtures::{block, sprite};
+        let mut raw = block(1, 0, 0);
+        raw[14..16].copy_from_slice(&0x0002u16.to_le_bytes());
+        let mut rows: [Vec<Vec<[u8; 24]>>; 8] = std::array::from_fn(|_| Vec::new());
+        rows[usize::from(depth & 7)] = vec![vec![raw]];
+        state
+            .weapon_effects
+            .sprites
+            .push(sprite(EFFECT_ITEM_SPARKLE, rows));
+    }
+
+    /// A room with one camera cut so `tick_effects` projects.
+    fn camera_room() -> RoomState {
+        use crate::state::Cut;
+        RoomState {
+            cuts: vec![Cut {
+                index: 0,
+                pos: [0, 0, 0],
+                look_at: [0, 0, 1000],
+                fov: 200,
+                ..Cut::default()
+            }],
+            ..RoomState::default()
+        }
+    }
+
+    #[test]
+    fn absolute_item_sparkle_anchors_on_the_item_matrix_with_the_bias() {
+        for (flags, bias) in [(0x8700u16, 0), (0x8710, -2), (0x8720, -4)] {
+            let mut state = item_game("1000", 1);
+            install_sparkle_sprite(&mut state, objects::sparkle_effect_id(flags));
+            let mut values = item_values(0x33, 0, 0xFF, [100, -200, 300]);
+            values[15] = i64::from(flags);
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                assert_eq!(
+                    host.on_item(op(0x18), &operands(&values)),
+                    StepResult::Continue
+                );
+            }
+            let record = *state.items.record(0).unwrap();
+            assert_ne!(record.sparkle, 0, "flags {flags:#06x} spawned no sparkle");
+            let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+            assert_eq!(effect.effect_type, EFFECT_ITEM_SPARKLE);
+            assert_eq!(effect.depth_group, objects::sparkle_effect_id(flags));
+            assert_eq!(effect.attach, effects::Attach::Item(0));
+            assert_eq!(effect.local_offset, [0, bias as i16, 0]);
+
+            // The tick lands the billboard on the item's own position plus
+            // the vertical bias (the Y rotation seed here is zero).
+            state.tick_effects(&camera_room());
+            let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+            for (axis, expected) in [100, -200 + bias as i16, 300].iter().enumerate() {
+                assert!(
+                    (i32::from(effect.pos[axis]) - i32::from(*expected)).abs() <= 1,
+                    "flags {flags:#06x} axis {axis}: {:?} is not {expected}",
+                    effect.pos
+                );
+            }
+            assert_eq!(effect.sprite_offset, [100, -200, 300]);
+        }
+    }
+
+    #[test]
+    fn parented_item_sparkle_lands_on_the_item() {
+        // The player parent: the sparkle resolves the item's composed frame,
+        // so it sits at the item's world position plus the vertical bias.
+        let mut state = item_game("1000", 1);
+        install_sparkle_sprite(&mut state, 0x13);
+        state.entities[0].pos = [1000, 0, 2000];
+        let mut values = item_values(0x29, 0, 0xFE, [50, 10, 20]);
+        values[15] = 0x8210; // effect nibble 0x200 -> 0x13, bias 1 -> -2
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+        }
+        let record = *state.items.record(0).unwrap();
+        let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+        assert_eq!(effect.attach, effects::Attach::Item(0));
+        assert_eq!(effect.local_offset, [0, -2, 0]);
+        let item_world = objects::item_world_transform(
+            &state.items,
+            &state.objects,
+            0,
+            state.entities[0].pos,
+            state.entities[0].angle,
+        );
+        state.tick_effects(&camera_room());
+        let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+        for (axis, expected) in [item_world.t[0], item_world.t[1] - 2, item_world.t[2]]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                (i32::from(effect.pos[axis]) - expected).abs() <= 1,
+                "player sparkle {:?} is not {expected} on axis {axis}",
+                effect.pos
+            );
+        }
+
+        // The omodel parent, even while its record is inactive (the original
+        // reads the matrix pointer regardless of the active flag).
+        let mut state = item_game("1000", 1);
+        install_sparkle_sprite(&mut state, 0x13);
+        state.objects.reset(1);
+        {
+            let parent = state.objects.record_mut(0).unwrap();
+            parent.flag = 0;
+            parent.pos = [500, 0, 600];
+        }
+        let mut values = item_values(0x37, 0, 0x00, [50, 10, 20]);
+        values[15] = 0x8210;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+        }
+        let record = *state.items.record(0).unwrap();
+        let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+        assert_eq!(effect.attach, effects::Attach::Item(0));
+        assert_eq!(effect.local_offset, [0, -2, 0]);
+        let item_world = objects::item_world_transform(
+            &state.items,
+            &state.objects,
+            0,
+            state.entities[0].pos,
+            state.entities[0].angle,
+        );
+        state.tick_effects(&camera_room());
+        let effect = *state.effects.slot(usize::from(record.sparkle)).unwrap();
+        for (axis, expected) in [item_world.t[0], item_world.t[1] - 2, item_world.t[2]]
+            .iter()
+            .enumerate()
+        {
+            assert!(
+                (i32::from(effect.pos[axis]) - expected).abs() <= 1,
+                "omodel sparkle {:?} is not {expected} on axis {axis}",
+                effect.pos
+            );
+        }
+    }
+
+    #[test]
+    fn sparkle_frees_on_model_flag_set_and_on_pickup() {
+        let mut state = item_game("1000", 1);
+        install_sparkle_sprite(&mut state, 0x1C);
+        let mut values = item_values(0x33, 0, 0xFF, [0, 0, 0]);
+        values[15] = 0x8700;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+        }
+        let record = *state.items.record(0).unwrap();
+        assert_ne!(record.sparkle, 0);
+        assert_eq!(state.effects.active_count(), 1);
+
+        // `model_flag_set` clearing the drawn byte frees the handle.
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_item(op(0x19), &operands(&[0, 0])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.items.record(0).unwrap().sparkle, 0);
+        assert_eq!(state.effects.active_count(), 0);
+        assert_eq!(
+            state.effects.free_slots(),
+            crate::effects::EFFECT_POOL_SIZE as u8
+        );
+
+        // A pickup also frees it and clears the room-items bit.
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+        }
+        assert_eq!(state.effects.active_count(), 1);
+        assert!(state.pick_up(0));
+        assert_eq!(state.items.record(0).unwrap().sparkle, 0);
+        assert_eq!(state.effects.active_count(), 0);
+        assert!(!state.room_item_present(1));
+        assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn include_key_prompts_unless_the_key_is_equipped() {
+        let mut state = item_game("1000", 1);
+        let mut action = item_action(0, 0x33, 1, [0, 0, 1, 1]);
+        action.handler = HANDLER_INCLUDE_KEY;
+        action.sce = HANDLER_INCLUDE_KEY;
+        state.room_actions[0] = Some(action);
+        assert!(state.run_room_action(0, HANDLER_INCLUDE_KEY));
+        assert_eq!(state.message.id, Some(MESSAGE_INCLUDE_KEY));
+        assert_eq!(state.message_item_slot, Some(0));
+        assert!(state.message.active);
+
+        // The equipped key is the action's item: the prompt is skipped.
+        let mut state = item_game("1000", 1);
+        state.room_actions[0] = Some(action);
+        state.set_equipped(Some(0x33));
+        assert!(!state.run_room_action(0, HANDLER_INCLUDE_KEY));
+        assert!(!state.message.active, "the prompt must be skipped");
+    }
+
+    #[test]
+    fn set_key_flag_keeps_the_immediate_award() {
+        let mut state = item_game("1000", 1);
+        state.room_actions[0] = Some(item_action(0, 0x42, 2, [0, 0, 1, 1]));
+        assert!(state.run_room_action(0, HANDLER_ITEM));
+        assert_eq!(
+            state.inventory,
+            vec![InventoryItem {
+                id: 0x42,
+                quantity: 2
+            }]
+        );
+        assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn flag_bank_set_maps_the_banks_and_limits_five_and_six() {
+        for (bank, bit) in [
+            (0u8, 5u8),
+            (1, 5),
+            (2, 5),
+            (3, 5),
+            (4, 5),
+            (7, 5),
+            (8, 0x82),
+            (9, 5),
+            // Banks 5/6 drop the selector's high three bits.
+            (5, 0x25),
+            (6, 0x25),
+        ] {
+            let mut state = item_game("1000", 1);
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                host.on_room_action(
+                    op(0x0D),
+                    &operands(&[
+                        0,
+                        0,
+                        0,
+                        1,
+                        1,
+                        i64::from(HANDLER_FLAG_BANK_SET),
+                        1,
+                        i64::from(bank),
+                        i64::from(bit),
+                        1,
+                    ]),
+                );
+            }
+            assert!(
+                state.run_room_action(0, HANDLER_FLAG_BANK_SET),
+                "bank {bank} bit {bit:#x}"
+            );
+            let sel = if bank == 5 || bank == 6 {
+                bit & 0x1F
+            } else {
+                bit
+            };
+            assert!(state.flags[usize::from(bank)].bit(sel));
+            if bank == 5 || bank == 6 {
+                assert!(
+                    !state.flags[usize::from(bank)].bit(bit),
+                    "bank {bank} reached past its first dword"
+                );
+            }
+
+            // A zero value clears the same bit.
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                host.on_room_action(
+                    op(0x0D),
+                    &operands(&[
+                        0,
+                        0,
+                        0,
+                        1,
+                        1,
+                        i64::from(HANDLER_FLAG_BANK_SET),
+                        1,
+                        i64::from(bank),
+                        i64::from(bit),
+                        0,
+                    ]),
+                );
+            }
+            assert!(state.run_room_action(0, HANDLER_FLAG_BANK_SET));
+            assert!(!state.flags[usize::from(bank)].bit(sel));
+        }
+
+        // The default arm folds unknown banks onto the item-use bank.
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_room_action(
+                op(0x0D),
+                &operands(&[0, 0, 0, 1, 1, i64::from(HANDLER_FLAG_BANK_SET), 1, 12, 3, 1]),
+            );
+        }
+        assert!(state.run_room_action(0, HANDLER_FLAG_BANK_SET));
+        assert!(state.flags[usize::from(BANK_ITEM_USE)].bit(3));
+    }
+
+    #[test]
+    fn document_handler_awards_and_raises_the_file_bit() {
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x60, 0, 0xFF, [1, 2, 3])));
+        }
+        assert_eq!(state.room_actions[0].unwrap().handler, HANDLER_DOCUMENT);
+        assert!(state.run_room_action(0, HANDLER_DOCUMENT));
+        assert!(state.has_item(0x60));
+        assert!(state.file_collected(1), "the FILE bit is raised");
+        assert_eq!(state.items.record(0).unwrap().flag, 0, "the model clears");
+        assert!(state.room_actions[0].is_none());
+        assert_eq!(
+            state.last_interaction.map(|interaction| interaction.kind),
+            Some(RoomActionKind::Item),
+            "the reach-animation return is recorded as the interaction"
+        );
+    }
+
+    #[test]
+    fn map_handler_raises_the_room_flag_and_never_awards() {
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x50, 0, 0xFF, [1, 2, 3])));
+        }
+        assert_eq!(state.room_actions[0].unwrap().handler, HANDLER_PICKUP_KEY);
+        assert!(state.run_room_action(0, HANDLER_PICKUP_KEY));
+        assert!(
+            state.inventory.is_empty(),
+            "a map never enters the inventory"
+        );
+        assert!(
+            state.flags[usize::from(BANK_ROOM_FLAGS)].bit(ROOM_FLAG_MAP_BASE + 2),
+            "the courtyard map's owned bit is raised"
+        );
+        assert!(!state.room_item_present(1));
+        assert_eq!(state.items.record(0).unwrap().flag, 0);
+        assert_eq!(state.last_picked_item, Some(0x50));
+        assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn the_room_items_polarity_matches_new_game() {
+        let mut state = item_game("1000", 1);
+        // The shipped new-game bank is all-set ("item still here").
+        state.flags[7].bytes_mut().fill(0xFF);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x33, 0, 0xFF, [1, 2, 3])));
+        }
+        assert!(
+            state.room_actions[0].is_some(),
+            "a new-game bit registers the action"
+        );
+        assert_eq!(state.items.record(0).unwrap().flag, 1);
+
+        // The pickup clears the bit.
+        assert!(state.pick_up(0));
+        assert!(!state.room_item_present(1));
+        assert!(!state.flag_test(7, 1, false));
+
+        // `0xFF` is a real selector, not a sentinel (two shipped builds use
+        // it): the all-set bank marks it present and clearing it takes.
+        assert!(state.room_item_present(0xFF));
+        state.mark_item_taken(0xFF);
+        assert!(!state.room_item_present(0xFF));
+
+        // A reload keeps it cleared: flags survive a room entry.
+        let room = RoomState {
+            item_count: 1,
+            ..RoomState::default()
+        };
+        state.enter_room(RoomId::parse("1010").unwrap(), &room);
+        assert!(!state.room_item_present(1), "the clear survived the reload");
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x33, 0, 0xFF, [1, 2, 3])));
+        }
+        assert!(
+            state.room_actions[0].is_none(),
+            "a taken item does not come back"
+        );
+        assert_eq!(state.items.record(0).unwrap().flag, 0);
+    }
+
     #[test]
     fn item_pickup_stacks_and_consumes_the_action() {
         let mut state = game();
@@ -7215,6 +7795,7 @@ mod tests {
             handler: HANDLER_ITEMBOX,
             flags: 0x81,
             params: [0; 8],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         state.interact([-550, 0, 50], 0, true);
@@ -7240,6 +7821,7 @@ mod tests {
             handler: HANDLER_MESSAGE,
             flags: 0x81,
             params: [HANDLER_MESSAGE, 0x81, 170, 0, 79, 0, 0, 0],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         state.interact([-550, 0, 50], 0, true);
@@ -7487,6 +8069,7 @@ mod tests {
     #[test]
     fn give_item_runs_the_action_and_stops() {
         let mut state = game();
+        state.apply_flag(7, 23, 0);
         {
             let mut host = ScdGameHost::new(&mut state);
             host.on_item(
@@ -8128,11 +8711,15 @@ mod tests {
         let mut action = item_action(0, 0x42, 2, [0, 0, 100, 100]);
         action.room_items_flag = 7;
         state.room_actions[0] = Some(action);
+        state.apply_flag(7, 7, 0);
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.last_picked_item, Some(0x42));
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0x42);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 1);
-        assert!(state.flag_test(7, 7, false));
+        assert!(
+            !state.room_item_present(7),
+            "the pickup clears the room-items bit"
+        );
     }
 
     #[test]
@@ -8472,6 +9059,7 @@ mod tests {
             handler: HANDLER_MESSAGE,
             flags: 0x04,
             params: [2, 0, 7, 0, 0, 0, 0, 0],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         let mut player = push_player();
@@ -8496,6 +9084,7 @@ mod tests {
             handler: HANDLER_MESSAGE,
             flags: 0x04,
             params: [2, 0, 7, 0, 0, 0, 0, 0],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         let player = push_player();
@@ -8593,6 +9182,7 @@ mod tests {
             handler: HANDLER_ITEMBOX,
             flags: 0x01,
             params: [HANDLER_ITEMBOX, 0x01, 0, 0, 0, 0, 0, 0],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         // params word 1 (entry +4) is the lid slot: bytes 4/5.
@@ -8651,6 +9241,7 @@ mod tests {
             handler: HANDLER_ITEMBOX,
             flags: 0x01,
             params: [0; 8],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         assert!(state.open_itembox(0));

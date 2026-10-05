@@ -738,17 +738,17 @@ pub fn item_rotation(item: &ItemRecord) -> [[i32; 3]; 3] {
     )
 }
 
-/// The composed world matrix of item `index`.
+/// The composed world matrix of item `index`, without the shading context the
+/// render pass carries.
 ///
 /// Parent selectors (no `0x80` split): `0xFF` absolute, its own rotation and
 /// position; `0xFE` the player, the entity matrix composed with the item's
 /// local matrix; anything else an omodel index, [`rebuild`] of that record
 /// composed with the local matrix. A missing parent record falls back to the
 /// item's local matrix.
-pub fn item_world_matrix(
+pub fn item_world_transform(
     items: &ItemTable,
     objects: &ObjectTable,
-    lighting: &Lighting,
     index: usize,
     player_pos: [i32; 3],
     player_angle: u16,
@@ -767,10 +767,52 @@ pub fn item_world_matrix(
         0xFF => local,
         0xFE => anim::compose(&anim::entity_matrix(player_pos, player_angle), &local),
         parent => match objects.record(usize::from(parent)) {
-            Some(parent) => anim::compose(&rebuild(parent, lighting), &local),
+            // `rebuild` is lighting-independent, so no `Lighting` is needed.
+            Some(parent) => {
+                let parent = Mat4x3 {
+                    r: rotation(parent),
+                    t: parent.pos,
+                };
+                anim::compose(&parent, &local)
+            }
             None => local,
         },
     }
+}
+
+/// The composed world matrix of item `index` for the render pass, which keeps
+/// the lighting context for symmetry with the object pass.
+pub fn item_world_matrix(
+    items: &ItemTable,
+    objects: &ObjectTable,
+    lighting: &Lighting,
+    index: usize,
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Mat4x3 {
+    let _ = lighting;
+    item_world_transform(items, objects, index, player_pos, player_angle)
+}
+
+/// The sparkle billboard's depth (the effect id) selected by an
+/// `item_aot_set` flags word: bits `0x0F00` pick the animation row.
+pub fn sparkle_effect_id(flags: u16) -> u8 {
+    match flags & 0x0F00 {
+        0x000 => 0x03,
+        0x100 => 0x14,
+        0x200 => 0x13,
+        0x300 => 0x1B,
+        0x400 => 0x04,
+        0x500 => 0x0C,
+        0x700 => 0x1C,
+        _ => 0x14,
+    }
+}
+
+/// The sparkle's vertical bias from an `item_aot_set` flags word: bits
+/// `0x00F0` count units of `-2` (the shipped data uses 0/-2/-4).
+pub fn sparkle_bias(flags: u16) -> i32 {
+    -2 * i32::from((flags & 0x00F0) >> 4)
 }
 
 /// Player SCA height for the 422-unit body radius (Chris, 0x05FA).
@@ -1911,5 +1953,38 @@ mod tests {
         items.record_mut(0).unwrap().parent = 0x09;
         let world = item_world_matrix(&items, &objects, &lighting, 0, [0, 0, 0], 0);
         assert_eq!(world.t, [50, 0, 0]);
+    }
+
+    #[test]
+    fn sparkle_effect_ids_cover_every_nibble() {
+        for (flags, effect) in [
+            (0x0000u16, 0x03u8),
+            (0x0100, 0x14),
+            (0x0200, 0x13),
+            (0x0300, 0x1B),
+            (0x0400, 0x04),
+            (0x0500, 0x0C),
+            (0x0600, 0x14),
+            (0x0700, 0x1C),
+            (0x0800, 0x14),
+            (0x0F00, 0x14),
+        ] {
+            assert_eq!(
+                sparkle_effect_id(flags | 0x8000),
+                effect,
+                "flags {flags:#06x}"
+            );
+        }
+        // The low flag bits and the parent do not affect the effect id.
+        assert_eq!(sparkle_effect_id(0x8711), 0x1C);
+    }
+
+    #[test]
+    fn sparkle_bias_is_minus_two_per_nibble_unit() {
+        assert_eq!(sparkle_bias(0x8700), 0);
+        assert_eq!(sparkle_bias(0x8710), -2);
+        assert_eq!(sparkle_bias(0x8720), -4);
+        assert_eq!(sparkle_bias(0x87F0), -30);
+        assert_eq!(sparkle_bias(0x800F), 0, "the low nibble is not the bias");
     }
 }

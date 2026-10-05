@@ -6652,6 +6652,7 @@ mod tests {
             sce: 4,
             handler: 4,
             flags: 0x81,
+            item_data: None,
             room_items_flag: 0xFF,
             params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
         });
@@ -6950,6 +6951,7 @@ mod tests {
             sce: 4,
             handler: 4,
             flags: 0x81,
+            item_data: None,
             room_items_flag: 0xFF,
             params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
         });
@@ -7015,6 +7017,7 @@ mod tests {
             handler: 8,
             flags: 0x41,
             params: [0; 8],
+            item_data: None,
             room_items_flag: 0xFF,
         });
         // The handler arms the lid; the ramp settles before the UI opens.

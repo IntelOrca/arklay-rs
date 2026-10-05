@@ -91,6 +91,11 @@ impl EffectBlock {
 /// `parent - 2`) and `>= 0x80` an object model `parent & 0x7F`. An object
 /// model resolves to its composed rotation and world position; a missing or
 /// inactive object falls back to the identity transform.
+///
+/// [`Self::Item`] is the item-model equivalent ([`Self::from_parent`] cannot
+/// produce it): a pick-up sparkle attaches to the item's own composed
+/// transform, so it rides the item's parent chain too; a missing item record
+/// falls back to identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Attach {
     /// Identity transform (parent 0).
@@ -102,6 +107,8 @@ pub enum Attach {
     Entity(u8),
     /// An object model (parent `>= 0x80`, id `parent & 0x7F`).
     Omodel(u8),
+    /// An item record's own composed transform (item-model index).
+    Item(u8),
 }
 
 impl Attach {

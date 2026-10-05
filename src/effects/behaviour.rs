@@ -309,6 +309,18 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
             );
             return std::array::from_fn(|slot| world.r[slot / 3][slot % 3] as i16);
         }
+        Attach::Item(index) => {
+            // The item is not an entity; its composed world transform is the
+            // attach frame. A missing record falls back to identity.
+            let world = crate::objects::item_world_transform(
+                &game.items,
+                &game.objects,
+                usize::from(index),
+                game.entities[0].pos,
+                game.entities[0].angle,
+            );
+            return std::array::from_fn(|slot| world.r[slot / 3][slot % 3] as i16);
+        }
         Attach::Player => &game.entities[0],
         Attach::Entity(slot) => match game.entities.get(usize::from(slot)) {
             Some(entity) => entity,
@@ -339,6 +351,16 @@ fn attach_translation(game: &GameState, attach: Attach) -> [i32; 3] {
                 return [0, 0, 0];
             }
             crate::objects::world_matrix(
+                &game.objects,
+                usize::from(index),
+                game.entities[0].pos,
+                game.entities[0].angle,
+            )
+            .t
+        }
+        Attach::Item(index) => {
+            crate::objects::item_world_transform(
+                &game.items,
                 &game.objects,
                 usize::from(index),
                 game.entities[0].pos,
