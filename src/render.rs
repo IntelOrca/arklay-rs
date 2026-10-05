@@ -422,6 +422,11 @@ impl Framebuffer {
     /// are farther behind and paint first), so equal-depth sprites keep their
     /// submission order, exactly like the original's pending-sprite queue.
     pub fn draw_sprites(&mut self, sprites: &mut [SpriteDraw<'_>]) {
+        // TODO(parity): (visual) the original blends: the pending text shadow
+        // is semi-transparent black with alpha = brightness*255/30, and sprite
+        // descriptors carry a blend level (often 0.5) plus U/V mirror flags.
+        // `SpriteDraw` has no alpha and no mirror, so every queued sprite
+        // overwrites its destination.
         sprites.sort_by_key(|sprite| std::cmp::Reverse(sprite.depth));
         for sprite in sprites.iter() {
             match sprite.source {
@@ -521,9 +526,9 @@ impl Framebuffer {
     /// Draw a TMD mesh full-bright, without lighting or backface culling.
     ///
     /// This is the door animation's path: panels are drawn over black with the
-    /// door texture's single 256-colour CLUT row and direct (unpaged) UVs, and
-    /// the original's TMD renderer runs with culling disabled. Triangles are
-    /// painter-sorted back-to-front exactly like [`Framebuffer::draw_model`].
+    /// door texture's single 256-colour CLUT row and direct (unpaged) UVs.
+    /// Triangles are painter-sorted back-to-front exactly like
+    /// [`Framebuffer::draw_model`].
     pub fn draw_model_unlit(
         &mut self,
         mesh: &Tmd,
@@ -531,6 +536,9 @@ impl Framebuffer {
         joints: &[anim::Mat4x3],
         camera: &Camera,
     ) {
+        // TODO(parity): (visual) `cull` is false here and in the `.ivm` path,
+        // but the original backface-culls every TMD packet, doors and item
+        // meshes included; a panel that faces away still paints here.
         self.draw_objects_unlit(mesh.objects.iter().zip(joints), texture, camera);
     }
 
@@ -1012,6 +1020,10 @@ pub fn draw_gameplay_scene(
 ) {
     framebuffer.clear();
     if let Some(background) = background {
+        // TODO(parity): (visual) the original draws the cut as the display
+        // image through the pending-sprite queue, shifted by the display origin
+        // (screen panning) and multiplied by the global colour; this blit is
+        // 1:1 and untinted.
         framebuffer.blit(background);
     }
 
@@ -1106,6 +1118,10 @@ fn collect_shadow(shadow: &Shadow<'_>, camera: &Camera, items: &mut Vec<SceneIte
     ];
     let view: [[i32; 3]; 4] = local.map(|corner| camera.view_position(fixed_mul(&entity, corner)));
 
+    // TODO(parity): (visual) the original's drawn key is the integer mean
+    // (truncating `/ 4`) of the four unclipped corner view Zs, quantised to an
+    // ordering-table bucket; this f64 mean rounds to the nearest unit, which
+    // can flip a shadow's order against a mask or triangle it ties with.
     let mean_depth =
         view.iter().map(|vertex| f64::from(vertex[2])).sum::<f64>() / view.len() as f64;
 
@@ -1193,6 +1209,11 @@ impl Camera {
     /// cut camera: the same from/look-at construction the original's
     /// `MatrixToCamera` performs, with the scene's focal length in pixels.
     pub fn from_points(from: [i32; 3], to: [i32; 3], fov: i32) -> Self {
+        // TODO(parity): (visual) the original camera is a 4.12 fixed-point
+        // matrix projected with truncating integer math (`(vx*f)/vz + 160`),
+        // applies the cut's roll and the subpixel screen-shake offset; this
+        // f64, round-to-nearest camera ignores roll and shake, so projected
+        // pixels can differ by a unit and shake is absent.
         let from = [f64::from(from[0]), f64::from(from[1]), f64::from(from[2])];
         let to = [f64::from(to[0]), f64::from(to[1]), f64::from(to[2])];
         let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
@@ -1421,6 +1442,9 @@ fn collect_triangles(
         let normal0 = normals.get(usize::from(prim.normals[0])).copied().flatten();
         let normal1 = normals.get(usize::from(prim.normals[1])).copied().flatten();
         let normal2 = normals.get(usize::from(prim.normals[2])).copied().flatten();
+        // TODO(parity): (visual) a corner whose stored normal is zero length is
+        // dropped here; the original substitutes the primitive's first vertex
+        // normal for it (flat shading) and still draws the packet.
         if lighting.is_some() && (normal0.is_none() || normal1.is_none() || normal2.is_none()) {
             continue;
         }
@@ -1445,6 +1469,12 @@ fn collect_triangles(
         let depth1 = f64::from(camera.view_position(*vertex1)[2]);
         let depth2 = f64::from(camera.view_position(*vertex2)[2]);
 
+        // TODO(parity): (visual) `clut`/`tsb` are read only for the texture page
+        // and palette row: the original also blends a primitive whose CLUT
+        // carries the ABE bit (background/source halves, or a per-texel STP
+        // knockout for palettes with STP entries) and marks some transparent
+        // TMDs unlit. This port writes every triangle opaque, and the TIM
+        // decoder drops the STP bit.
         let (page_x, page_y, palette_row) = match lighting {
             Some(_) => (
                 f64::from(u32::from(prim.tsb & 0xF) * 128),
@@ -1514,10 +1544,17 @@ fn collect_ivm_triangles(
         } else {
             &[0, 1, 2]
         };
+        // TODO(parity): (visual) an untextured gouraud primitive is painted
+        // with one packet colour; the original interpolates the packet's three
+        // per-vertex colours across the triangle.
         let flat = match prim.kind {
             crate::ivm::IvmPrimKind::Gouraud => Some(prim.color),
             _ => None,
         };
+        // TODO(parity): (visual) the original drops the WHOLE packet when any
+        // one of its 3/4 corners is inside the near plane; splitting a quad
+        // here tests each half separately, so one clipped corner still draws
+        // half the quad.
         for corners in order.as_chunks::<3>().0 {
             let (i0, i1, i2) = (corners[0], corners[1], corners[2]);
             let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
@@ -1675,6 +1712,12 @@ fn normalize(vector: [i32; 3]) -> Option<[f64; 3]> {
 
 /// Shade one vertex: ambient plus the room lights, clamped to 0..255.
 fn shade_vertex(normal: &Option<[f64; 3]>, world: [i32; 3], lighting: &Lighting) -> [f64; 3] {
+    // TODO(parity): (visual) the original latches the room lights once per
+    // entity from that entity's own position, measures point-light falloff from
+    // X and Z only, truncates the attenuated colour to a byte capped at 0x80
+    // per channel, and truncates the 12-bit ambient to 8 bits. This shader
+    // evaluates the lights in world space per vertex with the full 3D distance
+    // and unclamped float colour, so an entity's shade drifts from the original.
     let mut shade = lighting
         .ambient
         .map(|channel| f64::from(channel) / AMBIENT_DIVISOR);

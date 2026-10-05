@@ -323,6 +323,10 @@ impl AnimPlayer {
     /// (keyframe and timing) comes from the end of the clip while the counter
     /// still runs forwards.
     pub fn update(&mut self, clips: &[model::Clip]) -> bool {
+        // TODO(parity): (visual) a clip change snaps: the original eases into a
+        // new or reversed clip by blending the previous pose with the incoming
+        // keyframe over `blend_counter` steps (every joint rotation and the
+        // root Y translation); this port applies the keyframe immediately.
         if self.timing > 1 {
             self.timing -= 1;
             return false;

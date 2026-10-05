@@ -39,14 +39,19 @@ const BREATHE_CLIP: usize = 1;
 const WALK_CLIP: usize = 2;
 /// EMW clip 3: the forward run.
 const RUN_CLIP: usize = 3;
+// TODO(parity): (gameplay) the original falls back to EMD clip 2 for the
+// backward walk while an enemy is in view; this engine has no enemy-visibility
+// test, so the fallback is never selected.
 /// EMD clip 3: the backward run. The original plays it from the body model,
-/// not the no-weapon EMW, and only falls back to EMD clip 2 while an enemy is
-/// in view (this engine has no enemy visibility test yet).
+/// not the no-weapon EMW.
 const BACK_CLIP: usize = 3;
 
 /// Ticks the settle pose is held before the breathe transition begins.
 const IDLE_SETTLE_TICKS: u32 = 100;
 
+// TODO(parity): (gameplay) while the original's slow-motion flag is set the
+// walk and run speeds are halved and a locomotion frame is applied only every
+// other tick; this engine always runs at full speed and cadence.
 /// Walk speed before the per-character footfall modulation.
 const WALK_SPEED: i32 = 0x5D;
 /// Backward walk speed.

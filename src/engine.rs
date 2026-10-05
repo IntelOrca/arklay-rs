@@ -3456,6 +3456,11 @@ fn render_frame(
         })
     });
 
+    // TODO(parity): (visual) the original gates each joint on the entity's
+    // per-joint flags (0x74 members must lie inside the camera's switch zone, a
+    // couple of animation phases draw only those members, and 0x20/0x4 route to
+    // the path-trail/severed-limb steps); this engine poses and draws every
+    // joint unconditionally.
     let player_joints = assets.and_then(|assets| {
         let (keyframes, clips) = match player_state.clip_source {
             player::ClipSource::Emd => (&assets.emd.keyframes, &assets.emd.clips),
@@ -3492,6 +3497,10 @@ fn render_frame(
         npc_joints.push(joints);
     }
 
+    // TODO(parity): (visual) the original applies each object's runtime colour
+    // scale and background blend weight (scripted model tints, the death-wound
+    // tint, semi-transparent records); `EntityMesh` carries neither, so every
+    // character draws untinted and opaque.
     let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(1 + models.len());
     for (model, joints) in models.iter().zip(&npc_joints) {
         meshes.push(EntityMesh {

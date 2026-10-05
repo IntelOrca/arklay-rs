@@ -124,6 +124,10 @@ fn decode_prim(
 ) -> Result<TmdPrim> {
     let word = |slot: usize| u32::from_le_bytes(packet[slot * 4..slot * 4 + 4].try_into().unwrap());
     let command = word(0);
+    // TODO(parity): (gameplay) the original's TMD path also accepts the other
+    // packet types (flat-textured, flat/gouraud untextured, quads); this parser
+    // fails the whole model on ANY other command, so such an EMD/EMW does not
+    // load at all instead of drawing.
     if command != GOURAUD_TEXTURED_TRIANGLE {
         bail!(
             "unsupported TMD primitive command 0x{command:08X}; only 0x{GOURAUD_TEXTURED_TRIANGLE:08X} is supported"
