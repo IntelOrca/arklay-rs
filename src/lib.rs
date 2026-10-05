@@ -2,8 +2,10 @@
 
 pub mod anim;
 pub mod audio;
+pub mod avi;
 pub mod bgm;
 pub mod bmp;
+pub mod cinepak;
 pub mod convert;
 pub mod door;
 pub mod effects;
