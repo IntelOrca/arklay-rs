@@ -171,6 +171,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
     if let Some(capture_path) = capture {
         let mut loaded = load_room(&pack, id)?;
         let mut game = new_game_state(&pack, id, &loaded.room);
+        seed_room_items(&mut game);
         let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         run_room_init(&mut loaded, &mut game);
@@ -534,10 +535,12 @@ impl GameSession {
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
-    /// Boot `id` directly, the `--room` path.
+    /// Boot `id` directly, the `--room` path. A direct boot is a fresh game
+    /// state, so the shipped room-items bank is seeded like a new game's.
     fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Self> {
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
+        seed_room_items(&mut game);
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
@@ -1284,6 +1287,16 @@ impl GameSession {
     }
 }
 
+/// Apply the shipped new-game room-items bank: bit set = the item is still in
+/// its room. Every boot that is not loading a save starts from this pattern,
+/// so a directly booted room's `item_aot_set` sites register instead of
+/// reading as already taken.
+fn seed_room_items(game: &mut game::GameState) {
+    game.flags[7]
+        .bytes_mut()
+        .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+}
+
 /// Apply the shipped new-game state: health, room-item flags, save counter
 /// and starting inventory (knife, spray, and Jill's Beretta with 15 rounds).
 fn seed_new_game(game: &mut game::GameState, character: u8) {
@@ -1292,9 +1305,7 @@ fn seed_new_game(game: &mut game::GameState, character: u8) {
     game.max_health = game::character_max_health(character);
     // `set_health_status` also mirrors the byte the scripts read with `cmpb 50`.
     game.set_health_status(0x10);
-    game.flags[7]
-        .bytes_mut()
-        .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    seed_room_items(game);
     // The three carried room-pickup quantities SetInitialItems seeds
     // (BioCard 0x20C..0x20E): ROOM1160's shotgun shells and the two
     // flamethrower rooms' fuel.
@@ -2574,6 +2585,7 @@ pub fn simulate_room_with_input(
 ) -> Result<SimulatedRoom> {
     let loaded = load_room(pack, id)?;
     let mut game = new_game_state(pack, id, &loaded.room);
+    seed_room_items(&mut game);
     let player_state = player::spawn(id, &loaded.room);
     game.sync_entity_from_player(&player_state);
     simulate_loaded(pack, loaded, game, player_state, ticks, input)
@@ -2591,6 +2603,7 @@ pub fn simulate_room_seeded(
 ) -> Result<SimulatedRoom> {
     let loaded = load_room(pack, id)?;
     let mut game = new_game_state(pack, id, &loaded.room);
+    seed_room_items(&mut game);
     for &(bank, bit) in flags {
         game.apply_flag(bank, bit, 0);
     }

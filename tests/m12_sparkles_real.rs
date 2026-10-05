@@ -9,7 +9,7 @@ mod common;
 
 use arklay::effects;
 use arklay::engine::{NEW_GAME_ROOM_ITEMS, SimulatedRoom, render_game_frame, simulate_room_seeded};
-use arklay::game::{GameState, RoomActionKind, ScdGameHost};
+use arklay::game::{FlagBank, GameState, RoomActionKind, ScdGameHost};
 use arklay::objects;
 use arklay::pack::Pack;
 use arklay::player;
@@ -37,10 +37,16 @@ fn assets() -> Option<Pack> {
     Some(Pack::open(&pack_path).unwrap())
 }
 
-/// The new-game room-items bank (every item bit set) plus the
+/// The selectors set in the shipped new-game room-items bank plus the
 /// second-playthrough flag, as `set` operations for `simulate_room_seeded`.
+/// The pattern clears selectors 1 and 172.
 fn seeded_flags(extra: &[(u8, u8)]) -> Vec<(u8, u8)> {
-    let mut flags: Vec<(u8, u8)> = (0..=255u16).map(|bit| (7, bit as u8)).collect();
+    let mut bank = FlagBank::new();
+    bank.bytes_mut().copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    let mut flags: Vec<(u8, u8)> = (0..=255u16)
+        .filter(|bit| bank.bit(*bit as u8))
+        .map(|bit| (7, bit as u8))
+        .collect();
     flags.push((0, 0x7B));
     flags.extend_from_slice(extra);
     flags
@@ -204,7 +210,7 @@ fn room_513_parented_sparkle_tracks_omodel_6() {
     assert_eq!(effect.effect_type, 0x0B);
     assert_eq!(effect.depth_group, 0x0C, "the 0x500 nibble is effect 0x0C");
     assert_eq!(effect.attach, effects::Attach::Item(model as u8));
-    assert_eq!(effect.local_offset, [0, -2, 0], "bias nibble 1 is -2");
+    assert_eq!(effect.local_offset, [0, -32, 0], "bias byte 0x10 is -32");
 
     sim.game.tick_effects(&sim.room);
     let before = sim.game.effects.slot(handle).unwrap().pos;
@@ -219,6 +225,51 @@ fn room_513_parented_sparkle_tracks_omodel_6() {
         "the sparkle did not track omodel 6"
     );
     assert_eq!(after[1], before[1], "the vertical bias is unchanged");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn shipped_sparkle_variety_rooms_pick_their_effect_and_bias() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    // One room per shipped `0x0F00` nibble (plus the two nonzero bias bytes):
+    // the room declares the site, the test reads the spawned billboard back.
+    let cases: [(&str, &[(u8, u8)], u8, u8, i16); 5] = [
+        ("1000", &[], 0x33, 0x1C, 0),
+        ("4091", &[], 0x13, 0x04, -32),
+        ("40F0", &[], 0x3D, 0x14, 0),
+        ("2100", &[], 0x2C, 0x03, -64),
+        // The lab key's build is gated on ScenarioFlags2 bit 0xC0.
+        ("5130", &[(1, 0xC0)], 0x37, 0x0C, -32),
+    ];
+    for (room, extra, item, effect_id, bias) in cases {
+        let sim = simulate_room_seeded(
+            &pack,
+            RoomId::parse(room).unwrap(),
+            &seeded_flags(extra),
+            0,
+            player::Input::default(),
+        )
+        .unwrap_or_else(|error| panic!("ROOM{room} loads: {error:#}"));
+        let (_, model) = item_action(&sim.game, item)
+            .unwrap_or_else(|| panic!("ROOM{room} item {item:#04x} registers"));
+        let record = sim.game.items.record(model).expect("the item record");
+        let sparkle = *sim
+            .game
+            .effects
+            .slot(usize::from(record.sparkle))
+            .unwrap_or_else(|| panic!("ROOM{room} spawned no sparkle"));
+        assert_eq!(
+            sparkle.depth_group, effect_id,
+            "ROOM{room} item {item:#04x} effect id"
+        );
+        assert_eq!(
+            sparkle.local_offset,
+            [0, bias, 0],
+            "ROOM{room} item {item:#04x} bias"
+        );
+    }
 }
 
 #[test]

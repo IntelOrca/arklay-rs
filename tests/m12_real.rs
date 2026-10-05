@@ -11,8 +11,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::Command;
 
-use arklay::engine::{SimulatedRoom, render_game_frame, simulate_room, simulate_room_seeded};
-use arklay::game::{GameState, RoomAction, RoomActionKind};
+use arklay::engine::{
+    NEW_GAME_ROOM_ITEMS, SimulatedRoom, render_game_frame, simulate_room, simulate_room_seeded,
+};
+use arklay::game::{FlagBank, GameState, RoomAction, RoomActionKind};
 use arklay::message::MessageWindow;
 use arklay::pack::Pack;
 use arklay::player;
@@ -24,10 +26,22 @@ fn assets() -> Option<Pack> {
     Some(Pack::open(&pack_path).unwrap())
 }
 
-/// The new-game room-items bank (every item bit set) plus the second
-/// playthrough flag, so no item build is conditionally skipped.
+/// The selectors set in the shipped new-game room-items bank, decoded through
+/// the same [`FlagBank`] the game uses. The pattern clears selectors 1 and
+/// 172, so a fixture that needs those adds them explicitly.
+fn new_game_room_item_bits() -> Vec<(u8, u8)> {
+    let mut bank = FlagBank::new();
+    bank.bytes_mut().copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    (0..=255u16)
+        .filter(|bit| bank.bit(*bit as u8))
+        .map(|bit| (7, bit as u8))
+        .collect()
+}
+
+/// The shipped room-items bank plus the second playthrough flag, so no item
+/// build is conditionally skipped.
 fn seeded_flags(extra: &[(u8, u8)]) -> Vec<(u8, u8)> {
-    let mut flags: Vec<(u8, u8)> = (0..=255u16).map(|bit| (7, bit as u8)).collect();
+    let mut flags = new_game_room_item_bits();
     flags.push((0, 0x7B));
     flags.extend_from_slice(extra);
     flags
@@ -407,9 +421,13 @@ fn corpus_desks_run_the_full_flow_and_items_stay_in_bounds() {
         desk_rooms.len()
     );
     assert!(simulated > 300, "only {simulated} rooms simulated");
-    assert!(
-        item_rooms > 200,
-        "only {item_rooms} room variants built items"
+    assert_eq!(
+        item_rooms, 226,
+        "the shipped seed must build items in 226 room variants"
+    );
+    assert_eq!(
+        built_items, 519,
+        "the shipped seed must build all 519 item declarations"
     );
     assert_eq!(
         hidden_items, 4,
@@ -458,11 +476,52 @@ fn real_room_401_ticks_captures_are_deterministic() {
     let pack = Pack::open(&pack_path).unwrap();
     let id = RoomId::parse("4010").unwrap();
     let captured = arklay::bmp::decode(&first).unwrap();
-    let sim = simulate_room(&pack, id, 30, player::Input::default()).unwrap();
+    let mut sim = simulate_room(&pack, id, 30, player::Input::default()).unwrap();
     assert_eq!(
         captured.rgba, sim.frame.rgba,
         "CLI capture != simulated frame"
     );
+
+    // The direct boot seeds the shipped room-items bank, so ROOM4010's three
+    // declarations all build instead of reading as taken. Without this the
+    // capture above would compare two item-less frames. The key's edge is
+    // re-armed inert by the init `room_action_arm`, so two actions register.
+    assert_eq!(sim.game.items.built, 3, "ROOM4010 builds its three items");
+    let registered = sim
+        .game
+        .room_actions
+        .iter()
+        .flatten()
+        .filter(|action| action.kind == RoomActionKind::Item)
+        .count();
+    assert_eq!(registered, 2, "the book and the drawer edge register");
+    assert!(
+        sim.game.items.records.iter().any(|record| record.active()),
+        "at least one item model is drawn"
+    );
+
+    // Some cut frames the live items, and hiding them changes the pixels.
+    let mut painted = 0usize;
+    for cut in 0..sim.room.cuts.len() {
+        sim.room.current_cut = cut;
+        let shown = render_game_frame(&pack, id, &sim.room, &sim.game, &sim.player).unwrap();
+        let mut hidden = sim.game.clone();
+        for record in &mut hidden.items.records {
+            record.flag = 0;
+        }
+        let blank = render_game_frame(&pack, id, &sim.room, &hidden, &sim.player).unwrap();
+        painted = painted.max(
+            shown
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(blank.rgba.as_chunks::<4>().0)
+                .filter(|(shown, blank)| shown != blank)
+                .count(),
+        );
+    }
+    assert!(painted > 0, "the item models painted no pixels in any cut");
 }
 
 #[test]

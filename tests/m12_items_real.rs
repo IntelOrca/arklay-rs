@@ -7,11 +7,14 @@
 
 mod common;
 
-use arklay::engine::{SimulatedRoom, render_game_frame, simulate_new_game, simulate_room_seeded};
-use arklay::game::{GameState, RoomAction, RoomActionKind};
+use arklay::engine::{
+    NEW_GAME_ROOM_ITEMS, SimulatedRoom, render_game_frame, simulate_new_game, simulate_room_seeded,
+};
+use arklay::game::{FlagBank, GameState, RoomAction, RoomActionKind};
 use arklay::objects;
 use arklay::pack::Pack;
 use arklay::player;
+use arklay::rdt;
 use arklay::render::Lighting;
 use arklay::state::RoomId;
 
@@ -34,11 +37,17 @@ fn item_record<'a>(game: &'a GameState, action: &RoomAction) -> Option<&'a objec
     game.items.record(usize::from(action.item_model()))
 }
 
-/// The new-game room-items bank shape ("every bit still here") as `set`
-/// operations, so a real room's `item_aot_set` sites register. The test
-/// fixtures boot a room directly and have no save block to seed from.
+/// The selectors set in the shipped new-game room-items bank ("bit still
+/// here") as `set` operations, decoded through the same [`FlagBank`] the game
+/// uses. The pattern clears selectors 1 and 172, so a fixture that needs one
+/// adds it explicitly.
 fn new_game_shape() -> Vec<(u8, u8)> {
-    (0..=255u16).map(|bit| (7, bit as u8)).collect()
+    let mut bank = FlagBank::new();
+    bank.bytes_mut().copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    (0..=255u16)
+        .filter(|bit| bank.bit(*bit as u8))
+        .map(|bit| (7, bit as u8))
+        .collect()
 }
 
 /// Boot `room` with the room-items bank set, plus any extra flag bits, and run
@@ -168,23 +177,24 @@ fn room_513_lab_key_rides_omodel_6() {
         return;
     };
     // The key's build is gated on ScenarioFlags2 bit 0xC0.
-    let sim = simulate_with_flags(&pack, "5130", &[(1, 0xC0)]);
+    let mut sim = simulate_with_flags(&pack, "5130", &[(1, 0xC0)]);
     let action = item_action(&sim.game, 0x37).expect("the lab key registers");
     let model = usize::from(action.item_model());
     let record = *item_record(&sim.game, action).expect("the lab key record");
     assert_eq!(record.parent, 0x06);
     assert_eq!(record.pos, [0, 0, 0]);
     assert_eq!(record.asset, Some(0));
-    // The 0x8511 flags word spawns the bias-1 sparkle on the same omodel.
+    // The 0x8511 flags word's bias byte 0x10 is -32 on the same omodel.
+    let handle = usize::from(record.sparkle);
     let sparkle = *sim
         .game
         .effects
-        .slot(usize::from(record.sparkle))
+        .slot(handle)
         .expect("the parented sparkle is live");
     assert_eq!(sparkle.effect_type, 0x0B);
     assert_eq!(sparkle.depth_group, 0x0C);
     assert_eq!(sparkle.attach, arklay::effects::Attach::Item(0));
-    assert_eq!(sparkle.local_offset, [0, -2, 0]);
+    assert_eq!(sparkle.local_offset, [0, -32, 0]);
 
     // The second declaration of omodel 6 from the other branch is the one the
     // parent carries; a zero local offset lands the key exactly on it.
@@ -199,6 +209,18 @@ fn room_513_lab_key_rides_omodel_6() {
         sim.player.angle,
     );
     assert_eq!(world.t, objects::rebuild(parent, &lighting).t);
+
+    // Once the behaviour has armed the billboard, its world Y is the item's
+    // world Y minus the 32-unit bias, not the old 2-unit nibble reading.
+    sim.game.tick_effects(&sim.room);
+    let effect = *sim.game.effects.slot(handle).unwrap();
+    for (axis, expected) in [world.t[0], world.t[1] - 32, world.t[2]].iter().enumerate() {
+        assert!(
+            (i32::from(effect.pos[axis]) - expected).abs() <= 1,
+            "the 513 sparkle axis {axis} is {:?}, not {expected}",
+            effect.pos
+        );
+    }
 
     // The room's other item is absolute at the far end of the corridor.
     let absolute = item_action(&sim.game, 0x0B).expect("the absolute item registers");
@@ -344,4 +366,171 @@ fn simulate_new_game_in_room_100_registers_the_three_item_actions() {
         "the new-game room-items bank registers all three builds"
     );
     assert_eq!(sim.game.items.built, 3);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_303_flare_follows_the_player_when_they_move() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    let mut sim = simulate(&pack, "3030");
+    let action = item_action(&sim.game, 0x2A).expect("the flare registers");
+    let model = usize::from(action.item_model());
+    let record = *item_record(&sim.game, action).expect("the flare record");
+    assert_eq!(record.parent, 0xFE, "the flare is parented to the player");
+
+    let before = objects::item_world_transform(
+        &sim.game.items,
+        &sim.game.objects,
+        model,
+        sim.player.pos,
+        sim.player.angle,
+    );
+    // Move the player: the flare is re-resolved against the moved frame.
+    sim.player.pos[0] += 1000;
+    sim.player.pos[2] -= 500;
+    sim.game.sync_entity_from_player(&sim.player);
+    let after = objects::item_world_transform(
+        &sim.game.items,
+        &sim.game.objects,
+        model,
+        sim.player.pos,
+        sim.player.angle,
+    );
+    assert_eq!(
+        after.t[0] - before.t[0],
+        1000,
+        "the flare did not follow the player's X move"
+    );
+    assert_eq!(
+        after.t[2] - before.t[2],
+        -500,
+        "the flare did not follow the player's Z move"
+    );
+    assert_eq!(after.t[1], before.t[1], "Y is unchanged");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_30e_jill_skips_the_ink_ribbon_until_the_second_playthrough() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    // Jill's variant is the player digit 1. The first playthrough clears the
+    // ribbon site's room-items bit without building the model.
+    let first = simulate_with_flags(&pack, "30E1", &[]);
+    assert!(
+        !first.game.room_item_present(0xF0),
+        "the ribbon site is marked taken"
+    );
+    assert_eq!(
+        first.game.items.built, 2,
+        "only the two non-ribbon items build"
+    );
+    assert_eq!(
+        first.game.items.record(2).unwrap(),
+        &objects::ItemRecord::default(),
+        "the ribbon model is not built"
+    );
+    assert!(item_action(&first.game, 0x2F).is_none());
+
+    // The second-playthrough flag lets the ribbon site build normally.
+    let second = simulate_with_flags(&pack, "30E1", &[(0, 0x7B)]);
+    assert!(second.game.room_item_present(0xF0));
+    assert_eq!(second.game.items.built, 3);
+    let action = item_action(&second.game, 0x2F).expect("the ribbon registers");
+    assert_eq!(action.item_model(), 2);
+    let record = item_record(&second.game, action).unwrap();
+    assert_eq!(record.flag, 1);
+    assert_ne!(record.sparkle, 0, "the 0x8700 ribbon sparkle is live");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_715_second_trophy_item_sits_0x96_lower() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    let sim = simulate(&pack, "7150");
+    assert_eq!(sim.game.items.built, 4, "all four declarations build");
+    // The RDT declares model 1 (the second build) at z=8180; the override
+    // drops 0x96 so the document sits on the lower trophy.
+    let lower = sim.game.items.record(1).expect("the second build");
+    assert_eq!(lower.pos[2], 8180 - 0x96);
+    assert_eq!(lower.committed[2], (8180 - 0x96) as i16);
+    // The first build keeps its declared Z.
+    assert_eq!(sim.game.items.record(0).unwrap().pos[2], 10020);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_406_map_palette_is_darkened_in_the_render() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    let id = RoomId::parse("4060").unwrap();
+    let sim = simulate(&pack, "4060");
+    let map = item_action(&sim.game, 0x52).expect("the guardhouse map registers");
+    let pair = usize::from(map.item_model());
+    assert!(item_record(&sim.game, map).unwrap().active());
+
+    // Decode the shipped, undarkened pair straight from the RDT.
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let stock = rdt::parse(data, id).unwrap();
+    let stock_texture = stock
+        .item_models
+        .iter()
+        .find(|asset| asset.pair_index == pair)
+        .expect("the map pair")
+        .texture
+        .clone();
+    let darkened_texture = sim
+        .room
+        .item_models
+        .iter()
+        .find(|asset| asset.pair_index == pair)
+        .expect("the loaded map pair")
+        .texture
+        .clone();
+    assert_ne!(
+        darkened_texture.palettes, stock_texture.palettes,
+        "the map pair's palette was not rewritten"
+    );
+
+    // Replacing only the texture reverts the darkening; some cut frames the
+    // map and must change pixels.
+    let mut stock_room = sim.room.clone();
+    stock_room
+        .item_models
+        .iter_mut()
+        .find(|asset| asset.pair_index == pair)
+        .expect("the loaded map pair")
+        .texture = stock_texture;
+    let mut painted = 0usize;
+    for cut in 0..sim.room.cuts.len() {
+        stock_room.current_cut = cut;
+        let mut darkened_room = stock_room.clone();
+        darkened_room.current_cut = cut;
+        darkened_room
+            .item_models
+            .iter_mut()
+            .find(|asset| asset.pair_index == pair)
+            .expect("the loaded map pair")
+            .texture = darkened_texture.clone();
+        let darkened =
+            render_game_frame(&pack, id, &darkened_room, &sim.game, &sim.player).unwrap();
+        let stock = render_game_frame(&pack, id, &stock_room, &sim.game, &sim.player).unwrap();
+        painted = painted.max(
+            darkened
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(stock.rgba.as_chunks::<4>().0)
+                .filter(|(darkened, stock)| darkened != stock)
+                .count(),
+        );
+    }
+    assert!(painted > 0, "the darkened map palette painted no pixels");
 }

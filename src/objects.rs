@@ -443,7 +443,10 @@ pub struct ItemRecord {
     pub parent: u8,
     /// Live 32-bit position (record +0x34).
     pub pos: [i32; 3],
-    /// The 16-bit position copy (record +0x6C).
+    /// The 16-bit position copy (record +0x6C), written at build. Unlike the
+    /// object records, no item logic reads it back — the original's item
+    /// records never enter the push/commit path — so it is kept only as the
+    /// parity field and the build-time assertion the tests check.
     pub committed: [i16; 3],
     /// Rotation SVECTOR (record +0x72): Y is seeded from the `anim` operand,
     /// X/Z are zeroed at build and written by `eml_rot`.
@@ -555,7 +558,9 @@ impl ItemTable {
     }
 
     /// `eml_rot` (0x3B): selectors below `0x8000` name the item table and write
-    /// the record's rotation X/Z, active records only.
+    /// the record's rotation X/Z. The gate is the whole flag byte (`record +0`
+    /// nonzero), not the drawn bit: an item whose byte is any nonzero value
+    /// rotates.
     pub fn rotate(&mut self, operands: &[Operand]) -> bool {
         let selector = (u16::from(operand_u8(operands, 0)) << 8) | 0x3B;
         if selector >= 0x8000 {
@@ -564,7 +569,7 @@ impl ItemTable {
         let Some(record) = self.records.get_mut(usize::from(operand_u8(operands, 0))) else {
             return false;
         };
-        if !record.active() {
+        if record.flag == 0 {
             return false;
         }
         record.rotation[0] = operand_i16(operands, 1);
@@ -743,9 +748,10 @@ pub fn item_rotation(item: &ItemRecord) -> [[i32; 3]; 3] {
 ///
 /// Parent selectors (no `0x80` split): `0xFF` absolute, its own rotation and
 /// position; `0xFE` the player, the entity matrix composed with the item's
-/// local matrix; anything else an omodel index, [`rebuild`] of that record
-/// composed with the local matrix. A missing parent record falls back to the
-/// item's local matrix.
+/// local matrix; anything else an omodel index. The omodel's frame is the full
+/// SCA chain ([`world_matrix`]), so an item rides its parent's parent the same
+/// way the object render pass does. A missing parent record contributes the
+/// identity chain, leaving the item's local matrix.
 pub fn item_world_transform(
     items: &ItemTable,
     objects: &ObjectTable,
@@ -766,17 +772,10 @@ pub fn item_world_transform(
     match item.parent {
         0xFF => local,
         0xFE => anim::compose(&anim::entity_matrix(player_pos, player_angle), &local),
-        parent => match objects.record(usize::from(parent)) {
-            // `rebuild` is lighting-independent, so no `Lighting` is needed.
-            Some(parent) => {
-                let parent = Mat4x3 {
-                    r: rotation(parent),
-                    t: parent.pos,
-                };
-                anim::compose(&parent, &local)
-            }
-            None => local,
-        },
+        parent => {
+            let parent = world_matrix(objects, usize::from(parent), player_pos, player_angle);
+            anim::compose(&parent, &local)
+        }
     }
 }
 
@@ -799,7 +798,7 @@ pub fn item_world_matrix(
 pub fn sparkle_effect_id(flags: u16) -> u8 {
     match flags & 0x0F00 {
         0x000 => 0x03,
-        0x100 => 0x14,
+        0x100 => 0x0B,
         0x200 => 0x13,
         0x300 => 0x1B,
         0x400 => 0x04,
@@ -809,10 +808,11 @@ pub fn sparkle_effect_id(flags: u16) -> u8 {
     }
 }
 
-/// The sparkle's vertical bias from an `item_aot_set` flags word: bits
-/// `0x00F0` count units of `-2` (the shipped data uses 0/-2/-4).
+/// The sparkle's vertical bias from an `item_aot_set` flags word: the raw
+/// masked byte `0x00F0` counts units of `-2` (the shipped data uses the byte
+/// values `0x10`/`0x20`, so the bias is -32/-64).
 pub fn sparkle_bias(flags: u16) -> i32 {
-    -2 * i32::from((flags & 0x00F0) >> 4)
+    -2 * i32::from(flags & 0x00F0)
 }
 
 /// Player SCA height for the 422-unit body radius (Chris, 0x05FA).
@@ -1883,12 +1883,17 @@ mod tests {
         assert!(!items.set_flag(&operands(&[0, 1, 0x40])));
         assert!(!items.set_flag(&operands(&[1, 9, 0x00])));
 
-        // eml_rot writes X/Z on active records only.
+        // eml_rot writes X/Z whenever the whole flag byte is nonzero.
         assert!(items.rotate(&operands(&[1, 0x1111, 0x2222])));
         assert_eq!(items.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+        // A nonzero byte with the drawn bit clear still rotates: the gate is
+        // the byte, not bit 0.
+        items.record_mut(1).unwrap().flag = 0x40;
+        assert!(items.rotate(&operands(&[1, 0x3333, 0x4444])));
+        assert_eq!(items.record(1).unwrap().rotation, [0x3333, 2, 0x4444]);
         items.record_mut(1).unwrap().flag = 0;
-        assert!(!items.rotate(&operands(&[1, 0x3333, 0x4444])));
-        assert_eq!(items.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+        assert!(!items.rotate(&operands(&[1, 0x5555, 0x6666])));
+        assert_eq!(items.record(1).unwrap().rotation, [0x3333, 2, 0x4444]);
         // A selector at or above 0x8000 names the omodel table.
         assert!(!items.rotate(&operands(&[0x80, 0x5555, 0x6666])));
     }
@@ -1940,7 +1945,7 @@ mod tests {
         );
         assert_eq!(world.t, [1099, -199, 2299]);
 
-        // Omodel-parented: rebuild(parent) composed with the local.
+        // Omodel-parented: the parent's composed world frame with the local.
         let mut objects = ObjectTable::new(1);
         objects.record_mut(0).unwrap().pos = [500, 0, 600];
         objects.record_mut(0).unwrap().rotation = [0, 0x400, 0];
@@ -1948,6 +1953,19 @@ mod tests {
         items.record_mut(0).unwrap().pos = [50, 0, 0];
         let world = item_world_matrix(&items, &objects, &lighting, 0, [0, 0, 0], 0);
         assert_eq!(world.t, [500, 0, 600 - 49]);
+
+        // The parent chain is walked: omodel 1 rides omodel 0, and the item
+        // must inherit both translations instead of only its immediate
+        // parent's local position.
+        let mut objects = ObjectTable::new(2);
+        objects.record_mut(0).unwrap().pos = [500, 0, 600];
+        objects.record_mut(1).unwrap().parent = 0x00;
+        objects.record_mut(1).unwrap().pos = [100, 0, 0];
+        items.record_mut(0).unwrap().parent = 0x01;
+        items.record_mut(0).unwrap().pos = [50, 0, 0];
+        let world = item_world_matrix(&items, &objects, &lighting, 0, [0, 0, 0], 0);
+        // The near-identity 4.12 rotation truncates each 100/50 hop by one.
+        assert_eq!(world.t, [648, 0, 600]);
 
         // A missing parent falls back to the local matrix.
         items.record_mut(0).unwrap().parent = 0x09;
@@ -1959,7 +1977,7 @@ mod tests {
     fn sparkle_effect_ids_cover_every_nibble() {
         for (flags, effect) in [
             (0x0000u16, 0x03u8),
-            (0x0100, 0x14),
+            (0x0100, 0x0B),
             (0x0200, 0x13),
             (0x0300, 0x1B),
             (0x0400, 0x04),
@@ -1980,11 +1998,11 @@ mod tests {
     }
 
     #[test]
-    fn sparkle_bias_is_minus_two_per_nibble_unit() {
+    fn sparkle_bias_is_minus_two_per_masked_byte_unit() {
         assert_eq!(sparkle_bias(0x8700), 0);
-        assert_eq!(sparkle_bias(0x8710), -2);
-        assert_eq!(sparkle_bias(0x8720), -4);
-        assert_eq!(sparkle_bias(0x87F0), -30);
+        assert_eq!(sparkle_bias(0x8710), -32);
+        assert_eq!(sparkle_bias(0x8720), -64);
+        assert_eq!(sparkle_bias(0x87F0), -480);
         assert_eq!(sparkle_bias(0x800F), 0, "the low nibble is not the bias");
     }
 }
