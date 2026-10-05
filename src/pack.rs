@@ -12,7 +12,8 @@
 //! reader reject unsafe paths (absolute, `..` components, backslashes, NUL
 //! bytes or empty), so a pack can never name a file outside its pack root.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufWriter, Write};
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,6 +34,20 @@ const ENTRY_LEN: usize = 32;
 #[derive(Debug, Default)]
 pub struct PackWriter {
     entries: Vec<(String, Vec<u8>)>,
+    /// ASCII-lowercased entry paths, for O(1) duplicate detection.
+    seen: HashSet<String>,
+}
+
+/// Entry order and offsets of a serialized pack.
+struct SerializeLayout {
+    /// Number of entries, as written in the header.
+    entry_count: u32,
+    /// Lowercased path and entry index per output position.
+    order: Vec<(String, usize)>,
+    /// The fixed-size table of contents.
+    toc: Vec<u8>,
+    /// Total serialized size in bytes.
+    total: usize,
 }
 
 impl PackWriter {
@@ -47,11 +62,7 @@ impl PackWriter {
     /// NUL bytes or `..` components, and must be unique ignoring ASCII case.
     pub fn add(&mut self, path: &str, data: Vec<u8>) -> Result<()> {
         validate_path(path)?;
-        if self
-            .entries
-            .iter()
-            .any(|(existing, _)| existing.eq_ignore_ascii_case(path))
-        {
+        if !self.seen.insert(path.to_ascii_lowercase()) {
             bail!("duplicate pack entry: {path}");
         }
         self.entries.push((path.to_owned(), data));
@@ -63,8 +74,13 @@ impl PackWriter {
         self.entries.is_empty()
     }
 
-    /// Serialize the pack, sorting entries by ASCII-lowercased path.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+    /// Total size in bytes of the serialized pack.
+    pub fn pack_size(&self) -> Result<usize> {
+        Ok(self.serialize_layout()?.total)
+    }
+
+    /// Compute the sorted entry order, table of contents and total size.
+    fn serialize_layout(&self) -> Result<SerializeLayout> {
         let count = self.entries.len();
         let entry_count = u32::try_from(count).context("too many pack entries")?;
         let toc_len = count
@@ -109,25 +125,49 @@ impl PackWriter {
             data_offset += data.len();
         }
 
-        let mut out = Vec::with_capacity(total);
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
-        out.extend_from_slice(&entry_count.to_le_bytes());
-        out.extend_from_slice(&toc);
-        for (_, index) in &order {
-            out.extend_from_slice(self.entries[*index].0.as_bytes());
-            out.push(0);
+        Ok(SerializeLayout {
+            entry_count,
+            order,
+            toc,
+            total,
+        })
+    }
+
+    /// Write the pack to `out`, sorting entries by ASCII-lowercased path.
+    ///
+    /// Unlike [`PackWriter::to_bytes`] this never materializes a second copy
+    /// of the entry data.
+    pub fn stream_to(&self, out: &mut impl Write) -> Result<()> {
+        let layout = self.serialize_layout()?;
+        out.write_all(&MAGIC)?;
+        out.write_all(&VERSION.to_le_bytes())?;
+        out.write_all(&layout.entry_count.to_le_bytes())?;
+        out.write_all(&layout.toc)?;
+        for (_, index) in &layout.order {
+            out.write_all(self.entries[*index].0.as_bytes())?;
+            out.write_all(&[0])?;
         }
-        for (_, index) in &order {
-            out.extend_from_slice(&self.entries[*index].1);
+        for (_, index) in &layout.order {
+            out.write_all(&self.entries[*index].1)?;
         }
-        debug_assert_eq!(out.len(), total);
+        Ok(())
+    }
+
+    /// Serialize the pack, sorting entries by ASCII-lowercased path.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(self.pack_size()?);
+        self.stream_to(&mut out)?;
         Ok(out)
     }
 
     /// Serialize the pack and write it to `path`.
     pub fn write(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_bytes()?)
+        let file = std::fs::File::create(path)
+            .with_context(|| format!("failed to write pack {}", path.display()))?;
+        let mut out = BufWriter::new(file);
+        self.stream_to(&mut out)
+            .with_context(|| format!("failed to write pack {}", path.display()))?;
+        out.flush()
             .with_context(|| format!("failed to write pack {}", path.display()))
     }
 }
@@ -461,6 +501,21 @@ mod tests {
         expected.extend_from_slice(&[0x01, 0x02, 0x03, 0xDE, 0xAD]);
 
         assert_eq!(writer.to_bytes().unwrap(), expected);
+    }
+
+    #[test]
+    fn streaming_matches_in_memory_serialization() {
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", vec![1, 2, 3]).unwrap();
+        writer.add("roomcut/100_000.bmp", vec![9; 64]).unwrap();
+        writer.add("MixEd.TxT", b"hello".to_vec()).unwrap();
+
+        let bytes = writer.to_bytes().unwrap();
+        assert_eq!(writer.pack_size().unwrap(), bytes.len());
+
+        let mut streamed = Vec::new();
+        writer.stream_to(&mut streamed).unwrap();
+        assert_eq!(streamed, bytes);
     }
 
     #[test]
