@@ -79,12 +79,25 @@ impl Progress {
         self.last_plain = self.phase_started;
         self.line_len = 0;
         self.active = true;
+        // Draw the zero line immediately so a long first item does not leave
+        // the phase invisible until the first update or the plain interval.
+        if self.tty {
+            self.draw_tty();
+        } else {
+            self.draw_plain();
+        }
     }
 
     /// Advance the active phase by one item, naming the item just processed.
     pub fn advance(&mut self, item: &str) {
         self.set_item(item);
         self.advance_by(1);
+    }
+
+    /// Advance the active phase by `count` items, naming the batch.
+    pub fn advance_named(&mut self, count: u64, item: &str) {
+        self.set_item(item);
+        self.advance_by(count);
     }
 
     /// Advance the active phase by `count` unnamed units (e.g. bytes).
