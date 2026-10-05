@@ -93,7 +93,7 @@ const COMMAND_SIG: [&str; 81] = [
     "model_op",
     "objtbl_b_set",
     "ck_anim",
-    "tbl37_set:uuu",
+    "room_bgm_state_set:uuu",
     "ck_bits",
     "get_eml_state:u",
     "msgnode_set",
@@ -793,10 +793,11 @@ mod tests {
         // M13 renamed these rows to the handlers the port implements; the
         // opcode table and the original-tool display signatures must agree,
         // and both the disassembly and the listing must render the new name.
-        let expected: [(u8, &str); 8] = [
+        let expected: [(u8, &str); 9] = [
             (0x1E, "voice_play"),
             (0x27, "snd_fade_set"),
             (0x2F, "snd_pan_vol_set"),
+            (0x37, "room_bgm_state_set"),
             (0x43, "bgm_volume_ramp"),
             (0x4A, "bgm_restore"),
             (0x4B, "bgm_stop_all"),

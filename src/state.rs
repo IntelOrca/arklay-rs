@@ -285,6 +285,10 @@ pub struct RoomState {
     pub item_count: u8,
     pub cuts: Vec<Cut>,
     pub current_cut: usize,
+    /// The live room-SFX pair index (`g_nextRoomSfxId`): 0 at boot, reloaded
+    /// from every door record's sfx byte. Bank-0 `se_play_3d` resolves through
+    /// this pair of [`crate::sfx::room_sfx`] entries.
+    pub room_sfx: u8,
     /// Ambient light color, 12-bit per channel.
     pub ambient: [i16; 3],
     /// The room's three lights.

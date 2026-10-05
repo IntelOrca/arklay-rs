@@ -113,6 +113,9 @@ pub fn parse(data: &[u8], id: RoomId) -> Result<RoomState> {
         item_count,
         cuts,
         current_cut: 0,
+        // A freshly parsed room boots with the wooden-door pair; a door
+        // transition reloads it from the record's sfx byte.
+        room_sfx: 0,
         ambient,
         lights,
         collision,

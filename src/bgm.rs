@@ -271,6 +271,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) {
         if previous != 0xFF {
             fade_out_all(game);
         }
+        game.bgm.target = 0xFF;
         game.bgm.state = 0xFF;
         return;
     }
@@ -338,6 +339,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) {
     if start_secondary {
         start_secondary_slots(game, effective);
     }
+    game.bgm.target = effective;
     game.bgm.state = u16::from(effective);
 }
 
@@ -373,7 +375,7 @@ fn load_and_start(game: &mut GameState, id: RoomId, state: u8) {
         *channel = BgmChannelState {
             name: Some(name),
             looping: music::GROUP_LOOPS[usize::from(group)][index],
-            volume: if is_muted_seed(name) { -9999 } else { 0 },
+            volume: if is_muted_seed(name) { -9999 } else { -1 },
             pan: 0,
             pan_pair: (0, 0),
             restart: false,
@@ -413,6 +415,11 @@ fn start_secondary_slots(game: &mut GameState, state: u8) {
 
 /// Tear every BGM bank down and stop the voice line, the original's
 /// `bgm_fade_out_all` (without its sleep-driven crossfade).
+///
+/// The mixer banks are only signalled through the
+/// [`crate::game::BgmState::stop_all`] edge: [`apply_live`] consumes it and
+/// calls `Mixer::stop_all_bgm`, so the script host can keep running without an
+/// audio device.
 fn fade_out_all(game: &mut GameState) {
     for channel in &mut game.bgm.channels {
         *channel = BgmChannelState::default();
@@ -420,6 +427,7 @@ fn fade_out_all(game: &mut GameState) {
     game.voice.request = None;
     game.voice.stop_requested = true;
     game.clear_voice_playing();
+    game.bgm.stop_all = true;
 }
 
 /// Reconcile the mixer with the game's BGM/voice state.
@@ -441,9 +449,19 @@ pub fn apply_live(
     advance_fade(game);
     advance_ramp(game);
 
+    // Consume the fade-out edge even without a device so it cannot leak into a
+    // later session.
+    let stop_all = std::mem::take(&mut game.bgm.stop_all);
+
     let Some(mixer) = mixer.as_mut() else {
         return;
     };
+    if stop_all {
+        // `bgm_fade_out_all` stopped and destroyed every bank. Without this the
+        // channel records are already cleared, so the loop below would leave
+        // the old mixer buffers sounding (a 0xFF room would loop forever).
+        mixer.stop_all_bgm();
+    }
     for index in 0..BGM_CHANNELS {
         let enabled = game.bgm.state & (8 << index) != 0;
         let bank = game.bgm.channels[index];
@@ -492,7 +510,7 @@ mod tests {
         GameState::new(id, &RoomState::default())
     }
 
-    /// Store `value` in the room's BGM row (the `tbl37_set` write).
+    /// Store `value` in the room's BGM row (the `room_bgm_state_set` write).
     fn set_row(game: &mut GameState, id: RoomId, value: u8) {
         let stage = usize::from(id.stage - 1);
         game.room_bgm[stage * 32 + usize::from(id.room)] = value;
@@ -531,7 +549,7 @@ mod tests {
         assert!(game.bgm.channels[0].pending_load);
         assert!(game.bgm.channels[0].restart, "bit 3 starts the channel");
         assert!(game.bgm.channels[0].looping);
-        assert_eq!(game.bgm.channels[0].volume, 0);
+        assert_eq!(game.bgm.channels[0].volume, -1);
         assert!(game.bgm.channels[1].name.is_none());
     }
 
@@ -678,9 +696,9 @@ mod tests {
             names(&game),
             vec![Some("Bgm_00"), Some("Se_01"), Some("Bgm_05")]
         );
-        assert_eq!(game.bgm.channels[0].volume, 0);
+        assert_eq!(game.bgm.channels[0].volume, -1);
         assert_eq!(game.bgm.channels[1].volume, -9999);
-        assert_eq!(game.bgm.channels[2].volume, 0);
+        assert_eq!(game.bgm.channels[2].volume, -1);
     }
 
     #[test]
@@ -765,6 +783,9 @@ mod tests {
     fn empty_pack(name: &str) -> (std::path::PathBuf, Pack) {
         let path =
             std::env::temp_dir().join(format!("arklay-bgm-{}-{}.akpak", std::process::id(), name));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         crate::pack::PackWriter::new().write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
         (path, pack)
@@ -865,5 +886,52 @@ mod tests {
         assert!(!game.voice_playing(), "the voice wait flag cleared");
         assert!(game.voice.request.is_none());
         assert!(game.voice.stop_requested);
+    }
+
+    #[test]
+    fn ff_room_target_stops_the_mixer_banks() {
+        let (_path, pack) = empty_pack("ff-stop");
+        let id = RoomId::parse("1000").unwrap();
+        let mut game = game_for(id);
+
+        let _ = unsafe {
+            sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
+        };
+        let Some(mut mixer) = Mixer::open() else {
+            eprintln!("skipping ff-room mixer test: no audio device");
+            return;
+        };
+        mixer.play_bgm_channel(
+            0,
+            audio::Wav {
+                format: audio::WavFormat::S16Le,
+                channels: 1,
+                sample_rate: 22050,
+                data: vec![0, 0, 1, 0, 2, 0],
+            },
+        );
+        assert!(mixer.bgm_channel_playing(0), "the fake bank is sounding");
+
+        // The live state says channel 0 is enabled and loaded, then a 0xFF
+        // room target fades everything out.
+        game.bgm.state = 0x08;
+        game.bgm.channels[0].name = Some("Bgm_13");
+        set_row(&mut game, id, 0xFF);
+        update_room_bgm(&mut game, id, Some(id));
+        assert!(game.bgm.stop_all, "the fade armed the mixer tear-down edge");
+
+        let mut music = Some(mixer);
+        let mut cache = BgmCache::default();
+        apply_live(&mut music, &mut game, &mut cache, &pack, None);
+        let mixer = music.as_ref().unwrap();
+        assert!(
+            !mixer.bgm_channel_playing(0),
+            "a 0xFF room stops the sounding bank"
+        );
+        assert!(
+            !mixer.bgm_channel_loaded(0),
+            "fade_out_all destroys the mixer bank"
+        );
+        assert!(!game.bgm.stop_all, "the edge is consumed");
     }
 }

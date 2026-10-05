@@ -625,6 +625,12 @@ impl Mixer {
         self.state.bgm_channel_playing(index)
     }
 
+    /// Whether BGM channel `index` has a loaded buffer.
+    #[cfg(test)]
+    pub(crate) fn bgm_channel_loaded(&self, index: usize) -> bool {
+        self.state.bgm_channel_loaded(index)
+    }
+
     /// Stop and drop every BGM channel.
     pub fn stop_all_bgm(&mut self) {
         self.state.stop_all_bgm();
@@ -708,6 +714,14 @@ impl Mixer {
             return;
         };
         let _ = unsafe { SDL_PutAudioStreamData(self.stream, pcm.as_ptr().cast(), len) };
+    }
+
+    /// Advance the mixer state by `frames` without the queued-frames throttle,
+    /// so a test can play a short buffer to its end deterministically.
+    #[cfg(test)]
+    pub(crate) fn render_for_test(&mut self, frames: usize) {
+        let mut pcm = Vec::new();
+        self.state.render(frames, &mut pcm);
     }
 
     /// Whether BGM channel 0 is currently sounding.

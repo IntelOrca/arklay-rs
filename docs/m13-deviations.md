@@ -14,11 +14,11 @@ is a bounded no-op or a documented approximation rather than a silent failure.
    `snd3d_enemy_drops` and dropped. The 80 shipped sites are all scripted
    cues.
 
-3. **Monster-AI room columns.** The sparse bank-2 room table transcribes only
-   the columns the shipped scripts reach plus the six extra names they use.
-   The monster-AI columns 0-9 stay absent; the corpus reaches them exactly
-   three times (bank-2 ids 3/7 in rows 67 and 180), and those play nothing
-   rather than a wrong sound.
+3. **Room action effect zones (0x0B).** `room_action_effect` raises the
+   `MSF2_EFFECT_ZONE` bit while the player stands in its zone, so footsteps
+   shift their room-table column by -3 like the original. The dust billboards
+   the original also spawns under a moving player are cosmetic and are not
+   drawn.
 
 4. **One-shot vs restart mixer semantics.** The original restarts one buffer
    per bank; this mixer appends one-shot voices, so two identical cues can
@@ -30,16 +30,22 @@ is a bounded no-op or a documented approximation rather than a silent failure.
    per-sample pan curve; the direction and the endpoints match, the
    intermediate curve is an approximation.
 
-6. **Unreferenced voice files.** 47 shipped `voice/*.WAV` files (6.0 MiB) are
+6. **Scripted fade scope.** `snd_fade_set` steps the three BGM channels down
+   and then stops the voice line, but the original's `UpdateSoundFade` also
+   sweeps the SFX, room-SFX, character and enemy banks. Those banks are
+   one-shots in the port, whose gains are fixed at play time, so the fade does
+   not reach them; the BGM and voice behaviour matches.
+
+7. **Unreferenced voice files.** 47 shipped `voice/*.WAV` files (6.0 MiB) are
    not named by any stage table row and stay out of the voice pack. The
    conversion summary lists them; a script that somehow named one records a
    miss and never raises the F7 wait, so it cannot deadlock.
 
-7. **FMV (`movie_on`, 0x29).** Films are out of scope: the opcode keeps its
+8. **FMV (`movie_on`, 0x29).** Films are out of scope: the opcode keeps its
    graceful no-op, so a scene that requests one advances instead of waiting.
    No AVI demuxer, Cinepak decoder or attract mode is part of this milestone.
 
-8. **Costume model swap.** `costume_set`/`costume_ck` (0x4F/0x50) store and
+9. **Costume model swap.** `costume_set`/`costume_ck` (0x4F/0x50) store and
    branch on the original's one-byte variant in the wardrobe rooms (11C in
    stages 1 and 6), but the alternate player model (`em1030`/`em1031`) is not
    loaded: the port's player assets resolve the base `player/{character}.emd`

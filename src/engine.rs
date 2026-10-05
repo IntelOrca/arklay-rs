@@ -690,7 +690,7 @@ impl GameSession {
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
         // The original runs `update_room_bgm` after the destination's init
-        // script (so a `tbl37_set` it performs is visible) and after the
+        // script (so a `room_bgm_state_set` it performs is visible) and after the
         // room's data is loaded.
         bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
         let auxiliary = self.audio_packs.voice();
@@ -2500,7 +2500,11 @@ fn finish_transition(
     music: &mut Option<Mixer>,
     sfx_cache: &mut SfxCache,
 ) {
+    // The original's `room_transition_load` latches the record's sfx byte and
+    // reloads `g_RoomSfxBanks` before the destination's init runs; camera-only
+    // records reload the pair too, even though the room stays.
     if session.camera_only {
+        loaded.room.room_sfx = session.door.sfx;
         if !session.silent {
             play_room_sfx(music, sfx_cache, pack, session.door.sfx, 1);
         }
@@ -2516,6 +2520,7 @@ fn finish_transition(
         return;
     };
     *loaded = destination;
+    loaded.room.room_sfx = session.door.sfx;
     game.enter_room(session.target, &loaded.room);
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
@@ -3190,7 +3195,7 @@ fn play_snd3d_requests(
         };
         let pos = match request.pos {
             game::Snd3dPos::Point(pos) => pos,
-            // The 6-byte form has no position; the BGM-pan path falls back to
+            // Position type 3 queues no position; the one-shot falls back to
             // the player (documented).
             game::Snd3dPos::None => game.entities[0].pos,
         };
@@ -5466,7 +5471,7 @@ mod tests {
             "the character byte carries the player flag"
         );
         // ROOM1001's init writes its per-room BGM row; the live state byte is
-        // not touched by `tbl37_set`.
+        // not touched by `room_bgm_state_set`.
         assert_eq!(game.room_bgm[0], 0x09, "init should write the BGM table");
         assert_eq!(
             game.bgm.state, 0xFF,
@@ -6436,6 +6441,205 @@ mod tests {
         assert_eq!(game.snd3d_noops.get(&(2, 24)), None, "panel02 resolves");
         assert!(game.bgm.channels[0].restart, "bank 4 restarted channel 0");
         assert_ne!(game.bgm.channels[0].pan, 0, "bank 4 panned channel 0");
+    }
+
+    #[test]
+    fn a_door_transition_loads_the_live_room_sfx_pair() {
+        let dir = TempDir::new();
+        let path = dir.0.join("pair.akpak");
+        PackWriter::new().write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+
+        let id = RoomId::parse("1000").unwrap();
+        let mut loaded = LoadedRoom {
+            id,
+            room: RoomState {
+                stage: 1,
+                room: 2,
+                ..RoomState::default()
+            },
+            scripts: Default::default(),
+            player_assets: None,
+        };
+        let mut game = game::GameState::new(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
+        // A camera-only, silent record: the pair still latches from its sfx
+        // byte, exactly like the original's `room_transition_load`.
+        let mut session = TransitionMode {
+            transition: transition::Transition::new(DoorAnimation::missing()),
+            door: game::Door {
+                camera: 0x80 | 0x40,
+                sfx: 1,
+                ..game::Door::default()
+            },
+            target: id,
+            camera_only: true,
+            silent: true,
+            destination: None,
+            frame: transition::TransitionFrame::default(),
+        };
+        let mut music: Option<Mixer> = None;
+        let mut cache = SfxCache::default();
+        finish_transition(
+            &pack,
+            &mut session,
+            &mut game,
+            &mut player_state,
+            &mut loaded,
+            &mut music,
+            &mut cache,
+        );
+        assert_eq!(loaded.room.room_sfx, 1, "the record's sfx byte is live");
+        assert_eq!(
+            sfx::play_sfx_3d(&loaded.room, 0, 0, 0, [0; 3], [1000, 0, 0], [1000, 0, 0]).name,
+            Some("Dr_mtl01"),
+            "bank 0 now resolves through the new pair"
+        );
+
+        // The same latch happens on a room-changing record, after the
+        // destination room has replaced the outgoing one.
+        let target = RoomId::parse("1001").unwrap();
+        let mut session = TransitionMode {
+            transition: transition::Transition::new(DoorAnimation::missing()),
+            door: game::Door {
+                camera: 0x40,
+                sfx: 2,
+                next_room: 0x01,
+                ..game::Door::default()
+            },
+            target,
+            camera_only: false,
+            silent: true,
+            destination: Some(LoadedRoom {
+                id: target,
+                room: RoomState {
+                    stage: 1,
+                    room: 1,
+                    ..RoomState::default()
+                },
+                scripts: Default::default(),
+                player_assets: None,
+            }),
+            frame: transition::TransitionFrame::default(),
+        };
+        finish_transition(
+            &pack,
+            &mut session,
+            &mut game,
+            &mut player_state,
+            &mut loaded,
+            &mut music,
+            &mut cache,
+        );
+        assert_eq!(loaded.id, target);
+        assert_eq!(loaded.room.room_sfx, 2, "the destination latches its pair");
+        assert_eq!(
+            sfx::play_sfx_3d(&loaded.room, 0, 0, 1, [0; 3], [1000, 0, 0], [1000, 0, 0]).name,
+            Some("Dr_brk01"),
+            "the loaded pair 2 names the trap-door sound"
+        );
+    }
+
+    /// A minimal 16-bit mono WAV for the voice handshake test.
+    fn voice_wav_bytes(samples: &[i16]) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut body = Vec::new();
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes());
+        body.extend_from_slice(&22050u32.to_le_bytes());
+        body.extend_from_slice(&(22050u32 * 2).to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&16u16.to_le_bytes());
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&data);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn voice_tick_handshakes_pending_requests() {
+        let dir = TempDir::new();
+        let path = dir.0.join("voice.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add("voice/v004_00.wav", voice_wav_bytes(&[100, 200]))
+            .unwrap();
+        writer
+            .add("voice/v004_01.wav", voice_wav_bytes(&[300, 400]))
+            .unwrap();
+        writer.write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+
+        let _ = unsafe {
+            sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
+        };
+        let Some(mixer) = Mixer::open() else {
+            eprintln!("skipping voice handshake test: no audio device");
+            return;
+        };
+        let mut music = Some(mixer);
+        let mut cache = VoiceCache::default();
+        let id = RoomId::parse("1000").unwrap();
+        let mut game = game::GameState::new(id, &RoomState::default());
+        let request = |name| game::VoiceRequest {
+            name,
+            volume: 0,
+            pan: 0,
+        };
+
+        // A queued request starts on the next tick and raises the F7 wait bit.
+        game.voice.request = Some(request("V004_00"));
+        game.set_voice_playing();
+        tick_voice(&mut music, &mut cache, &mut game, &pack, None);
+        assert!(cache.active, "the line started");
+        assert!(game.voice_playing(), "F7 waits on the active line");
+        assert!(music.as_ref().unwrap().voice_playing());
+
+        // The line runs to its end; the next tick notices, clears the wait bit
+        // and leaves the channel free.
+        music.as_mut().unwrap().render_for_test(4);
+        assert!(!music.as_ref().unwrap().voice_playing());
+        assert!(
+            game.voice_playing(),
+            "the wait holds until the tick sees it"
+        );
+        tick_voice(&mut music, &mut cache, &mut game, &pack, None);
+        assert!(!cache.active, "the finish released the channel");
+        assert!(!game.voice_playing(), "F7 advances once the line is done");
+
+        // A request queued while a line is active waits, then starts when the
+        // channel frees.
+        game.voice.request = Some(request("V004_00"));
+        game.set_voice_playing();
+        tick_voice(&mut music, &mut cache, &mut game, &pack, None);
+        game.voice.request = Some(request("V004_01"));
+        game.set_voice_playing();
+        tick_voice(&mut music, &mut cache, &mut game, &pack, None);
+        assert_eq!(
+            cache.pending.map(|pending| pending.name),
+            Some("V004_01"),
+            "a second line stays pending while the first plays"
+        );
+        assert!(music.as_ref().unwrap().voice_playing());
+        assert!(game.voice_playing());
+
+        music.as_mut().unwrap().render_for_test(4);
+        tick_voice(&mut music, &mut cache, &mut game, &pack, None);
+        assert!(cache.pending.is_none(), "the pending line was taken");
+        assert!(cache.active);
+        assert!(
+            game.voice_playing(),
+            "the pending line kept the wait raised"
+        );
+        assert!(music.as_ref().unwrap().voice_playing());
+        assert_eq!(game.voice.misses, 0);
     }
 
     #[test]

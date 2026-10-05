@@ -217,6 +217,9 @@ const HANDLER_ITEMBOX: u8 = 8;
 const HANDLER_EVENT: u8 = 9;
 /// `room_check_actions` index of the typewriter handler.
 const HANDLER_TYPEWRITER: u8 = 16;
+/// `room_check_actions` index of the room effect-zone handler, which raises
+/// `MSF2_EFFECT_ZONE` while the player is inside its zone.
+const HANDLER_EFFECT_ZONE: u8 = 0x0B;
 /// `room_check_actions` index of the stair/ladder entry handler.
 const HANDLER_STAIRS_ZONE: u8 = 0x0C;
 /// `room_check_actions` index of the stair height ramp handler.
@@ -561,12 +564,19 @@ pub struct BgmState {
     /// byte, because `bgm_stop_all`/`bgm_restore` shift the saved mask through
     /// the high byte exactly like the original's 32-bit `g_BGM_STATE`.
     pub state: u16,
+    /// The current room's target state byte (`g_targetBgmState`): set by
+    /// [`crate::bgm::update_room_bgm`] with any type-2 bit-7 mask consumed.
+    /// `0xFF` disables `bgm_restore`/`bgm_stop_all` exactly like the original.
+    pub target: u8,
     /// The three loaded channel banks.
     pub channels: [BgmChannelState; 3],
     /// The live volume ramp (`bgm_volume_ramp`).
     pub ramp: VolumeRamp,
     /// The live sound fade (`snd_fade_set`).
     pub fade: SoundFade,
+    /// Tear every mixer BGM bank down on the next `apply_live` (the
+    /// `bgm_fade_out_all` edge; the original stops and destroys the banks).
+    pub stop_all: bool,
 }
 
 impl Default for BgmState {
@@ -575,9 +585,11 @@ impl Default for BgmState {
     fn default() -> Self {
         Self {
             state: 0xFF,
+            target: 0xFF,
             channels: [BgmChannelState::default(); 3],
             ramp: VolumeRamp::default(),
             fade: SoundFade::default(),
+            stop_all: false,
         }
     }
 }
@@ -588,8 +600,8 @@ pub enum Snd3dPos {
     /// A world point (position type 0's scratch `(x, 0, z)`, position type 1's
     /// player position, or a player cue's own position).
     Point([i32; 3]),
-    /// The original's remaining forms (position type 3 and the 6-byte form):
-    /// no position is queued. The bank-4 path falls back to the player.
+    /// Position type 3 (`play_sfx`): no position is queued. The bank-4 path
+    /// falls back to the player.
     None,
 }
 
@@ -708,6 +720,10 @@ pub enum RoomActionKind {
     Message,
     /// A typewriter (`SCE_TYPEWRITER`).
     Typewriter,
+    /// A movement effect zone (`room_check_actions[0x0B]`): raises
+    /// `MSF2_EFFECT_ZONE` while the player is inside it, which shifts the
+    /// footstep sound column.
+    EffectZone,
     /// A desk (`SCE_HIKIDASHI`).
     Desk,
     /// A stair/ladder entry registered by `set_stairs_zone` (handler `0x0C`).
@@ -728,6 +744,7 @@ impl RoomActionKind {
             HANDLER_EVENT => Self::Event,
             HANDLER_MESSAGE => Self::Message,
             HANDLER_TYPEWRITER => Self::Typewriter,
+            HANDLER_EFFECT_ZONE => Self::EffectZone,
             HANDLER_DESK => Self::Desk,
             HANDLER_STAIRS_ZONE => Self::StairsZone,
             HANDLER_STAIRS_HEIGHT => Self::StairsHeight,
@@ -1136,7 +1153,7 @@ pub struct GameState {
     pub bgm: BgmState,
     /// The per-stage/room BGM state table (BioCard 0x33C, `g_roomBgmState`).
     /// Seeded from [`music::ROOM_STATE`] on a new game and restored from a
-    /// save; `tbl37_set` writes it at `stage0 * 32 + room`.
+    /// save; `room_bgm_state_set` writes it at `stage0 * 32 + room`.
     pub room_bgm: [u8; ROOM_BGM_LEN],
     /// Voice-line state behind the `voice_play` wait handshake.
     pub voice: VoiceState,
@@ -3018,6 +3035,10 @@ impl GameState {
     /// player probe. Handlers 5/6 (`check_door`/`check_door_side`), which latch
     /// the approach side into zone flags for the door animation, are also not run.
     pub fn interact(&mut self, pos: [i32; 3], angle: u16, action_press: bool) {
+        // The original clears `MSF2_EFFECT_ZONE` before `update_player_position`
+        // every frame; the 0x0B handler re-raises it when the player is still
+        // inside the zone, so the bit never latches across a frame.
+        self.flags[5].apply(MSF2_EFFECT_ZONE, 1);
         // The live action table is the stair-zone store; rebuilding it here
         // also picks up `aot_reset`/`aot_on` edits and the entry's own toggled
         // word.
@@ -3122,6 +3143,9 @@ impl GameState {
             }
             RoomActionKind::Desk => {
                 self.check_desk(room_action.slot);
+            }
+            RoomActionKind::EffectZone => {
+                self.raise_effect_zone();
             }
             RoomActionKind::Typewriter | RoomActionKind::Other => {
                 self.record_interaction(room_action.slot, room_action.kind, None);
@@ -3662,6 +3686,14 @@ impl GameState {
         false
     }
 
+    /// `room_action_effect` (handler 0x0B): raise the effect-zone bit, which
+    /// shifts every footstep sound column by -3. The original also spawns a
+    /// dust billboard under a moving player; that cosmetic half is not ported
+    /// (documented in `docs/m13-deviations.md`).
+    fn raise_effect_zone(&mut self) {
+        self.flags[5].apply(MSF2_EFFECT_ZONE, 0);
+    }
+
     /// Run one room action handler by index, as `aot_on` and `give_item` do.
     ///
     /// Handler `0` and any unimplemented handler are inert. Item handlers pick
@@ -3669,14 +3701,19 @@ impl GameState {
     /// its message, and the menu-driven handlers record a placeholder.
     ///
     /// The desk handler (0x0E) runs the full lock/key/open/award flow through
-    /// [`Self::check_desk`]. TODO(parity): (scripting) 0x0B room_action_effect
-    /// (the moving-player dust billboards) is not run at all.
+    /// [`Self::check_desk`]; the effect-zone handler (0x0B) raises
+    /// `MSF2_EFFECT_ZONE` but does not draw the original's moving-player dust
+    /// billboards (documented deviation).
     pub fn run_room_action(&mut self, slot: u8, handler: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
         };
         match handler {
             HANDLER_DOOR => self.try_door(slot),
+            HANDLER_EFFECT_ZONE => {
+                self.raise_effect_zone();
+                true
+            }
             HANDLER_INCLUDE_KEY if action.kind == RoomActionKind::Item => self.include_key(slot),
             HANDLER_ITEM if action.kind == RoomActionKind::Item => self.pick_up(slot),
             HANDLER_PICKUP_KEY if action.kind == RoomActionKind::Item => self.pick_up_map(slot),
@@ -4918,9 +4955,10 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_sound(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             // `se_play_3d`: bank/id/volume plus a position form. Types 0-3
-            // carry an X/Z pair (the reader sizes the 10-byte form); the
-            // 6-byte form queues no position. Type 2 indexes an enemy that can
-            // never exist in this milestone, so it is counted and dropped.
+            // carry a 10-byte instruction and queue a request (type 3 without a
+            // position); the 6-byte form (type 4+) has no case in the original
+            // and is consumed silently. Type 2 indexes an enemy that can never
+            // exist in this milestone, so it is counted and dropped.
             0x17 => {
                 let bank = operand_u8(operands, 0);
                 let id = operand_u8(operands, 1);
@@ -4962,16 +5000,9 @@ impl ScdHost for ScdGameHost<'_> {
                             pos: Snd3dPos::None,
                         });
                     }
-                    _ => {
-                        // The 6-byte form has no position; the original's
-                        // switch has no case for it and consumes it silently.
-                        self.state.snd3d_requests.push(Snd3dRequest {
-                            bank,
-                            id,
-                            volume,
-                            pos: Snd3dPos::None,
-                        });
-                    }
+                    // The 6-byte form (position type 4+) has no case in the
+                    // original's switch: it consumes the instruction silently.
+                    _ => {}
                 }
                 StepResult::Continue
             }
@@ -4981,15 +5012,18 @@ impl ScdHost for ScdGameHost<'_> {
                 StepResult::Continue
             }
             // `snd_pan_vol_set`: cache the raw pan/volume pair and set the
-            // channel's millibel volume from it.
+            // channel's millibel volume from it. The original passes both
+            // bytes through a `short` cast, so 0xFF is -1, and its `set_volume`
+            // clamps the result to the audible `-9999..=-1` range.
             0x2F => {
                 let channel = operand_u8(operands, 0);
-                let pan = operand_u8(operands, 1);
-                let volume = operand_u8(operands, 2);
+                let pan = operand_i8(operands, 1);
+                let volume = operand_i8(operands, 2);
                 if let Some(bank) = self.state.bgm.channels.get_mut(usize::from(channel)) {
-                    bank.pan_pair = (pan, volume);
+                    bank.pan_pair = (pan as u8, volume as u8);
                     if bank.name.is_some() {
-                        bank.volume = crate::sfx::pan_volume(pan, volume);
+                        bank.volume = crate::sfx::pan_volume(i32::from(pan), i32::from(volume))
+                            .clamp(-9999, -1);
                     }
                 }
                 StepResult::Continue
@@ -5030,7 +5064,7 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // `tbl37_set`: write the per-stage/room BGM state table, not the
+            // `room_bgm_state_set`: write the per-stage/room BGM state table, not the
             // live byte. Operands are stage (0-based), room and value.
             0x37 => {
                 let stage = usize::from(operand_u8(operands, 0));
@@ -5042,29 +5076,35 @@ impl ScdHost for ScdGameHost<'_> {
                 StepResult::Continue
             }
             // `bgm_restore`: shift the saved channel mask back down and
-            // restart every channel whose bit is set again.
+            // restart every channel whose bit is set again. The original gates
+            // the whole handler on the room's target state byte.
             0x4A => {
-                self.state.bgm.state >>= 8;
-                for index in 0..BGM_CHANNELS {
-                    if self.state.bgm.state & (8u16 << index) != 0
-                        && let Some(bank) = self.state.bgm.channels.get_mut(index)
-                        && bank.name.is_some()
-                    {
-                        bank.restart = true;
+                if self.state.bgm.target != 0xFF {
+                    self.state.bgm.state >>= 8;
+                    for index in 0..BGM_CHANNELS {
+                        if self.state.bgm.state & (8u16 << index) != 0
+                            && let Some(bank) = self.state.bgm.channels.get_mut(index)
+                            && bank.name.is_some()
+                        {
+                            bank.restart = true;
+                        }
                     }
                 }
                 StepResult::Continue
             }
             // `bgm_stop_all`: stop all three banks and the voice, then save the
-            // live channel mask in the high byte.
+            // live channel mask in the high byte. The target byte guard matches
+            // `bgm_restore`: a `0xFF` room leaves both opcodes inert.
             0x4B => {
-                for bank in &mut self.state.bgm.channels {
-                    bank.restart = false;
+                if self.state.bgm.target != 0xFF {
+                    for bank in &mut self.state.bgm.channels {
+                        bank.restart = false;
+                    }
+                    self.state.bgm.state <<= 8;
+                    self.state.voice.request = None;
+                    self.state.voice.stop_requested = true;
+                    self.state.clear_voice_playing();
                 }
-                self.state.bgm.state <<= 8;
-                self.state.voice.request = None;
-                self.state.voice.stop_requested = true;
-                self.state.clear_voice_playing();
                 StepResult::Continue
             }
             _ => self.placeholder(op),
@@ -5793,6 +5833,8 @@ mod tests {
         let mut state = game();
         state.bgm.channels[0].name = Some("Bgm_13");
         state.bgm.state = 0x08 | 0x20;
+        // The room's target state byte is not 0xFF, so both handlers act.
+        state.bgm.target = 0x28;
         let mut host = ScdGameHost::new(&mut state);
         // 0x4B stops everything and shifts the mask into the high byte.
         assert_eq!(
@@ -5807,6 +5849,30 @@ mod tests {
         );
         assert_eq!(host.state().bgm.state, 0x08 | 0x20);
         assert!(host.state().bgm.channels[0].restart);
+    }
+
+    #[test]
+    fn bgm_bank_handlers_are_inert_in_a_ff_room() {
+        let mut state = game();
+        state.bgm.target = 0xFF;
+        state.bgm.state = 0x08;
+        state.bgm.channels[0].name = Some("Bgm_13");
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_sound(op(0x4B), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.state().bgm.state,
+            0x08,
+            "0x4B leaves the live byte untouched without a target"
+        );
+        assert_eq!(
+            host.on_sound(op(0x4A), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().bgm.state, 0x08);
+        assert!(!host.state().bgm.channels[0].restart);
     }
 
     #[test]
@@ -5826,6 +5892,17 @@ mod tests {
             state.bgm.channels[1].volume,
             crate::sfx::pan_volume(95, 95),
             "the seed's -9999 is replaced by the pan pair's millibels"
+        );
+        // The original sign-extends both bytes through a `short` cast, so
+        // 0xFF is -1 and the result clamps to the audible floor.
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_sound(op(0x2F), &operands(&[1, 0xFF, 0xFF]));
+        }
+        assert_eq!(state.bgm.channels[1].pan_pair, (0xFF, 0xFF));
+        assert_eq!(
+            state.bgm.channels[1].volume, -9999,
+            "a 255/255 pair is silence, not a loud positive gain"
         );
         // An unloaded channel caches the pair but keeps its volume.
         let mut host = ScdGameHost::new(&mut state);
@@ -5905,6 +5982,38 @@ mod tests {
     }
 
     #[test]
+    fn effect_zone_action_raises_the_slow_footstep_bit() {
+        let mut state = game();
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::EffectZone,
+            zone: [0, 0, 100, 100],
+            sce: HANDLER_EFFECT_ZONE,
+            handler: HANDLER_EFFECT_ZONE,
+            // Probe the entity position itself, once per frame.
+            flags: 0x41,
+            params: [0; 8],
+            item_data: None,
+            room_items_flag: 0xFF,
+        });
+        // Inside the zone the frame's probe raises the bit.
+        state.interact([50, 0, 50], 0, false);
+        assert!(
+            state.flags[5].bit(MSF2_EFFECT_ZONE),
+            "the zone raises the slow-footstep bit"
+        );
+        // Stepping outside clears it on the next frame.
+        state.interact([5000, 0, 5000], 0, false);
+        assert!(
+            !state.flags[5].bit(MSF2_EFFECT_ZONE),
+            "the bit never latches across frames"
+        );
+        // The direct handler path (`cmd_room_action`) raises it too.
+        assert!(state.run_room_action(0, HANDLER_EFFECT_ZONE));
+        assert!(state.flags[5].bit(MSF2_EFFECT_ZONE));
+    }
+
+    #[test]
     fn se_play_3d_parses_every_position_type() {
         let mut state = game();
         state.entities[0].pos = [100, 20, 300];
@@ -5919,7 +6028,8 @@ mod tests {
             // Type 3: queued without a position, with the original's
             // `play_sfx(sndType, sndType)` id quirk.
             host.on_sound(op(0x17), &operands(&[1, 7, 0, 3, 0, 0, 0]));
-            // The 6-byte form: no position.
+            // The 6-byte form (type 4+): no case in the original's switch, so
+            // the instruction is consumed silently.
             host.on_sound(op(0x17), &operands(&[4, 23, 0, 4, 0]));
         }
         assert_eq!(
@@ -5940,12 +6050,6 @@ mod tests {
                 Snd3dRequest {
                     bank: 1,
                     id: 1,
-                    volume: 0,
-                    pos: Snd3dPos::None,
-                },
-                Snd3dRequest {
-                    bank: 4,
-                    id: 23,
                     volume: 0,
                     pos: Snd3dPos::None,
                 },

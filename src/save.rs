@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn room_bgm_table_round_trips_the_live_table() {
         let mut state = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
-        // A script's `tbl37_set` write must survive the block, not the shipped
+        // A script's `room_bgm_state_set` write must survive the block, not the shipped
         // constant.
         state.room_bgm[7] = 0x40;
         let file = SaveFile::from_state(&state);

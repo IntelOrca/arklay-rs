@@ -412,11 +412,11 @@ fn room_10f_toggles_its_scripted_bgm_channels() {
 
 #[test]
 #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-fn a_save_after_tbl37_set_reloads_the_modified_table() {
+fn a_save_after_room_bgm_state_set_reloads_the_modified_table() {
     let Some((root, _pack)) = common::asset_env() else {
         return;
     };
-    // ROOM1001's init performs a `tbl37_set(0, 0, 9)`; the live table must be
+    // ROOM1001's init performs a `room_bgm_state_set(0, 0, 9)`; the live table must be
     // what the save captures, not the shipped constant at that slot.
     let game = init_room(&root, "1001");
     assert_eq!(game.room_bgm[0], 9, "the init script's write is live");
@@ -560,11 +560,57 @@ fn every_shipped_se_play_3d_resolves_or_is_an_audited_noop() {
         sites.len(),
         "every site resolves, pans the BGM or is an audited no-op"
     );
-    // Bank 1 is the unloaded weapon bank and the corpus's bank-0/3 sites all
-    // resolve; only bank-2's untranscribed prop/monster columns stay no-ops.
-    assert!(
-        noops.iter().all(|(bank, _, _)| *bank == 1 || *bank == 2),
-        "unexpected unresolved banks: {noops:?}"
+    // Every bank-0/2/3 site whose original table entry is non-null must
+    // resolve; a site that lands on a genuinely empty table slot (or past the
+    // original's per-bank bound) plays nothing, exactly like the original's
+    // null bank handle.
+    let mut named_sites = 0usize;
+    for site in &sites {
+        let original = match site.bank {
+            0 => sfx::room_sfx(0, usize::from(site.id)),
+            2 => sfx::room_sound(site.row, usize::from(site.id)),
+            3 => sfx::character_sfx(0, site.id),
+            _ => None,
+        };
+        let room = RoomState {
+            stage: site.stage,
+            room: site.room,
+            ..RoomState::default()
+        };
+        let play = sfx::play_sfx_3d(
+            &room,
+            0,
+            site.bank,
+            site.id,
+            [0; 3],
+            [1000, 0, 0],
+            [1000, 0, 0],
+        );
+        match original {
+            Some(name) => {
+                named_sites += 1;
+                assert_eq!(
+                    play.name,
+                    Some(name),
+                    "bank {} id {} row {} names {name} in the original table",
+                    site.bank,
+                    site.id,
+                    site.row
+                );
+            }
+            None => assert!(
+                play.name.is_none(),
+                "bank {} id {} row {} resolved {:?} without a table entry",
+                site.bank,
+                site.id,
+                site.row,
+                play.name
+            ),
+        }
+    }
+    assert_eq!(
+        resolved, named_sites,
+        "every non-null original table entry resolves"
     );
     assert_eq!(banks.get(&0), Some(&73));
     assert_eq!(banks.get(&4), Some(&4));
@@ -573,44 +619,17 @@ fn every_shipped_se_play_3d_resolves_or_is_an_audited_noop() {
         12,
         "the twelve weapon-bank sites are the audited bank-1 deviation"
     );
-    // The monster-AI columns (bank-2 ids 0-9) stay absent: the corpus reaches
-    // them exactly twice, both scripted enemy cues (rows 67 and 180).
-    let mut monster_ai: Vec<(u8, usize)> = noops
+    // The previously dropped item/prop names now resolve through the table.
+    let reached: std::collections::BTreeSet<&str> = sites
         .iter()
-        .filter(|(bank, id, _)| *bank == 2 && *id < 10)
-        .map(|(_, id, row)| (*id, *row))
+        .filter(|site| site.bank == 2)
+        .filter_map(|site| sfx::room_sound(site.row, usize::from(site.id)))
         .collect();
-    monster_ai.sort_unstable();
-    assert_eq!(
-        monster_ai,
-        vec![(3, 180), (7, 67), (7, 67)],
-        "only the scripted enemy cues need the absent columns"
-    );
-    let mut bank2_noops: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
-    for (bank, id, _) in &noops {
-        if *bank == 2 {
-            *bank2_noops.entry(*id).or_insert(0) += 1;
-        }
-    }
-    println!("audited bank-2 no-op ids: {bank2_noops:?}");
-    // The six names the sparse table carries are the point of the addition.
-    let six = [
-        "call", "panel02", "Rancher", "slide_b2", "D_gacha", "mv_step",
-    ];
-    let mut found: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
-    for site in &sites {
-        if site.bank != 2 {
-            continue;
-        }
-        if let Some(name) = sfx::room_sound(site.row, usize::from(site.id))
-            && six.contains(&name)
-        {
-            *found.entry(name).or_insert(0) += 1;
-        }
-    }
-    println!("sparse bank-2 names reached: {found:?}");
-    for name in ["call", "panel02", "Rancher", "slide_b2", "D_gacha"] {
-        assert!(found.contains_key(name), "{name} is reached by the corpus");
+    for name in [
+        "spray", "emblemA", "magnum01", "ClkDX4LR", "mv_clk", "crank", "bubble_S", "call",
+        "panel02", "Rancher", "slide_b2", "D_gacha",
+    ] {
+        assert!(reached.contains(name), "{name} is reached by the corpus");
     }
 }
 
@@ -675,12 +694,24 @@ fn room_105s_3d_se_sites_resolve_through_the_room_and_character_banks() {
             assert!((-1.0..=1.0).contains(&play.pan));
         } else {
             assert_eq!(request.bank, 2, "room 105's other cues are bank 2");
-            // The room's prop columns are outside the transcribed sparse table:
-            // each is an audited no-op rather than a wrong sound.
-            assert!(play.name.is_none());
+            // Every bank-2 request matches the room's full row.
+            assert_eq!(play.name, sfx::room_sound(5, usize::from(request.id)));
         }
     }
     assert_eq!(bank0, 4, "room 1051 fires both room-SFX slots twice");
+    // The room's prop columns now resolve to their original names.
+    for (id, name) in [
+        (23u8, "emblemA"),
+        (24, "magnum01"),
+        (26, "ClkDX4LR"),
+        (27, "mv_clk"),
+    ] {
+        assert_eq!(
+            sfx::play_sfx_3d(&room, 0, 2, id, [0, 0, 0], [1000, 0, 0], [1000, 0, 0]).name,
+            Some(name),
+            "room 105's bank-2 id {id}"
+        );
+    }
 
     // The character bank selects the player's table with the same 3D pan.
     let chris = sfx::play_sfx_3d(&room, 0, 3, 2, [0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
@@ -810,30 +841,23 @@ fn room_3030s_fade_and_pan_volume_move_the_channel_gains() {
 
 #[test]
 #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
-fn the_six_bank_2_names_and_31_character_names_are_packed() {
+fn the_room_and_character_names_are_packed() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let six = [
-        "panel02", "slide_b2", "Rancher", "mv_step", "D_gacha", "call",
-    ];
     let names = character_sfx_names();
     assert_eq!(names.len(), 31, "the character tables name 31 sounds");
     let mut missing = Vec::new();
-    for name in six
+    // Every named sound the room tables and the shared tables reference: the
+    // full per-room table, the character table and the BGM group tracks.
+    for name in sfx::SE_NAMES
         .iter()
         .copied()
-        .map(String::from)
-        .chain(names.iter().map(|name| (*name).to_owned()))
+        .chain(names.iter().copied())
+        .chain(arklay::music::se_track_names())
     {
         let path = format!("se/{}.wav", name.to_ascii_lowercase());
-        if !pack.contains(&path) {
-            missing.push(path);
-        }
-    }
-    for seed in ["Se_01", "Se_4d", "Se_42"] {
-        let path = format!("se/{}.wav", seed.to_ascii_lowercase());
         if !pack.contains(&path) {
             missing.push(path);
         }
@@ -888,9 +912,8 @@ fn conversion_writes_the_referenced_voice_pack() {
     }
     assert!(missing.is_empty(), "unpacked voice entries: {missing:?}");
 
-    // The main pack gained the slice-4 sounds: the six bank-2 room names, the
-    // 31 character SFX and the non-Bgm BGM group tracks (the muted seeds
-    // among them).
+    // The main pack gained the full room-table sound set, the 31 character
+    // SFX and the non-Bgm BGM group tracks (the muted seeds among them).
     let main = Pack::open(&out).unwrap();
     assert_eq!(
         main.paths().filter(|path| path.starts_with("se/")).count(),
@@ -898,22 +921,13 @@ fn conversion_writes_the_referenced_voice_pack() {
         "every named effect and BGM group track is packed"
     );
     let mut se_missing = Vec::new();
-    for name in [
-        "panel02", "slide_b2", "Rancher", "mv_step", "D_gacha", "call",
-    ] {
+    for name in sfx::SE_NAMES
+        .iter()
+        .copied()
+        .chain(character_sfx_names())
+        .chain(arklay::music::se_track_names())
+    {
         let path = format!("se/{}.wav", name.to_ascii_lowercase());
-        if !main.contains(&path) {
-            se_missing.push(path);
-        }
-    }
-    for name in character_sfx_names() {
-        let path = format!("se/{}.wav", name.to_ascii_lowercase());
-        if !main.contains(&path) {
-            se_missing.push(path);
-        }
-    }
-    for seed in ["Se_01", "Se_4d", "Se_42"] {
-        let path = format!("se/{}.wav", seed.to_ascii_lowercase());
         if !main.contains(&path) {
             se_missing.push(path);
         }
@@ -934,7 +948,7 @@ const IMPLEMENTED_OPCODES: [u8; 12] = [
     0x1E, // voice_play
     0x27, // snd_fade_set
     0x2F, // snd_pan_vol_set
-    0x37, // tbl37_set
+    0x37, // room_bgm_state_set
     0x43, // bgm_volume_ramp
     0x4A, // bgm_restore
     0x4B, // bgm_stop_all
@@ -1101,9 +1115,10 @@ fn integration_deviations_are_documented() {
     for topic in [
         "Weapon banks",
         "Enemy position type 2",
-        "Monster-AI room columns",
+        "Room action effect zones",
         "One-shot vs restart",
         "Pan law",
+        "Scripted fade scope",
         "Unreferenced voice files",
         "movie_on",
         "Costume model swap",

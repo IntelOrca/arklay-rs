@@ -104,7 +104,7 @@ pub const COMMAND_OPS: [Op; 81] = [
     op(0x34, "model_op", "ubuuuuu", false, Some(8)),
     op(0x35, "objtbl_b_set", "uuu", false, Some(4)),
     op(0x36, "ck_anim", "uuu", true, Some(4)),
-    op(0x37, "tbl37_set", "uuu", false, Some(4)),
+    op(0x37, "room_bgm_state_set", "uuu", false, Some(4)),
     op(0x38, "ck_bits", "uU", true, Some(4)),
     op(0x39, "get_eml_state", "u", false, Some(2)),
     op(0x3A, "msgnode_set", "uuu", false, Some(4)),
