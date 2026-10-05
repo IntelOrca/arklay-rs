@@ -14,27 +14,37 @@ const DICT_ENTRIES: u16 = 34981;
 const MAX_WIDTH: u8 = 16;
 const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
+/// MSB-first bit reader with a small accumulator refilled one byte at a time.
 struct BitReader<'a> {
     data: &'a [u8],
-    bit: usize,
+    pos: usize,
+    acc: u32,
+    bits: u32,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, bit: 0 }
+        Self {
+            data,
+            pos: 0,
+            acc: 0,
+            bits: 0,
+        }
     }
 
     fn read(&mut self, width: u8) -> Result<u16> {
-        let mut value = 0u16;
-        for _ in 0..width {
-            let byte = self.bit >> 3;
-            let Some(&b) = self.data.get(byte) else {
+        while self.bits < u32::from(width) {
+            let Some(&byte) = self.data.get(self.pos) else {
                 bail!("truncated LZW stream");
             };
-            value = (value << 1) | u16::from((b >> (7 - (self.bit & 7))) & 1);
-            self.bit += 1;
+            self.acc = (self.acc << 8) | u32::from(byte);
+            self.bits += 8;
+            self.pos += 1;
         }
-        Ok(value)
+        self.bits -= u32::from(width);
+        let value = (self.acc >> self.bits) & ((1u32 << width) - 1);
+        self.acc &= (1u32 << self.bits) - 1;
+        Ok(value as u16)
     }
 }
 
@@ -51,7 +61,7 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
     let mut width = 9u8;
     let mut prev: Option<u16> = None;
     let mut out = Vec::new();
-    let mut string = Vec::new();
+    let mut stack = Vec::new();
 
     loop {
         let code = reader.read(width)?;
@@ -86,26 +96,28 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
         let special = next_code <= code;
         let lookup = if special { prev_code } else { code };
 
-        string.clear();
+        // Expand the code's prefix chain into the stack leaf-first; `c` ends as
+        // the chain's literal root byte.
+        stack.clear();
         let mut c = lookup;
         while c >= FIRST_CODE {
             let Some(entry) = dict.get((c - FIRST_CODE) as usize) else {
                 bail!("missing LZW dictionary entry {c:#x}");
             };
-            string.push(entry.byte);
+            stack.push(entry.byte);
             c = entry.prefix;
         }
-        string.push(c as u8);
-        string.reverse();
+        let first = c as u8;
 
-        let first = string[0];
-        if special {
-            string.push(first);
-        }
-        if out.len() + string.len() > MAX_OUTPUT {
+        let length = stack.len() + 1 + usize::from(special);
+        if out.len() + length > MAX_OUTPUT {
             bail!("LZW output exceeds the {MAX_OUTPUT}-byte limit");
         }
-        out.extend_from_slice(&string);
+        out.push(first);
+        out.extend(stack.iter().rev());
+        if special {
+            out.push(first);
+        }
 
         if next_code >= DICT_ENTRIES {
             bail!("LZW dictionary overflow");
