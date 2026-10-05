@@ -436,6 +436,14 @@ pub fn tracks_for(group: u8) -> Vec<(&'static str, bool)> {
 }
 
 /// The first non-null track of the group selected for `id`.
+///
+/// TODO(parity): (audio) the original loads up to three group channels and
+/// starts each one whose state bit 3-5 is set, then crossfades and handles the
+/// restart/reload state types (bits 6-7), the three tracks it loads muted for
+/// later SCD volume opcodes (Se_01, Se_4d, Se_42) and per-track pan/volume.
+/// The port plays only the first channel, at full volume, with no fade or
+/// restart handling, so multi-channel scenes (e.g. the underground cutscene's
+/// dialogue track) are silent and transitions cut abruptly.
 pub fn primary_track(id: RoomId) -> Option<(&'static str, bool)> {
     tracks_for(group_for(id)?).into_iter().next()
 }

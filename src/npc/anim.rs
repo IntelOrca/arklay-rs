@@ -64,6 +64,12 @@ impl EntityAnim {
     /// reads the frame data backwards; `blend_step` is the caller's step (kept
     /// for the interpolation the renderer does not do yet). Returns whether
     /// the clip just completed.
+    ///
+    /// TODO(parity): (gameplay) the original interpolates between the current
+    /// and pending keyframes by `blend_step` (the published `blend_counter`
+    /// scaled step) and runs `entity_apply_anim_vertex` for the vertex-anim
+    /// joints; the port poses whole keyframes only, so NPC motion is a step
+    /// animation instead of a blend.
     pub fn advance(
         &mut self,
         entity: &mut Entity,

@@ -89,6 +89,11 @@ pub enum ScreenAction {
 ///
 /// The context is built fresh each tick by the app, so screens never own (or
 /// borrow beyond a call) the pack.
+///
+/// TODO(parity): (UI) the original screens play cursor/confirm/cancel cues from
+/// the SFX banks (title EVIL01, character-select 0/1, menu 4/5/6, save/load
+/// 29/30/31, ...). The context carries no mixer or sound queue, so every port
+/// screen is silent; add an sfx request channel here when UI audio is wired.
 pub struct UiContext<'a> {
     /// The open game pack.
     pub pack: &'a Pack,

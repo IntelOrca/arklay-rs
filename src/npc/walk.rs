@@ -97,6 +97,12 @@ pub fn entity_apply_walk_speed(entity: &mut Entity, speed: i16) {
 /// `Add_speedXZ`: move `distance` units along the entity's yaw plus `offset`,
 /// resolved against the room collision with the entity's radius. A blocked
 /// move rolls back to the pre-move position.
+///
+/// TODO(parity): (gameplay) the original's Add_speedXZ is a bare un-collided
+/// add; scripted state-8 walks can cross geometry, and state 9 only resolves
+/// the final position afterwards with check_room_collision (which pushes out
+/// of walls rather than rolling back). The port's pre-check + rollback makes
+/// characters stop at walls the original would pass through or slide along.
 pub fn advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) {
     try_advance_xz(room, entity, offset, distance);
 }
@@ -120,6 +126,10 @@ pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distan
 /// The engine's mixer consumes the queue; a room with no matching floor zone
 /// or sound name stays silent.
 pub fn footstep(sounds: &mut Vec<EntitySound>, room: &RoomState, entity: &Entity, sound_type: u8) {
+    // TODO(parity): (audio) the original folds `g_main_state_flags2`'s
+    // MSF2_EFFECT_ZONE bit into the column as a -3 offset (`inputMod`) and has
+    // a door-transition special case that adds 0x23; the port always passes
+    // `slow = false`, so the slippery/effect-zone footstep variant never plays.
     if let Some(name) = sfx::footstep_sound(room, entity.pos, sound_type, false) {
         sounds.push(EntitySound {
             name,
@@ -199,6 +209,12 @@ pub enum ZonePath {
 /// the player's zone. Returns the next zone to walk into and the shared-edge
 /// crossing; the same zone is [`ZonePath::Direct`] and a point outside the
 /// grid or a disconnected target is [`ZonePath::Unreachable`].
+///
+/// TODO(parity): (gameplay) the original walks the zone graph with the
+/// distance-weighted CW/CCW ring searches (zone_walk_cw/ccw) that keep the
+/// shortest crossing path, and treats a `to.z == 0` target as a zone index
+/// whose midpoint is the waypoint. The BFS returns a valid but sometimes
+/// different first step (no distance weighting) and has no z==0 mode.
 pub fn zone_path_find(room: &RoomState, from: [i32; 3], to: [i32; 3]) -> ZonePath {
     let count = room.walk_zones.len();
     let Some(start) = walk_zone_find(room, from[0], from[2]) else {
@@ -882,6 +898,12 @@ pub fn separate_from_character(
 /// and the other entity is `entA`; the original's guards are `entB->state == 4`
 /// (the eating/headless state) and status bit 1 on either side (the
 /// deactivation bit, e.g. the lab power-room Wesker).
+///
+/// TODO(parity): (gameplay) the original resolves the entities' SCA volume
+/// lists: each volume has its own radius/half-height, the overlap is also
+/// tested in Y, the push direction uses the entity's pre-move `position` to
+/// break degenerate overlaps and the pair returns a hit flag. The port pushes
+/// by the two flat `sca_radius` values in XZ only and returns nothing.
 fn resolve_sca_collision(
     room: &RoomState,
     entity: &mut Entity,
@@ -975,6 +997,11 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         reset_lookat(entity, seed);
     }
 
+    // TODO(parity): (gameplay) the original runs entity_pathfind_update here
+    // before the behaviour swap: it tracks the player through the room's
+    // boundary quadrants and latches a waypoint into player_pos_x/z on the
+    // frames line-of-sight refreshes. The port recomputes the crossing every
+    // tick from zone_path_find instead, so the waypoint timing differs.
     swap_behavior(entity, player_pos);
     entity.splatter_flag = walk_zone_find(room, entity.pos[0], entity.pos[2]).unwrap_or(0xFF);
     match entity.action_behavior {

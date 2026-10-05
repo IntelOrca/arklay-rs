@@ -242,6 +242,9 @@ impl Screen for CharSelectScreen {
 
     fn update(&mut self, _cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
+        // TODO(parity): (UI) the original slides and rescales the two cards
+        // between their front/back positions while the pick changes (and plays
+        // the select cues); the port snaps straight to the end poses.
         match self.stage {
             Stage::Idle => {
                 self.fade = self.fade.saturating_sub(8);

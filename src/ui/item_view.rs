@@ -215,6 +215,15 @@ impl Screen for ItemViewScreen {
             return ScreenResult::Done(ScreenAction::Resume);
         }
         if input.confirm {
+            // TODO(parity): (UI) the original confirm first runs the examine
+            // check: for the examinable items it compares the model's current
+            // yaw/pitch against the `g_ItemExamineCombos` windows and only
+            // opens the description (or the red-book zoom) when the rotation
+            // matches. The port opens the description unconditionally, so the
+            // rotation puzzle items skip their check. The original also plays
+            // an entry zoom + light ramp (`g_bItemViewerZoomTimer`) and spins
+            // the model while a direction is held; the port steps the angle
+            // once per key edge and draws full-bright.
             self.start_description();
             return ScreenResult::Continue;
         }

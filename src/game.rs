@@ -1131,6 +1131,11 @@ impl GameState {
         }
         let id = operand_u8(operands, 0);
         if !(CHARACTER_ID_MIN..=CHARACTER_ID_MAX).contains(&id) {
+            // TODO(parity): (gameplay) the original allocates and runs the
+            // monster entity for ids below 0x20 (and the DC-only ids above);
+            // the port parses the record but creates nothing, so rooms that
+            // spawn zombies alongside a character look emptier and their
+            // scripts' get_eml_state/eml_state on those slots are inert.
             return false;
         }
         let slot = 1 + usize::from(operand_u8(operands, 11) & 0x0F);
@@ -1140,6 +1145,13 @@ impl GameState {
         // re-initialises an occupied slot when no saved enemy state matches
         // (FUN_0048f330); this always leaves the occupied slot untouched.
         if occupied && !force_init {
+            // TODO(parity): (gameplay) the original still runs the re-init block
+            // whenever the slot's status bit is set, even when the saved-state
+            // check suppressed shouldInit: it overwrites state/id/anim and
+            // increments g_enemy_count anyway. The port leaves the occupied
+            // slot untouched (no enemy snapshot store yet) and only counts a
+            // new allocation. Add the saved-state restore before relying on
+            // re-spawning an occupied slot.
             return false;
         }
 
@@ -1170,6 +1182,12 @@ impl GameState {
         entity.variant = (operand_u8(operands, 11) & 0x0F)
             | ((operand_u8(operands, 14) & 0x0F) << 4)
             | if force_init { 0x80 } else { 0 };
+        // TODO(parity): (gameplay) the original points the new entity at the
+        // SCA record g_scaDataTable[0] (Chris' radius/hit box) and reserves
+        // `operand 4 * 6` bytes of the rotated hit-data pool; the port stores a
+        // flat DEFAULT_ENEMY_RADIUS and has no SCA hit volumes, so per-character
+        // hit boxes and the SCA collision pass differ (see npc/walk.rs
+        // resolve_sca_collision).
         entity.sca_radius = DEFAULT_ENEMY_RADIUS;
         if !occupied {
             self.enemy_count = self.enemy_count.saturating_add(1);
@@ -1222,7 +1240,13 @@ impl GameState {
                 entity.action_behavior = 0;
                 entity.action_state = 0;
             }
-            9 => entity.joint_flags ^= param,
+            9 => {
+                // TODO(parity): (gameplay) the original XORs each joint's own
+                // flag bit (bit i toggles joint i's flags byte); the port only
+                // records the bitfield. No renderer support for per-joint
+                // hiding yet, so scripts that hide a joint are inert.
+                entity.joint_flags ^= param;
+            }
             10 => entity.action_state = param as u8,
             _ => {}
         }
@@ -1258,8 +1282,17 @@ impl GameState {
         // The original reseeds its random seed from `rand()` at the top of
         // every gameplay frame, before any entity thinks; the look-at
         // scheduling reads the frame's value.
+        // TODO(parity): (gameplay) the port advances a fixed xorshift instead
+        // of the platform `rand()` stream, so the state-9 look-at wander and
+        // behaviour-0 wait lengths are deterministic but differ from the
+        // original's per-frame draws.
         self.rand_seed = next_random(self.rand_seed);
         if self.message_freezes_entities() {
+            // TODO(parity): (gameplay) the original still runs the state
+            // dispatch when the message bit is set and always updates the
+            // switch-zone bit and queues the fade sprite afterwards; the port
+            // skips the whole NPC update, so a frozen character's
+            // has_enter_switch_zone (and its shadow) stops tracking the camera.
             return 0;
         }
         crate::npc::update_all(self, room, models, pack)
@@ -1480,6 +1513,11 @@ impl GameState {
                 // The selector is the word at +2 and the index the signed word
                 // at +4. Object and item models have no entity this milestone,
                 // so only the player and enemy targets latch a live slot.
+                // TODO(parity): (gameplay) target types 2 (object model) and 3
+                // (item model) resolve to g_omodel_table/g_item_model_table in
+                // the original and refresh the look-at from their transforms;
+                // the port ignores them, so a script aiming a character at an
+                // omodel keeps its previous target.
                 target_entity =
                     motion_target_slot(operand_u8(operands, 1), operand_i16(operands, 2));
                 target = target_entity.map(|slot| self.entities[usize::from(slot)].pos);
@@ -3360,6 +3398,11 @@ impl ScdHost for ScdGameHost<'_> {
     }
 
     fn on_sound(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        // TODO(parity): (audio) the sound commands the port does not model fall
+        // through to `placeholder`: 0x2F se_volume (per-channel pan/volume),
+        // 0x43 se_rate (volume ramp), and 0x4A/0x4B bgm_bank_down/up. The
+        // original applies each to the live DirectSound bank immediately, so
+        // scripted fades and channel mixing are missing here.
         match op.op {
             0x15 => {
                 let channel = operand_u8(operands, 0);

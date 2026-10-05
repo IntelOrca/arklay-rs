@@ -62,6 +62,11 @@ pub fn init(
         entity.timing_control = 0;
     }
     apply_pose_variant(entity, flags, room);
+    // TODO(parity): (gameplay) the per-character init handlers also apply the
+    // ambient joint tints, build the ground-shadow quad from `character_init`
+    // (tint + half extents/offset) and point the entity at its SCA hit record;
+    // the port applies the opening clip/frame only, so wounded Rebecca/Wesker
+    // tints, their resized shadows and per-character hit boxes are missing.
     entity.blend_counter = 0;
     clock.advance(entity, clips, false, INIT_BLEND_STEP);
 }
@@ -205,6 +210,12 @@ fn walk_01_knock(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
 /// Behaviour 2: the scripted death. Only the animation state machine runs; the
 /// blood billboards, the death timer and the ground-pool grow are effects and
 /// stay absent. The state stops at 2 once the clip completes.
+///
+/// TODO(parity): (gameplay) the original also arms death_timer 0xB4, raises
+/// joint-1's flag, sprays type-0 blood billboards for the first ten frames,
+/// tints three joints on frame 3, plays the wet sound on frame 0x2A and grows
+/// a ground pool for 30 frames; the port parks in the pool state with no
+/// effect or timer.
 fn walk_02(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     match entity.action_state {
         0 => {
@@ -230,6 +241,11 @@ fn walk_02_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
 /// Behaviour 3: the bleeding-out death. The animation plays to completion,
 /// then the character clears status bit 1 and drops to health -1. The 250-tick
 /// billboard grow is an effect and stays absent, so state 2 parks.
+///
+/// TODO(parity): (gameplay) the original seeds the facing from enemy 1, tints
+/// five joints on frame 8, sprays blood before frame 9 and after frame 0x5F,
+/// runs the vertex-animation pass and shrinks/grows the billboard over the
+/// 250-tick timer; none of that is modelled.
 fn walk_03(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     match entity.action_state {
         0 => {

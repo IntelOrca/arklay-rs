@@ -148,6 +148,10 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
             let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
             for _ in 0..ticks {
+                // TODO(parity): (harness) the transition tick_room returns is
+                // discarded here, so a scripted scene that opens a door during
+                // `--ticks` silently keeps its room instead of playing the
+                // transition. The same drop exists in `simulate_loaded`.
                 tick_room(
                     &mut command_vm,
                     &mut event_vm,
@@ -983,6 +987,9 @@ impl GameSession {
     /// radio tab does; without the radio the tab is inert.
     fn handle_tab(&mut self, pack: &Pack, cursor: u8) {
         match cursor {
+            // TODO(parity): (UI) the original's map tab (cursor 0) draws the
+            // room map overlay; the port leaves it inert, so selecting the map
+            // does nothing.
             0 => {}
             2 => self.open_file(pack),
             4 => {
@@ -2845,6 +2852,9 @@ fn play_footsteps(
         // turn and backward run, 1 for the forward run). The slow argument is
         // the original's effect-zone flag, which no room script in this slice
         // raises.
+        // TODO(parity): (audio) the player footsteps go through the same
+        // PlayEntitySnd path as the NPCs, so the MSF2_EFFECT_ZONE -3 column
+        // offset applies here too; the port hard-codes `slow = false`.
         let Some(name) = sfx::footstep_sound(room, footstep.pos, footstep.sound_type, false) else {
             continue;
         };
@@ -3214,10 +3224,11 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
 /// Apply the room's queued BGM requests; the engine plays one track at a time.
 ///
 /// TODO(parity): (audio) the original keeps three independent BGM channel
-/// handles (`g_SndBank`) that `bgm_play`/`bgm_stop` address per script channel
-/// and re-derives from the per-room `g_roomBgmState` table; this engine plays or
-/// stops the single room track, so channel 1/2 requests and per-room BGM state
-/// are collapsed and `bgm_stop` on one channel stops everything.
+/// handles (`g_SndBank`) that `bgm_play`/`bgm_stop` address per script channel,
+/// re-derives them from the per-room `g_roomBgmState` table, fades old banks
+/// out, handles the restart/reload state types (bits 6-7) and applies the
+/// per-channel volume opcodes. This engine plays or stops the single room
+/// track, so channel 1/2 requests, fades and per-room BGM state are collapsed.
 fn apply_bgm_requests(
     music: &mut Option<MusicPlayer>,
     requests: &mut Vec<game::BgmRequest>,
@@ -3489,6 +3500,10 @@ fn render_frame(
     // below stay alive for the draw call.
     let mut models: Vec<Arc<Emd>> = Vec::new();
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    // TODO(parity): (UI) the original queues a fade sprite (ground shadow) for
+    // every character inside its camera switch zone, with the per-character
+    // tint/quad from `npc::data::character_init`; the port draws only the
+    // player's shadow, so NPCs have none (see the TODO(M10) above).
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
         if !entity.active() {

@@ -215,6 +215,11 @@ fn resample_linear(input: &[i16], from: u32, to: u32) -> Vec<i16> {
 
 /// Constant-power left and right gains for `pan`, where -1 is hard left, 1 is
 /// hard right and 0 is centered.
+///
+/// TODO(parity): (audio) the original hands DirectSound a pan value in
+/// `-10000..=10000` and lets the backend's own pan law scale the channels; the
+/// port's `sqrt` constant-power curve is a different law, so the stereo image
+/// of a panned cue differs (usually a few dB in the near channel).
 fn pan_gains(pan: f32) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
     (((1.0 - pan) * 0.5).sqrt(), ((1.0 + pan) * 0.5).sqrt())
@@ -297,6 +302,13 @@ impl MixState {
     /// the pool is full the voice that has played the most of its buffer is
     /// stolen; voices tied on progress give way oldest-first, so a burst of
     /// new sounds can never evict the copy that was just started.
+    ///
+    /// TODO(parity): (audio) the original plays each sound through a single
+    /// DirectSound bank (one buffer per room/enemy/character sound record), so
+    /// replaying the same cue restarts that buffer and two actors using the
+    /// same cue cut each other off. The port appends independent voices, so
+    /// overlapping copies mix where the original would restart, and the voice
+    /// pool (16) has no counterpart in the original's fixed bank set.
     pub(crate) fn play_sfx(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
         if pcm.is_empty() {
             return;

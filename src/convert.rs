@@ -154,6 +154,12 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
 
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
+    // TODO(parity): (conversion) the original installs more than this pack
+    // carries: the voice WAVs under `voice/` (the SCD 0x1E lines), the FMV
+    // AVIs, the room effect sheets (ESP/ESPTIM, `effspr`) and the held-weapon
+    // TMDs under `players/ws*.tmd`. Those systems are unimplemented, so the
+    // conversion is complete only for the modelled categories; add their
+    // copy phases when the runtime grows them.
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress)?;

@@ -46,6 +46,10 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     }
     // `scd_entity_flags` bit 2 refreshes the held-weapon joint; the weapon
     // TMDs stay unpacked this milestone, so the bit is inert.
+    // TODO(parity): (gameplay) the original runs EntityUpdateWeaponJoint on
+    // `scd_entity_flags & 4` (hand selected by bit 3); without the held-weapon
+    // TMDs the joint is never updated, so a script that raises the bit is a
+    // no-op.
 }
 
 /// Run one behaviour handler with the entity, its clock, the system flag bank
@@ -72,6 +76,12 @@ fn run(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip], beha
         6 => handler_06(entity, clock, clips, system),
         7 => handler_07(entity, clock, clips, system),
         8 => {
+            // TODO(parity): (gameplay) the fire behaviour is inert: the
+            // original plays the scripted animation, spawns the muzzle/shell
+            // billboards on their trigger frames, tags them with the weapon id
+            // and raises the completion flag (with the flamethrower states 4/5
+            // doing a looping spray and yaw sweep). A scene that waits on the
+            // flag can stall forever; only the placeholder count is recorded.
             *npc_placeholders.entry(8).or_insert(0) += 1;
         }
         9 => handler_09(entity, clock, clips, system),

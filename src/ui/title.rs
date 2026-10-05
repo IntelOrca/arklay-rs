@@ -201,6 +201,12 @@ impl Screen for TitleScreen {
     fn update(&mut self, _cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
         self.fade = self.fade.saturating_sub(FADE_STEP);
+        // TODO(parity): (UI) the original title runs an attract/demo timer
+        // (`g_titleDemoTime`): idling on PRESS or on the option menu eventually
+        // fades into the attract demo and back, the selection id cycles
+        // NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED submenu), and
+        // confirming plays EVIL01. The port waits on PRESS forever with only
+        // the two entries and no cue.
         match self.stage {
             Stage::Press => {
                 self.press_brightness = self
