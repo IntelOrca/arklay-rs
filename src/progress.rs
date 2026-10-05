@@ -81,10 +81,13 @@ impl Progress {
         self.active = true;
         // Draw the zero line immediately so a long first item does not leave
         // the phase invisible until the first update or the plain interval.
-        if self.tty {
-            self.draw_tty();
-        } else {
-            self.draw_plain();
+        // Empty phases only render their final line from `end_phase`.
+        if self.total > 0 {
+            if self.tty {
+                self.draw_tty();
+            } else {
+                self.draw_plain();
+            }
         }
     }
 

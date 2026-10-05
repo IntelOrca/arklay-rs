@@ -46,8 +46,6 @@ struct SerializeLayout {
     order: Vec<(String, usize)>,
     /// The fixed-size table of contents.
     toc: Vec<u8>,
-    /// Total serialized size in bytes.
-    total: usize,
 }
 
 impl PackWriter {
@@ -76,10 +74,24 @@ impl PackWriter {
 
     /// Total size in bytes of the serialized pack.
     pub fn pack_size(&self) -> Result<usize> {
-        Ok(self.serialize_layout()?.total)
+        let count = self.entries.len();
+        u32::try_from(count).context("too many pack entries")?;
+        let toc_len = count
+            .checked_mul(ENTRY_LEN)
+            .context("pack table of contents is too large")?;
+        let mut total = HEADER_LEN
+            .checked_add(toc_len)
+            .context("pack table of contents is too large")?;
+        for (path, data) in &self.entries {
+            total = total
+                .checked_add(path.len() + 1)
+                .and_then(|size| size.checked_add(data.len()))
+                .context("pack data exceeds addressable size")?;
+        }
+        Ok(total)
     }
 
-    /// Compute the sorted entry order, table of contents and total size.
+    /// Compute the sorted entry order and table of contents.
     fn serialize_layout(&self) -> Result<SerializeLayout> {
         let count = self.entries.len();
         let entry_count = u32::try_from(count).context("too many pack entries")?;
@@ -99,16 +111,10 @@ impl PackWriter {
         order.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut data_start = paths_start;
-        let mut total = paths_start;
         for (_, index) in &order {
-            let (path, data) = &self.entries[*index];
             data_start = data_start
-                .checked_add(path.len() + 1)
+                .checked_add(self.entries[*index].0.len() + 1)
                 .context("pack paths exceed addressable size")?;
-            total = total
-                .checked_add(path.len() + 1)
-                .and_then(|size| size.checked_add(data.len()))
-                .context("pack data exceeds addressable size")?;
         }
 
         let mut toc = Vec::with_capacity(toc_len);
@@ -129,16 +135,11 @@ impl PackWriter {
             entry_count,
             order,
             toc,
-            total,
         })
     }
 
-    /// Write the pack to `out`, sorting entries by ASCII-lowercased path.
-    ///
-    /// Unlike [`PackWriter::to_bytes`] this never materializes a second copy
-    /// of the entry data.
-    pub fn stream_to(&self, out: &mut impl Write) -> Result<()> {
-        let layout = self.serialize_layout()?;
+    /// Write a prepared layout to `out`.
+    fn write_layout(&self, layout: &SerializeLayout, out: &mut impl Write) -> Result<()> {
         out.write_all(&MAGIC)?;
         out.write_all(&VERSION.to_le_bytes())?;
         out.write_all(&layout.entry_count.to_le_bytes())?;
@@ -153,19 +154,34 @@ impl PackWriter {
         Ok(())
     }
 
+    /// Write the pack to `out`, sorting entries by ASCII-lowercased path.
+    ///
+    /// Unlike [`PackWriter::to_bytes`] this never materializes a second copy
+    /// of the entry data.
+    pub fn stream_to(&self, out: &mut impl Write) -> Result<()> {
+        let layout = self.serialize_layout()?;
+        self.write_layout(&layout, out)
+    }
+
     /// Serialize the pack, sorting entries by ASCII-lowercased path.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(self.pack_size()?);
+        let size = self.pack_size()?;
+        let mut out = Vec::with_capacity(size);
         self.stream_to(&mut out)?;
+        debug_assert_eq!(out.len(), size);
         Ok(out)
     }
 
     /// Serialize the pack and write it to `path`.
+    ///
+    /// The layout is prepared before the file is created, so a serialization
+    /// error cannot leave a truncated pack behind.
     pub fn write(&self, path: &Path) -> Result<()> {
+        let layout = self.serialize_layout()?;
         let file = std::fs::File::create(path)
             .with_context(|| format!("failed to write pack {}", path.display()))?;
         let mut out = BufWriter::new(file);
-        self.stream_to(&mut out)
+        self.write_layout(&layout, &mut out)
             .with_context(|| format!("failed to write pack {}", path.display()))?;
         out.flush()
             .with_context(|| format!("failed to write pack {}", path.display()))
@@ -516,6 +532,15 @@ mod tests {
         let mut streamed = Vec::new();
         writer.stream_to(&mut streamed).unwrap();
         assert_eq!(streamed, bytes);
+    }
+
+    #[test]
+    fn streaming_an_empty_pack_is_just_the_header() {
+        let writer = PackWriter::new();
+        let mut out = Vec::new();
+        writer.stream_to(&mut out).unwrap();
+        assert_eq!(out, empty_pack());
+        assert_eq!(writer.pack_size().unwrap(), HEADER_LEN);
     }
 
     #[test]

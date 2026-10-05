@@ -18,7 +18,7 @@ use std::fs;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -63,8 +63,9 @@ type JobResult<T> = Result<(String, u64, T)>;
 /// Run `job(0..count)` on up to `jobs` scoped workers, returning the results in
 /// job order and advancing `progress` as each job completes.
 ///
-/// The first error in job order is returned, so failures do not depend on
-/// thread scheduling.
+/// The first error returned by a job is reported, so failures do not depend on
+/// thread scheduling; once a job fails no further jobs are claimed, though work
+/// already in flight still finishes. A panicking job unwinds through the scope.
 fn parallel_map<T: Send>(
     count: usize,
     jobs: usize,
@@ -86,27 +87,42 @@ fn parallel_map<T: Send>(
     }
 
     let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
     let progress = Mutex::new(progress);
     let results = Mutex::new(Vec::with_capacity(count));
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
                 loop {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     if index >= count {
                         return;
                     }
                     let result = job(index);
-                    if let Ok((label, units, _)) = &result {
-                        progress.lock().unwrap().advance_named(*units, label);
+                    match &result {
+                        Ok((label, units, _)) => {
+                            progress
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .advance_named(*units, label);
+                        }
+                        Err(_) => stop.store(true, Ordering::Relaxed),
                     }
-                    results.lock().unwrap().push((index, result));
+                    results
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push((index, result));
                 }
             });
         }
     });
 
-    let mut collected = results.into_inner().unwrap();
+    let mut collected = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     collected.sort_by_key(|(index, _)| *index);
     let mut out = Vec::with_capacity(count);
     for (_, result) in collected {
@@ -271,8 +287,9 @@ pub fn convert_game_with_options(
             .first()
             .map(|(id, camera)| id.cut_entry(*camera))
             .unwrap_or_default();
+        debug_assert!(!targets.is_empty(), "cut groups are never empty");
         let mut entries = Vec::with_capacity(targets.len());
-        let last = targets.len() - 1;
+        let last = targets.len().saturating_sub(1);
         for (position, (id, camera)) in targets.iter().enumerate() {
             let entry = id.cut_entry(*camera);
             let data = if position == last {
@@ -310,8 +327,9 @@ pub fn convert_game_with_options(
         let (pak, targets) = &mask_groups[index];
         let mut bmp_bytes = convert_roommask(pak)?;
         let label = targets.first().cloned().unwrap_or_default();
+        debug_assert!(!targets.is_empty(), "mask groups are never empty");
         let mut entries = Vec::with_capacity(targets.len());
-        let last = targets.len() - 1;
+        let last = targets.len().saturating_sub(1);
         for (position, entry) in targets.iter().enumerate() {
             let data = if position == last {
                 std::mem::take(&mut bmp_bytes)
@@ -2711,6 +2729,43 @@ mod tests {
 
         let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
+    }
+
+    #[test]
+    fn parallel_map_reports_the_first_error_in_job_order() {
+        let mut progress = Progress::new();
+        let result = parallel_map(16, 4, &mut progress, |index| {
+            if index == 5 || index == 11 {
+                bail!("job {index} failed");
+            }
+            Ok((format!("job {index}"), 1, index))
+        });
+        let message = result.unwrap_err().to_string();
+        assert!(message.contains("job 5"), "{message}");
+    }
+
+    #[test]
+    fn conversion_is_identical_for_any_worker_count() {
+        let root = TempDir::new("jobs-parity");
+        make_stage_dirs(&root.path);
+        write_npc_files(&root.path);
+        let pak = camera_pak();
+
+        fs::write(root.path.join("STAGE1/ROOM1000.RDT"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/room1001.rdt"), rdt_bytes(1)).unwrap();
+        fs::write(root.path.join("STAGE1/RC1000.pak"), &pak).unwrap();
+        fs::write(root.path.join("STAGE6/ROOM6000.RDT"), rdt_bytes(1)).unwrap();
+
+        fs::create_dir_all(root.path.join("sound")).unwrap();
+        fs::write(root.path.join("sound/BGM_13.WAV"), b"wav13").unwrap();
+        write_se_files(&root.path);
+        write_door_files(&root.path);
+
+        let serial = root.path.join("serial.akpak");
+        let parallel = root.path.join("parallel.akpak");
+        convert_game_with_options(&root.path, &serial, None, 1).unwrap();
+        convert_game_with_options(&root.path, &parallel, None, 4).unwrap();
+        assert_eq!(fs::read(&serial).unwrap(), fs::read(&parallel).unwrap());
     }
 
     #[test]

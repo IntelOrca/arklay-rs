@@ -273,7 +273,9 @@ pub fn encode_texture8_to_vec(texture: &Texture8) -> Result<Vec<u8>> {
         let assigned = match colors.entry(rgb) {
             Entry::Occupied(color) => *color.get(),
             Entry::Vacant(color) => {
-                let assigned = palette.len() as u8;
+                let Ok(assigned) = u8::try_from(palette.len()) else {
+                    bail!("texture uses more than 256 colours");
+                };
                 color.insert(assigned);
                 palette.push(rgb);
                 assigned
@@ -281,7 +283,6 @@ pub fn encode_texture8_to_vec(texture: &Texture8) -> Result<Vec<u8>> {
         };
         *slot = u16::from(assigned);
     }
-    debug_assert!(palette.len() <= 256);
 
     let palette_len = palette.len();
     let row_bytes = width;
@@ -524,6 +525,33 @@ mod tests {
         let expected: Vec<u8> =
             [[10, 20, 30, 255], [200, 100, 50, 255], [10, 20, 30, 255]].concat();
         assert_eq!(image.rgba, expected);
+    }
+
+    #[test]
+    fn texture8_encoding_matches_the_generic_rgba_path() {
+        let mut palettes = vec![[0u8; 4]; 256];
+        palettes[0] = [10, 20, 30, 255];
+        palettes[1] = [200, 100, 50, 255];
+        palettes[2] = [10, 20, 30, 255];
+        let texture = Texture8 {
+            width: 4,
+            height: 2,
+            indices: vec![2, 1, 0, 2, 1, 1, 0, 0],
+            palettes,
+        };
+
+        let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
+        for &index in &texture.indices {
+            rgba.extend_from_slice(&texture.palette(0, index));
+        }
+        let legacy = encode_to_vec(&Image {
+            width: texture.width,
+            height: texture.height,
+            rgba,
+        })
+        .unwrap();
+
+        assert_eq!(encode_texture8_to_vec(&texture).unwrap(), legacy);
     }
 
     #[test]
