@@ -14,14 +14,16 @@ use std::path::{Path, PathBuf};
 
 use arklay::bgm;
 use arklay::convert::{VoicePackOptions, convert_game_with_voice};
-use arklay::game::{BgmState, GameState, ScdGameHost};
+use arklay::game::{BgmState, GameState, ScdGameHost, Snd3dPos};
 use arklay::message::MessageWindow;
 use arklay::pack::Pack;
 use arklay::save::SaveFile;
 use arklay::scd::host::ScdHost;
 use arklay::scd::ir::{Decoded, Scripts};
+use arklay::scd::opcode::command_op;
 use arklay::scd::reader;
 use arklay::scd::vm::{CommandVm, EventVm};
+use arklay::sfx;
 use arklay::state::{RoomId, RoomState};
 use arklay::voice;
 
@@ -425,6 +427,424 @@ fn a_save_after_tbl37_set_reloads_the_modified_table() {
     assert_eq!(restored.bgm, BgmState::default());
 }
 
+/// One `se_play_3d` site: bank/id and its room identity and table row.
+struct Snd3dSite {
+    bank: u8,
+    id: u8,
+    row: usize,
+    stage: u8,
+    room: u8,
+}
+
+/// Every `se_play_3d` (0x17) site in the shipped scripts.
+fn snd3d_sites(root: &Path) -> Vec<Snd3dSite> {
+    let mut sites = Vec::new();
+    for stage in 1..=7u8 {
+        let dir = root.join("JPN").join(format!("STAGE{stage}"));
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(|entry| entry.ok()) {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            let Some(digits) = name
+                .to_ascii_lowercase()
+                .strip_prefix("room")
+                .and_then(|name| name.strip_suffix(".rdt"))
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            let id = RoomId::parse(&digits).unwrap();
+            let bytes = fs::read(entry.path()).unwrap();
+            let Ok(scripts) = reader::parse(&bytes) else {
+                continue;
+            };
+            for insn in scripts
+                .init
+                .iter()
+                .flat_map(|block| block.insns.iter())
+                .chain(scripts.main.iter().flat_map(|block| block.insns.iter()))
+                .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+            {
+                let Decoded::Command(op) = insn.decoded else {
+                    continue;
+                };
+                if op.op != 0x17 {
+                    continue;
+                }
+                sites.push(Snd3dSite {
+                    bank: insn.operands.first().map_or(0, |operand| operand.value) as u8,
+                    id: insn.operands.get(1).map_or(0, |operand| operand.value) as u8,
+                    row: sfx::room_row(id.stage, id.room),
+                    stage: id.stage,
+                    room: id.room,
+                });
+            }
+        }
+    }
+    sites
+}
+
+/// The 31 character-SFX names the character tables reference.
+fn character_sfx_names() -> Vec<&'static str> {
+    let mut names = HashSet::new();
+    for table in 0..8u8 {
+        for id in 0..16u8 {
+            if let Some(name) = sfx::character_sfx(table, id) {
+                names.insert(name);
+            }
+        }
+    }
+    let mut names: Vec<&'static str> = names.into_iter().collect();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn every_shipped_se_play_3d_resolves_or_is_an_audited_noop() {
+    let Some((root, _pack)) = common::asset_env() else {
+        return;
+    };
+    let sites = snd3d_sites(&root);
+    assert_eq!(
+        sites.len(),
+        793,
+        "the shipped corpus has 793 se_play_3d sites"
+    );
+
+    let mut banks = std::collections::BTreeMap::new();
+    let mut resolved = 0usize;
+    let mut bgm = 0usize;
+    let mut noops: Vec<(u8, u8, usize)> = Vec::new();
+    for site in &sites {
+        // The corpus rows resolve against the synthetic stage/room identity.
+        let room = RoomState {
+            stage: site.stage,
+            room: site.room,
+            ..RoomState::default()
+        };
+        *banks.entry(site.bank).or_insert(0u64) += 1;
+        let play = sfx::play_sfx_3d(
+            &room,
+            0,
+            site.bank,
+            site.id,
+            [0; 3],
+            [1000, 0, 0],
+            [1000, 0, 0],
+        );
+        if play.bgm {
+            bgm += 1;
+        } else if play.name.is_some() {
+            resolved += 1;
+        } else {
+            noops.push((site.bank, site.id, site.row));
+        }
+    }
+    println!(
+        "se_play_3d corpus: {} sites, banks {banks:?}, resolved {resolved}, \
+         bgm-pan {bgm}, audited no-ops {}",
+        sites.len(),
+        noops.len()
+    );
+    assert_eq!(
+        resolved + bgm + noops.len(),
+        sites.len(),
+        "every site resolves, pans the BGM or is an audited no-op"
+    );
+    // Bank 1 is the unloaded weapon bank and the corpus's bank-0/3 sites all
+    // resolve; only bank-2's untranscribed prop/monster columns stay no-ops.
+    assert!(
+        noops.iter().all(|(bank, _, _)| *bank == 1 || *bank == 2),
+        "unexpected unresolved banks: {noops:?}"
+    );
+    assert_eq!(banks.get(&0), Some(&73));
+    assert_eq!(banks.get(&4), Some(&4));
+    assert_eq!(
+        noops.iter().filter(|(bank, _, _)| *bank == 1).count(),
+        12,
+        "the twelve weapon-bank sites are the audited bank-1 deviation"
+    );
+    // The monster-AI columns (bank-2 ids 0-9) stay absent: the corpus reaches
+    // them exactly twice, both scripted enemy cues (rows 67 and 180).
+    let mut monster_ai: Vec<(u8, usize)> = noops
+        .iter()
+        .filter(|(bank, id, _)| *bank == 2 && *id < 10)
+        .map(|(_, id, row)| (*id, *row))
+        .collect();
+    monster_ai.sort_unstable();
+    assert_eq!(
+        monster_ai,
+        vec![(3, 180), (7, 67), (7, 67)],
+        "only the scripted enemy cues need the absent columns"
+    );
+    let mut bank2_noops: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+    for (bank, id, _) in &noops {
+        if *bank == 2 {
+            *bank2_noops.entry(*id).or_insert(0) += 1;
+        }
+    }
+    println!("audited bank-2 no-op ids: {bank2_noops:?}");
+    // The six names the sparse table carries are the point of the addition.
+    let six = [
+        "call", "panel02", "Rancher", "slide_b2", "D_gacha", "mv_step",
+    ];
+    let mut found: std::collections::BTreeMap<&str, u64> = std::collections::BTreeMap::new();
+    for site in &sites {
+        if site.bank != 2 {
+            continue;
+        }
+        if let Some(name) = sfx::room_sound(site.row, usize::from(site.id))
+            && six.contains(&name)
+        {
+            *found.entry(name).or_insert(0) += 1;
+        }
+    }
+    println!("sparse bank-2 names reached: {found:?}");
+    for name in ["call", "panel02", "Rancher", "slide_b2", "D_gacha"] {
+        assert!(found.contains_key(name), "{name} is reached by the corpus");
+    }
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_105s_3d_se_sites_resolve_through_the_room_and_character_banks() {
+    let Some((root, _pack)) = common::asset_env() else {
+        return;
+    };
+    let scripts = room_scripts(&root, "1051");
+    let id = RoomId::parse("1051").unwrap();
+    let mut game = GameState::new(id, &RoomState::default());
+    {
+        let mut host = ScdGameHost::new(&mut game);
+        let op = command_op(0x17).unwrap();
+        for insn in scripts
+            .init
+            .iter()
+            .flat_map(|block| block.insns.iter())
+            .chain(scripts.main.iter().flat_map(|block| block.insns.iter()))
+            .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+        {
+            if matches!(insn.decoded, Decoded::Command(candidate) if candidate.op == 0x17) {
+                host.on_sound(op, &insn.operands);
+            }
+        }
+    }
+    assert!(!game.snd3d_requests.is_empty(), "room 105 has 3D SE sites");
+
+    let room = RoomState {
+        stage: 1,
+        room: 0x05,
+        cuts: vec![arklay::state::Cut {
+            index: 0,
+            pos: [0, 0, 0],
+            look_at: [1000, 0, 0],
+            fov: 200,
+            ..arklay::state::Cut::default()
+        }],
+        ..RoomState::default()
+    };
+    let mut bank0 = 0usize;
+    for request in &game.snd3d_requests {
+        let pos = match request.pos {
+            Snd3dPos::Point(pos) => pos,
+            Snd3dPos::None => [0, 0, 0],
+        };
+        let play = sfx::play_sfx_3d(
+            &room,
+            0,
+            request.bank,
+            request.id,
+            [0, 0, 0],
+            [1000, 0, 0],
+            pos,
+        );
+        if request.bank == 0 {
+            bank0 += 1;
+            let name = play.name.expect("a bank-0 cue resolves");
+            assert!(name.starts_with("Dr_wd"), "bank-0 pair name {name}");
+            assert!(play.gain.is_finite() && (0.0..=1.1).contains(&play.gain));
+            assert!((-1.0..=1.0).contains(&play.pan));
+        } else {
+            assert_eq!(request.bank, 2, "room 105's other cues are bank 2");
+            // The room's prop columns are outside the transcribed sparse table:
+            // each is an audited no-op rather than a wrong sound.
+            assert!(play.name.is_none());
+        }
+    }
+    assert_eq!(bank0, 4, "room 1051 fires both room-SFX slots twice");
+
+    // The character bank selects the player's table with the same 3D pan.
+    let chris = sfx::play_sfx_3d(&room, 0, 3, 2, [0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
+    assert_eq!(chris.name, Some("Chris03"));
+    let jill = sfx::play_sfx_3d(&room, 1, 3, 2, [0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
+    assert_eq!(jill.name, Some("Jill03"));
+    assert!(chris.pan.is_finite() && (-1.0..=1.0).contains(&chris.pan));
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_1050s_muted_seed_fades_up_on_the_scripted_volume() {
+    let Some((root, _pack)) = common::asset_env() else {
+        return;
+    };
+    let scripts = room_scripts(&root, "1050");
+    let id = RoomId::parse("1050").unwrap();
+    let mut game = GameState::new(id, &RoomState::default());
+    {
+        let mut vm = CommandVm::new(&scripts);
+        let mut host = ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+    bgm::update_room_bgm(&mut game, id, None);
+    assert_eq!(
+        game.bgm.channels[1].name,
+        Some("Se_01"),
+        "room 1050's group loads the muted seed on channel 1"
+    );
+    assert_eq!(game.bgm.channels[1].volume, -9999);
+
+    // The room's `se_volume` sites all target the seed channel; replay them.
+    let op = command_op(0x2F).unwrap();
+    let mut applied = 0usize;
+    for insn in scripts
+        .init
+        .iter()
+        .flat_map(|block| block.insns.iter())
+        .chain(scripts.main.iter().flat_map(|block| block.insns.iter()))
+        .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+    {
+        if !matches!(insn.decoded, Decoded::Command(candidate) if candidate.op == 0x2F) {
+            continue;
+        }
+        let mut host = ScdGameHost::new(&mut game);
+        host.on_sound(op, &insn.operands);
+        applied += 1;
+    }
+    assert!(applied > 0, "room 1050 scripts its seed's volume");
+    let volume = game.bgm.channels[1].volume;
+    assert!(volume > -9999, "the seed left silence, volume {volume}");
+    assert!(sfx::volume_gain(volume) > sfx::volume_gain(-9999));
+    assert_ne!(game.bgm.channels[1].pan_pair, (0, 0));
+}
+
+#[test]
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+fn room_3030s_fade_and_se_volume_move_the_channel_gains() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let scripts = room_scripts(&root, "3030");
+    let id = RoomId::parse("3030").unwrap();
+    let mut game = GameState::new(id, &RoomState::default());
+    {
+        let mut vm = CommandVm::new(&scripts);
+        let mut host = ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+    bgm::update_room_bgm(&mut game, id, None);
+    assert!(
+        game.bgm.channels[0].name.is_some(),
+        "room 3030 loads its first BGM bank"
+    );
+
+    // Replay the script's volume/ramp/fade ops in stream order.
+    let ops = [0x27u8, 0x2F, 0x43];
+    let mut seen = Vec::new();
+    for op_code in ops {
+        let op = command_op(op_code).unwrap();
+        for insn in scripts
+            .init
+            .iter()
+            .flat_map(|block| block.insns.iter())
+            .chain(scripts.main.iter().flat_map(|block| block.insns.iter()))
+            .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+        {
+            if insn.decoded != Decoded::Command(op) {
+                continue;
+            }
+            seen.push(op_code);
+            let mut host = ScdGameHost::new(&mut game);
+            host.on_sound(op, &insn.operands);
+        }
+    }
+    assert!(seen.contains(&0x43), "room 3030 ramps its channels");
+    assert!(seen.contains(&0x27), "room 3030 fades its channels");
+
+    // Tick the counters: the live ramp and fade move the channel millibels.
+    let mut cache = bgm::BgmCache::default();
+    let before = game.bgm.channels[0].volume;
+    for _ in 0..8 {
+        bgm::apply_live(&mut None, &mut game, &mut cache, &pack, None);
+    }
+    assert_ne!(
+        game.bgm.channels[0].volume, before,
+        "the scripted ramp moved channel 0's gain"
+    );
+
+    // The last `snd_fade_set` arms the teardown; enough ticks end it.
+    for _ in 0..400 {
+        bgm::apply_live(&mut None, &mut game, &mut cache, &pack, None);
+    }
+    assert!(!game.bgm.fade.active(), "the scripted fade finishes");
+    // The original leaves a stale ramp counter once its bank is destroyed
+    // (`UpdateSoundDecay` bails on a null handle); the ramp is finished when
+    // its channel's bank was torn down.
+    let index = usize::from(game.bgm.ramp.channel);
+    let ramp_done =
+        !game.bgm.ramp.active() || index >= 3 || game.bgm.channels[index].name.is_none();
+    assert!(
+        ramp_done,
+        "the scripted ramp finishes or its bank is destroyed"
+    );
+}
+
+#[test]
+#[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+fn the_six_bank_2_names_and_31_character_names_are_packed() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let six = [
+        "panel02", "slide_b2", "Rancher", "mv_step", "D_gacha", "call",
+    ];
+    let names = character_sfx_names();
+    assert_eq!(names.len(), 31, "the character tables name 31 sounds");
+    let mut missing = Vec::new();
+    for name in six
+        .iter()
+        .copied()
+        .map(String::from)
+        .chain(names.iter().map(|name| (*name).to_owned()))
+    {
+        let path = format!("se/{}.wav", name.to_ascii_lowercase());
+        if !pack.contains(&path) {
+            missing.push(path);
+        }
+    }
+    for seed in ["Se_01", "Se_4d", "Se_42"] {
+        let path = format!("se/{}.wav", seed.to_ascii_lowercase());
+        if !pack.contains(&path) {
+            missing.push(path);
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "reconvert the pack; missing entries: {missing:?}"
+    );
+    assert_eq!(
+        pack.paths().filter(|path| path.starts_with("se/")).count(),
+        sfx::SE_NAMES.len() + arklay::music::se_track_names().len(),
+        "the pack carries every named effect and BGM group track"
+    );
+}
+
 #[test]
 #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT; writes ~470 MiB"]
 fn conversion_writes_the_referenced_voice_pack() {
@@ -463,6 +883,38 @@ fn conversion_writes_the_referenced_voice_pack() {
         }
     }
     assert!(missing.is_empty(), "unpacked voice entries: {missing:?}");
+
+    // The main pack gained the slice-4 sounds: the six bank-2 room names, the
+    // 31 character SFX and the non-Bgm BGM group tracks (the muted seeds
+    // among them).
+    let main = Pack::open(&out).unwrap();
+    assert_eq!(
+        main.paths().filter(|path| path.starts_with("se/")).count(),
+        sfx::SE_NAMES.len() + arklay::music::se_track_names().len(),
+        "every named effect and BGM group track is packed"
+    );
+    let mut se_missing = Vec::new();
+    for name in [
+        "panel02", "slide_b2", "Rancher", "mv_step", "D_gacha", "call",
+    ] {
+        let path = format!("se/{}.wav", name.to_ascii_lowercase());
+        if !main.contains(&path) {
+            se_missing.push(path);
+        }
+    }
+    for name in character_sfx_names() {
+        let path = format!("se/{}.wav", name.to_ascii_lowercase());
+        if !main.contains(&path) {
+            se_missing.push(path);
+        }
+    }
+    for seed in ["Se_01", "Se_4d", "Se_42"] {
+        let path = format!("se/{}.wav", seed.to_ascii_lowercase());
+        if !main.contains(&path) {
+            se_missing.push(path);
+        }
+    }
+    assert!(se_missing.is_empty(), "missing se entries: {se_missing:?}");
 
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&voice_out);

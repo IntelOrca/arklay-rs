@@ -152,6 +152,7 @@ fn run(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip], beha
         handler_08(game, slot, room, clips);
         return;
     }
+    let slow = game.flags[5].bit(crate::game::MSF2_EFFECT_ZONE);
     let GameState {
         entities,
         entity_anims,
@@ -166,10 +167,10 @@ fn run(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip], beha
     match behavior {
         0 => handler_00(entity, clock, clips),
         1 => handler_01(entity, clock, clips, system),
-        2 => handler_02(entity, clock, clips, room, system, entity_sounds),
-        3 => handler_03(entity, clock, clips, room, system, entity_sounds),
-        4 => handler_04(entity, clock, clips, room, system, entity_sounds),
-        5 => handler_05(entity, clock, clips, room, system, entity_sounds),
+        2 => handler_02(entity, clock, clips, room, system, entity_sounds, slow),
+        3 => handler_03(entity, clock, clips, room, system, entity_sounds, slow),
+        4 => handler_04(entity, clock, clips, room, system, entity_sounds, slow),
+        5 => handler_05(entity, clock, clips, room, system, entity_sounds, slow),
         6 => handler_06(entity, clock, clips, system),
         7 => handler_07(entity, clock, clips, system),
         9 => handler_09(entity, clock, clips, system),
@@ -268,6 +269,7 @@ fn handler_02(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
 ) {
     let target = scripted_target(entity);
     match entity.action_state {
@@ -286,9 +288,9 @@ fn handler_02(
             entity.animation_id = 7;
             entity.action_state = 3;
             entity.blend_counter = 7;
-            handler_02_walk(entity, clock, clips, room, system, sounds, target);
+            handler_02_walk(entity, clock, clips, room, system, sounds, slow, target);
         }
-        3 => handler_02_walk(entity, clock, clips, room, system, sounds, target),
+        3 => handler_02_walk(entity, clock, clips, room, system, sounds, slow, target),
         _ => {}
     }
 }
@@ -303,6 +305,7 @@ fn handler_02_turn(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], 
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the handler signature is fixed
 fn handler_02_walk(
     entity: &mut Entity,
     clock: &mut EntityAnim,
@@ -310,11 +313,12 @@ fn handler_02_walk(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
     target: [i32; 3],
 ) {
     let frame = entity.animation_frame_id;
     if frame == 8 || frame == 0x16 {
-        walk::footstep(sounds, room, entity, 0);
+        walk::footstep(sounds, room, entity, 0, slow);
     }
     walk::entity_apply_walk_speed(entity, 0x5D);
     walk::rotate_toward_target(entity, target, entity.scd_timer);
@@ -335,6 +339,7 @@ fn handler_03(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
 ) {
     let target = scripted_target(entity);
     match entity.action_state {
@@ -354,9 +359,9 @@ fn handler_03(
             entity.animation_id = 8;
             entity.action_state = 3;
             entity.blend_counter = 7;
-            handler_03_walk(entity, clock, clips, room, system, sounds, target);
+            handler_03_walk(entity, clock, clips, room, system, sounds, slow, target);
         }
-        3 => handler_03_walk(entity, clock, clips, room, system, sounds, target),
+        3 => handler_03_walk(entity, clock, clips, room, system, sounds, slow, target),
         4 => {
             entity.animation_frame_id = 0;
             entity.timing_control = 0;
@@ -386,6 +391,7 @@ fn handler_03_turn(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], 
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the handler signature is fixed
 fn handler_03_walk(
     entity: &mut Entity,
     clock: &mut EntityAnim,
@@ -393,11 +399,12 @@ fn handler_03_walk(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
     target: [i32; 3],
 ) {
     let frame = entity.animation_frame_id;
     if frame == 0 || frame == 10 {
-        walk::footstep(sounds, room, entity, 1);
+        walk::footstep(sounds, room, entity, 1, slow);
     }
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
@@ -451,6 +458,7 @@ fn handler_04(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
 ) {
     let target = scripted_target(entity);
     if entity.action_state == 0 {
@@ -465,7 +473,7 @@ fn handler_04(
 
     let frame = entity.animation_frame_id;
     if frame == 8 || frame == 0x16 {
-        walk::footstep(sounds, room, entity, 0);
+        walk::footstep(sounds, room, entity, 0, slow);
     }
     entity.move_speed_current = 0x3C;
     // The original's `frame > 4 || frame < 8` is true for every byte, so the
@@ -485,6 +493,7 @@ fn handler_05(
     room: &RoomState,
     system: &mut FlagBank,
     sounds: &mut Vec<EntitySound>,
+    slow: bool,
 ) {
     let target = scripted_target(entity);
     if entity.action_state == 0 {
@@ -500,7 +509,7 @@ fn handler_05(
 
     let frame = entity.animation_frame_id as i8;
     if (frame == 7 || frame == 0x1B) && entity.timing_control as i8 == 2 {
-        walk::footstep(sounds, room, entity, 0);
+        walk::footstep(sounds, room, entity, 0, slow);
     }
     backward_step(entity, clock, clips, room, system, target);
 }

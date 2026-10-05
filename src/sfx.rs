@@ -461,7 +461,19 @@ static ROOM_SFX: [&[Option<&'static str>]; 15] = [
 
 /// Every sound effect name shipped in the pack, sorted.
 #[rustfmt::skip]
-pub static SE_NAMES: [&str; 68] = [
+pub static SE_NAMES: [&str; 105] = [
+    "Ch_ef01",
+    "Ch_ef02",
+    "Ch_ef03",
+    "Ch_ef04",
+    "Chris01",
+    "Chris02",
+    "Chris03",
+    "Chris04",
+    "Chris08",
+    "Chris09",
+    "Chris10",
+    "D_gacha",
     "Dr_air01",
     "Dr_air02",
     "Dr_brk01",
@@ -481,10 +493,32 @@ pub static SE_NAMES: [&str; 68] = [
     "Ev_new02",
     "Ev_old01",
     "Ev_old02",
+    "Jill01",
+    "Jill02",
+    "Jill03",
+    "Jill04",
+    "Jill_ef01",
+    "Jill_ef02",
+    "Jill_ef03",
+    "Jill_ef04",
     "Ladder01",
+    "Mapled",
+    "Rancher",
+    "Reb01",
+    "Reb02",
+    "Reb03",
+    "Reb04",
+    "Reb_ef01",
+    "Reb_ef02",
+    "Reb_ef03",
+    "Reb_ef04",
     "St_mtl01",
     "St_wcp01",
     "St_wd01",
+    "call",
+    "cancel",
+    "cursor",
+    "decide",
     "drw_c_op",
     "drw_c_sh",
     "drw_opmt",
@@ -524,6 +558,9 @@ pub static SE_NAMES: [&str; 68] = [
     "ft_wdA",
     "ft_wdB",
     "key_desk",
+    "mv_step",
+    "panel02",
+    "slide_b2",
     "taore_ca",
     "taore_cp",
     "taore_pl",
@@ -532,14 +569,217 @@ pub static SE_NAMES: [&str; 68] = [
     "taore_wd",
 ];
 
+/// The eight 16-slot character SFX tables (`g_charactersSfxTable`), selected
+/// by the player/character model id. Tables 2/3 and 6/7 share their rows.
+static CHARACTER_HEADS: [[Option<&'static str>; 4]; 8] = [
+    [
+        Some("Chris01"),
+        Some("Chris02"),
+        Some("Chris03"),
+        Some("Chris04"),
+    ],
+    [
+        Some("Jill01"),
+        Some("Jill02"),
+        Some("Jill03"),
+        Some("Jill04"),
+    ],
+    [Some("Reb01"), Some("Reb02"), Some("Reb03"), Some("Reb04")],
+    [Some("Reb01"), Some("Reb02"), Some("Reb03"), Some("Reb04")],
+    [
+        Some("Ch_ef01"),
+        Some("Ch_ef02"),
+        Some("Ch_ef03"),
+        Some("Ch_ef04"),
+    ],
+    [
+        Some("Jill_ef01"),
+        Some("Jill_ef02"),
+        Some("Jill_ef03"),
+        Some("Jill_ef04"),
+    ],
+    [
+        Some("Reb_ef01"),
+        Some("Reb_ef02"),
+        Some("Reb_ef03"),
+        Some("Reb_ef04"),
+    ],
+    [
+        Some("Reb_ef01"),
+        Some("Reb_ef02"),
+        Some("Reb_ef03"),
+        Some("Reb_ef04"),
+    ],
+];
+
+/// Slots 4..=10 shared by every character table.
+static CHARACTER_SHARED: [Option<&'static str>; 7] = [
+    Some("cursor"),
+    Some("cancel"),
+    Some("decide"),
+    Some("Chris08"),
+    Some("Chris10"),
+    Some("Chris09"),
+    Some("Mapled"),
+];
+
+/// Name in character table `table` (`0..=7`), slot `id` (`0..=15`).
+pub fn character_sfx(table: u8, id: u8) -> Option<&'static str> {
+    let head = CHARACTER_HEADS.get(usize::from(table))?;
+    if id < 4 {
+        return head[usize::from(id)];
+    }
+    CHARACTER_SHARED.get(usize::from(id) - 4).copied().flatten()
+}
+
+/// Sparse room-table names outside the 12-column footstep window, keyed by
+/// `row * 48 + column`.
+///
+/// Only the entries the shipped script corpus reaches are transcribed; the
+/// monster-AI columns stay absent and the corpus audit asserts nothing else is
+/// needed. `mv_step` is packed but the corpus never addresses its column.
+static EXTRA_ROOM_SOUNDS: &[(u16, &str)] = &[
+    // call: the guardhouse crows (rooms 3000/3040).
+    (58 * 48 + 23, "call"),
+    (62 * 48 + 23, "call"),
+    // Rancher: room 3030's scripted guard.
+    (61 * 48 + 24, "Rancher"),
+    // panel02: the lab's shutter panels (5040/5110) and room 7170.
+    (120 * 48 + 24, "panel02"),
+    (133 * 48 + 23, "panel02"),
+    (197 * 48 + 23, "panel02"),
+    // slide_b2: room 7170.
+    (197 * 48 + 24, "slide_b2"),
+    // D_gacha: room 7140.
+    (194 * 48 + 20, "D_gacha"),
+];
+
 /// Name for entity/footstep sound column `index` in room row `row`.
 ///
 /// `row` is `stage_index * 29 + room`, the same row layout the original uses.
-/// `index` is the packed zone offset plus the entity sound type; columns below
-/// [`FIRST_COLUMN`] and rows without shipped names resolve to `None`.
+/// `index` is the packed zone offset plus the entity sound type or a script's
+/// bank-2 id; columns below [`FIRST_COLUMN`] resolve through the sparse
+/// [`EXTRA_ROOM_SOUNDS`] entries, and rows without shipped names to `None`.
 pub fn room_sound(row: usize, index: usize) -> Option<&'static str> {
-    let column = index.checked_sub(FIRST_COLUMN)?;
-    ROOM_SOUNDS.get(row)?.get(column).copied().flatten()
+    if let Some(column) = index.checked_sub(FIRST_COLUMN)
+        && let Some(name) = ROOM_SOUNDS.get(row)?.get(column).copied().flatten()
+    {
+        return Some(name);
+    }
+    let key = (row * 48 + index) as u16;
+    EXTRA_ROOM_SOUNDS
+        .iter()
+        .find(|(entry, _)| *entry == key)
+        .map(|(_, name)| *name)
+}
+
+/// One resolved 3D SE request (`Play3DSnd`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sfx3dPlay {
+    /// The wav basename to load and play, or `None` for a typed no-op.
+    pub name: Option<&'static str>,
+    /// Bank 4: pan and restart BGM channel 0 instead of playing a one-shot.
+    pub bgm: bool,
+    /// Linear mixer gain from [`sound_gain_pan`].
+    pub gain: f32,
+    /// Mixer pan in `-1..=1` from [`sound_gain_pan`].
+    pub pan: f32,
+    /// Raw DirectSound pan `(right - left) * 0x4E` (the BGM channel stores
+    /// this form).
+    pub raw_pan: i32,
+}
+
+impl Sfx3dPlay {
+    /// A typed no-op (an unloaded bank, an out-of-range id or an absent table
+    /// entry).
+    fn noop() -> Self {
+        Self {
+            name: None,
+            bgm: false,
+            gain: 0.0,
+            pan: 0.0,
+            raw_pan: 0,
+        }
+    }
+}
+
+/// Resolve one 3D sound request through the five sound banks and compute its
+/// mixer gain and pan (`Play3DSnd` + `Calc3DSndPan` + `CalcPanVolume`).
+///
+/// `room` names the bank-2 row, `character` selects the bank-3 table and
+/// `from`/`to`/`sound` are the camera and source positions. Bank 4 (`bgm`)
+/// asks the caller to pan and restart BGM channel 0. Bank 1 is the
+/// weapon/menu bank, which no weapon ever loads in this milestone, so it is
+/// always a typed no-op.
+pub fn play_sfx_3d(
+    room: &RoomState,
+    character: u8,
+    bank: u8,
+    id: u8,
+    from: [i32; 3],
+    to: [i32; 3],
+    sound: [i32; 3],
+) -> Sfx3dPlay {
+    match bank {
+        0 => {
+            if id > 1 {
+                return Sfx3dPlay::noop();
+            }
+            match room_sfx(0, usize::from(id)) {
+                Some(name) => with_gain_pan(name, from, to, sound),
+                None => Sfx3dPlay::noop(),
+            }
+        }
+        // The weapon/menu bank: 12 shipped sites name it, but with no weapons
+        // the bank is unloaded and only gains sounds once a weapon loads a
+        // different progression (out of scope), so every request is a no-op.
+        1 => Sfx3dPlay::noop(),
+        2 => {
+            if id > 0x2F {
+                return Sfx3dPlay::noop();
+            }
+            match room_sound(room_row(room.stage, room.room), usize::from(id)) {
+                Some(name) => with_gain_pan(name, from, to, sound),
+                None => Sfx3dPlay::noop(),
+            }
+        }
+        3 => {
+            if id > 0x0F {
+                return Sfx3dPlay::noop();
+            }
+            match character_sfx(character & 7, id) {
+                Some(name) => with_gain_pan(name, from, to, sound),
+                None => Sfx3dPlay::noop(),
+            }
+        }
+        4 => {
+            if id >= 0x30 {
+                return Sfx3dPlay::noop();
+            }
+            // Bank 4 pans BGM channel 0 to the source and restarts it.
+            let (left, right) = scene_pan(from, to, sound);
+            Sfx3dPlay {
+                name: None,
+                bgm: true,
+                gain: 0.0,
+                pan: pan_position(left, right),
+                raw_pan: (i32::from(right) - i32::from(left)) * 0x4E,
+            }
+        }
+        _ => Sfx3dPlay::noop(),
+    }
+}
+
+/// Compose a resolved name with the 3D gain/pan curves.
+fn with_gain_pan(name: &'static str, from: [i32; 3], to: [i32; 3], sound: [i32; 3]) -> Sfx3dPlay {
+    let (left, right) = scene_pan(from, to, sound);
+    Sfx3dPlay {
+        name: Some(name),
+        bgm: false,
+        gain: volume_gain(pan_volume(left, right)),
+        pan: pan_position(left, right),
+        raw_pan: (i32::from(right) - i32::from(left)) * 0x4E,
+    }
 }
 
 /// Name in the room SE pair table: entry `index`, slot `slot`.
@@ -770,6 +1010,34 @@ mod tests {
     }
 
     #[test]
+    fn footstep_sound_slow_flag_shifts_the_column() {
+        // Stage 1 room 6's row has ft_stwp at column 45 and ft_cpA at column
+        // 42: the slow flag's -3 offset lands on the concrete variant.
+        let room = RoomState {
+            stage: 1,
+            room: 6,
+            footstep_zones: vec![FootstepZone {
+                base_x: 0,
+                base_z: 0,
+                width: 1000,
+                height: 1000,
+                sound_data: 45,
+            }],
+            ..RoomState::default()
+        };
+        assert_eq!(
+            footstep_sound(&room, [10, 0, 10], 0, false),
+            Some("ft_stwp"),
+            "zone 45 names its own column"
+        );
+        assert_eq!(
+            footstep_sound(&room, [10, 0, 10], 0, true),
+            Some("ft_cpA"),
+            "the slow flag drops the column to 42"
+        );
+    }
+
+    #[test]
     fn footstep_sound_composes_zone_and_table() {
         let room = room_1001();
         assert_eq!(
@@ -850,8 +1118,127 @@ mod tests {
 
     #[test]
     fn se_names_are_sorted_and_unique() {
-        assert_eq!(SE_NAMES.len(), 68);
+        assert_eq!(SE_NAMES.len(), 105);
         assert!(SE_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn character_tables_select_by_id_and_share_the_tail() {
+        assert_eq!(character_sfx(0, 0), Some("Chris01"));
+        assert_eq!(character_sfx(0, 3), Some("Chris04"));
+        assert_eq!(character_sfx(1, 0), Some("Jill01"));
+        assert_eq!(character_sfx(2, 1), Some("Reb02"));
+        assert_eq!(character_sfx(3, 1), Some("Reb02"));
+        assert_eq!(character_sfx(4, 0), Some("Ch_ef01"));
+        assert_eq!(character_sfx(5, 3), Some("Jill_ef04"));
+        assert_eq!(character_sfx(6, 0), Some("Reb_ef01"));
+        assert_eq!(character_sfx(7, 0), Some("Reb_ef01"));
+        for table in 0..8 {
+            assert_eq!(character_sfx(table, 4), Some("cursor"));
+            assert_eq!(character_sfx(table, 10), Some("Mapled"));
+            assert_eq!(character_sfx(table, 11), None);
+            assert_eq!(character_sfx(table, 15), None);
+        }
+        assert_eq!(character_sfx(8, 0), None, "there are eight tables");
+    }
+
+    #[test]
+    fn room_sound_reads_the_sparse_bank_2_extras() {
+        // The corpus-reached entries outside the 36..=47 window.
+        assert_eq!(room_sound(58, 23), Some("call"));
+        assert_eq!(room_sound(62, 23), Some("call"));
+        assert_eq!(room_sound(61, 24), Some("Rancher"));
+        assert_eq!(room_sound(120, 24), Some("panel02"));
+        assert_eq!(room_sound(133, 23), Some("panel02"));
+        assert_eq!(room_sound(197, 23), Some("panel02"));
+        assert_eq!(room_sound(197, 24), Some("slide_b2"));
+        assert_eq!(room_sound(194, 20), Some("D_gacha"));
+        // The monster-AI columns stay absent.
+        assert_eq!(room_sound(0, 3), None);
+        assert_eq!(room_sound(67, 7), None);
+        assert_eq!(room_sound(180, 3), None);
+        assert_eq!(room_sound(58, 24), None);
+        assert_eq!(room_sound(203, 23), None);
+    }
+
+    #[test]
+    fn play_sfx_3d_resolves_each_bank() {
+        let room = RoomState {
+            stage: 1,
+            room: 0x05,
+            ..RoomState::default()
+        };
+        let camera = [0, 0, 0];
+        let target = [1000, 0, 0];
+        let sound = [1000, 0, 0];
+
+        // Bank 0: the room SFX pair, slots 0/1 only.
+        let play = play_sfx_3d(&room, 0, 0, 0, camera, target, sound);
+        assert_eq!(play.name, Some("Dr_wd01"));
+        assert_eq!(play.pan, 0.0, "straight ahead is centred");
+        assert_eq!(play.gain, volume_gain(pan_volume(125, 125)));
+        assert_eq!(
+            play_sfx_3d(&room, 0, 0, 1, camera, target, sound).name,
+            Some("Dr_wd02")
+        );
+        assert_eq!(
+            play_sfx_3d(&room, 0, 0, 2, camera, target, sound).name,
+            None
+        );
+
+        // Bank 1 is the unloaded weapon bank: typed no-op.
+        assert_eq!(
+            play_sfx_3d(&room, 0, 1, 7, camera, target, sound).name,
+            None
+        );
+
+        // Bank 2: the room table; row 5's corpus props are absent, but the
+        // sparse panel02 row exists.
+        assert_eq!(
+            play_sfx_3d(&room, 0, 2, 23, camera, target, sound).name,
+            None
+        );
+        let room_panel = RoomState {
+            stage: 5,
+            room: 4,
+            ..RoomState::default()
+        };
+        assert_eq!(
+            play_sfx_3d(&room_panel, 0, 2, 24, camera, target, sound).name,
+            Some("panel02")
+        );
+
+        // Bank 3: the selected character table.
+        let chris = play_sfx_3d(&room, 0, 3, 2, camera, target, sound);
+        assert_eq!(chris.name, Some("Chris03"));
+        let jill = play_sfx_3d(&room, 1, 3, 2, camera, target, sound);
+        assert_eq!(jill.name, Some("Jill03"));
+        assert_eq!(
+            play_sfx_3d(&room, 0, 3, 16, camera, target, sound).name,
+            None
+        );
+
+        // Bank 4: BGM pan, no one-shot.
+        let play = play_sfx_3d(&room, 0, 4, 23, camera, target, sound);
+        assert!(play.bgm && play.name.is_none());
+        assert_eq!(play.raw_pan, 0);
+        assert!(!play_sfx_3d(&room, 0, 4, 0x30, camera, target, sound).bgm);
+
+        // Unknown banks are typed no-ops.
+        assert_eq!(
+            play_sfx_3d(&room, 0, 9, 0, camera, target, sound).name,
+            None
+        );
+    }
+
+    #[test]
+    fn play_sfx_3d_follows_the_3d_pan_curves() {
+        let room = RoomState::default();
+        let (gain, pan) = sound_gain_pan([0, 0, 0], [1000, 0, 0], [0, 0, 2000]);
+        let play = play_sfx_3d(&room, 0, 0, 0, [0, 0, 0], [1000, 0, 0], [0, 0, 2000]);
+        assert_eq!(play.name, Some("Dr_wd01"));
+        assert!((play.gain - gain).abs() < 1e-6);
+        assert!((play.pan - pan).abs() < 1e-6);
     }
 
     #[test]

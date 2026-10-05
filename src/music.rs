@@ -423,6 +423,28 @@ pub fn group_for(stage: usize, room: usize, state: u8) -> Option<u8> {
     if group == 0xFF { None } else { Some(group) }
 }
 
+/// Every non-`Bgm_*` group-track basename, sorted and deduplicated.
+///
+/// The `Bgm_*` tracks live in `bgm/`; the rest (the three muted seeds,
+/// `chain1`, the `Se_3*`/`Se_4*`/`Se_5*` cues and the mixed dialogue track
+/// `V110_00`) are read from `se/`, so conversion packs them alongside the
+/// named sound effects.
+pub fn se_track_names() -> Vec<&'static str> {
+    let mut names: Vec<&'static str> = GROUP_TRACKS
+        .iter()
+        .flatten()
+        .filter_map(|slot| *slot)
+        .filter(|name| {
+            !name
+                .get(..4)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bgm_"))
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 /// The non-null `(basename, loop)` slots of a group, in slot order.
 pub fn tracks_for(group: u8) -> Vec<(&'static str, bool)> {
     let Some(names) = GROUP_TRACKS.get(usize::from(group)) else {

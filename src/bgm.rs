@@ -22,6 +22,152 @@ use crate::sfx;
 use crate::state::RoomId;
 use crate::voice;
 
+/// The original's per-step volume scale (`g_SndDistSteps` and the ramp
+/// direction both use it).
+const STEP_SCALE: i32 = 0x4E;
+
+/// Arm a volume ramp on channel `channel` (`bgm_volume_ramp`, 0x43; the
+/// original's `FUN_004804a0`).
+///
+/// Only an enabled channel with a loaded bank is ramped. `frames == 0` would
+/// fault the original's divide; the port refuses it (documented hardening).
+pub fn start_volume_ramp(game: &mut GameState, channel: u8, delta: i8, frames: u8) {
+    let index = usize::from(channel);
+    if index >= BGM_CHANNELS || frames == 0 {
+        return;
+    }
+    if game.bgm.state & (8u16 << index) == 0 {
+        return;
+    }
+    if game.bgm.channels[index].name.is_none() {
+        return;
+    }
+    game.bgm.ramp = crate::game::VolumeRamp {
+        channel,
+        direction: (i32::from(delta) / i32::from(frames)) * STEP_SCALE,
+        frames_left: i32::from(frames) * 2,
+    };
+}
+
+/// Build the scripted fade table (`snd_fade_set`, 0x27; the original's
+/// `BuildSndFadeTbl`).
+///
+/// Each loaded channel gets the number of `steps * 0x4E` millibel ticks it
+/// needs to reach silence; unloaded channels get zero. `steps == 0` would
+/// fault the original's divide; the port refuses it (documented hardening).
+pub fn build_snd_fade_tbl(game: &mut GameState, steps: i8) {
+    let dist_steps = i32::from(steps) * STEP_SCALE;
+    game.bgm.fade.dist_steps = dist_steps;
+    game.bgm.fade.kind = 0x7F;
+    for (index, bank) in game.bgm.channels.iter().enumerate() {
+        game.bgm.fade.steps[index] = if bank.name.is_none() || dist_steps == 0 {
+            0
+        } else {
+            ((-10000 - bank.volume) / dist_steps).max(0)
+        };
+    }
+}
+
+/// Advance the scripted fade one tick (`UpdateSoundFadeState`).
+///
+/// The positive phase steps every channel still carrying a step count down by
+/// `dist_steps` millibels; once every count runs out the fade enters the
+/// original's negative countdown, which stops the banks and finally destroys
+/// them. The original also steps the voice/sfx/enemy banks; the port fades the
+/// three BGM channels only (documented).
+fn advance_fade(game: &mut GameState) {
+    if game.bgm.fade.kind == 0 {
+        return;
+    }
+    if game.bgm.fade.kind < 0 {
+        game.bgm.fade.kind += 1;
+        match game.bgm.fade.kind {
+            // Stop the BGM banks, then the voice line.
+            -29 => {
+                for bank in &mut game.bgm.channels {
+                    bank.stop = true;
+                }
+            }
+            -4 => {
+                game.voice.request = None;
+                game.voice.stop_requested = true;
+                game.clear_voice_playing();
+            }
+            // Destroy the banks (the original clears every handle).
+            -2 => {
+                for bank in &mut game.bgm.channels {
+                    *bank = BgmChannelState::default();
+                }
+            }
+            // The final `UpdateSoundFade(-1)` nudge and the end of the fade.
+            -1 => {
+                for bank in &mut game.bgm.channels {
+                    if bank.name.is_some() {
+                        bank.volume = (bank.volume - 1).clamp(-9999, -1);
+                    }
+                }
+                game.bgm.fade.kind = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // The scripted fade reaches the channels through the original's global
+    // `apply_vol_delta(bank, g_SndDistSteps)`: a negative step count scales the
+    // per-tick volume towards silence.
+    let dist_steps = game.bgm.fade.dist_steps;
+    for (index, bank) in game.bgm.channels.iter_mut().enumerate() {
+        if game.bgm.fade.steps[index] <= 0 {
+            continue;
+        }
+        if bank.name.is_some() {
+            let mut volume = bank.volume;
+            if volume == 2000 {
+                volume = -9999;
+            }
+            bank.volume = (volume + dist_steps).clamp(-9999, -1);
+        }
+        game.bgm.fade.steps[index] -= 1;
+    }
+    if game.bgm.fade.steps.iter().all(|steps| *steps < 1) {
+        game.bgm.fade.kind = -30;
+    }
+}
+
+/// Advance the volume ramp one tick (`UpdateSoundDecay`).
+///
+/// The step is the original's `vol + (400 / (frames_left + 1) * direction) /
+/// 100`; once the volume passes -10000 or the frames run out the channel is
+/// stopped and its volume reset to -1.
+fn advance_ramp(game: &mut GameState) {
+    if !game.bgm.ramp.active() {
+        return;
+    }
+    let index = usize::from(game.bgm.ramp.channel);
+    let direction = game.bgm.ramp.direction;
+    let Some(bank) = game.bgm.channels.get_mut(index) else {
+        game.bgm.ramp = crate::game::VolumeRamp::default();
+        return;
+    };
+    if bank.name.is_none() {
+        return;
+    }
+    let mut volume = bank.volume;
+    if volume == 2000 {
+        volume = -9999;
+    }
+    let frames_left = game.bgm.ramp.frames_left - 1;
+    let current = volume + (400 / (frames_left + 1) * direction) / 100;
+    bank.volume = current;
+    game.bgm.ramp.frames_left = frames_left;
+    if current < -10000 || frames_left <= 0 {
+        game.bgm.ramp = crate::game::VolumeRamp::default();
+        bank.volume = -1;
+        bank.stop = true;
+    }
+}
+
 /// The three tracks the original loads muted and later fades up with the
 /// scripted volume opcodes.
 const MUTED_SEEDS: [&str; 3] = ["Se_01", "Se_4d", "Se_42"];
@@ -229,8 +375,10 @@ fn load_and_start(game: &mut GameState, id: RoomId, state: u8) {
             looping: music::GROUP_LOOPS[usize::from(group)][index],
             volume: if is_muted_seed(name) { -9999 } else { 0 },
             pan: 0,
+            pan_pair: (0, 0),
             restart: false,
             pending_load: true,
+            stop: false,
         };
     }
 }
@@ -287,6 +435,12 @@ pub fn apply_live(
     pack: &Pack,
     auxiliary: Option<&Pack>,
 ) {
+    // The original runs the fade state machine before the decay ramp; both
+    // advance once per tick even when no audio device is open, so scripts and
+    // tests observe the same counters.
+    advance_fade(game);
+    advance_ramp(game);
+
     let Some(mixer) = mixer.as_mut() else {
         return;
     };
@@ -307,6 +461,10 @@ pub fn apply_live(
                     mixer.stop_bgm_channel(index);
                 }
             }
+        }
+        if game.bgm.channels[index].stop {
+            game.bgm.channels[index].stop = false;
+            mixer.stop_bgm_channel(index);
         }
         if game.bgm.channels[index].restart {
             game.bgm.channels[index].restart = false;
@@ -354,8 +512,10 @@ mod tests {
             looping: true,
             volume: 0,
             pan: 0,
+            pan_pair: (0, 0),
             restart: false,
             pending_load: false,
+            stop: false,
         };
     }
 
@@ -523,6 +683,43 @@ mod tests {
         assert_eq!(game.bgm.channels[2].volume, 0);
     }
 
+    #[test]
+    fn muted_seeds_fade_up_on_the_scripted_volume_pair() {
+        use crate::game::ScdGameHost;
+        use crate::scd::host::ScdHost;
+        use crate::scd::ir::Operand;
+        use crate::scd::opcode::command_op;
+
+        // Room 1050's shipped state 0x10 starts group 0 on channel 1, whose
+        // track is the muted Se_01 seed.
+        let id = RoomId::parse("1050").unwrap();
+        let mut game = game_for(id);
+        update_room_bgm(&mut game, id, None);
+        assert_eq!(game.bgm.channels[1].name, Some("Se_01"));
+        assert_eq!(game.bgm.channels[1].volume, -9999, "the seed loads muted");
+
+        // The script pairs a `se_volume` set on channel 1; it must replace the
+        // seed's -9999 with the pan pair's millibels.
+        {
+            let mut host = ScdGameHost::new(&mut game);
+            let operands: Vec<Operand> = [1i64, 85, 85]
+                .iter()
+                .map(|&value| Operand {
+                    value,
+                    target: None,
+                })
+                .collect();
+            host.on_sound(command_op(0x2F).unwrap(), &operands);
+        }
+        let volume = game.bgm.channels[1].volume;
+        assert_eq!(volume, sfx::pan_volume(85, 85));
+        assert!(
+            sfx::volume_gain(volume) > sfx::volume_gain(-9999),
+            "the seed's gain rose from silence"
+        );
+        assert_eq!(game.bgm.channels[1].pan_pair, (85, 85));
+    }
+
     fn courtyard_game(player: u8, flags: &[u8]) -> (RoomId, GameState) {
         let id = RoomId {
             stage: 3,
@@ -562,6 +759,81 @@ mod tests {
         assert_eq!(jill.bgm.channels[2].name, Some("V110_00"));
         assert!(!jill.bgm.channels[2].looping);
         assert!(jill.bgm.channels[2].pending_load);
+    }
+
+    /// An empty on-disk pack for driving `apply_live`'s counter advances.
+    fn empty_pack(name: &str) -> (std::path::PathBuf, Pack) {
+        let path =
+            std::env::temp_dir().join(format!("arklay-bgm-{}-{}.akpak", std::process::id(), name));
+        crate::pack::PackWriter::new().write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+        (path, pack)
+    }
+
+    #[test]
+    fn volume_ramp_steps_towards_silence_and_stops() {
+        let (_path, pack) = empty_pack("ramp");
+        let id = RoomId::parse("1000").unwrap();
+        let mut game = game_for(id);
+        game.bgm.state = 0x10;
+        game.bgm.channels[1].name = Some("Se_01");
+        game.bgm.channels[1].volume = -9999;
+        start_volume_ramp(&mut game, 1, 95, 30);
+        assert_eq!(game.bgm.ramp.direction, (95 / 30) * 0x4E);
+        assert_eq!(game.bgm.ramp.frames_left, 60);
+        let mut cache = BgmCache::default();
+        apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        assert!(
+            game.bgm.channels[1].volume > -9999,
+            "the first ramp tick raises the seed"
+        );
+        assert_eq!(game.bgm.ramp.frames_left, 59);
+
+        // A ramp that passes silence stops the channel and resets the volume.
+        game.bgm.channels[1].volume = -9999;
+        start_volume_ramp(&mut game, 1, -95, 1);
+        apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        assert!(!game.bgm.ramp.active());
+        assert_eq!(game.bgm.channels[1].volume, -1);
+        assert!(game.bgm.channels[1].stop);
+    }
+
+    #[test]
+    fn snd_fade_steps_the_channels_down_then_stops_them() {
+        let (_path, pack) = empty_pack("fade");
+        let id = RoomId::parse("1000").unwrap();
+        let mut game = game_for(id);
+        game.bgm.channels[0].name = Some("Bgm_13");
+        game.bgm.channels[0].volume = -1;
+        game.bgm.channels[1].name = Some("Se_01");
+        game.bgm.channels[1].volume = -1;
+        game.bgm.state = 0x08 | 0x10;
+        build_snd_fade_tbl(&mut game, -5);
+        assert_eq!(game.bgm.fade.dist_steps, -5 * 0x4E);
+        assert_eq!(game.bgm.fade.kind, 0x7F);
+        assert_eq!(game.bgm.fade.steps[0], (-10000 + 1) / (-5 * 0x4E));
+        assert_eq!(game.bgm.fade.steps[1], game.bgm.fade.steps[0]);
+        assert_eq!(game.bgm.fade.steps[2], 0, "channel 2 has no bank");
+
+        let mut cache = BgmCache::default();
+        let steps = game.bgm.fade.steps[0];
+        for _ in 0..steps {
+            apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        }
+        assert_eq!(
+            game.bgm.channels[0].volume,
+            (-1 - steps * 5 * 0x4E).max(-9999),
+            "the fade stepped the channel down"
+        );
+        assert_eq!(game.bgm.fade.steps[0], 0);
+        assert_eq!(game.bgm.fade.kind, -30, "the teardown countdown started");
+
+        // The countdown stops the banks and finally clears them.
+        for _ in 0..30 {
+            apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        }
+        assert!(!game.bgm.fade.active());
+        assert!(game.bgm.channels.iter().all(|bank| bank.name.is_none()));
     }
 
     #[test]

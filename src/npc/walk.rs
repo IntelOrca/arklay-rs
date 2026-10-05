@@ -123,14 +123,17 @@ pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distan
 
 /// The state-8/9 footstep callback (`PlayEntitySnd`): resolve the entity's
 /// floor zone sound for `sound_type` and queue it at the entity's position.
-/// The engine's mixer consumes the queue; a room with no matching floor zone
-/// or sound name stays silent.
-pub fn footstep(sounds: &mut Vec<EntitySound>, room: &RoomState, entity: &Entity, sound_type: u8) {
-    // TODO(parity): (audio) the original folds `g_main_state_flags2`'s
-    // MSF2_EFFECT_ZONE bit into the column as a -3 offset (`inputMod`) and has
-    // a door-transition special case that adds 0x23; the port always passes
-    // `slow = false`, so the slippery/effect-zone footstep variant never plays.
-    if let Some(name) = sfx::footstep_sound(room, entity.pos, sound_type, false) {
+/// `slow` is the engine's `MSF2_EFFECT_ZONE` bit, which shifts the column by
+/// -3. The engine's mixer consumes the queue; a room with no matching floor
+/// zone or sound name stays silent.
+pub fn footstep(
+    sounds: &mut Vec<EntitySound>,
+    room: &RoomState,
+    entity: &Entity,
+    sound_type: u8,
+    slow: bool,
+) {
+    if let Some(name) = sfx::footstep_sound(room, entity.pos, sound_type, slow) {
         sounds.push(EntitySound {
             name,
             pos: entity.pos,
@@ -856,13 +859,18 @@ fn behavior_03(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
 /// `npc_walk_footstep_sound`: the state-9 footfall frames. Animations 3 and 7
 /// step on frames 8 and 0x16 with sound 0; animation 8 on frames 0 and 0xA
 /// with sound 1.
-fn walk_footstep_sound(sounds: &mut Vec<EntitySound>, room: &RoomState, entity: &Entity) {
+fn walk_footstep_sound(
+    sounds: &mut Vec<EntitySound>,
+    room: &RoomState,
+    entity: &Entity,
+    slow: bool,
+) {
     let sound_type = match (entity.animation_id, entity.animation_frame_id) {
         (3 | 7, 8 | 0x16) => 0,
         (8, 0 | 0x0A) => 1,
         _ => return,
     };
-    footstep(sounds, room, entity, sound_type);
+    footstep(sounds, room, entity, sound_type, slow);
 }
 
 /// `ResolveEntityScaCollision` against the player: push the character out of
@@ -973,6 +981,7 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     let player_status = game.entities[0].status_flags;
     let player_radius = player_radius(game.id.player_flag);
     let seed = game.rand_seed;
+    let slow = game.flags[5].bit(crate::game::MSF2_EFFECT_ZONE);
 
     let GameState {
         entities,
@@ -1016,7 +1025,7 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     let blend_step = crate::npc::anim::blend_step(entity);
     let done = clock.advance(entity, clips, reverse, blend_step);
     entity.attacking_direction = u8::from(done);
-    walk_footstep_sound(entity_sounds, room, entity);
+    walk_footstep_sound(entity_sounds, room, entity, slow);
     separate_from_player(room, entity, player_pos, player_radius, player_status);
     for (other_pos, other_radius, other_status) in others {
         separate_from_character(room, entity, other_pos, other_radius, other_status);
@@ -1138,7 +1147,7 @@ mod tests {
         };
         let e = entity([100, 0, 100], 0, 0);
         let mut sounds = Vec::new();
-        footstep(&mut sounds, &room, &e, 0);
+        footstep(&mut sounds, &room, &e, 0, false);
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].pos, [100, 0, 100]);
         assert!(sounds[0].name.starts_with("ft_"));
@@ -1615,22 +1624,83 @@ mod tests {
         let mut e = entity([100, 0, 100], 0, 0);
         e.animation_id = 7;
         e.animation_frame_id = 8;
-        walk_footstep_sound(&mut sounds, &room, &e);
+        walk_footstep_sound(&mut sounds, &room, &e, false);
         assert_eq!(sounds.len(), 1);
         assert_eq!(sounds[0].name, "ft_wdA");
 
         sounds.clear();
         e.animation_id = 8;
         e.animation_frame_id = 0;
-        walk_footstep_sound(&mut sounds, &room, &e);
+        walk_footstep_sound(&mut sounds, &room, &e, false);
         assert_eq!(sounds.len(), 1, "the fast walk uses the B footstep");
         assert_eq!(sounds[0].name, "ft_wdB");
 
         sounds.clear();
         e.animation_id = 7;
         e.animation_frame_id = 7;
-        walk_footstep_sound(&mut sounds, &room, &e);
+        walk_footstep_sound(&mut sounds, &room, &e, false);
         assert!(sounds.is_empty(), "frame 7 is not a contact");
+    }
+
+    #[test]
+    fn effect_zone_flag_shifts_the_state9_footstep_column() {
+        let room = RoomState {
+            stage: 1,
+            room: 6,
+            footstep_zones: vec![FootstepZone {
+                base_x: 0,
+                base_z: 0,
+                width: 0x8000,
+                height: 0x8000,
+                sound_data: 45,
+            }],
+            ..RoomState::default()
+        };
+        let mut game = GameState::new(crate::state::RoomId::parse("1060").unwrap(), &room);
+        // Clip 7 has enough frames that the clock advances the placed frame
+        // 7 onto the contact frame 8.
+        let clips = vec![
+            Clip {
+                frames: vec![
+                    crate::model::ClipFrame {
+                        keyframe: 0,
+                        timing: 0,
+                    };
+                    32
+                ],
+            };
+            9
+        ];
+        let place = |game: &mut GameState| {
+            let mut e = Entity {
+                id: 0x23,
+                action_behavior: 4,
+                animation_id: 7,
+                animation_frame_id: 7,
+                pos: [100, 0, 100],
+                ..Entity::default()
+            };
+            e.set_active(true);
+            game.entities[1] = e;
+            game.entity_sounds.clear();
+        };
+
+        place(&mut game);
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(
+            game.entity_sounds.last().map(|sound| sound.name),
+            Some("ft_stwp")
+        );
+
+        // The room-action effect-zone bit (MSF2_EFFECT_ZONE) drops the column
+        // by three: the concrete footstep variant plays.
+        game.flags[5].apply(crate::game::MSF2_EFFECT_ZONE, 0);
+        place(&mut game);
+        update(&mut game, 1, &room, &clips);
+        assert_eq!(
+            game.entity_sounds.last().map(|sound| sound.name),
+            Some("ft_cpA")
+        );
     }
 
     #[test]

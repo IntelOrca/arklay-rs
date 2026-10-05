@@ -612,7 +612,10 @@ fn copy_se(
     let index = index_dir(sound)?;
     let mut files = Vec::new();
     let mut missing = Vec::new();
-    for name in sfx::SE_NAMES {
+    // The named sound effects plus the non-`Bgm_*` group tracks (the muted
+    // seeds, the lab cues and `V110_00`) the three-channel BGM engine reads
+    // from `se/`.
+    for name in sfx::SE_NAMES.iter().copied().chain(music::se_track_names()) {
         let file = format!("{}.wav", name.to_ascii_lowercase());
         match index.get(&file) {
             Some(path) => files.push((format!("se/{file}"), path.clone())),
@@ -2337,7 +2340,7 @@ mod tests {
     fn write_se_files(root: &Path) {
         let sound = root.join("sound");
         fs::create_dir_all(&sound).unwrap();
-        for name in sfx::SE_NAMES {
+        for name in sfx::SE_NAMES.iter().copied().chain(music::se_track_names()) {
             fs::write(
                 sound.join(format!("{}.WAV", name.to_ascii_uppercase())),
                 name.as_bytes(),
@@ -2885,7 +2888,11 @@ mod tests {
         assert_eq!(count("roomcut/"), 2);
         assert_eq!(count("roommask/"), 0);
         assert_eq!(count("bgm/"), 3);
-        assert_eq!(count("se/"), 68);
+        assert_eq!(
+            count("se/"),
+            sfx::SE_NAMES.len() + music::se_track_names().len(),
+            "one pack entry per named effect and per non-Bgm group track"
+        );
         assert_eq!(count("door/"), 34);
         assert_eq!(count("player/"), 6);
         assert_eq!(count("npc/"), 15);
@@ -3923,7 +3930,11 @@ mod tests {
         // reuse the stage 1/2 pages.
         assert_eq!(count("roommask/"), 601);
         assert_eq!(count("bgm/"), 61);
-        assert_eq!(count("se/"), 68);
+        assert_eq!(
+            count("se/"),
+            sfx::SE_NAMES.len() + music::se_track_names().len(),
+            "one pack entry per named effect and per non-Bgm group track"
+        );
         assert_eq!(count("door/"), 34);
         assert_eq!(count("npc/"), 15);
         assert_eq!(count("effspr/"), 33);

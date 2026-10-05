@@ -781,8 +781,17 @@ impl GameSession {
         if typewriter_fired {
             self.game.check_typewriter();
         }
-        // The scripts have had their say: reconcile the three BGM channels and
-        // start any queued voice line whose wait flag is set.
+        // The scripts have had their say: resolve the tick's `se_play_3d`
+        // requests (a bank-4 request pans and restarts BGM channel 0 before
+        // the BGM reconciliation below), then reconcile the three BGM
+        // channels and start any queued voice line whose wait flag is set.
+        play_snd3d_requests(
+            &mut self.music,
+            &mut self.sfx_cache,
+            pack,
+            &self.loaded.room,
+            &mut self.game,
+        );
         bgm::apply_live(
             &mut self.music,
             &mut self.game,
@@ -798,12 +807,17 @@ impl GameSession {
             self.audio_packs.voice(),
         );
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
+        // `MSF2_EFFECT_ZONE` (the second dword of main-state flag bank 5) is
+        // the original's slippery/effect-zone bit: it shifts every footstep
+        // column by -3.
+        let slow = self.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
         play_footsteps(
             &mut self.music,
             &mut self.sfx_cache,
             pack,
             &self.loaded.room,
             &mut self.player,
+            slow,
         );
         play_entity_sounds(
             &mut self.music,
@@ -818,6 +832,8 @@ impl GameSession {
             pack,
             &self.loaded.room,
             &mut self.player,
+            self.game.id.player_flag,
+            slow,
         );
         // The global SE bank (the lid's `0x20`) has no pack mapping yet.
         self.game.sfx_requests.clear();
@@ -3042,6 +3058,71 @@ fn play_door_animation_sfx(
     }
 }
 
+/// Consume the tick's queued `se_play_3d` requests through the sound banks.
+///
+/// Each request resolves its bank: a named one-shot loads from the pack and
+/// plays with [`sfx::sound_gain_pan`], bank 4 pans and restarts BGM channel 0,
+/// and an unloaded bank/absent table entry is recorded in
+/// [`game::GameState::snd3d_noops`] for the corpus audit.
+fn play_snd3d_requests(
+    music: &mut Option<Mixer>,
+    cache: &mut SfxCache,
+    pack: &Pack,
+    room: &RoomState,
+    game: &mut game::GameState,
+) {
+    let requests = std::mem::take(&mut game.snd3d_requests);
+    if requests.is_empty() {
+        return;
+    }
+    let character = game.id.player_flag;
+    for request in requests {
+        // A room without a camera cannot place the sound; drop it without
+        // recording a bank no-op.
+        let Some(cut) = room.cuts.get(room.current_cut) else {
+            continue;
+        };
+        let pos = match request.pos {
+            game::Snd3dPos::Point(pos) => pos,
+            // The 6-byte form has no position; the BGM-pan path falls back to
+            // the player (documented).
+            game::Snd3dPos::None => game.entities[0].pos,
+        };
+        let play = sfx::play_sfx_3d(
+            room,
+            character,
+            request.bank,
+            request.id,
+            cut.pos,
+            cut.look_at,
+            pos,
+        );
+        if play.bgm {
+            if let Some(bank) = game.bgm.channels.first_mut()
+                && bank.name.is_some()
+            {
+                bank.pan = play.raw_pan;
+                bank.restart = true;
+            }
+            continue;
+        }
+        let Some(name) = play.name else {
+            *game
+                .snd3d_noops
+                .entry((request.bank, request.id))
+                .or_insert(0) += 1;
+            continue;
+        };
+        let Some(mixer) = music.as_mut() else {
+            continue;
+        };
+        let Some(wav) = cache.load(pack, name) else {
+            continue;
+        };
+        mixer.play_sfx(wav, play.gain, play.pan);
+    }
+}
+
 /// Consume the tick's footstep events: resolve the floor zone's sound and play
 /// each as a 3D one-shot through the mixer.
 fn play_footsteps(
@@ -3050,6 +3131,7 @@ fn play_footsteps(
     pack: &Pack,
     room: &RoomState,
     player_state: &mut player::PlayerState,
+    slow: bool,
 ) {
     let footsteps = player_state.take_footsteps();
     if footsteps.is_empty() {
@@ -3063,13 +3145,9 @@ fn play_footsteps(
     };
     for footstep in footsteps {
         // The footstep carries its own entity sound type (0 for the walk,
-        // turn and backward run, 1 for the forward run). The slow argument is
-        // the original's effect-zone flag, which no room script in this slice
-        // raises.
-        // TODO(parity): (audio) the player footsteps go through the same
-        // PlayEntitySnd path as the NPCs, so the MSF2_EFFECT_ZONE -3 column
-        // offset applies here too; the port hard-codes `slow = false`.
-        let Some(name) = sfx::footstep_sound(room, footstep.pos, footstep.sound_type, false) else {
+        // turn and backward run, 1 for the forward run) and the effect-zone
+        // slow flag shifts the column by -3 (`MSF2_EFFECT_ZONE`).
+        let Some(name) = sfx::footstep_sound(room, footstep.pos, footstep.sound_type, slow) else {
             continue;
         };
         let Some(wav) = cache.load(pack, name) else {
@@ -3080,17 +3158,29 @@ fn play_footsteps(
     }
 }
 
-/// Consume the tick's locked-behaviour sound cues.
+/// The bank and id one queued player cue resolves through.
 ///
-/// `SE_FOOTSTEP` resolves through the same room footstep path as the walk;
-/// the global `Play3DSnd` ids (the push grunt and the vault cue) have no pack
-/// mapping in this slice and are drained without a voice.
+/// The push and ladder cues are room-table columns exactly like the original's
+/// `Play3DSnd(2, ...)` calls: the push grunts are ids `0x16`/`0x17`, the
+/// vault/ladder step `0x23` (column 35) and the climb end `0x2D` (column 45).
+/// The hit-reaction grunts are character-bank ids 0-3 (bank 3).
+fn player_sound_bank(id: u16) -> (u8, u8) {
+    match id {
+        0..=3 => (3, id as u8),
+        _ => (2, id as u8),
+    }
+}
+
+/// Consume the tick's locked-behaviour sound cues through the same bank
+/// dispatch as `se_play_3d`.
 fn play_player_sounds(
     music: &mut Option<Mixer>,
     cache: &mut SfxCache,
     pack: &Pack,
     room: &RoomState,
     player_state: &mut player::PlayerState,
+    character: u8,
+    slow: bool,
 ) {
     let sounds = player_state.take_sounds();
     if sounds.is_empty() {
@@ -3103,22 +3193,27 @@ fn play_player_sounds(
         return;
     };
     for sound in sounds {
-        // TODO(parity): (audio) the grunt (`0x16`/`0x17`), vault/ladder step
-        // (`0x23`) and climb-end (`0x2D`) ids address the original's global SE
-        // bank, which the pack does not carry; only the entity footstep
-        // resolves. The queue still carries the id and world position, so a
-        // future global-SE bank slots in here.
-        if sound.id != player::SE_FOOTSTEP {
+        if sound.id == player::SE_FOOTSTEP {
+            let Some(name) = sfx::footstep_sound(room, sound.pos, 0, slow) else {
+                continue;
+            };
+            let Some(wav) = cache.load(pack, name) else {
+                continue;
+            };
+            let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
+            mixer.play_sfx(wav, gain, pan);
             continue;
         }
-        let Some(name) = sfx::footstep_sound(room, sound.pos, 0, false) else {
+        let (bank, id) = player_sound_bank(sound.id);
+        // Bank 3 follows the player's character table.
+        let play = sfx::play_sfx_3d(room, character, bank, id, cut.pos, cut.look_at, sound.pos);
+        let Some(name) = play.name else {
             continue;
         };
         let Some(wav) = cache.load(pack, name) else {
             continue;
         };
-        let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
-        mixer.play_sfx(wav, gain, pan);
+        mixer.play_sfx(wav, play.gain, play.pan);
     }
 }
 
@@ -6133,6 +6228,89 @@ mod tests {
             &mut sounds,
         );
         assert!(sounds.is_empty(), "an absent mixer still drains the queue");
+    }
+
+    #[test]
+    fn player_cues_map_to_their_original_banks() {
+        // The hit-reaction grunts are character-bank ids 0-3.
+        for id in 0..=3u16 {
+            assert_eq!(player_sound_bank(id), (3, id as u8));
+        }
+        // The push grunts (`0x16`/`0x17`), vault/ladder step (`0x23`) and
+        // climb end (`0x2D`) are room-table columns.
+        for id in [0x16u16, 0x17, 0x23, 0x2D] {
+            assert_eq!(player_sound_bank(id), (2, id as u8));
+        }
+        // Room 1000's row names column 45, so the climb-end cue resolves to
+        // its footstep sound through the same dispatch.
+        let room = RoomState {
+            stage: 1,
+            room: 0,
+            ..RoomState::default()
+        };
+        let play = sfx::play_sfx_3d(&room, 0, 2, 0x2D, [0; 3], [1000, 0, 0], [1000, 0, 0]);
+        assert_eq!(play.name, Some("ft_wdA"));
+    }
+
+    #[test]
+    fn snd3d_requests_resolve_audit_and_pan_the_bgm() {
+        let dir = TempDir::new();
+        let path = dir.0.join("empty.akpak");
+        PackWriter::new().write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+
+        let id = RoomId::parse("5040").unwrap();
+        let mut game = game::GameState::new(id, &RoomState::default());
+        let room = RoomState {
+            stage: 5,
+            room: 4,
+            cuts: vec![crate::state::Cut {
+                index: 0,
+                pos: [0, 0, 0],
+                look_at: [1000, 0, 0],
+                fov: 200,
+                ..crate::state::Cut::default()
+            }],
+            ..RoomState::default()
+        };
+        let point = |x: i32, z: i32| game::Snd3dPos::Point([x, 0, z]);
+        // Row 120's panel02 resolves (the empty pack only makes the load miss,
+        // which is not a bank no-op).
+        game.snd3d_requests.push(game::Snd3dRequest {
+            bank: 2,
+            id: 24,
+            volume: 0,
+            pos: point(1000, 0),
+        });
+        // The unloaded weapon bank and an absent room column are audited.
+        game.snd3d_requests.push(game::Snd3dRequest {
+            bank: 1,
+            id: 7,
+            volume: 0,
+            pos: point(0, 0),
+        });
+        game.snd3d_requests.push(game::Snd3dRequest {
+            bank: 2,
+            id: 3,
+            volume: 0,
+            pos: point(0, 0),
+        });
+        // Bank 4 pans and restarts BGM channel 0 when a bank is loaded.
+        game.bgm.channels[0].name = Some("Bgm_13");
+        game.snd3d_requests.push(game::Snd3dRequest {
+            bank: 4,
+            id: 23,
+            volume: 0,
+            pos: point(0, 2000),
+        });
+
+        play_snd3d_requests(&mut None, &mut SfxCache::default(), &pack, &room, &mut game);
+        assert!(game.snd3d_requests.is_empty(), "the queue always drains");
+        assert_eq!(game.snd3d_noops.get(&(1, 7)), Some(&1));
+        assert_eq!(game.snd3d_noops.get(&(2, 3)), Some(&1));
+        assert_eq!(game.snd3d_noops.get(&(2, 24)), None, "panel02 resolves");
+        assert!(game.bgm.channels[0].restart, "bank 4 restarted channel 0");
+        assert_ne!(game.bgm.channels[0].pan, 0, "bank 4 panned channel 0");
     }
 
     #[test]

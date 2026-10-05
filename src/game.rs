@@ -253,6 +253,10 @@ const MSF_LADDER_DOWN: u8 = 27;
 const MSF_MIRROR_PLANE_X: u8 = 30;
 /// `main_state_flags` bit 0: the mirror pass is enabled.
 const MSF_MIRROR_ENABLE: u8 = 31;
+/// `main_state_flags2` bit 0 (`MSF2_EFFECT_ZONE`): a room effect zone is
+/// active, so footsteps shift their room-table column by -3. The second dword
+/// of flag bank 5 selects it at selector `0x3F`.
+pub const MSF2_EFFECT_ZONE: u8 = 0x3F;
 /// Flag bank holding the per-frame item-use flags (`g_itemUseFlags`).
 pub const BANK_ITEM_USE: u8 = 9;
 /// Scenario flag raised by the chemical combine effect.
@@ -472,8 +476,8 @@ pub struct DeskFlow {
 /// One of the three BGM channel banks (`g_SndBank[i]`).
 ///
 /// The game host owns the loaded-bank records; the engine's mixer is synced to
-/// them after every script tick. `restart` and `pending_load` are the edges the
-/// engine consumes when it reconciles the mixer.
+/// them after every script tick. `restart`, `stop` and `pending_load` are the
+/// edges the engine consumes when it reconciles the mixer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BgmChannelState {
     /// Loaded track basename (a `GROUP_TRACKS` entry), `None` when no bank is
@@ -486,13 +490,67 @@ pub struct BgmChannelState {
     pub volume: i32,
     /// DirectSound pan (`(right - left) * 0x4E`), 0 centred.
     pub pan: i32,
+    /// The raw `(pan, volume)` pair `snd_pan_vol_set` (0x2F) caches per channel
+    /// (`g_SndPanVol`). The original never reads it back; kept for parity.
+    pub pan_pair: (u8, u8),
     /// A script (`bgm_play`/`bgm_restore`) asked for a restart from sample 0.
     pub restart: bool,
     /// The engine has not loaded this bank into its mixer yet.
     pub pending_load: bool,
+    /// The volume ramp reached silence (`UpdateSoundDecay`): stop this bank.
+    /// The engine consumes the edge; the original leaves the state bit set.
+    pub stop: bool,
 }
 
-/// BGM state: the live state byte and the three channel banks.
+/// The live volume ramp (`bgm_volume_ramp`, 0x43; the original's `g_SndRamp*`).
+///
+/// Only one ramp runs at a time. `frames_left == 0` means idle; every tick the
+/// ramp recomputes the channel volume from its current value plus a hyperbolic
+/// step towards `direction`, and stops the channel once it passes silence or
+/// runs out of frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VolumeRamp {
+    /// The channel bank the ramp drives.
+    pub channel: u8,
+    /// Millibel direction per step, `(delta / frames) * 0x4E`.
+    pub direction: i32,
+    /// Ticks remaining (`frames * 2` when armed).
+    pub frames_left: i32,
+}
+
+impl VolumeRamp {
+    /// Whether a ramp is running.
+    pub fn active(&self) -> bool {
+        self.frames_left != 0
+    }
+}
+
+/// The scripted sound fade (`snd_fade_set`, 0x27; the original's `g_SndFade*`).
+///
+/// `build_snd_fade_tbl` computes how many `dist_steps`-sized millibel steps
+/// each loaded channel needs to reach silence. Every tick each channel still
+/// carrying a positive count is stepped down; once all counts run out the fade
+/// enters the original's negative countdown, stopping and finally destroying
+/// the banks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SoundFade {
+    /// Per-tick millibel decrement (`steps * 0x4E`).
+    pub dist_steps: i32,
+    /// `g_SndFadeType`: 0 idle, positive fading, negative the teardown count.
+    pub kind: i32,
+    /// Per-channel remaining step counts (`g_SndFadeStepTbl`).
+    pub steps: [i32; 3],
+}
+
+impl SoundFade {
+    /// Whether a fade is running.
+    pub fn active(&self) -> bool {
+        self.kind != 0
+    }
+}
+
+/// BGM state: the live state byte, the three channel banks and the scripted
+/// ramp/fade counters.
 ///
 /// The per-room target table lives in [`GameState::room_bgm`]; `state` is the
 /// live `g_BGM_STATE` the original shifts with `0x4A`/`0x4B`.
@@ -505,17 +563,49 @@ pub struct BgmState {
     pub state: u16,
     /// The three loaded channel banks.
     pub channels: [BgmChannelState; 3],
+    /// The live volume ramp (`bgm_volume_ramp`).
+    pub ramp: VolumeRamp,
+    /// The live sound fade (`snd_fade_set`).
+    pub fade: SoundFade,
 }
 
 impl Default for BgmState {
     /// The reset value: `g_BGM_STATE` starts `0xFF` (nothing playing) with
-    /// every bank empty.
+    /// every bank empty and no ramp or fade armed.
     fn default() -> Self {
         Self {
             state: 0xFF,
             channels: [BgmChannelState::default(); 3],
+            ramp: VolumeRamp::default(),
+            fade: SoundFade::default(),
         }
     }
+}
+
+/// The position form of one `se_play_3d` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Snd3dPos {
+    /// A world point (position type 0's scratch `(x, 0, z)`, position type 1's
+    /// player position, or a player cue's own position).
+    Point([i32; 3]),
+    /// The original's remaining forms (position type 3 and the 6-byte form):
+    /// no position is queued. The bank-4 path falls back to the player.
+    None,
+}
+
+/// One `se_play_3d` (0x17) request queued for the engine's one-shot mixer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snd3dRequest {
+    /// Sound bank: 0 room SFX pair, 1 weapon/menu, 2 room table, 3 character,
+    /// 4 BGM pan.
+    pub bank: u8,
+    /// Sound id within the bank.
+    pub id: u8,
+    /// Signed volume operand (unused by the original's 3D dispatch, carried
+    /// for parity).
+    pub volume: i8,
+    /// Where the sound plays.
+    pub pos: Snd3dPos,
 }
 
 /// Bytes of the per-stage/room BGM state table (7 stages x 32 rooms).
@@ -1124,6 +1214,15 @@ pub struct GameState {
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
+    /// `se_play_3d` (0x17) requests queued by the scripts, consumed by the
+    /// engine's bank dispatch.
+    pub snd3d_requests: Vec<Snd3dRequest>,
+    /// Position-type-2 requests dropped because no enemy slot exists
+    /// (documented no-enemy deviation), for the corpus audit.
+    pub snd3d_enemy_drops: u64,
+    /// `se_play_3d` requests whose bank/table combination resolved to a typed
+    /// no-op, counted by `(bank, id)` for the corpus audit.
+    pub snd3d_noops: BTreeMap<(u8, u8), u64>,
     /// Global one-shot SE ids queued by the script handlers (the item-box lid
     /// plays `0x20`, the desk lid `0x24` and its key turn `0x26`). The port
     /// has no pack mapping for the global SE bank in this slice; the engine
@@ -1241,6 +1340,9 @@ impl Default for GameState {
             npc_placeholders: BTreeMap::new(),
             pending_events: Vec::new(),
             entity_sounds: Vec::new(),
+            snd3d_requests: Vec::new(),
+            snd3d_enemy_drops: 0,
+            snd3d_noops: BTreeMap::new(),
             sfx_requests: Vec::new(),
             rand_seed: RAND_SEED_INITIAL,
             effects: effects::EffectPool::new(),
@@ -2147,6 +2249,7 @@ impl GameState {
         self.last_interaction = None;
         self.pending_events.clear();
         self.entity_sounds.clear();
+        self.snd3d_requests.clear();
     }
 
     /// Apply every queued `inst_cfg`/`obj_xfm` rewrite to the live room.
@@ -4799,12 +4902,94 @@ impl ScdHost for ScdGameHost<'_> {
     }
 
     fn on_sound(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
-        // TODO(parity): (audio) the remaining sound commands fall through to
-        // `placeholder`: 0x17 se_play_3d, 0x27 snd_fadeout, 0x2F se_volume and
-        // 0x43 se_rate (slices 3/4). The original applies each to the live
-        // DirectSound bank immediately, so scripted fades and 3D dispatch are
-        // missing here.
         match op.op {
+            // `se_play_3d`: bank/id/volume plus a position form. Types 0-3
+            // carry an X/Z pair (the reader sizes the 10-byte form); the
+            // 6-byte form queues no position. Type 2 indexes an enemy that can
+            // never exist in this milestone, so it is counted and dropped.
+            0x17 => {
+                let bank = operand_u8(operands, 0);
+                let id = operand_u8(operands, 1);
+                let volume = operand_i8(operands, 2);
+                let pos_type = operand_u8(operands, 3);
+                match pos_type {
+                    0 => {
+                        let x = i32::from(operand_i16(operands, 5));
+                        let z = i32::from(operand_i16(operands, 6));
+                        self.state.snd3d_requests.push(Snd3dRequest {
+                            bank,
+                            id,
+                            volume,
+                            pos: Snd3dPos::Point([x, 0, z]),
+                        });
+                    }
+                    1 => {
+                        let pos = self.state.entities[0].pos;
+                        self.state.snd3d_requests.push(Snd3dRequest {
+                            bank,
+                            id,
+                            volume,
+                            pos: Snd3dPos::Point(pos),
+                        });
+                    }
+                    2 => {
+                        // No enemy slot ever allocates, so the request is a
+                        // counted no-op (the milestone's no-enemy deviation).
+                        self.state.snd3d_enemy_drops += 1;
+                    }
+                    3 => {
+                        // The original calls `play_sfx(sndType, sndType)`,
+                        // ignoring the parsed id: bank and id are both the bank
+                        // operand.
+                        self.state.snd3d_requests.push(Snd3dRequest {
+                            bank,
+                            id: bank,
+                            volume,
+                            pos: Snd3dPos::None,
+                        });
+                    }
+                    _ => {
+                        // The 6-byte form has no position; the original's
+                        // switch has no case for it and consumes it silently.
+                        self.state.snd3d_requests.push(Snd3dRequest {
+                            bank,
+                            id,
+                            volume,
+                            pos: Snd3dPos::None,
+                        });
+                    }
+                }
+                StepResult::Continue
+            }
+            // `snd_fade_set`: arm the channel fade table.
+            0x27 => {
+                crate::bgm::build_snd_fade_tbl(self.state, operand_i8(operands, 0));
+                StepResult::Continue
+            }
+            // `snd_pan_vol_set`: cache the raw pan/volume pair and set the
+            // channel's millibel volume from it.
+            0x2F => {
+                let channel = operand_u8(operands, 0);
+                let pan = operand_u8(operands, 1);
+                let volume = operand_u8(operands, 2);
+                if let Some(bank) = self.state.bgm.channels.get_mut(usize::from(channel)) {
+                    bank.pan_pair = (pan, volume);
+                    if bank.name.is_some() {
+                        bank.volume = crate::sfx::pan_volume(pan, volume);
+                    }
+                }
+                StepResult::Continue
+            }
+            // `bgm_volume_ramp`: arm the ramp on an enabled, loaded channel.
+            0x43 => {
+                crate::bgm::start_volume_ramp(
+                    self.state,
+                    operand_u8(operands, 0),
+                    operand_i8(operands, 1),
+                    operand_u8(operands, 2),
+                );
+                StepResult::Continue
+            }
             // `bgm_play`: `operand` is the channel; start the loaded bank (a
             // no-op bank is loaded) and set its enable bit.
             0x15 => {
@@ -5606,6 +5791,84 @@ mod tests {
     }
 
     #[test]
+    fn snd_pan_vol_set_stores_the_pair_and_sets_the_volume() {
+        let mut state = game();
+        state.bgm.channels[1].name = Some("Se_01");
+        state.bgm.channels[1].volume = -9999;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_sound(op(0x2F), &operands(&[1, 95, 95])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.bgm.channels[1].pan_pair, (95, 95));
+        assert_eq!(
+            state.bgm.channels[1].volume,
+            crate::sfx::pan_volume(95, 95),
+            "the seed's -9999 is replaced by the pan pair's millibels"
+        );
+        // An unloaded channel caches the pair but keeps its volume.
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_sound(op(0x2F), &operands(&[0, 10, 10]));
+        assert_eq!(state.bgm.channels[0].pan_pair, (10, 10));
+        assert_eq!(state.bgm.channels[0].volume, 0);
+    }
+
+    #[test]
+    fn bgm_volume_ramp_arms_only_enabled_loaded_channels() {
+        let mut state = game();
+        state.bgm.state = 0x10;
+        state.bgm.channels[1].name = Some("Se_01");
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_sound(op(0x43), &operands(&[1, -95, 30])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.bgm.ramp.channel, 1);
+        assert_eq!(state.bgm.ramp.direction, (-95 / 30) * 0x4E);
+        assert_eq!(state.bgm.ramp.frames_left, 60);
+
+        // Channel 0 is disabled and unloaded: the request is refused.
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_sound(op(0x43), &operands(&[0, 10, 10]));
+            // A zero frame count would fault the original's divide; refused.
+            host.on_sound(op(0x43), &operands(&[1, 10, 0]));
+        }
+        assert_eq!(state.bgm.ramp.channel, 1, "the live ramp is untouched");
+        assert_eq!(state.bgm.ramp.frames_left, 60);
+    }
+
+    #[test]
+    fn snd_fade_set_builds_the_step_table() {
+        let mut state = game();
+        state.bgm.channels[0].name = Some("Bgm_13");
+        state.bgm.channels[0].volume = -1;
+        state.bgm.channels[1].name = Some("Se_01");
+        state.bgm.channels[1].volume = -9999;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // 251 as a signed char is -5: the fade-out direction.
+            assert_eq!(
+                host.on_sound(op(0x27), &operands(&[251])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.bgm.fade.dist_steps, -5 * 0x4E);
+        assert_eq!(state.bgm.fade.kind, 0x7F);
+        assert_eq!(
+            state.bgm.fade.steps[0],
+            (-10000 - -1) / (-5 * 0x4E),
+            "a full-volume channel needs its share of steps"
+        );
+        assert_eq!(state.bgm.fade.steps[1], 0, "-9999 is already silent");
+        assert_eq!(state.bgm.fade.steps[2], 0, "no bank loaded");
+    }
+
+    #[test]
     fn room_bgm_state_writes_the_per_room_table() {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
@@ -5620,6 +5883,56 @@ mod tests {
             0xFF,
             "0x37 never touches the live byte"
         );
+    }
+
+    #[test]
+    fn se_play_3d_parses_every_position_type() {
+        let mut state = game();
+        state.entities[0].pos = [100, 20, 300];
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // Type 0: the scratch point (x, 0, z).
+            host.on_sound(op(0x17), &operands(&[2, 23, 0, 0, 0, -5, 7]));
+            // Type 1: the player's position.
+            host.on_sound(op(0x17), &operands(&[3, 2, 1, 1, 0, 0, 0]));
+            // Type 2: an enemy index; counted and dropped.
+            host.on_sound(op(0x17), &operands(&[2, 11, 0, 2, 6, 0, 0]));
+            // Type 3: queued without a position, with the original's
+            // `play_sfx(sndType, sndType)` id quirk.
+            host.on_sound(op(0x17), &operands(&[1, 7, 0, 3, 0, 0, 0]));
+            // The 6-byte form: no position.
+            host.on_sound(op(0x17), &operands(&[4, 23, 0, 4, 0]));
+        }
+        assert_eq!(
+            state.snd3d_requests,
+            vec![
+                Snd3dRequest {
+                    bank: 2,
+                    id: 23,
+                    volume: 0,
+                    pos: Snd3dPos::Point([-5, 0, 7]),
+                },
+                Snd3dRequest {
+                    bank: 3,
+                    id: 2,
+                    volume: 1,
+                    pos: Snd3dPos::Point([100, 20, 300]),
+                },
+                Snd3dRequest {
+                    bank: 1,
+                    id: 1,
+                    volume: 0,
+                    pos: Snd3dPos::None,
+                },
+                Snd3dRequest {
+                    bank: 4,
+                    id: 23,
+                    volume: 0,
+                    pos: Snd3dPos::None,
+                },
+            ]
+        );
+        assert_eq!(state.snd3d_enemy_drops, 1);
     }
 
     #[test]
@@ -6002,7 +6315,7 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_sound(op(0x27), &operands(&[0])),
+                host.on_sound(op(0x26), &operands(&[0])),
                 StepResult::Placeholder
             );
             assert_eq!(
@@ -6014,7 +6327,7 @@ mod tests {
         assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x3A], 1);
-        assert_eq!(state.placeholders[&0x27], 1);
+        assert_eq!(state.placeholders[&0x26], 1);
         assert_eq!(state.placeholders[&0x4C], 1);
     }
 
