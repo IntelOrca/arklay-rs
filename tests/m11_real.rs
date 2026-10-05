@@ -18,10 +18,12 @@ use arklay::state::{RoomId, RoomState};
 /// The opcodes M11 implements. A placeholder hit for any of these would mean a
 /// shipped script reached an opcode the milestone claims to handle, and every
 /// entry must appear in the shipped scripts or the check would be vacuous.
-const IMPLEMENTED_OPCODES: [u8; 13] = [
+const IMPLEMENTED_OPCODES: [u8; 15] = [
     0x0C, // set_stairs_zone
     0x0F, // scene_setup
     0x11, // stairs_height_update
+    0x18, // item_aot_set
+    0x19, // model_flag_set
     0x1F, // obj
     0x30, // inst_cfg
     0x34, // model_op

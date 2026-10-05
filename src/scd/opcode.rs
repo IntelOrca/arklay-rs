@@ -74,7 +74,7 @@ pub const COMMAND_OPS: [Op; 81] = [
     op(0x16, "bgm_stop", "u", false, Some(2)),
     op(0x17, "se_play_3d", "uubuuII", false, None),
     op(0x18, "item_aot_set", "uIIIIuuuuIIIUuuU", false, Some(26)),
-    op(0x19, "setbyte", "uuu", false, Some(4)),
+    op(0x19, "model_flag_set", "uuu", false, Some(4)),
     op(0x1A, "item_ck", "u", true, Some(2)),
     op(0x1B, "enemy", "uuuuuIUUUIUuuuu", false, Some(22)),
     op(0x1C, "timer_setup", "uIU", false, Some(6)),

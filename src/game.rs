@@ -143,6 +143,14 @@ const ITEM_OIL: u8 = 0x32;
 const ITEM_DESK_KEY: u8 = 0x3D;
 /// The radio is not an inventory item; taking it raises a scenario flag.
 const ITEM_COMM_RADIO: u8 = 0x4D;
+/// First map item id; ids through [`ITEM_MAP_LAST`] use the map pick-up.
+const ITEM_MAP_FIRST: u8 = 0x4E;
+/// Last map item id.
+const ITEM_MAP_LAST: u8 = 0x53;
+/// Item id of the courtyard map, one of the two darkened pairs.
+const ITEM_MAP_COURTYARD: u8 = 0x50;
+/// Item id of the guardhouse map, the other darkened pair.
+const ITEM_MAP_GUARDHOUSE: u8 = 0x52;
 /// Scenario flag raised when the radio is taken.
 const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 /// Scenario flag raised when Jill has the lockpick.
@@ -189,6 +197,8 @@ const HANDLER_TYPEWRITER: u8 = 16;
 const HANDLER_STAIRS_ZONE: u8 = 0x0C;
 /// `room_check_actions` index of the stair height ramp handler.
 const HANDLER_STAIRS_HEIGHT: u8 = 0x11;
+/// `room_check_actions` index of the document (set_room_event_flag) handler.
+const HANDLER_DOCUMENT: u8 = 0x0D;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
 const MSF_MENU_GOT_ITEM: u8 = 21;
 /// `main_state_flags` bit 0x800, toggled by `give_item` (item viewer).
@@ -562,7 +572,8 @@ impl RoomAction {
         self.params[2]
     }
 
-    /// Item world position. The record's Y is not retained this slice.
+    /// Item world position from the action's copied operands. The action drops
+    /// the record's Y; the built [`crate::objects::ItemRecord`] carries it.
     pub fn item_position(&self) -> [i16; 3] {
         let x = i16::from_le_bytes([self.params[4], self.params[5]]);
         let z = i16::from_le_bytes([self.params[6], self.params[7]]);
@@ -959,6 +970,13 @@ pub struct GameState {
     /// The room's runtime object-model records, one per declared omodel slot;
     /// rebuilt by the init script and cleared on room entry.
     pub objects: ObjectTable,
+    /// The room's runtime item-model records, one per declared item pair;
+    /// built by `item_aot_set` and cleared on room entry.
+    pub items: crate::objects::ItemTable,
+    /// Queued `item_aot_set` palette darkenings (the two map items), indexed by
+    /// pair. The host has no room borrow, so the engine applies them with the
+    /// other room edits.
+    pub item_palette_edits: Vec<u8>,
     /// Queued `inst_cfg` collision-boundary rewrites, applied by the engine's
     /// room tick before physics and cleared with it.
     pub collision_edits: Vec<CollisionEdit>,
@@ -1056,6 +1074,8 @@ impl Default for GameState {
             rand_seed: RAND_SEED_INITIAL,
             effects: effects::EffectPool::new(),
             objects: ObjectTable::default(),
+            items: crate::objects::ItemTable::default(),
+            item_palette_edits: Vec::new(),
             collision_edits: Vec::new(),
             light_edits: Vec::new(),
             object_push: false,
@@ -1105,6 +1125,7 @@ impl GameState {
         state.max_health = character_max_health(id.player_flag);
         state.resolve_room_effects(room);
         state.objects.reset(usize::from(room.omodel_slot_count));
+        state.items.reset(usize::from(room.item_count));
         state
     }
 
@@ -1148,6 +1169,25 @@ impl GameState {
         match self.flags.get_mut(usize::from(bank)) {
             Some(bank) => bank.apply(sel, mode),
             None => false,
+        }
+    }
+
+    /// Whether a bank-7 room-items bit marks its item as still in the room.
+    ///
+    /// TODO(parity): (gameplay) the original's bank starts at 0xFF ("bit set =
+    /// item still here") and a pick-up clears the bit; the port ships the
+    /// inverted convention (set = taken). M12 slice 4 flips it; this method and
+    /// [`Self::mark_item_taken`] are the seam and change polarity together.
+    pub fn room_item_present(&self, flag: u8) -> bool {
+        flag != 0xFF && !self.flag_test(7, flag, false)
+    }
+
+    /// Mark a bank-7 room-items bit as taken; `0xFF` selects no bit.
+    pub fn mark_item_taken(&mut self, flag: u8) {
+        if flag != 0xFF {
+            // The current convention marks a taken item by setting the bit;
+            // slice 4 flips this mode to 1 with `room_item_present`.
+            self.apply_flag(7, flag, 0);
         }
     }
 
@@ -1693,16 +1733,23 @@ impl GameState {
         if flags & 0x0F != 0 {
             if flags == 0x93 {
                 // The selector is the word at +2 and the index the signed word
-                // at +4. Object and item models have no entity this milestone,
-                // so only the player and enemy targets latch a live slot.
-                // TODO(parity): (gameplay) target types 2 (object model) and 3
-                // (item model) resolve to g_omodel_table/g_item_model_table in
-                // the original and refresh the look-at from their transforms;
-                // the port ignores them, so a script aiming a character at an
-                // omodel keeps its previous target.
-                target_entity =
-                    motion_target_slot(operand_u8(operands, 1), operand_i16(operands, 2));
-                target = target_entity.map(|slot| self.entities[usize::from(slot)].pos);
+                // at +4. Type 3 names the item table and its record's live
+                // position becomes the look-at target.
+                // TODO(parity): (gameplay) target type 2 (object model)
+                // resolves to g_omodel_table in the original and refreshes the
+                // look-at from its transform; the port ignores it, so a script
+                // aiming a character at an omodel keeps its previous target.
+                let selector = operand_u8(operands, 1);
+                let index = operand_i16(operands, 2);
+                if selector == 3 {
+                    target = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| self.items.record(index))
+                        .map(|record| record.pos);
+                } else {
+                    target_entity = motion_target_slot(selector, index);
+                    target = target_entity.map(|slot| self.entities[usize::from(slot)].pos);
+                }
             } else {
                 let mut x = i32::from(operand_i16(operands, 1));
                 let mut y = i32::from(operand_i16(operands, 2));
@@ -1854,6 +1901,8 @@ impl GameState {
         self.last_tracked_effect = None;
         self.effect_missing_logged.clear();
         self.objects.reset(usize::from(room.omodel_slot_count));
+        self.items.reset(usize::from(room.item_count));
+        self.item_palette_edits.clear();
         self.collision_edits.clear();
         self.light_edits.clear();
         // The original's `room_set` clears the low nibble of the main-state
@@ -1914,14 +1963,25 @@ impl GameState {
         for edit in self.light_edits.drain(..) {
             edit.apply(room);
         }
+        // The two map items' pairs are darkened in place, exactly like the
+        // original's CLUT rewrite at the build (the pair is tagged by index).
+        for pair in self.item_palette_edits.drain(..) {
+            if let Some(asset) = room
+                .item_models
+                .iter_mut()
+                .find(|asset| asset.pair_index == usize::from(pair))
+            {
+                crate::objects::darken_map_palette(&mut asset.texture);
+            }
+        }
     }
 
     /// `ck_counter` (0x3C): whether the player is within `max_dist` of the
     /// selected target.
     ///
     /// Target types: `0` enemy `spec >> 8` (the port's entity slot `+ 1`),
-    /// `1` omodel `spec >> 8`; `2` names the item-model table and is a typed
-    /// no-op this milestone. Any other type reports false.
+    /// `1` omodel `spec >> 8`, `2` item model `spec >> 8`. Any other type
+    /// reports false.
     pub fn distance_test(&self, target_spec: u16, max_dist: u16) -> bool {
         let target = match target_spec & 0xFF {
             0 => self
@@ -1930,6 +1990,10 @@ impl GameState {
                 .map(|entity| entity.pos),
             1 => self
                 .objects
+                .record(usize::from(target_spec >> 8))
+                .map(|record| record.pos),
+            2 => self
+                .items
                 .record(usize::from(target_spec >> 8))
                 .map(|record| record.pos),
             _ => None,
@@ -3878,15 +3942,16 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_item(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x18 => {
-                // TODO(parity): (scripting) the original maps item-model ids
-                // 0x4E..=0x53 to the key-pickup handler (0x0F) and documents to
-                // 0x0D, skips an ink-ribbon model on Jill's first playthrough,
-                // and masks the +0x18 flags word it writes back; this always
-                // registers an ordinary item pickup (HANDLER_ITEM). The record's
-                // Y coordinate is dropped too.
-                // Byte layout: slot/rot, zone x4, item type, entry flags, model
-                // index, sca parent, model xyz, anim, roomItems flag, entry
-                // flags, flags word.
+                // The build's action handler is derived from the item id: an
+                // ink ribbon on Jill's first playthrough is skipped entirely
+                // (its room-items bit cleared), ordinary items get the pickup
+                // handler, maps the key-pickup event and documents their own.
+                // The crank's hex handle (0x1E) gets an extra texture-dirty
+                // write in the original; it has no analogue in the port
+                // (documented no-op).
+                // Byte layout: slot/rot, zone x4, item type, quantity, model
+                // index, sca parent, model X, model Y, model Z, anim word,
+                // roomItems flag, entry flags, flags word.
                 let slot = operand_u8(operands, 0) & 0x7F;
                 let item = operand_u8(operands, 5);
                 let quantity = operand_u8(operands, 6);
@@ -3895,26 +3960,52 @@ impl ScdHost for ScdGameHost<'_> {
                 let x = operand_i16(operands, 9).to_le_bytes();
                 let z = operand_i16(operands, 11).to_le_bytes();
                 let room_items_flag = operand_u8(operands, 13);
-                // A set roomItems flag means the item was already taken.
-                if self.state.flag_test(7, room_items_flag, false) {
+                if item == items::ITEM_INK_RIBBONS
+                    && self.state.id.player_flag & 3 == 1
+                    && !self
+                        .state
+                        .flag_test(BANK_SCENARIO, SCENARIO_FLAG_SECOND_PLAYTHROUGH, false)
+                {
+                    self.state.mark_item_taken(room_items_flag);
                     return StepResult::Continue;
                 }
-                let action = RoomAction {
-                    slot,
-                    kind: RoomActionKind::Item,
-                    zone: [
-                        operand_i16(operands, 1),
-                        operand_i16(operands, 2),
-                        operand_i16(operands, 3),
-                        operand_i16(operands, 4),
-                    ],
-                    sce: HANDLER_ITEM,
-                    handler: HANDLER_ITEM,
-                    flags: operand_u8(operands, 14),
-                    params: [item, quantity, model, parent, x[0], x[1], z[0], z[1]],
-                    room_items_flag,
-                };
-                self.store_action(action);
+                // TODO(parity): (gameplay) M12 slice 4 flips bank 7 to the
+                // original's set = "still here"; until then the seam keeps the
+                // port's clear = present convention.
+                let present = self.state.room_item_present(room_items_flag);
+                let handler = if present { item_handler(item) } else { 0 };
+                // The record is built even when the flag marks it taken, so the
+                // build-order byte keeps naming every declaration; a hidden
+                // record keeps its flag byte 0.
+                let previous_asset = self.state.items.last_asset;
+                let built = self.state.items.build(operands, present, self.state.id);
+                // The courtyard and guardhouse maps darken their pair's 256
+                // palette entries, but only when the pair changes (the
+                // original's last-item-data cache).
+                if built
+                    && matches!(item, ITEM_MAP_COURTYARD | ITEM_MAP_GUARDHOUSE)
+                    && previous_asset != Some(model)
+                {
+                    self.state.item_palette_edits.push(model);
+                }
+                if present {
+                    let action = RoomAction {
+                        slot,
+                        kind: RoomActionKind::Item,
+                        zone: [
+                            operand_i16(operands, 1),
+                            operand_i16(operands, 2),
+                            operand_i16(operands, 3),
+                            operand_i16(operands, 4),
+                        ],
+                        sce: handler,
+                        handler,
+                        flags: operand_u8(operands, 14),
+                        params: [item, quantity, model, parent, x[0], x[1], z[0], z[1]],
+                        room_items_flag,
+                    };
+                    self.store_action(action);
+                }
                 StepResult::Continue
             }
             // TODO(parity): (gameplay) 0x2C is the original's `item_remove`, which
@@ -3925,9 +4016,23 @@ impl ScdHost for ScdGameHost<'_> {
                 condition_result(removed)
             }
             0x1C => self.equipped_test(operands),
-            // TODO(parity): (scripting) 0x19 model_flag_set and 0x4C
-            // item_record_transfer (moves a pick-up quantity between a room
-            // action record and the BioCard bytes 0x20C..0x20E) stay placeholders.
+            // `model_flag_set` (0x19): write the item record's byte 0
+            // wholesale. Every shipped write clears the record; clearing also
+            // frees the pick-up sparkle's handle (the pool free is slice 3).
+            0x19 => {
+                let index = usize::from(operand_u8(operands, 0));
+                let value = operand_u8(operands, 1);
+                if let Some(record) = self.state.items.record_mut(index) {
+                    record.flag = value;
+                    if value == 0 {
+                        record.sparkle = 0;
+                    }
+                }
+                StepResult::Continue
+            }
+            // TODO(parity): (scripting) 0x4C item_record_transfer (moves a
+            // pick-up quantity between a room action record and the BioCard
+            // bytes 0x20C..0x20E) stays a placeholder.
             0x4C => self.placeholder(op),
             _ => self.placeholder(op),
         }
@@ -4034,14 +4139,22 @@ impl ScdHost for ScdGameHost<'_> {
                 StepResult::Continue
             }
             0x35 => {
-                self.state.objects.set_flag(operands, self.state.id);
+                // `objtbl_b_set`: table 0 writes an omodel byte, table 1 the
+                // item table. The water-tank entry's forced omodel clear fires
+                // before the table selector, so it is tried first and wins for
+                // both tables.
+                if !self.state.objects.set_flag(operands, self.state.id) {
+                    self.state.items.set_flag(operands);
+                }
                 StepResult::Continue
             }
             // `ck_anim` (0x36): compare the record's push counter.
             0x36 => condition_result(self.state.objects.compare_counter(operands)),
-            // `eml_rot` (0x3B): item-model selectors are a typed no-op.
+            // `eml_rot` (0x3B): selectors below 0x8000 name the item table.
             0x3B => {
-                self.state.objects.rotate(operands);
+                if !self.state.objects.rotate(operands) {
+                    self.state.items.rotate(operands);
+                }
                 StepResult::Continue
             }
             // `eml_pos` (0x47): the object index is the first operand byte.
@@ -4222,9 +4335,22 @@ fn channel_bit(channel: u8) -> u8 {
     1u8.checked_shl(u32::from(channel) + 3).unwrap_or(0)
 }
 
+/// The room-action handler an `item_aot_set` item id selects: maps use
+/// `pickup_key_event` (0x0F), documents `set_room_event_flag` (0x0D) and
+/// everything ordinary the pickup handler (4).
+fn item_handler(item: u8) -> u8 {
+    if item < ITEM_MAP_FIRST {
+        HANDLER_ITEM
+    } else if item <= ITEM_MAP_LAST {
+        HANDLER_PICKUP_KEY
+    } else {
+        HANDLER_DOCUMENT
+    }
+}
+
 /// The entity slot an `act_motion` target pair resolves to: type 0 the player,
-/// type 1 enemy `index` (slot `index + 1`). Object and item models have no
-/// entity this slice.
+/// type 1 enemy `index` (slot `index + 1`). Object models have no entity this
+/// slice; item models resolve to their record position in `apply_act_motion`.
 fn motion_target_slot(entity_type: u8, index: i16) -> Option<u8> {
     match entity_type {
         0 => Some(0),
@@ -4902,6 +5028,37 @@ mod tests {
         GameState::new(RoomId::parse("1001").unwrap(), &room)
     }
 
+    /// A state for `room_id` with `slots` declared item-model records.
+    fn item_game(room_id: &str, slots: u8) -> GameState {
+        let room = RoomState {
+            item_count: slots,
+            ..RoomState::default()
+        };
+        GameState::new(RoomId::parse(room_id).unwrap(), &room)
+    }
+
+    /// The 16 decoded `item_aot_set` operands for slot 0 and `model`.
+    fn item_values(item: u8, model: u8, parent: u8, pos: [i64; 3]) -> Vec<i64> {
+        vec![
+            0,
+            0,
+            0,
+            100,
+            100,
+            i64::from(item),
+            1,
+            i64::from(model),
+            i64::from(parent),
+            pos[0],
+            pos[1],
+            pos[2],
+            0,
+            1,
+            0,
+            0,
+        ]
+    }
+
     /// The 23 decoded `obj` operand bytes for slot 0.
     fn obj_values() -> Vec<i64> {
         let mut values = vec![0, 0x41, 0xFF, 100, -200, 300, 0x1234];
@@ -5063,7 +5220,7 @@ mod tests {
                 host.on_flow(op(0x3C), &operands(&[0, 1, i64::from(exact) - 1])),
                 StepResult::Finished
             );
-            // Type 2 is the item-model table; a typed no-op.
+            // Type 2 is the item-model table; the unbuilt table misses.
             assert_eq!(
                 host.on_flow(op(0x3C), &operands(&[0, 2, 1000])),
                 StepResult::Finished
@@ -5092,10 +5249,6 @@ mod tests {
                 StepResult::Placeholder
             );
             assert_eq!(
-                host.on_item(op(0x19), &operands(&[0, 0, 0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
                 host.on_message(op(0x29), &operands(&[0])),
                 StepResult::Placeholder
             );
@@ -5112,9 +5265,8 @@ mod tests {
                 StepResult::Placeholder
             );
         }
-        assert_eq!(state.placeholders.len(), 6);
+        assert_eq!(state.placeholders.len(), 5);
         assert_eq!(state.placeholders[&0x2B], 1);
-        assert_eq!(state.placeholders[&0x19], 1);
         assert_eq!(state.placeholders[&0x29], 1);
         assert_eq!(state.placeholders[&0x3A], 1);
         assert_eq!(state.placeholders[&0x27], 1);
@@ -6664,7 +6816,12 @@ mod tests {
 
     #[test]
     fn item_aot_set_stores_item_fields() {
-        let mut state = game();
+        // Chris: the ink-ribbon skip is Jill's first-playthrough only.
+        let room = RoomState {
+            item_count: 1,
+            ..RoomState::default()
+        };
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
         {
             let mut host = ScdGameHost::new(&mut state);
             assert_eq!(
@@ -6686,6 +6843,321 @@ mod tests {
         assert_eq!(action.item_model(), 0);
         assert_eq!(action.item_position(), [5040, 0, 8630]);
         assert_eq!(action.flags, 0x81);
+        assert_eq!(action.handler, HANDLER_ITEM);
+
+        // The record keeps the operand's Y that the action's copy drops.
+        let record = state.items.record(0).expect("item record");
+        assert_eq!(record.flag, 1);
+        assert_eq!(record.model, 0);
+        assert_eq!(record.parent, 0xFF);
+        assert_eq!(record.pos, [5040, -910, 8630]);
+        assert_eq!(record.committed, [5040, -910, 8630]);
+        assert_eq!(record.rotation, [0, 0, 0]);
+        assert_eq!(record.asset, Some(0));
+        assert_eq!(record.sparkle, 0);
+        assert_eq!(record.alt_rotation, 0x4000_0000);
+    }
+
+    #[test]
+    fn item_handler_derives_from_the_item_id() {
+        assert_eq!(item_handler(0x00), HANDLER_ITEM);
+        assert_eq!(item_handler(0x4D), HANDLER_ITEM);
+        assert_eq!(item_handler(0x4E), HANDLER_PICKUP_KEY);
+        assert_eq!(item_handler(0x53), HANDLER_PICKUP_KEY);
+        assert_eq!(item_handler(0x54), HANDLER_DOCUMENT);
+        assert_eq!(item_handler(0xFF), HANDLER_DOCUMENT);
+
+        for (item, handler) in [
+            (0x33, HANDLER_ITEM),
+            (0x4E, HANDLER_PICKUP_KEY),
+            (0x50, HANDLER_PICKUP_KEY),
+            (0x60, HANDLER_DOCUMENT),
+        ] {
+            let mut state = item_game("1000", 1);
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                assert_eq!(
+                    host.on_item(
+                        op(0x18),
+                        &operands(&item_values(item, 0, 0xFF, [10, -20, 30]))
+                    ),
+                    StepResult::Continue
+                );
+            }
+            let action = state.room_actions[0].expect("item action");
+            assert_eq!(action.kind, RoomActionKind::Item);
+            assert_eq!(action.sce, handler);
+            assert_eq!(action.handler, handler);
+            assert_eq!(state.items.record(0).unwrap().flag, 1);
+        }
+    }
+
+    #[test]
+    fn item_aot_set_hides_taken_items_but_still_counts_them() {
+        let mut state = item_game("1000", 1);
+        state.mark_item_taken(1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_item(op(0x18), &operands(&item_values(0x33, 0, 0xFF, [1, 2, 3]))),
+                StepResult::Continue
+            );
+        }
+        // The record is built with its drawn bit clear and consumes a build
+        // order tag; the inert action is not registered.
+        assert_eq!(state.items.built, 1);
+        assert_eq!(state.items.record(0).unwrap().flag, 0);
+        assert!(!state.items.record(0).unwrap().active());
+        assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn item_aot_set_skips_jills_first_playthrough_ink_ribbon() {
+        // A flag bit not yet marked taken; the skip must strike it.
+        let mut state = item_game("1001", 1);
+        assert!(state.room_item_present(1));
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_item(op(0x18), &operands(&item_values(0x2F, 0, 0xFF, [1, 2, 3]))),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.items.built, 0, "the ribbon is not built");
+        assert!(state.items.records[0] == crate::objects::ItemRecord::default());
+        assert!(state.room_actions[0].is_none());
+        assert!(!state.room_item_present(1), "the ribbon is marked taken");
+
+        // On a second playthrough the ribbon builds normally.
+        let mut state = item_game("1001", 1);
+        state.apply_flag(0, SCENARIO_FLAG_SECOND_PLAYTHROUGH, 0);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x2F, 0, 0xFF, [1, 2, 3])));
+        }
+        assert_eq!(state.items.built, 1);
+        assert_eq!(state.items.record(0).unwrap().flag, 1);
+        assert!(state.room_actions[0].is_some());
+
+        // Chris never takes the skip.
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x2F, 0, 0xFF, [1, 2, 3])));
+        }
+        assert_eq!(state.items.built, 1);
+    }
+
+    #[test]
+    fn item_aot_set_darkens_the_map_pairs_palette_once() {
+        use crate::model::{Texture8, Tmd};
+        use crate::objects::ObjectAsset;
+
+        let texture = || Texture8 {
+            width: 1,
+            height: 1,
+            indices: vec![0],
+            palettes: vec![[255, 82, 74, 255]],
+        };
+        let mut room = RoomState {
+            item_count: 2,
+            item_models: vec![
+                ObjectAsset {
+                    pair_index: 0,
+                    model: Tmd::default(),
+                    texture: texture(),
+                },
+                ObjectAsset {
+                    pair_index: 1,
+                    model: Tmd::default(),
+                    texture: texture(),
+                },
+            ],
+            ..RoomState::default()
+        };
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // The ordinary item first, then the courtyard map on the other
+            // pair; a second declaration of the same pair must not re-darken.
+            host.on_item(op(0x18), &operands(&item_values(0x33, 0, 0xFF, [0, 0, 0])));
+            host.on_item(op(0x18), &operands(&item_values(0x50, 1, 0xFF, [0, 0, 0])));
+            host.on_item(op(0x18), &operands(&item_values(0x50, 1, 0xFF, [0, 0, 0])));
+        }
+        assert_eq!(state.item_palette_edits, vec![1]);
+        // The edit lands with the room pass, not inside the host.
+        assert_eq!(room.item_models[0].texture.palettes[0], [255, 82, 74, 255]);
+        assert_eq!(room.item_models[1].texture.palettes[0], [255, 82, 74, 255]);
+        state.apply_room_edits(&mut room);
+        assert_eq!(room.item_models[0].texture.palettes[0], [255, 82, 74, 255]);
+        assert_eq!(room.item_models[1].texture.palettes[0], [180, 8, 0, 255]);
+        assert!(state.item_palette_edits.is_empty());
+    }
+
+    #[test]
+    fn item_opcodes_write_the_record_through_the_host() {
+        let mut state = item_game("1000", 2);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(
+                op(0x18),
+                &operands(&item_values(0x33, 1, 0xFF, [10, -20, 30])),
+            );
+            // `objtbl_b_set` table 1 writes byte 0 wholesale.
+            assert_eq!(
+                host.on_model(op(0x35), &operands(&[1, 1, 0x0F])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().items.record(1).unwrap().flag, 0x0F);
+            // `eml_rot` selector 1 names item 1 and writes X/Z only.
+            assert_eq!(
+                host.on_model(op(0x3B), &operands(&[1, 0x1111, 0x2222])),
+                StepResult::Continue
+            );
+            let record = host.state().items.record(1).unwrap();
+            assert_eq!(record.rotation, [0x1111, 0, 0x2222]);
+            // An inactive record keeps its rotation.
+            host.state_mut().items.record_mut(1).unwrap().flag = 0;
+            assert_eq!(
+                host.on_model(op(0x3B), &operands(&[1, 0x3333, 0x4444])),
+                StepResult::Continue
+            );
+            assert_eq!(
+                host.state().items.record(1).unwrap().rotation,
+                [0x1111, 0, 0x2222]
+            );
+        }
+        assert!(state.placeholders.is_empty());
+    }
+
+    #[test]
+    fn objtbl_table_1_routes_to_items_and_the_water_tank_stays_omodel() {
+        let room = RoomState {
+            omodel_slot_count: 1,
+            item_count: 1,
+            ..RoomState::default()
+        };
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
+        state.objects.record_mut(0).unwrap().flag = 1;
+        state.items.record_mut(0).unwrap().flag = 1;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // Table 1 writes the item byte and leaves the omodel alone.
+            host.on_model(op(0x35), &operands(&[1, 0, 0x40]));
+            assert_eq!(host.state().items.record(0).unwrap().flag, 0x40);
+            assert_eq!(host.state().objects.record(0).unwrap().flag, 1);
+            // Table 0 writes the omodel byte and leaves the item alone.
+            host.on_model(op(0x35), &operands(&[0, 0, 0x20]));
+            assert_eq!(host.state().objects.record(0).unwrap().flag, 0x20);
+            assert_eq!(host.state().items.record(0).unwrap().flag, 0x40);
+            // An unknown table writes nothing.
+            host.on_model(op(0x35), &operands(&[2, 0, 0x80]));
+            assert_eq!(host.state().objects.record(0).unwrap().flag, 0x20);
+            assert_eq!(host.state().items.record(0).unwrap().flag, 0x40);
+        }
+
+        // The water-tank entry's forced clear fires before the table selector,
+        // so a table-1 write to object 5 still zeroes the omodel only.
+        let tank = RoomState {
+            omodel_slot_count: 6,
+            item_count: 6,
+            ..RoomState::default()
+        };
+        let mut state = GameState::new(RoomId::parse("40D0").unwrap(), &tank);
+        state.objects.record_mut(5).unwrap().flag = 0x41;
+        state.items.record_mut(5).unwrap().flag = 0x41;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_model(op(0x35), &operands(&[1, 5, 0x40]));
+        }
+        assert_eq!(state.objects.record(5).unwrap().flag, 0);
+        assert_eq!(state.items.record(5).unwrap().flag, 0x41);
+    }
+
+    #[test]
+    fn model_flag_set_writes_the_item_byte_and_drops_the_sparkle() {
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&item_values(0x33, 0, 0xFF, [0, 0, 0])));
+            // A wholesale write, not a bit op: 0x80 stays 0x80.
+            assert_eq!(
+                host.on_item(op(0x19), &operands(&[0, 0x80])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().items.record(0).unwrap().flag, 0x80);
+        }
+        // Clearing frees the record's sparkle handle (the pool free is slice 3).
+        state.items.record_mut(0).unwrap().sparkle = 7;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_item(op(0x19), &operands(&[0, 0])),
+                StepResult::Continue
+            );
+            // A missing record is inert, not a placeholder.
+            assert_eq!(
+                host.on_item(op(0x19), &operands(&[9, 1])),
+                StepResult::Continue
+            );
+        }
+        let record = state.items.record(0).unwrap();
+        assert_eq!(record.flag, 0);
+        assert_eq!(record.sparkle, 0);
+        assert!(state.placeholders.is_empty());
+    }
+
+    #[test]
+    fn ck_counter_type_2_uses_the_item_record_position() {
+        let mut state = item_game("1000", 1);
+        state.items.record_mut(0).unwrap().pos = [300, 1000, 400];
+        assert!(state.distance_test(2, 500));
+        assert!(!state.distance_test(2, 499));
+        // The index is the spec's high byte.
+        assert!(!state.distance_test(0x0102, 1000));
+    }
+
+    #[test]
+    fn actor_motion_type_3_uses_the_item_record_position() {
+        let mut state = item_game("1000", 1);
+        state.items.record_mut(0).unwrap().pos = [77, 5, 88];
+        state.selected_entity = 0;
+        let mut host = ScdGameHost::new(&mut state);
+        // flags 0x93: target type 3, index 0.
+        let insn = actor_bytes(&[0x81, 0x93, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00]);
+        assert_eq!(dispatch_actor(&mut host, &insn), StepResult::Continue);
+        let entity = host.state().entities[0];
+        assert_eq!(entity.target, [77, 5, 88]);
+        assert_eq!(entity.target_entity, None);
+    }
+
+    #[test]
+    fn enter_room_resizes_and_clears_the_item_table() {
+        let mut state = item_game("1000", 2);
+        state.items.build(
+            &operands(&item_values(0x33, 0, 0xFF, [0, 0, 0])),
+            true,
+            state.id,
+        );
+        assert_eq!(state.items.built, 1);
+        state.item_palette_edits.push(0);
+
+        let room = RoomState {
+            item_count: 3,
+            ..RoomState::default()
+        };
+        state.enter_room(RoomId::parse("1010").unwrap(), &room);
+        assert_eq!(state.items.records.len(), 3);
+        assert_eq!(state.items.built, 0);
+        assert_eq!(state.items.last_asset, None);
+        assert!(
+            state
+                .items
+                .records
+                .iter()
+                .all(|record| *record == crate::objects::ItemRecord::default())
+        );
+        assert!(state.item_palette_edits.is_empty());
     }
 
     #[test]

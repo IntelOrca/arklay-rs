@@ -13,9 +13,11 @@
 //! builds a record (its 28-byte operand block is mapped field for field),
 //! `objtbl_b_set` writes its flag byte, `ck_anim` compares its push counter,
 //! `eml_rot`/`eml_pos` write its rotation and position, `model_op` accumulates
-//! its colour tint, and the renderer composes its world matrix. Item-model
-//! records are not built this milestone; the item-table selectors are typed
-//! no-ops.
+//! its colour tint, and the renderer composes its world matrix. Every declared
+//! item-model slot owns one [`ItemRecord`]: `item_aot_set` builds it, the
+//! item-table selectors of `objtbl_b_set`/`eml_rot`/`model_flag_set` write it,
+//! and the second render pass composes its world matrix against its absolute,
+//! player or omodel parent.
 //!
 //! This module also owns the three entity/object box tests the room-object
 //! pass is built on: [`chk_entity_slide`] (resolve an actor against a record),
@@ -417,6 +419,213 @@ impl ObjectTable {
     }
 }
 
+/// Item flag bit `0x01`: drawn. `model_flag_set` writes the whole byte.
+pub const ITEM_FLAG_ACTIVE: u8 = 0x01;
+
+/// One runtime item record, the pick-up models `item_aot_set` builds into
+/// `g_item_model_table`.
+///
+/// The original reuses the same 0xA4-byte entity head as the object records;
+/// the port keeps only the fields the build, the item-table selectors and the
+/// render/attach passes address. The two `0x40` words at record `+0xC`/`+0xF`
+/// are the alternate-rotation seed the slot byte's bit `0x80` toggles; nothing
+/// else in the port consumes them, so they are kept as one raw word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemRecord {
+    /// Flag byte (record +0): bit 0 = drawn, written wholesale by
+    /// `model_flag_set`.
+    pub flag: u8,
+    /// Model byte (record +1): the build-order counter, the original's
+    /// texture-bank tag. This is **not** the pair index.
+    pub model: u8,
+    /// SCA parent selector (record +0x64): `0xFF` absolute, `0xFE` the player,
+    /// anything else an omodel index (there is no `0x80` split).
+    pub parent: u8,
+    /// Live 32-bit position (record +0x34).
+    pub pos: [i32; 3],
+    /// The 16-bit position copy (record +0x6C).
+    pub committed: [i16; 3],
+    /// Rotation SVECTOR (record +0x72): Y is seeded from the `anim` operand,
+    /// X/Z are zeroed at build and written by `eml_rot`.
+    pub rotation: [i16; 3],
+    /// The bound pair's index in [`crate::state::RoomState::item_models`].
+    pub asset: Option<u8>,
+    /// Effect-pool slot of the pick-up sparkle (record +0x86), `0` when none.
+    pub sparkle: u8,
+    /// The `0x40`-word alternate-rotation seed at record `+0xC`/`+0xF`:
+    /// `0x4000_0000`, or `0x4000_0040` when the slot byte's bit `0x80` is set.
+    pub alt_rotation: u32,
+}
+
+impl Default for ItemRecord {
+    /// An unbuilt slot: inactive and absolute.
+    fn default() -> Self {
+        Self {
+            flag: 0,
+            model: 0,
+            parent: 0xFF,
+            pos: [0; 3],
+            committed: [0; 3],
+            rotation: [0; 3],
+            asset: None,
+            sparkle: 0,
+            alt_rotation: 0,
+        }
+    }
+}
+
+impl ItemRecord {
+    /// Whether the drawn flag is set.
+    pub fn active(&self) -> bool {
+        self.flag & ITEM_FLAG_ACTIVE != 0
+    }
+}
+
+/// One record per declared item-model slot plus the build counter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemTable {
+    /// The declared item records; `item_aot_set` model bytes past the end are
+    /// ignored.
+    pub records: Vec<ItemRecord>,
+    /// `g_ItemModelCount`: how many `item_aot_set` calls have built a record.
+    pub built: u8,
+    /// Pair index of the last built record, the original's `DAT_00bca0d0`
+    /// texture-bank cache tag. The map items' palette darkening uses it.
+    pub last_asset: Option<u8>,
+}
+
+impl ItemTable {
+    /// An empty table for `slot_count` declared item-model slots.
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            records: vec![ItemRecord::default(); slot_count],
+            built: 0,
+            last_asset: None,
+        }
+    }
+
+    /// Room entry: drop every record and both counters, then size the table to
+    /// the new room's declared slot count.
+    pub fn reset(&mut self, slot_count: usize) {
+        self.records.clear();
+        self.records.resize(slot_count, ItemRecord::default());
+        self.built = 0;
+        self.last_asset = None;
+    }
+
+    /// One record by slot.
+    pub fn record(&self, index: usize) -> Option<&ItemRecord> {
+        self.records.get(index)
+    }
+
+    /// One record by slot, mutably.
+    pub fn record_mut(&mut self, index: usize) -> Option<&mut ItemRecord> {
+        self.records.get_mut(index)
+    }
+
+    /// `item_aot_set` (0x18): build the pair named by operand 7.
+    ///
+    /// The record's flag byte is 1 while `visible` and 0 otherwise; the record
+    /// is still built (and counts) when hidden, exactly like the original, so
+    /// the build-order byte keeps naming the declaration order. A model index
+    /// past the declared table is ignored and does not count.
+    pub fn build(&mut self, operands: &[Operand], visible: bool, id: RoomId) -> bool {
+        let model = operand_u8(operands, 7);
+        if self.records.get(usize::from(model)).is_none() {
+            return false;
+        }
+        self.records[usize::from(model)] = build_item(operands, visible, self.built, id);
+        self.built = self.built.wrapping_add(1);
+        self.last_asset = Some(model);
+        true
+    }
+
+    /// `objtbl_b_set` (0x35): the item table (selector 1) writes byte 0
+    /// wholesale. Other selectors are the omodel table's (or unknown) and are
+    /// refused.
+    pub fn set_flag(&mut self, operands: &[Operand]) -> bool {
+        if operand_u8(operands, 0) != 1 {
+            return false;
+        }
+        let Some(record) = self.records.get_mut(usize::from(operand_u8(operands, 1))) else {
+            return false;
+        };
+        record.flag = operand_u8(operands, 2);
+        true
+    }
+
+    /// `eml_rot` (0x3B): selectors below `0x8000` name the item table and write
+    /// the record's rotation X/Z, active records only.
+    pub fn rotate(&mut self, operands: &[Operand]) -> bool {
+        let selector = (u16::from(operand_u8(operands, 0)) << 8) | 0x3B;
+        if selector >= 0x8000 {
+            return false;
+        }
+        let Some(record) = self.records.get_mut(usize::from(operand_u8(operands, 0))) else {
+            return false;
+        };
+        if !record.active() {
+            return false;
+        }
+        record.rotation[0] = operand_i16(operands, 1);
+        record.rotation[2] = operand_i16(operands, 2);
+        true
+    }
+}
+
+/// Map one `item_aot_set` operand block onto an [`ItemRecord`].
+///
+/// `built` is the table's build counter before the increment, stored as the
+/// record's model byte. `visible` selects the drawn bit. The stage-7 trophy
+/// room's second built item drops 0x96 from its Z, and the slot byte's bit
+/// `0x80` selects the alternate-rotation seed.
+pub fn build_item(operands: &[Operand], visible: bool, built: u8, id: RoomId) -> ItemRecord {
+    let mut pos = [
+        i32::from(operand_i16(operands, 9)),
+        i32::from(operand_i16(operands, 10)),
+        i32::from(operand_i16(operands, 11)),
+    ];
+    // The trophy room's second declaration sits 0x96 units lower.
+    if id.stage == 7 && id.room == 0x15 && built & 0x3F == 1 {
+        pos[2] -= 0x96;
+    }
+    ItemRecord {
+        flag: u8::from(visible),
+        model: built,
+        parent: operand_u8(operands, 8),
+        pos,
+        committed: [pos[0] as i16, pos[1] as i16, pos[2] as i16],
+        rotation: [0, operand_i16(operands, 12), 0],
+        asset: Some(operand_u8(operands, 7)),
+        sparkle: 0,
+        alt_rotation: if operand_u8(operands, 0) & 0x80 != 0 {
+            0x4000_0040
+        } else {
+            0x4000_0000
+        },
+    }
+}
+
+/// The two map items' palette darkening: each 5-bit channel drops by 9 and
+/// values below 10 clamp to 0, bit 15 kept; every one of the pair's 256
+/// entries is rewritten.
+///
+/// The port's TIM decode expands the 5551 word to RGBA8 (and drops the STP
+/// bit, a documented no-op), so the 5-bit channel is recovered by rounding the
+/// expanded byte back, then re-expanded the same way the decoder does.
+pub fn darken_map_palette(texture: &mut Texture8) {
+    let darken = |channel: u8| -> u8 {
+        let value = (u32::from(channel) * 31 + 127) / 255;
+        let value = if value < 10 { 0 } else { value - 9 };
+        (value * 255 / 31) as u8
+    };
+    for palette in &mut texture.palettes {
+        palette[0] = darken(palette[0]);
+        palette[1] = darken(palette[1]);
+        palette[2] = darken(palette[2]);
+    }
+}
+
 /// The `obj` stage/room positional special cases.
 fn apply_position_overrides(pos: &mut [i32; 3], slot: usize, id: RoomId) {
     // Front lesson room (stages 2F and their return): slot 0 shifts Z by
@@ -518,6 +727,50 @@ pub fn world_matrix(
         r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
         t: [0, 0, 0],
     })
+}
+
+/// The item's 4.12 rotation matrix from its SVECTOR.
+pub fn item_rotation(item: &ItemRecord) -> [[i32; 3]; 3] {
+    anim::rotation_matrix(
+        i32::from(item.rotation[0]),
+        i32::from(item.rotation[1]),
+        i32::from(item.rotation[2]),
+    )
+}
+
+/// The composed world matrix of item `index`.
+///
+/// Parent selectors (no `0x80` split): `0xFF` absolute, its own rotation and
+/// position; `0xFE` the player, the entity matrix composed with the item's
+/// local matrix; anything else an omodel index, [`rebuild`] of that record
+/// composed with the local matrix. A missing parent record falls back to the
+/// item's local matrix.
+pub fn item_world_matrix(
+    items: &ItemTable,
+    objects: &ObjectTable,
+    lighting: &Lighting,
+    index: usize,
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Mat4x3 {
+    let Some(item) = items.record(index) else {
+        return Mat4x3 {
+            r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            t: [0, 0, 0],
+        };
+    };
+    let local = Mat4x3 {
+        r: item_rotation(item),
+        t: item.pos,
+    };
+    match item.parent {
+        0xFF => local,
+        0xFE => anim::compose(&anim::entity_matrix(player_pos, player_angle), &local),
+        parent => match objects.record(usize::from(parent)) {
+            Some(parent) => anim::compose(&rebuild(parent, lighting), &local),
+            None => local,
+        },
+    }
 }
 
 /// Player SCA height for the 422-unit body radius (Chris, 0x05FA).
@@ -1451,5 +1704,212 @@ mod tests {
         assert!(within_distance([0, 0, 0], [3, 1000, 4], 5));
         assert!(!within_distance([0, 0, 0], [3, 0, 4], 4));
         assert!(within_distance([-3, 0, -4], [0, 0, 0], 5));
+    }
+
+    /// The 16 decoded `item_aot_set` operands for slot 0, model 0.
+    fn item_operands(item: u8, model: u8, parent: u8, x: i64, y: i64, z: i64) -> Vec<Operand> {
+        operands(&[
+            0,
+            0,
+            0,
+            100,
+            100,
+            i64::from(item),
+            1,
+            i64::from(model),
+            i64::from(parent),
+            x,
+            y,
+            z,
+            0x0E42,
+            0x16,
+            0x81,
+            0,
+        ])
+    }
+
+    fn room(stage: u8, room: u8) -> RoomId {
+        RoomId {
+            stage,
+            room,
+            player_flag: 0,
+        }
+    }
+
+    #[test]
+    fn item_table_builds_counts_and_clears() {
+        let mut items = ItemTable::new(2);
+        assert!(items.build(
+            &item_operands(0x33, 0, 0xFF, 100, -200, 300),
+            true,
+            room(1, 0)
+        ));
+        assert!(items.build(&item_operands(0x05, 1, 0x00, 7, 8, 9), false, room(1, 0)));
+        assert_eq!(items.built, 2);
+
+        let first = items.record(0).unwrap();
+        assert_eq!(first.flag, 1);
+        assert_eq!(first.model, 0);
+        assert_eq!(first.parent, 0xFF);
+        assert_eq!(first.pos, [100, -200, 300]);
+        assert_eq!(first.committed, [100, -200, 300]);
+        assert_eq!(first.rotation, [0, 0x0E42, 0]);
+        assert_eq!(first.asset, Some(0));
+        assert_eq!(first.sparkle, 0);
+        assert_eq!(first.alt_rotation, 0x4000_0000);
+        assert!(first.active());
+
+        // A hidden declaration is still built and still counts.
+        let second = items.record(1).unwrap();
+        assert_eq!(second.flag, 0);
+        assert_eq!(second.model, 1);
+        assert_eq!(second.pos, [7, 8, 9]);
+        assert!(!second.active());
+
+        // Out-of-range model bytes are ignored and do not count.
+        assert!(!items.build(&item_operands(0x33, 9, 0xFF, 0, 0, 0), true, room(1, 0)));
+        assert_eq!(items.built, 2);
+
+        items.reset(3);
+        assert_eq!(items.records.len(), 3);
+        assert_eq!(items.built, 0);
+        assert_eq!(items.last_asset, None);
+        assert!(
+            items
+                .records
+                .iter()
+                .all(|record| *record == ItemRecord::default())
+        );
+    }
+
+    #[test]
+    fn build_item_transcribes_the_quirks() {
+        // The slot byte's 0x80 bit selects the alternate-rotation seed.
+        let alternate = build_item(
+            &operands(&[0x80, 0, 0, 0, 0, 0x33, 1, 0, 0xFF, 1, 2, 3, 0x100, 0, 0, 0]),
+            true,
+            0,
+            room(1, 0),
+        );
+        assert_eq!(alternate.alt_rotation, 0x4000_0040);
+        assert_eq!(alternate.rotation, [0, 0x100, 0]);
+        assert_eq!(alternate.pos, [1, 2, 3]);
+
+        // Stage 7 room 0x15's second built item drops 0x96 from Z.
+        let trophy = build_item(
+            &item_operands(0x33, 0, 0xFF, 1, 2, 0x200),
+            true,
+            1,
+            room(7, 0x15),
+        );
+        assert_eq!(trophy.pos[2], 0x200 - 0x96);
+        assert_eq!(trophy.committed[2], (0x200 - 0x96) as i16);
+        // The first and third built items keep their Z.
+        let first = build_item(
+            &item_operands(0x33, 0, 0xFF, 1, 2, 0x200),
+            true,
+            0,
+            room(7, 0x15),
+        );
+        assert_eq!(first.pos[2], 0x200);
+        let third = build_item(
+            &item_operands(0x33, 0, 0xFF, 1, 2, 0x200),
+            true,
+            2,
+            room(7, 0x15),
+        );
+        assert_eq!(third.pos[2], 0x200);
+        // The same built count in another room is untouched.
+        let elsewhere = build_item(
+            &item_operands(0x33, 0, 0xFF, 1, 2, 0x200),
+            true,
+            1,
+            room(7, 0x14),
+        );
+        assert_eq!(elsewhere.pos[2], 0x200);
+    }
+
+    #[test]
+    fn item_set_flag_and_rotate_route_through_the_table() {
+        let mut items = ItemTable::new(2);
+        items.record_mut(1).unwrap().flag = 1;
+        items.record_mut(1).unwrap().rotation = [1, 2, 3];
+
+        // The item table is selector 1; the value is byte 0 wholesale.
+        assert!(items.set_flag(&operands(&[1, 1, 0x0F])));
+        assert_eq!(items.record(1).unwrap().flag, 0x0F);
+        assert!(!items.set_flag(&operands(&[0, 1, 0x40])));
+        assert!(!items.set_flag(&operands(&[1, 9, 0x00])));
+
+        // eml_rot writes X/Z on active records only.
+        assert!(items.rotate(&operands(&[1, 0x1111, 0x2222])));
+        assert_eq!(items.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+        items.record_mut(1).unwrap().flag = 0;
+        assert!(!items.rotate(&operands(&[1, 0x3333, 0x4444])));
+        assert_eq!(items.record(1).unwrap().rotation, [0x1111, 2, 0x2222]);
+        // A selector at or above 0x8000 names the omodel table.
+        assert!(!items.rotate(&operands(&[0x80, 0x5555, 0x6666])));
+    }
+
+    #[test]
+    fn darken_map_palette_drops_nine_per_five_bit_channel() {
+        // 255 expands from 5-bit 31 (31*255/31); darkened to 22 -> 180.
+        // 82 expands from 10; darkened to 1 -> 8. 74 expands from 9 and
+        // clamps to 0. The alpha (the port's STP stand-in) is untouched.
+        let mut texture = Texture8 {
+            width: 1,
+            height: 1,
+            indices: vec![0],
+            palettes: vec![[255, 82, 74, 255], [0, 0, 0, 128]],
+        };
+        darken_map_palette(&mut texture);
+        assert_eq!(texture.palettes[0], [180, 8, 0, 255]);
+        assert_eq!(texture.palettes[1], [0, 0, 0, 128]);
+    }
+
+    #[test]
+    fn item_world_matrix_composes_each_parent_kind() {
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [crate::state::Light::default(); 3],
+        };
+        let mut items = ItemTable::new(1);
+        let item = items.record_mut(0).unwrap();
+        *item = build_item(
+            &item_operands(0x33, 0, 0xFF, 100, -200, 300),
+            true,
+            0,
+            room(1, 0),
+        );
+
+        // Absolute: rotation + local position.
+        let world = item_world_matrix(&items, &ObjectTable::new(0), &lighting, 0, [0, 0, 0], 0);
+        assert_eq!(world.t, [100, -200, 300]);
+
+        // Player-parented: the entity matrix composed with the local.
+        items.record_mut(0).unwrap().parent = 0xFE;
+        let world = item_world_matrix(
+            &items,
+            &ObjectTable::new(0),
+            &lighting,
+            0,
+            [1000, 0, 2000],
+            0,
+        );
+        assert_eq!(world.t, [1099, -199, 2299]);
+
+        // Omodel-parented: rebuild(parent) composed with the local.
+        let mut objects = ObjectTable::new(1);
+        objects.record_mut(0).unwrap().pos = [500, 0, 600];
+        objects.record_mut(0).unwrap().rotation = [0, 0x400, 0];
+        items.record_mut(0).unwrap().parent = 0x00;
+        items.record_mut(0).unwrap().pos = [50, 0, 0];
+        let world = item_world_matrix(&items, &objects, &lighting, 0, [0, 0, 0], 0);
+        assert_eq!(world.t, [500, 0, 600 - 49]);
+
+        // A missing parent falls back to the local matrix.
+        items.record_mut(0).unwrap().parent = 0x09;
+        let world = item_world_matrix(&items, &objects, &lighting, 0, [0, 0, 0], 0);
+        assert_eq!(world.t, [50, 0, 0]);
     }
 }

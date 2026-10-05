@@ -4005,6 +4005,47 @@ fn visible_objects<'a>(
     visible
 }
 
+/// The item-model pass, mirroring `visible_objects` for the item table: a
+/// record is visible while its active bit is set, its declared pair decoded
+/// into the room's item asset table, and its composed world probe point inside
+/// the current camera's zone. The world matrix resolves the item's parent kind
+/// (absolute, player or omodel); the switch-zone cull uses that composed
+/// translation, the original's `is_entity_in_switch_zone`.
+fn visible_items<'a>(
+    room: &'a RoomState,
+    items: &'a objects::ItemTable,
+    objects: &'a objects::ObjectTable,
+    lighting: &Lighting,
+    camera: usize,
+    player_pos: [i32; 3],
+    player_angle: u16,
+) -> Vec<(
+    &'a objects::ObjectAsset,
+    &'a objects::ItemRecord,
+    anim::Mat4x3,
+)> {
+    let mut visible = Vec::new();
+    for (slot, record) in items.records.iter().enumerate() {
+        if !record.active() {
+            continue;
+        }
+        let Some(asset) = record.asset.and_then(|pair| {
+            room.item_models
+                .iter()
+                .find(|asset| asset.pair_index == usize::from(pair))
+        }) else {
+            continue;
+        };
+        let world =
+            objects::item_world_matrix(items, objects, lighting, slot, player_pos, player_angle);
+        if !npc::in_camera_zone(room, camera, world.t) {
+            continue;
+        }
+        visible.push((asset, record, world));
+    }
+    visible
+}
+
 /// The per-room object render suppressions the original applies in
 /// `RoomObjectRender`.
 ///
@@ -4173,12 +4214,22 @@ fn render_frame(
         npc_slots.push(slot);
     }
 
-    // The room's object models are submitted before the NPC and player meshes:
-    // the shared far-to-near sort is stable, so equal-depth triangles keep the
-    // original's room-object-under-character tie order.
+    // The room's object and item models are submitted before the NPC and
+    // player meshes (the original's room pass then the character pass): the
+    // shared far-to-near sort is stable, so equal-depth triangles keep the
+    // original's object < item < character tie order.
     let visible = visible_objects(
         room,
         &game.objects,
+        room.current_cut,
+        game.entities[0].pos,
+        game.entities[0].angle,
+    );
+    let visible_item_models = visible_items(
+        room,
+        &game.items,
+        &game.objects,
+        &lighting,
         room.current_cut,
         game.entities[0].pos,
         game.entities[0].angle,
@@ -4187,17 +4238,31 @@ fn render_frame(
     for (_, _, world) in &visible {
         object_joints.push(vec![*world]);
     }
+    let mut item_joints: Vec<Vec<anim::Mat4x3>> = Vec::with_capacity(visible_item_models.len());
+    for (_, _, world) in &visible_item_models {
+        item_joints.push(vec![*world]);
+    }
 
     // TODO(parity): (visual) the original applies each record's background
     // blend weight and semi-transparency; `EntityMesh` carries only the RGB
     // multiplier and the joint draw gate, so records blend opaquely.
-    let mut meshes: Vec<EntityMesh<'_>> = Vec::with_capacity(visible.len() + 1 + models.len());
+    let mut meshes: Vec<EntityMesh<'_>> =
+        Vec::with_capacity(visible.len() + visible_item_models.len() + 1 + models.len());
     for ((asset, record, _), joints) in visible.iter().zip(&object_joints) {
         meshes.push(EntityMesh {
             mesh: &asset.model,
             texture: &asset.texture,
             joints,
             tint: record.shade(),
+            hidden_joints: 0,
+        });
+    }
+    for ((asset, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
+        meshes.push(EntityMesh {
+            mesh: &asset.model,
+            texture: &asset.texture,
+            joints,
+            tint: [255; 3],
             hidden_joints: 0,
         });
     }
@@ -4251,7 +4316,7 @@ fn render_frame(
         &lighting,
         layer.as_ref(),
         Some(&effect_layer),
-        visible.len(),
+        visible.len() + visible_item_models.len(),
         mirror.as_ref(),
     );
 }
@@ -4536,6 +4601,76 @@ mod tests {
         // A camera with no zone keeps every record out.
         objects.record_mut(1).unwrap().asset = Some(1);
         assert!(visible_objects(&room, &objects, 3, [0, 0, 0], 0).is_empty());
+    }
+
+    #[test]
+    fn visible_items_filter_active_zone_and_asset_and_compose_parents() {
+        use crate::objects::{ITEM_FLAG_ACTIVE, ItemTable, ObjectAsset, ObjectTable};
+
+        let asset = |pair: usize| ObjectAsset {
+            pair_index: pair,
+            model: crate::model::Tmd::default(),
+            texture: crate::model::Texture8 {
+                width: 0,
+                height: 0,
+                indices: Vec::new(),
+                palettes: Vec::new(),
+            },
+        };
+        let room = RoomState {
+            item_models: vec![asset(0), asset(1), asset(2)],
+            zones: vec![crate::state::Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0, 0], [0, 1000], [1000, 1000], [1000, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let lighting = Lighting::from_room(&room);
+        let mut items = ItemTable::new(3);
+        // Slot 0 is inactive, slot 1 active inside the zone and slot 2 active
+        // but outside it.
+        {
+            let record = items.record_mut(1).unwrap();
+            record.flag = ITEM_FLAG_ACTIVE;
+            record.asset = Some(1);
+            record.pos = [500, 0, 500];
+        }
+        {
+            let record = items.record_mut(2).unwrap();
+            record.flag = ITEM_FLAG_ACTIVE;
+            record.asset = Some(2);
+            record.pos = [5000, 0, 5000];
+        }
+
+        let no_objects = ObjectTable::new(0);
+        let visible = visible_items(&room, &items, &no_objects, &lighting, 0, [0, 0, 0], 0);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].0.pair_index, 1);
+        assert_eq!(visible[0].1, items.record(1).unwrap());
+        assert_eq!(visible[0].2.t, [500, 0, 500]);
+
+        // A pair that failed to decode is skipped, and a camera with no zone
+        // keeps every item out.
+        items.record_mut(1).unwrap().asset = Some(9);
+        assert!(visible_items(&room, &items, &no_objects, &lighting, 0, [0, 0, 0], 0).is_empty());
+        items.record_mut(1).unwrap().asset = Some(1);
+        assert!(visible_items(&room, &items, &no_objects, &lighting, 3, [0, 0, 0], 0).is_empty());
+
+        // A player-parented item rides the entity matrix.
+        items.record_mut(1).unwrap().parent = 0xFE;
+        items.record_mut(1).unwrap().pos = [10, 0, 0];
+        let visible = visible_items(&room, &items, &no_objects, &lighting, 0, [400, 0, 0], 0);
+        assert_eq!(visible[0].2.t, [409, 0, 0]);
+
+        // An omodel-parented item composes the parent's rebuild and still
+        // culls by the composed point.
+        let mut objects = ObjectTable::new(1);
+        objects.record_mut(0).unwrap().pos = [200, 0, 0];
+        items.record_mut(1).unwrap().parent = 0x00;
+        items.record_mut(1).unwrap().pos = [50, 0, 0];
+        let visible = visible_items(&room, &items, &objects, &lighting, 0, [0, 0, 0], 0);
+        assert_eq!(visible[0].2.t, [249, 0, 0]);
     }
 
     #[test]

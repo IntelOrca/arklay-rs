@@ -1147,8 +1147,8 @@ pub fn draw_gameplay_scene(
 /// The effect quads are submitted after the masks (the original's `update_2d_effects`
 /// runs after the entity pass), so at an exact key tie an effect paints over a
 /// mask or triangle submitted earlier in the frame. `mirror_from` is the first
-/// mesh index eligible for the mirror pass: the room object meshes come first
-/// and are never reflected.
+/// mesh index eligible for the mirror pass: the room object and item meshes
+/// come first and are never reflected.
 ///
 /// `mirror` appends the entity meshes' mirrored triangles, drawn through the
 /// reflected camera and visibility-tested joint by joint, after the primary
@@ -2650,6 +2650,71 @@ mod tests {
             Some(&layer),
         );
         assert_eq!(framebuffer_pixel(&masked, 180, 100), [9, 8, 7, 255]);
+    }
+
+    #[test]
+    fn equal_depth_object_item_character_meshes_keep_the_submission_order() {
+        // `engine::render_frame` submits the room objects, then the room items,
+        // then the NPC/player meshes; the stable far-to-near sort keeps an
+        // exact tie in that order, so a character paints over an item and an
+        // item over an object.
+        let red = solid_texture([255, 0, 0, 255]);
+        let green = solid_texture([0, 255, 0, 255]);
+        let blue = solid_texture([0, 0, 255, 255]);
+        let mesh0 = mesh_at(1024, false);
+        let joints = [identity()];
+        fn entity<'a>(
+            mesh: &'a Tmd,
+            texture: &'a Texture8,
+            joints: &'a [anim::Mat4x3],
+        ) -> EntityMesh<'a> {
+            EntityMesh {
+                mesh,
+                texture,
+                joints,
+                tint: [255; 3],
+                hidden_joints: 0,
+            }
+        }
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+
+        // Object then item: the item (later) paints over the object.
+        let mut object_item = Framebuffer::new();
+        let meshes = [
+            entity(&mesh0, &red, &joints),
+            entity(&mesh0, &green, &joints),
+        ];
+        draw_gameplay_scene(
+            &mut object_item,
+            None,
+            &meshes,
+            None,
+            &straight_camera(),
+            &lighting,
+            None,
+        );
+        assert_eq!(framebuffer_pixel(&object_item, 180, 100), [0, 255, 0, 255]);
+
+        // Object, item then character: the character wins the tie.
+        let mut all = Framebuffer::new();
+        let meshes = [
+            entity(&mesh0, &red, &joints),
+            entity(&mesh0, &green, &joints),
+            entity(&mesh0, &blue, &joints),
+        ];
+        draw_gameplay_scene(
+            &mut all,
+            None,
+            &meshes,
+            None,
+            &straight_camera(),
+            &lighting,
+            None,
+        );
+        assert_eq!(framebuffer_pixel(&all, 180, 100), [0, 0, 255, 255]);
     }
 
     #[test]
