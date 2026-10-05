@@ -46,6 +46,17 @@ struct Cli {
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
 
+    /// Run N fixed 30 Hz ticks before a `--room` capture frame is drawn, so
+    /// scripted NPC scenes can be captured deterministically and audio-free
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        requires = "capture",
+        conflicts_with = "ui"
+    )]
+    ticks: u32,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -225,7 +236,7 @@ fn main() -> Result<()> {
             }
             if let Some(room) = cli.room {
                 let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
-                return arklay::engine::run(&pack, id, cli.capture.as_deref());
+                return arklay::engine::run(&pack, id, cli.capture.as_deref(), cli.ticks);
             }
             // No room and no `--ui`: boot the title screen, the app root.
             arklay::engine::run_ui_with_options(

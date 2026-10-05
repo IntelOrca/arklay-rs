@@ -1,11 +1,40 @@
 //! Scripted-character (NPC) driver and model metadata.
 //!
 //! Entity ids `0x20..=0x2E` are the game's human characters. [`data`] holds
-//! their model paths, collision radii and behaviour dispatch tables, [`idle`]
-//! their state-1 behaviours plus the state-0 spawn init, and [`anim`] the
-//! per-entity animation clock that publishes the pending frame into the entity
-//! words the scripts and behaviours read. [`update_all`] runs the driver for
-//! every active entity slot and is called by the room tick after the event VM.
+//! their model paths, collision radii, per-character init data and behaviour
+//! dispatch tables, [`idle`] their state-1 behaviours plus the state-0 spawn
+//! init, and [`anim`] the per-entity animation clock that publishes the pending
+//! frame into the entity words the scripts and behaviours read. [`update_all`]
+//! runs the driver for every active entity slot and is called by the room tick
+//! after the event VM.
+//!
+//! # Documented deviations from the original
+//!
+//! - **Monsters are invisible.** Entity ids `0x00..=0x1F` (and the DC-only ids)
+//!   allocate no entity at all, so rooms that spawn zombies alongside a
+//!   character look emptier than the original until the enemy milestone.
+//! - **State-8 handler 08 is inert.** The weapon-fire behaviour has no weapon
+//!   TMDs, muzzle flash or effects, so a scene that waits on its completion
+//!   flag can stall (never crash); the handler is counted in
+//!   [`crate::game::GameState::npc_placeholders`].
+//! - **NPC shadows are not drawn.** The per-character tint and shadow geometry
+//!   are tabulated by [`data::character_init`], but the renderer still draws
+//!   only the player's shadow; the NPC fade-sprite pass is a slice-6 stretch
+//!   left to M10.
+//! - **Joint tints and hiding are not applied.** The wounded Rebecca joint
+//!   tints and `model_op`/`objs_hide` joint colour/visibility writes have no
+//!   renderer support yet.
+//! - **Look-at is simplified.** The original slews a tracking joint every
+//!   update; this port stores the target and steps the entity yaw in the walk
+//!   layer.
+//! - **Pathfinding is a BFS.** [`walk::zone_path_find`] reaches the same
+//!   walk-zone adjacency as the original's iterative ring expansion with a
+//!   breadth-first search over the zone graph.
+//! - **RNG is deterministic.** The look-at scheduling reads a fixed-seed
+//!   sequence reseeded once per gameplay frame, not the platform `rand()`.
+//! - **Blend snapping.** `blend_counter` and the derived step are computed and
+//!   published, but the renderer poses whole keyframes; it does not
+//!   interpolate between them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -24,8 +53,8 @@ pub mod walk;
 
 pub use anim::EntityAnim;
 pub use data::{
-    FIRST_ID, LAST_ID, RADIUS_LARGE, RADIUS_MEDIUM, RADIUS_SPRAWLED, character_name,
-    collision_radius, model_path, shadow_tint,
+    CharacterInit, FIRST_ID, LAST_ID, RADIUS_LARGE, RADIUS_MEDIUM, RADIUS_SPRAWLED, character_init,
+    character_name, collision_radius, model_path, shadow_tint,
 };
 
 /// First entity id backed by an `npc/*.emd` model.
@@ -134,6 +163,8 @@ pub fn update_entity(
                 &mut game.entities[slot],
                 &mut game.entity_anims[slot],
                 clips,
+                &game.flags,
+                game.id,
             );
             false
         }
@@ -141,6 +172,7 @@ pub fn update_entity(
             &mut game.entities[slot],
             &mut game.entity_anims[slot],
             clips,
+            room,
         ),
         8 => {
             scd::update(game, slot, room, clips);

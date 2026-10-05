@@ -12,7 +12,9 @@
 //! - 04/05: walk backwards to the target at the fast/slow pace;
 //! - 06: turn in place;
 //! - 08: the weapon-fire behaviour stays a recorded placeholder this
-//!   milestone (no weapon TMDs, effects or muzzle flashes).
+//!   milestone (no weapon TMDs, effects or muzzle flashes). An out-of-range
+//!   `action_behavior` (>= 11) is a NULL table slot in the original and is
+//!   recorded in the same placeholder map instead of dispatching.
 //!
 //! Completion is signalled the way the scripts wait for it: the handler raises
 //! `scd_anim_param` in the system flag bank, and the event script's `bit_test`
@@ -32,6 +34,9 @@ use super::walk;
 pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
     let behavior = game.entities[slot].action_behavior;
     if behavior >= 11 {
+        // The original reports the NULL table slot and dispatches nothing; the
+        // count makes the stall visible to tests and debugging.
+        *game.npc_placeholders.entry(behavior).or_insert(0) += 1;
         return;
     }
     run(game, slot, room, clips, behavior);
@@ -789,9 +794,9 @@ mod tests {
     }
 
     #[test]
-    fn out_of_range_behavior_is_inert() {
+    fn out_of_range_behavior_is_recorded_and_inert() {
         let mut game = game_with(state8(11));
         update(&mut game, 1, &RoomState::default(), &clips());
-        assert!(game.npc_placeholders.is_empty());
+        assert_eq!(game.npc_placeholders.get(&11), Some(&1));
     }
 }

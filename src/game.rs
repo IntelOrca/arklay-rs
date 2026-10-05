@@ -12,8 +12,9 @@
 //! with the original's masks: walk-in zones fire every frame, action-key zones
 //! only while the key is held, at a point 600 units in front of the player.
 //! Items and doors act for real; the menu-driven kinds record a placeholder
-//! interaction. Entities, models and effects stay recorded placeholders until
-//! their systems exist.
+//! interaction. The scripted characters (`0x20..=0x2E`) allocate entities,
+//! render and run their native driver; monsters still allocate nothing and
+//! effects stay recorded placeholders until their systems exist.
 
 use std::collections::BTreeMap;
 
@@ -853,8 +854,9 @@ pub struct GameState {
     pub frame: u64,
     /// Call counts of opcodes whose systems do not exist yet.
     pub placeholders: BTreeMap<u8, u64>,
-    /// Call counts of state-8 handlers that stay placeholders (the fire
-    /// behaviour, `action_behavior` 8).
+    /// Call counts of state-8 handlers that stay placeholders: the fire
+    /// behaviour (`action_behavior` 8) and any out-of-range behaviour the
+    /// original would have dispatched through a NULL table slot.
     pub npc_placeholders: BTreeMap<u8, u64>,
     /// BGM requests produced by the scripts.
     pub room_bgm_requests: Vec<BgmRequest>,

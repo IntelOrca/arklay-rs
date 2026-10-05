@@ -38,6 +38,9 @@ cargo run -- re1.akpak
 
 # Headless capture (no display)
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
+# Run N fixed 30 Hz ticks before a room capture (deterministic, audio-free),
+# so scripted NPC scenes are captured in motion
+cargo run -- re1.akpak --room 20D --player 0 --ticks 30 --capture npc.bmp
 cargo run -- re1.akpak --ui title --capture title.bmp
 cargo run -- re1.akpak --ui menu --capture menu.bmp
 cargo run -- re1.akpak --ui box --capture box.bmp

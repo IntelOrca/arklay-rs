@@ -87,34 +87,132 @@ pub fn collision_radius(id: u8) -> Option<i32> {
     })
 }
 
-/// The packed `0x00RRGGBB` tint the character's ground shadow blends towards,
-/// indexed by `id - FIRST_ID`.
+/// The packed `0x00RRGGBB` tint the character's ground shadow blends towards
+/// plus the shadow quad's half-extents and the local offset it is built
+/// around, indexed by `id - FIRST_ID`.
 ///
 /// The grey `0x808080` of the living characters special-cases to near-black in
 /// [`crate::shadow::billboard_tint`]; the corpse props carry warm tints and
-/// Richard and Enrico are dimmer. NPC shadows are not drawn yet; the table is
-/// the state-0 init data the shadow path will read.
-const SHADOW_TINTS: [u32; 15] = [
-    0x0080_8080, // Chris
-    0x0080_8080, // Jill
-    0x0080_8080, // Barry
-    0x0080_8080, // Rebecca
-    0x0080_8080, // Wesker
-    0x00FF_FF50, // Kenneth corpse
-    0x00FF_FF50, // Forest corpse
-    0x0060_6060, // Richard
-    0x0040_4040, // Enrico
-    0x0060_6060, // Kenneth (devoured)
-    0x0080_8080, // Barry 2
-    0x0080_8080, // Barry 2 (Stars)
-    0x0080_8080, // Rebecca 2 (Stars)
-    0x0080_8080, // Barry 3
-    0x0080_8080, // Wesker 2 (Stars)
+/// Richard and Enrico are dimmer. The state-0 init applies the tint and the
+/// geometry, exactly like the original's per-character init handlers. NPC
+/// shadows themselves are the slice-6 stretch and stay deferred: the table is
+/// the spawn data the shadow path will read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CharacterInit {
+    /// Packed `0x00RRGGBB` shadow tint.
+    pub tint: u32,
+    /// Shadow quad half-extent along the entity's local X.
+    pub shadow_half_x: i16,
+    /// Shadow quad half-extent along the entity's local Z.
+    pub shadow_half_z: i16,
+    /// Local offset the shadow quad is built around.
+    pub shadow_offset: [i16; 3],
+}
+
+/// The living characters' shadow geometry: the 0x200 x 0x280 quad with the
+/// small -0x50 Z offset the per-character init handlers pass.
+const SHADOW_LIVING: CharacterInit = CharacterInit {
+    tint: 0x0080_8080,
+    shadow_half_x: 0x200,
+    shadow_half_z: 0x280,
+    shadow_offset: [0, 0, -0x50],
+};
+
+/// Per-character state-0 init data, indexed by `id - FIRST_ID`.
+///
+/// The Barry, Rebecca and Wesker cutscene aliases reuse their base character's
+/// record. The three corpse props and Richard/Enrico restart on animation 0 and
+/// carry their own tints and quad sizes.
+const CHARACTER_INITS: [CharacterInit; 15] = [
+    SHADOW_LIVING, // Chris
+    SHADOW_LIVING, // Jill
+    SHADOW_LIVING, // Barry
+    SHADOW_LIVING, // Rebecca
+    SHADOW_LIVING, // Wesker
+    CharacterInit {
+        // Kenneth corpse
+        tint: 0x00FF_FF50,
+        shadow_half_x: 500,
+        shadow_half_z: 700,
+        shadow_offset: [0, 0, 0],
+    },
+    CharacterInit {
+        // Forest corpse
+        tint: 0x00FF_FF50,
+        shadow_half_x: 700,
+        shadow_half_z: 700,
+        shadow_offset: [-600, 0, 200],
+    },
+    CharacterInit {
+        // Richard
+        tint: 0x0060_6060,
+        shadow_half_x: 500,
+        shadow_half_z: 700,
+        shadow_offset: [0, 0, 0],
+    },
+    CharacterInit {
+        // Enrico
+        tint: 0x0040_4040,
+        shadow_half_x: 700,
+        shadow_half_z: 700,
+        shadow_offset: [-600, 0, 200],
+    },
+    CharacterInit {
+        // Kenneth (devoured)
+        tint: 0x0060_6060,
+        shadow_half_x: 500,
+        shadow_half_z: 700,
+        shadow_offset: [0, 0, 0],
+    },
+    SHADOW_LIVING, // Barry 2
+    SHADOW_LIVING, // Barry 2 (Stars)
+    SHADOW_LIVING, // Rebecca 2 (Stars)
+    SHADOW_LIVING, // Barry 3
+    SHADOW_LIVING, // Wesker 2 (Stars)
 ];
+
+/// The state-0 spawn-init data of character `id`, or `None` for non-characters.
+pub fn character_init(id: u8) -> Option<CharacterInit> {
+    CHARACTER_INITS.get(index(id)?).copied()
+}
 
 /// The packed shadow tint of character `id`, or `None` for non-characters.
 pub fn shadow_tint(id: u8) -> Option<u32> {
-    SHADOW_TINTS.get(index(id)?).copied()
+    Some(character_init(id)?.tint)
+}
+
+/// Scenario-flag bit (bank 1, `g_ScenarioFlags2`) that gives Rebecca her
+/// wounded/darkened variant: a different opening pose and tinted joints.
+pub const REBECCA_WOUNDED_FLAG: u8 = 0xC0;
+/// Scenario-flag bit (bank 0, `g_ScenarioFlags`) that gives Wesker his later
+/// animation and enlarged shadow.
+pub const WESKER_VARIANT_FLAG: u8 = 0x37;
+/// Opening clip of Rebecca's wounded variant.
+pub const REBECCA_WOUNDED_ANIM: u8 = 0x33;
+/// Opening frame of Rebecca's wounded variant.
+pub const REBECCA_WOUNDED_FRAME: u8 = 0x3D;
+/// Opening clip of Wesker's variant.
+pub const WESKER_VARIANT_ANIM: u8 = 0x30;
+/// Opening frame of Wesker's variant.
+pub const WESKER_VARIANT_FRAME: u8 = 0x6D;
+/// Zero-based stage index of the laboratory.
+pub const STAGE_LABORATORY_INDEX: u8 = 4;
+/// Room id of the lab power room, where Wesker's status bit 1 is forced.
+pub const ROOM_POWER_ROOM: u8 = 0x11;
+
+/// Whether `id` is Rebecca (including her cutscene alias).
+pub fn is_rebecca(id: u8) -> bool {
+    matches!(id, 0x23 | 0x2C)
+}
+
+/// Whether `id` is Wesker (including his cutscene alias).
+pub fn is_wesker(id: u8) -> bool {
+    matches!(id, 0x24 | 0x2E)
+}
+
+/// Whether `id` is one of the three corpse props that restart on animation 0.
+pub fn is_corpse(id: u8) -> bool {
+    matches!(id, 0x25 | 0x26 | 0x29)
 }
 
 /// The state-1 idle handler an `action_behavior` byte selects.
@@ -223,6 +321,29 @@ mod tests {
         }
         assert_eq!(shadow_tint(FIRST_ID - 1), None);
         assert_eq!(shadow_tint(LAST_ID + 1), None);
+    }
+
+    #[test]
+    fn character_init_carries_the_per_character_shadow_geometry() {
+        let living = character_init(0x20).unwrap();
+        assert_eq!(living.shadow_half_x, 0x200);
+        assert_eq!(living.shadow_half_z, 0x280);
+        assert_eq!(living.shadow_offset, [0, 0, -0x50]);
+        assert_eq!(character_init(0x2E), Some(living), "Wesker alias");
+
+        let forest = character_init(0x26).unwrap();
+        assert_eq!((forest.shadow_half_x, forest.shadow_half_z), (700, 700));
+        assert_eq!(forest.shadow_offset, [-600, 0, 200]);
+        let enrico = character_init(0x28).unwrap();
+        assert_eq!((enrico.shadow_half_x, enrico.shadow_half_z), (700, 700));
+        assert_eq!(enrico.shadow_offset, [-600, 0, 200]);
+
+        assert!(is_rebecca(0x23) && is_rebecca(0x2C) && !is_rebecca(0x24));
+        assert!(is_wesker(0x24) && is_wesker(0x2E) && !is_wesker(0x23));
+        assert!(is_corpse(0x25) && is_corpse(0x26) && is_corpse(0x29));
+        assert!(!is_corpse(0x23));
+        assert_eq!(character_init(FIRST_ID - 1), None);
+        assert_eq!(character_init(LAST_ID + 1), None);
     }
 
     #[test]

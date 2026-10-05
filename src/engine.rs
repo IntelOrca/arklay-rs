@@ -126,19 +126,46 @@ impl Drop for SurfaceHandle {
 /// Inventory and flags survive through [`game::GameState::enter_room`];
 /// room-scoped state (the action table, camera, message) is rebuilt by the new
 /// room. Capture mode renders one frame (with its room-mask layer) and never
-/// opens audio.
-pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
+/// opens audio. `ticks` runs that many fixed 30 Hz room ticks before the frame
+/// is drawn, so a scripted NPC scene can be captured without a display; the
+/// same deterministic path [`simulate_room`] uses is taken, audio-free.
+pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let pack = Pack::open(pack)?;
 
     if let Some(capture_path) = capture {
         let mut loaded = load_room(&pack, id)?;
         let mut game = game::GameState::new(id, &loaded.room);
-        let player_state = player::spawn(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         run_room_init(&loaded, &mut game);
         drain_mask_toggles(&mut loaded.room, &mut game);
-        apply_camera(&mut loaded.room, &mut game, None);
+        apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+
+        let mut npc_models = npc::EntityModelCache::default();
+        if ticks > 0 {
+            let scripts = Rc::new(loaded.scripts.clone());
+            let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+            let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
+            for _ in 0..ticks {
+                tick_room(
+                    &mut command_vm,
+                    &mut event_vm,
+                    RoomContext {
+                        room: &mut loaded.room,
+                        game: &mut game,
+                        player: &mut player_state,
+                        player_assets: loaded.player_assets.as_ref(),
+                        pack: &pack,
+                        npc_models: &mut npc_models,
+                    },
+                    player::Input::default(),
+                    false,
+                );
+                drain_mask_toggles(&mut loaded.room, &mut game);
+            }
+        }
+
         let title = window_title(
             &loaded.id.room3(),
             loaded.room.current_cut,
@@ -146,7 +173,6 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>) -> Result<()> {
         );
         let display = Display::new(&title, true)?;
         let mut framebuffer = Framebuffer::new();
-        let mut npc_models = npc::EntityModelCache::default();
         render_frame(
             &mut framebuffer,
             &pack,
@@ -554,16 +580,6 @@ impl GameSession {
         };
         session.enter_room();
         Ok(session)
-    }
-
-    /// The parsed EMD model for character `id`, loading `npc/{id:02x}.emd`
-    /// from the pack on first use.
-    ///
-    /// A missing or invalid model is remembered and logged once; the caller
-    /// keeps the entity but draws it without a mesh.
-    #[allow(dead_code)] // wired into the render path by the next slice
-    fn npc_model(&mut self, pack: &Pack, id: u8) -> Option<Arc<Emd>> {
-        self.npc_models.get(pack, id)
     }
 
     /// Run the room boot: init script, queued events, the player mirror, mask
@@ -3419,6 +3435,10 @@ fn render_frame(
 
     // The shadow rests on the player's floor height and is skipped unless the
     // player is in the current camera's zone (or the room forces it on).
+    // TODO(M10): queue one shadow per visible character through the same
+    // fade-sprite path, using `npc::data::character_init`'s tint and quad
+    // geometry and the entity's `has_enter_switch_zone` bit; the renderer
+    // currently accepts a single shadow, so that pass is deferred.
     let shadow_texture = shadows.page_for(pack);
     let shadow = shadow_texture.and_then(|texture| {
         shadow::visible(id, room, room.current_cut, player_state).then(|| render::Shadow {
@@ -3832,7 +3852,7 @@ mod tests {
         writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
         writer.write(&pack_path).unwrap();
 
-        run(&pack_path, id, Some(&capture_path)).unwrap();
+        run(&pack_path, id, Some(&capture_path), 0).unwrap();
 
         let decoded = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
         assert_eq!(decoded.width, WIDTH as u32);
@@ -4213,6 +4233,7 @@ mod tests {
             Path::new(&path),
             RoomId::parse("1001").unwrap(),
             Some(&capture_path),
+            0,
         )
         .unwrap();
 
@@ -4562,12 +4583,12 @@ mod tests {
         let id = RoomId::parse("1000").unwrap();
         let dir = TempDir::new();
         let capture_path = dir.0.join("room1000_masked.bmp");
-        run(Path::new(&path), id, Some(&capture_path)).unwrap();
+        run(Path::new(&path), id, Some(&capture_path), 0).unwrap();
         let captured = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
 
         // The capture path is deterministic.
         let repeat_path = dir.0.join("room1000_masked2.bmp");
-        run(Path::new(&path), id, Some(&repeat_path)).unwrap();
+        run(Path::new(&path), id, Some(&repeat_path), 0).unwrap();
         let repeat = bmp::decode(&std::fs::read(&repeat_path).unwrap()).unwrap();
         assert_eq!(captured.rgba, repeat.rgba, "two captures differ");
 
@@ -5443,6 +5464,49 @@ mod tests {
             .unwrap();
         assert!(!session.game.message.active, "the action key dismissed it");
         assert!(!session.game.message_locks_controls());
+    }
+
+    #[test]
+    fn a_message_pause_freezes_the_scripted_characters_end_to_end() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        // A character parked in the spawn state: only the entity tick can move
+        // it to idle, so the state word reports whether the tick ran.
+        session.game.entities[1] = game::Entity {
+            id: 0x23,
+            status_flags: game::ENTITY_STATUS_ACTIVE,
+            ..game::Entity::default()
+        };
+        session.game.show_message(0x40, game::MESSAGE_FLAG_ENTITIES);
+        assert!(session.game.message_freezes_entities());
+
+        for _ in 0..4 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.game.message.active, "the window is still up");
+        assert_eq!(
+            session.game.entities[1].state(),
+            0,
+            "the frozen character never initialised"
+        );
+
+        // Closing the window releases the entity tick on the next frame.
+        session.game.cancel_message();
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(
+            session.game.entities[1].state(),
+            1,
+            "the character initialised once the window closed"
+        );
     }
 
     #[test]

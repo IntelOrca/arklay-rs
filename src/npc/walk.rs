@@ -96,12 +96,21 @@ pub fn entity_apply_walk_speed(entity: &mut Entity, speed: i16) {
 /// resolved against the room collision with the entity's radius. A blocked
 /// move rolls back to the pre-move position.
 pub fn advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) {
+    try_advance_xz(room, entity, offset, distance);
+}
+
+/// [`advance_xz`] reporting whether the move was committed. The idle walk-01
+/// behaviour uses the result as its collision probe: the original commits the
+/// move and rolls it back on a hit, so "did not move" is the hit.
+pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) -> bool {
     let (dx, dz) = player::rotate_speed(entity.angle, offset, i32::from(distance));
     let proposed = [entity.pos[0] + dx, entity.pos[1], entity.pos[2] + dz];
     let radius = i32::from(entity.sca_radius);
-    if !player::position_blocked(room, proposed, radius) {
-        entity.pos = proposed;
+    if player::position_blocked(room, proposed, radius) {
+        return false;
     }
+    entity.pos = proposed;
+    true
 }
 
 /// The state-8/9 footstep callback (`PlayEntitySnd`): resolve the entity's
@@ -846,6 +855,11 @@ pub fn separate_from_player(
     player_pos: [i32; 3],
     player_radius: i32,
 ) {
+    // Status bit 1 is the original's deactivation bit; `ResolveEntityScaCollision`
+    // skips a pair when either side carries it (the lab power-room Wesker).
+    if entity.status_flags & 2 != 0 {
+        return;
+    }
     let dx = entity.pos[0] - player_pos[0];
     let dz = entity.pos[2] - player_pos[2];
     let dist =

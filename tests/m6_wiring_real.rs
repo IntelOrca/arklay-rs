@@ -67,7 +67,13 @@ fn real_menu_capture_over_room_1001_is_deterministic() {
     // capture that lost its UI layer would otherwise still pass the non-black
     // check on the room background alone.
     let baseline_path = dir.join("room.bmp");
-    engine::run(&path, RoomId::parse("1001").unwrap(), Some(&baseline_path)).unwrap();
+    engine::run(
+        &path,
+        RoomId::parse("1001").unwrap(),
+        Some(&baseline_path),
+        0,
+    )
+    .unwrap();
     let menu = bmp::decode(&first_bytes).unwrap();
     let baseline = bmp::decode(&std::fs::read(&baseline_path).unwrap()).unwrap();
     let changed = changed_pixels(&menu, &baseline);
@@ -178,7 +184,7 @@ fn real_locked_door_message_renders_over_a_frozen_frame() {
     let dir = std::env::temp_dir().join(format!("arklay-m6-door-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let capture = dir.join("room1010.bmp");
-    engine::run(&path, id, Some(&capture)).unwrap();
+    engine::run(&path, id, Some(&capture), 0).unwrap();
     let frozen = bmp::decode(&std::fs::read(&capture).unwrap()).unwrap();
 
     let font = Font::new(

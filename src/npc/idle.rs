@@ -8,15 +8,18 @@
 //! animation state machine but leave the effect calls to the milestone that
 //! adds them.
 //!
-//! The movement and collision of behaviour 1 land with the walk layer; this
-//! slice runs its animation and speed trim only, so the character walks in
-//! place until the probe exists.
+//! Behaviour 1 walks forward until the room collision probe fires, then plays
+//! the knock animation; the move uses the walk layer's collision-resolved
+//! [`super::walk::advance_xz`]. The voice cue the original plays on the hit is
+//! out of M9 scope (no voice), so only the animation state advances.
 
-use crate::game::Entity;
+use crate::game::{Entity, FLAG_BANK_COUNT, FlagBank};
 use crate::model::Clip;
+use crate::state::{RoomId, RoomState};
 
 use super::anim::EntityAnim;
 use super::data::{self, IdleBehavior};
+use super::walk;
 
 /// The blend step the state-0 init poses with (the original's `0x400`).
 const INIT_BLEND_STEP: u16 = 0x400;
@@ -25,9 +28,20 @@ const IDLE_BLEND_STEP: u16 = 0x400;
 
 /// State-0 spawn init: drop into state 1 with the behaviour/action scratch
 /// cleared, zero rotation X/Z (never the yaw the spawn record wrote), force
-/// health to -1, give the character its collision radius and pose the skeleton
+/// health to -1, give the character its collision radius, apply the
+/// per-character pose variant the story flags select and pose the skeleton
 /// once at the spawned clip frame.
-pub fn init(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+///
+/// `flags` are the game's flag banks and `room` the room being booted: the
+/// wounded Rebecca and Wesker-variant poses and the power-room status bit are
+/// flag/stage conditions the original's per-character init handlers read.
+pub fn init(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    flags: &[FlagBank; FLAG_BANK_COUNT],
+    room: RoomId,
+) {
     entity.set_state(1);
     entity.set_ignore(0);
     entity.action_behavior = 0;
@@ -40,23 +54,59 @@ pub fn init(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
 
     // The three corpse props restart on animation 0 frame 0 instead of the
     // spawned pose.
-    if matches!(entity.id, 0x25 | 0x26 | 0x29) {
+    if data::is_corpse(entity.id) {
         entity.animation_id = 0;
         entity.animation_frame_id = 0;
         entity.timing_control = 0;
     }
+    apply_pose_variant(entity, flags, room);
     entity.blend_counter = 0;
     clock.advance(entity, clips, false, INIT_BLEND_STEP);
+}
+
+/// Apply the flag-gated per-character opening pose, mirroring the original's
+/// Rebecca and Wesker init handlers:
+///
+/// - Rebecca (and her cutscene alias) with the partner-alive scenario bit set
+///   opens on the wounded clip/frame; the three tinted joints and the resized
+///   shadow are presentation and stay deferred with the shadow stretch.
+/// - Wesker (and his alias) with the variant scenario bit set opens on his
+///   later clip/frame; the enlarged shadow is likewise deferred, and the
+///   tracking joint's zeroed yaw/pitch and 0x10 pitch step have no analogue
+///   until joint-level control exists.
+/// - Wesker in the lab power room additionally gets status bit 1, the
+///   original's deactivation bit, which takes him out of the entity/player
+///   separation pass while he still renders and animates.
+fn apply_pose_variant(entity: &mut Entity, flags: &[FlagBank; FLAG_BANK_COUNT], room: RoomId) {
+    if data::is_rebecca(entity.id) && flags[1].bit(data::REBECCA_WOUNDED_FLAG) {
+        entity.animation_id = data::REBECCA_WOUNDED_ANIM;
+        entity.animation_frame_id = data::REBECCA_WOUNDED_FRAME;
+        entity.timing_control = 0;
+    } else if data::is_wesker(entity.id) && flags[0].bit(data::WESKER_VARIANT_FLAG) {
+        entity.animation_id = data::WESKER_VARIANT_ANIM;
+        entity.animation_frame_id = data::WESKER_VARIANT_FRAME;
+    }
+    if data::is_wesker(entity.id)
+        && room.stage == data::STAGE_LABORATORY_INDEX + 1
+        && room.room == data::ROOM_POWER_ROOM
+    {
+        entity.status_flags |= 2;
+    }
 }
 
 /// One state-1 tick. Returns whether the common tail should advance the
 /// animation clock (the handlers that need the completion result advance it
 /// themselves and return `false`).
-pub fn update(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) -> bool {
+pub fn update(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    room: &RoomState,
+) -> bool {
     match data::idle_behavior(entity.action_behavior) {
         IdleBehavior::ById => behavior_by_id(entity),
         IdleBehavior::Walk01 => {
-            walk_01(entity, clock, clips);
+            walk_01(entity, clock, clips, room);
             false
         }
         IdleBehavior::Walk02 => {
@@ -98,9 +148,10 @@ fn play_anim(entity: &mut Entity) -> bool {
 }
 
 /// Behaviour 1: walk forward until the collision probe fires, then knock on
-/// the obstacle. The probe and the `Add_speedXZ` movement are the walk layer's;
-/// this slice keeps the animation state machine and the per-frame speed trim.
-fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// the obstacle. The move is the walk layer's collision-resolved
+/// [`walk::advance_xz`]; a blocked move leaves the character in place and
+/// advances to the knock state.
+fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) {
     match entity.action_state {
         0 => {
             entity.action_state = 1;
@@ -109,17 +160,17 @@ fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
             entity.animation_id = 0x35;
             entity.blend_counter = 0;
             entity.move_speed_current = 1000;
-            walk_01_step(entity, clock, clips);
+            walk_01_step(entity, clock, clips, room);
         }
-        1 => walk_01_step(entity, clock, clips),
+        1 => walk_01_step(entity, clock, clips, room),
         2 => {
             entity.action_state = 3;
             entity.animation_frame_id = 0;
             entity.timing_control = 0;
             entity.animation_id = 0x36;
             entity.blend_counter = 3;
-            // The original plays 3D sound 0x1C here; NPC sounds land with the
-            // walk layer's mixer wiring.
+            // The original plays voice 0xA9 on the hit; voices are out of M9
+            // scope, so only the knock animation runs.
             walk_01_knock(entity, clock, clips);
         }
         3 => walk_01_knock(entity, clock, clips),
@@ -128,12 +179,16 @@ fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
 }
 
 /// Behaviour 1, walking state: bleed 15 off the speed for every animation
-/// frame spent, then advance. `Add_speedXZ(0x800)` moves the entity once the
-/// walk layer exists.
-fn walk_01_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
+/// frame spent, advance the clip, then `Add_speedXZ(0x800)` along the facing.
+/// A move the room collision refuses (checked before the commit, the same
+/// rollback the original's probe performs) advances to the knock state.
+fn walk_01_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) {
     let trim = u16::from(entity.animation_frame_id) * 0xF;
     entity.move_speed_current = (entity.move_speed_current as i16).wrapping_sub(trim as i16) as u16;
     clock.advance(entity, clips, false, IDLE_BLEND_STEP);
+    if !walk::try_advance_xz(room, entity, 0, 0x800) {
+        entity.action_state = 2;
+    }
 }
 
 /// Behaviour 1, knocking state: play the knock animation and advance the
@@ -205,6 +260,18 @@ mod tests {
     use crate::game::Entity;
     use crate::model::{Clip, ClipFrame};
 
+    fn no_flags() -> [FlagBank; FLAG_BANK_COUNT] {
+        [FlagBank::new(); FLAG_BANK_COUNT]
+    }
+
+    fn room() -> RoomId {
+        RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        }
+    }
+
     fn clips() -> Vec<Clip> {
         vec![Clip {
             frames: vec![
@@ -233,7 +300,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        init(&mut entity, &mut clock, &clips());
+        init(&mut entity, &mut clock, &clips(), &no_flags(), room());
 
         assert_eq!(entity.state(), 1);
         assert_eq!(entity.ignore(), 0);
@@ -262,11 +329,177 @@ mod tests {
                 ..Entity::default()
             };
             let mut clock = EntityAnim::default();
-            init(&mut entity, &mut clock, &clips());
+            init(&mut entity, &mut clock, &clips(), &no_flags(), room());
             assert_eq!(entity.animation_id, 0, "id {id:#04x}");
             assert_eq!(entity.animation_frame_id, 1, "id {id:#04x}");
             assert_eq!(entity.blend_counter, 0, "id {id:#04x}");
         }
+    }
+
+    /// A clip table long enough for the Rebecca and Wesker variant frames.
+    fn variant_clips() -> Vec<Clip> {
+        let frame = ClipFrame {
+            keyframe: 0,
+            timing: 1,
+        };
+        let mut clips = vec![Clip::default(); 0x34];
+        clips[usize::from(data::REBECCA_WOUNDED_ANIM)] = Clip {
+            frames: vec![frame; usize::from(data::REBECCA_WOUNDED_FRAME) + 2],
+        };
+        clips[usize::from(data::WESKER_VARIANT_ANIM)] = Clip {
+            frames: vec![frame; usize::from(data::WESKER_VARIANT_FRAME) + 2],
+        };
+        clips
+    }
+
+    #[test]
+    fn init_applies_the_flag_gated_character_poses() {
+        let mut flags = no_flags();
+        flags[1].apply(data::REBECCA_WOUNDED_FLAG, 0);
+        let mut entity = Entity {
+            id: 0x23,
+            animation_id: 0x10,
+            animation_frame_id: 0x0C,
+            timing_control: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        init(&mut entity, &mut clock, &variant_clips(), &flags, room());
+        assert_eq!(entity.animation_id, data::REBECCA_WOUNDED_ANIM);
+        assert_eq!(
+            clock.display_frame(),
+            usize::from(data::REBECCA_WOUNDED_FRAME)
+        );
+
+        let mut flags = no_flags();
+        flags[0].apply(data::WESKER_VARIANT_FLAG, 0);
+        let mut entity = Entity {
+            id: 0x24,
+            animation_id: 0x10,
+            animation_frame_id: 0x0C,
+            timing_control: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        init(&mut entity, &mut clock, &variant_clips(), &flags, room());
+        assert_eq!(entity.animation_id, data::WESKER_VARIANT_ANIM);
+        assert_eq!(
+            clock.display_frame(),
+            usize::from(data::WESKER_VARIANT_FRAME)
+        );
+
+        // Without the flags the spawned pose is kept.
+        let mut entity = Entity {
+            id: 0x23,
+            animation_id: 0x10,
+            animation_frame_id: 0,
+            timing_control: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        init(
+            &mut entity,
+            &mut clock,
+            &variant_clips(),
+            &no_flags(),
+            room(),
+        );
+        assert_eq!(entity.animation_id, 0x10);
+    }
+
+    #[test]
+    fn init_forces_weskers_status_bit_in_the_lab_power_room() {
+        let power_room = RoomId {
+            stage: data::STAGE_LABORATORY_INDEX + 1,
+            room: data::ROOM_POWER_ROOM,
+            player_flag: 0,
+        };
+        let mut wesker = Entity {
+            id: 0x24,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        init(&mut wesker, &mut clock, &clips(), &no_flags(), power_room);
+        assert_eq!(wesker.status_flags & 2, 2);
+
+        // Another lab room, and another character, leave the bit clear.
+        let other_room = RoomId {
+            room: 0x10,
+            ..power_room
+        };
+        let mut wesker = Entity {
+            id: 0x24,
+            ..Entity::default()
+        };
+        init(&mut wesker, &mut clock, &clips(), &no_flags(), other_room);
+        assert_eq!(wesker.status_flags & 2, 0);
+
+        let mut rebecca = Entity {
+            id: 0x23,
+            ..Entity::default()
+        };
+        init(&mut rebecca, &mut clock, &clips(), &no_flags(), power_room);
+        assert_eq!(rebecca.status_flags & 2, 0);
+    }
+
+    /// A room whose east half (x >= 1000) is a wall, wide enough that the
+    /// behaviour's 0x800-unit step cannot jump clean over it.
+    fn blocked_room() -> RoomState {
+        RoomState {
+            collision: crate::state::Collision {
+                cell_x: 0,
+                cell_z: 0,
+                quadrants: std::array::from_fn(|_| {
+                    vec![crate::state::CollisionRect {
+                        x_max: 4000,
+                        z_max: 2000,
+                        x_min: 1000,
+                        z_min: 0,
+                        kind: 1,
+                        flags: 0,
+                    }]
+                }),
+            },
+            ..RoomState::default()
+        }
+    }
+
+    #[test]
+    fn idle_walk_01_moves_until_the_collision_probe_fires() {
+        let room = blocked_room();
+        // Angle 0 walks +X; 0x800 units from x=-3000 lands free.
+        let mut walker = Entity {
+            id: 0x27,
+            pos: [-3000, 0, 500],
+            angle: 0,
+            sca_radius: 100,
+            action_behavior: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        update(&mut walker, &mut clock, &clips(), &room);
+        assert_eq!(walker.action_state, 1);
+        assert!(
+            walker.pos[0] > -3000 + 2000,
+            "the walker stepped east to {:?}",
+            walker.pos
+        );
+        assert_eq!(walker.pos[2], 500, "the walk keeps its Z");
+
+        // From x=900 the same step would cross into the wall: the move is
+        // rolled back and the knock state is entered.
+        let mut knocker = Entity {
+            id: 0x27,
+            pos: [900, 0, 500],
+            angle: 0,
+            sca_radius: 100,
+            action_behavior: 1,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        update(&mut knocker, &mut clock, &clips(), &room);
+        assert_eq!(knocker.action_state, 2);
+        assert_eq!(knocker.pos, [900, 0, 500], "the blocked move rolled back");
     }
 
     #[test]
@@ -283,7 +516,12 @@ mod tests {
         };
         let mut clock = EntityAnim::default();
 
-        assert!(update(&mut entity, &mut clock, &clips()));
+        assert!(update(
+            &mut entity,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
         assert_eq!(entity.action_state, 1);
         assert_eq!(entity.animation_id, 0);
         assert_eq!(entity.animation_frame_id, 0);
@@ -293,7 +531,12 @@ mod tests {
         // The common tail advances the rewound clip.
         clock.advance(&mut entity, &clips(), false, IDLE_BLEND_STEP);
         assert_eq!(clock.display_frame(), 0);
-        assert!(update(&mut entity, &mut clock, &clips()));
+        assert!(update(
+            &mut entity,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
     }
 
     #[test]
@@ -305,7 +548,12 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(&mut entity, &mut clock, &clips()));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
     }
 
     #[test]
@@ -317,7 +565,12 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(&mut living, &mut clock, &clips()));
+        assert!(!update(
+            &mut living,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
         assert_eq!(living.animation_id, 4, "a living character is untouched");
 
         let mut corpse = Entity {
@@ -327,7 +580,12 @@ mod tests {
             animation_id: 4,
             ..Entity::default()
         };
-        assert!(update(&mut corpse, &mut clock, &clips()));
+        assert!(update(
+            &mut corpse,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
         assert_eq!(corpse.animation_id, 0);
         assert_eq!(corpse.action_state, 1);
     }
@@ -342,7 +600,12 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        assert!(!update(&mut entity, &mut clock, &clips()));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips(),
+            &RoomState::default()
+        ));
         assert_eq!((entity.action_state, entity.animation_id), (3, 9));
     }
 
@@ -371,14 +634,24 @@ mod tests {
 
         // The setup call rewinds to frame 0, sets the starting speed and
         // advances once.
-        assert!(!update(&mut entity, &mut clock, &clips));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default()
+        ));
         assert_eq!(entity.action_state, 1);
         assert_eq!(entity.animation_id, 0x35);
         assert_eq!(entity.move_speed_current, 1000);
         assert_eq!(clock.display_frame(), 0);
 
         // The second call trims frame 1's 15 from the speed.
-        assert!(!update(&mut entity, &mut clock, &clips));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default()
+        ));
         assert_eq!(entity.move_speed_current, 985);
         assert_eq!(clock.display_frame(), 1);
     }
@@ -404,7 +677,12 @@ mod tests {
         };
         // The one-frame clip completes in the setup call, so the death
         // animation parks in its (effect-only) pool state.
-        assert!(!update(&mut entity, &mut clock, &clips));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default()
+        ));
         assert_eq!((entity.action_state, entity.animation_id), (2, 0x33));
 
         let mut entity = Entity {
@@ -412,7 +690,12 @@ mod tests {
             action_behavior: 3,
             ..Entity::default()
         };
-        assert!(!update(&mut entity, &mut clock, &clips));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default()
+        ));
         assert_eq!(entity.action_state, 2);
         assert_eq!(entity.animation_id, 0x30);
         assert_eq!(entity.hit_state, 0x80);
@@ -420,7 +703,12 @@ mod tests {
 
         // State 2 clears status bit 1 and forces health -1.
         entity.health = 40;
-        assert!(!update(&mut entity, &mut clock, &clips));
+        assert!(!update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default()
+        ));
         assert_eq!(entity.status_flags & 2, 0);
         assert_eq!(entity.health, -1);
     }
