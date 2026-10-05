@@ -15,8 +15,10 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -43,8 +45,122 @@ const CUT_HEIGHT: u32 = 240;
 /// Byte offset of the bit depth field in a BMP header.
 const BMP_BPP_OFFSET: usize = 28;
 
-/// Bytes written per chunk while streaming the finished pack to disk.
+/// Bytes buffered while streaming the finished pack to disk.
 const WRITE_CHUNK: usize = 1 << 20;
+
+/// Resolve the requested worker count: `0` selects one worker per CPU.
+fn worker_count(jobs: usize) -> usize {
+    if jobs != 0 {
+        return jobs.max(1);
+    }
+    std::thread::available_parallelism().map_or(1, |count| count.get())
+}
+
+/// One parallel job's result: the progress label, the phase units it completes
+/// and the value it produces.
+type JobResult<T> = Result<(String, u64, T)>;
+
+/// Run `job(0..count)` on up to `jobs` scoped workers, returning the results in
+/// job order and advancing `progress` as each job completes.
+///
+/// The first error in job order is returned, so failures do not depend on
+/// thread scheduling.
+fn parallel_map<T: Send>(
+    count: usize,
+    jobs: usize,
+    progress: &mut Progress,
+    job: impl Fn(usize) -> JobResult<T> + Sync,
+) -> Result<Vec<(String, T)>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let threads = jobs.clamp(1, count);
+    if threads == 1 {
+        let mut out = Vec::with_capacity(count);
+        for index in 0..count {
+            let (label, units, value) = job(index)?;
+            progress.advance_named(units, &label);
+            out.push((label, value));
+        }
+        return Ok(out);
+    }
+
+    let next = AtomicUsize::new(0);
+    let progress = Mutex::new(progress);
+    let results = Mutex::new(Vec::with_capacity(count));
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= count {
+                        return;
+                    }
+                    let result = job(index);
+                    if let Ok((label, units, _)) = &result {
+                        progress.lock().unwrap().advance_named(*units, label);
+                    }
+                    results.lock().unwrap().push((index, result));
+                }
+            });
+        }
+    });
+
+    let mut collected = results.into_inner().unwrap();
+    collected.sort_by_key(|(index, _)| *index);
+    let mut out = Vec::with_capacity(count);
+    for (_, result) in collected {
+        let (label, _, value) = result?;
+        out.push((label, value));
+    }
+    Ok(out)
+}
+
+/// A writer that advances a byte-based progress phase as data is written.
+struct ProgressWriter<'a, W> {
+    inner: W,
+    progress: &'a mut Progress,
+}
+
+impl<W: Write> Write for ProgressWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.progress.advance_by(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Read and add `files` to the pack on the worker pool.
+fn copy_raw_files(
+    files: Vec<(String, PathBuf)>,
+    label: &str,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    progress.begin(label, files.len() as u64, "files");
+    let results = parallel_map(files.len(), jobs, progress, |index| {
+        let (entry, source) = &files[index];
+        let data =
+            fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
+        Ok((entry.clone(), 1, data))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, data) in results {
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&entry, data)
+            .with_context(|| format!("failed to add {entry}"))?;
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
 
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 ///
@@ -57,6 +173,20 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
 /// Convert the game installation under `root` into the `.akpak` pack `out`,
 /// taking the text tables from `exe` instead of the discovered `Bio.exe`.
 pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Result<()> {
+    convert_game_with_options(root, out, exe, 0)
+}
+
+/// Like [`convert_game_with_exe`], but with an explicit worker count.
+///
+/// A `jobs` of `0` selects one worker per available CPU, and the output is
+/// byte-identical whatever the worker count.
+pub fn convert_game_with_options(
+    root: &Path,
+    out: &Path,
+    exe: Option<&Path>,
+    jobs: usize,
+) -> Result<()> {
+    let jobs = worker_count(jobs);
     let mut progress = Progress::new();
     let Plan {
         rooms,
@@ -70,7 +200,7 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
         data,
         font,
         mut warnings,
-    } = build_plan(root)?;
+    } = build_plan_with_progress(root, jobs, &mut progress)?;
     let exe = match exe {
         Some(path) if path.is_file() => Some(path.to_path_buf()),
         Some(path) => {
@@ -101,12 +231,18 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     let mut mask_count = 0usize;
     let mut mask_bytes = 0usize;
 
-    // Resolve the cut jobs first so RDTs and backgrounds can be reported as
-    // two clean phases instead of alternating per room.
-    let mut cut_jobs: Vec<(RoomId, usize, PathBuf)> = Vec::new();
+    // Group the cut jobs by source file first, so stages 6 and 7 that reuse a
+    // STAGE1/STAGE2 background decode it once and reuse the BMP for every
+    // entry. Entry order does not matter: the pack writer sorts by path.
+    let mut cut_sources: BTreeMap<PathBuf, Vec<(RoomId, usize)>> = BTreeMap::new();
+    let mut cut_total = 0u64;
     for room in &rooms {
         for (camera, pak) in room.paks.iter().enumerate() {
-            cut_jobs.push((room.id, camera, pak.clone()));
+            cut_sources
+                .entry(pak.clone())
+                .or_default()
+                .push((room.id, camera));
+            cut_total += 1;
         }
     }
 
@@ -126,54 +262,100 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     }
     progress.end_phase();
 
-    let cut_total = cut_jobs.len() as u64;
     progress.begin("roomcut", cut_total, "cuts");
-    for (id, camera, pak) in cut_jobs {
-        let bmp_bytes = convert_camera(&pak)?;
-        let entry = id.cut_entry(camera);
-        cut_bytes += bmp_bytes.len();
-        cut_count += 1;
-        stage_counts[id.stage_index() as usize].1 += 1;
-        writer
-            .add(&entry, bmp_bytes)
-            .with_context(|| format!("failed to add {entry}"))?;
-        progress.advance(&entry);
+    let cut_groups: Vec<(PathBuf, Vec<(RoomId, usize)>)> = cut_sources.into_iter().collect();
+    let cut_results = parallel_map(cut_groups.len(), jobs, &mut progress, |index| {
+        let (pak, targets) = &cut_groups[index];
+        let mut bmp_bytes = convert_camera(pak)?;
+        let label = targets
+            .first()
+            .map(|(id, camera)| id.cut_entry(*camera))
+            .unwrap_or_default();
+        let mut entries = Vec::with_capacity(targets.len());
+        let last = targets.len() - 1;
+        for (position, (id, camera)) in targets.iter().enumerate() {
+            let entry = id.cut_entry(*camera);
+            let data = if position == last {
+                std::mem::take(&mut bmp_bytes)
+            } else {
+                bmp_bytes.clone()
+            };
+            entries.push((*id, entry, data));
+        }
+        Ok((label, targets.len() as u64, entries))
+    })?;
+    for (_label, entries) in cut_results {
+        for (id, entry, bytes) in entries {
+            cut_bytes += bytes.len();
+            cut_count += 1;
+            stage_counts[id.stage_index() as usize].1 += 1;
+            writer
+                .add(&entry, bytes)
+                .with_context(|| format!("failed to add {entry}"))?;
+        }
     }
     progress.end_phase();
 
-    let mask_total = roommask.len() as u64;
-    progress.begin("roommask", mask_total, "files");
+    // Mask pages sharing a source `OSP*.pak` decode once too.
+    let mut mask_sources: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
     for asset in &roommask {
-        let bmp_bytes = convert_roommask(&asset.source)?;
-        mask_bytes += bmp_bytes.len();
-        mask_count += 1;
-        writer
-            .add(&asset.entry, bmp_bytes)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(&asset.entry);
+        mask_sources
+            .entry(asset.source.clone())
+            .or_default()
+            .push(asset.entry.clone());
+    }
+    progress.begin("roommask", roommask.len() as u64, "files");
+    let mask_groups: Vec<(PathBuf, Vec<String>)> = mask_sources.into_iter().collect();
+    let mask_results = parallel_map(mask_groups.len(), jobs, &mut progress, |index| {
+        let (pak, targets) = &mask_groups[index];
+        let mut bmp_bytes = convert_roommask(pak)?;
+        let label = targets.first().cloned().unwrap_or_default();
+        let mut entries = Vec::with_capacity(targets.len());
+        let last = targets.len() - 1;
+        for (position, entry) in targets.iter().enumerate() {
+            let data = if position == last {
+                std::mem::take(&mut bmp_bytes)
+            } else {
+                bmp_bytes.clone()
+            };
+            entries.push((entry.clone(), data));
+        }
+        Ok((label, targets.len() as u64, entries))
+    })?;
+    for (_label, entries) in mask_results {
+        for (entry, bytes) in entries {
+            mask_bytes += bytes.len();
+            mask_count += 1;
+            writer
+                .add(&entry, bytes)
+                .with_context(|| format!("failed to add {entry}"))?;
+        }
     }
     progress.end_phase();
 
-    let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress)?;
-    let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress)?;
+    let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress, jobs)?;
+    let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress, jobs)?;
     // TODO(parity): (conversion) the original installs more than this pack
     // carries: the voice WAVs under `voice/` (the SCD 0x1E lines), the FMV
     // AVIs and the held-weapon TMDs under `players/ws*.tmd`. Those systems
     // are unimplemented, so the conversion is complete only for the modelled
     // categories; add their copy phases when the runtime grows them.
-    let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress)?;
-    let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress)?;
-    let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress)?;
-    let (effect_count, effect_bytes) = copy_effect_sheets(&effects, &mut writer, &mut progress)?;
+    let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress, jobs)?;
+    let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress, jobs)?;
+    let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress, jobs)?;
+    let (effect_count, effect_bytes) =
+        copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
     let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
-    let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress)?;
-    let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress)?;
+    let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress, jobs)?;
+    let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress, jobs)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
-    let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress)?;
+    let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress, jobs)?;
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
     let (text_count, text_bytes) = copy_text(exe.as_deref(), &mut writer, &mut progress)?;
-    let (ivm_count, ivm_bytes) = copy_item_models(item_m2.as_deref(), &mut writer, &mut progress)?;
-    let (file_count, file_bytes) = copy_file_art(item_m2.as_deref(), &mut writer, &mut progress)?;
+    let (ivm_count, ivm_bytes) =
+        copy_item_models(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
+    let (file_count, file_bytes) =
+        copy_file_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
         println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
@@ -197,16 +379,22 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
 
-    let pack_bytes = writer.to_bytes()?;
-    let size = pack_bytes.len();
+    // Stream the pack straight to disk: the entry data is already in memory,
+    // so materializing a second serialized copy would only cost memory and a
+    // full memcpy.
+    let size = writer.pack_size()?;
     progress.begin("write", size as u64, "bytes");
-    let mut file =
+    let file =
         fs::File::create(out).with_context(|| format!("failed to create {}", out.display()))?;
-    for chunk in pack_bytes.chunks(WRITE_CHUNK) {
-        file.write_all(chunk)
-            .with_context(|| format!("failed to write {}", out.display()))?;
-        progress.advance_by(chunk.len() as u64);
-    }
+    let mut file = ProgressWriter {
+        inner: BufWriter::with_capacity(WRITE_CHUNK, file),
+        progress: &mut progress,
+    };
+    writer
+        .stream_to(&mut file)
+        .with_context(|| format!("failed to write {}", out.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to write {}", out.display()))?;
     drop(file);
     progress.end_phase();
 
@@ -281,6 +469,7 @@ fn copy_music(
     sound: &Option<PathBuf>,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(sound) = sound else {
         return Ok((0, 0));
@@ -298,21 +487,7 @@ fn copy_music(
         files.push((path, entry.path()));
     }
 
-    progress.begin("bgm", files.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (path, source) in files {
-        let data =
-            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&path, data)
-            .with_context(|| format!("failed to add {path}"))?;
-        progress.advance(&path);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "bgm", writer, progress, jobs)
 }
 
 /// Add every sound effect named by the room sound tables.
@@ -323,6 +498,7 @@ fn copy_se(
     sound: &Option<PathBuf>,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(sound) = sound else {
         return Ok((0, 0));
@@ -347,21 +523,7 @@ fn copy_se(
         );
     }
 
-    progress.begin("se", files.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (path, source) in files {
-        let data =
-            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&path, data)
-            .with_context(|| format!("failed to add {path}"))?;
-        progress.advance(&path);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "se", writer, progress, jobs)
 }
 
 /// Add every door animation named by the door type table.
@@ -374,6 +536,7 @@ fn copy_doors(
     item_m1: &Option<PathBuf>,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m1 else {
         return Ok((0, 0));
@@ -399,21 +562,7 @@ fn copy_doors(
         );
     }
 
-    progress.begin("door", files.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (path, source) in files {
-        let data =
-            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&path, data)
-            .with_context(|| format!("failed to add {path}"))?;
-        progress.advance(&path);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "door", writer, progress, jobs)
 }
 
 /// Add every resolved player model and locomotion clip to the pack.
@@ -421,22 +570,13 @@ fn copy_players(
     players: &[PlayerAsset],
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
-    progress.begin("player", players.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for asset in players {
-        let data = fs::read(&asset.source)
-            .with_context(|| format!("failed to read {}", asset.source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&asset.entry, data)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(&asset.entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    let files = players
+        .iter()
+        .map(|asset| (asset.entry.clone(), asset.source.clone()))
+        .collect();
+    copy_raw_files(files, "player", writer, progress, jobs)
 }
 
 /// The 33 shipped effect-sheet names: `esp000`, `esp001` and `esp200`..`esp230`.
@@ -455,22 +595,13 @@ fn copy_effect_sheets(
     assets: &[EffectSheet],
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
-    progress.begin("effspr", assets.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for asset in assets {
-        let data = fs::read(&asset.source)
-            .with_context(|| format!("failed to read effect sheet {}", asset.source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&asset.entry, data)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(&asset.entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    let files = assets
+        .iter()
+        .map(|asset| (asset.entry.clone(), asset.source.clone()))
+        .collect();
+    copy_raw_files(files, "effspr", writer, progress, jobs)
 }
 
 /// Add every resolved scripted-character (NPC) model to the pack raw.
@@ -478,11 +609,11 @@ fn copy_npc_models(
     assets: &[NpcAsset],
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     progress.begin("npc", assets.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for asset in assets {
+    let results = parallel_map(assets.len(), jobs, progress, |index| {
+        let asset = &assets[index];
         let data = fs::read(&asset.source).with_context(|| {
             format!(
                 "failed to read NPC model {:#04x} ({})",
@@ -490,12 +621,16 @@ fn copy_npc_models(
                 asset.source.display()
             )
         })?;
+        Ok((asset.entry.clone(), 1, data))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, data) in results {
         bytes += data.len();
         count += 1;
         writer
-            .add(&asset.entry, data)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(&asset.entry);
+            .add(&entry, data)
+            .with_context(|| format!("failed to add {entry}"))?;
     }
     progress.end_phase();
     Ok((count, bytes))
@@ -509,21 +644,25 @@ fn copy_ui_art(
     data: &DataPlan,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     progress.begin("ui", data.ui.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for asset in &data.ui {
+    let results = parallel_map(data.ui.len(), jobs, progress, |index| {
+        let asset = &data.ui[index];
         let raw = fs::read(&asset.source)
             .with_context(|| format!("failed to read {}", asset.source.display()))?;
         let converted = convert_ui_asset(asset.kind, &raw)
             .with_context(|| format!("failed to convert {}", asset.source.display()))?;
+        Ok((asset.entry.to_string(), 1, converted))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, converted) in results {
         bytes += converted.len();
         count += 1;
         writer
-            .add(asset.entry, converted)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(asset.entry);
+            .add(&entry, converted)
+            .with_context(|| format!("failed to add {entry}"))?;
     }
     progress.end_phase();
     Ok((count, bytes))
@@ -534,6 +673,7 @@ fn copy_item_art(
     data: &DataPlan,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(palette_path) = &data.palette else {
         return Ok((0, 0));
@@ -547,19 +687,22 @@ fn copy_item_art(
         .with_context(|| format!("failed to decode {} as a CLUT TIM", palette_path.display()))?;
 
     progress.begin("item", data.items.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for asset in &data.items {
+    let results = parallel_map(data.items.len(), jobs, progress, |index| {
+        let asset = &data.items[index];
         let pix = fs::read(&asset.source)
             .with_context(|| format!("failed to read {}", asset.source.display()))?;
         let bmp_bytes = bake_item_atlas(&pix, asset.rows, &texture)
             .with_context(|| format!("failed to bake {}", asset.source.display()))?;
+        Ok((asset.entry.to_string(), 1, bmp_bytes))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, bmp_bytes) in results {
         bytes += bmp_bytes.len();
         count += 1;
         writer
-            .add(asset.entry, bmp_bytes)
-            .with_context(|| format!("failed to add {}", asset.entry))?;
-        progress.advance(asset.entry);
+            .add(&entry, bmp_bytes)
+            .with_context(|| format!("failed to add {entry}"))?;
     }
     progress.end_phase();
     Ok((count, bytes))
@@ -592,30 +735,22 @@ fn copy_core_effects(
     data: &DataPlan,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
-    let mut resolved: Vec<(&str, &PathBuf)> = Vec::new();
+    let mut files = Vec::new();
     if let Some(path) = &data.core_esp {
-        resolved.push((crate::effects::room::CORE_ESP_ENTRY, path));
+        files.push((
+            crate::effects::room::CORE_ESP_ENTRY.to_string(),
+            path.clone(),
+        ));
     }
     if let Some(path) = &data.core_etm {
-        resolved.push((crate::effects::room::CORE_ETM_ENTRY, path));
+        files.push((
+            crate::effects::room::CORE_ETM_ENTRY.to_string(),
+            path.clone(),
+        ));
     }
-
-    progress.begin("core00", resolved.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (entry, source) in resolved {
-        let raw =
-            fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += raw.len();
-        count += 1;
-        writer
-            .add(entry, raw)
-            .with_context(|| format!("failed to add {entry}"))?;
-        progress.advance(entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "core00", writer, progress, jobs)
 }
 
 /// Add the raw `KAGE.TIM` player-shadow coverage page.
@@ -1252,6 +1387,7 @@ fn copy_item_models(
     item_m2: Option<&Path>,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m2 else {
         println!("warning: no ITEM_M2 directory found; item models will be missing");
@@ -1277,21 +1413,7 @@ fn copy_item_models(
         );
     }
 
-    progress.begin("item", files.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (entry, source) in files {
-        let data =
-            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&entry, data)
-            .with_context(|| format!("failed to add {entry}"))?;
-        progress.advance(&entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "item", writer, progress, jobs)
 }
 
 /// Add the document-reader art to the pack under `file/`: the `FILE` covers,
@@ -1301,6 +1423,7 @@ fn copy_file_art(
     item_m2: Option<&Path>,
     writer: &mut PackWriter,
     progress: &mut Progress,
+    jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m2 else {
         println!("warning: no ITEM_M2 directory found; file art will be missing");
@@ -1348,21 +1471,7 @@ fn copy_file_art(
         files.push((format!("file/{name}"), index[name].clone()));
     }
 
-    progress.begin("file", files.len() as u64, "files");
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (entry, source) in files {
-        let data =
-            fs::read(&source).with_context(|| format!("failed to read {}", source.display()))?;
-        bytes += data.len();
-        count += 1;
-        writer
-            .add(&entry, data)
-            .with_context(|| format!("failed to add {entry}"))?;
-        progress.advance(&entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
+    copy_raw_files(files, "file", writer, progress, jobs)
 }
 
 /// Add `DATA/FONT.TIM` raw as `font/font.tim`; the JPN sheet is 4bpp and
@@ -1586,7 +1695,14 @@ struct Plan {
 }
 
 /// Discover, enumerate, and validate every conversion input.
+#[cfg(test)]
 fn build_plan(root: &Path) -> Result<Plan> {
+    build_plan_with_progress(root, 1, &mut Progress::new())
+}
+
+/// Discover, enumerate, and validate every conversion input, reporting the RDT
+/// read/parse scan on `progress` and using `jobs` workers for it.
+fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -> Result<Plan> {
     let layout = discover_layout(root)?;
     let (npc, npc_warnings) = resolve_npc_assets(&layout)?;
     let Layout {
@@ -1614,8 +1730,10 @@ fn build_plan(root: &Path) -> Result<Plan> {
         None => (None, None),
     };
     let data = resolve_data_assets(data.as_deref())?;
-    let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
 
+    // Enumerate every RDT first so reading and parsing them can be one
+    // reported parallel phase, then merge the rooms in file order.
+    let mut rdt_files: Vec<(RoomId, PathBuf)> = Vec::new();
     for (digit, dir) in &stages {
         for entry in read_dir_sorted(dir)? {
             let name = entry.file_name();
@@ -1634,27 +1752,35 @@ fn build_plan(root: &Path) -> Result<Plan> {
                     id.stage
                 );
             }
-
-            let path = entry.path();
-            let bytes =
-                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-            let state = rdt::parse(&bytes, id)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-
-            let room = rooms.entry((id.stage, id.room)).or_insert_with(|| Room {
-                id,
-                rdts: Vec::new(),
-                cameras: 0,
-                paks: Vec::new(),
-                mask_groups: Vec::new(),
-            });
-            room.cameras = room.cameras.max(state.cuts.len());
-            room.mask_groups.resize(room.cameras, 0);
-            for (camera, cut) in state.cuts.iter().enumerate() {
-                room.mask_groups[camera] = room.mask_groups[camera].max(cut.mask_group_count);
-            }
-            room.rdts.push(Rdt { id, bytes });
+            rdt_files.push((id, entry.path()));
         }
+    }
+
+    progress.begin("scan", rdt_files.len() as u64, "files");
+    let parsed = parallel_map(rdt_files.len(), jobs, progress, |index| {
+        let (id, path) = &rdt_files[index];
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        let state = rdt::parse(&bytes, *id)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        Ok((id.rdt_entry(), 1, (bytes, state)))
+    })?;
+    progress.end_phase();
+
+    let mut rooms: BTreeMap<(u8, u8), Room> = BTreeMap::new();
+    for ((id, _), (_label, (bytes, state))) in rdt_files.into_iter().zip(parsed) {
+        let room = rooms.entry((id.stage, id.room)).or_insert_with(|| Room {
+            id,
+            rdts: Vec::new(),
+            cameras: 0,
+            paks: Vec::new(),
+            mask_groups: Vec::new(),
+        });
+        room.cameras = room.cameras.max(state.cuts.len());
+        room.mask_groups.resize(room.cameras, 0);
+        for (camera, cut) in state.cuts.iter().enumerate() {
+            room.mask_groups[camera] = room.mask_groups[camera].max(cut.mask_group_count);
+        }
+        room.rdts.push(Rdt { id, bytes });
     }
 
     let indices: BTreeMap<u8, HashMap<String, PathBuf>> = stages
@@ -2260,7 +2386,8 @@ mod tests {
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (count, bytes) = copy_effect_sheets(&plan.effects, &mut writer, &mut progress).unwrap();
+        let (count, bytes) =
+            copy_effect_sheets(&plan.effects, &mut writer, &mut progress, 1).unwrap();
         assert_eq!(count, 33);
         assert_eq!(
             bytes,
@@ -2332,7 +2459,7 @@ mod tests {
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (count, bytes) = copy_core_effects(&data_plan, &mut writer, &mut progress).unwrap();
+        let (count, bytes) = copy_core_effects(&data_plan, &mut writer, &mut progress, 1).unwrap();
         assert_eq!(count, 2);
         assert_eq!(bytes, "esp-bytes".len() + "etm-bytes".len());
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
@@ -2364,7 +2491,7 @@ mod tests {
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (count, _) = copy_core_effects(&plan, &mut writer, &mut progress).unwrap();
+        let (count, _) = copy_core_effects(&plan, &mut writer, &mut progress, 1).unwrap();
         assert_eq!(count, 0);
     }
 
@@ -3013,8 +3140,8 @@ mod tests {
         // The same conversion the pack writer performs, checked for counts.
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (ui_count, _) = copy_ui_art(&plan, &mut writer, &mut progress).unwrap();
-        let (item_count, _) = copy_item_art(&plan, &mut writer, &mut progress).unwrap();
+        let (ui_count, _) = copy_ui_art(&plan, &mut writer, &mut progress, 1).unwrap();
+        let (item_count, _) = copy_item_art(&plan, &mut writer, &mut progress, 1).unwrap();
         let (data_count, _) = copy_bio_card(&plan, &mut writer, &mut progress).unwrap();
         let (shadow_count, _) = copy_shadow(&plan, &mut writer, &mut progress).unwrap();
         assert_eq!(ui_count, UI_ASSETS.len());
@@ -3300,8 +3427,9 @@ mod tests {
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (items, item_bytes) = copy_item_models(Some(&dir), &mut writer, &mut progress).unwrap();
-        let (files, file_bytes) = copy_file_art(Some(&dir), &mut writer, &mut progress).unwrap();
+        let (items, item_bytes) =
+            copy_item_models(Some(&dir), &mut writer, &mut progress, 1).unwrap();
+        let (files, file_bytes) = copy_file_art(Some(&dir), &mut writer, &mut progress, 1).unwrap();
 
         assert_eq!(items, 2);
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
@@ -3435,8 +3563,9 @@ mod tests {
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
         let (items, items_bytes) =
-            copy_item_models(Some(&dir), &mut writer, &mut progress).unwrap();
-        let (files, files_bytes) = copy_file_art(Some(&dir), &mut writer, &mut progress).unwrap();
+            copy_item_models(Some(&dir), &mut writer, &mut progress, 1).unwrap();
+        let (files, files_bytes) =
+            copy_file_art(Some(&dir), &mut writer, &mut progress, 1).unwrap();
 
         assert_eq!(items, 77);
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
@@ -3661,7 +3790,7 @@ mod tests {
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new();
-        let (count, bytes) = copy_npc_models(&assets, &mut writer, &mut progress).unwrap();
+        let (count, bytes) = copy_npc_models(&assets, &mut writer, &mut progress, 1).unwrap();
 
         assert_eq!(count, 15);
         assert_eq!(bytes, 2_295_340, "total NPC model bytes");

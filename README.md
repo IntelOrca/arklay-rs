@@ -21,8 +21,11 @@ cargo build
 ## Usage (M0)
 
 ```sh
-# Convert an RE1 installation into a game pack
+# Convert an RE1 installation into a game pack (parallel across CPUs)
 cargo run -- convert-game /path/to/re1 --out re1.akpak
+
+# Limit the conversion to N workers (default: one per available CPU)
+cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 
 # List every pack entry with its size, then the entry count and total bytes
 cargo run -- list re1.akpak

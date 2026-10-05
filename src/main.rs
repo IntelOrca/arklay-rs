@@ -76,6 +76,10 @@ enum Command {
         /// discovered under the root)
         #[arg(long, value_name = "EXE")]
         exe: Option<PathBuf>,
+
+        /// Number of worker threads (default: one per available CPU)
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
+        jobs: Option<u16>,
     },
 
     /// Extract every entry of a game pack into a directory
@@ -210,9 +214,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::ConvertGame { root, out, exe }) => {
-            arklay::convert::convert_game_with_exe(&root, &out, exe.as_deref())
-        }
+        Some(Command::ConvertGame {
+            root,
+            out,
+            exe,
+            jobs,
+        }) => arklay::convert::convert_game_with_options(
+            &root,
+            &out,
+            exe.as_deref(),
+            jobs.map_or(0, usize::from),
+        ),
         Some(Command::Extract { pack, out }) => extract_pack(&pack, &out),
         Some(Command::List { pack }) => list_pack(&pack),
         Some(Command::Scd { action }) => match action {
