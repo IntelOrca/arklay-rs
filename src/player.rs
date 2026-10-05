@@ -20,15 +20,18 @@
 //! its contacts closer together, so running produces more footfalls per second
 //! than walking.
 //!
-//! Two locked action behaviours sit on top of the locomotion machine:
+//! Three locked action behaviours sit on top of the locomotion machine:
 //! [`LockedAction::Push`] plays the room animation pair's `0x30` wind-up and
-//! `0x31` push loop while the object pass keeps raising the push bit, and
+//! `0x31` push loop while the object pass keeps raising the push bit,
 //! [`LockedAction::Vault`] runs the `0x33`/`0x35` climb-over clip and the
-//! `0x73A`/`0x708` warp. Both are selected outside this module (the action
-//! press and the push bit are read by [`crate::game::GameState::tick_objects`])
-//! and their one-shot sounds are drained through [`PlayerState::take_sounds`].
-//! A room without the embedded animation pair falls back to a short wind-up
-//! and the warp (documented on the behaviour functions).
+//! `0x73A`/`0x708` warp, and [`LockedAction::Ladder`] runs the eight-state
+//! `set_stairs_zone` climb (approach, turn, the room's `0x33`/`0x35` climb
+//! clip with its step SEs, descent and walk-away). All are selected outside
+//! this module (the action press and the push bit are read by
+//! [`crate::game::GameState::tick_objects`]) and their one-shot sounds are
+//! drained through [`PlayerState::take_sounds`]. A room without the embedded
+//! animation pair falls back to a short wind-up and the warp (documented on
+//! the behaviour functions).
 
 use crate::anim::AnimPlayer;
 use crate::model::Clip;
@@ -244,6 +247,78 @@ pub const SE_VAULT_STEP: u16 = 0x23;
 /// `PlayEntitySnd(0)`).
 pub const SE_FOOTSTEP: u16 = 0;
 
+/// Room-animation clip of the plain ladder climb (`attackAnim 0x33`).
+pub const LADDER_CLIP_PLAIN: usize = 0x33;
+/// Room-animation clip of the variant ladder climb (`attackAnim 0x35`).
+pub const LADDER_CLIP_VARIANT: usize = 0x35;
+/// Approach speed of ladder states 0/1.
+pub const LADDER_APPROACH_SPEED: i32 = 0x5D;
+/// Per-tick turn step of the approach rotate-toward-target.
+pub const LADDER_APPROACH_TURN: u16 = 0x40;
+/// Distance at which the approach hands over to the turn state.
+pub const LADDER_ARRIVE_DISTANCE: i32 = 900;
+/// Walk-away speed of ladder state 7.
+pub const LADDER_WALK_AWAY_SPEED: i32 = 0x3C;
+/// Ticks the walk-away runs (the original's `attackDirection` countdown).
+pub const LADDER_WALK_AWAY_TICKS: u8 = 0x0F;
+/// Walk-away frame that plays the entity footstep.
+pub const LADDER_WALK_AWAY_FOOTSTEP_FRAME: usize = 8;
+/// Descend step-off distance on the plain ladder.
+pub const LADDER_STEP_OFF: i32 = 1000;
+/// Descend step-off distance on the variant ladder.
+pub const LADDER_STEP_OFF_VARIANT: i32 = 2000;
+/// Height the variant climb sets on its shift frame.
+pub const LADDER_VARIANT_HEIGHT: i32 = 0xA8C;
+/// Z displacement the variant clip applies on its shift frame.
+pub const LADDER_VARIANT_SLIDE: i32 = 0x708;
+/// Variant-clip frame that applies the Z displacement and the height.
+pub const LADDER_VARIANT_SHIFT_FRAME: usize = 0x0F;
+/// Variant-clip frame that plays the climb grunt.
+pub const LADDER_VARIANT_GRUNT_FRAME: usize = 0x1A;
+/// Plain-climb frame that plays the climb-end SE.
+pub const LADDER_CLIMB_END_FRAME: usize = 0x32;
+/// Step SE of the plain climb.
+pub const SE_LADDER_STEP: u16 = 0x23;
+/// SE played when the plain climb reaches its end frame.
+pub const SE_LADDER_END: u16 = 0x2D;
+/// Grunt SE of the variant climb.
+pub const SE_LADDER_GRUNT: u16 = 0x17;
+
+/// The transcribed ladder step-frame table: `move_speed_current` indexes the
+/// frame that plays [`SE_LADDER_STEP`], and the counter advances on each match.
+/// The first three entries are the shipped climb's 12/29/39; the 80/100/130
+/// tail is kept for the longer stair clips the same handler serves (a zero
+/// entry matches no displayed frame once the counter reaches it).
+#[rustfmt::skip]
+pub const LADDER_STEP_FRAMES: [u8; 64] = [
+    0x0C, 0x1D, 0x27, 0x00, 0x50, 0x64, 0x82, 0x64,
+    0x6B, 0x68, 0x00, 0x64, 0x64, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x64, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// A camera screen-effect rectangle written by the climb behaviours (the
+/// original's `BillboardSetRect`). The camera-scroll consumer is not ported,
+/// so the values are recorded for tests and a later slice; the eight words the
+/// original writes map `right` to `+0x60`/`+0x70`, `-left` to
+/// `+0x58`/`+0x68`, `front` to `+0x5C`/`+0x64` and `-back` to
+/// `+0x6C`/`+0x74`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenEffect {
+    /// The rectangle's `right` argument.
+    pub right: u16,
+    /// The rectangle's `left` argument.
+    pub left: u16,
+    /// The rectangle's `front` argument.
+    pub front: u16,
+    /// The rectangle's `back` argument.
+    pub back: u16,
+}
+
 /// A one-shot player sound request (the original's `Play3DSnd` and
 /// `PlayEntitySnd` calls in the action behaviours). The engine resolves
 /// [`SE_FOOTSTEP`] through the room's footstep zones.
@@ -266,6 +341,9 @@ pub enum LockedAction {
     /// `action_behavior 0x0a` with msf bit 7 raised: the vault into a
     /// climbable object (clips `0x33`/`0x35` and the `0x73A`/`0x708` warp).
     Vault,
+    /// `action_behavior 0x0b`: the eight-state ladder climb selected by an
+    /// action press inside a marked `set_stairs_zone` zone.
+    Ladder,
 }
 
 /// The moving player: position, facing, collision radius and animation.
@@ -310,8 +388,11 @@ pub struct PlayerState {
     pub push_heavy: bool,
     /// `attackDirection` of the latched climb candidate (`-1`/`1`).
     pub attack_direction: i8,
-    /// `move_speed_current`, used by the push and vault state machines.
+    /// `move_speed_current`, used by the push, vault and ladder state machines.
     pub move_speed_current: u16,
+    /// The ladder climb's state 8 ran: the room probe clears zone flag `0x10`
+    /// and `MSF_LADDER_DOWN` and returns the message flag next tick.
+    pub ladder_release: bool,
     /// The last tick's input; `tick_objects` reads the action edges from here.
     pub input: Input,
     /// One-shot sound requests emitted since the last
@@ -319,6 +400,9 @@ pub struct PlayerState {
     sounds: Vec<PlayerSound>,
     /// Footstep events emitted since the last [`PlayerState::take_footsteps`].
     footsteps: Vec<Footstep>,
+    /// Camera screen-effect rectangles recorded since the last
+    /// [`PlayerState::take_screen_effects`].
+    screen_effects: Vec<ScreenEffect>,
 }
 
 /// Spawn in the middle of the first walkable zone (or the origin when none).
@@ -355,9 +439,11 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         push_heavy: false,
         attack_direction: 0,
         move_speed_current: 0,
+        ladder_release: false,
         input: Input::default(),
         sounds: Vec::new(),
         footsteps: Vec::new(),
+        screen_effects: Vec::new(),
     }
 }
 
@@ -567,6 +653,7 @@ fn update_locked(
     match player.locked {
         LockedAction::Push => update_push(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::Vault => update_vault(player, emd_clips, emw_clips, room_clips),
+        LockedAction::Ladder => update_ladder(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::None => {}
     }
 }
@@ -723,7 +810,218 @@ fn update_vault(
     }
 }
 
+/// `player_behavior_0b_ladder` (0x00496480): the eight-state ladder climb.
+///
+/// States 0/1 walk to the latched base at speed `0x5D`, rotating toward it in
+/// `0x40` steps; state 2 eases the remaining angle onto a quadrant; state 3
+/// picks the room clip `0x33`/`0x35` and writes the first screen-effect
+/// rectangle; state 4 runs the climb with its step SEs, the variant frame
+/// `0x0F` displacement/height and the frame `0x1A` grunt; state 5 steps off;
+/// states 6/7 walk away; state 8 releases the zone and control.
+///
+/// The room collision pass stays suspended through the approach (the latched
+/// base can sit inside the shaft's collision volume); the walk-away uses the
+/// normal resolved step.
+#[allow(clippy::too_many_lines)]
+fn update_ladder(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    if player.action_state == 0 {
+        player.action_state = 1;
+        player.move_speed_current = LADDER_APPROACH_SPEED as u16;
+        player.set_clip(ClipSource::Emw, WALK_CLIP);
+    }
+    match player.action_state {
+        1 => {
+            let base = [
+                i32::from(player.stairs.base[0]),
+                i32::from(player.stairs.base[1]),
+            ];
+            rotate_toward(player, base[0], base[1], LADDER_APPROACH_TURN);
+            player.advance(emd_clips, emw_clips, room_clips);
+            let speed = i32::from(player.move_speed_current as i16);
+            let (dx, dz) = rotate_speed(player.angle, 0, speed);
+            player.pos[0] += dx;
+            player.pos[2] += dz;
+            let dx = i64::from(player.pos[0] - base[0]);
+            let dz = i64::from(player.pos[2] - base[1]);
+            if dx * dx + dz * dz
+                < i64::from(LADDER_ARRIVE_DISTANCE) * i64::from(LADDER_ARRIVE_DISTANCE)
+            {
+                player.action_state = 2;
+            }
+        }
+        2 => {
+            player.advance(emd_clips, emw_clips, room_clips);
+            let angle = player.angle & 0x0FFF;
+            let step = (angle & 0x3FC) >> 2;
+            let turn = if angle & 0x400 == 0 {
+                step
+            } else {
+                step.wrapping_neg()
+            };
+            player.angle = angle.wrapping_add(turn) & 0x0FFF;
+            if player.angle & 0x3E0 == 0 {
+                player.action_state = 3;
+            }
+        }
+        3 => {
+            let clip = if player.stairs.ladder {
+                LADDER_CLIP_VARIANT
+            } else {
+                LADDER_CLIP_PLAIN
+            };
+            player.set_clip(ClipSource::Room, clip);
+            player.move_speed_current = 0;
+            player.action_state = 4;
+            player.screen_effects.push(ScreenEffect {
+                right: 800,
+                left: 700,
+                front: 700,
+                back: 700,
+            });
+            ladder_climb_tick(player, emd_clips, emw_clips, room_clips);
+        }
+        4 => ladder_climb_tick(player, emd_clips, emw_clips, room_clips),
+        5 => {
+            ladder_descend(player);
+        }
+        6 => ladder_walk_away_start(player),
+        7 => {
+            if player.anim.display_frame == LADDER_WALK_AWAY_FOOTSTEP_FRAME {
+                player.queue_sound(SE_FOOTSTEP);
+            }
+            player.advance(emd_clips, emw_clips, room_clips);
+            let speed = i32::from(player.move_speed_current as i16);
+            player.locked_step(room, speed);
+            if player.attack_direction == 0 {
+                player.action_state = 8;
+                player.queue_sound(SE_FOOTSTEP);
+            } else {
+                player.attack_direction -= 1;
+            }
+        }
+        8 => {
+            // Release: the port's room probe clears zone flag 0x10 and
+            // `MSF_LADDER_DOWN` and returns the message flag next tick.
+            player.stairs.ladder = false;
+            player.ladder_release = true;
+            player.locked = LockedAction::None;
+            player.action_state = 0;
+            player.move_speed_current = 0;
+            player.attack_direction = 0;
+            player.enter_idle();
+        }
+        _ => {}
+    }
+}
+
+/// State 4 of the ladder climb: the SE schedule, the variant shift and the
+/// per-tick clip advance that ends the state on completion.
+fn ladder_climb_tick(
+    player: &mut PlayerState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    let frame = player.anim.display_frame;
+    if player.stairs.ladder {
+        if frame == LADDER_VARIANT_SHIFT_FRAME {
+            let slide = if player.angle > 0x800 {
+                LADDER_VARIANT_SLIDE
+            } else {
+                -LADDER_VARIANT_SLIDE
+            };
+            player.pos[2] += slide;
+            player.pos[1] = LADDER_VARIANT_HEIGHT;
+        }
+        if frame == LADDER_VARIANT_GRUNT_FRAME {
+            player.queue_sound(SE_LADDER_GRUNT);
+        }
+    } else {
+        let step = LADDER_STEP_FRAMES
+            .get(usize::from(player.move_speed_current))
+            .copied();
+        if step == Some(frame as u8) {
+            player.queue_sound(SE_LADDER_STEP);
+            player.move_speed_current = player.move_speed_current.wrapping_add(1);
+        }
+        if frame == LADDER_CLIMB_END_FRAME {
+            player.queue_sound(SE_LADDER_END);
+        }
+    }
+    if player.advance(emd_clips, emw_clips, room_clips) {
+        player.action_state += 1;
+    }
+}
+
+/// State 5 of the ladder climb: step off the ladder and either release
+/// (variant) or set up the walk-away.
+fn ladder_descend(player: &mut PlayerState) {
+    player.move_speed_current = 0;
+    player.anim.frame = 0;
+    player.anim.display_frame = 0;
+    player.anim.timing = 0;
+    let direction = if player.angle > 0x800 { 1 } else { -1 };
+    let distance = if player.stairs.ladder {
+        LADDER_STEP_OFF_VARIANT
+    } else {
+        LADDER_STEP_OFF
+    };
+    player.pos[2] += direction * distance;
+    player.pos[1] = if player.stairs.ladder {
+        LADDER_VARIANT_HEIGHT
+    } else {
+        0
+    };
+    player.screen_effects.push(ScreenEffect {
+        right: 500,
+        left: 500,
+        front: 700,
+        back: 700,
+    });
+    if player.stairs.ladder {
+        player.action_state = 8;
+    } else {
+        ladder_walk_away_start(player);
+    }
+}
+
+/// State 6: switch to the walk-away clip and start the 15-tick countdown.
+fn ladder_walk_away_start(player: &mut PlayerState) {
+    player.action_state = 7;
+    player.move_speed_current = LADDER_WALK_AWAY_SPEED as u16;
+    player.attack_direction = LADDER_WALK_AWAY_TICKS as i8;
+    player.set_clip(ClipSource::Emw, WALK_CLIP);
+}
+
+/// The original's `entity_rotate_toward_target` for the ladder approach: turn
+/// the facing toward `(target_x, target_z)` by `step`, snapping when the
+/// remaining angle is inside `2*step`.
+fn rotate_toward(player: &mut PlayerState, target_x: i32, target_z: i32, step: u16) {
+    let target =
+        crate::sfx::angle_between_xz(player.pos[0], player.pos[2], target_x, target_z) & 0x0FFF;
+    let delta = step.wrapping_sub(player.angle).wrapping_add(target) & 0x0FFF;
+    if i32::from(delta) < i32::from(step as i16) * 2 {
+        player.angle = target;
+        return;
+    }
+    player.angle = player.angle.wrapping_sub(step) & 0x0FFF;
+    if delta < 0x801 {
+        player.angle = player.angle.wrapping_add(step.wrapping_mul(2)) & 0x0FFF;
+    }
+}
+
 impl PlayerState {
+    /// Drain the camera screen-effect rectangles recorded since the last call.
+    pub fn take_screen_effects(&mut self) -> Vec<ScreenEffect> {
+        std::mem::take(&mut self.screen_effects)
+    }
+
     /// Whether the vault's selected room clip exists and has frames.
     fn vault_clip_present(&self, room_clips: &[Clip]) -> bool {
         room_clips
@@ -1270,9 +1568,11 @@ mod tests {
             push_heavy: false,
             attack_direction: 0,
             move_speed_current: 0,
+            ladder_release: false,
             input: Input::default(),
             sounds: Vec::new(),
             footsteps: Vec::new(),
+            screen_effects: Vec::new(),
         }
     }
 
@@ -2440,6 +2740,221 @@ mod tests {
             "run {} footfalls, walk {}",
             run_ticks.len(),
             walk_ticks.len()
+        );
+    }
+
+    /// Drive a locked ladder climb, collecting every queued sound id and the
+    /// screen-effect records, until control returns.
+    fn ladder_drive(
+        player: &mut PlayerState,
+        room: &RoomState,
+        emd: &[Clip],
+        emw: &[Clip],
+        room_clips: &[Clip],
+        ticks: usize,
+    ) -> (Vec<u16>, Vec<ScreenEffect>, Vec<(usize, u16)>) {
+        let mut sounds = Vec::new();
+        let mut effects = Vec::new();
+        let mut frames = Vec::new();
+        for _ in 0..ticks {
+            let before = player.anim.display_frame;
+            update_with_room(player, room, emd, emw, room_clips, Input::default());
+            frames.push((player.anim.clip, before as u16));
+            sounds.extend(player.take_sounds().into_iter().map(|sound| sound.id));
+            effects.extend(player.take_screen_effects());
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+        (sounds, effects, frames)
+    }
+
+    #[test]
+    fn ladder_plain_climb_plays_the_transcribed_step_frames() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        // The shipped ROOM301 clip 0x33 has 59 frames; frame 0x32 is the sound
+        // cue while the clip's own completion advances the state.
+        let room_clips = room_clips(&[(LADDER_CLIP_PLAIN, 59)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Ladder;
+        player.action_state = 0;
+        player.stairs.base = [100, 0];
+        player.stairs.ladder = false;
+
+        let (sounds, effects, frames) =
+            ladder_drive(&mut player, &room, &emd, &emw, &room_clips, 300);
+
+        assert_eq!(effects.len(), 2, "the climb writes two screen effects");
+        assert_eq!(
+            effects[0],
+            ScreenEffect {
+                right: 800,
+                left: 700,
+                front: 700,
+                back: 700,
+            }
+        );
+        assert_eq!(
+            effects[1],
+            ScreenEffect {
+                right: 500,
+                left: 500,
+                front: 700,
+                back: 700,
+            }
+        );
+        // The step SE fires on the transcribed frames; the end SE on frame 0x32.
+        let step_frames = [12u16, 29, 39];
+        for frame in step_frames {
+            assert!(
+                frames
+                    .iter()
+                    .any(|&(clip, at)| clip == LADDER_CLIP_PLAIN && at == frame),
+                "frame {frame} never displayed"
+            );
+        }
+        let step_count = sounds.iter().filter(|&&id| id == SE_LADDER_STEP).count();
+        assert_eq!(step_count, 3, "step SEs: {sounds:?}");
+        assert!(sounds.contains(&SE_LADDER_END), "end SE: {sounds:?}");
+        assert!(!sounds.contains(&SE_LADDER_GRUNT));
+
+        // The plain step-off is -1000 Z (facing +X) and the walk-away runs
+        // with the entity footstep at frame 8.
+        assert_eq!(player.pos[1], 0, "the plain climb returns to the floor");
+        assert_eq!(player.pos[2], -LADDER_STEP_OFF);
+        assert_eq!(
+            sounds.iter().filter(|&&id| id == SE_FOOTSTEP).count(),
+            2,
+            "walk-away footsteps: {sounds:?}"
+        );
+    }
+
+    #[test]
+    fn ladder_variant_shift_sets_the_height_and_slide() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        let room_clips = room_clips(&[(LADDER_CLIP_VARIANT, 40)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Ladder;
+        player.action_state = 4;
+        player.stairs.ladder = true;
+        player.angle = 0xC00;
+        player.set_clip(ClipSource::Room, LADDER_CLIP_VARIANT);
+        player.anim.display_frame = LADDER_VARIANT_SHIFT_FRAME;
+
+        update_with_room(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &room_clips,
+            Input::default(),
+        );
+        assert_eq!(player.pos[2], LADDER_VARIANT_SLIDE, "the +Z shift");
+        assert_eq!(player.pos[1], LADDER_VARIANT_HEIGHT);
+        assert!(player.take_sounds().is_empty());
+
+        // Frame 0x1A plays the grunt instead of a step SE.
+        player.anim.display_frame = LADDER_VARIANT_GRUNT_FRAME;
+        update_with_room(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &room_clips,
+            Input::default(),
+        );
+        let sounds: Vec<u16> = player.take_sounds().iter().map(|s| s.id).collect();
+        assert_eq!(sounds, [SE_LADDER_GRUNT]);
+    }
+
+    #[test]
+    fn ladder_variant_rides_up_and_releases() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        let room_clips = room_clips(&[(LADDER_CLIP_VARIANT, 40)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Ladder;
+        player.action_state = 0;
+        // Base straight ahead in +Z so the approach keeps the 0xC00 facing.
+        player.stairs.base = [0, 100];
+        player.stairs.ladder = true;
+        player.angle = 0xC00;
+
+        let (sounds, effects, _) = ladder_drive(&mut player, &room, &emd, &emw, &room_clips, 300);
+
+        assert!(sounds.contains(&SE_LADDER_GRUNT), "{sounds:?}");
+        assert!(!sounds.contains(&SE_LADDER_STEP), "variant has no step SE");
+        assert!(!sounds.contains(&SE_LADDER_END), "variant has no end SE");
+        assert_eq!(
+            player.pos[1], LADDER_VARIANT_HEIGHT,
+            "the variant holds the upper height"
+        );
+        // The variant step-off is +2000 Z after the +0x708 shift.
+        assert!(
+            player.pos[2] >= LADDER_VARIANT_SLIDE + LADDER_STEP_OFF_VARIANT,
+            "variant travel {}",
+            player.pos[2]
+        );
+        assert_eq!(effects.len(), 2);
+        assert!(
+            player.ladder_release,
+            "state 8 must raise the release for the room probe"
+        );
+    }
+
+    #[test]
+    fn ladder_state_8_clears_the_variant_and_releases_control() {
+        let room = RoomState::default();
+        let emd = clips();
+        let emw = clips();
+        let room_clips = room_clips(&[(LADDER_CLIP_VARIANT, 40)]);
+        let mut player = player_at(0, 0);
+        player.locked = LockedAction::Ladder;
+        player.action_state = 0;
+        player.stairs.base = [100, 0];
+        player.stairs.ladder = true;
+        player.angle = 0xC00;
+        for _ in 0..300 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emw,
+                &room_clips,
+                Input::default(),
+            );
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+        assert_eq!(player.locked, LockedAction::None);
+        assert!(player.ladder_release);
+        assert!(!player.stairs.ladder, "state 8 clears zone flag 0x10");
+        assert_eq!(player.anim.clip, SETTLE_CLIP);
+        assert_eq!(player.clip_source, ClipSource::Emd);
+    }
+
+    #[test]
+    fn ladder_step_table_records_the_shipped_frames() {
+        assert_eq!(
+            &LADDER_STEP_FRAMES[..4],
+            &[12, 29, 39, 0],
+            "the plain climb's step frames"
+        );
+        assert_eq!(
+            &LADDER_STEP_FRAMES[4..7],
+            &[80, 100, 130],
+            "the longer stair-clip tail"
+        );
+        // The SE ids are the transcribed globals.
+        assert_eq!(
+            (SE_LADDER_STEP, SE_LADDER_END, SE_LADDER_GRUNT),
+            (0x23, 0x2D, 0x17)
         );
     }
 }

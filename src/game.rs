@@ -199,6 +199,9 @@ const MSF_MENU_MODE_ITEMBOX: u8 = 19;
 const MSF_DOOR_TRANSITION: u8 = 24;
 /// `main_state_flags` bit 0x40: `update_room_objects` is pushing an object.
 const MSF_OBJECT_PUSH: u8 = 25;
+/// `main_state_flags` bit 0x10: `set_stairs_zone` saw a ladder entry, so the
+/// action press selects the climb behaviour instead of the stairs/door one.
+const MSF_LADDER_DOWN: u8 = 27;
 /// `main_state_flags` bit 1: the mirror plane is `X = k` (else `Z = k`).
 const MSF_MIRROR_PLANE_X: u8 = 30;
 /// `main_state_flags` bit 0: the mirror pass is enabled.
@@ -869,10 +872,10 @@ pub struct GameState {
     /// Stair/ladder entry latched by `set_stairs_zone` or a stair door.
     pub stair_entry: Option<StairEntryState>,
     /// The stair/ladder climb behaviour is active: the player's collision pass
-    /// is suspended and the facing is held towards the climb target.
+    /// is suspended and the facing is held towards the climb target. Stair
+    /// doors use this latch; the eight-state ladder climb is a player locked
+    /// behaviour and raises only `MSF_LADDER_DOWN`.
     pub stair_climb: bool,
-    /// `main_state_flags` bit 4, raised by `set_stairs_zone` (ladder down).
-    pub ladder_down: bool,
     /// Scripted entities; slot 0 is the player.
     pub entities: [Entity; ENTITY_COUNT],
     /// Per-slot animation clocks for the scripted entities, parallel to
@@ -1013,7 +1016,6 @@ impl Default for GameState {
             stair_height: None,
             stair_entry: None,
             stair_climb: false,
-            ladder_down: false,
             entities: initial_entities(),
             entity_anims: std::array::from_fn(|_| crate::npc::EntityAnim::default()),
             enemy_count: 0,
@@ -2496,21 +2498,29 @@ impl GameState {
         self.stair_height = None;
         self.stair_entry = None;
         self.stair_climb = false;
-        self.ladder_down = false;
+        self.flags[5].apply(MSF_LADDER_DOWN, 1);
         // `player_state_init` clears the zone flags when a room loads.
         self.entities[0].zone_flags = 0;
+    }
+
+    /// Whether the ladder mode flag (`MSF_LADDER_DOWN`) is raised.
+    pub fn ladder_down(&self) -> bool {
+        self.flags[5].bit(MSF_LADDER_DOWN)
     }
 
     /// Copy the stair probe's result onto the visible player: the ramp height
     /// to hold this tick, the latched entry flags and the climb behaviour.
     ///
-    /// The height is applied to `player.pos[1]` immediately, exactly where the
-    /// original's `stairs_height_update` writes `localMatrix.t[1]` and `posY`
-    /// after the frame's movement.
+    /// The zone flags are read live (the original's `set_stairs_zone` writes
+    /// them on the player entity and the ladder's state 3 tests them), while
+    /// the base comes from the latched entry. The height is applied to
+    /// `player.pos[1]` immediately, exactly where the original's
+    /// `stairs_height_update` writes `localMatrix.t[1]` and `posY` after the
+    /// frame's movement.
     pub fn apply_stair_state(&self, player: &mut PlayerState) {
         player.stairs.height = self.stair_height;
-        player.stairs.in_zone = self.stair_entry.is_some();
-        player.stairs.ladder = self.stair_entry.is_some_and(|entry| entry.ladder);
+        player.stairs.in_zone = self.entities[0].zone_flags & 0x20 != 0;
+        player.stairs.ladder = self.entities[0].zone_flags & 0x10 != 0;
         if let Some(entry) = self.stair_entry {
             player.stairs.base = [entry.base_x, entry.base_z];
             if self.stair_climb {
@@ -2545,13 +2555,9 @@ impl GameState {
     ///
     /// Raises zone flag `0x20` (plus `0x10` for the ladder variant), stores the
     /// ladder base in `unk_c6`/`unk_c8`, toggles the entry's own low word so a
-    /// two-way ladder flips ends, and raises the ladder-down state. The
-    /// stair/ladder climb behaviour starts from here.
-    ///
-    /// TODO(parity): (gameplay) the original starts an eight-state climb
-    /// behaviour (walk-up, turn, climb anim 0x33/0x35 with step sounds and a
-    /// camera effect, then descent/step-back states); this latches a target and
-    /// holds the facing until the player is within 900 units.
+    /// two-way ladder flips ends, and raises `MSF_LADDER_DOWN`. The action
+    /// press that ran this handler then selects the climb behaviour; walking
+    /// into the zone no longer starts anything by itself.
     fn apply_stairs_zone(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -2580,8 +2586,7 @@ impl GameState {
             target_x: i32::from(base_x),
             target_z: i32::from(base_z),
         });
-        self.ladder_down = true;
-        self.stair_climb = true;
+        self.flags[5].apply(MSF_LADDER_DOWN, 0);
         if let Some(action) = self.room_actions[usize::from(slot)].as_mut() {
             action.params[2] ^= 1;
         }
@@ -2609,8 +2614,9 @@ impl GameState {
     /// and their bit `0x01` is set. Probe bit `0x40` tests the player position
     /// itself; otherwise a point 600 units in front is tested. Only the first
     /// action-key entry that matches fires, as in the original. Item and door
-    /// actions act for real, stair zones drive the player's height and climb
-    /// state, the menu-driven kinds record a placeholder.
+    /// actions act for real, a stair zone marks the player and raises the
+    /// ladder mode for the press handler in [`GameState::tick_objects`], and
+    /// the menu-driven kinds record a placeholder.
     ///
     /// TODO(parity): (scripting) the original probes bit-0 entries every frame
     /// (mask 1) and bit-2 entries only from the collision pass (mask 4); this
@@ -2623,18 +2629,6 @@ impl GameState {
         // word.
         self.stair_zones = StairZones::collect(&self.room_actions);
         self.stair_height = None;
-        // A ladder climb releases once the player reaches its base, matching
-        // the original climb's 900-unit arrival test.
-        if self.stair_climb
-            && let Some(entry) = self.stair_entry
-        {
-            let dx = pos[0] - entry.target_x;
-            let dz = pos[2] - entry.target_z;
-            if dx * dx + dz * dz < 900 * 900 {
-                self.stair_climb = false;
-            }
-        }
-
         self.probe_actions(pos, angle, 1, pos, action);
     }
 
@@ -2656,6 +2650,10 @@ impl GameState {
         entity_pos: [i32; 3],
         action: bool,
     ) {
+        // The original clears the "action available" bit at the top of every
+        // `update_player_position` pass; `set_stairs_zone` re-raises it when a
+        // zone matches.
+        self.entities[0].zone_flags &= !0x20;
         let (dx, dz) = crate::player::reach_offset(angle);
         let reach = [pos[0] + dx, pos[1], pos[2] + dz];
         let mut action_fired = false;
@@ -2916,6 +2914,15 @@ impl GameState {
     pub fn tick_objects(&mut self, room: &RoomState, player: &mut PlayerState) {
         use crate::objects;
 
+        // A finished ladder climb (state 8) returns the zone flag, the ladder
+        // mode bit and the message flag the climb locked out.
+        if player.ladder_release {
+            player.ladder_release = false;
+            self.entities[0].zone_flags &= !0x10;
+            self.flags[5].apply(MSF_LADDER_DOWN, 1);
+            self.message_flags |= 0x0040;
+        }
+
         // The action press drives `check_climb_object` exactly where the
         // original's input path calls it. A second press mid-climb verifies
         // the facing: settling flips the vault to the return side.
@@ -2931,16 +2938,26 @@ impl GameState {
                     self.entities[0].zone_flags |= 0x10;
                     self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
                 }
-            } else if let Some(candidate) =
-                objects::check_climb_object(&self.objects, player.pos, player.angle)
-            {
-                player.vault_bit = true;
-                player.climb_object = Some(candidate.slot as u8);
-                player.attack_direction = candidate.attack_direction;
-                player.locked = crate::player::LockedAction::Vault;
-                player.action_state = 0;
-                player.move_speed_current = 0;
-                self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
+            } else if player.locked == crate::player::LockedAction::None {
+                if let Some(candidate) =
+                    objects::check_climb_object(&self.objects, player.pos, player.angle)
+                {
+                    player.vault_bit = true;
+                    player.climb_object = Some(candidate.slot as u8);
+                    player.attack_direction = candidate.attack_direction;
+                    player.locked = crate::player::LockedAction::Vault;
+                    player.action_state = 0;
+                    player.move_speed_current = 0;
+                    self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
+                } else if self.entities[0].zone_flags & 0x20 != 0 && self.ladder_down() {
+                    // `player_input_to_behavior`'s zone branch: the action-key
+                    // probe above ran `set_stairs_zone`, so the marked zone and
+                    // ladder mode are live. Without the mode the stair-door
+                    // behaviour (M5's transition) owns the tick.
+                    player.locked = crate::player::LockedAction::Ladder;
+                    player.action_state = 0;
+                    player.move_speed_current = 0;
+                }
             }
         }
 
@@ -6340,8 +6357,9 @@ mod tests {
         assert_eq!(state.entities[0].zone_flags & 0x30, 0x30);
         assert_eq!(state.entities[0].unk_c6, 5000);
         assert_eq!(state.entities[0].unk_c8, 6000);
-        assert!(state.ladder_down);
-        assert!(state.stair_climb);
+        assert!(state.ladder_down());
+        // Marking the zone no longer starts the climb; the action press does.
+        assert!(!state.stair_climb);
         // The entry's own low word toggled, so a two-way ladder flips ends.
         assert_eq!(state.room_actions[2].unwrap().param_word(0), 0);
 
@@ -6384,7 +6402,121 @@ mod tests {
         assert!(!entry.ladder, "variant 0 is not the ladder variant");
         assert_eq!((entry.base_x, entry.base_z), (7, 8));
         assert_eq!(state.entities[0].zone_flags & 0x20, 0x20);
-        assert!(state.ladder_down);
+        assert!(state.ladder_down());
+    }
+
+    #[test]
+    fn the_ladder_zone_marks_on_press_and_starts_the_climb() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // Slot 2, handler 0x0C, action-key probe, ladder variant 1, base
+            // (5000, 6000); the zone covers the reach point at x 1900.
+            host.on_room_action(
+                op(0x0D),
+                &operands(&[2, 1000, 2000, 1000, 1000, 0x0C, 0x81, 1, 5000, 6000]),
+            );
+        }
+        let mut player =
+            crate::player::spawn(RoomId::parse("1000").unwrap(), &RoomState::default());
+        player.pos = [1300, 0, 2500];
+
+        // Walking into the zone does not mark or start anything.
+        state.interact(player.pos, 0, false);
+        assert_eq!(state.entities[0].zone_flags & 0x20, 0);
+        state.tick_objects(&RoomState::default(), &mut player);
+        assert_eq!(player.locked, crate::player::LockedAction::None);
+
+        // The action press runs `set_stairs_zone`; the object pass then starts
+        // the climb because the ladder mode bit is raised.
+        player.input.action_pressed = true;
+        state.interact(player.pos, 0, true);
+        assert_eq!(state.entities[0].zone_flags & 0x30, 0x30);
+        assert!(state.ladder_down());
+        state.tick_objects(&RoomState::default(), &mut player);
+        assert_eq!(player.locked, crate::player::LockedAction::Ladder);
+        assert_eq!(player.action_state, 0);
+
+        // A second press mid-climb neither flips the vault nor restarts.
+        player.input.action_pressed = true;
+        state.tick_objects(&RoomState::default(), &mut player);
+        assert_eq!(player.locked, crate::player::LockedAction::Ladder);
+        assert!(!player.vault_bit);
+    }
+
+    #[test]
+    fn the_ladder_release_returns_the_zone_and_message_flags() {
+        let mut state = game();
+        state.entities[0].zone_flags = 0x30;
+        state.flags[5].apply(MSF_LADDER_DOWN, 0);
+        let mut player =
+            crate::player::spawn(RoomId::parse("1000").unwrap(), &RoomState::default());
+        player.stairs.ladder = true;
+        player.ladder_release = true;
+
+        state.tick_objects(&RoomState::default(), &mut player);
+
+        assert!(!player.ladder_release);
+        assert_eq!(state.entities[0].zone_flags & 0x10, 0);
+        assert!(!state.ladder_down());
+        assert_ne!(state.message_flags & 0x40, 0, "message flag returned");
+    }
+
+    #[test]
+    fn aot_switch_toggles_survive_the_ladder_zone_probe() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // `aot_switch(pad, group, disable)` plus an action-key ladder zone.
+            host.on_misc(op(0x25), &operands(&[0, 3, 0]));
+            host.on_room_action(
+                op(0x0D),
+                &operands(&[2, 1000, 2000, 1000, 1000, 0x0C, 0x81, 1, 5000, 6000]),
+            );
+        }
+        let queued = state.mask_toggles.clone();
+        state.entities[0].pos = [1300, 0, 2500];
+        state.interact(state.entities[0].pos, 0, true);
+        assert_eq!(
+            state.mask_toggles, queued,
+            "the ladder probe must not disturb the mask-group queue"
+        );
+        assert!(state.ladder_down());
+    }
+
+    #[test]
+    fn enter_room_resets_the_ladder_and_object_state() {
+        let mut state = game();
+        state.entities[0].zone_flags = 0x30;
+        state.flags[5].apply(MSF_LADDER_DOWN, 0);
+        state.stair_entry = Some(StairEntryState {
+            slot: 2,
+            ladder: true,
+            base_x: 5,
+            base_z: 6,
+            target_x: 5,
+            target_z: 6,
+        });
+        state.stair_climb = true;
+        state.stair_height = Some(10);
+        state.objects.records = vec![crate::objects::ObjectRecord::default()];
+        state.objects.built = 1;
+
+        state.enter_room(
+            RoomId::parse("1010").unwrap(),
+            &RoomState {
+                omodel_slot_count: 0,
+                ..RoomState::default()
+            },
+        );
+
+        assert_eq!(state.entities[0].zone_flags, 0);
+        assert!(!state.ladder_down());
+        assert!(state.stair_entry.is_none());
+        assert!(!state.stair_climb);
+        assert!(state.stair_height.is_none());
+        assert_eq!(state.objects.built, 0);
+        assert!(state.objects.records.is_empty());
     }
 
     #[test]

@@ -56,6 +56,32 @@ fn tick(
     game.apply_stair_state(player);
 }
 
+/// One engine-ordered tick with the real player clips and the object pass, in
+/// the engine's order: player, room probe, objects, stair hand-off. The
+/// action-key probe is skipped while a locked behaviour owns the tick, exactly
+/// like `engine::tick_room`.
+fn ladder_tick(
+    player: &mut PlayerState,
+    room: &RoomState,
+    game: &mut GameState,
+    emd_clips: &[arklay::model::Clip],
+    emw_clips: &[arklay::model::Clip],
+    input: Input,
+    action: bool,
+) {
+    let room_clips = room
+        .room_anim
+        .as_ref()
+        .map(|anim| anim.clips.as_slice())
+        .unwrap_or(&[]);
+    player::update_with_room(player, room, emd_clips, emw_clips, room_clips, input);
+    game.sync_entity_from_player(player);
+    let probe_action = action && player.locked == player::LockedAction::None;
+    game.interact(player.pos, player.angle, probe_action);
+    game.tick_objects(room, player);
+    game.apply_stair_state(player);
+}
+
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn lab_stairway_ramps_height_up_and_down() {
@@ -191,28 +217,197 @@ fn lab_ladder_zone_latches_flags_and_base() {
     player.angle = 0xC00;
     game.sync_entity_from_player(&player);
     assert!(!player::position_blocked(&room, player.pos, player.radius));
-    tick(&mut player, &room, &mut game, Input::default(), true);
 
+    // Walking into the zone does not mark it: the entry is an action-key
+    // probe, so only a press runs `set_stairs_zone`.
+    tick(&mut player, &room, &mut game, Input::default(), false);
+    assert!(game.stair_entry.is_none());
+    assert_eq!(game.entities[0].zone_flags & 0x20, 0);
+
+    // The press marks the zone and the object pass starts the climb.
+    ladder_tick(
+        &mut player,
+        &room,
+        &mut game,
+        &[],
+        &[],
+        Input {
+            action_pressed: true,
+            ..Input::default()
+        },
+        true,
+    );
     let latched = game.stair_entry.expect("ladder entry latched");
     assert_eq!(latched.slot, 2);
     assert!(latched.ladder);
     assert_eq!((latched.base_x, latched.base_z), (0x56EA, 0x2BD7));
-    assert_eq!(game.entities[0].zone_flags & 0x30, 0x30);
+    // The variant bit survives; the object-side mask-4 pass clears the in-zone
+    // bit 0x20 after the decision, exactly like the original's per-object
+    // `update_player_position` walk.
+    assert_eq!(game.entities[0].zone_flags & 0x10, 0x10);
     assert_eq!(game.entities[0].unk_c6, 0x56EA);
     assert_eq!(game.entities[0].unk_c8, 0x2BD7);
-    assert!(game.ladder_down, "main_state_flags bit 4");
-    assert!(player.stairs.climbing);
-    assert!(player.stairs.in_zone);
+    assert!(game.ladder_down(), "main_state_flags bit 4");
+    assert!(!game.stair_climb, "the ladder climb is a player behaviour");
+    assert_eq!(player.locked, player::LockedAction::Ladder);
     assert_eq!(player.stairs.base, [0x56EA, 0x2BD7]);
+    // The entry's own low word toggled, so the next press flips the end.
+    assert_eq!(game.room_actions[2].unwrap().param_word(0), 0);
+}
 
-    // Reaching the base releases the climb. The 8-state ladder animation is a
-    // later milestone, so only the state hand-off is asserted here.
-    player.pos = [22250, 0, 11223];
-    game.sync_entity_from_player(&player);
-    tick(&mut player, &room, &mut game, Input::default(), false);
-    assert!(!game.stair_climb);
-    assert!(!player.stairs.climbing);
-    assert!(player.stairs.in_zone, "the zone flag itself persists");
+/// The per-tick `(state, display frame, position)` log of one ladder leg.
+type LadderLog = Vec<(u8, usize, [i32; 3])>;
+
+/// Drive one ladder leg from `start_angle` (`x`, `y`, `z`, `angle`): press
+/// action on the first tick and tick until control returns. Returns the queued
+/// sound ids, the recorded screen effects and the per-tick log.
+fn drive_ladder(
+    player: &mut PlayerState,
+    room: &RoomState,
+    game: &mut GameState,
+    emd_clips: &[arklay::model::Clip],
+    emw_clips: &[arklay::model::Clip],
+    start_angle: [i32; 4],
+    ticks: usize,
+) -> (Vec<u16>, Vec<player::ScreenEffect>, LadderLog) {
+    player.pos = [start_angle[0], start_angle[1], start_angle[2]];
+    player.angle = start_angle[3] as u16;
+    game.sync_entity_from_player(player);
+    let mut sounds = Vec::new();
+    let mut effects = Vec::new();
+    let mut log = Vec::new();
+    for tick in 0..ticks {
+        let pressed = tick == 0;
+        let input = Input {
+            action_pressed: pressed,
+            ..Input::default()
+        };
+        ladder_tick(player, room, game, emd_clips, emw_clips, input, pressed);
+        sounds.extend(player.take_sounds().iter().map(|sound| sound.id));
+        effects.extend(player.take_screen_effects());
+        log.push((player.action_state, player.anim.display_frame, player.pos));
+        if tick > 0 && player.locked == player::LockedAction::None {
+            break;
+        }
+    }
+    (sounds, effects, log)
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_301_ladder_climbs_the_shaft_both_ways() {
+    let Some(path) = pack_path() else {
+        return;
+    };
+    let pack = Pack::open(&path).unwrap();
+    let id = RoomId::parse("3010").unwrap();
+    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(bytes, id).unwrap();
+    let scripts = arklay::scd::reader::parse(bytes).unwrap();
+    let mut game = GameState::new(id, &room);
+    assert!(game.apply_flag(0, 47, 0), "scenario flag 47");
+    {
+        let mut vm = CommandVm::new(&scripts);
+        let mut host = ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+    assert!(room.room_anim.is_some(), "ROOM301 room animation pair");
+    let emd = emd::parse(pack.read("player/00.emd").unwrap()).unwrap();
+    let emw = emd::parse_emw(pack.read("player/00.emw").unwrap()).unwrap();
+    let mut player = player::spawn(id, &room);
+
+    // Bottom leg: slot 2's variant zone starts the 0x35 clip, which shifts the
+    // player +0x708 in Z on frame 0x0F, raises the height to 0xA8C and grunts.
+    let start = [22200, 0, 10250];
+    let (sounds, effects, log) = drive_ladder(
+        &mut player,
+        &room,
+        &mut game,
+        &emd.clips,
+        &emw.clips,
+        [start[0], start[1], start[2], 0xC00],
+        400,
+    );
+    assert!(log.iter().any(|&(state, ..)| state >= 4), "never climbed");
+    assert!(log.iter().any(|&(_, frame, _)| frame == 0x0F));
+    assert!(
+        sounds.contains(&player::SE_LADDER_GRUNT),
+        "variant grunt missing: {sounds:?}"
+    );
+    assert!(
+        !sounds.contains(&player::SE_LADDER_STEP),
+        "the variant must not play the plain step SE"
+    );
+    assert_eq!(effects.len(), 2, "two screen-effect writes per climb");
+    assert_eq!(
+        player.pos[1],
+        player::LADDER_VARIANT_HEIGHT,
+        "the variant ride holds the upper height"
+    );
+    assert!(
+        player.pos[2] >= start[2] + player::LADDER_VARIANT_SLIDE + player::LADDER_STEP_OFF_VARIANT,
+        "variant displacement: {:?}",
+        player.pos
+    );
+    assert_eq!(player.locked, player::LockedAction::None);
+    assert!(
+        !player.ladder_release,
+        "the object pass consumed the release"
+    );
+    assert!(!game.ladder_down(), "state 8 cleared the ladder mode");
+    assert_eq!(game.entities[0].zone_flags & 0x10, 0);
+    assert_eq!(
+        game.room_actions[2].unwrap().param_word(0),
+        0,
+        "the entry word toggled"
+    );
+    println!(
+        "ROOM301 bottom (variant 0x35): {start:?} -> {:?}, sounds {sounds:?}, effects {}",
+        player.pos,
+        effects.len()
+    );
+
+    // Top leg: slot 3's plain zone (variant word 0) plays 0x33 with the three
+    // step SEs, the frame 0x32 end SE, the -1000 step-off and the walk-away.
+    let top = [22200, 0, 26100];
+    let (sounds, effects, log) = drive_ladder(
+        &mut player,
+        &room,
+        &mut game,
+        &emd.clips,
+        &emw.clips,
+        [top[0], top[1], top[2], 0x400],
+        400,
+    );
+    assert!(log.iter().any(|&(state, ..)| state >= 4), "never climbed");
+    assert!(log.iter().any(|&(_, frame, _)| frame == 0x32));
+    let steps = sounds
+        .iter()
+        .filter(|&&id| id == player::SE_LADDER_STEP)
+        .count();
+    assert_eq!(steps, 3, "plain step SEs: {sounds:?}");
+    assert!(
+        sounds.contains(&player::SE_LADDER_END),
+        "plain end SE missing: {sounds:?}"
+    );
+    assert!(
+        sounds.contains(&player::SE_FOOTSTEP),
+        "walk-away footstep missing: {sounds:?}"
+    );
+    assert_eq!(effects.len(), 2);
+    assert_eq!(player.pos[1], 0, "the plain descent returns to the floor");
+    assert!(
+        player.pos[2] <= top[2] - player::LADDER_STEP_OFF,
+        "plain step-off: {:?}",
+        player.pos
+    );
+    assert_eq!(game.room_actions[3].unwrap().param_word(0), 1);
+    assert!(!game.ladder_down());
+    println!(
+        "ROOM301 top (plain 0x33): {top:?} -> {:?}, sounds {sounds:?}, effects {}",
+        player.pos,
+        effects.len()
+    );
 }
 
 #[test]

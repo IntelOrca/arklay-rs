@@ -1,4 +1,20 @@
 //! Engine entry point: open a pack, load a room, simulate and display it.
+//!
+//! # M11 deviations
+//!
+//! The world-interaction milestone leaves five deliberate gaps:
+//! - item models (`objtbl_b_set` table 1 and `eml_rot`'s item selector) stay
+//!   typed no-ops, so scripted pick-up models are invisible;
+//! - mirrored effect billboards are not drawn: the mirror pass reflects the
+//!   player/NPC joint meshes only;
+//! - per-texel PSX semi-transparency is absent; a primitive carrying the ABE
+//!   bit uses the flat half blend the effect path already uses;
+//! - the original's stage-5 texture-bank and palette overrides are documented
+//!   no-ops, as is the positional fix-up path; the model's own decoded texture
+//!   is used everywhere;
+//! - the climb's camera screen-effect rectangles are recorded
+//!   ([`crate::player::ScreenEffect`]) but the camera-scroll consumer that
+//!   reads them is not ported.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, c_void};
@@ -2948,9 +2964,11 @@ fn play_player_sounds(
         return;
     };
     for sound in sounds {
-        // TODO(parity): (audio) the grunt (`0x16`/`0x17`) and vault (`0x23`)
-        // ids address the original's global SE bank, which the pack does not
-        // carry; only the entity footstep resolves.
+        // TODO(parity): (audio) the grunt (`0x16`/`0x17`), vault/ladder step
+        // (`0x23`) and climb-end (`0x2D`) ids address the original's global SE
+        // bank, which the pack does not carry; only the entity footstep
+        // resolves. The queue still carries the id and world position, so a
+        // future global-SE bank slots in here.
         if sound.id != player::SE_FOOTSTEP {
             continue;
         }
@@ -3616,10 +3634,14 @@ fn tick_room(
     context.game.tick_effects(context.room);
     // The original runs the room action probe after the player's movement, so
     // `stairs_height_update` measures the frame's final position and the climb
-    // behaviour starts from where the player actually is.
+    // behaviour starts from where the player actually is. The action-key
+    // entries (bit 0x80, including `set_stairs_zone`) belong to the input path:
+    // a locked action behaviour does not read a new press, so the probe sees
+    // only the every-frame entries while the vault/push/ladder owns the tick.
     {
         let mut host = game::ScdGameHost::new(context.game);
-        host.interact(context.player.pos, context.player.angle, action);
+        let probe_action = action && context.player.locked == player::LockedAction::None;
+        host.interact(context.player.pos, context.player.angle, probe_action);
     }
     // The room objects run after the player's physics and the player-side
     // probe: the push probe, the object-side action probe and the climb scan
@@ -6201,6 +6223,65 @@ mod tests {
             1,
             "the character initialised once the window closed"
         );
+    }
+
+    #[test]
+    #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+    fn real_message_freeze_blocks_the_climb_press() {
+        let Ok(pack_path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&pack_path)).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("1070").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        // Stand in reach of the room's climbable ladder, exactly like the
+        // real-asset vault test.
+        let ladder_slot = (0..session.game.objects.records.len())
+            .find(|&slot| {
+                session.game.objects.record(slot).unwrap().flag & objects::OBJECT_FLAG_CLIMBABLE
+                    != 0
+            })
+            .expect("ROOM107 declares a climbable ladder");
+        let ladder = *session.game.objects.record(ladder_slot).unwrap();
+        let angle = (ladder.rotation[1].wrapping_sub(0x800) as u16) & 0x0FFF;
+        let radians = f64::from(angle) * std::f64::consts::TAU / 4096.0;
+        let reach = 300 + i32::from(ladder.half_extents[0]);
+        session.player.angle = angle;
+        session.player.pos = [
+            ladder.pos[0] - (radians.cos() * f64::from(reach)) as i32,
+            0,
+            ladder.pos[2] + (radians.sin() * f64::from(reach)) as i32,
+        ];
+        session.game.sync_entity_from_player(&session.player);
+
+        let press = player::Input {
+            action_pressed: true,
+            action_held: true,
+            ..player::Input::default()
+        };
+
+        // The control bit clear is the message freeze: the press never reaches
+        // the climb scan.
+        session.game.message_flags &= !game::MESSAGE_FLAG_CONTROLS;
+        assert!(session.game.message_locks_controls());
+        session
+            .tick(&pack, UiInput::default(), press, true)
+            .unwrap();
+        assert_eq!(session.player.locked, player::LockedAction::None);
+        assert!(!session.player.vault_bit);
+
+        // Releasing the freeze lets the same press latch the vault.
+        session.game.message_flags |= game::MESSAGE_FLAG_CONTROLS;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), press, true)
+            .unwrap();
+        assert_eq!(session.player.locked, player::LockedAction::Vault);
+        assert!(session.player.vault_bit);
     }
 
     #[test]
