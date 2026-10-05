@@ -235,7 +235,8 @@ fn shipped_sparkle_variety_rooms_pick_their_effect_and_bias() {
     };
     // One room per shipped `0x0F00` nibble (plus the two nonzero bias bytes):
     // the room declares the site, the test reads the spawned billboard back.
-    let cases: [(&str, &[(u8, u8)], u8, u8, i16); 5] = [
+    type Case = (&'static str, &'static [(u8, u8)], u8, u8, i16);
+    let cases: [Case; 5] = [
         ("1000", &[], 0x33, 0x1C, 0),
         ("4091", &[], 0x13, 0x04, -32),
         ("40F0", &[], 0x3D, 0x14, 0),
