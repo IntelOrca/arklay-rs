@@ -22,7 +22,7 @@ use crate::save;
 use crate::state::Image;
 use crate::tim;
 
-use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
 /// Screen origin the original's sprite path adds to every descriptor.
 const SCREEN_ORIGIN_X: i32 = 160;
@@ -198,7 +198,7 @@ impl Screen for TitleScreen {
         Ok(())
     }
 
-    fn update(&mut self, _cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
+    fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
         self.fade = self.fade.saturating_sub(FADE_STEP);
         // TODO(parity): (UI) the original title runs an attract/demo timer
@@ -206,7 +206,8 @@ impl Screen for TitleScreen {
         // fades into the attract demo and back, the selection id cycles
         // NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED submenu), and
         // confirming plays EVIL01. The port waits on PRESS forever with only
-        // the two entries and no cue.
+        // the two entries, but plays EVIL01 on the PRESS dismissal and the
+        // character cue slots on the option moves.
         match self.stage {
             Stage::Press => {
                 self.press_brightness = self
@@ -214,6 +215,7 @@ impl Screen for TitleScreen {
                     .saturating_add(PRESS_RAMP_STEP)
                     .min(PRESS_FULL);
                 if input.any || input.confirm || input.cancel {
+                    cx.play_cue(UiCue::Title);
                     self.stage = Stage::Menu;
                     self.ticks = 0;
                 }
@@ -221,15 +223,19 @@ impl Screen for TitleScreen {
             Stage::Menu => {
                 if input.left {
                     self.move_selection(-1);
+                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.right {
                     self.move_selection(1);
+                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.up {
                     self.move_selection(-1);
+                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.down {
                     self.move_selection(1);
+                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.confirm {
                     let action = match self.selection {
@@ -238,6 +244,7 @@ impl Screen for TitleScreen {
                         _ => Some(ScreenAction::CharSelect),
                     };
                     if let Some(action) = action {
+                        cx.play_cue(UiCue::Decide);
                         self.exit = Some(action);
                         self.stage = Stage::FadeOut;
                     }
@@ -482,6 +489,7 @@ mod tests {
             font: None,
             text: None,
             ticks: 0,
+            cues: Default::default(),
         }
     }
 }

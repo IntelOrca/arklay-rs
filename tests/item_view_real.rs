@@ -39,6 +39,7 @@ fn context<'a>(pack: &'a Pack, text: &'a Text, font: Option<&'a Font>) -> UiCont
         font,
         text: Some(text),
         ticks: 0,
+        cues: Default::default(),
     }
 }
 

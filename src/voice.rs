@@ -2,7 +2,8 @@
 //!
 //! Each 0-based stage selects one of five name rows through an eight-entry
 //! selector: stages 5 and 6 reuse the rows of stages 0 and 1, and stage 7 has
-//! no table at all. `xa_on` (0x1E) resolves its id through the current stage;
+//! no table at all. `voice_play` (0x1E, the original's `xa_on`) resolves its id
+//! through the current stage;
 //! an empty record or an id past the end of the row is silent and the wait
 //! flag is never raised, so a script cannot stall on a missing line.
 

@@ -85,15 +85,40 @@ pub enum ScreenAction {
     Quit,
 }
 
+/// One UI cue a screen asks the app to play after its tick.
+///
+/// Every port screen is silent on its own: it queues a cue through
+/// [`UiContext::play_cue`], and the app resolves and mixes it when an audio
+/// device is open. Captures leave the queue drained and unplayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiCue {
+    /// The title's opening cue (`Evil01`, global bank 12).
+    Title,
+    /// A cursor move (character-table slot 4).
+    Cursor,
+    /// A cancel (character-table slot 5).
+    Cancel,
+    /// A confirm/decide (character-table slot 6).
+    Decide,
+}
+
+impl UiCue {
+    /// The pack `se/` name the cue plays, or `None` when the bank slot is
+    /// empty.
+    pub fn name(self) -> Option<&'static str> {
+        match self {
+            UiCue::Title => crate::sfx::global_sfx(12, 0),
+            UiCue::Cursor => Some(crate::sfx::UI_CURSOR),
+            UiCue::Cancel => Some(crate::sfx::UI_CANCEL),
+            UiCue::Decide => Some(crate::sfx::UI_DECIDE),
+        }
+    }
+}
+
 /// Everything a screen may read while it runs.
 ///
 /// The context is built fresh each tick by the app, so screens never own (or
 /// borrow beyond a call) the pack.
-///
-/// TODO(parity): (UI) the original screens play cursor/confirm/cancel cues from
-/// the SFX banks (title EVIL01, character-select 0/1, menu 4/5/6, save/load
-/// 29/30/31, ...). The context carries no mixer or sound queue, so every port
-/// screen is silent; add an sfx request channel here when UI audio is wired.
 pub struct UiContext<'a> {
     /// The open game pack.
     pub pack: &'a Pack,
@@ -105,6 +130,17 @@ pub struct UiContext<'a> {
     pub text: Option<&'a Text>,
     /// Fixed ticks the app has run, for deterministic animations.
     pub ticks: u64,
+    /// Cues the screen requested this tick; the app drains them after
+    /// [`Screen::update`]. Interior mutability keeps `update`'s `&UiContext`
+    /// borrow (screens only ever push).
+    pub cues: std::cell::RefCell<Vec<UiCue>>,
+}
+
+impl UiContext<'_> {
+    /// Queue one cue for the app to play after this tick.
+    pub fn play_cue(&self, cue: UiCue) {
+        self.cues.borrow_mut().push(cue);
+    }
 }
 
 /// The shared screen contract.
@@ -124,5 +160,18 @@ pub trait Screen {
     /// draws; `0` means fully visible and `255` fully black.
     fn fade(&self) -> u8 {
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cue_names_resolve_to_pack_sounds() {
+        assert_eq!(UiCue::Cursor.name(), Some("cursor"));
+        assert_eq!(UiCue::Cancel.name(), Some("cancel"));
+        assert_eq!(UiCue::Decide.name(), Some("decide"));
+        assert_eq!(UiCue::Title.name(), Some("Evil01"));
     }
 }

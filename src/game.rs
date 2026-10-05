@@ -611,7 +611,7 @@ pub struct Snd3dRequest {
 /// Bytes of the per-stage/room BGM state table (7 stages x 32 rooms).
 pub const ROOM_BGM_LEN: usize = 224;
 
-/// A voice line queued by `xa_on` (0x1E) for the engine's voice cache.
+/// A voice line queued by `voice_play` (0x1E) for the engine's voice cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceRequest {
     /// Voice basename resolved from the stage row, e.g. `V004_00`.
@@ -629,7 +629,7 @@ pub struct VoiceState {
     /// The most recent line the script asked for; the engine takes it on the
     /// next tick and holds it until the voice channel frees up.
     pub request: Option<VoiceRequest>,
-    /// The script (`xa_on` type 2) or `bgm_stop_all` asked the engine to stop
+    /// The script (`voice_play` type 2) or `bgm_stop_all` asked the engine to stop
     /// the active line.
     pub stop_requested: bool,
     /// Names that resolved to nothing (empty record or out-of-range id), kept
@@ -1138,7 +1138,7 @@ pub struct GameState {
     /// Seeded from [`music::ROOM_STATE`] on a new game and restored from a
     /// save; `tbl37_set` writes it at `stage0 * 32 + room`.
     pub room_bgm: [u8; ROOM_BGM_LEN],
-    /// Voice-line state behind the `xa_on` wait handshake.
+    /// Voice-line state behind the `voice_play` wait handshake.
     pub voice: VoiceState,
     /// The player's inventory.
     pub inventory: Vec<InventoryItem>,
@@ -1180,6 +1180,13 @@ pub struct GameState {
     /// state bits. Combat does not raise the aim bits yet, so this stays `0`;
     /// the effect flag-stage behaviours latch it for their follow-on phases.
     pub player_flags: u8,
+    /// The alternate-outfit selector (`g_bCostumeVariant`): `costume_set`
+    /// (0x4F) stores the operand's low bit and `costume_ck` (0x50) tests it.
+    /// The original's `LoadEntityEMD` reads it to pick the alternate player
+    /// model; this port records and branches on the bit, but the alternate
+    /// model load is not wired (documented deviation), so the wardrobe room's
+    /// switch changes the flag without swapping the outfit.
+    pub costume_variant: u8,
     /// The item the inventory cursor last selected.
     pub selected_item: Option<u8>,
     /// The player's maximum health (`max_health >> 2` drives the EKG colour).
@@ -1325,6 +1332,7 @@ impl Default for GameState {
             last_used_item: None,
             equipped: None,
             player_flags: 0,
+            costume_variant: 0,
             selected_item: None,
             max_health: 0,
             health_status: 0,
@@ -1451,7 +1459,7 @@ impl GameState {
 
     /// Whether a voice line is playing (`MSF_VOICE_PLAYING` in flag bank 5).
     ///
-    /// The `xa_on` handler raises the bit when a line is requested and the
+    /// The `voice_play` handler raises the bit when a line is requested and the
     /// engine clears it when the mixer reports the line finished; the event
     /// VM's F7 wait polls this through [`GameState::script_waiting`].
     pub fn voice_playing(&self) -> bool {
@@ -4275,9 +4283,14 @@ impl ScdHost for ScdGameHost<'_> {
                 let max_dist = operand_u16(operands, 2);
                 condition_result(self.state.distance_test(target, max_dist))
             }
-            // TODO(parity): (scripting) conditions 0x38 dpad test, 0x3F player
-            // direction and 0x50 costume variant report false here (recorded
-            // placeholders), so scripts using them always take the else branch.
+            // `costume_ck` (0x50): the original ignores the operand byte and
+            // returns `g_bCostumeVariant`, so the condition is true exactly
+            // when the alternate-outfit bit was set by a preceding
+            // `costume_set`.
+            0x50 => condition_result(self.state.costume_variant & 1 != 0),
+            // TODO(parity): (scripting) conditions 0x38 dpad test and 0x3F
+            // player direction report false here (recorded placeholders), so
+            // scripts using them always take the else branch.
             _ => self.placeholder(op),
         }
     }
@@ -4376,7 +4389,8 @@ impl ScdHost for ScdGameHost<'_> {
                     .show_message(operand_u8(operands, 0), operand_u16(operands, 1));
                 StepResult::Continue
             }
-            // `xa_on` / `voice_play` (0x1E): type 1 queues a voice line, type 2
+            // `voice_play` (0x1E, the original's `xa_on`): type 1 queues a voice
+            // line, type 2
             // stops the active one. Every shipped site is type 1; the type-2
             // path is kept for completeness and for a host-driven stop.
             0x1E => {
@@ -5084,10 +5098,15 @@ impl ScdHost for ScdGameHost<'_> {
             }
             mnemonic if mnemonic.starts_with("act_") => self.state.apply_actor_op(op, operands),
             mnemonic if mnemonic.starts_with("tw_") => self.state.apply_tween_op(op, operands),
-            // TODO(parity): (scripting) 0x0F mirror_set and 0x4F costume
-            // variant set stay placeholders, and `evt_work_set` types 2/3
-            // (object/item models) select no entity, so actor/tween ops aimed
-            // at them do nothing.
+            // `costume_set` (0x4F): store the operand's low bit, the original's
+            // one-byte `g_bCostumeVariant`.
+            "costume_set" => {
+                self.state.costume_variant = operand_u8(operands, 0) & 1;
+                StepResult::Continue
+            }
+            // TODO(parity): (scripting) 0x0F mirror_set stays a placeholder,
+            // and `evt_work_set` types 2/3 (object/item models) select no
+            // entity, so actor/tween ops aimed at them do nothing.
             _ => self.placeholder(op),
         }
     }
@@ -5936,7 +5955,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_type_one_queues_a_line_and_raises_the_wait_bit() {
+    fn voice_play_type_one_queues_a_line_and_raises_the_wait_bit() {
         let mut state = game();
         {
             let mut host = ScdGameHost::new(&mut state);
@@ -5958,7 +5977,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_resolves_each_stage_to_its_row() {
+    fn voice_play_resolves_each_stage_to_its_row() {
         let cases: [(&str, u16, &str); 5] = [
             ("1000", 0, "V001_00"),
             ("2000", 0, "V104_00"),
@@ -5980,7 +5999,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_stage_one_id_0x33_is_mixed_down() {
+    fn voice_play_stage_one_id_0x33_is_mixed_down() {
         let mut state = game();
         {
             let mut host = ScdGameHost::new(&mut state);
@@ -5995,7 +6014,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_empty_records_and_out_of_range_ids_never_raise_the_bit() {
+    fn voice_play_empty_records_and_out_of_range_ids_never_raise_the_bit() {
         // 0-based stage 4 (the guardhouse table) id 181 is an empty record.
         let id = RoomId {
             stage: 5,
@@ -6014,7 +6033,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_type_two_stops_and_clears_the_wait() {
+    fn voice_play_type_two_stops_and_clears_the_wait() {
         let mut state = game();
         {
             let mut host = ScdGameHost::new(&mut state);
@@ -6031,7 +6050,7 @@ mod tests {
     }
 
     #[test]
-    fn xa_on_unknown_types_are_inert() {
+    fn voice_play_unknown_types_are_inert() {
         let mut state = game();
         let before = state.voice;
         let mut host = ScdGameHost::new(&mut state);
@@ -6056,6 +6075,52 @@ mod tests {
         assert!(state.script_waiting());
         state.message.set_menu_choice_id(0x01);
         assert!(!state.script_waiting());
+    }
+
+    #[test]
+    fn costume_set_stores_the_low_bit_and_costume_ck_tests_it() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(host.state().costume_variant, 0);
+            // The condition is false until `costume_set` writes a bit.
+            assert_eq!(
+                host.on_flow(op(0x50), &operands(&[0])),
+                StepResult::Finished
+            );
+            assert_eq!(
+                host.on_misc(op(0x4F), &operands(&[3])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().costume_variant, 1);
+            // `costume_ck` ignores its operand byte.
+            assert_eq!(
+                host.on_flow(op(0x50), &operands(&[0xFF])),
+                StepResult::Continue
+            );
+            // Only the operand's low bit is stored.
+            assert_eq!(
+                host.on_misc(op(0x4F), &operands(&[2])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().costume_variant, 0);
+            assert_eq!(
+                host.on_flow(op(0x50), &operands(&[0])),
+                StepResult::Finished
+            );
+        }
+    }
+
+    #[test]
+    fn costume_ops_do_not_record_placeholders() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_misc(op(0x4F), &operands(&[1]));
+            host.on_flow(op(0x50), &operands(&[0]));
+        }
+        assert!(!state.placeholders.contains_key(&0x4F));
+        assert!(!state.placeholders.contains_key(&0x50));
     }
 
     #[test]

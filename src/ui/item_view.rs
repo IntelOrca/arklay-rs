@@ -32,7 +32,7 @@ use crate::text::Text;
 
 use super::layout;
 use super::main_menu::item_name_bytes;
-use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
 /// Pack path prefix of the shipped item-view models.
 pub const ITEM_MODEL_PREFIX: &str = "item/";
@@ -212,9 +212,11 @@ impl Screen for ItemViewScreen {
         }
 
         if input.cancel {
+            cx.play_cue(UiCue::Cancel);
             return ScreenResult::Done(ScreenAction::Resume);
         }
         if input.confirm {
+            cx.play_cue(UiCue::Decide);
             // TODO(parity): (UI) the original confirm first runs the examine
             // check: for the examinable items it compares the model's current
             // yaw/pitch against the `g_ItemExamineCombos` windows and only
@@ -351,6 +353,7 @@ mod tests {
             font: None,
             text: Some(text),
             ticks: 0,
+            cues: Default::default(),
         }
     }
 

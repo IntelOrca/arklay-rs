@@ -829,7 +829,7 @@ mod tests {
     op!(CK_BITS, 0x38, "ck_bits", true);
     op!(CK_COUNTER, 0x3C, "ck_counter", true);
     op!(CK_TWEEN, 0x3F, "ck_tween", true);
-    op!(XA_FLAG_CK, 0x50, "xa_flag_ck", true);
+    op!(COSTUME_CK, 0x50, "costume_ck", true);
 
     op!(EVT_NOP, 0x00, "evt_nop", false);
     op!(EVT_ACTOR_BEGIN, 0x01, "evt_actor_begin", false);
@@ -1218,7 +1218,7 @@ mod tests {
             (&CK_BITS, "flow"),
             (&CK_COUNTER, "flow"),
             (&CK_TWEEN, "flow"),
-            (&XA_FLAG_CK, "flow"),
+            (&COSTUME_CK, "flow"),
         ];
         for (op, class) in cases {
             let insns = vec![

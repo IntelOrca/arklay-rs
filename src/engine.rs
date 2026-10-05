@@ -201,9 +201,11 @@ pub fn run_with_voice(
             let scripts = Rc::new(loaded.scripts.clone());
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
             let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
-            // Captures stay audio-free: every `xa_on` wait is released as soon
+            // Captures stay audio-free: every `voice_play` wait is released as soon
             // as it is raised, so the frames match the audio-less corpus runs.
             let mut voice_cache = VoiceCache::default();
+            let mut bgm_cache = bgm::BgmCache::default();
+            let mut snd3d_cache = SfxCache::default();
             let mut no_mixer: Option<Mixer> = None;
             for _ in 0..ticks {
                 // TODO(parity): (harness) the transition tick_room returns is
@@ -223,6 +225,14 @@ pub fn run_with_voice(
                     },
                     player::Input::default(),
                 );
+                play_snd3d_requests(
+                    &mut no_mixer,
+                    &mut snd3d_cache,
+                    &pack,
+                    &loaded.room,
+                    &mut game,
+                );
+                bgm::apply_live(&mut no_mixer, &mut game, &mut bgm_cache, &pack, None);
                 tick_voice(&mut no_mixer, &mut voice_cache, &mut game, &pack, None);
                 // No input is fed headlessly, so release a message's menu
                 // choice the way an auto-confirm would; the F7 wait must not
@@ -977,6 +987,7 @@ impl GameSession {
             font: self.font.as_ref(),
             text: Some(&self.text),
             ticks: self.game.frame,
+            cues: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -984,7 +995,7 @@ impl GameSession {
     /// block itself; on completion the engine mirrors the write into the live
     /// state (ribbon and save counter) and resumes gameplay.
     fn tick_save_screen(&mut self, pack: &Pack, ui: UiInput) {
-        let result = {
+        let (result, cues) = {
             let Self {
                 save_screen,
                 save_dir,
@@ -1002,9 +1013,12 @@ impl GameSession {
                 font: font.as_ref(),
                 text: Some(text),
                 ticks: game.frame,
+                cues: std::cell::RefCell::new(Vec::new()),
             };
-            screen.update(&cx, ui)
+            let result = screen.update(&cx, ui);
+            (result, cx.cues.into_inner())
         };
+        self.play_ui_cue_names(pack, cues);
         if result == ScreenResult::Continue {
             return;
         }
@@ -1311,6 +1325,7 @@ impl GameSession {
                     font: font.as_ref(),
                     text: Some(text),
                     ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
                 let fade = screen.fade();
@@ -1376,6 +1391,25 @@ impl GameSession {
     fn update_audio(&mut self) {
         if let Some(mixer) = &mut self.music {
             mixer.update();
+        }
+    }
+
+    /// Play UI cues through the session's own mixer (the typewriter save
+    /// screen runs while the room's mixer is open).
+    fn play_ui_cue_names(&mut self, pack: &Pack, cues: Vec<ui::UiCue>) {
+        if cues.is_empty() {
+            return;
+        }
+        let Some(mixer) = self.music.as_mut() else {
+            return;
+        };
+        for cue in cues {
+            let Some(name) = cue.name() else {
+                continue;
+            };
+            if let Some(wav) = self.sfx_cache.load(pack, name) {
+                mixer.play_sfx(wav, 1.0, 0.0);
+            }
         }
     }
 }
@@ -1472,6 +1506,12 @@ struct App {
     ticks: u64,
     /// Whether entering a game opens the audio device; captures leave it off.
     audio: bool,
+    /// The UI screens' own mixer, opened lazily on the first cue so captures
+    /// and audio-less runs stay silent. Gameplay sessions own a separate
+    /// mixer; UI cues never share it.
+    ui_music: Option<Mixer>,
+    /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
+    ui_sfx_cache: SfxCache,
 }
 
 /// How one app tick ended.
@@ -1506,6 +1546,8 @@ impl App {
             framebuffer: Framebuffer::new(),
             ticks: 0,
             audio,
+            ui_music: None,
+            ui_sfx_cache: SfxCache::default(),
         }
     }
 
@@ -1517,6 +1559,38 @@ impl App {
             font: self.font.as_ref(),
             text: Some(&self.text),
             ticks: self.ticks,
+            cues: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Play the cues a screen queued this tick.
+    ///
+    /// The mixer opens on the first cue and only on the interactive path
+    /// (`audio`); capture runs leave `ui_music` closed and the queue is
+    /// dropped, so their frames never depend on the sound device.
+    fn play_ui_cues(&mut self, cues: Vec<ui::UiCue>) {
+        if cues.is_empty() || !self.audio {
+            return;
+        }
+        if self.ui_music.is_none() {
+            self.ui_music = Mixer::open();
+        }
+        let App {
+            pack,
+            ui_music,
+            ui_sfx_cache,
+            ..
+        } = self;
+        let Some(mixer) = ui_music.as_mut() else {
+            return;
+        };
+        for cue in cues {
+            let Some(name) = cue.name() else {
+                continue;
+            };
+            if let Some(wav) = ui_sfx_cache.load(pack, name) {
+                mixer.play_sfx(wav, 1.0, 0.0);
+            }
         }
     }
 
@@ -1669,64 +1743,76 @@ impl App {
 
     /// Advance the title/select/load screen; Play reports `Continue` here.
     fn screen_update(&mut self, ui: UiInput) -> ScreenResult {
-        let App {
-            pack,
-            save_dir,
-            font,
-            text,
-            mode,
-            ticks,
-            ..
-        } = self;
-        let cx = UiContext {
-            pack,
-            save_dir,
-            font: font.as_ref(),
-            text: Some(text),
-            ticks: *ticks,
-        };
-        match mode {
-            Mode::Title(screen) => screen.update(&cx, ui),
-            Mode::Select(screen) => screen.update(&cx, ui),
-            Mode::Load(screen) => screen.update(&cx, ui),
-            Mode::Play(_) => ScreenResult::Continue,
-        }
-    }
-
-    /// Tick the gameplay session or its modal.
-    fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
-        let App {
-            pack,
-            save_dir,
-            font,
-            text,
-            mode,
-            ticks,
-            ..
-        } = self;
-        let Mode::Play(session) = mode else {
-            return Ok(AppFlow::Continue);
-        };
-        if let Some(modal) = session.modal.as_mut() {
+        let (result, cues) = {
+            let App {
+                pack,
+                save_dir,
+                font,
+                text,
+                mode,
+                ticks,
+                ..
+            } = self;
             let cx = UiContext {
                 pack,
                 save_dir,
                 font: font.as_ref(),
                 text: Some(text),
                 ticks: *ticks,
+                cues: std::cell::RefCell::new(Vec::new()),
             };
-            match modal.update(&cx, ui) {
-                ScreenResult::Done(ScreenAction::Resume) => session.close_modal(),
-                ScreenResult::Done(ScreenAction::Quit) => return Ok(AppFlow::Quit),
-                _ => {}
-            }
-        } else if !session.transition_finished {
-            if session.transition.is_some() {
-                session.tick_transition(pack, action || input.run);
-            } else {
-                session.tick(pack, ui, input, action)?;
+            let result = match mode {
+                Mode::Title(screen) => screen.update(&cx, ui),
+                Mode::Select(screen) => screen.update(&cx, ui),
+                Mode::Load(screen) => screen.update(&cx, ui),
+                Mode::Play(_) => ScreenResult::Continue,
+            };
+            (result, cx.cues.into_inner())
+        };
+        self.play_ui_cues(cues);
+        result
+    }
+
+    /// Tick the gameplay session or its modal.
+    fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
+        let mut cues: Vec<ui::UiCue> = Vec::new();
+        {
+            let App {
+                pack,
+                save_dir,
+                font,
+                text,
+                mode,
+                ticks,
+                ..
+            } = self;
+            let Mode::Play(session) = mode else {
+                return Ok(AppFlow::Continue);
+            };
+            if let Some(modal) = session.modal.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: *ticks,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                };
+                match modal.update(&cx, ui) {
+                    ScreenResult::Done(ScreenAction::Resume) => session.close_modal(),
+                    ScreenResult::Done(ScreenAction::Quit) => return Ok(AppFlow::Quit),
+                    _ => {}
+                }
+                cues = cx.cues.into_inner();
+            } else if !session.transition_finished {
+                if session.transition.is_some() {
+                    session.tick_transition(pack, action || input.run);
+                } else {
+                    session.tick(pack, ui, input, action)?;
+                }
             }
         }
+        self.play_ui_cues(cues);
         Ok(AppFlow::Continue)
     }
 
@@ -1750,6 +1836,7 @@ impl App {
                     font: font.as_ref(),
                     text: Some(text),
                     ticks: *ticks,
+                    cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_to_black(screen.fade());
@@ -1761,6 +1848,7 @@ impl App {
                     font: font.as_ref(),
                     text: Some(text),
                     ticks: *ticks,
+                    cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_to_black(screen.fade());
@@ -1772,6 +1860,7 @@ impl App {
                     font: font.as_ref(),
                     text: Some(text),
                     ticks: *ticks,
+                    cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_to_black(screen.fade());
@@ -1788,6 +1877,7 @@ impl App {
                         font: font.as_ref(),
                         text: Some(text),
                         ticks: *ticks,
+                        cues: std::cell::RefCell::new(Vec::new()),
                     };
                     modal.draw(&cx, framebuffer);
                     let fade = modal.fade();
@@ -1824,6 +1914,10 @@ impl App {
                 session.finish_transition(&self.pack);
             }
             session.update_audio();
+        }
+        // The UI screens' cue mixer streams independently of the gameplay one.
+        if let Some(mixer) = &mut self.ui_music {
+            mixer.update();
         }
     }
 
@@ -2799,8 +2893,12 @@ fn simulate_loaded(
     let mut effect_pages = EffectPageCache::default();
     let mut npc_models = npc::EntityModelCache::default();
     let mut framebuffer = Framebuffer::new();
-    // Headless runs have no device: a voice wait clears the tick it is raised.
+    // Headless runs have no device: a voice wait clears the tick it is raised,
+    // but the BGM state machine, its ramps/fades and the 3D SE dispatch still
+    // run after the scripts exactly like the interactive tick.
     let mut voice_cache = VoiceCache::default();
+    let mut bgm_cache = bgm::BgmCache::default();
+    let mut snd3d_cache = SfxCache::default();
     let mut no_mixer: Option<Mixer> = None;
 
     for tick in 0..ticks {
@@ -2817,6 +2915,14 @@ fn simulate_loaded(
             },
             input(tick),
         );
+        play_snd3d_requests(
+            &mut no_mixer,
+            &mut snd3d_cache,
+            pack,
+            &loaded.room,
+            &mut game,
+        );
+        bgm::apply_live(&mut no_mixer, &mut game, &mut bgm_cache, pack, None);
         tick_voice(&mut no_mixer, &mut voice_cache, &mut game, pack, None);
         // Headless runs feed no input; release a message's menu choice the way
         // an auto-confirm would so a script's F7 cannot stall on it.
@@ -4857,6 +4963,25 @@ mod tests {
             height: HEIGHT as u32,
             rgba,
         }
+    }
+
+    #[test]
+    fn voice_pack_path_auto_discovers_the_sibling_and_honours_the_override() {
+        let dir = TempDir::new();
+        let main = dir.0.join("re1.akpak");
+        std::fs::write(&main, b"pack").unwrap();
+        // No sibling yet: voice-less, silently.
+        assert_eq!(voice_pack_path(&main, None), None);
+        let sibling = dir.0.join("re1.voice.akpak");
+        std::fs::write(&sibling, b"voice").unwrap();
+        assert_eq!(voice_pack_path(&main, None), Some(sibling.clone()));
+        // An explicit path wins, and a missing one resolves to nothing (with
+        // a warning on stderr).
+        assert_eq!(voice_pack_path(&main, Some(&sibling)), Some(sibling));
+        assert_eq!(
+            voice_pack_path(&main, Some(&dir.0.join("absent.akpak"))),
+            None
+        );
     }
 
     #[test]
@@ -7448,6 +7573,7 @@ mod tests {
             font: None,
             text: Some(&session.text),
             ticks: 0,
+            cues: Default::default(),
         };
         assert_eq!(
             modal.update(
@@ -7489,6 +7615,7 @@ mod tests {
             font: None,
             text: Some(&session.text),
             ticks: 0,
+            cues: Default::default(),
         };
         assert_eq!(
             modal.update(

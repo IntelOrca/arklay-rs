@@ -24,7 +24,7 @@ use crate::render::Framebuffer;
 use crate::save::{self, PLAYER_SLOT_COUNT, SAVE_SLOT_COUNT, SaveFile, SaveSlotInfo};
 use crate::state::Image;
 
-use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
 /// Horizontal position of the screen header.
 const HEADER_X: i32 = 0x61;
@@ -382,29 +382,36 @@ impl Screen for SaveLoadScreen {
         match self.stage {
             Stage::Idle => {
                 if input.up {
+                    cx.play_cue(UiCue::Cursor);
                     self.move_cursor(-1);
                 }
                 if input.down {
+                    cx.play_cue(UiCue::Cursor);
                     self.move_cursor(1);
                 }
                 if input.confirm {
+                    cx.play_cue(UiCue::Decide);
                     self.confirm(cx);
                 } else if input.cancel {
+                    cx.play_cue(UiCue::Cancel);
                     self.cancel();
                 }
             }
             Stage::ConfirmOverwrite => {
                 if input.left {
+                    cx.play_cue(UiCue::Cursor);
                     self.confirm_choice = 0;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
                 }
                 if input.right {
+                    cx.play_cue(UiCue::Cursor);
                     self.confirm_choice = 1;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
                 }
                 if input.confirm {
+                    cx.play_cue(UiCue::Decide);
                     if self.confirm_choice == 1 {
                         self.stage = Stage::Idle;
                         self.blink_state = false;
@@ -413,6 +420,7 @@ impl Screen for SaveLoadScreen {
                         self.begin_save(cx);
                     }
                 } else if input.cancel {
+                    cx.play_cue(UiCue::Cancel);
                     self.stage = Stage::Idle;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
@@ -739,6 +747,7 @@ mod tests {
             font: None,
             text: None,
             ticks: 0,
+            cues: Default::default(),
         }
     }
 

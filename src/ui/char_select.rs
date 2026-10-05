@@ -21,7 +21,7 @@ use crate::render::Framebuffer;
 use crate::state::Image;
 use crate::tim;
 
-use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
 /// Screen origin the original's sprite path adds to every descriptor.
 const SCREEN_ORIGIN_X: i32 = 160;
@@ -240,23 +240,26 @@ impl Screen for CharSelectScreen {
         Ok(())
     }
 
-    fn update(&mut self, _cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
+    fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
         // TODO(parity): (UI) the original slides and rescales the two cards
-        // between their front/back positions while the pick changes (and plays
-        // the select cues); the port snaps straight to the end poses.
+        // between their front/back positions while the pick changes; the port
+        // snaps straight to the end poses but plays the select cue slots.
         match self.stage {
             Stage::Idle => {
                 self.fade = self.fade.saturating_sub(8);
                 if input.left || input.right {
+                    cx.play_cue(UiCue::Cursor);
                     self.toggle();
                 }
                 if input.confirm {
+                    cx.play_cue(UiCue::Decide);
                     self.exit = Some(ScreenAction::NewGame {
                         character: self.selected,
                     });
                     self.stage = Stage::FadeOut;
                 } else if input.cancel {
+                    cx.play_cue(UiCue::Cancel);
                     self.exit = Some(ScreenAction::Title);
                     self.stage = Stage::FadeOut;
                 }
@@ -323,6 +326,7 @@ mod tests {
             font: None,
             text: None,
             ticks: 0,
+            cues: Default::default(),
         }
     }
 
@@ -378,6 +382,29 @@ mod tests {
             result,
             ScreenResult::Done(ScreenAction::NewGame { character: 1 })
         );
+    }
+
+    #[test]
+    fn cue_queue_follows_the_input_edges() {
+        let mut screen = CharSelectScreen::new();
+        let cx = context();
+        screen.update(
+            &cx,
+            UiInput {
+                right: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Cursor]);
+        cx.cues.borrow_mut().clear();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Decide]);
     }
 
     #[test]

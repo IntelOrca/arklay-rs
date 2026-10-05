@@ -698,7 +698,7 @@ mod tests {
         assert_eq!(game.bgm.channels[1].name, Some("Se_01"));
         assert_eq!(game.bgm.channels[1].volume, -9999, "the seed loads muted");
 
-        // The script pairs a `se_volume` set on channel 1; it must replace the
+        // The script pairs a `snd_pan_vol_set` set on channel 1; it must replace the
         // seed's -9999 with the pan pair's millibels.
         {
             let mut host = ScdGameHost::new(&mut game);

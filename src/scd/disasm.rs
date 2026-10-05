@@ -68,7 +68,7 @@ const COMMAND_SIG: [&str; 81] = [
     "enemy:euuuuuuIuuIIIuuuu",
     "timer_setup",
     "ck_last_item",
-    "xa_on",
+    "voice_play",
     "obj:uuuIIIIuuuuuuuuuuuuuuuu",
     "dir_set:uIIIIII",
     "pos_set:uIIIIII",
@@ -77,7 +77,7 @@ const COMMAND_SIG: [&str; 81] = [
     "aot_on:usu",
     "aot_switch",
     "",
-    "snd_fadeout:u",
+    "snd_fade_set:u",
     "eml_state:uuuUu",
     "movie_on:u",
     "effect",
@@ -85,7 +85,7 @@ const COMMAND_SIG: [&str; 81] = [
     "remove_item:t",
     "give_item:uuu",
     "",
-    "se_volume",
+    "snd_pan_vol_set",
     "inst_cfg",
     "setw",
     "nop_wide",
@@ -105,20 +105,20 @@ const COMMAND_SIG: [&str; 81] = [
     "obj_xfm",
     "spd_set",
     "effect_kill_b",
-    "se_rate",
+    "bgm_volume_ramp",
     "task_kill",
     "spd_add",
     "msg_list",
     "eml_pos",
     "effect_clear:u",
     "bank_bit:u",
-    "bgm_bank_down:u",
-    "bgm_bank_up:u",
+    "bgm_restore:u",
+    "bgm_stop_all:u",
     "swap_var",
     "objs_hide:u",
     "mass_mask",
-    "xa_flag:u",
-    "xa_flag_ck",
+    "costume_set:u",
+    "costume_ck",
 ];
 
 /// Original-tool display signatures for event state 0 (0x00-0x09).
@@ -786,6 +786,42 @@ mod tests {
 .main
 ";
         assert_eq!(render(&door_scripts(), &[]), expected);
+    }
+
+    #[test]
+    fn audio_and_costume_names_match_the_implemented_handlers() {
+        // M13 renamed these rows to the handlers the port implements; the
+        // opcode table and the original-tool display signatures must agree,
+        // and both the disassembly and the listing must render the new name.
+        let expected: [(u8, &str); 8] = [
+            (0x1E, "voice_play"),
+            (0x27, "snd_fade_set"),
+            (0x2F, "snd_pan_vol_set"),
+            (0x43, "bgm_volume_ramp"),
+            (0x4A, "bgm_restore"),
+            (0x4B, "bgm_stop_all"),
+            (0x4F, "costume_set"),
+            (0x50, "costume_ck"),
+        ];
+        for (op, name) in expected {
+            assert_eq!(
+                command_op(op).unwrap().mnemonic,
+                name,
+                "opcode {op:#04X} mnemonic"
+            );
+            let signature = COMMAND_SIG[usize::from(op)]
+                .split_once(':')
+                .map_or(COMMAND_SIG[usize::from(op)], |(signature, _)| signature);
+            assert_eq!(signature, name, "opcode {op:#04X} display signature");
+
+            let width = command_op(op).unwrap().width.unwrap();
+            let bytes: Vec<u8> = std::iter::once(op)
+                .chain(std::iter::repeat_n(0, width - 1))
+                .collect();
+            let insn = command_insn(0x100, &bytes, Vec::new());
+            let (rendered, _) = format_insn(&insn, EventState::Top, None);
+            assert_eq!(rendered, name, "opcode {op:#04X} renders");
+        }
     }
 
     #[test]

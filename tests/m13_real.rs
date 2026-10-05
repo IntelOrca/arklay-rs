@@ -5,18 +5,22 @@
 //!
 //! Only an unset environment skips; a partial configuration fails loudly. The
 //! conversion test additionally writes a full pack pair and takes minutes.
+//! The deviations documentation test runs without assets.
 
 mod common;
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use arklay::bgm;
 use arklay::convert::{VoicePackOptions, convert_game_with_voice};
+use arklay::engine::simulate_room;
 use arklay::game::{BgmState, GameState, ScdGameHost, Snd3dPos};
 use arklay::message::MessageWindow;
 use arklay::pack::Pack;
+use arklay::player;
 use arklay::save::SaveFile;
 use arklay::scd::host::ScdHost;
 use arklay::scd::ir::{Decoded, Scripts};
@@ -105,7 +109,7 @@ fn room_1000s_opening_lines_resolve_to_v004() {
 
 #[test]
 #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-fn every_shipped_xa_on_resolves_to_a_present_file() {
+fn every_shipped_voice_play_resolves_to_a_present_file() {
     let Some((root, _pack)) = common::asset_env() else {
         return;
     };
@@ -165,12 +169,12 @@ fn every_shipped_xa_on_resolves_to_a_present_file() {
     }
     assert!(
         missing.is_empty(),
-        "{} unresolved xa_on site(s): {:?}",
+        "{} unresolved voice_play site(s): {:?}",
         missing.len(),
         missing
     );
-    assert_eq!(sites, 710, "the shipped corpus has 710 xa_on sites");
-    println!("resolved {sites} xa_on sites");
+    assert_eq!(sites, 710, "the shipped corpus has 710 voice_play sites");
+    println!("resolved {sites} voice_play sites");
 }
 
 #[test]
@@ -182,7 +186,7 @@ fn room_1000_stalls_on_f7_while_a_line_plays() {
     let scripts = room_scripts(&root, "1000");
     let id = RoomId::parse("1000").unwrap();
 
-    // The scripted run: the first xa_on raises the wait bit, and the F7 that
+    // The scripted run: the first voice_play raises the wait bit, and the F7 that
     // follows must hold until the engine clears it.
     let mut game = GameState::new(id, &RoomState::default());
     {
@@ -204,9 +208,9 @@ fn room_1000_stalls_on_f7_while_a_line_plays() {
         }
     }
     assert_eq!(first, Some("V004_00"), "the first line must be V004_00");
-    assert!(game.voice_playing(), "xa_on raised the wait bit");
+    assert!(game.voice_playing(), "voice_play raised the wait bit");
 
-    // Held: the next xa_on must not replace the active line.
+    // Held: the next voice_play must not replace the active line.
     for _ in 0..60 {
         let mut host = ScdGameHost::new(&mut game);
         event_vm.step(&mut host);
@@ -708,7 +712,7 @@ fn room_1050s_muted_seed_fades_up_on_the_scripted_volume() {
     );
     assert_eq!(game.bgm.channels[1].volume, -9999);
 
-    // The room's `se_volume` sites all target the seed channel; replay them.
+    // The room's `snd_pan_vol_set` sites all target the seed channel; replay them.
     let op = command_op(0x2F).unwrap();
     let mut applied = 0usize;
     for insn in scripts
@@ -734,7 +738,7 @@ fn room_1050s_muted_seed_fades_up_on_the_scripted_volume() {
 
 #[test]
 #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-fn room_3030s_fade_and_se_volume_move_the_channel_gains() {
+fn room_3030s_fade_and_pan_volume_move_the_channel_gains() {
     let Some((root, pack_path)) = common::asset_env() else {
         return;
     };
@@ -918,4 +922,195 @@ fn conversion_writes_the_referenced_voice_pack() {
 
     let _ = fs::remove_file(&out);
     let _ = fs::remove_file(&voice_out);
+}
+
+/// The M13 opcodes the audio layer implements. A placeholder hit for any of
+/// these in a shipped room would mean a script reached a handler the milestone
+/// claims to own.
+const IMPLEMENTED_OPCODES: [u8; 12] = [
+    0x15, // bgm_play
+    0x16, // bgm_stop
+    0x17, // se_play_3d
+    0x1E, // voice_play
+    0x27, // snd_fade_set
+    0x2F, // snd_pan_vol_set
+    0x37, // tbl37_set
+    0x43, // bgm_volume_ramp
+    0x4A, // bgm_restore
+    0x4B, // bgm_stop_all
+    0x4F, // costume_set
+    0x50, // costume_ck
+];
+
+/// Every opcode byte that appears in one RDT's init, main or event scripts.
+fn script_opcodes(bytes: &[u8]) -> std::collections::BTreeSet<u8> {
+    let Ok(scripts) = reader::parse(bytes) else {
+        return Default::default();
+    };
+    scripts
+        .init
+        .iter()
+        .chain(&scripts.main)
+        .flat_map(|block| block.insns.iter())
+        .chain(scripts.events.iter().flat_map(|stream| stream.insns.iter()))
+        .map(|insn| insn.op)
+        .collect()
+}
+
+/// Inventory the pack's room entries.
+fn room_ids(pack: &Pack) -> Vec<RoomId> {
+    let mut ids: Vec<RoomId> = pack
+        .paths()
+        .filter(|path| path.starts_with("room/") && path.ends_with(".rdt"))
+        .filter_map(|path| RoomId::parse(&path[5..9]).ok())
+        .collect();
+    ids.sort_by_key(|id| (id.stage, id.room, id.player_flag));
+    ids.dedup_by_key(|id| (id.stage, id.room, id.player_flag));
+    ids
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_m13_corpus_audit_has_no_implemented_placeholders() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let ids = room_ids(&pack);
+    assert!(ids.len() > 300, "expected the shipped room corpus");
+
+    let mut simulated = 0usize;
+    let mut corpus_ops: std::collections::BTreeSet<u8> = Default::default();
+    let mut noops = 0u64;
+    let mut enemy_drops = 0u64;
+    for id in &ids {
+        // 600 ticks per room: long enough for the shipped dialogue, ramp and
+        // fade scenes to finish with the audio state machine running.
+        let Ok(sim) = simulate_room(&pack, *id, 600, player::Input::default()) else {
+            // Stub rooms without camera cuts cannot load.
+            continue;
+        };
+        simulated += 1;
+        if let Ok(bytes) = pack.read(&id.rdt_entry()) {
+            corpus_ops.extend(script_opcodes(bytes));
+        }
+        noops += sim.game.snd3d_noops.values().sum::<u64>();
+        enemy_drops += sim.game.snd3d_enemy_drops;
+        let hits: Vec<(u8, u64)> = IMPLEMENTED_OPCODES
+            .iter()
+            .filter_map(|op| {
+                sim.game
+                    .placeholders
+                    .get(op)
+                    .copied()
+                    .map(|count| (*op, count))
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "ROOM{id:?} dispatched implemented placeholders: {hits:?}"
+        );
+    }
+    println!(
+        "M13 corpus: {simulated} rooms simulated, {noops} audited 3D-SE no-ops, \
+         {enemy_drops} enemy position drops, zero implemented placeholders"
+    );
+    assert!(simulated > 300, "only {simulated} rooms simulated");
+    assert!(
+        enemy_drops <= 80,
+        "more enemy position drops ({enemy_drops}) than shipped sites"
+    );
+
+    // Every implemented opcode must really appear in the shipped scripts; an
+    // entry no room ever decodes would make its placeholder check vacuous.
+    for op in IMPLEMENTED_OPCODES {
+        assert!(
+            corpus_ops.contains(&op),
+            "implemented opcode {op:#04x} never appears in a shipped script; \
+             remove it from IMPLEMENTED_OPCODES"
+        );
+    }
+}
+
+/// Run the CLI capture for one room and return the written bytes.
+fn cli_capture(pack: &Path, room: &str, ticks: u32, extra: &[&str], out: &Path) -> Vec<u8> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arklay"));
+    command
+        .arg(pack)
+        .arg("--room")
+        .arg(room)
+        .arg("--player")
+        .arg("0")
+        .arg("--ticks")
+        .arg(ticks.to_string())
+        .arg("--capture")
+        .arg(out)
+        .env("SDL_AUDIODRIVER", "dummy")
+        .env("SDL_VIDEODRIVER", "dummy");
+    command.args(extra);
+    let status = command.status().expect("spawn arklay");
+    assert!(status.success(), "the CLI capture failed");
+    std::fs::read(out).expect("read the CLI capture")
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_captures_stay_deterministic_and_audio_free() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("arklay-m13-capture-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Two CLI runs with the same arguments are byte-identical.
+    let first = cli_capture(&pack_path, "100", 30, &[], &dir.join("first.bmp"));
+    let second = cli_capture(&pack_path, "100", 30, &[], &dir.join("second.bmp"));
+    assert_eq!(first, second, "two --ticks captures differ");
+
+    // Supplying a voice pack (here the main pack itself, a valid empty voice
+    // source) must not change a frame: the capture path never opens audio.
+    let voice_arg = pack_path.to_string_lossy().into_owned();
+    let with_voice = cli_capture(
+        &pack_path,
+        "100",
+        30,
+        &["--voice", &voice_arg],
+        &dir.join("voice.bmp"),
+    );
+    assert_eq!(first, with_voice, "a voice pack changed the capture");
+
+    // The library seam reproduces the CLI frame exactly (the audio state
+    // machine ran in both).
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1000").unwrap();
+    let captured = arklay::bmp::decode(&first).unwrap();
+    let sim = simulate_room(&pack, id, 30, player::Input::default()).unwrap();
+    assert_eq!(
+        captured.rgba, sim.frame.rgba,
+        "CLI capture != simulated frame"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn integration_deviations_are_documented() {
+    let deviations = include_str!("../docs/m13-deviations.md");
+    for topic in [
+        "Weapon banks",
+        "Enemy position type 2",
+        "Monster-AI room columns",
+        "One-shot vs restart",
+        "Pan law",
+        "Unreferenced voice files",
+        "movie_on",
+        "Costume model swap",
+    ] {
+        assert!(
+            deviations.contains(topic),
+            "the deviations list is missing `{topic}`"
+        );
+    }
 }

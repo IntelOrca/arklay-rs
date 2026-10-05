@@ -459,9 +459,127 @@ static ROOM_SFX: [&[Option<&'static str>]; 15] = [
     &[Some("Ev_ftn01"), Some("Ev_ftn02")], // 14
 ];
 
+/// UI cue names shared by every character table (slots 4/5/6): the port's
+/// screens queue these through [`crate::ui::UiCue`].
+pub const UI_CURSOR: &str = "cursor";
+/// Confirm cue name (see [`UI_CURSOR`]).
+pub const UI_CANCEL: &str = "cancel";
+/// Decide cue name (see [`UI_CURSOR`]).
+pub const UI_DECIDE: &str = "decide";
+
+/// The non-combat global sound banks (`g_st11`..=`g_st15`), one 16-slot row
+/// each. Only the entries the title, character-select, ending and misc screens
+/// name are transcribed; `N` is a silent slot. The rows are indexed by
+/// `bank - 11`, so `global_sfx` accepts bank `11..=15`.
+static GLOBAL_BANKS: [[Option<&'static str>; 16]; 5] = [
+    // 11: Bio (the live-action intro's cue).
+    [
+        Some("Bio01"),
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        Some(UI_CANCEL),
+        Some("type01"),
+        Some("type02"),
+    ],
+    // 12: Evil / title.
+    [
+        Some("Evil01"),
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        Some(UI_CANCEL),
+        Some("type01"),
+        Some("type02"),
+    ],
+    // 13: Select (character-select cursor and decide).
+    [
+        Some("Select06"),
+        Some("Select05"),
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+    ],
+    // 14: Ending.
+    [
+        Some("Ending07"),
+        N,
+        Some("Ending06"),
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        Some(UI_CANCEL),
+        Some("type01"),
+        Some("type02"),
+    ],
+    // 15: Win95 / misc.
+    [
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        N,
+        Some("Win95_mg"),
+        N,
+        N,
+        Some("A_mcn03"),
+        N,
+        N,
+        N,
+        N,
+        N,
+    ],
+];
+
+/// Name in global bank `bank` (`11..=15`), slot `id` (`0..=15`).
+pub fn global_sfx(bank: u8, id: u8) -> Option<&'static str> {
+    let row = GLOBAL_BANKS.get(usize::from(bank.checked_sub(11)?))?;
+    row.get(usize::from(id)).copied().flatten()
+}
+
 /// Every sound effect name shipped in the pack, sorted.
 #[rustfmt::skip]
-pub static SE_NAMES: [&str; 105] = [
+pub static SE_NAMES: [&str; 115] = [
+    "A_mcn03",
+    "Bio01",
     "Ch_ef01",
     "Ch_ef02",
     "Ch_ef03",
@@ -485,6 +603,8 @@ pub static SE_NAMES: [&str; 105] = [
     "Dr_reb02",
     "Dr_wd01",
     "Dr_wd02",
+    "Ending06",
+    "Ending07",
     "Ev_ftn01",
     "Ev_ftn02",
     "Ev_lab01",
@@ -493,6 +613,7 @@ pub static SE_NAMES: [&str; 105] = [
     "Ev_new02",
     "Ev_old01",
     "Ev_old02",
+    "Evil01",
     "Jill01",
     "Jill02",
     "Jill03",
@@ -512,9 +633,12 @@ pub static SE_NAMES: [&str; 105] = [
     "Reb_ef02",
     "Reb_ef03",
     "Reb_ef04",
+    "Select05",
+    "Select06",
     "St_mtl01",
     "St_wcp01",
     "St_wd01",
+    "Win95_mg",
     "call",
     "cancel",
     "cursor",
@@ -567,6 +691,8 @@ pub static SE_NAMES: [&str; 105] = [
     "taore_sp",
     "taore_st",
     "taore_wd",
+    "type01",
+    "type02",
 ];
 
 /// The eight 16-slot character SFX tables (`g_charactersSfxTable`), selected
@@ -614,9 +740,9 @@ static CHARACTER_HEADS: [[Option<&'static str>; 4]; 8] = [
 
 /// Slots 4..=10 shared by every character table.
 static CHARACTER_SHARED: [Option<&'static str>; 7] = [
-    Some("cursor"),
-    Some("cancel"),
-    Some("decide"),
+    Some(UI_CURSOR),
+    Some(UI_CANCEL),
+    Some(UI_DECIDE),
     Some("Chris08"),
     Some("Chris10"),
     Some("Chris09"),
@@ -1118,8 +1244,33 @@ mod tests {
 
     #[test]
     fn se_names_are_sorted_and_unique() {
-        assert_eq!(SE_NAMES.len(), 105);
+        assert_eq!(SE_NAMES.len(), 115);
         assert!(SE_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn global_banks_expose_only_the_named_slots() {
+        // The title/select/ending/bio/misc rows the non-combat screens use.
+        assert_eq!(global_sfx(11, 0), Some("Bio01"));
+        assert_eq!(global_sfx(12, 0), Some("Evil01"));
+        assert_eq!(global_sfx(13, 0), Some("Select06"));
+        assert_eq!(global_sfx(13, 1), Some("Select05"));
+        assert_eq!(global_sfx(14, 0), Some("Ending07"));
+        assert_eq!(global_sfx(14, 2), Some("Ending06"));
+        assert_eq!(global_sfx(15, 7), Some("Win95_mg"));
+        assert_eq!(global_sfx(15, 10), Some("A_mcn03"));
+        for bank in [11, 12, 14] {
+            assert_eq!(global_sfx(bank, 13), Some(UI_CANCEL), "bank {bank}");
+            assert_eq!(global_sfx(bank, 14), Some("type01"), "bank {bank}");
+            assert_eq!(global_sfx(bank, 15), Some("type02"), "bank {bank}");
+        }
+        // Silent slots and out-of-range banks/ids resolve to nothing.
+        assert_eq!(global_sfx(12, 1), None);
+        assert_eq!(global_sfx(13, 2), None);
+        assert_eq!(global_sfx(15, 0), None);
+        assert_eq!(global_sfx(10, 0), None);
+        assert_eq!(global_sfx(16, 0), None);
+        assert_eq!(global_sfx(12, 16), None);
     }
 
     #[test]
