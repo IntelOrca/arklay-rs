@@ -1255,6 +1255,11 @@ pub struct GameState {
     pub npc_placeholders: BTreeMap<u8, u64>,
     /// Event scripts requested by `evt_exec`, consumed by the engine's event VM.
     pub pending_events: Vec<(u8, u8)>,
+    /// Event slots requested by `task_kill` (0x44), consumed by the engine's
+    /// event VM before the next step. The script host cannot reach the VM's
+    /// event slots, so the kill travels through the state like the
+    /// `pending_events` start hand-off.
+    pub pending_event_kills: Vec<u8>,
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
@@ -1385,6 +1390,7 @@ impl Default for GameState {
             placeholders: BTreeMap::new(),
             npc_placeholders: BTreeMap::new(),
             pending_events: Vec::new(),
+            pending_event_kills: Vec::new(),
             entity_sounds: Vec::new(),
             snd3d_requests: Vec::new(),
             snd3d_enemy_drops: 0,
@@ -2312,6 +2318,7 @@ impl GameState {
         self.typewriter = TypewriterFlow::Idle;
         self.last_interaction = None;
         self.pending_events.clear();
+        self.pending_event_kills.clear();
         self.entity_sounds.clear();
         self.snd3d_requests.clear();
     }
@@ -2553,6 +2560,81 @@ impl GameState {
             self.rebuild_slots();
         }
         true
+    }
+
+    /// The original's `item_remove` (0x2C): clear the WHOLE inventory slot
+    /// holding `item` and rearrange the inventory, reporting whether the item
+    /// was held at all.
+    ///
+    /// Unlike [`Self::remove_item`] this ignores quantity, so a zero-quantity
+    /// stack (the starting knife) is cleared too, exactly like the original's
+    /// slot scan. The use/combine paths keep the one-unit consume.
+    pub fn item_remove(&mut self, item: u8) -> bool {
+        let Some(index) = self.inventory.iter().position(|stack| stack.id == item) else {
+            return false;
+        };
+        self.inventory.remove(index);
+        self.rebuild_slots();
+        if self.equipped == Some(item) && !self.inventory.iter().any(|stack| stack.id == item) {
+            self.set_equipped(None);
+        }
+        true
+    }
+
+    /// The original's `item_record_transfer` (0x4C): move a pick-up quantity
+    /// between the room action record in `slot` and the BioCard state byte at
+    /// `field` (the three carried quantities live at 0x20C..0x20E).
+    ///
+    /// The operands are `[mode, slot, field]`. Mode 0 copies the record's
+    /// quantity into the state byte, mode 1 the reverse and mode 2 looks the
+    /// record's item up in the inventory and writes the held quantity into
+    /// both. Every mode is a no-op when its operands cannot be resolved.
+    pub fn transfer_item_record(&mut self, operands: &[Operand]) -> StepResult {
+        let mode = operand_u8(operands, 0);
+        let slot = usize::from(operand_u8(operands, 1));
+        let field = usize::from(operand_u8(operands, 2));
+        let Some(action) = self.room_actions.get(slot).copied().flatten() else {
+            return StepResult::Continue;
+        };
+        match mode {
+            0 => {
+                if let Some(byte) = self.state_bytes.get_mut(field) {
+                    *byte = action.item_quantity();
+                }
+            }
+            1 => {
+                if let Some(&byte) = self.state_bytes.get(field) {
+                    self.set_action_quantity(slot, byte);
+                }
+            }
+            2 => {
+                let held = self
+                    .inventory
+                    .iter()
+                    .find(|stack| stack.id == action.item_id())
+                    .map(|stack| stack.quantity);
+                if let Some(quantity) = held {
+                    if let Some(byte) = self.state_bytes.get_mut(field) {
+                        *byte = quantity;
+                    }
+                    self.set_action_quantity(slot, quantity);
+                }
+            }
+            _ => {}
+        }
+        StepResult::Continue
+    }
+
+    /// Write the retained record quantity of room action `slot`: the item
+    /// operand block's second byte, falling back to the generic params for an
+    /// action that never built an item.
+    fn set_action_quantity(&mut self, slot: usize, quantity: u8) {
+        if let Some(action) = self.room_actions.get_mut(slot).and_then(Option::as_mut) {
+            match action.item_data.as_mut() {
+                Some(data) => data[1] = quantity,
+                None => action.params[1] = quantity,
+            }
+        }
     }
 
     /// `ck_item_count`: no item family table exists yet, so only the exact item
@@ -4677,8 +4759,14 @@ impl ScdHost for ScdGameHost<'_> {
                 self.state.apply_flag(5, MSF_MENU_ITEM_VIEW, 2);
                 StepResult::Finished
             }
-            // TODO(parity): (scripting) 0x44 scd_event_kill (deactivate an event
-            // slot) stays a placeholder.
+            // `task_kill`: deactivate a running event slot. The host cannot
+            // reach the event VM's slots, so the request is queued and the
+            // engine applies it before the next event step, the same hand-off
+            // shape as `evt_exec`.
+            0x44 => {
+                self.state.pending_event_kills.push(operand_u8(operands, 0));
+                StepResult::Continue
+            }
             _ => self.placeholder(op),
         }
     }
@@ -4778,11 +4866,10 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // TODO(parity): (gameplay) 0x2C is the original's `item_remove`, which
-            // clears the WHOLE slot holding the item and rearranges the
-            // inventory; `remove_item` here only takes one unit off the stack.
+            // `item_remove`: clear the whole slot holding the item and
+            // rearrange the inventory (a condition: absent reports false).
             0x2C => {
-                let removed = self.state.remove_item(operand_u8(operands, 0));
+                let removed = self.state.item_remove(operand_u8(operands, 0));
                 condition_result(removed)
             }
             0x1C => self.equipped_test(operands),
@@ -4798,10 +4885,9 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // TODO(parity): (scripting) 0x4C item_record_transfer (moves a
-            // pick-up quantity between a room action record and the BioCard
-            // bytes 0x20C..0x20E) stays a placeholder.
-            0x4C => self.placeholder(op),
+            // `item_record_transfer`: move a pick-up quantity between the room
+            // action record and the BioCard state bytes.
+            0x4C => self.state.transfer_item_record(operands),
             _ => self.placeholder(op),
         }
     }
@@ -6536,16 +6622,15 @@ mod tests {
                 host.on_sound(op(0x26), &operands(&[0])),
                 StepResult::Placeholder
             );
-            assert_eq!(
-                host.on_item(op(0x4C), &operands(&[0, 0, 0])),
-                StepResult::Placeholder
-            );
         }
-        assert_eq!(state.placeholders.len(), 4);
+        assert_eq!(state.placeholders.len(), 3);
         assert_eq!(state.placeholders[&0x2B], 1);
         assert_eq!(state.placeholders[&0x3A], 1);
         assert_eq!(state.placeholders[&0x26], 1);
-        assert_eq!(state.placeholders[&0x4C], 1);
+        assert!(
+            !state.placeholders.contains_key(&0x4C),
+            "0x4C is implemented now"
+        );
     }
 
     #[test]
@@ -8053,6 +8138,8 @@ mod tests {
         state.desk.saved_camera = Some(2);
         state.object_push = true;
         state.flags[5].apply(MSF_OBJECT_PUSH, 0);
+        state.pending_events.push((2, 5));
+        state.pending_event_kills.push(6);
 
         state.enter_room(RoomId::parse("1140").unwrap(), &RoomState::default());
 
@@ -8073,6 +8160,8 @@ mod tests {
         assert_eq!(state.desk, DeskFlow::default());
         assert!(!state.object_push);
         assert!(!state.flags[5].bit(MSF_OBJECT_PUSH));
+        assert!(state.pending_events.is_empty(), "queued starts reset");
+        assert!(state.pending_event_kills.is_empty(), "queued kills reset");
     }
 
     #[test]
@@ -9739,21 +9828,170 @@ mod tests {
             host.on_item(op(0x1C), &operands(&[6])),
             StepResult::Finished
         );
-        assert_eq!(
-            host.on_item(op(0x2C), &operands(&[7])),
-            StepResult::Continue
-        );
-        assert!(host.state().has_item(7));
-        assert_eq!(host.state().item_count(7), 1);
+        // `item_remove` (0x2C) clears the WHOLE slot, not one unit.
         assert_eq!(
             host.on_item(op(0x2C), &operands(&[7])),
             StepResult::Continue
         );
         assert!(!host.state().has_item(7));
+        assert_eq!(host.state().item_count(7), 0);
         assert_eq!(
             host.on_item(op(0x2C), &operands(&[7])),
             StepResult::Finished
         );
+    }
+
+    #[test]
+    fn item_remove_clears_the_whole_slot_and_compacts() {
+        let mut state = game();
+        state.add_item(0x0B, 5);
+        state.add_item(0x41, 1);
+        state.add_item(0x44, 1);
+        state.select_item(Some(0x44));
+        state.set_equipped(Some(0x0B));
+
+        assert!(state.item_remove(0x0B));
+        assert_eq!(
+            state.inventory,
+            vec![
+                InventoryItem {
+                    id: 0x41,
+                    quantity: 1,
+                },
+                InventoryItem {
+                    id: 0x44,
+                    quantity: 1,
+                },
+            ],
+            "the slot is removed and the rest compacts"
+        );
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 2);
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
+            0x44
+        );
+        assert_eq!(state.equipped, None, "the equipped stack was removed");
+        assert!(!state.item_remove(0x0B), "an absent item reports false");
+
+        // The original's slot scan ignores quantity, so the zero-quantity
+        // starting knife is cleared too.
+        state.inventory.push(InventoryItem { id: 1, quantity: 0 });
+        assert!(state.item_remove(1));
+        assert!(state.inventory.iter().all(|stack| stack.id != 1));
+
+        // The one-unit consume stays for the use/combine paths.
+        state.add_item(0x0B, 2);
+        assert!(state.remove_item(0x0B));
+        assert_eq!(state.item_count(0x0B), 1);
+        assert!(state.remove_item(0x0B));
+        assert!(!state.has_item(0x0B));
+    }
+
+    #[test]
+    fn item_remove_keeps_an_equipped_copy_in_another_slot() {
+        let mut state = game();
+        // A spilled stack can leave two stacks of the same item; the equipped
+        // marker only clears when the removal takes the last copy.
+        state.inventory.push(InventoryItem {
+            id: 0x0B,
+            quantity: 5,
+        });
+        state.inventory.push(InventoryItem {
+            id: 0x0B,
+            quantity: 3,
+        });
+        state.rebuild_slots();
+        state.set_equipped(Some(0x0B));
+        assert!(state.item_remove(0x0B));
+        assert_eq!(state.item_count(0x0B), 3);
+        assert_eq!(state.equipped, Some(0x0B), "another stack still holds it");
+    }
+
+    #[test]
+    fn task_kill_queues_the_event_slot() {
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_room_action(op(0x44), &operands(&[3])),
+                StepResult::Continue
+            );
+        }
+        assert_eq!(state.pending_event_kills, vec![3]);
+        assert!(
+            !state.placeholders.contains_key(&0x44),
+            "0x44 must not record a placeholder"
+        );
+    }
+
+    #[test]
+    fn item_record_transfer_moves_quantities_both_ways() {
+        let mut state = item_game("1000", 1);
+        let mut values = item_values(0x20, 0, 0, [1, 2, 3]);
+        values[6] = 3;
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+            let record = host.state().room_actions[0].unwrap();
+            assert_eq!(record.item_id(), 0x20);
+            assert_eq!(record.item_quantity(), 3);
+
+            // mode 0: the record's quantity goes to BioCard 0x20C.
+            assert_eq!(
+                host.on_item(op(0x4C), &operands(&[0, 0, 0x0C])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().state_bytes[0x0C], 3);
+
+            // mode 1: the state byte goes back into the record.
+            host.state_mut().state_bytes[0x0C] = 7;
+            assert_eq!(
+                host.on_item(op(0x4C), &operands(&[1, 0, 0x0C])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().room_actions[0].unwrap().item_quantity(), 7);
+
+            // mode 2: the held quantity lands in both.
+            host.state_mut().add_item(0x20, 5);
+            assert_eq!(
+                host.on_item(op(0x4C), &operands(&[2, 0, 0x0C])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().state_bytes[0x0C], 5);
+            assert_eq!(host.state().room_actions[0].unwrap().item_quantity(), 5);
+
+            // The second carried quantity is a separate byte.
+            assert_eq!(
+                host.on_item(op(0x4C), &operands(&[0, 0, 0x0D])),
+                StepResult::Continue
+            );
+            assert_eq!(host.state().state_bytes[0x0D], 5);
+        }
+
+        // A missing action or an out-of-range field is a quiet no-op.
+        let mut state = game();
+        assert_eq!(
+            state.transfer_item_record(&operands(&[1, 3, 0x0C])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            state.transfer_item_record(&operands(&[0, 3, 0xFF])),
+            StepResult::Continue
+        );
+
+        // mode 2 with the item not held leaves both sides alone.
+        let mut state = item_game("1000", 1);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_item(op(0x18), &operands(&values));
+        }
+        state.state_bytes[0x0C] = 9;
+        assert_eq!(
+            state.transfer_item_record(&operands(&[2, 0, 0x0C])),
+            StepResult::Continue
+        );
+        assert_eq!(state.state_bytes[0x0C], 9);
+        assert_eq!(state.room_actions[0].unwrap().item_quantity(), 3);
     }
 
     #[test]

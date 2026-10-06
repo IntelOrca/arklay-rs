@@ -33,6 +33,8 @@ pub const SAVE_BLOCK_SIZE: usize = 0x800;
 pub const SAVE_LAYOUT_SIZE: usize = 0x41C;
 /// Bytes of the bio-card prefix at the start of the block.
 pub const PREFIX_LEN: usize = 0x200;
+/// BioCard offset the [`GameState`] state image starts at.
+pub const STATE_IMAGE_OFFSET: usize = 0x200;
 /// Number of save slots.
 pub const SAVE_SLOT_COUNT: usize = 8;
 /// Bytes of room-BGM state at the end of the layout.
@@ -52,6 +54,10 @@ pub const SAVE_PREFIX_ENTRY: &str = "data/bio_card.dat";
 pub struct SaveFile {
     /// Bio-card prefix copied verbatim from `data/bio_card.dat`.
     pub prefix: [u8; PREFIX_LEN],
+    /// The 64-byte state image at BioCard 0x200..0x240, copied verbatim. The
+    /// explicit fields below mirror the parts the port owns; the remaining
+    /// bytes (0x208..0x20F, 0x214..0x223) survive only here.
+    pub state_bytes: [u8; STATE_BYTES],
     /// Stage id (0x200).
     pub stage: u8,
     /// Room id (0x201).
@@ -120,6 +126,7 @@ impl Default for SaveFile {
     fn default() -> Self {
         Self {
             prefix: [0; PREFIX_LEN],
+            state_bytes: [0; STATE_BYTES],
             stage: 0,
             room: 0,
             camera: 0,
@@ -156,16 +163,46 @@ impl Default for SaveFile {
 }
 
 impl SaveFile {
+    /// Mirror every field the port owns into [`SaveFile::state_bytes`], so the
+    /// captured image describes exactly what [`SaveFile::to_bytes`] writes and
+    /// a reload followed by a re-capture is identical. The bytes with no
+    /// explicit field (0x208..0x20F, 0x214..0x223) are left untouched.
+    fn sync_state_image(&mut self) {
+        self.state_bytes[0] = self.stage;
+        self.state_bytes[1] = self.room;
+        self.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)] = self.camera;
+        self.state_bytes[usize::from(STATE_BYTE_CUT)] = self.cut;
+        self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = self.menu_choice;
+        self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)] = self.selected_item;
+        self.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)] = self.total_held;
+        self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = self.fwd_action;
+        self.state_bytes[usize::from(STATE_BYTE_ENT_ACTION)] = self.ent_action;
+        self.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = self.used_item;
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = self.picked_item;
+        put_i16(&mut self.state_bytes, 0x1E, self.health);
+        put_u32(&mut self.state_bytes, 0x24, self.timer);
+        self.state_bytes[usize::from(STATE_BYTE_SAVES)] = self.saves;
+        self.state_bytes[usize::from(STATE_BYTE_EQUIPPED)] = self.equipped;
+        self.state_bytes[0x2A] = self.room_item_backup;
+        self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] = self.character;
+        put_i16(&mut self.state_bytes, 0x2C, self.pos_x);
+        put_i16(&mut self.state_bytes, 0x2E, self.pos_z);
+        put_i16(&mut self.state_bytes, 0x30, self.angle);
+        self.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)] = self.health_status;
+        // BioCard 0x234 opens the 32-byte scenario bank 2; its first 12 bytes
+        // fall inside the 0x200..0x240 image.
+        self.state_bytes[0x34..].copy_from_slice(&self.scenario2[..STATE_BYTES - 0x34]);
+    }
+
     /// Capture a game state. The bio-card prefix stays zero until
     /// [`SaveFile::set_prefix`] or [`SaveFile::from_state_with_prefix`].
     ///
-    /// TODO(parity): (save) the original memcpy's the whole 0x41C BioCard block,
-    /// so BioCard 0x208..0x20F (specialRoomLightR, characterModelId,
-    /// scdLastEnemyFlags, bulletEffectId, pickupQtyA/B/C) and the 0x214..0x223
-    /// state words (fading state, special-room light, randSeed, countdown timer,
-    /// health copy, held/pressed d-pad) round-trip through the slot; this layout
-    /// drops them, so a reload loses e.g. the remembered pick-up quantities
-    /// opcode 0x4C moves.
+    /// The whole BioCard state image is captured: the explicit fields mirror
+    /// the parts the port owns and [`SaveFile::state_bytes`] preserves the
+    /// rest, including BioCard 0x208..0x20F (special-room light, character
+    /// model id, last enemy flags, bullet effect id, pickup quantities A/B/C)
+    /// and the 0x214..0x223 words (fade state, light, rand seed, countdown,
+    /// health copy, pad), so the quantities opcode 0x4C moves survive a reload.
     pub fn from_state(state: &GameState) -> Self {
         // BioCard 0x224 is the play-timer snapshot the original mirrors every
         // frame; it lives in the state byte image.
@@ -175,6 +212,7 @@ impl SaveFile {
                 .expect("timer bytes"),
         );
         let mut file = Self {
+            state_bytes: state.state_bytes,
             stage: state.id.stage,
             room: state.id.room,
             camera: state.camera.current_cut.min(0xFF) as u8,
@@ -190,6 +228,7 @@ impl SaveFile {
             timer,
             saves: state.state_bytes[usize::from(STATE_BYTE_SAVES)],
             equipped: state.equipped.unwrap_or(0),
+            room_item_backup: state.state_bytes[0x2A],
             character: state.state_bytes[usize::from(STATE_BYTE_CHARACTER)],
             pos_x: state.entities[0].pos[0] as i16,
             pos_z: state.entities[0].pos[2] as i16,
@@ -210,6 +249,7 @@ impl SaveFile {
         for (slot, stack) in file.player_slots.iter_mut().zip(state.inventory.iter()) {
             *slot = *stack;
         }
+        file.sync_state_image();
         file
     }
 
@@ -287,7 +327,10 @@ impl SaveFile {
         state.bgm = BgmState::default();
         state.voice = VoiceState::default();
 
-        state.state_bytes = [0; STATE_BYTES];
+        // The saved image comes first; the explicit fields below restate the
+        // bytes the port owns, exactly like the original's prefix-then-fields
+        // memcpy.
+        state.state_bytes = self.state_bytes;
         state.state_bytes[0] = self.stage;
         state.state_bytes[1] = self.room;
         state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)] = self.camera;
@@ -315,6 +358,10 @@ impl SaveFile {
     pub fn to_bytes(&self) -> [u8; SAVE_BLOCK_SIZE] {
         let mut bytes = [0u8; SAVE_BLOCK_SIZE];
         bytes[..PREFIX_LEN].copy_from_slice(&self.prefix);
+        // The whole state image goes down first; the explicit field writes
+        // below restate the bytes the port owns and the rest survives verbatim.
+        bytes[STATE_IMAGE_OFFSET..STATE_IMAGE_OFFSET + STATE_BYTES]
+            .copy_from_slice(&self.state_bytes);
         bytes[0x200] = self.stage;
         bytes[0x201] = self.room;
         bytes[0x202] = self.camera;
@@ -366,6 +413,9 @@ impl SaveFile {
         }
         let mut file = Self {
             prefix: bytes[..PREFIX_LEN].try_into().expect("prefix bytes"),
+            state_bytes: bytes[STATE_IMAGE_OFFSET..STATE_IMAGE_OFFSET + STATE_BYTES]
+                .try_into()
+                .expect("state bytes"),
             stage: bytes[0x200],
             room: bytes[0x201],
             camera: bytes[0x202],
@@ -590,6 +640,7 @@ mod tests {
         for (index, byte) in file.room_bgm.iter_mut().enumerate() {
             *byte = (index as u8).wrapping_mul(3);
         }
+        file.sync_state_image();
         file
     }
 
@@ -647,6 +698,89 @@ mod tests {
         let file = filled();
         let bytes = file.to_bytes();
         assert_eq!(SaveFile::from_bytes(&bytes).unwrap(), file);
+    }
+
+    #[test]
+    fn state_image_offsets_match_the_bio_card_layout() {
+        assert_eq!(STATE_IMAGE_OFFSET, 0x200);
+        assert_eq!(STATE_IMAGE_OFFSET + 0x0C, 0x20C, "pickup quantity A");
+        assert_eq!(STATE_IMAGE_OFFSET + 0x0E, 0x20E, "pickup quantity C");
+        assert_eq!(STATE_IMAGE_OFFSET + 0x14, 0x214, "first dropped word");
+        assert_eq!(STATE_IMAGE_OFFSET + 0x23, 0x223, "last dropped word");
+        assert_eq!(STATE_IMAGE_OFFSET + STATE_BYTES, 0x240);
+    }
+
+    #[test]
+    fn state_image_round_trips_the_dropped_bio_card_bytes() {
+        let mut state = GameState::new(RoomId::parse("11C1").unwrap(), &RoomState::default());
+        // 0x208..0x20F: special-room light, character model id, last enemy
+        // flags, bullet effect id and the three pickup quantities.
+        state.state_bytes[0x08..0x10].copy_from_slice(&[0x21, 0x02, 0x43, 0x04, 0x05, 7, 240, 240]);
+        // 0x214..0x21D and 0x220..0x223: fade state, light, rand seed,
+        // countdown and the held/pressed pad words (0x21E is the health copy,
+        // owned by the explicit field).
+        for (index, byte) in state.state_bytes[0x14..0x1E].iter_mut().enumerate() {
+            *byte = 0x30 + index as u8;
+        }
+        for (index, byte) in state.state_bytes[0x20..0x24].iter_mut().enumerate() {
+            *byte = 0x50 + index as u8;
+        }
+        state.entities[0].health = 0x1234;
+        state.state_bytes[0x2A] = 0x5C;
+
+        let file = SaveFile::from_state(&state);
+        assert_eq!(
+            &file.state_bytes[0x08..0x10],
+            &state.state_bytes[0x08..0x10]
+        );
+        let bytes = file.to_bytes();
+        assert_eq!(
+            &bytes[0x208..0x210],
+            &state.state_bytes[0x08..0x10],
+            "the prefix rides the block verbatim"
+        );
+        assert_eq!(&bytes[0x214..0x21E], &state.state_bytes[0x14..0x1E]);
+        assert_eq!(&bytes[0x220..0x224], &state.state_bytes[0x20..0x24]);
+        assert_eq!(
+            &bytes[0x21E..0x220],
+            &0x1234i16.to_le_bytes(),
+            "health copy"
+        );
+        assert_eq!(bytes[0x22A], 0x5C, "room-item backup");
+
+        let parsed = SaveFile::from_bytes(&bytes).unwrap();
+        let mut restored = GameState::default();
+        parsed.apply_to(&mut restored);
+        assert_eq!(
+            &restored.state_bytes[0x08..0x10],
+            &state.state_bytes[0x08..0x10]
+        );
+        assert_eq!(
+            &restored.state_bytes[0x14..0x1E],
+            &state.state_bytes[0x14..0x1E]
+        );
+        assert_eq!(
+            &restored.state_bytes[0x20..0x24],
+            &state.state_bytes[0x20..0x24]
+        );
+        assert_eq!(restored.state_bytes[0x2A], 0x5C);
+        assert_eq!(SaveFile::from_state(&restored), file);
+    }
+
+    #[test]
+    fn old_slots_load_every_state_image_byte_as_written() {
+        // A pre-M15 writer never touched 0x208..0x20F and 0x214..0x223, so an
+        // old slot loads them zero instead of failing.
+        let file = filled();
+        let mut bytes = file.to_bytes();
+        bytes[0x208..0x210].fill(0);
+        bytes[0x214..0x21E].fill(0);
+        bytes[0x220..0x224].fill(0);
+        let parsed = SaveFile::from_bytes(&bytes).unwrap();
+        assert!(parsed.state_bytes[0x08..0x10].iter().all(|&byte| byte == 0));
+        assert!(parsed.state_bytes[0x14..0x1E].iter().all(|&byte| byte == 0));
+        assert!(parsed.state_bytes[0x20..0x24].iter().all(|&byte| byte == 0));
+        assert_eq!(parsed.prefix, file.prefix);
     }
 
     #[test]

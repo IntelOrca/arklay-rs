@@ -13,7 +13,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use arklay::convert;
-use arklay::engine::simulate_room;
+use arklay::engine::{NEW_GAME_ROOM_ITEMS, simulate_room, simulate_room_seeded};
+use arklay::game::FlagBank;
 use arklay::manifest;
 use arklay::pack::{Pack, PackWriter};
 use arklay::player;
@@ -73,6 +74,18 @@ fn collect_rdts(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 
 /// One stream's body: `(kind, block sizes, instruction bytes, trailing)`.
 type StreamBody = (String, Vec<u16>, Vec<u8>, Vec<u8>);
+
+/// Every room identity the pack ships, sorted and deduplicated.
+fn room_ids(pack: &Pack) -> Vec<RoomId> {
+    let mut ids: Vec<RoomId> = pack
+        .paths()
+        .filter(|path| path.starts_with("room/") && path.ends_with(".rdt"))
+        .filter_map(|path| RoomId::parse(&path[5..9]).ok())
+        .collect();
+    ids.sort_by_key(|id| (id.stage, id.room, id.player_flag));
+    ids.dedup_by_key(|id| (id.stage, id.room, id.player_flag));
+    ids
+}
 
 /// The stream bodies of `scripts`, ignoring the absolute offsets a container
 /// lays the streams out at.
@@ -297,6 +310,89 @@ fn layer_shadows_real_entries_and_no_mod_is_identical() {
     let layered_run = simulate_room(&plain, id, 30, player::Input::default()).unwrap();
     assert_eq!(plain_run.frame.rgba, layered_run.frame.rgba);
     assert_eq!(plain_run.baseline.rgba, layered_run.baseline.rgba);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn rider_opcodes_execute_without_placeholders() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+
+    // List the rooms whose scripts carry each rider opcode, so any capture
+    // hash that changes can be scoped to the rooms that execute it.
+    let mut files = Vec::new();
+    collect_rdts(&root, &mut files);
+    files.sort();
+    let riders = [0x2Cu8, 0x44, 0x4C];
+    let mut carrying: BTreeMap<u8, BTreeSet<String>> = BTreeMap::new();
+    for path in &files {
+        let data = fs::read(path).unwrap();
+        if data.len() <= 4 {
+            continue;
+        }
+        let scripts = scd::reader::parse(&data).unwrap();
+        let mut opcodes = BTreeSet::new();
+        for insn in scripts
+            .init
+            .iter()
+            .chain(&scripts.main)
+            .flat_map(|block| &block.insns)
+            .chain(scripts.events.iter().flat_map(|stream| &stream.insns))
+        {
+            opcodes.insert(insn.op);
+        }
+        for op in riders {
+            if opcodes.contains(&op) {
+                carrying
+                    .entry(op)
+                    .or_default()
+                    .insert(path.file_stem().unwrap().to_string_lossy().into_owned());
+            }
+        }
+    }
+    for op in riders {
+        println!(
+            "{op:#04x} carried by: {:?}",
+            carrying
+                .get(&op)
+                .map(|rooms| rooms.iter().collect::<Vec<_>>())
+        );
+    }
+    assert!(carrying.contains_key(&0x2C), "item_remove ships");
+    assert!(carrying.contains_key(&0x44), "task_kill ships");
+    let transfers = carrying.get(&0x4C).expect("item_record_transfer ships");
+    for room in ["ROOM1160", "ROOM30B0", "ROOM3080"] {
+        assert!(transfers.contains(room), "{room} uses item_record_transfer");
+    }
+
+    // Run the corpus with the new-game room-items bank and the
+    // second-playthrough bit, so the gated scripts execute; a rider opcode
+    // still implemented as a placeholder records a hit the moment it runs.
+    let mut bank = FlagBank::new();
+    bank.bytes_mut().copy_from_slice(&NEW_GAME_ROOM_ITEMS);
+    let mut flags: Vec<(u8, u8)> = (0..=255u16)
+        .filter(|bit| bank.bit(*bit as u8))
+        .map(|bit| (7, bit as u8))
+        .collect();
+    flags.push((0, 0x7B));
+
+    let mut simulated = 0usize;
+    for id in room_ids(&pack) {
+        let Ok(sim) = simulate_room_seeded(&pack, id, &flags, 120, player::Input::default()) else {
+            continue;
+        };
+        simulated += 1;
+        for op in riders {
+            if let Some(count) = sim.game.placeholders.get(&op) {
+                panic!("ROOM{id:?} dispatched rider {op:#04x} {count} times");
+            }
+        }
+    }
+    assert!(simulated > 300, "the corpus should run, saw {simulated}");
 }
 
 #[test]

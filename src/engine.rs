@@ -4753,6 +4753,15 @@ fn start_pending_events(game: &mut game::GameState, event_vm: &mut scd::vm::Even
     }
 }
 
+/// Apply every event kill requested by `task_kill` (0x44) in the command
+/// scripts. This runs after the command pass and before the event VM steps, so
+/// a queue-and-kill pair in one frame leaves the slot dead before it can run.
+fn apply_pending_event_kills(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm) {
+    for slot in game.pending_event_kills.drain(..) {
+        event_vm.kill(usize::from(slot));
+    }
+}
+
 /// The mutable state one simulated tick works on.
 struct RoomContext<'a> {
     room: &'a mut RoomState,
@@ -4792,6 +4801,7 @@ fn tick_room(
         command_vm.run_main(&mut host);
     }
     start_pending_events(context.game, event_vm);
+    apply_pending_event_kills(context.game, event_vm);
     {
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
@@ -6316,6 +6326,77 @@ mod tests {
         assert_eq!(player_state.angle, 1024);
         assert!(game.doors[0].is_none());
         assert!(game.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn pending_task_kills_deactivate_slots_before_the_next_step() {
+        use crate::scd::host::PlaceholderHost;
+        use crate::scd::ir::{Decoded, Insn, Operand, Scripts, Stream, StreamKind};
+        use crate::scd::opcode::{Op, event_control_op};
+
+        fn insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+            Insn {
+                offset,
+                op: op.op,
+                bytes: vec![op.op; len],
+                decoded: Decoded::Event(op),
+                operands: values
+                    .iter()
+                    .map(|&value| Operand {
+                        value,
+                        target: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        let sleep = event_control_op(0xF8).unwrap();
+        let sleep_tick = event_control_op(0xF9).unwrap();
+        let finish = event_control_op(0xFF).unwrap();
+        // Event 0 sleeps essentially forever; event 1 finishes at once.
+        let scripts = Scripts {
+            events: vec![
+                Stream {
+                    kind: StreamKind::Event(0),
+                    offset: 0,
+                    insns: vec![
+                        insn(0x6000, sleep, 4, &[0xF9, 0x7FFF]),
+                        insn(0x6004, sleep_tick, 1, &[]),
+                        insn(0x6005, finish, 1, &[]),
+                    ],
+                    trailing: Vec::new(),
+                },
+                Stream {
+                    kind: StreamKind::Event(1),
+                    offset: 0,
+                    insns: vec![insn(0x7000, finish, 1, &[])],
+                    trailing: Vec::new(),
+                },
+            ],
+            ..Scripts::default()
+        };
+
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+        event_vm.start(3, 0);
+        event_vm.start(4, 1);
+        assert_eq!(event_vm.active_slots(), 2);
+
+        let mut game = game::GameState::default();
+        game.pending_event_kills.extend([3, 3, 9]);
+        apply_pending_event_kills(&mut game, &mut event_vm);
+        assert!(
+            game.pending_event_kills.is_empty(),
+            "the kill queue drains once"
+        );
+        assert!(!event_vm.kill(3), "a repeated kill is a no-op");
+        assert!(!event_vm.kill(9), "an out-of-range slot is a no-op");
+
+        event_vm.step(&mut PlaceholderHost);
+        assert_eq!(
+            event_vm.active_slots(),
+            0,
+            "the killed sleeping slot must not run"
+        );
     }
 
     #[test]

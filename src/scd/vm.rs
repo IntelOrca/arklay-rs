@@ -237,6 +237,19 @@ impl EventVm {
         self.restart(target, event, false);
     }
 
+    /// Deactivate event slot `slot`, the effect of the command VM's
+    /// `task_kill` (0x44). Returns whether the slot was active, so a repeated
+    /// kill or an out-of-range slot is a no-op.
+    pub fn kill(&mut self, slot: usize) -> bool {
+        match self.slots.get_mut(slot) {
+            Some(entry) if entry.active => {
+                entry.active = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Step every active slot once.
     pub fn step(&mut self, host: &mut impl ScdHost) {
         for index in 0..SLOT_COUNT {
@@ -1343,6 +1356,27 @@ mod tests {
         let mut host = RecordingHost::default();
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
+    }
+
+    #[test]
+    fn kill_deactivates_a_slot_and_is_idempotent() {
+        let scripts = event_scripts(vec![
+            vec![control(0x2000, &EVT_FINISH, 1, Vec::new())],
+            vec![control(0x3000, &EVT_FINISH, 1, Vec::new())],
+        ]);
+        let mut vm = EventVm::new(&scripts);
+        vm.start(0, 0);
+        vm.start(1, 1);
+        assert_eq!(vm.active_slots(), 2);
+
+        assert!(vm.kill(0));
+        assert_eq!(vm.active_slots(), 1);
+        assert!(!vm.kill(0), "a repeated kill is a no-op");
+        assert!(!vm.kill(8), "an out-of-range slot is a no-op");
+
+        let mut host = RecordingHost::default();
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 0, "the surviving slot ran to finish");
     }
 
     #[test]
