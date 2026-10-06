@@ -161,6 +161,10 @@ enum Command {
         /// Output directory (created if needed)
         #[arg(long, short, value_name = "OUT_DIR")]
         out: PathBuf,
+
+        /// Mod pack layers to apply, repeatable
+        #[arg(long = "mod", value_name = "PATH")]
+        mods: Vec<PathBuf>,
     },
 
     /// List every entry of a game pack with its size
@@ -168,12 +172,40 @@ enum Command {
         /// Game pack to read
         #[arg(value_name = "PACK")]
         pack: PathBuf,
+
+        /// Mod pack layers to apply, repeatable
+        #[arg(long = "mod", value_name = "PATH")]
+        mods: Vec<PathBuf>,
     },
 
     /// Script tools
     Scd {
         #[command(subcommand)]
         action: ScdAction,
+    },
+
+    /// Mod authoring tools
+    Mod {
+        #[command(subcommand)]
+        action: ModAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ModAction {
+    /// Build a mod source directory into an .akpak mod pack
+    Build {
+        /// Mod source directory, which must hold manifest.toml
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+
+        /// Output mod pack path
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+
+        /// Base pack checking the declared base id and the override paths
+        #[arg(long, value_name = "PATH")]
+        base: Option<PathBuf>,
     },
 }
 
@@ -223,12 +255,39 @@ fn export_scd(rdt: &std::path::Path, out: &std::path::Path, list: bool) -> Resul
     Ok(())
 }
 
+/// Build a mod source directory and print its summary and aggregated warnings.
+fn build_mod_pack(dir: &Path, out: &Path, base: Option<&Path>) -> Result<()> {
+    let summary = arklay::modding::build_mod(dir, out, base)?;
+    for warning in &summary.warnings {
+        println!("warning: {warning}");
+    }
+    println!(
+        "built {} ({} entries, {} bytes)",
+        out.display(),
+        summary.entries.len(),
+        summary.bytes
+    );
+    Ok(())
+}
+
+/// Open `pack_path`, applying the `mods` layers and printing their warnings.
+fn open_game_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<Pack> {
+    if mods.is_empty() {
+        return Pack::open(pack_path);
+    }
+    let pack = Pack::open_layered(pack_path, mods)?;
+    for warning in pack.warnings() {
+        println!("warning: {warning}");
+    }
+    Ok(pack)
+}
+
 /// Extract every entry of `pack_path` below `out_dir`, preserving paths.
 ///
 /// The pack reader validates every entry path, so no file can be written
 /// outside `out_dir`.
-fn extract_pack(pack_path: &Path, out_dir: &Path) -> Result<()> {
-    let pack = Pack::open(pack_path)?;
+fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()> {
+    let pack = open_game_pack(pack_path, mods)?;
     let mut progress = Progress::new();
     progress.begin("extract", pack.len() as u64, "files");
 
@@ -271,8 +330,8 @@ fn write_list(pack: &Pack, out: &mut impl Write) -> Result<(u64, u64)> {
 }
 
 /// Print every entry of `pack_path` and a final count/bytes summary.
-fn list_pack(pack_path: &Path) -> Result<()> {
-    let pack = Pack::open(pack_path)?;
+fn list_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
+    let pack = open_game_pack(pack_path, mods)?;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     let (count, bytes) = write_list(&pack, &mut out)?;
@@ -319,10 +378,13 @@ fn main() -> Result<()> {
                 &movie,
             )
         }
-        Some(Command::Extract { pack, out }) => extract_pack(&pack, &out),
-        Some(Command::List { pack }) => list_pack(&pack),
+        Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
+        Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
         Some(Command::Scd { action }) => match action {
             ScdAction::Export { rdt, out, list } => export_scd(&rdt, &out, list),
+        },
+        Some(Command::Mod { action }) => match action {
+            ModAction::Build { dir, out, base } => build_mod_pack(&dir, &out, base.as_deref()),
         },
         None => {
             let Some(pack) = cli.pack else {
@@ -430,7 +492,7 @@ mod tests {
         let pack = sample_pack(&pack_path);
 
         let out = dir.path.join("out");
-        extract_pack(&pack_path, &out).unwrap();
+        extract_pack(&pack_path, &out, &[]).unwrap();
 
         for entry in pack.entries() {
             let extracted = fs::read(out.join(entry.path())).unwrap();
@@ -453,7 +515,7 @@ mod tests {
 
         let dir = TempDir::new("real-extract");
         let out = dir.path.join("out");
-        extract_pack(&pack_path, &out).unwrap();
+        extract_pack(&pack_path, &out, &[]).unwrap();
 
         for sample in ["room/1001.rdt", "roomcut/100_000.bmp", "bgm/013.wav"] {
             let extracted = fs::read(out.join(sample)).unwrap();
@@ -480,5 +542,63 @@ mod tests {
             "room/1001.rdt"
         );
         assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn list_shows_the_merged_view_of_two_layers() {
+        use arklay::manifest;
+
+        let dir = TempDir::new("layered-list");
+        let base_path = dir.path.join("base.akpak");
+        let first_path = dir.path.join("first.akpak");
+        let second_path = dir.path.join("second.akpak");
+
+        let mut base = PackWriter::new();
+        base.add(
+            manifest::ENTRY,
+            manifest::Manifest::base("re1").render().into_bytes(),
+        )
+        .unwrap();
+        base.add("room/1000.rdt", b"base".to_vec()).unwrap();
+        base.write(&base_path).unwrap();
+
+        let manifest_bytes = |id: &str, load_order: i32| {
+            manifest::Manifest {
+                kind: manifest::PackKind::Mod,
+                base: Some("re1".to_string()),
+                load_order,
+                ..manifest::Manifest::base(id)
+            }
+            .render()
+            .into_bytes()
+        };
+        let mut first = PackWriter::new();
+        first
+            .add(manifest::ENTRY, manifest_bytes("first", 0))
+            .unwrap();
+        first.add("room/1000.rdt", b"first".to_vec()).unwrap();
+        first.write(&first_path).unwrap();
+        let second_manifest = manifest_bytes("second", 10);
+        let mut second = PackWriter::new();
+        second
+            .add(manifest::ENTRY, second_manifest.clone())
+            .unwrap();
+        second.add("room/1000.rdt", b"second".to_vec()).unwrap();
+        second.write(&second_path).unwrap();
+
+        let pack = open_game_pack(&base_path, &[first_path, second_path]).unwrap();
+        let mut out = Vec::new();
+        let (count, bytes) = write_list(&pack, &mut out).unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{:>12} manifest.toml\n{:>12} room/1000.rdt\n",
+                second_manifest.len(),
+                "second".len()
+            )
+        );
+        assert_eq!(bytes as usize, second_manifest.len() + "second".len());
     }
 }

@@ -1,0 +1,11 @@
+[pack]
+format = 1
+id = "demo"
+name = "Demo mod"
+version = "0.1.0"
+kind = "mod"
+base = "re1"
+load_order = 10
+rdt = "re1"
+scd = "re1"
+lua = ["lua/demo.lua"]

@@ -80,6 +80,11 @@ impl RoomId {
         format!("room/{:04x}.rdt", self.rdt_number())
     }
 
+    /// Pack path of a standalone SCD override, e.g. `scd/1001.scd`.
+    pub fn scd_entry(self) -> String {
+        format!("scd/{:04x}.scd", self.rdt_number())
+    }
+
     /// Three-digit room id used by cut names, e.g. `100`, `11C`.
     pub fn room3(self) -> String {
         format!("{}{:02X}", self.stage, self.room)
@@ -360,6 +365,7 @@ mod tests {
         assert_eq!(id.room, 0x00);
         assert_eq!(id.rdt_number(), 0x1000);
         assert_eq!(id.rdt_entry(), "room/1000.rdt");
+        assert_eq!(id.scd_entry(), "scd/1000.scd");
         assert_eq!(id.room3(), "100");
         assert_eq!(id.cut_entry(3), "roomcut/100_003.bmp");
         assert_eq!(id.stage_index(), 0);

@@ -14,9 +14,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+
+use crate::manifest;
 
 /// Magic bytes at the start of every pack.
 pub const MAGIC: [u8; 4] = *b"APAK";
@@ -215,12 +217,25 @@ struct Entry {
     length: usize,
 }
 
-/// A parsed `.akpak` pack.
+/// A parsed `.akpak` pack, optionally layered over by mod packs.
+///
+/// A plain [`Pack::open`] holds one pack image; [`Pack::open_layered`] adds an
+/// owned list of mod layers. Every lookup then resolves the overlays last to
+/// first and the base last, so a mod can shadow any entry without any loader
+/// changing. A pack with no overlays follows exactly the single-pack path.
 #[derive(Debug)]
 pub struct Pack {
     data: Vec<u8>,
     entries: Vec<Entry>,
     lookup: HashMap<String, usize>,
+    /// Parsed `manifest.toml`, when the pack carries one.
+    manifest: Option<manifest::Manifest>,
+    /// Filesystem origin, when opened from disk.
+    source: Option<PathBuf>,
+    /// Mod layers in applied order; the last one wins.
+    overlays: Vec<Pack>,
+    /// Non-fatal problems found while layering.
+    warnings: Vec<String>,
 }
 
 impl Pack {
@@ -228,7 +243,90 @@ impl Pack {
     pub fn open(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read pack {}", path.display()))?;
-        Self::from_bytes(data)
+        let mut pack = Self::from_bytes(data)?;
+        pack.source = Some(path.to_path_buf());
+        Ok(pack)
+    }
+
+    /// Open `base` and layer the `mods` packs over it.
+    ///
+    /// Each mod must carry a valid mod manifest whose `base` matches the
+    /// base's declared id (when the base declares one). Mods are applied in
+    /// `(load_order, id)` order, so later layers win a shared entry. Duplicate
+    /// mod ids and duplicate layer paths are rejected. A base without a
+    /// manifest is tolerated as `id = <pack stem>`, `kind = base`, RE1
+    /// dialects, with a warning.
+    pub fn open_layered(base: &Path, mods: &[PathBuf]) -> Result<Self> {
+        let mut pack = Self::open(base)?;
+        let mut warnings = Vec::new();
+        let base_declared = pack.manifest.is_some();
+        if !base_declared {
+            let id = pack_stem(base);
+            warnings.push(format!(
+                "base pack {} has no {}; treating it as id \"{id}\", kind base",
+                base.display(),
+                manifest::ENTRY
+            ));
+            pack.manifest = Some(manifest::Manifest::base(id));
+        }
+        let base_id = pack
+            .manifest
+            .as_ref()
+            .expect("a base manifest always exists here")
+            .id
+            .clone();
+
+        let mut layers = Vec::with_capacity(mods.len());
+        let mut ids: HashMap<String, PathBuf> = HashMap::new();
+        let mut paths: HashSet<PathBuf> = HashSet::new();
+        for path in mods {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if !paths.insert(canonical) {
+                bail!("duplicate mod layer path {}", path.display());
+            }
+            let layer = Self::open(path)
+                .with_context(|| format!("failed to open mod {}", path.display()))?;
+            let Some(manifest) = layer.manifest.clone() else {
+                bail!(
+                    "mod {} has no {} entry and cannot be layered",
+                    path.display(),
+                    manifest::ENTRY
+                );
+            };
+            if manifest.kind != manifest::PackKind::Mod {
+                bail!(
+                    "mod {} declares kind {}, expected mod",
+                    path.display(),
+                    manifest.kind
+                );
+            }
+            if base_declared
+                && let Some(declared) = &manifest.base
+                && declared != &base_id
+            {
+                bail!(
+                    "mod {} declares base \"{declared}\" but the base pack declares \"{base_id}\"",
+                    path.display()
+                );
+            }
+            if let Some(previous) = ids.insert(manifest.id.clone(), path.clone()) {
+                bail!(
+                    "duplicate mod id \"{}\": {} and {}",
+                    manifest.id,
+                    previous.display(),
+                    path.display()
+                );
+            }
+            layers.push((manifest, layer));
+        }
+        layers.sort_by(|a, b| {
+            a.0.load_order
+                .cmp(&b.0.load_order)
+                .then_with(|| a.0.id.cmp(&b.0.id))
+        });
+        pack.overlays = layers.into_iter().map(|(_, layer)| layer).collect();
+        pack.warnings = warnings;
+        Ok(pack)
     }
 
     /// Parse a pack from an in-memory image.
@@ -301,50 +399,155 @@ impl Pack {
             });
         }
 
+        let manifest = match lookup.get(&manifest::ENTRY.to_ascii_lowercase()) {
+            Some(&index) => {
+                let entry = &entries[index];
+                let text = std::str::from_utf8(&data[entry.offset..entry.offset + entry.length])
+                    .context("manifest.toml is not valid UTF-8")?;
+                Some(manifest::Manifest::parse(text).context("invalid manifest.toml")?)
+            }
+            None => None,
+        };
+
         Ok(Self {
             data,
             entries,
             lookup,
+            manifest,
+            source: None,
+            overlays: Vec::new(),
+            warnings: Vec::new(),
         })
+    }
+
+    /// The parsed `manifest.toml`, when the pack carries one.
+    pub fn manifest(&self) -> Option<&manifest::Manifest> {
+        self.manifest.as_ref()
+    }
+
+    /// The mod layers in applied order (first applied first, winner last).
+    pub fn overrides(&self) -> impl Iterator<Item = &Pack> {
+        self.overlays.iter()
+    }
+
+    /// Whether any mod layer is applied.
+    pub fn is_layered(&self) -> bool {
+        !self.overlays.is_empty()
+    }
+
+    /// Non-fatal problems found while layering, e.g. a base without a
+    /// manifest defaulting to its pack stem.
+    pub fn warnings(&self) -> &[String] {
+        &self.warnings
+    }
+
+    /// The filesystem pack that provides `path` in the merged view, for
+    /// diagnostics. A pack parsed from memory has no path.
+    pub fn layer_of(&self, path: &str) -> Option<&Path> {
+        self.winner(path).and_then(|layer| layer.source.as_deref())
+    }
+
+    /// The layer whose entry wins `path`: the last overlay that has it, or the
+    /// base, or nothing.
+    fn winner(&self, path: &str) -> Option<&Pack> {
+        let key = path.to_ascii_lowercase();
+        for layer in self.overlays.iter().rev() {
+            if layer.lookup.contains_key(&key) {
+                return Some(layer);
+            }
+        }
+        self.lookup.contains_key(&key).then_some(self)
     }
 
     /// Whether an entry with this path exists, ignoring ASCII case.
     pub fn contains(&self, path: &str) -> bool {
-        self.lookup.contains_key(&path.to_ascii_lowercase())
+        self.winner(path).is_some()
     }
 
     /// Read an entry's data, looking the path up ignoring ASCII case.
     pub fn read(&self, path: &str) -> Result<&[u8]> {
-        let index = self
+        let Some(layer) = self.winner(path) else {
+            bail!("no pack entry named {path}");
+        };
+        let index = *layer
             .lookup
             .get(&path.to_ascii_lowercase())
-            .with_context(|| format!("no pack entry named {path}"))?;
-        let entry = &self.entries[*index];
-        Ok(&self.data[entry.offset..entry.offset + entry.length])
+            .expect("the winning layer holds the entry");
+        let entry = &layer.entries[index];
+        Ok(&layer.data[entry.offset..entry.offset + entry.length])
     }
 
-    /// Original-case entry paths in table-of-contents order.
+    /// The merged entries: shadowed base entries hidden, later layers winning,
+    /// in lowercased-path order. A single pack keeps its table-of-contents
+    /// order.
+    fn merged_entries(&self) -> Vec<(&str, usize)> {
+        if self.overlays.is_empty() {
+            return self
+                .entries
+                .iter()
+                .map(|entry| (entry.path.as_str(), entry.length))
+                .collect();
+        }
+        let mut merged: HashMap<String, (&str, usize)> = HashMap::with_capacity(self.entries.len());
+        for entry in &self.entries {
+            merged.insert(
+                entry.path.to_ascii_lowercase(),
+                (entry.path.as_str(), entry.length),
+            );
+        }
+        for layer in &self.overlays {
+            for entry in &layer.entries {
+                merged.insert(
+                    entry.path.to_ascii_lowercase(),
+                    (entry.path.as_str(), entry.length),
+                );
+            }
+        }
+        let mut merged: Vec<(String, &str, usize)> = merged
+            .into_iter()
+            .map(|(key, (path, size))| (key, path, size))
+            .collect();
+        merged.sort_by(|a, b| a.0.cmp(&b.0));
+        merged
+            .into_iter()
+            .map(|(_, path, size)| (path, size))
+            .collect()
+    }
+
+    /// Original-case entry paths in table-of-contents order, or the merged
+    /// view in lowercased-path order when layered.
     pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.entries.iter().map(|entry| entry.path.as_str())
+        self.merged_entries().into_iter().map(|(path, _)| path)
     }
 
-    /// Every entry in table-of-contents order, with its path and size.
+    /// Every entry in table-of-contents order, or the merged view in
+    /// lowercased-path order when layered.
     pub fn entries(&self) -> impl Iterator<Item = PackEntry<'_>> {
-        self.entries.iter().map(|entry| PackEntry {
-            path: entry.path.as_str(),
-            size: entry.length,
-        })
+        self.merged_entries()
+            .into_iter()
+            .map(|(path, size)| PackEntry { path, size })
     }
 
-    /// Number of entries in the pack.
+    /// Number of entries in the pack, or in the merged view when layered.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        if self.overlays.is_empty() {
+            return self.entries.len();
+        }
+        self.merged_entries().len()
     }
 
-    /// Whether the pack has no entries.
+    /// Whether the pack (or merged view) has no entries.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
+}
+
+/// The default id of a pack without a manifest: its file stem, or `pack`.
+fn pack_stem(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("pack")
+        .to_string()
 }
 
 /// Validate an entry path for safe use on disk.
@@ -730,5 +933,319 @@ mod tests {
         let pack = Pack::open(&path).unwrap();
         assert_eq!(pack.read("A.BIN").unwrap(), &[7, 8, 9]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Self-deleting temporary directory unique to this process and label.
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path =
+                std::env::temp_dir().join(format!("arklay-pack-{}-{label}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Write a pack of raw entries to `path`.
+    fn write_pack(path: &Path, entries: &[(&str, &[u8])]) {
+        let mut writer = PackWriter::new();
+        for (entry, data) in entries {
+            writer.add(entry, data.to_vec()).unwrap();
+        }
+        writer.write(path).unwrap();
+    }
+
+    /// The rendered bytes of a mod manifest.
+    fn mod_manifest(id: &str, base: &str, load_order: i32) -> Vec<u8> {
+        manifest::Manifest {
+            format: manifest::FORMAT,
+            id: id.to_string(),
+            name: None,
+            version: None,
+            kind: manifest::PackKind::Mod,
+            base: Some(base.to_string()),
+            load_order,
+            rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
+            scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
+            engine: None,
+            lua: Vec::new(),
+        }
+        .render()
+        .into_bytes()
+    }
+
+    #[test]
+    fn layers_shadow_entries_case_insensitively() {
+        let dir = TempDir::new("layers");
+        let base = dir.join("base.akpak");
+        let mod_a = dir.join("mod-a.akpak");
+        let mod_b = dir.join("mod-b.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[
+                (manifest::ENTRY, &base_manifest),
+                ("room/1000.rdt", b"base-room"),
+                ("bgm/013.wav", b"music"),
+            ],
+        );
+        write_pack(
+            &mod_a,
+            &[
+                (manifest::ENTRY, &mod_manifest("a", "base", 0)),
+                ("ROOM/1000.RDT", b"mod-a"),
+            ],
+        );
+        write_pack(
+            &mod_b,
+            &[
+                (manifest::ENTRY, &mod_manifest("b", "base", 10)),
+                ("room/1000.rdt", b"mod-b"),
+                ("new/file.bin", b"new"),
+            ],
+        );
+
+        let layered = Pack::open_layered(&base, &[mod_a, mod_b.clone()]).unwrap();
+        assert!(layered.is_layered());
+        assert!(layered.warnings().is_empty());
+        assert_eq!(layered.manifest().unwrap().id, "base");
+        assert_eq!(layered.read("room/1000.rdt").unwrap(), b"mod-b");
+        assert_eq!(layered.read("ROOM/1000.RDT").unwrap(), b"mod-b");
+        assert_eq!(layered.read("BgM/013.WaV").unwrap(), b"music");
+        assert!(layered.contains("new/file.bin"));
+        assert!(!layered.contains("missing.bin"));
+        assert!(layered.read("missing.bin").is_err());
+        assert_eq!(
+            layered.paths().collect::<Vec<_>>(),
+            [
+                "bgm/013.wav",
+                "manifest.toml",
+                "new/file.bin",
+                "room/1000.rdt"
+            ]
+        );
+        assert_eq!(layered.len(), 4);
+        assert_eq!(
+            layered
+                .entries()
+                .map(|entry| entry.size())
+                .collect::<Vec<_>>(),
+            [5, mod_manifest("b", "base", 10).len(), 3, 5]
+        );
+        assert_eq!(layered.layer_of("room/1000.rdt"), Some(mod_b.as_path()));
+        assert_eq!(layered.layer_of("bgm/013.wav"), Some(base.as_path()));
+        assert_eq!(layered.layer_of("missing.bin"), None);
+        assert_eq!(layered.overrides().count(), 2);
+    }
+
+    #[test]
+    fn later_layers_win_and_sort_by_load_order_then_id() {
+        let dir = TempDir::new("order");
+        let base = dir.join("base.akpak");
+        let first = dir.join("first.akpak");
+        let second = dir.join("second.akpak");
+        let third = dir.join("third.akpak");
+        write_pack(&base, &[("x.txt", b"base")]);
+        write_pack(
+            &first,
+            &[
+                (manifest::ENTRY, &mod_manifest("first", "base", 10)),
+                ("x.txt", b"first"),
+            ],
+        );
+        write_pack(
+            &second,
+            &[
+                (manifest::ENTRY, &mod_manifest("second", "base", 10)),
+                ("X.TXT", b"second"),
+            ],
+        );
+        write_pack(
+            &third,
+            &[
+                (manifest::ENTRY, &mod_manifest("third", "base", 0)),
+                ("x.txt", b"third"),
+            ],
+        );
+
+        // Passed out of order: load_order first, then id, decides application.
+        let layered = Pack::open_layered(&base, &[first, second, third]).unwrap();
+        let order: Vec<&str> = layered
+            .overrides()
+            .map(|layer| layer.manifest().unwrap().id.as_str())
+            .collect();
+        assert_eq!(order, ["third", "first", "second"]);
+        assert_eq!(layered.read("x.txt").unwrap(), b"second");
+        assert_eq!(layered.read("X.TXT").unwrap(), b"second");
+    }
+
+    #[test]
+    fn layered_validation_reports_named_failures() {
+        let dir = TempDir::new("validation");
+        let base = dir.join("base.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[(manifest::ENTRY, &base_manifest), ("x.txt", b"base")],
+        );
+
+        let bare = dir.join("bare.akpak");
+        write_pack(&bare, &[("x.txt", b"bare")]);
+        let err = Pack::open_layered(&base, &[bare]).unwrap_err().to_string();
+        assert!(
+            err.contains("bare.akpak") && err.contains("manifest.toml"),
+            "{err}"
+        );
+
+        let wrong = dir.join("wrong.akpak");
+        write_pack(
+            &wrong,
+            &[(manifest::ENTRY, &mod_manifest("wrong", "other", 0))],
+        );
+        let err = Pack::open_layered(&base, &[wrong]).unwrap_err().to_string();
+        assert!(
+            err.contains("\"other\"") && err.contains("\"base\""),
+            "{err}"
+        );
+
+        let duplicate_a = dir.join("duplicate-a.akpak");
+        let duplicate_b = dir.join("duplicate-b.akpak");
+        write_pack(
+            &duplicate_a,
+            &[(manifest::ENTRY, &mod_manifest("same", "base", 0))],
+        );
+        write_pack(
+            &duplicate_b,
+            &[(manifest::ENTRY, &mod_manifest("same", "base", 1))],
+        );
+        let err = Pack::open_layered(&base, &[duplicate_a, duplicate_b.clone()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate mod id"), "{err}");
+
+        let err = Pack::open_layered(&base, &[duplicate_b.clone(), duplicate_b])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate mod layer path"), "{err}");
+
+        let other_base = dir.join("other-base.akpak");
+        write_pack(
+            &other_base,
+            &[(
+                manifest::ENTRY,
+                manifest::Manifest::base("x")
+                    .render()
+                    .into_bytes()
+                    .as_slice(),
+            )],
+        );
+        let err = Pack::open_layered(&base, &[other_base])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected mod"), "{err}");
+    }
+
+    #[test]
+    fn base_without_manifest_defaults_to_its_stem() {
+        let dir = TempDir::new("default-base");
+        let base = dir.join("re1.akpak");
+        write_pack(&base, &[("x.txt", b"base")]);
+
+        let layered = Pack::open_layered(&base, &[]).unwrap();
+        let manifest = layered.manifest().unwrap();
+        assert_eq!(manifest.id, "re1");
+        assert_eq!(manifest.kind, manifest::PackKind::Base);
+        assert_eq!(manifest.rdt_version, manifest::DEFAULT_RDT_VERSION);
+        assert_eq!(manifest.scd_version, manifest::DEFAULT_SCD_VERSION);
+        assert!(!layered.is_layered());
+        assert_eq!(layered.warnings().len(), 1);
+        assert!(
+            layered.warnings()[0].contains("manifest.toml"),
+            "{:?}",
+            layered.warnings()
+        );
+    }
+
+    #[test]
+    fn single_pack_view_is_unchanged_by_layering() {
+        let dir = TempDir::new("single");
+        let base = dir.join("base.akpak");
+        write_pack(
+            &base,
+            &[("b.txt", b"bb"), ("A.txt", b"aa"), ("c/C.bin", b"cc")],
+        );
+
+        let plain = Pack::open(&base).unwrap();
+        let layered = Pack::open_layered(&base, &[]).unwrap();
+        assert_eq!(
+            plain.paths().collect::<Vec<_>>(),
+            layered.paths().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            plain
+                .entries()
+                .map(|e| (e.path(), e.size()))
+                .collect::<Vec<_>>(),
+            layered
+                .entries()
+                .map(|e| (e.path(), e.size()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(plain.len(), layered.len());
+        for path in plain.paths() {
+            assert_eq!(
+                plain.read(path).unwrap(),
+                layered.read(path).unwrap(),
+                "{path}"
+            );
+        }
+
+        let memory = Pack::from_bytes(std::fs::read(&base).unwrap()).unwrap();
+        assert_eq!(
+            plain.paths().collect::<Vec<_>>(),
+            memory.paths().collect::<Vec<_>>()
+        );
+        assert_eq!(plain.manifest(), None);
+        assert!(memory.manifest().is_none());
+    }
+
+    #[test]
+    fn pack_surfaces_and_validates_the_manifest() {
+        let manifest = manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("re1".to_string()),
+            ..manifest::Manifest::base("demo")
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.manifest(), Some(&manifest));
+        assert!(pack.manifest().unwrap().is_mod());
+        assert_eq!(pack.len(), 1);
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, b"this is not toml".to_vec())
+            .unwrap();
+        let err = Pack::from_bytes(writer.to_bytes().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid manifest.toml"), "{err}");
     }
 }

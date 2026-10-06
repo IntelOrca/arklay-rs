@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::items;
+use crate::manifest;
 use crate::model::Texture8;
 use crate::movie;
 use crate::music;
@@ -479,6 +480,7 @@ pub fn convert_game_with_packs(
         copy_item_models(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
     let (file_count, file_bytes) =
         copy_file_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
+    let (manifest_count, manifest_bytes) = copy_manifest(&mut writer)?;
 
     // Voice: `--with-voice` embeds the entries in the main pack; the default
     // writes a second plain v1 pack now, before the main pack streams.
@@ -555,6 +557,10 @@ pub fn convert_game_with_packs(
     println!("text: {text_count} entries, {text_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
+    println!(
+        "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
+        base_manifest().id
+    );
     if voice_enabled {
         println!("voice: {voice_count} entries, {voice_bytes} bytes{voice_note}");
         if !voice_unreferenced.is_empty() {
@@ -606,6 +612,7 @@ pub fn convert_game_with_packs(
         + text_count
         + ivm_count
         + file_count
+        + manifest_count
         + if embed_voice { voice_count } else { 0 }
         + if embed_movie { movie_count } else { 0 };
     println!(
@@ -1700,6 +1707,36 @@ fn copy_file_art(
     }
 
     copy_raw_files(files, "file", writer, progress, jobs)
+}
+
+/// The id of the pack `convert-game` writes.
+pub const BASE_PACK_ID: &str = "re1";
+
+/// The base pack's self-description.
+fn base_manifest() -> manifest::Manifest {
+    manifest::Manifest {
+        format: manifest::FORMAT,
+        id: BASE_PACK_ID.to_string(),
+        name: Some(env!("CARGO_PKG_NAME").to_string()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        kind: manifest::PackKind::Base,
+        base: None,
+        load_order: 0,
+        rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
+        scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
+        engine: None,
+        lua: Vec::new(),
+    }
+}
+
+/// Add the base pack's rendered `manifest.toml`: its only self-description.
+fn copy_manifest(writer: &mut PackWriter) -> Result<(usize, usize)> {
+    let text = base_manifest().render().into_bytes();
+    let bytes = text.len();
+    writer
+        .add(manifest::ENTRY, text)
+        .with_context(|| format!("failed to add {}", manifest::ENTRY))?;
+    Ok((1, bytes))
 }
 
 /// Add `DATA/FONT.TIM` raw as `font/font.tim`; the JPN sheet is 4bpp and
@@ -3037,7 +3074,16 @@ mod tests {
         assert_eq!(pack.read("npc/20.emd").unwrap(), b"npc-20");
         assert_eq!(pack.read("npc/2e.emd").unwrap(), b"npc-2e");
 
+        let manifest = manifest::Manifest::parse(
+            std::str::from_utf8(pack.read(manifest::ENTRY).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.id, BASE_PACK_ID);
+        assert_eq!(manifest.kind, manifest::PackKind::Base);
+        assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("manifest"), 1);
         assert_eq!(count("room/"), 3);
         assert_eq!(count("roomcut/"), 2);
         assert_eq!(count("roommask/"), 0);
@@ -4477,6 +4523,23 @@ mod tests {
             );
             assert!((670..=700).contains(&prims), "{} primitives", asset.entry);
         }
+    }
+
+    #[test]
+    fn base_manifest_renders_and_parses_back() {
+        let manifest = base_manifest();
+        assert_eq!(
+            manifest::Manifest::parse(&manifest.render()).unwrap(),
+            manifest
+        );
+
+        let mut writer = PackWriter::new();
+        let (count, bytes) = copy_manifest(&mut writer).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(bytes, manifest.render().len());
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.manifest(), Some(&manifest));
+        assert_eq!(pack.len(), 1);
     }
 
     #[test]
