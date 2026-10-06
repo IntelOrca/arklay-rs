@@ -1,10 +1,11 @@
-//! M16 slices 7, 8 and 10 real-asset audit.
+//! M16 slices 7, 8, 10 and 11 real-asset audit.
 //!
 //! Exercises the item-search/condition opcodes, the scripted room effects and
 //! player ops, and the transition-following harness against the shipped room
 //! corpus: every room simulates 300 ticks with zero placeholder hits for the
-//! newly implemented opcodes, and the rooms whose scripts walk the player
-//! through a door list their destinations.
+//! newly implemented opcodes, no *new* placeholder arm is reached anywhere
+//! (only the two documented leftovers), and the rooms whose scripts walk the
+//! player through a door list their destinations.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/home/ted/openre/assets/re1 ARKLAY_RE1_PACK=/home/ted/openre/re1.akpak cargo test --test m16_game_real -- --ignored`
