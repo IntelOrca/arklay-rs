@@ -491,13 +491,13 @@ mod tests {
             mod_manifest_text("demo", "re1").as_bytes(),
         );
         write(&source.join("data.bin"), b"a");
-        write(&source.join("DATA.BIN"), b"b");
         // A case-insensitive filesystem (Windows, some macOS mounts) resolves
         // both names to the same file, so the duplicate never reaches the
         // builder; the pack writer's own duplicate test covers that platform.
-        if std::fs::read(source.join("DATA.BIN")).ok() == Some(b"a".to_vec()) {
+        if source.join("DATA.BIN").exists() {
             return;
         }
+        write(&source.join("DATA.BIN"), b"b");
         let out = dir.path.join("demo.akpak");
 
         let err = build_mod(&source, &out, None).unwrap_err().to_string();
