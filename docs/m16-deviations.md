@@ -18,11 +18,11 @@ authoring limits are in `docs/m15-deviations.md`.
    exact instruction boundaries. Scripts that roll dice read the correct word;
    scripts that compare two consumers' draws in one frame can differ.
 
-2. **Flat half blend where per-texel STP is not modelled.** A textured packet
-   whose CLUT carries ABE blends as `(source + destination) / 2`. The original
-   selects the blend per texel from the CLUT entry's STP bit; the port applies
-   the documented flat half blend when the palette has STP entries, and keeps
-   the per-texel bitmap only as far as the TIM decoder exposes it.
+2. **ABE blends only STP-flagged texels.** A textured packet whose CLUT carries
+   ABE blends as `(source + destination) / 2`, but only at texels whose palette
+   entry carries the STP bit. A palette row with no STP entries has no blend
+   texels at all, so the packet draws fully opaque; the TIM decoder exposes the
+   full per-entry STP bitmap for this.
 
 3. **Camera roll is synthetic-only.** `Camera` composes a roll and the integer
    projection is unit-tested, but every shipped RDT camera stores roll 0, so no
@@ -65,6 +65,19 @@ authoring limits are in `docs/m15-deviations.md`.
    never committed; the harness is a regression and cross-implementation check,
    **not** an independently produced oracle. Only an unset variable skips.
 
+9. **Look-at target modes.** The yaw slew transcribes the original's routine
+   (the `yawStep * 2` fold, the zero-target decay, the out-of-cone snap reject
+   and the two cone clamps). The look-at control byte's absolute-angle mode
+   (`0x20`, target fields become the literal yaw/pitch), the one-shot
+   aim-then-freeze mode (`0x40`) and the live-target reload (`0x80`, which
+   re-reads the target in world space with the `-0xA28` head-height bias) are
+   not modelled: the port's `target` is the interface's own refreshed position
+   and there is no per-entity `scd_pos` state. The pitch target is derived from
+   the entity's position rather than the tracking joint's world translation and
+   uses the port's under-two-steps snap rule instead of the original's
+   revert-past-the-cone pitch branches, and a zero horizontal distance yields
+   pitch 0 rather than the original's ceiling/floor value.
+
 ## `TODO(parity)` sites that intentionally remain
 
 Line numbers are from the M16 tree. The exact-camera and platform-random
@@ -74,6 +87,7 @@ predating those slices is read.
 
 | Site | Group | Why it stays |
 |---|---|---|
+| `src/game.rs` `on_flags` `0x05` | scripting | an out-of-range flag bank/selector/mode records a placeholder; the original's indexed write is undefined there |
 | `src/game.rs:1931` | gameplay | monster ids below `0x20` allocate no entity; no enemies |
 | `src/game.rs:1941` | scripting | the force-init re-init block needs the enemy snapshot store |
 | `src/game.rs:1945` | gameplay | occupied-slot re-init is part of the enemy system |
@@ -97,8 +111,9 @@ predating those slices is read.
 
 Every other `TODO(parity)` from the M16 inventory is closed by its slice:
 the camera/projection/roll, the platform random and BioCard word, the packet
-ABE/STP/cull/gouraud/near-plane rules, the latched lighting and background
-modulation, the sprite blend/mirror and text/NPC shadows, the animation blends
+ABE/STP/cull/gouraud/near-plane rules, the per-vertex latched lighting and
+background modulation, the `room_sprite_hide` (0x49) sprite-mask pass, the
+sprite blend/mirror and text/NPC shadows, the animation blends
 and joint gates, the item searches and condition semantics, the scripted room
 effects and player ops, the message order, the character-select slide, the
 item-view examine combos, the map tab, the herb combine refusal, the raw-slot
@@ -111,8 +126,18 @@ cadence and the headless transition follow.
 - `--ui menu` is unchanged; `--ui map` is new (the pack gains `map/`).
 - Room captures change where a message is dismissed over an action zone (item 6)
   or where a scripted door is now followed inside the tick window. The corpus
-  audit prints the rooms whose captures transition; none did under the audit's
-  idle/action drive, and no room's placeholder set changed.
-- The map conversion additions (`map/map00.tim`..`map0e.tim`, `map/blue.tim`,
-  `map/tables.bin`) are the only new pack entries; every pre-existing entry is
-  byte-identical.
+  audit prints the rooms whose captures transition; none do under its
+  idle/action drive, so a companion real-door test asserts the shipped
+  transition-follow path, and no room's placeholder set changed.
+- The root pack was reconverted after the review fixes. The map conversion
+  additions (`map/map00.tim`..`map0e.tim`, `map/blue.tim`, `map/tables.bin`) and
+  the pack `manifest.toml` are the only new entries; an entry-by-entry
+  extraction diff of the old and new packs is byte-identical everywhere else.
+  The `--ui map`/`--ui view` ignored tests pass against the new pack.
+- The M16 review fixes re-baseline the lit captures: entity lighting now
+  evaluates each packet normal against the entity's latched three lights
+  (ambient `value * 255 / 4096`), the room `0x49` sprite-hide op applies, the
+  special-room-light overlay blends its saturated mask at `state >> 7`, the STP
+  fallback is opaque and the random stream starts at the CRT default 1 and never
+  reseeds. The synthetic unit expectations were re-baselined; the golden-frame
+  harness would need its lit frames regenerated before comparing.

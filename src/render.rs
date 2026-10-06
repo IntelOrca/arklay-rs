@@ -1,10 +1,10 @@
 //! Deterministic software rasterizer for the player model and room masks.
 //!
 //! [`Framebuffer::draw_model`] transforms a TMD mesh by the per-joint 4.12
-//! matrices, shades every polygon with the entity's latched room light
-//! ([`Lighting::latched`]), sorts the triangles back-to-front and rasterizes
-//! them into the RGBA8 buffer. ABE packets blend with the per-texel STP
-//! selector the TIM CLUTs carry. Nothing here uses SDL; the engine owns
+//! matrices, shades every vertex normal against the entity's latched room
+//! lights ([`Lighting::latched`]), sorts the triangles back-to-front and
+//! rasterizes them into the RGBA8 buffer. ABE packets blend with the per-texel
+//! STP selector the TIM CLUTs carry. Nothing here uses SDL; the engine owns
 //! presentation and only uploads [`Framebuffer::rgba`].
 //!
 //! [`draw_gameplay_scene`] is the full gameplay path. It draws the camera's
@@ -532,6 +532,38 @@ impl Framebuffer {
         }
     }
 
+    /// Alpha-blend a solid rectangle over the framebuffer.
+    ///
+    /// `alpha` is the source weight: 0 leaves the destination untouched and
+    /// 255 paints the colour exactly. Out-of-bounds parts are clipped.
+    pub fn blend_rect(&mut self, dst: [i32; 4], color: [u8; 3], alpha: u8) {
+        let [x, y, width, height] = dst;
+        if width <= 0 || height <= 0 || alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(dst, [color[0], color[1], color[2], 255]);
+            return;
+        }
+        let start_x = x.max(0) as u32;
+        let start_y = y.max(0) as u32;
+        let end_x = x.saturating_add(width).min(self.width as i32).max(0) as u32;
+        let end_y = y.saturating_add(height).min(self.height as i32).max(0) as u32;
+        let source = u32::from(alpha);
+        let keep = u32::from(255 - alpha);
+        for row in start_y..end_y {
+            for column in start_x..end_x {
+                let offset = (row as usize * self.width as usize + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    for (channel, &value) in pixel[..3].iter_mut().zip(&color) {
+                        *channel =
+                            ((u32::from(value) * source + u32::from(*channel) * keep) / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
     /// Draw a pending list far-to-near.
     ///
     /// The sort is stable on descending [`SpriteDraw::depth`] (higher depths
@@ -832,17 +864,13 @@ impl Framebuffer {
                     255,
                 ];
                 let offset = (y as usize * width + x as usize) * 4;
-                // A packet carrying the ABE bit blends. When the palette holds
-                // STP entries the bit is the true selector and only flagged
-                // texels blend; a palette without STP entries falls back to the
-                // flat half blend the effect path uses (documented fallback).
+                // A packet carrying the ABE bit blends only where the sampled
+                // palette entry carries the STP bit. A palette row with no STP
+                // entries has no blend texels at all, so the packet is fully
+                // opaque there; the STP selector is the whole story.
                 let blend = triangle.blend
-                    && match palette_index {
-                        Some(index) if texture.row_has_stp(triangle.palette_row) => {
-                            texture.palette_stp(triangle.palette_row, index)
-                        }
-                        _ => true,
-                    };
+                    && palette_index
+                        .is_some_and(|index| texture.palette_stp(triangle.palette_row, index));
                 if blend && let Some(dst) = self.rgba.get(offset..offset + 4) {
                     for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
                         *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
@@ -1398,7 +1426,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     items.extend(triangles.into_iter().map(SceneItem::Triangle));
 
     if let Some(layer) = mask_layer {
-        collect_masks(layer, &mut items);
+        collect_masks(layer, camera.screen, &mut items);
     }
 
     if let Some(layer) = effect_layer {
@@ -1430,8 +1458,10 @@ fn root_position(joints: &[anim::Mat4x3]) -> [i32; 3] {
 ///
 /// [`mask::mask_sprite_key`] folds together the shared per-(room, camera) bias
 /// record, the room's per-entry overrides and the zero-depth rule (a computed
-/// brightness depth of exactly zero sorts at the fixed key 550).
-fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem<'_>>) {
+/// brightness depth of exactly zero sorts at the fixed key 550). `offset` is
+/// the frame's screen offset (the shake), which the original adds to every
+/// mask sprite's screen position.
+fn collect_masks(layer: &MaskLayer<'_>, offset: [i32; 2], items: &mut Vec<SceneItem<'_>>) {
     for index in mask::mask_submission_order(layer.room, layer.camera, layer.cut.masks.len()) {
         let Some(sprite) = layer.cut.masks.get(index) else {
             continue;
@@ -1445,7 +1475,7 @@ fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem<'_>>) {
         items.push(SceneItem::Mask(MaskQuad {
             key,
             uv: (u32::from(sprite.uv.0), u32::from(sprite.uv.1)),
-            pos: sprite.pos,
+            pos: (sprite.pos.0 + offset[0], sprite.pos.1 + offset[1]),
             size: (u32::from(sprite.size.0), u32::from(sprite.size.1)),
         }));
     }
@@ -1528,14 +1558,17 @@ fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<Scen
 /// `lift` joins the primitive's translation row, the same displacement the
 /// original applies to the quad origin: the translation grows downwards, so a
 /// positive lift drops the vertex down the screen. u/v stay in the texture's
-/// 0..4096 space and are scaled to texels by the rasterizer.
+/// 0..4096 space and are scaled to texels by the rasterizer. The frame's screen
+/// offset (the shake) shifts the projected vertex like every other scene
+/// primitive.
 fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camera) -> ShadowVertex {
     let focal = f64::from(camera.fov);
     let inv_z = 1.0 / f64::from(view[2]);
     ShadowVertex {
         position: [
-            f64::from(CENTER_X) + f64::from(view[0]) * focal * inv_z,
-            f64::from(CENTER_Y) - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z,
+            f64::from(CENTER_X) + f64::from(view[0]) * focal * inv_z + f64::from(camera.screen[0]),
+            f64::from(CENTER_Y) - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z
+                + f64::from(camera.screen[1]),
         ],
         inv_z,
         u: uv[0] / 4096.0,
@@ -1821,51 +1854,82 @@ impl Lighting {
 
     /// Latch the room's lights for one entity at `entity_pos`.
     ///
-    /// The original samples the lights once per entity, so every polygon of a
-    /// model shares one shade. A point light's falloff is measured on X and Z
-    /// only, `radius - sqrt(dx^2 + dz^2)` clamped at zero, and its colour is
-    /// attenuated with a truncating integer division. The accumulated light
-    /// colour is capped at `0x80` per channel; the 12-bit ambient truncates to
-    /// eight bits with `>> 4`. A directional light contributes its colour
-    /// unchanged. The result is added to the ambient and saturates at 255.
+    /// The original samples the lights once per entity and then evaluates each
+    /// vertex normal against the latched directions. A point light's falloff is
+    /// measured on X and Z only, `radius - sqrt(dx^2 + dz^2)` clamped at zero,
+    /// and its colour is attenuated with a truncating integer division. The
+    /// light's stored direction points from the light towards the entity; the
+    /// latched `direction` is its negation, the direction from the entity
+    /// towards the light, so a normal `N` gets `max(0, dot(N, direction))`.
+    /// The per-channel colour caps at `0x80` before the `0..255` conversion.
+    /// The 12-bit ambient truncates to eight bits with `(value * 255) / 4096`.
     pub fn latched(&self, entity_pos: [i32; 3]) -> EntityLight {
-        let ambient = self
-            .ambient
-            .map(|channel| (i32::from(channel).clamp(0, 0x1000) >> 4).min(0xFF) as u32);
-        let mut accumulated = [0u32; 3];
-        for light in &self.lights {
-            let contribution = if light.kind == 0 {
+        let ambient = self.ambient.map(|channel| {
+            let channel = i32::from(channel).clamp(0, 0x1000);
+            f64::from((channel * 255) / 4096)
+        });
+        let sources = std::array::from_fn(|index| {
+            let light = &self.lights[index];
+            let (offset, color) = if light.kind == 0 {
+                let offset = [
+                    entity_pos[0] - light.pos[0],
+                    entity_pos[1] - light.pos[1],
+                    entity_pos[2] - light.pos[2],
+                ];
                 let radius = i32::from(light.radius);
-                if radius <= 0 {
+                let attenuation = if radius <= 0 {
+                    0
+                } else {
+                    let dx = i64::from(offset[0]);
+                    let dz = i64::from(offset[2]);
+                    (i64::from(radius) - integer_sqrt(dx * dx + dz * dz)).max(0)
+                };
+                let color = if radius <= 0 {
                     [0; 3]
                 } else {
-                    let dx = i64::from(entity_pos[0]) - i64::from(light.pos[0]);
-                    let dz = i64::from(entity_pos[2]) - i64::from(light.pos[2]);
-                    let distance = integer_sqrt(dx * dx + dz * dz);
-                    let attenuation = (i64::from(radius) - distance).max(0) as u64;
-                    light
-                        .color
-                        .map(|channel| ((u64::from(channel) * attenuation) / radius as u64) as u8)
-                }
+                    light.color.map(|channel| {
+                        ((u64::from(channel) * attenuation as u64) / radius as u64) as u8
+                    })
+                };
+                (offset, color)
             } else {
-                light.color
+                (light.pos, light.color)
             };
-            for (slot, &channel) in accumulated.iter_mut().zip(&contribution) {
-                *slot += u32::from(channel);
+            // The original's normalize clamps a near-zero length to 1.0.
+            let length = (f64::from(offset[0]).powi(2)
+                + f64::from(offset[1]).powi(2)
+                + f64::from(offset[2]).powi(2))
+            .sqrt()
+            .max(1.0);
+            EntityLightSource {
+                direction: [
+                    -f64::from(offset[0]) / length,
+                    -f64::from(offset[1]) / length,
+                    -f64::from(offset[2]) / length,
+                ],
+                color: color.map(|channel| f64::from(channel.min(0x80)) * 255.0 / 128.0),
             }
-        }
-        EntityLight {
-            color: std::array::from_fn(|channel| {
-                (ambient[channel] + accumulated[channel].min(0x80)).min(0xFF) as u8
-            }),
-        }
+        });
+        EntityLight { ambient, sources }
     }
 }
 
-/// One entity's latched room-light colour, in the rasterizer's 0..=255 scale.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One entity's latched room lighting: the ambient colour and the three light
+/// directions/colours, all in the rasterizer's `0..=255` colour scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityLight {
-    pub color: [u8; 3],
+    /// Ambient colour.
+    pub ambient: [f64; 3],
+    /// The room's three lights, latched at the entity's position.
+    pub sources: [EntityLightSource; 3],
+}
+
+/// One latched light: the unit direction from the entity towards the light and
+/// its attenuated, `0x80`-capped colour.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityLightSource {
+    pub direction: [f64; 3],
+    pub color: [f64; 3],
 }
 
 /// The ABE (semi-transparency) bit of a primitive's CLUT word.
@@ -1907,8 +1971,8 @@ struct Triangle {
     cull: bool,
     /// A solid gouraud colour; `None` samples the texture instead.
     flat: Option<[u8; 3]>,
-    /// The packet's semi-transparency bit: rasterize with the flat half blend
-    /// the effect path uses (the documented fallback for per-texel STP).
+    /// The packet's semi-transparency bit: rasterize with a per-texel blend
+    /// where the sampled CLUT entry carries the STP bit.
     blend: bool,
 }
 
@@ -2028,10 +2092,10 @@ fn triangle_depth_key(depth: f64) -> u32 {
 ///
 /// `lighting` selects the gameplay path (room lights, the primitive's own
 /// palette row and paged UVs); `None` is the full-bright door path (white
-/// shade, palette row 0, direct UVs). `light` is the entity's latched colour,
-/// re-used for every polygon of the object. `cull` drops back-facing packets.
-/// `texture` is the page index every emitted triangle samples. `tint` is the
-/// per-channel RGB multiplier applied when the triangle is shaded.
+/// shade, palette row 0, direct UVs). `light` is the entity's latched lights,
+/// evaluated per packet normal. `cull` drops back-facing packets. `texture` is
+/// the page index every emitted triangle samples. `tint` is the per-channel
+/// RGB multiplier applied when the triangle is shaded.
 ///
 /// The original decides the near-plane and backface tests once per *packet*,
 /// so a quad never loses only one of its halves; the parser carries the quad's
@@ -2056,6 +2120,12 @@ fn collect_triangles(
     // The raw-Y form's vertices skip the standard input Y negation; the pool
     // is built lazily so the common path pays nothing.
     let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
+    // World-space unit normals: the packet's normal rotated by the joint.
+    let normals: Vec<Option<[f64; 3]>> = object
+        .normals
+        .iter()
+        .map(|normal| normalize(rotate(joint, *normal)))
+        .collect();
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
@@ -2124,27 +2194,71 @@ fn collect_triangles(
             None => (0.0, 0.0, 0),
         };
 
-        let shade = match (lighting, light) {
-            // The gameplay path shades every polygon of the object with its
-            // entity's latched colour and the mesh tint.
-            (Some(_), Some(light)) if !blend => [
-                f64::from(light.color[0]) * f64::from(tint[0]) / CHANNEL_MAX,
-                f64::from(light.color[1]) * f64::from(tint[1]) / CHANNEL_MAX,
-                f64::from(light.color[2]) * f64::from(tint[2]) / CHANNEL_MAX,
-            ],
-            // A blended packet on a lit mesh and every door/item polygon are
-            // full-bright: the mesh tint alone.
-            (Some(_), _) => [f64::from(tint[0]), f64::from(tint[1]), f64::from(tint[2])],
-            (None, _) => [CHANNEL_MAX; 3],
-        };
+        // Corner normals; a zero-length normal borrows the packet's first real
+        // one (the original substitutes and still draws the packet), and a
+        // packet with no usable normal at all is dropped on the lit path.
+        let mut corner_normals = [
+            normals.get(usize::from(prim.normals[0])).copied().flatten(),
+            normals.get(usize::from(prim.normals[1])).copied().flatten(),
+            normals.get(usize::from(prim.normals[2])).copied().flatten(),
+        ];
+        if lighting.is_some() {
+            let Some(substitute) = corner_normals.iter().flatten().next().copied() else {
+                continue;
+            };
+            for normal in &mut corner_normals {
+                if normal.is_none() {
+                    *normal = Some(substitute);
+                }
+            }
+        }
+
+        // An untextured packet's colour word is a per-corner vertex colour in
+        // the original's 1/1024 scale; the sampled flat colour is white and the
+        // shade carries the packet colour.
+        let vertex_scale = prim
+            .flat_color
+            .map(|colour| colour.map(|channel| f64::from(channel) / 1024.0));
 
         let corners = [
-            (position0, depth0, &prim.uv[0]),
-            (position1, depth1, &prim.uv[1]),
-            (position2, depth2, &prim.uv[2]),
+            (position0, depth0, &prim.uv[0], corner_normals[0]),
+            (position1, depth1, &prim.uv[1], corner_normals[1]),
+            (position2, depth2, &prim.uv[2], corner_normals[2]),
         ];
         let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
-            let (position, depth, uv) = corners[corner];
+            let (position, depth, uv, normal) = corners[corner];
+            let shade = match (lighting, light) {
+                // The gameplay path evaluates each corner normal against the
+                // latched light directions, clamps the accumulated light, then
+                // folds in the vertex colour and the mesh tint.
+                (Some(_), Some(light)) if !blend => {
+                    let mut shade = light.ambient;
+                    if let Some(normal) = normal {
+                        for source in &light.sources {
+                            let diffuse = (normal[0] * source.direction[0]
+                                + normal[1] * source.direction[1]
+                                + normal[2] * source.direction[2])
+                                .max(0.0);
+                            for (channel, &value) in shade.iter_mut().zip(&source.color) {
+                                *channel += diffuse * value;
+                            }
+                        }
+                    }
+                    for (channel, &scale) in shade.iter_mut().zip(&tint) {
+                        *channel = channel.min(CHANNEL_MAX) * f64::from(scale) / CHANNEL_MAX;
+                    }
+                    if let Some(scale) = vertex_scale {
+                        for (channel, &scale) in shade.iter_mut().zip(&scale) {
+                            *channel *= scale;
+                        }
+                    }
+                    shade
+                }
+                // A blended packet on a lit mesh and every door/item polygon
+                // are full-bright: the mesh tint alone.
+                (Some(_), _) => tint.map(f64::from),
+                (None, _) => [CHANNEL_MAX; 3],
+            };
             RasterVertex {
                 position,
                 inv_z: 1.0 / depth,
@@ -2162,8 +2276,9 @@ fn collect_triangles(
             texture,
             palette_row,
             cull,
-            // An untextured packet paints its flat colour.
-            flat: prim.flat_color,
+            // An untextured packet paints its per-corner colour through the
+            // shade; the sampled colour is white.
+            flat: prim.flat_color.map(|_| [255, 255, 255]),
             blend,
         });
     }
@@ -2324,6 +2439,37 @@ fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
+/// Rotate a normal by a joint's 4.12 rotation, ignoring the translation.
+fn rotate(joint: &anim::Mat4x3, normal: [i16; 3]) -> [i32; 3] {
+    let v = [
+        i128::from(normal[0]),
+        -i128::from(normal[1]),
+        i128::from(normal[2]),
+    ];
+    std::array::from_fn(|row| {
+        let r = joint.r[row];
+        let mut sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
+        if row == 1 {
+            sum = -sum;
+        }
+        clamp_i32(sum >> FIXED_BITS)
+    })
+}
+
+/// Normalize a fixed-point vector; zero-length vectors have no direction.
+fn normalize(vector: [i32; 3]) -> Option<[f64; 3]> {
+    let real = [
+        f64::from(vector[0]),
+        f64::from(vector[1]),
+        f64::from(vector[2]),
+    ];
+    let length = (real[0] * real[0] + real[1] * real[1] + real[2] * real[2]).sqrt();
+    if length <= f64::MIN_POSITIVE {
+        return None;
+    }
+    Some([real[0] / length, real[1] / length, real[2] / length])
+}
+
 /// Clamp an intermediate to the `i32` range.
 fn clamp_i32(value: i128) -> i32 {
     value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
@@ -2375,6 +2521,18 @@ mod tests {
         anim::Mat4x3 {
             r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
             t: [0, 0, 0],
+        }
+    }
+
+    /// A latched light with a black ambient and no sources: the lit path's
+    /// zero shade.
+    fn dark_entity_light() -> EntityLight {
+        EntityLight {
+            ambient: [0.0; 3],
+            sources: std::array::from_fn(|_| EntityLightSource {
+                direction: [0.0; 3],
+                color: [0.0; 3],
+            }),
         }
     }
 
@@ -2459,7 +2617,8 @@ mod tests {
     fn rasterizes_a_front_facing_triangle() {
         let framebuffer = render_triangle(false);
         let center = (53 * 320 + 226) * 4;
-        assert_eq!(&framebuffer.rgba[center..center + 4], &[10, 20, 30, 255]);
+        // The default ambient 4095 maps to 254, so each channel truncates.
+        assert_eq!(&framebuffer.rgba[center..center + 4], &[9, 19, 29, 255]);
         assert_eq!(&framebuffer.rgba[0..4], &[0, 0, 0, 0]);
         let corner = (239 * 320 + 319) * 4;
         assert_eq!(&framebuffer.rgba[corner..corner + 4], &[0, 0, 0, 0]);
@@ -2474,7 +2633,7 @@ mod tests {
     #[test]
     fn synthetic_triangle_render_matches_golden_hash() {
         let framebuffer = render_triangle(false);
-        assert_eq!(fnv1a(&framebuffer.rgba), 1_660_610_673_012_094_917);
+        assert_eq!(fnv1a(&framebuffer.rgba), 16_946_568_591_050_320_677);
     }
 
     #[test]
@@ -2859,7 +3018,7 @@ mod tests {
             &lighting,
             None,
         );
-        assert_eq!(framebuffer_pixel(&tied, 180, 100), [0, 255, 0, 255]);
+        assert_eq!(framebuffer_pixel(&tied, 180, 100), [0, 254, 0, 255]);
 
         // A mask whose rounded key also ties both triangles is collected after
         // them, so it wins the tie and samples its own page.
@@ -2934,7 +3093,7 @@ mod tests {
             &lighting,
             None,
         );
-        assert_eq!(framebuffer_pixel(&object_item, 180, 100), [0, 255, 0, 255]);
+        assert_eq!(framebuffer_pixel(&object_item, 180, 100), [0, 254, 0, 255]);
 
         // Object, item then character: the character wins the tie.
         let mut all = Framebuffer::new();
@@ -2952,7 +3111,40 @@ mod tests {
             &lighting,
             None,
         );
-        assert_eq!(framebuffer_pixel(&all, 180, 100), [0, 0, 255, 255]);
+        assert_eq!(framebuffer_pixel(&all, 180, 100), [0, 0, 254, 255]);
+    }
+
+    #[test]
+    fn screen_shake_shifts_shadows_and_masks() {
+        let texture = solid_image(1, 1, [255, 255, 255, 128]);
+        let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
+        let mut plain = Vec::new();
+        collect_shadow(&shadow, &straight_camera(), &mut plain);
+        let mut camera = straight_camera();
+        camera.screen = [4, -3];
+        let mut shaken = Vec::new();
+        collect_shadow(&shadow, &camera, &mut shaken);
+        let [SceneItem::Shadow(plain)] = &plain[..] else {
+            panic!("expected one plain shadow");
+        };
+        let [SceneItem::Shadow(shifted)] = &shaken[..] else {
+            panic!("expected one shaken shadow");
+        };
+        for (plain, shifted) in plain.corners.iter().zip(&shifted.corners) {
+            assert_eq!(shifted.position[0], plain.position[0] + 4.0);
+            assert_eq!(shifted.position[1], plain.position[1] - 3.0);
+        }
+
+        let cut = Cut {
+            masks: vec![mask_sprite((10, 20), 100, 1)],
+            mask_active: 1,
+            ..Cut::default()
+        };
+        let page = solid_image(1, 1, [1, 2, 3, 255]);
+        let layer = MaskLayer::new(room(), 0, &cut, &page);
+        let mut items = Vec::new();
+        collect_masks(&layer, [4, -3], &mut items);
+        assert!(matches!(&items[..], [SceneItem::Mask(quad)] if quad.pos == (14, 17)));
     }
 
     #[test]
@@ -2974,7 +3166,7 @@ mod tests {
         let layer = MaskLayer::new(room(), 0, &cut, &page);
 
         let mut items = vec![scene_triangle(64)];
-        collect_masks(&layer, &mut items);
+        collect_masks(&layer, [0, 0], &mut items);
         mask::order_far_to_near(&mut items, SceneItem::key);
 
         let order: Vec<(u32, Option<(i32, i32)>)> = items
@@ -3006,7 +3198,7 @@ mod tests {
         };
         let page = solid_image(1, 1, [1, 2, 3, 255]);
         let mut items = Vec::new();
-        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), &mut items);
+        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), [0, 0], &mut items);
         assert!(matches!(&items[..], [SceneItem::Mask(quad)] if quad.pos == (0, 0)));
 
         // Activating group 2 adds its sprite; deactivating group 1 hides the
@@ -3019,6 +3211,7 @@ mod tests {
                 active,
                 ..MaskLayer::new(room(), 0, &cut, &page)
             },
+            [0, 0],
             &mut items,
         );
         assert_eq!(items.len(), 2);
@@ -3030,6 +3223,7 @@ mod tests {
                 active,
                 ..MaskLayer::new(room(), 0, &cut, &page)
             },
+            [0, 0],
             &mut items,
         );
         assert!(matches!(&items[..], [SceneItem::Mask(quad)] if quad.pos == (1, 0)));
@@ -3092,7 +3286,7 @@ mod tests {
     fn near_player_paints_over_a_far_mask() {
         // Mask key 6080 is behind the triangle's key of 1000.
         let framebuffer = interleaved_frame(380);
-        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [10, 20, 30, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 19, 29, 255]);
         // Neither item covers this background pixel.
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
     }
@@ -3114,7 +3308,7 @@ mod tests {
         let framebuffer = interleaved_frame(4);
         assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 8, 7, 255]);
         // A triangle pixel outside the 20x20 mask keeps the player colour.
-        assert_eq!(framebuffer_pixel(&framebuffer, 220, 110), [10, 20, 30, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 220, 110), [9, 19, 29, 255]);
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
     }
 
@@ -3132,7 +3326,7 @@ mod tests {
         };
         let page = solid_image(1, 1, [1, 2, 3, 255]);
         let mut items = Vec::new();
-        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), &mut items);
+        collect_masks(&MaskLayer::new(room(), 0, &cut, &page), [0, 0], &mut items);
         assert!(matches!(&items[0], SceneItem::Mask(quad) if quad.key == 550));
     }
 
@@ -3608,7 +3802,7 @@ mod tests {
 
         let mut items = Vec::new();
         collect_shadow(&shadow, &straight_camera(), &mut items);
-        collect_masks(&layer, &mut items);
+        collect_masks(&layer, [0, 0], &mut items);
         mask::order_far_to_near(&mut items, SceneItem::key);
         assert!(matches!(items[0], SceneItem::Shadow(_)));
         assert!(matches!(items[1], SceneItem::Mask(_)));
@@ -4066,7 +4260,7 @@ mod tests {
             &identity(),
             &straight_camera(),
             Some(&lighting),
-            Some(EntityLight { color: [0; 3] }),
+            Some(dark_entity_light()),
             true,
             0,
             [255; 3],
@@ -4086,7 +4280,7 @@ mod tests {
             &identity(),
             &straight_camera(),
             Some(&lighting),
-            Some(EntityLight { color: [0; 3] }),
+            Some(dark_entity_light()),
             true,
             0,
             [255; 3],
@@ -4100,7 +4294,8 @@ mod tests {
     fn the_abe_path_blends_half_over_the_destination() {
         let mut mesh = mesh_at(1000, false);
         mesh.objects[0].prims[0].clut = 0x8000;
-        let texture = solid_texture([255, 255, 255, 255]);
+        let mut texture = solid_texture([255, 255, 255, 255]);
+        texture.stp = vec![true];
         let joints = [identity()];
         let lighting = Lighting {
             ambient: [0; 3],
@@ -4168,14 +4363,16 @@ mod tests {
             [177, 177, 177, 255]
         );
 
-        // With no STP entries the whole packet uses the flat half blend.
+        // With no STP entries there are no blend texels: the packet is fully
+        // opaque, exactly the original's per-texel selector with an all-clear
+        // mask.
         texture.stp = vec![false; 2 * crate::model::PALETTE_ROW_LEN];
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         framebuffer.rasterize(&texture, &triangle);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [177, 177, 177, 255]
+            [255, 255, 255, 255]
         );
     }
 
@@ -4393,11 +4590,16 @@ mod tests {
             ambient: [4095, 1775, 15],
             lights: [Light::default(); 3],
         };
-        // 12-bit ambient truncates with >> 4.
-        assert_eq!(ambient_only.latched([0, 0, 0]).color, [255, 110, 0]);
+        // The 12-bit ambient converts with the original's `value * 255 / 4096`.
+        let light = ambient_only.latched([0, 0, 0]);
+        assert_eq!(light.ambient, [254.0, 110.0, 0.0]);
+        for source in light.sources {
+            assert_eq!(source.color, [0.0; 3]);
+        }
 
         // A point light at the entity's own X/Z (a huge Y offset does not
-        // count) reaches full attenuation; the accumulated light caps at 0x80.
+        // count for falloff) reaches full attenuation; its 255 colour caps at
+        // 0x80 before the 1/128 scale, so the latched colour is 255.
         let point = Lighting {
             ambient: [0; 3],
             lights: [
@@ -4411,9 +4613,13 @@ mod tests {
                 Light::default(),
             ],
         };
-        assert_eq!(point.latched([0, 0, 0]).color, [0x80, 0x80, 0x80]);
+        let light = point.latched([0, 0, 0]);
+        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
+        // The stored direction points from the entity towards the light.
+        assert_eq!(light.sources[0].direction, [0.0, 1.0, 0.0]);
 
-        // Half the radius out on X/Z truncates each channel.
+        // Half the radius out on X/Z truncates each channel, and the direction
+        // is normalized over all three axes.
         let point = Lighting {
             ambient: [0; 3],
             lights: [
@@ -4427,11 +4633,18 @@ mod tests {
                 Light::default(),
             ],
         };
-        assert_eq!(point.latched([300, 0, 400]).color, [100, 50, 1]);
+        let light = point.latched([300, 0, 400]);
+        assert_eq!(
+            light.sources[0].color,
+            [199.21875, 99.609375, 1.9921875],
+            "100/50/1 attenuated bytes at the 1/128 scale"
+        );
+        assert!((light.sources[0].direction[0] + 0.6).abs() < 1e-9);
+        assert!((light.sources[0].direction[2] + 0.8).abs() < 1e-9);
 
         // A light at or beyond the radius contributes nothing, and a zero
         // radius is black.
-        assert_eq!(point.latched([0, 0, 1000]).color, [0, 0, 0]);
+        assert_eq!(point.latched([0, 0, 1000]).sources[0].color, [0.0; 3]);
         let zero = Lighting {
             ambient: [0; 3],
             lights: [
@@ -4445,10 +4658,13 @@ mod tests {
                 Light::default(),
             ],
         };
-        assert_eq!(zero.latched([0, 0, 0]).color, [0, 0, 0]);
+        let light = zero.latched([0, 0, 0]);
+        assert_eq!(light.sources[0].color, [0.0; 3]);
+        assert_eq!(light.sources[0].direction, [0.0, 0.0, 0.0]);
 
-        // A directional light is used as-is (capped at 0x80) and adds to the
-        // ambient.
+        // A directional light's position is its direction vector: it is
+        // normalized, capped at 0x80 and reversed (the stored direction points
+        // towards the light).
         let directional = Lighting {
             ambient: [16, 16, 16],
             lights: [
@@ -4462,13 +4678,37 @@ mod tests {
                 Light::default(),
             ],
         };
-        assert_eq!(directional.latched([0, 0, 0]).color, [129, 129, 129]);
+        let light = directional.latched([0, 0, 0]);
+        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
+        assert_eq!(light.sources[0].direction, [-1.0, 0.0, 0.0]);
+        assert!((light.ambient[0] - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn untextured_gouraud_folds_the_packet_colour_into_the_shade() {
+        // An untextured packet's colour word is a vertex colour in the
+        // original's 1/1024 units; the sampled flat colour is white, so a full
+        // ambient and an 0xFF colour give 255 * 255 / 1024 = 63.
+        let mut mesh = mesh_at(1000, false);
+        mesh.objects[0].prims[0].textured = false;
+        mesh.objects[0].prims[0].flat_color = Some([255, 255, 255]);
+        let texture = solid_texture([200, 200, 200, 255]);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [4096; 3],
+            lights: [Light::default(); 3],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
+        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [63, 63, 63, 255]);
     }
 
     #[test]
     fn a_lit_scene_matches_hand_computed_pixels() {
-        // The texture is 200 grey; the entity's latched colour is 64 grey, so
-        // each covered pixel is 200 * 64 / 255 = 50.
+        // The texture is 200 grey. A directional light [-1] points its
+        // direction along +Z, so the triangle's +Z normal takes the full
+        // diffuse; its 64 colour scales to 64 / 128 = 0.5 by the original's
+        // byte conversion, and 200 * 127.5 / 255 = 100.
         let mesh = mesh_at(1000, false);
         let texture = solid_texture([200, 200, 200, 255]);
         let joints = [identity()];
@@ -4476,7 +4716,7 @@ mod tests {
             ambient: [0; 3],
             lights: [
                 Light {
-                    pos: [1, 0, 0],
+                    pos: [0, 0, -1],
                     color: [64, 64, 64],
                     kind: 1,
                     radius: 0,
@@ -4487,15 +4727,19 @@ mod tests {
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
-        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [50, 50, 50, 255]);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 200, 100),
+            [100, 100, 100, 255]
+        );
 
-        // A point light directly overhead at 10,000 Y still lights the entity:
-        // the falloff ignores Y, unlike the old per-vertex distance.
+        // A point light on the normal's side with half the falloff radius:
+        // the 500-unit X/Z distance halves the colour to 32 (63.75 after the
+        // 1/128 scale), so the pixel is 200 * 63.75 / 255 = 50.
         let lighting = Lighting {
             ambient: [0; 3],
             lights: [
                 Light {
-                    pos: [0, 10_000, 0],
+                    pos: [0, 0, 500],
                     color: [64, 64, 64],
                     kind: 0,
                     radius: 1000,
@@ -4507,6 +4751,25 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
         assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [50, 50, 50, 255]);
+
+        // The same light on the other side of the surface leaves the +Z normal
+        // unlit: the per-vertex normal is what selects diffuse.
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0, 0, 1],
+                    color: [64, 64, 64],
+                    kind: 1,
+                    radius: 0,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
+        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [0, 0, 0, 255]);
     }
 
     #[test]

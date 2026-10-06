@@ -155,10 +155,14 @@ impl EntityAnim {
     /// A `0x10` look-at flag enables the slew; bit 0 enables the yaw and bit 1
     /// the pitch. The yaw target is the angle to the target minus the entity's
     /// own facing; the pitch is the target's elevation over the horizontal
-    /// distance. Both step by at most `look_at_yaw_step`/`look_at_pitch_step`
-    /// per call and clamp to the original's +/-0x2C8 yaw and +/-0x138 pitch
-    /// cone. Cleared flags leave the last angles frozen, so the joint holds
-    /// its aim instead of snapping back.
+    /// distance. The yaw slew is the original's exact routine: it snaps only
+    /// when the remaining turn is under one step, keeps the previous angle
+    /// when the snap would land outside the +/-0x2C8 cone, decays a zero
+    /// target toward zero, and clamps the period branches to the cone.
+    ///
+    /// The pitch is a bounded approximation: the port derives its target from
+    /// the entity position rather than the tracking joint's world translation
+    /// and steps it with the same under-two-steps snap rule.
     pub fn slew_look_at(&mut self, entity: &Entity) {
         if entity.look_at_flags & 0x10 == 0 {
             return;
@@ -190,12 +194,7 @@ impl EntityAnim {
         } else {
             0
         };
-        self.look_at_yaw = step_angle(
-            self.look_at_yaw,
-            yaw_target,
-            u16::from(entity.look_at_yaw_step),
-            YAW_CONE,
-        );
+        self.look_at_yaw = slew_yaw(self.look_at_yaw, yaw_target, entity.look_at_yaw_step);
         self.look_at_pitch = step_angle(
             self.look_at_pitch,
             pitch_target as u16 & 0x0FFF,
@@ -209,6 +208,58 @@ impl EntityAnim {
 const YAW_CONE: u16 = 0x2C8;
 /// The tracking joint's pitch cone half-width, `+/-0x138`.
 const PITCH_CONE: u16 = 0x138;
+
+/// One yaw step of the original's look-at slew.
+///
+/// `yaw_diff` folds the step into the turn, so the routine snaps under one
+/// step; if the snap lands outside the `+/-0x2C8` cone the previous angle is
+/// kept rather than clamped. A zero target decays toward zero from whichever
+/// side it is on. The two period branches step toward the target and clamp to
+/// the cone, exactly the original's comparisons.
+fn slew_yaw(current: i16, target: u16, step: u8) -> i16 {
+    let step = i32::from(step);
+    let target = i32::from(target) & 0x0FFF;
+    let current = i32::from(current) & 0x0FFF;
+    let yaw_diff = (step - current + target) & 0x0FFF;
+    if yaw_diff < step * 2 {
+        // Snap, but keep the previous angle when the target is out of cone.
+        if ((target + i32::from(YAW_CONE)) & 0x0FFF) > 0x590 {
+            signed12(current)
+        } else {
+            signed12(target)
+        }
+    } else if target == 0 {
+        let next = if current < 0x801 {
+            (current - step) & 0x0FFF
+        } else {
+            (current + step) & 0x0FFF
+        };
+        signed12(next)
+    } else if ((target - current) & 0x0FFF) < 0x800 {
+        let mut next = (current + step) & 0x0FFF;
+        if ((next as i16 - 0x2C8) & 0x0FFF) < 0xA70 {
+            next = 0x2C8;
+        }
+        signed12(next)
+    } else {
+        let mut next = (current - step) & 0x0FFF;
+        if ((next as i16 + 0x2C8) & 0x0FFF) > 0x590 {
+            next = 0xD38;
+        }
+        signed12(next)
+    }
+}
+
+/// Reinterpret a 12-bit angle as a signed value, the original's `(short)`
+/// store of the wrapped rotation component.
+fn signed12(value: i32) -> i16 {
+    let wrapped = value & 0x0FFF;
+    if wrapped > 0x800 {
+        (wrapped - 0x1000) as i16
+    } else {
+        wrapped as i16
+    }
+}
 
 /// Step one 12-bit angle toward `target` by at most `step`, snapping when the
 /// remaining turn is under two steps, then clamp into `+/-cone`.
@@ -466,6 +517,19 @@ mod tests {
         entity.target = [1000, 0, 0];
         clock.slew_look_at(&entity);
         assert_eq!(clock.look_at_yaw, frozen);
+    }
+
+    #[test]
+    fn look_at_yaw_snaps_only_under_one_step_and_keeps_out_of_cone_snaps() {
+        // yaw_diff folds the step into the turn, so the snap window is
+        // [-step, step): 0x3F snaps, 0x40 steps.
+        assert_eq!(slew_yaw(0, 0x3F, 0x40), 0x3F);
+        assert_eq!(slew_yaw(0, 0x40, 0x40), 0x40);
+
+        // A snap whose target is outside the +/-0x2C8 cone keeps the previous
+        // angle instead of jumping to the target.
+        assert_eq!(slew_yaw(-0x2C8, 0xD00, 0x40), -0x2C8);
+        assert_eq!(slew_yaw(0, 0, 0x40) as u16 & 0xFFF, 0);
     }
 
     #[test]

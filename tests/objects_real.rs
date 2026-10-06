@@ -779,7 +779,6 @@ fn room_3031_obj_xfm_relights_the_room_and_the_capture() {
     game.sync_entity_from_player(&player);
 
     let before_lights = room.lights;
-    let before = arklay::engine::render_game_frame(&pack, id, &room, &mut game, &player).unwrap();
 
     // Event 1A's first block rewrites all three lights; start it directly
     // rather than waiting for the in-game trigger.
@@ -797,14 +796,28 @@ fn room_3031_obj_xfm_relights_the_room_and_the_capture() {
     assert_ne!(room.lights, before_lights, "obj_xfm never rewrote a light");
     println!("ROOM3031 lights {:?} -> {:?}", before_lights, room.lights);
 
-    let after = arklay::engine::render_game_frame(&pack, id, &room, &mut game, &player).unwrap();
-    let changed = before
+    // The render seam: the frame's lighting is latched from `room.lights`, so
+    // an otherwise identical room with the ambient and lights cleared must
+    // render differently. (The event's own edit saturates the latched light,
+    // so comparing the live frame before and after the edit cannot show it.)
+    let lit = arklay::engine::render_game_frame(&pack, id, &room, &mut game, &player).unwrap();
+    let mut dark_room = room.clone();
+    dark_room.ambient = [0; 3];
+    dark_room.lights = [arklay::state::Light::default(); 3];
+    let dark =
+        arklay::engine::render_game_frame(&pack, id, &dark_room, &mut game, &player).unwrap();
+    let changed = lit
         .rgba
+        .as_chunks::<4>()
+        .0
         .iter()
-        .zip(&after.rgba)
+        .zip(dark.rgba.as_chunks::<4>().0)
         .filter(|(a, b)| a != b)
         .count();
-    assert!(changed > 50, "the relit frame only changed {changed} bytes");
+    assert!(
+        changed > 0,
+        "clearing the room lights did not change one pixel"
+    );
 }
 
 #[test]

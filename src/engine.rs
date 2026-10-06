@@ -4011,10 +4011,21 @@ pub fn simulate_typewriter(
 fn drain_mask_toggles(room: &mut RoomState, game: &mut game::GameState) {
     let Some(cut) = room.cuts.get_mut(room.current_cut) else {
         game.mask_toggles.clear();
+        game.sprite_hide = 0;
         return;
     };
     for toggle in game.mask_toggles.drain(..) {
         mask::set_group_active(&mut cut.mask_active, toggle.group, toggle.active);
+    }
+    // The queued `room_sprite_hide` mask: bits 0..16 each clear the group they
+    // name, then the mask is consumed. Bit 0 names no group and is inert.
+    if game.sprite_hide != 0 {
+        for bit in 0..0x10u8 {
+            if game.sprite_hide & (1 << bit) != 0 {
+                mask::set_group_active(&mut cut.mask_active, bit, false);
+            }
+        }
+        game.sprite_hide = 0;
     }
 }
 
@@ -4922,13 +4933,16 @@ fn build_effect_quads(
         };
 
         // The UV record's pivot is authored as a centre offset; the original
-        // turns it into a top-left distance with `0x80 - pivot`.
+        // turns it into a top-left distance with `0x80 - pivot`. The frame's
+        // screen offset (the shake) joins every sprite position.
         let pivot_x = 0x80 - i32::from(effect.uv[2]);
         let pivot_y = 0x80 - i32::from(effect.uv[3]);
-        let left = i32::from(effect.screen[0]) - sar12(pivot_x * scale);
-        let top = i32::from(effect.screen[1]) - sar12(pivot_y * scale);
-        let right = i32::from(effect.screen[0]) + sar12((width as i32 - pivot_x) * scale);
-        let bottom = i32::from(effect.screen[1]) + sar12((height as i32 - pivot_y) * scale);
+        let screen_x = i32::from(effect.screen[0]) + camera.screen[0];
+        let screen_y = i32::from(effect.screen[1]) + camera.screen[1];
+        let left = screen_x - sar12(pivot_x * scale);
+        let top = screen_y - sar12(pivot_y * scale);
+        let right = screen_x + sar12((width as i32 - pivot_x) * scale);
+        let bottom = screen_y + sar12((height as i32 - pivot_y) * scale);
 
         let light_record =
             effects::pages::camera_light_record(folded, usize::from(id.room), room.current_cut);
@@ -5917,11 +5931,15 @@ fn render_frame(
         visible.len() + visible_item_models.len(),
         mirror.as_ref(),
     );
-    // The special-room-light overlay (`0x1C`) is a full-screen tinted rect
-    // drawn over the scene; the state advances once per gameplay tick in
-    // `tick_room`. Its absence (a state parked at -1) draws nothing.
-    if let Some(color) = game.special_light_fill() {
-        framebuffer.fill_rect([0, 0, WIDTH, HEIGHT], color);
+    // The special-room-light overlay (`0x1C`) is a full-screen saturated tint
+    // alpha-blended over the scene; the state advances once per gameplay tick
+    // in `tick_room`. Its absence (a parked state, an all-zero mask or a
+    // suppressing room) draws nothing, and the guardhouse control room draws
+    // the same rect twice.
+    if let Some(light) = game.special_light_rect(id, room.current_cut) {
+        for _ in 0..light.draws {
+            framebuffer.blend_rect([0, 0, WIDTH, HEIGHT], light.color, light.alpha);
+        }
     }
 }
 
@@ -7411,6 +7429,13 @@ mod tests {
 
         assert_eq!(room.cuts[0].mask_active, 0b0001_0101);
         assert!(game.mask_toggles.is_empty());
+
+        // `room_sprite_hide` (0x49) clears the named groups and is consumed;
+        // bit 0 names no group, and bits at or above 16 are not walked.
+        game.sprite_hide = 1 | (1 << 1) | (1 << 5) | (1 << 16);
+        drain_mask_toggles(&mut room, &mut game);
+        assert_eq!(room.cuts[0].mask_active, 0b0000_0100);
+        assert_eq!(game.sprite_hide, 0);
     }
 
     #[test]
@@ -8899,17 +8924,26 @@ mod tests {
         let dir = TempDir::new();
         let (pack_path, a, _b, _red, _blue) = walk_in_door_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let room = rdt::parse(pack.read(&a.rdt_entry()).unwrap(), a).unwrap();
+        let loaded = load_room(&pack, a).unwrap();
+        let room = loaded.room;
         let mut game = game::GameState::new(a, &room);
         game.light_fade_set(0, 0x4000, 0b111);
         game.advance_special_light();
-        assert_eq!(game.special_light_fill(), Some([0x80, 0x80, 0x80, 255]));
+        assert_eq!(
+            game.special_light_rect(a, 0),
+            Some(game::SpecialLight {
+                color: [255, 255, 255],
+                alpha: 0x80,
+                draws: 1,
+            })
+        );
 
         let player_state = player::spawn(a, &room);
         let image = render_game_frame(&pack, a, &room, &mut game, &player_state).unwrap();
+        // The saturated white veil at alpha 0x80 over the [200, 0, 0] backdrop.
         assert_eq!(
             image.rgba[0..4],
-            [0x80, 0x80, 0x80, 255],
+            [227, 128, 128, 255],
             "the scripted overlay covers the background"
         );
     }
@@ -10909,6 +10943,12 @@ end
         assert_eq!(quad.pos, [77, 18]);
         // depth_group 8 -> tint level 1 of colour record 1.
         assert_eq!(quad.tint, [0xB2, 0xB2, 0xB2]);
+
+        // The frame's screen offset (the shake) shifts the billboard.
+        let mut shaken = camera;
+        shaken.screen = [5, -4];
+        let quads = build_effect_quads(&game, &room, id, &shaken, &pages);
+        assert_eq!(quads[0].pos, [82, 14]);
     }
 
     #[test]

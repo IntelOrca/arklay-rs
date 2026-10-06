@@ -286,14 +286,10 @@ impl Font {
     }
 }
 
-/// The text shadow's blend alpha: `brightness * 255 / 30`, capped at 255, with
-/// the brightness 0 and 2 that the text pass treats as full also full here.
+/// The text shadow's blend alpha: `brightness * 255 / 30`, capped at 255.
+/// Unlike the text pass, the shadow pass has no 0/2 collapse.
 pub fn shadow_alpha(brightness: u8) -> u8 {
-    if brightness == 0 || brightness == 2 {
-        255
-    } else {
-        (u32::from(brightness) * 255 / 30).min(255) as u8
-    }
+    (u32::from(brightness) * 255 / 30).min(255) as u8
 }
 
 #[cfg(test)]
@@ -512,8 +508,10 @@ mod tests {
     #[test]
     fn draw_text_queues_a_black_shadow_at_the_brightness_alpha() {
         let font = Font::new(sheet_with_cell(168, 28));
-        assert_eq!(shadow_alpha(2), 255);
-        assert_eq!(shadow_alpha(0), 255);
+        // The shadow pass uses brightness * 255 / 30 with no 0/2 collapse;
+        // only the text pass maps 0 and 2 to full.
+        assert_eq!(shadow_alpha(0), 0);
+        assert_eq!(shadow_alpha(2), 17);
         assert_eq!(shadow_alpha(15), 127);
         assert_eq!(shadow_alpha(30), 255);
 
@@ -531,11 +529,12 @@ mod tests {
         // The shadow-only column one past the glyph's right edge.
         assert_eq!(pixel(&framebuffer, 24, 11), [100, 100, 100, 255]);
 
-        // At the full-brightness default the shadow is an opaque black edge.
+        // At the exit fade's default brightness the shadow keeps its
+        // brightness-derived alpha rather than collapsing.
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
         font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0C]);
-        assert_eq!(pixel(&framebuffer, 24, 11), [0, 0, 0, 255]);
+        assert_eq!(pixel(&framebuffer, 24, 11), [186, 186, 186, 255]);
     }
 
     #[test]

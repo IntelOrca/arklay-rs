@@ -985,6 +985,57 @@ pub struct MaskToggle {
     pub active: bool,
 }
 
+/// One frame's special-room-light overlay (`0x1C`): a saturated mask colour
+/// blended over the frame at `alpha`, `draws` times.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialLight {
+    /// Saturated per-channel mask colour.
+    pub color: [u8; 3],
+    /// Blend alpha (the original's sprite alpha).
+    pub alpha: u8,
+    /// Times the original draws the rect (2 in the guardhouse control room).
+    pub draws: u8,
+}
+
+/// Stage digit of the courtyard (1-based; the original's 0-indexed stage 2).
+const COURTYARD_STAGE: u8 = 3;
+/// Courtyard fountain room, whose camera 3 doubles the overlay channels.
+const ROOM_FOUNTAIN: u8 = 0x05;
+/// Guardhouse control room, which draws the overlay twice.
+const ROOM_CONTROL_ROOM: u8 = 0x11;
+/// Courtyard water gate.
+const ROOM_WATER_GATE: u8 = 0x01;
+/// Courtyard falls.
+const ROOM_FALLS: u8 = 0x02;
+/// Courtyard garden.
+const ROOM_COURTYARD_GARDEN: u8 = 0x00;
+/// Courtyard boulder 2 passage.
+const ROOM_BOULDER_2_PASSAGE: u8 = 0x0F;
+/// Courtyard elevator to the laboratory.
+const ROOM_ELEVATOR_TO_LABORATORY: u8 = 0x10;
+/// Laboratory entry hall.
+const ROOM_LABORATORY_ENTRY: u8 = 0x00;
+
+/// The original's suppressions of the special-room-light fade: (stage, room,
+/// camera) triples whose scenes never draw it.
+fn special_light_suppressed(id: RoomId, camera: usize) -> bool {
+    if id.stage == COURTYARD_STAGE {
+        if id.room == ROOM_COURTYARD_GARDEN || id.room == ROOM_WATER_GATE || id.room == ROOM_FALLS {
+            return true;
+        }
+        if id.room == ROOM_FOUNTAIN && camera == 0 {
+            return true;
+        }
+        if id.room == ROOM_BOULDER_2_PASSAGE && camera == 1 {
+            return true;
+        }
+        if id.room == ROOM_ELEVATOR_TO_LABORATORY && camera == 0 {
+            return true;
+        }
+    }
+    id.stage == LABORATORY_STAGE && id.room == ROOM_LABORATORY_ENTRY
+}
+
 /// One 3D entity sound cue queued by an NPC handler (the original's
 /// `PlayEntitySnd`), already resolved to a room sound name and position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1369,6 +1420,10 @@ pub struct GameState {
     pub transition_door: Option<Door>,
     /// Mask-group toggles requested by `aot_switch`, consumed by the engine.
     pub mask_toggles: Vec<MaskToggle>,
+    /// The pending room-sprite hide mask queued by `room_sprite_hide` (0x49):
+    /// one bit per group id. Consumed by the engine's mask pass, which clears
+    /// the matching groups and empties the mask.
+    pub sprite_hide: u32,
     /// Item ids picked up this room, in order, for tests.
     pub item_events: Vec<u8>,
     /// The last placeholder interaction recorded by the action layer.
@@ -1404,8 +1459,8 @@ pub struct GameState {
     /// drains the queue (documented).
     pub sfx_requests: Vec<u16>,
     /// The platform random stream's 32-bit state (the original's
-    /// `g_randState`). Seeded 0 at a new game and on every room entry;
-    /// [`GameState::tick_entities`] draws it once per gameplay tick.
+    /// `g_randState`). Starts at 1, the CRT default, and is never reseeded in
+    /// gameplay; [`GameState::tick_entities`] draws it once per gameplay tick.
     pub rand_state: u32,
     /// This frame's platform-random draw (the original's `g_RandSeed`), written
     /// once per gameplay tick before entity thinking and read by the NPC and
@@ -1515,6 +1570,7 @@ impl Default for GameState {
             transition: None,
             transition_door: None,
             mask_toggles: Vec::new(),
+            sprite_hide: 0,
             item_events: Vec::new(),
             last_interaction: None,
             frame: 0,
@@ -1534,7 +1590,7 @@ impl Default for GameState {
             snd3d_enemy_drops: 0,
             snd3d_noops: BTreeMap::new(),
             sfx_requests: Vec::new(),
-            rand_state: 0,
+            rand_state: 1,
             rand_seed: 0,
             effects: effects::EffectPool::new(),
             objects: ObjectTable::default(),
@@ -1561,10 +1617,11 @@ impl Default for GameState {
 /// congruential generator `state = state * 214013 + 2531011`, returning bits
 /// 16..30.
 ///
-/// The original seeds this stream once at boot and draws it once per gameplay
-/// frame into `g_RandSeed` (BioCard word 3, the word scripts roll dice with
-/// via `cmpw 3`); the same stream feeds screen shake and the NPC/effect
-/// consumers. The port seeds it 0 on a new game and on every room entry.
+/// The original seeds this stream once at boot with the CRT default 1 and
+/// draws it once per gameplay frame into `g_RandSeed` (BioCard word 3, the
+/// word scripts roll dice with via `cmpw 3`); the same stream feeds screen
+/// shake and the NPC/effect consumers. The port starts at 1 and never
+/// reseeds, not even across a room load.
 pub fn platform_rand(state: &mut u32) -> u16 {
     *state = state.wrapping_mul(214013).wrapping_add(2531011);
     ((*state >> 16) & 0x7FFF) as u16
@@ -2526,10 +2583,8 @@ impl GameState {
         // clears the delta and the scripted channel masks.
         self.state_words[1] = 0xFFFF;
         self.state_words[2] = 0;
-        // The platform random stream restarts at 0 with the room, so the first
-        // gameplay tick's draw is the stream's first value.
-        self.rand_state = 0;
-        self.rand_seed = 0;
+        // The platform random stream is a process-global: it starts at the
+        // CRT default 1 and is never reseeded, not even by a room load.
         self.special_light_masks = [0; 3];
         self.got_item_slot = None;
         self.event_item_used = false;
@@ -2573,6 +2628,7 @@ impl GameState {
         self.transition = None;
         self.transition_door = None;
         self.mask_toggles.clear();
+        self.sprite_hide = 0;
         // A door-animation message is applied while the transition runs and
         // must survive the destination's room boot, so an active window is
         // kept; otherwise the message resets and only the BioCard menu-choice
@@ -3738,26 +3794,71 @@ impl GameState {
         }
     }
 
-    /// The full-screen special-room-light overlay colour for this frame, or
-    /// `None` while the state is parked below zero.
+    /// The full-screen special-room-light overlay for this frame, or `None`
+    /// while the state is parked below zero, the mask is all-zero or the
+    /// (room, camera) pair suppresses the fade.
     ///
-    /// The intensity is the state shifted down 7 bits; each channel is the
-    /// scripted mask bit-anded with it, exactly the original's `FadingRect`.
-    pub fn special_light_fill(&self) -> Option<[u8; 4]> {
+    /// The state's high byte is the blend intensity and the scripted channel
+    /// mask bit-anded with it is the raw rect colour. The original's
+    /// `draw_rect` then forces every non-zero channel to saturation and uses
+    /// the LAST non-zero raw component as the alpha; the `room_light_fade_set`
+    /// operand's low two bits select the per-channel variant (black veil or
+    /// half alpha). The courtyard fountain's camera 3 doubles the raw channels
+    /// before saturation, and the guardhouse control room draws the same rect
+    /// twice.
+    pub fn special_light_rect(&self, id: RoomId, camera: usize) -> Option<SpecialLight> {
         let state = self.state_words[1] as i16;
         if state < 0 {
             return None;
         }
         let intensity = ((state as i32) >> 7) as u8;
-        let color = [
+        let mut channels = [
             self.special_light_masks[2] & intensity,
             self.special_light_masks[1] & intensity,
             self.special_light_masks[0] & intensity,
-            255,
         ];
-        // A fully black overlay is the original's additive no-op; skipping the
-        // fill keeps the room pixels instead of blacking the frame out.
-        (color[0] != 0 || color[1] != 0 || color[2] != 0).then_some(color)
+        if id.stage == COURTYARD_STAGE && id.room == ROOM_FOUNTAIN && camera == 3 {
+            channels = channels.map(|channel| channel.saturating_mul(2));
+        }
+        let mut brightness = 0u8;
+        for channel in channels {
+            if channel != 0 {
+                brightness = channel;
+            }
+        }
+        if brightness == 0 {
+            return None;
+        }
+        if special_light_suppressed(id, camera) {
+            return None;
+        }
+        let variant = self.state_bytes[usize::from(STATE_BYTE_SPECIAL_LIGHT_R)] & 3;
+        let (color, alpha) = match variant {
+            // The black veil keeps the level as its alpha.
+            2 => ([0, 0, 0], brightness),
+            // Half level; the colour is the saturated mask like variants 0/1.
+            3 => (
+                channels.map(|channel| if channel != 0 { 0xFF } else { 0 }),
+                brightness >> 1,
+            ),
+            _ => (
+                channels.map(|channel| if channel != 0 { 0xFF } else { 0 }),
+                brightness,
+            ),
+        };
+        if alpha == 0 {
+            return None;
+        }
+        let draws = if id.stage == GUARDHOUSE_STAGE && id.room == ROOM_CONTROL_ROOM {
+            2
+        } else {
+            1
+        };
+        Some(SpecialLight {
+            color,
+            alpha,
+            draws,
+        })
     }
 
     /// `msgnode_set` (0x3A): rewrite a camera-switch-zone record's two header
@@ -5910,6 +6011,19 @@ impl ScdHost for ScdGameHost<'_> {
     }
 
     fn on_misc(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+        // `room_sprite_hide` (0x49): queue a room-sprite group id for hiding.
+        // Operand 0xFF clears the pending mask instead of adding to it; the
+        // engine's mask pass clears the selected groups.
+        if op.op == 0x49 {
+            let value = operand_u16(operands, 0);
+            let selector = (value >> 8) as u8;
+            if selector == 0xFF {
+                self.state.sprite_hide = 0;
+            } else {
+                self.state.sprite_hide |= 1u32 << (selector & 0x1F);
+            }
+            return StepResult::Continue;
+        }
         match op.mnemonic {
             // `aot_switch` (0x25): pad, sprite group id, disable flag. A zero
             // disable byte enables the group, anything else hides it. The
@@ -7378,6 +7492,29 @@ mod tests {
     }
 
     #[test]
+    fn room_sprite_hide_queues_and_wipes_the_mask() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        // The operand's high byte names the bit; 0xFF00 wipes the queue.
+        assert_eq!(
+            host.on_misc(op(0x49), &operands(&[0x0200])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().sprite_hide, 1 << 2);
+        assert_eq!(
+            host.on_misc(op(0x49), &operands(&[0x2500])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().sprite_hide, (1 << 2) | (1 << 5));
+        assert_eq!(
+            host.on_misc(op(0x49), &operands(&[0xFF00])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().sprite_hide, 0);
+        assert!(host.state().placeholders.is_empty());
+    }
+
+    #[test]
     fn effect_opcodes_do_not_record_placeholders() {
         let mut state = effect_game();
         let mut host = ScdGameHost::new(&mut state);
@@ -7963,12 +8100,13 @@ mod tests {
     }
 
     #[test]
-    fn platform_rand_follows_the_msvc_recurrence_from_seed_zero() {
+    fn platform_rand_follows_the_msvc_recurrence_from_the_crt_default_seed() {
         // The first draws of `state = state * 214013 + 2531011`, bits 16..30,
-        // from the boot seed 0; the values are computed from the recurrence.
-        let mut state = 0u32;
-        let mut expected_state = 0u32;
-        for expected in [38u16, 7719, 21238, 2437, 8855, 11797] {
+        // from the CRT default seed 1 (the process-global start); the values
+        // are computed from the recurrence.
+        let mut state = 1u32;
+        let mut expected_state = 1u32;
+        for expected in [41u16, 18467, 6334, 26500, 19169, 15724] {
             expected_state = expected_state.wrapping_mul(214013).wrapping_add(2531011);
             assert_eq!(platform_rand(&mut state), expected);
             assert_eq!(state, expected_state);
@@ -7985,14 +8123,14 @@ mod tests {
         let mut models = crate::npc::EntityModelCache::default();
         state.tick_entities(&room, &mut models, &pack);
 
-        // The frame draw is the stream's first value from seed 0.
-        let draw = 38u16;
-        assert_eq!(state.rand_state, 2531011);
+        // The frame draw is the stream's first value from the CRT default 1.
+        let draw = 41u16;
+        assert_eq!(state.rand_state, 2745024);
         assert_eq!(state.rand_seed, draw);
         assert_eq!(state.state_words[3], draw);
         // The scripts' `cmpw 3` reads the word (mode 0 is unsigned equality).
         assert!(state.compare_word(3, 0, draw as i16));
-        assert!(!state.compare_word(3, 0, 39));
+        assert!(!state.compare_word(3, 0, 42));
     }
 
     #[test]
@@ -8004,11 +8142,11 @@ mod tests {
         assert_eq!(state.rand_state, frozen);
 
         state.flags[5].apply(MSF2_SCREEN_SHAKE, 0);
-        // X = 38 & 1 = 0, Y = 7719 & 1 = 1, direction 21238 & 3 = 2 negates X.
+        // X = 41 & 1 = 1, Y = 18467 & 1 = 1, direction 6334 & 3 = 2 negates X.
+        assert_eq!(state.shake_offset(), [-1, 1]);
+        // X = 26500 & 1 = 0, Y = 19169 & 1 = 1, direction 15724 & 3 = 0.
         assert_eq!(state.shake_offset(), [0, 1]);
-        // X = 2437 & 1 = 1, Y = 8855 & 1 = 1, direction 11797 & 3 = 1 negates Y.
-        assert_eq!(state.shake_offset(), [1, -1]);
-        assert_eq!(state.rand_state, 773_150_046, "six draws consumed");
+        assert_eq!(state.rand_state, 1_030_492_215, "six draws consumed");
     }
 
     #[test]
@@ -12129,6 +12267,7 @@ mod tests {
         state.flags[usize::from(BANK_SYSTEM)].bytes_mut()[0] = 0x55;
         state.state_words[1] = 5;
         state.special_light_masks = [1, 2, 3];
+        state.rand_state = 0x1234_5678;
         state.got_item_slot = Some(4);
         state.event_item_used = true;
 
@@ -12150,6 +12289,10 @@ mod tests {
         assert_eq!(state.state_words[1], 0xFFFF, "the light parks at -1");
         assert_eq!(state.state_words[2], 0);
         assert_eq!(state.special_light_masks, [0; 3]);
+        assert_eq!(
+            state.rand_state, 0x1234_5678,
+            "the random stream is process-global and survives a room load"
+        );
         assert_eq!(state.got_item_slot, None);
         assert!(!state.event_item_used);
     }
@@ -12218,6 +12361,7 @@ mod tests {
     #[test]
     fn light_fade_state_machine_signs_masks_and_ramp() {
         let mut state = game();
+        let id = RoomId::parse("1010").unwrap();
         // Delta > 0 fades up from 0; the mask bits force B, G and R.
         state.light_fade_set(3, 0x0100, 0b111);
         assert_eq!(
@@ -12227,13 +12371,22 @@ mod tests {
         assert_eq!(state.state_words[1], 0);
         assert_eq!(state.state_words[2], 0x0100);
         assert_eq!(state.special_light_masks, [0xFF, 0xFF, 0xFF]);
-        assert_eq!(state.special_light_fill(), None, "intensity 0 is invisible");
+        assert_eq!(
+            state.special_light_rect(id, 0),
+            None,
+            "intensity 0 is invisible"
+        );
         state.advance_special_light();
         assert_eq!(state.state_words[1], 0x0100);
+        // state >> 7 is the raw intensity; the rect saturates the mask and
+        // the r&3 variant 3 halves the alpha.
         assert_eq!(
-            state.special_light_fill(),
-            Some([0x02, 0x02, 0x02, 255]),
-            "state >> 7 is the intensity"
+            state.special_light_rect(id, 0),
+            Some(SpecialLight {
+                color: [255, 255, 255],
+                alpha: 1,
+                draws: 1,
+            })
         );
 
         // Delta < 0 fades down from 0x7FFF and stops drawing once negative.
@@ -12244,7 +12397,7 @@ mod tests {
             state.advance_special_light();
         }
         assert!((state.state_words[1] as i16) < 0);
-        assert_eq!(state.special_light_fill(), None);
+        assert_eq!(state.special_light_rect(id, 0), None);
         // A parked state does not advance.
         let parked = state.state_words[1];
         state.advance_special_light();
@@ -12255,7 +12408,87 @@ mod tests {
         state.light_fade_set(2, 0, 0);
         assert_eq!(state.state_words[1], 0x2000);
         assert_eq!(state.special_light_masks, [0, 0, 0]);
-        assert_eq!(state.special_light_fill(), None);
+        assert_eq!(state.special_light_rect(id, 0), None);
+    }
+
+    #[test]
+    fn special_light_overlay_variants_follow_the_room_and_camera() {
+        let mut state = game();
+        let mut id = RoomId::parse("1010").unwrap();
+        state.state_words[1] = 0x2000;
+        state.special_light_masks = [0, 0, 0xFF];
+
+        // Variant 0/1: the saturated red mask at the full intensity.
+        state.light_fade_set(0, 0, 0);
+        state.special_light_masks = [0, 0, 0xFF];
+        assert_eq!(
+            state.special_light_rect(id, 0),
+            Some(SpecialLight {
+                color: [255, 0, 0],
+                alpha: 0x40,
+                draws: 1,
+            })
+        );
+
+        // Variant 2 is the black veil; it keeps the level as its alpha.
+        state.light_fade_set(2, 0, 0);
+        state.special_light_masks = [0, 0, 0xFF];
+        assert_eq!(
+            state.special_light_rect(id, 0),
+            Some(SpecialLight {
+                color: [0, 0, 0],
+                alpha: 0x40,
+                draws: 1,
+            })
+        );
+
+        // The courtyard fountain doubles the raw channels before saturation,
+        // which doubles the alpha too.
+        id = RoomId::from_room_and_player("305", 0).unwrap();
+        state.light_fade_set(0, 0, 0);
+        state.special_light_masks = [0, 0, 0x40];
+        assert_eq!(
+            state.special_light_rect(id, 3),
+            Some(SpecialLight {
+                color: [255, 0, 0],
+                alpha: 0x80,
+                draws: 1,
+            })
+        );
+
+        // The guardhouse control room draws the rect twice.
+        id = RoomId::from_room_and_player("411", 0).unwrap();
+        state.special_light_masks = [0, 0, 0xFF];
+        assert_eq!(
+            state.special_light_rect(id, 0).map(|light| light.draws),
+            Some(2)
+        );
+
+        // The suppression list: the courtyard garden, water gate, falls,
+        // fountain camera 0, boulder passage camera 1, the laboratory entry
+        // and the elevator camera 0 never draw it.
+        for (room, camera) in [
+            ("300", 0),
+            ("301", 0),
+            ("302", 0),
+            ("305", 0),
+            ("30F", 1),
+            ("310", 0),
+            ("500", 0),
+        ] {
+            let suppressed = RoomId::from_room_and_player(room, 0).unwrap();
+            assert_eq!(
+                state.special_light_rect(suppressed, camera),
+                None,
+                "ROOM{room} camera {camera} must suppress the fade"
+            );
+        }
+        // The same rooms at other cameras still draw.
+        assert!(
+            state
+                .special_light_rect(RoomId::from_room_and_player("305", 0).unwrap(), 1)
+                .is_some()
+        );
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //! player ops, and the transition-following harness against the shipped room
 //! corpus: every room simulates 300 ticks with zero placeholder hits for the
 //! newly implemented opcodes, no *new* placeholder arm is reached anywhere
-//! (only the two documented leftovers), and the rooms whose scripts walk the
-//! player through a door list their destinations.
+//! (only the one documented leftover), and the rooms whose scripts walk the
+//! player through a door list their destinations. A companion test drives a
+//! shipped door through the real transition-follow path, since no room walks
+//! itself through a door under the audit's idle/action drive.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/home/ted/openre/assets/re1 ARKLAY_RE1_PACK=/home/ted/openre/re1.akpak cargo test --test m16_game_real -- --ignored`
@@ -40,11 +42,10 @@ const SLICE_OPCODES: [u8; 12] = [
     0x46, // msg_list
 ];
 
-/// The only placeholder arms the shipped corpus still dispatches, both
-/// intentional and named in `docs/m16-deviations.md`: `0x05` with an
-/// out-of-range flag bank and the unimplemented `0x49` player op. Any other
-/// op reaching a placeholder arm fails the audit.
-const KNOWN_PLACEHOLDERS: [u8; 2] = [0x05, 0x49];
+/// The only placeholder arms the shipped corpus still dispatches, intentional
+/// and named in `docs/m16-deviations.md`: `0x05` with an out-of-range flag
+/// bank. Any other op reaching a placeholder arm fails the audit.
+const KNOWN_PLACEHOLDERS: [u8; 1] = [0x05];
 
 /// Every opcode byte that appears in one RDT's init, main or event scripts.
 fn script_opcodes(bytes: &[u8]) -> BTreeSet<u8> {
@@ -169,4 +170,33 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
         "the corpus dispatched new placeholder ops: {new_placeholders:02x?}"
     );
     assert!(simulated > 300, "only {simulated} rooms simulated");
+}
+
+/// The transition-follow path on real data: press a shipped room's door,
+/// run its `.dor` timeline to completion and assert the destination room was
+/// loaded, placed and rendered. The corpus audit above only *records* rooms
+/// whose scripts walk the player through a door (none do under its idle/action
+/// drive), so this is the real-data counterpart of the synthetic follow test.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_door_transition_reboots_the_destination_room() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+
+    // ROOM1001's first door leads to 1002; its record is a plain door with no
+    // key requirement.
+    let source = RoomId::parse("1001").unwrap();
+    let sim = arklay::engine::simulate_door(&pack, source, 0, None).unwrap();
+    assert_ne!(sim.target, source, "the door must cross into another room");
+    assert_eq!(sim.room.stage, sim.target.stage);
+    assert_eq!(sim.room.room, sim.target.room);
+    assert!(sim.frame_count > 0, "the .dor timeline ran no frame");
+    assert!(
+        sim.gameplay_frame.rgba.iter().any(|&byte| byte != 0),
+        "the destination's first gameplay frame is blank"
+    );
+    // The destination is a loadable shipped room, not a placeholder.
+    assert!(pack.read(&sim.target.rdt_entry()).is_ok());
 }

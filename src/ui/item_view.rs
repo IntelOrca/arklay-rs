@@ -178,8 +178,18 @@ impl ItemViewScreen {
     }
 
     /// The examine check's result for the model's current pose.
+    ///
+    /// The red book's spin accumulator gates the zoom: once one spin-in has
+    /// completed (`zoom_spin != 0`) a later examine opens the description
+    /// straight away instead of replaying the spin. The doom books have no
+    /// such gate.
     pub fn examine(&self) -> ExamineOutcome {
-        examine_check(self.item, self.yaw, self.pitch, self.roll)
+        match examine_check(self.item, self.yaw, self.pitch, self.roll) {
+            ExamineOutcome::Zoom if self.item == items::ITEM_RED_BOOK && self.zoom_spin != 0 => {
+                ExamineOutcome::Open
+            }
+            outcome => outcome,
+        }
     }
 
     /// Whether the zoom spin is running.
@@ -571,6 +581,25 @@ mod tests {
         assert_eq!(examine_check(0x3E, 0, 0, 0), ExamineOutcome::Refused);
         // The PC machineguns keep their descriptions.
         assert_eq!(examine_check(0x6F, 0, 0, 0), ExamineOutcome::Open);
+    }
+
+    #[test]
+    fn red_book_skips_the_zoom_once_the_spin_accumulator_has_run() {
+        let mut screen = ItemViewScreen::new(items::ITEM_RED_BOOK);
+        screen.yaw = 0x400;
+        assert_eq!(screen.examine(), ExamineOutcome::Zoom);
+
+        // A finished spin-in parks the accumulator above its 0x300 target;
+        // the same pose then opens the description instead of replaying the
+        // zoom. The doom books have no such gate.
+        screen.zoom_spin = 0x301;
+        assert_eq!(screen.examine(), ExamineOutcome::Open);
+
+        let mut doom = ItemViewScreen::new(items::ITEM_RED_BOOK + 1);
+        doom.yaw = 0x400;
+        assert_eq!(doom.examine(), ExamineOutcome::Zoom);
+        doom.zoom_spin = 0x301;
+        assert_eq!(doom.examine(), ExamineOutcome::Zoom);
     }
 
     #[test]

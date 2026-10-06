@@ -27,6 +27,8 @@ use arklay::state::{Light, RoomId};
 
 /// The player stand-in's flat texture colour.
 const PLAYER: [u8; 4] = [200, 40, 40, 255];
+/// The stand-in shaded by the test's full ambient (4095 -> 254).
+const PLAYER_LIT: [u8; 4] = [199, 39, 39, 255];
 /// How far behind the pillar's key the stand-in is placed, in view units.
 const BACK_INSET: f64 = 1500.0;
 
@@ -192,7 +194,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     );
     assert_eq!(
         pixel(&framebuffer, 60, 140),
-        PLAYER,
+        PLAYER_LIT,
         "an unoccluded player pixel must stay visible"
     );
 
@@ -220,7 +222,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     );
     assert_eq!(
         pixel(&framebuffer, pillar.0, pillar.1),
-        PLAYER,
+        PLAYER_LIT,
         "disabling group 1 must reveal the player"
     );
 }
