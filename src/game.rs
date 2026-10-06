@@ -1196,6 +1196,10 @@ pub struct Entity {
     /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
     /// joint `i`'s flag bit.
     pub joint_flags: u16,
+    /// The obstacle pathfinder's state byte (entity +0x164): bits 0-4 are the
+    /// frame counter, bit 5 the last line-of-sight result. State 9's
+    /// `entity_pathfind_update` cycles it and latches the player waypoint.
+    pub pathfind_state: u8,
 }
 
 impl Entity {
@@ -2040,12 +2044,12 @@ impl GameState {
         entity.variant = (operand_u8(operands, 11) & 0x0F)
             | ((operand_u8(operands, 14) & 0x0F) << 4)
             | if force_init { 0x80 } else { 0 };
-        // TODO(parity): (gameplay) the original points the new entity at the
-        // SCA record g_scaDataTable[0] (Chris' radius/hit box) and reserves
-        // `operand 4 * 6` bytes of the rotated hit-data pool; the port stores a
-        // flat DEFAULT_ENEMY_RADIUS and has no SCA hit volumes, so per-character
-        // hit boxes and the SCA collision pass differ (see npc/walk.rs
-        // resolve_sca_collision).
+        // The original points the new entity at the SCA record g_scaDataTable[0]
+        // (Chris' radius/hit box) until the character's state-0 init swaps in
+        // its own record. The port stores the same initial radius; the
+        // per-character volume (offset, half-height and radius) is derived from
+        // `npc::data` wherever the collision layer needs it
+        // (see npc/walk.rs ScaHit).
         entity.sca_radius = DEFAULT_ENEMY_RADIUS;
         if !occupied {
             self.enemy_count = self.enemy_count.saturating_add(1);
@@ -4342,6 +4346,24 @@ impl GameState {
             }
             let saved = record.pos;
 
+            // 1. every active character is pushed out of the object, with its
+            // own SCA volume (`ChkEntitySlide` reads the record's radius,
+            // half-height and rotated part offset).
+            for slot in 1..ENTITY_COUNT {
+                let entity = self.entities[slot];
+                if !entity.active() {
+                    continue;
+                }
+                let hit = crate::npc::walk::ScaHit::character(entity.id, entity.sca_radius);
+                let ext = objects::EntityCollision {
+                    flag: entity.status_flags,
+                    radius: hit.radius,
+                    height: hit.half_height,
+                    offsets: hit.world_offset(entity.angle),
+                };
+                objects::chk_entity_slide(&mut self.entities[slot].pos, ext, &mut record, false);
+            }
+
             // 2. the push probe.
             let ent_ext = objects::EntityCollision::player(player.radius);
             let mut player_pos = player.pos;
@@ -4365,6 +4387,27 @@ impl GameState {
                     push_started = true;
                     record.push_counter = 8;
                     player.angle = player.angle.wrapping_add(0x200) & 0xC00;
+
+                    // A character standing where the object would go parks the
+                    // counter at 10 (the original does not abort the push on
+                    // this path; it just shoves the object off the character).
+                    for slot in 1..ENTITY_COUNT {
+                        let entity = self.entities[slot];
+                        if !entity.active() {
+                            continue;
+                        }
+                        let hit = crate::npc::walk::ScaHit::character(entity.id, entity.sca_radius);
+                        let ext = objects::EntityCollision {
+                            flag: entity.status_flags,
+                            radius: hit.radius,
+                            height: hit.half_height,
+                            offsets: hit.world_offset(entity.angle),
+                        };
+                        let mut ent_pos = entity.pos;
+                        if objects::chk_entity_slide(&mut ent_pos, ext, &mut record, true) != 0 {
+                            record.push_counter = 10;
+                        }
+                    }
 
                     // Another object in the way vetoes the whole push.
                     let mut vetoed = false;

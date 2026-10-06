@@ -87,6 +87,77 @@ pub fn collision_radius(id: u8) -> Option<i32> {
     })
 }
 
+/// One character's SCA collision volume: the entity-local point the cylinder
+/// is centred on, its half-height and its XZ radius.
+///
+/// The original's per-character `Sca_info` records (`0x004c2bb0`, 16 bytes
+/// each) pack a single volume into the same words as the list terminator: the
+/// local point at `+2/+4/+6` (`x`, `y`, `z`), the half-height at `+8` and the
+/// radius at `+10`. `ResolveEntityScaCollision` reads the point (rotated into
+/// world space by `SetEntityScaHitData`) and the two extents; the flat
+/// `collision_radius` is the same record's `+10`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaVolume {
+    /// Entity-local centre of the cylinder; Y is the height offset.
+    pub offset: [i16; 3],
+    /// Half-height of the cylinder.
+    pub half_height: i16,
+    /// Cylinder radius, the same value as [`collision_radius`].
+    pub radius: i16,
+}
+
+/// The standing characters' volume: centred 0x5FA below the origin, the
+/// radius depending on the model class.
+const SCA_STANDING_LARGE: ScaVolume = ScaVolume {
+    offset: [0, -0x5FA, 0],
+    half_height: 0x5FA,
+    radius: RADIUS_LARGE as i16,
+};
+/// The standing female models (Jill and Rebecca).
+const SCA_STANDING_MEDIUM: ScaVolume = ScaVolume {
+    offset: [0, -0x5FA, 0],
+    half_height: 0x5FA,
+    radius: RADIUS_MEDIUM as i16,
+};
+/// Kenneth/Forest's corpse: a short volume over the sprawled body.
+const SCA_SPRAWLED: ScaVolume = ScaVolume {
+    offset: [0x258, -0xB4, -0xC8],
+    half_height: 0xB4,
+    radius: RADIUS_SPRAWLED as i16,
+};
+/// Enrico's corpse: the same short volume without the Z offset.
+const SCA_SPRAWLED_ENRICO: ScaVolume = ScaVolume {
+    offset: [0x258, -0xB4, 0],
+    half_height: 0xB4,
+    radius: RADIUS_SPRAWLED as i16,
+};
+
+/// The per-character SCA volumes, indexed by `id - FIRST_ID`. The Barry,
+/// Rebecca and Wesker cutscene aliases reuse their base character's record,
+/// exactly like the original's init handlers.
+const SCA_VOLUMES: [ScaVolume; 15] = [
+    SCA_STANDING_LARGE,  // Chris
+    SCA_STANDING_MEDIUM, // Jill
+    SCA_STANDING_LARGE,  // Barry
+    SCA_STANDING_MEDIUM, // Rebecca
+    SCA_STANDING_LARGE,  // Wesker
+    SCA_STANDING_LARGE,  // Kenneth corpse
+    SCA_SPRAWLED,        // Forest corpse
+    SCA_STANDING_LARGE,  // Richard
+    SCA_SPRAWLED_ENRICO, // Enrico
+    SCA_STANDING_LARGE,  // Kenneth (devoured)
+    SCA_STANDING_LARGE,  // Barry 2
+    SCA_STANDING_LARGE,  // Barry 2 (Stars)
+    SCA_STANDING_MEDIUM, // Rebecca 2 (Stars)
+    SCA_STANDING_LARGE,  // Barry 3
+    SCA_STANDING_LARGE,  // Wesker 2 (Stars)
+];
+
+/// The SCA volume of character `id`, or `None` for non-characters.
+pub fn sca_volume(id: u8) -> Option<ScaVolume> {
+    SCA_VOLUMES.get(index(id)?).copied()
+}
+
 /// The packed `0x00RRGGBB` tint the character's ground shadow blends towards
 /// plus the shadow quad's half-extents and the local offset it is built
 /// around, indexed by `id - FIRST_ID`.
@@ -295,6 +366,37 @@ mod tests {
         }
         assert_eq!(collision_radius(FIRST_ID - 1), None);
         assert_eq!(collision_radius(LAST_ID + 1), None);
+    }
+
+    #[test]
+    fn sca_volumes_carry_the_record_radii_and_heights() {
+        for id in FIRST_ID..=LAST_ID {
+            let volume = sca_volume(id).unwrap_or_else(|| panic!("id {id:#04x} has no volume"));
+            assert_eq!(
+                i32::from(volume.radius),
+                collision_radius(id).unwrap(),
+                "id {id:#04x} radius matches the record"
+            );
+        }
+        // The standing volume sits 0x5FA below the origin with the same
+        // half-height; the sprawled bodies use their own offset and 0xB4.
+        let chris = sca_volume(0x20).unwrap();
+        assert_eq!(chris.offset, [0, -0x5FA, 0]);
+        assert_eq!(chris.half_height, 0x5FA);
+        let jill = sca_volume(0x21).unwrap();
+        assert_eq!(i32::from(jill.radius), RADIUS_MEDIUM);
+        assert_eq!(jill.half_height, 0x5FA);
+        let forest = sca_volume(0x26).unwrap();
+        assert_eq!(forest.offset, [0x258, -0xB4, -0xC8]);
+        assert_eq!(forest.half_height, 0xB4);
+        let enrico = sca_volume(0x28).unwrap();
+        assert_eq!(enrico.offset, [0x258, -0xB4, 0]);
+        // Aliases reuse their base character's record.
+        assert_eq!(sca_volume(0x2A), Some(sca_volume(0x22).unwrap()));
+        assert_eq!(sca_volume(0x2C), Some(sca_volume(0x23).unwrap()));
+        assert_eq!(sca_volume(0x2E), Some(sca_volume(0x24).unwrap()));
+        assert_eq!(sca_volume(FIRST_ID - 1), None);
+        assert_eq!(sca_volume(LAST_ID + 1), None);
     }
 
     #[test]

@@ -120,6 +120,9 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
     for _ in 0..600 {
         npc::scd::update(&mut game, slot, &sim.room, &model.clips);
         let entity = game.entities[slot];
+        // State 8 has no end-of-frame resolve, so the port keeps the walk
+        // layer's pre-check + rollback for this driver: the scripted walk
+        // slides against walls instead of crossing them.
         assert!(
             !player::position_blocked(&sim.room, entity.pos, i32::from(entity.sca_radius)),
             "the walk crossed a collision rect at {:?}",

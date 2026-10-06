@@ -323,7 +323,7 @@ fn handler_02_walk(
     walk::entity_apply_walk_speed(entity, 0x5D);
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0x96 {
         finish_walk(entity, system);
     }
@@ -408,7 +408,7 @@ fn handler_03_walk(
     }
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0xFA {
         entity.action_state = 4;
         if entity.collision_flags & 0x80 != 0 {
@@ -425,7 +425,7 @@ fn handler_03_stop(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], 
         entity.action_state = 6;
     }
     entity.move_speed_current = (entity.move_speed_current as i16).wrapping_sub(0x1E) as u16;
-    walk::advance_xz(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
 }
 
 /// The shared state 0/1 body of the backward walks: flip the facing 180
@@ -443,7 +443,7 @@ fn backward_step(
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     entity.angle = entity.angle.wrapping_sub(0x800);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz(room, entity, 0x800, entity.move_speed_current as i16);
+    walk::advance_xz_blocked(room, entity, 0x800, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 100 {
         finish_walk(entity, system);
     }

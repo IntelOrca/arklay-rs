@@ -35,9 +35,11 @@
 //! - **Look-at is simplified.** The original slews a tracking joint every
 //!   update; this port stores the target and steps the entity yaw in the walk
 //!   layer.
-//! - **Pathfinding is a BFS.** [`walk::zone_path_find`] reaches the same
-//!   walk-zone adjacency as the original's iterative ring expansion with a
-//!   breadth-first search over the zone graph.
+//! - **Pathfinding starts from fresh scratch.** [`walk::zone_path_find`] ports
+//!   the original's distance-weighted CW/CCW ring walk over the zone graph,
+//!   including the `to.z == 0` zone-index entry, but seeds each walk's scratch
+//!   arrays to zero instead of reusing the original's stale globals, so the
+//!   same inputs always take the same route.
 //! - **RNG is deterministic.** The look-at scheduling reads the platform
 //!   stream's per-frame draw (`GameState::rand_seed`); only the consumer call
 //!   order within a frame is the port's own.

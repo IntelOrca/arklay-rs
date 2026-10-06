@@ -1306,6 +1306,21 @@ pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
     (fixed_mul_12(m00, speed), fixed_mul_12(m20, speed))
 }
 
+/// Rotate an arbitrary local XZ point by a 12-bit yaw, the transform the SCA
+/// collision records run their part offsets through (the original's
+/// `SetEntityScaHitData` applies the entity's `RotMatrixY` to each part).
+pub(crate) fn rotate_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
+    let angle = angle & 0x0FFF;
+    let m00 = cos14(angle) >> 2;
+    let m02 = sin14(angle) >> 2;
+    let m20 = (-sin14(angle)) >> 2;
+    let m22 = cos14(angle) >> 2;
+    (
+        fixed_mul_12(m00, x) + fixed_mul_12(m02, z),
+        fixed_mul_12(m20, x) + fixed_mul_12(m22, z),
+    )
+}
+
 /// 4.12 matrix element times the speed, truncated back to an integer.
 fn fixed_mul_12(element: i32, speed: i32) -> i32 {
     let product = element * speed;
@@ -1333,7 +1348,7 @@ fn saturate14(value: i32) -> i32 {
 /// quadrant's records and lets each hit shape push the proposed position.
 /// Pass 2 re-classifies the pushed position and rolls the tick back to `prev`
 /// if it is still inside a blocking record.
-fn resolve_collision(
+pub(crate) fn resolve_collision(
     collision: &Collision,
     prev: [i32; 3],
     proposed: [i32; 3],

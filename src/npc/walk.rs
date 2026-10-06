@@ -4,25 +4,32 @@
 //! The original's state-8 handlers steer with `turn_toward_target` /
 //! `entity_rotate_toward_target`, trim their speed on the animation's footfall
 //! frames with `entity_apply_walk_speed`, and move with `Add_speedXZ`; state 9
-//! reuses the same helpers. The engine resolves every move against the room
-//! collision with the entity's own radius and rolls a blocked move back, so a
-//! scripted walk never pushes a character through geometry.
+//! reuses the same helpers. `Add_speedXZ` is a bare un-collided add: a
+//! character walks into geometry and is only pushed back out by the pass that
+//! runs later in its own driver ([`update`]'s state-9 tail, or the room-object
+//! pass). [`try_advance_xz`] keeps the rollback only for the idle walk-01
+//! probe, where the original saves the moved words, probes, and restores them.
 //!
 //! State 9 adds the walk-zone graph the room data provides: [`walk_zone_find`]
 //! locates the zone containing a point, [`walk_zone_shared_edge`] names the
-//! crossing between two zones, and [`zone_path_find`] walks the zone adjacency
-//! graph from the entity to the player. [`crossing_heading`] clamps the
-//! crossing into the shared corridor with two wall probes, and the four
-//! behaviours in [`update`] walk, run, pace or retreat on a distance ring.
-//! A character is pushed out of the player's radius and out of every other
-//! active character's radius after it moves, exactly like the original's
-//! `ResolveEntityScaCollision` + `HandleEnemyPlayerCollisions` tail; the other
-//! entity is never moved and no damage is transferred.
-
-use std::collections::VecDeque;
+//! crossing between two zones, and [`zone_path_find`] runs the original's
+//! distance-weighted CW/CCW zone-ring walk from the entity to the player (a
+//! `to.z == 0` target names a zone index instead, and the waypoint is that
+//! zone's midpoint). [`crossing_heading`] clamps the crossing into the shared
+//! corridor with two wall probes, and the four behaviours in [`update`] walk,
+//! run, pace or retreat on a distance ring.
+//!
+//! The collision tail matches the original's order: the entity's SCA volume is
+//! rotated into world space, [`separate_from_player`] and
+//! [`separate_from_character`] run the volume penetration test (XZ radius,
+//! height overlap, hit flag and the pre-move `position` degenerate fix), and
+//! the end-of-frame room collision pass pushes the result out of walls and
+//! rolls X/Z back to the last accepted position when it is still stuck. The
+//! pushed entity is never the player and no damage is transferred.
 
 use crate::game::{Entity, EntitySound, GameState};
 use crate::model::Clip;
+use crate::npc::data;
 use crate::player;
 use crate::sfx;
 use crate::state::RoomState;
@@ -94,30 +101,40 @@ pub fn entity_apply_walk_speed(entity: &mut Entity, speed: i16) {
     entity.move_speed_current = current as u16;
 }
 
-/// `Add_speedXZ`: move `distance` units along the entity's yaw plus `offset`,
-/// resolved against the room collision with the entity's radius. A blocked
-/// move rolls back to the pre-move position.
-///
-/// TODO(parity): (gameplay) the original's Add_speedXZ is a bare un-collided
-/// add; scripted state-8 walks can cross geometry, and state 9 only resolves
-/// the final position afterwards with check_room_collision (which pushes out
-/// of walls rather than rolling back). The port's pre-check + rollback makes
-/// characters stop at walls the original would pass through or slide along.
-pub fn advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) {
-    try_advance_xz(room, entity, offset, distance);
+/// `Add_speedXZ`: move `distance` units along the entity's yaw plus `offset`.
+/// A bare un-collided add - the original never tests the room here, so a
+/// scripted walk can cross geometry and only the driver's own collision pass
+/// (the state-9 tail or the room-object pass) pushes it back out.
+pub fn advance_xz(entity: &mut Entity, offset: u16, distance: i16) {
+    let (dx, dz) = player::rotate_speed(entity.angle, offset, i32::from(distance));
+    entity.pos[0] += dx;
+    entity.pos[2] += dz;
 }
 
-/// [`advance_xz`] reporting whether the move was committed. The idle walk-01
-/// behaviour uses the result as its collision probe: the original commits the
-/// move and rolls it back on a hit, so "did not move" is the hit.
+/// The state-8 scripted walks: `Add_speedXZ` with a pre-move collision probe.
+///
+/// The original's state-8 handlers have no end-of-frame room resolve at all,
+/// so an un-collided step can walk a scripted character straight through
+/// geometry with nothing to push it back out. The port keeps the pre-check +
+/// rollback for this driver only (documented deviation); state 9 mirrors the
+/// original's un-collided move and resolves in its own tail.
+pub fn advance_xz_blocked(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) {
+    let _ = try_advance_xz(room, entity, offset, distance);
+}
+
+/// The idle walk-01 collision probe: `Add_speedXZ` followed by the original's
+/// save/probe/restore. The move is committed, the room collision is asked
+/// whether the moved point is inside a wall, and the caller's saved words are
+/// put back either way - so "did not move" is the hit. This is the only place
+/// the original rolls a movement back on a collision result.
 pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) -> bool {
-    let (dx, dz) = player::rotate_speed(entity.angle, offset, i32::from(distance));
-    let proposed = [entity.pos[0] + dx, entity.pos[1], entity.pos[2] + dz];
+    let saved = entity.pos;
+    advance_xz(entity, offset, distance);
     let radius = i32::from(entity.sca_radius);
-    if player::position_blocked(room, proposed, radius) {
+    if player::position_blocked(room, entity.pos, radius) {
+        entity.pos = saved;
         return false;
     }
-    entity.pos = proposed;
     true
 }
 
@@ -207,121 +224,431 @@ pub enum ZonePath {
     Unreachable,
 }
 
-/// `zone_path_find`: a bidirectional BFS over the zone adjacency bitmask
-/// (record `+10`), starting from the entity's zone and meeting a search from
-/// the player's zone. Returns the next zone to walk into and the shared-edge
-/// crossing; the same zone is [`ZonePath::Direct`] and a point outside the
-/// grid or a disconnected target is [`ZonePath::Unreachable`].
-///
-/// TODO(parity): (gameplay) the original walks the zone graph with the
-/// distance-weighted CW/CCW ring searches (zone_walk_cw/ccw) that keep the
-/// shortest crossing path, and treats a `to.z == 0` target as a zone index
-/// whose midpoint is the waypoint. The BFS returns a valid but sometimes
-/// different first step (no distance weighting) and has no z==0 mode.
-pub fn zone_path_find(room: &RoomState, from: [i32; 3], to: [i32; 3]) -> ZonePath {
-    let count = room.walk_zones.len();
-    let Some(start) = walk_zone_find(room, from[0], from[2]) else {
-        return ZonePath::Unreachable;
-    };
-    let Some(target) = walk_zone_find(room, to[0], to[2]) else {
-        return ZonePath::Unreachable;
-    };
-    if start == target {
-        return ZonePath::Direct { zone: start };
-    }
+/// The original's zone-walk scratch block, per call. `idx` is the zones on
+/// the current walk, `dir` the per-step scan bound, `best` the best-path
+/// zones, `step`/`prev` the per-step walk and previous-position X/Z pairs.
+#[derive(Clone, Copy)]
+struct ZoneWalk {
+    idx: [u8; 0x10],
+    dir: [u8; 0x10],
+    best: [u8; 0x0C],
+    step: [[i16; 2]; 0x10],
+    prev: [[i16; 2]; 0x10],
+}
 
-    let mut seen_from = vec![false; count];
-    let mut prev_from: Vec<Option<u8>> = vec![None; count];
-    let mut seen_to = vec![false; count];
-    let mut prev_to: Vec<Option<u8>> = vec![None; count];
-    let mut queue_from = VecDeque::from([start]);
-    let mut queue_to = VecDeque::from([target]);
-    seen_from[usize::from(start)] = true;
-    seen_to[usize::from(target)] = true;
-
-    let mut meet = None;
-    while !queue_from.is_empty() && !queue_to.is_empty() {
-        for _ in 0..queue_from.len() {
-            let zone = queue_from.pop_front().expect("queue is non-empty");
-            for next in zone_neighbors(room, zone) {
-                if seen_from[usize::from(next)] {
-                    continue;
-                }
-                seen_from[usize::from(next)] = true;
-                prev_from[usize::from(next)] = Some(zone);
-                queue_from.push_back(next);
-                if seen_to[usize::from(next)] {
-                    meet = Some(next);
-                    break;
-                }
-            }
-            if meet.is_some() {
-                break;
-            }
-        }
-        if meet.is_some() {
-            break;
-        }
-        for _ in 0..queue_to.len() {
-            let zone = queue_to.pop_front().expect("queue is non-empty");
-            for next in zone_neighbors(room, zone) {
-                if seen_to[usize::from(next)] {
-                    continue;
-                }
-                seen_to[usize::from(next)] = true;
-                prev_to[usize::from(next)] = Some(zone);
-                queue_to.push_back(next);
-                if seen_from[usize::from(next)] {
-                    meet = Some(next);
-                    break;
-                }
-            }
-            if meet.is_some() {
-                break;
-            }
-        }
-    }
-
-    let Some(meet) = meet else {
-        return ZonePath::Unreachable;
-    };
-    let next = if meet == start {
-        // The target-side search reached the start: the first step is the
-        // start's predecessor on that side.
-        match prev_to[usize::from(start)] {
-            Some(zone) => zone,
-            None => return ZonePath::Unreachable,
-        }
-    } else {
-        let mut node = meet;
-        loop {
-            match prev_from[usize::from(node)] {
-                Some(previous) if previous == start => break node,
-                Some(previous) => node = previous,
-                None => return ZonePath::Unreachable,
-            }
-        }
-    };
-    let (_, crossing) = walk_zone_shared_edge(room, start, next);
-    ZonePath::Cross {
-        from: start,
-        next,
-        crossing,
+impl ZoneWalk {
+    /// A walk with the entity's zone and position seeded. The original never
+    /// clears the rest of the block, so stale scratch leaks between calls; the
+    /// port starts every walk from zeroes so the same inputs always take the
+    /// same route.
+    fn new(start: u8, pos: [i32; 3]) -> Self {
+        let mut walk = ZoneWalk {
+            idx: [0; 0x10],
+            dir: [0; 0x10],
+            best: [0; 0x0C],
+            step: [[0; 2]; 0x10],
+            prev: [[0; 2]; 0x10],
+        };
+        walk.prev[0] = [pos[0] as i16, pos[2] as i16];
+        walk.idx[0] = start;
+        walk.best[0] = start;
+        walk
     }
 }
 
-/// The zones adjacent to `zone`: every index whose bit is set in the zone's
-/// adjacency word. The word is 16-bit, so only zones 0-15 can ever be named,
-/// exactly like the original's `1 << (zone & 0x1F)` on a short.
-fn zone_neighbors(room: &RoomState, zone: u8) -> Vec<u8> {
-    let Some(entry) = room.walk_zones.get(usize::from(zone)) else {
-        return Vec::new();
+/// The zone's adjacency word (`flags`), zero for an index outside the table.
+fn zone_flags(room: &RoomState, zone: u8) -> u32 {
+    room.walk_zones
+        .get(usize::from(zone))
+        .map_or(0, |entry| u32::from(entry.flags))
+}
+
+/// The original's `SquareRoot0` as an unsigned accumulator step: zero for a
+/// non-positive value.
+fn sqrt0(value: i32) -> u32 {
+    if value <= 0 {
+        0
+    } else {
+        (f64::from(value)).sqrt() as u32
+    }
+}
+
+/// The shared-edge crossing between two zones as the original's two scratch
+/// words (`g_playerDisplacement` = X, `player_distance_z` = Z).
+fn crossing_xz(room: &RoomState, a: u8, b: u8) -> (i16, i16) {
+    let (_, crossing) = walk_zone_shared_edge(room, a, b);
+    (crossing[0] as i16, crossing[1] as i16)
+}
+
+/// The distance from a walk position's previous-position pair to its current
+/// step pair, the segment length the ring walk subtracts on a backtrack.
+fn step_length(walk: &ZoneWalk, i: usize) -> u32 {
+    let dz = i32::from(walk.step[i][1]) - i32::from(walk.prev[i][1]);
+    let dx = i32::from(walk.step[i][0]) - i32::from(walk.prev[i][0]);
+    sqrt0(dz * dz + dx * dx)
+}
+
+/// `zone_walk_ccw`: the descending (counter-clockwise) ring walk. Starting
+/// from `walk.idx[0]`, each step probes adjacent zones in descending index
+/// order until the target zone is reached, keeping the shortest total path in
+/// `walk.best`. Returns the first step's zone index, or `0xFF` when no path
+/// exists. Fresh positions start at `count` so the descending scan has a clean
+/// top and can never re-probe a consumed candidate (the original's byte wrap
+/// read past the zone table there).
+fn zone_walk_ccw(
+    room: &RoomState,
+    count: u8,
+    target: u8,
+    target_x: i16,
+    target_z: i16,
+    walk: &mut ZoneWalk,
+) -> u8 {
+    for k in 1..0x10 {
+        walk.idx[k] = count;
+    }
+
+    let mut step: i32 = 0;
+    let mut best: u32 = u32::MAX;
+    let mut dist: u32 = 0;
+
+    loop {
+        let i = step as usize;
+        let flags = zone_flags(room, walk.idx[i]);
+        let target_bit = 1u32 << (target & 0x1F);
+
+        if flags & target_bit == 0 {
+            // Target not adjacent: extend the walk.
+            if flags & ((1u32 << (walk.dir[i] & 0x1F)) - 1) == 0 {
+                if i != 0 {
+                    dist = dist.wrapping_sub(step_length(walk, i));
+                }
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            let new_len = step + 1;
+            if new_len >= 0x10 {
+                return finish(best, walk);
+            }
+            step = new_len;
+            let new_i = new_len as usize;
+
+            // Monotone descending scan of the valid zones: each probe is the
+            // previous candidate minus one.
+            let mut matched = None;
+            let mut candidate = walk.idx[new_i];
+            loop {
+                let zone = candidate.wrapping_sub(1);
+                if zone >= count {
+                    break;
+                }
+                walk.idx[new_i] = zone;
+                if flags & (1u32 << (zone & 0x1F)) != 0 {
+                    matched = Some(zone);
+                    break;
+                }
+                candidate = zone;
+            }
+            let Some(zone) = matched else {
+                if i != 0 {
+                    dist = dist.wrapping_sub(step_length(walk, i));
+                }
+                step = new_len - 2;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            };
+
+            // A zone already on the path truncates the walk there.
+            let mut visited = false;
+            let mut back = step - 1;
+            while back >= 0 {
+                if walk.idx[back as usize] == zone {
+                    visited = true;
+                    break;
+                }
+                back -= 1;
+            }
+            if visited {
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            let (cross_x, cross_z) = crossing_xz(room, walk.idx[new_i], walk.idx[new_i - 1]);
+            let dx = i32::from(walk.step[new_i][0]) - i32::from(cross_x);
+            let dz = i32::from(walk.step[new_i][1]) - i32::from(cross_z);
+            let segment = sqrt0(dz * dz + dx * dx);
+            dist = dist.wrapping_add(segment);
+            if best <= dist {
+                dist = dist.wrapping_sub(segment);
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            walk.prev[new_i] = [cross_x, cross_z];
+            walk.dir[new_i] = count;
+            continue;
+        }
+
+        // Target adjacent: the goal step.
+        walk.dir[i] = target;
+        let (cross_x, cross_z) = crossing_xz(room, walk.idx[i], target);
+        let back_dx = i32::from(cross_x) - i32::from(walk.prev[i][0]);
+        let back_dz = i32::from(cross_z) - i32::from(walk.prev[i][1]);
+        let goal_dx = i32::from(cross_x) - i32::from(target_x);
+        let goal_dz = i32::from(cross_z) - i32::from(target_z);
+        dist = dist.wrapping_add(sqrt0(back_dz * back_dz + back_dx * back_dx));
+        dist = dist.wrapping_add(sqrt0(goal_dz * goal_dz + goal_dx * goal_dx));
+        if dist < best {
+            let mut n = step + 1;
+            loop {
+                // The original's scratch arrays overlap (idx[n] aliases
+                // dir[n-1]); the goal write above just set dir[i] to the
+                // target, so best[step+1] is the target zone itself.
+                walk.best[n as usize] = if n == step + 1 {
+                    target
+                } else {
+                    walk.idx[n as usize]
+                };
+                best = dist;
+                n -= 1;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        if step != 0 {
+            dist = dist.wrapping_sub(sqrt0(goal_dz * goal_dz + goal_dx * goal_dx));
+            dist = dist.wrapping_sub(sqrt0(back_dz * back_dz + back_dx * back_dx));
+            dist = dist.wrapping_sub(step_length(walk, i));
+        }
+        step -= 1;
+        if step < 0 {
+            return finish(best, walk);
+        }
+    }
+}
+
+/// `zone_walk_cw`: the ascending (clockwise) ring walk. Same shape as
+/// [`zone_walk_ccw`] with the scan inverted: each probe is the previous
+/// candidate plus one (a fresh position starts at zero, so zone 0 is skipped
+/// on the ascending scan exactly like the original).
+fn zone_walk_cw(
+    room: &RoomState,
+    count: u8,
+    target: u8,
+    target_x: i16,
+    target_z: i16,
+    walk: &mut ZoneWalk,
+) -> u8 {
+    let mut step: i32 = 0;
+    let mut best: u32 = u32::MAX;
+    let mut dist: u32 = 0;
+
+    loop {
+        let i = step as usize;
+        let flags = zone_flags(room, walk.idx[i]);
+        let target_bit = 1u32 << (target & 0x1F);
+
+        if flags & target_bit == 0 {
+            if flags & !((1u32 << (walk.dir[i].wrapping_add(1) & 0x1F)) - 1) == 0 {
+                if i != 0 {
+                    dist = dist.wrapping_sub(step_length(walk, i));
+                }
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            let new_len = step + 1;
+            if new_len >= 0x10 {
+                return finish(best, walk);
+            }
+            step = new_len;
+            let new_i = new_len as usize;
+
+            let mut matched = None;
+            let mut candidate = walk.idx[new_i];
+            loop {
+                let zone = candidate.wrapping_add(1);
+                if zone >= count {
+                    break;
+                }
+                walk.idx[new_i] = zone;
+                if flags & (1u32 << (zone & 0x1F)) != 0 {
+                    matched = Some(zone);
+                    break;
+                }
+                candidate = zone;
+            }
+            let Some(zone) = matched else {
+                if i != 0 {
+                    dist = dist.wrapping_sub(step_length(walk, i));
+                }
+                step = new_len - 2;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            };
+
+            let mut visited = false;
+            let mut back = step - 1;
+            while back >= 0 {
+                if walk.idx[back as usize] == zone {
+                    visited = true;
+                    break;
+                }
+                back -= 1;
+            }
+            if visited {
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            let (cross_x, cross_z) = crossing_xz(room, walk.idx[new_i], walk.idx[new_i - 1]);
+            let dx = i32::from(walk.step[new_i][0]) - i32::from(cross_x);
+            let dz = i32::from(walk.step[new_i][1]) - i32::from(cross_z);
+            let segment = sqrt0(dz * dz + dx * dx);
+            dist = dist.wrapping_add(segment);
+            if best <= dist {
+                dist = dist.wrapping_sub(segment);
+                step -= 1;
+                if step < 0 {
+                    return finish(best, walk);
+                }
+                continue;
+            }
+
+            // The original stores the crossing in `step` on the ascending
+            // walk (the descending walk stores it in `prev`); both walks read
+            // it back the same way.
+            walk.step[new_i] = [cross_x, cross_z];
+            walk.dir[new_i] = 0xFF;
+            continue;
+        }
+
+        walk.dir[i] = target;
+        let (cross_x, cross_z) = crossing_xz(room, walk.idx[i], target);
+        let back_dx = i32::from(cross_x) - i32::from(walk.prev[i][0]);
+        let back_dz = i32::from(cross_z) - i32::from(walk.prev[i][1]);
+        let goal_dx = i32::from(cross_x) - i32::from(target_x);
+        let goal_dz = i32::from(cross_z) - i32::from(target_z);
+        dist = dist.wrapping_add(sqrt0(back_dz * back_dz + back_dx * back_dx));
+        dist = dist.wrapping_add(sqrt0(goal_dz * goal_dz + goal_dx * goal_dx));
+        if dist < best {
+            let mut n = step + 1;
+            loop {
+                walk.best[n as usize] = if n == step + 1 {
+                    target
+                } else {
+                    walk.idx[n as usize]
+                };
+                best = dist;
+                n -= 1;
+                if n == 0 {
+                    break;
+                }
+            }
+        }
+        if step != 0 {
+            dist = dist.wrapping_sub(sqrt0(goal_dz * goal_dz + goal_dx * goal_dx));
+            dist = dist.wrapping_sub(sqrt0(back_dz * back_dz + back_dx * back_dx));
+            dist = dist.wrapping_sub(step_length(walk, i));
+        }
+        step -= 1;
+        if step < 0 {
+            return finish(best, walk);
+        }
+    }
+}
+
+/// The walker exit: the best path's first step, or `0xFF` when none was found.
+fn finish(best: u32, walk: &ZoneWalk) -> u8 {
+    if best == u32::MAX { 0xFF } else { walk.best[1] }
+}
+
+/// `zone_path_find`: walk the zone adjacency graph from the entity's zone
+/// toward the target zone with the original's distance-weighted CW/CCW ring
+/// walks. Returns the next zone to walk into and the shared-edge crossing; the
+/// same zone is [`ZonePath::Direct`] and a point outside the grid or a
+/// disconnected target is [`ZonePath::Unreachable`].
+///
+/// A `to.z == 0` target is the original's alternate entry: `to.x` names a zone
+/// index and the waypoint becomes that zone's midpoint. A start zone of 0
+/// flips the chosen ring direction, exactly like the original.
+pub fn zone_path_find(room: &RoomState, from: [i32; 3], to: [i32; 3]) -> ZonePath {
+    let count = room.walk_zones.len().min(0xFF) as u8;
+    let Some(start) = walk_zone_find(room, from[0], from[2]) else {
+        return ZonePath::Unreachable;
     };
-    let flags = u32::from(entry.flags);
-    (0..room.walk_zones.len())
-        .filter(|index| flags & (1u32 << (index & 0x1F)) != 0)
-        .map(|index| index as u8)
-        .collect()
+
+    let (target, target_x, target_z) = if to[2] as i16 == 0 {
+        let target = (to[0] & 0xFF) as u8;
+        let Some(zone) = room.walk_zones.get(usize::from(target)) else {
+            return ZonePath::Unreachable;
+        };
+        let x = ((zone.x1 as u16).wrapping_add(zone.x2 as u16) >> 1) as i16;
+        let z = ((zone.z1 as u16).wrapping_add(zone.z2 as u16) >> 1) as i16;
+        (target, x, z)
+    } else {
+        let Some(target) = walk_zone_find(room, to[0], to[2]) else {
+            return ZonePath::Unreachable;
+        };
+        (target, to[0] as i16, to[2] as i16)
+    };
+
+    if target == start {
+        return ZonePath::Direct { zone: start };
+    }
+
+    // The shortest way around the zone ring: a delta past half the count
+    // walks the other way. Starting in zone 0 flips the direction.
+    let mut delta = i32::from(target) - i32::from(start);
+    if delta < 0 {
+        delta += i32::from(count);
+    }
+    let mut dir: i32 = if (i32::from(count) >> 1) < delta {
+        1
+    } else {
+        -1
+    };
+    if start == 0 {
+        dir = -dir;
+    }
+
+    let mut walk = ZoneWalk::new(start, from);
+    let first = if dir < 1 {
+        walk.dir[0] = count;
+        zone_walk_ccw(room, count, target, target_x, target_z, &mut walk)
+    } else {
+        walk.dir[0] = 0xFF;
+        zone_walk_cw(room, count, target, target_x, target_z, &mut walk)
+    };
+    if first == 0xFF {
+        return ZonePath::Unreachable;
+    }
+    let (_, crossing) = walk_zone_shared_edge(room, start, first);
+    ZonePath::Cross {
+        from: start,
+        next: first,
+        crossing,
+    }
 }
 
 /// The original's corridor test: whether `(x, z)` sits inside the overlapping
@@ -489,6 +816,153 @@ pub fn crossing_heading(
     let waypoint = [i32::from(cross_x), entity_pos[1], i32::from(cross_z)];
     let heading = sfx::angle_between_xz(entity_pos[0], entity_pos[2], waypoint[0], waypoint[2]);
     (waypoint, heading)
+}
+
+/// The `.y` component of the 3D cross product of two XZ vectors, the sign
+/// test `room_check_sight_blocked` runs its segment-diagonal crossings with.
+fn cross_y(a: [i32; 2], b: [i32; 2]) -> i32 {
+    a[1].wrapping_mul(b[0])
+        .wrapping_sub(b[1].wrapping_mul(a[0]))
+}
+
+/// One segment-vs-segment test from `room_check_sight_blocked`: does the ray
+/// `ent -> ent + delta` cross the box diagonal `a -> b`? Both halves are the
+/// standard 2D straddle test on the sign of the cross product. The
+/// `normalize_a` half shrinks `a - ent` through `VectorNormal` in the original;
+/// scaling cannot change the cross product's sign, so the port keeps the raw
+/// vector.
+fn ray_crosses_diagonal(
+    ent: [i32; 2],
+    delta: [i32; 2],
+    a: [i32; 2],
+    b: [i32; 2],
+    normalize_a: bool,
+) -> bool {
+    let _ = normalize_a;
+    let diag = [b[0] - a[0], b[1] - a[1]];
+    let p1 = [ent[0] + delta[0] - a[0], ent[1] + delta[1] - a[1]];
+    let p0 = [ent[0] - a[0], ent[1] - a[1]];
+    if (cross_y(diag, p1) ^ cross_y(diag, p0)) >= 0 {
+        return false;
+    }
+
+    let p1 = [b[0] - ent[0], b[1] - ent[1]];
+    let p0 = [a[0] - ent[0], a[1] - ent[1]];
+    (cross_y(delta, p1) ^ cross_y(delta, p0)) < 0
+}
+
+/// `room_check_sight_blocked`: does the straight line from the entity to the
+/// entity plus `delta` cross a sight-blocking boundary record of quadrant
+/// `cell` (0-3)? The per-record test walks the box's two diagonals; only
+/// fully-blocking records (`flags & 0x300 == 0x300`) occlude, except for Yawn
+/// (ids 13 and 18), for which every record occludes. Coordinates are scaled
+/// down by 18 before the cross products to keep them inside 32 bits.
+///
+/// The original also clobbers each tested record's `flags` down to the two
+/// blocking bits; the port cannot write through the shared room, so that
+/// destructive side effect is dropped here.
+fn room_check_sight_blocked(
+    room: &RoomState,
+    entity: &Entity,
+    ent_pos: [i32; 3],
+    delta: [i32; 3],
+    cell: u8,
+) -> u8 {
+    let quadrant = usize::from(cell & 3);
+    let records = &room.collision.quadrants[quadrant];
+
+    let ent_x = ent_pos[0] / 18;
+    let ent_z = ent_pos[2] / 18;
+    let dir_x = delta[0] / 18;
+    let dir_z = delta[2] / 18;
+    let ent = [ent_x, ent_z];
+    let dir = [dir_x, dir_z];
+
+    for rec in records {
+        let blocking = rec.flags & 0x300;
+        if blocking != 0x300 && entity.id != 13 && entity.id != 18 {
+            continue;
+        }
+        if rec.kind == 4 || rec.kind == 5 {
+            continue;
+        }
+        let x_max = i32::from(rec.x_max / 18);
+        let z_max = i32::from(rec.z_max / 18);
+        let x_min = i32::from(rec.x_min / 18);
+        let z_min = i32::from(rec.z_min / 18);
+        if ray_crosses_diagonal(ent, dir, [x_max, z_min], [x_min, z_max], true)
+            || ray_crosses_diagonal(ent, dir, [x_min, z_min], [x_max, z_max], false)
+        {
+            return 1;
+        }
+    }
+    0
+}
+
+/// `entity_check_angular_los`: is `target` outside the entity's angular field
+/// of view (`fov_half` either side), or is the sight line blocked? Returns 1
+/// when the target is not visible. `cell` is the pathfind counter byte the
+/// original passes to `room_check_sight_blocked` as the quadrant index; the
+/// caller only reaches this with the counter at 0-3.
+fn entity_check_angular_los(
+    room: &RoomState,
+    entity: &Entity,
+    fov_half: i16,
+    target: [i32; 3],
+    cell: u8,
+) -> u8 {
+    let target_angle = sfx::angle_between_xz(entity.pos[0], entity.pos[2], target[0], target[2]);
+    let delta = (fov_half as u16)
+        .wrapping_sub(entity.angle)
+        .wrapping_add(target_angle)
+        & 0x0FFF;
+    if i32::from(fov_half) * 2 < i32::from(delta) {
+        return 1;
+    }
+
+    let dir = [target[0] - entity.pos[0], 0, target[2] - entity.pos[2]];
+    room_check_sight_blocked(room, entity, entity.pos, dir, cell)
+}
+
+/// `entity_pathfind_update`: the obstacle pathfinder state machine the state-9
+/// driver runs before the behaviour. `pathfind_state` is a 5-bit counter plus
+/// the line-of-sight bit at 5; every advance increments the whole byte, so the
+/// LOS bit rides along until it is explicitly cleared on the counter-3 frame.
+/// When the counter reaches 3 with a clear sight line, the player position is
+/// latched into `player_pos_x`/`player_pos_z` as the movement waypoint.
+///
+/// Returns 0 (blocked at the waypoint frame), 1 (waypoint refreshed) or
+/// 2 (still counting); the state-9 driver ignores the value, exactly like the
+/// original.
+pub fn entity_pathfind_update(room: &RoomState, entity: &mut Entity, player_pos: [i32; 3]) -> u8 {
+    let val = entity.pathfind_state;
+    let counter = val & 0x1F;
+    if counter > 3 {
+        entity.pathfind_state = entity.pathfind_state.wrapping_add(1);
+        if entity.pathfind_state & 0x1F > 0x0F {
+            entity.pathfind_state &= 0xC0;
+        }
+        return 2;
+    }
+
+    let result = entity_check_angular_los(room, entity, 1512, player_pos, counter);
+    entity.pathfind_state = (result << 5) | val;
+
+    let val = entity.pathfind_state;
+    let counter = val & 0x1F;
+    if counter == 3 {
+        if val & 0x20 == 0 {
+            entity.player_pos_x = player_pos[0] as i16;
+            entity.player_pos_z = player_pos[2] as i16;
+            entity.pathfind_state = entity.pathfind_state.wrapping_add(1) & !0x20;
+            return 1;
+        }
+        entity.pathfind_state = entity.pathfind_state.wrapping_add(1) & !0x20;
+        return 0;
+    }
+
+    entity.pathfind_state = entity.pathfind_state.wrapping_add(1);
+    2
 }
 
 /// `npc_walk_choose_heading`: run [`zone_path_find`] from the character to the
@@ -770,7 +1244,7 @@ fn behavior_01(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
     if heading_within(entity.angle, heading as u16, 0x180) {
         turn_toward_heading(entity, heading, 0x30);
         entity_apply_walk_speed(entity, 0x5D);
-        advance_xz(room, entity, 0, entity.move_speed_current as i16);
+        advance_xz(entity, 0, entity.move_speed_current as i16);
         wander_lookat(entity, 0, seed);
         return;
     }
@@ -812,7 +1286,7 @@ fn behavior_02(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
         entity_apply_walk_speed(entity, 0x5D);
         entity.move_speed_current as i16
     };
-    advance_xz(room, entity, 0, move_speed);
+    advance_xz(entity, 0, move_speed);
     set_lookat_target(
         entity,
         i32::from(entity.player_pos_x),
@@ -825,7 +1299,7 @@ fn behavior_02(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
 /// within ±0x200 of straight ahead the character walks backward on animation 3
 /// at -0x3C with the look-at locked on the player; otherwise it turns 180
 /// degrees and walks forward on animation 7 with the look-at reset.
-fn behavior_03(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed: u16) {
+fn behavior_03(entity: &mut Entity, _room: &RoomState, player_pos: [i32; 3], seed: u16) {
     let mut heading =
         sfx::angle_between_xz(entity.pos[0], entity.pos[2], player_pos[0], player_pos[2]);
     entity.reaction_timer = heading as i16;
@@ -837,7 +1311,7 @@ fn behavior_03(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
             entity.blend_counter = 7;
         }
         turn_toward_heading(entity, heading as i16, 0x30);
-        advance_xz(room, entity, 0, -0x3C);
+        advance_xz(entity, 0, -0x3C);
         set_lookat_target(entity, player_pos[0], player_pos[2], seed);
         return;
     }
@@ -852,7 +1326,7 @@ fn behavior_03(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
     entity.reaction_timer = heading as i16;
     turn_toward_heading(entity, heading as i16, 0x30);
     entity_apply_walk_speed(entity, 0x5D);
-    advance_xz(room, entity, 0, entity.move_speed_current as i16);
+    advance_xz(entity, 0, entity.move_speed_current as i16);
     reset_lookat(entity, seed);
 }
 
@@ -873,33 +1347,109 @@ fn walk_footstep_sound(
     footstep(sounds, room, entity, sound_type, slow);
 }
 
+/// One entity's SCA collision volume: the entity-local centre the original's
+/// records carry, plus its half-height and XZ radius.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScaHit {
+    /// Entity-local cylinder centre; Y is the height offset.
+    pub offset: [i16; 3],
+    /// Cylinder half-height.
+    pub half_height: i16,
+    /// Cylinder radius.
+    pub radius: i16,
+}
+
+impl ScaHit {
+    /// The player's single volume: centred one body-height below the origin,
+    /// the record `check_room_collision` reads the radius from.
+    pub fn player(radius: i32) -> Self {
+        let height = crate::objects::player_height(radius);
+        ScaHit {
+            offset: [0, -height, 0],
+            half_height: height,
+            radius: radius as i16,
+        }
+    }
+
+    /// A character's record volume. The radius always comes from the live
+    /// `sca_radius`; an id with no SCA record (the synthetic fixtures) falls
+    /// back to the standing body so the Y test still overlaps.
+    pub fn character(id: u8, radius: i16) -> Self {
+        let standing = ScaHit {
+            offset: [0, -0x5FA, 0],
+            half_height: 0x5FA,
+            radius,
+        };
+        match data::sca_volume(id) {
+            Some(volume) => ScaHit {
+                offset: volume.offset,
+                half_height: volume.half_height,
+                radius,
+            },
+            None => standing,
+        }
+    }
+
+    /// `SetEntityScaHitData`: the world-space volume centre, the local offset
+    /// rotated by the entity's yaw.
+    pub(crate) fn world_offset(&self, angle: u16) -> [i32; 3] {
+        let (x, z) = player::rotate_xz(angle, i32::from(self.offset[0]), i32::from(self.offset[2]));
+        [x, i32::from(self.offset[1]), z]
+    }
+}
+
 /// `ResolveEntityScaCollision` against the player: push the character out of
-/// the player's radius along the separation line. The player is never moved
-/// and no damage is transferred. A push that would put the character inside a
-/// wall is retried on one axis at a time, then dropped, so the character never
-/// lands in geometry.
+/// the player's SCA volume. The player is never moved and no damage is
+/// transferred. `prev_pos` is the character's pre-move `position` word, which
+/// breaks a degenerate overlap when the character ran through the other
+/// volume in one frame.
 pub fn separate_from_player(
-    room: &RoomState,
     entity: &mut Entity,
+    prev_pos: [i32; 3],
     player_pos: [i32; 3],
+    player_angle: u16,
     player_radius: i32,
     player_status: u8,
-) {
-    resolve_sca_collision(room, entity, player_pos, player_radius, player_status);
+) -> bool {
+    resolve_sca_collision(
+        entity,
+        prev_pos,
+        player_pos,
+        player_angle,
+        ScaHit::player(player_radius),
+        player_status,
+    )
 }
 
 /// `ResolveEntityScaCollision` against another active character, the
 /// `HandleEnemyPlayerCollisions` pass the original's state-9 tail runs after
-/// the player pair: the character is pushed out of the other's radius and the
+/// the player pair: the character is pushed out of the other's volume and the
 /// other is never moved.
 pub fn separate_from_character(
-    room: &RoomState,
     entity: &mut Entity,
+    prev_pos: [i32; 3],
     other_pos: [i32; 3],
-    other_radius: i32,
+    other_angle: u16,
+    other: ScaHit,
     other_status: u8,
-) {
-    resolve_sca_collision(room, entity, other_pos, other_radius, other_status);
+) -> bool {
+    resolve_sca_collision(
+        entity,
+        prev_pos,
+        other_pos,
+        other_angle,
+        other,
+        other_status,
+    )
+}
+
+/// The original's `SquareRoot0`: integer square root, zero for non-positive.
+fn integer_sqrt(value: i32) -> i32 {
+    if value <= 0 {
+        0
+    } else {
+        (f64::from(value)).sqrt() as i32
+    }
 }
 
 /// The shared pair resolve. `entity` is the original's `entB` (the one pushed)
@@ -907,56 +1457,76 @@ pub fn separate_from_character(
 /// (the eating/headless state) and status bit 1 on either side (the
 /// deactivation bit, e.g. the lab power-room Wesker).
 ///
-/// TODO(parity): (gameplay) the original resolves the entities' SCA volume
-/// lists: each volume has its own radius/half-height, the overlap is also
-/// tested in Y, the push direction uses the entity's pre-move `position` to
-/// break degenerate overlaps and the pair returns a hit flag. The port pushes
-/// by the two flat `sca_radius` values in XZ only and returns nothing.
+/// The penetration test is the volume model: XZ distance between the two
+/// rotated volume centres against the summed radii, then the vertical centres
+/// against the summed half-heights. A pair that only overlaps in Y because the
+/// character moved across the other this frame is corrected from the pre-move
+/// `position`, exactly like the original's degenerate-overlap branch. Returns
+/// the pair hit flag.
 fn resolve_sca_collision(
-    room: &RoomState,
     entity: &mut Entity,
+    prev_pos: [i32; 3],
     other_pos: [i32; 3],
-    other_radius: i32,
+    other_angle: u16,
+    other: ScaHit,
     other_status: u8,
-) {
+) -> bool {
     if entity.state() == 4 || (entity.status_flags | other_status) & 2 != 0 {
-        return;
+        return false;
     }
-    let dx = entity.pos[0] - other_pos[0];
-    let dz = entity.pos[2] - other_pos[2];
-    let dist =
-        ((i64::from(dx) * i64::from(dx) + i64::from(dz) * i64::from(dz)) as f64).sqrt() as i32;
-    let radius = i32::from(entity.sca_radius);
-    let penetration = other_radius + radius - (dist + 1);
+
+    let own = ScaHit::character(entity.id, entity.sca_radius);
+    let a = other.world_offset(other_angle);
+    let b = own.world_offset(entity.angle);
+    let dx = (b[0] - a[0]) - other_pos[0] + entity.pos[0];
+    let dz = (b[2] - a[2]) - other_pos[2] + entity.pos[2];
+    let dist = integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
+    let penetration = i32::from(other.radius) + i32::from(own.radius) - (dist + 1);
     if penetration <= 0 {
-        return;
+        return false;
     }
 
-    let denominator = i64::from(dist + 1);
-    let push_x = (i64::from(penetration) * i64::from(dx) / denominator) as i32;
-    let push_z = (i64::from(penetration) * i64::from(dz) / denominator) as i32;
-    if push_x == 0 && push_z == 0 {
-        return;
+    let dy = b[1] + (entity.pos[1] - a[1]) - other_pos[1];
+    let max_height = i32::from(other.half_height) + i32::from(own.half_height);
+    if -max_height >= dy || dy >= max_height {
+        return false;
     }
 
-    let proposed = [
-        entity.pos[0] + push_x,
-        entity.pos[1],
-        entity.pos[2] + push_z,
-    ];
-    if !player::position_blocked(room, proposed, radius) {
-        entity.pos = proposed;
-        return;
+    let mut push_x = penetration.wrapping_mul(dx) / (dist + 1);
+    let mut push_z = penetration.wrapping_mul(dz) / (dist + 1);
+
+    // The pre-move Y says whether the pair already overlapped vertically
+    // before this frame's movement; when it did not, a horizontal crossing
+    // (the other centre now strictly between the old and new own centre) is a
+    // tunnelling overlap and the push is rewritten to the other side.
+    let dy2 = b[1] + (prev_pos[1] - a[1]) - other_pos[1];
+    if dy2 <= -max_height || max_height <= dy2 {
+        let other_radius = i32::from(other.radius);
+        let pos_xa = other_pos[0];
+        if (prev_pos[0] < pos_xa && pos_xa < entity.pos[0])
+            || (pos_xa < prev_pos[0] && entity.pos[0] < pos_xa)
+        {
+            if -push_x < 1 {
+                push_x = -(-push_x + other_radius * 2);
+            } else {
+                push_x += other_radius * 2;
+            }
+        }
+        let pos_za = other_pos[2];
+        if (prev_pos[2] < pos_za && pos_za < entity.pos[2])
+            || (pos_za < prev_pos[2] && entity.pos[2] < pos_za)
+        {
+            if -push_z < 1 {
+                push_z = -(-push_z + other_radius * 2);
+            } else {
+                push_z += other_radius * 2;
+            }
+        }
     }
-    let x_only = [entity.pos[0] + push_x, entity.pos[1], entity.pos[2]];
-    if push_x != 0 && !player::position_blocked(room, x_only, radius) {
-        entity.pos = x_only;
-        return;
-    }
-    let z_only = [entity.pos[0], entity.pos[1], entity.pos[2] + push_z];
-    if push_z != 0 && !player::position_blocked(room, z_only, radius) {
-        entity.pos = z_only;
-    }
+
+    entity.pos[0] += push_x;
+    entity.pos[2] += push_z;
+    true
 }
 
 /// The player's collision radius for the room's character flag.
@@ -971,13 +1541,17 @@ fn player_radius(player_flag: u8) -> i32 {
 /// One state-9 tick: the follow/pathfind driver.
 ///
 /// The first tick marks the character as ignoring the player and resets the
-/// look-at. Every tick swaps the behaviour on the distance ring, records the
-/// character's zone, runs the selected behaviour, advances the animation with
-/// the blend step `0x1000 / (blend_counter + 1)` and the reverse bit from
-/// `dir_control_flags`, queues the footfall sound and separates the character
-/// from the player.
+/// look-at. Every tick runs the obstacle pathfinder, swaps the behaviour on
+/// the distance ring, records the character's zone, runs the selected
+/// behaviour and advances the animation with the blend step
+/// `0x1000 / (blend_counter + 1)` and the reverse bit from `dir_control_flags`.
+/// The tail is the original's collision order: queue the footfall sound, run
+/// the SCA volume pairs (the player first, then every other active character),
+/// then resolve the result against the room collision with the last accepted
+/// position as the rollback point.
 pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
     let player_pos = game.entities[0].pos;
+    let player_angle = game.entities[0].angle;
     let player_status = game.entities[0].status_flags;
     let player_radius = player_radius(game.id.player_flag);
     let seed = game.rand_seed;
@@ -990,13 +1564,20 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         ..
     } = game;
     // The original's `HandleEnemyPlayerCollisions` scans the enemy list after
-    // the player pair; collect the other active characters' positions, radii
-    // and status flags before borrowing this slot mutably.
-    let others: Vec<([i32; 3], i32, u8)> = entities
+    // the player pair; collect the other active characters' positions, angles,
+    // volumes and status flags before borrowing this slot mutably.
+    let others: Vec<([i32; 3], u16, ScaHit, u8)> = entities
         .iter()
         .enumerate()
         .filter(|(index, other)| *index != 0 && *index != slot && other.status_flags != 0)
-        .map(|(_, other)| (other.pos, i32::from(other.sca_radius), other.status_flags))
+        .map(|(_, other)| {
+            (
+                other.pos,
+                other.angle,
+                ScaHit::character(other.id, other.sca_radius),
+                other.status_flags,
+            )
+        })
         .collect();
     let entity = &mut entities[slot];
     let clock = &mut entity_anims[slot];
@@ -1006,11 +1587,11 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         reset_lookat(entity, seed);
     }
 
-    // TODO(parity): (gameplay) the original runs entity_pathfind_update here
-    // before the behaviour swap: it tracks the player through the room's
-    // boundary quadrants and latches a waypoint into player_pos_x/z on the
-    // frames line-of-sight refreshes. The port recomputes the crossing every
-    // tick from zone_path_find instead, so the waypoint timing differs.
+    // The end-of-frame collision pass accepts the final position and the next
+    // tick's degenerate-overlap test reads it back as `position`; the position
+    // on entry is exactly that accepted word.
+    let prev_pos = entity.pos;
+    entity_pathfind_update(room, entity, player_pos);
     swap_behavior(entity, player_pos);
     entity.splatter_flag = walk_zone_find(room, entity.pos[0], entity.pos[2]).unwrap_or(0xFF);
     match entity.action_behavior {
@@ -1026,10 +1607,33 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     let done = clock.advance(entity, clips, reverse, blend_step);
     entity.attacking_direction = u8::from(done);
     walk_footstep_sound(entity_sounds, room, entity, slow);
-    separate_from_player(room, entity, player_pos, player_radius, player_status);
-    for (other_pos, other_radius, other_status) in others {
-        separate_from_character(room, entity, other_pos, other_radius, other_status);
+
+    separate_from_player(
+        entity,
+        prev_pos,
+        player_pos,
+        player_angle,
+        player_radius,
+        player_status,
+    );
+    for (other_pos, other_angle, other, other_status) in others {
+        separate_from_character(
+            entity,
+            prev_pos,
+            other_pos,
+            other_angle,
+            other,
+            other_status,
+        );
     }
+    // check_room_collision: push out of walls, or roll X/Z back to the
+    // accepted position when the pushed result is still stuck.
+    entity.pos = player::resolve_collision(
+        &room.collision,
+        prev_pos,
+        entity.pos,
+        i32::from(entity.sca_radius),
+    );
 }
 
 #[cfg(test)]
@@ -1118,17 +1722,57 @@ mod tests {
     }
 
     #[test]
-    fn advance_xz_rolls_back_a_blocked_move() {
+    fn advance_xz_is_un_collided() {
         let room = blocked_room();
-        // Angle 0 walks +X into the rectangle at x=1000.
+        // Angle 0 walks +X straight into the rectangle at x=1000: Add_speedXZ
+        // never consults the room, so the move commits. The 4.12 cosine
+        // saturates one unit short of 100 at yaw 0, the established
+        // `rotate_speed` behaviour.
         let mut e = entity([900, 0, 500], 0, 0);
-        advance_xz(&room, &mut e, 0, 100);
-        assert_eq!(e.pos, [900, 0, 500], "a blocked move rolls back");
+        advance_xz(&mut e, 0, 100);
+        assert_eq!(e.pos, [999, 0, 500]);
+        assert!(
+            player::position_blocked(&room, e.pos, 100),
+            "the bare move can land inside geometry"
+        );
 
-        // Walking away is free.
+        // The end-of-frame tail resolves it back out.
+        let resolved = player::resolve_collision(&room.collision, [900, 0, 500], e.pos, 100);
+        assert!(
+            !player::position_blocked(&room, resolved, 100),
+            "the collision pass pushes the character out: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn try_advance_xz_probes_and_restores() {
+        let room = blocked_room();
+        // The idle walk-01 probe: the move is committed for the test and then
+        // restored, and a blocked point reports the hit as `false`.
+        let mut e = entity([900, 0, 500], 0, 0);
+        assert!(!try_advance_xz(&room, &mut e, 0, 100));
+        assert_eq!(e.pos, [900, 0, 500], "the probe rolls the move back");
+
+        // Walking away is clear: the move stays committed.
         let mut e = entity([900, 0, 500], 0x800, 0);
-        advance_xz(&room, &mut e, 0, 100);
+        assert!(try_advance_xz(&room, &mut e, 0, 100));
         assert_eq!(e.pos, [800, 0, 500]);
+    }
+
+    #[test]
+    fn diagonal_approach_slides_along_the_wall() {
+        let room = blocked_room();
+        // The character steps diagonally into the wall's west face: only the X
+        // movement disagrees with the push, so X is corrected and the Z step is
+        // kept - the character slides instead of freezing.
+        let prev = [900, 0, 500];
+        let proposed = [1000, 0, 600];
+        let resolved = player::resolve_collision(&room.collision, prev, proposed, 100);
+        assert_eq!(resolved, [882, 0, 600], "X pushed out, Z kept");
+        assert!(
+            resolved[2] > prev[2],
+            "the slide kept the along-wall movement"
+        );
     }
 
     #[test]
@@ -1186,6 +1830,20 @@ mod tests {
                 zone(0, 0, 100, 100, 1 << 1),
                 zone(100, 0, 200, 100, (1 << 0) | (1 << 2)),
                 zone(100, 100, 200, 200, 1 << 1),
+            ],
+            ..RoomState::default()
+        }
+    }
+
+    /// A four-zone ring around a 200x200 square: 0 SW, 1 SE, 2 NE, 3 NW, each
+    /// adjacent to its two neighbours, so both ways around reach the far zone.
+    fn ring() -> RoomState {
+        RoomState {
+            walk_zones: vec![
+                zone(0, 0, 100, 100, (1 << 1) | (1 << 3)),
+                zone(100, 0, 200, 100, (1 << 0) | (1 << 2)),
+                zone(100, 100, 200, 200, (1 << 1) | (1 << 3)),
+                zone(0, 100, 100, 200, (1 << 0) | (1 << 2)),
             ],
             ..RoomState::default()
         }
@@ -1259,6 +1917,58 @@ mod tests {
     }
 
     #[test]
+    fn zone_path_find_wraps_around_the_ring() {
+        let room = ring();
+        // Zone 0 to zone 2 is not adjacent: the ring walk leaves through the
+        // NW neighbour. (Both two-hop routes are equal length; the CW walk's
+        // unwritten previous-position scratch is what selects zone 3, the same
+        // deterministic fresh-scratch result as the original's split arrays.)
+        assert_eq!(
+            zone_path_find(&room, [50, 0, 50], [150, 0, 150]),
+            ZonePath::Cross {
+                from: 0,
+                next: 3,
+                crossing: [50, 100]
+            }
+        );
+        // Zone 2 to zone 0 takes the same side of the ring back through
+        // zone 3, whose shared edge with zone 0 the crossing names.
+        assert_eq!(
+            zone_path_find(&room, [150, 0, 150], [50, 0, 50]),
+            ZonePath::Cross {
+                from: 2,
+                next: 3,
+                crossing: [100, 150]
+            }
+        );
+    }
+
+    #[test]
+    fn zone_path_find_zone_index_mode_uses_the_zone_midpoint() {
+        let room = ring();
+        // to.z == 0: to.x names a zone. Zone 2's midpoint is (150, 150), and
+        // the route from zone 0 starts the same way as the point-target form
+        // (the point [150, 0, 150] resolves into zone 2 as well).
+        let expected = ZonePath::Cross {
+            from: 0,
+            next: 3,
+            crossing: [50, 100],
+        };
+        assert_eq!(zone_path_find(&room, [50, 0, 50], [2, 0, 0]), expected);
+        assert_eq!(zone_path_find(&room, [50, 0, 50], [150, 0, 150]), expected);
+        // Standing in the named zone is a direct path.
+        assert_eq!(
+            zone_path_find(&room, [150, 0, 150], [2, 0, 0]),
+            ZonePath::Direct { zone: 2 }
+        );
+        // An index outside the table has no zone record to name.
+        assert_eq!(
+            zone_path_find(&room, [50, 0, 50], [9, 0, 0]),
+            ZonePath::Unreachable
+        );
+    }
+
+    #[test]
     fn zone_path_find_reports_unreachable_targets() {
         let room = RoomState {
             walk_zones: vec![zone(0, 0, 100, 100, 0), zone(1000, 1000, 1100, 1100, 0)],
@@ -1273,6 +1983,58 @@ mod tests {
             ZonePath::Unreachable,
             "a point outside every zone has no path"
         );
+    }
+
+    #[test]
+    fn entity_pathfind_update_cycles_and_latches_the_waypoint() {
+        let room = corridor();
+        let mut e = Entity {
+            id: 0x23,
+            pos: [50, 0, 50],
+            ..Entity::default()
+        };
+        let player = [80, 0, 50];
+        // A clear straight-ahead line: the counter just advances.
+        for _ in 0..3 {
+            assert_eq!(entity_pathfind_update(&room, &mut e, player), 2);
+        }
+        // Counter 3 with the LOS bit clear: latch the player waypoint.
+        assert_eq!(entity_pathfind_update(&room, &mut e, player), 1);
+        assert_eq!((e.player_pos_x, e.player_pos_z), (80, 50));
+        assert_eq!(e.pathfind_state & 0x1F, 4);
+        assert_eq!(e.pathfind_state & 0x20, 0, "the LOS bit stays clear");
+
+        // Past 3 the byte just counts; at 0x10 it clamps back to zero.
+        for _ in 0..12 {
+            assert_eq!(entity_pathfind_update(&room, &mut e, player), 2);
+        }
+        assert_eq!(e.pathfind_state & 0x1F, 0, "the counter clamps at 16");
+    }
+
+    #[test]
+    fn entity_pathfind_update_blocked_los_skips_the_latch() {
+        let room = corridor();
+        let mut e = Entity {
+            id: 0x23,
+            pos: [50, 0, 50],
+            angle: 0,
+            ..Entity::default()
+        };
+        // The player directly behind: outside the 1512 angular window, so
+        // every LOS result is blocked.
+        let player = [-100, 0, 50];
+        for _ in 0..3 {
+            entity_pathfind_update(&room, &mut e, player);
+        }
+        let waypoint = (e.player_pos_x, e.player_pos_z);
+        assert_eq!(entity_pathfind_update(&room, &mut e, player), 0);
+        assert_eq!(
+            (e.player_pos_x, e.player_pos_z),
+            waypoint,
+            "the blocked frame does not latch a waypoint"
+        );
+        assert_eq!(e.pathfind_state & 0x1F, 4);
+        assert_eq!(e.pathfind_state & 0x20, 0, "the LOS bit is cleared");
     }
 
     #[test]
@@ -1705,78 +2467,201 @@ mod tests {
 
     #[test]
     fn separation_pushes_the_character_out_of_the_player() {
-        let room = corridor();
         let mut e = entity([1100, 0, 500], 0, 0);
         e.sca_radius = 100;
-        separate_from_player(&room, &mut e, [1000, 0, 500], 100, 0);
+        let prev = e.pos;
+        assert!(separate_from_player(
+            &mut e,
+            prev,
+            [1000, 0, 500],
+            0,
+            100,
+            0
+        ));
         let dist = xz_distance_to(&e, [1000, 0, 500]);
         assert!(dist > 100, "pushed out of the overlap: {dist}");
     }
 
     #[test]
-    fn separation_never_pushes_into_a_wall() {
+    fn sca_volume_heights_gate_the_push() {
+        // The sprawled Enrico volume sits only 0xB4 above its base; a standing
+        // character whose volume bottom is far above it does not push the pair.
+        let mut e = entity([1050, 0, 300], 0, 0);
+        e.id = 0x28;
+        e.sca_radius = 500;
+        let prev = e.pos;
+        // A synthetic other volume 6000 units above the sprawled body.
+        let high = ScaHit {
+            offset: [0, 6000, 0],
+            half_height: 0x5FA,
+            radius: 100,
+        };
+        assert!(!separate_from_character(
+            &mut e,
+            prev,
+            [1150, 0, 300],
+            0,
+            high,
+            0
+        ));
+        assert_eq!(e.pos, prev, "the vertical gap skips the pair");
+
+        // Lower the other volume until the half-heights overlap: the push runs.
+        let low = ScaHit {
+            offset: [0, 0, 0],
+            half_height: 0x5FA,
+            radius: 100,
+        };
+        assert!(separate_from_character(
+            &mut e,
+            prev,
+            [1150, 0, 300],
+            0,
+            low,
+            0
+        ));
+        assert_ne!(e.pos, prev);
+    }
+
+    #[test]
+    fn sca_volume_offset_rotates_with_the_yaw() {
+        // Forest's record volume centres 0x258 along local +X and -0xC8 along
+        // local Z. At yaw 0x400 local +X faces -Z and local +Z faces +X, so
+        // the rotated centre is (-0xC8, -0xB4, -0x258).
+        let volume = data::sca_volume(0x26).unwrap();
+        let hit = ScaHit {
+            offset: volume.offset,
+            half_height: volume.half_height,
+            radius: volume.radius,
+        };
+        assert_eq!(hit.world_offset(0), [0x257, -0xB4, -0xC7]);
+        assert_eq!(hit.world_offset(0x400), [-0xC7, -0xB4, -0x258]);
+    }
+
+    #[test]
+    fn sca_resolve_is_un_collided_and_the_room_pass_clears_it() {
         let mut room = corridor();
-        // A wall sits on the side the character would be pushed toward.
+        // A wall sits just east of the character, on the side the player push
+        // drives it toward.
         room.collision.quadrants[0].push(CollisionRect {
-            x_max: 900,
+            x_max: 1400,
             z_max: 700,
-            x_min: 700,
+            x_min: 1200,
             z_min: 0,
             kind: 1,
             flags: 0,
         });
         let mut e = entity([1050, 0, 300], 0, 0);
         e.sca_radius = 100;
-        separate_from_player(&room, &mut e, [1150, 0, 300], 100, 0);
+        let prev = e.pos;
+        // The player sits west of the character, so the push drives it east
+        // into the wall.
+        assert!(separate_from_player(&mut e, prev, [950, 0, 300], 0, 100, 0));
         assert!(
-            !player::position_blocked(&room, e.pos, 100),
-            "the push was rolled back instead of landing in the wall: {:?}",
+            player::position_blocked(&room, e.pos, 100),
+            "the SCA resolve itself does not consult the room: {:?}",
             e.pos
         );
-        assert_eq!(e.pos, [1050, 0, 300], "the blocked axis was dropped");
+        // The end-of-frame tail then pushes it clear.
+        let resolved = player::resolve_collision(&room.collision, prev, e.pos, 100);
+        assert!(
+            !player::position_blocked(&room, resolved, 100),
+            "the room pass clears the pushed point: {resolved:?}"
+        );
     }
 
     #[test]
     fn separation_skips_state_4_and_deactivated_pairs() {
-        let room = corridor();
-
         // entB (the character) in state 4 is the eating/headless skip.
         let mut eating = entity([1050, 0, 300], 0, 0);
         eating.sca_radius = 100;
         eating.set_state(4);
-        separate_from_player(&room, &mut eating, [1150, 0, 300], 100, 0);
-        assert_eq!(eating.pos, [1050, 0, 300], "state 4 is skipped");
+        let prev = eating.pos;
+        assert!(!separate_from_player(
+            &mut eating,
+            prev,
+            [1150, 0, 300],
+            0,
+            100,
+            0
+        ));
+        assert_eq!(eating.pos, prev, "state 4 is skipped");
 
         // Status bit 1 on the character skips the pair.
         let mut deactivated = entity([1050, 0, 300], 0, 0);
         deactivated.sca_radius = 100;
         deactivated.status_flags |= 2;
-        separate_from_player(&room, &mut deactivated, [1150, 0, 300], 100, 0);
+        let prev = deactivated.pos;
+        assert!(!separate_from_player(
+            &mut deactivated,
+            prev,
+            [1150, 0, 300],
+            0,
+            100,
+            0
+        ));
         assert_eq!(
-            deactivated.pos,
-            [1050, 0, 300],
+            deactivated.pos, prev,
             "the character's deactivation bit is skipped"
         );
 
         // Status bit 1 on the player skips the pair too.
         let mut player_off = entity([1050, 0, 300], 0, 0);
         player_off.sca_radius = 100;
-        separate_from_player(&room, &mut player_off, [1150, 0, 300], 100, 2);
+        let prev = player_off.pos;
+        assert!(!separate_from_player(
+            &mut player_off,
+            prev,
+            [1150, 0, 300],
+            0,
+            100,
+            2
+        ));
         assert_eq!(
-            player_off.pos,
-            [1050, 0, 300],
+            player_off.pos, prev,
             "the player's deactivation bit is skipped"
         );
     }
 
     #[test]
     fn separation_resolves_character_against_character() {
-        let room = corridor();
         let mut e = entity([1050, 0, 300], 0, 0);
         e.sca_radius = 100;
-        separate_from_character(&room, &mut e, [1150, 0, 300], 100, 0);
+        let prev = e.pos;
+        let other = ScaHit::character(0x27, 100);
+        assert!(separate_from_character(
+            &mut e,
+            prev,
+            [1150, 0, 300],
+            0,
+            other,
+            0
+        ));
         let dist = xz_distance_to(&e, [1150, 0, 300]);
         assert!(dist > 100, "pushed out of the other character: {dist}");
+    }
+
+    #[test]
+    fn previous_position_breaks_a_degenerate_crossing() {
+        // The character's pre-move position was west of the other volume and
+        // its current position east of it: the pair overlaps in XZ but not in
+        // the pre-move Y, so the push is rewritten by the radius to the near
+        // side instead of the far one.
+        let mut e = entity([1100, 0, 0], 0, 0);
+        e.sca_radius = 100;
+        // The pre-move Y is far above the other volume, so the pair did not
+        // overlap vertically before the move; the current Y does overlap.
+        let prev = [900, 4000, 0];
+        let other = ScaHit::character(0x27, 100);
+        assert!(separate_from_character(
+            &mut e,
+            prev,
+            [1000, 0, 0],
+            0,
+            other,
+            0
+        ));
+        assert!(e.pos[0] <= 1000, "kept west of the crossed volume");
     }
 
     #[test]
