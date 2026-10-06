@@ -39,10 +39,10 @@
 //!   exercises them in the M10 acceptance captures. A full pool makes a spawn
 //!   return `None` (the original's `0xFF` sentinel), and an undeclared type is
 //!   skipped with a one-shot log instead of the original's NULL read.
-//! - **Deterministic RNG.** Behaviour draws use [`crate::game::GameState::rand_seed`],
-//!   a fixed-seed xorshift advanced once per gameplay frame, not the platform
-//!   `rand()`; the effect trajectories are repeatable but need not match the
-//!   original's per-frame values.
+//! - **Deterministic RNG.** Behaviour draws read
+//!   [`crate::game::GameState::rand_seed`], the platform stream's per-frame
+//!   value; only the consumer call order within a frame is the port's own (the
+//!   documented approximation), so the trajectories are repeatable.
 
 pub mod behaviour;
 #[cfg(test)]

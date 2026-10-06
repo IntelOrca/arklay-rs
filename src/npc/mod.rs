@@ -38,8 +38,9 @@
 //! - **Pathfinding is a BFS.** [`walk::zone_path_find`] reaches the same
 //!   walk-zone adjacency as the original's iterative ring expansion with a
 //!   breadth-first search over the zone graph.
-//! - **RNG is deterministic.** The look-at scheduling reads a fixed-seed
-//!   sequence reseeded once per gameplay frame, not the platform `rand()`.
+//! - **RNG is deterministic.** The look-at scheduling reads the platform
+//!   stream's per-frame draw (`GameState::rand_seed`); only the consumer call
+//!   order within a frame is the port's own.
 //! - **Blend snapping.** `blend_counter` and the derived step are computed and
 //!   published, but the renderer poses whole keyframes; it does not
 //!   interpolate between them.

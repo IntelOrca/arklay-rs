@@ -106,9 +106,6 @@ pub const BANK_SYSTEM: u8 = 4;
 /// Collision radius the `enemy` spawn gives an entity before its own init
 /// overrides it.
 pub const DEFAULT_ENEMY_RADIUS: i16 = 422;
-/// Seed the per-frame NPC random sequence starts from. Any non-zero value
-/// works; the sequence only has to be deterministic across runs.
-const RAND_SEED_INITIAL: u16 = 0xACE1;
 /// First entity id that is a scripted character.
 pub const CHARACTER_ID_MIN: u8 = 0x20;
 /// Last entity id that is a scripted character.
@@ -285,6 +282,10 @@ const MSF_MIRROR_ENABLE: u8 = 31;
 /// active, so footsteps shift their room-table column by -3. The second dword
 /// of flag bank 5 selects it at selector `0x3F`.
 pub const MSF2_EFFECT_ZONE: u8 = 0x3F;
+/// `main_state_flags2` bit 1 (`MSF2_SCREEN_SHAKE`): the boulder-tunnel event
+/// scripts enable the per-frame +/-1 screen shake. The second dword of flag
+/// bank 5 selects it at selector `0x3E`.
+pub const MSF2_SCREEN_SHAKE: u8 = 0x3E;
 /// `main_state_flags2` bit `0x400000` (`MSF2_DOOR_TURN_PENDING`): a
 /// `check_door` handler latched the approach side this frame. Selector
 /// `0x20 + (31 - 22) = 0x29` in flag bank 5.
@@ -1394,9 +1395,14 @@ pub struct GameState {
     /// has no pack mapping for the global SE bank in this slice; the engine
     /// drains the queue (documented).
     pub sfx_requests: Vec<u16>,
-    /// Per-frame random seed the NPC look-at scheduling reads. The original
-    /// reseeds its global from `rand()` at the top of every gameplay frame;
-    /// the port advances a deterministic xorshift so headless runs repeat.
+    /// The platform random stream's 32-bit state (the original's
+    /// `g_randState`). Seeded 0 at a new game and on every room entry;
+    /// [`GameState::tick_entities`] draws it once per gameplay tick.
+    pub rand_state: u32,
+    /// This frame's platform-random draw (the original's `g_RandSeed`), written
+    /// once per gameplay tick before entity thinking and read by the NPC and
+    /// effect consumers; the same value lands in the BioCard word `cmpw 3`
+    /// reads (`state_words[3]`).
     pub rand_seed: u16,
     /// The effect pool (64 slots).
     pub effects: effects::EffectPool,
@@ -1520,7 +1526,8 @@ impl Default for GameState {
             snd3d_enemy_drops: 0,
             snd3d_noops: BTreeMap::new(),
             sfx_requests: Vec::new(),
-            rand_seed: RAND_SEED_INITIAL,
+            rand_state: 0,
+            rand_seed: 0,
             effects: effects::EffectPool::new(),
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
@@ -1542,20 +1549,17 @@ impl Default for GameState {
     }
 }
 
-/// One 16-bit xorshift step: the deterministic stand-in for the original's
-/// per-frame `rand()` reseed. The zero state is remapped so the sequence never
-/// sticks.
+/// One draw of the original's platform random stream: the MSVC 32-bit linear
+/// congruential generator `state = state * 214013 + 2531011`, returning bits
+/// 16..30.
 ///
-/// TODO(parity): (scripting) the original stores the frame's `rand()` value in
-/// the BioCard randSeed word (state word 3) that scripts roll dice with via
-/// `cmpw 3`; the stand-in seed never reaches `state_words`, so those scripts
-/// always compare against zero.
-fn next_random(seed: u16) -> u16 {
-    let mut x = seed;
-    x ^= x << 7;
-    x ^= x >> 9;
-    x ^= x << 8;
-    if x == 0 { 0xACE1 } else { x }
+/// The original seeds this stream once at boot and draws it once per gameplay
+/// frame into `g_RandSeed` (BioCard word 3, the word scripts roll dice with
+/// via `cmpw 3`); the same stream feeds screen shake and the NPC/effect
+/// consumers. The port seeds it 0 on a new game and on every room entry.
+pub fn platform_rand(state: &mut u32) -> u16 {
+    *state = state.wrapping_mul(214013).wrapping_add(2531011);
+    ((*state >> 16) & 0x7FFF) as u16
 }
 
 impl GameState {
@@ -2069,14 +2073,13 @@ impl GameState {
         // their scripts' `get_eml_state`/`eml_state` on those slots are inert.
         // The state-8 weapon-fire handler dispatches for real and releases the
         // scenes that wait on it.
-        // The original reseeds its random seed from `rand()` at the top of
-        // every gameplay frame, before any entity thinks; the look-at
-        // scheduling reads the frame's value.
-        // TODO(parity): (gameplay) the port advances a fixed xorshift instead
-        // of the platform `rand()` stream, so the state-9 look-at wander and
-        // behaviour-0 wait lengths are deterministic but differ from the
-        // original's per-frame draws.
-        self.rand_seed = next_random(self.rand_seed);
+        // The original draws `rand()` once at the top of every gameplay frame,
+        // before any entity thinks; the look-at scheduling and the effect
+        // behaviours read that frame's value and the scripts read it back
+        // through the BioCard word that `cmpw 3` indexes.
+        let frame_rand = platform_rand(&mut self.rand_state);
+        self.rand_seed = frame_rand;
+        self.state_words[3] = frame_rand;
         if self.message_freezes_entities() {
             // TODO(parity): (gameplay) the original still runs the state
             // dispatch when the message bit is set and always updates the
@@ -2086,6 +2089,31 @@ impl GameState {
             return 0;
         }
         crate::npc::update_all(self, room, models, pack)
+    }
+
+    /// The frame's screen-shake offset: the original's `ApplyScreenShake`.
+    ///
+    /// While `MSF2_SCREEN_SHAKE` is set this draws three values from the
+    /// platform stream: the X and Y magnitudes (the draw's low bit, so 0 or
+    /// +/-1 after the direction step) and a direction 0..=3 that negates
+    /// neither, Y, X or both. The original's `rand()` is never negative, so
+    /// each axis draw's sign correction collapses to its low bit and the
+    /// direction is `draw & 3`. The offset is cleared to `[0, 0]` without
+    /// drawing when the bit is off, and the renderer applies it to the camera
+    /// projection and the background's display origin.
+    pub fn shake_offset(&mut self) -> [i32; 2] {
+        if !self.flags[5].bit(MSF2_SCREEN_SHAKE) {
+            return [0, 0];
+        }
+        let x = i32::from(platform_rand(&mut self.rand_state) & 1);
+        let y = i32::from(platform_rand(&mut self.rand_state) & 1);
+        let direction = platform_rand(&mut self.rand_state) & 3;
+        match direction {
+            1 => [x, -y],
+            2 => [-x, y],
+            3 => [-x, -y],
+            _ => [x, y],
+        }
     }
 
     /// One tick of the effect pool: behaviours, velocity integration, sprite
@@ -2490,6 +2518,10 @@ impl GameState {
         // clears the delta and the scripted channel masks.
         self.state_words[1] = 0xFFFF;
         self.state_words[2] = 0;
+        // The platform random stream restarts at 0 with the room, so the first
+        // gameplay tick's draw is the stream's first value.
+        self.rand_state = 0;
+        self.rand_seed = 0;
         self.special_light_masks = [0; 3];
         self.got_item_slot = None;
         self.event_item_used = false;
@@ -7896,6 +7928,55 @@ mod tests {
         assert!(state.message_locks_controls());
         assert!(!state.message_freezes_entities());
         assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
+    }
+
+    #[test]
+    fn platform_rand_follows_the_msvc_recurrence_from_seed_zero() {
+        // The first draws of `state = state * 214013 + 2531011`, bits 16..30,
+        // from the boot seed 0; the values are computed from the recurrence.
+        let mut state = 0u32;
+        let mut expected_state = 0u32;
+        for expected in [38u16, 7719, 21238, 2437, 8855, 11797] {
+            expected_state = expected_state.wrapping_mul(214013).wrapping_add(2531011);
+            assert_eq!(platform_rand(&mut state), expected);
+            assert_eq!(state, expected_state);
+        }
+    }
+
+    #[test]
+    fn the_frame_draw_lands_in_bio_card_word_three() {
+        let mut state = game();
+        let room = RoomState::default();
+        let pack =
+            crate::pack::Pack::from_bytes(crate::pack::PackWriter::new().to_bytes().unwrap())
+                .unwrap();
+        let mut models = crate::npc::EntityModelCache::default();
+        state.tick_entities(&room, &mut models, &pack);
+
+        // The frame draw is the stream's first value from seed 0.
+        let draw = 38u16;
+        assert_eq!(state.rand_state, 2531011);
+        assert_eq!(state.rand_seed, draw);
+        assert_eq!(state.state_words[3], draw);
+        // The scripts' `cmpw 3` reads the word (mode 0 is unsigned equality).
+        assert!(state.compare_word(3, 0, draw as i16));
+        assert!(!state.compare_word(3, 0, 39));
+    }
+
+    #[test]
+    fn screen_shake_draws_three_values_and_clears_when_the_bit_is_off() {
+        let mut state = game();
+        // The bit is clear: the offset is cleared without touching the stream.
+        let frozen = state.rand_state;
+        assert_eq!(state.shake_offset(), [0, 0]);
+        assert_eq!(state.rand_state, frozen);
+
+        state.flags[5].apply(MSF2_SCREEN_SHAKE, 0);
+        // X = 38 & 1 = 0, Y = 7719 & 1 = 1, direction 21238 & 3 = 2 negates X.
+        assert_eq!(state.shake_offset(), [0, 1]);
+        // X = 2437 & 1 = 1, Y = 8855 & 1 = 1, direction 11797 & 3 = 1 negates Y.
+        assert_eq!(state.shake_offset(), [1, -1]);
+        assert_eq!(state.rand_state, 773_150_046, "six draws consumed");
     }
 
     #[test]
