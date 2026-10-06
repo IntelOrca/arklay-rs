@@ -29,7 +29,7 @@ use crate::movie;
 use crate::music;
 use crate::objects::{self, CollisionEdit, LightEdit, ObjectTable};
 use crate::player::PlayerState;
-use crate::scd::host::{ScdHost, StepResult};
+use crate::scd::host::{EventRequest, ScdHost, StepResult};
 use crate::scd::ir::Operand;
 use crate::scd::opcode::Op;
 use crate::stairs::{self, StairEntryState, StairZones};
@@ -1253,13 +1253,11 @@ pub struct GameState {
     /// out-of-range behaviour the original would have dispatched through a
     /// NULL table slot. Behaviour 8 (weapon fire) now dispatches for real.
     pub npc_placeholders: BTreeMap<u8, u64>,
-    /// Event scripts requested by `evt_exec`, consumed by the engine's event VM.
-    pub pending_events: Vec<(u8, u8)>,
-    /// Event slots requested by `task_kill` (0x44), consumed by the engine's
-    /// event VM before the next step. The script host cannot reach the VM's
-    /// event slots, so the kill travels through the state like the
-    /// `pending_events` start hand-off.
-    pub pending_event_kills: Vec<u8>,
+    /// Ordered `evt_exec`/`task_kill` requests, consumed by the engine's event
+    /// VM. The script host cannot reach the VM's event slots, so starts and
+    /// kills share one queue and are applied in program order, exactly the
+    /// original's immediate `ScdEventEntry_Create` / table writes.
+    pub pending_event_requests: Vec<EventRequest>,
     /// 3D entity sound cues queued by the state-8/9 handlers, consumed by the
     /// engine's mixer.
     pub entity_sounds: Vec<EntitySound>,
@@ -1389,8 +1387,7 @@ impl Default for GameState {
             frame: 0,
             placeholders: BTreeMap::new(),
             npc_placeholders: BTreeMap::new(),
-            pending_events: Vec::new(),
-            pending_event_kills: Vec::new(),
+            pending_event_requests: Vec::new(),
             entity_sounds: Vec::new(),
             snd3d_requests: Vec::new(),
             snd3d_enemy_drops: 0,
@@ -2317,8 +2314,7 @@ impl GameState {
         self.camera = CameraState::default();
         self.typewriter = TypewriterFlow::Idle;
         self.last_interaction = None;
-        self.pending_events.clear();
-        self.pending_event_kills.clear();
+        self.pending_event_requests.clear();
         self.entity_sounds.clear();
         self.snd3d_requests.clear();
     }
@@ -2569,14 +2565,26 @@ impl GameState {
     /// Unlike [`Self::remove_item`] this ignores quantity, so a zero-quantity
     /// stack (the starting knife) is cleared too, exactly like the original's
     /// slot scan. The use/combine paths keep the one-unit consume.
+    ///
+    /// The original stores the equipped item as the 1-based index of its
+    /// inventory slot and `rearrange_item_slots` *remaps* that index as the
+    /// inventory compacts; it never clears the marker. This inventory is
+    /// already compact, so the equivalent is: remember the equipped item's
+    /// position, remove the target's first stack, then re-point at whatever
+    /// now occupies the remapped slot — the next item when the equipped stack
+    /// itself was removed, or nothing when it was last.
     pub fn item_remove(&mut self, item: u8) -> bool {
+        let equipped_slot = self
+            .equipped
+            .and_then(|equipped| self.inventory.iter().position(|stack| stack.id == equipped));
         let Some(index) = self.inventory.iter().position(|stack| stack.id == item) else {
             return false;
         };
         self.inventory.remove(index);
         self.rebuild_slots();
-        if self.equipped == Some(item) && !self.inventory.iter().any(|stack| stack.id == item) {
-            self.set_equipped(None);
+        if let Some(slot) = equipped_slot {
+            let remapped = if index < slot { slot - 1 } else { slot };
+            self.set_equipped(self.inventory.get(remapped).map(|stack| stack.id));
         }
         true
     }
@@ -3885,7 +3893,10 @@ impl GameState {
         }
         let event_slot = action.params[2];
         let event = action.params[4];
-        self.pending_events.push((event_slot, event));
+        self.pending_event_requests.push(EventRequest::Start {
+            slot: event_slot,
+            event,
+        });
         true
     }
 
@@ -4724,12 +4735,15 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // `evt_exec`: queue an event script. The event VM starts it on the
-            // next tick, exactly like the original's `cmd_scd_event_create`.
+            // `evt_exec`: queue an event script start. The engine applies the
+            // shared start/kill queue in program order on the next drain,
+            // exactly like the original's `cmd_scd_event_create`.
             0x14 => {
                 let slot = operand_u8(operands, 1);
                 let event = operand_u8(operands, 2);
-                self.state.pending_events.push((slot, event));
+                self.state
+                    .pending_event_requests
+                    .push(EventRequest::Start { slot, event });
                 StepResult::Continue
             }
             0x24 => {
@@ -4760,11 +4774,12 @@ impl ScdHost for ScdGameHost<'_> {
                 StepResult::Finished
             }
             // `task_kill`: deactivate a running event slot. The host cannot
-            // reach the event VM's slots, so the request is queued and the
-            // engine applies it before the next event step, the same hand-off
-            // shape as `evt_exec`.
+            // reach the event VM's slots, so the request shares the `evt_exec`
+            // queue and the engine applies both in program order.
             0x44 => {
-                self.state.pending_event_kills.push(operand_u8(operands, 0));
+                self.state
+                    .pending_event_requests
+                    .push(EventRequest::Kill(operand_u8(operands, 0)));
                 StepResult::Continue
             }
             _ => self.placeholder(op),
@@ -5300,6 +5315,10 @@ impl ScdHost for ScdGameHost<'_> {
 
     fn script_waiting(&mut self) -> bool {
         self.state.script_waiting()
+    }
+
+    fn take_event_requests(&mut self) -> Vec<EventRequest> {
+        std::mem::take(&mut self.state.pending_event_requests)
     }
 }
 
@@ -8138,8 +8157,10 @@ mod tests {
         state.desk.saved_camera = Some(2);
         state.object_push = true;
         state.flags[5].apply(MSF_OBJECT_PUSH, 0);
-        state.pending_events.push((2, 5));
-        state.pending_event_kills.push(6);
+        state
+            .pending_event_requests
+            .push(EventRequest::Start { slot: 2, event: 5 });
+        state.pending_event_requests.push(EventRequest::Kill(6));
 
         state.enter_room(RoomId::parse("1140").unwrap(), &RoomState::default());
 
@@ -8160,8 +8181,10 @@ mod tests {
         assert_eq!(state.desk, DeskFlow::default());
         assert!(!state.object_push);
         assert!(!state.flags[5].bit(MSF_OBJECT_PUSH));
-        assert!(state.pending_events.is_empty(), "queued starts reset");
-        assert!(state.pending_event_kills.is_empty(), "queued kills reset");
+        assert!(
+            state.pending_event_requests.is_empty(),
+            "queued starts and kills reset"
+        );
     }
 
     #[test]
@@ -8204,7 +8227,10 @@ mod tests {
         let action = state.room_actions[0].expect("event action");
         assert_eq!(action.kind, RoomActionKind::Event);
         state.interact([5, 0, 5], 0, true);
-        assert_eq!(state.pending_events, vec![(9, 7)]);
+        assert_eq!(
+            state.pending_event_requests,
+            vec![EventRequest::Start { slot: 9, event: 7 }]
+        );
     }
 
     #[test]
@@ -8246,14 +8272,17 @@ mod tests {
 
         // The press edge queues the event once.
         state.interact(state.entities[0].pos, 0, true);
-        assert_eq!(state.pending_events, vec![(9, 7)]);
-        state.pending_events.clear();
+        assert_eq!(
+            state.pending_event_requests,
+            vec![EventRequest::Start { slot: 9, event: 7 }]
+        );
+        state.pending_event_requests.clear();
 
         // The same entry with the button held must not re-fire: the engine
         // passes the press edge, not the held level.
         state.interact(state.entities[0].pos, 0, false);
         assert!(
-            state.pending_events.is_empty(),
+            state.pending_event_requests.is_empty(),
             "a held action re-triggered the event site"
         );
     }
@@ -9870,7 +9899,11 @@ mod tests {
             state.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
             0x44
         );
-        assert_eq!(state.equipped, None, "the equipped stack was removed");
+        assert_eq!(
+            state.equipped,
+            Some(0x41),
+            "the original remaps the equipped slot index, so the next item becomes equipped"
+        );
         assert!(!state.item_remove(0x0B), "an absent item reports false");
 
         // The original's slot scan ignores quantity, so the zero-quantity
@@ -9917,7 +9950,7 @@ mod tests {
                 StepResult::Continue
             );
         }
-        assert_eq!(state.pending_event_kills, vec![3]);
+        assert_eq!(state.pending_event_requests, vec![EventRequest::Kill(3)]);
         assert!(
             !state.placeholders.contains_key(&0x44),
             "0x44 must not record a placeholder"
@@ -10664,8 +10697,8 @@ mod tests {
                 let mut host = ScdGameHost::new(&mut state);
                 command_vm.run_main(&mut host);
             }
-            for (slot, event) in std::mem::take(&mut state.pending_events) {
-                event_vm.start(usize::from(slot), event);
+            for request in std::mem::take(&mut state.pending_event_requests) {
+                event_vm.apply(request);
             }
             {
                 let mut host = ScdGameHost::new(&mut state);

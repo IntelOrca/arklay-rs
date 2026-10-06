@@ -73,9 +73,9 @@ impl FireScene {
             let mut host = ScdGameHost::new(&mut self.game);
             self.command_vm.run_main(&mut host);
         }
-        let pending: Vec<(u8, u8)> = std::mem::take(&mut self.game.pending_events);
-        for (slot, event) in pending {
-            self.event_vm.start(usize::from(slot), event);
+        let pending = std::mem::take(&mut self.game.pending_event_requests);
+        for request in pending {
+            self.event_vm.apply(request);
         }
         {
             let mut host = ScdGameHost::new(&mut self.game);

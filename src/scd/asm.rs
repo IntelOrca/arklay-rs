@@ -2577,6 +2577,54 @@ off_0006:
     }
 
     #[test]
+    fn evt_do_jumps_over_255_bytes_are_rejected() {
+        // The reader's `evt_do` operand is one byte, so a target more than 255
+        // bytes past the inline payload cannot be encoded; the planner must
+        // reject it instead of truncating.
+        let mut source = String::from(
+            "\
+.version 1
+
+.main
+
+.event event_00
+    evt_do                  far
+    nop                     0
+",
+        );
+        for _ in 0..200 {
+            source.push_str("    nop                     0\n");
+        }
+        source.push_str("far:\n    evt_next\n    evt_dountil\n");
+        let error = assemble(&source).unwrap_err().to_string();
+        assert!(error.contains("does not fit a byte"), "{error}");
+    }
+
+    #[test]
+    fn evt_single_payloads_below_one_command_are_rejected() {
+        // The reader tolerates payloads 2 and 3 (an inline command truncated
+        // to less than its two-byte minimum), but a valid `evt_single` carries
+        // one complete command, so the assembler's floor is 4. Documented in
+        // docs/m15-deviations.md.
+        for payload in ["2", "3"] {
+            let error = assemble(&format!(
+                "\
+.version 1
+
+.main
+
+.event event_00
+    evt_single              {payload}
+    evt_finish
+"
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("4-255"), "payload {payload}: {error}");
+        }
+    }
+
+    #[test]
     fn odd_events_must_be_dense_and_ascending() {
         let gap = assemble(
             "\

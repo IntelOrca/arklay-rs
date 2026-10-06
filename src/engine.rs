@@ -819,7 +819,9 @@ impl GameSession {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.command_vm.run_init(&mut host);
         }
-        start_pending_events(&mut self.game, &mut self.event_vm);
+        // The init script's starts and kills apply in program order before the
+        // Lua room hook or the first tick can observe the slots.
+        apply_event_requests(&mut self.game, &mut self.event_vm);
         self.game.apply_room_edits(&mut self.loaded.room);
         // The Lua room-entry hook runs once the room state exists (RDT, init
         // script and room edits applied) and before the first tick's movement.
@@ -3583,6 +3585,12 @@ fn simulate_loaded_with(
 ) -> Result<SimulatedRoom> {
     let id = loaded.id;
     run_room_init(&mut loaded, &mut game);
+    // Match the engine's room boot: the init script's ordered event requests
+    // apply before the Lua room hook and the first tick's command pass.
+    let scripts = Rc::new(loaded.scripts.clone());
+    let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+    let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
+    apply_event_requests(&mut game, &mut event_vm);
     let lua = load_lua(pack);
     call_lua_room_load(lua.as_ref(), &mut game, id);
     drain_mask_toggles(&mut loaded.room, &mut game);
@@ -3591,9 +3599,6 @@ fn simulate_loaded_with(
     // the init script, so a headless run sees the same channel state.
     bgm::update_room_bgm(&mut game, id, None);
 
-    let scripts = Rc::new(loaded.scripts.clone());
-    let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
-    let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
     let mut masks = MaskCache::default();
     let mut shadows = ShadowCache::default();
     let mut effect_pages = EffectPageCache::default();
@@ -4890,19 +4895,15 @@ fn run_room_init(loaded: &mut LoadedRoom, game: &mut game::GameState) {
     game.apply_room_edits(&mut loaded.room);
 }
 
-/// Start every event script requested by `evt_exec` in the command scripts.
-fn start_pending_events(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm) {
-    for (slot, event) in game.pending_events.drain(..) {
-        event_vm.start(usize::from(slot), event);
-    }
-}
-
-/// Apply every event kill requested by `task_kill` (0x44) in the command
-/// scripts. This runs after the command pass and before the event VM steps, so
-/// a queue-and-kill pair in one frame leaves the slot dead before it can run.
-fn apply_pending_event_kills(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm) {
-    for slot in game.pending_event_kills.drain(..) {
-        event_vm.kill(usize::from(slot));
+/// Apply the command pass's `evt_exec` starts and `task_kill` kills in
+/// program order.
+///
+/// The ordered queue is what keeps `task_kill 6` followed by
+/// `evt_exec 0, 6, ...` working (the original's immediate table writes leave
+/// the new event running); applying all starts before all kills would kill it.
+fn apply_event_requests(game: &mut game::GameState, event_vm: &mut scd::vm::EventVm) {
+    for request in game.pending_event_requests.drain(..) {
+        event_vm.apply(request);
     }
 }
 
@@ -4944,8 +4945,7 @@ fn tick_room(
         let mut host = game::ScdGameHost::new(context.game);
         command_vm.run_main(&mut host);
     }
-    start_pending_events(context.game, event_vm);
-    apply_pending_event_kills(context.game, event_vm);
+    apply_event_requests(context.game, event_vm);
     {
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
@@ -6474,7 +6474,7 @@ mod tests {
 
     #[test]
     fn pending_task_kills_deactivate_slots_before_the_next_step() {
-        use crate::scd::host::PlaceholderHost;
+        use crate::scd::host::{EventRequest, PlaceholderHost};
         use crate::scd::ir::{Decoded, Insn, Operand, Scripts, Stream, StreamKind};
         use crate::scd::opcode::{Op, event_control_op};
 
@@ -6526,11 +6526,12 @@ mod tests {
         assert_eq!(event_vm.active_slots(), 2);
 
         let mut game = game::GameState::default();
-        game.pending_event_kills.extend([3, 3, 9]);
-        apply_pending_event_kills(&mut game, &mut event_vm);
+        game.pending_event_requests
+            .extend([EventRequest::Kill(3), EventRequest::Kill(3)]);
+        apply_event_requests(&mut game, &mut event_vm);
         assert!(
-            game.pending_event_kills.is_empty(),
-            "the kill queue drains once"
+            game.pending_event_requests.is_empty(),
+            "the request queue drains once"
         );
         assert!(!event_vm.kill(3), "a repeated kill is a no-op");
         assert!(!event_vm.kill(9), "an out-of-range slot is a no-op");
@@ -6541,6 +6542,123 @@ mod tests {
             0,
             "the killed sleeping slot must not run"
         );
+    }
+
+    #[test]
+    fn task_kill_and_evt_exec_apply_in_program_order() {
+        use crate::scd::host::EventRequest;
+        use crate::scd::ir::{Block, Decoded, Insn, Operand, Scripts, Stream, StreamKind};
+        use crate::scd::opcode::{Op, command_op, event_control_op};
+
+        fn command_insn(offset: usize, op: &'static Op, len: usize, values: &[i64]) -> Insn {
+            Insn {
+                offset,
+                op: op.op,
+                bytes: vec![op.op; len],
+                decoded: Decoded::Command(op),
+                operands: values
+                    .iter()
+                    .map(|&value| Operand {
+                        value,
+                        target: None,
+                    })
+                    .collect(),
+            }
+        }
+
+        let evt_exec = command_op(0x14).unwrap();
+        let task_kill = command_op(0x44).unwrap();
+        let end = command_op(0x00).unwrap();
+        let finish = event_control_op(0xFF).unwrap();
+
+        // Event 0x1B exists; the other slots' streams are empty.
+        let mut events: Vec<Stream> = (0..=0x1B)
+            .map(|index| Stream {
+                kind: StreamKind::Event(index as u8),
+                offset: 0,
+                insns: Vec::new(),
+                trailing: Vec::new(),
+            })
+            .collect();
+        events[0x1B] = Stream {
+            kind: StreamKind::Event(0x1B),
+            offset: 0,
+            insns: vec![Insn {
+                offset: 0x9000,
+                op: finish.op,
+                bytes: vec![0xFF],
+                decoded: Decoded::Control(finish),
+                operands: Vec::new(),
+            }],
+            trailing: Vec::new(),
+        };
+        let event_scripts = Scripts {
+            events,
+            ..Scripts::default()
+        };
+
+        // `kill_first` selects the ROOM3030 shape (`task_kill 6` then
+        // `evt_exec 0, 6, event_1B`) vs. the reverse.
+        let run = |kill_first: bool| {
+            let first = if kill_first {
+                command_insn(0x1000, task_kill, 2, &[6])
+            } else {
+                command_insn(0x1000, evt_exec, 4, &[0, 6, 0x1B])
+            };
+            let second_offset = 0x1000 + first.bytes.len();
+            let second = if kill_first {
+                command_insn(second_offset, evt_exec, 4, &[0, 6, 0x1B])
+            } else {
+                command_insn(second_offset, task_kill, 2, &[6])
+            };
+            let end_offset = second_offset + second.bytes.len();
+            let scripts = Scripts {
+                main: vec![Block {
+                    offset: 0,
+                    size: 0,
+                    insns: vec![first, second, command_insn(end_offset, end, 2, &[0])],
+                    trailing: Vec::new(),
+                }],
+                ..Scripts::default()
+            };
+
+            let mut command_vm = scd::vm::CommandVm::new(&scripts);
+            let mut game = game::GameState::default();
+            {
+                let mut host = game::ScdGameHost::new(&mut game);
+                command_vm.run_main(&mut host);
+            }
+            let expected = if kill_first {
+                vec![
+                    EventRequest::Kill(6),
+                    EventRequest::Start {
+                        slot: 6,
+                        event: 0x1B,
+                    },
+                ]
+            } else {
+                vec![
+                    EventRequest::Start {
+                        slot: 6,
+                        event: 0x1B,
+                    },
+                    EventRequest::Kill(6),
+                ]
+            };
+            assert_eq!(game.pending_event_requests, expected, "program order");
+
+            let mut event_vm = scd::vm::EventVm::new(&event_scripts);
+            apply_event_requests(&mut game, &mut event_vm);
+            assert!(game.pending_event_requests.is_empty());
+            assert_eq!(
+                event_vm.active_slots(),
+                usize::from(kill_first),
+                "a kill before the start leaves the new event running; a kill \
+                 after it stops the event"
+            );
+        };
+        run(true);
+        run(false);
     }
 
     #[test]
@@ -10155,6 +10273,107 @@ end
         assert_eq!(plain_run.script_source, ScriptSource::Rdt);
         assert!(!plain_run.game.flag_test(0, 1, false));
         assert_eq!(plain_run.frame.rgba, run.frame.rgba);
+    }
+
+    #[test]
+    fn init_event_requests_apply_in_program_order_at_room_boot() {
+        // The ROOM3030 main-script shape at room-boot time: the init script's
+        // `task_kill 6` immediately followed by `evt_exec 0, 6, event_00` must
+        // leave the new event running. The reversed pair must stop it.
+        let dir = TempDir::new();
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+
+        let container = |kill_first: bool| {
+            let requests = if kill_first {
+                "    task_kill               6\n    evt_exec                0, 6, event_00\n"
+            } else {
+                "    evt_exec                0, 6, event_00\n    task_kill               6\n"
+            };
+            let text = format!(
+                ".version 1\n\n.init\n.block\n{requests}\n.main\n\n\
+                 .event event_00\n    evt_single              6\n    \
+                 set                     FG_SCENARIO, 5, 0\n    evt_finish\n"
+            );
+            scd::asm::assemble(&text).unwrap().to_container().unwrap()
+        };
+
+        let run = |kill_first: bool, path: &Path| {
+            let mut writer = PackWriter::new();
+            writer
+                .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+                .unwrap();
+            writer.add(&id.cut_entry(0), bmp_bytes.clone()).unwrap();
+            writer.add(&id.scd_entry(), container(kill_first)).unwrap();
+            writer.write(path).unwrap();
+            let pack = Pack::open(path).unwrap();
+            simulate_room(&pack, id, 1, player::Input::default()).unwrap()
+        };
+
+        let kill_first = run(true, &dir.0.join("kill-first.akpak"));
+        assert!(
+            kill_first.game.flags[0].bit(5),
+            "task_kill before evt_exec must leave the new event running"
+        );
+
+        let start_first = run(false, &dir.0.join("start-first.akpak"));
+        assert!(
+            !start_first.game.flags[0].bit(5),
+            "evt_exec before task_kill must stop the new event"
+        );
+    }
+
+    #[test]
+    fn a_game_session_applies_init_event_requests_at_room_boot() {
+        // The literal `GameSession` boot path (`from_room` -> `enter_room`):
+        // the init's ordered kill/start pair resolves before the first tick,
+        // so the new event is live at boot and runs on tick one.
+        let dir = TempDir::new();
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let container = scd::asm::assemble(
+            "\
+.version 1
+
+.init
+.block
+    task_kill               6
+    evt_exec                0, 6, event_00
+
+.main
+
+.event event_00
+    evt_single              6
+    set                     FG_SCENARIO, 5, 0
+    evt_finish
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+        let pack_path = dir.0.join("game.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add(&id.scd_entry(), container).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, id, &dir.0.join("saves")).unwrap();
+        assert_eq!(
+            session.event_vm.active_slots(),
+            1,
+            "task_kill before evt_exec leaves the new event live at boot"
+        );
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.game.flags[0].bit(5),
+            "the init's event ran on the first tick"
+        );
     }
 
     #[cfg(feature = "lua")]

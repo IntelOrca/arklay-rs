@@ -21,11 +21,14 @@ no-combat scope of the engine is unchanged and is covered by
 3. **Lua sandbox limits.** The VM loads only the base, `string` and `table`
    libraries. `os`, `io`, `package`, `debug`, `coroutine` and `math` are
    absent, so hooks cannot read files, open sockets, read the clock, schedule
-   coroutines or use nondeterministic maths. There is no module loading, no
-   `require`, and no binary chunk support. Enforcement is the standard-library
-   set plus the process's safe-mode Lua state, not a bytecode verifier: a hook
-   can still allocate unbounded tables (bounded in practice by the
-   instruction budget below).
+   coroutines or use nondeterministic maths. The base library's filesystem and
+   loader entries (`dofile`, `loadfile` and `load`, which can also parse binary
+   chunks) and `collectgarbage` are set to nil before any chunk runs, so there
+   is no module loading and no `require`. Enforcement is the standard-library
+   set plus the process's safe-mode Lua state, not a bytecode verifier, so the
+   state also carries a fixed allocation ceiling (16 MiB); an allocation that
+   would pass it raises a memory error and disables the failing hook or skips
+   the failing chunk.
 
 4. **Hook error policy.** A chunk that fails to compile or run is logged once
    with a `[lua]` prefix and skipped; the remaining chunks still load. A hook
@@ -84,3 +87,10 @@ no-combat scope of the engine is unchanged and is covered by
     they are given and never auto-discover a sibling `mods/` directory. This
     keeps their output stable for a pack whose directory happens to contain a
     `mods/` folder.
+
+13. **`evt_single` minimum payload.** The reader tolerates a 2- or 3-byte
+    `evt_single` payload by truncating the inline command to less than its
+    two-byte minimum; the assembler requires the 4-byte minimum that holds one
+    complete command-VM instruction, so a source that would reproduce such a
+    malformed payload is rejected instead of emitted. No shipped room carries
+    one, so the disassemble/reassemble round trip is unaffected.

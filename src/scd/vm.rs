@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::scd::host::{ScdHost, StepResult};
+use crate::scd::host::{EventRequest, ScdHost, StepResult};
 use crate::scd::ir::{Block, Decoded, Insn, Operand, Scripts};
 use crate::scd::opcode::Op;
 
@@ -251,8 +251,15 @@ impl EventVm {
     }
 
     /// Step every active slot once.
+    ///
+    /// Requests the command code inside an event queues (`evt_exec`/
+    /// `task_kill`, including an inline `task_kill` from `evt_single`/
+    /// `evt_block`) are applied between slots, matching the original's outer
+    /// loop: a kill an event issues stops a later slot in the same pass, and a
+    /// start lands in time for a later slot to run.
     pub fn step(&mut self, host: &mut impl ScdHost) {
         for index in 0..SLOT_COUNT {
+            self.apply_requests(host);
             if !self.slots[index].active {
                 continue;
             }
@@ -266,6 +273,27 @@ impl EventVm {
                     break;
                 }
             }
+        }
+        // The last slot's requests have no later slot to affect this pass; apply
+        // them now so the next pass sees them already ordered ahead of any new
+        // command-pass request.
+        self.apply_requests(host);
+    }
+
+    /// Apply one host request. Public so the engine can drain the command
+    /// pass's ordered queue before [`Self::step`].
+    pub fn apply(&mut self, request: EventRequest) {
+        match request {
+            EventRequest::Start { slot, event } => self.start(usize::from(slot), event),
+            EventRequest::Kill(slot) => {
+                self.kill(usize::from(slot));
+            }
+        }
+    }
+
+    fn apply_requests(&mut self, host: &mut impl ScdHost) {
+        for request in host.take_event_requests() {
+            self.apply(request);
         }
     }
 
@@ -865,6 +893,7 @@ mod tests {
     op!(EVT_DOUNTIL, 0xFD, "evt_dountil", false);
     op!(EVT_NEXT, 0xFE, "evt_next", false);
     op!(EVT_FINISH, 0xFF, "evt_finish", false);
+    op!(TASK_KILL, 0x44, "task_kill", false);
 
     op!(ACT_FLAG_OP, 0x87, "act_flag_op", false);
     op!(ACT_END, 0x8B, "act_end", false);
@@ -1048,6 +1077,9 @@ mod tests {
         flag_calls: Vec<(u8, u8, bool)>,
         flag_results: VecDeque<bool>,
         results: VecDeque<StepResult>,
+        /// Event slots queued by an inline `task_kill`, consumed by the VM's
+        /// between-slot drain.
+        event_kills: Vec<u8>,
         /// The predicate the F7 wait polls.
         waiting: bool,
     }
@@ -1076,7 +1108,6 @@ mod tests {
         host_method!(on_flags, "flags");
         host_method!(on_camera, "camera");
         host_method!(on_message, "message");
-        host_method!(on_room_action, "room_action");
         host_method!(on_item, "item");
         host_method!(on_enemy, "enemy");
         host_method!(on_player, "player");
@@ -1085,6 +1116,15 @@ mod tests {
         host_method!(on_sound, "sound");
         host_method!(on_misc, "misc");
 
+        fn on_room_action(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
+            self.calls.push(("room_action", op.mnemonic));
+            if op.op == 0x44 {
+                self.event_kills
+                    .push(operands.first().map_or(0, |operand| operand.value as u8));
+            }
+            self.results.pop_front().unwrap_or(StepResult::Placeholder)
+        }
+
         fn flag_test(&mut self, bank: u8, bit: u8, expected: bool) -> bool {
             self.flag_calls.push((bank, bit, expected));
             self.flag_results.pop_front().unwrap_or(false)
@@ -1092,6 +1132,13 @@ mod tests {
 
         fn script_waiting(&mut self) -> bool {
             self.waiting
+        }
+
+        fn take_event_requests(&mut self) -> Vec<EventRequest> {
+            std::mem::take(&mut self.event_kills)
+                .into_iter()
+                .map(EventRequest::Kill)
+                .collect()
         }
     }
 
@@ -1377,6 +1424,34 @@ mod tests {
         let mut host = RecordingHost::default();
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0, "the surviving slot ran to finish");
+    }
+
+    #[test]
+    fn an_inline_kill_stops_a_later_slot_in_the_same_pass() {
+        // Slot 0's inline command kills slot 1; the original applies the kill
+        // between the outer loop's entries, so slot 1 must not run this pass.
+        let scripts = event_scripts(vec![
+            vec![
+                event(0x2000, &EVT_SINGLE, 2, vec![value(4)]),
+                command(0x2002, &TASK_KILL, 2, vec![value(1)]),
+                control(0x2004, &EVT_FINISH, 1, Vec::new()),
+            ],
+            vec![
+                event(0x3000, &EVT_SINGLE, 2, vec![value(4)]),
+                command(0x3002, &BGM_PLAY, 2, vec![value(0)]),
+                control(0x3004, &EVT_FINISH, 1, Vec::new()),
+            ],
+        ]);
+        let mut vm = EventVm::new(&scripts);
+        let mut host = RecordingHost::default();
+        vm.start(0, 0);
+        vm.start(1, 1);
+        vm.step(&mut host);
+        assert!(
+            host.class_names("sound").is_empty(),
+            "slot 1 must be killed between slots, before it runs"
+        );
+        assert_eq!(vm.active_slots(), 0);
     }
 
     #[test]

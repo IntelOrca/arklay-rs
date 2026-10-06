@@ -19,9 +19,11 @@
 //! Lua's colon syntax (`api:flag_set(0, 1, true)`).
 //!
 //! The sandbox loads only the base, `string` and `table` libraries, so `os`,
-//! `io`, `package`, `debug`, `coroutine` and `math` do not exist. An
-//! instruction-budget hook aborts a script that runs away, and every load or
-//! call error is logged once and disables only the failing hook (or skips the
+//! `io`, `package`, `debug`, `coroutine` and `math` do not exist; the base
+//! library's `dofile`, `loadfile`, `load` and `collectgarbage` globals are set
+//! to nil before any chunk runs. An instruction-budget hook aborts a script
+//! that runs away, a memory limit bounds allocation, and every load or call
+//! error is logged once and disables only the failing hook (or skips the
 //! failing chunk), never the game session. A pack with no Lua entries, or a
 //! build without the `lua` feature, loads no VM: every hook is a no-op and
 //! captures stay byte-identical.
@@ -79,8 +81,19 @@ mod imp {
     const HOOK_INTERVAL: u32 = 10_000;
     /// Instructions one hook call may execute before the budget aborts it.
     const CALL_BUDGET: u64 = 5_000_000;
+    /// Allocation ceiling for the sandboxed state, in bytes.
+    const MEMORY_LIMIT: usize = 16 * 1024 * 1024;
     /// Message pause word the Lua `api:message` accessor requests.
     const MESSAGE_PAUSE: u16 = 0;
+
+    /// Base-library globals removed before any chunk runs.
+    ///
+    /// mlua always opens Lua's base library, and Lua 5.4's base contains the
+    /// filesystem loaders (`dofile`, `loadfile`) plus `load` (which can parse
+    /// binary chunks) and the GC control; none of them belong in a sandboxed
+    /// hook. The library bindings the API uses (`string`, `table`, `print`,
+    /// `assert`, ...) stay.
+    const REMOVED_GLOBALS: [&str; 4] = ["dofile", "loadfile", "load", "collectgarbage"];
 
     /// The per-call instruction budget, shared with the VM's hook callback.
     #[derive(Debug, Default)]
@@ -136,6 +149,16 @@ mod imp {
             }
             let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE, LuaOptions::default())
                 .map_err(|err| anyhow::anyhow!("failed to create the Lua state: {err}"))?;
+            {
+                let globals = lua.globals();
+                for name in REMOVED_GLOBALS {
+                    globals.set(name, Value::Nil).map_err(|err| {
+                        anyhow::anyhow!("failed to remove the Lua global {name}: {err}")
+                    })?;
+                }
+            }
+            lua.set_memory_limit(MEMORY_LIMIT)
+                .map_err(|err| anyhow::anyhow!("failed to set the Lua memory limit: {err}"))?;
             let budget = Rc::new(Budget::default());
             let hook_budget = Rc::clone(&budget);
             lua.set_hook(
@@ -295,7 +318,8 @@ mod imp {
             });
 
             methods.add_method_mut("kill_event", |_lua, game, slot: u8| {
-                game.pending_event_kills.push(slot);
+                game.pending_event_requests
+                    .push(crate::scd::host::EventRequest::Kill(slot));
                 Ok(())
             });
 
@@ -439,10 +463,13 @@ end
 
         vm.call_tick(&mut game, 1);
         assert!(game.message.id.is_none(), "the tick hook waited for tick 3");
-        assert!(game.pending_event_kills.is_empty());
+        assert!(game.pending_event_requests.is_empty());
 
         vm.call_tick(&mut game, 3);
-        assert_eq!(game.pending_event_kills, [2]);
+        assert_eq!(
+            game.pending_event_requests,
+            [crate::scd::host::EventRequest::Kill(2)]
+        );
         assert_eq!(game.message.id, Some(9));
         assert_eq!(game.item_count(0x0B), 0, "item_remove clears the slot");
 
@@ -461,6 +488,10 @@ function on_room_load(api)
     assert(debug == nil, "debug")
     assert(coroutine == nil, "coroutine")
     assert(math == nil, "math")
+    assert(dofile == nil, "dofile")
+    assert(loadfile == nil, "loadfile")
+    assert(load == nil, "load")
+    assert(collectgarbage == nil, "collectgarbage")
     assert(type(string.upper) == "function", "string")
     assert(type(table.insert) == "function", "table")
     assert(type(print) == "function", "base")
@@ -476,6 +507,29 @@ end
             game.flags[0].bit(4),
             "the sandbox hook ran with only base/string/table"
         );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn the_memory_limit_stops_a_runaway_allocation() {
+        let source = r#"
+function on_tick(api, tick)
+    local huge = string.rep("x", 64 * 1024 * 1024)
+    api:flag_set(0, 6, true)
+    _ = huge
+end
+"#;
+        let pack = lua_pack(&["lua/memory.lua"], &[("lua/memory.lua", source)]);
+        let vm = LuaVm::load(&pack).unwrap().expect("a Lua VM");
+        let mut game = GameState::default();
+        vm.call_tick(&mut game, 1);
+        assert!(
+            !game.flags[0].bit(6),
+            "the allocation must fail before the flag write"
+        );
+        // The failed call disables the hook, so it cannot retry the allocation.
+        vm.call_tick(&mut game, 2);
+        assert!(!game.flags[0].bit(6));
     }
 
     #[cfg(feature = "lua")]

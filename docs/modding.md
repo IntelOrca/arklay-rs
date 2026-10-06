@@ -154,11 +154,14 @@ exist (Lua colon syntax):
 
 The VM loads the base, `string` and `table` libraries only: `os`, `io`,
 `package`, `debug`, `coroutine` and `math` do not exist, so there is no
-filesystem, network, clock or scheduling access. An instruction-budget hook
-aborts a script that runs away (the call errors out within a few million
-instructions). Every load or call error is logged once with a `[lua]` prefix
-and disables only the failing hook or chunk; the game session always
-continues. A pack with no `lua/` entries loads no VM, and a
+filesystem, network, clock or scheduling access. The base library's
+`dofile`, `loadfile`, `load` and `collectgarbage` globals are set to nil
+before any chunk runs, so a hook cannot load a file (or a binary chunk) or
+drive the collector, and the state carries a 16 MiB allocation ceiling. An
+instruction-budget hook aborts a script that runs away (the call errors out
+within a few million instructions). Every load or call error is logged once
+with a `[lua]` prefix and disables only the failing hook or chunk; the game
+session always continues. A pack with no `lua/` entries loads no VM, and a
 `--no-default-features` build has no Lua runtime at all: every hook compiles
 to a no-op and runs stay byte-identical.
 

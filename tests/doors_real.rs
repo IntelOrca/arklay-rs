@@ -281,8 +281,8 @@ fn event_payload_rearms_the_door_with_an_auto_probe() {
             let mut host = ScdGameHost::new(&mut state);
             event_vm.step(&mut host);
         }
-        for (slot, event) in std::mem::take(&mut state.pending_events) {
-            event_vm.start(usize::from(slot), event);
+        for request in std::mem::take(&mut state.pending_event_requests) {
+            event_vm.apply(request);
         }
         state.cancel_message();
         state.advance_frame();

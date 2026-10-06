@@ -74,7 +74,10 @@ pub fn build_mod(dir: &Path, out: &Path, base: Option<&Path>) -> Result<ModSumma
     let out_canonical = fs::canonicalize(out).ok();
 
     for (relative, source) in &files {
-        if relative == manifest::ENTRY {
+        // The manifest lookup above is case-resolved by the filesystem; skip
+        // whatever case variant was actually found so it is never packed
+        // twice (and never collides with the rendered lowercase entry).
+        if relative.eq_ignore_ascii_case(manifest::ENTRY) {
             continue;
         }
         if let Some(canonical) = &out_canonical
@@ -186,8 +189,10 @@ pub fn discover_mods(pack: &Path) -> Vec<PathBuf> {
     };
     let mut mods: Vec<PathBuf> = read
         .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
         .map(|entry| entry.path())
+        // `Path::is_file` follows symlinks, so a pack linked into `mods/` is
+        // discovered like a regular file.
+        .filter(|path| path.is_file())
         .filter(|path| {
             path.extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("akpak"))
@@ -633,6 +638,55 @@ mod tests {
         );
 
         assert!(discover_mods(&dir.path.join("elsewhere/missing.akpak")).is_empty());
+    }
+
+    #[test]
+    fn discover_mods_follows_symlinked_packs() {
+        let dir = TempDir::new("discover-links");
+        let pack = dir.path.join("game.akpak");
+        write(&pack, b"pack");
+        let mods = dir.path.join("mods");
+        write(&mods.join("real.akpak"), b"mod");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(mods.join("real.akpak"), mods.join("link.akpak")).unwrap();
+        #[cfg(not(unix))]
+        write(&mods.join("link.akpak"), b"mod");
+
+        let found = discover_mods(&pack);
+        assert_eq!(
+            found
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["link.akpak", "real.akpak"]
+        );
+    }
+
+    #[test]
+    fn a_case_variant_manifest_is_not_packed_twice() {
+        let dir = TempDir::new("manifest-case");
+        let source = dir.path.join("source");
+        write(
+            &source.join("manifest.toml"),
+            mod_manifest_text("demo", "re1").as_bytes(),
+        );
+        // On a case-insensitive filesystem this overwrites the entry above; on
+        // a case-sensitive one it is a second directory entry. Either way the
+        // uppercase variant must never become a second `manifest.toml` entry.
+        write(
+            &source.join("MANIFEST.TOML"),
+            mod_manifest_text("demo", "re1").as_bytes(),
+        );
+        let out = dir.path.join("demo.akpak");
+        let summary = build_mod(&source, &out, None).unwrap();
+        assert_eq!(
+            summary
+                .entries
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["manifest.toml"]
+        );
     }
 
     #[test]

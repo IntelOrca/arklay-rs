@@ -111,8 +111,8 @@ fn run_room(scripts: &arklay::scd::ir::Scripts, state: &mut GameState) {
             let mut host = ScdGameHost::new(state);
             vm.run_main(&mut host);
         }
-        for (slot, event) in std::mem::take(&mut state.pending_events) {
-            event_vm.start(usize::from(slot), event);
+        for request in std::mem::take(&mut state.pending_event_requests) {
+            event_vm.apply(request);
         }
         {
             let mut host = ScdGameHost::new(state);

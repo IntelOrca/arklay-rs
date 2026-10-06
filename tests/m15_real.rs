@@ -531,6 +531,44 @@ fn corpus_audit_runs_with_and_without_the_demo_layer() {
 }
 
 #[test]
+fn list_reports_layer_warnings_on_stderr_only() {
+    let dir = TempDir::new("list-stderr");
+    let base = dir.path.join("re1.akpak");
+    let mut writer = PackWriter::new();
+    writer.add("x.txt", b"base".to_vec()).unwrap();
+    writer.write(&base).unwrap();
+
+    let layer = dir.path.join("layer.akpak");
+    let mut writer = PackWriter::new();
+    writer.add(manifest::ENTRY, mod_manifest("re1")).unwrap();
+    writer.add("x.txt", b"layer".to_vec()).unwrap();
+    writer.write(&layer).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arklay"))
+        .args(["list"])
+        .arg(&base)
+        .arg("--mod")
+        .arg(&layer)
+        .output()
+        .expect("failed to run arklay list");
+    assert!(output.status.success());
+
+    // The stem-derived base id warns; the warning must not corrupt the TOC.
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("warning"),
+        "warnings leaked into the TOC: {stdout}"
+    );
+    assert!(
+        stdout.lines().last().unwrap().contains("entries, "),
+        "{stdout}"
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("warning:"), "{stderr}");
+    assert!(stderr.contains("manifest.toml"), "{stderr}");
+}
+
+#[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn pack_info_cli_prints_the_real_pack() {
     let Some((_root, pack_path)) = common::asset_env() else {

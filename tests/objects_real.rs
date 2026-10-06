@@ -644,8 +644,8 @@ fn room_30b_objs_hide_darkens_the_player() {
             let mut host = game::ScdGameHost::new(&mut game);
             command_vm.run_main(&mut host);
         }
-        for (slot, event) in game.pending_events.drain(..) {
-            event_vm.start(usize::from(slot), event);
+        for request in game.pending_event_requests.drain(..) {
+            event_vm.apply(request);
         }
         {
             let mut host = game::ScdGameHost::new(&mut game);
@@ -1153,8 +1153,8 @@ fn room_30b_objs_hide_changes_the_rendered_tint() {
             let mut host = game::ScdGameHost::new(&mut game);
             command_vm.run_main(&mut host);
         }
-        for (slot, event) in game.pending_events.drain(..) {
-            event_vm.start(usize::from(slot), event);
+        for request in game.pending_event_requests.drain(..) {
+            event_vm.apply(request);
         }
         {
             let mut host = game::ScdGameHost::new(&mut game);

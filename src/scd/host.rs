@@ -20,6 +20,21 @@ pub enum StepResult {
     Placeholder,
 }
 
+/// One ordered request from the command scripts to the event VM.
+///
+/// The command VM cannot touch the event slots directly, so `evt_exec` (0x14)
+/// and `task_kill` (0x44) — and the Lua `kill_event` hook — queue here. The
+/// requests are applied in program order, exactly the original's immediate
+/// `ScdEventEntry_Create` / `g_ScdEventTable[slot].active = 0`, so a kill
+/// followed by a start of the same slot leaves the new event running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRequest {
+    /// `evt_exec`: start `event` in `slot` (`slot >= 8` picks a free slot).
+    Start { slot: u8, event: u8 },
+    /// `task_kill`: deactivate `slot`.
+    Kill(u8),
+}
+
 /// Host interface: every game effect is a method with a default that records a
 /// placeholder. M4 fills these in without touching the decoder.
 pub trait ScdHost {
@@ -77,6 +92,15 @@ pub trait ScdHost {
     /// Defaults to false so a host without audio or a message window advances.
     fn script_waiting(&mut self) -> bool {
         false
+    }
+
+    /// Drain the event-VM requests (`evt_exec`/`task_kill`) queued since the
+    /// last call. [`crate::scd::vm::EventVm::step`] consumes them between
+    /// slots, matching the original's immediate create/kill: a request an
+    /// event's inline command makes affects the slots after it in the same
+    /// pass. Defaults to no requests.
+    fn take_event_requests(&mut self) -> Vec<EventRequest> {
+        Vec::new()
     }
 
     fn on_misc(&mut self, _op: &Op, _operands: &[Operand]) -> StepResult {

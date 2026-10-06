@@ -327,14 +327,15 @@ fn build_mod_pack(dir: &Path, out: &Path, base: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Open `pack_path`, applying the `mods` layers and printing their warnings.
+/// Open `pack_path`, applying the `mods` layers and reporting their warnings
+/// on stderr so `list`/`extract` stdout stays a clean machine-readable table.
 fn open_game_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<Pack> {
     if mods.is_empty() {
         return Pack::open(pack_path);
     }
     let pack = Pack::open_layered(pack_path, mods)?;
     for warning in pack.warnings() {
-        println!("warning: {warning}");
+        eprintln!("warning: {warning}");
     }
     Ok(pack)
 }
@@ -445,10 +446,8 @@ fn write_pack_info(pack_path: &Path, pack: &Pack, out: &mut impl Write) -> Resul
 
 /// Print the `pack info` report for `pack_path` plus the `mods` layers.
 fn pack_info(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
+    // `open_game_pack` already reports any layer warnings on stderr.
     let pack = open_game_pack(pack_path, mods)?;
-    for warning in pack.warnings() {
-        eprintln!("warning: {warning}");
-    }
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     write_pack_info(pack_path, &pack, &mut out)

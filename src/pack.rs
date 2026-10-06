@@ -300,8 +300,10 @@ impl Pack {
                     manifest.kind
                 );
             }
-            if base_declared
-                && let Some(declared) = &manifest.base
+            // The declared base must match the base pack's id whether that id
+            // was declared or derived from the pack's stem, exactly like the
+            // mod builder's check.
+            if let Some(declared) = &manifest.base
                 && declared != &base_id
             {
                 bail!(
@@ -1111,7 +1113,9 @@ mod tests {
 
         let bare = dir.join("bare.akpak");
         write_pack(&bare, &[("x.txt", b"bare")]);
-        let err = Pack::open_layered(&base, &[bare]).unwrap_err().to_string();
+        let err = Pack::open_layered(&base, std::slice::from_ref(&bare))
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("bare.akpak") && err.contains("manifest.toml"),
             "{err}"
@@ -1163,6 +1167,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected mod"), "{err}");
+
+        // A base without a manifest still checks a mod's declared base
+        // against the stem id it adopts.
+        let bare_mod = dir.join("bare-mod.akpak");
+        write_pack(
+            &bare_mod,
+            &[(manifest::ENTRY, &mod_manifest("bare-mod", "other", 0))],
+        );
+        let err = Pack::open_layered(&bare, &[bare_mod])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("\"other\"") && err.contains("\"bare\""),
+            "{err}"
+        );
     }
 
     #[test]
