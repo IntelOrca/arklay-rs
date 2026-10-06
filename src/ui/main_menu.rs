@@ -396,16 +396,11 @@ impl MainMenu {
                         }
                     }
                     CombineResult::NeedsDrugStore => MenuEvent::Message(MESSAGE_NEEDS_DRUG_STORE),
-                    CombineResult::NoRecipe => {
-                        if is_herb(self.selected_item)
-                            && target_slot < game.inventory.len()
-                            && is_herb(game.inventory[target_slot].id)
-                        {
-                            MenuEvent::Message(MESSAGE_NO_RECIPE)
-                        } else {
-                            MenuEvent::None
-                        }
-                    }
+                    // Two herbs with no recipe: the original's distinct
+                    // "cannot combine" result shows `0xF6`; every other pair
+                    // is refused silently.
+                    CombineResult::HerbNoRecipe => MenuEvent::Message(MESSAGE_NO_RECIPE),
+                    CombineResult::NoRecipe => MenuEvent::None,
                 }
             }
         }
@@ -643,10 +638,6 @@ fn category_index(item: u8) -> u16 {
         items::UseCategory::Always => 8,
         items::UseCategory::Unusable => 9,
     }
-}
-
-fn is_herb(item: u8) -> bool {
-    (0x43..=0x4B).contains(&item)
 }
 
 /// Remove one item from `slot`, compacting the inventory.
@@ -1242,6 +1233,30 @@ mod tests {
         game.add_item(0x41, 1);
         assert_eq!(game.combine_slots(0, 1), CombineResult::NoRecipe);
         assert_eq!(game.inventory.len(), 2);
+    }
+
+    #[test]
+    fn two_herbs_without_a_recipe_show_the_cannot_combine_message() {
+        // Red + blue has no recipe, but both are herbs: the original's
+        // distinct result 3, which shows `0xF6` rather than refusing silently.
+        let mut game = new_game();
+        game.add_item(0x43, 1); // red herb
+        game.add_item(0x45, 1); // blue herb
+        assert_eq!(game.combine_slots(0, 1), CombineResult::HerbNoRecipe);
+
+        let mut menu = MainMenu::new(8);
+        menu.open(&mut game);
+        menu.handle_input(&mut game, MenuInput::Confirm);
+        menu.handle_input(&mut game, MenuInput::Down);
+        menu.handle_input(&mut game, MenuInput::Down);
+        menu.handle_input(&mut game, MenuInput::Confirm);
+        assert_eq!(menu.mode, MenuMode::Move);
+        menu.handle_input(&mut game, MenuInput::Right);
+        assert_eq!(
+            menu.handle_input(&mut game, MenuInput::Confirm),
+            MenuEvent::Message(MESSAGE_NO_RECIPE)
+        );
+        assert_eq!(game.inventory.len(), 2, "nothing was consumed");
     }
 
     #[test]

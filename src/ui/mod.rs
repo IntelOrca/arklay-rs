@@ -19,6 +19,7 @@ pub mod item_box;
 pub mod item_view;
 pub mod layout;
 pub mod main_menu;
+pub mod map;
 pub mod save_load;
 pub mod status;
 pub mod title;
@@ -32,17 +33,28 @@ use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::text::Text;
 
-/// One frame of edge-triggered UI input.
+/// One frame of UI input.
 ///
-/// Every flag is an edge: it is true only on the tick the key went down, so a
-/// screen never has to debounce. `any` covers every other key the platform
-/// reported this tick and drives the title's "press any button" gate.
+/// `up`/`down`/`left`/`right` are edges: true only on the tick the key went
+/// down, so a screen never has to debounce. The `held_*` flags are the keys'
+/// held level, which the item viewer reads to spin its model continuously;
+/// captures and synthetic tests leave them false. `any` covers every other key
+/// the platform reported this tick and drives the title's "press any button"
+/// gate.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UiInput {
     pub up: bool,
     pub down: bool,
     pub left: bool,
     pub right: bool,
+    /// Held level of the direction keys, for continuous spin.
+    pub held_up: bool,
+    /// Held level of the direction keys, for continuous spin.
+    pub held_down: bool,
+    /// Held level of the direction keys, for continuous spin.
+    pub held_left: bool,
+    /// Held level of the direction keys, for continuous spin.
+    pub held_right: bool,
     /// Confirm (Space or Return).
     pub confirm: bool,
     /// Cancel (X or Backspace).

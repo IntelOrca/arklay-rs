@@ -180,13 +180,18 @@ const ITEM_MAP_COURTYARD: u8 = 0x50;
 /// Item id of the guardhouse map, the other darkened pair.
 const ITEM_MAP_GUARDHOUSE: u8 = 0x52;
 /// First map-owned bit in the room-flags bank: `0x7C + (item - 0x4E)`.
-const ROOM_FLAG_MAP_BASE: u8 = 0x7C;
+pub const ROOM_FLAG_MAP_BASE: u8 = 0x7C;
+/// Per map group base of the visited-room bits in the room-flags bank,
+/// indexed by the zero-based stage (`(stage - 1) % 5`): mansion 1F, mansion
+/// 2F, courtyard + underground, guardhouse and laboratory. The bases are the
+/// running sum of the per-group room counts.
+pub const STAGE_ROOM_FLAG_OFFSETS: [u8; 6] = [0, 32, 63, 82, 100, 0];
 /// Prompt message the include-key handler shows before the pickup.
 const MESSAGE_INCLUDE_KEY: u8 = 0xC1;
 /// Effect sprite the item build's `0x8000` flag spawns.
 const EFFECT_ITEM_SPARKLE: u8 = 0x0B;
 /// Scenario flag raised when the radio is taken.
-const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
+pub const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 /// Scenario flag raised when Jill has the lockpick.
 const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
 /// `main_state_flags` bit `0x2000`: the selected key was used up.
@@ -210,7 +215,7 @@ pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
 /// Scenario flag selecting the second-visit stage variants.
 const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
 /// Scenario/state flag bank index.
-const BANK_SCENARIO: u8 = 0;
+pub const BANK_SCENARIO: u8 = 0;
 /// Door lock flag bank index.
 const BANK_LOCKS: u8 = 2;
 /// `room_check_actions` index of the item pickup handler.
@@ -750,6 +755,9 @@ pub enum UseResult {
 pub enum CombineResult {
     /// The two items do not mix.
     NoRecipe,
+    /// Two herbs (0x43..=0x4B) with no recipe between them: the original's
+    /// distinct "cannot combine" result, which shows message `0xF6`.
+    HerbNoRecipe,
     /// Chemicals can only be mixed in the guardhouse drug store.
     NeedsDrugStore,
     /// The recipe was applied.
@@ -2549,6 +2557,7 @@ impl GameState {
         self.flags[5].apply(MSF_OBJECT_PUSH, 1);
         self.resolve_room_effects(room);
         self.id = id;
+        self.mark_room_visited(id);
         self.state_bytes[0] = id.stage;
         self.state_bytes[1] = id.room;
         self.set_camera_cut(0);
@@ -2582,6 +2591,22 @@ impl GameState {
         self.pending_event_requests.clear();
         self.entity_sounds.clear();
         self.snd3d_requests.clear();
+    }
+
+    /// Raise the room's visited bit (`room_set_visited_flag`): the bit block
+    /// below [`ROOM_FLAG_MAP_BASE`] at the stage's map group offset. The map
+    /// tab tints the floor plan from these bits.
+    pub fn mark_room_visited(&mut self, id: RoomId) {
+        let group = usize::from((id.stage.wrapping_sub(1)) % 5).min(5);
+        let bit = STAGE_ROOM_FLAG_OFFSETS[group].wrapping_add(id.room);
+        self.apply_flag(BANK_ROOM_FLAGS, bit, 0);
+    }
+
+    /// Whether the room's visited bit is up.
+    pub fn room_visited(&self, id: RoomId) -> bool {
+        let group = usize::from((id.stage.wrapping_sub(1)) % 5).min(5);
+        let bit = STAGE_ROOM_FLAG_OFFSETS[group].wrapping_add(id.room);
+        self.flags[usize::from(BANK_ROOM_FLAGS)].bit(bit)
     }
 
     /// Apply every queued `inst_cfg`/`obj_xfm` rewrite to the live room.
@@ -3155,11 +3180,10 @@ impl GameState {
     /// The cursor item's combine table selects the recipe; `new_cursor` and
     /// `new_target` replace the slot ids first and then the record's effect
     /// (ammo transfer, quantity merge, chemical flag) rearranges quantities.
-    /// Empty slots are compacted afterwards.
-    ///
-    /// TODO(parity): (ui) two herbs (0x43..=0x4B) with no recipe return the
-    /// original's distinct "cannot combine" result (message 0xF6); this reports
-    /// `NoRecipe`.
+    /// Empty slots are compacted afterwards. A pair with no recipe reports
+    /// [`CombineResult::HerbNoRecipe`] when both ids are herbs and
+    /// [`CombineResult::NoRecipe`] otherwise, exactly like the original's two
+    /// distinct refusals.
     pub fn combine_slots(&mut self, cursor_slot: usize, target_slot: usize) -> CombineResult {
         if cursor_slot == target_slot {
             return CombineResult::NoRecipe;
@@ -3174,7 +3198,15 @@ impl GameState {
             return CombineResult::NoRecipe;
         }
         let Some(record) = items::combine(cursor.id, target.id) else {
-            return CombineResult::NoRecipe;
+            // No recipe: the original distinguishes two herbs (its result 3,
+            // the `0xF6` "cannot combine" message) from every other pair.
+            return if (HERB_MIN..=HERB_MAX).contains(&cursor.id)
+                && (HERB_MIN..=HERB_MAX).contains(&target.id)
+            {
+                CombineResult::HerbNoRecipe
+            } else {
+                CombineResult::NoRecipe
+            };
         };
         // The one-way ammo transfers need an empty destination: effect 6 fills
         // the cursor stack, effect 7 the target stack, and the original refuses
@@ -9791,6 +9823,34 @@ mod tests {
     }
 
     #[test]
+    fn every_map_pickup_raises_its_owned_bit() {
+        for (item, index) in [
+            (0x4Eu8, 0u8),
+            (0x4F, 1),
+            (0x50, 2),
+            (0x51, 3),
+            (0x52, 4),
+            (0x53, 5),
+        ] {
+            let mut state = item_game("1000", 1);
+            let mut values = item_values(item, 0, 0xFF, [0, 0, 0]);
+            values[15] = 0;
+            {
+                let mut host = ScdGameHost::new(&mut state);
+                host.on_item(op(0x18), &operands(&values));
+            }
+            assert!(state.pick_up_map(0), "item {item:#04x} picks up");
+            assert!(
+                state.flags[usize::from(BANK_ROOM_FLAGS)]
+                    .bit(ROOM_FLAG_MAP_BASE + index),
+                "item {item:#04x} raises the owned bit {index}"
+            );
+            assert_eq!(state.last_picked_item, Some(item));
+            assert!(!state.room_item_present(1), "the room bit is cleared");
+        }
+    }
+
+    #[test]
     fn include_key_prompts_unless_the_key_is_equipped() {
         let mut state = item_game("1000", 1);
         let mut action = item_action(0, 0x33, 1, [0, 0, 1, 1]);
@@ -10875,6 +10935,38 @@ mod tests {
         assert!(state.doors.iter().all(Option::is_none));
         assert_eq!(state.message.id, None);
         assert_eq!(state.camera.current_cut, 0);
+    }
+
+    #[test]
+    fn enter_room_raises_the_visited_bit_for_the_stage_group() {
+        let mut state = game();
+        // Stage 1 is map group 0 (base 0): room 1 -> bit 1.
+        let id = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        state.enter_room(id, &RoomState::default());
+        assert!(state.room_visited(id));
+        assert!(state.flags[usize::from(BANK_ROOM_FLAGS)].bit(1));
+        // Stage 3 (group 2, base 63): room 0x10 -> bit 79.
+        let id = RoomId {
+            stage: 3,
+            room: 0x10,
+            player_flag: 0,
+        };
+        state.enter_room(id, &RoomState::default());
+        assert!(state.room_visited(id));
+        assert!(state.flags[usize::from(BANK_ROOM_FLAGS)].bit(63 + 0x10));
+        // Stage 6 wraps to group 0 like the original's `stageId % 5`.
+        let id = RoomId {
+            stage: 6,
+            room: 1,
+            player_flag: 0,
+        };
+        state.enter_room(id, &RoomState::default());
+        assert!(state.room_visited(id));
+        assert!(state.flags[usize::from(BANK_ROOM_FLAGS)].bit(1));
     }
 
     #[test]

@@ -32,6 +32,7 @@ use crate::progress::{Progress, format_duration};
 use crate::sfx;
 use crate::state::{Image, RoomId};
 use crate::text;
+use crate::ui::map::MapTables;
 use crate::voice;
 use crate::{bmp, door, lzw, rdt, tim};
 
@@ -480,6 +481,9 @@ pub fn convert_game_with_packs(
         copy_item_models(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
     let (file_count, file_bytes) =
         copy_file_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
+    let (map_count, map_bytes) =
+        copy_map_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
+    let (maptbl_count, maptbl_bytes) = copy_map_tables(exe.as_deref(), &mut writer, &mut progress)?;
     let (manifest_count, manifest_bytes) = copy_manifest(&mut writer)?;
 
     // Voice: `--with-voice` embeds the entries in the main pack; the default
@@ -557,6 +561,8 @@ pub fn convert_game_with_packs(
     println!("text: {text_count} entries, {text_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
+    println!("map: {map_count} entries, {map_bytes} bytes");
+    println!("maptbl: {maptbl_count} entry, {maptbl_bytes} bytes");
     println!(
         "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
         base_manifest().id
@@ -612,6 +618,8 @@ pub fn convert_game_with_packs(
         + text_count
         + ivm_count
         + file_count
+        + map_count
+        + maptbl_count
         + manifest_count
         + if embed_voice { voice_count } else { 0 }
         + if embed_movie { movie_count } else { 0 };
@@ -1446,6 +1454,41 @@ impl<'a> PeImage<'a> {
     }
 }
 
+/// JPN virtual addresses of the map bookkeeping tables. The tables are
+/// contiguous in the data segment but two of them overlap (the group table
+/// starts on the layout table's last byte and the layout room count on the
+/// group table's tail), so each is read as its own range and packed into the
+/// port's contiguous `map/tables.bin` format.
+const MAP_STAGE_ROOM_OFFSETS_VA: u32 = 0x4B1BC8;
+const MAP_ROOM_COUNTS_VA: u32 = 0x4B1BD0;
+const MAP_AREA_VA: u32 = 0x4B1BD8;
+const MAP_LAYOUTS_VA: u32 = 0x4B1BE8;
+const MAP_GROUPS_VA: u32 = 0x4B1BF7;
+const MAP_LAYOUT_ROOM_COUNT_VA: u32 = 0x4B1C03;
+const MAP_LAYOUT_OFFSET_VA: u32 = 0x4B1C07;
+
+/// Extract the seven map bookkeeping tables from the executable image.
+fn extract_map_tables(data: &[u8]) -> Result<MapTables> {
+    let image = PeImage::parse(data)?;
+    let read = |va: u32, len: usize| -> Result<Vec<u8>> {
+        let offset = image
+            .va_to_offset(va)
+            .with_context(|| format!("map table address 0x{va:08X} is not in the image"))?;
+        data.get(offset..offset + len)
+            .map(<[u8]>::to_vec)
+            .with_context(|| format!("map table at 0x{va:08X} is truncated"))
+    };
+    Ok(MapTables {
+        stage_room_offsets: read(MAP_STAGE_ROOM_OFFSETS_VA, 6)?.try_into().unwrap(),
+        room_counts: read(MAP_ROOM_COUNTS_VA, 6)?.try_into().unwrap(),
+        area: read(MAP_AREA_VA, 16)?.try_into().unwrap(),
+        layouts: read(MAP_LAYOUTS_VA, 16)?.try_into().unwrap(),
+        groups: read(MAP_GROUPS_VA, 16)?.try_into().unwrap(),
+        layout_room_count: read(MAP_LAYOUT_ROOM_COUNT_VA, 4)?.try_into().unwrap(),
+        layout_offset: read(MAP_LAYOUT_OFFSET_VA, 4)?.try_into().unwrap(),
+    })
+}
+
 /// Extract the five executable text tables, in pack-entry order.
 fn extract_text_tables(data: &[u8]) -> Result<Vec<(&'static str, Vec<u8>)>> {
     let image = PeImage::parse(data)?;
@@ -1707,6 +1750,89 @@ fn copy_file_art(
     }
 
     copy_raw_files(files, "file", writer, progress, jobs)
+}
+
+/// Add the map floor-plan TIMs to the pack under `map/`: the fifteen
+/// `MAP00`-`MAP0E` browser/display plans plus the `Map_blue` backdrop. The
+/// engine decodes them itself, so no conversion is needed.
+fn copy_map_art(
+    item_m2: Option<&Path>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    let Some(dir) = item_m2 else {
+        println!("warning: no ITEM_M2 directory found; the map art will be missing");
+        return Ok((0, 0));
+    };
+
+    let index = index_dir(dir)?;
+    let mut missing = Vec::new();
+    let mut files = Vec::new();
+    for number in 0..=0x0Eu32 {
+        let name = format!("map{number:02x}.tim");
+        match index.get(&name) {
+            Some(path) => files.push((format!("map/{name}"), path.clone())),
+            None => missing.push(name),
+        }
+    }
+    match index.get("map_blue.tim") {
+        Some(path) => files.push(("map/blue.tim".to_string(), path.clone())),
+        None => missing.push("map_blue.tim".to_string()),
+    }
+    if !missing.is_empty() {
+        println!(
+            "warning: missing {} map art file(s) in {}: {}; the map tab degrades to blank",
+            missing.len(),
+            dir.display(),
+            missing.join(", ")
+        );
+    }
+
+    copy_raw_files(files, "map", writer, progress, jobs)
+}
+
+/// Extract the map bookkeeping tables into `map/tables.bin`.
+///
+/// A missing or unreadable executable is a warning: the map tab falls back to
+/// its built-in defaults and still reports the visited/owned bits.
+fn copy_map_tables(
+    exe: Option<&Path>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(path) = exe else {
+        return Ok((0, 0));
+    };
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) => {
+            println!(
+                "warning: failed to read executable {}: {error}; the map tables will be missing",
+                path.display()
+            );
+            return Ok((0, 0));
+        }
+    };
+    let tables = match extract_map_tables(&data) {
+        Ok(tables) => tables,
+        Err(error) => {
+            println!(
+                "warning: failed to extract the map tables from {}: {error:#}; the map tab uses its defaults",
+                path.display()
+            );
+            return Ok((0, 0));
+        }
+    };
+    let bytes = tables.encode();
+    let len = bytes.len();
+    writer
+        .add(crate::ui::map::TABLES_ENTRY, bytes)
+        .with_context(|| format!("failed to add {}", crate::ui::map::TABLES_ENTRY))?;
+    progress.begin("maptbl", 1, "files");
+    progress.advance(crate::ui::map::TABLES_ENTRY);
+    progress.end_phase();
+    Ok((1, len))
 }
 
 /// The id of the pack `convert-game` writes.
@@ -3975,6 +4101,36 @@ mod tests {
         pe
     }
 
+    /// [`synthetic_text_exe`] with the map bookkeeping tables at their JPN
+    /// virtual addresses, overlaps and all.
+    fn synthetic_text_and_map_exe() -> Vec<u8> {
+        let mut pe = synthetic_text_exe();
+        let tables = MapTables::default();
+        pe_place(&mut pe, MAP_STAGE_ROOM_OFFSETS_VA, &tables.stage_room_offsets);
+        pe_place(&mut pe, MAP_ROOM_COUNTS_VA, &tables.room_counts);
+        pe_place(&mut pe, MAP_AREA_VA, &tables.area);
+        pe_place(&mut pe, MAP_LAYOUTS_VA, &tables.layouts);
+        pe_place(&mut pe, MAP_GROUPS_VA, &tables.groups);
+        pe_place(
+            &mut pe,
+            MAP_LAYOUT_ROOM_COUNT_VA,
+            &tables.layout_room_count,
+        );
+        pe_place(&mut pe, MAP_LAYOUT_OFFSET_VA, &tables.layout_offset);
+        pe
+    }
+
+    #[test]
+    fn extracts_map_tables_from_a_synthetic_executable() {
+        let data = synthetic_text_and_map_exe();
+        let tables = extract_map_tables(&data).unwrap();
+        assert_eq!(tables, MapTables::default());
+        assert_eq!(tables.encode().len(), crate::ui::map::TABLES_BYTES);
+        // A truncated image fails loudly instead of defaulting.
+        assert!(extract_map_tables(&synthetic_pe()[..0x20]).is_err());
+        assert!(extract_map_tables(&[]).is_err());
+    }
+
     #[test]
     fn maps_virtual_addresses_through_the_section_table() {
         let data = synthetic_pe();
@@ -4101,7 +4257,7 @@ mod tests {
         let root = TempDir::new("text-item-file");
         make_stage_dirs(&root.path);
         fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
-        fs::write(root.path.join("Bio.exe"), synthetic_text_exe()).unwrap();
+        fs::write(root.path.join("Bio.exe"), synthetic_text_and_map_exe()).unwrap();
         let dir = root.path.join("ITEM_M2");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("I00V.IVM"), b"ivm0").unwrap();
@@ -4122,6 +4278,14 @@ mod tests {
             )
             .unwrap();
         }
+        for number in 0..=0x0Eu32 {
+            fs::write(
+                dir.join(format!("MAP{number:02X}.TIM")),
+                format!("plan{number}"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("Map_blue.TIM"), b"blue").unwrap();
 
         let out = root.path.join("out.akpak");
         convert_game(&root.path, &out).unwrap();
@@ -4131,12 +4295,17 @@ mod tests {
         assert_eq!(count("text/"), 5);
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
+        assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
         let messages =
             crate::text::Table::parse_message(pack.read("text/messages.bin").unwrap()).unwrap();
         assert_eq!(messages.len(), 64);
         assert_eq!(messages.get(0), Some(&[0x0C, 0x0D, 0x01, 0x00][..]));
         assert_eq!(pack.read("item/mini.ivm").unwrap(), b"ivm1");
         assert_eq!(pack.read("file/textm_42.tim").unwrap(), b"page42");
+        assert_eq!(pack.read("map/map0e.tim").unwrap(), b"plan14");
+        assert_eq!(pack.read("map/blue.tim").unwrap(), b"blue");
+        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        assert_eq!(tables, MapTables::default());
     }
 
     #[test]
@@ -4205,6 +4374,24 @@ mod tests {
 
     #[test]
     #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn extracts_real_map_tables() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let path = PathBuf::from(root).join("Bio.exe");
+        let data = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        let tables = extract_map_tables(&data).unwrap();
+        assert_eq!(
+            tables,
+            MapTables::default(),
+            "the installed map tables match the documented values"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
     fn packs_real_item_and_file_art() {
         let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
             return;
@@ -4218,13 +4405,17 @@ mod tests {
         let (files, files_bytes) =
             copy_file_art(Some(&dir), &mut writer, &mut progress, 1).unwrap();
 
+        let (maps, maps_bytes) = copy_map_art(Some(&dir), &mut writer, &mut progress, 1).unwrap();
+
         assert_eq!(items, 77);
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
-        assert!(items_bytes > 0 && files_bytes > 0);
+        assert_eq!(maps, 16);
+        assert!(items_bytes > 0 && files_bytes > 0 && maps_bytes > 0);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("item/"), 77);
         assert_eq!(count("file/"), 62);
+        assert_eq!(count("map/"), 16);
         assert_eq!(
             pack.read("item/i00v.ivm").unwrap(),
             fs::read(dir.join("I00V.IVM")).unwrap()
@@ -4232,6 +4423,10 @@ mod tests {
         assert_eq!(
             pack.read("file/textm_z0.tim").unwrap(),
             fs::read(dir.join("TEXTM_Z0.TIM")).unwrap()
+        );
+        assert_eq!(
+            pack.read("map/map0b.tim").unwrap(),
+            fs::read(dir.join("MAP0B.TIM")).unwrap()
         );
     }
 
@@ -4266,6 +4461,9 @@ mod tests {
         assert_eq!(count("door/"), 34);
         assert_eq!(count("npc/"), 15);
         assert_eq!(count("effspr/"), 33);
+        assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
+        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        assert_eq!(tables, MapTables::default(), "the installed tables match");
         assert!(pack.contains("npc/20.emd"));
         assert!(pack.contains("npc/2e.emd"));
         assert!(pack.contains("effspr/esp000.tim"));

@@ -298,6 +298,40 @@ pub fn record(item: u8) -> Option<ItemRecord> {
     })
 }
 
+/// The item id of the red book (the item viewer's zoom special case).
+pub const ITEM_RED_BOOK: u8 = 0x3E;
+/// The item id of the first-aid spray (the zoom path's upper bound).
+pub const ITEM_FIRST_AID_SPRAY: u8 = 0x41;
+
+/// Offset of the item-examine combo table inside [`ITEM_LOOKUP`].
+pub const EXAMINE_COMBOS_OFFSET: usize = 0x16B;
+/// Offset of the item-examine type table inside [`ITEM_LOOKUP`].
+const EXAMINE_TYPES_OFFSET: usize = 0x19B;
+/// Number of 12-byte examine-combo records.
+pub const EXAMINE_COMBO_COUNT: usize = 4;
+
+/// The examine-type byte for an item flag index: the high nibble is the number
+/// of combo records to try from the low nibble's record index. `None` past the
+/// 48-entry table (no shipped item reaches one).
+pub fn examine_type(flag_index: u8) -> Option<u8> {
+    ITEM_LOOKUP
+        .get(EXAMINE_TYPES_OFFSET + usize::from(flag_index))
+        .copied()
+}
+
+/// The `index`th examine-combo record: the model's pitch/yaw/roll
+/// `(target, tolerance)` windows in 12-bit GTE angle units, or `None` past the
+/// four records.
+pub fn examine_combo(index: usize) -> Option<[(u16, u16); 3]> {
+    if index >= EXAMINE_COMBO_COUNT {
+        return None;
+    }
+    let base = EXAMINE_COMBOS_OFFSET.checked_add(index.checked_mul(12)?)?;
+    let bytes = ITEM_LOOKUP.get(base..base + 12)?;
+    let word = |word: usize| u16::from_le_bytes([bytes[word * 2], bytes[word * 2 + 1]]);
+    Some([(word(0), word(1)), (word(2), word(3)), (word(4), word(5))])
+}
+
 /// The stack maximum for `item` (0 when unknown).
 pub fn max_quantity(item: u8) -> u8 {
     record(item).map_or(0, |record| record.max_quantity)
@@ -572,6 +606,21 @@ mod tests {
         );
         let usage = ITEM_LOOKUP[0x144];
         assert_eq!(usage, USE_THRESHOLDS[9]);
+    }
+
+    #[test]
+    fn examine_tables_are_indexed_from_the_lookup() {
+        // Types: 0x10 -> one record from 0, 0x11 -> one from 1, 0x21 -> two
+        // from 1, 0x13 -> one from 3.
+        assert_eq!(examine_type(0), Some(0x10));
+        assert_eq!(examine_type(3), Some(0x11));
+        assert_eq!(examine_type(11), Some(0x21));
+        assert_eq!(examine_type(13), Some(0x13));
+        assert_eq!(examine_combo(0), Some([(0, 0), (300, 3072), (0, 0)]));
+        assert_eq!(examine_combo(1), Some([(0, 0), (560, 0), (560, 2048)]));
+        assert_eq!(examine_combo(2), Some([(0, 0), (560, 0), (560, 0)]));
+        assert_eq!(examine_combo(3), Some([(0, 0), (400, 1024), (0, 0)]));
+        assert_eq!(examine_combo(4), None);
     }
 
     #[test]

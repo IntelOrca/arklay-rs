@@ -39,6 +39,12 @@ const SLICE_OPCODES: [u8; 12] = [
     0x46, // msg_list
 ];
 
+/// The only placeholder arms the shipped corpus still dispatches, both
+/// intentional and named in `docs/m16-deviations.md`: `0x05` with an
+/// out-of-range flag bank and the unimplemented `0x49` player op. Any other
+/// op reaching a placeholder arm fails the audit.
+const KNOWN_PLACEHOLDERS: [u8; 2] = [0x05, 0x49];
+
 /// Every opcode byte that appears in one RDT's init, main or event scripts.
 fn script_opcodes(bytes: &[u8]) -> BTreeSet<u8> {
     let Ok(scripts) = scd::reader::parse(bytes) else {
@@ -92,6 +98,7 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
     let mut simulated = 0usize;
     let mut corpus_ops: BTreeSet<u8> = Default::default();
     let mut transitions: Vec<(RoomId, RoomId)> = Vec::new();
+    let mut corpus_placeholders: std::collections::BTreeMap<u8, u64> = Default::default();
     for id in &ids {
         let Ok(sim) = simulate_room(&pack, *id, 300, player::Input::default()) else {
             // Stub rooms without camera cuts cannot load.
@@ -103,6 +110,9 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
         }
         if let Ok(bytes) = pack.read(&id.rdt_entry()) {
             corpus_ops.extend(script_opcodes(bytes));
+        }
+        for (&op, &count) in &sim.game.placeholders {
+            *corpus_placeholders.entry(op).or_default() += count;
         }
         let hits = slice_placeholder_hits(&sim.game.placeholders);
         assert!(
@@ -124,6 +134,9 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
                 transitions.push(entry);
             }
         }
+        for (&op, &count) in &pressed.game.placeholders {
+            *corpus_placeholders.entry(op).or_default() += count;
+        }
         let hits = slice_placeholder_hits(&pressed.game.placeholders);
         assert!(
             hits.is_empty(),
@@ -139,9 +152,20 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
     }
 
     transitions.sort_by_key(|(from, to)| (from.stage, from.room, to.room));
+    let placeholders: Vec<(u8, u64)> = corpus_placeholders.iter().map(|(&o, &c)| (o, c)).collect();
+    let new_placeholders: Vec<(u8, u64)> = corpus_placeholders
+        .iter()
+        .filter(|(op, _)| !KNOWN_PLACEHOLDERS.contains(op))
+        .map(|(&op, &count)| (op, count))
+        .collect();
     println!(
         "m16 corpus: {simulated} rooms simulated, zero slice placeholders; \
          rooms whose captures now transition: {transitions:?}"
+    );
+    println!("m16 corpus placeholders: {placeholders:02x?}");
+    assert!(
+        new_placeholders.is_empty(),
+        "the corpus dispatched new placeholder ops: {new_placeholders:02x?}"
     );
     assert!(simulated > 300, "only {simulated} rooms simulated");
 }

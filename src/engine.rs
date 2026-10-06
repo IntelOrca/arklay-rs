@@ -669,6 +669,9 @@ struct GameSession {
     file: Option<FileScreen>,
     /// FILE tab art, loaded on the first open.
     file_assets: Option<FileAssets>,
+    /// The map tab; the room stays frozen while it is up. It is gated by the
+    /// radio scenario flag, exactly like the radio tab.
+    map: Option<ui::map::MapScreen>,
     /// The typewriter save screen; the room stays frozen while it is up.
     save_screen: Option<ui::save_load::SaveLoadScreen>,
     /// Where `savedat*.dat` slot files live for this session.
@@ -833,6 +836,7 @@ impl GameSession {
             item_box_assets: None,
             file: None,
             file_assets: None,
+            map: None,
             save_screen: None,
             save_dir: save_dir.to_path_buf(),
             lua: load_lua(pack),
@@ -882,16 +886,19 @@ impl GameSession {
         );
     }
 
-    /// One fixed 30 Hz tick: message window, scripts, interaction, player
-    /// movement, camera, BGM/mask/footstep drains and a door transition
+    /// One fixed 30 Hz tick: scripts/entities, the message window, interaction,
+    /// player movement, camera, BGM/mask/footstep drains and a door transition
     /// request.
     ///
-    /// The message window advances first so its yes/no post-actions (item
-    /// pickup and use) reach the state before the room scripts run. While it
-    /// masks the control bit the player's movement and action input are
-    /// blanked, exactly like the original's cleared d-pad word. START then
-    /// opens the pause menu instead of ticking the room; while the menu is up
-    /// the room stays frozen and the same input drives the menu.
+    /// The message window advances after the script/entity pass, exactly like
+    /// the original's `main_loop`, so a message a script raises this tick (and
+    /// the state that script changed) is visible to the same frame's window
+    /// and its yes/no post-actions (item pickup and use) run after the
+    /// scripts. While a message masks the control bit the player's movement
+    /// and action input are blanked, exactly like the original's cleared d-pad
+    /// word. START opens the pause menu while no message owns the tick; while
+    /// the menu is up the room stays frozen and the same input drives the
+    /// menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
         // A film owns the tick while it plays: the room's scripts, entities,
         // effects and the player stay frozen, exactly like the original's
@@ -911,48 +918,26 @@ impl GameSession {
 
         let was_active = self.game.message.active;
         let was_locked = self.game.message_locks_controls();
-        // TODO(parity): (scripting) the original advances the message window in
-        // `main_loop` AFTER the game task (script/entity) pass; this window (and
-        // its pickup/use post-actions) runs first, so state it changes is visible
-        // to the same frame's scripts.
-        self.game.update_message(
-            MessageInput {
-                action,
-                left: input.left,
-                right: input.right,
-            },
-            &self.loaded.room,
-            &self.text,
-        );
 
-        // The typewriter prompt was answered: a confirmed save opens the save
-        // screen instead of running the room this tick.
-        if let Some(ink_ribbon) = self.game.take_typewriter_confirm() {
-            self.open_typewriter_save(pack, ink_ribbon);
-            return Ok(());
-        }
-
-        if ui.start && !self.game.message.active {
+        // START opens the pause menu while no message owns the tick. The
+        // window advances after the script pass, so the frame's start state
+        // decides; the press that dismissed a window is spent on it.
+        if ui.start && !was_active {
             self.open_menu(pack);
             return Ok(());
         }
 
-        // A paused message ignores the player this tick; the press that
-        // dismissed it is spent on the window rather than the room (the
-        // original clears the held and previous held pad bits on dismissal),
-        // so an action-gated zone behind the window never sees the same press.
-        // The swallow then latches until the key is released, exactly like the
-        // cleared edge-detect history. `update_message` has already blanked the
-        // direction bits of a state-5/6 dismissal into `game.dpad_blanked`.
-        let dismissed = was_active && !self.game.message.active;
-        if dismissed && action {
-            self.swallow_action = true;
-        } else if !action {
+        // The press that dismissed a message last tick is swallowed until the
+        // key is released, exactly like the original's cleared edge-detect
+        // history. The release is seen on this tick so the room probe runs on
+        // the frame the key comes up. A dismissal last tick blanked the
+        // direction bits of a state-5/6 message into `game.dpad_blanked`;
+        // releasing a blanked direction restores it, a still-held one stays
+        // suppressed for this tick.
+        if !action {
             self.swallow_action = false;
         }
         let raw = input;
-        // Releasing a blanked direction restores it; a still-held one stays
-        // suppressed for this tick.
         self.game.dpad_blanked &= game::dpad_word(&raw) & game::DPAD_DIRECTIONS;
         let mut input = raw;
         if self.game.dpad_blanked & 0x1 != 0 {
@@ -988,8 +973,36 @@ impl GameSession {
             input,
         );
         // The Lua hooks run after the room tick: `on_tick` sees the whole
-        // tick's state and `on_message` may rewrite a message the tick raised.
+        // tick's state and `on_message` may rewrite a message the tick raised
+        // before the window resolves its bytes.
         run_lua_tick_hooks(self.lua.as_ref(), &mut self.game, message_before);
+        // The message window advances after the script/entity task pass,
+        // exactly like the original's `main_loop`: a request a script raised
+        // this tick and the state it changed are visible to the same frame's
+        // window, and the window's pickup/use post-actions run after the
+        // scripts rather than before them.
+        self.game.update_message(
+            MessageInput {
+                action,
+                left: raw.left,
+                right: raw.right,
+            },
+            &self.loaded.room,
+            &self.text,
+        );
+        // The dismissal bookkeeping now sees the post-script window state: a
+        // press that dismissed a window this tick latches the swallow until
+        // the key is released.
+        let dismissed = was_active && !self.game.message.active;
+        if dismissed && action {
+            self.swallow_action = true;
+        }
+        // The typewriter prompt was answered: a confirmed save opens the save
+        // screen instead of running the rest of the room's tick.
+        if let Some(ink_ribbon) = self.game.take_typewriter_confirm() {
+            self.open_typewriter_save(pack, ink_ribbon);
+            return Ok(());
+        }
         // A typewriter runs its save prompt; the item-box overlay opens when
         // the lid has settled (`MSF_MENU_MODE_ITEMBOX`). The interaction is
         // consumed so the next probe has to fire again.
@@ -1338,6 +1351,24 @@ impl GameSession {
             return;
         }
 
+        // The map tab returns to the inventory on cancel.
+        if self.map.is_some() {
+            if let Some(map) = self.map.as_mut() {
+                map.tick();
+            }
+            let Some(event_input) = menu_input(ui) else {
+                return;
+            };
+            let event = self
+                .map
+                .as_mut()
+                .map(|map| map.handle_input(&self.game, event_input));
+            if event == Some(ui::map::MapEvent::Close) {
+                self.map = None;
+            }
+            return;
+        }
+
         // The FILE tab returns to the inventory on close.
         if self.file.is_some() {
             if let Some(file) = self.file.as_mut() {
@@ -1385,17 +1416,20 @@ impl GameSession {
 
     /// Run the action of a selected top tab.
     ///
-    /// The map tab (cursor 0) is out of M6 scope and inert. The file tab
-    /// (cursor 2) opens the document selector/reader. The radio tab (cursor 4)
-    /// uses the carried radio when its scenario flag is up: the used-item byte
-    /// 0x4D reaches the room scripts and the menu closes, as the original's
-    /// radio tab does; without the radio the tab is inert.
+    /// The map tab (cursor 0) opens the floor-plan browser when the carried
+    /// radio's scenario flag is up (the same flag the radio tab reads); without
+    /// it the tab is inert. The file tab (cursor 2) opens the document
+    /// selector/reader. The radio tab (cursor 4) uses the carried radio when
+    /// its scenario flag is up: the used-item byte 0x4D reaches the room
+    /// scripts and the menu closes, as the original's radio tab does; without
+    /// the radio the tab is inert.
     fn handle_tab(&mut self, pack: &Pack, cursor: u8) {
         match cursor {
-            // TODO(parity): (UI) the original's map tab (cursor 0) draws the
-            // room map overlay; the port leaves it inert, so selecting the map
-            // does nothing.
-            0 => {}
+            0 => {
+                if self.game.has_radio() {
+                    self.open_map(pack);
+                }
+            }
             2 => self.open_file(pack),
             4 => {
                 if self.game.has_radio() {
@@ -1453,6 +1487,16 @@ impl GameSession {
         let mut file = FileScreen::default();
         file.open(&self.game);
         self.file = Some(file);
+    }
+
+    /// Open the map tab over the frozen inventory panel. The table/art load
+    /// warns and leaves the tab blank when the pack lacks the map entries.
+    fn open_map(&mut self, pack: &Pack) {
+        if self.map.is_some() {
+            return;
+        }
+        self.open_menu(pack);
+        self.map = Some(ui::map::MapScreen::open(pack, &self.game));
     }
 
     /// Advance an active transition animation one fixed frame. The finished
@@ -1574,6 +1618,9 @@ impl GameSession {
                     &self.game,
                 );
             }
+        }
+        if let Some(map) = self.map.as_mut() {
+            map.draw(&mut self.framebuffer, pack, &self.game);
         }
         if self.save_screen.is_some() {
             let Self {
@@ -1738,6 +1785,8 @@ pub enum AppBoot {
     ItemBox,
     /// The FILE tab over the deterministic capture room.
     File,
+    /// The map tab over the deterministic capture room.
+    Map,
     /// The item viewer over the deterministic capture room's combat knife.
     View,
 }
@@ -2029,6 +2078,7 @@ impl App {
             AppBoot::Menu => self.open_menu(),
             AppBoot::ItemBox => self.open_item_box_capture(),
             AppBoot::File => self.open_file_capture(),
+            AppBoot::Map => self.open_map_capture(),
             AppBoot::View => self.open_view(),
         }
     }
@@ -2118,6 +2168,20 @@ impl App {
         let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_file_capture();
         session.open_file(&self.pack);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the map tab capture over [`MENU_ROOM`] with the capture inventory
+    /// and the radio's scenario flag up, so the tab is available.
+    fn open_map_capture(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
+        session.seed_menu_capture();
+        session
+            .game
+            .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_HAS_RADIO, 0);
+        session.open_map(&self.pack);
         self.start_session(session);
         Ok(())
     }
@@ -2425,10 +2489,11 @@ impl App {
 ///
 /// `font` renders the decoded font sheet with sample text; `title`, `select`,
 /// `game`, `load` and `save` boot the app screens, `menu` boots the pause menu
-/// over [`MENU_ROOM`] with the deterministic capture inventory, and `view`
-/// boots the item viewer over that same inventory with the combat knife
-/// examined. `capture` renders one deterministic frame and exits; otherwise
-/// the window stays up until the user quits.
+/// over [`MENU_ROOM`] with the deterministic capture inventory, `file`, `map`
+/// and `box` boot those tabs over the same inventory, and `view` boots the
+/// item viewer over it with the combat knife examined. `capture` renders one
+/// deterministic frame and exits; otherwise the window stays up until the user
+/// quits.
 pub fn run_ui(pack: &Path, screen: &str, capture: Option<&Path>) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     run_ui_with_options(pack, screen, capture, &save_dir, 0)
@@ -2491,11 +2556,12 @@ pub fn run_ui_with_voice_and_movie(
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
         "file" => AppBoot::File,
+        "map" => AppBoot::Map,
         "view" => AppBoot::View,
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu`, `box`, `file`, `view`, `save` or `load`"
+                 `menu`, `box`, `file`, `map`, `view`, `save` or `load`"
             )
         }
     };
@@ -2592,6 +2658,10 @@ fn run_ui_impl(
             AppBoot::File => {
                 app.open_file_capture()?;
                 app.settle(FILE_CAPTURE_TICKS)?;
+            }
+            AppBoot::Map => {
+                app.open_map_capture()?;
+                app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::View => {
                 app.open_view()?;
@@ -5341,6 +5411,10 @@ impl InputState {
                 down: pressed & KEY_DOWN != 0,
                 left: pressed & KEY_LEFT != 0,
                 right: pressed & KEY_RIGHT != 0,
+                held_up: self.held & KEY_UP != 0,
+                held_down: self.held & KEY_DOWN != 0,
+                held_left: self.held & KEY_LEFT != 0,
+                held_right: self.held & KEY_RIGHT != 0,
                 confirm: pressed & KEY_CONFIRM != 0,
                 cancel: pressed & KEY_CANCEL != 0,
                 page_left: pressed & KEY_LEFTBRACKET != 0,
@@ -8597,6 +8671,158 @@ mod tests {
         }
     }
 
+    #[test]
+    fn select_slide_frame_sequence_moves_the_cards() {
+        // A pack with the two select sheets, as `--ui select` needs to draw
+        // anything at all.
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("select.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                "ui/sel_back.bmp",
+                bmp::encode_to_vec(&solid_image([0, 0, 40, 255])).unwrap(),
+            )
+            .unwrap();
+        writer
+            .add(
+                "ui/select_b.bmp",
+                bmp::encode_to_vec(&test_image()).unwrap(),
+            )
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), None, None, false);
+        app.boot(AppBoot::CharSelect).unwrap();
+        // Let the fade-in finish so the frames differ by the slide alone.
+        app.settle(40).unwrap();
+        app.draw();
+        let resting = app.frame().rgba.clone();
+
+        // Press right: the first slide frame moves the cards.
+        app.update(
+            UiInput {
+                right: true,
+                ..UiInput::default()
+            },
+            player::Input::default(),
+            false,
+        )
+        .unwrap();
+        app.draw();
+        let first = app.frame().rgba.clone();
+        assert_ne!(first, resting, "the first slide frame moved the cards");
+
+        // Mid-slide the pose keeps changing.
+        app.settle(9).unwrap();
+        app.draw();
+        let mid = app.frame().rgba.clone();
+        assert_ne!(mid, first, "the mid-slide pose is a new frame");
+        assert_ne!(mid, resting);
+
+        // The slide lands after 34 ticks with the pick flipped, and the settled
+        // frame differs from the boot pose.
+        app.settle(25).unwrap();
+        app.draw();
+        let settled = app.frame().rgba.clone();
+        assert_ne!(settled, resting, "the landed pose swapped the cards");
+        let Mode::Select(screen) = &app.mode else {
+            panic!("character select must stay open");
+        };
+        assert!(!screen.swapping());
+        assert_eq!(screen.selected(), 1);
+    }
+
+    /// A minimal 8bpp TIM with four pixels and a 256-entry palette, enough for
+    /// the map screen's plan and backdrop layers.
+    fn synthetic_map_tim() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x10u32.to_le_bytes());
+        data.extend_from_slice(&9u32.to_le_bytes());
+        data.extend_from_slice(&524u32.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&256u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        for index in 0..256u16 {
+            let value: u16 = if index == 0 { 0 } else { 0x7FFF };
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        let pixels = [13u8, 14, 200, 0];
+        data.extend_from_slice(&(12u32 + pixels.len() as u32).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&pixels);
+        data
+    }
+
+    #[test]
+    fn map_tab_is_gated_by_the_radio_flag() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("1000").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.open_menu(&pack);
+        session.handle_tab(&pack, 0);
+        assert!(session.map.is_none(), "no radio: the map tab is inert");
+        session
+            .game
+            .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_HAS_RADIO, 0);
+        session.handle_tab(&pack, 0);
+        assert!(session.map.is_some(), "the radio flag opens the map tab");
+    }
+
+    #[test]
+    fn map_capture_draws_the_floor_plan() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("map.akpak");
+        let id = RoomId::parse("1001").unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer
+            .add(&id.cut_entry(0), bmp::encode_to_vec(&test_image()).unwrap())
+            .unwrap();
+        writer
+            .add(
+                ui::map::TABLES_ENTRY,
+                ui::map::MapTables::default().encode(),
+            )
+            .unwrap();
+        writer
+            .add("map/map0d.tim", synthetic_map_tim())
+            .unwrap();
+        writer
+            .add(ui::map::BLUE_ENTRY, synthetic_map_tim())
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), None, None, false);
+        app.boot(AppBoot::Map).unwrap();
+        app.settle(MENU_CAPTURE_TICKS).unwrap();
+        app.draw();
+        let painted = app
+            .frame()
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+            .count();
+        assert!(painted > 0, "the map capture drew the floor plan");
+        let Mode::Play(session) = &app.mode else {
+            panic!("the map capture must own a session");
+        };
+        assert!(session.map.is_some());
+    }
+
     /// A two-room pack whose first room walks the player into a scripted door
     /// on the first tick, with distinct backgrounds so the destination frame
     /// is identifiable. Returns `(path, source, destination, source bg, dest bg)`.
@@ -8933,6 +9159,69 @@ end
     }
 
     #[test]
+    fn a_script_raised_message_advances_in_the_same_tick() {
+        // The main script raises message 5 every tick. The window must
+        // advance after the script pass, so by the end of the first tick it
+        // has already resolved its bytes and left the idle phase.
+        let dir = TempDir::new();
+        let path = dir.0.join("same-tick.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let container = scd::asm::assemble(
+            "\
+.version 1
+
+.init
+
+.main
+.block
+    message                 0x45, 0
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+        let messages: Vec<Option<Vec<u8>>> =
+            (0..64).map(|_| Some(vec![0x0C, 0x01, 0x00])).collect();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add(&id.scd_entry(), container).unwrap();
+        writer
+            .add("text/messages.bin", crate::text::encode_table(&messages))
+            .unwrap();
+        for table in [
+            "text/names.bin",
+            "text/unknown.bin",
+            "text/idesc.bin",
+            "text/save.bin",
+        ] {
+            writer.add(table, crate::text::encode_table(&[])).unwrap();
+        }
+        writer.write(&path).unwrap();
+
+        let pack = Pack::open(&path).unwrap();
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+        for _ in 0..3 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.game.message.active, "the script's message is up");
+        assert!(
+            session.game.message.has_source(),
+            "the window resolved its bytes in the same tick"
+        );
+        assert_ne!(
+            session.game.message.phase(),
+            crate::message::MessagePhase::Idle,
+            "the window advanced in the same tick"
+        );
+    }
+
+    #[test]
     fn a_message_pause_freezes_the_scripted_characters_end_to_end() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
@@ -9043,25 +9332,27 @@ end
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
 
-        // An action-gated item zone the player stands in and faces, so any
-        // action press the room tick sees picks the spray up.
+        // An action-gated message zone the player stands in and faces: any
+        // action press the room tick sees re-arms message 0x41.
         session.player.pos = [0, 0, 0];
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
         session.game.room_actions[2] = Some(game::RoomAction {
             slot: 2,
-            kind: game::RoomActionKind::Item,
+            kind: game::RoomActionKind::Message,
             zone: [0, 0, 1000, 1000],
-            sce: 4,
-            handler: 4,
+            sce: 2,
+            handler: 2,
             flags: 0x81,
             item_data: None,
             room_items_flag: 0xFF,
-            params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
+            params: [2, 0x81, 0x41, 0, 0, 0, 0, 0],
         });
 
-        // A message that does not pause gameplay: the action key still
-        // dismisses it, and the same held key must not reach the room probe.
+        // A message that does not pause gameplay: the action key dismisses it.
+        // Under the script-first order the dismissing tick's room probe runs
+        // while the window is still up, so the zone's own request is refused;
+        // the still-held key must not re-arm it once the window closes.
         session.game.show_message(0x40, 0);
         for _ in 0..600 {
             if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
@@ -9076,7 +9367,6 @@ end
             crate::message::MessagePhase::WaitInput
         );
 
-        // The dismissing tick swallows the press.
         session
             .tick(
                 &pack,
@@ -9090,9 +9380,10 @@ end
             )
             .unwrap();
         assert!(!session.game.message.active);
-        assert!(
-            !session.game.has_item(ITEM_FIRST_AID_SPRAY),
-            "the dismissing press triggered the zone behind the window"
+        assert_eq!(
+            session.game.message.id,
+            Some(0x40),
+            "the zone did not re-arm the window on the dismissal tick"
         );
 
         // The still-held key stays swallowed until it is released.
@@ -9108,7 +9399,7 @@ end
             )
             .unwrap();
         assert!(
-            !session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            !session.game.message.active,
             "a still-held action key re-triggered the zone"
         );
 
@@ -9129,9 +9420,10 @@ end
             )
             .unwrap();
         assert!(
-            session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            session.game.message.active,
             "a fresh press after release must reach the zone"
         );
+        assert_eq!(session.game.message.id, Some(0x41));
     }
 
     #[test]
@@ -9163,8 +9455,9 @@ end
             crate::message::MessagePhase::WaitInput
         );
 
-        // The dismissing tick swallows the direction: `dpad_held` still has
-        // the key physically down but the gameplay word is blank.
+        // The dismissal happens after the script pass, so the dismissing
+        // tick's own direction reaches the room; the dismissal records the
+        // blank, which applies from the next tick.
         session
             .tick(
                 &pack,
@@ -9179,9 +9472,18 @@ end
             )
             .unwrap();
         assert!(!session.game.message.active);
-        assert_eq!(session.game.dpad_held & 1, 0, "the direction is blanked");
+        assert_eq!(
+            session.game.dpad_blanked & 1,
+            1,
+            "the dismissal recorded the blank direction"
+        );
+        assert_eq!(
+            session.game.dpad_held & 1,
+            1,
+            "the dismissing tick's direction still reached the room"
+        );
 
-        // Still held: it stays blanked.
+        // Still held: the blank now suppresses the direction.
         session
             .tick(&pack, UiInput::default(), held_up, false)
             .unwrap();

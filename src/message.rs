@@ -49,7 +49,8 @@
 //! once per fixed tick, feeding the held keys the same way the room tick does:
 //!
 //! ```ignore
-//! // In the gameplay tick, before the room scripts and player movement:
+//! // In the gameplay tick, after the room scripts and entity pass (the
+//! // original's `main_loop` order):
 //! game.update_message(
 //!     MessageInput { action, left: input.left, right: input.right },
 //!     &room,

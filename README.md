@@ -40,7 +40,7 @@ cargo run -- extract re1.akpak --out extracted/
 # Launch room 100 as player 0 (RDT 1000)
 cargo run -- re1.akpak --room 100 --player 0
 
-# Boot the title screen (or --ui title|select|game|menu|box|file|load|font)
+# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|font)
 cargo run -- re1.akpak
 
 # Headless capture (no display)
@@ -49,9 +49,12 @@ cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
 # so scripted NPC scenes are captured in motion
 cargo run -- re1.akpak --room 20D --player 0 --ticks 30 --capture npc.bmp
 cargo run -- re1.akpak --ui title --capture title.bmp
+cargo run -- re1.akpak --ui select --capture select.bmp
 cargo run -- re1.akpak --ui menu --capture menu.bmp
 cargo run -- re1.akpak --ui box --capture box.bmp
 cargo run -- re1.akpak --ui file --capture file.bmp
+cargo run -- re1.akpak --ui map --capture map.bmp
+cargo run -- re1.akpak --ui view --capture view.bmp
 ```
 
 ## Mods and authoring
@@ -107,9 +110,23 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 | `Shift` + `.` | Next camera cut |
 | `Esc` | Quit |
 
+The character select slides the two cards between their poses while the pick
+changes; the item viewer spins the model while a direction is held and confirm
+runs the item's examine check (the rotation-gated descriptions and the red
+book's zoom). The map tab needs the radio's scenario flag; up/down step the
+rooms of the current floor plan, left/right step between the plans the owned
+maps unlock, and confirm shows the full plan of the current area. A pack
+without `map/` leaves the tab blank.
+
 Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
 pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
 refused.
+
+The ignored `tests/m16_ui_real.rs` golden harness compares sampled
+room/message/NPC/UI frames against a locally generated set when
+`ARKLAY_RE1_GOLDEN` points at it; the set is never committed and is a
+regression/cross-check, not an independent oracle. `docs/m16-deviations.md`
+lists every approximation M16 leaves.
 
 ## License
 

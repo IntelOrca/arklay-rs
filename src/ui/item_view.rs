@@ -7,17 +7,21 @@
 //!
 //! The model renders through [`Framebuffer::draw_ivm_unlit`]: full-bright,
 //! one 256-colour CLUT row with direct UVs and backface culling disabled, one
-//! root matrix for every object. The name and the description both draw on the
-//! original's item line (`0xBA`, left margin `0x22` for the Japanese sheet).
+//! root matrix for every object. The name and the description both draw on
+//! the original's item line (`0xBA`, left margin `0x22` for the Japanese sheet).
 //!
 //! # Input
 //!
 //! Left/right turn the model's turntable, up/down pitch it, at the original's
-//! `0x20` 12-bit units per 30 Hz frame; the angles wrap at `0x1000`. Confirm
-//! opens the description window, confirm again dismisses it, and cancel leaves
-//! the viewer. A missing model (the placeholder name `m`, or a pack without
-//! `item_m2` art) or a missing description logs a warning and leaves that
-//! layer empty instead of failing the screen.
+//! `0x20` 12-bit units per 30 Hz frame while the key is held; the angles wrap
+//! at `0x1000`. Confirm runs the item's examine check: the pose must fall
+//! inside one of the item's `g_ItemExamineCombos` windows for the description
+//! to open, and the red book (and the two doom books) take the zoom spin path
+//! first. An item with no combo records opens immediately. Confirm again
+//! dismisses the description, and cancel leaves the viewer. A missing model
+//! (the placeholder name `m`, or a pack without `item_m2` art) or a missing
+//! description logs a warning and leaves that layer empty instead of failing
+//! the screen.
 
 use anyhow::Result;
 
@@ -51,6 +55,28 @@ const INGRAM_DESCRIPTION: u16 = 0x4E;
 /// The description table index the Minimi maps to (1-based).
 const MINIMI_DESCRIPTION: u16 = 0x4F;
 
+/// Where the viewer's model animation is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewStage {
+    /// The resting display: the direction keys drive the turntable.
+    Display,
+    /// The red/doom book zoom: the entry spin-in runs to `0x300` degrees and
+    /// then opens the description.
+    Zoom,
+}
+
+/// What the item examine check asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExamineOutcome {
+    /// The pose is inside a window (or the item has no windows): open the
+    /// description.
+    Open,
+    /// A book whose pose matched: run the zoom spin before the description.
+    Zoom,
+    /// The pose is outside every window: the examine is refused.
+    Refused,
+}
+
 /// The item viewer's screen state.
 #[derive(Debug, Clone)]
 pub struct ItemViewScreen {
@@ -66,6 +92,19 @@ pub struct ItemViewScreen {
     pub yaw: i32,
     /// Turntable pitch in 12-bit angle units.
     pub pitch: i32,
+    /// Turntable roll in 12-bit angle units. The port has no roll key, but the
+    /// examine windows test it, so it stays a field.
+    pub roll: i32,
+    /// Which stage of the model animation is running.
+    stage: ViewStage,
+    /// Ticks the zoom has run.
+    zoom_timer: i32,
+    /// The zoom's spin accumulator, the original's `DAT_00ae9f5e`.
+    zoom_spin: i32,
+    /// The zoom's entry ramp, drawn as a black fade over the screen. The
+    /// original ramps its three viewer lights; the port approximates that
+    /// with the screen fade.
+    entry_fade: u8,
     /// The description window, drawn on the menu line.
     message: MessageWindow,
 }
@@ -80,6 +119,11 @@ impl ItemViewScreen {
             model: None,
             yaw: 0,
             pitch: 0,
+            roll: 0,
+            stage: ViewStage::Display,
+            zoom_timer: 0,
+            zoom_spin: 0,
+            entry_fade: 0,
             message: MessageWindow::default(),
         }
     }
@@ -128,9 +172,19 @@ impl ItemViewScreen {
     /// resting translation toward the camera.
     pub fn root_matrix(&self) -> Mat4x3 {
         Mat4x3 {
-            r: anim::rotation_matrix(self.pitch, self.yaw, 0),
+            r: anim::rotation_matrix(self.pitch, self.yaw, self.roll),
             t: [MODEL_REST_X, 0, 0],
         }
+    }
+
+    /// The examine check's result for the model's current pose.
+    pub fn examine(&self) -> ExamineOutcome {
+        examine_check(self.item, self.yaw, self.pitch, self.roll)
+    }
+
+    /// Whether the zoom spin is running.
+    pub fn zooming(&self) -> bool {
+        self.stage == ViewStage::Zoom
     }
 
     /// The fixed viewer camera.
@@ -154,6 +208,66 @@ impl ItemViewScreen {
 /// full turn.
 pub fn spin(angle: i32, positive: bool) -> i32 {
     (angle + if positive { ROTATE_STEP } else { -ROTATE_STEP }) & 0x0FFF
+}
+
+/// Whether `angle` falls inside the `(target, tolerance)` exam window,
+/// transcribed from the item examine check: the target is added to the angle,
+/// the tolerance subtracted, and the result must land inside `2 * target`.
+/// A zero target always passes.
+pub fn window_matches(angle: i32, target: u16, tolerance: u16) -> bool {
+    if target == 0 {
+        return true;
+    }
+    let shifted = (angle + i32::from(target)) & 0x0FFF;
+    ((shifted - i32::from(tolerance)) & 0x0FFF) <= i32::from(target) * 2
+}
+
+/// Run the item's examine check against the model's yaw/pitch/roll angles.
+///
+/// The lookup record's name-class byte is the flag index into the examine-type
+/// table; items with its top bit set (the port has no weapon-ammo examine
+/// messages) and items whose type byte has no records open immediately, as do
+/// the ids past the item table (the PC machineguns keep their descriptions).
+/// A pose inside one of the type byte's records opens the description, except
+/// the books (red book 0x3E and the two doom books 0x3F/0x40), which take the
+/// zoom path.
+pub fn examine_check(item: u8, yaw: i32, pitch: i32, roll: i32) -> ExamineOutcome {
+    let Some(record) = items::record(item) else {
+        return ExamineOutcome::Open;
+    };
+    if record.name_class & 0x80 != 0 {
+        return ExamineOutcome::Open;
+    }
+    let Some(ex_type) = items::examine_type(record.name_class) else {
+        return ExamineOutcome::Open;
+    };
+    if ex_type & 0xF0 == 0 {
+        return ExamineOutcome::Open;
+    }
+    let count = usize::from(ex_type >> 4);
+    let first = usize::from(ex_type & 0x0F);
+    // The record pairs are the model's x/y/z Euler angles: the pitch (x
+    // rotation, `DAT_00ae9f64`), the yaw (`DAT_00ae9f66`) and the roll
+    // (`DAT_00ae9f68`) the viewer's recompute extracts from its matrix.
+    let angles = [pitch, yaw, roll];
+    for offset in 0..count {
+        let Some(combo) = items::examine_combo(first + offset) else {
+            continue;
+        };
+        let matched = combo
+            .iter()
+            .zip(angles)
+            .all(|((target, tolerance), angle)| window_matches(angle, *target, *tolerance));
+        if matched {
+            if item == items::ITEM_RED_BOOK
+                || (items::ITEM_RED_BOOK < item && item < items::ITEM_FIRST_AID_SPRAY)
+            {
+                return ExamineOutcome::Zoom;
+            }
+            return ExamineOutcome::Open;
+        }
+    }
+    ExamineOutcome::Refused
 }
 
 /// The item's description-table entry: descriptions are item id - 1, except
@@ -191,6 +305,13 @@ impl Screen for ItemViewScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         let empty = Text::default();
         self.open_with(cx.pack, cx.text.unwrap_or(&empty), &[0; 4]);
+        self.yaw = 0;
+        self.pitch = 0;
+        self.roll = 0;
+        self.stage = ViewStage::Display;
+        self.zoom_timer = 0;
+        self.zoom_spin = 0;
+        self.entry_fade = 0;
         Ok(())
     }
 
@@ -211,35 +332,55 @@ impl Screen for ItemViewScreen {
             return ScreenResult::Continue;
         }
 
+        // The zoom spin runs to its target before the description opens; the
+        // original ignores the pad for its duration.
+        if self.stage == ViewStage::Zoom {
+            self.zoom_timer += 1;
+            let step = (self.zoom_timer * 4).min(0x20);
+            self.zoom_spin += step;
+            self.yaw = (self.yaw + step) & 0x0FFF;
+            self.pitch = (self.pitch - step * 2) & 0x0FFF;
+            self.entry_fade = self.entry_fade.saturating_sub(12);
+            if self.zoom_spin > 0x300 {
+                self.stage = ViewStage::Display;
+                self.entry_fade = 0;
+                self.start_description();
+            }
+            return ScreenResult::Continue;
+        }
+
         if input.cancel {
             cx.play_cue(UiCue::Cancel);
             return ScreenResult::Done(ScreenAction::Resume);
         }
         if input.confirm {
             cx.play_cue(UiCue::Decide);
-            // TODO(parity): (UI) the original confirm first runs the examine
-            // check: for the examinable items it compares the model's current
-            // yaw/pitch against the `g_ItemExamineCombos` windows and only
-            // opens the description (or the red-book zoom) when the rotation
-            // matches. The port opens the description unconditionally, so the
-            // rotation puzzle items skip their check. The original also plays
-            // an entry zoom + light ramp (`g_bItemViewerZoomTimer`) and spins
-            // the model while a direction is held; the port steps the angle
-            // once per key edge and draws full-bright.
-            self.start_description();
+            match self.examine() {
+                ExamineOutcome::Open => self.start_description(),
+                ExamineOutcome::Zoom => {
+                    self.stage = ViewStage::Zoom;
+                    self.zoom_timer = 0;
+                    self.zoom_spin = 0;
+                    self.entry_fade = 255;
+                }
+                ExamineOutcome::Refused => {}
+            }
             return ScreenResult::Continue;
         }
 
-        if input.left {
+        // A direction held spins the model one step per tick, like the
+        // original's raw-held spin vector; the edge flags cover taps shorter
+        // than a tick.
+        if input.left || input.held_left {
             self.yaw = spin(self.yaw, false);
         }
-        if input.right {
+        if input.right || input.held_right {
             self.yaw = spin(self.yaw, true);
         }
-        if input.up {
+        if input.up || input.held_up {
             self.pitch = spin(self.pitch, false);
         }
-        if input.down {
+        if input.down || input.held_down {
             self.pitch = spin(self.pitch, true);
         }
         ScreenResult::Continue
@@ -267,6 +408,10 @@ impl Screen for ItemViewScreen {
                 &self.name,
             );
         }
+    }
+
+    fn fade(&self) -> u8 {
+        self.entry_fade
     }
 }
 
@@ -397,6 +542,119 @@ mod tests {
         assert_eq!(spin(0x0FF0, true), 0x10);
         assert_eq!(spin(0x10, false), 0x0FF0);
         assert_eq!(spin(0x0FFF, true), 0x1F);
+    }
+
+    #[test]
+    fn examine_windows_map_the_combo_records() {
+        // Crank (0x1D): one record, yaw centred on 0x12C with a 0x0C00 window.
+        assert_eq!(examine_check(0x1D, 0x0BF0, 0, 0), ExamineOutcome::Open);
+        assert_eq!(examine_check(0x1D, 0, 0, 0), ExamineOutcome::Refused);
+        // Sword key (0x33): record 1 wants yaw/pitch within +-0x230 and the
+        // roll window at +-0x5D0..0xA30.
+        assert_eq!(
+            examine_check(0x33, 0x100, 0x0F00, 0x800),
+            ExamineOutcome::Open
+        );
+        assert_eq!(
+            examine_check(0x33, 0x100, 0x0F00, 0),
+            ExamineOutcome::Refused
+        );
+        // Lab key A (0x37) has no records: it opens at any pose, like every
+        // item whose record has the top name bit set (the knife).
+        assert_eq!(examine_check(0x37, 0x123, 0x456, 0x789), ExamineOutcome::Open);
+        assert_eq!(examine_check(0x01, 0, 0, 0), ExamineOutcome::Open);
+        // The red book's record 3 matches only around yaw 0x270..0x550.
+        assert_eq!(examine_check(0x3E, 0x400, 0, 0), ExamineOutcome::Zoom);
+        assert_eq!(examine_check(0x3E, 0, 0, 0), ExamineOutcome::Refused);
+        // The PC machineguns keep their descriptions.
+        assert_eq!(examine_check(0x6F, 0, 0, 0), ExamineOutcome::Open);
+    }
+
+    #[test]
+    fn held_directions_spin_the_model_every_tick() {
+        let dir = TempDir::new();
+        let pack = empty_pack(&dir);
+        let text = Text::default();
+        let cx = context(&pack, &text);
+        let mut screen = ItemViewScreen::new(1);
+        for _ in 0..3 {
+            screen.update(
+                &cx,
+                UiInput {
+                    held_right: true,
+                    ..UiInput::default()
+                },
+            );
+        }
+        assert_eq!(screen.yaw, 3 * ROTATE_STEP);
+        screen.update(
+            &cx,
+            UiInput {
+                held_up: true,
+                ..UiInput::default()
+            },
+        );
+        assert_eq!(screen.pitch, 0x0FE0);
+    }
+
+    #[test]
+    fn misaligned_confirm_refuses_and_aligned_opens() {
+        let dir = TempDir::new();
+        let pack = empty_pack(&dir);
+        let text = Text::default();
+        let cx = context(&pack, &text);
+
+        // The crank's window needs a turned pose: the resting pose refuses.
+        let mut screen = ItemViewScreen::new(0x1D);
+        screen.description = Some(vec![0x0C, 0x01, 0x00]);
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+        );
+        assert!(!screen.message_active(), "the misaligned pose is refused");
+
+        screen.yaw = 0x0BF0;
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+        );
+        assert!(screen.message_active(), "the aligned pose opens");
+    }
+
+    #[test]
+    fn the_red_book_zooms_before_the_description() {
+        let dir = TempDir::new();
+        let pack = empty_pack(&dir);
+        let text = Text::default();
+        let cx = context(&pack, &text);
+
+        let mut screen = ItemViewScreen::new(0x3E);
+        screen.description = Some(vec![0x0C, 0x01, 0x00]);
+        screen.yaw = 0x400;
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+        );
+        assert!(screen.zooming(), "the matched red book takes the zoom path");
+        assert!(!screen.message_active());
+
+        let mut ticks = 0;
+        while screen.zooming() && ticks < 200 {
+            screen.update(&cx, UiInput::default());
+            ticks += 1;
+        }
+        assert!(!screen.zooming(), "the zoom finishes");
+        assert!(screen.message_active(), "the zoom opens the description");
+        assert_eq!(screen.entry_fade, 0, "the entry ramp reaches full");
     }
 
     #[test]
