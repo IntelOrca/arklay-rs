@@ -22,6 +22,8 @@ jobs:
       - run: cargo test --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
       - run: cargo test --release --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
         env:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/release

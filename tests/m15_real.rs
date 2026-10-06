@@ -634,16 +634,18 @@ fn conversion_adds_exactly_the_manifest_entry() {
     assert_eq!(manifest.kind, manifest::PackKind::Base);
     assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
 
-    // M16's map tab adds the floor-plan art and the extracted tables on top
-    // of the manifest. The shipped pack predates both, so filter the map
-    // entries out of the path comparison and account for them in the count.
-    const MAP_ENTRIES: usize = 17;
-    let previous_paths: Vec<&str> = previous.paths().collect();
-    let mut converted_paths: Vec<&str> = converted.paths().collect();
-    converted_paths
-        .retain(|path| !path.eq_ignore_ascii_case(manifest::ENTRY) && !path.starts_with("map/"));
+    // The manifest and M16's map entries are part of every converted pack now;
+    // filter them from both sides so the comparison covers the game content.
+    let filter = |paths: Vec<&str>| -> Vec<String> {
+        paths
+            .into_iter()
+            .filter(|path| !path.eq_ignore_ascii_case(manifest::ENTRY) && !path.starts_with("map/"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let previous_paths = filter(previous.paths().collect());
+    let converted_paths = filter(converted.paths().collect());
     assert_eq!(converted_paths, previous_paths);
-    assert_eq!(converted.len(), previous.len() + 1 + MAP_ENTRIES);
     for path in &previous_paths {
         assert_eq!(
             converted.read(path).unwrap(),

@@ -591,7 +591,18 @@ impl Display {
             }
         }
 
-        let sdl = SdlHandle::acquire()?;
+        // Headless captures fall back to the always-present dummy driver when
+        // the offscreen driver cannot initialize (e.g. no EGL on CI).
+        let sdl = match SdlHandle::acquire() {
+            Ok(sdl) => sdl,
+            Err(err) if capture => {
+                unsafe {
+                    SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"dummy".as_ptr());
+                }
+                SdlHandle::acquire().map_err(|_| err)?
+            }
+            Err(err) => return Err(err),
+        };
 
         let title = CString::new(title).context("window title contains a NUL byte")?;
         let window = unsafe {
