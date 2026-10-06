@@ -110,11 +110,17 @@ pub fn init(
         entity.timing_control = 0;
     }
     apply_pose_variant(entity, flags, room);
-    // TODO(parity): (gameplay) the per-character init handlers also apply the
-    // ambient joint tints, build the ground-shadow quad from `character_init`
-    // (tint + half extents/offset) and point the entity at its SCA hit record;
-    // the port applies the opening clip/frame only, so wounded Rebecca/Wesker
-    // tints, their resized shadows and per-character hit boxes are missing.
+    // The original's per-character handlers also select the character's shadow
+    // tint and quad from `character_init` with the wounded-Rebecca and
+    // variant-Wesker overrides, and point the entity at its SCA hit record.
+    // The port resolves the shadow through [`data::character_shadow`] where
+    // the shadow is queued and derives the SCA volume in the collision layer,
+    // so nothing is stored here. The handlers' remaining work is not
+    // observable in this port: the ambient joint tints and the joint flag bit
+    // wounded Rebecca clears have no joint-colour support ([`super`] documents
+    // that deviation), and Wesker's zeroed tracking-joint yaw/pitch and 0x10
+    // pitch step have no analogue until the renderer slews a real joint (the
+    // port's look-at steps the entity yaw instead).
     entity.blend_counter = 0;
     clock.advance(entity, clips, false, INIT_BLEND_STEP);
 }
@@ -152,11 +158,15 @@ fn apply_pose_variant(entity: &mut Entity, flags: &[FlagBank; FLAG_BANK_COUNT], 
 /// One state-1 tick. Returns whether the common tail should advance the
 /// animation clock (the handlers that need the completion result advance it
 /// themselves and return `false`) and the billboard spawn requests.
+///
+/// `enemy_angle` is the facing of the second enemy-list slot (`g_EnemiesList[1]`,
+/// the port's entity slot 2): the bleeding-out death copies it on entry.
 pub fn update(
     entity: &mut Entity,
     clock: &mut EntityAnim,
     clips: &[Clip],
     room: &RoomState,
+    enemy_angle: u16,
 ) -> (bool, Vec<EffectSpawn>) {
     let mut spawns = Vec::new();
     let advance = match data::idle_behavior(entity.action_behavior) {
@@ -170,7 +180,7 @@ pub fn update(
             false
         }
         IdleBehavior::Walk03 => {
-            walk_03(entity, clock, clips, &mut spawns);
+            walk_03(entity, clock, clips, enemy_angle, &mut spawns);
             false
         }
         IdleBehavior::PlayAnim => play_anim(entity),
@@ -321,14 +331,15 @@ fn walk_02_step(
 }
 
 /// Behaviour 3: the bleeding-out death. The animation plays to completion,
-/// then the character clears status bit 1 and drops to health -1. The type-0
-/// blood sheets spray before frame 9 (pivot 0x5DC below the body) and after
-/// frame 0x5F; the joint tints, vertex animation and the 250-tick ground-pool
-/// grow stay deferred.
+/// then the character clears status bit 1 and drops to health -1 while the
+/// 250-tick ground-pool countdown runs. The type-0 blood sheets spray before
+/// frame 9 (pivot 0x5DC below the body) and after frame 0x5F; the joint
+/// tints, vertex animation and the growing ground billboard stay deferred.
 fn walk_03(
     entity: &mut Entity,
     clock: &mut EntityAnim,
     clips: &[Clip],
+    enemy_angle: u16,
     spawns: &mut Vec<EffectSpawn>,
 ) {
     match entity.action_state {
@@ -338,14 +349,21 @@ fn walk_03(
             entity.timing_control = 0;
             entity.animation_id = 0x30;
             entity.blend_counter = 0;
+            entity.action_ticks_counter = 0xFA;
             entity.hit_state = 0x80;
             entity.status_flags |= 6;
+            // The original faces `g_EnemiesList[1]` (the port's entity slot 2).
+            entity.angle = enemy_angle;
             walk_03_step(entity, clock, clips, spawns);
         }
         1 => walk_03_step(entity, clock, clips, spawns),
         2 => {
             entity.status_flags &= !2;
             entity.health = -1;
+            entity.action_ticks_counter = entity.action_ticks_counter.wrapping_sub(1);
+            if entity.action_ticks_counter == 0 {
+                entity.action_state = 3;
+            }
         }
         _ => {}
     }
@@ -418,7 +436,7 @@ mod tests {
     /// The advance half of [`super::update`], for tests that do not inspect
     /// the spawn requests.
     fn tick(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) -> bool {
-        update(entity, clock, clips, room).0
+        update(entity, clock, clips, room, 0).0
     }
 
     #[test]
@@ -467,6 +485,103 @@ mod tests {
             assert_eq!(entity.animation_id, 0, "id {id:#04x}");
             assert_eq!(entity.animation_frame_id, 1, "id {id:#04x}");
             assert_eq!(entity.blend_counter, 0, "id {id:#04x}");
+        }
+    }
+
+    #[test]
+    fn init_fixtures_cover_every_character_id() {
+        for id in data::FIRST_ID..=data::LAST_ID {
+            let mut entity = Entity {
+                id,
+                angle: 0x123,
+                animation_id: 0x11,
+                animation_frame_id: 0,
+                timing_control: 1,
+                health: 55,
+                sca_radius: 1,
+                ..Entity::default()
+            };
+            let mut clock = EntityAnim::default();
+            init(&mut entity, &mut clock, &clips(), &no_flags(), room());
+
+            assert_eq!(entity.state(), 1, "id {id:#04x} drops to state 1");
+            assert_eq!(entity.ignore(), 0, "id {id:#04x}");
+            assert_eq!(
+                (entity.action_behavior, entity.action_state),
+                (0, 0),
+                "id {id:#04x}"
+            );
+            assert_eq!(entity.pitch, 0, "id {id:#04x}");
+            assert_eq!(entity.roll, 0, "id {id:#04x}");
+            assert_eq!(entity.health, -1, "id {id:#04x}");
+            assert_eq!(entity.angle, 0x123, "id {id:#04x} keeps the spawn yaw");
+            assert_eq!(
+                i32::from(entity.sca_radius),
+                data::collision_radius(id).unwrap(),
+                "id {id:#04x} gets its own radius"
+            );
+            if data::is_corpse(id) {
+                assert_eq!(entity.animation_id, 0, "id {id:#04x} rewinds");
+                assert_eq!(entity.blend_counter, 0, "id {id:#04x}");
+            } else {
+                assert_eq!(
+                    entity.animation_id, 0x11,
+                    "id {id:#04x} keeps the spawned pose"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_applies_the_flag_gated_poses_to_the_aliases() {
+        let mut flags = no_flags();
+        flags[1].apply(data::REBECCA_WOUNDED_FLAG, 0);
+        for id in [0x23, 0x2C] {
+            let mut entity = Entity {
+                id,
+                animation_id: 0x10,
+                timing_control: 1,
+                ..Entity::default()
+            };
+            let mut clock = EntityAnim::default();
+            init(&mut entity, &mut clock, &variant_clips(), &flags, room());
+            assert_eq!(
+                entity.animation_id,
+                data::REBECCA_WOUNDED_ANIM,
+                "id {id:#04x}"
+            );
+            assert_eq!(
+                clock.display_frame(),
+                usize::from(data::REBECCA_WOUNDED_FRAME),
+                "id {id:#04x}"
+            );
+            assert_eq!(entity.blend_counter, 0, "the wounded pose rewinds");
+        }
+
+        let mut flags = no_flags();
+        flags[0].apply(data::WESKER_VARIANT_FLAG, 0);
+        for id in [0x24, 0x2E] {
+            let mut entity = Entity {
+                id,
+                animation_id: 0x10,
+                timing_control: 1,
+                ..Entity::default()
+            };
+            let mut clock = EntityAnim::default();
+            init(&mut entity, &mut clock, &variant_clips(), &flags, room());
+            assert_eq!(
+                entity.animation_id,
+                data::WESKER_VARIANT_ANIM,
+                "id {id:#04x}"
+            );
+            assert_eq!(
+                clock.display_frame(),
+                usize::from(data::WESKER_VARIANT_FRAME),
+                "id {id:#04x}"
+            );
+            // The variant does not touch timing_control, exactly like the
+            // original's Wesker handler.
+            assert_eq!(entity.timing_control, 1, "id {id:#04x}");
         }
     }
 
@@ -840,6 +955,60 @@ mod tests {
     }
 
     #[test]
+    fn walk_03_faces_enemy_one_and_counts_the_ground_pool_down() {
+        let instant = ClipFrame {
+            keyframe: 0,
+            timing: 0,
+        };
+        let mut clips = vec![Clip::default(); 0x34];
+        clips[0x30] = Clip {
+            frames: vec![instant],
+        };
+        let mut entity = Entity {
+            id: 0x27,
+            action_behavior: 3,
+            angle: 0x111,
+            ..Entity::default()
+        };
+        let mut clock = EntityAnim::default();
+        // Entry copies the second enemy-list slot's facing and arms the
+        // 250-tick ground-pool countdown; the one-frame clip parks in state 2.
+        let (_, _) = update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default(),
+            0x777,
+        );
+        assert_eq!(entity.angle, 0x777, "faces enemy slot 1");
+        assert_eq!(entity.action_ticks_counter, 0xFA);
+        assert_eq!(entity.action_state, 2);
+
+        // The countdown clears the status bit every tick and only advances
+        // when it reaches zero.
+        entity.action_ticks_counter = 2;
+        entity.status_flags |= 2;
+        let (_, _) = update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default(),
+            0x777,
+        );
+        assert_eq!(entity.action_ticks_counter, 1);
+        assert_eq!(entity.action_state, 2);
+        assert_eq!(entity.status_flags & 2, 0);
+        let (_, _) = update(
+            &mut entity,
+            &mut clock,
+            &clips,
+            &RoomState::default(),
+            0x777,
+        );
+        assert_eq!(entity.action_state, 3, "the pool timer parks the body");
+    }
+
+    #[test]
     fn death_behaviours_emit_the_type_zero_blood_spawns() {
         let instant = ClipFrame {
             keyframe: 0,
@@ -861,7 +1030,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default(), 0);
         assert_eq!(spawns.len(), 3);
         let sheet = EffectSpawn {
             effect_type: 0,
@@ -894,7 +1063,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default(), 0);
         assert_eq!(
             spawns,
             vec![EffectSpawn {
@@ -916,7 +1085,7 @@ mod tests {
             ..Entity::default()
         };
         let mut clock = EntityAnim::default();
-        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default());
+        let (_, spawns) = update(&mut entity, &mut clock, &clips, &RoomState::default(), 0);
         assert_eq!(
             spawns,
             vec![EffectSpawn {

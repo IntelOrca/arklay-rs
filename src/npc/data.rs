@@ -7,6 +7,8 @@
 //! one of three shadow-tint classes. The idle behaviour byte selects one of the
 //! state-1 handlers from [`IdleBehavior`].
 
+use crate::game::{FLAG_BANK_COUNT, FlagBank};
+
 /// First entity id backed by an `npc/*.emd` model.
 pub const FIRST_ID: u8 = 0x20;
 /// Last entity id backed by an `npc/*.emd` model.
@@ -164,10 +166,9 @@ pub fn sca_volume(id: u8) -> Option<ScaVolume> {
 ///
 /// The grey `0x808080` of the living characters special-cases to near-black in
 /// [`crate::shadow::billboard_tint`]; the corpse props carry warm tints and
-/// Richard and Enrico are dimmer. The state-0 init applies the tint and the
-/// geometry, exactly like the original's per-character init handlers. NPC
-/// shadows themselves are the slice-6 stretch and stay deferred: the table is
-/// the spawn data the shadow path will read.
+/// Richard and Enrico are dimmer. The state-0 init builds each character's
+/// shadow from this record, and [`character_shadow`] applies the story-flag
+/// overrides on top of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CharacterInit {
     /// Packed `0x00RRGGBB` shadow tint.
@@ -252,6 +253,34 @@ pub fn shadow_tint(id: u8) -> Option<u32> {
     Some(character_init(id)?.tint)
 }
 
+/// The tint the wounded Rebecca and variant Wesker shadows blend towards.
+pub const VARIANT_SHADOW_TINT: u32 = 0x00FF_FF70;
+/// Half-extent of the wounded Rebecca's resized shadow quad.
+pub const REBECCA_WOUNDED_SHADOW_HALF: i16 = 0x1E0;
+/// Half-extent of the variant Wesker's enlarged shadow quad.
+pub const WESKER_VARIANT_SHADOW_HALF: i16 = 0x5DC;
+
+/// The character's shadow record with the story-flag overrides applied.
+///
+/// The original's state-0 init handlers call `BillboardSetColor` and
+/// `BillboardAdjSize` on the character's shadow after building it: wounded
+/// Rebecca (scenario bank 1, bit 0xC0) gets the 0x00FFFF70 tint and a 0x1E0
+/// square, and variant Wesker (scenario bank 0, bit 0x37) the same tint at
+/// 0x5DC. The port resolves the same overrides where the shadow is queued.
+pub fn character_shadow(id: u8, flags: &[FlagBank; FLAG_BANK_COUNT]) -> Option<CharacterInit> {
+    let mut init = character_init(id)?;
+    if is_rebecca(id) && flags[1].bit(REBECCA_WOUNDED_FLAG) {
+        init.tint = VARIANT_SHADOW_TINT;
+        init.shadow_half_x = REBECCA_WOUNDED_SHADOW_HALF;
+        init.shadow_half_z = REBECCA_WOUNDED_SHADOW_HALF;
+    } else if is_wesker(id) && flags[0].bit(WESKER_VARIANT_FLAG) {
+        init.tint = VARIANT_SHADOW_TINT;
+        init.shadow_half_x = WESKER_VARIANT_SHADOW_HALF;
+        init.shadow_half_z = WESKER_VARIANT_SHADOW_HALF;
+    }
+    Some(init)
+}
+
 /// Scenario-flag bit (bank 1, `g_ScenarioFlags2`) that gives Rebecca her
 /// wounded/darkened variant: a different opening pose and tinted joints.
 pub const REBECCA_WOUNDED_FLAG: u8 = 0xC0;
@@ -329,6 +358,48 @@ pub fn idle_0_plays_animation(id: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_flags() -> [FlagBank; FLAG_BANK_COUNT] {
+        [FlagBank::new(); FLAG_BANK_COUNT]
+    }
+
+    #[test]
+    fn character_shadow_applies_the_story_variant_overrides() {
+        // Without the flags the base record is returned unchanged.
+        for id in FIRST_ID..=LAST_ID {
+            assert_eq!(
+                character_shadow(id, &no_flags()),
+                character_init(id),
+                "id {id:#04x}"
+            );
+        }
+
+        // Wounded Rebecca: the enemy tint and the 0x1E0 square, on both her
+        // ids; Wesker is untouched.
+        let mut flags = no_flags();
+        flags[1].apply(REBECCA_WOUNDED_FLAG, 0);
+        for id in [0x23, 0x2C] {
+            let wounded = character_shadow(id, &flags).unwrap();
+            assert_eq!(wounded.tint, VARIANT_SHADOW_TINT, "id {id:#04x}");
+            assert_eq!(wounded.shadow_half_x, REBECCA_WOUNDED_SHADOW_HALF);
+            assert_eq!(wounded.shadow_half_z, REBECCA_WOUNDED_SHADOW_HALF);
+            assert_eq!(wounded.shadow_offset, [0, 0, -0x50]);
+        }
+        assert_eq!(character_shadow(0x24, &flags), character_init(0x24));
+
+        // Variant Wesker: the same tint at 0x5DC, on both his ids.
+        let mut flags = no_flags();
+        flags[0].apply(WESKER_VARIANT_FLAG, 0);
+        for id in [0x24, 0x2E] {
+            let variant = character_shadow(id, &flags).unwrap();
+            assert_eq!(variant.tint, VARIANT_SHADOW_TINT, "id {id:#04x}");
+            assert_eq!(variant.shadow_half_x, WESKER_VARIANT_SHADOW_HALF);
+            assert_eq!(variant.shadow_half_z, WESKER_VARIANT_SHADOW_HALF);
+        }
+        assert_eq!(character_shadow(0x23, &flags), character_init(0x23));
+
+        assert_eq!(character_shadow(FIRST_ID - 1, &no_flags()), None);
+    }
 
     #[test]
     fn model_paths_cover_the_character_id_range() {

@@ -25,13 +25,15 @@
 //! - **No combat.** Behaviours 10, 37, 43 and 45 stay counted placeholders and
 //!   no shipped script or effect animation reaches them; the corpus audit locks
 //!   that. There is no damage, health or hit reaction.
-//! - **NPC shadows are not drawn.** The per-character tint and shadow geometry
-//!   are tabulated by [`data::character_init`], but the renderer still draws
-//!   only the player's shadow; the NPC fade-sprite pass is a slice-6 stretch
-//!   left to M10.
+//! - **The shadow quad is not adjustable at runtime.** NPC ground shadows are
+//!   drawn from [`data::character_shadow`], including the wounded-Rebecca and
+//!   variant-Wesker tint/resize overrides, but the original's per-entity quad
+//!   at `entity+0xE4` is not modelled, so the scripted deaths' growing ground
+//!   billboard stays deferred.
 //! - **Joint tints and hiding are not applied.** The wounded Rebecca joint
-//!   tints and `model_op`/`objs_hide` joint colour/visibility writes have no
-//!   renderer support yet.
+//!   tints, the joint flag bit her init clears, Wesker's zeroed tracking-joint
+//!   yaw/pitch and 0x10 pitch step, and the `model_op`/`objs_hide` joint
+//!   colour/visibility writes have no renderer support yet.
 //! - **Look-at is simplified.** The original slews a tracking joint every
 //!   update; this port stores the target and steps the entity yaw in the walk
 //!   layer.
@@ -65,7 +67,7 @@ pub mod walk;
 pub use anim::EntityAnim;
 pub use data::{
     CharacterInit, FIRST_ID, LAST_ID, RADIUS_LARGE, RADIUS_MEDIUM, RADIUS_SPRAWLED, character_init,
-    character_name, collision_radius, model_path, shadow_tint,
+    character_name, character_shadow, collision_radius, model_path, shadow_tint,
 };
 
 /// First entity id backed by an `npc/*.emd` model.
@@ -180,11 +182,15 @@ pub fn update_entity(
             false
         }
         1 => {
+            // The bleeding-out death copies `g_EnemiesList[1]`'s facing, the
+            // second enemy-list slot (the port's entity slot 2).
+            let enemy_angle = game.entities.get(2).map_or(0, |entity| entity.angle);
             let (advance, spawns) = idle::update(
                 &mut game.entities[slot],
                 &mut game.entity_anims[slot],
                 clips,
                 room,
+                enemy_angle,
             );
             idle::apply_spawns(game, slot, spawns);
             advance

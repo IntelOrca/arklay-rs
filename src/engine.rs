@@ -5855,7 +5855,7 @@ fn render_frame(
         // from `character_init` and the local offset applied to its position.
         if let Some(texture) = shadow_texture
             && entity.has_enter_switch_zone != 0
-            && let Some(init) = npc::data::character_init(entity.id)
+            && let Some(init) = npc::data::character_shadow(entity.id, &game.flags)
         {
             shadow_list.push(render::Shadow {
                 texture,
