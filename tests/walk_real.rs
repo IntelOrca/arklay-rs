@@ -8,9 +8,10 @@ mod common;
 use arklay::audio;
 use arklay::engine::{SimulatedRoom, simulate_room_seeded};
 use arklay::game::GameState;
-use arklay::npc::walk::xz_distance_to;
+use arklay::npc::walk::{xz_distance_to, zone_path_find};
 use arklay::pack::Pack;
 use arklay::player::{self, Input};
+use arklay::rdt;
 use arklay::sfx;
 use arklay::state::RoomId;
 
@@ -87,6 +88,57 @@ fn follow_run(name: &str) {
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_room5000_follow_closes_distance_in_the_walk_zones() {
     follow_run("5000");
+}
+
+/// Every shipped room's zone graph is walked from every zone to every zone
+/// index. The deep-chain rooms (thirteen-plus zones in a row) drove the ring
+/// walk's best-path copy past the end of its scratch array, so this sweep is
+/// the corpus-level guard for that path shape.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_corpus_zone_paths_never_panic() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let mut rooms = 0usize;
+    let mut paths = 0usize;
+    for entry in pack.entries() {
+        let path = entry.path();
+        if !path.starts_with("room/") || !path.ends_with(".rdt") {
+            continue;
+        }
+        let Ok(id) = RoomId::parse(&path[5..9]) else {
+            continue;
+        };
+        let Ok(data) = pack.read(path) else {
+            continue;
+        };
+        let Ok(room) = rdt::parse(data, id) else {
+            continue;
+        };
+        if room.walk_zones.is_empty() {
+            continue;
+        }
+        rooms += 1;
+        for from_index in 0..room.walk_zones.len() {
+            let zone = &room.walk_zones[from_index];
+            let from = [
+                (i32::from(zone.x1) + i32::from(zone.x2)) / 2,
+                0,
+                (i32::from(zone.z1) + i32::from(zone.z2)) / 2,
+            ];
+            for to_index in 0..room.walk_zones.len().min(0x100) {
+                let _ = zone_path_find(&room, from, [to_index as i32, 0, 0]);
+                paths += 1;
+            }
+        }
+    }
+    assert!(
+        rooms >= 300,
+        "only {rooms} rooms with walk zones ran; the pack looks wrong"
+    );
+    assert!(paths > 0, "no zone path was walked");
 }
 
 #[test]

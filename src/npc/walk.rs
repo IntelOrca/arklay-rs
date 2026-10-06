@@ -230,11 +230,15 @@ pub enum ZonePath {
 /// The original's zone-walk scratch block, per call. `idx` is the zones on
 /// the current walk, `dir` the per-step scan bound, `best` the best-path
 /// zones, `step`/`prev` the per-step walk and previous-position X/Z pairs.
+///
+/// `best` holds `step + 1` entries when the goal step is recorded, and `step`
+/// can reach 15 (the walk refuses to extend past index 15), so the array must
+/// hold the entry at index 16.
 #[derive(Clone, Copy)]
 struct ZoneWalk {
     idx: [u8; 0x10],
     dir: [u8; 0x10],
-    best: [u8; 0x0C],
+    best: [u8; 0x11],
     step: [[i16; 2]; 0x10],
     prev: [[i16; 2]; 0x10],
 }
@@ -248,7 +252,7 @@ impl ZoneWalk {
         let mut walk = ZoneWalk {
             idx: [0; 0x10],
             dir: [0; 0x10],
-            best: [0; 0x0C],
+            best: [0; 0x11],
             step: [[0; 2]; 0x10],
             prev: [[0; 2]; 0x10],
         };
@@ -296,8 +300,12 @@ fn step_length(walk: &ZoneWalk, i: usize) -> u32 {
 /// order until the target zone is reached, keeping the shortest total path in
 /// `walk.best`. Returns the first step's zone index, or `0xFF` when no path
 /// exists. Fresh positions start at `count` so the descending scan has a clean
-/// top and can never re-probe a consumed candidate (the original's byte wrap
-/// read past the zone table there).
+/// top and can never re-probe a consumed candidate.
+///
+/// Every candidate scan is bounded and non-wrapping: a probe below zone 0 ends
+/// the scan instead of wrapping to `0xFF` and reading past the zone table the
+/// way the original's byte arithmetic does. The same clamp keeps the ascending
+/// walk below `count`.
 fn zone_walk_ccw(
     room: &RoomState,
     count: u8,
@@ -445,7 +453,8 @@ fn zone_walk_ccw(
 /// `zone_walk_cw`: the ascending (clockwise) ring walk. Same shape as
 /// [`zone_walk_ccw`] with the scan inverted: each probe is the previous
 /// candidate plus one (a fresh position starts at zero, so zone 0 is skipped
-/// on the ascending scan exactly like the original).
+/// on the ascending scan exactly like the original, and the scan stops at
+/// `count` rather than wrapping through zero).
 fn zone_walk_cw(
     room: &RoomState,
     count: u8,
@@ -1403,9 +1412,9 @@ impl ScaHit {
 
 /// `ResolveEntityScaCollision` against the player: push the character out of
 /// the player's SCA volume. The player is never moved and no damage is
-/// transferred. `prev_pos` is the character's pre-move `position` word, which
-/// breaks a degenerate overlap when the character ran through the other
-/// volume in one frame.
+/// transferred. `prev_pos` is the character's stored `position` word (+0x6C),
+/// the last room-collision-accepted position, which breaks a degenerate
+/// overlap when the character ran through the other volume in one frame.
 pub fn separate_from_player(
     entity: &mut Entity,
     prev_pos: [i32; 3],
@@ -1590,10 +1599,11 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         reset_lookat(entity, seed);
     }
 
-    // The end-of-frame collision pass accepts the final position and the next
-    // tick's degenerate-overlap test reads it back as `position`; the position
-    // on entry is exactly that accepted word.
-    let prev_pos = entity.pos;
+    // The original's `position` word (+0x6C) is the last position its
+    // collision pass accepted; the object pass can shove the live matrix after
+    // the state-9 tail without rewriting it, so the tail must read the stored
+    // word, not the current `pos`.
+    let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
     entity_pathfind_update(room, entity, player_pos);
     swap_behavior(entity, player_pos);
     entity.splatter_flag = walk_zone_find(room, entity.pos[0], entity.pos[2]).unwrap_or(0xFF);
@@ -1630,13 +1640,16 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         );
     }
     // check_room_collision: push out of walls, or roll X/Z back to the
-    // accepted position when the pushed result is still stuck.
+    // accepted position when the pushed result is still stuck. Accepting the
+    // result advances the stored `position` word, like the original's
+    // `collision_accept`.
     entity.pos = player::resolve_collision(
         &room.collision,
         prev_pos,
         entity.pos,
         i32::from(entity.sca_radius),
     );
+    entity.saved_pos = Some(entity.pos);
 }
 
 #[cfg(test)]
@@ -1838,6 +1851,26 @@ mod tests {
         }
     }
 
+    /// A chain of `count` zones along X: zone `i` is [100i, 100(i+1)) x [0,
+    /// 100), adjacent to `i-1` and `i+1`.
+    fn chain(count: usize) -> RoomState {
+        RoomState {
+            walk_zones: (0..count)
+                .map(|i| {
+                    let mut flags = 0u16;
+                    if i > 0 {
+                        flags |= 1 << (i - 1);
+                    }
+                    if i + 1 < count {
+                        flags |= 1 << (i + 1);
+                    }
+                    zone((i * 100) as i16, 0, ((i + 1) * 100) as i16, 100, flags)
+                })
+                .collect(),
+            ..RoomState::default()
+        }
+    }
+
     /// A four-zone ring around a 200x200 square: 0 SW, 1 SE, 2 NE, 3 NW, each
     /// adjacent to its two neighbours, so both ways around reach the far zone.
     fn ring() -> RoomState {
@@ -1944,6 +1977,25 @@ mod tests {
                 crossing: [100, 150]
             }
         );
+    }
+
+    #[test]
+    fn zone_path_find_walks_a_deep_chain_to_the_last_zone() {
+        // A chain forces the ring walk to step through every zone before the
+        // goal step; the scratch copies the whole best path, whose length
+        // reaches one past the last visited zone. Sixteen zones put `step` at
+        // its maximum of 15, so the copy reaches index 16.
+        for count in [13usize, 16] {
+            let room = chain(count);
+            assert_eq!(
+                zone_path_find(&room, [50, 0, 50], [(count - 1) as i32, 0, 0]),
+                ZonePath::Cross {
+                    from: 0,
+                    next: 1,
+                    crossing: [100, 50]
+                }
+            );
+        }
     }
 
     #[test]
@@ -2113,6 +2165,42 @@ mod tests {
         assert_eq!(game.entities[1].ignore(), 1);
         assert_eq!(game.entities[1].look_at_flags, 0x10);
         assert_eq!(game.entities[1].action_state, 1, "the pace wait started");
+    }
+
+    #[test]
+    fn state9_tail_rolls_back_to_the_stored_position_not_the_push() {
+        // The room-object pass runs after the state-9 tail and shoves the
+        // character without touching the original's `position` word. The next
+        // tail's room resolve must roll back to that stored word, not to the
+        // shove it just received.
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(CollisionRect {
+            x_max: 1400,
+            z_max: 1000,
+            x_min: 1000,
+            z_min: 0,
+            kind: 1,
+            flags: 0x300,
+        });
+        let accepted = [100, 0, 500];
+        let pushed = [1200, 0, 500];
+        let mut game = GameState::default();
+        game.entities[0].pos = [0, 0, 0];
+        game.entities[1] = Entity {
+            id: 0x23,
+            pos: pushed,
+            sca_radius: 100,
+            action_behavior: 4,
+            saved_pos: Some(accepted),
+            ..Entity::default()
+        };
+        game.entities[1].set_active(true);
+        update(&mut game, 1, &room, &[]);
+        assert_eq!(
+            game.entities[1].pos, accepted,
+            "the tail kept the object-pass push instead of the accepted position"
+        );
+        assert_eq!(game.entities[1].saved_pos, Some(accepted));
     }
 
     #[test]

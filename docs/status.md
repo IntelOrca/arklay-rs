@@ -102,15 +102,22 @@ Still missing by design:
 
 ## `TODO(parity)` dispositions
 
-20 sites (`rg -n "TODO\(parity\)" src`); M17 changes none of them:
+11 sites (`rg -n "TODO\(parity\)" src`):
 
 | Group | Count | Sites | Disposition |
 |---|---|---|---|
-| Gameplay | 14 | enemy spawn/re-init `game.rs:1992/2002/2006/2043/2102/2136/2149`; walkers/world `npc/walk.rs:101/216/910/1009`; weapon joint `npc/scd.rs:140`; idle init `npc/idle.rs:113`; backward clip `player.rs:55` | enemy/weapon work or the actor/world milestone |
-| Audio | 3 | pan law `audio.rs:260`; one-shot restart `audio.rs:488`; flamethrower cues `npc/scd.rs:799` | the first two are the documented M13 deviations; the third needs the enemy bank |
+| Gameplay | 7 | enemy spawn/re-init/state/idle `game.rs:2004/2018/2116/2150/2163`; weapon joint `npc/scd.rs:140`; backward clip `player.rs:55` | enemy/weapon work or the actor/world milestone |
+| Scripting | 1 | force-init re-init `game.rs:2014` | needs the saved-enemy-state store before an occupied slot can be reused |
+| Audio | 1 | flamethrower cues `npc/scd.rs:799` | needs the enemy bank |
 | UI | 1 | title idle timer `ui/title.rs:204` | blocked on the attract demo, which replays inputs over monster rooms |
-| Visual | 1 | per-record background blend weight/STP `engine.rs:5926` | the record's blend source is not decoded |
 | Conversion | 1 | held-weapon TMDs `convert.rs:464` | needs the weapon system |
+
+M18 closed nine of the sites this table used to list and removed their
+comments: the collision-resolved walk, zone-graph walker, SCA resolve and
+obstacle pathfinder in `npc/walk.rs`; the idle init in `npc/idle.rs`; the
+spawn SCA-record TODO in `game.rs`; the pan law and per-bank one-shot restart
+in `audio.rs`; and the per-record background blend weight in `engine.rs`. See
+`docs/m18-deviations.md` for the replacements and their capture re-baselines.
 
 ## Road to enemies
 

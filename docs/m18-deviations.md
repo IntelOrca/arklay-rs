@@ -7,15 +7,17 @@ re-baselines and the deliberately bounded remainders.
 
 ## Closed: DirectSound pan law
 
-`audio::pan_gains` now applies the original's DirectSound split instead of the
-constant-power curve: for a normalized pan `p` in `-1..=1` the left gain is
-`(1 - p) / 2` and the right `(1 + p) / 2`, so a centered cue plays at half
-level per channel and a hard pan leaves the near channel at full scale. Every
-path that panned before uses it unchanged: `sfx::sound_gain_pan` for 3D SE,
-`sfx::pan_from_raw` for the BGM channel and the voice line, and the unkeyed
-one-shot path. The offline test
-`audio::tests::mixer_pan_follows_the_3d_curves_at_the_documented_angles` locks
-the curve at the `sfx` tests' straight-ahead, 90-degree and far angles.
+`audio::pan_gains` now applies DirectSound's `SetPan` law instead of the
+constant-power curve: for a normalized pan `p` in `-1..=1` the near channel
+stays at full scale and the far channel is attenuated by `|p| * 10000`
+hundredths of a decibel, i.e. amplitude `10^(-5|p|)`. A centered cue therefore
+plays at full level in both channels, and a hard pan drops the far channel to
+-100 dB. Every path that panned before uses it unchanged: `sfx::sound_gain_pan`
+for 3D SE, `sfx::pan_from_raw` for the BGM channel and the voice line, and the
+unkeyed one-shot path. The offline tests
+`audio::tests::mixer_pan_is_the_directsound_decibel_law`,
+`audio::tests::mixer_pan_follows_the_3d_curves_at_the_documented_angles` and the
+mixer's per-test channel expectations lock the curve.
 
 ## Closed: per-bank one-shot restart
 
@@ -27,17 +29,28 @@ gameplay cue by its original bank: `(bank, id)` for `se_play_3d`, `(2, column)`
 for footsteps and entity sounds, `(3, id)` for character cues and `(0, slot)`
 for the room-SFX pair. Distinct banks still append through the 16-voice pool,
 and the UI/test path (`Mixer::play_sfx`) intentionally keeps the append
-behaviour.
+behaviour. The engine-level test
+`engine::tests::same_bank_entity_footsteps_restart_the_engine_voice` locks the
+bank keying through the real `play_entity_sounds` path.
 
 ## Closed: per-record background blend weight
 
-A mesh record's TMD now carries the original's `+0x68` background weight.
-`render::record_blend_weight` transcribes `GetTmdBlendMode`: the first
-semi-transparent primitive's ABR field selects `{0x80, 0x00, 0x80, 0xD0}`, and
-the blent texel mixes as `source * (256 - weight) + background * weight`.
-`ObjectRecord::blend_override` carries `cmd_omodel_set`'s `DAT_004d2be0`
-override, armed for the west-wing study (stage 2F and its return) slot 1, the
-water tank's surface.
+A mesh record's TMD now carries the original's remapped `+0x68` background
+weight. `render::record_blend_weight` transcribes `GetTmdBlendMode` and the
+`CreateTmdObjectInternal` remap that follows it:
+
+- no semi-transparent primitive leaves the record on the M16 per-packet half
+  blend (`None`);
+- `GetTmdBlendMode`'s result is the record's `blend_override` (`DAT_004d2be0`)
+  when one is armed, otherwise the first semi-transparent primitive's ABR
+  field's raw table value `{0x80, 0x00, 0x80, 0xD0}`;
+- the creator keeps only that value's zero/non-zero distinction: `0x00` draws
+  opaque and every other value collapses to the `0x80` half blend, except the
+  `cmd_omodel_set` `0x30` override, which becomes the `0x33` (0.2) background
+  weight.
+
+`ObjectRecord::blend_override` carries the override, armed for the west-wing
+study (stage 2F and its return) slot 1, the water tank's surface.
 
 Residual scope:
 
@@ -57,15 +70,29 @@ Residual scope:
   colour)` therefore continues to receive white in gameplay, and the
   "background blend" this milestone closes is the record weight above.
 
+## Documented remainder: the LOS flag write-back
+
+`room_check_sight_blocked` masks each tested collision record's flags down to
+the two blocking bits and writes the result back, discarding the low byte's
+floor/step fine value for the rest of the room's life. The port reads the
+shared `RoomState` immutably from the pathfind driver and drops that
+destructive side effect (the note on `npc::walk::room_check_sight_blocked`
+carries the same caveat). This is a real divergence for a room whose collision
+resolve reads a floor/step record after a sight check; no port test currently
+orders those two operations over a step record, and the state-driven captures
+are unaffected.
+
 ## Capture re-baselines
 
 - **ROOM20A0/20A1 (and the revisit ROOM70A0/70A1).** The init script builds
   omodel slot 1, a fully semi-transparent water-tank surface, and
-  `cmd_omodel_set` arms `0x30` for it. Its blended texels now mix at 81%
-  model / 18.75% background instead of 50/50. The ignored test
+  `cmd_omodel_set` arms `0x30` for it. Its blended texels now mix at 80% model
+  / 20% background (the `0x33` weight, 51/256) instead of 81% model / 18.75%
+  background. The ignored test
   `objects_real::room_20a0_water_tank_blend_weight_rebaselines_its_capture`
-  re-renders every cut with and without the override; cut 1 changes 2501
-  pixels, and the record shows `blend_override == Some(0x30)`.
+  re-renders every cut with and without the override and locks the re-baseline:
+  cut 1 changes 837 pixels, and the record shows `blend_override ==
+  Some(0x30)`.
 - **ROOM20B0/20B1 and ROOM70B0/70B1.** Their omodel 0 is a two-primitive
   record whose first ABR is 1 (`B + F`), so it now draws opaque instead of
   half-blended. No committed capture test draws these rooms; the corpus audit
@@ -82,6 +109,8 @@ Targeted commands used (root and pack from the local install):
 cargo test --lib
 ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
   cargo test --test objects_real room_20a0_water_tank_blend_weight_rebaselines_its_capture -- --ignored --nocapture
+ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
+  cargo test --test walk_real real_corpus_zone_paths_never_panic -- --ignored
 ```
 
 The audio tests are offline (no device): the pan samples and the

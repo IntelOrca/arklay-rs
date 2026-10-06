@@ -10,9 +10,10 @@
 //! Behaviour 1 walks along its reversed facing (the original's
 //! `Add_speedXZ(0x800)` moves by `move_speed_current` at yaw + 0x800) until the
 //! room collision probe fires, then plays the knock animation; the move uses
-//! the walk layer's collision-resolved [`super::walk::advance_xz`]. The voice
-//! cue the original plays on the hit is out of M9 scope (no voice), so only the
-//! animation state advances.
+//! the walk layer's pre-checked [`super::walk::try_advance_xz`], which commits
+//! a clear step and rolls a blocked one back. The voice cue the original plays
+//! on the hit is out of M9 scope (no voice), so only the animation state
+//! advances.
 //!
 //! Behaviours 2 and 3 are the two scripted deaths. Their type-0 blood sprays
 //! now go into the effect pool: the port approximates the original's dead-move
@@ -215,9 +216,9 @@ fn play_anim(entity: &mut Entity) -> bool {
 }
 
 /// Behaviour 1: walk forward until the collision probe fires, then knock on
-/// the obstacle. The move is the walk layer's collision-resolved
-/// [`walk::advance_xz`]; a blocked move leaves the character in place and
-/// advances to the knock state.
+/// the obstacle. The move is the walk layer's pre-checked
+/// [`walk::try_advance_xz`]: a clear step commits and a blocked one rolls back,
+/// leaving the character in place and advancing to the knock state.
 fn walk_01(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) {
     match entity.action_state {
         0 => {
@@ -257,6 +258,10 @@ fn walk_01_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], roo
     clock.advance(entity, clips, false, IDLE_BLEND_STEP);
     if !walk::try_advance_xz(room, entity, 0x800, entity.move_speed_current as i16) {
         entity.action_state = 2;
+    } else {
+        // The original's probe runs `check_room_collision`, whose accept
+        // advances `position` (+0x6C) even though it restores the matrix.
+        entity.saved_pos = Some(entity.pos);
     }
 }
 

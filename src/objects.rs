@@ -922,6 +922,10 @@ pub struct EntityCollision {
     pub height: i16,
     /// World-space part offsets.
     pub offsets: [i32; 3],
+    /// Entity-local X/Z offsets from the SCA record's own words
+    /// (`entSize[1]`/`entSize[3]`). The move-object mode anchors the pushed
+    /// object here, unrotated, exactly like the original.
+    pub local_offset: [i16; 2],
 }
 
 impl EntityCollision {
@@ -933,6 +937,7 @@ impl EntityCollision {
             radius: radius as i16,
             height,
             offsets: [0, -i32::from(height), 0],
+            local_offset: [0, 0],
         }
     }
 }
@@ -988,8 +993,9 @@ pub fn chk_entity_slide(
             };
             if move_object {
                 moved += 1;
-                // The entity's own X half-extent is zero for the player.
-                obj.pos[0] = ent_pos[0] + push;
+                // The object parks at the entity's local SCA part offset, not
+                // its origin (`entSize[1] + entPos` in the original).
+                obj.pos[0] = ent_pos[0] + i32::from(ent.local_offset[0]) + push;
             } else {
                 ent_pos[0] = obj_x + push;
             }
@@ -1003,7 +1009,7 @@ pub fn chk_entity_slide(
             };
             if move_object {
                 moved += 1;
-                obj.pos[2] = ent_pos[2] + push;
+                obj.pos[2] = ent_pos[2] + i32::from(ent.local_offset[1]) + push;
             } else {
                 ent_pos[2] = obj_z + push;
             }
@@ -1646,6 +1652,7 @@ mod tests {
             radius: 100,
             height: 500,
             offsets: [0, -500, 0],
+            local_offset: [0, 0],
         };
         let mut pos = [400, 0, 0];
         assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
@@ -1661,6 +1668,38 @@ mod tests {
     }
 
     #[test]
+    fn chk_entity_slide_mode_one_anchors_at_the_local_part_offset() {
+        // A character whose SCA record centres its volume away from the entity
+        // origin (the sprawled corpses carry 0x258 / -0xC8): move-object mode
+        // parks the object at entity position + local offset + push.
+        let mut obj = collision_record([500, 0, 0], [100, 100, 150]);
+        let ent = EntityCollision {
+            flag: 0,
+            radius: 100,
+            height: 500,
+            offsets: [0, -500, 0],
+            local_offset: [40, -70],
+        };
+        let mut pos = [400, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, true), 1);
+        // entX + localX + extX = 400 + 40 + 200 = 640.
+        assert_eq!(obj.pos, [640, 0, 0]);
+
+        let mut obj = collision_record([0, 0, 140], [200, 100, 100]);
+        let ent = EntityCollision {
+            flag: 0,
+            radius: 100,
+            height: 100,
+            offsets: [0, -100, 0],
+            local_offset: [40, -70],
+        };
+        let mut pos = [0, 0, 0];
+        assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, true), 1);
+        // entZ + localZ + extZ = 0 - 70 + 200 = 130.
+        assert_eq!(obj.pos, [0, 0, 130]);
+    }
+
+    #[test]
     fn chk_entity_slide_resolves_along_z_when_z_is_shallower() {
         // dx = 300, dz = 10; extX = 200, extZ = 150. |extX*dz| = 2000 <
         // |extZ*dx| = 45000, so the shallower axis is X again. Swap to make Z
@@ -1671,6 +1710,7 @@ mod tests {
             radius: 100,
             height: 100,
             offsets: [0, -100, 0],
+            local_offset: [0, 0],
         };
         let mut pos = [0, 0, 0];
         // |extX*dz| = 300*140 = 42000, |extZ*dx| = 200*10 = 2000 -> Z axis.
@@ -1688,6 +1728,7 @@ mod tests {
             radius: 50,
             height: 1234,
             offsets: [0, -1234, 0],
+            local_offset: [0, 0],
         };
         assert_eq!(chk_entity_slide(&mut pos, ent, &mut obj, false), 0);
         assert_eq!(pos, [100, 0, 0], "a collision-disabled entity never moves");

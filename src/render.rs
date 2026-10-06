@@ -1235,21 +1235,30 @@ pub struct EntityMesh<'a> {
     pub hidden_joints: u32,
 }
 
-/// The original's `GetTmdBlendMode`: the background weight of the first
-/// semi-transparent primitive of `model`, or `None` when the TMD carries none.
+/// The original's `GetTmdBlendMode` plus `CreateTmdObjectInternal`'s remap:
+/// the background weight of the first semi-transparent primitive of `model`,
+/// or `None` when the TMD carries none.
 ///
-/// The table is indexed by the primitive texpage's ABR field. `0x80` is the
-/// common `B/2 + F/2` rule, `0x00` keeps no background (opaque), and `0xD0`
-/// keeps mostly background. `CreateTmdObjectInternal` stamps the value into
-/// every record of the TMD, so one primitive marks the whole model.
-pub(crate) fn record_blend_weight(model: &Tmd) -> Option<u8> {
-    const ABR_WEIGHT: [u8; 4] = [0x80, 0x00, 0x80, 0xD0];
+/// `GetTmdBlendMode` returns `blend_override` when it is set, otherwise the
+/// primitive texpage ABR field's raw table value `{0x80, 0x00, 0x80, 0xD0}`.
+/// `CreateTmdObjectInternal` then keeps only that value's zero/non-zero
+/// distinction: `0x00` leaves the record opaque and every non-zero value
+/// collapses to the `0x80` half blend, except the `cmd_omodel_set` `0x30`
+/// override, which becomes the `0x33` (0.2) background weight. One primitive
+/// marks every record of the TMD.
+pub(crate) fn record_blend_weight(model: &Tmd, blend_override: Option<u8>) -> Option<u8> {
+    const ABR_MODE: [u8; 4] = [0x80, 0x00, 0x80, 0xD0];
     let prim = model
         .objects
         .iter()
         .flat_map(|object| &object.prims)
         .find(|prim| prim.blend)?;
-    Some(ABR_WEIGHT[usize::from((prim.tsb >> 5) & 3)])
+    let mode = blend_override.unwrap_or(ABR_MODE[usize::from((prim.tsb >> 5) & 3)]);
+    Some(match mode {
+        0 => 0x00,
+        0x30 => 0x33,
+        _ => 0x80,
+    })
 }
 
 impl EntityMesh<'_> {
@@ -4429,7 +4438,7 @@ mod tests {
     }
 
     #[test]
-    fn record_blend_weight_reads_the_abr_table() {
+    fn record_blend_weight_remaps_the_abr_table() {
         let with_prim = |blend: bool, tsb: u16| Tmd {
             objects: vec![TmdObject {
                 vertices: vec![[0; 3]; 3],
@@ -4449,13 +4458,36 @@ mod tests {
             }],
         };
         // No semi-transparent primitive means no record weight.
-        assert_eq!(record_blend_weight(&with_prim(false, 0)), None);
-        // ABR 0 and 2 are the authored half blend, 1 is opaque and 3 keeps
-        // mostly background; the ABR field is texpage bits 5-6.
-        assert_eq!(record_blend_weight(&with_prim(true, 0 << 5)), Some(0x80));
-        assert_eq!(record_blend_weight(&with_prim(true, 1 << 5)), Some(0x00));
-        assert_eq!(record_blend_weight(&with_prim(true, 2 << 5)), Some(0x80));
-        assert_eq!(record_blend_weight(&with_prim(true, 3 << 5)), Some(0xD0));
+        assert_eq!(record_blend_weight(&with_prim(false, 0), None), None);
+        // The ABR field is texpage bits 5-6. Its raw table value only carries
+        // the zero/non-zero distinction: ABR 1 is opaque, 0, 2 and 3 all
+        // collapse to the half blend.
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 0 << 5), None),
+            Some(0x80)
+        );
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 1 << 5), None),
+            Some(0x00)
+        );
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 2 << 5), None),
+            Some(0x80)
+        );
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 3 << 5), None),
+            Some(0x80)
+        );
+        // The armed `cmd_omodel_set` override wins over the ABR and becomes
+        // the 0.2 background weight.
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 0 << 5), Some(0x30)),
+            Some(0x33)
+        );
+        assert_eq!(
+            record_blend_weight(&with_prim(true, 3 << 5), Some(0x30)),
+            Some(0x33)
+        );
     }
 
     #[test]
@@ -4487,19 +4519,20 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
 
-        // 0x30/256 background: (255 * 208 + 100 * 48) / 256 = 225.
-        framebuffer.rasterize(&texture, &triangle(Some(0x30)));
+        // The 0x33 override weight (0.2 background): (255 * 205 + 100 * 51) /
+        // 256 = 224.
+        framebuffer.rasterize(&texture, &triangle(Some(0x33)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [225, 225, 225, 255]
+            [224, 224, 224, 255]
         );
 
-        // 0xD0/256 background: (255 * 48 + 100 * 208) / 256 = 129.
+        // The 0x80 half blend: (255 * 128 + 100 * 128) / 256 = 177.
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle(Some(0xD0)));
+        framebuffer.rasterize(&texture, &triangle(Some(0x80)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [129, 129, 129, 255]
+            [177, 177, 177, 255]
         );
 
         // A zero background weight is opaque, the ABR 1 `B + F` rule.

@@ -1285,9 +1285,9 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
     let player = arklay::player::spawn(id, &room);
     game.sync_entity_from_player(&player);
 
-    // Re-baseline check: the override must repaint the frames that draw the
-    // tank. The record is restored after each cut so the comparison is the
-    // weight alone.
+    // Re-baseline check: the 0.2 override must repaint the frames that draw
+    // the tank with a different mix than the authored 0.5 half blend. The
+    // record is restored after each cut so the comparison is the weight alone.
     let mut best = 0usize;
     let mut best_cut = 0usize;
     for cut in 0..room.cuts.len() {
@@ -1301,8 +1301,10 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
         game.objects.record_mut(1).unwrap().blend_override = Some(0x30);
         let changed = weighed
             .rgba
+            .as_chunks::<4>()
+            .0
             .iter()
-            .zip(&plain.rgba)
+            .zip(plain.rgba.as_chunks::<4>().0)
             .filter(|(a, b)| a != b)
             .count();
         if changed > best {
@@ -1310,9 +1312,12 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
             best_cut = cut;
         }
     }
-    println!("ROOM20A0 cut {best_cut}: the tank blend weight changes {best} bytes");
-    assert!(
-        best > 0,
-        "the water-tank blend weight did not change any captured frame"
+    println!("ROOM20A0 cut {best_cut}: the tank blend weight changes {best} pixels");
+    // Re-baselined: cut 1's tank surface is the only capture the override
+    // moves, and the 0.5 half blend -> 0.2 override mix repaints 837 pixels.
+    assert_eq!(
+        best, 837,
+        "cut {best_cut}: the water-tank blend weight changed {best} pixels"
     );
+    assert_eq!(best_cut, 1, "the tank capture moved off cut 1");
 }

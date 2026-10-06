@@ -5947,11 +5947,11 @@ fn render_frame(
             joints,
             tint: record.shade(),
             // The record's background blend weight: the TMD's first
-            // semi-transparent primitive picks the ABR weight, and
+            // semi-transparent primitive picks the ABR mode, and
             // `cmd_omodel_set`'s armed override (the water-tank surface) wins
-            // over it, exactly like `GetTmdBlendMode` + `DAT_004d2be0`.
-            blend_weight: render::record_blend_weight(&asset.model)
-                .map(|weight| record.blend_override.unwrap_or(weight)),
+            // over it, exactly like `GetTmdBlendMode` + `DAT_004d2be0`; the
+            // creator's remap lives in `record_blend_weight`.
+            blend_weight: render::record_blend_weight(&asset.model, record.blend_override),
             hidden_joints: 0,
         });
     }
@@ -5961,7 +5961,7 @@ fn render_frame(
             texture: &asset.texture,
             joints,
             tint: [255; 3],
-            blend_weight: render::record_blend_weight(&asset.model),
+            blend_weight: render::record_blend_weight(&asset.model, None),
             hidden_joints: 0,
         });
     }
@@ -7895,6 +7895,73 @@ mod tests {
             &mut sounds,
         );
         assert!(sounds.is_empty(), "an absent mixer still drains the queue");
+    }
+
+    #[test]
+    fn same_bank_entity_footsteps_restart_the_engine_voice() {
+        let dir = TempDir::new();
+        let path = dir.0.join("footsteps.akpak");
+        let mut writer = PackWriter::new();
+        // Long enough to survive the mixer's per-call queue fill (2048
+        // frames), so the voice count still contains the live cues.
+        writer
+            .add("se/ft_wda.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
+        writer.write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+
+        let _ = unsafe {
+            sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
+        };
+        let mixer = Mixer::open();
+        let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER) };
+        let Some(mixer) = mixer else {
+            eprintln!("skipping same-bank footstep test: no audio device");
+            return;
+        };
+        let mut music = Some(mixer);
+        let mut cache = SfxCache::default();
+        let room = RoomState {
+            cuts: vec![crate::state::Cut {
+                index: 0,
+                pos: [0, 0, 0],
+                look_at: [1000, 0, 0],
+                fov: 200,
+                ..crate::state::Cut::default()
+            }],
+            ..RoomState::default()
+        };
+        fn cue(
+            music: &mut Option<Mixer>,
+            cache: &mut SfxCache,
+            pack: &Pack,
+            room: &RoomState,
+            column: u8,
+        ) {
+            let mut sounds = vec![game::EntitySound {
+                name: "ft_wdA",
+                column,
+                pos: [1000, 0, 0],
+            }];
+            play_entity_sounds(music, cache, pack, room, &mut sounds);
+        }
+
+        cue(&mut music, &mut cache, &pack, &room, 45);
+        assert_eq!(music.as_ref().unwrap().active_sfx(), 1);
+        // The same room-sound column keys the same bank and restarts its voice.
+        cue(&mut music, &mut cache, &pack, &room, 45);
+        assert_eq!(
+            music.as_ref().unwrap().active_sfx(),
+            1,
+            "a repeated entity footstep appended a voice"
+        );
+        // A different column keys a different bank and stacks.
+        cue(&mut music, &mut cache, &pack, &room, 46);
+        assert_eq!(
+            music.as_ref().unwrap().active_sfx(),
+            2,
+            "a distinct entity footstep bank did not append"
+        );
     }
 
     #[test]

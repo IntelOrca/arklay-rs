@@ -1075,6 +1075,12 @@ pub struct Entity {
     pub id: u8,
     /// Room position.
     pub pos: [i32; 3],
+    /// The original's `position` word (+0x6C): the last position a room
+    /// collision resolve accepted. The state-9 tail's tunnelling test and
+    /// rollback read this, not the live `pos`, so an object-pass push after
+    /// the tail does not become the rollback point. `None` until a driver
+    /// binds it, which keeps fixtures and non-collision paths on `pos`.
+    pub saved_pos: Option<[i32; 3]>,
     /// 12-bit yaw.
     pub angle: u16,
     /// Rotation X component of the entity's rotation vector.
@@ -2032,6 +2038,8 @@ impl GameState {
             i32::from(operand_i16(operands, 9)),
             i32::from(operand_u16(operands, 10)),
         ];
+        // `cmd_enemy_set` writes the SVECTOR position from the same operands.
+        entity.saved_pos = Some(entity.pos);
         entity.animation_id = operand_u8(operands, 12);
         entity.animation_frame_id = operand_u8(operands, 13);
         entity.timing_control = 1;
@@ -4362,6 +4370,7 @@ impl GameState {
                     radius: hit.radius,
                     height: hit.half_height,
                     offsets: hit.world_offset(entity.angle),
+                    local_offset: [hit.offset[0], hit.offset[2]],
                 };
                 objects::chk_entity_slide(&mut self.entities[slot].pos, ext, &mut record, false);
             }
@@ -4404,6 +4413,7 @@ impl GameState {
                             radius: hit.radius,
                             height: hit.half_height,
                             offsets: hit.world_offset(entity.angle),
+                            local_offset: [hit.offset[0], hit.offset[2]],
                         };
                         let mut ent_pos = entity.pos;
                         if objects::chk_entity_slide(&mut ent_pos, ext, &mut record, true) != 0 {
@@ -5712,6 +5722,8 @@ impl ScdHost for ScdGameHost<'_> {
                         i32::from(operand_i16(operands, 5)),
                         i32::from(operand_i16(operands, 6)),
                     ];
+                    // `cmd_enemy_pos_set` writes the SVECTOR position too.
+                    entity.saved_pos = Some(entity.pos);
                     entity.pitch = operand_i16(operands, 1) as u16;
                     entity.angle = operand_i16(operands, 2) as u16 & 0x0FFF;
                     entity.roll = operand_i16(operands, 3) as u16;

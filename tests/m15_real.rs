@@ -282,9 +282,9 @@ fn layer_shadows_real_entries_and_no_mod_is_identical() {
         layered.read("bgm/013.wav").unwrap(),
         base.read("bgm/013.wav").unwrap()
     );
-    // The shipped pack predates the manifest, so the one extra merged entry is
-    // the layer's own `manifest.toml`.
-    assert_eq!(layered.len(), base.len() + 1);
+    // The mod's `manifest.toml` replaces the base's same-path entry, so the
+    // layered view has exactly the base's entry count.
+    assert_eq!(layered.len(), base.len());
     assert!(layered.contains(manifest::ENTRY));
     assert_eq!(layered.layer_of(shadow), Some(mod_path.as_path()));
 

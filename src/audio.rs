@@ -258,12 +258,15 @@ fn mono_or_warn(wav: &Wav) -> Option<Vec<i16>> {
 /// hard right and 0 is centered.
 ///
 /// The game hands DirectSound a raw pan `(right - left) * 0x4E` in
-/// `-10000..=10000`; the backend splits it linearly, left `(10000 - pan) / 20000`
-/// and right `(10000 + pan) / 20000`, so a centered cue plays at half level in
-/// both channels and a hard pan leaves the near channel at full scale.
+/// `-10000..=10000` hundredths of a decibel. DirectSound keeps the near
+/// channel at full scale and attenuates the far channel by `|pan|` hundredths
+/// of a decibel, i.e. `10^(-|pan| / 2000)` in amplitude, so a centered cue
+/// plays at full level in both channels and a hard pan leaves the far channel
+/// at -100 dB.
 fn pan_gains(pan: f32) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
-    ((1.0 - pan) * 0.5, (1.0 + pan) * 0.5)
+    let far = 10.0f32.powf(-pan.abs() * 5.0);
+    if pan > 0.0 { (far, 1.0) } else { (1.0, far) }
 }
 
 /// One playing buffer with its mix parameters.
@@ -1023,6 +1026,12 @@ impl Mixer {
         self.state.bgm_channel_playing(0)
     }
 
+    /// Number of live one-shot voices. Test seam for the engine's bank keys.
+    #[cfg(test)]
+    pub(crate) fn active_sfx(&self) -> usize {
+        self.state.active_sfx()
+    }
+
     /// Alias for [`Mixer::play_bgm`], kept for the engine's music path.
     pub fn play(&mut self, wav: Wav) -> Result<()> {
         self.play_bgm(wav)
@@ -1279,37 +1288,42 @@ mod tests {
     }
 
     #[test]
-    fn mixer_pan_is_the_directsound_linear_law() {
-        assert_eq!(pan_gains(0.0), (0.5, 0.5));
-        assert_eq!(pan_gains(-1.0), (1.0, 0.0));
-        assert_eq!(pan_gains(1.0), (0.0, 1.0));
-        assert_eq!(pan_gains(-0.5), (0.75, 0.25));
-        assert_eq!(pan_gains(0.5), (0.25, 0.75));
-        assert_eq!(pan_gains(-2.0), (1.0, 0.0));
-        assert_eq!(pan_gains(2.0), (0.0, 1.0));
+    fn mixer_pan_is_the_directsound_decibel_law() {
+        // Centered is unity on both channels; only the far channel attenuates.
+        assert_eq!(pan_gains(0.0), (1.0, 1.0));
+        assert_eq!(pan_gains(-1.0), (1.0, 1e-5));
+        assert_eq!(pan_gains(1.0), (1e-5, 1.0));
+        // Half pan: the far channel is down 50 dB.
+        assert!((pan_gains(-0.5).0 - 1.0).abs() < 1e-6);
+        assert!((pan_gains(-0.5).1 - 10.0f32.powf(-2.5)).abs() < 1e-6);
+        assert!((pan_gains(0.5).0 - 10.0f32.powf(-2.5)).abs() < 1e-6);
+        assert!((pan_gains(0.5).1 - 1.0).abs() < 1e-6);
+        assert_eq!(pan_gains(-2.0), pan_gains(-1.0));
+        assert_eq!(pan_gains(2.0), pan_gains(1.0));
     }
 
     #[test]
     fn mixer_pan_follows_the_3d_curves_at_the_documented_angles() {
         // The sfx tests' camera geometry: straight ahead at 1000 units, 90
         // degrees off the look axis, and the far wide-angle case. The pan pair
-        // runs through `pan_position` and then the linear DirectSound law.
+        // runs through `pan_position` and then the DirectSound dB law.
         let gains = |from, to, sound| {
             let (_, pan) = crate::sfx::sound_gain_pan(from, to, sound);
             pan_gains(pan)
         };
         let ahead = gains([0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
-        assert!((ahead.0 - 0.5).abs() < 1e-6 && (ahead.1 - 0.5).abs() < 1e-6);
+        assert_eq!(ahead, (1.0, 1.0));
 
-        // scene_pan gives (123, 83): pan = (83 - 123) * 78 / 10000 = -0.312.
+        // scene_pan gives (123, 83): pan = (83 - 123) * 78 / 10000 = -0.312,
+        // so the right channel is down 31.2 dB.
         let wide = gains([0, 0, 0], [1000, 0, 0], [0, 0, 2000]);
-        assert!((wide.0 - 0.656).abs() < 1e-4, "{wide:?}");
-        assert!((wide.1 - 0.344).abs() < 1e-4, "{wide:?}");
+        assert!((wide.0 - 1.0).abs() < 1e-6, "{wide:?}");
+        assert!((wide.1 - 10.0f32.powf(-1.56)).abs() < 1e-5, "{wide:?}");
 
         // scene_pan gives (67, 41) far away: pan = (41 - 67) * 78 / 10000.
         let far = gains([0, 0, 0], [1000, 0, 0], [0, 0, 30000]);
-        assert!((far.0 - 0.6014).abs() < 1e-4, "{far:?}");
-        assert!((far.1 - 0.3986).abs() < 1e-4, "{far:?}");
+        assert!((far.0 - 1.0).abs() < 1e-6, "{far:?}");
+        assert!((far.1 - 10.0f32.powf(-1.014)).abs() < 1e-5, "{far:?}");
     }
 
     #[test]
@@ -1320,8 +1334,8 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        // Centered: half the sample in each channel.
-        assert_eq!(out_samples(&out), vec![250, 250]);
+        // Centered: full gain in both channels.
+        assert_eq!(out_samples(&out), vec![500, 500]);
     }
 
     #[test]
@@ -1332,7 +1346,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(3, &mut out);
-        assert_eq!(out_samples(&out), vec![50, 50, -50, -50, 25, 25]);
+        assert_eq!(out_samples(&out), vec![100, 100, -100, -100, 50, 50]);
         assert!(state.bgm_channel_loaded(0));
         assert!(state.bgm_channel_playing(0));
         assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 0);
@@ -1394,10 +1408,10 @@ mod tests {
         state.load_movie_audio(vec![1000, 1000, 2000, 2000, 3000, 3000]);
 
         // Unpaused: the looping BGM, the voice bank and the film sum. Both
-        // banks are centered, so each contributes half its sample per channel.
+        // banks are centered, so each contributes its full sample per channel.
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let mixed = (100.0 * 0.5 + 10.0 * 0.5) as i16;
+        let mixed = (100.0 + 10.0) as i16;
         assert_eq!(out_samples(&out), vec![1000 + mixed, 1000 + mixed]);
 
         // Pausing stops the BGM and voice banks and rewinds them; the film
@@ -1451,7 +1465,7 @@ mod tests {
         assert_eq!(state.active_sfx(), 1);
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![500, 500]);
+        assert_eq!(out_samples(&out), vec![1000, 1000]);
 
         // The same bank one tick later must restart that one voice from sample
         // 0 with the new buffer and parameters, not append a second copy.
@@ -1462,7 +1476,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![1000, 1000]);
+        assert_eq!(out_samples(&out), vec![2000, 2000]);
 
         // A voice restarted after expiry starts fresh, not at old progress.
         state.render(7, &mut out);
@@ -1486,7 +1500,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![1000, 1000]);
+        assert_eq!(out_samples(&out), vec![2000, 2000]);
         assert_eq!(state.sfx[0].pos, 1);
         assert_eq!(state.sfx[1].pos, 1);
     }
@@ -1501,7 +1515,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![2000, 2000]);
+        assert_eq!(out_samples(&out), vec![4000, 4000]);
         assert!(state.sfx.iter().all(|voice| voice.pos == 1));
 
         // All four expire together and the mixer goes silent.
@@ -1562,7 +1576,7 @@ mod tests {
         state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
         state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
 
-        let expected = (100.0 * 0.5 + 2.0 * 1000.0 * 0.5) as i16;
+        let expected = (100.0 + 2.0 * 1000.0) as i16;
         let mut out = Vec::new();
         state.render(1, &mut out);
         assert_eq!(out_samples(&out), vec![expected, expected]);
@@ -1585,8 +1599,9 @@ mod tests {
         let mut out = Vec::new();
         state.render(1, &mut out);
         // Four copies of 20000 at gain 2 sum to 160000 on the hard-left
-        // channel: it saturates at the rail and never wraps negative.
-        assert_eq!(out_samples(&out), vec![i16::MAX, 0]);
+        // channel: it saturates at the rail and never wraps negative. The
+        // unused channel keeps only the far-channel attenuation tail.
+        assert_eq!(out_samples(&out), vec![i16::MAX, 1]);
     }
 
     #[test]
@@ -1705,7 +1720,7 @@ mod tests {
         state.restart_bgm_channel(0);
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let expected = 50;
+        let expected = 100;
         assert_eq!(out_samples(&out), vec![expected, expected]);
 
         // A non-looping bank stops itself at the end but stays loaded.
@@ -1768,8 +1783,8 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let left = (100.0 * 0.5 + 1000.0) as i16;
-        let right = (100.0 * 0.5 + 1000.0) as i16;
+        let left = (100.0 + 1000.0) as i16;
+        let right = (100.0 + 1000.0) as i16;
         let samples = out_samples(&out);
         assert!(
             (i32::from(samples[0]) - i32::from(left)).abs() <= 1,

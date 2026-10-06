@@ -2437,10 +2437,10 @@ mod tests {
             mixer.render(1, &mut out);
             if active == 1 {
                 sounded += 1;
-                // Center-panned: half the sample in each channel.
+                // Center-panned: full sample in both channels.
                 let left = i16::from_le_bytes([out[out.len() - 4], out[out.len() - 3]]);
                 let right = i16::from_le_bytes([out[out.len() - 2], out[out.len() - 1]]);
-                assert_eq!((left, right), (500, 500), "tick {tick}");
+                assert_eq!((left, right), (1000, 1000), "tick {tick}");
             }
         }
 
