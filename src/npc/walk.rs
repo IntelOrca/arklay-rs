@@ -124,9 +124,10 @@ pub fn advance_xz_blocked(room: &RoomState, entity: &mut Entity, offset: u16, di
 
 /// The idle walk-01 collision probe: `Add_speedXZ` followed by the original's
 /// save/probe/restore. The move is committed, the room collision is asked
-/// whether the moved point is inside a wall, and the caller's saved words are
-/// put back either way - so "did not move" is the hit. This is the only place
-/// the original rolls a movement back on a collision result.
+/// whether the moved point is inside a wall, and a hit restores the pre-move
+/// position. (The original restores its post-move saved words instead, keeping
+/// the probe step inside the geometry; the port rolls that single step back,
+/// since no other pass ever resolves it.)
 pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) -> bool {
     let saved = entity.pos;
     advance_xz(entity, offset, distance);
