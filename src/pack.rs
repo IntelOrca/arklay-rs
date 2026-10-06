@@ -447,6 +447,12 @@ impl Pack {
         self.winner(path).and_then(|layer| layer.source.as_deref())
     }
 
+    /// The filesystem path this pack was opened from, or `None` when it was
+    /// parsed from memory.
+    pub fn source(&self) -> Option<&Path> {
+        self.source.as_deref()
+    }
+
     /// The layer whose entry wins `path`: the last overlay that has it, or the
     /// base, or nothing.
     fn winner(&self, path: &str) -> Option<&Pack> {

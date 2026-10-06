@@ -82,6 +82,7 @@ use crate::ending;
 use crate::font;
 use crate::game;
 use crate::items;
+use crate::lua;
 use crate::mask;
 use crate::message::MessageInput;
 use crate::model::Emd;
@@ -193,14 +194,17 @@ pub fn run_with_voice(
     ticks: u32,
     voice: Option<&Path>,
 ) -> Result<()> {
-    run_with_voice_and_movie(pack, id, capture, ticks, voice, None)
+    run_with_voice_and_movie(pack, id, capture, ticks, voice, None, &[], false)
 }
 
-/// [`run_with_voice`] with an explicit movie-pack path.
+/// [`run_with_voice`] with an explicit movie-pack path and the runtime layers.
 ///
 /// `movie` overrides the sibling `<pack stem>.movie.akpak` discovery; a path
 /// that does not exist logs a warning and leaves every film request a graceful
-/// advance. The movie pack is consulted only by the film loader.
+/// advance. The movie pack is consulted only by the film loader. `mods` are the
+/// explicit `--mod` layers and `no_mods` ignores them and the sibling `mods/`
+/// discovery, exactly like [`open_game_pack`].
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_voice_and_movie(
     pack: &Path,
     id: RoomId,
@@ -208,11 +212,13 @@ pub fn run_with_voice_and_movie(
     ticks: u32,
     voice: Option<&Path>,
     movie: Option<&Path>,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let voice_path = voice_pack_path(pack, voice);
     let movie_path = movie_pack_path(pack, movie);
-    let pack = Pack::open(pack)?;
+    let pack = open_game_pack(pack, mods, no_mods)?;
 
     if let Some(capture_path) = capture {
         let mut loaded = load_room(&pack, id)?;
@@ -221,6 +227,8 @@ pub fn run_with_voice_and_movie(
         let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         run_room_init(&mut loaded, &mut game);
+        let lua = load_lua(&pack);
+        call_lua_room_load(lua.as_ref(), &mut game, id);
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
         bgm::update_room_bgm(&mut game, id, None);
@@ -241,6 +249,7 @@ pub fn run_with_voice_and_movie(
                 // discarded here, so a scripted scene that opens a door during
                 // `--ticks` silently keeps its room instead of playing the
                 // transition. The same drop exists in `simulate_loaded`.
+                let message_before = game.message.menu_choice_id() & 0x80 != 0;
                 tick_room(
                     &mut command_vm,
                     &mut event_vm,
@@ -254,6 +263,7 @@ pub fn run_with_voice_and_movie(
                     },
                     player::Input::default(),
                 );
+                run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
                 play_snd3d_requests(
                     &mut no_mixer,
                     &mut snd3d_cache,
@@ -310,6 +320,86 @@ pub fn run_with_voice_and_movie(
     let display = Display::new(&title, false)?;
     session.start_audio(&pack);
     run_session_loop(&pack, &mut session, &display)
+}
+
+/// Open a game pack together with its runtime mod layers.
+///
+/// `mods` are the explicit `--mod` layers. Unless `no_mods` is set, the
+/// sibling `mods/` directory is scanned for `*.akpak` candidates as well; a
+/// pack discovered and also passed explicitly applies only once. `no_mods`
+/// ignores both the discovered and the explicit layers, giving the plain
+/// single-pack path a vanilla run needs. Layer warnings are printed once here,
+/// and a non-fatal base without a manifest still boots.
+pub fn open_game_pack(path: &Path, mods: &[PathBuf], no_mods: bool) -> Result<Pack> {
+    if no_mods {
+        return Pack::open(path);
+    }
+    let mut layers: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for layer in crate::modding::discover_mods(path) {
+        let canonical = std::fs::canonicalize(&layer).unwrap_or_else(|_| layer.clone());
+        if seen.insert(canonical) {
+            layers.push(layer);
+        }
+    }
+    for layer in mods {
+        let canonical = std::fs::canonicalize(layer).unwrap_or_else(|_| layer.clone());
+        if seen.insert(canonical) {
+            layers.push(layer.clone());
+        }
+    }
+    if layers.is_empty() {
+        return Pack::open(path);
+    }
+    let pack = Pack::open_layered(path, &layers)?;
+    for warning in pack.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    Ok(pack)
+}
+
+/// Load a pack's Lua hooks, logging a failure instead of failing the session.
+fn load_lua(pack: &Pack) -> Option<lua::LuaVm> {
+    match lua::LuaVm::load(pack) {
+        Ok(vm) => vm,
+        Err(err) => {
+            eprintln!("warning: Lua hooks unavailable: {err:#}");
+            None
+        }
+    }
+}
+
+/// Run `on_room_load` for the room that just finished entering.
+fn call_lua_room_load(lua: Option<&lua::LuaVm>, game: &mut game::GameState, id: RoomId) {
+    if let Some(lua) = lua {
+        lua.call_room_load(game, id);
+    }
+}
+
+/// Run the per-tick Lua hooks: `on_tick` after the room tick and `on_message`
+/// rewriting the id of a message raised during it.
+///
+/// `message_was_up` is the window's menu byte before the tick: a request that
+/// turns a down window up during the tick is a fresh message. The byte, not
+/// `active`, is the signal because the headless harness releases the menu bit
+/// every tick so a script's F7 wait cannot stall.
+fn run_lua_tick_hooks(lua: Option<&lua::LuaVm>, game: &mut game::GameState, message_was_up: bool) {
+    let Some(lua) = lua else {
+        return;
+    };
+    lua.call_tick(game, game.frame);
+    let message_raised = !message_was_up && game.message.menu_choice_id() & 0x80 != 0;
+    if !message_raised {
+        return;
+    }
+    let Some(id) = game.message.id else {
+        return;
+    };
+    if let Some(filtered) = lua.filter_message(game, u16::from(id))
+        && let Ok(filtered) = u8::try_from(filtered)
+    {
+        game.message.id = Some(filtered);
+    }
 }
 
 /// The interactive gameplay loop shared by `--room` and the app's Play mode.
@@ -544,6 +634,9 @@ struct GameSession {
     save_screen: Option<ui::save_load::SaveLoadScreen>,
     /// Where `savedat*.dat` slot files live for this session.
     save_dir: PathBuf,
+    /// The pack's sandboxed Lua hooks, when it ships any: one VM per session,
+    /// called on room entry and after every fixed tick.
+    lua: Option<lua::LuaVm>,
     framebuffer: Framebuffer,
     titled_cut: usize,
     transition: Option<TransitionMode>,
@@ -703,6 +796,7 @@ impl GameSession {
             file_assets: None,
             save_screen: None,
             save_dir: save_dir.to_path_buf(),
+            lua: load_lua(pack),
             framebuffer: Framebuffer::new(),
             titled_cut: usize::MAX,
             transition: None,
@@ -727,6 +821,9 @@ impl GameSession {
         }
         start_pending_events(&mut self.game, &mut self.event_vm);
         self.game.apply_room_edits(&mut self.loaded.room);
+        // The Lua room-entry hook runs once the room state exists (RDT, init
+        // script and room edits applied) and before the first tick's movement.
+        call_lua_room_load(self.lua.as_ref(), &mut self.game, self.loaded.id);
         self.game.sync_player(&mut self.player);
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
@@ -817,6 +914,7 @@ impl GameSession {
             input
         };
 
+        let message_before = self.game.message.menu_choice_id() & 0x80 != 0;
         let transition = tick_room(
             &mut self.command_vm,
             &mut self.event_vm,
@@ -830,6 +928,9 @@ impl GameSession {
             },
             input,
         );
+        // The Lua hooks run after the room tick: `on_tick` sees the whole
+        // tick's state and `on_message` may rewrite a message the tick raised.
+        run_lua_tick_hooks(self.lua.as_ref(), &mut self.game, message_before);
         // A typewriter runs its save prompt; the item-box overlay opens when
         // the lid has settled (`MSF_MENU_MODE_ITEMBOX`). The interaction is
         // consumed so the next probe has to fire again.
@@ -2294,10 +2395,22 @@ pub fn run_ui_with_voice(
     character: u8,
     voice: Option<&Path>,
 ) -> Result<()> {
-    run_ui_with_voice_and_movie(pack, screen, capture, save_dir, character, voice, None)
+    run_ui_with_voice_and_movie(
+        pack,
+        screen,
+        capture,
+        save_dir,
+        character,
+        voice,
+        None,
+        &[],
+        false,
+    )
 }
 
-/// [`run_ui_with_voice`] with an explicit movie-pack path.
+/// [`run_ui_with_voice`] with an explicit movie-pack path and the runtime
+/// layers; `mods`/`no_mods` behave exactly like [`open_game_pack`].
+#[allow(clippy::too_many_arguments)]
 pub fn run_ui_with_voice_and_movie(
     pack: &Path,
     screen: &str,
@@ -2306,9 +2419,11 @@ pub fn run_ui_with_voice_and_movie(
     character: u8,
     voice: Option<&Path>,
     movie: Option<&Path>,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
     let boot = match screen {
-        "font" => return run_font_ui(pack, capture),
+        "font" => return run_font_ui(pack, capture, mods, no_mods),
         "title" => AppBoot::Title,
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
@@ -2325,7 +2440,7 @@ pub fn run_ui_with_voice_and_movie(
             )
         }
     };
-    run_ui_impl(pack, boot, capture, save_dir, voice, movie)
+    run_ui_impl(pack, boot, capture, save_dir, voice, movie, mods, no_mods)
 }
 
 /// The interactive root boot: the two logos, the title's opening film and the
@@ -2337,11 +2452,23 @@ pub fn run_root_with_voice_and_movie(
     save_dir: &Path,
     voice: Option<&Path>,
     movie: Option<&Path>,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
-    run_ui_impl(pack, AppBoot::Boot, capture, save_dir, voice, movie)
+    run_ui_impl(
+        pack,
+        AppBoot::Boot,
+        capture,
+        save_dir,
+        voice,
+        movie,
+        mods,
+        no_mods,
+    )
 }
 
 /// The shared body of the `--ui` boot and the interactive root boot.
+#[allow(clippy::too_many_arguments)]
 fn run_ui_impl(
     pack: &Path,
     boot: AppBoot,
@@ -2349,12 +2476,14 @@ fn run_ui_impl(
     save_dir: &Path,
     voice: Option<&Path>,
     movie: Option<&Path>,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
     let voice_path = voice_pack_path(pack, voice);
     let movie_path = movie_pack_path(pack, movie);
 
     if let Some(capture_path) = capture {
-        let pack = Pack::open(pack)?;
+        let pack = open_game_pack(pack, mods, no_mods)?;
         let mut app = App::new(
             pack,
             save_dir.to_path_buf(),
@@ -2417,7 +2546,7 @@ fn run_ui_impl(
         return app.capture(capture_path);
     }
 
-    let pack = Pack::open(pack)?;
+    let pack = open_game_pack(pack, mods, no_mods)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), voice_path, movie_path, true);
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
@@ -2470,6 +2599,7 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
 /// frame and writes it, so the BMP is deterministic. Interactive playback uses
 /// the app's mode machine, so a real device drives the audio-led clock, a
 /// skippable film ends on a button and the app quits when the film finishes.
+#[allow(clippy::too_many_arguments)]
 pub fn run_fmv(
     pack: &Path,
     movie: Option<&Path>,
@@ -2477,11 +2607,13 @@ pub fn run_fmv(
     character: u8,
     capture: Option<&Path>,
     ticks: u32,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
     let movie_path = movie_pack_path(pack, movie);
     let save_dir = save::default_save_dir_for_pack(pack);
     if let Some(capture_path) = capture {
-        let pack = Pack::open(pack)?;
+        let pack = open_game_pack(pack, mods, no_mods)?;
         let film_pack = match &movie_path {
             Some(path) => Some(
                 Pack::open(path)
@@ -2502,7 +2634,7 @@ pub fn run_fmv(
         return display.capture(capture_path);
     }
 
-    let pack = Pack::open(pack)?;
+    let pack = open_game_pack(pack, mods, no_mods)?;
     let mut app = App::new(pack, save_dir, None, movie_path, true);
     let session = {
         let source = app.movie_pack.open("movie").unwrap_or(&app.pack);
@@ -2522,6 +2654,7 @@ pub fn run_fmv(
 /// capture advances `ticks` fixed 30 Hz ticks over the chain and writes the
 /// current frame; interactive playback quits when the chain ends. The RESULT
 /// screen, the epilogue and the next-cycle save are not part of this path.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ending(
     pack: &Path,
     movie: Option<&Path>,
@@ -2529,6 +2662,8 @@ pub fn run_ending(
     character: u8,
     capture: Option<&Path>,
     ticks: u32,
+    mods: &[PathBuf],
+    no_mods: bool,
 ) -> Result<()> {
     let films = ending::chain(id, character, false, false);
     if films.is_empty() {
@@ -2536,7 +2671,7 @@ pub fn run_ending(
     }
     let movie_path = movie_pack_path(pack, movie);
     let save_dir = save::default_save_dir_for_pack(pack);
-    let pack = Pack::open(pack)?;
+    let pack = open_game_pack(pack, mods, no_mods)?;
     let mut app = App::new(pack, save_dir, None, movie_path, capture.is_none());
     let chain: Vec<(u8, u8)> = films.iter().map(|&film| (film, character)).collect();
     if app.play_film_chain(chain, None)? == AppFlow::Quit {
@@ -2552,8 +2687,13 @@ pub fn run_ending(
 }
 
 /// The `--ui font` screen.
-fn run_font_ui(pack_path: &Path, capture: Option<&Path>) -> Result<()> {
-    let pack = Pack::open(pack_path)?;
+fn run_font_ui(
+    pack_path: &Path,
+    capture: Option<&Path>,
+    mods: &[PathBuf],
+    no_mods: bool,
+) -> Result<()> {
+    let pack = open_game_pack(pack_path, mods, no_mods)?;
     let bytes = pack
         .read("font/font.tim")
         .context("the pack has no font/font.tim (re-run convert-game)")?;
@@ -3443,6 +3583,8 @@ fn simulate_loaded_with(
 ) -> Result<SimulatedRoom> {
     let id = loaded.id;
     run_room_init(&mut loaded, &mut game);
+    let lua = load_lua(pack);
+    call_lua_room_load(lua.as_ref(), &mut game, id);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
     // Match the engine's room boot: the per-room BGM state machine runs after
@@ -3478,6 +3620,7 @@ fn simulate_loaded_with(
             }
             continue;
         }
+        let message_before = game.message.menu_choice_id() & 0x80 != 0;
         tick_room(
             &mut command_vm,
             &mut event_vm,
@@ -3491,6 +3634,7 @@ fn simulate_loaded_with(
             },
             input(tick),
         );
+        run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
         play_snd3d_requests(
             &mut no_mixer,
             &mut snd3d_cache,
@@ -8145,6 +8289,98 @@ mod tests {
         assert!(session.transition.is_none());
     }
 
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_transition_reruns_on_room_load_for_the_destination() {
+        use crate::manifest;
+
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        let manifest = manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("base".to_string()),
+            lua: vec!["lua/rooms.lua".to_string()],
+            ..manifest::Manifest::base("demo")
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        writer
+            .add(&a.rdt_entry(), synthetic_rdt(&door_init()))
+            .unwrap();
+        writer
+            .add(&b.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
+        writer
+            .add(
+                "lua/rooms.lua",
+                "\
+function on_room_load(api)
+    if api:room() == \"100\" then api:flag_set(0, 5, true) end
+    if api:room() == \"101\" then api:flag_set(0, 6, true) end
+end
+"
+                .as_bytes()
+                .to_vec(),
+            )
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        assert!(session.game.flags[0].bit(5), "the source room loaded");
+        assert!(!session.game.flags[0].bit(6));
+        session.player.pos = [-450, 0, 250];
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+
+        for _ in 0..10 {
+            session
+                .tick(
+                    &pack,
+                    UiInput::default(),
+                    player::Input {
+                        action_pressed: true,
+                        action_held: true,
+                        ..player::Input::default()
+                    },
+                    true,
+                )
+                .unwrap();
+            if session.transition.is_some() {
+                break;
+            }
+        }
+        assert!(session.transition.is_some(), "the door never opened");
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, false);
+            if session.transition_finished {
+                break;
+            }
+        }
+        session.finish_transition(&pack);
+
+        assert_eq!(session.loaded.id, b);
+        assert!(
+            session.game.flags[0].bit(6),
+            "the destination's on_room_load ran again"
+        );
+    }
+
     /// A pack with one synthetic room, its cut background and a 64-entry
     /// global message table whose entries all wait for input.
     fn message_pack(dir: &TempDir) -> PathBuf {
@@ -9918,6 +10154,93 @@ mod tests {
         let plain_run = simulate_room(&plain, id, 1, player::Input::default()).unwrap();
         assert_eq!(plain_run.script_source, ScriptSource::Rdt);
         assert!(!plain_run.game.flag_test(0, 1, false));
+        assert_eq!(plain_run.frame.rgba, run.frame.rgba);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn simulate_room_runs_the_lua_hooks_without_changing_the_frame() {
+        use crate::manifest;
+
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let override_container = scd::asm::assemble(
+            "\
+.version 1
+
+.init
+
+.main
+.block
+    message                 0, 0
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+
+        // The hook sets a room-entry flag, grants an item on tick 2 and
+        // rewrites the raised message's id.
+        let source = r#"
+function on_room_load(api)
+    api:flag_set(0, 4, true)
+end
+
+function on_tick(api, tick)
+    if tick >= 2 then
+        api:give_item(0x44)
+    end
+end
+
+function on_message(api, id)
+    return id + 1
+end
+"#;
+        let manifest = manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("base".to_string()),
+            lua: vec!["lua/demo.lua".to_string()],
+            ..manifest::Manifest::base("demo")
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer
+            .add(&id.scd_entry(), override_container.clone())
+            .unwrap();
+        writer
+            .add("lua/demo.lua", source.as_bytes().to_vec())
+            .unwrap();
+        let lua_pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let run = simulate_room(&lua_pack, id, 3, player::Input::default()).unwrap();
+        assert!(run.game.flags[0].bit(4), "on_room_load set its flag");
+        assert!(
+            run.game.item_count(0x44) >= 1,
+            "on_tick granted the item from tick 2"
+        );
+        assert_eq!(
+            run.game.message.id,
+            Some(1),
+            "on_message rewrote the raised id"
+        );
+
+        // A Lua-less pack with the same override renders the identical frame.
+        let mut plain = PackWriter::new();
+        plain
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        plain.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        plain.add(&id.scd_entry(), override_container).unwrap();
+        let plain_pack = Pack::from_bytes(plain.to_bytes().unwrap()).unwrap();
+        let plain_run = simulate_room(&plain_pack, id, 3, player::Input::default()).unwrap();
+        assert!(!plain_run.game.flags[0].bit(4));
+        assert_eq!(plain_run.game.message.id, Some(0));
         assert_eq!(plain_run.frame.rgba, run.frame.rgba);
     }
 }

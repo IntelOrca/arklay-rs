@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use arklay::convert;
-use arklay::engine::{NEW_GAME_ROOM_ITEMS, simulate_room, simulate_room_seeded};
+use arklay::engine::{NEW_GAME_ROOM_ITEMS, ScriptSource, simulate_room, simulate_room_seeded};
 use arklay::game::FlagBank;
 use arklay::manifest;
 use arklay::pack::{Pack, PackWriter};
@@ -393,6 +393,185 @@ fn rider_opcodes_execute_without_placeholders() {
         }
     }
     assert!(simulated > 300, "the corpus should run, saw {simulated}");
+}
+
+/// Build the checked-in demo sources through the `arklay mod build` binary.
+fn build_demo_pack(dir: &std::path::Path) -> PathBuf {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mods/demo");
+    let out = dir.join("demo.akpak");
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_arklay"))
+        .arg("mod")
+        .arg("build")
+        .arg(&source)
+        .arg("--out")
+        .arg(&out)
+        .status()
+        .expect("failed to run arklay mod build");
+    assert!(status.success(), "arklay mod build failed");
+    out
+}
+
+/// Run the runtime capture CLI and return the written BMP bytes.
+fn capture(
+    pack: &std::path::Path,
+    mods: &[&std::path::Path],
+    no_mods: bool,
+    out: &PathBuf,
+) -> Vec<u8> {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_arklay"));
+    command.arg(pack);
+    for layer in mods {
+        command.arg("--mod").arg(layer);
+    }
+    if no_mods {
+        command.arg("--no-mods");
+    }
+    command
+        .args(["--room", "100", "--ticks", "40", "--capture"])
+        .arg(out);
+    let status = command.status().expect("failed to run the capture CLI");
+    assert!(status.success(), "capture failed");
+    fs::read(out).unwrap()
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn demo_pack_boots_room_1000_with_the_script_lua_and_background() {
+    // `--room 100` is RDT 1000: the three-digit CLI id is stage 1, room 0x00.
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let base = Pack::open(&pack_path).unwrap();
+    let temp = TempDir::new("demo");
+    let demo_pack = build_demo_pack(&temp.path);
+    let built = Pack::open(&demo_pack).unwrap();
+    assert_eq!(built.len(), 4, "manifest, script, hooks and background");
+    assert_eq!(built.manifest().unwrap().id, "demo");
+    assert_eq!(built.manifest().unwrap().base.as_deref(), Some("re1"));
+
+    // The replacement background is the demo's own art.
+    assert_ne!(
+        built.read("roomcut/100_000.bmp").unwrap(),
+        base.read("roomcut/100_000.bmp").unwrap()
+    );
+
+    let layered = Pack::open_layered(&pack_path, std::slice::from_ref(&demo_pack)).unwrap();
+    let id = RoomId::parse("1000").unwrap();
+    let run = simulate_room(&layered, id, 40, player::Input::default()).unwrap();
+    assert_eq!(run.script_source, ScriptSource::Override);
+    assert!(run.game.flags[0].bit(1), "the demo init set its flag");
+    assert!(run.game.flags[0].bit(2), "on_room_load set its flag");
+    assert!(run.game.flags[0].bit(3), "the event ran");
+    assert_eq!(
+        run.game.message.id,
+        Some(0),
+        "the main script raised a message"
+    );
+    assert!(
+        run.game.item_count(0x0F) >= 1,
+        "on_tick granted the demo item"
+    );
+    for op in [0x2Cu8, 0x44, 0x4C] {
+        assert!(
+            !run.game.placeholders.contains_key(&op),
+            "rider {op:#04x} is implemented"
+        );
+    }
+
+    // The headless runs are deterministic, and the replacement background
+    // reaches the frame: the demo frame differs from a vanilla one.
+    let repeat = simulate_room(&layered, id, 40, player::Input::default()).unwrap();
+    assert_eq!(run.frame.rgba, repeat.frame.rgba);
+    let vanilla = simulate_room(&base, id, 40, player::Input::default()).unwrap();
+    assert_ne!(run.frame.rgba, vanilla.frame.rgba);
+
+    // The same acceptance through the CLI's `--capture`: deterministic with
+    // `--mod`, and `--no-mods` gives today's vanilla capture byte-for-byte.
+    let demo_first = temp.path.join("demo-first.bmp");
+    let demo_second = temp.path.join("demo-second.bmp");
+    let base_bmp = temp.path.join("base.bmp");
+    let no_mods_bmp = temp.path.join("no-mods.bmp");
+    let first = capture(&pack_path, &[&demo_pack], false, &demo_first);
+    let second = capture(&pack_path, &[&demo_pack], false, &demo_second);
+    let plain = capture(&pack_path, &[], false, &base_bmp);
+    let ignored = capture(&pack_path, &[&demo_pack], true, &no_mods_bmp);
+    assert_eq!(first, second, "the demo capture is deterministic");
+    assert_ne!(first, plain, "the background override changed the frame");
+    assert_eq!(ignored, plain, "--no-mods ignores every layer");
+    assert_eq!(fs::read(&demo_first).unwrap(), first);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn corpus_audit_runs_with_and_without_the_demo_layer() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let temp = TempDir::new("corpus-demo");
+    let demo_pack = build_demo_pack(&temp.path);
+    let layered = Pack::open_layered(&pack_path, std::slice::from_ref(&demo_pack)).unwrap();
+
+    let mut plain_runs = 0usize;
+    let mut layered_runs = 0usize;
+    for id in room_ids(&pack) {
+        if simulate_room(&pack, id, 5, player::Input::default()).is_ok() {
+            plain_runs += 1;
+        }
+        if simulate_room(&layered, id, 5, player::Input::default()).is_ok() {
+            layered_runs += 1;
+        }
+    }
+    assert!(plain_runs > 300, "the corpus should run, saw {plain_runs}");
+    assert_eq!(
+        plain_runs, layered_runs,
+        "the demo layer must not stop a room from running"
+    );
+    println!("corpus audit: {plain_runs} rooms with and without the demo layer");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn pack_info_cli_prints_the_real_pack() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_arklay"))
+        .args(["pack", "info"])
+        .arg(&pack_path)
+        .output()
+        .expect("failed to run arklay pack info");
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.starts_with(&format!("pack: {}", pack_path.display())),
+        "{text}"
+    );
+    let pack = Pack::open(&pack_path).unwrap();
+    match pack.manifest() {
+        Some(manifest) => assert!(
+            text.contains(&format!("manifest: {} ({})", manifest.id, manifest.kind)),
+            "{text}"
+        ),
+        None => assert!(text.contains("manifest: none"), "{text}"),
+    }
+    assert!(text.contains("layers: 0"), "{text}");
+    assert!(
+        text.contains(&format!("{} entries, ", pack.len())),
+        "{text}"
+    );
+}
+
+#[test]
+#[ignore = "slow: builds the workspace without the default features"]
+fn no_default_features_builds_with_noop_hooks() {
+    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/no-default-check");
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["check", "--no-default-features", "--lib"])
+        .env("CARGO_TARGET_DIR", target)
+        .status()
+        .expect("failed to run cargo check");
+    assert!(status.success(), "the lean build must compile");
 }
 
 #[test]

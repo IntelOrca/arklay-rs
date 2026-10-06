@@ -16,6 +16,7 @@ pub mod font;
 pub mod game;
 pub mod items;
 pub mod ivm;
+pub mod lua;
 pub mod lzw;
 pub mod manifest;
 pub mod mask;

@@ -6,9 +6,19 @@ rust-version = "1.88"
 description = "A from-scratch engine for the classic Resident Evil games"
 license = "MIT"
 
+[features]
+default = ["lua"]
+# Sandboxed Lua 5.4 scripting hooks (an optional dependency, so a
+# `--no-default-features` build compiles every hook to a no-op).
+lua = ["dep:mlua"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+mlua = { version = "0.10", default-features = false, features = [
+    "lua54",
+    "vendored",
+], optional = true }
 sdl3-sys = { version = "0.7", default-features = false }
 
 [target.'cfg(windows)'.dependencies]

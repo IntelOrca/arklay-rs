@@ -16,9 +16,13 @@ and linked statically, so no separate DLL is needed.
 
 ```sh
 cargo build
+# A lean build with no Lua runtime (every hook is a no-op)
+cargo build --no-default-features
 ```
 
-## Usage (M0)
+Lua 5.4 is vendored and compiled from source by the default-on `lua` feature.
+
+## Usage
 
 ```sh
 # Convert an RE1 installation into a game pack (parallel across CPUs)
@@ -49,6 +53,38 @@ cargo run -- re1.akpak --ui menu --capture menu.bmp
 cargo run -- re1.akpak --ui box --capture box.bmp
 cargo run -- re1.akpak --ui file --capture file.bmp
 ```
+
+## Mods and authoring
+
+Packs layer. Any entry of a mod pack shadows the base pack's entry, including a
+whole-room `scd/{id}.scd` script override and `lua/**` hooks:
+
+```sh
+# Build the checked-in demo sources into a pack (no game assets included)
+cargo run -- mod build mods/demo --out demo.akpak
+
+# Layer it explicitly; --mod is repeatable, later load_order wins
+cargo run -- re1.akpak --mod demo.akpak --room 100 --ticks 40 --capture demo.bmp
+
+# A clean vanilla run: no --mod and no sibling mods/ discovery
+cargo run -- re1.akpak --no-mods --room 100
+
+# Every sibling mods/*.akpak applies automatically
+cargo run -- re1.akpak --room 100
+
+# Inspect a pack's manifest, layers and merged entries
+cargo run -- pack info re1.akpak --mod demo.akpak
+
+# Disassemble/reassemble a room's scripts
+cargo run -- scd export ROOM1000.RDT --out 1000.s
+cargo run -- scd build 1000.s --out scd/1000.scd
+```
+
+`docs/modding.md` documents the manifest grammar, the `.s` grammar, the mod
+source convention and the sandboxed Lua hook API; `docs/m15-deviations.md`
+records the deliberate limits (whole-room script replacement, sandbox,
+error/budget policy). A run without any layer stays byte-identical to a
+pre-M15 run, Lua or not.
 
 `convert-game` and `extract` report progress on stderr per phase (RDTs,
 camera cuts, BGM, player files, bytes written): one in-place line with

@@ -85,6 +85,14 @@ struct Cli {
     )]
     character: u8,
 
+    /// Mod pack layers to apply, repeatable (ignored with `--no-mods`)
+    #[arg(long = "mod", value_name = "PATH", requires = "pack")]
+    mods: Vec<PathBuf>,
+
+    /// Ignore the `--mod` layers and the sibling `mods/` directory
+    #[arg(long, requires = "pack")]
+    no_mods: bool,
+
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
@@ -189,6 +197,12 @@ enum Command {
         #[command(subcommand)]
         action: ModAction,
     },
+
+    /// Pack inspection tools
+    Pack {
+        #[command(subcommand)]
+        action: PackAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -206,6 +220,20 @@ enum ModAction {
         /// Base pack checking the declared base id and the override paths
         #[arg(long, value_name = "PATH")]
         base: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PackAction {
+    /// Print a pack's manifest, applied layers and merged entries
+    Info {
+        /// Game pack to read
+        #[arg(value_name = "PACK")]
+        pack: PathBuf,
+
+        /// Mod pack layers to apply, repeatable
+        #[arg(long = "mod", value_name = "PATH")]
+        mods: Vec<PathBuf>,
     },
 }
 
@@ -368,6 +396,64 @@ fn list_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+/// Write the `pack info` report: manifest, applied layers and merged entries.
+fn write_pack_info(pack_path: &Path, pack: &Pack, out: &mut impl Write) -> Result<()> {
+    writeln!(out, "pack: {}", pack_path.display())?;
+    match pack.manifest() {
+        Some(manifest) => {
+            writeln!(out, "manifest: {} ({})", manifest.id, manifest.kind)?;
+            writeln!(out, "  format: {}", manifest.format)?;
+            if let Some(name) = &manifest.name {
+                writeln!(out, "  name: {name}")?;
+            }
+            if let Some(version) = &manifest.version {
+                writeln!(out, "  version: {version}")?;
+            }
+            if let Some(engine) = &manifest.engine {
+                writeln!(out, "  engine: {engine}")?;
+            }
+            writeln!(out, "  rdt: {}", manifest.rdt_version)?;
+            writeln!(out, "  scd: {}", manifest.scd_version)?;
+            if !manifest.lua.is_empty() {
+                writeln!(out, "  lua: {}", manifest.lua.join(", "))?;
+            }
+        }
+        None => writeln!(out, "manifest: none")?,
+    }
+    let layers: Vec<&Pack> = pack.overrides().collect();
+    writeln!(out, "layers: {}", layers.len())?;
+    for (index, layer) in layers.iter().enumerate() {
+        let path = layer
+            .source()
+            .map_or_else(|| "<memory>".to_string(), |path| path.display().to_string());
+        match layer.manifest() {
+            Some(manifest) => writeln!(
+                out,
+                "  {index}: {path} (id {}, load_order {}, base {})",
+                manifest.id,
+                manifest.load_order,
+                manifest.base.as_deref().unwrap_or("-")
+            )?,
+            None => writeln!(out, "  {index}: {path}")?,
+        }
+    }
+    writeln!(out, "entries:")?;
+    let (count, bytes) = write_list(pack, out)?;
+    writeln!(out, "{count} entries, {bytes} bytes")?;
+    Ok(())
+}
+
+/// Print the `pack info` report for `pack_path` plus the `mods` layers.
+fn pack_info(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
+    let pack = open_game_pack(pack_path, mods)?;
+    for warning in pack.warnings() {
+        eprintln!("warning: {warning}");
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    write_pack_info(pack_path, &pack, &mut out)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -416,6 +502,9 @@ fn main() -> Result<()> {
         Some(Command::Mod { action }) => match action {
             ModAction::Build { dir, out, base } => build_mod_pack(&dir, &out, base.as_deref()),
         },
+        Some(Command::Pack { action }) => match action {
+            PackAction::Info { pack, mods } => pack_info(&pack, &mods),
+        },
         None => {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
@@ -431,6 +520,8 @@ fn main() -> Result<()> {
                     cli.character,
                     cli.capture.as_deref(),
                     cli.ticks,
+                    &cli.mods,
+                    cli.no_mods,
                 );
             }
             if let Some(id) = cli.fmv {
@@ -441,6 +532,8 @@ fn main() -> Result<()> {
                     cli.character,
                     cli.capture.as_deref(),
                     cli.ticks,
+                    &cli.mods,
+                    cli.no_mods,
                 );
             }
             if let Some(screen) = cli.ui {
@@ -452,6 +545,8 @@ fn main() -> Result<()> {
                     cli.player,
                     cli.voice.as_deref(),
                     cli.movie.as_deref(),
+                    &cli.mods,
+                    cli.no_mods,
                 );
             }
             if let Some(room) = cli.room {
@@ -463,6 +558,8 @@ fn main() -> Result<()> {
                     cli.ticks,
                     cli.voice.as_deref(),
                     cli.movie.as_deref(),
+                    &cli.mods,
+                    cli.no_mods,
                 );
             }
             // No room and no `--ui`: boot the app root, whose interactive run
@@ -474,6 +571,8 @@ fn main() -> Result<()> {
                 &save_dir,
                 cli.voice.as_deref(),
                 cli.movie.as_deref(),
+                &cli.mods,
+                cli.no_mods,
             )
         }
     }
@@ -651,5 +750,163 @@ mod tests {
         assert_eq!(scripts.main[0].insns[0].bytes, [0x0E, 0x00]);
         assert_eq!(scripts.events.len(), 1);
         assert_eq!(scripts.events[0].insns[0].bytes, [0xFF]);
+    }
+
+    #[test]
+    fn pack_info_reports_the_manifest_layers_and_merged_entries() {
+        use arklay::manifest;
+
+        let dir = TempDir::new("pack-info");
+        let base_path = dir.path.join("base.akpak");
+        let mod_path = dir.path.join("demo.akpak");
+
+        let base_manifest = manifest::Manifest {
+            name: Some("Base".to_string()),
+            version: Some("1.0".to_string()),
+            engine: Some("arklay test".to_string()),
+            ..manifest::Manifest::base("re1")
+        };
+        let mut base = PackWriter::new();
+        base.add(manifest::ENTRY, base_manifest.render().into_bytes())
+            .unwrap();
+        base.add("room/1000.rdt", b"base".to_vec()).unwrap();
+        base.write(&base_path).unwrap();
+
+        let mod_manifest = manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("re1".to_string()),
+            load_order: 7,
+            lua: vec!["lua/demo.lua".to_string()],
+            ..manifest::Manifest::base("demo")
+        };
+        let mut layer = PackWriter::new();
+        layer
+            .add(manifest::ENTRY, mod_manifest.render().into_bytes())
+            .unwrap();
+        layer.add("lua/demo.lua", b"return 1".to_vec()).unwrap();
+        layer.write(&mod_path).unwrap();
+
+        let pack = open_game_pack(&base_path, std::slice::from_ref(&mod_path)).unwrap();
+        let mut out = Vec::new();
+        write_pack_info(&base_path, &pack, &mut out).unwrap();
+        let lua_size = 8;
+        let manifest_size = mod_manifest.render().len();
+        let bytes = lua_size + manifest_size + 4;
+        let expected = format!(
+            "\
+pack: {base}
+manifest: re1 (base)
+  format: 1
+  name: Base
+  version: 1.0
+  engine: arklay test
+  rdt: re1
+  scd: re1
+layers: 1
+  0: {mod_path} (id demo, load_order 7, base re1)
+entries:
+{lua_size:>12} lua/demo.lua
+{manifest_size:>12} manifest.toml
+{room_size:>12} room/1000.rdt
+3 entries, {bytes} bytes
+",
+            base = base_path.display(),
+            mod_path = mod_path.display(),
+            room_size = 4,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
+    }
+
+    #[test]
+    fn pack_info_reports_a_manifest_less_pack() {
+        let dir = TempDir::new("pack-info-bare");
+        let pack_path = dir.path.join("re1.akpak");
+        let pack = sample_pack(&pack_path);
+        let mut out = Vec::new();
+        write_pack_info(&pack_path, &pack, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("manifest: none"), "{text}");
+        assert!(text.contains("layers: 0"), "{text}");
+        assert!(text.contains("2 entries, 15 bytes"), "{text}");
+    }
+
+    #[test]
+    fn the_cli_accepts_the_runtime_mod_flags() {
+        let cli = Cli::try_parse_from([
+            "arklay",
+            "game.akpak",
+            "--room",
+            "100",
+            "--mod",
+            "a.akpak",
+            "--mod",
+            "b.akpak",
+            "--no-mods",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.mods,
+            [PathBuf::from("a.akpak"), PathBuf::from("b.akpak")]
+        );
+        assert!(cli.no_mods);
+        assert_eq!(cli.room.as_deref(), Some("100"));
+
+        // The subcommands keep their own `--mod` flags.
+        let list =
+            Cli::try_parse_from(["arklay", "list", "game.akpak", "--mod", "x.akpak"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Command::List { mods, .. }) if mods == [PathBuf::from("x.akpak")]
+        ));
+    }
+
+    #[test]
+    fn runtime_layer_set_discovers_siblings_and_honours_no_mods() {
+        use arklay::manifest;
+        use arklay::pack::Pack;
+
+        let dir = TempDir::new("runtime-layers");
+        let game_dir = dir.path.join("game");
+        fs::create_dir_all(game_dir.join("mods")).unwrap();
+        let pack_path = game_dir.join("re1.akpak");
+
+        let mut base = PackWriter::new();
+        base.add(
+            manifest::ENTRY,
+            manifest::Manifest::base("re1").render().into_bytes(),
+        )
+        .unwrap();
+        base.add("room/1000.rdt", b"base".to_vec()).unwrap();
+        base.write(&pack_path).unwrap();
+
+        let mod_path = game_dir.join("mods/demo.akpak");
+        let mod_manifest = manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("re1".to_string()),
+            load_order: 10,
+            ..manifest::Manifest::base("demo")
+        };
+        let mut layer = PackWriter::new();
+        layer
+            .add(manifest::ENTRY, mod_manifest.render().into_bytes())
+            .unwrap();
+        layer.add("room/1000.rdt", b"layer".to_vec()).unwrap();
+        layer.write(&mod_path).unwrap();
+
+        // The sibling directory is discovered.
+        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false).unwrap();
+        assert!(discovered.is_layered());
+        assert_eq!(discovered.read("room/1000.rdt").unwrap(), b"layer");
+
+        // `--no-mods` ignores both the discovery and an explicit `--mod`.
+        let vanilla =
+            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true)
+                .unwrap();
+        assert!(!vanilla.is_layered());
+        assert_eq!(vanilla.read("room/1000.rdt").unwrap(), b"base");
+        assert_eq!(
+            vanilla.paths().collect::<Vec<_>>(),
+            Pack::open(&pack_path).unwrap().paths().collect::<Vec<_>>()
+        );
     }
 }
