@@ -23,6 +23,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "==> cargo check --no-default-features"
 cargo check --no-default-features
 
+echo "==> cargo check --manifest-path fuzz/Cargo.toml"
+cargo check --manifest-path fuzz/Cargo.toml
+
 echo "==> cargo test (debug)"
 cargo test
 

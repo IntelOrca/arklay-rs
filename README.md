@@ -159,8 +159,10 @@ lists every approximation M16 leaves.
 - CI gates those commands on Linux and Windows plus a 1.88 MSRV check, and
   uploads `arklay-linux-x86_64.tar.gz` and `arklay-windows-x86_64.zip`
   artifacts (binary, README, LICENSE). A scheduled, non-gating fuzz workflow
-  runs every `fuzz/` target for 60 seconds when the fuzz package is present:
-  `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=60`.
+  runs every `fuzz/` target for 300 seconds:
+  `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=300`; the
+  stable compile gate `cargo check --manifest-path fuzz/Cargo.toml` runs in
+  `scripts/check.sh` and CI.
 - A full-game soak (`tests/soak_real.rs`, ignored) walks every RDT with
   transitions and save round-trips under memory and wall-clock ceilings:
   `ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... cargo test --release --test

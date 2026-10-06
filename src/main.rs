@@ -106,7 +106,7 @@ struct Cli {
     /// Print a frame-time report after the run: per-tick min/avg/p95/max, the
     /// load/update/effect/render phase totals and the entity/effect high-water
     /// marks. Requires `--ticks`; a `--capture` is not needed.
-    #[arg(long, requires = "ticks", conflicts_with = "ui")]
+    #[arg(long, requires = "ticks", conflicts_with_all = ["ui", "ending", "fmv"])]
     stats: bool,
 
     #[command(subcommand)]

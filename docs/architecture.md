@@ -21,6 +21,7 @@ responsibility.
 | Module | Owner | Responsibility |
 |---|---|---|
 | `pack` | Container | `.akpak` v1 reader/writer, layered mod packs, entry lookup, atomic `PackWriter::write` |
+| `budget` | Container | Fixed per-format decode caps and checked allocation shared by every parser |
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
 | `convert` | Tooling | `convert-game`: discover an install and migrate every asset category into packs (main, voice, movie) |
@@ -154,9 +155,9 @@ claims about the original.
 | `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
 | `manifest.toml` | `manifest::Manifest::parse` | line/key/value length caps | `manifest` unit tests, `tests/torture`, `fuzz/manifest` |
 | RDT room | `rdt::parse` | section counts bounded by remaining bytes; `MAX_RECORDS` | `rdt` unit tests, `tests/m16_game_real.rs`, `tests/soak_real.rs`, `tests/torture`, `fuzz/rdt` |
-| SCD scripts | `scd::reader::parse` | instructions/events per block bounded by block size | `scd` unit tests, `fuzz/scd` |
-| SCD assembler | `scd::asm::assemble` | input size, line count, `MAX_LZW_OUTPUT`-class output cap | `scd` unit tests, `tests/cli.rs`, `fuzz/scd_asm` |
-| `.dor` door | `door::parse` | bytecode bounded by input; `MAX_RECORDS` | `door` unit tests, `tests/torture`, `tests/doors_scan.rs` |
+| SCD scripts | `scd::reader::parse` | instructions per block, `MAX_SCD_EVENTS` event-table cap | `scd` unit tests, `fuzz/scd` |
+| SCD assembler | `scd::asm::assemble` | input size, line count, `MAX_ASM_OUTPUT` (64 MiB) | `scd` unit tests, `tests/cli.rs`, `fuzz/scd_asm` |
+| `.dor` door | `door::parse` | bytecode bounded by input; `MAX_SCRIPTS` | `door` unit tests, `tests/torture`, `fuzz/dor`, `tests/doors_scan.rs` |
 | TIM | `tim::decode`, `decode_8bpp`, `decode_4bpp` | `MAX_PIXELS` (4096x4096), CLUT entry cap, `budget::alloc` | `tim` unit tests, `tests/torture`, `fuzz/tim` |
 | TMD | `tmd::parse` | objects/vertices/normals/primitives, `try_reserve_exact` | `tmd` unit tests, `fuzz/tmd` |
 | EMD/EMW | `emd::parse`, `parse_emw`, `parse_room_anim` | skeletons/keyframes/clips | `emd` unit tests, `fuzz/emd` |
@@ -219,7 +220,7 @@ These hold across every milestone and are the regression gate:
   `cargo test --release --test perf_real -- --ignored --nocapture`;
   `ARKLAY_PERF_BUDGET_MS=<ms>` overrides the per-tick p95 budget.
 - Fuzzing (nightly, separate package):
-  `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=60`.
+  `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=300`.
   The stable compile gate is `cargo check --manifest-path fuzz/Cargo.toml`.
 - The mirror of the CI gate: `./scripts/check.sh` (add `--full` to include the
   ignored suite when the asset variables are set).
@@ -228,4 +229,5 @@ CI runs fmt, clippy `--all-targets --all-features -D warnings`, debug and
 release tests, the `--no-default-features` check, the doc build and the Linux
 artifact smoke on Ubuntu; tests and the release artifact on Windows; and a
 `cargo check --all-features` MSRV job on 1.88.0. A scheduled, non-gating fuzz
-workflow runs each target for 60 seconds.
+workflow runs each target for 300 seconds, and the fuzz package's stable
+compile gate runs in CI and `scripts/check.sh`.

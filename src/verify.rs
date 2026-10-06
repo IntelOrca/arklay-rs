@@ -4,12 +4,14 @@
 //! The classifier is path-driven: a pack path prefix or extension selects the
 //! parser the engine would use for that entry. An entry whose format is not in
 //! the table is *opaque*: it is counted and never fails, so a pack carrying a
-//! future or third-party asset cannot break the command. `--strict` turns an
-//! opaque entry into a failure.
+//! future or third-party asset cannot break the command. That includes a
+//! `text/*.bin` name with no table parser and a `room/*.rdt` whose stem is not
+//! a four-digit room id. `--strict` turns an opaque entry into a failure.
 //!
-//! For every RDT the command also checks that each camera cut's background
-//! (`roomcut/{room}_{camera:03}.bmp`) is present in the merged pack, so a pack
-//! whose rooms reference missing art fails even when every present entry
+//! For every RDT the command checks that the room has at least one camera
+//! cut, that each cut's background (`roomcut/{room}_{camera:03}.bmp`) is
+//! present in the merged pack, and that the embedded init/main/event scripts
+//! parse, so a room the engine cannot load fails even when every present entry
 //! parses.
 //!
 //! No failure aborts the walk: the report lists every failing path with its
@@ -106,13 +108,28 @@ pub fn classify(path: &str) -> Format {
         return Format::BioCard;
     }
     if lower.starts_with("room/") && lower.ends_with(".rdt") {
-        return Format::Rdt;
+        return match lower
+            .strip_prefix("room/")
+            .and_then(|rest| rest.strip_suffix(".rdt"))
+        {
+            Some(stem) if stem.len() == 4 && RoomId::parse(stem).is_ok() => Format::Rdt,
+            // A non-four-digit name is not a room the loader can ever ask for,
+            // so it stays opaque rather than failing third-party packs.
+            _ => Format::Opaque,
+        };
     }
     if lower.starts_with("scd/") && lower.ends_with(".scd") {
         return Format::Scd;
     }
     if lower.starts_with("text/") && lower.ends_with(".bin") {
-        return Format::Text;
+        let name = lower.rsplit('/').next().unwrap_or(&lower);
+        return if known_text_table(name) {
+            Format::Text
+        } else {
+            // A future or third-party `text/*.bin` table has no parser; count
+            // it opaque so it cannot break the command.
+            Format::Opaque
+        };
     }
     if lower.starts_with("roomcut/") && lower.ends_with(".bmp") {
         return Format::Cut;
@@ -134,6 +151,17 @@ pub fn classify(path: &str) -> Format {
         Some((_, "avi")) => Format::Avi,
         _ => Format::Opaque,
     }
+}
+
+/// Whether a `text/*.bin` file name has a table parser.
+///
+/// The classifier uses this list, so an unrecognized table name never reaches
+/// the `Text` arm.
+fn known_text_table(name: &str) -> bool {
+    matches!(
+        name,
+        "messages.bin" | "idesc.bin" | "names.bin" | "unknown.bin" | "save.bin"
+    )
 }
 
 /// Per-format counters in the report.
@@ -277,10 +305,27 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
         Format::Rdt => {
             let id = room_id_from_path(path)?;
             let room = crate::rdt::parse(data, id)?;
+            // The engine refuses a room with no camera cuts, so verification
+            // must reject it too.
+            if room.cuts.is_empty() {
+                bail!("room has no camera cuts");
+            }
             for cut in &room.cuts {
                 let cut_path = id.cut_entry(cut.index);
                 if !pack.contains(&cut_path) {
                     bail!("RDT references missing background {cut_path}");
+                }
+            }
+            // The engine prefers a standalone `scd/{id}.scd` override and only
+            // falls back to the RDT's embedded scripts, so a corrupt embedded
+            // table is not a failure when the merged pack carries an override
+            // the reader accepts.
+            match pack.read(&id.scd_entry()) {
+                Ok(bytes) => {
+                    crate::scd::reader::parse(bytes).context("invalid SCD override")?;
+                }
+                Err(_) => {
+                    crate::scd::reader::parse(data).context("invalid room SCD scripts")?;
                 }
             }
         }
@@ -428,10 +473,84 @@ mod tests {
         assert_eq!(classify("door/door00.dor"), Format::Dor);
         assert_eq!(classify("se/a_mcn03.wav"), Format::Wav);
         assert_eq!(classify("text/messages.bin"), Format::Text);
+        assert_eq!(classify("text/save.bin"), Format::Text);
         assert_eq!(classify("map/tables.bin"), Format::MapTables);
         assert_eq!(classify("data/bio_card.dat"), Format::BioCard);
         assert_eq!(classify("movie/00.avi"), Format::Avi);
         assert_eq!(classify("data/core00.esp"), Format::Opaque);
+        // A future text table or a room the loader can never request stays
+        // opaque instead of breaking the command.
+        assert_eq!(classify("text/credits.bin"), Format::Opaque);
+        assert_eq!(classify("room/bonus.rdt"), Format::Opaque);
+        assert_eq!(classify("room/100.rdt"), Format::Opaque);
+        assert_eq!(classify("room/zzzz.rdt"), Format::Opaque);
+    }
+
+    #[test]
+    fn future_text_tables_and_odd_room_names_are_opaque() {
+        let mut writer = PackWriter::new();
+        writer.add("text/credits.bin", vec![1, 2, 3]).unwrap();
+        writer.add("room/bonus.rdt", vec![1, 2, 3]).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let lenient = verify_pack(&pack, false);
+        assert!(lenient.valid());
+        assert_eq!(lenient.opaque, 2);
+        assert_eq!(lenient.failed, 0);
+        assert!(!lenient.formats.contains_key(&Format::Text));
+        assert!(!lenient.formats.contains_key(&Format::Rdt));
+
+        let strict = verify_pack(&pack, true);
+        assert!(!strict.valid());
+        assert_eq!(strict.failed, 2);
+        assert_eq!(strict.opaque, 2);
+    }
+
+    #[test]
+    fn a_room_without_camera_cuts_fails_like_the_engine() {
+        // Parses as an RDT and its (empty) SCD parses, but the engine refuses
+        // a room with no camera cuts on load.
+        let rdt = vec![0u8; 0x94];
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", rdt).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let report = verify_pack(&pack, false);
+
+        assert!(!report.valid());
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].error.contains("no camera cuts"),
+            "{}",
+            report.failures[0].error
+        );
+    }
+
+    #[test]
+    fn a_corrupt_script_pointer_fails_an_otherwise_loadable_rdt() {
+        // The room header and its camera parse and the background is present,
+        // but the event script pointer is out of bounds: the engine's SCD
+        // reader rejects the room on load, so verification must too.
+        let mut rdt = vec![0u8; 0x94];
+        rdt[0x01] = 1;
+        rdt.extend_from_slice(&[0u8; 44]);
+        let events = 0x48 + 8 * 4;
+        rdt[events..events + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", rdt).unwrap();
+        writer.add("roomcut/100_000.bmp", tiny_bmp()).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let report = verify_pack(&pack, false);
+
+        assert!(!report.valid(), "a corrupt script table must fail");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].path, "room/1000.rdt");
+        assert!(
+            report.failures[0].error.contains("event SCD table pointer"),
+            "{}",
+            report.failures[0].error
+        );
     }
 
     #[test]
@@ -523,6 +642,35 @@ mod tests {
             "{}",
             report.failures[0].error
         );
+    }
+
+    #[test]
+    fn an_scd_override_rescues_a_room_with_corrupt_embedded_scripts() {
+        // The RDT's embedded event pointer is corrupt, but the merged pack
+        // carries a valid standalone override: the engine loads the override,
+        // so verification must accept the room.
+        let mut rdt = vec![0u8; 0x94];
+        rdt[0x01] = 1;
+        rdt.extend_from_slice(&[0u8; 44]);
+        let events = 0x48 + 8 * 4;
+        rdt[events..events + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let mut scd = vec![0u8; 0x94];
+        let init = scd.len();
+        scd.extend_from_slice(&4u16.to_le_bytes());
+        scd.extend_from_slice(&[0x0E, 0x00]);
+        scd.extend_from_slice(&0u16.to_le_bytes());
+        scd[0x48 + 6 * 4..0x48 + 7 * 4].copy_from_slice(&(init as u32).to_le_bytes());
+
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", rdt).unwrap();
+        writer.add("roomcut/100_000.bmp", tiny_bmp()).unwrap();
+        writer.add("scd/1000.scd", scd).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let report = verify_pack(&pack, false);
+
+        assert!(report.valid(), "failures: {:?}", report.failures);
     }
 
     #[test]

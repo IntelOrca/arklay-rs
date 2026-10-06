@@ -25,7 +25,7 @@ workspace install (`/home/ted/openre/assets/re1`) and converted packs.
 | M14 FMV | AVI/Cinepak, `movie_on` hand-off, opening/ending flow | done |
 | M15 Mods and authoring | Manifest, layered packs, text-SCD assembler, Lua hooks, demo pack | done |
 | M16 Fidelity sweep | Exact fixed-point presentation, scripting/UI parity, harness leftovers | done |
-| M17 Hardening | Budgets, torture, fuzz, `verify`, atomic CLI, `--stats`, soak, CI, docs | this milestone |
+| M17 Hardening | Budgets, torture, fuzz, `verify`, atomic CLI, `--stats`, soak, CI, docs | done |
 
 Enemies, combat and the attract demo are explicitly out of scope so far; every
 deferred item is listed below or in the milestone deviations files.
@@ -41,7 +41,7 @@ pack: re1.akpak
 2541 entries, 408551500 bytes
 format       entries        ok    failed          bytes
 manifest           1         1         0            101
-rdt              348       348         0      107997096
+rdt              348       320        28      107997096
 roomcut          842       842         0      175695340
 roommask         601       601         0       29133338
 bmp               12        12         0        1784964
@@ -55,14 +55,19 @@ text               5         5         0           6581
 maptables          1         1         0             72
 biocard            1         1         0           1052
 opaque             2         2         0          57988
-verify: 2541 entries, 2541 ok, 0 failed, 2 opaque
+verify: 2541 entries, 2513 ok, 28 failed, 2 opaque
 ```
+
+The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
+whose header declares no camera cuts: the engine refuses them on load and the
+soak skips them, so `verify` reports them instead of green-lighting rooms the
+engine cannot load. Every other entry parses. The two opaque entries are
+`data/core00.esp` and `data/core00.etm`, the effect tables whose pair parser is
+not in the path classifier; `--strict` turns them into failures by design.
 
 The companion packs verify clean too: the voice pack (`re1.voice.akpak`, 517
 `wav` entries, 101,697,368 bytes) and the movie pack (`re1.movie.akpak`, 27
-`avi` entries, 251,624,740 bytes). The two opaque entries are
-`data/core00.esp` and `data/core00.etm`, the effect tables whose pair parser is
-not in the path classifier; `--strict` turns them into failures by design.
+`avi` entries, 251,624,740 bytes).
 
 ## Verification spine
 
@@ -72,23 +77,23 @@ not in the path classifier; `--strict` turns them into failures by design.
 | Movie decode goldens | `tests/m14_real.rs` (ignored) | present |
 | Deterministic captures/states/saves | M16 tests, `tests/save_real.rs`, soak round-trip | present |
 | Save round-trip | `tests/save_real.rs`, `tests/soak_real.rs`, synthetic M16 slice-10 test | present |
-| Stable torture matrix (>=10k mutated inputs) | `tests/torture.rs` (parallel budget slice) | scheduled for this milestone |
-| cargo-fuzz targets and seeds | `fuzz/` package (parallel fuzz slice) | scheduled for this milestone; `fuzz.yml` is gated on `fuzz/Cargo.toml` |
+| Stable torture matrix (>=10k mutated inputs) | `tests/torture.rs` (parallel budget slice) | present, 17 formats |
+| cargo-fuzz targets and seeds | `fuzz/` package (parallel fuzz slice) | present, 18 targets with committed synthetic seeds |
 | Scheduled fuzz workflow | `.github/workflows/fuzz.yml` | present, nightly, non-gating |
-| Decode budgets and memory ceilings | `src/budget.rs` (parallel budget slice), `tests/memory.rs` | scheduled for this milestone |
+| Decode budgets and memory ceilings | `src/budget.rs` (parallel budget slice), `tests/memory.rs` | present |
 | `arklay verify` | `src/verify.rs`, `tests/cli.rs` | present |
 | CLI error paths and atomic outputs | `src/atomic.rs`, `tests/cli.rs` | present |
 | `--stats` frame-time report | `src/stats.rs`, `tests/cli.rs`, `tests/perf_real.rs` | present |
 | Full-game soak | `tests/soak_real.rs` (ignored) | present |
 | CI matrix (Linux/Windows/release/MSRV/artifact) | `.github/workflows/ci.yml` | present |
 | Local gate | `scripts/check.sh` | present |
-| `docs/architecture.md`, `docs/status.md`, `docs/m17-deviations.md` | this docs pass | present |
+| `docs/architecture.md`, `docs/status.md`, `docs/m17-deviations.md` | this docs set | present |
 
 Still missing by design:
 
-- The fuzz package's seeds and 17 targets are their own slice; until it lands,
-  the workflow job skips and the always-run torture matrix (parallel slice) is
-  the fuzz gate.
+- The cargo-fuzz runs need nightly and run on a weekly schedule, never as a
+  pull-request gate; every change is covered by the always-run torture matrix
+  and the stable `cargo check --manifest-path fuzz/Cargo.toml` compile gate.
 - The real-asset tests, goldens and budgets need a local install and are never
   run in CI with game data; they are ignored tests behind
   `ARKLAY_RE1_ROOT`/`ARKLAY_RE1_PACK`.
@@ -102,9 +107,9 @@ Still missing by design:
 | Group | Count | Sites | Disposition |
 |---|---|---|---|
 | Gameplay | 14 | enemy spawn/re-init `game.rs:1992/2002/2006/2043/2102/2136/2149`; walkers/world `npc/walk.rs:101/216/910/1009`; weapon joint `npc/scd.rs:140`; idle init `npc/idle.rs:113`; backward clip `player.rs:55` | enemy/weapon work or the actor/world milestone |
-| Audio | 3 | pan law `audio.rs:223`; one-shot restart `audio.rs:451`; flamethrower cues `npc/scd.rs:799` | the first two are the documented M13 deviations; the third needs the enemy bank |
+| Audio | 3 | pan law `audio.rs:260`; one-shot restart `audio.rs:488`; flamethrower cues `npc/scd.rs:799` | the first two are the documented M13 deviations; the third needs the enemy bank |
 | UI | 1 | title idle timer `ui/title.rs:204` | blocked on the attract demo, which replays inputs over monster rooms |
-| Visual | 1 | per-record background blend weight/STP `engine.rs:5899` | the record's blend source is not decoded |
+| Visual | 1 | per-record background blend weight/STP `engine.rs:5926` | the record's blend source is not decoded |
 | Conversion | 1 | held-weapon TMDs `convert.rs:464` | needs the weapon system |
 
 ## Road to enemies

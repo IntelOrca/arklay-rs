@@ -12,11 +12,17 @@ before. What follows is what the milestone's tools deliberately do not prove.
   prefix/name, everything else by extension. A known format under an unknown
   name is counted opaque; `--strict` turns that into a failure. This is
   deliberate: future pack entries must not be able to break the command.
-- **Cross-references are partial.** For every RDT, each camera's
-  `roomcut/{room}_{camera:03}.bmp` must exist, and the manifest's Lua hooks
-  must exist. Script-named assets (door ids, per-room sound names, effect
-  sheets) are not resolved; a script that names a missing resource is a
-  runtime warning, not a verify failure.
+- **An RDT must load the way the engine loads it.** It needs at least one
+  camera cut, a `roomcut/{room}_{camera:03}.bmp` for every cut, and the
+  init/main/event SCD table the reader would use (a standalone `scd/{id}.scd`
+  override, when the merged pack carries one, instead of the embedded one).
+  The shipped pack carries 28 four-byte stub rooms with no camera cuts, so
+  `verify` reports those 28 as failures exactly as the loader refuses them;
+  the soak skips the same stubs.
+- **Cross-references are partial.** The manifest's Lua hooks must exist, but
+  script-named assets (door ids, per-room sound names, effect sheets) are not
+  resolved; a script that names a missing resource is a runtime warning, not a
+  verify failure.
 - **`data/core00.esp`/`core00.etm` are opaque.** Their pair parser exists but
   is not in the path table; verify reports them as opaque and does not parse
   them.
@@ -28,13 +34,14 @@ before. What follows is what the milestone's tools deliberately do not prove.
 ## Fuzzing
 
 - **Time budgets are not proof.** The stable torture matrix applies a fixed
-  mutation schedule and the scheduled cargo-fuzz job runs each target for 60
+  mutation schedule and the scheduled cargo-fuzz job runs each target for 300
   seconds per invocation. Both find panics on the inputs they happen to try;
   neither is exhaustive, and a clean run is not a proof of memory safety.
-- **The workflow is gated while the package is absent.** `.github/workflows/
-  fuzz.yml` skips cleanly unless `fuzz/Cargo.toml` exists, so the always-run
-  torture matrix (its own slice) is the gate that runs on every change until
-  the `fuzz/` package lands.
+- **The workflow is scheduled, not a gate.** `.github/workflows/fuzz.yml` runs
+  the committed `fuzz/` package on a weekly schedule and never gates a pull
+  request. `scripts/check.sh` and CI instead run the stable
+  `cargo check --manifest-path fuzz/Cargo.toml` compile gate plus the
+  always-run torture matrix on every change.
 
 ## The soak
 

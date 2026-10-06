@@ -261,7 +261,7 @@ impl Pack {
     /// image is read, so an oversized pack is rejected without allocating it.
     pub fn open(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
-            .with_context(|| format!("failed to stat pack {}", path.display()))?;
+            .with_context(|| format!("failed to read pack {}", path.display()))?;
         budget::check_len_u64(metadata.len(), budget::MAX_PACK_BYTES, "pack file size")
             .with_context(|| format!("failed to read pack {}", path.display()))?;
         let data = std::fs::read(path)

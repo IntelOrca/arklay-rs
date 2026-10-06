@@ -10,12 +10,12 @@
 //! no parser panics, aborts or grows without bound on malformed data.
 //!
 //! The caps are policy, chosen per format from the shipped corpus with
-//! generous headroom (the converter's pack holds 2,523 entries and 408 MiB):
+//! generous headroom (the converter's pack holds 2,541 entries and 408 MiB):
 //!
 //! | cap | limit | corpus peak | formats |
 //! |---|---|---|---|
 //! | [`MAX_PACK_BYTES`] | 2 GiB | 408 MiB | `.akpak` image |
-//! | [`MAX_PACK_ENTRIES`] | 1,048,576 | 2,523 | pack table of contents |
+//! | [`MAX_PACK_ENTRIES`] | 1,048,576 | 2,541 | pack table of contents |
 //! | [`MAX_ENTRY_BYTES`] | 1 GiB | ~40 MiB | one pack entry |
 //! | [`MAX_DECODE_ALLOC`] | 512 MiB | ~64 MiB | one transient decode buffer |
 //! | [`MAX_PIXELS`] | 16,777,216 | 320x240 | TIM/BMP/IVM/cinepak canvas |

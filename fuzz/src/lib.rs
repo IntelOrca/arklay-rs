@@ -13,7 +13,7 @@ use arklay::manifest::Manifest;
 use arklay::pack::{Pack, PackWriter};
 use arklay::save::SaveFile;
 use arklay::state::RoomId;
-use arklay::{audio, bmp, emd, ivm, lzw, mask, rdt, scd, tim, tmd};
+use arklay::{audio, bmp, door, emd, ivm, lzw, mask, rdt, scd, tim, tmd};
 
 pub fn pack(data: &[u8]) {
     let _ = Pack::from_bytes(data.to_vec());
@@ -25,6 +25,7 @@ pub fn manifest(data: &[u8]) {
 
 pub fn rdt(data: &[u8]) {
     let _ = rdt::parse(data, RoomId::parse("1000").unwrap());
+    let _ = scd::reader::parse(data);
 }
 
 pub fn scd(data: &[u8]) {
@@ -88,6 +89,10 @@ pub fn mask(data: &[u8]) {
 
 pub fn wav(data: &[u8]) {
     let _ = audio::parse_wav(data);
+}
+
+pub fn dor(data: &[u8]) {
+    let _ = door::parse(data);
 }
 
 /// Build a one-entry v1 pack with `lua/fuzz.lua` holding the input, then load

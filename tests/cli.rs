@@ -370,6 +370,52 @@ fn verify_strict_fails_an_unknown_extension() {
 }
 
 #[test]
+fn verify_merges_mod_layers_before_classifying() {
+    let dir = TempDir::new("verify-mod");
+    let base = dir.join("base.akpak");
+    let layer = dir.join("layer.akpak");
+
+    let mut writer = PackWriter::new();
+    writer
+        .add(
+            manifest::ENTRY,
+            manifest::Manifest::base("re1").render().into_bytes(),
+        )
+        .unwrap();
+    writer.add("ui/base.tim", tiny_tim()).unwrap();
+    writer.write(&base).unwrap();
+
+    let mod_manifest = manifest::Manifest {
+        kind: manifest::PackKind::Mod,
+        base: Some("re1".to_string()),
+        ..manifest::Manifest::base("demo")
+    };
+    let mut writer = PackWriter::new();
+    writer
+        .add(manifest::ENTRY, mod_manifest.render().into_bytes())
+        .unwrap();
+    // The layer shadows the base's TIM with corrupt bytes and adds a new one,
+    // so verification must walk the merged view exactly like the runtime.
+    writer.add("ui/base.tim", b"not a tim".to_vec()).unwrap();
+    writer.add("ui/extra.tim", tiny_tim()).unwrap();
+    writer.write(&layer).unwrap();
+
+    let output = run(&[
+        "verify",
+        base.to_str().unwrap(),
+        "--mod",
+        layer.to_str().unwrap(),
+    ]);
+    let out = stdout(&output);
+    assert!(!output.status.success(), "stderr: {}", stderr(&output));
+    assert!(out.contains("ui/base.tim"), "{out}");
+    assert!(
+        out.contains("verify: 3 entries, 2 ok, 1 failed, 0 opaque"),
+        "{out}"
+    );
+}
+
+#[test]
 fn stats_runs_without_a_capture_and_reports_ordered_counters() {
     let dir = TempDir::new("stats");
     let path = dir.join("game.akpak");
@@ -406,6 +452,19 @@ fn stats_runs_without_a_capture_and_reports_ordered_counters() {
         assert!(phase.contains(&key), "phase line lacks {key}: {phase:?}");
     }
     assert!(line("stats high_water ").contains("entities"));
+}
+
+#[test]
+fn stats_is_refused_with_fmv_and_ending() {
+    for extra in [
+        ["--fmv", "0", "--ticks", "5", "--stats"],
+        ["--ending", "1", "--ticks", "5", "--stats"],
+    ] {
+        let mut args = vec!["game.akpak"];
+        args.extend_from_slice(&extra);
+        let output = run(&args);
+        assert_failure(&output, "--stats");
+    }
 }
 
 #[test]

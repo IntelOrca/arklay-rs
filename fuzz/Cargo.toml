@@ -125,6 +125,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "dor"
+path = "fuzz_targets/dor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "lua"
 path = "fuzz_targets/lua.rs"
 test = false

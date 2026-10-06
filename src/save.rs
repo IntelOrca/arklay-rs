@@ -959,6 +959,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unwritable_save_directory_is_reported() {
+        let dir = TempDir::new("unwritable");
+        // A regular file where the save directory should be: creating the
+        // directory fails before any slot is written.
+        let blocked = dir.path.join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+
+        let err = save(&blocked, 0, &filled()).unwrap_err();
+
+        let text = format!("{err:#}");
+        assert!(text.contains("failed to create"), "{text}");
+        assert!(text.contains("blocked"), "{text}");
+        assert_eq!(fs::read(&blocked).unwrap(), b"not a directory");
+        assert!(load(&blocked, 0).is_err());
+    }
+
+    #[test]
     fn a_truncated_slot_reads_as_empty() {
         let dir = TempDir::new("truncated");
         fs::write(dir.path.join("savedat2.dat"), [0u8; 8]).unwrap();

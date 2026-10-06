@@ -46,7 +46,9 @@ impl Histogram {
     /// Record one duration.
     pub fn record(&mut self, duration: Duration) {
         let ns = duration.as_nanos().min(u128::from(u64::MAX)) as u64;
-        let index = bucket_index(ns);
+        // A duration beyond the largest bucket still records: clamp it into the
+        // last bucket instead of indexing past the end of the array.
+        let index = bucket_index(ns).min(BUCKETS - 1);
         self.buckets[index] += 1;
         if self.count == 0 || ns < self.min_ns {
             self.min_ns = ns;
@@ -224,6 +226,19 @@ mod tests {
         assert_eq!(histogram.mean(), Duration::ZERO);
         assert_eq!(histogram.p95(), Duration::ZERO);
         assert_eq!(histogram.max(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_duration_beyond_the_largest_bucket_clamps_into_it() {
+        let mut histogram = Histogram::default();
+        histogram.record(Duration::from_nanos(u64::MAX));
+        histogram.record(Duration::MAX);
+
+        assert_eq!(histogram.count(), 2);
+        assert_eq!(histogram.max(), Duration::from_nanos(u64::MAX));
+        assert_eq!(histogram.buckets[BUCKETS - 1], 2);
+        assert_eq!(histogram.buckets.iter().sum::<u64>(), 2);
+        assert!(histogram.p95() <= histogram.max());
     }
 
     #[test]

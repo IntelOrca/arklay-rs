@@ -2,13 +2,13 @@
 //!
 //! Builds a minimal valid synthetic seed for every parser the engine reads
 //! (LZW, TIM in all three modes, TMD, IVM, EMD/EMW, RDT, SCD reader and
-//! assembler, pack, manifest, save, indexed/direct BMP, mask table, WAV and a
-//! minimal 320x240 `cvid` AVI), then applies a deterministic mutation matrix:
-//! truncation at sampled lengths, single-byte flips at sampled offsets, zero
-//! runs, LCG random overwrites, 512 fully random inputs and text-boundary
-//! cases. Every case runs the same public entry point the engine uses inside
-//! `catch_unwind`; a panic fails the test naming the format, the case index
-//! and the input as hex.
+//! assembler, pack, manifest, save, indexed/direct BMP, mask table, WAV, a
+//! minimal 320x240 `cvid` AVI and a `.dor` door), then applies a deterministic
+//! mutation matrix: truncation at sampled lengths, single-byte flips at
+//! sampled offsets, zero runs, LCG random overwrites, 512 fully random inputs
+//! and text-boundary cases. Every case runs the same public entry point the
+//! engine uses inside `catch_unwind`; a panic fails the test naming the format,
+//! the case index and the input as hex.
 //!
 //! The matrix is always-run, dependency-free beyond the engine itself and
 //! enforces a floor of 10,000 cases. The seed builders double as the committed
@@ -28,7 +28,7 @@ use arklay::manifest::{self, Manifest};
 use arklay::pack::{Pack, PackWriter};
 use arklay::save::SaveFile;
 use arklay::state::{Image, RoomId};
-use arklay::{audio, bmp, emd, ivm, lzw, mask, rdt, scd, tim, tmd};
+use arklay::{audio, bmp, door, emd, ivm, lzw, mask, rdt, scd, tim, tmd};
 
 /// One parser target: a synthetic seed and the engine entry point it feeds.
 struct Target {
@@ -54,6 +54,7 @@ fn run_manifest(data: &[u8]) {
 
 fn run_rdt(data: &[u8]) {
     let _ = rdt::parse(data, RoomId::parse("1000").unwrap());
+    let _ = scd::reader::parse(data);
 }
 
 fn run_scd(data: &[u8]) {
@@ -116,6 +117,10 @@ fn run_mask(data: &[u8]) {
 
 fn run_wav(data: &[u8]) {
     let _ = audio::parse_wav(data);
+}
+
+fn run_dor(data: &[u8]) {
+    let _ = door::parse(data);
 }
 
 // --- synthetic seeds -------------------------------------------------------
@@ -448,6 +453,24 @@ fn seed_mask() -> Vec<u8> {
     data
 }
 
+/// A `.dor` door: one script, the shared TMD triangle and a small 8bpp TIM.
+fn seed_dor() -> Vec<u8> {
+    let mut data = vec![0u8; 12];
+    let table = data.len();
+    data.extend_from_slice(&[0u8; 8]);
+    let script = data.len();
+    data.extend_from_slice(&[0x00, 0x00]);
+    let tmd_offset = data.len();
+    data.extend_from_slice(&tmd_bytes());
+    let tim_offset = data.len();
+    data.extend_from_slice(&minimal_tim_texture());
+    data[0..4].copy_from_slice(&(table as u32).to_le_bytes());
+    data[4..8].copy_from_slice(&(tmd_offset as u32).to_le_bytes());
+    data[8..12].copy_from_slice(&(tim_offset as u32).to_le_bytes());
+    data[table..table + 4].copy_from_slice(&((script - table) as u32).to_le_bytes());
+    data
+}
+
 fn seed_wav() -> Vec<u8> {
     let data = [0u8, 64, 128, 192, 255, 128, 64, 0];
     let mut fmt = Vec::new();
@@ -681,6 +704,11 @@ fn targets() -> Vec<Target> {
             seed: seed_wav,
             run: run_wav,
         },
+        Target {
+            name: "dor",
+            seed: seed_dor,
+            run: run_dor,
+        },
     ]
 }
 
@@ -874,7 +902,7 @@ fn torture_matrix_never_panics() {
         total >= 10_000,
         "torture matrix ran {total} cases, below the 10,000 floor"
     );
-    assert_eq!(per_format.len(), 16, "every target must run");
+    assert_eq!(per_format.len(), 17, "every target must run");
 }
 
 /// Regenerate the committed cargo-fuzz seed corpus from these builders.

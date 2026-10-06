@@ -2,9 +2,9 @@
 //!
 //! A command that writes one artifact (a capture, an assembled script, a
 //! pack) writes a sibling temporary file and renames it over the destination
-//! once the bytes are on disk. A failure mid-write removes the temporary file
-//! and leaves any previous destination untouched, so a failed run never
-//! leaves a partial artifact behind.
+//! once the bytes are synced to disk. A failure mid-write removes the
+//! temporary file and leaves any previous destination untouched, so a failed
+//! run never leaves a partial artifact behind.
 //!
 //! The rename stays within the destination's directory, so it is atomic on
 //! every supported platform and does not require a temporary directory on the
@@ -36,7 +36,7 @@ pub fn write(path: &Path, contents: &[u8]) -> Result<()> {
         .with_context(|| format!("failed to create {}", temp.display()))?;
     let result = file
         .write_all(contents)
-        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all())
         .with_context(|| format!("failed to write {}", temp.display()));
     drop(file);
     if let Err(err) = result {

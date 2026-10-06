@@ -284,15 +284,15 @@ fn parse_events(data: &[u8], base: usize) -> Result<Vec<Stream>> {
         {
             bail!("event SCD offset {offset:#X} at 0x{at:X} is not increasing");
         }
+        // The cap is checked before the push so an adversarial table cannot
+        // grow the offset list (one `usize` per 4 input bytes) before failing.
+        budget::check_len(
+            starts.len() + 1,
+            budget::MAX_SCD_EVENTS,
+            "event SCD table count",
+        )?;
         starts.push(start);
         index += 1;
-    }
-
-    if starts.len() > budget::MAX_SCD_EVENTS {
-        bail!(
-            "event SCD table at 0x{base:X} holds more than {} events",
-            budget::MAX_SCD_EVENTS
-        );
     }
 
     let last_end = starts
@@ -941,6 +941,25 @@ mod tests {
 
         let message = budget::assert_cap_error(parse(&data));
         assert!(message.contains("SCD block count"), "{message}");
+    }
+
+    #[test]
+    fn rejects_more_events_than_the_cap_before_growing_the_list() {
+        // A huge event table whose entries all point at increasing in-bounds
+        // offsets: the cap must fire before the offset list grows by one
+        // `usize` per 4 input bytes.
+        let mut table = Vec::new();
+        let count = budget::MAX_SCD_EVENTS + 1;
+        for index in 0..count {
+            table.extend_from_slice(&(index as u32 + 1).to_le_bytes());
+        }
+        table.resize((count + 64) * 4, 0);
+        let mut builder = RdtBuilder::new();
+        builder.push_section(EVENT_SLOT_OFFSET, &table);
+        let data = builder.finish_with_event_sentinel();
+
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("event SCD table count"), "{message}");
     }
 
     #[test]
