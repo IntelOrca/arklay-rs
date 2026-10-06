@@ -233,6 +233,12 @@ pub struct ObjectRecord {
     pub tint: [i8; 3],
     /// The luminance light scale stored by `model_op` (slice 4).
     pub light_scale: i16,
+    /// The TMD background-weight override armed for this build, the original's
+    /// `DAT_004d2be0`. `cmd_omodel_set` writes it immediately before binding
+    /// the TMD, so it applies to this record's model: the west-wing study
+    /// (stage 2F and its return) room 0x0A slot 1 arms `0x30` (the water
+    /// tank's surface, 81% opaque instead of the authored half blend).
+    pub blend_override: Option<u8>,
 }
 
 impl Default for ObjectRecord {
@@ -257,6 +263,7 @@ impl Default for ObjectRecord {
             asset: None,
             tint: [0; 3],
             light_scale: 0,
+            blend_override: None,
         }
     }
 }
@@ -355,6 +362,12 @@ impl ObjectTable {
         // stage/room special cases around the generic load.
         apply_position_overrides(&mut pos, slot, id);
 
+        // `cmd_omodel_set` arms `DAT_004d2be0 = 0x30` just before binding the
+        // TMD in the west-wing study (stage 2F and its return) slot 1: the
+        // water tank's surface, drawn 81% opaque instead of the authored half
+        // blend. It is consumed by the bind and reset to -1 right after.
+        let blend_override = (id.stage % 5 == 2 && id.room == 0x0A && slot == 1).then_some(0x30);
+
         let record = &mut self.records[slot];
         *record = ObjectRecord {
             flag: operand_u8(operands, 1),
@@ -381,6 +394,7 @@ impl ObjectTable {
             asset: Some(slot as u8),
             tint: [0; 3],
             light_scale: 0,
+            blend_override,
         };
         self.built = self.built.wrapping_add(1);
         true
@@ -1349,7 +1363,32 @@ mod tests {
         assert_eq!(record.push_counter, 0);
         assert_eq!(record.tint, [0; 3]);
         assert_eq!(record.light_scale, 0);
+        assert_eq!(record.blend_override, None);
         assert_eq!(objects.record(0).unwrap(), &ObjectRecord::default());
+    }
+
+    #[test]
+    fn obj_arms_the_water_tank_blend_override() {
+        // Stage 2F room 0x0A slot 1 is the water tank's surface:
+        // `cmd_omodel_set` arms `DAT_004d2be0 = 0x30` just before binding the
+        // TMD, and the return stage (7, the same room) does the same. Every
+        // other build carries no override.
+        let override_for = |stage: u8, room: u8, slot: u8| {
+            let id = RoomId {
+                stage,
+                room,
+                player_flag: 0,
+            };
+            let mut objects = table(3);
+            assert!(objects.build(&obj_operands(slot, 1, 0xFF), id));
+            objects.record(usize::from(slot)).unwrap().blend_override
+        };
+        assert_eq!(override_for(2, 0x0A, 1), Some(0x30));
+        assert_eq!(override_for(7, 0x0A, 1), Some(0x30));
+        assert_eq!(override_for(2, 0x0A, 0), None);
+        assert_eq!(override_for(2, 0x0A, 2), None);
+        assert_eq!(override_for(2, 0x0B, 1), None);
+        assert_eq!(override_for(1, 0x0A, 1), None);
     }
 
     #[test]

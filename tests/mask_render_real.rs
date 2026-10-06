@@ -162,6 +162,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
         texture: &texture,
         joints: &joints,
         tint: [255; 3],
+        blend_weight: None,
         hidden_joints: 0,
     }];
 
@@ -259,6 +260,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
         texture,
         joints: &joints,
         tint: [255; 3],
+        blend_weight: None,
         hidden_joints: 0,
     }];
 

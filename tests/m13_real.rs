@@ -1116,8 +1116,6 @@ fn integration_deviations_are_documented() {
         "Weapon banks",
         "Enemy position type 2",
         "Room action effect zones",
-        "One-shot vs restart",
-        "Pan law",
         "Scripted fade scope",
         "Unreferenced voice files",
         "movie_on",
@@ -1126,6 +1124,13 @@ fn integration_deviations_are_documented() {
         assert!(
             deviations.contains(topic),
             "the deviations list is missing `{topic}`"
+        );
+    }
+    // M18 closed these two deviations; the list must not carry them again.
+    for closed in ["One-shot vs restart", "Pan law"] {
+        assert!(
+            !deviations.contains(closed),
+            "the deviations list still carries the closed `{closed}`"
         );
     }
 }

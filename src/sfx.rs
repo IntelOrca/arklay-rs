@@ -2608,6 +2608,19 @@ pub fn entity_sound_index(zone_low: u8, sound_type: u8, slow: bool) -> u8 {
     }
 }
 
+/// The entity bank slot `PlayEntitySnd` resolves for `pos`: the room sound
+/// column, which the original's `g_emSndBanks[soundType * 2]` names and every
+/// same-column cue therefore restarts.
+pub fn entity_sound_column(
+    room: &RoomState,
+    pos: [i32; 3],
+    sound_type: u8,
+    slow: bool,
+) -> Option<u8> {
+    let zone = room.footstep_zone(pos[0], pos[2])?;
+    Some(entity_sound_index(zone as u8, sound_type, slow))
+}
+
 /// Resolve the footstep sound for `pos` in `room`: look up the floor zone,
 /// apply the entity sound type and name the resulting column.
 pub fn footstep_sound(

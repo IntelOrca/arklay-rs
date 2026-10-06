@@ -2399,7 +2399,7 @@ mod tests {
     }
 
     #[test]
-    fn running_footsteps_play_overlapping_copies() {
+    fn running_footsteps_restart_the_bank_voice() {
         use crate::audio::MixState;
 
         let room = RoomState::default();
@@ -2412,12 +2412,13 @@ mod tests {
         };
 
         let mut mixer = MixState::new();
-        // Longer than the 10-tick gap between the run's contact frames, so the
-        // second footfall starts while the first copy is still playing.
+        // Longer than the 10-tick gap between the run's contact frames, so a
+        // buffer-per-cue mixer would overlap the second copy. The original's
+        // one buffer per entity sound bank restarts that voice instead.
         let step_pcm = vec![1000i16; 2000];
         let mut out = Vec::new();
         let mut triggers = Vec::new();
-        let mut overlaps = 0usize;
+        let mut sounded = 0usize;
 
         for tick in 0..60 {
             step(&mut player, &room, &clips, input);
@@ -2426,19 +2427,20 @@ mod tests {
                 triggers.push(tick);
             }
             for _ in &events {
-                mixer.play_sfx(step_pcm.clone(), 1.0, 0.0);
+                // The run's bank-2 column key; both contacts resolve the same
+                // column, so the second restarts the first.
+                mixer.play_sfx_on_bank(0x0201, step_pcm.clone(), 1.0, 0.0);
             }
 
             let active = mixer.active_sfx();
+            assert!(active <= 1, "tick {tick}: {active} footstep voices");
             mixer.render(1, &mut out);
-            if active >= 2 {
-                overlaps += 1;
-                // Every center-panned copy contributes 1000/sqrt(2); the sum
-                // must hold all of them, not just the newest.
-                let level = active as i16 * 707;
+            if active == 1 {
+                sounded += 1;
+                // Center-panned: half the sample in each channel.
                 let left = i16::from_le_bytes([out[out.len() - 4], out[out.len() - 3]]);
                 let right = i16::from_le_bytes([out[out.len() - 2], out[out.len() - 1]]);
-                assert_eq!((left, right), (level, level), "tick {tick}");
+                assert_eq!((left, right), (500, 500), "tick {tick}");
             }
         }
 
@@ -2447,7 +2449,7 @@ mod tests {
             "the run triggered {} footfalls in 60 ticks",
             triggers.len()
         );
-        assert!(overlaps >= 1, "no frame mixed two footstep voices");
+        assert!(sounded >= 2, "the footstep bank never sounded");
     }
 
     #[test]

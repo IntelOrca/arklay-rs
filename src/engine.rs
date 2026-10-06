@@ -4099,6 +4099,13 @@ fn apply_door_message(game: &mut game::GameState, message: door::vm::Message) {
     game.show_message(message.id, message.value);
 }
 
+/// The original's one-buffer-per-bank key: the bank table in the high byte and
+/// its slot in the low byte, so a repeated cue on one bank restarts that
+/// bank's voice while a different bank appends.
+fn sfx_bank_key(bank: u8, slot: u8) -> u64 {
+    (u64::from(bank) << 8) | u64::from(slot)
+}
+
 /// Play the room-SFX `slot` (0 open, 1 close) of the door's SFX pair.
 fn play_room_sfx(
     music: &mut Option<Mixer>,
@@ -4114,7 +4121,7 @@ fn play_room_sfx(
         return;
     };
     if let Some(wav) = cache.load(pack, name) {
-        mixer.play_sfx(wav, 1.0, 0.0);
+        mixer.play_sfx_on_bank(sfx_bank_key(0, slot as u8), wav, 1.0, 0.0);
     }
 }
 
@@ -4145,7 +4152,7 @@ fn play_door_animation_sfx(
         return;
     };
     if let Some(wav) = cache.load(pack, name) {
-        mixer.play_sfx(wav, 1.0, 0.0);
+        mixer.play_sfx_on_bank(sfx_bank_key(0, effect.id), wav, 1.0, 0.0);
     }
 }
 
@@ -4210,7 +4217,12 @@ fn play_snd3d_requests(
         let Some(wav) = cache.load(pack, name) else {
             continue;
         };
-        mixer.play_sfx(wav, play.gain, play.pan);
+        mixer.play_sfx_on_bank(
+            sfx_bank_key(request.bank, request.id),
+            wav,
+            play.gain,
+            play.pan,
+        );
     }
 }
 
@@ -4244,8 +4256,10 @@ fn play_footsteps(
         let Some(wav) = cache.load(pack, name) else {
             continue;
         };
+        let column =
+            sfx::entity_sound_column(room, footstep.pos, footstep.sound_type, slow).unwrap_or(0);
         let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, footstep.pos);
-        mixer.play_sfx(wav, gain, pan);
+        mixer.play_sfx_on_bank(sfx_bank_key(2, column), wav, gain, pan);
     }
 }
 
@@ -4291,8 +4305,9 @@ fn play_player_sounds(
             let Some(wav) = cache.load(pack, name) else {
                 continue;
             };
+            let column = sfx::entity_sound_column(room, sound.pos, 0, slow).unwrap_or(0);
             let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
-            mixer.play_sfx(wav, gain, pan);
+            mixer.play_sfx_on_bank(sfx_bank_key(2, column), wav, gain, pan);
             continue;
         }
         let (bank, id) = player_sound_bank(sound.id);
@@ -4304,7 +4319,7 @@ fn play_player_sounds(
         let Some(wav) = cache.load(pack, name) else {
             continue;
         };
-        mixer.play_sfx(wav, play.gain, play.pan);
+        mixer.play_sfx_on_bank(sfx_bank_key(bank, id), wav, play.gain, play.pan);
     }
 }
 
@@ -4331,7 +4346,7 @@ fn play_entity_sounds(
             continue;
         };
         let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
-        mixer.play_sfx(wav, gain, pan);
+        mixer.play_sfx_on_bank(sfx_bank_key(2, sound.column), wav, gain, pan);
     }
 }
 
@@ -5923,9 +5938,6 @@ fn render_frame(
         item_joints.push(vec![*world]);
     }
 
-    // TODO(parity): (visual) the original applies each record's background
-    // blend weight and semi-transparency; `EntityMesh` carries only the RGB
-    // multiplier and the joint draw gate, so records blend opaquely.
     let mut meshes: Vec<EntityMesh<'_>> =
         Vec::with_capacity(visible.len() + visible_item_models.len() + 1 + models.len());
     for ((asset, record, _), joints) in visible.iter().zip(&object_joints) {
@@ -5934,6 +5946,12 @@ fn render_frame(
             texture: &asset.texture,
             joints,
             tint: record.shade(),
+            // The record's background blend weight: the TMD's first
+            // semi-transparent primitive picks the ABR weight, and
+            // `cmd_omodel_set`'s armed override (the water-tank surface) wins
+            // over it, exactly like `GetTmdBlendMode` + `DAT_004d2be0`.
+            blend_weight: render::record_blend_weight(&asset.model)
+                .map(|weight| record.blend_override.unwrap_or(weight)),
             hidden_joints: 0,
         });
     }
@@ -5943,6 +5961,7 @@ fn render_frame(
             texture: &asset.texture,
             joints,
             tint: [255; 3],
+            blend_weight: render::record_blend_weight(&asset.model),
             hidden_joints: 0,
         });
     }
@@ -5955,6 +5974,7 @@ fn render_frame(
             texture: &model.texture,
             joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: *hidden,
         });
     }
@@ -5971,6 +5991,7 @@ fn render_frame(
             texture: &assets.emd.texture,
             joints,
             tint: game.player_tint,
+            blend_weight: None,
             hidden_joints: hidden,
         });
     }
@@ -7805,6 +7826,7 @@ mod tests {
             texture: &assets.emd.texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         }];
         let camera = Camera::from_cut(cut);
@@ -7862,6 +7884,7 @@ mod tests {
 
         let mut sounds = vec![game::EntitySound {
             name: "ft_wdA",
+            column: 45,
             pos: [0, 0, 0],
         }];
         play_entity_sounds(

@@ -1042,6 +1042,8 @@ fn special_light_suppressed(id: RoomId, camera: usize) -> bool {
 pub struct EntitySound {
     /// Room sound name resolved from the footstep zone.
     pub name: &'static str,
+    /// The entity bank slot (room sound column) the cue plays through.
+    pub column: u8,
     /// World position the sound plays at.
     pub pos: [i32; 3],
 }

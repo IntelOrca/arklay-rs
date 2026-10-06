@@ -700,6 +700,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 &mut triangles,
             );
         }
@@ -745,6 +746,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 &mut triangles,
             );
         }
@@ -872,8 +874,14 @@ impl Framebuffer {
                     && palette_index
                         .is_some_and(|index| texture.palette_stp(triangle.palette_row, index));
                 if blend && let Some(dst) = self.rgba.get(offset..offset + 4) {
+                    // The record's background weight in 256ths; `None` keeps
+                    // the M16 per-packet half blend.
+                    let background = u32::from(triangle.blend_weight.unwrap_or(0x80));
+                    let source = 256 - background;
                     for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
-                        *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
+                        *channel = ((u32::from(*channel) * source
+                            + u32::from(destination) * background)
+                            / 256) as u8;
                     }
                 }
                 if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
@@ -1215,10 +1223,33 @@ pub struct EntityMesh<'a> {
     /// Per-channel RGB multiplier applied to every shaded triangle (default
     /// white); the shared plumbing for `model_op` and `objs_hide`.
     pub tint: [u8; 3],
+    /// The record's background blend weight (the original's `+0x68` field),
+    /// from [`record_blend_weight`] and the record's `DAT_004d2be0` override.
+    /// `None` keeps the M16 per-packet half blend; `Some(weight)` mixes a
+    /// blended texel as `source * (256 - weight) + background * weight`, so
+    /// `Some(0)` draws opaque and `Some(0x30)` keeps 18.75% background.
+    pub blend_weight: Option<u8>,
     /// Joint draw gate: bit `i` set means joint `i` is hidden and never draws
     /// (not even in the mirror copy), the port's stand-in for the joint flag
     /// byte's bit 0.
     pub hidden_joints: u32,
+}
+
+/// The original's `GetTmdBlendMode`: the background weight of the first
+/// semi-transparent primitive of `model`, or `None` when the TMD carries none.
+///
+/// The table is indexed by the primitive texpage's ABR field. `0x80` is the
+/// common `B/2 + F/2` rule, `0x00` keeps no background (opaque), and `0xD0`
+/// keeps mostly background. `CreateTmdObjectInternal` stamps the value into
+/// every record of the TMD, so one primitive marks the whole model.
+pub(crate) fn record_blend_weight(model: &Tmd) -> Option<u8> {
+    const ABR_WEIGHT: [u8; 4] = [0x80, 0x00, 0x80, 0xD0];
+    let prim = model
+        .objects
+        .iter()
+        .flat_map(|object| &object.prims)
+        .find(|prim| prim.blend)?;
+    Some(ABR_WEIGHT[usize::from((prim.tsb >> 5) & 3)])
 }
 
 impl EntityMesh<'_> {
@@ -1387,6 +1418,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                 true,
                 texture,
                 mesh.tint,
+                mesh.blend_weight,
                 &mut triangles,
             );
         }
@@ -1415,6 +1447,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                     false,
                     texture,
                     mesh.tint,
+                    mesh.blend_weight,
                     &mut triangles,
                 );
             }
@@ -1974,6 +2007,9 @@ struct Triangle {
     /// The packet's semi-transparency bit: rasterize with a per-texel blend
     /// where the sampled CLUT entry carries the STP bit.
     blend: bool,
+    /// The record's background blend weight in 256ths. `None` is the M16
+    /// per-packet half blend; see [`EntityMesh::blend_weight`].
+    blend_weight: Option<u8>,
 }
 
 /// One projected shadow vertex: screen position, inverse view Z and the
@@ -2110,6 +2146,7 @@ fn collect_triangles(
     cull: bool,
     texture: usize,
     tint: [u8; 3],
+    blend_weight: Option<u8>,
     triangles: &mut Vec<Triangle>,
 ) {
     let vertices: Vec<[i32; 3]> = object
@@ -2280,6 +2317,7 @@ fn collect_triangles(
             // shade; the sampled colour is white.
             flat: prim.flat_color.map(|_| [255, 255, 255]),
             blend,
+            blend_weight,
         });
     }
 }
@@ -2394,6 +2432,7 @@ fn collect_ivm_triangles(
                 cull: true,
                 flat,
                 blend: prim.blend,
+                blend_weight: None,
             });
         }
     }
@@ -2956,6 +2995,7 @@ mod tests {
             cull: false,
             flat: None,
             blend: false,
+            blend_weight: None,
         })
     }
 
@@ -2993,6 +3033,7 @@ mod tests {
                 texture: &red,
                 joints: &joints,
                 tint: [255; 3],
+                blend_weight: None,
                 hidden_joints: 0,
             },
             EntityMesh {
@@ -3000,6 +3041,7 @@ mod tests {
                 texture: &green,
                 joints: &joints,
                 tint: [255; 3],
+                blend_weight: None,
                 hidden_joints: 0,
             },
         ];
@@ -3070,6 +3112,7 @@ mod tests {
                 texture,
                 joints,
                 tint: [255; 3],
+                blend_weight: None,
                 hidden_joints: 0,
             }
         }
@@ -3262,6 +3305,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         }];
         let lighting = Lighting {
@@ -3992,6 +4036,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         }];
         let camera = straight_camera();
@@ -4097,6 +4142,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0b1,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -4125,6 +4171,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -4182,6 +4229,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         }];
 
@@ -4226,6 +4274,7 @@ mod tests {
             texture: &texture,
             joints: &joints,
             tint: [128, 128, 128],
+            blend_weight: None,
             hidden_joints: 0,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -4264,6 +4313,7 @@ mod tests {
             true,
             0,
             [255; 3],
+            None,
             &mut triangles,
         );
         assert_eq!(triangles.len(), 1);
@@ -4284,6 +4334,7 @@ mod tests {
             true,
             0,
             [255; 3],
+            None,
             &mut triangles,
         );
         assert!(!triangles[0].blend);
@@ -4349,6 +4400,7 @@ mod tests {
             cull: false,
             flat: None,
             blend: true,
+            blend_weight: None,
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
@@ -4370,6 +4422,89 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         framebuffer.rasterize(&texture, &triangle);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 11, 11),
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn record_blend_weight_reads_the_abr_table() {
+        let with_prim = |blend: bool, tsb: u16| Tmd {
+            objects: vec![TmdObject {
+                vertices: vec![[0; 3]; 3],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![TmdPrim {
+                    vertices: [0, 1, 2],
+                    normals: [0, 0, 0],
+                    uv: [[0, 0]; 3],
+                    clut: 0,
+                    tsb,
+                    textured: true,
+                    blend,
+                    raw_y: false,
+                    flat_color: None,
+                    quad: None,
+                }],
+            }],
+        };
+        // No semi-transparent primitive means no record weight.
+        assert_eq!(record_blend_weight(&with_prim(false, 0)), None);
+        // ABR 0 and 2 are the authored half blend, 1 is opaque and 3 keeps
+        // mostly background; the ABR field is texpage bits 5-6.
+        assert_eq!(record_blend_weight(&with_prim(true, 0 << 5)), Some(0x80));
+        assert_eq!(record_blend_weight(&with_prim(true, 1 << 5)), Some(0x00));
+        assert_eq!(record_blend_weight(&with_prim(true, 2 << 5)), Some(0x80));
+        assert_eq!(record_blend_weight(&with_prim(true, 3 << 5)), Some(0xD0));
+    }
+
+    #[test]
+    fn a_record_blend_weight_scales_the_per_texel_mix() {
+        let mut texture = solid_texture([255, 255, 255, 255]);
+        texture.stp = vec![true];
+        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+            position,
+            inv_z: 1.0 / 1000.0,
+            u,
+            v,
+            shade: [CHANNEL_MAX; 3],
+        };
+        let triangle = |blend_weight| Triangle {
+            raster: [
+                raster_vertex([10.0, 10.0], 0.0, 0.0),
+                raster_vertex([20.0, 10.0], 2.0, 0.0),
+                raster_vertex([10.0, 20.0], 0.0, 0.0),
+            ],
+            depth: 1000.0,
+            key: 1000,
+            texture: 0,
+            palette_row: 0,
+            cull: false,
+            flat: None,
+            blend: true,
+            blend_weight,
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+
+        // 0x30/256 background: (255 * 208 + 100 * 48) / 256 = 225.
+        framebuffer.rasterize(&texture, &triangle(Some(0x30)));
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 11, 11),
+            [225, 225, 225, 255]
+        );
+
+        // 0xD0/256 background: (255 * 48 + 100 * 208) / 256 = 129.
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        framebuffer.rasterize(&texture, &triangle(Some(0xD0)));
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 11, 11),
+            [129, 129, 129, 255]
+        );
+
+        // A zero background weight is opaque, the ABR 1 `B + F` rule.
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        framebuffer.rasterize(&texture, &triangle(Some(0)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]

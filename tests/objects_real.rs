@@ -269,6 +269,7 @@ fn room_107_objects_render() {
                 texture: &asset.texture,
                 joints,
                 tint: [255; 3],
+                blend_weight: None,
                 hidden_joints: 0,
             })
             .collect();
@@ -1028,6 +1029,7 @@ fn room_112_mirror_renders_reflection_pixels() {
         texture: &emd.texture,
         joints: &joints,
         tint: [255; 3],
+        blend_weight: None,
         hidden_joints: 0,
     }];
     // A stand-in room-object mesh with a flat blue page: it sits before the
@@ -1045,6 +1047,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             texture: &blue,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         },
         EntityMesh {
@@ -1052,6 +1055,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             texture: &emd.texture,
             joints: &joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         },
     ];
@@ -1233,5 +1237,82 @@ fn room_30b_objs_hide_changes_the_rendered_tint() {
     assert!(
         sum(&tinted) < sum(&plain),
         "the objs_hide tint must darken the frame"
+    );
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("20A0").unwrap();
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+
+    // `cmd_omodel_set` arms the tank surface's override and the record's TMD is
+    // fully semi-transparent, so the record gets `0x30` instead of the authored
+    // half blend.
+    let record = *game.objects.record(1).unwrap();
+    assert_eq!(
+        record.blend_override,
+        Some(0x30),
+        "ROOM20A0 slot 1 did not arm the water-tank blend override"
+    );
+    let asset = room
+        .object_models
+        .iter()
+        .find(|asset| asset.pair_index == 1)
+        .expect("ROOM20A0 has no omodel pair 1");
+    assert!(
+        asset
+            .model
+            .objects
+            .iter()
+            .flat_map(|o| &o.prims)
+            .any(|p| p.blend),
+        "the tank surface has no semi-transparent primitive"
+    );
+
+    let player = arklay::player::spawn(id, &room);
+    game.sync_entity_from_player(&player);
+
+    // Re-baseline check: the override must repaint the frames that draw the
+    // tank. The record is restored after each cut so the comparison is the
+    // weight alone.
+    let mut best = 0usize;
+    let mut best_cut = 0usize;
+    for cut in 0..room.cuts.len() {
+        let mut cut_room = room.clone();
+        cut_room.current_cut = cut;
+        let weighed =
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &mut game, &player).unwrap();
+        game.objects.record_mut(1).unwrap().blend_override = None;
+        let plain =
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &mut game, &player).unwrap();
+        game.objects.record_mut(1).unwrap().blend_override = Some(0x30);
+        let changed = weighed
+            .rgba
+            .iter()
+            .zip(&plain.rgba)
+            .filter(|(a, b)| a != b)
+            .count();
+        if changed > best {
+            best = changed;
+            best_cut = cut;
+        }
+    }
+    println!("ROOM20A0 cut {best_cut}: the tank blend weight changes {best} bytes");
+    assert!(
+        best > 0,
+        "the water-tank blend weight did not change any captured frame"
     );
 }

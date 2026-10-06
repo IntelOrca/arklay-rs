@@ -101,6 +101,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         texture: &emd.texture,
         joints: &joints,
         tint: [255; 3],
+        blend_weight: None,
         hidden_joints: 0,
     }];
 

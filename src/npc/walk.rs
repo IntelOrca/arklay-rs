@@ -152,8 +152,10 @@ pub fn footstep(
     slow: bool,
 ) {
     if let Some(name) = sfx::footstep_sound(room, entity.pos, sound_type, slow) {
+        let column = sfx::entity_sound_column(room, entity.pos, sound_type, slow).unwrap_or(0);
         sounds.push(EntitySound {
             name,
+            column,
             pos: entity.pos,
         });
     }

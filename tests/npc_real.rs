@@ -154,6 +154,7 @@ fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [u
             texture: &model.texture,
             joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         })
         .collect();
@@ -464,6 +465,7 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
             texture: &model.texture,
             joints,
             tint: [255; 3],
+            blend_weight: None,
             hidden_joints: 0,
         })
         .collect();

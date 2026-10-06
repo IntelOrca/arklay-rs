@@ -559,6 +559,7 @@ fn capture_player_partway_up_the_lab_stairway() {
         texture: &emd.texture,
         joints: &joints,
         tint: [255; 3],
+        blend_weight: None,
         hidden_joints: 0,
     }];
     let mut framebuffer = Framebuffer::new();

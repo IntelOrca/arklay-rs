@@ -7,15 +7,15 @@
 //! controlled BGM channels, one dedicated voice (dialogue) channel and a pool
 //! of one-shot voices, each with its own gain and pan.
 //!
-//! Starting a one-shot never replaces or restarts an existing voice: a new
-//! [`Voice`] is appended, including when the source buffer is already playing,
-//! so several copies of the same WAV (a run's overlapping footsteps) mix
-//! together. The BGM channels and the voice channel each hold one buffer: a
-//! load replaces it, a stop rewinds it and keeps it loaded, and a restart
-//! begins it again from sample 0, matching the original's fixed bank set.
-//! Voices are summed as 32-bit floats and each output sample is saturated to
-//! the 16-bit rail, matching the hardware sum the original mixer relies on. A
-//! missing device or a failed SDL call leaves the engine silent, never fatal.
+//! A one-shot started on a bank restarts that bank's voice (seek to sample 0)
+//! when it is already sounding, matching the original's one DirectSound buffer
+//! per sound record; distinct banks append, and the unkeyed test/UI path always
+//! appends. The BGM channels and the voice channel each hold one buffer: a load
+//! replaces it, a stop rewinds it and keeps it loaded, and a restart begins it
+//! again from sample 0, matching the original's fixed bank set. Voices are
+//! summed as 32-bit floats and each output sample is saturated to the 16-bit
+//! rail, matching the hardware sum the original mixer relies on. A missing
+//! device or a failed SDL call leaves the engine silent, never fatal.
 
 use std::ffi::{CStr, c_int};
 use std::ptr;
@@ -254,16 +254,16 @@ fn mono_or_warn(wav: &Wav) -> Option<Vec<i16>> {
     }
 }
 
-/// Constant-power left and right gains for `pan`, where -1 is hard left, 1 is
+/// The original's DirectSound pan law for `pan`, where -1 is hard left, 1 is
 /// hard right and 0 is centered.
 ///
-/// TODO(parity): (audio) the original hands DirectSound a pan value in
-/// `-10000..=10000` and lets the backend's own pan law scale the channels; the
-/// port's `sqrt` constant-power curve is a different law, so the stereo image
-/// of a panned cue differs (usually a few dB in the near channel).
+/// The game hands DirectSound a raw pan `(right - left) * 0x4E` in
+/// `-10000..=10000`; the backend splits it linearly, left `(10000 - pan) / 20000`
+/// and right `(10000 + pan) / 20000`, so a centered cue plays at half level in
+/// both channels and a hard pan leaves the near channel at full scale.
 fn pan_gains(pan: f32) -> (f32, f32) {
     let pan = pan.clamp(-1.0, 1.0);
-    (((1.0 - pan) * 0.5).sqrt(), ((1.0 + pan) * 0.5).sqrt())
+    ((1.0 - pan) * 0.5, (1.0 + pan) * 0.5)
 }
 
 /// One playing buffer with its mix parameters.
@@ -276,6 +276,10 @@ struct Voice {
     looping: bool,
     /// Start order among one-shot voices; smaller values are older.
     seq: u64,
+    /// The one-shot's bank, when it has one. A repeated cue on the same bank
+    /// restarts this voice instead of appending a new one; `None` voices (the
+    /// unkeyed test/UI entries) never match.
+    bank: Option<u64>,
 }
 
 impl Voice {
@@ -287,7 +291,20 @@ impl Voice {
             pan,
             looping,
             seq,
+            bank: None,
         }
+    }
+
+    /// Re-arm this voice for `bank`: replace the buffer and mix parameters,
+    /// seek to sample 0 and take the newest start order.
+    fn restart(&mut self, bank: u64, pcm: Vec<i16>, gain: f32, pan: f32, seq: u64) {
+        self.pcm = pcm;
+        self.pos = 0;
+        self.gain = gain.max(0.0);
+        self.pan = pan;
+        self.looping = false;
+        self.seq = seq;
+        self.bank = Some(bank);
     }
 
     /// Whether a one-shot voice has played its whole buffer.
@@ -478,19 +495,45 @@ impl MixState {
         self.voice_finished
     }
 
-    /// Start a one-shot voice.
+    /// Start a one-shot voice on `bank`, the original's one-buffer-per-sound
+    /// rule.
     ///
-    /// Always appends, even when an identical buffer is already playing. When
-    /// the pool is full the voice that has played the most of its buffer is
-    /// stolen; voices tied on progress give way oldest-first, so a burst of
-    /// new sounds can never evict the copy that was just started.
+    /// When the bank already has a one-shot voice it is restarted (buffer and
+    /// mix parameters replaced, seek to sample 0) instead of appending, so two
+    /// cues on the same bank cut each other off exactly like DirectSound's
+    /// single buffer does. Distinct banks still append, and a full pool steals
+    /// the voice that has played the most of its buffer; voices tied on
+    /// progress give way oldest-first, so a burst of new sounds can never
+    /// evict the copy that was just started.
+    pub(crate) fn play_sfx_on_bank(&mut self, bank: u64, pcm: Vec<i16>, gain: f32, pan: f32) {
+        if pcm.is_empty() {
+            return;
+        }
+        let seq = self.next_sfx_seq;
+        if let Some(voice) = self.sfx.iter_mut().find(|voice| voice.bank == Some(bank)) {
+            self.next_sfx_seq += 1;
+            voice.restart(bank, pcm, gain, pan, seq);
+            return;
+        }
+        if self.sfx.len() >= MAX_SFX_VOICES
+            && let Some((index, _)) = self
+                .sfx
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, voice)| (voice.pos, std::cmp::Reverse(voice.seq)))
+        {
+            self.sfx.remove(index);
+        }
+        self.next_sfx_seq += 1;
+        let mut voice = Voice::new(pcm, gain.max(0.0), pan, false, seq);
+        voice.bank = Some(bank);
+        self.sfx.push(voice);
+    }
+
+    /// Start an unkeyed one-shot voice, always appending.
     ///
-    /// TODO(parity): (audio) the original plays each sound through a single
-    /// DirectSound bank (one buffer per room/enemy/character sound record), so
-    /// replaying the same cue restarts that buffer and two actors using the
-    /// same cue cut each other off. The port appends independent voices, so
-    /// overlapping copies mix where the original would restart, and the voice
-    /// pool (16) has no counterpart in the original's fixed bank set.
+    /// The UI cues and the offline tests use this path; the gameplay paths key
+    /// their cues through [`MixState::play_sfx_on_bank`].
     pub(crate) fn play_sfx(&mut self, pcm: Vec<i16>, gain: f32, pan: f32) {
         if pcm.is_empty() {
             return;
@@ -861,11 +904,26 @@ impl Mixer {
     }
 
     /// Start a one-shot voice with `gain` and `pan` (-1 left, 1 right).
+    ///
+    /// The unkeyed path always appends; the engine's gameplay cues use
+    /// [`Mixer::play_sfx_on_bank`] instead.
     pub fn play_sfx(&mut self, wav: Wav, gain: f32, pan: f32) {
         let Some(mono) = mono_or_warn(&wav) else {
             return;
         };
         self.state.play_sfx(mono, gain, pan);
+        self.resume();
+        self.update();
+    }
+
+    /// Start a one-shot voice on `bank`, restarting that bank's voice when it
+    /// is already sounding (the original's one DirectSound buffer per sound
+    /// record).
+    pub fn play_sfx_on_bank(&mut self, bank: u64, wav: Wav, gain: f32, pan: f32) {
+        let Some(mono) = mono_or_warn(&wav) else {
+            return;
+        };
+        self.state.play_sfx_on_bank(bank, mono, gain, pan);
         self.resume();
         self.update();
     }
@@ -1221,16 +1279,37 @@ mod tests {
     }
 
     #[test]
-    fn mixer_pan_is_constant_power() {
-        let center = std::f32::consts::FRAC_1_SQRT_2;
-        let (left, right) = pan_gains(0.0);
-        assert!((left - center).abs() < 1e-6, "{left}");
-        assert!((right - center).abs() < 1e-6, "{right}");
-
+    fn mixer_pan_is_the_directsound_linear_law() {
+        assert_eq!(pan_gains(0.0), (0.5, 0.5));
         assert_eq!(pan_gains(-1.0), (1.0, 0.0));
         assert_eq!(pan_gains(1.0), (0.0, 1.0));
+        assert_eq!(pan_gains(-0.5), (0.75, 0.25));
+        assert_eq!(pan_gains(0.5), (0.25, 0.75));
         assert_eq!(pan_gains(-2.0), (1.0, 0.0));
         assert_eq!(pan_gains(2.0), (0.0, 1.0));
+    }
+
+    #[test]
+    fn mixer_pan_follows_the_3d_curves_at_the_documented_angles() {
+        // The sfx tests' camera geometry: straight ahead at 1000 units, 90
+        // degrees off the look axis, and the far wide-angle case. The pan pair
+        // runs through `pan_position` and then the linear DirectSound law.
+        let gains = |from, to, sound| {
+            let (_, pan) = crate::sfx::sound_gain_pan(from, to, sound);
+            pan_gains(pan)
+        };
+        let ahead = gains([0, 0, 0], [1000, 0, 0], [1000, 0, 0]);
+        assert!((ahead.0 - 0.5).abs() < 1e-6 && (ahead.1 - 0.5).abs() < 1e-6);
+
+        // scene_pan gives (123, 83): pan = (83 - 123) * 78 / 10000 = -0.312.
+        let wide = gains([0, 0, 0], [1000, 0, 0], [0, 0, 2000]);
+        assert!((wide.0 - 0.656).abs() < 1e-4, "{wide:?}");
+        assert!((wide.1 - 0.344).abs() < 1e-4, "{wide:?}");
+
+        // scene_pan gives (67, 41) far away: pan = (41 - 67) * 78 / 10000.
+        let far = gains([0, 0, 0], [1000, 0, 0], [0, 0, 30000]);
+        assert!((far.0 - 0.6014).abs() < 1e-4, "{far:?}");
+        assert!((far.1 - 0.3986).abs() < 1e-4, "{far:?}");
     }
 
     #[test]
@@ -1241,8 +1320,8 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let expected = (1000.0 * 0.5 * std::f32::consts::FRAC_1_SQRT_2) as i16;
-        assert_eq!(out_samples(&out), vec![expected, expected]);
+        // Centered: half the sample in each channel.
+        assert_eq!(out_samples(&out), vec![250, 250]);
     }
 
     #[test]
@@ -1253,7 +1332,7 @@ mod tests {
 
         let mut out = Vec::new();
         state.render(3, &mut out);
-        assert_eq!(out_samples(&out), vec![70, 70, -70, -70, 35, 35]);
+        assert_eq!(out_samples(&out), vec![50, 50, -50, -50, 25, 25]);
         assert!(state.bgm_channel_loaded(0));
         assert!(state.bgm_channel_playing(0));
         assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 0);
@@ -1314,11 +1393,11 @@ mod tests {
         state.play_voice(vec![10, 20, 30, 40], 1.0, 0.0);
         state.load_movie_audio(vec![1000, 1000, 2000, 2000, 3000, 3000]);
 
-        // Unpaused: the looping BGM, the voice bank and the film sum.
-        let center = std::f32::consts::FRAC_1_SQRT_2;
+        // Unpaused: the looping BGM, the voice bank and the film sum. Both
+        // banks are centered, so each contributes half its sample per channel.
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let mixed = (100.0 * center + 10.0 * center) as i16;
+        let mixed = (100.0 * 0.5 + 10.0 * 0.5) as i16;
         assert_eq!(out_samples(&out), vec![1000 + mixed, 1000 + mixed]);
 
         // Pausing stops the BGM and voice banks and rewinds them; the film
@@ -1366,43 +1445,63 @@ mod tests {
     }
 
     #[test]
-    fn mixer_same_source_overlaps_and_sums() {
+    fn mixer_same_bank_restarts_the_voice() {
         let mut state = MixState::new();
-        let pcm = vec![1000i16; 8];
-
-        state.play_sfx(pcm.clone(), 1.0, 0.0);
+        state.play_sfx_on_bank(7, vec![1000i16; 8], 1.0, 0.0);
         assert_eq!(state.active_sfx(), 1);
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![707, 707]);
+        assert_eq!(out_samples(&out), vec![500, 500]);
 
-        // A second copy started one tick later must add to the first voice,
-        // not replace it or restart it from zero.
-        state.play_sfx(pcm.clone(), 1.0, 0.0);
-        assert_eq!(state.active_sfx(), 2, "the second voice replaced the first");
-        assert_eq!(state.sfx[0].pos, 1, "the first voice was restarted");
+        // The same bank one tick later must restart that one voice from sample
+        // 0 with the new buffer and parameters, not append a second copy.
+        state.play_sfx_on_bank(7, vec![2000i16; 8], 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 1, "the second cue appended a voice");
+        assert_eq!(state.sfx[0].pos, 0, "the bank voice did not seek to zero");
+        assert_eq!(state.sfx[0].pcm[0], 2000, "the buffer was not replaced");
+
+        let mut out = Vec::new();
+        state.render(1, &mut out);
+        assert_eq!(out_samples(&out), vec![1000, 1000]);
+
+        // A voice restarted after expiry starts fresh, not at old progress.
+        state.render(7, &mut out);
+        assert!(state.sfx.is_empty());
+        state.play_sfx_on_bank(7, vec![100i16; 2], 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 1);
+        assert_eq!(state.sfx[0].pos, 0);
+    }
+
+    #[test]
+    fn mixer_distinct_banks_append_and_sum() {
+        let mut state = MixState::new();
+        state.play_sfx_on_bank(1, vec![1000i16; 8], 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 1);
+
+        // A different bank is a different one-shot: it appends and sums.
+        state.play_sfx_on_bank(2, vec![1000i16; 8], 1.0, 0.0);
+        assert_eq!(state.active_sfx(), 2, "the distinct cue replaced the first");
+        assert_eq!(state.sfx[0].pos, 0);
         assert_eq!(state.sfx[1].pos, 0);
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![1414, 1414]);
-
-        // Both voices step forward independently.
-        assert_eq!(state.sfx[0].pos, 2);
+        assert_eq!(out_samples(&out), vec![1000, 1000]);
+        assert_eq!(state.sfx[0].pos, 1);
         assert_eq!(state.sfx[1].pos, 1);
     }
 
     #[test]
-    fn mixer_four_same_sources_stack() {
+    fn mixer_four_distinct_banks_stack() {
         let mut state = MixState::new();
-        for _ in 0..4 {
-            state.play_sfx(vec![1000i16; 4], 1.0, 0.0);
+        for bank in 0..4 {
+            state.play_sfx_on_bank(bank, vec![1000i16; 4], 1.0, 0.0);
         }
         assert_eq!(state.active_sfx(), 4);
 
         let mut out = Vec::new();
         state.render(1, &mut out);
-        assert_eq!(out_samples(&out), vec![2828, 2828]);
+        assert_eq!(out_samples(&out), vec![2000, 2000]);
         assert!(state.sfx.iter().all(|voice| voice.pos == 1));
 
         // All four expire together and the mixer goes silent.
@@ -1463,8 +1562,7 @@ mod tests {
         state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
         state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
 
-        let center = std::f32::consts::FRAC_1_SQRT_2;
-        let expected = (100.0 * center + 2.0 * 1000.0 * center) as i16;
+        let expected = (100.0 * 0.5 + 2.0 * 1000.0 * 0.5) as i16;
         let mut out = Vec::new();
         state.render(1, &mut out);
         assert_eq!(out_samples(&out), vec![expected, expected]);
@@ -1607,8 +1705,7 @@ mod tests {
         state.restart_bgm_channel(0);
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let center = std::f32::consts::FRAC_1_SQRT_2;
-        let expected = (100.0 * center) as i16;
+        let expected = 50;
         assert_eq!(out_samples(&out), vec![expected, expected]);
 
         // A non-looping bank stops itself at the end but stays loaded.
@@ -1669,11 +1766,10 @@ mod tests {
         state.play_voice(vec![1000, 1000], 1.0, -1.0);
         state.play_sfx(vec![1000, 1000], 1.0, 1.0);
 
-        let center = std::f32::consts::FRAC_1_SQRT_2;
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let left = (100.0 * center + 1000.0) as i16;
-        let right = (100.0 * center + 1000.0) as i16;
+        let left = (100.0 * 0.5 + 1000.0) as i16;
+        let right = (100.0 * 0.5 + 1000.0) as i16;
         let samples = out_samples(&out);
         assert!(
             (i32::from(samples[0]) - i32::from(left)).abs() <= 1,
