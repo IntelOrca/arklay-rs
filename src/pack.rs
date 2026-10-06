@@ -18,6 +18,7 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::budget;
 use crate::manifest;
 
 /// Magic bytes at the start of every pack.
@@ -240,7 +241,14 @@ pub struct Pack {
 
 impl Pack {
     /// Read and parse a pack from disk.
+    ///
+    /// The file size is checked against [`budget::MAX_PACK_BYTES`] before the
+    /// image is read, so an oversized pack is rejected without allocating it.
     pub fn open(path: &Path) -> Result<Self> {
+        let metadata = std::fs::metadata(path)
+            .with_context(|| format!("failed to stat pack {}", path.display()))?;
+        budget::check_len_u64(metadata.len(), budget::MAX_PACK_BYTES, "pack file size")
+            .with_context(|| format!("failed to read pack {}", path.display()))?;
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read pack {}", path.display()))?;
         let mut pack = Self::from_bytes(data)?;
@@ -333,6 +341,7 @@ impl Pack {
 
     /// Parse a pack from an in-memory image.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+        budget::check_len_u64(data.len() as u64, budget::MAX_PACK_BYTES, "pack size")?;
         if data.len() < HEADER_LEN {
             bail!("pack is smaller than the header");
         }
@@ -344,6 +353,7 @@ impl Pack {
             bail!("unsupported pack version {version}");
         }
         let entry_count = u32::from_le_bytes([data[6], data[7], data[8], data[9]]) as usize;
+        budget::check_len(entry_count, budget::MAX_PACK_ENTRIES, "pack entry count")?;
         let toc_end = entry_count
             .checked_mul(ENTRY_LEN)
             .and_then(|size| size.checked_add(HEADER_LEN))
@@ -352,13 +362,18 @@ impl Pack {
             bail!("pack table of contents is truncated");
         }
 
-        let mut entries = Vec::with_capacity(entry_count);
-        let mut lookup = HashMap::with_capacity(entry_count);
+        let mut entries = budget::alloc::<Entry>(entry_count, "pack table of contents")?;
+        let mut lookup = HashMap::new();
+        budget::reserve_map(&mut lookup, entry_count, "pack lookup table")?;
         for index in 0..entry_count {
             let toc = &data[HEADER_LEN + index * ENTRY_LEN..HEADER_LEN + (index + 1) * ENTRY_LEN];
             let path_offset = read_u64(toc, 0)?;
             let data_offset = read_u64(toc, 8)?;
-            let length = read_u64(toc, 16)?;
+            let length = budget::check_len_u64(
+                read_u64(toc, 16)?,
+                budget::MAX_ENTRY_BYTES,
+                &format!("entry {index} length"),
+            )?;
             let kind = toc[24];
             if kind != 0 {
                 bail!("entry {index} has unsupported kind {kind}");
@@ -881,6 +896,23 @@ mod tests {
         let mut counted = empty_pack();
         counted[6..10].copy_from_slice(&3u32.to_le_bytes());
         assert!(Pack::from_bytes(counted).is_err());
+    }
+
+    #[test]
+    fn rejects_an_entry_count_over_the_cap_before_allocating() {
+        let mut counted = empty_pack();
+        let huge = u32::try_from(budget::MAX_PACK_ENTRIES + 1).unwrap();
+        counted[6..10].copy_from_slice(&huge.to_le_bytes());
+        let message = budget::assert_cap_error(Pack::from_bytes(counted));
+        assert!(message.contains("entry count"), "{message}");
+    }
+
+    #[test]
+    fn rejects_an_entry_length_over_the_cap() {
+        let mut bytes = single_entry_pack("a.txt", b"xyz");
+        write_u64(&mut bytes, HEADER_LEN + 16, budget::MAX_ENTRY_BYTES + 1);
+        let message = budget::assert_cap_error(Pack::from_bytes(bytes));
+        assert!(message.contains("length"), "{message}");
     }
 
     #[test]

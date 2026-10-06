@@ -28,6 +28,7 @@
 use anyhow::{Context, Result, bail};
 
 use crate::anim::{self, Mat4x3};
+use crate::budget;
 use crate::model::{Texture8, Tmd};
 use crate::render::Lighting;
 use crate::scd::ir::Operand;
@@ -70,6 +71,12 @@ pub fn parse_assets(data: &[u8], pointer: u32, count: u8) -> (Vec<ObjectAsset>, 
     if pointer == 0 || count == 0 {
         return (assets, warnings);
     }
+    // Pair pointers may overlap, so the per-model caps alone do not bound the
+    // total; keep a running budget across every decoded pair.
+    let mut total_pixels = 0usize;
+    let mut total_vertices = 0usize;
+    let mut total_normals = 0usize;
+    let mut total_prims = 0usize;
     let base = pointer as usize;
     for pair in 0..usize::from(count) {
         let at = base + pair * 8;
@@ -122,7 +129,59 @@ pub fn parse_assets(data: &[u8], pointer: u32, count: u8) -> (Vec<ObjectAsset>, 
             })
         })();
         match parsed {
-            Ok(asset) => assets.push(asset),
+            Ok(asset) => {
+                let totals = (|| -> Result<(usize, usize, usize, usize)> {
+                    let pixels = total_pixels
+                        .checked_add(asset.texture.indices.len())
+                        .context("object texture pixel total overflows")?;
+                    let vertices = total_vertices
+                        .checked_add(
+                            asset
+                                .model
+                                .objects
+                                .iter()
+                                .map(|o| o.vertices.len())
+                                .sum::<usize>(),
+                        )
+                        .context("object vertex total overflows")?;
+                    let normals = total_normals
+                        .checked_add(
+                            asset
+                                .model
+                                .objects
+                                .iter()
+                                .map(|o| o.normals.len())
+                                .sum::<usize>(),
+                        )
+                        .context("object normal total overflows")?;
+                    let prims = total_prims
+                        .checked_add(
+                            asset
+                                .model
+                                .objects
+                                .iter()
+                                .map(|o| o.prims.len())
+                                .sum::<usize>(),
+                        )
+                        .context("object primitive total overflows")?;
+                    budget::check_len(pixels, budget::MAX_PIXELS, "object texture pixel total")?;
+                    budget::check_len(vertices, budget::MAX_TMD_VERTICES, "object vertex total")?;
+                    budget::check_len(normals, budget::MAX_TMD_VERTICES, "object normal total")?;
+                    budget::check_len(prims, budget::MAX_TMD_PRIMS, "object primitive total")?;
+                    Ok((pixels, vertices, normals, prims))
+                })();
+                match totals {
+                    Ok((pixels, vertices, normals, prims)) => {
+                        (total_pixels, total_vertices, total_normals, total_prims) =
+                            (pixels, vertices, normals, prims);
+                        assets.push(asset);
+                    }
+                    Err(error) => {
+                        warnings.push(format!("model pair {pair}: {error:#}"));
+                        break;
+                    }
+                }
+            }
             Err(error) => warnings.push(format!("model pair {pair}: {error:#}")),
         }
     }

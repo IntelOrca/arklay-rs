@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::mask;
 pub use crate::state::{Collision, CollisionRect, FootstepZone, Light, WalkZone, Zone};
 use crate::state::{Cut, RoomId, RoomState};
@@ -265,6 +266,7 @@ fn parse_collision(data: &[u8], pointer: u32) -> Result<Collision> {
             .checked_add(count as usize)
             .context("collision record count overflows")?;
     }
+    budget::check_len(total, budget::MAX_RECORDS, "collision record count")?;
 
     let records_start = base + COLLISION_HEADER_SIZE;
     let records_end = total
@@ -337,6 +339,11 @@ fn parse_zones(data: &[u8], pointer: u32) -> Result<Vec<Zone>> {
             corner[0] = i16_at(data, offset + 4 + index * 4)?;
             corner[1] = i16_at(data, offset + 6 + index * 4)?;
         }
+        budget::check_len(
+            zones.len() + 1,
+            budget::MAX_RECORDS,
+            "camera switch zone count",
+        )?;
         zones.push(Zone {
             cam_to,
             cam_from,
@@ -418,6 +425,7 @@ fn parse_footstep_zones(data: &[u8], pointer: u32, next: u32) -> Result<Vec<Foot
     };
 
     let count = (end - start) / FOOTSTEP_ZONE_SIZE;
+    budget::check_len(count, budget::MAX_RECORDS, "footstep zone count")?;
     let mut zones = Vec::with_capacity(count);
     for index in 0..count {
         let offset = start + index * FOOTSTEP_ZONE_SIZE;
@@ -459,8 +467,12 @@ fn parse_messages(data: &[u8], pointers: &[u32; POINTER_COUNT]) -> Result<Option
         .filter(|&value| value > base && value <= data.len())
         .min()
         .unwrap_or(data.len());
+    let len = end - base;
+    budget::check_len(len, budget::MAX_DECODE_ALLOC, "room message block size")?;
+    let mut block = budget::alloc::<u8>(len, "room message block")?;
+    block.extend_from_slice(&data[base..end]);
 
-    Ok(Some(data[base..end].to_vec()))
+    Ok(Some(block))
 }
 
 impl RoomState {
@@ -1009,6 +1021,21 @@ mod tests {
         }
 
         assert!(parse(&data, ROOM_ID).is_err());
+    }
+
+    #[test]
+    fn rejects_collision_counts_over_the_cap() {
+        let mut data = build_rdt(0, &[]);
+        let offset = data.len();
+        set_ptr(&mut data, COLLISION_SLOT, offset);
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        for count in [i32::MAX, 0, 0, 0, 0] {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+
+        let message = budget::assert_cap_error(parse(&data, ROOM_ID));
+        assert!(message.contains("collision record count"), "{message}");
     }
 
     #[test]

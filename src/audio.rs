@@ -21,7 +21,6 @@ use std::ffi::{CStr, c_int};
 use std::ptr;
 
 use anyhow::{Context, Result, bail};
-
 use sdl3_sys::audio::{
     SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, SDL_AUDIO_S16LE, SDL_AudioSpec, SDL_AudioStream,
     SDL_ClearAudioStream, SDL_DestroyAudioStream, SDL_GetAudioStreamQueued,
@@ -29,6 +28,8 @@ use sdl3_sys::audio::{
     SDL_ResumeAudioStreamDevice,
 };
 use sdl3_sys::init::{SDL_INIT_AUDIO, SDL_InitSubSystem};
+
+use crate::budget;
 
 /// Sample rate of every mixer voice and of the output stream.
 pub const SAMPLE_RATE: u32 = 22050;
@@ -138,7 +139,10 @@ pub fn parse_wav(bytes: &[u8]) -> Result<Wav> {
                 channels = fmt_channels;
                 sample_rate = fmt_rate;
             }
-            b"data" => data = Some(bytes[start..end].to_vec()),
+            b"data" => {
+                budget::check_len(size, budget::MAX_WAV_DATA, "WAV data chunk size")?;
+                data = Some(bytes[start..end].to_vec());
+            }
             _ => {}
         }
 
@@ -164,25 +168,38 @@ fn chunk_label(id: &[u8]) -> String {
 ///
 /// 8-bit unsigned samples are centered and scaled up by 8 bits; 16-bit
 /// samples are read little-endian. Multi-channel data is averaged down to
-/// mono, and any other sample rate is linearly resampled.
-fn to_mono(wav: &Wav) -> Vec<i16> {
+/// mono, and any other sample rate is linearly resampled. Both the source
+/// sample count and the resampled result are capped at
+/// [`budget::MAX_WAV_SAMPLES`], so a tiny sample rate cannot expand a small
+/// file into an unbounded buffer.
+fn to_mono(wav: &Wav) -> Result<Vec<i16>> {
     let mut mono: Vec<i16> = match wav.format {
-        WavFormat::U8 => wav
-            .data
-            .iter()
-            .map(|&byte| (i16::from(byte) - 128) << 8)
-            .collect(),
-        WavFormat::S16Le => wav
-            .data
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|chunk| i16::from_le_bytes(*chunk))
-            .collect(),
+        WavFormat::U8 => {
+            budget::check_len(wav.data.len(), budget::MAX_WAV_SAMPLES, "WAV sample count")?;
+            wav.data
+                .iter()
+                .map(|&byte| (i16::from(byte) - 128) << 8)
+                .collect()
+        }
+        WavFormat::S16Le => {
+            let samples = wav.data.len() / 2;
+            budget::check_len(samples, budget::MAX_WAV_SAMPLES, "WAV sample count")?;
+            wav.data
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|chunk| i16::from_le_bytes(*chunk))
+                .collect()
+        }
     };
 
     if wav.channels > 1 {
         let channels = usize::from(wav.channels);
+        budget::check_len(
+            mono.len() / channels,
+            budget::MAX_WAV_SAMPLES,
+            "WAV frame count",
+        )?;
         mono = mono
             .chunks(channels)
             .map(|frame| {
@@ -193,28 +210,48 @@ fn to_mono(wav: &Wav) -> Vec<i16> {
     }
 
     if wav.sample_rate != SAMPLE_RATE {
-        mono = resample_linear(&mono, wav.sample_rate, SAMPLE_RATE);
+        mono = resample_linear(&mono, wav.sample_rate, SAMPLE_RATE)?;
     }
-    mono
+    Ok(mono)
 }
 
 /// Linearly resample `input` from `from` Hz to `to` Hz.
-fn resample_linear(input: &[i16], from: u32, to: u32) -> Vec<i16> {
+///
+/// The output length is checked against [`budget::MAX_WAV_SAMPLES`] and the
+/// buffer is reserved through [`budget::alloc`].
+fn resample_linear(input: &[i16], from: u32, to: u32) -> Result<Vec<i16>> {
     if input.is_empty() || from == 0 || to == 0 || from == to {
-        return input.to_vec();
+        return Ok(input.to_vec());
     }
 
-    let out_len = (input.len() as u64 * u64::from(to) / u64::from(from)) as usize;
-    (0..out_len)
-        .map(|index| {
-            let position = index as f64 * f64::from(from) / f64::from(to);
-            let base = position.floor() as usize;
-            let fraction = (position - base as f64) as f32;
-            let a = f32::from(input[base.min(input.len() - 1)]);
-            let b = f32::from(input[(base + 1).min(input.len() - 1)]);
-            (a + (b - a) * fraction) as i16
-        })
-        .collect()
+    let out_len_u64 = input.len() as u64 * u64::from(to) / u64::from(from);
+    let out_len = usize::try_from(out_len_u64).context("resampled WAV length overflows")?;
+    budget::check_len(
+        out_len,
+        budget::MAX_WAV_SAMPLES,
+        "resampled WAV sample count",
+    )?;
+    let mut out = budget::alloc::<i16>(out_len, "resampled WAV buffer")?;
+    for index in 0..out_len {
+        let position = index as f64 * f64::from(from) / f64::from(to);
+        let base = position.floor() as usize;
+        let fraction = (position - base as f64) as f32;
+        let a = f32::from(input[base.min(input.len() - 1)]);
+        let b = f32::from(input[(base + 1).min(input.len() - 1)]);
+        out.push((a + (b - a) * fraction) as i16);
+    }
+    Ok(out)
+}
+
+/// Convert a WAV for playback, logging and dropping an over-cap source.
+fn mono_or_warn(wav: &Wav) -> Option<Vec<i16>> {
+    match to_mono(wav) {
+        Ok(mono) => Some(mono),
+        Err(error) => {
+            eprintln!("[audio] dropping WAV: {error:#}");
+            None
+        }
+    }
 }
 
 /// Constant-power left and right gains for `pan`, where -1 is hard left, 1 is
@@ -719,14 +756,20 @@ impl Mixer {
     /// the channel's volume and pan before the first samples are rendered (a
     /// bank that loads muted must not leak a full-gain burst).
     pub fn play_bgm_channel(&mut self, index: usize, wav: Wav) {
-        self.state.load_bgm_channel(index, to_mono(&wav), true);
+        let Some(mono) = mono_or_warn(&wav) else {
+            return;
+        };
+        self.state.load_bgm_channel(index, mono, true);
         self.state.restart_bgm_channel(index);
         self.resume();
     }
 
     /// Load `wav` into BGM channel `index` without starting it.
     pub fn load_bgm_channel(&mut self, index: usize, wav: Wav) {
-        self.state.load_bgm_channel(index, to_mono(&wav), true);
+        let Some(mono) = mono_or_warn(&wav) else {
+            return;
+        };
+        self.state.load_bgm_channel(index, mono, true);
         self.resume();
     }
 
@@ -776,7 +819,7 @@ impl Mixer {
         if !unsafe { SDL_ClearAudioStream(self.stream) } {
             bail!("SDL_ClearAudioStream failed");
         }
-        self.state.play_bgm(to_mono(&wav));
+        self.state.play_bgm(to_mono(&wav)?);
         self.resume();
         self.update();
         Ok(())
@@ -795,7 +838,10 @@ impl Mixer {
 
     /// Replace the voice (dialogue) buffer and start it from sample 0.
     pub fn play_voice(&mut self, wav: Wav, gain: f32, pan: f32) {
-        self.state.play_voice(to_mono(&wav), gain, pan);
+        let Some(mono) = mono_or_warn(&wav) else {
+            return;
+        };
+        self.state.play_voice(mono, gain, pan);
         self.resume();
     }
 
@@ -816,7 +862,10 @@ impl Mixer {
 
     /// Start a one-shot voice with `gain` and `pan` (-1 left, 1 right).
     pub fn play_sfx(&mut self, wav: Wav, gain: f32, pan: f32) {
-        self.state.play_sfx(to_mono(&wav), gain, pan);
+        let Some(mono) = mono_or_warn(&wav) else {
+            return;
+        };
+        self.state.play_sfx(mono, gain, pan);
         self.resume();
         self.update();
     }
@@ -1140,21 +1189,35 @@ mod tests {
     #[test]
     fn mixer_upsamples_u8_to_s16() {
         let wav = parse_wav(&wav_bytes(WavFormat::U8, 1, 22050, &[0, 128, 255])).unwrap();
-        assert_eq!(to_mono(&wav), vec![-32768, 0, 32512]);
+        assert_eq!(to_mono(&wav).unwrap(), vec![-32768, 0, 32512]);
     }
 
     #[test]
     fn mixer_averages_channels_to_mono() {
         let data = s16_bytes(&[1000, 3000, -1000, -3000]);
         let wav = parse_wav(&wav_bytes(WavFormat::S16Le, 2, 22050, &data)).unwrap();
-        assert_eq!(to_mono(&wav), vec![2000, -2000]);
+        assert_eq!(to_mono(&wav).unwrap(), vec![2000, -2000]);
     }
 
     #[test]
     fn mixer_resamples_44100_to_22050() {
         let data = s16_bytes(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         let wav = parse_wav(&wav_bytes(WavFormat::S16Le, 1, 44100, &data)).unwrap();
-        assert_eq!(to_mono(&wav), vec![0, 2, 4, 6, 8]);
+        assert_eq!(to_mono(&wav).unwrap(), vec![0, 2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn rejects_a_resample_bomb_before_allocating_it() {
+        // A 1 Hz source expands by 22,050x; a small file would otherwise ask
+        // for hundreds of millions of samples.
+        let wav = Wav {
+            format: WavFormat::U8,
+            channels: 1,
+            sample_rate: 1,
+            data: vec![0u8; 8192],
+        };
+        let message = budget::assert_cap_error(to_mono(&wav));
+        assert!(message.contains("resampled WAV sample count"), "{message}");
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::model::{Tmd, TmdObject, TmdPrim};
 
 const HEADER_LEN: usize = 12;
@@ -43,6 +44,7 @@ pub fn parse(data: &[u8]) -> Result<Tmd> {
     }
 
     let object_count = read_u32(data, 8)? as usize;
+    budget::check_len(object_count, budget::MAX_TMD_OBJECTS, "TMD object count")?;
     let table_len = object_count
         .checked_mul(DESCRIPTOR_LEN)
         .context("TMD object count overflows")?;
@@ -53,7 +55,10 @@ pub fn parse(data: &[u8]) -> Result<Tmd> {
         format!("TMD descriptor table for {object_count} object(s) is truncated")
     })?;
 
-    let mut objects = Vec::with_capacity(object_count);
+    let mut objects = budget::alloc::<TmdObject>(object_count, "TMD object list")?;
+    let mut total_vertices = 0usize;
+    let mut total_normals = 0usize;
+    let mut total_prims = 0usize;
     for (index, descriptor) in table.as_chunks::<DESCRIPTOR_LEN>().0.iter().enumerate() {
         let field = |slot: usize| {
             i32::from_le_bytes(descriptor[slot * 4..slot * 4 + 4].try_into().unwrap())
@@ -61,6 +66,20 @@ pub fn parse(data: &[u8]) -> Result<Tmd> {
         let vertices = parse_vertices(data, field(0), field(1), index)?;
         let mut normals = parse_normals(data, field(2), field(3), index)?;
         let prims = parse_prims(data, field(4), field(5), &vertices, &mut normals, index)?;
+        // Object offsets may overlap, so cap the totals across the whole file
+        // as well as per pool.
+        total_vertices = total_vertices
+            .checked_add(vertices.len())
+            .context("TMD vertex total overflows")?;
+        total_normals = total_normals
+            .checked_add(normals.len())
+            .context("TMD normal total overflows")?;
+        total_prims = total_prims
+            .checked_add(prims.len())
+            .context("TMD primitive total overflows")?;
+        budget::check_len(total_vertices, budget::MAX_TMD_VERTICES, "TMD vertex total")?;
+        budget::check_len(total_normals, budget::MAX_TMD_VERTICES, "TMD normal total")?;
+        budget::check_len(total_prims, budget::MAX_TMD_PRIMS, "TMD primitive total")?;
         objects.push(TmdObject {
             vertices,
             normals,
@@ -72,6 +91,7 @@ pub fn parse(data: &[u8]) -> Result<Tmd> {
 
 fn parse_vertices(data: &[u8], offset: i32, count: i32, object: usize) -> Result<Vec<[i16; 3]>> {
     let count = checked_count(count, &format!("object {object} vertex"))?;
+    budget::check_len(count, budget::MAX_TMD_VERTICES, "TMD vertex count")?;
     let start = relative(offset, &format!("object {object} vertex offset"))?;
     let bytes = checked_slice(
         data,
@@ -91,6 +111,7 @@ fn parse_vertices(data: &[u8], offset: i32, count: i32, object: usize) -> Result
 
 fn parse_normals(data: &[u8], offset: i32, count: i32, object: usize) -> Result<Vec<[i16; 3]>> {
     let count = checked_count(count, &format!("object {object} normal"))?;
+    budget::check_len(count, budget::MAX_TMD_VERTICES, "TMD normal count")?;
     let start = relative(offset, &format!("object {object} normal offset"))?;
     let bytes = checked_slice(
         data,
@@ -117,8 +138,12 @@ fn parse_prims(
     object: usize,
 ) -> Result<Vec<TmdPrim>> {
     let count = checked_count(count, &format!("object {object} primitive"))?;
+    budget::check_len(count, budget::MAX_TMD_PRIMS, "TMD primitive count")?;
     let start = relative(offset, &format!("object {object} primitive offset"))?;
-    let mut prims = Vec::with_capacity(count);
+    // A packet is at least four bytes, so the remaining input caps the useful
+    // reservation even when the declared count is larger.
+    let capacity = count.min(data.len().saturating_sub(start) / 4);
+    let mut prims = budget::alloc::<TmdPrim>(capacity, "TMD primitive list")?;
     let mut cursor = start;
     for packet in 0..count {
         let (decoded, size) = decode_prim(data, cursor, vertices.len(), normals)
@@ -153,6 +178,23 @@ fn decode_prim(
     let packet = data
         .get(offset..offset + size)
         .with_context(|| format!("primitive 0x{command:08X} at 0x{offset:X} is truncated"))?;
+    // Reject unknown commands before reading any packet word: a command whose
+    // own size field is tiny is not one of the supported forms, and the
+    // unconditional word reads below would otherwise index past the packet.
+    if !matches!(
+        command,
+        GOURAUD_TEXTURED_TRIANGLE
+            | GOURAUD_TEXTURED_TRIANGLE_BLEND
+            | FLAT_TEXTURED_TRIANGLE
+            | TEXTURED_TRIANGLE_RAW_Y
+            | GOURAUD_FLAT_UNTEXTURED_TRIANGLE
+            | GOURAUD_TEXTURED_QUAD
+    ) {
+        bail!(
+            "unsupported TMD primitive command 0x{command:08X}; only the six \
+             0x34000609/0x36000609/0x24000507/0x25010607/0x30000406/0x3C00080C forms are supported"
+        );
+    }
     let word = |slot: usize| u32::from_le_bytes(packet[slot * 4..slot * 4 + 4].try_into().unwrap());
     let w1 = word(1);
     let w2 = word(2);
@@ -312,10 +354,7 @@ fn decode_prim(
             }
             prims
         }
-        _ => bail!(
-            "unsupported TMD primitive command 0x{command:08X}; only the six \
-             0x34000609/0x36000609/0x24000507/0x25010607/0x30000406/0x3C00080C forms are supported"
-        ),
+        _ => unreachable!("unknown commands are rejected before the word reads"),
     };
     Ok((decoded, size))
 }
@@ -635,6 +674,30 @@ mod tests {
     fn rejects_truncated_header() {
         let err = parse(&[0u8; 8]).unwrap_err().to_string();
         assert!(err.contains("header"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_counts_over_the_caps_before_allocating() {
+        let mut data = vec![0u8; HEADER_LEN];
+        data[0..4].copy_from_slice(&0x41u32.to_le_bytes());
+        data[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("object count"), "{message}");
+
+        let mut data = sample_tmd(&[]);
+        data[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&i32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("vertex count"), "{message}");
+
+        let mut data = sample_tmd(&[]);
+        data[HEADER_LEN + 12..HEADER_LEN + 16].copy_from_slice(&i32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("normal count"), "{message}");
+
+        let mut data = sample_tmd(&[]);
+        data[HEADER_LEN + 20..HEADER_LEN + 24].copy_from_slice(&i32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("primitive count"), "{message}");
     }
 
     #[test]

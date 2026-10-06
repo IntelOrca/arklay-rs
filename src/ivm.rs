@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::model::Texture8;
 use crate::tim;
 
@@ -143,6 +144,11 @@ fn parse_tmd(data: &[u8]) -> Result<Vec<IvmObject>> {
         bail!("IVM TMD has magic 0x{magic:08X}, expected 0x{TMD_MAGIC:08X}");
     }
     let object_count = read_u32(data, 8)? as usize;
+    budget::check_len(
+        object_count,
+        budget::MAX_TMD_OBJECTS,
+        "IVM TMD object count",
+    )?;
     let table_len = object_count
         .checked_mul(TMD_DESCRIPTOR_LEN)
         .context("IVM TMD object count overflows")?;
@@ -152,7 +158,10 @@ fn parse_tmd(data: &[u8]) -> Result<Vec<IvmObject>> {
             format!("IVM TMD descriptor table for {object_count} object(s) is truncated")
         })?;
 
-    let mut objects = Vec::with_capacity(object_count);
+    let mut objects = budget::alloc::<IvmObject>(object_count, "IVM TMD object list")?;
+    let mut total_vertices = 0usize;
+    let mut total_normals = 0usize;
+    let mut total_prims = 0usize;
     for (index, descriptor) in table.as_chunks::<TMD_DESCRIPTOR_LEN>().0.iter().enumerate() {
         let field = |slot: usize| {
             i32::from_le_bytes(descriptor[slot * 4..slot * 4 + 4].try_into().unwrap())
@@ -160,6 +169,30 @@ fn parse_tmd(data: &[u8]) -> Result<Vec<IvmObject>> {
         let vertices = parse_pool(data, field(0), field(1), index, "vertex")?;
         let normals = parse_pool(data, field(2), field(3), index, "normal")?;
         let prims = parse_prims(data, field(4), field(5), &vertices, &normals, index)?;
+        total_vertices = total_vertices
+            .checked_add(vertices.len())
+            .context("IVM TMD vertex total overflows")?;
+        total_normals = total_normals
+            .checked_add(normals.len())
+            .context("IVM TMD normal total overflows")?;
+        total_prims = total_prims
+            .checked_add(prims.len())
+            .context("IVM TMD primitive total overflows")?;
+        budget::check_len(
+            total_vertices,
+            budget::MAX_TMD_VERTICES,
+            "IVM TMD vertex total",
+        )?;
+        budget::check_len(
+            total_normals,
+            budget::MAX_TMD_VERTICES,
+            "IVM TMD normal total",
+        )?;
+        budget::check_len(
+            total_prims,
+            budget::MAX_TMD_PRIMS,
+            "IVM TMD primitive total",
+        )?;
         objects.push(IvmObject {
             vertices,
             normals,
@@ -179,6 +212,7 @@ fn parse_pool(
 ) -> Result<Vec<[i16; 3]>> {
     let count = usize::try_from(count)
         .with_context(|| format!("IVM TMD object {object} {what} count is negative: {count}"))?;
+    budget::check_len(count, budget::MAX_TMD_VERTICES, "IVM TMD pool count")?;
     let start = relative(data, offset, object, what)?;
     let bytes = data
         .get(start..)
@@ -215,11 +249,12 @@ fn parse_prims(
 ) -> Result<Vec<IvmPrim>> {
     let count = usize::try_from(count)
         .with_context(|| format!("IVM TMD object {object} primitive count is negative: {count}"))?;
+    budget::check_len(count, budget::MAX_TMD_PRIMS, "IVM TMD primitive count")?;
     let mut position = relative(data, offset, object, "primitive")?;
     // A primitive packet is at least 4 bytes, so the remaining mesh bytes cap
     // how many can possibly parse; never reserve an attacker-sized count.
     let capacity = count.min(data.len().saturating_sub(position) / 4);
-    let mut prims = Vec::with_capacity(capacity);
+    let mut prims = budget::alloc::<IvmPrim>(capacity, "IVM TMD primitive list")?;
     for index in 0..count {
         let packet = data
             .get(position..position + 4)
@@ -560,6 +595,22 @@ mod tests {
         let error = parse(&data).unwrap_err();
         let message = format!("{error:#}");
         assert!(message.contains("0x34000404"), "{message}");
+    }
+
+    #[test]
+    fn rejects_counts_over_the_caps_before_allocating() {
+        let mut data = sample_ivm();
+        let tmd = texture_end(&data).unwrap();
+        data[tmd + 8..tmd + 12].copy_from_slice(&u32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("object count"), "{message}");
+
+        let mut data = sample_ivm();
+        let tmd = texture_end(&data).unwrap();
+        let count_at = tmd + TMD_HEADER_LEN + 4;
+        data[count_at..count_at + 4].copy_from_slice(&i32::MAX.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("pool count"), "{message}");
     }
 
     #[test]

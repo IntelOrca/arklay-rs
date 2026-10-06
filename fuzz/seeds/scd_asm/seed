@@ -1,0 +1,13 @@
+
+.version 1
+
+.init
+.block
+    nop                     0
+
+.main
+.block
+    nop                     0
+
+.event event_00
+    evt_finish

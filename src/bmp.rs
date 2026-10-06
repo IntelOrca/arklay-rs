@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
+use crate::budget;
 use crate::model::Texture8;
 use crate::state::Image;
 
@@ -114,6 +115,10 @@ fn decode_with_key(data: &[u8], key: Option<[u8; 3]>) -> Result<Image> {
 
     let width = width as usize;
     let height = height as usize;
+    let pixel_count = width
+        .checked_mul(height)
+        .context("BMP dimensions overflow")?;
+    budget::check_len(pixel_count, budget::MAX_PIXELS, "BMP pixel count")?;
     let row_bytes = width * bpp as usize / 8;
     let row_stride = (row_bytes + 3) & !3;
     let image_size = row_stride
@@ -130,7 +135,11 @@ fn decode_with_key(data: &[u8], key: Option<[u8; 3]>) -> Result<Image> {
     }
 
     let pixels = &data[pixel_offset..end];
-    let mut rgba = vec![0u8; width * height * 4];
+    let rgba_len = pixel_count
+        .checked_mul(4)
+        .context("BMP RGBA buffer overflows")?;
+    let mut rgba = budget::alloc::<u8>(rgba_len, "BMP RGBA buffer")?;
+    rgba.resize(rgba_len, 0);
     for y in 0..height {
         let src = &pixels[(height - 1 - y) * row_stride..];
         let dst = &mut rgba[y * width * 4..(y + 1) * width * 4];
@@ -647,6 +656,15 @@ mod tests {
         data[30..34].copy_from_slice(&1u32.to_le_bytes());
         let err = decode(&data).unwrap_err();
         assert!(err.to_string().contains("compression"), "{err}");
+    }
+
+    #[test]
+    fn decode_rejects_dimensions_over_the_pixel_cap() {
+        let mut data = encode_to_vec(&few_colors(2, 2)).unwrap();
+        data[18..22].copy_from_slice(&i32::MAX.to_le_bytes());
+        data[22..26].copy_from_slice(&2i32.to_le_bytes());
+        let message = budget::assert_cap_error(decode(&data));
+        assert!(message.contains("pixel count"), "{message}");
     }
 
     #[test]

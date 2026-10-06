@@ -18,6 +18,8 @@ use std::ops::Range;
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
+
 /// Microseconds per second, the unit of `avih`'s frame duration.
 const MICROS_PER_SECOND: u32 = 1_000_000;
 
@@ -188,12 +190,12 @@ impl Avi {
         let (videos, audios) = match (idx1, movi) {
             (Some(index), Some(movi)) => {
                 let movi_type = movi.start - 4;
-                match index_entries(&data, index, movi_type) {
+                match index_entries(&data, index, movi_type, budget::MAX_AVI_FRAMES) {
                     Some(entries) => entries,
-                    None => walk_movi(&data, movi)?,
+                    None => walk_movi(&data, movi, budget::MAX_AVI_FRAMES)?,
                 }
             }
-            (None, Some(movi)) => walk_movi(&data, movi)?,
+            (None, Some(movi)) => walk_movi(&data, movi, budget::MAX_AVI_FRAMES)?,
             (_, None) => bail!("AVI has no LIST movi chunk"),
         };
         if videos.is_empty() {
@@ -414,7 +416,9 @@ fn strh_frame_duration(data: &[u8], strh: Range<usize>) -> Result<Option<u32>> {
 /// staff roll), so the corpus's exact integer rates are recovered by rounding;
 /// the rate is stored as `(fps, 1)`.
 fn frame_rate(avih_us: Option<u32>, strh_us: Option<u32>) -> Result<(u32, u32)> {
-    let us = avih_us.filter(|&us| us > 0).or(strh_us);
+    let us = avih_us
+        .filter(|&us| us > 0)
+        .or(strh_us.filter(|&us| us > 0));
     let us = us.context("AVI declares neither avih nor strh frame duration")?;
     let fps = ((u64::from(MICROS_PER_SECOND) + u64::from(us) / 2) / u64::from(us)).max(1);
     if fps > u64::from(u32::MAX) {
@@ -431,6 +435,7 @@ fn index_entries(
     data: &[u8],
     index: Range<usize>,
     movi_type: usize,
+    max_frames: usize,
 ) -> Option<(Vec<ChunkRef>, Vec<ChunkRef>)> {
     let mut videos = Vec::new();
     let mut audios = Vec::new();
@@ -452,6 +457,9 @@ fn index_entries(
             return None;
         }
         data.get(chunk + 8..chunk + 8 + len)?;
+        if videos.len() >= max_frames || audios.len() >= max_frames {
+            return None;
+        }
         match &id {
             b"00dc" | b"00db" => videos.push(ChunkRef {
                 offset: chunk + 8,
@@ -479,10 +487,14 @@ fn index_entries(
 
 /// Walk `LIST movi` recursively and collect the video and audio chunks in file
 /// order. Used when there is no `idx1`, or when the index fails validation.
-fn walk_movi(data: &[u8], movi: Range<usize>) -> Result<(Vec<ChunkRef>, Vec<ChunkRef>)> {
+fn walk_movi(
+    data: &[u8],
+    movi: Range<usize>,
+    max_frames: usize,
+) -> Result<(Vec<ChunkRef>, Vec<ChunkRef>)> {
     let mut videos = Vec::new();
     let mut audios = Vec::new();
-    collect_movi(data, movi, &mut videos, &mut audios, 0)?;
+    collect_movi(data, movi, &mut videos, &mut audios, 0, max_frames)?;
     Ok((videos, audios))
 }
 
@@ -493,6 +505,7 @@ fn collect_movi(
     videos: &mut Vec<ChunkRef>,
     audios: &mut Vec<ChunkRef>,
     depth: usize,
+    max_frames: usize,
 ) -> Result<()> {
     if depth > 4 {
         return Ok(());
@@ -507,6 +520,9 @@ fn collect_movi(
             .checked_add(size)
             .filter(|&chunk_end| chunk_end <= end)
             .with_context(|| format!("movi chunk {:?} overruns the list", fourcc(&id)))?;
+        if videos.len() >= max_frames || audios.len() >= max_frames {
+            bail!("AVI chunk index exceeds the {max_frames} frames per stream limit");
+        }
         match &id {
             b"00dc" | b"00db" => videos.push(ChunkRef {
                 offset: body,
@@ -516,7 +532,14 @@ fn collect_movi(
                 offset: body,
                 len: size,
             }),
-            b"LIST" => collect_movi(data, body + 4..chunk_end, videos, audios, depth + 1)?,
+            b"LIST" => collect_movi(
+                data,
+                body + 4..chunk_end,
+                videos,
+                audios,
+                depth + 1,
+                max_frames,
+            )?,
             _ => {}
         }
         pos = chunk_end + (size & 1);
@@ -956,6 +979,33 @@ mod tests {
         let err = Avi::parse(bad_audio.build(None)).unwrap_err().to_string();
         assert!(err.contains("audio format tag"), "{err}");
         assert!(err.contains("80"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_zero_frame_duration_instead_of_dividing_by_zero() {
+        // A `strh` whose rate is far above its scale yields a zero
+        // microseconds-per-frame; the frame rate must reject it rather than
+        // divide by zero. Found by the avi fuzz target.
+        let hdrl = hdrl_with_video_strh(0, 1, strh(b"vids", 1, 2_000_000, 1));
+        let mut fixture = Fixture::new().with_hdrl(hdrl);
+        fixture.push(b"00dc", &[1]);
+        let err = Avi::parse(fixture.build(None)).unwrap_err().to_string();
+        assert!(err.contains("frame duration"), "{err}");
+    }
+
+    #[test]
+    fn rejects_streams_over_the_frame_cap() {
+        let file = interleaved().build_rec_index();
+        let movi = file.windows(4).position(|w| w == b"movi").unwrap();
+        let movi_size = u32::from_le_bytes(file[movi - 4..movi].try_into().unwrap()) as usize;
+        let movi_range = movi + 4..movi + movi_size;
+        let idx = file.windows(4).position(|w| w == b"idx1").unwrap();
+        let idx_size = u32::from_le_bytes(file[idx + 4..idx + 8].try_into().unwrap()) as usize;
+        let idx_range = idx + 8..idx + 8 + idx_size;
+
+        assert!(index_entries(&file, idx_range, movi, 2).is_none());
+        let err = walk_movi(&file, movi_range, 2).unwrap_err().to_string();
+        assert!(err.contains("limit"), "{err}");
     }
 
     #[test]

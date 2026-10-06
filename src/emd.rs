@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::model::{Clip, ClipFrame, Emd, Emw, Keyframe, Skeleton};
 use crate::{tim, tmd};
 
@@ -144,6 +145,7 @@ fn check_order(directory: &[usize], directory_start: usize, kind: &str) -> Resul
 fn parse_skeleton(data: &[u8], emr_offset: usize, emr_end: usize) -> Result<Skeleton> {
     let armature_offset = read_u16(data, emr_offset)? as usize;
     let joint_count = read_u16(data, emr_offset + 4)? as usize;
+    budget::check_len(joint_count, budget::MAX_EMD_JOINTS, "EMR joint count")?;
 
     let position_bytes = chunk_slice(
         data,
@@ -169,7 +171,7 @@ fn parse_skeleton(data: &[u8], emr_offset: usize, emr_end: usize) -> Result<Skel
         emr_end,
         "EMR armature entries",
     )?;
-    let mut children = Vec::with_capacity(joint_count);
+    let mut children = budget::alloc(joint_count, "EMR joint children")?;
     for (index, entry) in entries
         .as_chunks::<ARMATURE_ENTRY_LEN>()
         .0
@@ -217,7 +219,8 @@ fn parse_keyframes(data: &[u8], emr_offset: usize, emr_end: usize) -> Result<Vec
     }
 
     let count = (emr_end - start) / frame_stride;
-    let mut keyframes = Vec::with_capacity(count);
+    budget::check_len(count, budget::MAX_EMD_KEYFRAMES, "EMR keyframe count")?;
+    let mut keyframes = budget::alloc(count, "EMR keyframe list")?;
     for index in 0..count {
         let base = start + index * frame_stride;
         let offset = chunk_slice(data, base, ANGLE_LEN, emr_end, "EMR keyframe offset")?;
@@ -259,6 +262,7 @@ fn parse_clips(data: &[u8], edd_offset: usize, chunk_end: usize) -> Result<Vec<C
 
     let first_offset = u16::from_le_bytes([chunk[2], chunk[3]]) as usize;
     let clip_count = first_offset / EDD_ENTRY_LEN;
+    budget::check_len(clip_count, budget::MAX_EMD_CLIPS, "EDD clip count")?;
     let table_len = clip_count * EDD_ENTRY_LEN;
     if table_len > chunk.len() {
         bail!(
@@ -267,7 +271,8 @@ fn parse_clips(data: &[u8], edd_offset: usize, chunk_end: usize) -> Result<Vec<C
         );
     }
 
-    let mut clips = Vec::with_capacity(clip_count);
+    let mut clips = budget::alloc(clip_count, "EDD clip list")?;
+    let mut total_frames = 0usize;
     for (index, entry) in chunk[..table_len]
         .as_chunks::<EDD_ENTRY_LEN>()
         .0
@@ -276,6 +281,11 @@ fn parse_clips(data: &[u8], edd_offset: usize, chunk_end: usize) -> Result<Vec<C
     {
         let frame_count = u16::from_le_bytes([entry[0], entry[1]]) as usize;
         let frame_offset = u16::from_le_bytes([entry[2], entry[3]]) as usize;
+        // Clip frame lists may overlap, so cap their total as well.
+        total_frames = total_frames
+            .checked_add(frame_count)
+            .context("EDD frame total overflows")?;
+        budget::check_len(total_frames, budget::MAX_RECORDS, "EDD clip frame total")?;
         let frames_len = frame_count
             .checked_mul(EDD_FRAME_LEN)
             .context("EDD frame list overflows")?;
@@ -628,6 +638,22 @@ mod tests {
         let err = parse(&data).unwrap_err().to_string();
 
         assert!(err.contains("clip 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn rejects_joint_and_clip_counts_over_the_caps() {
+        let mut data = minimal_emd();
+        data[4..6].copy_from_slice(&0xFFFFu16.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("joint count"), "{message}");
+
+        let mut data = minimal_emd();
+        let len = data.len();
+        let edd_offset = u32::from_le_bytes(data[len - 12..len - 8].try_into().unwrap()) as usize;
+        let over = u16::try_from((budget::MAX_EMD_CLIPS + 1) * EDD_ENTRY_LEN).unwrap();
+        data[edd_offset + 2..edd_offset + 4].copy_from_slice(&over.to_le_bytes());
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("clip count"), "{message}");
     }
 
     #[test]

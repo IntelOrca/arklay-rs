@@ -14,6 +14,8 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
+
 use crate::effects::pool::{EFFECT_BLOCK_LEN, EffectBlock};
 use crate::model::Texture8;
 use crate::pack::Pack;
@@ -391,6 +393,10 @@ fn parse_animation(data: &[u8], base: usize) -> Result<SpriteAnimation> {
     let mut animation = SpriteAnimation::default();
     animation.depth_table.copy_from_slice(table);
 
+    // Depth rows may point at the same frames, so cap the per-sprite totals
+    // as well as the per-row walk.
+    let mut total_frames = 0usize;
+    let mut total_blocks = 0usize;
     for (row, &entry) in animation.depth_table.iter().enumerate() {
         let row_offset = usize::from(entry) * 4;
         if row_offset < 8 {
@@ -405,6 +411,10 @@ fn parse_animation(data: &[u8], base: usize) -> Result<SpriteAnimation> {
         if frame_count as usize > data.len() / 4 {
             bail!("depth row {row} claims {frame_count} frames, past the file end");
         }
+        total_frames = total_frames
+            .checked_add(frame_count as usize)
+            .context("effect frame total overflows")?;
+        budget::check_len(total_frames, budget::MAX_RECORDS, "effect frame total")?;
         let mut cursor = row_at + 4;
         let mut frames = Vec::new();
         for frame in 0..frame_count {
@@ -413,6 +423,10 @@ fn parse_animation(data: &[u8], base: usize) -> Result<SpriteAnimation> {
                 .with_context(|| format!("depth row {row} frame {frame} is truncated"))?;
             let block_count = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) as usize;
             cursor += 4;
+            total_blocks = total_blocks
+                .checked_add(block_count)
+                .context("effect block total overflows")?;
+            budget::check_len(total_blocks, budget::MAX_RECORDS, "effect block total")?;
             let bytes = block_count
                 .checked_mul(EFFECT_BLOCK_LEN)
                 .context("frame block count overflows")?;

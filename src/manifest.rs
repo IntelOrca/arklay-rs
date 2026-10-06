@@ -17,6 +17,8 @@ use std::collections::HashSet;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::budget;
+
 /// The pack entry holding a rendered manifest.
 pub const ENTRY: &str = "manifest.toml";
 
@@ -105,7 +107,12 @@ impl Manifest {
     }
 
     /// Parse a manifest, naming the line of every malformed value.
+    ///
+    /// The source, every line and the statement count are capped by
+    /// [`budget::MAX_TEXT_BYTES`], [`budget::MAX_MANIFEST_LINE`] and
+    /// [`budget::MAX_MANIFEST_ITEMS`].
     pub fn parse(text: &str) -> Result<Self> {
+        budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "manifest size")?;
         let mut format = None;
         let mut id = None;
         let mut name = None;
@@ -178,6 +185,11 @@ impl Manifest {
                     let Value::Array(values) = item.value else {
                         bail!("manifest.toml line {line}: `lua` must be a string array");
                     };
+                    budget::check_len(
+                        values.len(),
+                        budget::MAX_MANIFEST_LUA,
+                        "manifest lua list length",
+                    )?;
                     if values.iter().any(String::is_empty) {
                         bail!("manifest.toml line {line}: `lua` entries must not be empty");
                     }
@@ -279,6 +291,11 @@ fn parse_items(text: &str) -> Result<Vec<Item>> {
 
     for (index, raw) in text.lines().enumerate() {
         let line = index + 1;
+        budget::check_len(
+            raw.len(),
+            budget::MAX_MANIFEST_LINE,
+            &format!("manifest.toml line {line} length"),
+        )?;
         let content = strip_comment(raw).trim();
         if content.is_empty() {
             continue;
@@ -310,6 +327,11 @@ fn parse_items(text: &str) -> Result<Vec<Item>> {
         if !seen.insert((section.clone(), key.to_string())) {
             bail!("manifest.toml line {line}: duplicate key `{key}`");
         }
+        budget::check_len(
+            items.len() + 1,
+            budget::MAX_MANIFEST_ITEMS,
+            "manifest statement count",
+        )?;
         items.push(Item {
             section: section.clone(),
             key: key.to_string(),
@@ -459,6 +481,11 @@ fn parse_array(text: &str, line: usize) -> Result<Vec<String>> {
             bail!("manifest.toml line {line}: unterminated array");
         }
         let (value, consumed) = parse_quoted(rest, line)?;
+        budget::check_len(
+            values.len() + 1,
+            budget::MAX_MANIFEST_ITEMS,
+            "manifest array length",
+        )?;
         values.push(value);
         rest = rest[consumed..].trim_start();
         if let Some(after) = rest.strip_prefix(',') {
@@ -706,6 +733,29 @@ lua = [\"lua/a.lua\", \"lua/b.lua\"]
             let err = Manifest::parse(text).unwrap_err().to_string();
             assert!(err.contains(want), "{text:?}: {err}");
         }
+    }
+
+    #[test]
+    fn rejects_text_over_the_caps() {
+        let long_line = format!("id = \"{}\"\n", "a".repeat(budget::MAX_MANIFEST_LINE));
+        let message = budget::assert_cap_error(Manifest::parse(&long_line));
+        assert!(message.contains("line 1 length"), "{message}");
+
+        let mut many = String::new();
+        for index in 0..=budget::MAX_MANIFEST_ITEMS {
+            many.push_str(&format!("k{index} = 1\n"));
+        }
+        let message = budget::assert_cap_error(Manifest::parse(&many));
+        assert!(message.contains("statement count"), "{message}");
+
+        let entries: Vec<&str> =
+            std::iter::repeat_n("\"lua/a.lua\"", budget::MAX_MANIFEST_LUA + 1).collect();
+        let text = format!(
+            "format = 1\nid = \"x\"\nkind = \"base\"\nlua = [{}]\n",
+            entries.join(", ")
+        );
+        let message = budget::assert_cap_error(Manifest::parse(&text));
+        assert!(message.contains("lua list length"), "{message}");
     }
 
     #[test]

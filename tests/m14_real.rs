@@ -162,7 +162,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// Decode one whole film and return the per-frame CRC-32 hashes.
 fn decode_film(avi: &Avi) -> Vec<u32> {
-    let mut decoder = Decoder::new(320, 240);
+    let mut decoder = Decoder::new(320, 240).expect("320x240 is within the canvas cap");
     let mut hashes = Vec::with_capacity(avi.frame_count());
     for index in 0..avi.frame_count() {
         let frame = avi.video(index).expect("indexed frame exists");
@@ -280,7 +280,7 @@ fn decoded_frames_match_the_independent_goldens() {
     for &(name, frames, _) in FILMS {
         let avi = parse_film(&root, name);
         let picks = [0usize, frames / 2, frames - 1];
-        let mut decoder = Decoder::new(320, 240);
+        let mut decoder = Decoder::new(320, 240).expect("320x240 is within the canvas cap");
         let mut rgba = vec![0u8; 320 * 240 * 4];
         for index in 0..frames {
             let frame = avi.video(index).unwrap();

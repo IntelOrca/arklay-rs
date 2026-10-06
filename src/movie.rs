@@ -234,7 +234,7 @@ impl MovieSession {
             id,
             character: character & 1,
             avi,
-            decoder: Decoder::new(320, 240),
+            decoder: Decoder::new(320, 240)?,
             rgba: vec![0u8; 320 * 240 * 4],
             presented: 0,
             kept_frames,

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::game::{
     BgmState, CameraState, FLAG_BANK_COUNT, FlagBank, GameState, ITEM_BOX_SLOTS, InventoryItem,
     STATE_BYTE_CHARACTER, STATE_BYTE_CUT, STATE_BYTE_ENT_ACTION, STATE_BYTE_EQUIPPED,
@@ -403,7 +404,8 @@ impl SaveFile {
     }
 
     /// Parse a save block. The layout needs [`SAVE_LAYOUT_SIZE`] bytes; the
-    /// full 0x800 block is the usual input.
+    /// full [`SAVE_BLOCK_SIZE`] block is the usual input and
+    /// [`budget::MAX_SAVE_BYTES`] is the largest accepted.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < SAVE_LAYOUT_SIZE {
             bail!(
@@ -411,6 +413,7 @@ impl SaveFile {
                 bytes.len()
             );
         }
+        budget::check_len(bytes.len(), budget::MAX_SAVE_BYTES, "save block size")?;
         let mut file = Self {
             prefix: bytes[..PREFIX_LEN].try_into().expect("prefix bytes"),
             state_bytes: bytes[STATE_IMAGE_OFFSET..STATE_IMAGE_OFFSET + STATE_BYTES]
@@ -509,11 +512,23 @@ impl SaveSlotInfo {
     }
 }
 
+/// Read a slot file after checking its size against the save cap.
+fn read_slot_bytes(path: &Path) -> Result<Vec<u8>> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    budget::check_len_u64(
+        metadata.len(),
+        budget::MAX_SAVE_BYTES as u64,
+        "save slot file size",
+    )?;
+    fs::read(path).with_context(|| format!("failed to read {}", path.display()))
+}
+
 /// Read one slot's header, or `None` when the file is missing or too short to
 /// be a save.
 pub fn read_slot_info(dir: &Path, index: usize) -> Option<SaveSlotInfo> {
     let path = slot_path(dir, index)?;
-    let bytes = fs::read(path).ok()?;
+    let bytes = read_slot_bytes(&path).ok()?;
     let file = SaveFile::from_bytes(&bytes).ok()?;
     Some(SaveSlotInfo::from_file(&file))
 }
@@ -535,7 +550,7 @@ pub fn save(dir: &Path, index: usize, file: &SaveFile) -> Result<()> {
 pub fn load(dir: &Path, index: usize) -> Result<SaveFile> {
     let path =
         slot_path(dir, index).with_context(|| format!("save slot {index} is out of range"))?;
-    let bytes = fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let bytes = read_slot_bytes(&path)?;
     SaveFile::from_bytes(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -789,6 +804,13 @@ mod tests {
         assert!(SaveFile::from_bytes(&bytes[..SAVE_LAYOUT_SIZE - 1]).is_err());
         assert!(SaveFile::from_bytes(&[]).is_err());
         assert!(SaveFile::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn from_bytes_rejects_a_block_over_the_cap() {
+        let bytes = vec![0u8; budget::MAX_SAVE_BYTES + 1];
+        let message = budget::assert_cap_error(SaveFile::from_bytes(&bytes));
+        assert!(message.contains("save block size"), "{message}");
     }
 
     #[test]

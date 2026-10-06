@@ -1,0 +1,5 @@
+format = 1
+id = "re1"
+name = "Arklay"
+kind = "base"
+lua = ["lua/a.lua"]

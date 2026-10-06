@@ -1,0 +1,54 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Weekly, Saturday 04:43 UTC; fuzzing is never a pull-request gate.
+    - cron: "43 4 * * 6"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - pack
+          - manifest
+          - rdt
+          - scd
+          - scd_asm
+          - emd
+          - tim
+          - tmd
+          - ivm
+          - avi
+          - cinepak
+          - lzw
+          - bmp
+          - save
+          - mask
+          - wav
+          - lua
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: fuzz
+        # The scratch corpus is the writable one; the committed synthetic
+        # seeds stay read-only so a run never dirties the checkout.
+        run: |
+          mkdir -p corpus/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

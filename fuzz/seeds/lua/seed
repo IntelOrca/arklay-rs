@@ -1,0 +1,2 @@
+function on_room_load(api) end
+function on_tick(api, tick) end

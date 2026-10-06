@@ -4,7 +4,9 @@
 //! increases the code width by one and `0x102` resets the dictionary. The
 //! first code after a start or reset is a raw literal byte.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+
+use crate::budget;
 
 const END: u16 = 0x100;
 const WIDEN: u16 = 0x101;
@@ -12,7 +14,6 @@ const RESET: u16 = 0x102;
 const FIRST_CODE: u16 = 0x103;
 const DICT_ENTRIES: u16 = 34981;
 const MAX_WIDTH: u8 = 16;
-const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
 /// MSB-first bit reader with a small accumulator refilled one byte at a time.
 struct BitReader<'a> {
@@ -54,7 +55,15 @@ struct Entry {
 }
 
 /// Decode a RE1 `.pak` LZW stream.
+///
+/// The output is capped at [`budget::MAX_LZW_OUTPUT`]; a stream that would
+/// exceed it is rejected before the next run is appended.
 pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
+    decode_with_limit(input, budget::MAX_LZW_OUTPUT)
+}
+
+/// Decode with an explicit output ceiling, for the unit-tested bomb guard.
+fn decode_with_limit(input: &[u8], max_output: usize) -> Result<Vec<u8>> {
     let mut reader = BitReader::new(input);
     let mut dict: Vec<Entry> = Vec::new();
     let mut next_code = FIRST_CODE;
@@ -97,10 +106,15 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
         let lookup = if special { prev_code } else { code };
 
         // Expand the code's prefix chain into the stack leaf-first; `c` ends as
-        // the chain's literal root byte.
+        // the chain's literal root byte. A well-formed entry only ever points
+        // at an earlier code, so a chain longer than the dictionary itself is
+        // cyclic and is rejected instead of looping forever.
         stack.clear();
         let mut c = lookup;
         while c >= FIRST_CODE {
+            if stack.len() >= usize::from(DICT_ENTRIES) {
+                bail!("LZW dictionary chain is cyclic or longer than {DICT_ENTRIES} entries");
+            }
             let Some(entry) = dict.get((c - FIRST_CODE) as usize) else {
                 bail!("missing LZW dictionary entry {c:#x}");
             };
@@ -110,9 +124,15 @@ pub fn decode(input: &[u8]) -> Result<Vec<u8>> {
         let first = c as u8;
 
         let length = stack.len() + 1 + usize::from(special);
-        if out.len() + length > MAX_OUTPUT {
-            bail!("LZW output exceeds the {MAX_OUTPUT}-byte limit");
+        let projected = out
+            .len()
+            .checked_add(length)
+            .context("LZW output length overflows")?;
+        if projected > max_output {
+            bail!("LZW output exceeds the {max_output}-byte limit");
         }
+        out.try_reserve(length)
+            .map_err(|_| anyhow::anyhow!("LZW output cannot reserve {length} more bytes"))?;
         out.push(first);
         out.extend(stack.iter().rev());
         if special {
@@ -328,6 +348,33 @@ mod tests {
         }
         writer.write(WIDEN, MAX_WIDTH);
         assert!(decode(&writer.finish()).is_err());
+    }
+
+    #[test]
+    fn rejects_an_output_bomb_before_allocating_it() {
+        let mut writer = BitWriter::new();
+        writer.write(0x00, 9);
+        writer.write(FIRST_CODE, 9);
+        writer.write(FIRST_CODE, 9);
+        writer.write(FIRST_CODE, 9);
+        writer.write(END, 9);
+        let stream = writer.finish();
+        assert_eq!(decode(&stream).unwrap(), [0u8; 7]);
+        let err = decode_with_limit(&stream, 4).unwrap_err().to_string();
+        assert!(err.contains("4-byte limit"), "{err}");
+    }
+
+    #[test]
+    fn rejects_a_self_referential_dictionary_chain() {
+        // Found by the lzw fuzz target: a forward-referencing code makes a
+        // dictionary entry point at itself; the chain walk must stop with an
+        // error instead of growing the stack without bound.
+        let stream = [
+            0x08, 0x00, 0x0B, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22,
+            0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x20,
+        ];
+        let err = decode(&stream).unwrap_err().to_string();
+        assert!(err.contains("cyclic"), "{err}");
     }
 
     #[test]

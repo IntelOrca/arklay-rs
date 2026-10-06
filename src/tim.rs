@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::model::{PALETTE_ROW_LEN, Texture8};
 use crate::state::Image;
 
@@ -55,9 +56,12 @@ pub fn decode(data: &[u8]) -> Result<Image> {
     let width = u16::from_le_bytes(block[8..10].try_into().unwrap());
     let height = u16::from_le_bytes(block[10..12].try_into().unwrap());
 
-    let pixel_bytes = (width as usize)
+    let pixel_count = (width as usize)
         .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(PIXEL_BYTES))
+        .context("TIM image dimensions overflow")?;
+    budget::check_len(pixel_count, budget::MAX_PIXELS, "TIM pixel count")?;
+    let pixel_bytes = pixel_count
+        .checked_mul(PIXEL_BYTES)
         .context("TIM image dimensions overflow")?;
     let start = HEADER_LEN + IMAGE_BLOCK_HEADER_LEN;
     let end = start
@@ -70,7 +74,7 @@ pub fn decode(data: &[u8]) -> Result<Image> {
         )
     })?;
 
-    let mut rgba = Vec::with_capacity(pixel_bytes / PIXEL_BYTES * 4);
+    let mut rgba = budget::alloc::<u8>(pixel_count * 4, "TIM RGBA buffer")?;
     for px in raw.as_chunks::<PIXEL_BYTES>().0 {
         let v = u16::from_le_bytes([px[0], px[1]]);
         let r = v & 31;
@@ -132,6 +136,7 @@ pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
     let clut_count = clut_width
         .checked_mul(clut_height)
         .context("TIM CLUT dimensions overflow")?;
+    budget::check_len(clut_count, budget::MAX_CLUT_ENTRIES, "TIM CLUT entry count")?;
     let clut_start = HEADER_LEN + BLOCK_HEADER_LEN;
     let clut_end = clut_start
         .checked_add(
@@ -172,6 +177,7 @@ pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
         .checked_mul(2)
         .and_then(|width| width.checked_mul(height))
         .context("TIM image dimensions overflow")?;
+    budget::check_len(pixel_count, budget::MAX_PIXELS, "TIM pixel count")?;
     let pixel_start = image_start + BLOCK_HEADER_LEN;
     let indices = data
         .get(pixel_start..pixel_start + pixel_count)
@@ -234,6 +240,8 @@ pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
     let clut_count = clut_width
         .checked_mul(clut_height)
         .context("TIM CLUT dimensions overflow")?;
+    budget::check_len(clut_height, budget::MAX_CLUT_ROWS, "TIM CLUT row count")?;
+    budget::check_len(clut_count, budget::MAX_CLUT_ENTRIES, "TIM CLUT entry count")?;
     let clut_start = HEADER_LEN + BLOCK_HEADER_LEN;
     let clut_end = clut_start
         .checked_add(
@@ -276,6 +284,7 @@ pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
         .checked_mul(2)
         .and_then(|bytes| bytes.checked_mul(height))
         .context("TIM image dimensions overflow")?;
+    budget::check_len(byte_count * 2, budget::MAX_PIXELS, "TIM pixel count")?;
     let pixel_start = image_start + BLOCK_HEADER_LEN;
     let raw = data
         .get(pixel_start..pixel_start + byte_count)
@@ -285,7 +294,7 @@ pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
                 data.len().saturating_sub(pixel_start)
             )
         })?;
-    let mut indices = Vec::with_capacity(byte_count * 2);
+    let mut indices = budget::alloc::<u8>(byte_count * 2, "TIM 4bpp index buffer")?;
     for byte in raw {
         indices.push(byte & 0xF);
         indices.push(byte >> 4);
@@ -407,6 +416,27 @@ mod tests {
             let err = decode(&data).unwrap_err().to_string();
             assert!(err.contains(name), "mode {mode}: unexpected error: {err}");
         }
+    }
+
+    #[test]
+    fn rejects_pixel_counts_over_the_cap() {
+        let data = tim(2, 0xFFFF, 0xFFFF, &[], 12);
+        let message = budget::assert_cap_error(decode(&data));
+        assert!(message.contains("pixel count"), "{message}");
+    }
+
+    #[test]
+    fn rejects_clut_entries_over_the_cap() {
+        let data = tim_8bpp(512, 512, &[], 1, 1, &[]);
+        let message = budget::assert_cap_error(decode_8bpp(&data));
+        assert!(message.contains("CLUT entry count"), "{message}");
+    }
+
+    #[test]
+    fn rejects_clut_rows_over_the_cap() {
+        let data = tim_4bpp(0, 0xFFFF, &[], 1, 1, &[0, 0]);
+        let message = budget::assert_cap_error(decode_4bpp(&data));
+        assert!(message.contains("CLUT row count"), "{message}");
     }
 
     #[test]

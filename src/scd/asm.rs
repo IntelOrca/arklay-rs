@@ -24,6 +24,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
+use crate::budget;
 use crate::scd::decomp::constants;
 use crate::scd::disasm::{self, EventState};
 use crate::scd::ir::{Block, Decoded, Insn, Stream, StreamKind};
@@ -107,7 +108,12 @@ impl Assembled {
 }
 
 /// Assemble `.s` source into the SCD IR.
+///
+/// The source size, line count and assembled container size are capped by
+/// [`budget::MAX_TEXT_BYTES`], [`budget::MAX_ASM_LINES`] and
+/// [`budget::MAX_ASM_OUTPUT`].
 pub fn assemble(text: &str) -> Result<Assembled> {
+    budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "SCD source size")?;
     let source = parse_source(text)?;
 
     let mut finished: Vec<Finished> = Vec::new();
@@ -254,6 +260,7 @@ fn container_layout(
         layout.events_base = Some(base);
     }
     layout.total = pos;
+    budget::check_len(layout.total, budget::MAX_ASM_OUTPUT, "assembled SCD size")?;
     Ok(layout)
 }
 
@@ -379,6 +386,7 @@ fn parse_source(text: &str) -> Result<Source> {
 
     for (index, raw) in text.lines().enumerate() {
         let line_no = index + 1;
+        budget::check_len(line_no, budget::MAX_ASM_LINES, "SCD source line count")?;
         let indent = raw.len() - raw.trim_start().len();
         let line = raw.trim();
         if line.is_empty() {
@@ -2097,6 +2105,13 @@ mod tests {
 .event event_00
     evt_finish
 ";
+
+    #[test]
+    fn rejects_sources_over_the_line_cap() {
+        let text = "\n".repeat(budget::MAX_ASM_LINES + 1);
+        let message = budget::assert_cap_error(assemble(&text));
+        assert!(message.contains("line count"), "{message}");
+    }
 
     #[test]
     fn assembles_the_disassembler_shape() {

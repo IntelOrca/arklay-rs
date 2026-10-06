@@ -73,6 +73,7 @@ mod imp {
         Value, VmState,
     };
 
+    use crate::budget;
     use crate::game::GameState;
     use crate::pack::Pack;
     use crate::state::RoomId;
@@ -147,6 +148,7 @@ mod imp {
             if paths.is_empty() {
                 return Ok(None);
             }
+            budget::check_len(paths.len(), budget::MAX_LUA_CHUNKS, "lua chunk count")?;
             let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE, LuaOptions::default())
                 .map_err(|err| anyhow::anyhow!("failed to create the Lua state: {err}"))?;
             {
@@ -182,6 +184,11 @@ mod imp {
                         continue;
                     }
                 };
+                budget::check_len(
+                    bytes.len(),
+                    budget::MAX_LUA_CHUNK,
+                    &format!("lua chunk {path} size"),
+                )?;
                 budget.begin();
                 if let Err(err) = lua.load(bytes).set_name(path.clone()).exec() {
                     eprintln!("[lua] failed to run {path}: {err}");
@@ -342,6 +349,8 @@ pub use imp::LuaVm;
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lua")]
+    use crate::budget;
     use crate::game::GameState;
     use crate::pack::Pack;
 
@@ -578,6 +587,19 @@ end
         vm.call_tick(&mut game, 1);
         // The hook is disabled after the abort.
         vm.call_tick(&mut game, 2);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn rejects_chunks_over_the_source_cap() {
+        let source = "x".repeat(budget::MAX_LUA_CHUNK + 1);
+        let pack = lua_pack(&["lua/big.lua"], &[("lua/big.lua", &source)]);
+        let Err(error) = LuaVm::load(&pack) else {
+            panic!("an over-cap chunk must be rejected");
+        };
+        let message = error.to_string();
+        assert!(message.contains("lua chunk"), "{message}");
+        assert!(message.contains("limit"), "{message}");
     }
 
     #[cfg(feature = "lua")]

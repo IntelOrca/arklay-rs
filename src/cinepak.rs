@@ -15,6 +15,8 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
+
 /// The frame header is a flags byte, a 24-bit size, width, height and strip
 /// count.
 const FRAME_HEADER: usize = 10;
@@ -74,15 +76,28 @@ pub struct Decoder {
 
 impl Decoder {
     /// Create a decoder for a `width`x`height` canvas, initially black.
-    pub fn new(width: u16, height: u16) -> Self {
-        let len = width as usize * height as usize * 3;
-        Decoder {
+    ///
+    /// The canvas is capped at [`budget::MAX_CINEPAK_PIXELS`]; an oversized
+    /// request fails before the two canvases are allocated.
+    pub fn new(width: u16, height: u16) -> Result<Self> {
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .context("cinepak canvas dimensions overflow")?;
+        budget::check_len(pixels, budget::MAX_CINEPAK_PIXELS, "cinepak canvas pixels")?;
+        let len = pixels
+            .checked_mul(3)
+            .context("cinepak canvas size overflows")?;
+        let mut rgb = budget::alloc::<u8>(len, "cinepak canvas")?;
+        let mut scratch = budget::alloc::<u8>(len, "cinepak scratch canvas")?;
+        rgb.resize(len, 0);
+        scratch.resize(len, 0);
+        Ok(Decoder {
             width,
             height,
-            rgb: vec![0; len],
-            scratch: vec![0; len],
+            rgb,
+            scratch,
             strips: Vec::new(),
-        }
+        })
     }
 
     /// Decode one frame over the previous canvas.
@@ -614,8 +629,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_canvases_over_the_pixel_cap() {
+        let message = budget::assert_cap_error(Decoder::new(0xFFFF, 0xFFFF));
+        assert!(message.contains("canvas pixels"), "{message}");
+        assert!(Decoder::new(320, 240).is_ok());
+    }
+
+    #[test]
     fn v1_codebook_and_v1_vectors_paint_stretched_blocks() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let entries = [[10, 20, 30, 40, 0, 0], [50, 60, 70, 80, 0, 0]];
         let codebooks = chunk(0x26, &codebook(&entries, false));
         let vectors = chunk(VECTOR_V1, &[0, 1, 1, 0]);
@@ -641,7 +663,7 @@ mod tests {
 
     #[test]
     fn v4_codebook_and_v4_vectors_tile_four_entries() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let entries: Vec<[u8; 6]> = (0..8)
             .map(|i| [1 + i * 4, 2 + i * 4, 3 + i * 4, 4 + i * 4, 0, 0])
             .collect();
@@ -672,7 +694,7 @@ mod tests {
 
     #[test]
     fn flag_vectors_mix_v4_and_v1_per_block() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let v4 = chunk(0x20, &codebook(&[grey(1), grey(2), grey(3), grey(4)], true));
         let v1 = chunk(0x26, &codebook(&[grey(90)], false));
         // Block 0 V4, block 1 V1, block 2 V4, block 3 V1.
@@ -695,7 +717,7 @@ mod tests {
 
     #[test]
     fn selective_vectors_skip_unchanged_blocks() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(100), grey(200)], false));
         let paint = chunk(VECTOR_V1, &[0, 0, 0, 0]);
         let first = frame(
@@ -718,7 +740,7 @@ mod tests {
 
     #[test]
     fn touch_up_updates_selected_entries_only() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let full = chunk(0x26, &codebook(&[grey(10), grey(20)], false));
         let paint = chunk(VECTOR_V1, &[0, 1, 0, 1]);
         let first = frame(
@@ -741,7 +763,7 @@ mod tests {
 
     #[test]
     fn second_strip_inherits_the_first_codebook() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(77)], false));
         let paint = chunk(VECTOR_V1, &[0, 0]);
         let first = strip(INTRA_STRIP, 0, 0, 8, 4, &[codebook, paint]);
@@ -755,7 +777,7 @@ mod tests {
 
     #[test]
     fn zero_top_continues_the_previous_strip() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(40)], false));
         let paint = chunk(VECTOR_V1, &[0, 0]);
         let first = strip(INTRA_STRIP, 0, 0, 8, 4, &[codebook, paint]);
@@ -771,7 +793,7 @@ mod tests {
 
     #[test]
     fn partial_strips_clip_bottom_and_right_edges() {
-        let mut decoder = Decoder::new(6, 6);
+        let mut decoder = Decoder::new(6, 6).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(10)], false));
         let paint = chunk(VECTOR_V1, &[0, 0]);
         let strip = strip(INTRA_STRIP, 0, 0, 6, 4, &[codebook, paint]);
@@ -785,7 +807,7 @@ mod tests {
 
     #[test]
     fn yuv_expansion_uses_the_codec_weights_and_clamps() {
-        let mut decoder = Decoder::new(4, 4);
+        let mut decoder = Decoder::new(4, 4).unwrap();
         let warm = chunk(0x20, &codebook(&[[250, 250, 250, 250, 127, 127]], true));
         let cool = chunk(0x20, &codebook(&[[0, 0, 0, 0, 128, 128]], true));
         let paint = chunk(VECTOR_FLAG, &vectors_v4(0x8000_0000, &[0, 0, 0, 0]));
@@ -804,7 +826,7 @@ mod tests {
 
     #[test]
     fn empty_frames_keep_the_canvas() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(33)], false));
         let paint = chunk(VECTOR_V1, &[0]);
         let strip = strip(INTRA_STRIP, 0, 0, 4, 4, &[codebook, paint]);
@@ -816,7 +838,7 @@ mod tests {
 
     #[test]
     fn malformed_frames_error_and_keep_the_canvas() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(44)], false));
         let paint = chunk(VECTOR_V1, &[0, 0, 0, 0]);
         let good = frame(
@@ -874,7 +896,7 @@ mod tests {
 
     #[test]
     fn a_failed_frame_rolls_back_the_codebooks() {
-        let mut decoder = Decoder::new(8, 8);
+        let mut decoder = Decoder::new(8, 8).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(100)], false));
         let paint = chunk(VECTOR_V1, &[0, 0, 0, 0]);
         let first = frame(
@@ -969,7 +991,7 @@ mod tests {
 
     #[test]
     fn rgba_expansion_is_opaque() {
-        let mut decoder = Decoder::new(2, 2);
+        let mut decoder = Decoder::new(2, 2).unwrap();
         let codebook = chunk(0x26, &codebook(&[grey(7)], false));
         let paint = chunk(VECTOR_V1, &[0]);
         let strip = strip(INTRA_STRIP, 0, 0, 2, 2, &[codebook, paint]);

@@ -8,12 +8,13 @@
 
 use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::state::RoomId;
 
 /// Highest group count a camera table may declare. Group ids are one-based and
 /// [`Cut`](crate::state::Cut) tracks group visibility in a `u32`, so a camera
 /// can have at most 32 groups. The shipped data peaks at 20.
-const MAX_GROUPS: usize = 32;
+const MAX_GROUPS: usize = budget::MAX_MASK_GROUPS;
 
 /// Number of entries in the room table (room within stage, times stage).
 const ROOM_TABLE_LEN: usize = 160;
@@ -105,6 +106,11 @@ impl MaskTable {
         for (index, group) in groups.iter().enumerate() {
             let group_id = (index + 1) as u8;
             for _ in 0..group.sprite_count {
+                budget::check_len(
+                    sprites.len().saturating_add(1),
+                    budget::MAX_MASK_SPRITES,
+                    "mask sprite count",
+                )?;
                 let uv = read_u16(data, offset)?;
                 let delta = read_u16(data, offset + 2)?;
                 let pos_data = read_u16(data, offset + 4)?;
@@ -724,6 +730,23 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(message.contains("more than"), "{message}");
+    }
+
+    #[test]
+    fn rejects_sprite_counts_over_the_cap() {
+        // Two groups of 65,535 packed-size sprites each: parsing the second
+        // group's second sprite crosses the 65,536-sprite cap before the input
+        // runs out.
+        let groups = [[0xFFFFu16, 0, 0, 0], [2, 0, 0, 0]];
+        let mut data = table(2, &groups, &[]);
+        for _ in 0..=budget::MAX_MASK_SPRITES {
+            // A nonzero high nibble selects the packed eight-byte size form.
+            for word in [0u16, 0, 100, 0x2000] {
+                data.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        let message = budget::assert_cap_error(MaskTable::parse(&data, TABLE_OFFSET));
+        assert!(message.contains("mask sprite count"), "{message}");
     }
 
     #[test]

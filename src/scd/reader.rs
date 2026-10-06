@@ -11,8 +11,9 @@
 //! overrunning block size) return an error, while unknown opcodes simply end
 //! the surrounding stream and the remaining bytes become trailing data.
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
+use crate::budget;
 use crate::scd::ir::{Block, Decoded, Insn, Operand, Scripts, Stream, StreamKind};
 use crate::scd::opcode::{
     Op, actor_op, command_op, command_width, event_control_op, event_top_op, tween_op,
@@ -63,7 +64,7 @@ pub fn decode_command_block(data: &[u8], start: usize, end: usize) -> (Vec<Insn>
     let end = end.min(data.len());
     let mut insns = Vec::new();
     let mut pc = start;
-    while pc < end {
+    while pc < end && insns.len() < budget::MAX_SCD_INSTRUCTIONS {
         let Some(insn) = decode_command_at(data, pc, end) else {
             break;
         };
@@ -89,7 +90,7 @@ pub fn decode_event_stream(data: &[u8], start: usize, end: usize) -> (Vec<Insn>,
     let mut pc = start;
     let mut state = 0u8;
 
-    while pc < end {
+    while pc < end && insns.len() < budget::MAX_SCD_INSTRUCTIONS {
         let op_byte = data[pc];
 
         if let Some(control) = event_control_op(op_byte) {
@@ -217,6 +218,7 @@ fn parse_container(data: &[u8], base: usize, name: &str) -> Result<Vec<Block>> {
         );
     }
     let mut blocks = Vec::new();
+    let mut total_insns = 0usize;
     let mut pos = base;
     loop {
         if pos + 2 > data.len() {
@@ -229,8 +231,17 @@ fn parse_container(data: &[u8], base: usize, name: &str) -> Result<Vec<Block>> {
         if size < 2 || pos + usize::from(size) > data.len() {
             bail!("{name} SCD block at 0x{pos:X} has invalid size {size}");
         }
+        budget::check_len(blocks.len() + 1, budget::MAX_SCD_BLOCKS, "SCD block count")?;
         let end = pos + usize::from(size);
         let (insns, trailing) = decode_command_block(data, pos + 2, end);
+        total_insns = total_insns
+            .checked_add(insns.len())
+            .context("SCD instruction count overflows")?;
+        budget::check_len(
+            total_insns,
+            budget::MAX_SCD_INSTRUCTIONS,
+            "SCD instruction count",
+        )?;
         blocks.push(Block {
             offset: pos,
             size,
@@ -277,8 +288,11 @@ fn parse_events(data: &[u8], base: usize) -> Result<Vec<Stream>> {
         index += 1;
     }
 
-    if starts.len() > usize::from(u8::MAX) + 1 {
-        bail!("event SCD table at 0x{base:X} holds more than 256 events");
+    if starts.len() > budget::MAX_SCD_EVENTS {
+        bail!(
+            "event SCD table at 0x{base:X} holds more than {} events",
+            budget::MAX_SCD_EVENTS
+        );
     }
 
     let last_end = starts
@@ -287,6 +301,7 @@ fn parse_events(data: &[u8], base: usize) -> Result<Vec<Stream>> {
         .unwrap_or(data.len());
 
     let mut events = Vec::with_capacity(starts.len());
+    let mut total_insns = 0usize;
     for (index, &start) in starts.iter().enumerate() {
         let end = if index + 1 < starts.len() {
             starts[index + 1]
@@ -294,6 +309,14 @@ fn parse_events(data: &[u8], base: usize) -> Result<Vec<Stream>> {
             last_end
         };
         let (insns, trailing) = decode_event_stream(data, start, end);
+        total_insns = total_insns
+            .checked_add(insns.len())
+            .context("SCD instruction count overflows")?;
+        budget::check_len(
+            total_insns,
+            budget::MAX_SCD_INSTRUCTIONS,
+            "SCD instruction count",
+        )?;
         events.push(Stream {
             kind: StreamKind::Event(index as u8),
             offset: start,
@@ -903,6 +926,21 @@ mod tests {
         assert!(stream.trailing.iter().all(|&byte| byte == 0));
         assert!(matches!(stream.insns[2].decoded, Decoded::Event(op) if op.op == 0x07));
         assert!(matches!(stream.insns[3].decoded, Decoded::Command(op) if op.op == 0x0E));
+    }
+
+    #[test]
+    fn rejects_more_blocks_than_the_cap() {
+        let mut container = Vec::new();
+        for _ in 0..=budget::MAX_SCD_BLOCKS {
+            container.extend_from_slice(&2u16.to_le_bytes());
+        }
+        container.extend_from_slice(&0u16.to_le_bytes());
+        let mut builder = RdtBuilder::new();
+        builder.push_section(INIT_SLOT_OFFSET, &container);
+        let data = builder.finish_with_event_sentinel();
+
+        let message = budget::assert_cap_error(parse(&data));
+        assert!(message.contains("SCD block count"), "{message}");
     }
 
     #[test]

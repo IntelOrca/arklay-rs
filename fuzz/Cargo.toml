@@ -1,0 +1,135 @@
+[package]
+name = "arklay-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.88"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arklay = { path = "..", features = ["lua"] }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "pack"
+path = "fuzz_targets/pack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rdt"
+path = "fuzz_targets/rdt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scd"
+path = "fuzz_targets/scd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "scd_asm"
+path = "fuzz_targets/scd_asm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emd"
+path = "fuzz_targets/emd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tim"
+path = "fuzz_targets/tim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tmd"
+path = "fuzz_targets/tmd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ivm"
+path = "fuzz_targets/ivm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avi"
+path = "fuzz_targets/avi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cinepak"
+path = "fuzz_targets/cinepak.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lzw"
+path = "fuzz_targets/lzw.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bmp"
+path = "fuzz_targets/bmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "save"
+path = "fuzz_targets/save.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mask"
+path = "fuzz_targets/mask.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wav"
+path = "fuzz_targets/wav.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lua"
+path = "fuzz_targets/lua.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
