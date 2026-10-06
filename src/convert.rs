@@ -583,21 +583,34 @@ pub fn convert_game_with_packs(
 
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
-    // full memcpy.
+    // full memcpy. The bytes land in a sibling temporary file that is renamed
+    // over `out` once the stream is complete, so a failed conversion leaves no
+    // partial pack behind.
     let size = writer.pack_size()?;
     progress.begin("write", size as u64, "bytes");
+    let temp = crate::atomic::temp_path(out)?;
     let file =
-        fs::File::create(out).with_context(|| format!("failed to create {}", out.display()))?;
+        fs::File::create(&temp).with_context(|| format!("failed to create {}", temp.display()))?;
     let mut file = ProgressWriter {
         inner: BufWriter::with_capacity(WRITE_CHUNK, file),
         progress: &mut progress,
     };
-    writer
+    let result = writer
         .stream_to(&mut file)
-        .with_context(|| format!("failed to write {}", out.display()))?;
-    file.flush()
-        .with_context(|| format!("failed to write {}", out.display()))?;
+        .with_context(|| format!("failed to write {}", out.display()))
+        .and_then(|()| {
+            file.flush()
+                .with_context(|| format!("failed to write {}", out.display()))
+        });
     drop(file);
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp);
+        return Err(err);
+    }
+    fs::rename(&temp, out).with_context(|| {
+        let _ = fs::remove_file(&temp);
+        format!("failed to move the written pack into {}", out.display())
+    })?;
     progress.end_phase();
 
     let entries = rdt_count

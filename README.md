@@ -34,6 +34,11 @@ cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 # List every pack entry with its size, then the entry count and total bytes
 cargo run -- list re1.akpak
 
+# Validate a pack: parse every known-format entry and print a per-format
+# report; exits 1 when a known-format entry fails (--strict also fails
+# unknown extensions)
+cargo run -- verify re1.akpak
+
 # Extract every pack entry below a directory, preserving relative paths
 cargo run -- extract re1.akpak --out extracted/
 
@@ -55,7 +60,16 @@ cargo run -- re1.akpak --ui box --capture box.bmp
 cargo run -- re1.akpak --ui file --capture file.bmp
 cargo run -- re1.akpak --ui map --capture map.bmp
 cargo run -- re1.akpak --ui view --capture view.bmp
+
+# Frame-time report for a 600-tick room run: per-tick min/avg/p95/max, the
+# load/update/effect/render phase totals and the entity/effect high-water
+# marks. Needs no --capture; the budgets live in docs/performance.md
+cargo run -- re1.akpak --room 100 --ticks 600 --stats
 ```
+
+Captures, assembled scripts and converted packs are written to a sibling
+temporary file and renamed into place, so a failed run never leaves a partial
+artifact behind.
 
 ## Mods and authoring
 
@@ -127,6 +141,30 @@ room/message/NPC/UI frames against a locally generated set when
 `ARKLAY_RE1_GOLDEN` points at it; the set is never committed and is a
 regression/cross-check, not an independent oracle. `docs/m16-deviations.md`
 lists every approximation M16 leaves.
+
+## Hardening and release
+
+- `docs/architecture.md` maps every module, the fixed 30 Hz frame flow, the
+  trust boundaries, the per-format budget caps and the engine invariants.
+- `docs/status.md` is the milestone/format/verification matrix;
+  `docs/m17-deviations.md` records what the hardening tooling does not prove.
+- `docs/performance.md` records the frame-time budgets and the reference
+  machine; `ARKLAY_PERF_BUDGET_MS` overrides the per-tick p95 budget in the
+  ignored performance test.
+- The local CI mirror: `./scripts/check.sh` runs fmt, clippy
+  `--all-targets --all-features -D warnings`, the `--no-default-features`
+  check, debug and release tests and the doc build; `./scripts/check.sh --full`
+  adds the ignored real-asset suite when `ARKLAY_RE1_ROOT` and
+  `ARKLAY_RE1_PACK` are set.
+- CI gates those commands on Linux and Windows plus a 1.88 MSRV check, and
+  uploads `arklay-linux-x86_64.tar.gz` and `arklay-windows-x86_64.zip`
+  artifacts (binary, README, LICENSE). A scheduled, non-gating fuzz workflow
+  runs every `fuzz/` target for 60 seconds when the fuzz package is present:
+  `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=60`.
+- A full-game soak (`tests/soak_real.rs`, ignored) walks every RDT with
+  transitions and save round-trips under memory and wall-clock ceilings:
+  `ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... cargo test --release --test
+  soak_real -- --ignored --nocapture`.
 
 ## License
 

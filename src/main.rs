@@ -100,14 +100,14 @@ struct Cli {
     /// Run N fixed 30 Hz ticks before a capture frame is drawn, so scripted
     /// NPC scenes and `--fmv` frames can be captured deterministically and
     /// audio-free
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = 0,
-        requires = "capture",
-        conflicts_with = "ui"
-    )]
+    #[arg(long, value_name = "N", default_value_t = 0, conflicts_with = "ui")]
     ticks: u32,
+
+    /// Print a frame-time report after the run: per-tick min/avg/p95/max, the
+    /// load/update/effect/render phase totals and the entity/effect high-water
+    /// marks. Requires `--ticks`; a `--capture` is not needed.
+    #[arg(long, requires = "ticks", conflicts_with = "ui")]
+    stats: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -184,6 +184,24 @@ enum Command {
         /// Mod pack layers to apply, repeatable
         #[arg(long = "mod", value_name = "PATH")]
         mods: Vec<PathBuf>,
+    },
+
+    /// Validate a game pack: parse every known-format entry and report a
+    /// per-format table. Unknown entries are counted opaque and do not fail
+    /// the run unless `--strict` is set.
+    Verify {
+        /// Game pack to read
+        #[arg(value_name = "PACK")]
+        pack: PathBuf,
+
+        /// Mod pack layers to apply, repeatable
+        #[arg(long = "mod", value_name = "PATH")]
+        mods: Vec<PathBuf>,
+
+        /// Treat every entry whose format is not in the verifier's table as a
+        /// failure
+        #[arg(long)]
+        strict: bool,
     },
 
     /// Script tools
@@ -282,12 +300,13 @@ fn export_scd(rdt: &std::path::Path, out: &std::path::Path, list: bool) -> Resul
     } else {
         bail!("output `{}` must end in .s or .bio", out.display());
     };
-    std::fs::write(out, text).with_context(|| format!("failed to write {}", out.display()))?;
+    arklay::atomic::write(out, text.as_bytes())
+        .with_context(|| format!("failed to write {}", out.display()))?;
 
     if list {
         let listing = arklay::scd::disasm::render_listing(&scripts, &data);
         let listing_path = out.with_extension("lst");
-        std::fs::write(&listing_path, listing)
+        arklay::atomic::write(&listing_path, listing.as_bytes())
             .with_context(|| format!("failed to write {}", listing_path.display()))?;
     }
     Ok(())
@@ -302,7 +321,8 @@ fn build_scd(input: &Path, out: &Path) -> Result<()> {
     let container = assembled
         .to_container()
         .with_context(|| format!("failed to lay out {}", input.display()))?;
-    fs::write(out, &container).with_context(|| format!("failed to write {}", out.display()))?;
+    arklay::atomic::write(out, &container)
+        .with_context(|| format!("failed to write {}", out.display()))?;
     println!(
         "assembled {} -> {} ({} bytes)",
         input.display(),
@@ -357,7 +377,7 @@ fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        fs::write(&destination, data)
+        arklay::atomic::write(&destination, data)
             .with_context(|| format!("failed to write {}", destination.display()))?;
         bytes += data.len() as u64;
         progress.advance(entry.path());
@@ -394,6 +414,26 @@ fn list_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<()> {
     let mut out = stdout.lock();
     let (count, bytes) = write_list(&pack, &mut out)?;
     writeln!(out, "{count} entries, {bytes} bytes")?;
+    Ok(())
+}
+
+/// Validate every known-format entry of `pack_path` and print the report.
+///
+/// The report goes to stdout; the error summary goes to stderr, and the exit
+/// status is non-zero when any known-format entry failed (or, under
+/// `--strict`, any unknown entry).
+fn verify_pack(pack_path: &Path, mods: &[PathBuf], strict: bool) -> Result<()> {
+    // `open_game_pack` reports layer warnings on stderr, keeping the report
+    // stdout clean.
+    let pack = open_game_pack(pack_path, mods)?;
+    let report = arklay::verify::verify_pack(&pack, strict);
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    report.write(pack_path, &mut out)?;
+    out.flush()?;
+    if !report.valid() {
+        bail!("{} pack entries failed verification", report.failed);
+    }
     Ok(())
 }
 
@@ -494,6 +534,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
+        Some(Command::Verify { pack, mods, strict }) => verify_pack(&pack, &mods, strict),
         Some(Command::Scd { action }) => match action {
             ScdAction::Export { rdt, out, list } => export_scd(&rdt, &out, list),
             ScdAction::Build { input, out } => build_scd(&input, &out),
@@ -508,6 +549,12 @@ fn main() -> Result<()> {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
+            if cli.ticks > 0 && cli.capture.is_none() && !cli.stats {
+                bail!("--ticks requires --capture (or --stats)");
+            }
+            if cli.stats && cli.room.is_none() {
+                bail!("--stats requires --room");
+            }
             let save_dir = cli
                 .save_dir
                 .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
@@ -559,6 +606,7 @@ fn main() -> Result<()> {
                     cli.movie.as_deref(),
                     &cli.mods,
                     cli.no_mods,
+                    cli.stats,
                 );
             }
             // No room and no `--ui`: boot the app root, whose interactive run

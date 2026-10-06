@@ -177,17 +177,32 @@ impl PackWriter {
 
     /// Serialize the pack and write it to `path`.
     ///
-    /// The layout is prepared before the file is created, so a serialization
-    /// error cannot leave a truncated pack behind.
+    /// The layout is prepared before the file is created and the bytes land in
+    /// a sibling temporary file that is renamed into place once complete, so a
+    /// serialization or I/O error cannot leave a truncated or partial pack
+    /// behind.
     pub fn write(&self, path: &Path) -> Result<()> {
         let layout = self.serialize_layout()?;
-        let file = std::fs::File::create(path)
+        let temp = crate::atomic::temp_path(path)?;
+        let file = std::fs::File::create(&temp)
             .with_context(|| format!("failed to write pack {}", path.display()))?;
         let mut out = BufWriter::new(file);
-        self.write_layout(&layout, &mut out)
-            .with_context(|| format!("failed to write pack {}", path.display()))?;
-        out.flush()
+        let result = self
+            .write_layout(&layout, &mut out)
             .with_context(|| format!("failed to write pack {}", path.display()))
+            .and_then(|()| {
+                out.flush()
+                    .with_context(|| format!("failed to write pack {}", path.display()))
+            });
+        drop(out);
+        if let Err(err) = result {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err);
+        }
+        std::fs::rename(&temp, path).with_context(|| {
+            let _ = std::fs::remove_file(&temp);
+            format!("failed to move the written pack into {}", path.display())
+        })
     }
 }
 

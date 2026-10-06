@@ -37,6 +37,8 @@ use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 
@@ -100,6 +102,7 @@ use crate::scd;
 use crate::sfx;
 use crate::shadow;
 use crate::state::{Image, RoomId, RoomState};
+use crate::stats;
 use crate::text::Text;
 use crate::tim;
 use crate::transition::{self, DoorStepper};
@@ -126,11 +129,42 @@ const TITLE_OPENING_ID: u8 = 0;
 /// The prologue film the character confirm requests before a new game.
 const PROLOGUE_ID: u8 = 1;
 
+/// The process-wide SDL video lifetime.
+///
+/// `SDL_Init` runs once for the first live handle and `SDL_Quit` when the last
+/// one drops, so several displays can coexist without one tearing SDL down
+/// under another. The interactive engine holds one handle for its whole run;
+/// the capture/UI test seams overlap in one test process.
+static SDL_REFS: AtomicUsize = AtomicUsize::new(0);
+static SDL_LIFETIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct SdlHandle;
+
+impl SdlHandle {
+    /// Initialize SDL video if this is the first live handle.
+    fn acquire() -> Result<Self> {
+        let _guard = SDL_LIFETIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if SDL_REFS.load(Ordering::SeqCst) == 0 {
+            unsafe { SDL_SetMainReady() };
+            if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
+                bail!("SDL_Init failed: {}", sdl_error());
+            }
+        }
+        SDL_REFS.fetch_add(1, Ordering::SeqCst);
+        Ok(Self)
+    }
+}
 
 impl Drop for SdlHandle {
     fn drop(&mut self) {
-        unsafe { SDL_Quit() };
+        let _guard = SDL_LIFETIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if SDL_REFS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            unsafe { SDL_Quit() };
+        }
     }
 }
 
@@ -194,16 +228,20 @@ pub fn run_with_voice(
     ticks: u32,
     voice: Option<&Path>,
 ) -> Result<()> {
-    run_with_voice_and_movie(pack, id, capture, ticks, voice, None, &[], false)
+    run_with_voice_and_movie(pack, id, capture, ticks, voice, None, &[], false, false)
 }
 
-/// [`run_with_voice`] with an explicit movie-pack path and the runtime layers.
+/// [`run_with_voice`] with an explicit movie-pack path, the runtime layers and
+/// the `--stats` frame-time report.
 ///
 /// `movie` overrides the sibling `<pack stem>.movie.akpak` discovery; a path
 /// that does not exist logs a warning and leaves every film request a graceful
 /// advance. The movie pack is consulted only by the film loader. `mods` are the
 /// explicit `--mod` layers and `no_mods` ignores them and the sibling `mods/`
-/// discovery, exactly like [`open_game_pack`].
+/// discovery, exactly like [`open_game_pack`]. With `stats` the fixed-tick run
+/// records a per-tick histogram and the load/update/effect/render phases and
+/// prints the [`crate::stats`] report to stdout at exit; it runs without a
+/// capture and without opening a display.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_voice_and_movie(
     pack: &Path,
@@ -214,13 +252,16 @@ pub fn run_with_voice_and_movie(
     movie: Option<&Path>,
     mods: &[PathBuf],
     no_mods: bool,
+    stats: bool,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let voice_path = voice_pack_path(pack, voice);
     let movie_path = movie_pack_path(pack, movie);
     let pack = open_game_pack(pack, mods, no_mods)?;
 
-    if let Some(capture_path) = capture {
+    if capture.is_some() || stats {
+        let mut timings = stats::Stats::new();
+        let load_start = Instant::now();
         let mut loaded = load_room(&pack, id)?;
         let mut game = new_game_state(&pack, id, &loaded.room);
         seed_room_items(&mut game);
@@ -232,6 +273,7 @@ pub fn run_with_voice_and_movie(
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
         bgm::update_room_bgm(&mut game, id, None);
+        timings.phases.load = load_start.elapsed();
 
         let mut npc_models = npc::EntityModelCache::default();
         if ticks > 0 {
@@ -247,6 +289,7 @@ pub fn run_with_voice_and_movie(
             let mut sfx_cache = SfxCache::default();
             let mut door_transition: Option<TransitionMode> = None;
             for _ in 0..ticks {
+                let tick_start = Instant::now();
                 // A door transition owns the tick and follows into its
                 // destination room, exactly like the interactive session (but
                 // audio-free): the `--ticks` capture ends in the room the last
@@ -282,10 +325,12 @@ pub fn run_with_voice_and_movie(
                     } else {
                         door_transition = Some(session);
                     }
+                    timings.record_tick(tick_start.elapsed());
+                    timings.observe_high_water(active_entities(&game), game.effects.active_count());
                     continue;
                 }
                 let message_before = game.message.menu_choice_id() & 0x80 != 0;
-                let requested = tick_room(
+                let requested = tick_room_timed(
                     &mut command_vm,
                     &mut event_vm,
                     RoomContext {
@@ -297,6 +342,7 @@ pub fn run_with_voice_and_movie(
                         npc_models: &mut npc_models,
                     },
                     player::Input::default(),
+                    Some(&mut timings.phases),
                 );
                 run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
                 if let Some(request) = requested {
@@ -321,15 +367,12 @@ pub fn run_with_voice_and_movie(
                 // A capture never plays a film: the request is taken and
                 // dropped so a `movie_on` cannot stall the headless run.
                 game.take_fmv_request();
+                timings.record_tick(tick_start.elapsed());
+                timings.observe_high_water(active_entities(&game), game.effects.active_count());
             }
         }
 
-        let title = window_title(
-            &loaded.id.room3(),
-            loaded.room.current_cut,
-            loaded.room.cuts.len(),
-        );
-        let display = Display::new(&title, true)?;
+        let render_start = Instant::now();
         let mut framebuffer = Framebuffer::new();
         render_frame(
             &mut framebuffer,
@@ -344,8 +387,24 @@ pub fn run_with_voice_and_movie(
             &mut ShadowCache::default(),
             &mut EffectPageCache::default(),
         );
-        display.present(&framebuffer)?;
-        return display.capture(capture_path);
+        timings.phases.render += render_start.elapsed();
+
+        if let Some(capture_path) = capture {
+            let title = window_title(
+                &loaded.id.room3(),
+                loaded.room.current_cut,
+                loaded.room.cuts.len(),
+            );
+            let display = Display::new(&title, true)?;
+            display.present(&framebuffer)?;
+            display.capture(capture_path)?;
+        }
+        if stats {
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            timings.report(&mut out)?;
+        }
+        return Ok(());
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
@@ -359,6 +418,14 @@ pub fn run_with_voice_and_movie(
     let display = Display::new(&title, false)?;
     session.start_audio(&pack);
     run_session_loop(&pack, &mut session, &display)
+}
+
+/// Number of active entity slots, slot 0 (the player) included.
+fn active_entities(game: &game::GameState) -> usize {
+    game.entities
+        .iter()
+        .filter(|entity| entity.active())
+        .count()
 }
 
 /// Open a game pack together with its runtime mod layers.
@@ -524,11 +591,7 @@ impl Display {
             }
         }
 
-        unsafe { SDL_SetMainReady() };
-        if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
-            bail!("SDL_Init failed: {}", sdl_error());
-        }
-        let sdl = SdlHandle;
+        let sdl = SdlHandle::acquire()?;
 
         let title = CString::new(title).context("window title contains a NUL byte")?;
         let window = unsafe {
@@ -2474,7 +2537,7 @@ impl App {
 
     /// Write the current app frame as a BMP.
     fn capture(&self, path: &Path) -> Result<()> {
-        bmp::encode(
+        capture_bmp(
             &Image {
                 width: self.framebuffer.width,
                 height: self.framebuffer.height,
@@ -2836,11 +2899,7 @@ fn run_font_ui(
         }
     }
 
-    unsafe { SDL_SetMainReady() };
-    if !unsafe { SDL_Init(SDL_INIT_VIDEO) } {
-        bail!("SDL_Init failed: {}", sdl_error());
-    }
-    let _sdl = SdlHandle;
+    let _sdl = SdlHandle::acquire()?;
 
     let title = CString::new("Arklay - font").context("window title contains a NUL byte")?;
     let window = unsafe {
@@ -5125,6 +5184,21 @@ fn tick_room(
     context: RoomContext<'_>,
     input: player::Input,
 ) -> Option<game::RoomTransition> {
+    tick_room_timed(command_vm, event_vm, context, input, None)
+}
+
+/// [`tick_room`] with optional phase timers for `--stats`.
+///
+/// When `phases` is given, the script/entity/player update and the effect pool
+/// update add their durations to it.
+fn tick_room_timed(
+    command_vm: &mut scd::vm::CommandVm,
+    event_vm: &mut scd::vm::EventVm,
+    context: RoomContext<'_>,
+    input: player::Input,
+    mut phases: Option<&mut stats::PhaseTotals>,
+) -> Option<game::RoomTransition> {
+    let update_start = Instant::now();
     // The original publishes the remapped D-pad held/pressed words before the
     // scripts run, so a `ck_bits` (0x38) condition sees this frame's pad.
     let held = game::dpad_word(&input);
@@ -5189,10 +5263,17 @@ fn tick_room(
         );
     }
     context.game.sync_entity_from_player(context.player);
+    if let Some(phases) = phases.as_mut() {
+        phases.update += update_start.elapsed();
+    }
     // The effects run after the player's physics and before the action probe,
     // so a script that spawns this frame animates this frame and a dust effect
     // the probe spawns does too.
+    let effect_start = Instant::now();
     context.game.tick_effects(context.room);
+    if let Some(phases) = phases.as_mut() {
+        phases.effect += effect_start.elapsed();
+    }
     // The original runs the room action probe after the player's movement, so
     // `stairs_height_update` measures the frame's final position and the climb
     // behaviour starts from where the player actually is. The action-key
@@ -6079,7 +6160,7 @@ fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
         }
     }
 
-    bmp::encode(
+    capture_bmp(
         &Image {
             width: WIDTH as u32,
             height: HEIGHT as u32,
@@ -6087,6 +6168,13 @@ fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
         },
         path,
     )
+}
+
+/// Write one capture BMP through a sibling temporary file, so a failed
+/// capture never leaves a partial artifact behind.
+fn capture_bmp(image: &Image, path: &Path) -> Result<()> {
+    let data = bmp::encode_to_vec(image)?;
+    crate::atomic::write(path, &data)
 }
 
 #[cfg(test)]
@@ -7482,6 +7570,32 @@ mod tests {
         assert!(cache.get(&pack, 0x1F).is_none());
     }
 
+    /// The save round-trip the full-game soak asserts: capture the state,
+    /// serialize it, parse the block back, apply it to a clone and check the
+    /// persisted fields and the idempotent serialization.
+    fn assert_save_round_trip(state: &game::GameState) {
+        let file = save::SaveFile::from_state(state);
+        let bytes = file.to_bytes();
+        let parsed = save::SaveFile::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.to_bytes(), bytes, "to_bytes is not idempotent");
+
+        let mut restored = state.clone();
+        parsed.apply_to(&mut restored);
+        assert_eq!(restored.inventory, state.inventory);
+        assert_eq!(restored.item_box, state.item_box);
+        assert_eq!(restored.camera.current_cut, usize::from(file.camera));
+        assert_eq!(restored.entities[0].health, state.entities[0].health);
+        assert_eq!(
+            [restored.entities[0].pos[0], restored.entities[0].pos[2]],
+            [state.entities[0].pos[0], state.entities[0].pos[2]]
+        );
+        assert_eq!(restored.entities[0].angle, state.entities[0].angle);
+        assert_eq!(&restored.flags[1].bytes()[..], &file.scenario2[..]);
+        assert_eq!(&restored.flags[3].bytes()[..], &file.enemies[..]);
+        assert_eq!(&restored.flags[7].bytes()[..], &file.room_items[..]);
+        assert_eq!(restored.state_bytes, parsed.state_bytes);
+    }
+
     #[test]
     fn synthetic_transition_runs_to_completion_and_swaps_rooms() {
         let dir = TempDir::new();
@@ -7527,6 +7641,8 @@ mod tests {
         assert!(sim.timeline.iter().any(|(_, black, _)| !black));
         assert_eq!(non_black_pixels(&sim.first_frame), 0);
         assert!(sim.game.doors[0].is_none(), "the door table is rebuilt");
+        // The M17 soak's save round-trip over the crossed transition state.
+        assert_save_round_trip(&sim.game);
     }
 
     #[test]
