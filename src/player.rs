@@ -6,10 +6,10 @@
 //! from the stair state the room scripts drive ([`StairState`]), which either
 //! holds the ramp height or suspends collision while a stair/ladder climb runs.
 //!
-//! The original's slow-motion modifier halves the walk speed and holds each
-//! locomotion frame for an extra tick while a room flag is set. No state
-//! source sets that flag in this engine yet, so the port always runs at full
-//! speed and the modifier's doubled footstep cadence is not modelled.
+//! The original's slow-motion modifier (`MSF2_EFFECT_ZONE`) halves the walk
+//! and run speeds and holds each locomotion frame for an extra tick; the
+//! engine raises [`Input::slow_motion`] from the room-effect flag and the
+//! locomotion machine applies both halves.
 //!
 //! Footsteps follow the clip each behavior plays. The walk and the in-place
 //! turn share the no-weapon walk cycle and fire on its contact frames `0x08`
@@ -62,9 +62,6 @@ const BACK_CLIP: usize = 3;
 /// Ticks the settle pose is held before the breathe transition begins.
 const IDLE_SETTLE_TICKS: u32 = 100;
 
-// TODO(parity): (gameplay) while the original's slow-motion flag is set the
-// walk and run speeds are halved and a locomotion frame is applied only every
-// other tick; this engine always runs at full speed and cadence.
 /// Walk speed before the per-character footfall modulation.
 const WALK_SPEED: i32 = 0x5D;
 /// Backward walk speed.
@@ -126,6 +123,10 @@ pub struct Input {
     pub run: bool,
     pub action_held: bool,
     pub action_pressed: bool,
+    /// `MSF2_EFFECT_ZONE` this tick: walk/run speeds halve and the locomotion
+    /// animation advances only every other tick (the original's slow-motion
+    /// variant).
+    pub slow_motion: bool,
 }
 
 /// A footstep sound request emitted when a locomotion clip is about to apply
@@ -395,6 +396,9 @@ pub struct PlayerState {
     pub ladder_release: bool,
     /// The last tick's input; `tick_objects` reads the action edges from here.
     pub input: Input,
+    /// Slow-motion animation cadence counter (the original's `attackDirection`
+    /// reuse): 0 applies the frame and re-arms to 1, 1 skips the frame.
+    pub slow_counter: i16,
     /// One-shot sound requests emitted since the last
     /// [`PlayerState::take_sounds`].
     sounds: Vec<PlayerSound>,
@@ -441,6 +445,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         move_speed_current: 0,
         ladder_release: false,
         input: Input::default(),
+        slow_counter: 0,
         sounds: Vec::new(),
         footsteps: Vec::new(),
         screen_effects: Vec::new(),
@@ -490,6 +495,7 @@ pub fn update_with_room(
         player.behavior = behavior;
         player.idle_ticks = 0;
         player.idle_phase = 0;
+        player.slow_counter = 0;
         player.set_clip(entry_clip_source(behavior), entry_clip(behavior));
     }
 
@@ -501,13 +507,20 @@ pub fn update_with_room(
         turned_angle(player.angle, behavior, input)
     };
 
-    let speed = match behavior {
+    let mut speed = match behavior {
         BEHAVIOR_WALK => walk_speed(player.radius, player.anim.frame),
         BEHAVIOR_TURN => 0,
         BEHAVIOR_BACK => BACK_SPEED,
         BEHAVIOR_RUN => RUN_SPEED,
         _ => 0,
     };
+    // `MSF2_EFFECT_ZONE` halves the walk and run speeds; the animation
+    // cadence below also drops to every other tick. The turn and backward
+    // behaviours have no slow variant in the original.
+    let slow_locomotion = input.slow_motion && matches!(behavior, BEHAVIOR_WALK | BEHAVIOR_RUN);
+    if slow_locomotion {
+        speed /= 2;
+    }
     // The original checks the pending animation frame and plays the footstep
     // before `Joint_move` applies it and before the tick's movement, so the
     // sound uses the pre-move position.
@@ -535,6 +548,7 @@ pub fn update_with_room(
     }
 
     if behavior == BEHAVIOR_IDLE {
+        player.slow_counter = 0;
         player.idle_ticks = player.idle_ticks.saturating_add(1);
         match player.idle_phase {
             0 => {
@@ -554,7 +568,17 @@ pub fn update_with_room(
                 player.advance(emd_clips, emw_clips, room_clips);
             }
         }
+    } else if slow_locomotion {
+        // The original keeps a counter in `attackDirection`: a frame applies
+        // when it was 0, then the counter re-arms to 1 and the next tick skips.
+        let previous = player.slow_counter;
+        player.slow_counter -= 1;
+        if previous == 0 {
+            player.advance(emd_clips, emw_clips, room_clips);
+            player.slow_counter = 1;
+        }
     } else {
+        player.slow_counter = 0;
         player.advance(emd_clips, emw_clips, room_clips);
     }
 }
@@ -1572,6 +1596,7 @@ mod tests {
             move_speed_current: 0,
             ladder_release: false,
             input: Input::default(),
+            slow_counter: 0,
             sounds: Vec::new(),
             footsteps: Vec::new(),
             screen_effects: Vec::new(),
@@ -1645,6 +1670,77 @@ mod tests {
 
         assert_eq!(player.pos[0], 1000);
         assert!(player.pos[2] < 1000, "walked z {}", player.pos[2]);
+    }
+
+    #[test]
+    fn slow_motion_halves_walk_speed_and_cadence() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut fast = player_at(1000, 1000);
+        let mut slow = player_at(1000, 1000);
+        let fast_input = Input {
+            up: true,
+            ..Input::default()
+        };
+        let slow_input = Input {
+            up: true,
+            slow_motion: true,
+            ..Input::default()
+        };
+
+        for _ in 0..10 {
+            step(&mut fast, &room, &clips, fast_input);
+            step(&mut slow, &room, &clips, slow_input);
+        }
+
+        // The animation advances on every tick at full speed and every other
+        // tick under slow motion (`slow_counter` 0 applied / 1 skipped).
+        assert_eq!(fast.anim.frame, 10, "full-speed cadence");
+        assert_eq!(slow.anim.frame, 5, "slow-motion cadence");
+
+        // The speeds halve per tick, so the slow walk covers roughly half the
+        // ground (the frame-driven footfall modulation makes it approximate).
+        let fast_dx = fast.pos[0] - 1000;
+        let slow_dx = slow.pos[0] - 1000;
+        assert!(slow_dx > 0, "slow motion still walks");
+        assert!(slow_dx * 3 < fast_dx * 2, "slow < 2/3 of full speed");
+        assert!(slow_dx * 4 > fast_dx, "slow > 1/4 of full speed");
+
+        // Dropping the flag returns to the full cadence and speed.
+        step(
+            &mut slow,
+            &room,
+            &clips,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+        );
+        assert_eq!(slow.anim.frame, 6);
+    }
+
+    #[test]
+    fn slow_motion_does_not_touch_turning_or_backing() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut fast = player_at(1000, 1000);
+        fast.angle = 0;
+        let mut slow = fast.clone();
+        let fast_input = Input {
+            down: true,
+            ..Input::default()
+        };
+        let slow_input = Input {
+            down: true,
+            slow_motion: true,
+            ..Input::default()
+        };
+        for _ in 0..6 {
+            step(&mut fast, &room, &clips, fast_input);
+            step(&mut slow, &room, &clips, slow_input);
+        }
+        assert_eq!(fast.pos[0], slow.pos[0], "backing is not slowed");
+        assert_eq!(fast.anim.frame, slow.anim.frame);
     }
 
     #[test]

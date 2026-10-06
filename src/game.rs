@@ -142,6 +142,22 @@ const MESSAGE_LOCKED_KEY: u8 = 0xD3;
 const MESSAGE_NO_LOCKPICK: u8 = 0xD5;
 /// Message shown by a door restricted to the other character.
 const MESSAGE_WRONG_CHARACTER: u8 = 0xD6;
+/// Bank-2 cue the locked-door messages play.
+const DOOR_CUE_LOCKED: u16 = 0x14;
+/// Bank-2 cue a 0xFE door plays (opens from the other side).
+const DOOR_CUE_OTHER_SIDE: u16 = 0x21;
+/// Bank-2 cue an ordinary key turn plays.
+const DOOR_CUE_KEY_TURN: u16 = 0x22;
+/// First bank-2 cue the lab B3 passage adds before the key-turn cue.
+const DOOR_CUE_LAB_B3_A: u16 = 0x17;
+/// Second bank-2 cue the lab B3 passage adds.
+const DOOR_CUE_LAB_B3_B: u16 = 0x18;
+/// The lab B3 passage's own key-turn cue.
+const DOOR_CUE_LAB_B3_C: u16 = 0x19;
+/// 1-based stage id of the laboratory.
+const LABORATORY_STAGE: u8 = 5;
+/// Room id of the lab B3 central passage (0x05).
+const ROOM_LAB_B3_PASSAGE: u8 = 0x05;
 /// Item id of the sword key, which Jill may replace with her lockpick.
 const ITEM_SWORD_KEY: u8 = 0x33;
 /// Item id of the lockpick, which the use action never consumes.
@@ -210,6 +226,10 @@ const HANDLER_FLAG_BANK_SET: u8 = 7;
 const HANDLER_PICKUP_KEY: u8 = 15;
 /// `room_check_actions` index of the door handler.
 const HANDLER_DOOR: u8 = 1;
+/// `room_check_actions` index of the X-splitting door approach latch.
+const HANDLER_DOOR_CHECK: u8 = 5;
+/// `room_check_actions` index of the Z-splitting door approach latch.
+const HANDLER_DOOR_CHECK_SIDE: u8 = 6;
 /// `room_check_actions` index of the message handler.
 const HANDLER_MESSAGE: u8 = 2;
 /// `room_check_actions` index of the item-box handler.
@@ -265,6 +285,23 @@ const MSF_MIRROR_ENABLE: u8 = 31;
 /// active, so footsteps shift their room-table column by -3. The second dword
 /// of flag bank 5 selects it at selector `0x3F`.
 pub const MSF2_EFFECT_ZONE: u8 = 0x3F;
+/// `main_state_flags2` bit `0x400000` (`MSF2_DOOR_TURN_PENDING`): a
+/// `check_door` handler latched the approach side this frame. Selector
+/// `0x20 + (31 - 22) = 0x29` in flag bank 5.
+pub const MSF2_DOOR_TURN_PENDING: u8 = 0x29;
+/// The four D-pad direction bits of the held/pressed pad word the scripts read
+/// with `ck_bits` (0x38) and that a message dismissal blanks. `up` is bit 0
+/// because the original's walk behaviour tests `dpadHeld & 1` for forward.
+pub const DPAD_DIRECTIONS: u16 = 0x000F;
+/// State word index of `g_PlayerDpadHeld` (BioCard 0x220).
+pub const STATE_WORD_DPAD_HELD: u8 = 6;
+/// State word index of `g_PlayerDpadPressed` (BioCard 0x222).
+pub const STATE_WORD_DPAD_PRESSED: u8 = 7;
+/// State byte index of `g_SpecialRoomLightR` (BioCard 0x208).
+pub const STATE_BYTE_SPECIAL_LIGHT_R: u8 = 8;
+/// BioCard bytes before the scenarioFlags2 bank; indices at or past it alias
+/// the flag banks instead of the state block.
+const BIO_BLOCK_BYTES: usize = 52;
 /// Flag bank holding the per-frame item-use flags (`g_itemUseFlags`).
 pub const BANK_ITEM_USE: u8 = 9;
 /// Scenario flag raised by the chemical combine effect.
@@ -748,6 +785,9 @@ pub enum RoomActionKind {
     StairsZone,
     /// A Y ramp registered by `stairs_height_update` (handler `0x11`).
     StairsHeight,
+    /// A door approach-side latch (`check_door`/`check_door_side`, handlers
+    /// 5/6) that feeds the door animation instead of opening anything.
+    DoorCheck,
     /// Anything else; stores its parameters but does not act yet.
     Other,
 }
@@ -757,6 +797,8 @@ impl RoomActionKind {
     fn from_sce(sce: u8) -> Self {
         match sce {
             HANDLER_DOOR => Self::Door,
+            HANDLER_DOOR_CHECK => Self::DoorCheck,
+            HANDLER_DOOR_CHECK_SIDE => Self::DoorCheck,
             HANDLER_ITEM | HANDLER_PICKUP_KEY => Self::Item,
             HANDLER_ITEMBOX => Self::ItemBox,
             HANDLER_EVENT => Self::Event,
@@ -1014,6 +1056,16 @@ pub struct Entity {
     pub selector: u16,
     /// Health word written by `tw_set_sel` selector 3 and `tw_set_field`.
     pub health: i16,
+    /// Scripted attack animation (`attackAnim`, 0x2B).
+    pub attack_anim: u8,
+    /// Animation scratch byte `unk_bf` (0x2B/0x33 clear it).
+    pub unk_bf: u8,
+    /// Animation scratch byte `unk_8c` (0x33 sub-commands 1/6/7).
+    pub unk_8c: u8,
+    /// `isBeingAttackedFlag` (0x33 sub-command 1). Combat never raises it.
+    pub is_being_attacked: u8,
+    /// `unk_e0` scratch word (0x33 sub-command 10 toggles bit 0x40).
+    pub unk_e0: u16,
     /// Animation position offsets (`unk_c6`/`unk_c8`); the state-8 walk
     /// handlers steer at this pair.
     pub unk_c6: u16,
@@ -1138,6 +1190,51 @@ impl Entity {
     }
 }
 
+/// A room model record selected by `evt_work_set` type 2/3.
+///
+/// The object and item tables have no entity slots, so actor/tween ops aimed
+/// at them cannot use [`Entity`]; the selection is recorded so a later op can
+/// resolve the record's live transform (and the corpus audit can see that the
+/// selection was understood rather than dropped).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelTarget {
+    /// `g_omodel_table[index]`.
+    Object(u8),
+    /// `g_item_model_table[index]`.
+    Item(u8),
+}
+
+/// One queued `0x3A` camera-switch-zone header rewrite.
+///
+/// The original writes the record's second word (the source camera group) from
+/// operand byte 1 and its first word (the target camera) from operand byte 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ZoneEdit {
+    /// Index into the room's `zones` table.
+    pub index: u8,
+    /// The record's `cam_from` word (`+2`).
+    pub cam_from: i16,
+    /// The record's `cam_to` word (`+0`).
+    pub cam_to: i16,
+}
+
+/// One queued `0x46` room-light rewrite: all three records plus the ambient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoomLightsEdit {
+    /// The three rewritten light records.
+    pub lights: [crate::state::Light; 3],
+    /// The rewritten ambient colour words.
+    pub ambient: [i16; 3],
+}
+
+impl RoomLightsEdit {
+    /// Apply the rewrite to the room.
+    pub fn apply(&self, room: &mut RoomState) {
+        room.lights = self.lights;
+        room.ambient = self.ambient;
+    }
+}
+
 /// The game state the SCD scripts read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
@@ -1206,6 +1303,28 @@ pub struct GameState {
     pub last_enemy_flags: u8,
     /// Entity slot the current event operates on, or [`ENTITY_NONE`].
     pub selected_entity: u8,
+    /// Object or item record the current event selected with
+    /// `evt_work_set` type 2/3, if any.
+    pub selected_model: Option<ModelTarget>,
+    /// The room action slot a scripted `0x2D` armed for the got-item viewer.
+    /// The award runs when that viewer closes, not when the script runs.
+    pub got_item_slot: Option<u8>,
+    /// `g_eventItemUsedFlag`: a door consumed a key logically and the physical
+    /// removal waits for the key-turn prompt's dismissal.
+    pub event_item_used: bool,
+    /// `g_SpecialRoomLightState` channel masks (B, G, R) armed by `0x1C`.
+    pub special_light_masks: [u8; 3],
+    /// The held D-pad word (`g_PlayerDpadHeld`), mirrored into
+    /// [`STATE_WORD_DPAD_HELD`] every tick and blanked on a message dismissal.
+    pub dpad_held: u16,
+    /// Direction bits a state-5/6 message dismissal blanked: while a bit stays
+    /// held the engine suppresses that direction, and releasing it restores
+    /// control, exactly like the original's cleared-and-held pad word.
+    pub dpad_blanked: u16,
+    /// Queued `0x3A` camera-switch-zone header rewrites.
+    pub zone_edits: Vec<ZoneEdit>,
+    /// Queued `0x46` full room-light rewrites.
+    pub room_light_edits: Vec<RoomLightsEdit>,
     /// The last item picked up by any path.
     pub last_picked_item: Option<u8>,
     /// The last item used from a menu.
@@ -1385,6 +1504,14 @@ impl Default for GameState {
             item_events: Vec::new(),
             last_interaction: None,
             frame: 0,
+            selected_model: None,
+            got_item_slot: None,
+            event_item_used: false,
+            special_light_masks: [0; 3],
+            dpad_held: 0,
+            dpad_blanked: 0,
+            zone_edits: Vec::new(),
+            room_light_edits: Vec::new(),
             placeholders: BTreeMap::new(),
             npc_placeholders: BTreeMap::new(),
             pending_event_requests: Vec::new(),
@@ -1446,6 +1573,9 @@ impl GameState {
         // (BioCard 0x33C); a save load replaces it from the block.
         state.room_bgm = music::ROOM_STATE;
         state.state_bytes[STATE_BYTE_CHARACTER as usize] = id.player_flag & 1;
+        // `GameInit` parks the special-room-light state at -1 so no overlay
+        // draws until a script arms one.
+        state.state_words[1] = 0xFFFF;
         // InitializeGame derives the maximum from the character on every path,
         // so a state built without `seed_new_game` still has a real maximum.
         state.max_health = character_max_health(id.player_flag);
@@ -1558,39 +1688,107 @@ impl GameState {
         self.apply_flag(7, flag, 1);
     }
 
-    /// The `cmpb` condition on `state_bytes[index]`.
+    /// Read one byte of the original's unbounded BioCard-relative state array.
+    ///
+    /// Indices below [`BIO_BLOCK_BYTES`] are the state block itself. Past it
+    /// the original walks straight into the packed flag banks, so the shipped
+    /// out-of-block writes alias them instead of vanishing:
+    /// `52..=83` scenarioFlags2, `84..=91` locksFlags, `92..=123`
+    /// enemiesFlags, `124..=155` roomItemsFlags, `156..=159` the examined-item
+    /// bytes, `160..=175` scenarioFlags, `176..=195` roomFlags. Anything past
+    /// the itembox area reads 0, exactly as an out-of-range byte of the
+    /// original's block would only mean something for a game that packed its
+    /// globals adjacently.
+    fn biocard_byte(&self, index: u8) -> u8 {
+        let index = usize::from(index);
+        if index < BIO_BLOCK_BYTES {
+            return self.state_bytes.get(index).copied().unwrap_or(0);
+        }
+        match index {
+            52..=83 => self.flags[1].bytes()[index - 52],
+            84..=91 => self.flags[2].bytes()[index - 84],
+            92..=123 => self.flags[3].bytes()[index - 92],
+            124..=155 => self.flags[7].bytes()[index - 124],
+            156..=159 => self.message.examined[index - 156],
+            160..=175 => self.flags[0].bytes()[index - 160],
+            176..=195 => self.flags[8].bytes()[index - 176],
+            _ => 0,
+        }
+    }
+
+    /// Write one byte of the original's unbounded BioCard-relative state
+    /// array. The out-of-block ranges alias the flag banks, mirroring
+    /// [`Self::biocard_byte`].
+    fn set_biocard_byte(&mut self, index: u8, value: u8) {
+        let index = usize::from(index);
+        if index < BIO_BLOCK_BYTES {
+            if let Some(slot) = self.state_bytes.get_mut(index) {
+                *slot = value;
+            }
+            return;
+        }
+        match index {
+            52..=83 => self.flags[1].bytes_mut()[index - 52] = value,
+            84..=91 => self.flags[2].bytes_mut()[index - 84] = value,
+            92..=123 => self.flags[3].bytes_mut()[index - 92] = value,
+            124..=155 => self.flags[7].bytes_mut()[index - 124] = value,
+            156..=159 => self.message.examined[index - 156] = value,
+            160..=175 => self.flags[0].bytes_mut()[index - 160] = value,
+            176..=195 => self.flags[8].bytes_mut()[index - 176] = value,
+            _ => {}
+        }
+    }
+
+    /// Read one word of the original's BioCard-relative fading-state array:
+    /// word 0 `fadingState` .. word 15 the health-status/dcMode pair, then the
+    /// same flag-bank aliases as [`Self::biocard_byte`] (`16..` from
+    /// scenarioFlags2, two-byte stride).
+    fn biocard_word(&self, index: u8) -> u16 {
+        let index = usize::from(index);
+        if index < 16 {
+            return self.state_words.get(index).copied().unwrap_or(0);
+        }
+        let lo = self.biocard_byte((0x14 + index * 2) as u8);
+        let hi = self.biocard_byte((0x15 + index * 2) as u8);
+        u16::from(lo) | (u16::from(hi) << 8)
+    }
+
+    /// Write one word of the BioCard-relative fading-state array.
+    fn set_biocard_word(&mut self, index: u8, value: u16) {
+        let index = usize::from(index);
+        if index < 16 {
+            if let Some(slot) = self.state_words.get_mut(index) {
+                *slot = value;
+            }
+            return;
+        }
+        self.set_biocard_byte((0x14 + index * 2) as u8, value as u8);
+        self.set_biocard_byte((0x15 + index * 2) as u8, (value >> 8) as u8);
+    }
+
+    /// The `cmpb` condition on the BioCard state byte at `index`.
     pub fn compare_byte(&self, index: u8, mode: u8, value: u8) -> bool {
-        let state = self
-            .state_bytes
-            .get(usize::from(index))
-            .copied()
-            .unwrap_or(0);
+        let state = self.biocard_byte(index);
         compare(mode, i64::from(state), i64::from(value))
     }
 
-    /// The `cmpw` condition on `state_words[index]`, comparing unsigned words.
+    /// The `cmpw` condition on the BioCard fading-state word at `index`,
+    /// comparing unsigned words.
     pub fn compare_word(&self, index: u8, mode: u8, value: i16) -> bool {
-        let state = self
-            .state_words
-            .get(usize::from(index))
-            .copied()
-            .unwrap_or(0);
+        let state = self.biocard_word(index);
         compare(mode, i64::from(state), i64::from(value as u16))
     }
 
-    /// Write one `setb` state byte. Out-of-range indices are dropped.
+    /// Write one `setb` state byte.
     ///
     /// Index [`STATE_BYTE_ROOM_CAMERA`] is the live camera id, so writing it
     /// also moves [`GameState::camera`]; index [`STATE_BYTE_MENU_CHOICE`] is
     /// the window's menu-choice byte, index [`STATE_BYTE_SELECTED_ITEM`] the
     /// item name substitution reads, and [`STATE_BYTE_HEALTH_STATUS`] mirrors
-    /// into [`GameState::health_status`].
-    ///
-    /// TODO(parity): (scripting) the original's `setb` indexes the whole BioCard
-    /// unchecked, so scripts writing indices past the state block (57 and 82
-    /// occur in shipped rooms) alias scenarioFlags2; this drops out-of-range
-    /// indices, and in-range ones (e.g. 57) do not reach the flag banks at all.
-    /// The same unbounded-index rule applies to `setw`/`cmpb`/`cmpw`.
+    /// into [`GameState::health_status`]. Indices past the 52-byte state block
+    /// alias the packed flag banks exactly like the original's unchecked
+    /// `(&g_stageId)[index]` (shipped rooms use 57 and 82, both inside
+    /// scenarioFlags2).
     pub fn set_byte(&mut self, index: u8, value: u8) {
         if index == STATE_BYTE_ROOM_CAMERA {
             self.camera.current_cut = usize::from(value);
@@ -1604,16 +1802,12 @@ impl GameState {
         if index == STATE_BYTE_HEALTH_STATUS {
             self.health_status = value;
         }
-        if let Some(slot) = self.state_bytes.get_mut(usize::from(index)) {
-            *slot = value;
-        }
+        self.set_biocard_byte(index, value);
     }
 
-    /// Write one `setw` state word. Out-of-range indices are dropped.
+    /// Write one `setw` state word, aliasing the flag banks past word 15.
     pub fn set_word(&mut self, index: u8, value: u16) {
-        if let Some(slot) = self.state_words.get_mut(usize::from(index)) {
-            *slot = value;
-        }
+        self.set_biocard_word(index, value);
     }
 
     /// Count one execution of a not-yet-implemented opcode.
@@ -1626,23 +1820,46 @@ impl GameState {
         self.frame = self.frame.saturating_add(1);
     }
 
-    /// `evt_work_set`: turn an entity type/index pair into a slot. Type 0 is
-    /// the player, type 1 an enemy (`index` becomes slot `index + 1`), and
-    /// object/item models have no entity this slice and select
-    /// [`ENTITY_NONE`]. Returns whether a slot was selected.
+    /// `evt_work_set`: turn a type/index pair into a selection.
+    ///
+    /// Type 0 is the player, type 1 an enemy (`index` becomes slot
+    /// `index + 1`), type 2 an object model and type 3 an item model. The two
+    /// model kinds have no entity slot, so they clear [`Self::selected_entity`]
+    /// and record [`Self::selected_model`] instead; a later actor/tween op can
+    /// then resolve the record's live transform. Returns whether a valid
+    /// selection was made (an out-of-range index still counts as selected, the
+    /// way the original's pointer table would hand back whatever sits there).
     pub fn select_entity(&mut self, entity_type: u8, index: u8) -> bool {
-        let slot = match entity_type {
-            0 => Some(0usize),
-            1 => 1usize.checked_add(usize::from(index)),
-            _ => None,
-        }
-        .filter(|slot| *slot < ENTITY_COUNT);
-        match slot {
-            Some(slot) => {
-                self.selected_entity = slot as u8;
+        self.selected_model = None;
+        match entity_type {
+            0 => {
+                self.selected_entity = 0;
                 true
             }
-            None => {
+            1 => {
+                let slot = 1usize.checked_add(usize::from(index));
+                match slot.filter(|slot| *slot < ENTITY_COUNT) {
+                    Some(slot) => {
+                        self.selected_entity = slot as u8;
+                        true
+                    }
+                    None => {
+                        self.selected_entity = ENTITY_NONE;
+                        false
+                    }
+                }
+            }
+            2 => {
+                self.selected_model = Some(ModelTarget::Object(index));
+                self.selected_entity = ENTITY_NONE;
+                true
+            }
+            3 => {
+                self.selected_model = Some(ModelTarget::Item(index));
+                self.selected_entity = ENTITY_NONE;
+                true
+            }
+            _ => {
                 self.selected_entity = ENTITY_NONE;
                 false
             }
@@ -2100,15 +2317,17 @@ impl GameState {
         if flags & 0x0F != 0 {
             if flags == 0x93 {
                 // The selector is the word at +2 and the index the signed word
-                // at +4. Type 3 names the item table and its record's live
-                // position becomes the look-at target.
-                // TODO(parity): (gameplay) target type 2 (object model)
-                // resolves to g_omodel_table in the original and refreshes the
-                // look-at from its transform; the port ignores it, so a script
-                // aiming a character at an omodel keeps its previous target.
+                // at +4. Type 2 names the object table and type 3 the item
+                // table; either record's live position becomes the look-at
+                // target.
                 let selector = operand_u8(operands, 1);
                 let index = operand_i16(operands, 2);
-                if selector == 3 {
+                if selector == 2 {
+                    target = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| self.objects.record(index))
+                        .map(|record| record.pos);
+                } else if selector == 3 {
                     target = usize::try_from(index)
                         .ok()
                         .and_then(|index| self.items.record(index))
@@ -2259,9 +2478,21 @@ impl GameState {
     /// not. The player entity slot survives; the other entity slots reset. The
     /// identity bytes are reseeded from the new room.
     pub fn enter_room(&mut self, id: RoomId, room: &RoomState) {
-        // TODO(parity): (scripting) the original's `room_state_reset` also clears
-        // pickedItemId, usedItemId, fwdPosActionId and g_SysFlags[1] on a room
-        // change; this keeps the previous room's picked/used item and probe bytes.
+        // `room_state_reset`: the picked/used item ids, the forward action
+        // probe and the second system-flag word do not survive a door. (The
+        // original also runs this every frame; the port's per-room reset is
+        // the behaviour the scripts in the corpus depend on.)
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 0;
+        self.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = 0;
+        self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = 0;
+        self.flags[usize::from(BANK_SYSTEM)].bytes_mut()[4..8].fill(0);
+        // `room_set` parks the special-room-light state at -1 (no overlay) and
+        // clears the delta and the scripted channel masks.
+        self.state_words[1] = 0xFFFF;
+        self.state_words[2] = 0;
+        self.special_light_masks = [0; 3];
+        self.got_item_slot = None;
+        self.event_item_used = false;
         // The effect pool and the resolved sprite metadata reset with the room
         // (the original's effect init), so no billboard leaks across a door.
         self.effects.clear();
@@ -2272,6 +2503,8 @@ impl GameState {
         self.item_palette_edits.clear();
         self.collision_edits.clear();
         self.light_edits.clear();
+        self.zone_edits.clear();
+        self.room_light_edits.clear();
         // The original's `room_set` clears the low nibble of the main-state
         // flags, so the mirror's enable/axis bits never survive a doorway; the
         // mirror geometry, the item-box lid flow and the push latch reset with
@@ -2330,6 +2563,15 @@ impl GameState {
         }
         for edit in self.light_edits.drain(..) {
             edit.apply(room);
+        }
+        for edit in self.room_light_edits.drain(..) {
+            edit.apply(room);
+        }
+        for edit in self.zone_edits.drain(..) {
+            if let Some(zone) = room.zones.get_mut(usize::from(edit.index)) {
+                zone.cam_from = edit.cam_from;
+                zone.cam_to = edit.cam_to;
+            }
         }
         // The two map items' pairs are darkened in place, exactly like the
         // original's CLUT rewrite at the build (the pair is tagged by index).
@@ -2447,14 +2689,11 @@ impl GameState {
 
     /// Whether at least one `item` is held.
     ///
-    /// TODO(parity): (scripting) the original's `item_ck`/`get_item_slot` scans
-    /// slot ids regardless of quantity, so the starting knife (id 1, quantity 0)
-    /// counts as held; requiring `quantity > 0` here makes `testitem`/`item_ck`
-    /// for the knife (and any other zero-quantity stack) report false.
+    /// The original's `item_ck`/`get_item_slot` scans slot ids regardless of
+    /// quantity, so the starting knife (id 1, quantity 0) and a door key used
+    /// down to an empty stack both count as held while their slot exists.
     pub fn has_item(&self, item: u8) -> bool {
-        self.inventory
-            .iter()
-            .any(|stack| stack.id == item && stack.quantity > 0)
+        self.inventory.iter().any(|stack| stack.id == item)
     }
 
     /// How many `item` are held.
@@ -2645,20 +2884,40 @@ impl GameState {
         }
     }
 
-    /// `ck_item_count`: no item family table exists yet, so only the exact item
-    /// id is matched. Returns the summed quantity and the matching stack count.
+    /// `ck_item_count` (0x22): the summed quantity and the matching stack count
+    /// of the item group `search` selects.
     ///
-    /// TODO(parity): (scripting) the original's search id selects an item GROUP
-    /// (0x0A any, 0x0B item 2, 0x0C item 3, 0x0D items 4/5, 0x0F item 6,
-    /// 0x10..=0x12 items 7/8/9), not an exact item id; only exact ids are summed
-    /// here, so group counts read 0.
+    /// Groups: `0x0A` any (the original overwrites the total with each slot's
+    /// own quantity rather than summing, so the total is the LAST matching
+    /// stack's quantity), `0x0B` item 2, `0x0C` item 3, `0x0D` items 4/5,
+    /// `0x0F` item 6, `0x10..=0x12` items 7/8/9. `0x0E` and every other
+    /// selector match nothing, and the handler reports false when no stack
+    /// matched regardless of the compare.
     pub fn item_family_total(&self, search: u8) -> (u32, u32) {
-        let count = self
-            .inventory
-            .iter()
-            .filter(|stack| stack.id == search)
-            .count() as u32;
-        (self.item_count(search), count)
+        let mut total = 0u32;
+        let mut count = 0u32;
+        for stack in &self.inventory {
+            let item = stack.id;
+            let matches = match search {
+                0x0A => {
+                    // The any-family arm keeps only the last stack's quantity.
+                    total = u32::from(stack.quantity);
+                    count += 1;
+                    continue;
+                }
+                0x0B => item == 2,
+                0x0C => item == 3,
+                0x0D => item == 4 || item == 5,
+                0x0F => item == 6,
+                0x10..=0x12 => (7..=9).contains(&item),
+                _ => false,
+            };
+            if matches {
+                total = total.saturating_add(u32::from(stack.quantity));
+                count += 1;
+            }
+        }
+        (total, count)
     }
 
     /// Whether document `index` (`0..16`) has been collected: the room-flags
@@ -2680,19 +2939,15 @@ impl GameState {
         file_index(item).is_some_and(|index| self.file_collected(index))
     }
 
-    /// The item-box confirm action: move the whole inventory stack at
-    /// `player_slot` into box slot `box_slot` and bring the box stack back.
+    /// The item-box confirm action: exchange the two raw slots verbatim.
     ///
-    /// The original swaps the two raw slots directly. With the dense inventory
-    /// a withdrawn stack merges into an existing stack of the same stackable
-    /// item (up to `items::ITEM_QUANTITY_CAP`) instead of leaving a duplicate,
-    /// and a deposited stack frees its slot. The equipped marker is cleared
-    /// when the swap takes the equipped item away and no copy remains.
-    ///
-    /// TODO(parity): (inventory) the original swaps the two raw slots verbatim,
-    /// so the withdrawn stack always lands in the vacated player slot and box
-    /// slot counts stay one-for-one; the merge/spill here can combine stacks the
-    /// original would keep separate.
+    /// The box slot takes the player slot's whole stack and the player slot
+    /// takes the box stack, empty or not; nothing merges, so two stacks of the
+    /// same stackable item can coexist across the swap exactly as in the
+    /// original. The original clears the equipped marker when the swap takes
+    /// the equipped slot away (`g_EquippedItemId` is the 1-based slot index),
+    /// approximated here by clearing it when the swapped-out player stack held
+    /// the equipped item.
     ///
     /// Returns whether anything moved.
     pub fn item_box_swap(&mut self, box_slot: usize, player_slot: usize) -> bool {
@@ -2704,62 +2959,20 @@ impl GameState {
         if box_item.id == 0 && player_item.id == 0 {
             return false;
         }
-
-        // Deposit: the player stack takes the box slot.
-        self.item_box[box_slot] = player_item;
-
-        // Withdraw: merge a stackable into an existing stack, otherwise place
-        // it in the vacated player slot.
-        let merge_target = if box_item.id != 0 && items::is_stackable(box_item.id) {
-            self.inventory
-                .iter()
-                .enumerate()
-                .find(|(index, stack)| *index != player_slot && stack.id == box_item.id)
-                .map(|(index, _)| index)
-        } else {
-            None
-        };
-        match merge_target {
-            Some(target) => {
-                let total =
-                    u16::from(self.inventory[target].quantity) + u16::from(box_item.quantity);
-                let cap = u16::from(items::ITEM_QUANTITY_CAP);
-                if total <= cap {
-                    self.inventory[target].quantity = total as u8;
-                    if player_slot < self.inventory.len() {
-                        self.inventory.remove(player_slot);
-                    }
-                } else {
-                    // The merge overflows the cap: keep the remainder as its
-                    // own stack in the vacated player slot.
-                    self.inventory[target].quantity = cap as u8;
-                    let spill = InventoryItem {
-                        id: box_item.id,
-                        quantity: (total - cap) as u8,
-                    };
-                    if player_slot < self.inventory.len() {
-                        self.inventory[player_slot] = spill;
-                    } else {
-                        self.inventory.push(spill);
-                    }
-                }
-            }
-            None => {
-                if box_item.id != 0 {
-                    if player_slot < self.inventory.len() {
-                        self.inventory[player_slot] = box_item;
-                    } else {
-                        self.inventory.push(box_item);
-                    }
-                } else if player_slot < self.inventory.len() {
-                    self.inventory.remove(player_slot);
-                }
-            }
-        }
-        self.rebuild_slots();
-        if self.equipped.is_some_and(|item| !self.has_item(item)) {
+        if self.equipped == Some(player_item.id) && player_item.id != 0 {
             self.set_equipped(None);
         }
+        self.item_box[box_slot] = player_item;
+        if player_slot < self.inventory.len() {
+            if box_item.id == 0 {
+                self.inventory.remove(player_slot);
+            } else {
+                self.inventory[player_slot] = box_item;
+            }
+        } else if box_item.id != 0 {
+            self.inventory.push(box_item);
+        }
+        self.rebuild_slots();
         true
     }
 
@@ -3147,22 +3360,17 @@ impl GameState {
 
     /// Probe the room action table for the player at `pos` facing `angle`.
     ///
-    /// Mirrors the original's two probes: entries without probe bit `0x80` are
-    /// tested every frame when their low flag bits intersect the frame masks
-    /// (`1` and `4`), and entries with `0x80` only on the action-press edge
-    /// (`action_press`) and when their bit `0x01` is set. Probe bit `0x40`
-    /// tests the player position itself; otherwise a point 600 units in front
-    /// is tested. Only the first action-key entry that matches fires, as in the
-    /// original. Item and door actions act for real, a stair zone marks the
-    /// player and raises the ladder mode for the press handler in
-    /// [`GameState::tick_objects`], and the menu-driven kinds record a
-    /// placeholder.
-    ///
-    /// TODO(parity): (scripting) the original probes bit-0 entries every frame
-    /// (mask 1) and bit-2 entries only from the collision pass (mask 4); this
-    /// merges both masks into one walk, so a bit-2-only zone can fire from the
-    /// player probe. Handlers 5/6 (`check_door`/`check_door_side`), which latch
-    /// the approach side into zone flags for the door animation, are also not run.
+    /// This is the original's `update_player_position(1)` pass: entries whose
+    /// flag byte has bit 0 set are tested every frame against the reach or
+    /// entity probe, while entries with bit `0x80` (and bit 0) wait for the
+    /// action-press edge (`action_press`). Bit-2 entries belong to the
+    /// object-side pass [`GameState::tick_objects`] runs with mask 4. Probe bit
+    /// `0x40` tests the player position itself; otherwise a point 600 units in
+    /// front is tested. Only the first action-key entry that matches fires, as
+    /// in the original. Item and door actions act for real, a stair zone marks
+    /// the player and raises the ladder mode for the press handler in
+    /// [`GameState::tick_objects`], the door check handlers latch the approach
+    /// side, and the menu-driven kinds record a placeholder.
     pub fn interact(&mut self, pos: [i32; 3], angle: u16, action_press: bool) {
         // The original clears `MSF2_EFFECT_ZONE` before `update_player_position`
         // every frame; the 0x0B handler re-raises it when the player is still
@@ -3276,6 +3484,12 @@ impl GameState {
             RoomActionKind::EffectZone => {
                 self.raise_effect_zone();
             }
+            RoomActionKind::DoorCheck => {
+                self.apply_door_check(
+                    room_action.slot,
+                    room_action.handler == HANDLER_DOOR_CHECK_SIDE,
+                );
+            }
             RoomActionKind::Typewriter | RoomActionKind::Other => {
                 self.record_interaction(room_action.slot, room_action.kind, None);
             }
@@ -3326,6 +3540,276 @@ impl GameState {
     /// draws the same mesh, so it follows automatically.
     pub fn player_joint_tint(&mut self) {
         self.player_tint = [0x30, 0, 0];
+    }
+
+    /// `plw_anim` (0x2B): put the player into a scripted attack animation.
+    ///
+    /// `behavior` is the operator of the original's signed behavior word (the
+    /// word's high byte; the opcode is its low byte), so the action state is
+    /// `(behavior + 2) & 0xFF` with the action behavior byte 0, exactly the
+    /// original's `(val + 0x200) & 0xFF00` split. `param` carries the attack
+    /// animation in its low byte and the animation frame id in its high byte.
+    pub fn attack_anim_set(&mut self, behavior: u8, param: u16) {
+        let adj = (u16::from(behavior).wrapping_add(2) << 8) & 0xFF00;
+        let entity = &mut self.entities[0];
+        entity.attack_anim = param as u8;
+        entity.action_behavior = adj as u8;
+        entity.action_state = (adj >> 8) as u8;
+        entity.animation_frame_id = (param >> 8) as u8;
+        entity.unk_bf = 0;
+        entity.unk_8c = 0;
+        entity.animation_id = 8;
+    }
+
+    /// `sys_multi` (0x33): the player property setter.
+    ///
+    /// Sub-commands: 0 clear equipped weapon, 1 enter the being-attacked
+    /// animation, 3 write/or/xor the player flags byte, 4 force action 1/6,
+    /// 5 the facing direction, 6 clear `unk_8c`, 7 reset to idle, 8
+    /// write/or/xor the health-status flags, 9 XOR the joint flags, 10
+    /// set/clear the `unk_e0` bit `0x40`. Unknown sub-commands are inert.
+    pub fn player_prop_set(&mut self, operands: &[Operand]) {
+        let sub = operand_u8(operands, 0);
+        let param = operand_u16(operands, 1);
+        match sub {
+            0 => {
+                self.set_equipped(None);
+                self.entities[0].attack_anim = 0;
+            }
+            1 => {
+                let entity = &mut self.entities[0];
+                entity.is_being_attacked = param as u8;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+                // `attackDirection = 100`, the original's being-attacked side.
+                entity.attacking_direction = 100;
+                entity.move_speed_current = 0;
+                entity.attack_anim = 0;
+                entity.animation_id = 1;
+                entity.unk_8c = 3;
+            }
+            3 => {
+                let mode = (param >> 8) as u8;
+                let value = param as u8;
+                match mode {
+                    0 => self.player_flags = value,
+                    1 => self.player_flags |= value,
+                    2 => self.player_flags ^= value,
+                    _ => {}
+                }
+            }
+            4 => {
+                self.entities[0].action_behavior = 1;
+                self.entities[0].action_state = 6;
+            }
+            5 => {
+                self.entities[0].angle = param & 0x0FFF;
+            }
+            6 => {
+                self.entities[0].unk_8c = 0;
+            }
+            7 => {
+                let entity = &mut self.entities[0];
+                entity.animation_id = 1;
+                entity.animation_frame_id = 0;
+                entity.action_behavior = 0;
+                entity.action_state = 2;
+                entity.is_being_attacked = 0;
+                entity.unk_bf = 0;
+                entity.attack_anim = 0;
+                entity.unk_8c = 3;
+            }
+            8 => {
+                let mode = (param >> 8) as u8;
+                let value = param as u8;
+                let status = match mode {
+                    0 => value,
+                    1 => self.health_status | value,
+                    2 => self.health_status ^ value,
+                    _ => self.health_status,
+                };
+                self.set_health_status(status);
+            }
+            9 => {
+                self.entities[0].joint_flags ^= param;
+            }
+            10 => {
+                if param & 0xFF00 == 0 {
+                    self.entities[0].unk_e0 &= !0x40;
+                } else {
+                    self.entities[0].unk_e0 |= 0x40;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `timer_setup` (0x1C, the original's `room_light_fade_set`): arm the
+    /// special-room-light state machine.
+    ///
+    /// The operand's `r` byte, signed delta and B/G/R mask seed the state: a
+    /// non-zero delta restarts the state at 0 (fade up) or `0x7FFF` (fade
+    /// down, i.e. a negative delta), and each masked channel is forced to
+    /// `0xFF` in the overlay colour. A zero delta leaves the live state alone.
+    pub fn light_fade_set(&mut self, r: u8, delta: i16, mask: u16) {
+        self.state_bytes[usize::from(STATE_BYTE_SPECIAL_LIGHT_R)] = r;
+        self.state_words[2] = delta as u16;
+        self.special_light_masks = [
+            if mask & 1 != 0 { 0xFF } else { 0 },
+            if mask & 2 != 0 { 0xFF } else { 0 },
+            if mask & 4 != 0 { 0xFF } else { 0 },
+        ];
+        if delta != 0 {
+            self.state_words[1] = if delta < 1 { 0x7FFF } else { 0 };
+        }
+    }
+
+    /// Advance the special-room-light state by its delta, once per rendered
+    /// frame after the overlay has been drawn (the original's `main_loop`).
+    /// A state parked below zero is the "no overlay" resting value and does
+    /// not advance.
+    pub fn advance_special_light(&mut self) {
+        if (self.state_words[1] as i16) >= 0 {
+            self.state_words[1] = self.state_words[1].wrapping_add(self.state_words[2]);
+        }
+    }
+
+    /// The full-screen special-room-light overlay colour for this frame, or
+    /// `None` while the state is parked below zero.
+    ///
+    /// The intensity is the state shifted down 7 bits; each channel is the
+    /// scripted mask bit-anded with it, exactly the original's `FadingRect`.
+    pub fn special_light_fill(&self) -> Option<[u8; 4]> {
+        let state = self.state_words[1] as i16;
+        if state < 0 {
+            return None;
+        }
+        let intensity = ((state as i32) >> 7) as u8;
+        let color = [
+            self.special_light_masks[2] & intensity,
+            self.special_light_masks[1] & intensity,
+            self.special_light_masks[0] & intensity,
+            255,
+        ];
+        // A fully black overlay is the original's additive no-op; skipping the
+        // fill keeps the room pixels instead of blacking the frame out.
+        (color[0] != 0 || color[1] != 0 || color[2] != 0).then_some(color)
+    }
+
+    /// `msgnode_set` (0x3A): rewrite a camera-switch-zone record's two header
+    /// words. Operand 1 is the record's source-camera group (`+2`) and
+    /// operand 2 the target camera (`+0`).
+    pub fn cut_zone_set(&mut self, operands: &[Operand]) {
+        self.zone_edits.push(ZoneEdit {
+            index: operand_u8(operands, 0),
+            cam_from: i16::from(operand_u8(operands, 1)),
+            cam_to: i16::from(operand_u8(operands, 2)),
+        });
+    }
+
+    /// `msg_list` (0x46): overwrite the room's three light records and the
+    /// ambient colour from the scripted 44-byte block.
+    ///
+    /// The operand decode is the emitted `uIIIuuuuIIIIuuuuIIIIuuuuIIII`
+    /// signature: one unused byte, then per light `x, y, z` (signed words),
+    /// `r`, `g`, `b`, `type` (bytes) and `radius` (signed word), then the
+    /// three ambient words. The original also repaints the background clear
+    /// colour; the port's renderer reads the ambient through
+    /// [`crate::render::Lighting::from_room`], which this edit feeds.
+    pub fn room_lights_set(&mut self, operands: &[Operand]) {
+        let light = |base: usize| crate::state::Light {
+            pos: [
+                i32::from(operand_i16(operands, base)),
+                i32::from(operand_i16(operands, base + 1)),
+                i32::from(operand_i16(operands, base + 2)),
+            ],
+            color: [
+                operand_u8(operands, base + 3),
+                operand_u8(operands, base + 4),
+                operand_u8(operands, base + 5),
+            ],
+            kind: u16::from(operand_u8(operands, base + 6)),
+            radius: operand_i16(operands, base + 7),
+        };
+        self.room_light_edits.push(RoomLightsEdit {
+            lights: [light(1), light(9), light(17)],
+            ambient: [
+                operand_i16(operands, 25),
+                operand_i16(operands, 26),
+                operand_i16(operands, 27),
+            ],
+        });
+    }
+
+    /// Queue the got-item viewer for `slot` and arm its menu flags.
+    ///
+    /// The award itself waits for [`Self::close_got_item_viewer`], the
+    /// original's item viewer calling `room_event_take_item` when it closes in
+    /// got-item mode.
+    pub fn arm_got_item(&mut self, slot: u8) {
+        self.got_item_slot = Some(slot);
+        self.apply_flag(5, MSF_MENU_GOT_ITEM, 0);
+        self.apply_flag(5, MSF_MENU_ITEM_VIEW, 2);
+    }
+
+    /// The got-item viewer closed: award the armed room action and clear the
+    /// menu flags. Returns whether an item was awarded.
+    pub fn close_got_item_viewer(&mut self) -> bool {
+        self.apply_flag(5, MSF_MENU_GOT_ITEM, 1);
+        self.apply_flag(5, MSF_MENU_ITEM_VIEW, 1);
+        let Some(slot) = self.got_item_slot.take() else {
+            return false;
+        };
+        // `room_event_take_item`: award the action (the radio raises its
+        // scenario flag instead of adding an inventory stack).
+        self.pick_up(slot)
+    }
+
+    /// `check_door` (handler 5) and `check_door_side` (handler 6): latch the
+    /// side the player approaches a door zone from.
+    ///
+    /// `axis_z` selects the Z-splitting sibling. The approach side (±1) is
+    /// written to the entity's attack direction, the facing tests leave the
+    /// side unresolved when the player looks away, and the 0x10 turn bit plus
+    /// the 0x20 zone bit are raised for the door animation. The message
+    /// interaction bit is cleared and `MSF2_DOOR_TURN_PENDING` is raised.
+    pub fn apply_door_check(&mut self, slot: u8, axis_z: bool) {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return;
+        };
+        let entity = &mut self.entities[0];
+        let angle = entity.angle;
+        let (player_coord, origin, extent) = if axis_z {
+            (entity.pos[2], action.zone[1], action.zone[3])
+        } else {
+            (entity.pos[0], action.zone[0], action.zone[2])
+        };
+        let mut approach = 0i16;
+        if (player_coord - i32::from(origin)) < (extent as u16 >> 1) as i32 {
+            let turn = if axis_z { 0x800 } else { 0x400 };
+            if ((i32::from(angle) + turn) & 0x800) == 0 {
+                approach = 1;
+            }
+        } else if axis_z {
+            // The side variant's angle test reads the high byte's bit 3.
+            if ((angle >> 8) as u8 & 8) == 0 {
+                approach = -1;
+            }
+        } else if ((i32::from(angle) - 0x400) & 0x800) == 0 {
+            approach = -1;
+        }
+        let zone_bit = if axis_z { 0x60 } else { 0x20 };
+        if approach != 0 {
+            entity.animation_frame_id = 0;
+            self.message_flags &= !0x0040;
+            entity.zone_flags &= !0x10;
+            let param = action.param_word(0) as i16;
+            if (((approach >> 1) ^ param) & 1) != 0 {
+                entity.zone_flags |= 0x10;
+            }
+        }
+        entity.zone_flags |= zone_bit;
+        self.flags[5].apply(MSF2_DOOR_TURN_PENDING, 0);
     }
 
     /// `open_itembox` (handler 8): gate and arm the lid.
@@ -3839,6 +4323,14 @@ impl GameState {
         };
         match handler {
             HANDLER_DOOR => self.try_door(slot),
+            HANDLER_DOOR_CHECK => {
+                self.apply_door_check(slot, false);
+                true
+            }
+            HANDLER_DOOR_CHECK_SIDE => {
+                self.apply_door_check(slot, true);
+                true
+            }
             HANDLER_EFFECT_ZONE => {
                 self.raise_effect_zone();
                 true
@@ -4047,13 +4539,13 @@ impl GameState {
     /// substituting for the sword key) and the special `0xFE`/`0xFF` keys.
     ///
     /// A key turn only raises the lock flag and plays the message; the door
-    /// transitions on the next probe, exactly as in the original. Returns
-    /// whether a room transition was requested.
-    ///
-    /// TODO(parity): (gameplay/audio) the original plays the locked/key-turn
-    /// sound effects and defers consuming the key to `check_event_item_usage`
-    /// once the prompt message is dismissed; here the key is removed immediately
-    /// and no door sound is queued.
+    /// transitions on the next probe, exactly as in the original. The key is
+    /// consumed logically (`g_eventItemUsedFlag` + the selected item) but the
+    /// physical removal waits for the prompt's dismissal via
+    /// [`Self::check_event_item_usage`]. The locked/key-turn bank-2 cues are
+    /// queued in [`GameState::sfx_requests`]; the port has no bank mapping for
+    /// them yet, so the engine drains and drops them. Returns whether a room
+    /// transition was requested.
     pub fn try_door(&mut self, slot: u8) -> bool {
         let Some(door) = self.doors.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -4073,33 +4565,67 @@ impl GameState {
         if need == 0xFE {
             // Opens from the far side: show the message, then raise the flag so
             // the next probe walks through.
+            self.sfx_requests.push(DOOR_CUE_OTHER_SIDE);
             self.show_message(MESSAGE_OTHER_SIDE, 0xFF);
             self.apply_flag(BANK_LOCKS, door.lock & 0x3F, 0);
             return false;
         }
         if need == 0xFF {
+            self.sfx_requests.push(DOOR_CUE_LOCKED);
             self.show_message(MESSAGE_LOCKED_KEY, 0xFF);
             return false;
         }
-        if need == ITEM_SWORD_KEY && self.id.player_flag & 1 == 1 {
+        let turned = if need == ITEM_SWORD_KEY && self.id.player_flag & 1 == 1 {
             // Jill substitutes her lockpick for the sword key, but only once
             // she has picked it up.
             if !self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_LOCKPICK, false) {
+                self.sfx_requests.push(DOOR_CUE_LOCKED);
                 self.show_message(MESSAGE_NO_LOCKPICK, 0xFF);
                 return false;
             }
+            ITEM_LOCK_PICK
         } else if !self.has_item(need) {
             // "It's locked": keyed message indexed from the sword key.
+            self.sfx_requests.push(DOOR_CUE_LOCKED);
             let index = need.wrapping_sub(ITEM_SWORD_KEY).min(10);
             self.show_message(LOCKED_MESSAGE.saturating_add(index), 0xFF);
             return false;
         } else {
-            // The key is consumed by the turn.
-            self.remove_item(need);
-        }
+            need
+        };
+        // The turn arms the deferred removal: the item stays in the inventory
+        // until the prompt dismisses (`check_event_item_usage`).
+        self.event_item_used = true;
+        self.selected_item = Some(turned);
+        self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)] = turned;
+        let cue = if self.id.stage == LABORATORY_STAGE && self.id.room == ROOM_LAB_B3_PASSAGE {
+            // The lab B3 passage plays the two mechanism sounds then this cue.
+            self.sfx_requests.push(DOOR_CUE_LAB_B3_A);
+            self.sfx_requests.push(DOOR_CUE_LAB_B3_B);
+            DOOR_CUE_LAB_B3_C
+        } else {
+            DOOR_CUE_KEY_TURN
+        };
+        self.sfx_requests.push(cue);
         self.show_message(MESSAGE_KEY_TURN, 0xFF);
         self.apply_flag(BANK_LOCKS, door.lock & 0x3F, 0);
         false
+    }
+
+    /// `check_event_item_usage` (0x0041c490): consume the key a door or desk
+    /// turn armed once its key-turn prompt has been dismissed.
+    ///
+    /// The original runs this every frame and tests the menu-choice byte's high
+    /// bit; the port calls it from [`Self::update_message`] after the window
+    /// settles, so the key survives while the prompt is up and leaves the
+    /// inventory the moment it closes. Returns whether an item was consumed.
+    pub fn check_event_item_usage(&mut self) -> bool {
+        if !self.event_item_used || self.message.menu_choice_id() & 0x80 != 0 {
+            return false;
+        }
+        self.use_selected_item();
+        self.event_item_used = false;
+        true
     }
 
     /// Arm the transition described by `door`, decoding the destination's
@@ -4252,12 +4778,14 @@ impl GameState {
         let selected = self.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)];
         self.message.update(input, text, selected);
         // A dismissal (input, timer or an empty source) releases the pause
-        // mask before any replacement the post-actions request.
+        // mask before any replacement the post-actions request. The original
+        // blanks the held d-pad direction bits on a state-5/6 dismissal unless
+        // the message's flags bit 0 protects them; the bits stay suppressed
+        // until the key is released.
         if was_active && !self.message.active {
-            // TODO(parity): (input) the original also blanks the held and
-            // previous-held d-pad bits on a state 5/6 dismissal unless
-            // message_flags bit 0 is set; only the action press is swallowed
-            // here, so a direction held through the dismissal resumes at once.
+            if self.message_flags & 1 == 0 {
+                self.dpad_blanked |= self.dpad_held & DPAD_DIRECTIONS;
+            }
             self.message_flags = self.message_flags_backup;
         }
         let pause = self.message.pause;
@@ -4343,6 +4871,35 @@ impl GameState {
     }
 }
 
+/// Encode one tick's input into the D-pad word the scripts read.
+///
+/// The layout is the port's documented approximation of `g_PlayerDpadHeld`:
+/// bit 0 up/forward (the walk behaviour's `held & 1`), bit 1 down, bit 2 left,
+/// bit 3 right, bit 4 run, bit 7 action. Skipped mid-`dpad_word` bits are the
+/// original's button remap slots this port does not surface to scripts.
+pub fn dpad_word(input: &crate::player::Input) -> u16 {
+    let mut word = 0u16;
+    if input.up {
+        word |= 0x0001;
+    }
+    if input.down {
+        word |= 0x0002;
+    }
+    if input.left {
+        word |= 0x0004;
+    }
+    if input.right {
+        word |= 0x0008;
+    }
+    if input.run {
+        word |= 0x0010;
+    }
+    if input.action_held {
+        word |= 0x0080;
+    }
+    word
+}
+
 /// Compare `state` against `value` with the shared condition mode table.
 fn compare(mode: u8, state: i64, value: i64) -> bool {
     match mode {
@@ -4424,17 +4981,18 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_flow(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x0E | 0x32 => StepResult::Continue,
-            // TODO(parity): (scripting) the original compares against a byte
-            // whose "nothing used/picked" value is 0, so `testitem 0` /
-            // `testpickup 0` are true when no item has been used/picked yet;
-            // `Option`-based matching here makes those always false.
+            // `testitem`/`testpickup`: the original compares against the raw
+            // BioCard byte, so id 0 is true while no item has been used or
+            // picked rather than the "none" sentinel the `Option` implies.
             0x10 => {
                 let item = operand_u8(operands, 0);
-                condition_result(self.state.last_used_item == Some(item))
+                condition_result(self.state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] == item)
             }
             0x11 => {
                 let item = operand_u8(operands, 0);
-                condition_result(self.state.last_picked_item == Some(item))
+                condition_result(
+                    self.state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] == item,
+                )
             }
             0x1A => condition_result(self.state.has_item(operand_u8(operands, 0))),
             0x1D => self.equipped_test(operands),
@@ -4445,6 +5003,13 @@ impl ScdHost for ScdGameHost<'_> {
                 let (total, stacks) = self.state.item_family_total(search);
                 condition_result(stacks > 0 && compare(mode, i64::from(total), i64::from(value)))
             }
+            // `ck_bits` (0x38): `held & mask` with an invert byte.
+            0x38 => {
+                let invert = operand_u8(operands, 0) != 0;
+                let mask = operand_u16(operands, 1);
+                let held = self.state.state_words[usize::from(STATE_WORD_DPAD_HELD)];
+                condition_result((held & mask != 0) != invert)
+            }
             // `ck_counter` (0x3C): the player's XZ distance to an enemy or
             // object model against the maximum.
             0x3C => {
@@ -4452,14 +5017,19 @@ impl ScdHost for ScdGameHost<'_> {
                 let max_dist = operand_u16(operands, 2);
                 condition_result(self.state.distance_test(target, max_dist))
             }
+            // `ck_tween` (0x3F, the original's `cmd_player_dir_test`): a
+            // wrap-aware range test on the player's facing angle.
+            0x3F => {
+                let min = operand_u16(operands, 1);
+                let max = operand_u16(operands, 2);
+                let dir = self.state.entities[0].angle;
+                condition_result(dir.wrapping_sub(min) <= max.wrapping_sub(min))
+            }
             // `costume_ck` (0x50): the original ignores the operand byte and
             // returns `g_bCostumeVariant`, so the condition is true exactly
             // when the alternate-outfit bit was set by a preceding
             // `costume_set`.
             0x50 => condition_result(self.state.costume_variant & 1 != 0),
-            // TODO(parity): (scripting) conditions 0x38 dpad test and 0x3F
-            // player direction report false here (recorded placeholders), so
-            // scripts using them always take the else branch.
             _ => self.placeholder(op),
         }
     }
@@ -4531,20 +5101,33 @@ impl ScdHost for ScdGameHost<'_> {
                 self.state.camera.locked = operand_u8(operands, 0) != 0;
                 StepResult::Continue
             }
-            // This slice maps 0x1C to the equipped item test alongside 0x1D;
-            // the real 0x1C (room light fade setup) stays unimplemented.
-            //
-            // TODO(parity): (scripting) 0x1C is the original's
-            // `room_light_fade_set` (writes specialRoomLightR and the light
-            // state/delta words) and 0x3A cut_zone_set/0x46 room_lights_set
-            // are still placeholders.
-            0x1C => self.equipped_test(operands),
+            // `timer_setup` (0x1C, the original's `room_light_fade_set`).
+            0x1C => {
+                self.state.light_fade_set(
+                    operand_u8(operands, 0),
+                    operand_i16(operands, 1),
+                    operand_u16(operands, 2),
+                );
+                StepResult::Continue
+            }
+            // `msgnode_set` (0x3A): the host cannot borrow the room, so the
+            // camera-zone rewrite is queued and applied by the room tick.
+            0x3A => {
+                self.state.cut_zone_set(operands);
+                StepResult::Continue
+            }
             // `obj_xfm` (0x40): the host cannot borrow the room, so the
             // light rewrite is queued and applied by the room tick.
             0x40 => {
                 self.state
                     .light_edits
                     .push(crate::objects::light_edit(operands));
+                StepResult::Continue
+            }
+            // `msg_list` (0x46): the full room-light rewrite is queued for the
+            // same seam.
+            0x46 => {
+                self.state.room_lights_set(operands);
                 StepResult::Continue
             }
             _ => self.placeholder(op),
@@ -4752,25 +5335,12 @@ impl ScdHost for ScdGameHost<'_> {
                 StepResult::Continue
             }
             0x2D => {
+                // `give_item` arms the got-item viewer. Every shipped site
+                // passes handler 4 (`set_key_flag`), which only raises the
+                // item-view flag in the original; the award runs when the
+                // viewer closes (`close_got_item_viewer`), not here.
                 let slot = operand_u8(operands, 0);
-                let handler = operand_u8(operands, 1);
-                self.state.run_room_action(slot, handler);
-                // TODO(parity): (scripting/gameplay) the original only arms the
-                // room action here (MSF_MENU_MODE_GOT_ITEM + toggled ITEM_VIEW)
-                // and awards the item when the item-viewer flow closes; this
-                // awards it immediately and never opens the "got item" viewer.
-                if self
-                    .state
-                    .room_actions
-                    .get(usize::from(slot))
-                    .is_some_and(|action| {
-                        action.is_some_and(|action| action.kind == RoomActionKind::Item)
-                    })
-                {
-                    self.state.pick_up(slot);
-                }
-                self.state.apply_flag(5, MSF_MENU_GOT_ITEM, 0);
-                self.state.apply_flag(5, MSF_MENU_ITEM_VIEW, 2);
+                self.state.arm_got_item(slot);
                 StepResult::Finished
             }
             // `task_kill`: deactivate a running event slot. The host cannot
@@ -4887,7 +5457,6 @@ impl ScdHost for ScdGameHost<'_> {
                 let removed = self.state.item_remove(operand_u8(operands, 0));
                 condition_result(removed)
             }
-            0x1C => self.equipped_test(operands),
             // `model_flag_set` (0x19): write the item record's byte 0
             // wholesale. The original touches only that byte: clearing the
             // model does not free the pick-up sparkle, which expires on its
@@ -4976,15 +5545,26 @@ impl ScdHost for ScdGameHost<'_> {
                 entity.pos[1] = entity.pos[1].wrapping_add(i32::from(operand_i8(operands, 0)));
                 StepResult::Continue
             }
+            // `plw_anim` (0x2B): the scripted attack animation. The behavior
+            // word's low byte is the consumed opcode, so operand 0 is its high
+            // byte and operand 1 holds attackAnim/animation_frame_id.
+            0x2B => {
+                let behavior = operand_u8(operands, 0);
+                let param =
+                    u16::from(operand_u8(operands, 1)) | (u16::from(operand_u8(operands, 2)) << 8);
+                self.state.attack_anim_set(behavior, param);
+                StepResult::Continue
+            }
+            // `sys_multi` (0x33): the player property setter.
+            0x33 => {
+                self.state.player_prop_set(operands);
+                StepResult::Continue
+            }
             // objs_hide: the player joint tint.
             0x4D => {
                 self.state.player_joint_tint();
                 StepResult::Continue
             }
-            // TODO(parity): (scripting) 0x2B attack_anim_set, 0x33
-            // player_prop_set (clear equip, attacked/stunned animation, flags,
-            // health-status and joint writes) and 0x4D player_joint_tint stay
-            // placeholders.
             _ => self.placeholder(op),
         }
     }
@@ -5298,9 +5878,6 @@ impl ScdHost for ScdGameHost<'_> {
                 self.state.costume_variant = operand_u8(operands, 0) & 1;
                 StepResult::Continue
             }
-            // TODO(parity): (scripting) 0x0F mirror_set stays a placeholder,
-            // and `evt_work_set` types 2/3 (object/item models) select no
-            // entity, so actor/tween ops aimed at them do nothing.
             _ => self.placeholder(op),
         }
     }
@@ -5882,13 +6459,15 @@ mod tests {
         );
 
         // A door key that hits zero raises the depletion flag and stays as an
-        // empty stack.
+        // empty stack: `has_item` still finds the slot (the original's
+        // quantity-independent scan) while the count reads zero.
         let mut state = game();
         state.add_item(0x35, 1);
         state.select_item(Some(0x35));
         state.show_message(0, 0);
         confirm_yes_no(&mut state, &room);
-        assert!(!state.has_item(0x35));
+        assert!(state.has_item(0x35), "the empty slot is still held");
+        assert_eq!(state.item_count(0x35), 0);
         assert!(
             state
                 .inventory
@@ -6630,26 +7209,23 @@ mod tests {
         {
             let mut host = ScdGameHost::new(&mut state);
             assert_eq!(
-                host.on_player(op(0x2B), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
-                host.on_camera(op(0x3A), &operands(&[0])),
-                StepResult::Placeholder
-            );
-            assert_eq!(
                 host.on_sound(op(0x26), &operands(&[0])),
                 StepResult::Placeholder
             );
+            assert_eq!(
+                host.on_effect(op(0x2E), &operands(&[0])),
+                StepResult::Placeholder
+            );
         }
-        assert_eq!(state.placeholders.len(), 3);
-        assert_eq!(state.placeholders[&0x2B], 1);
-        assert_eq!(state.placeholders[&0x3A], 1);
+        assert_eq!(state.placeholders.len(), 2);
         assert_eq!(state.placeholders[&0x26], 1);
-        assert!(
-            !state.placeholders.contains_key(&0x4C),
-            "0x4C is implemented now"
-        );
+        assert_eq!(state.placeholders[&0x2E], 1);
+        for implemented in [0x1C_u8, 0x2B, 0x33, 0x3A, 0x46, 0x4C] {
+            assert!(
+                !state.placeholders.contains_key(&implemented),
+                "{implemented:#04x} is implemented now"
+            );
+        }
     }
 
     #[test]
@@ -9557,16 +10133,38 @@ mod tests {
         assert_eq!(state.message.id, Some(LOCKED_MESSAGE + 1));
         assert!(state.message.active);
 
-        // With the key: the key turns, is consumed and raises the lock flag.
-        // (The locked message must be read first: a live window refuses the
-        // next prompt, exactly like the original's set_message_display.)
+        // With the key: the turn queues the key-turn prompt and raises the lock
+        // flag, but the key stays in the inventory until the prompt dismisses
+        // (`check_event_item_usage`). (The locked message must be read first: a
+        // live window refuses the next prompt, exactly like the original's
+        // set_message_display.)
         state.cancel_message();
         state.add_item(0x34, 1);
         state.interact([-550, 0, 50], 0, true);
         assert!(state.transition.is_none());
         assert_eq!(state.message.id, Some(0xC3));
-        assert!(!state.has_item(0x34), "the key is consumed by the turn");
+        assert!(state.has_item(0x34), "the key survives the prompt");
+        assert_eq!(state.selected_item, Some(0x34));
         assert!(state.flag_test(2, 5, false));
+        assert!(
+            state.sfx_requests.contains(&DOOR_CUE_KEY_TURN),
+            "the turn queued its cue"
+        );
+
+        // Dismissing the prompt consumes the key (one unit); the door-key
+        // range keeps an empty stack behind and raises the depletion flag.
+        state.cancel_message();
+        assert!(state.check_event_item_usage());
+        assert_eq!(state.item_count(0x34), 0, "the key is consumed");
+        assert!(
+            state
+                .inventory
+                .iter()
+                .any(|stack| stack.id == 0x34 && stack.quantity == 0),
+            "the depleted key slot remains"
+        );
+        assert!(state.flags[5].bit(MSF_MENU_KEY_DEPLETED));
+        assert!(!state.event_item_used);
 
         // The next probe walks through.
         state.cancel_message();
@@ -9772,7 +10370,7 @@ mod tests {
     }
 
     #[test]
-    fn give_item_runs_the_action_and_stops() {
+    fn give_item_arms_the_viewer_and_awards_on_close() {
         let mut state = game();
         state.apply_flag(7, 23, 0);
         {
@@ -9786,6 +10384,15 @@ mod tests {
                 StepResult::Finished
             );
         }
+        // Armed, not awarded: the viewer owns the award now.
+        assert!(state.inventory.is_empty());
+        assert_eq!(state.got_item_slot, Some(2));
+        assert!(state.flags[5].bit(MSF_MENU_GOT_ITEM));
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert!(state.room_actions[2].is_some());
+
+        // Closing the viewer awards the item and consumes the action.
+        assert!(state.close_got_item_viewer());
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
@@ -9795,6 +10402,9 @@ mod tests {
         );
         assert_eq!(state.last_picked_item, Some(0x42));
         assert!(state.room_actions[2].is_none());
+        assert!(!state.flags[5].bit(MSF_MENU_GOT_ITEM));
+        assert!(!state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert_eq!(state.got_item_slot, None);
     }
 
     #[test]
@@ -9816,8 +10426,8 @@ mod tests {
     fn test_and_remove_item_opcodes() {
         let mut state = game();
         state.add_item(7, 2);
-        state.last_used_item = Some(7);
-        state.last_picked_item = Some(9);
+        state.record_used_item(7);
+        state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 9;
         state.equipped = Some(5);
 
         let mut host = ScdGameHost::new(&mut state);
@@ -9837,6 +10447,26 @@ mod tests {
             host.on_flow(op(0x11), &operands(&[7])),
             StepResult::Finished
         );
+        // `testitem 0`/`testpickup 0` are true before any use/pick, because
+        // the conditions compare against the raw byte rather than an Option.
+        assert_eq!(
+            host.on_flow(op(0x10), &operands(&[0])),
+            StepResult::Finished
+        );
+        assert_eq!(
+            host.on_flow(op(0x11), &operands(&[0])),
+            StepResult::Finished
+        );
+        let mut fresh = game();
+        let mut fresh_host = ScdGameHost::new(&mut fresh);
+        assert_eq!(
+            fresh_host.on_flow(op(0x10), &operands(&[0])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            fresh_host.on_flow(op(0x11), &operands(&[0])),
+            StepResult::Continue
+        );
         assert_eq!(
             host.on_flow(op(0x1A), &operands(&[7])),
             StepResult::Continue
@@ -9848,14 +10478,6 @@ mod tests {
         assert_eq!(
             host.on_flow(op(0x1D), &operands(&[5])),
             StepResult::Continue
-        );
-        assert_eq!(
-            host.on_camera(op(0x1C), &operands(&[5])),
-            StepResult::Continue
-        );
-        assert_eq!(
-            host.on_item(op(0x1C), &operands(&[6])),
-            StepResult::Finished
         );
         // `item_remove` (0x2C) clears the WHOLE slot, not one unit.
         assert_eq!(
@@ -10028,49 +10650,118 @@ mod tests {
     }
 
     #[test]
-    fn ck_item_count_uses_the_compare_modes() {
+    fn ck_item_count_groups_and_compare_modes() {
         let mut state = game();
-        state.add_item(0x0B, 10);
+        // One stack per grouped id: 2, 3, 4, 5, 6, 7, 8, 9.
+        for (item, quantity) in [
+            (2u8, 4u8),
+            (3, 5),
+            (4, 6),
+            (5, 7),
+            (6, 8),
+            (7, 9),
+            (8, 1),
+            (9, 2),
+        ] {
+            state.add_item(item, quantity);
+        }
 
         let mut host = ScdGameHost::new(&mut state);
+        // Group 0x0B is item 2 alone (total 4): all six modes.
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 0, 10])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 0, 4])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 0, 9])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 0, 5])),
             StepResult::Finished
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 1, 9])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 1, 3])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 2, 10])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 2, 4])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 3, 11])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 3, 5])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 4, 10])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 4, 4])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 5, 9])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 5, 3])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 5, 10])),
+            host.on_flow(op(0x22), &operands(&[0x0B, 5, 4])),
+            StepResult::Finished
+        );
+        // An unknown mode is false.
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0B, 6, 4])),
+            StepResult::Finished
+        );
+
+        // The remaining groups sum their own ids.
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0C, 0, 5])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0D, 0, 13])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0F, 0, 8])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x10, 0, 12])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x11, 0, 12])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x12, 0, 12])),
+            StepResult::Continue
+        );
+        // 0x0E selects no family, and an unheld group reports false even when
+        // the compare would hold.
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0E, 0, 0])),
             StepResult::Finished
         );
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0C, 0, 0])),
+            host.on_flow(op(0x22), &operands(&[0x0E, 4, 100])),
             StepResult::Finished
         );
+        // An exact item id is not a family selector: item 2 held, search 2.
         assert_eq!(
-            host.on_flow(op(0x22), &operands(&[0x0B, 6, 10])),
+            host.on_flow(op(0x22), &operands(&[2, 0, 4])),
+            StepResult::Finished
+        );
+
+        // The any-family (0x0A) total is the LAST stack's quantity, not the
+        // sum, exactly like the original's overwrite-instead-of-add loop.
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0A, 0, 2])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0A, 0, 42])),
+            StepResult::Finished
+        );
+
+        let mut empty = game();
+        let mut host = ScdGameHost::new(&mut empty);
+        assert_eq!(
+            host.on_flow(op(0x22), &operands(&[0x0A, 0, 0])),
             StepResult::Finished
         );
     }
@@ -10231,54 +10922,49 @@ mod tests {
     }
 
     #[test]
-    fn item_box_swap_merges_withdrawn_stackables_into_an_existing_stack() {
+    fn item_box_swap_exchanges_raw_slots_verbatim() {
         let mut state = game();
         state.add_item(1, 1); // knife in slot 0
         state.add_item(0x0B, 10); // handgun ammo in slot 1
+        state.add_item(0x0C, 20); // a second, different stackable in slot 2
         state.item_box[0] = InventoryItem {
             id: 0x0B,
-            quantity: 20,
+            quantity: 30,
         };
 
-        // Deposit the knife from slot 0 and withdraw the ammo, which must
-        // merge into the existing ammo stack rather than leaving a duplicate.
+        // The swap is verbatim: the knife lands in the box and the box ammo
+        // lands in the vacated player slot as its own stack, never merging into
+        // the ammo stack already held.
         assert!(state.item_box_swap(0, 0));
         assert_eq!(state.item_box[0].id, 1);
-        assert_eq!(state.item_count(0x0B), 30);
-        assert_eq!(
-            state.inventory.len(),
-            1,
-            "the withdrawn stack merged into the existing one"
-        );
+        assert_eq!(state.item_box[0].quantity, 1);
+        assert_eq!(state.inventory.len(), 3);
         assert_eq!(state.inventory[0].id, 0x0B);
         assert_eq!(state.inventory[0].quantity, 30);
+        assert_eq!(state.item_count(0x0B), 40, "10 + 30, no merge");
+
+        // An emptied box slot swaps back verbatim and the player slot clears.
+        state.item_box[0] = InventoryItem::default();
+        assert!(state.item_box_swap(0, 0));
+        assert!(state.item_box[0].id == 0x0B && state.item_box[0].quantity == 30);
+        assert_eq!(state.inventory.len(), 2, "the withdrawn 30 left the player");
+        assert_eq!(state.item_count(0x0B), 10);
     }
 
     #[test]
-    fn an_item_box_merge_that_overflows_the_cap_spills_into_the_player_slot() {
+    fn an_item_box_swap_never_touches_a_quantity_cap() {
         let mut state = game();
-        state.add_item(1, 1); // knife in slot 0
-        state.add_item(0x0B, 0xF0); // ammo in slot 1
+        state.add_item(0x0B, 0xF0);
         state.item_box[0] = InventoryItem {
             id: 0x0B,
             quantity: 0xF0,
         };
 
+        // The raw exchange keeps the rounds in their own slots; nothing caps.
         assert!(state.item_box_swap(0, 0));
-        assert_eq!(state.item_box[0].id, 1, "the knife was deposited");
-        assert_eq!(state.inventory.len(), 2);
-        let ammo: u32 = state.item_count(0x0B);
-        assert_eq!(ammo, 0xF0 + 0xF0, "no rounds are lost");
-        assert_eq!(
-            state.inventory[1].quantity,
-            items::ITEM_QUANTITY_CAP,
-            "the existing stack caps first"
-        );
-        assert_eq!(
-            state.inventory[0].quantity,
-            (0xF0u16 + 0xF0 - u16::from(items::ITEM_QUANTITY_CAP)) as u8,
-            "the remainder spills into the vacated slot"
-        );
+        assert_eq!(state.inventory.len(), 1);
+        assert_eq!(state.inventory[0].quantity, 0xF0);
+        assert_eq!(state.item_box[0].quantity, 0xF0);
     }
 
     #[test]
@@ -11150,5 +11836,578 @@ mod tests {
         assert_eq!(state.player_tint, [255, 255, 255]);
         state.player_joint_tint();
         assert_eq!(state.player_tint, [0x30, 0, 0]);
+    }
+
+    // ------------------------------------------------------------------
+    // M16 slice 7: searches and conditions.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn item_searches_count_zero_quantity_stacks() {
+        let mut state = game();
+        // The starting-knife shape: id present, quantity 0.
+        state.add_item(1, 0);
+        assert!(state.has_item(1), "the slot counts as held");
+        assert_eq!(state.item_count(1), 0);
+
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_flow(op(0x1A), &operands(&[1])),
+            StepResult::Continue
+        );
+        assert_eq!(
+            host.on_flow(op(0x1A), &operands(&[2])),
+            StepResult::Finished
+        );
+        // `item_remove` clears the whole zero-quantity slot; the one-unit
+        // `remove_item` path never can.
+        assert!(!host.state_mut().remove_item(1));
+        assert!(host.state_mut().has_item(1));
+        assert_eq!(
+            host.on_item(op(0x2C), &operands(&[1])),
+            StepResult::Continue
+        );
+        assert!(!host.state().has_item(1));
+    }
+
+    #[test]
+    fn ck_bits_applies_the_invert_byte() {
+        let mut state = game();
+        state.state_words[usize::from(STATE_WORD_DPAD_HELD)] = 0x0001;
+        let mut host = ScdGameHost::new(&mut state);
+        // Mask set and held.
+        assert_eq!(
+            host.on_flow(op(0x38), &operands(&[0, 1])),
+            StepResult::Continue
+        );
+        // Mask clear.
+        assert_eq!(
+            host.on_flow(op(0x38), &operands(&[0, 2])),
+            StepResult::Finished
+        );
+        // Invert flips both.
+        assert_eq!(
+            host.on_flow(op(0x38), &operands(&[1, 1])),
+            StepResult::Finished
+        );
+        assert_eq!(
+            host.on_flow(op(0x38), &operands(&[1, 2])),
+            StepResult::Continue
+        );
+    }
+
+    #[test]
+    fn ck_tween_wraps_the_direction_range() {
+        let mut state = game();
+        state.entities[0].angle = 0x0F00;
+        let mut host = ScdGameHost::new(&mut state);
+        // The range 0x0E00..=0x0100 wraps through zero and contains 0x0F00.
+        assert_eq!(
+            host.on_flow(op(0x3F), &operands(&[0, 0x0E00, 0x0100])),
+            StepResult::Continue
+        );
+        // 0x0500 lies outside the wrapped range.
+        host.state_mut().entities[0].angle = 0x0500;
+        assert_eq!(
+            host.on_flow(op(0x3F), &operands(&[0, 0x0E00, 0x0100])),
+            StepResult::Finished
+        );
+        // A non-wrapping range still works.
+        host.state_mut().entities[0].angle = 0x0800;
+        assert_eq!(
+            host.on_flow(op(0x3F), &operands(&[0, 0x0400, 0x0C00])),
+            StepResult::Continue
+        );
+    }
+
+    #[test]
+    fn setb_cmpb_setw_cmpw_alias_the_flag_banks() {
+        let mut state = game();
+        // Shipped index 57 lands in scenarioFlags2[5].
+        state.set_byte(57, 0x80);
+        assert_eq!(state.flags[1].bytes()[5], 0x80);
+        assert!(state.compare_byte(57, 0, 0x80));
+        // Shipped index 82 lands in scenarioFlags2[30].
+        state.set_byte(82, 0x01);
+        assert_eq!(state.flags[1].bytes()[30], 0x01);
+        assert!(state.compare_byte(82, 1, 0));
+        // Word 24 is scenarioFlags2's ninth word (bytes 16/17).
+        state.set_word(24, 0x1234);
+        assert_eq!(state.flags[1].bytes()[16], 0x34);
+        assert_eq!(state.flags[1].bytes()[17], 0x12);
+        assert!(state.compare_word(24, 0, 0x1234));
+        // Word 32 is g_LocksFlags' first word.
+        state.set_word(32, 0x0002);
+        assert_eq!(state.flags[2].bytes()[0], 0x02);
+        assert_eq!(state.flags[2].bytes()[1], 0x00);
+        // A state-block index still hits the block directly.
+        state.set_byte(STATE_BYTE_ROOM_CAMERA, 3);
+        assert_eq!(state.camera.current_cut, 3);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 3);
+    }
+
+    #[test]
+    fn enter_room_resets_the_room_state_fields() {
+        let mut state = game();
+        state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 9;
+        state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = 8;
+        state.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = 7;
+        state.flags[usize::from(BANK_SYSTEM)].bytes_mut()[4] = 0xAA;
+        state.flags[usize::from(BANK_SYSTEM)].bytes_mut()[0] = 0x55;
+        state.state_words[1] = 5;
+        state.special_light_masks = [1, 2, 3];
+        state.got_item_slot = Some(4);
+        state.event_item_used = true;
+
+        state.enter_room(RoomId::parse("1010").unwrap(), &RoomState::default());
+
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)], 0);
+        assert_eq!(state.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)], 0);
+        assert_eq!(
+            state.flags[usize::from(BANK_SYSTEM)].bytes()[4],
+            0,
+            "g_SysFlags[1] is cleared by the room reset"
+        );
+        assert_eq!(
+            state.flags[usize::from(BANK_SYSTEM)].bytes()[0],
+            0x55,
+            "the first system word survives (room_state_reset only clears [1])"
+        );
+        assert_eq!(state.state_words[1], 0xFFFF, "the light parks at -1");
+        assert_eq!(state.state_words[2], 0);
+        assert_eq!(state.special_light_masks, [0; 3]);
+        assert_eq!(state.got_item_slot, None);
+        assert!(!state.event_item_used);
+    }
+
+    #[test]
+    fn probe_masks_split_the_player_and_object_passes() {
+        let mut state = game();
+        // A bit-2-only item zone: mask 1 never sees it, mask 4 does.
+        let mut action = item_action(1, 0x41, 1, [0, 0, 1000, 1000]);
+        action.flags = 0x04;
+        state.room_actions[1] = Some(action);
+
+        state.probe_actions([0, 0, 0], 0, 1, [0, 0, 0], false);
+        assert!(state.inventory.is_empty(), "the player pass skips bit 2");
+
+        state.probe_actions([0, 0, 0], 0, 4, [0, 0, 50], false);
+        assert!(state.has_item(0x41), "the object pass dispatches bit 2");
+        assert!(state.room_actions[1].is_none(), "the pickup consumed it");
+    }
+
+    #[test]
+    fn door_check_handlers_latch_the_approach_side() {
+        let mut state = game();
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::DoorCheck,
+            zone: [0, 0, 1000, 1000],
+            sce: HANDLER_DOOR_CHECK,
+            handler: HANDLER_DOOR_CHECK,
+            // Bit 0 probes every frame, bit 0x40 probes the entity position
+            // itself rather than 600 units ahead of the facing.
+            flags: 0x41,
+            params: [HANDLER_DOOR_CHECK, 0x01, 0, 0, 0, 0, 0, 0],
+            item_data: None,
+            room_items_flag: 0xFF,
+        });
+        // Right of centre (X >= width/2) facing +X picks the -1 side; the
+        // entry's +2 word bit 0 is clear, so the turn-away bit lands.
+        state.entities[0].pos = [800, 0, 500];
+        state.entities[0].angle = 0x400;
+        state.message_flags |= 0x0040;
+        state.probe_actions([800, 0, 500], 0x400, 1, [800, 0, 500], false);
+        assert_eq!(state.entities[0].zone_flags & 0x20, 0x20);
+        assert_eq!(state.entities[0].zone_flags & 0x10, 0x10);
+        assert_eq!(
+            state.message_flags & 0x0040,
+            0,
+            "the interaction bit clears"
+        );
+        assert!(state.flags[5].bit(MSF2_DOOR_TURN_PENDING));
+
+        // Looking away leaves the side unresolved but still marks the zone.
+        state.entities[0].zone_flags = 0;
+        state.entities[0].angle = 0;
+        state.flags[5].apply(MSF2_DOOR_TURN_PENDING, 1);
+        state.probe_actions([800, 0, 500], 0, 1, [800, 0, 500], false);
+        assert_eq!(state.entities[0].zone_flags & 0x20, 0x20);
+        assert_eq!(state.entities[0].zone_flags & 0x10, 0, "no side resolved");
+        assert!(state.flags[5].bit(MSF2_DOOR_TURN_PENDING));
+    }
+
+    // ------------------------------------------------------------------
+    // M16 slice 8: scripted room effects and player ops.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn light_fade_state_machine_signs_masks_and_ramp() {
+        let mut state = game();
+        // Delta > 0 fades up from 0; the mask bits force B, G and R.
+        state.light_fade_set(3, 0x0100, 0b111);
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_SPECIAL_LIGHT_R)],
+            3
+        );
+        assert_eq!(state.state_words[1], 0);
+        assert_eq!(state.state_words[2], 0x0100);
+        assert_eq!(state.special_light_masks, [0xFF, 0xFF, 0xFF]);
+        assert_eq!(state.special_light_fill(), None, "intensity 0 is invisible");
+        state.advance_special_light();
+        assert_eq!(state.state_words[1], 0x0100);
+        assert_eq!(
+            state.special_light_fill(),
+            Some([0x02, 0x02, 0x02, 255]),
+            "state >> 7 is the intensity"
+        );
+
+        // Delta < 0 fades down from 0x7FFF and stops drawing once negative.
+        state.light_fade_set(1, -0x400, 0b100);
+        assert_eq!(state.state_words[1], 0x7FFF);
+        assert_eq!(state.special_light_masks, [0, 0, 0xFF]);
+        for _ in 0..40 {
+            state.advance_special_light();
+        }
+        assert!((state.state_words[1] as i16) < 0);
+        assert_eq!(state.special_light_fill(), None);
+        // A parked state does not advance.
+        let parked = state.state_words[1];
+        state.advance_special_light();
+        assert_eq!(state.state_words[1], parked);
+
+        // A zero delta rewrites the channels but leaves the live state.
+        state.state_words[1] = 0x2000;
+        state.light_fade_set(2, 0, 0);
+        assert_eq!(state.state_words[1], 0x2000);
+        assert_eq!(state.special_light_masks, [0, 0, 0]);
+        assert_eq!(state.special_light_fill(), None);
+    }
+
+    #[test]
+    fn room_lights_set_feeds_lighting_from_room() {
+        let mut state = game();
+        let mut values = vec![0i64];
+        for light in 0..3i64 {
+            values.extend_from_slice(&[
+                100 + light,
+                200 + light,
+                300 + light,
+                0x10 + light,
+                0x20,
+                0x30,
+                7,
+                0x400,
+            ]);
+        }
+        values.extend_from_slice(&[0x111, 0x222, 0x333]);
+        assert_eq!(values.len(), 28);
+        state.room_lights_set(&operands(&values));
+        let mut room = RoomState::default();
+        state.apply_room_edits(&mut room);
+
+        let lighting = crate::render::Lighting::from_room(&room);
+        assert_eq!(lighting.ambient, [0x111, 0x222, 0x333]);
+        assert_eq!(lighting.lights[0].pos, [100, 200, 300]);
+        assert_eq!(lighting.lights[0].color, [0x10, 0x20, 0x30]);
+        assert_eq!(lighting.lights[0].kind, 7);
+        assert_eq!(lighting.lights[0].radius, 0x400);
+        assert_eq!(lighting.lights[2].pos, [102, 202, 302]);
+        assert_eq!(lighting.lights[2].color, [0x12, 0x20, 0x30]);
+    }
+
+    #[test]
+    fn cut_zone_set_rewrites_the_camera_zone() {
+        use crate::state::{Cut, Zone};
+
+        let mut room = RoomState {
+            cuts: vec![Cut::default(); 3],
+            zones: vec![
+                Zone {
+                    cam_to: 0,
+                    cam_from: 0,
+                    corners: [[0; 2]; 4],
+                },
+                Zone {
+                    cam_to: 1,
+                    cam_from: 0,
+                    corners: [[0, 0], [0, 100], [100, 100], [100, 0]],
+                },
+            ],
+            ..RoomState::default()
+        };
+        let mut state = game();
+        state.cut_zone_set(&operands(&[1, 0, 2]));
+        state.apply_room_edits(&mut room);
+        assert_eq!(room.zones[1].cam_from, 0);
+        assert_eq!(room.zones[1].cam_to, 2);
+
+        // The rewrite is visible to the zone walk: cut 0 -> 2 inside the quad.
+        assert_eq!(crate::player::camera_for_position(&room, 0, [50, 0, 50]), 2);
+    }
+
+    #[test]
+    fn player_ops_apply_the_shipped_subcommands() {
+        let mut state = game();
+        let mut host = ScdGameHost::new(&mut state);
+        // 0x2B: behavior byte 2 -> action state 4, attackAnim 40, frame 3.
+        assert_eq!(
+            host.on_player(op(0x2B), &operands(&[2, 40, 3])),
+            StepResult::Continue
+        );
+        {
+            let entity = &host.state().entities[0];
+            assert_eq!(entity.action_behavior, 0);
+            assert_eq!(entity.action_state, 4);
+            assert_eq!(entity.attack_anim, 40);
+            assert_eq!(entity.animation_frame_id, 3);
+            assert_eq!(entity.animation_id, 8);
+        }
+
+        // 0x33 sub 0 clears the equipped item.
+        host.state_mut().set_equipped(Some(5));
+        host.state_mut().entities[0].attack_anim = 9;
+        host.on_player(op(0x33), &operands(&[0, 0]));
+        assert_eq!(host.state().equipped, None);
+        assert_eq!(host.state().entities[0].attack_anim, 0);
+
+        // sub 3 writes/or/xors the player flags byte.
+        host.on_player(op(0x33), &operands(&[3, 0x40]));
+        assert_eq!(host.state().player_flags, 0x40);
+        host.on_player(op(0x33), &operands(&[3, 0x0140]));
+        assert_eq!(host.state().player_flags, 0x40);
+        host.on_player(op(0x33), &operands(&[3, 0x0240]));
+        assert_eq!(host.state().player_flags, 0x00);
+
+        // sub 4 forces action 1/6, sub 5 the facing, sub 7 the idle reset.
+        host.on_player(op(0x33), &operands(&[4, 0]));
+        assert_eq!(host.state().entities[0].action_behavior, 1);
+        assert_eq!(host.state().entities[0].action_state, 6);
+        host.on_player(op(0x33), &operands(&[5, 0x0800]));
+        assert_eq!(host.state().entities[0].angle, 0x0800);
+        host.on_player(op(0x33), &operands(&[7, 0]));
+        assert_eq!(host.state().entities[0].animation_id, 1);
+        assert_eq!(host.state().entities[0].action_state, 2);
+
+        // sub 8 writes/or/xors the health-status flags.
+        host.state_mut().set_health_status(0x02);
+        host.on_player(op(0x33), &operands(&[8, 0x0120]));
+        assert_eq!(host.state().health_status, 0x22);
+        host.on_player(op(0x33), &operands(&[8, 0x0220]));
+        assert_eq!(host.state().health_status, 0x02);
+        host.on_player(op(0x33), &operands(&[8, 0x0222]));
+        assert_eq!(host.state().health_status, 0x20);
+
+        // sub 9 toggles the joint flags, sub 10 the unk_e0 bit.
+        host.on_player(op(0x33), &operands(&[9, 0x0005]));
+        assert_eq!(host.state().entities[0].joint_flags, 0x0005);
+        host.on_player(op(0x33), &operands(&[9, 0x0005]));
+        assert_eq!(host.state().entities[0].joint_flags, 0);
+        host.on_player(op(0x33), &operands(&[10, 0x0100]));
+        assert_eq!(host.state().entities[0].unk_e0 & 0x40, 0x40);
+        host.on_player(op(0x33), &operands(&[10, 0]));
+        assert_eq!(host.state().entities[0].unk_e0 & 0x40, 0);
+    }
+
+    #[test]
+    fn evt_work_set_selects_models_and_act_motion_resolves_them() {
+        let mut state = game();
+        state.objects.records = vec![object_record([100, 0, 200], [10, 10, 10])];
+        state.items.reset(1);
+        state.items.record_mut(0).unwrap().pos = [300, 0, 400];
+
+        assert!(state.select_entity(2, 0));
+        assert_eq!(state.selected_model, Some(ModelTarget::Object(0)));
+        assert_eq!(state.selected_entity, ENTITY_NONE);
+        assert!(state.select_entity(3, 0));
+        assert_eq!(state.selected_model, Some(ModelTarget::Item(0)));
+
+        // `act_motion` with the live-target flag resolves both tables.
+        state.selected_entity = 0;
+        state.entities[0].target = [0; 3];
+        let motion = actor_op(0x81).unwrap();
+        assert_eq!(
+            state.apply_act_motion(motion, &operands(&[0x93, 2, 0, 0, 0, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(state.entities[0].target, [100, 0, 200]);
+        assert_eq!(
+            state.apply_act_motion(motion, &operands(&[0x93, 3, 0, 0, 0, 0])),
+            StepResult::Continue
+        );
+        assert_eq!(state.entities[0].target, [300, 0, 400]);
+
+        // A plain `evt_work_set` to an entity clears the model selection.
+        assert!(state.select_entity(0, 0));
+        assert_eq!(state.selected_model, None);
+        assert_eq!(state.selected_entity, 0);
+    }
+
+    /// One main-VM block from `(op, byte length, operands)` triples, with the
+    /// instruction offsets laid out consecutively from `base`.
+    fn main_block(base: usize, insns: &[(&'static Op, usize, Vec<i64>)]) -> crate::scd::ir::Block {
+        let mut offset = base;
+        let mut block = crate::scd::ir::Block {
+            offset: base,
+            size: 0,
+            insns: Vec::new(),
+            trailing: Vec::new(),
+        };
+        for (op, len, values) in insns {
+            block
+                .insns
+                .push(insn(offset, op, Decoded::Command(op), *len, values));
+            offset += len;
+        }
+        block
+    }
+
+    /// Run one synthetic main-script block against `state`. A false condition
+    /// at depth 0 ends the block, so a marker after a false condition stays 0.
+    fn run_script_block(
+        state: &mut GameState,
+        base: usize,
+        insns: &[(&'static Op, usize, Vec<i64>)],
+    ) {
+        let scripts = Scripts {
+            main: vec![main_block(base, insns)],
+            ..Scripts::default()
+        };
+        let mut command_vm = crate::scd::vm::CommandVm::new(&scripts);
+        let mut host = ScdGameHost::new(state);
+        command_vm.run_main(&mut host);
+    }
+
+    #[test]
+    fn a_synthetic_script_runs_every_slice_condition() {
+        let mut state = game();
+        state.add_item(1, 0); // knife-style zero-quantity stack
+        state.add_item(2, 4);
+        state.record_used_item(7);
+        state.state_words[usize::from(STATE_WORD_DPAD_HELD)] = 0x0001;
+        state.entities[0].angle = 0x0F00;
+
+        // `setb`/`cmpb` aliasing: write scenarioFlags2[5] through index 57.
+        run_script_block(
+            &mut state,
+            0x1000,
+            &[
+                (op(0x08), 4, vec![57, 0x80, 0]),
+                (op(0x06), 4, vec![57, 0, 0x80]),
+                (op(0x08), 4, vec![21, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[21], 1);
+        assert_eq!(state.flags[1].bytes()[5], 0x80);
+
+        // `testitem 7` is true; `testitem 9` is false and stops the block.
+        run_script_block(
+            &mut state,
+            0x2000,
+            &[
+                (op(0x10), 2, vec![7]),
+                (op(0x08), 4, vec![22, 1, 0]),
+                (op(0x10), 2, vec![9]),
+                (op(0x08), 4, vec![23, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[22], 1);
+        assert_eq!(state.state_bytes[23], 0, "testitem 9 is false");
+
+        // `testpickup 0` is true before any pick; `testitem 0` is false once
+        // the used byte was recorded.
+        run_script_block(
+            &mut state,
+            0x3000,
+            &[
+                (op(0x11), 2, vec![0]),
+                (op(0x08), 4, vec![24, 1, 0]),
+                (op(0x10), 2, vec![0]),
+                (op(0x08), 4, vec![25, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[24], 1);
+        assert_eq!(state.state_bytes[25], 0);
+
+        // The knife-held search and the item-count group.
+        run_script_block(
+            &mut state,
+            0x4000,
+            &[
+                (op(0x1A), 2, vec![1]),
+                (op(0x08), 4, vec![26, 1, 0]),
+                (op(0x22), 4, vec![0x0B, 0, 4]),
+                (op(0x08), 4, vec![27, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[26], 1);
+        assert_eq!(state.state_bytes[27], 1);
+
+        // The dpad test with the invert byte: held passes, inverted fails.
+        run_script_block(
+            &mut state,
+            0x5000,
+            &[
+                (op(0x38), 4, vec![0, 1]),
+                (op(0x08), 4, vec![28, 1, 0]),
+                (op(0x38), 4, vec![1, 1]),
+                (op(0x08), 4, vec![29, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[28], 1);
+        assert_eq!(state.state_bytes[29], 0);
+
+        // The wrap-aware direction range.
+        run_script_block(
+            &mut state,
+            0x6000,
+            &[
+                (op(0x3F), 6, vec![0, 0x0E00, 0x0100]),
+                (op(0x08), 4, vec![30, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[30], 1);
+
+        // The `setw` alias: word 24 is scenarioFlags2's ninth word.
+        run_script_block(
+            &mut state,
+            0x7000,
+            &[
+                (op(0x31), 4, vec![24, 0x1234]),
+                (op(0x07), 6, vec![0, 24, 0, 0x1234]),
+                (op(0x08), 4, vec![31, 1, 0]),
+            ],
+        );
+        assert_eq!(state.state_bytes[31], 1);
+        assert_eq!(state.flags[1].bytes()[16], 0x34);
+        assert_eq!(state.flags[1].bytes()[17], 0x12);
+    }
+
+    #[test]
+    fn a_synthetic_script_arms_the_special_light_and_player_ops() {
+        let mut state = game();
+        run_script_block(
+            &mut state,
+            0x1000,
+            &[
+                // Delta 0x0100 fades up, mask 7 arms all three channels.
+                (op(0x1C), 6, vec![3, 0x0100, 7]),
+                (op(0x2B), 4, vec![2, 40, 3]),
+                (op(0x33), 2, vec![4, 0]),
+            ],
+        );
+        assert_eq!(state.state_words[1], 0, "the fade restarts at 0");
+        assert_eq!(state.state_words[2], 0x0100);
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_SPECIAL_LIGHT_R)],
+            3
+        );
+        assert_eq!(state.special_light_masks, [0xFF, 0xFF, 0xFF]);
+        assert_eq!(state.entities[0].attack_anim, 40, "0x2B ran");
+        assert_eq!(state.entities[0].animation_id, 8);
+        assert_eq!(state.entities[0].animation_frame_id, 3);
+        assert_eq!(state.entities[0].action_behavior, 1, "0x33 sub 4 ran");
+        assert_eq!(state.entities[0].action_state, 6);
     }
 }

@@ -198,15 +198,22 @@ fn key_locked_door_needs_and_consumes_its_key() {
     // A live window refuses the next prompt, so the message is read first.
     state.cancel_message();
 
-    // With the key: the lock turns, the key is consumed and the flag is set.
+    // With the key: the lock turns and the flag is set; the key's physical
+    // removal waits for the prompt's dismissal (`check_event_item_usage`).
     state.add_item(0x34, 1);
     assert!(
         press(&mut state, 1).is_none(),
         "key turn does not transition"
     );
     assert_eq!(state.message.id, Some(0xC3));
-    assert!(!state.has_item(0x34));
+    assert!(state.has_item(0x34), "the key survives the prompt");
+    assert_eq!(state.item_count(0x34), 1);
     assert!(state.flag_test(2, 0x0A, false));
+
+    // Dismissing the prompt consumes the key.
+    state.cancel_message();
+    assert!(state.check_event_item_usage());
+    assert_eq!(state.item_count(0x34), 0);
 
     // The next probe walks through.
     state.cancel_message();

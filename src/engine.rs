@@ -244,13 +244,48 @@ pub fn run_with_voice_and_movie(
             let mut bgm_cache = bgm::BgmCache::default();
             let mut snd3d_cache = SfxCache::default();
             let mut no_mixer: Option<Mixer> = None;
+            let mut sfx_cache = SfxCache::default();
+            let mut door_transition: Option<TransitionMode> = None;
             for _ in 0..ticks {
-                // TODO(parity): (harness) the transition tick_room returns is
-                // discarded here, so a scripted scene that opens a door during
-                // `--ticks` silently keeps its room instead of playing the
-                // transition. The same drop exists in `simulate_loaded`.
+                // A door transition owns the tick and follows into its
+                // destination room, exactly like the interactive session (but
+                // audio-free): the `--ticks` capture ends in the room the last
+                // scripted door led to.
+                if let Some(mut session) = door_transition.take() {
+                    let frame = session.transition.tick(false);
+                    session.frame = frame;
+                    for message in session.transition.stepper_mut().take_messages() {
+                        apply_door_message(&mut game, message);
+                    }
+                    let _ = session.transition.stepper_mut().take_sfx();
+                    session.transition.set_sound_busy(false);
+                    if frame.finished {
+                        let from = loaded.id;
+                        finish_transition(
+                            &pack,
+                            &mut session,
+                            &mut game,
+                            &mut player_state,
+                            &mut loaded,
+                            &mut no_mixer,
+                            &mut sfx_cache,
+                        );
+                        let scripts = Rc::new(loaded.scripts.clone());
+                        command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+                        event_vm = scd::vm::EventVm::from_scripts(scripts);
+                        run_room_init(&mut loaded, &mut game);
+                        apply_event_requests(&mut game, &mut event_vm);
+                        call_lua_room_load(lua.as_ref(), &mut game, loaded.id);
+                        drain_mask_toggles(&mut loaded.room, &mut game);
+                        apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+                        bgm::update_room_bgm(&mut game, loaded.id, Some(from));
+                    } else {
+                        door_transition = Some(session);
+                    }
+                    continue;
+                }
                 let message_before = game.message.menu_choice_id() & 0x80 != 0;
-                tick_room(
+                let requested = tick_room(
                     &mut command_vm,
                     &mut event_vm,
                     RoomContext {
@@ -264,6 +299,10 @@ pub fn run_with_voice_and_movie(
                     player::Input::default(),
                 );
                 run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
+                if let Some(request) = requested {
+                    let record = game.transition_door.take().unwrap_or_default();
+                    door_transition = Some(start_transition(&pack, &record, &request)?);
+                }
                 play_snd3d_requests(
                     &mut no_mixer,
                     &mut snd3d_cache,
@@ -903,12 +942,30 @@ impl GameSession {
         // original clears the held and previous held pad bits on dismissal),
         // so an action-gated zone behind the window never sees the same press.
         // The swallow then latches until the key is released, exactly like the
-        // cleared edge-detect history.
+        // cleared edge-detect history. `update_message` has already blanked the
+        // direction bits of a state-5/6 dismissal into `game.dpad_blanked`.
         let dismissed = was_active && !self.game.message.active;
         if dismissed && action {
             self.swallow_action = true;
         } else if !action {
             self.swallow_action = false;
+        }
+        let raw = input;
+        // Releasing a blanked direction restores it; a still-held one stays
+        // suppressed for this tick.
+        self.game.dpad_blanked &= game::dpad_word(&raw) & game::DPAD_DIRECTIONS;
+        let mut input = raw;
+        if self.game.dpad_blanked & 0x1 != 0 {
+            input.up = false;
+        }
+        if self.game.dpad_blanked & 0x2 != 0 {
+            input.down = false;
+        }
+        if self.game.dpad_blanked & 0x4 != 0 {
+            input.left = false;
+        }
+        if self.game.dpad_blanked & 0x8 != 0 {
+            input.right = false;
         }
         let input = if was_locked || self.swallow_action {
             player::Input::default()
@@ -3363,6 +3420,9 @@ pub struct SimulatedRoom {
     /// Where the room's SCD scripts were loaded from: the RDT or a standalone
     /// `scd/{id}.scd` override.
     pub script_source: ScriptSource,
+    /// Destination rooms a scripted door entered during the run, in order.
+    /// The final [`SimulatedRoom::room`] is the last destination.
+    pub transitions: Vec<RoomId>,
 }
 
 /// Drive a room headlessly for `ticks` fixed ticks and render the final frame.
@@ -3612,6 +3672,9 @@ fn simulate_loaded_with(
     let mut snd3d_cache = SfxCache::default();
     let mut no_mixer: Option<Mixer> = None;
     let mut film: Option<MovieSession> = None;
+    let mut sfx_cache = SfxCache::default();
+    let mut door_transition: Option<TransitionMode> = None;
+    let mut transitions: Vec<RoomId> = Vec::new();
 
     for tick in 0..ticks {
         // A film owns the tick while it plays: the room's scripts, entities,
@@ -3625,8 +3688,44 @@ fn simulate_loaded_with(
             }
             continue;
         }
+        // A door transition owns the tick: run its timeline (audio-free, like
+        // the capture loop) and swap the destination in when it finishes.
+        if let Some(mut session) = door_transition.take() {
+            let frame = session.transition.tick(false);
+            session.frame = frame;
+            for message in session.transition.stepper_mut().take_messages() {
+                apply_door_message(&mut game, message);
+            }
+            let _ = session.transition.stepper_mut().take_sfx();
+            session.transition.set_sound_busy(false);
+            if frame.finished {
+                let from = loaded.id;
+                finish_transition(
+                    pack,
+                    &mut session,
+                    &mut game,
+                    &mut player_state,
+                    &mut loaded,
+                    &mut no_mixer,
+                    &mut sfx_cache,
+                );
+                let scripts = Rc::new(loaded.scripts.clone());
+                command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+                event_vm = scd::vm::EventVm::from_scripts(scripts);
+                run_room_init(&mut loaded, &mut game);
+                apply_event_requests(&mut game, &mut event_vm);
+                call_lua_room_load(lua.as_ref(), &mut game, loaded.id);
+                drain_mask_toggles(&mut loaded.room, &mut game);
+                apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+                bgm::update_room_bgm(&mut game, loaded.id, Some(from));
+                transitions.push(loaded.id);
+            } else {
+                door_transition = Some(session);
+            }
+            continue;
+        }
         let message_before = game.message.menu_choice_id() & 0x80 != 0;
-        tick_room(
+        let requested = tick_room(
             &mut command_vm,
             &mut event_vm,
             RoomContext {
@@ -3640,6 +3739,12 @@ fn simulate_loaded_with(
             input(tick),
         );
         run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
+        // A scripted door follows into its destination: the interactive engine
+        // plays the `.dor` timeline and reboots the destination room.
+        if let Some(request) = requested {
+            let record = game.transition_door.take().unwrap_or_default();
+            door_transition = Some(start_transition(pack, &record, &request)?);
+        }
         play_snd3d_requests(
             &mut no_mixer,
             &mut snd3d_cache,
@@ -3670,7 +3775,7 @@ fn simulate_loaded_with(
     render_frame(
         &mut framebuffer,
         pack,
-        id,
+        loaded.id,
         &loaded.room,
         &player_state,
         &game,
@@ -3697,7 +3802,7 @@ fn simulate_loaded_with(
     render_frame(
         &mut baseline_framebuffer,
         pack,
-        id,
+        loaded.id,
         &loaded.room,
         &player_state,
         &game,
@@ -3717,13 +3822,14 @@ fn simulate_loaded_with(
     }
 
     Ok(SimulatedRoom {
-        id,
+        id: loaded.id,
         room: loaded.room,
         game,
         player: player_state,
         frame,
         baseline,
         script_source: loaded.script_source,
+        transitions,
     })
 }
 
@@ -4933,14 +5039,25 @@ fn tick_room(
     context: RoomContext<'_>,
     input: player::Input,
 ) -> Option<game::RoomTransition> {
+    // The original publishes the remapped D-pad held/pressed words before the
+    // scripts run, so a `ck_bits` (0x38) condition sees this frame's pad.
+    let held = game::dpad_word(&input);
+    let pressed = held & !game::dpad_word(&context.player.input);
+    context.game.dpad_held = held;
+    context.game.state_words[usize::from(game::STATE_WORD_DPAD_HELD)] = held;
+    context.game.state_words[usize::from(game::STATE_WORD_DPAD_PRESSED)] = pressed;
+    // The special-room-light state advances once per gameplay frame, after the
+    // previous frame's overlay was drawn (the original's `main_loop`).
+    context.game.advance_special_light();
     // The original zeroes the per-frame item-use flag bank at the top of every
     // game frame, before the room scripts decide what is usable this frame.
     context.game.clear_item_use_flags();
-    // The desk flow and the item-box lid ramp before the scripts run (the
-    // original's `check_desk_state`/`check_itembox_state` are the first
-    // gameplay calls each frame).
+    // The desk flow, the item-box lid ramp and the deferred key consumption run
+    // before the scripts (the original's `check_desk_state`/`check_itembox_state`/
+    // `check_event_item_usage` are the first gameplay calls each frame).
     context.game.check_desk_state();
     context.game.check_itembox_state();
+    context.game.check_event_item_usage();
     {
         let mut host = game::ScdGameHost::new(context.game);
         command_vm.run_main(&mut host);
@@ -4970,6 +5087,12 @@ fn tick_room(
             .as_ref()
             .map(|anim| anim.clips.as_slice())
             .unwrap_or(&[]);
+        // The effect-zone flag (raised by the 0x0B handler at the end of the
+        // previous probe) halves walk/run speed and the animation cadence this
+        // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
+        // locomotion handlers.
+        let mut input = input;
+        input.slow_motion = context.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
         player::update_with_room(
             context.player,
             context.room,
@@ -5208,6 +5331,7 @@ impl InputState {
                 run: active & KEY_RUN != 0,
                 action_held: active & KEY_CONFIRM != 0,
                 action_pressed: pressed & KEY_CONFIRM != 0,
+                slow_motion: false,
             },
             action: active & KEY_CONFIRM != 0,
             ui: UiInput {
@@ -5620,6 +5744,12 @@ fn render_frame(
         visible.len() + visible_item_models.len(),
         mirror.as_ref(),
     );
+    // The special-room-light overlay (`0x1C`) is a full-screen tinted rect
+    // drawn over the scene; the state advances once per gameplay tick in
+    // `tick_room`. Its absence (a state parked at -1) draws nothing.
+    if let Some(color) = game.special_light_fill() {
+        framebuffer.fill_rect([0, 0, WIDTH, HEIGHT], color);
+    }
 }
 
 /// Upload the framebuffer and draw it scaled to the window.
@@ -8333,6 +8463,111 @@ mod tests {
         assert_eq!(updates.get(), 1, "the modal must advance each tick");
     }
 
+    fn solid_image(color: [u8; 4]) -> Image {
+        let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
+        for _ in 0..WIDTH * HEIGHT {
+            rgba.extend_from_slice(&color);
+        }
+        Image {
+            width: WIDTH as u32,
+            height: HEIGHT as u32,
+            rgba,
+        }
+    }
+
+    /// A two-room pack whose first room walks the player into a scripted door
+    /// on the first tick, with distinct backgrounds so the destination frame
+    /// is identifiable. Returns `(path, source, destination, source bg, dest bg)`.
+    fn walk_in_door_pack(dir: &TempDir) -> (std::path::PathBuf, RoomId, RoomId, Image, Image) {
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        let red = solid_image([200, 0, 0, 255]);
+        let blue = solid_image([0, 0, 200, 255]);
+
+        // The shipped door zone sits at [100,200,300,400]; move it to
+        // [500,0,200,200] so the idle spawn's forward reach probe at [600,0,0]
+        // lands inside it (negative origins wrap in the original's
+        // unsigned-point test). Probe flags 0x01 walk in every frame.
+        let mut init = door_init();
+        for (offset, value) in [(2usize, 500i16), (4, 0), (6, 200), (8, 200)] {
+            init[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        }
+        init[25] = 0x01;
+
+        let pack_path = dir.0.join("game.akpak");
+        let mut writer = PackWriter::new();
+        writer.add(&a.rdt_entry(), synthetic_rdt(&init)).unwrap();
+        writer
+            .add(&b.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer
+            .add(&a.cut_entry(0), bmp::encode_to_vec(&red).unwrap())
+            .unwrap();
+        writer
+            .add(&b.cut_entry(0), bmp::encode_to_vec(&blue).unwrap())
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        (pack_path, a, b, red, blue)
+    }
+
+    #[test]
+    fn simulate_room_follows_a_scripted_door_into_the_destination() {
+        let dir = TempDir::new();
+        let (pack_path, a, b, _red, _blue) = walk_in_door_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let sim = simulate_room(&pack, a, 40, player::Input::default()).unwrap();
+        assert_eq!(sim.transitions, vec![b], "the door followed to room 1");
+        assert_eq!(sim.id, b);
+        assert_eq!(sim.game.id, b);
+        assert_eq!(sim.room.room, b.room);
+        // The rendered frame shows the destination's background.
+        assert_eq!(sim.frame.rgba[0..4], [0, 0, 200, 255]);
+    }
+
+    #[test]
+    fn ticks_capture_follows_a_scripted_door_into_the_destination() {
+        let dir = TempDir::new();
+        let (pack_path, a, _b, _red, blue) = walk_in_door_pack(&dir);
+        let capture_path = dir.0.join("capture.bmp");
+
+        run(&pack_path, a, Some(&capture_path), 40).unwrap();
+        let decoded = bmp::decode(&std::fs::read(&capture_path).unwrap()).unwrap();
+        assert_eq!(
+            decoded.rgba[0..4],
+            blue.rgba[0..4],
+            "the capture ends in the destination room"
+        );
+    }
+
+    #[test]
+    fn the_special_light_overlay_fills_the_frame() {
+        let dir = TempDir::new();
+        let (pack_path, a, _b, _red, _blue) = walk_in_door_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let room = rdt::parse(pack.read(&a.rdt_entry()).unwrap(), a).unwrap();
+        let mut game = game::GameState::new(a, &room);
+        game.light_fade_set(0, 0x4000, 0b111);
+        game.advance_special_light();
+        assert_eq!(game.special_light_fill(), Some([0x80, 0x80, 0x80, 255]));
+
+        let player_state = player::spawn(a, &room);
+        let image = render_game_frame(&pack, a, &room, &game, &player_state).unwrap();
+        assert_eq!(
+            image.rgba[0..4],
+            [0x80, 0x80, 0x80, 255],
+            "the scripted overlay covers the background"
+        );
+    }
+
     #[test]
     fn session_transition_swaps_rooms() {
         let dir = TempDir::new();
@@ -8774,6 +9009,135 @@ end
         assert!(
             session.game.has_item(ITEM_FIRST_AID_SPRAY),
             "a fresh press after release must reach the zone"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_message_blanks_a_held_direction_until_release() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        // Pause word 1 masks message_flags bit 0, so the dismissal is not
+        // protected and must blank the held direction.
+        session.game.show_message(0x40, 1);
+        let held_up = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        for _ in 0..600 {
+            if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
+                break;
+            }
+            session
+                .tick(&pack, UiInput::default(), held_up, false)
+                .unwrap();
+        }
+        assert_eq!(
+            session.game.message.phase(),
+            crate::message::MessagePhase::WaitInput
+        );
+
+        // The dismissing tick swallows the direction: `dpad_held` still has
+        // the key physically down but the gameplay word is blank.
+        session
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    up: true,
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!session.game.message.active);
+        assert_eq!(session.game.dpad_held & 1, 0, "the direction is blanked");
+
+        // Still held: it stays blanked.
+        session
+            .tick(&pack, UiInput::default(), held_up, false)
+            .unwrap();
+        assert_eq!(session.game.dpad_held & 1, 0);
+
+        // Release, then press again: control resumes.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), held_up, false)
+            .unwrap();
+        assert_eq!(
+            session.game.dpad_held & 1,
+            1,
+            "release restores the direction"
+        );
+    }
+
+    #[test]
+    fn a_message_that_protects_bit_zero_keeps_the_direction() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        // Pause word 0xFE leaves bit 0 set, the dismissal's protection bit.
+        session.game.show_message(0x40, 0xFE);
+        for _ in 0..600 {
+            if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
+                break;
+            }
+            session
+                .tick(
+                    &pack,
+                    UiInput::default(),
+                    player::Input {
+                        up: true,
+                        ..player::Input::default()
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        session
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    up: true,
+                    action_pressed: true,
+                    action_held: true,
+                    ..player::Input::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert!(!session.game.message.active);
+        // The dismissing tick also swallows the action press, blanking the
+        // whole pad for that frame; the protection shows on the next tick,
+        // when the still-held direction is published again.
+        session
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    up: true,
+                    ..player::Input::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            session.game.dpad_held & 1,
+            1,
+            "bit 0 protects the held direction"
         );
     }
 
