@@ -224,6 +224,16 @@ enum ScdAction {
         #[arg(long)]
         list: bool,
     },
+
+    /// Assemble a text .s source into a standalone .scd container
+    Build {
+        /// Input .s source
+        input: PathBuf,
+
+        /// Output .scd container
+        #[arg(long, value_name = "PATH")]
+        out: PathBuf,
+    },
 }
 
 /// Export an RDT's SCD streams to `out` (`.s` disassembly or `.bio`
@@ -252,6 +262,25 @@ fn export_scd(rdt: &std::path::Path, out: &std::path::Path, list: bool) -> Resul
         std::fs::write(&listing_path, listing)
             .with_context(|| format!("failed to write {}", listing_path.display()))?;
     }
+    Ok(())
+}
+
+/// Assemble a text `.s` source into a standalone `.scd` container.
+fn build_scd(input: &Path, out: &Path) -> Result<()> {
+    let text =
+        fs::read_to_string(input).with_context(|| format!("failed to read {}", input.display()))?;
+    let assembled = arklay::scd::asm::assemble(&text)
+        .with_context(|| format!("failed to assemble {}", input.display()))?;
+    let container = assembled
+        .to_container()
+        .with_context(|| format!("failed to lay out {}", input.display()))?;
+    fs::write(out, &container).with_context(|| format!("failed to write {}", out.display()))?;
+    println!(
+        "assembled {} -> {} ({} bytes)",
+        input.display(),
+        out.display(),
+        container.len()
+    );
     Ok(())
 }
 
@@ -382,6 +411,7 @@ fn main() -> Result<()> {
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
         Some(Command::Scd { action }) => match action {
             ScdAction::Export { rdt, out, list } => export_scd(&rdt, &out, list),
+            ScdAction::Build { input, out } => build_scd(&input, &out),
         },
         Some(Command::Mod { action }) => match action {
             ModAction::Build { dir, out, base } => build_mod_pack(&dir, &out, base.as_deref()),
@@ -600,5 +630,26 @@ mod tests {
             )
         );
         assert_eq!(bytes as usize, second_manifest.len() + "second".len());
+    }
+
+    #[test]
+    fn scd_build_writes_a_container_the_reader_parses() {
+        let dir = TempDir::new("scd-build");
+        let input = dir.path.join("1000.s");
+        let out = dir.path.join("1000.scd");
+        fs::write(
+            &input,
+            ".version 1\n\n.main\n.block\n    nop                     0\n\n.event event_00\n    evt_finish\n",
+        )
+        .unwrap();
+
+        build_scd(&input, &out).unwrap();
+
+        let bytes = fs::read(&out).unwrap();
+        let scripts = arklay::scd::reader::parse(&bytes).unwrap();
+        assert_eq!(scripts.main.len(), 1);
+        assert_eq!(scripts.main[0].insns[0].bytes, [0x0E, 0x00]);
+        assert_eq!(scripts.events.len(), 1);
+        assert_eq!(scripts.events[0].insns[0].bytes, [0xFF]);
     }
 }

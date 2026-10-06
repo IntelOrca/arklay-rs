@@ -202,16 +202,14 @@ pub fn discover_mods(pack: &Path) -> Vec<PathBuf> {
 }
 
 /// Assemble a text `.s` source into a standalone `.scd` container.
-///
-/// The text-SCD assembler is a later slice of this milestone. Until it lands,
-/// the builder accepts already assembled `scd/*.scd` sources and this function
-/// reports the missing piece instead of silently packing the text.
 pub fn assemble_scd(source: &Path) -> Result<Vec<u8>> {
-    bail!(
-        "cannot assemble {}: text-SCD assembly is not available in this build; \
-         pack an assembled scd container instead",
-        source.display()
-    )
+    let text = fs::read_to_string(source)
+        .with_context(|| format!("failed to read {}", source.display()))?;
+    let assembled = crate::scd::asm::assemble(&text)
+        .with_context(|| format!("failed to assemble {}", source.display()))?;
+    assembled
+        .to_container()
+        .with_context(|| format!("failed to lay out {}", source.display()))
 }
 
 /// The pack entry a `scd/<stem>.s` source assembles into, if it is one.
@@ -389,14 +387,48 @@ mod tests {
     }
 
     #[test]
-    fn scd_sources_need_the_assembler_and_are_not_packed() {
+    fn scd_sources_are_assembled_and_not_packed() {
         let dir = TempDir::new("scd-source");
         let source = dir.path.join("source");
         write(
             &source.join("manifest.toml"),
             mod_manifest_text("demo", "re1").as_bytes(),
         );
-        write(&source.join("scd/1000.s"), b".version 1\n");
+        write(
+            &source.join("scd/1000.s"),
+            b".version 1\n\n.main\n.block\n    nop                     0\n",
+        );
+
+        let out = dir.path.join("demo.akpak");
+        let summary = build_mod(&source, &out, None).unwrap();
+        assert_eq!(
+            summary
+                .entries
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            ["manifest.toml", "scd/1000.scd"]
+        );
+
+        let pack = Pack::open(&out).unwrap();
+        assert!(!pack.contains("scd/1000.s"));
+        let scripts = crate::scd::reader::parse(pack.read("scd/1000.scd").unwrap()).unwrap();
+        assert_eq!(scripts.main.len(), 1);
+        assert_eq!(scripts.main[0].insns[0].bytes, [0x0E, 0x00]);
+    }
+
+    #[test]
+    fn a_broken_scd_source_fails_the_build() {
+        let dir = TempDir::new("scd-broken");
+        let source = dir.path.join("source");
+        write(
+            &source.join("manifest.toml"),
+            mod_manifest_text("demo", "re1").as_bytes(),
+        );
+        write(
+            &source.join("scd/1000.s"),
+            b".version 1\n\n.init\n    frob 1\n",
+        );
 
         let out = dir.path.join("demo.akpak");
         let err = build_mod(&source, &out, None).unwrap_err().to_string();

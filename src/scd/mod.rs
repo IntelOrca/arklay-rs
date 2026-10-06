@@ -5,6 +5,7 @@
 //! event scripts (run by the event VM). The reader decodes the raw bytes into
 //! an instruction IR that keeps every original byte and absolute file offset.
 
+pub mod asm;
 pub mod decomp;
 pub mod disasm;
 pub mod host;

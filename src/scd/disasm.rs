@@ -37,7 +37,7 @@ const DB_CHUNK: usize = 16;
 /// entry is an undecodable dead slot. This table matches the operand split of
 /// the original tool, which differs from the decoder's own signature for some
 /// opcodes (e.g. `aot_set` splits its trailing words into bytes).
-const COMMAND_SIG: [&str; 81] = [
+pub(super) const COMMAND_SIG: [&str; 81] = [
     "end:u",
     "if:l",
     "else:l",
@@ -122,7 +122,7 @@ const COMMAND_SIG: [&str; 81] = [
 ];
 
 /// Original-tool display signatures for event state 0 (0x00-0x09).
-const EVENT_TOP_SIG: [&str; 10] = [
+pub(super) const EVENT_TOP_SIG: [&str; 10] = [
     "evt_nop",
     "evt_actor_begin",
     "evt_tween_begin",
@@ -136,7 +136,7 @@ const EVENT_TOP_SIG: [&str; 10] = [
 ];
 
 /// Original-tool display signatures for control opcodes (0xF6-0xFF).
-const CONTROL_SIG: [&str; 10] = [
+pub(super) const CONTROL_SIG: [&str; 10] = [
     "evt_push_cond",
     "evt_skip_if",
     "evt_sleep",
@@ -150,7 +150,7 @@ const CONTROL_SIG: [&str; 10] = [
 ];
 
 /// Original-tool display signatures for actor opcodes (state 1).
-const ACTOR_SIG: [&str; 13] = [
+pub(super) const ACTOR_SIG: [&str; 13] = [
     "act_nop",
     "act_reset",
     "act_motion:u",
@@ -167,7 +167,7 @@ const ACTOR_SIG: [&str; 13] = [
 ];
 
 /// Original-tool display signatures for tween opcodes (state 2).
-const TWEEN_SIG: [&str; 12] = [
+pub(super) const TWEEN_SIG: [&str; 12] = [
     "tw_nop",
     "tw_end",
     "tw_pos_add",
@@ -247,6 +247,9 @@ fn render_with(scripts: &Scripts, style: Style) -> String {
     emitter.blank();
     emitter.raw(".init");
     for block in &scripts.init {
+        if style == Style::Assembly {
+            emitter.raw(".block");
+        }
         emit_insns(
             &mut emitter,
             &block.insns,
@@ -258,6 +261,9 @@ fn render_with(scripts: &Scripts, style: Style) -> String {
     emitter.blank();
     emitter.raw(".main");
     for block in &scripts.main {
+        if style == Style::Assembly {
+            emitter.raw(".block");
+        }
         emit_insns(
             &mut emitter,
             &block.insns,
@@ -438,15 +444,21 @@ pub(super) fn format_insn(
 
     // Variable-width commands were decoded with the real operand split; render
     // those values instead of re-reading a fixed display signature, which would
-    // invent operands for the shorter sub-commands.
+    // invent operands for the shorter sub-commands. Some sub-commands carry a
+    // trailing raw byte the signature does not name (e.g. `eml_state` sub 1),
+    // so append every byte the operand split left undecoded.
     if let Decoded::Command(op) = insn.decoded
         && op.width.is_none()
     {
-        let args = insn
+        let mut args: Vec<String> = insn
             .operands
             .iter()
             .map(|operand| operand.value.to_string())
             .collect();
+        let footprint = decoded_operand_bytes(op.operands, insn.bytes.len());
+        for byte in insn.bytes.get(1 + footprint..).unwrap_or(&[]) {
+            args.push(byte.to_string());
+        }
         return (op.mnemonic.to_string(), args);
     }
 
@@ -455,6 +467,24 @@ pub(super) fn format_insn(
         Some(signature) => (signature.to_string(), raw_args(insn)),
         None => ("unk".to_string(), unknown_args(insn)),
     }
+}
+
+/// The number of operand bytes a signature consumes from an instruction of
+/// `width` total bytes (including the opcode). Mirrors the reader's operand
+/// split and stops when the next operand would overrun the instruction.
+fn decoded_operand_bytes(signature: &str, width: usize) -> usize {
+    let mut pos = 1usize;
+    for byte in signature.bytes() {
+        let size = match byte {
+            b'U' | b'I' => 2,
+            _ => 1,
+        };
+        if pos + size > width {
+            break;
+        }
+        pos += size;
+    }
+    pos - 1
 }
 
 /// The original-tool display signature, `None` for undecodable opcodes.
@@ -781,6 +811,7 @@ mod tests {
 .version 1
 
 .init
+.block
     door_aot_set            0, 2700, 500, 1700, 1800, 3, 0, 0, 4, 0, RDT_001, 8700, 0, 7900, 1024, UNLOCKED, 129
 
 .main
@@ -880,6 +911,7 @@ mod tests {
 .version 1
 
 .init
+.block
     if                      off_020A
     ck                      FG_SCENARIO, 31, 1
     set                     FG_SCENARIO, 1, 0
@@ -1001,6 +1033,7 @@ off_0210:
 .version 1
 
 .init
+.block
     if                      off_0302 + 3
 
 off_0302:

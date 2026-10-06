@@ -3218,6 +3218,9 @@ pub struct SimulatedRoom {
     /// The final state rendered with every character slot deactivated, so a
     /// test can assert the characters actually painted something.
     pub baseline: Image,
+    /// Where the room's SCD scripts were loaded from: the RDT or a standalone
+    /// `scd/{id}.scd` override.
+    pub script_source: ScriptSource,
 }
 
 /// Drive a room headlessly for `ticks` fixed ticks and render the final frame.
@@ -3571,6 +3574,7 @@ fn simulate_loaded_with(
         player: player_state,
         frame,
         baseline,
+        script_source: loaded.script_source,
     })
 }
 
@@ -4651,17 +4655,30 @@ fn select_effect_page(
     pages.base[page].as_ref().map(|_| page)
 }
 
+/// Where a room's SCD scripts were loaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptSource {
+    /// The scripts embedded in the room's RDT.
+    Rdt,
+    /// A standalone `scd/{id}.scd` override from a layered pack.
+    Override,
+}
+
 /// Everything loaded for one room, so a transition can load the next room with
 /// the same code path as the initial load.
 struct LoadedRoom {
     id: RoomId,
     room: RoomState,
     scripts: scd::ir::Scripts,
+    script_source: ScriptSource,
     player_assets: Option<PlayerAssets>,
 }
 
 /// Load `id` from `pack`: RDT, camera backgrounds, SCD scripts and player
 /// assets.
+///
+/// A layered pack's `scd/{id}.scd` standalone container overrides the RDT's
+/// embedded scripts; without one the RDT bytes are parsed exactly as before.
 fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
     let rdt_bytes = pack.read(&id.rdt_entry())?;
     let mut room = rdt::parse(rdt_bytes, id)?;
@@ -4678,12 +4695,23 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
             .with_context(|| format!("missing background for cut {}", cut.index))?;
         cut.background = Some(bmp::decode(bytes).with_context(|| format!("invalid {path}"))?);
     }
-    let scripts = scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?;
+    let (scripts, script_source) = match pack.read(&id.scd_entry()) {
+        Ok(bytes) => (
+            scd::reader::parse(bytes)
+                .with_context(|| format!("invalid SCD override {}", id.scd_entry()))?,
+            ScriptSource::Override,
+        ),
+        Err(_) => (
+            scd::reader::parse(rdt_bytes).context("invalid room SCD scripts")?,
+            ScriptSource::Rdt,
+        ),
+    };
     let player_assets = load_player_assets(pack, id);
     Ok(LoadedRoom {
         id,
         room,
         scripts,
+        script_source,
         player_assets,
     })
 }
@@ -7135,6 +7163,7 @@ mod tests {
                 ..RoomState::default()
             },
             scripts: Default::default(),
+            script_source: ScriptSource::Rdt,
             player_assets: None,
         };
         let mut game = game::GameState::new(id, &loaded.room);
@@ -7194,6 +7223,7 @@ mod tests {
                     ..RoomState::default()
                 },
                 scripts: Default::default(),
+                script_source: ScriptSource::Rdt,
                 player_assets: None,
             }),
             frame: transition::TransitionFrame::default(),
@@ -9704,5 +9734,109 @@ mod tests {
         assert_eq!(select_effect_page(&pages, 1, true, &sprite, 8), Some(1));
         // Weapon art never redirects.
         assert_eq!(select_effect_page(&pages, 1, false, &sprite, 24), Some(1));
+    }
+
+    /// A standalone `.scd` override whose init sets FG_SCENARIO bit 1.
+    fn override_container() -> Vec<u8> {
+        scd::asm::assemble(
+            "\
+.version 1
+
+.init
+.block
+    set                     FG_SCENARIO, 1, 0
+
+.main
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap()
+    }
+
+    #[test]
+    fn load_room_prefers_a_standalone_scd_override() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add(&id.scd_entry(), override_container()).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let loaded = load_room(&pack, id).unwrap();
+        assert_eq!(loaded.script_source, ScriptSource::Override);
+        assert_eq!(loaded.scripts.init.len(), 1);
+        assert_eq!(
+            loaded.scripts.init[0].insns[0].bytes,
+            [0x05, 0x00, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn load_room_falls_back_to_the_rdt_scripts() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let loaded = load_room(&pack, id).unwrap();
+        assert_eq!(loaded.script_source, ScriptSource::Rdt);
+        assert_eq!(loaded.scripts.init[0].insns[0].bytes, [0x0E, 0x00]);
+    }
+
+    #[test]
+    fn simulate_room_runs_the_override_scripts() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add(&id.scd_entry(), override_container()).unwrap();
+        writer.write(&pack_path).unwrap();
+
+        let pack = Pack::open(&pack_path).unwrap();
+        let run = simulate_room(&pack, id, 1, player::Input::default()).unwrap();
+        assert_eq!(run.script_source, ScriptSource::Override);
+        assert!(
+            run.game.flag_test(0, 1, false),
+            "the override init set FG_SCENARIO bit 1"
+        );
+
+        // Without the override the RDT script leaves the flag clear and the
+        // deterministic run stays byte-identical to the vanilla path.
+        let plain_path = dir.0.join("plain.akpak");
+        let mut plain = PackWriter::new();
+        plain
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
+            .unwrap();
+        plain
+            .add(&id.cut_entry(0), bmp::encode_to_vec(&test_image()).unwrap())
+            .unwrap();
+        plain.write(&plain_path).unwrap();
+        let plain = Pack::open(&plain_path).unwrap();
+        let plain_run = simulate_room(&plain, id, 1, player::Input::default()).unwrap();
+        assert_eq!(plain_run.script_source, ScriptSource::Rdt);
+        assert!(!plain_run.game.flag_test(0, 1, false));
+        assert_eq!(plain_run.frame.rgba, run.frame.rgba);
     }
 }

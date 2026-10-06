@@ -17,6 +17,7 @@ use arklay::engine::simulate_room;
 use arklay::manifest;
 use arklay::pack::{Pack, PackWriter};
 use arklay::player;
+use arklay::scd;
 use arklay::state::RoomId;
 
 /// Self-deleting temporary directory unique to this process and label.
@@ -49,6 +50,191 @@ fn mod_manifest(base: &str) -> Vec<u8> {
     }
     .render()
     .into_bytes()
+}
+
+/// Collect every `.RDT` under `dir`, recursively.
+fn collect_rdts(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rdts(&path, out);
+        } else if path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .to_ascii_uppercase()
+                .ends_with(".RDT")
+        }) {
+            out.push(path);
+        }
+    }
+}
+
+/// One stream's body: `(kind, block sizes, instruction bytes, trailing)`.
+type StreamBody = (String, Vec<u16>, Vec<u8>, Vec<u8>);
+
+/// The stream bodies of `scripts`, ignoring the absolute offsets a container
+/// lays the streams out at.
+fn stream_bodies(scripts: &scd::ir::Scripts) -> Vec<StreamBody> {
+    let mut out = Vec::new();
+    for (index, block) in scripts.init.iter().enumerate() {
+        let insns = block
+            .insns
+            .iter()
+            .flat_map(|insn| insn.bytes.iter().copied())
+            .collect();
+        out.push((
+            format!("init[{index}]"),
+            vec![block.size],
+            insns,
+            block.trailing.clone(),
+        ));
+    }
+    for (index, block) in scripts.main.iter().enumerate() {
+        let insns = block
+            .insns
+            .iter()
+            .flat_map(|insn| insn.bytes.iter().copied())
+            .collect();
+        out.push((
+            format!("main[{index}]"),
+            vec![block.size],
+            insns,
+            block.trailing.clone(),
+        ));
+    }
+    for stream in &scripts.events {
+        let insns = stream
+            .insns
+            .iter()
+            .flat_map(|insn| insn.bytes.iter().copied())
+            .collect();
+        out.push((
+            format!("{:?}", stream.kind),
+            Vec::new(),
+            insns,
+            stream.trailing.clone(),
+        ));
+    }
+    out
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn every_rdt_disassembles_reassembles_and_reparses() {
+    let Some((root, _pack)) = common::asset_env() else {
+        return;
+    };
+    let mut files = Vec::new();
+    collect_rdts(&root, &mut files);
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "no RDT files found under {}",
+        root.display()
+    );
+
+    let mut rooms = 0usize;
+    let mut events = 0usize;
+    let mut insns = 0usize;
+    for path in &files {
+        let data = fs::read(path).unwrap();
+        if data.len() <= 4 {
+            continue;
+        }
+        let scripts = scd::reader::parse(&data)
+            .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+        let text = scd::disasm::render(&scripts, &data);
+        let assembled = scd::asm::assemble(&text)
+            .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+        let container = assembled.to_container().unwrap();
+        let reparsed = scd::reader::parse(&container)
+            .unwrap_or_else(|error| panic!("{}: container: {error:#}", path.display()));
+
+        assert_eq!(
+            stream_bodies(&reparsed),
+            stream_bodies(&scripts),
+            "{}: stream bodies differ",
+            path.display()
+        );
+        assert_eq!(
+            scd::decomp::render(&reparsed, &container),
+            scd::decomp::render(&scripts, &data),
+            "{}: .bio differs",
+            path.display()
+        );
+        events += reparsed.events.len();
+        insns += reparsed
+            .init
+            .iter()
+            .chain(&reparsed.main)
+            .flat_map(|block| &block.insns)
+            .count()
+            + reparsed
+                .events
+                .iter()
+                .flat_map(|stream| &stream.insns)
+                .count();
+        rooms += 1;
+    }
+    assert_eq!(rooms, 320, "expected the 320 shipped rooms");
+    println!("round-tripped {rooms} rooms, {events} events, {insns} instructions");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn assembled_containers_load_in_the_engine() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let base = Pack::open(&pack_path).unwrap();
+    let dir = TempDir::new("engine-override");
+    let mut files = Vec::new();
+    collect_rdts(&root, &mut files);
+    files.sort();
+
+    let mut loaded = 0usize;
+    for path in &files {
+        let data = fs::read(path).unwrap();
+        if data.len() <= 4 {
+            continue;
+        }
+        // Map ROOM####.RDT to its RoomId.
+        let stem = path
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .to_ascii_uppercase();
+        let Some(digits) = stem.strip_prefix("ROOM") else {
+            continue;
+        };
+        let Ok(id) = RoomId::parse(digits) else {
+            continue;
+        };
+        if !base.contains(&id.rdt_entry()) {
+            continue;
+        }
+        let scripts = scd::reader::parse(&data).unwrap();
+        let container = scd::asm::assemble(&scd::disasm::render(&scripts, &data))
+            .unwrap()
+            .to_container()
+            .unwrap();
+
+        let mod_path = dir.path.join(format!("{}.akpak", id.rdt_number()));
+        let mut writer = PackWriter::new();
+        writer.add(manifest::ENTRY, mod_manifest("re1")).unwrap();
+        writer.add(&id.scd_entry(), container).unwrap();
+        writer.write(&mod_path).unwrap();
+
+        let layered = Pack::open_layered(&pack_path, std::slice::from_ref(&mod_path)).unwrap();
+        let run = simulate_room(&layered, id, 1, player::Input::default())
+            .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+        assert_eq!(run.id, id);
+        loaded += 1;
+    }
+    assert!(loaded > 0, "no rooms loaded from the real pack");
+    println!("loaded {loaded} assembled containers through simulate_room");
 }
 
 #[test]
