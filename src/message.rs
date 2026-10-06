@@ -792,6 +792,7 @@ mod tests {
             height,
             indices,
             palettes,
+            stp: Vec::new(),
         }
     }
 

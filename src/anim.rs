@@ -212,6 +212,22 @@ pub(crate) fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
     matrix
 }
 
+/// The look-at tracking joint's local rotation: a Y-X-Z Euler rotation with
+/// the given yaw and pitch, composed from the existing trig tables. The
+/// original builds it with `RotMatrixYXZ(0, yaw, pitch)` and composes it onto
+/// the joint's world matrix.
+pub fn look_at_matrix(yaw: i16, pitch: i16) -> Mat4x3 {
+    let yaw = Mat4x3 {
+        r: rotation_matrix(0, i32::from(yaw), 0),
+        t: [0; 3],
+    };
+    let pitch = Mat4x3 {
+        r: rotation_matrix(i32::from(pitch), 0, 0),
+        t: [0; 3],
+    };
+    compose(&yaw, &pitch)
+}
+
 /// `a * b` for two [`Mat4x3`] values: rotation matrix product and the game's
 /// conjugated translation, every 4.12 product truncated toward zero.
 ///
@@ -268,6 +284,18 @@ pub struct AnimPlayer {
     /// frame counter still walks forward and wraps at the same place, matching
     /// the game's reverse `Joint_move`, which reads frame `count - 1 - frame`.
     pub reverse: bool,
+    /// Remaining clip-blend steps; 0 applies the keyframe directly.
+    pub blend_counter: u16,
+    /// The step the blend weights are derived from (0x400 for the player
+    /// clips). `0x1000 / blend_step - 1` is the counter a switch arms.
+    pub blend_step: u16,
+    /// The keyframe displayed before the latest consuming tick; it is the
+    /// blend's source pose, so a clip change blends from the pose on screen
+    /// rather than from the new clip's frame table.
+    pub previous_keyframe: usize,
+    /// The blend counter the latest consuming tick applied (before the
+    /// decrement), or 0 when that tick snapped.
+    pub blend_used: u16,
 }
 
 impl AnimPlayer {
@@ -279,16 +307,31 @@ impl AnimPlayer {
             display_frame: 0,
             timing: 0,
             reverse: false,
+            blend_counter: 0,
+            blend_step: 0x400,
+            previous_keyframe: 0,
+            blend_used: 0,
         }
     }
 
     /// Switch clips and restart playback from frame 0. The direction is left
-    /// alone; callers that need reverse set it explicitly.
+    /// alone; callers that need reverse set it explicitly. The switch arms the
+    /// clip blend over `0x1000 / blend_step - 1` steps, so the previous pose
+    /// eases into the new clip's first keyframe.
     pub fn set_clip(&mut self, clip: usize) {
         self.clip = clip;
         self.frame = 0;
         self.display_frame = 0;
         self.timing = 0;
+        self.blend_counter = self.full_blend_counter();
+    }
+
+    /// The blend counter a clip change arms for the configured step.
+    pub fn full_blend_counter(&self) -> u16 {
+        0x1000u16
+            .checked_div(self.blend_step)
+            .unwrap_or(0)
+            .saturating_sub(1)
     }
 
     /// The clip frame whose data is applied for logical frame `index`, or
@@ -323,10 +366,6 @@ impl AnimPlayer {
     /// (keyframe and timing) comes from the end of the clip while the counter
     /// still runs forwards.
     pub fn update(&mut self, clips: &[model::Clip]) -> bool {
-        // TODO(parity): (visual) a clip change snaps: the original eases into a
-        // new or reversed clip by blending the previous pose with the incoming
-        // keyframe over `blend_counter` steps (every joint rotation and the
-        // root Y translation); this port applies the keyframe immediately.
         if self.timing > 1 {
             self.timing -= 1;
             return false;
@@ -350,6 +389,16 @@ impl AnimPlayer {
         } else {
             0
         };
+        // The blend uses the counter this consume applies, then decrements it,
+        // exactly like `Joint_move`'s blending branch. The source pose is the
+        // keyframe on screen before this consume.
+        self.previous_keyframe = self
+            .data_frame(clip, self.display_frame)
+            .map_or(0, |frame| usize::from(frame.keyframe));
+        self.blend_used = self.blend_counter;
+        if self.blend_counter > 0 {
+            self.blend_counter -= 1;
+        }
         self.display_frame = index;
         let data = if self.reverse {
             clip.frames[clip.frames.len() - 1 - index]
@@ -364,6 +413,106 @@ impl AnimPlayer {
         }
         false
     }
+
+    /// The pose to display for the frame applied last.
+    ///
+    /// When a blend is active the previous and current frames' keyframes are
+    /// interpolated with the weights the counter applied. The batch-tick
+    /// accumulation the original gets from writing the interpolated rotations
+    /// back into the joint structs is not modelled; each step independently
+    /// interpolates from the previous applied keyframe.
+    pub fn pose_keyframe(
+        &self,
+        clips: &[model::Clip],
+        keyframes: &[model::Keyframe],
+    ) -> Option<model::Keyframe> {
+        let current = keyframes.get(self.keyframe_index(clips))?;
+        if self.blend_used == 0 || self.blend_step == 0 {
+            return Some(current.clone());
+        }
+        let Some(previous) = keyframes.get(self.previous_keyframe) else {
+            return Some(current.clone());
+        };
+        Some(blend_keyframes(
+            previous,
+            current,
+            self.blend_used,
+            self.blend_step,
+        ))
+    }
+}
+
+/// Interpolate `current` towards `target` with the original's fixed-point
+/// weights: `out = (current * blend + target * inverse) * step >> 12` per
+/// component, where `inverse = 0x1000 / step - blend`, with the last step's
+/// angle wrap fix so a rotation takes the short way around. The root X and Z
+/// translations come straight from the target; root Y is interpolated like a
+/// rotation.
+pub fn blend_keyframes(
+    current: &model::Keyframe,
+    target: &model::Keyframe,
+    blend: u16,
+    step: u16,
+) -> model::Keyframe {
+    let step = i32::from(step);
+    let blend = i32::from(blend);
+    let inverse = (0x1000 / step.max(1)) - blend;
+    let count = current.rotations.len().max(target.rotations.len());
+    let rotations: Vec<[i16; 3]> = (0..count)
+        .map(|joint| {
+            let rotation: [i16; 3] = std::array::from_fn(|axis| {
+                let cur = i32::from(
+                    current
+                        .rotations
+                        .get(joint)
+                        .map_or(0, |rotation| rotation[axis]),
+                );
+                let tgt = i32::from(
+                    target
+                        .rotations
+                        .get(joint)
+                        .map_or(0, |rotation| rotation[axis]),
+                );
+                let cur = if inverse == 1 {
+                    fix_wrap(cur, tgt)
+                } else {
+                    cur
+                };
+                (trunc_div_12(tgt * inverse * step) + trunc_div_12(cur * blend * step)) as i16
+            });
+            rotation
+        })
+        .collect();
+    let root_y = {
+        let cur = i32::from(current.offset[1]);
+        let tgt = i32::from(target.offset[1]);
+        trunc_div_12(tgt * inverse * step) + trunc_div_12(cur * blend * step)
+    };
+    model::Keyframe {
+        offset: [target.offset[0], root_y as i16, target.offset[2]],
+        rotations,
+    }
+}
+
+/// The original's last-blend-step angle adjustment: shift `current` by one
+/// full turn when the target lies more than half a turn away in the lerp's
+/// direction.
+fn fix_wrap(current: i32, target: i32) -> i32 {
+    let diff = (target - current + 0x800) as u16;
+    if diff > 0x1000 {
+        if diff & 0x8000 == 0 {
+            current.wrapping_add(0x1000)
+        } else {
+            current.wrapping_sub(0x1000)
+        }
+    } else {
+        current
+    }
+}
+
+/// `(value) >> 12` with the original's truncation-toward-zero correction.
+fn trunc_div_12(value: i32) -> i32 {
+    (value + ((value >> 31) & 0xFFF)) >> 12
 }
 
 #[cfg(test)]
@@ -599,6 +748,95 @@ mod tests {
         player.set_clip(1);
 
         assert_eq!((player.clip, player.frame, player.timing), (1, 0, 0));
+    }
+
+    #[test]
+    fn blend_keyframes_interpolates_each_step_and_the_root_y() {
+        let current = Keyframe {
+            offset: [10, 100, 20],
+            rotations: vec![[0, 0, 0]],
+        };
+        let target = Keyframe {
+            offset: [50, 200, 60],
+            rotations: vec![[0x400, 0, 0]],
+        };
+        // Step 0x400: counter 3 weights the target 1/4, counter 2 half,
+        // counter 1 three quarters.
+        let pose = blend_keyframes(&current, &target, 3, 0x400);
+        assert_eq!(pose.rotations[0][0], 0x100);
+        assert_eq!(pose.offset, [50, 125, 60]);
+        let pose = blend_keyframes(&current, &target, 2, 0x400);
+        assert_eq!(pose.rotations[0][0], 0x200);
+        assert_eq!(pose.offset[1], 150);
+        let pose = blend_keyframes(&current, &target, 1, 0x400);
+        assert_eq!(pose.rotations[0][0], 0x300);
+        assert_eq!(pose.offset[1], 175);
+        // The root X and Z translations snap to the target.
+        assert_eq!(pose.offset[0], 50);
+        assert_eq!(pose.offset[2], 60);
+    }
+
+    #[test]
+    fn blend_keyframes_fixes_the_last_step_angle_wrap() {
+        // The wrap fix applies when the target weight is one step (counter 3
+        // at step 0x400): from 0xF00 towards 0x100 the short way is +0x200, so
+        // the current angle shifts by a full turn and the weighted sum lands
+        // on 0xF80 instead of 0x480.
+        let current = Keyframe {
+            offset: [0; 3],
+            rotations: vec![[0x0F00, 0, 0]],
+        };
+        let target = Keyframe {
+            offset: [0; 3],
+            rotations: vec![[0x0100, 0, 0]],
+        };
+        let pose = blend_keyframes(&current, &target, 3, 0x400);
+        assert_eq!(pose.rotations[0][0] & 0x0FFF, 0x0F80);
+        assert_eq!(pose.rotations[0][0], -0x80);
+        // Without the shift the same weights would give 0xB80.
+        assert_eq!(
+            (trunc_div_12(0x100 * 0x400) + trunc_div_12(0xF00 * 3 * 0x400)) as i16,
+            0xB80
+        );
+    }
+
+    #[test]
+    fn a_clip_change_eases_the_pose_over_the_blend_counter() {
+        let clips = vec![timing_clip(&[1, 1, 1, 1, 1])];
+        let keyframes: Vec<Keyframe> = (0..5)
+            .map(|index| Keyframe {
+                offset: [0, 0, 0],
+                rotations: vec![[(index as i16) * 0x100, 0, 0]],
+            })
+            .collect();
+        let mut player = AnimPlayer::new(0);
+        player.set_clip(0);
+        assert_eq!(player.full_blend_counter(), 3, "step 0x400 arms counter 3");
+
+        // Frame 0 is the blend's own source: the pose stays on it.
+        player.update(&clips);
+        assert_eq!(
+            player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
+            [0, 0, 0]
+        );
+        // Frame 1 with counter 2: halfway between keyframe 0 and 0x100.
+        player.update(&clips);
+        assert_eq!(
+            player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
+            [0x80, 0, 0]
+        );
+        // Frame 2 with counter 1: 0.75 * 0x200 + 0.25 * 0x100 = 0x1C0.
+        player.update(&clips);
+        assert_eq!(
+            player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
+            [0x1C0, 0, 0]
+        );
+        // Frame 3 with counter 0 snaps to the keyframe.
+        player.update(&clips);
+        assert_eq!(
+            player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
+            [0x300, 0, 0]
+        );
     }
 
     #[test]

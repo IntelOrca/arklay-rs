@@ -15,6 +15,8 @@ const MODE_4BPP: u32 = 0;
 const MODE_8BPP: u32 = 1;
 /// Palette entries a 4bpp texel can index.
 const CLUT_ROW_LEN: usize = 16;
+/// The BGR555 word's semi-transparency (STP) bit.
+const STP_BIT: u16 = 0x8000;
 
 /// Decode a PSX TIM image. Only 16bpp direct color (mode 2) is supported.
 ///
@@ -95,7 +97,8 @@ pub fn decode(data: &[u8]) -> Result<Image> {
 /// block's length field covers its 12-byte header and all BGR555 entries; the
 /// image block's width field is in 16-bit units, so the pixel width is twice
 /// the stored value. Palettes are flattened row-major with the 256 entries of
-/// the player texture's CLUT row first. The STP bit is ignored.
+/// the player texture's CLUT row first, and each entry's bit 15 is kept in
+/// [`Texture8::stp`] as the semi-transparency selector.
 pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
     if data.len() < HEADER_LEN {
         bail!(
@@ -149,12 +152,14 @@ pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
             data.len().saturating_sub(clut_start)
         )
     })?;
-    let palettes = clut_bytes
+    let clut_words: Vec<u16> = clut_bytes
         .as_chunks::<PIXEL_BYTES>()
         .0
         .iter()
-        .map(|entry| expand_bgr555(u16::from_le_bytes([entry[0], entry[1]])))
+        .map(|entry| u16::from_le_bytes([entry[0], entry[1]]))
         .collect();
+    let palettes = clut_words.iter().map(|&word| expand_bgr555(word)).collect();
+    let stp = clut_words.iter().map(|&word| word & STP_BIT != 0).collect();
 
     let image_start = HEADER_LEN
         .checked_add(clut_length)
@@ -183,6 +188,7 @@ pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
         height: height as u32,
         indices,
         palettes,
+        stp,
     })
 }
 
@@ -194,6 +200,7 @@ pub fn decode_8bpp(data: &[u8]) -> Result<Texture8> {
 /// [`PALETTE_ROW_LEN`]-entry stride, so [`Texture8::palette`] looks up a row by
 /// its 4bpp texel index. The shipped 768x256 Japanese sheet stores 272 entries
 /// per CLUT row; only the leading 16 are reachable, exactly as on the console.
+/// Each entry's bit 15 becomes its [`Texture8::stp`] flag.
 pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
     if data.len() < HEADER_LEN {
         bail!(
@@ -248,11 +255,13 @@ pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
         )
     })?;
     let mut palettes = vec![[0u8; 4]; clut_height * PALETTE_ROW_LEN];
+    let mut stp = vec![false; clut_height * PALETTE_ROW_LEN];
     for row in 0..clut_height {
         for index in 0..clut_width.min(CLUT_ROW_LEN) {
             let offset = (row * clut_width + index) * PIXEL_BYTES;
             let entry = u16::from_le_bytes([clut_bytes[offset], clut_bytes[offset + 1]]);
             palettes[row * PALETTE_ROW_LEN + index] = expand_bgr555(entry);
+            stp[row * PALETTE_ROW_LEN + index] = entry & STP_BIT != 0;
         }
     }
 
@@ -287,6 +296,7 @@ pub fn decode_4bpp(data: &[u8]) -> Result<Texture8> {
         height: height as u32,
         indices,
         palettes,
+        stp,
     })
 }
 
@@ -485,6 +495,50 @@ mod tests {
         assert_eq!(texture.palette(1, 0), [255, 255, 255, 255]);
         assert_eq!(texture.palette(1, 1), [0, 0, 0, 255]);
         assert_eq!(texture.palette(2, 0), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn keeps_the_clut_stp_bit_per_palette_entry() {
+        // Bit 15 of each BGR555 CLUT word is the STP selector; the colour
+        // channels are unchanged.
+        let opaque = pixel(0, 0, 0);
+        let stp_white = 0x8000 | pixel(31, 31, 31);
+        let data = tim_8bpp(
+            2,
+            2,
+            &[opaque, stp_white, stp_white, opaque],
+            1,
+            1,
+            &[0, 1, 2, 3],
+        );
+
+        let texture = decode_8bpp(&data).unwrap();
+
+        assert_eq!(texture.palettes[1], [255, 255, 255, 255]);
+        assert_eq!(
+            texture.stp,
+            vec![false, true, true, false],
+            "STP flags must follow the CLUT words"
+        );
+        assert!(texture.row_has_stp(0));
+        assert!(texture.palette_stp(0, 1));
+        assert!(!texture.palette_stp(0, 0));
+    }
+
+    #[test]
+    fn normalizes_4bpp_stp_flags_to_the_row_stride() {
+        let mut palette = vec![0u16; 32];
+        palette[3] = 0x8000 | pixel(31, 0, 0);
+        palette[16 + 4] = 0x8000 | pixel(0, 31, 0); // Second row, entry 4.
+        let data = tim_4bpp(16, 2, &palette, 1, 1, &[0x30, 0x00]);
+
+        let texture = decode_4bpp(&data).unwrap();
+
+        assert_eq!(texture.palette(0, 3), [255, 0, 0, 255]);
+        assert!(texture.palette_stp(0, 3));
+        assert!(!texture.palette_stp(0, 0));
+        assert!(texture.palette_stp(1, 4));
+        assert!(!texture.palette_stp(1, 0));
     }
 
     #[test]

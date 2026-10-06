@@ -157,6 +157,7 @@ mod tests {
                 .iter()
                 .map(|&r5| [palette_red(r5), 0, 0, 255])
                 .collect(),
+            stp: Vec::new(),
         }
     }
 

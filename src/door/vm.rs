@@ -1052,6 +1052,7 @@ mod tests {
                 height: 1,
                 indices: vec![0],
                 palettes: vec![[0, 0, 0, 255]],
+                stp: Vec::new(),
             },
             orders: [crate::door::Order::default(); ORDER_COUNT],
         }

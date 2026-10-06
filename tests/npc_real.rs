@@ -85,7 +85,7 @@ fn render_cut(
         &mut framebuffer,
         cut.background.as_ref(),
         meshes,
-        None,
+        &[],
         &camera,
         &lighting,
         None,
@@ -337,6 +337,190 @@ fn real_room40c1_off_zone_character_paints_on_screen() {
         near, changed,
         "the frame delta is not the off-zone character's pixels"
     );
+}
+
+/// The baked shadow page: the pack entry when present, else the install file.
+fn shadow_page(pack: &Pack, root: &Path) -> Image {
+    if let Ok(bytes) = pack.read(arklay::shadow::KAGE_ENTRY) {
+        return arklay::shadow::decode(bytes).unwrap_or_else(|err| {
+            panic!("pack {} is invalid: {err:#}", arklay::shadow::KAGE_ENTRY);
+        });
+    }
+    let path = ["JPN", ""]
+        .iter()
+        .map(|prefix| root.join(prefix).join("DATA").join("KAGE.TIM"))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| panic!("no KAGE.TIM under {}", root.display()));
+    arklay::shadow::decode(&std::fs::read(&path).unwrap())
+        .unwrap_or_else(|err| panic!("invalid {}: {err:#}", path.display()))
+}
+
+/// A real actor room queues the player's and every in-zone character's ground
+/// shadow into the same frame, each darkening the floor under its own entity.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
+    let Some((root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    // ROOM1060 spawns Wesker and Jill inside the boot camera's switch zone.
+    let id = RoomId::parse("1060").unwrap();
+    let sim = simulate_room(&pack, id, 2, player::Input::default()).unwrap();
+    let texture = shadow_page(&pack, &root);
+
+    let mut shadows: Vec<arklay::render::Shadow<'_>> = Vec::new();
+    if arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player) {
+        shadows.push(arklay::render::Shadow {
+            texture: &texture,
+            pos: sim.player.pos,
+            angle: sim.player.angle,
+            half_x: arklay::shadow::PLAYER_HALF_X,
+            half_z: arklay::shadow::PLAYER_HALF_Z,
+            lift: arklay::shadow::offset_y(id, sim.room.current_cut),
+            tint: arklay::shadow::billboard_tint(arklay::shadow::PLAYER_COLOR),
+        });
+    }
+    for entity in sim.game.entities.iter().filter(|entity| entity.active()) {
+        if entity.has_enter_switch_zone == 0 {
+            continue;
+        }
+        let Some(init) = arklay::npc::character_init(entity.id) else {
+            continue;
+        };
+        shadows.push(arklay::render::Shadow {
+            texture: &texture,
+            pos: [
+                entity.pos[0] + i32::from(init.shadow_offset[0]),
+                entity.pos[1],
+                entity.pos[2] + i32::from(init.shadow_offset[2]),
+            ],
+            angle: entity.angle,
+            half_x: i32::from(init.shadow_half_x),
+            half_z: i32::from(init.shadow_half_z),
+            lift: arklay::shadow::offset_y(id, sim.room.current_cut),
+            tint: arklay::shadow::billboard_tint(init.tint),
+        });
+    }
+    println!(
+        "queued {} shadow(s): player={} npc={}",
+        shadows.len(),
+        arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player),
+        shadows.len()
+            - usize::from(arklay::shadow::visible(
+                id,
+                &sim.room,
+                sim.room.current_cut,
+                &sim.player
+            ))
+    );
+    assert!(
+        shadows.len() >= 2,
+        "the fixture room must queue the player and at least one character shadow"
+    );
+
+    // Pose the characters and render the cut that frames them, with and
+    // without the shadow list; each queued shadow must darken its own floor.
+    let characters: Vec<(usize, Entity, Emd)> = [0x24u8, 0x21]
+        .iter()
+        .filter_map(|&id| character(&pack, &sim.game, id))
+        .collect();
+    assert!(!characters.is_empty(), "the fixture spawns no character");
+    let on_screen = |index: usize| {
+        let camera = Camera::from_cut(&sim.room.cuts[index]);
+        characters
+            .iter()
+            .filter(|(_, entity, _)| {
+                camera
+                    .project(entity.pos)
+                    .is_some_and(|[x, y]| (16..304).contains(&x) && (16..224).contains(&y))
+            })
+            .count()
+    };
+    let camera_cut = (0..sim.room.cuts.len())
+        .max_by_key(|&index| on_screen(index))
+        .expect("the room has cuts");
+    assert!(
+        on_screen(camera_cut) > 0,
+        "no cut frames a fixture character"
+    );
+    let mut models: Vec<&Emd> = Vec::new();
+    let mut joint_sets: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    for (slot, entity, emd) in &characters {
+        let keyframe = sim.game.entity_anims[*slot].keyframe_index(entity, &emd.clips);
+        let matrix = anim::entity_matrix(entity.pos, entity.angle);
+        joint_sets.push(anim::joint_matrices(
+            &emd.skeleton,
+            &emd.keyframes[keyframe],
+            &matrix,
+        ));
+        models.push(emd);
+    }
+    let meshes: Vec<EntityMesh<'_>> = models
+        .iter()
+        .zip(&joint_sets)
+        .map(|(model, joints)| EntityMesh {
+            mesh: &model.mesh,
+            texture: &model.texture,
+            joints,
+            tint: [255; 3],
+            hidden_joints: 0,
+        })
+        .collect();
+    let cut = &sim.room.cuts[camera_cut];
+    let camera = Camera::from_cut(cut);
+    let lighting = Lighting::from_room(&sim.room);
+    let render = |shadow_list: &[arklay::render::Shadow<'_>]| {
+        let mut framebuffer = Framebuffer::new();
+        arklay::render::draw_gameplay_scene(
+            &mut framebuffer,
+            cut.background.as_ref(),
+            &meshes,
+            shadow_list,
+            &camera,
+            &lighting,
+            None,
+        );
+        framebuffer.rgba
+    };
+    let with = render(&shadows);
+    let without = render(&[]);
+    assert_ne!(with, without, "the shadow list never painted");
+
+    let mut checked = 0;
+    for (_, entity, _) in &characters {
+        let Some([cx, cy]) = camera.project(entity.pos) else {
+            continue;
+        };
+        if !(16..304).contains(&cx) || !(16..224).contains(&cy) {
+            continue;
+        }
+        checked += 1;
+        let darkened = with
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(without.as_chunks::<4>().0)
+            .enumerate()
+            .filter(|(index, (a, b))| {
+                a != b && a[..3].iter().zip(&b[..3]).all(|(x, y)| x <= y) && {
+                    let px = (index % 320) as i32;
+                    let py = (index / 320) as i32;
+                    (px - cx).abs() <= 120 && (py - cy).abs() <= 160
+                }
+            })
+            .count();
+        println!(
+            "character {:#04x} shadow darkened {darkened} pixels",
+            entity.id
+        );
+        assert!(
+            darkened > 30,
+            "character {:#04x} queued no shadow near its feet",
+            entity.id
+        );
+    }
+    assert!(checked > 0, "no fixture character was on screen");
 }
 
 #[test]

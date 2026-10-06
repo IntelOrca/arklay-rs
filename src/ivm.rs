@@ -22,6 +22,8 @@ const TMD_DESCRIPTOR_LEN: usize = 28;
 const VERTEX_LEN: usize = 8;
 /// The flag bit the mesh decoder masks out of every polygon command.
 const COMMAND_MASK: u32 = 0x3DFF_FFFF;
+/// The semi-transparency (ABE) command bit, stripped by [`COMMAND_MASK`].
+const ABE_BIT: u32 = 0x0200_0000;
 
 /// Gouraud textured triangle (`0x34000609` / `0x36000609`).
 const GOURAUD_TEXTURED_TRIANGLE: u32 = 0x3400_0609;
@@ -75,12 +77,17 @@ pub struct IvmPrim {
     pub normals: [u16; 4],
     /// Texture coordinates of each corner.
     pub uv: [[u8; 2]; 4],
-    /// Flat shade colour (`255` per channel on textured polygons).
-    pub color: [u8; 3],
+    /// Per-corner shade colours. The shipped untextured gouraud packets carry
+    /// one flat colour word, which the original applies to all three corners;
+    /// textured polygons shade white here because the mesh path is full-bright.
+    pub colors: [[u8; 3]; 3],
     /// CLUT word from the packet's colour word.
     pub clut: u16,
     /// Texture-page word from the packet.
     pub tsb: u16,
+    /// The packet's semi-transparency (ABE) command bit. A blended packet
+    /// takes the per-texel STP path over its palette row.
+    pub blend: bool,
 }
 
 /// Parse one `.IVM` file.
@@ -222,13 +229,14 @@ fn parse_prims(
         let packet = data.get(position..position + size).with_context(|| {
             format!("IVM TMD object {object} primitive {index} overruns the mesh")
         })?;
-        let prim = decode_prim(
+        let mut prim = decode_prim(
             command & COMMAND_MASK,
             packet,
             vertices.len(),
             normals.len(),
         )
         .with_context(|| format!("IVM TMD object {object} primitive {index}"))?;
+        prim.blend = command & ABE_BIT != 0;
         prims.push(prim);
         position += size;
     }
@@ -252,9 +260,10 @@ fn decode_prim(
                 vertices: corners(&[word(4), word(5), word(6)], true, 3),
                 normals: corners(&[word(4), word(5), word(6)], false, 3),
                 uv: uvs(&[color, word(2), word(3)], 3),
-                color: [255, 255, 255],
+                colors: [[255, 255, 255]; 3],
                 clut: (color >> 16) as u16,
                 tsb: (word(2) >> 16) as u16,
+                blend: false,
             }
         }
         GOURAUD_TEXTURED_QUAD => {
@@ -265,9 +274,10 @@ fn decode_prim(
                 vertices: corners(&[word(5), word(6), word(7), word(8)], true, 4),
                 normals: corners(&[word(5), word(6), word(7), word(8)], false, 4),
                 uv: uvs(&[color, word(2), word(3), word(4)], 4),
-                color: [255, 255, 255],
+                colors: [[255, 255, 255]; 3],
                 clut: (color >> 16) as u16,
                 tsb: (word(2) >> 16) as u16,
+                blend: false,
             }
         }
         FLAT_TEXTURED_TRIANGLE => {
@@ -284,9 +294,10 @@ fn decode_prim(
                 ],
                 normals: [normal, 0, 0, 0],
                 uv: uvs(&[color, word(2), word(3)], 3),
-                color: shade(color),
+                colors: [shade(color); 3],
                 clut: (color >> 16) as u16,
                 tsb: (word(2) >> 16) as u16,
+                blend: false,
             }
         }
         GOURAUD_TRIANGLE => {
@@ -297,9 +308,10 @@ fn decode_prim(
                 vertices: corners(&[word(2), word(3), word(4)], true, 3),
                 normals: corners(&[word(2), word(3), word(4)], false, 3),
                 uv: [[0, 0]; 4],
-                color: shade(color),
+                colors: [shade(color); 3],
                 clut: 0,
                 tsb: 0,
+                blend: false,
             }
         }
         other => bail!("unsupported TMD polygon command 0x{other:08X}"),
@@ -505,9 +517,19 @@ mod tests {
         assert_eq!(prim.vertices, [0, 1, 2, 0]);
         assert_eq!(prim.normals, [0, 1, 2, 0]);
         assert_eq!(prim.uv, [[1, 10], [2, 11], [3, 12], [0, 0]]);
-        assert_eq!(prim.color, [255, 255, 255]);
+        assert_eq!(prim.colors, [[255, 255, 255]; 3]);
         assert_eq!(prim.clut, 0x7800);
         assert_eq!(prim.tsb, 0x80);
+    }
+
+    #[test]
+    fn keeps_the_abe_flag_from_the_polygon_command() {
+        let mut data = sample_ivm();
+        let prim_at = data.len() - 28;
+        data[prim_at..prim_at + 4]
+            .copy_from_slice(&(GOURAUD_TEXTURED_TRIANGLE | ABE_BIT).to_le_bytes());
+        let ivm = parse(&data).unwrap();
+        assert!(ivm.objects[0].prims[0].blend);
     }
 
     #[test]

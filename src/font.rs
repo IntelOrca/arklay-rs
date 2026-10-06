@@ -7,7 +7,7 @@
 //! original's CLUT-driven [`Tint`] table and the pending 2D sprite path.
 
 use crate::model::Texture8;
-use crate::render::Framebuffer;
+use crate::render::{Framebuffer, SpriteBlend, SpriteDraw};
 
 pub use crate::render::Tint;
 
@@ -248,26 +248,65 @@ impl Font {
         } else {
             Glyphs::plain(bytes, self.metrics)
         };
+        // Every glyph queues its shadow pass first and its text pass second,
+        // both at the pending-sprite depth the brightness selects; the stable
+        // order keeps the shadow under the glyph. The shadow is one pixel down
+        // and right, a semi-transparent black silhouette.
+        let alpha = shadow_alpha(brightness);
+        let mut sprites: Vec<SpriteDraw<'_>> = Vec::new();
         let mut cursor = x;
         for glyph in glyphs {
             if glyph.visible() {
-                framebuffer.draw_indexed_sprite(
+                let src = [glyph.u, glyph.v, glyph.width, glyph.height];
+                if alpha > 0 {
+                    sprites.push(
+                        SpriteDraw::indexed(
+                            &self.texture,
+                            src,
+                            [cursor + 1, y + 1, glyph.width, glyph.height],
+                            0,
+                            brightness,
+                            Tint::White,
+                        )
+                        .with_blend(SpriteBlend::BlackAlpha(alpha)),
+                    );
+                }
+                sprites.push(SpriteDraw::indexed(
                     &self.texture,
-                    [glyph.u, glyph.v, glyph.width, glyph.height],
+                    src,
                     [cursor, y, glyph.width, glyph.height],
                     0,
                     brightness,
                     tint,
-                );
+                ));
             }
             cursor += glyph.advance;
         }
+        framebuffer.draw_sprites(&mut sprites);
+    }
+}
+
+/// The text shadow's blend alpha: `brightness * 255 / 30`, capped at 255, with
+/// the brightness 0 and 2 that the text pass treats as full also full here.
+pub fn shadow_alpha(brightness: u8) -> u8 {
+    if brightness == 0 || brightness == 2 {
+        255
+    } else {
+        (u32::from(brightness) * 255 / 30).min(255) as u8
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_image(width: u32, height: u32, color: [u8; 4]) -> crate::state::Image {
+        crate::state::Image {
+            width,
+            height,
+            rgba: color.repeat((width * height) as usize),
+        }
+    }
 
     fn metrics_jpn() -> FontMetrics {
         FontMetrics::from_sheet_width(768)
@@ -298,6 +337,7 @@ mod tests {
             height,
             indices,
             palettes,
+            stp: Vec::new(),
         }
     }
 
@@ -320,6 +360,7 @@ mod tests {
             height,
             indices,
             palettes,
+            stp: Vec::new(),
         }
     }
 
@@ -466,6 +507,35 @@ mod tests {
         // Brightness 15 dims the white glyph to 127.
         font.draw_text(&mut framebuffer, 10, 50, Tint::White, 15, &[0x0C]);
         assert_eq!(pixel(&framebuffer, 10, 50), [127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn draw_text_queues_a_black_shadow_at_the_brightness_alpha() {
+        let font = Font::new(sheet_with_cell(168, 28));
+        assert_eq!(shadow_alpha(2), 255);
+        assert_eq!(shadow_alpha(0), 255);
+        assert_eq!(shadow_alpha(15), 127);
+        assert_eq!(shadow_alpha(30), 255);
+
+        fn pixel(framebuffer: &Framebuffer, x: i32, y: i32) -> [u8; 4] {
+            let offset = (y as usize * 320 + x as usize) * 4;
+            framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+        }
+
+        // Over a 200 grey page: the text pass paints 127 grey at brightness
+        // 15, and the shadow's one-pixel edge darkens the grey by 127/255.
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 15, &[0x0C]);
+        assert_eq!(pixel(&framebuffer, 10, 10), [127, 127, 127, 255]);
+        // The shadow-only column one past the glyph's right edge.
+        assert_eq!(pixel(&framebuffer, 24, 11), [100, 100, 100, 255]);
+
+        // At the full-brightness default the shadow is an opaque black edge.
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0C]);
+        assert_eq!(pixel(&framebuffer, 24, 11), [0, 0, 0, 255]);
     }
 
     #[test]

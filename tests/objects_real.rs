@@ -277,7 +277,7 @@ fn room_107_objects_render() {
             &mut framebuffer,
             None,
             &meshes,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -1023,6 +1023,7 @@ fn room_112_mirror_renders_reflection_pixels() {
         height: 1,
         indices: vec![0],
         palettes: vec![[0, 0, 255, 255]],
+        stp: Vec::new(),
     };
     let object_meshes = [
         EntityMesh {
@@ -1056,14 +1057,22 @@ fn room_112_mirror_renders_reflection_pixels() {
         };
         let mut plain = Framebuffer::new();
         arklay::render::draw_gameplay_scene(
-            &mut plain, None, &meshes, None, &camera, &lighting, None,
+            &mut plain,
+            None,
+            &meshes,
+            &[],
+            &camera,
+            &lighting,
+            None,
         );
         let mut reflected = Framebuffer::new();
         arklay::render::draw_gameplay_scene_with_effects(
             &mut reflected,
             None,
+            [0, 0],
+            [255; 3],
             &meshes,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -1089,8 +1098,10 @@ fn room_112_mirror_renders_reflection_pixels() {
         arklay::render::draw_gameplay_scene_with_effects(
             &mut object_plain,
             None,
+            [0, 0],
+            [255; 3],
             &object_meshes,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -1102,8 +1113,10 @@ fn room_112_mirror_renders_reflection_pixels() {
         arklay::render::draw_gameplay_scene_with_effects(
             &mut object_reflected,
             None,
+            [0, 0],
+            [255; 3],
             &object_meshes,
-            None,
+            &[],
             &camera,
             &lighting,
             None,

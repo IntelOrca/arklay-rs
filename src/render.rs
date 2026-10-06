@@ -1,12 +1,13 @@
 //! Deterministic software rasterizer for the player model and room masks.
 //!
 //! [`Framebuffer::draw_model`] transforms a TMD mesh by the per-joint 4.12
-//! matrices, shades the vertices with the room lighting, sorts the triangles
-//! back-to-front and rasterizes them into the RGBA8 buffer. Nothing here uses
-//! SDL; the engine owns presentation and only uploads [`Framebuffer::rgba`].
+//! matrices, shades every polygon with the entity's latched room light
+//! ([`Lighting::latched`]), sorts the triangles back-to-front and rasterizes
+//! them into the RGBA8 buffer. ABE packets blend with the per-texel STP
+//! selector the TIM CLUTs carry. Nothing here uses SDL; the engine owns
+//! presentation and only uploads [`Framebuffer::rgba`].
 //!
-//! [`draw_gameplay_scene`] is the full gameplay path. It blits the camera's
-//! background and then paints one stable far-to-near list mixing the camera's
+//! [`draw_gameplay_scene`] is the full gameplay path. It draws the camera's
 //! mask sprites (from a [`MaskLayer`]) with the player's triangles, so the
 //! character passes behind foreground pillars:
 //!
@@ -49,8 +50,6 @@ const FIXED_ONE: f64 = 4096.0;
 const CENTER_X: f64 = 160.0;
 /// Vertical screen centre in pixels.
 const CENTER_Y: f64 = 120.0;
-/// Divisor that scales a 12-bit ambient channel to 0..255.
-const AMBIENT_DIVISOR: f64 = 16.0;
 /// Full scale of one colour channel.
 const CHANNEL_MAX: f64 = 255.0;
 
@@ -121,6 +120,18 @@ pub enum SpriteSource<'a> {
     Rgba(&'a Image),
 }
 
+/// How a pending sprite mixes with what is already in the framebuffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpriteBlend {
+    /// Overwrite the destination.
+    Opaque,
+    /// `(source + destination) / 2`, the PSX half blend.
+    Half,
+    /// Mix the destination towards black by `alpha`/255 wherever a texel is
+    /// opaque; the text shadow's pass. The source colour is ignored.
+    BlackAlpha(u8),
+}
+
 /// One pending 2D sprite, submitted to [`Framebuffer::draw_sprites`].
 ///
 /// Both rectangles are `[x, y, width, height]`: `src` in texture pixels and
@@ -136,6 +147,11 @@ pub struct SpriteDraw<'a> {
     pub dst: [i32; 4],
     /// Brightness in the original's 0..=30 range; 0 and 2 are both full.
     pub brightness: u8,
+    /// How the sprite mixes with the framebuffer.
+    pub blend: SpriteBlend,
+    /// Mirror the sampled source rectangle horizontally (`[0]`) or vertically
+    /// (`[1]`).
+    pub mirror: [bool; 2],
 }
 
 impl<'a> SpriteDraw<'a> {
@@ -158,6 +174,8 @@ impl<'a> SpriteDraw<'a> {
             src,
             dst,
             brightness,
+            blend: SpriteBlend::Opaque,
+            mirror: [false; 2],
         }
     }
 
@@ -169,7 +187,21 @@ impl<'a> SpriteDraw<'a> {
             src,
             dst,
             brightness,
+            blend: SpriteBlend::Opaque,
+            mirror: [false; 2],
         }
+    }
+
+    /// Override the sprite's blend mode.
+    pub fn with_blend(mut self, blend: SpriteBlend) -> Self {
+        self.blend = blend;
+        self
+    }
+
+    /// Override the sprite's U/V mirror flags.
+    pub fn with_mirror(mut self, mirror: [bool; 2]) -> Self {
+        self.mirror = mirror;
+        self
     }
 }
 
@@ -225,6 +257,40 @@ impl Framebuffer {
         }
     }
 
+    /// Draw a full-screen background through `origin` and a global colour.
+    ///
+    /// This is the cut's display image: the sampled window is shifted by the
+    /// display origin (screen panning and shake) with a clamp sampler, so a
+    /// positive X origin moves the image right by sampling one pixel further
+    /// left, and the edge row/column repeats. `colour` is the global colour
+    /// multiplier (`255` per channel is identity), applied with a truncating
+    /// integer scale. The destination is always opaque.
+    pub fn draw_background(&mut self, image: &Image, origin: [i32; 2], colour: [u8; 3]) {
+        if image.width == 0 || image.height == 0 {
+            return;
+        }
+        let width = self.width as usize;
+        for y in 0..self.height {
+            let source_y = (y as i32 - origin[1]).clamp(0, image.height as i32 - 1) as u32;
+            for x in 0..self.width {
+                let source_x = (x as i32 - origin[0]).clamp(0, image.width as i32 - 1) as u32;
+                let source = ((source_y * image.width + source_x) * 4) as usize;
+                let Some(texel) = image.rgba.get(source..source + 4) else {
+                    continue;
+                };
+                let offset = (y as usize * width + x as usize) * 4;
+                let Some(slot) = self.rgba.get_mut(offset..offset + 4) else {
+                    continue;
+                };
+                for channel in 0..3 {
+                    slot[channel] =
+                        (u32::from(texel[channel]) * u32::from(colour[channel]) / 255) as u8;
+                }
+                slot[3] = 255;
+            }
+        }
+    }
+
     /// Draw one indexed sprite with nearest sampling, clipped to the
     /// framebuffer.
     ///
@@ -241,13 +307,15 @@ impl Framebuffer {
         brightness: u8,
         tint: Tint,
     ) {
-        self.draw_indexed_sprite_scaled(
+        self.draw_indexed_sprite_full(
             texture,
             src,
             dst,
             clut_row,
             brightness_scale(brightness),
             tint,
+            SpriteBlend::Opaque,
+            [false; 2],
         );
     }
 
@@ -265,12 +333,38 @@ impl Framebuffer {
         scale: u8,
         tint: Tint,
     ) {
+        self.draw_indexed_sprite_full(
+            texture,
+            src,
+            dst,
+            clut_row,
+            scale,
+            tint,
+            SpriteBlend::Opaque,
+            [false; 2],
+        );
+    }
+
+    /// [`Framebuffer::draw_indexed_sprite_scaled`] with a blend mode and U/V
+    /// mirror flags.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_indexed_sprite_full(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        scale: u8,
+        tint: Tint,
+        blend: SpriteBlend,
+        mirror: [bool; 2],
+    ) {
         if texture.width == 0 || texture.height == 0 {
             return;
         }
         let scale = u32::from(scale);
         let tint = tint.rgb();
-        self.draw_sprite(src, dst, |u, v| {
+        self.draw_sprite(src, dst, mirror, blend, |u, v| {
             if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
                 return None;
             }
@@ -307,7 +401,14 @@ impl Framebuffer {
         dst: [i32; 4],
         brightness: u8,
     ) {
-        self.draw_rgba_sprite_scaled(image, src, dst, brightness_scale(brightness));
+        self.draw_rgba_sprite_full(
+            image,
+            src,
+            dst,
+            brightness_scale(brightness),
+            SpriteBlend::Opaque,
+            [false; 2],
+        );
     }
 
     /// Draw one RGBA sprite with a direct `0..=255` colour multiplier.
@@ -321,11 +422,25 @@ impl Framebuffer {
         dst: [i32; 4],
         scale: u8,
     ) {
+        self.draw_rgba_sprite_full(image, src, dst, scale, SpriteBlend::Opaque, [false; 2]);
+    }
+
+    /// [`Framebuffer::draw_rgba_sprite_scaled`] with a blend mode and U/V
+    /// mirror flags.
+    fn draw_rgba_sprite_full(
+        &mut self,
+        image: &Image,
+        src: [i32; 4],
+        dst: [i32; 4],
+        scale: u8,
+        blend: SpriteBlend,
+        mirror: [bool; 2],
+    ) {
         if image.width == 0 || image.height == 0 {
             return;
         }
         let scale = u32::from(scale);
-        self.draw_sprite(src, dst, |u, v| {
+        self.draw_sprite(src, dst, mirror, blend, |u, v| {
             if u < 0 || v < 0 || u >= image.width as i32 || v >= image.height as i32 {
                 return None;
             }
@@ -424,12 +539,8 @@ impl Framebuffer {
     /// The sort is stable on descending [`SpriteDraw::depth`] (higher depths
     /// are farther behind and paint first), so equal-depth sprites keep their
     /// submission order, exactly like the original's pending-sprite queue.
+    /// Each sprite's blend mode and mirror flags are honoured.
     pub fn draw_sprites(&mut self, sprites: &mut [SpriteDraw<'_>]) {
-        // TODO(parity): (visual) the original blends: the pending text shadow
-        // is semi-transparent black with alpha = brightness*255/30, and sprite
-        // descriptors carry a blend level (often 0.5) plus U/V mirror flags.
-        // `SpriteDraw` has no alpha and no mirror, so every queued sprite
-        // overwrites its destination.
         sprites.sort_by_key(|sprite| std::cmp::Reverse(sprite.depth));
         for sprite in sprites.iter() {
             match sprite.source {
@@ -437,27 +548,40 @@ impl Framebuffer {
                     texture,
                     clut_row,
                     tint,
-                } => self.draw_indexed_sprite(
+                } => self.draw_indexed_sprite_full(
                     texture,
                     sprite.src,
                     sprite.dst,
                     clut_row,
-                    sprite.brightness,
+                    brightness_scale(sprite.brightness),
                     tint,
+                    sprite.blend,
+                    sprite.mirror,
                 ),
-                SpriteSource::Rgba(image) => {
-                    self.draw_rgba_sprite(image, sprite.src, sprite.dst, sprite.brightness);
-                }
+                SpriteSource::Rgba(image) => self.draw_rgba_sprite_full(
+                    image,
+                    sprite.src,
+                    sprite.dst,
+                    brightness_scale(sprite.brightness),
+                    sprite.blend,
+                    sprite.mirror,
+                ),
             }
         }
     }
 
     /// Visit the framebuffer-visible pixels of a sprite: clip `dst` and map
     /// each destination pixel back to `src` with nearest sampling.
+    ///
+    /// `mirror` flips the sampled source rectangle around its own origin, and
+    /// `blend` mixes the sampled pixel with the framebuffer before it is
+    /// written.
     fn draw_sprite(
         &mut self,
         src: [i32; 4],
         dst: [i32; 4],
+        mirror: [bool; 2],
+        blend: SpriteBlend,
         mut sample: impl FnMut(i32, i32) -> Option<[u8; 4]>,
     ) {
         let [src_x, src_y, src_w, src_h] = src;
@@ -474,26 +598,49 @@ impl Framebuffer {
         }
         let width = self.width as usize;
         for y in start_y..end_y {
-            let Ok(tex_y) = i32::try_from(
-                i64::from(src_y)
-                    + (i64::from(y) - i64::from(dst_y)) * i64::from(src_h) / i64::from(dst_h),
+            let Ok(offset_y) = i32::try_from(
+                (i64::from(y) - i64::from(dst_y)) * i64::from(src_h) / i64::from(dst_h),
             ) else {
                 continue;
             };
+            let tex_y = if mirror[1] {
+                src_y + src_h - 1 - offset_y
+            } else {
+                src_y + offset_y
+            };
             for x in start_x..end_x {
-                let Ok(tex_x) = i32::try_from(
-                    i64::from(src_x)
-                        + (i64::from(x) - i64::from(dst_x)) * i64::from(src_w) / i64::from(dst_w),
+                let Ok(offset_x) = i32::try_from(
+                    (i64::from(x) - i64::from(dst_x)) * i64::from(src_w) / i64::from(dst_w),
                 ) else {
                     continue;
                 };
-                let Some(pixel) = sample(tex_x, tex_y) else {
+                let tex_x = if mirror[0] {
+                    src_x + src_w - 1 - offset_x
+                } else {
+                    src_x + offset_x
+                };
+                let Some(mut pixel) = sample(tex_x, tex_y) else {
                     continue;
                 };
                 let offset = (y as usize * width + x as usize) * 4;
-                if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
-                    slot.copy_from_slice(&pixel);
+                let Some(slot) = self.rgba.get_mut(offset..offset + 4) else {
+                    continue;
+                };
+                match blend {
+                    SpriteBlend::Opaque => {}
+                    SpriteBlend::Half => {
+                        for (channel, &destination) in pixel[..3].iter_mut().zip(slot.iter()) {
+                            *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
+                        }
+                    }
+                    SpriteBlend::BlackAlpha(alpha) => {
+                        let keep = u32::from(255 - alpha);
+                        for (channel, &destination) in pixel[..3].iter_mut().zip(slot.iter()) {
+                            *channel = (u32::from(destination) * keep / 255) as u8;
+                        }
+                    }
                 }
+                slot.copy_from_slice(&pixel);
             }
         }
     }
@@ -512,12 +659,14 @@ impl Framebuffer {
         lighting: &Lighting,
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
+        let light = lighting.latched(root_position(joints));
         for (object, joint) in mesh.objects.iter().zip(joints) {
             collect_triangles(
                 object,
                 joint,
                 camera,
                 Some(lighting),
+                Some(light),
                 true,
                 0,
                 [255; 3],
@@ -527,11 +676,12 @@ impl Framebuffer {
         self.rasterize_triangles(texture, triangles);
     }
 
-    /// Draw a TMD mesh full-bright, without lighting or backface culling.
+    /// Draw a TMD mesh full-bright, with backface culling.
     ///
     /// This is the door animation's path: panels are drawn over black with the
     /// door texture's single 256-colour CLUT row and direct (unpaged) UVs.
-    /// Triangles are painter-sorted back-to-front exactly like
+    /// Every packet backface-culls like the original's TMD pass; triangles are
+    /// painter-sorted back-to-front exactly like
     /// [`Framebuffer::draw_model`].
     pub fn draw_model_unlit(
         &mut self,
@@ -540,9 +690,6 @@ impl Framebuffer {
         joints: &[anim::Mat4x3],
         camera: &Camera,
     ) {
-        // TODO(parity): (visual) `cull` is false here and in the `.ivm` path,
-        // but the original backface-culls every TMD packet, doors and item
-        // meshes included; a panel that faces away still paints here.
         self.draw_objects_unlit(mesh.objects.iter().zip(joints), texture, camera);
     }
 
@@ -564,7 +711,8 @@ impl Framebuffer {
                 joint,
                 camera,
                 None,
-                false,
+                None,
+                true,
                 0,
                 [255; 3],
                 &mut triangles,
@@ -576,11 +724,12 @@ impl Framebuffer {
     /// Draw an item-view (`.ivm`) model full-bright: the item viewer's path.
     ///
     /// The item mesh keeps its own texture page (one 256-colour CLUT row, so
-    /// every polygon samples row 0 with direct UVs) and is drawn with backface
-    /// culling disabled, like the door path. Quads split into two fan
-    /// triangles; untextured gouraud polygons paint their packet colour as a
-    /// solid triangle. One matrix per object, in object order, supplies the
-    /// viewer's turntable rotation and distance.
+    /// every polygon samples row 0 with direct UVs) and every packet
+    /// backface-culls like the door and room TMD paths. Quads split into two
+    /// fan triangles but drop whole when any corner is inside the near plane;
+    /// untextured gouraud polygons interpolate their three corner colours.
+    /// One matrix per object, in object order, supplies the viewer's turntable
+    /// rotation and distance.
     pub fn draw_ivm_unlit(
         &mut self,
         ivm: &crate::ivm::Ivm,
@@ -651,9 +800,10 @@ impl Framebuffer {
                     (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
                         / inv_z;
                 // An untextured gouraud polygon keeps its packet colour; every
-                // other polygon samples the texture page through its row.
-                let color = match triangle.flat {
-                    Some(flat) => [flat[0], flat[1], flat[2], 255],
+                // other polygon samples the texture page through its row. The
+                // sampled palette index also selects per-texel STP blending.
+                let (color, palette_index) = match triangle.flat {
+                    Some(flat) => ([flat[0], flat[1], flat[2], 255], None),
                     None => {
                         let Some(texel_u) = wrap_texel(u, texture.width) else {
                             continue;
@@ -665,7 +815,10 @@ impl Framebuffer {
                         let Some(&palette_index) = texture.indices.get(index) else {
                             continue;
                         };
-                        texture.palette(triangle.palette_row, palette_index)
+                        (
+                            texture.palette(triangle.palette_row, palette_index),
+                            Some(palette_index),
+                        )
                     }
                 };
 
@@ -681,11 +834,18 @@ impl Framebuffer {
                     255,
                 ];
                 let offset = (y as usize * width + x as usize) * 4;
-                // A packet carrying the ABE command bit uses the effect path's
-                // flat half blend (the documented fallback for per-texel STP).
-                if triangle.blend
-                    && let Some(dst) = self.rgba.get(offset..offset + 4)
-                {
+                // A packet carrying the ABE bit blends. When the palette holds
+                // STP entries the bit is the true selector and only flagged
+                // texels blend; a palette without STP entries falls back to the
+                // flat half blend the effect path uses (documented fallback).
+                let blend = triangle.blend
+                    && match palette_index {
+                        Some(index) if texture.row_has_stp(triangle.palette_row) => {
+                            texture.palette_stp(triangle.palette_row, index)
+                        }
+                        _ => true,
+                    };
+                if blend && let Some(dst) = self.rgba.get(offset..offset + 4) {
                     for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
                         *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
                     }
@@ -704,16 +864,13 @@ impl Framebuffer {
         &mut self,
         textures: &[&Texture8],
         page: Option<&Image>,
-        shadow_texture: Option<&Image>,
         effect_pages: &[Option<&Image>],
-        items: &[SceneItem],
+        items: &[SceneItem<'_>],
     ) {
         for item in items {
             match item {
                 SceneItem::Shadow(poly) => {
-                    if let Some(shadow_texture) = shadow_texture {
-                        self.rasterize_shadow(shadow_texture, poly);
-                    }
+                    self.rasterize_shadow(poly.texture, poly);
                 }
                 SceneItem::Triangle(triangle) => {
                     if let Some(texture) = textures.get(triangle.texture) {
@@ -1108,7 +1265,7 @@ impl<'a> MaskLayer<'a> {
 
 /// Draw one gameplay frame: the background, then the depth-sorted scene list.
 ///
-/// The ground shadow is submitted first, then the meshes' triangles collected
+/// The ground shadows are submitted first, then the meshes' triangles collected
 /// in slice order and pre-sorted far-to-near with a stable sort, then the
 /// masks in [`mask::mask_submission_order`] (the order the original paints
 /// equal-key sprites in). [`mask::order_far_to_near`] is the stable sort, so
@@ -1123,7 +1280,7 @@ pub fn draw_gameplay_scene(
     framebuffer: &mut Framebuffer,
     background: Option<&Image>,
     meshes: &[EntityMesh<'_>],
-    shadow: Option<&Shadow<'_>>,
+    shadows: &[Shadow<'_>],
     camera: &Camera,
     lighting: &Lighting,
     mask_layer: Option<&MaskLayer<'_>>,
@@ -1131,8 +1288,10 @@ pub fn draw_gameplay_scene(
     draw_gameplay_scene_with_effects(
         framebuffer,
         background,
+        [0, 0],
+        [255; 3],
         meshes,
-        shadow,
+        shadows,
         camera,
         lighting,
         mask_layer,
@@ -1144,22 +1303,27 @@ pub fn draw_gameplay_scene(
 
 /// [`draw_gameplay_scene`] with the room's effect billboards interleaved.
 ///
-/// The effect quads are submitted after the masks (the original's `update_2d_effects`
-/// runs after the entity pass), so at an exact key tie an effect paints over a
-/// mask or triangle submitted earlier in the frame. `mirror_from` is the first
-/// mesh index eligible for the mirror pass: the room object and item meshes
-/// come first and are never reflected.
+/// `origin` is the display origin the background samples through (screen
+/// panning and shake; the sampled window shifts the opposite way, so a
+/// positive X moves the image right) and `colour` its global colour
+/// multiplier. The effect quads are submitted after the masks (the original's
+/// `update_2d_effects` runs after the entity pass), so at an exact key tie an
+/// effect paints over a mask or triangle submitted earlier in the frame.
+/// `mirror_from` is the first mesh index eligible for the mirror pass: the
+/// room object and item meshes come first and are never reflected.
 ///
 /// `mirror` appends the entity meshes' mirrored triangles, drawn through the
 /// reflected camera and visibility-tested joint by joint, after the primary
 /// pass (the original's second submission). Hidden joints never draw and never
 /// reach the mirror copy.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_gameplay_scene_with_effects(
+pub fn draw_gameplay_scene_with_effects<'a>(
     framebuffer: &mut Framebuffer,
     background: Option<&Image>,
+    origin: [i32; 2],
+    colour: [u8; 3],
     meshes: &[EntityMesh<'_>],
-    shadow: Option<&Shadow<'_>>,
+    shadows: &[Shadow<'a>],
     camera: &Camera,
     lighting: &Lighting,
     mask_layer: Option<&MaskLayer<'_>>,
@@ -1169,24 +1333,21 @@ pub fn draw_gameplay_scene_with_effects(
 ) {
     framebuffer.clear();
     if let Some(background) = background {
-        // TODO(parity): (visual) the original draws the cut as the display
-        // image through the pending-sprite queue, shifted by the display origin
-        // (screen panning) and multiplied by the global colour; this blit is
-        // 1:1 and untinted.
-        framebuffer.blit(background);
+        framebuffer.draw_background(background, origin, colour);
     }
 
     let mut items = Vec::new();
 
-    // The shadow is submitted before the models, so a mask or triangle whose
-    // rounded key ties it wins the tie the way the original's later
+    // The shadows are submitted before the models, so a mask or triangle whose
+    // rounded key ties one wins the tie the way the original's later
     // submission into the shared ordering table does.
-    if let Some(shadow) = shadow {
+    for shadow in shadows {
         collect_shadow(shadow, camera, &mut items);
     }
 
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
+        let light = lighting.latched(root_position(mesh.joints));
         for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
             if !mesh.joint_visible(index) {
                 continue;
@@ -1196,6 +1357,7 @@ pub fn draw_gameplay_scene_with_effects(
                 joint,
                 camera,
                 Some(lighting),
+                Some(light),
                 true,
                 texture,
                 mesh.tint,
@@ -1209,6 +1371,7 @@ pub fn draw_gameplay_scene_with_effects(
     // pass re-runs the character joints, never the room's own objects.
     if let Some(mirror) = mirror {
         for (texture, mesh) in meshes.iter().enumerate().skip(mirror_from) {
+            let light = lighting.latched(root_position(mesh.joints));
             for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
                 if !mesh.joint_visible(index) || !mirror.joint_visible(joint.t) {
                     continue;
@@ -1222,6 +1385,7 @@ pub fn draw_gameplay_scene_with_effects(
                     joint,
                     &mirror.camera,
                     Some(lighting),
+                    Some(light),
                     false,
                     texture,
                     mesh.tint,
@@ -1252,10 +1416,15 @@ pub fn draw_gameplay_scene_with_effects(
     framebuffer.draw_scene(
         &textures,
         mask_layer.map(|layer| layer.page),
-        shadow.map(|shadow| shadow.texture),
         &effect_pages,
         &items,
     );
+}
+
+/// The world position a mesh's light is latched from: its root joint's
+/// translation, which the entity matrix sets to the entity's own position.
+fn root_position(joints: &[anim::Mat4x3]) -> [i32; 3] {
+    joints.first().map_or([0; 3], |joint| joint.t)
 }
 
 /// Append a layer's active mask sprites to `items`, farthest submission
@@ -1264,7 +1433,7 @@ pub fn draw_gameplay_scene_with_effects(
 /// [`mask::mask_sprite_key`] folds together the shared per-(room, camera) bias
 /// record, the room's per-entry overrides and the zero-depth rule (a computed
 /// brightness depth of exactly zero sorts at the fixed key 550).
-fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem>) {
+fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem<'_>>) {
     for index in mask::mask_submission_order(layer.room, layer.camera, layer.cut.masks.len()) {
         let Some(sprite) = layer.cut.masks.get(index) else {
             continue;
@@ -1288,10 +1457,10 @@ fn collect_masks(layer: &MaskLayer<'_>, items: &mut Vec<SceneItem>) {
 ///
 /// The four corners are yawed into world space exactly like the model's root
 /// joint, clipped against the camera's near plane and projected. The painter's
-/// key is the mean view-space Z of the four *unclipped* corners, the same
-/// quantity and units a triangle's [`Triangle::depth`] uses. `None` when the
-/// whole quad is behind the camera or the texture is empty.
-fn collect_shadow(shadow: &Shadow<'_>, camera: &Camera, items: &mut Vec<SceneItem>) {
+/// key is the truncating integer mean of the four *unclipped* corner view Zs,
+/// the same quantity and units a triangle's [`Triangle::depth`] uses, so it
+/// goes through [`triangle_depth_key`] like every other scene key.
+fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<SceneItem<'a>>) {
     if shadow.texture.width == 0 || shadow.texture.height == 0 {
         return;
     }
@@ -1306,12 +1475,7 @@ fn collect_shadow(shadow: &Shadow<'_>, camera: &Camera, items: &mut Vec<SceneIte
     ];
     let view: [[i32; 3]; 4] = local.map(|corner| camera.view_position(fixed_mul(&entity, corner)));
 
-    // TODO(parity): (visual) the original's drawn key is the integer mean
-    // (truncating `/ 4`) of the four unclipped corner view Zs, quantised to an
-    // ordering-table bucket; this f64 mean rounds to the nearest unit, which
-    // can flip a shadow's order against a mask or triangle it ties with.
-    let mean_depth =
-        view.iter().map(|vertex| f64::from(vertex[2])).sum::<f64>() / view.len() as f64;
+    let mean_depth = view.iter().map(|vertex| i64::from(vertex[2])).sum::<i64>() / 4;
 
     // The texture's v axis runs towards the entity's local -Z and u along +X,
     // matching the viewport quad's UV orientation.
@@ -1354,8 +1518,9 @@ fn collect_shadow(shadow: &Shadow<'_>, camera: &Camera, items: &mut Vec<SceneIte
     }
 
     items.push(SceneItem::Shadow(ShadowPoly {
-        key: triangle_depth_key(mean_depth),
+        key: triangle_depth_key(mean_depth as f64),
         corners: polygon,
+        texture: shadow.texture,
         tint: shadow.tint,
     }));
 }
@@ -1608,6 +1773,72 @@ impl Lighting {
             lights: room.lights,
         }
     }
+
+    /// Latch the room's lights for one entity at `entity_pos`.
+    ///
+    /// The original samples the lights once per entity, so every polygon of a
+    /// model shares one shade. A point light's falloff is measured on X and Z
+    /// only, `radius - sqrt(dx^2 + dz^2)` clamped at zero, and its colour is
+    /// attenuated with a truncating integer division. The accumulated light
+    /// colour is capped at `0x80` per channel; the 12-bit ambient truncates to
+    /// eight bits with `>> 4`. A directional light contributes its colour
+    /// unchanged. The result is added to the ambient and saturates at 255.
+    pub fn latched(&self, entity_pos: [i32; 3]) -> EntityLight {
+        let ambient = self
+            .ambient
+            .map(|channel| (i32::from(channel).clamp(0, 0x1000) >> 4).min(0xFF) as u32);
+        let mut accumulated = [0u32; 3];
+        for light in &self.lights {
+            let contribution = if light.kind == 0 {
+                let radius = i32::from(light.radius);
+                if radius <= 0 {
+                    [0; 3]
+                } else {
+                    let dx = i64::from(entity_pos[0]) - i64::from(light.pos[0]);
+                    let dz = i64::from(entity_pos[2]) - i64::from(light.pos[2]);
+                    let distance = integer_sqrt(dx * dx + dz * dz);
+                    let attenuation = (i64::from(radius) - distance).max(0) as u64;
+                    light
+                        .color
+                        .map(|channel| ((u64::from(channel) * attenuation) / radius as u64) as u8)
+                }
+            } else {
+                light.color
+            };
+            for (slot, &channel) in accumulated.iter_mut().zip(&contribution) {
+                *slot += u32::from(channel);
+            }
+        }
+        EntityLight {
+            color: std::array::from_fn(|channel| {
+                (ambient[channel] + accumulated[channel].min(0x80)).min(0xFF) as u8
+            }),
+        }
+    }
+}
+
+/// One entity's latched room-light colour, in the rasterizer's 0..=255 scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityLight {
+    pub color: [u8; 3],
+}
+
+/// The ABE (semi-transparency) bit of a primitive's CLUT word.
+const ABE_BIT: u16 = 0x8000;
+
+/// Integer square root with truncation, as the original's `SquareRoot0` does.
+fn integer_sqrt(value: i64) -> i64 {
+    if value <= 0 {
+        return 0;
+    }
+    let mut root = (value as f64).sqrt() as i64;
+    while root * root > value {
+        root -= 1;
+    }
+    while (root + 1) * (root + 1) <= value {
+        root += 1;
+    }
+    root
 }
 
 /// One projected vertex ready for rasterization.
@@ -1650,11 +1881,13 @@ struct ShadowVertex {
 
 /// A ground shadow's clipped convex polygon, ready for rasterization.
 #[derive(Debug, Clone)]
-struct ShadowPoly {
+struct ShadowPoly<'a> {
     /// Painter's key from [`triangle_depth_key`].
     key: u32,
     /// Convex ring of three to five vertices in edge order.
     corners: Vec<ShadowVertex>,
+    /// The baked coverage page this polygon samples.
+    texture: &'a Image,
     /// The colour the quad blends towards.
     tint: [u8; 3],
 }
@@ -1711,14 +1944,14 @@ pub struct EffectLayer<'a> {
 }
 
 /// One item of a frame's painter's list.
-enum SceneItem {
-    Shadow(ShadowPoly),
+enum SceneItem<'a> {
+    Shadow(ShadowPoly<'a>),
     Mask(MaskQuad),
     Triangle(Triangle),
     Effect(EffectQuad),
 }
 
-impl SceneItem {
+impl SceneItem<'_> {
     /// The item's far-to-near key; larger keys are farther away.
     fn key(&self) -> u32 {
         match self {
@@ -1750,16 +1983,21 @@ fn triangle_depth_key(depth: f64) -> u32 {
 ///
 /// `lighting` selects the gameplay path (room lights, the primitive's own
 /// palette row and paged UVs); `None` is the full-bright door path (white
-/// shade, palette row 0, direct UVs). `cull` drops back-facing triangles; the
-/// door path disables it because the original renders with culling off.
+/// shade, palette row 0, direct UVs). `light` is the entity's latched colour,
+/// re-used for every polygon of the object. `cull` drops back-facing packets.
 /// `texture` is the page index every emitted triangle samples. `tint` is the
 /// per-channel RGB multiplier applied when the triangle is shaded.
+///
+/// The original decides the near-plane and backface tests once per *packet*,
+/// so a quad never loses only one of its halves; the parser carries the quad's
+/// four vertex indices in [`TmdPrim::quad`] so this can test all of them.
 #[allow(clippy::too_many_arguments)]
 fn collect_triangles(
     object: &TmdObject,
     joint: &anim::Mat4x3,
     camera: &Camera,
     lighting: Option<&Lighting>,
+    light: Option<EntityLight>,
     cull: bool,
     texture: usize,
     tint: [u8; 3],
@@ -1773,11 +2011,6 @@ fn collect_triangles(
     // The raw-Y form's vertices skip the standard input Y negation; the pool
     // is built lazily so the common path pays nothing.
     let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
-    let normals: Vec<Option<[f64; 3]>> = object
-        .normals
-        .iter()
-        .map(|normal| normalize(rotate(joint, *normal)))
-        .collect();
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
@@ -1791,6 +2024,17 @@ fn collect_triangles(
         } else {
             &vertices
         };
+        // The whole packet is dropped when any corner is inside the near plane;
+        // a plain triangle gets the same test through its three projections
+        // below, while a quad must check its fourth corner too.
+        if let Some(quad) = prim.quad
+            && quad.iter().any(|&index| {
+                pool.get(usize::from(index))
+                    .is_none_or(|vertex| camera.project(*vertex).is_none())
+            })
+        {
+            continue;
+        }
         let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
             pool.get(usize::from(prim.vertices[0])),
             pool.get(usize::from(prim.vertices[1])),
@@ -1798,26 +2042,6 @@ fn collect_triangles(
         ) else {
             continue;
         };
-        let normal0 = normals.get(usize::from(prim.normals[0])).copied().flatten();
-        let normal1 = normals.get(usize::from(prim.normals[1])).copied().flatten();
-        let normal2 = normals.get(usize::from(prim.normals[2])).copied().flatten();
-        // A corner whose stored normal is zero length borrows the primitive's
-        // first real normal (flat shading) instead of dropping the packet; the
-        // original substitutes and still draws it. A packet with no normal at
-        // all is dropped.
-        let mut corners_normals = [normal0, normal1, normal2];
-        if lighting.is_some() {
-            let substitute = corners_normals.iter().flatten().next().copied();
-            let Some(substitute) = substitute else {
-                continue;
-            };
-            for normal in &mut corners_normals {
-                if normal.is_none() {
-                    *normal = Some(substitute);
-                }
-            }
-        }
-        let [normal0, normal1, normal2] = corners_normals;
         let (Some(screen0), Some(screen1), Some(screen2)) = (
             camera.project(*vertex0),
             camera.project(*vertex1),
@@ -1839,12 +2063,10 @@ fn collect_triangles(
         let depth1 = f64::from(camera.view_position(*vertex1)[2]);
         let depth2 = f64::from(camera.view_position(*vertex2)[2]);
 
-        // TODO(parity): (visual) `clut`/`tsb` are read only for the texture page
-        // and palette row: the original also blends a primitive whose CLUT
-        // carries the ABE bit (background/source halves, or a per-texel STP
-        // knockout for palettes with STP entries) and marks some transparent
-        // TMDs unlit. This port writes every triangle opaque, and the TIM
-        // decoder drops the STP bit.
+        // The packet's CLUT word carries the ABE bit; a packet with it blends
+        // and is drawn full-bright, so the room lights do not apply. The TIM
+        // decoder keeps each palette entry's STP flag for the per-texel blend.
+        let blend = prim.blend || prim.clut & ABE_BIT != 0;
         let (page_x, page_y, palette_row) = match lighting {
             Some(_) => (
                 f64::from(u32::from(prim.tsb & 0xF) * 128),
@@ -1857,29 +2079,33 @@ fn collect_triangles(
             None => (0.0, 0.0, 0),
         };
 
+        let shade = match (lighting, light) {
+            // The gameplay path shades every polygon of the object with its
+            // entity's latched colour and the mesh tint.
+            (Some(_), Some(light)) if !blend => [
+                f64::from(light.color[0]) * f64::from(tint[0]) / CHANNEL_MAX,
+                f64::from(light.color[1]) * f64::from(tint[1]) / CHANNEL_MAX,
+                f64::from(light.color[2]) * f64::from(tint[2]) / CHANNEL_MAX,
+            ],
+            // A blended packet on a lit mesh and every door/item polygon are
+            // full-bright: the mesh tint alone.
+            (Some(_), _) => [f64::from(tint[0]), f64::from(tint[1]), f64::from(tint[2])],
+            (None, _) => [CHANNEL_MAX; 3],
+        };
+
         let corners = [
-            (position0, depth0, &prim.uv[0], normal0, vertex0),
-            (position1, depth1, &prim.uv[1], normal1, vertex1),
-            (position2, depth2, &prim.uv[2], normal2, vertex2),
+            (position0, depth0, &prim.uv[0]),
+            (position1, depth1, &prim.uv[1]),
+            (position2, depth2, &prim.uv[2]),
         ];
         let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
-            let (position, depth, uv, normal, vertex) = corners[corner];
+            let (position, depth, uv) = corners[corner];
             RasterVertex {
                 position,
                 inv_z: 1.0 / depth,
                 u: f64::from(uv[0]) + page_x,
                 v: f64::from(uv[1]) + page_y,
-                shade: match lighting {
-                    Some(lighting) => {
-                        let shade = shade_vertex(&normal, *vertex, lighting);
-                        [
-                            shade[0] * f64::from(tint[0]) / CHANNEL_MAX,
-                            shade[1] * f64::from(tint[1]) / CHANNEL_MAX,
-                            shade[2] * f64::from(tint[2]) / CHANNEL_MAX,
-                        ]
-                    }
-                    None => [CHANNEL_MAX; 3],
-                },
+                shade,
             }
         });
 
@@ -1893,7 +2119,7 @@ fn collect_triangles(
             cull,
             // An untextured packet paints its flat colour.
             flat: prim.flat_color,
-            blend: prim.blend,
+            blend,
         });
     }
 }
@@ -1902,9 +2128,11 @@ fn collect_triangles(
 ///
 /// Item prims carry their own vertex and normal pools like TMD objects but a
 /// richer packet set: textured triangles and quads (quads fan-split into two
-/// triangles), flat textured triangles, and untextured gouraud triangles whose
-/// packet colour is rasterized as a solid. The viewer draws with culling off
-/// and a single palette row, so every corner shades white and samples row 0.
+/// triangles), flat textured triangles, and untextured gouraud triangles which
+/// interpolate their three per-corner packet colours. Every packet
+/// backface-culls and a quad drops whole when any of its four corners is inside
+/// the near plane, exactly like the TMD path. The viewer uses a single palette
+/// row, so a textured prim samples row 0 and shades white.
 fn collect_ivm_triangles(
     object: &crate::ivm::IvmObject,
     joint: &anim::Mat4x3,
@@ -1923,17 +2151,29 @@ fn collect_ivm_triangles(
         } else {
             &[0, 1, 2]
         };
-        // TODO(parity): (visual) an untextured gouraud primitive is painted
-        // with one packet colour; the original interpolates the packet's three
-        // per-vertex colours across the triangle.
+        // A quad loses both of its halves when any corner is inside the near
+        // plane; a triangle's own three projections make the same test below.
+        let mut quad_corners = [0usize; 4];
+        for (slot, corner) in quad_corners.iter_mut().enumerate() {
+            *corner = usize::from(prim.vertices[slot]);
+        }
+        if prim.vertex_count == 4
+            && quad_corners.iter().any(|&index| {
+                vertices
+                    .get(index)
+                    .is_none_or(|vertex| camera.project(*vertex).is_none())
+            })
+        {
+            continue;
+        }
+        // An untextured gouraud polygon rasterizes white so the interpolated
+        // per-corner colours come out exactly; a textured polygon samples its
+        // page and keeps the white shade.
         let flat = match prim.kind {
-            crate::ivm::IvmPrimKind::Gouraud => Some(prim.color),
+            crate::ivm::IvmPrimKind::Gouraud => Some([255, 255, 255]),
             _ => None,
         };
-        // TODO(parity): (visual) the original drops the WHOLE packet when any
-        // one of its 3/4 corners is inside the near plane; splitting a quad
-        // here tests each half separately, so one clipped corner still draws
-        // half the quad.
+        let gouraud = prim.kind == crate::ivm::IvmPrimKind::Gouraud;
         for corners in order.as_chunks::<3>().0 {
             let (i0, i1, i2) = (corners[0], corners[1], corners[2]);
             let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
@@ -1951,23 +2191,36 @@ fn collect_ivm_triangles(
                 continue;
             };
 
+            let position0 = [f64::from(screen0[0]), f64::from(screen0[1])];
+            let position1 = [f64::from(screen1[0]), f64::from(screen1[1])];
+            let position2 = [f64::from(screen2[0]), f64::from(screen2[1])];
+            let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
+                - (position2[0] - position0[0]) * (position1[1] - position0[1]);
+            if !faces_camera(area) {
+                continue;
+            }
+
             let depth0 = f64::from(camera.view_position(*vertex0)[2]);
             let depth1 = f64::from(camera.view_position(*vertex1)[2]);
             let depth2 = f64::from(camera.view_position(*vertex2)[2]);
 
             let corner_data = [
-                (screen0, depth0, i0),
-                (screen1, depth1, i1),
-                (screen2, depth2, i2),
+                (position0, depth0, i0),
+                (position1, depth1, i1),
+                (position2, depth2, i2),
             ];
             let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
-                let (screen, depth, index) = corner_data[corner];
+                let (position, depth, index) = corner_data[corner];
                 RasterVertex {
-                    position: [f64::from(screen[0]), f64::from(screen[1])],
+                    position,
                     inv_z: 1.0 / depth,
                     u: f64::from(prim.uv[index][0]),
                     v: f64::from(prim.uv[index][1]),
-                    shade: [CHANNEL_MAX; 3],
+                    shade: if gouraud {
+                        prim.colors[index.min(2)].map(f64::from)
+                    } else {
+                        [CHANNEL_MAX; 3]
+                    },
                 }
             });
 
@@ -1978,35 +2231,12 @@ fn collect_ivm_triangles(
                 key: triangle_depth_key(depth),
                 texture: 0,
                 palette_row: 0,
-                cull: false,
+                cull: true,
                 flat,
-                blend: false,
+                blend: prim.blend,
             });
         }
     }
-}
-
-/// Rotate `vector` by `rotation` and negate the resulting Y.
-///
-/// This is the Y-sign conjugation `D * R * D` (with `D = diag(1, -1, 1)`) the
-/// PS1 matrix pipeline builds into every product: the game's joint matrices
-/// rotate Y-negated vectors and negate Y again on the way out, which flips the
-/// apparent sign of pitch and roll. Applying the matrices without it mirrors
-/// every limb that pitches or rolls.
-fn conjugate_rotate(rotation: &[[i32; 3]; 3], vector: [i32; 3]) -> [i32; 3] {
-    let v = [
-        i128::from(vector[0]),
-        -i128::from(vector[1]),
-        i128::from(vector[2]),
-    ];
-    std::array::from_fn(|row| {
-        let r = rotation[row];
-        let mut sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
-        if row == 1 {
-            sum = -sum;
-        }
-        clamp_i32(sum)
-    })
 }
 
 /// Transform a vertex by a joint's 4.12 rotation and translation.
@@ -2049,18 +2279,6 @@ fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
-/// Rotate a normal by a joint's 4.12 rotation, ignoring the translation.
-fn rotate(joint: &anim::Mat4x3, normal: [i16; 3]) -> [i32; 3] {
-    conjugate_rotate(
-        &joint.r,
-        [
-            i32::from(normal[0]),
-            i32::from(normal[1]),
-            i32::from(normal[2]),
-        ],
-    )
-}
-
 /// Round a real quantity to the 4.12 fixed-point representation.
 fn fixed(value: f64) -> i32 {
     (value * FIXED_ONE).round() as i32
@@ -2093,92 +2311,6 @@ fn top_left(from: [f64; 2], to: [f64; 2], positive: bool) -> bool {
     } else {
         dy > 0.0 || (dy == 0.0 && dx < 0.0)
     }
-}
-
-/// Normalize a fixed-point vector; zero-length vectors have no direction.
-fn normalize(vector: [i32; 3]) -> Option<[f64; 3]> {
-    let real = [
-        f64::from(vector[0]),
-        f64::from(vector[1]),
-        f64::from(vector[2]),
-    ];
-    let length = (real[0] * real[0] + real[1] * real[1] + real[2] * real[2]).sqrt();
-    if length <= f64::MIN_POSITIVE {
-        return None;
-    }
-    Some([real[0] / length, real[1] / length, real[2] / length])
-}
-
-/// Shade one vertex: ambient plus the room lights, clamped to 0..255.
-fn shade_vertex(normal: &Option<[f64; 3]>, world: [i32; 3], lighting: &Lighting) -> [f64; 3] {
-    // TODO(parity): (visual) the original latches the room lights once per
-    // entity from that entity's own position, measures point-light falloff from
-    // X and Z only, truncates the attenuated colour to a byte capped at 0x80
-    // per channel, and truncates the 12-bit ambient to 8 bits. This shader
-    // evaluates the lights in world space per vertex with the full 3D distance
-    // and unclamped float colour, so an entity's shade drifts from the original.
-    let mut shade = lighting
-        .ambient
-        .map(|channel| f64::from(channel) / AMBIENT_DIVISOR);
-    let Some(normal) = normal else {
-        return shade.map(|value| value.clamp(0.0, CHANNEL_MAX));
-    };
-
-    for light in &lighting.lights {
-        let (direction, attenuation) = if light.kind == 0 {
-            let offset = [
-                f64::from(light.pos[0]) - f64::from(world[0]),
-                f64::from(light.pos[1]) - f64::from(world[1]),
-                f64::from(light.pos[2]) - f64::from(world[2]),
-            ];
-            let distance =
-                (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt();
-            let attenuation = if light.radius > 0 {
-                (1.0 - distance / f64::from(light.radius)).max(0.0)
-            } else {
-                0.0
-            };
-            (offset, attenuation)
-        } else {
-            (
-                [
-                    f64::from(light.pos[0]),
-                    f64::from(light.pos[1]),
-                    f64::from(light.pos[2]),
-                ],
-                1.0,
-            )
-        };
-        if attenuation <= 0.0 {
-            continue;
-        }
-
-        let length = (direction[0] * direction[0]
-            + direction[1] * direction[1]
-            + direction[2] * direction[2])
-            .sqrt();
-        if length <= f64::MIN_POSITIVE {
-            continue;
-        }
-        let direction = [
-            direction[0] / length,
-            direction[1] / length,
-            direction[2] / length,
-        ];
-        let diffuse =
-            (normal[0] * direction[0] + normal[1] * direction[1] + normal[2] * direction[2])
-                .max(0.0);
-        if diffuse <= 0.0 {
-            continue;
-        }
-
-        let contribution = diffuse * attenuation;
-        for (channel_shade, color) in shade.iter_mut().zip(light.color) {
-            *channel_shade += contribution * f64::from(color);
-        }
-    }
-
-    shade.map(|value| value.clamp(0.0, CHANNEL_MAX))
 }
 
 /// Wrap a texture coordinate around one dimension.
@@ -2222,6 +2354,7 @@ mod tests {
             height: 1,
             indices: vec![0],
             palettes: vec![pixel],
+            stp: Vec::new(),
         }
     }
 
@@ -2245,6 +2378,7 @@ mod tests {
                     blend: false,
                     raw_y: false,
                     flat_color: None,
+                    quad: None,
                 }],
             }],
         }
@@ -2543,7 +2677,7 @@ mod tests {
         }
     }
 
-    fn scene_triangle(key: u32) -> SceneItem {
+    fn scene_triangle(key: u32) -> SceneItem<'static> {
         SceneItem::Triangle(Triangle {
             raster: std::array::from_fn(|_| RasterVertex {
                 position: [0.0; 2],
@@ -2616,7 +2750,7 @@ mod tests {
             &mut tied,
             None,
             &meshes,
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             None,
@@ -2644,7 +2778,7 @@ mod tests {
             &mut masked,
             None,
             &meshes,
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             Some(&layer),
@@ -2691,7 +2825,7 @@ mod tests {
             &mut object_item,
             None,
             &meshes,
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             None,
@@ -2709,7 +2843,7 @@ mod tests {
             &mut all,
             None,
             &meshes,
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             None,
@@ -2842,7 +2976,7 @@ mod tests {
             &mut framebuffer,
             Some(&background),
             &entities,
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             Some(&layer),
@@ -2926,7 +3060,7 @@ mod tests {
             &mut framebuffer,
             None,
             &[],
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             Some(&layer),
@@ -2970,7 +3104,7 @@ mod tests {
             &mut framebuffer,
             Some(&background),
             &[],
-            None,
+            &[],
             &straight_camera(),
             &lighting,
             Some(&layer),
@@ -2992,6 +3126,7 @@ mod tests {
             height: 2,
             indices,
             palettes,
+            stp: Vec::new(),
         }
     }
 
@@ -3248,10 +3383,9 @@ mod tests {
         assert!(items.is_empty());
     }
 
-    /// A shadow item covering screen (10,10)..(20,20) with a 1x1 page.
-    fn shadow_quad(alpha: u8) -> (Image, ShadowPoly) {
-        let texture = solid_image(1, 1, [255, 255, 255, alpha]);
-        let poly = ShadowPoly {
+    /// A shadow polygon covering screen (10,10)..(20,20), sampling `texture`.
+    fn shadow_poly(texture: &Image) -> ShadowPoly<'_> {
+        ShadowPoly {
             key: 1000,
             corners: vec![
                 ShadowVertex {
@@ -3279,14 +3413,15 @@ mod tests {
                     v: 1.0,
                 },
             ],
+            texture,
             tint: [0, 0, 1],
-        };
-        (texture, poly)
+        }
     }
 
     #[test]
     fn shadow_darkens_towards_the_tint_by_the_texel_alpha() {
-        let (texture, poly) = shadow_quad(128);
+        let texture = solid_image(1, 1, [255, 255, 255, 128]);
+        let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
         framebuffer.rasterize_shadow(&texture, &poly);
@@ -3298,7 +3433,8 @@ mod tests {
         assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [200, 200, 200, 255]);
 
         // A zero-alpha texel is a hole and leaves the destination untouched.
-        let (texture, poly) = shadow_quad(0);
+        let texture = solid_image(1, 1, [255, 255, 255, 0]);
+        let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
         framebuffer.rasterize_shadow(&texture, &poly);
@@ -3313,8 +3449,9 @@ mod tests {
         // The fan's shared diagonal passes through (15, 15); a camera on the
         // other side of the quad reverses the ring and must not double-blend
         // the seam either.
+        let texture = solid_image(1, 1, [255, 255, 255, 128]);
         for reversed in [false, true] {
-            let (texture, mut poly) = shadow_quad(128);
+            let mut poly = shadow_poly(&texture);
             if reversed {
                 poly.corners.reverse();
             }
@@ -3336,7 +3473,7 @@ mod tests {
         // of the quad samples its own texel.
         let mut texture = solid_image(2, 1, [255, 255, 255, 128]);
         texture.rgba[3] = 0;
-        let (_, poly) = shadow_quad(128);
+        let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
         framebuffer.rasterize_shadow(&texture, &poly);
@@ -3394,7 +3531,7 @@ mod tests {
             &mut with,
             Some(&background),
             &[],
-            Some(&shadow),
+            &[shadow],
             &camera,
             &lighting,
             None,
@@ -3404,7 +3541,7 @@ mod tests {
             &mut without,
             Some(&background),
             &[],
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3469,8 +3606,10 @@ mod tests {
         draw_gameplay_scene_with_effects(
             framebuffer,
             Some(background),
+            [0, 0],
+            [255; 3],
             &[],
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3543,7 +3682,7 @@ mod tests {
 
         let mut framebuffer = Framebuffer::new();
         let effect_pages = [Some(&effect_page)];
-        framebuffer.draw_scene(&[], Some(&mask_page), None, &effect_pages, &items);
+        framebuffer.draw_scene(&[], Some(&mask_page), &effect_pages, &items);
         assert_eq!(framebuffer_pixel(&framebuffer, 10, 10), [255, 0, 0, 255]);
 
         // The same effect against a real entity triangle at the same key.
@@ -3572,8 +3711,10 @@ mod tests {
         draw_gameplay_scene_with_effects(
             &mut framebuffer,
             None,
+            [0, 0],
+            [255; 3],
             &meshes,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3665,7 +3806,7 @@ mod tests {
             &mut framebuffer,
             None,
             &hidden,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3693,7 +3834,7 @@ mod tests {
             &mut framebuffer,
             None,
             &visible,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3751,8 +3892,10 @@ mod tests {
             draw_gameplay_scene_with_effects(
                 &mut framebuffer,
                 None,
+                [0, 0],
+                [255; 3],
                 &meshes,
-                None,
+                &[],
                 &camera,
                 &lighting,
                 None,
@@ -3792,7 +3935,7 @@ mod tests {
             &mut framebuffer,
             None,
             &tinted,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -3800,5 +3943,590 @@ mod tests {
         // (200, 40) lies inside mesh_at's screen triangle.
         let pixel = framebuffer_pixel(&framebuffer, 200, 40);
         assert!(pixel[0] > 100 && pixel[0] < 160, "{pixel:?}");
+    }
+
+    #[test]
+    fn the_abe_clut_bit_blends_and_forces_the_packet_unlit() {
+        // A packet whose CLUT word carries bit 15 is semi-transparent and is
+        // drawn full-bright: a zero ambient cannot darken it.
+        let mut abe = mesh_at(1000, false);
+        abe.objects[0].prims[0].clut = 0x8000;
+        let plain = mesh_at(1000, false);
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+        let mut triangles = Vec::new();
+        collect_triangles(
+            &abe.objects[0],
+            &identity(),
+            &straight_camera(),
+            Some(&lighting),
+            Some(EntityLight { color: [0; 3] }),
+            true,
+            0,
+            [255; 3],
+            &mut triangles,
+        );
+        assert_eq!(triangles.len(), 1);
+        assert!(triangles[0].blend, "the ABE bit must set the blend flag");
+        assert_eq!(
+            triangles[0].raster[0].shade, [CHANNEL_MAX; 3],
+            "a blended packet is full-bright"
+        );
+
+        // The same mesh without the bit is shaded black by the zero ambient.
+        let mut triangles = Vec::new();
+        collect_triangles(
+            &plain.objects[0],
+            &identity(),
+            &straight_camera(),
+            Some(&lighting),
+            Some(EntityLight { color: [0; 3] }),
+            true,
+            0,
+            [255; 3],
+            &mut triangles,
+        );
+        assert!(!triangles[0].blend);
+        assert_eq!(triangles[0].raster[0].shade, [0.0; 3]);
+    }
+
+    #[test]
+    fn the_abe_path_blends_half_over_the_destination() {
+        let mut mesh = mesh_at(1000, false);
+        mesh.objects[0].prims[0].clut = 0x8000;
+        let texture = solid_texture([255, 255, 255, 255]);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
+        // (255 + 100) / 2 truncates to 177 where the triangle covers.
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 200, 100),
+            [177, 177, 177, 255]
+        );
+        // Untouched grey outside it.
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 10, 220),
+            [100, 100, 100, 255]
+        );
+    }
+
+    #[test]
+    fn per_texel_stp_selects_which_texels_blend() {
+        // A two-texel page: entry 1 is opaque, entry 2 carries the STP bit.
+        let mut texture = Texture8 {
+            width: 2,
+            height: 1,
+            indices: vec![1, 2],
+            palettes: vec![[0u8; 4]; 2 * crate::model::PALETTE_ROW_LEN],
+            stp: vec![false; 2 * crate::model::PALETTE_ROW_LEN],
+        };
+        texture.palettes[1] = [255, 255, 255, 255];
+        texture.palettes[2] = [255, 255, 255, 255];
+        texture.stp[2] = true;
+        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+            position,
+            inv_z: 1.0 / 1000.0,
+            u,
+            v,
+            shade: [CHANNEL_MAX; 3],
+        };
+        let triangle = Triangle {
+            raster: [
+                raster_vertex([10.0, 10.0], 0.0, 0.0),
+                raster_vertex([20.0, 10.0], 2.0, 0.0),
+                raster_vertex([10.0, 20.0], 0.0, 0.0),
+            ],
+            depth: 1000.0,
+            key: 1000,
+            texture: 0,
+            palette_row: 0,
+            cull: false,
+            flat: None,
+            blend: true,
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        framebuffer.rasterize(&texture, &triangle);
+        // The opaque texel overwrites; the STP texel halves with the grey.
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 11, 11),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 18, 11),
+            [177, 177, 177, 255]
+        );
+
+        // With no STP entries the whole packet uses the flat half blend.
+        texture.stp = vec![false; 2 * crate::model::PALETTE_ROW_LEN];
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        framebuffer.rasterize(&texture, &triangle);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 11, 11),
+            [177, 177, 177, 255]
+        );
+    }
+
+    #[test]
+    fn a_back_facing_door_packet_is_culled() {
+        let mesh = mesh_at(1000, true);
+        let texture = solid_texture([10, 20, 30, 255]);
+        let joints = [identity()];
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_model_unlit(&mesh, &texture, &joints, &straight_camera());
+        assert!(
+            framebuffer.rgba.iter().all(|&byte| byte == 0),
+            "a door packet facing away must not paint"
+        );
+
+        // The same packet the other way round paints.
+        let mut framebuffer = Framebuffer::new();
+        let front = mesh_at(1000, false);
+        framebuffer.draw_model_unlit(&front, &texture, &joints, &straight_camera());
+        assert_ne!(framebuffer_pixel(&framebuffer, 200, 100), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_quad_drops_whole_when_one_corner_is_inside_the_near_plane() {
+        // Ring (0,1,3,2); only the (0,3,2) half is supplied. With corner 1 in
+        // front the half paints; with corner 1 behind the near plane the whole
+        // quad must drop instead of leaving the half.
+        let quad = |behind: bool| Tmd {
+            objects: vec![TmdObject {
+                vertices: vec![
+                    [0, 0, 1000],
+                    [0, 0, if behind { 0 } else { 1000 }],
+                    [1000, 0, 1000],
+                    [0, 1000, 1000],
+                ],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![TmdPrim {
+                    vertices: [0, 3, 2],
+                    normals: [0, 0, 0],
+                    uv: [[0, 0]; 3],
+                    clut: 0x7800,
+                    tsb: 0x80,
+                    textured: true,
+                    blend: false,
+                    raw_y: false,
+                    flat_color: None,
+                    quad: Some([0, 1, 3, 2]),
+                }],
+            }],
+        };
+        let texture = solid_texture([10, 20, 30, 255]);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [4095; 3],
+            lights: [Light::default(); 3],
+        };
+
+        let mut visible = Framebuffer::new();
+        visible.draw_model(
+            &quad(false),
+            &texture,
+            &joints,
+            &straight_camera(),
+            &lighting,
+        );
+        assert_ne!(framebuffer_pixel(&visible, 200, 100), [0, 0, 0, 0]);
+
+        let mut dropped = Framebuffer::new();
+        dropped.draw_model(
+            &quad(true),
+            &texture,
+            &joints,
+            &straight_camera(),
+            &lighting,
+        );
+        assert!(
+            dropped.rgba.iter().all(|&byte| byte == 0),
+            "half a quad survived a clipped corner"
+        );
+    }
+
+    #[test]
+    fn an_ivm_quad_drops_whole_and_gouraud_interpolates_corner_colours() {
+        use crate::ivm::{Ivm, IvmObject, IvmPrim, IvmPrimKind};
+        let texture = solid_texture([255, 255, 255, 255]);
+        let camera = straight_camera();
+
+        // A quad fan's corner 1 is behind the near plane: both halves drop.
+        let mut quad = Ivm {
+            texture: texture.clone(),
+            objects: vec![IvmObject {
+                vertices: vec![
+                    [1000, -1000, 1000],
+                    [0, 0, 0],
+                    [-1000, -1000, 1000],
+                    [0, 1000, 1000],
+                ],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![IvmPrim {
+                    kind: IvmPrimKind::TexturedGouraud,
+                    vertex_count: 4,
+                    vertices: [0, 1, 2, 3],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255; 3]; 3],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_ivm_unlit(&quad, &[identity()], &camera);
+        assert!(
+            framebuffer.rgba.iter().all(|&byte| byte == 0),
+            "an IVM quad survived a clipped corner"
+        );
+
+        // With every corner in front the quad paints.
+        quad.objects[0].vertices[1] = [0, 0, 1000];
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_ivm_unlit(&quad, &[identity()], &camera);
+        assert!(
+            framebuffer
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] != 0),
+            "an unclipped IVM quad did not paint"
+        );
+
+        // An untextured gouraud triangle with three distinct corner colours
+        // interpolates: each corner is dominated by its own channel and the
+        // centre is a near-equal mix.
+        let gouraud = Ivm {
+            texture: solid_texture([0, 0, 0, 255]),
+            objects: vec![IvmObject {
+                vertices: vec![[-300, -200, 1000], [0, 200, 1000], [300, -200, 1000]],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![IvmPrim {
+                    kind: IvmPrimKind::Gouraud,
+                    vertex_count: 3,
+                    vertices: [0, 1, 2, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255, 0, 0], [0, 0, 255], [0, 255, 0]],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_ivm_unlit(&gouraud, &[identity()], &camera);
+        let red = framebuffer_pixel(&framebuffer, 110, 155);
+        let green = framebuffer_pixel(&framebuffer, 210, 155);
+        let blue = framebuffer_pixel(&framebuffer, 160, 95);
+        assert!(
+            red[0] > 200 && red[1] < 60 && red[2] < 60,
+            "red corner {red:?}"
+        );
+        assert!(
+            green[1] > 200 && green[0] < 60 && green[2] < 60,
+            "green corner {green:?}"
+        );
+        assert!(
+            blue[2] > 200 && blue[0] < 60 && blue[1] < 60,
+            "blue corner {blue:?}"
+        );
+        let centre = framebuffer_pixel(&framebuffer, 160, 140);
+        for channel in centre[..3].iter() {
+            assert!(*channel > 40 && *channel < 200, "centre {centre:?}");
+        }
+    }
+
+    #[test]
+    fn the_item_view_and_door_captures_stay_deterministic() {
+        let texture = solid_texture([10, 20, 30, 255]);
+        let joints = [identity()];
+        let mut first = Framebuffer::new();
+        first.draw_model_unlit(&mesh_at(1000, false), &texture, &joints, &straight_camera());
+        let mut second = Framebuffer::new();
+        second.draw_model_unlit(&mesh_at(1000, false), &texture, &joints, &straight_camera());
+        assert_eq!(first.rgba, second.rgba, "door captures differ");
+
+        let ivm = crate::ivm::Ivm {
+            texture: solid_texture([1, 2, 3, 255]),
+            objects: vec![crate::ivm::IvmObject {
+                vertices: vec![[-1000, 1000, 1000], [1000, 1000, 1000], [0, -1000, 1000]],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![crate::ivm::IvmPrim {
+                    kind: crate::ivm::IvmPrimKind::Gouraud,
+                    vertex_count: 3,
+                    vertices: [0, 1, 2, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[10, 0, 0], [0, 10, 0], [0, 0, 10]],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        };
+        let mut first = Framebuffer::new();
+        first.draw_ivm_unlit(&ivm, &[identity()], &straight_camera());
+        let mut second = Framebuffer::new();
+        second.draw_ivm_unlit(&ivm, &[identity()], &straight_camera());
+        assert_eq!(first.rgba, second.rgba, "item-view captures differ");
+    }
+
+    #[test]
+    fn latched_lighting_uses_xz_falloff_the_80_cap_and_truncated_ambient() {
+        let ambient_only = Lighting {
+            ambient: [4095, 1775, 15],
+            lights: [Light::default(); 3],
+        };
+        // 12-bit ambient truncates with >> 4.
+        assert_eq!(ambient_only.latched([0, 0, 0]).color, [255, 110, 0]);
+
+        // A point light at the entity's own X/Z (a huge Y offset does not
+        // count) reaches full attenuation; the accumulated light caps at 0x80.
+        let point = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0, 100_000, 0],
+                    color: [255, 255, 255],
+                    kind: 0,
+                    radius: 1000,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        assert_eq!(point.latched([0, 0, 0]).color, [0x80, 0x80, 0x80]);
+
+        // Half the radius out on X/Z truncates each channel.
+        let point = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0, 0, 0],
+                    color: [201, 101, 3],
+                    kind: 0,
+                    radius: 1000,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        assert_eq!(point.latched([300, 0, 400]).color, [100, 50, 1]);
+
+        // A light at or beyond the radius contributes nothing, and a zero
+        // radius is black.
+        assert_eq!(point.latched([0, 0, 1000]).color, [0, 0, 0]);
+        let zero = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0; 3],
+                    color: [255, 0, 0],
+                    kind: 0,
+                    radius: 0,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        assert_eq!(zero.latched([0, 0, 0]).color, [0, 0, 0]);
+
+        // A directional light is used as-is (capped at 0x80) and adds to the
+        // ambient.
+        let directional = Lighting {
+            ambient: [16, 16, 16],
+            lights: [
+                Light {
+                    pos: [1, 0, 0],
+                    color: [200, 200, 200],
+                    kind: 1,
+                    radius: 0,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        assert_eq!(directional.latched([0, 0, 0]).color, [129, 129, 129]);
+    }
+
+    #[test]
+    fn a_lit_scene_matches_hand_computed_pixels() {
+        // The texture is 200 grey; the entity's latched colour is 64 grey, so
+        // each covered pixel is 200 * 64 / 255 = 50.
+        let mesh = mesh_at(1000, false);
+        let texture = solid_texture([200, 200, 200, 255]);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [1, 0, 0],
+                    color: [64, 64, 64],
+                    kind: 1,
+                    radius: 0,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
+        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [50, 50, 50, 255]);
+
+        // A point light directly overhead at 10,000 Y still lights the entity:
+        // the falloff ignores Y, unlike the old per-vertex distance.
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0, 10_000, 0],
+                    color: [64, 64, 64],
+                    kind: 0,
+                    radius: 1000,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
+        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [50, 50, 50, 255]);
+    }
+
+    #[test]
+    fn background_sampling_follows_the_origin_and_colour() {
+        let mut image = Image {
+            width: 320,
+            height: 240,
+            rgba: Vec::with_capacity(320 * 240 * 4),
+        };
+        for y in 0..240u32 {
+            for x in 0..320u32 {
+                image
+                    .rgba
+                    .extend_from_slice(&[(x % 256) as u8, (y % 256) as u8, 7, 255]);
+            }
+        }
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_background(&image, [1, 2], [255, 255, 255]);
+        // Origin +1 samples one pixel further left; +1 in Y samples one row
+        // up. The trailing edge clamps to the image's own edge.
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 0, 7, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [4, 3, 7, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 319, 239), [62, 237, 7, 255]);
+
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_background(&image, [0, 0], [128, 255, 0]);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 4, 3),
+            [(4u32 * 128 / 255) as u8, 3, 0, 255]
+        );
+    }
+
+    #[test]
+    fn sprite_blend_and_mirror_flags_change_the_pixels() {
+        let texture = indexed_texture(
+            vec![1, 2],
+            &[[0, 0, 0, 0], [200, 40, 40, 255], [40, 200, 40, 255]],
+        );
+        // A 2x1 source drawn into a 2x1 destination.
+        assert_eq!(texture.width, 2);
+        assert_eq!(texture.height, 2);
+
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        let mut sprites = vec![
+            SpriteDraw::indexed(&texture, [0, 0, 2, 1], [0, 0, 2, 1], 0, 2, Tint::White)
+                .with_mirror([true, false]),
+        ];
+        framebuffer.draw_sprites(&mut sprites);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [40, 200, 40, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 1, 0), [200, 40, 40, 255]);
+
+        // A half blend mixes with the grey destination.
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        let mut sprites = vec![
+            SpriteDraw::indexed(&texture, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::White)
+                .with_blend(SpriteBlend::Half),
+        ];
+        framebuffer.draw_sprites(&mut sprites);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [150, 70, 70, 255]);
+
+        // A black-alpha blend mixes the destination towards zero.
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
+        let mut sprites = vec![
+            SpriteDraw::indexed(&texture, [0, 0, 1, 1], [0, 0, 1, 1], 0, 2, Tint::White)
+                .with_blend(SpriteBlend::BlackAlpha(128)),
+        ];
+        framebuffer.draw_sprites(&mut sprites);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [99, 99, 99, 255]);
+    }
+
+    #[test]
+    fn shadow_depth_key_truncates_the_corner_mean() {
+        // The key is the truncating integer mean of the four unclipped corner
+        // Zs, not a rounded f64 mean. Search yaws, sizes and a pitched camera
+        // until a fixture's mean is not an exact integer, then pin it.
+        let texture = solid_image(1, 1, [255, 255, 255, 128]);
+        let cameras = [
+            straight_camera(),
+            Camera::from_cut(&Cut {
+                pos: [0, -1500, -1500],
+                look_at: [0, 0, 1000],
+                fov: 200,
+                ..Cut::default()
+            }),
+        ];
+        let mut exercised = false;
+        'search: for camera in &cameras {
+            for (half_x, half_z) in [(1234, 777), (500, 300), (61, 919), (1500, 1400)] {
+                for angle in (0x40..0x1000).step_by(0x40) {
+                    let shadow = Shadow {
+                        angle,
+                        ..shadow_at([0, 0, 1000], half_x, half_z, &texture)
+                    };
+                    let mut items = Vec::new();
+                    collect_shadow(&shadow, camera, &mut items);
+                    let [SceneItem::Shadow(poly)] = &items[..] else {
+                        panic!("expected one shadow");
+                    };
+                    let entity = anim::entity_matrix(shadow.pos, shadow.angle);
+                    let corners = [
+                        [-shadow.half_x as i16, 0, shadow.half_z as i16],
+                        [shadow.half_x as i16, 0, shadow.half_z as i16],
+                        [-shadow.half_x as i16, 0, -shadow.half_z as i16],
+                        [shadow.half_x as i16, 0, -shadow.half_z as i16],
+                    ];
+                    let sum: i64 = corners
+                        .iter()
+                        .map(|corner| {
+                            i64::from(camera.view_position(fixed_mul(&entity, *corner))[2])
+                        })
+                        .sum();
+                    let truncating = sum / 4;
+                    let rounded = (sum as f64 / 4.0).round() as i64;
+                    assert_eq!(i64::from(poly.key), truncating, "angle {angle:#x}");
+                    if truncating != rounded {
+                        exercised = true;
+                        break 'search;
+                    }
+                }
+            }
+        }
+        assert!(exercised, "no fixture made the corner mean non-integral");
     }
 }

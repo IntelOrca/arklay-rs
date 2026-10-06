@@ -318,6 +318,7 @@ mod tests {
                 height: 256,
                 indices: vec![1; 256 * 256],
                 palettes,
+                stp: Vec::new(),
             },
             objects: vec![IvmObject {
                 vertices: vec![[0, -1000, -1000], [0, -1000, 1000], [0, 1000, 0]],
@@ -328,9 +329,10 @@ mod tests {
                     vertices: [0, 1, 2, 0],
                     normals: [0, 0, 0, 0],
                     uv: [[0, 0], [255, 0], [0, 255], [0, 0]],
-                    color: [255, 255, 255],
+                    colors: [[255, 255, 255]; 3],
                     clut: 0,
                     tsb: 0,
+                    blend: false,
                 }],
             }],
         }

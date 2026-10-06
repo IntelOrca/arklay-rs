@@ -516,6 +516,7 @@ mod tests {
             height: 1,
             indices: vec![0, 1, 0],
             palettes,
+            stp: Vec::new(),
         };
 
         let data = encode_texture8_to_vec(&texture).unwrap();
@@ -538,6 +539,7 @@ mod tests {
             height: 2,
             indices: vec![2, 1, 0, 2, 1, 1, 0, 0],
             palettes,
+            stp: Vec::new(),
         };
 
         let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
@@ -608,6 +610,7 @@ mod tests {
             height: 2,
             indices: vec![0; 3],
             palettes: vec![[0u8; 4]; 256],
+            stp: Vec::new(),
         };
         assert!(encode_texture8_to_vec(&texture).is_err());
     }

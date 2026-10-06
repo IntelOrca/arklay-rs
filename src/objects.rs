@@ -1908,6 +1908,7 @@ mod tests {
             height: 1,
             indices: vec![0],
             palettes: vec![[255, 82, 74, 255], [0, 0, 0, 128]],
+            stp: Vec::new(),
         };
         darken_map_palette(&mut texture);
         assert_eq!(texture.palettes[0], [180, 8, 0, 255]);

@@ -3559,6 +3559,7 @@ mod tests {
             height: 1,
             indices: vec![0],
             palettes,
+            stp: Vec::new(),
         }
     }
 

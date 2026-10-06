@@ -33,6 +33,11 @@ pub struct TmdPrim {
     pub raw_y: bool,
     /// The packet colour of an untextured packet, `None` when textured.
     pub flat_color: Option<[u8; 3]>,
+    /// For a primitive split out of a textured gouraud quad, the packet's four
+    /// corner vertex indices in ring order; `None` for a real triangle packet.
+    /// The renderer drops the whole quad when any of the four is inside the
+    /// near plane, exactly like the original's per-packet clip test.
+    pub quad: Option<[u16; 4]>,
 }
 
 /// A TMD object: one vertex pool, one normal pool and the primitives using them.
@@ -53,12 +58,16 @@ pub struct Tmd {
 ///
 /// `indices` is row-major, `width * height` bytes. `palettes` is row-major too:
 /// `height`-independent CLUT rows of 256 entries each (`h` rows in file order).
+/// `stp` mirrors `palettes` entry for entry: it carries the PSX CLUT word's
+/// semi-transparency bit, which a textured packet blends on a per-texel basis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Texture8 {
     pub width: u32,
     pub height: u32,
     pub indices: Vec<u8>,
     pub palettes: Vec<[u8; 4]>,
+    /// One STP flag per palette entry; empty when the decoder had no CLUT.
+    pub stp: Vec<bool>,
 }
 
 impl Texture8 {
@@ -68,6 +77,21 @@ impl Texture8 {
             .get(row * PALETTE_ROW_LEN + index as usize)
             .copied()
             .unwrap_or([0, 0, 0, 0])
+    }
+
+    /// Whether one palette entry carries the STP bit; out-of-range is false.
+    pub fn palette_stp(&self, row: usize, index: u8) -> bool {
+        self.stp
+            .get(row * PALETTE_ROW_LEN + index as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Whether any entry of palette `row` carries the STP bit.
+    pub fn row_has_stp(&self, row: usize) -> bool {
+        let start = row * PALETTE_ROW_LEN;
+        let end = (start + PALETTE_ROW_LEN).min(self.stp.len());
+        start < end && self.stp[start..end].iter().any(|&flag| flag)
     }
 }
 

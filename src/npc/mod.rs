@@ -200,18 +200,14 @@ pub fn update_entity(
         game.entity_anims[slot].advance(&mut game.entities[slot], clips, false, IDLE_BLEND_STEP);
     }
 
-    // Common tail. The look-at slew itself belongs to the action/walk layer;
-    // the target an `act_motion` latched is already refreshed from its live
-    // entity here.
-    // TODO(parity): (gameplay) the original runs EntityUpdateLookAtAngles every
-    // NPC tick, slewing the tracking joint toward the stored scd_pos_* target
-    // (or the entity target) at lookAtYawStep/lookAtPitchStep, and zeroes
-    // scaMatrixData.field_00 for the SCA pass. The port stores the target but
-    // never slews a joint and has no per-joint hit data, so head tracking and
-    // SCA collision are approximations.
+    // Common tail: refresh the live look-at target, slew the tracking joint
+    // toward it at the instruction's yaw/pitch step, and recompute the
+    // camera-switch-zone shadow bit. The SCA hit-volume reset the original
+    // shares this tail with stays with the enemy milestone.
     if let Some(target) = look_at_target {
         game.entities[slot].target = target;
     }
+    game.entity_anims[slot].slew_look_at(&game.entities[slot]);
     game.entities[slot].has_enter_switch_zone = u8::from(in_camera_zone(
         room,
         room.current_cut,

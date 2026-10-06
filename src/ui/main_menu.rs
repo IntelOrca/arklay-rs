@@ -871,6 +871,7 @@ mod tests {
             height,
             indices,
             palettes,
+            stp: Vec::new(),
         }
     }
 
@@ -911,6 +912,7 @@ mod tests {
                 height: 256,
                 indices: vec![0; 768 * 256],
                 palettes: vec![[0u8; 4]; PALETTE_ROW_LEN],
+                stp: Vec::new(),
             }),
         }
     }

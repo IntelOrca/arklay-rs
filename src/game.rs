@@ -9036,6 +9036,7 @@ mod tests {
             height: 1,
             indices: vec![0],
             palettes: vec![[255, 82, 74, 255]],
+            stp: Vec::new(),
         };
         let mut room = RoomState {
             item_count: 2,

@@ -2639,7 +2639,7 @@ pub fn angle_between_xz(from_x: i32, from_z: i32, to_x: i32, to_z: i32) -> u16 {
 }
 
 /// Integer square root with the original GTE routine's truncation.
-fn integer_sqrt(value: i32) -> i32 {
+pub(crate) fn integer_sqrt(value: i32) -> i32 {
     if value <= 0 {
         0
     } else {

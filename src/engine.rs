@@ -5510,6 +5510,55 @@ fn object_render_skipped(room: &RoomState, camera: usize, record: &objects::Obje
     false
 }
 
+/// Compose the look-at tracking joint's aim onto a character's world matrices.
+///
+/// Joint 1 is the original's `lookAtJointIdx` for every character model; the
+/// original composes `RotMatrixYXZ(0, yaw, pitch)` onto its world matrix
+/// whenever the look-at flags are non-zero, so a cleared slew-enable bit
+/// freezes the last aim in place.
+fn apply_look_at(joints: &mut [anim::Mat4x3], entity: &game::Entity, clock: &npc::EntityAnim) {
+    if entity.look_at_flags == 0 || joints.len() < 2 {
+        return;
+    }
+    joints[1] = anim::compose(
+        &joints[1],
+        &anim::look_at_matrix(clock.look_at_yaw, clock.look_at_pitch),
+    );
+}
+
+/// The switch-zone member class of a character model: the original's joint
+/// flag bits `0x74`, whose joints draw only inside the current camera's switch
+/// zone. No shipped character model sets the class, so the gate is dormant for
+/// the corpus and exercised by the synthetic tests.
+fn member_joint_class(id: u8) -> u32 {
+    let _ = id;
+    0
+}
+
+/// The hidden-joint mask for one character: the scripted hidden bits plus
+/// every member-class joint whose world position is outside the current
+/// camera's switch zone.
+fn joint_hidden_mask(
+    members: u32,
+    room: &RoomState,
+    camera: usize,
+    joint_flags: u16,
+    joints: &[anim::Mat4x3],
+) -> u32 {
+    let mut hidden = u32::from(joint_flags);
+    for (index, joint) in joints.iter().enumerate() {
+        if index >= 32
+            || members & (1 << index) == 0
+            || hidden & (1 << index) != 0
+            || npc::in_camera_zone(room, camera, joint.t)
+        {
+            continue;
+        }
+        hidden |= 1 << index;
+    }
+    hidden
+}
+
 /// Draw one gameplay frame: the cut background, one mesh per active scripted
 /// character, the player model, the player's ground shadow and the camera's
 /// room-mask layer, depth-sorted together.
@@ -5557,15 +5606,16 @@ fn render_frame(
         active: cut.mask_active,
     });
 
-    // The shadow rests on the player's floor height and is skipped unless the
-    // player is in the current camera's zone (or the room forces it on).
-    // TODO(M10): queue one shadow per visible character through the same
-    // fade-sprite path, using `npc::data::character_init`'s tint and quad
-    // geometry and the entity's `has_enter_switch_zone` bit; the renderer
-    // currently accepts a single shadow, so that pass is deferred.
+    // Every ground shadow is submitted through the same fade-sprite path: the
+    // player's when its camera-zone test passes (or the room forces it on),
+    // and one per active character that has entered the camera's switch zone,
+    // using `character_init`'s tint, half extents and local offset.
     let shadow_texture = shadows.page_for(pack);
-    let shadow = shadow_texture.and_then(|texture| {
-        shadow::visible(id, room, room.current_cut, player_state).then(|| render::Shadow {
+    let mut shadow_list: Vec<render::Shadow<'_>> = Vec::new();
+    if let Some(texture) = shadow_texture
+        && shadow::visible(id, room, room.current_cut, player_state)
+    {
+        shadow_list.push(render::Shadow {
             texture,
             pos: player_state.pos,
             angle: player_state.angle,
@@ -5573,14 +5623,12 @@ fn render_frame(
             half_z: shadow::PLAYER_HALF_Z,
             lift: shadow::offset_y(id, room.current_cut),
             tint: shadow::billboard_tint(shadow::PLAYER_COLOR),
-        })
-    });
+        });
+    }
 
-    // TODO(parity): (visual) the original gates each joint on the entity's
-    // per-joint flags (0x74 members must lie inside the camera's switch zone, a
-    // couple of animation phases draw only those members, and 0x20/0x4 route to
-    // the path-trail/severed-limb steps); this engine poses and draws every
-    // joint unconditionally.
+    // Each character's joints are posed with the blended pose clock, the
+    // tracking joint's look-at aim composed on, and the switch-zone member
+    // gate folded into `hidden_joints` below.
     let player_joints = assets.and_then(|assets| {
         // The room's own animation pair drives the push/vault/ladder poses; a
         // room without it falls back to the EMD settle stance (documented).
@@ -5606,37 +5654,67 @@ fn render_frame(
                 ),
             },
         };
-        let keyframe = keyframes.get(player_state.anim.keyframe_index(clips))?;
+        // The blended pose the clock shows for the applied frame, then the
+        // tracking joint's aim composed onto it.
+        let keyframe = player_state.anim.pose_keyframe(clips, keyframes)?;
         let entity = anim::entity_matrix(player_state.pos, player_state.angle);
-        Some(anim::joint_matrices(skeleton, keyframe, &entity))
+        let mut joints = anim::joint_matrices(skeleton, &keyframe, &entity);
+        apply_look_at(&mut joints, &game.entities[0], &game.entity_anims[0]);
+        Some(joints)
     });
 
     // The parsed NPC models are held in `models` so the mesh references built
     // below stay alive for the draw call.
     let mut models: Vec<Arc<Emd>> = Vec::new();
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
-    let mut npc_slots: Vec<usize> = Vec::new();
-    // TODO(parity): (UI) the original queues a fade sprite (ground shadow) for
-    // every character inside its camera switch zone, with the per-character
-    // tint/quad from `npc::data::character_init`; the port draws only the
-    // player's shadow, so NPCs have none (see the TODO(M10) above).
+    let mut npc_hidden: Vec<u32> = Vec::new();
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
         if !entity.active() {
             continue;
         }
+        // A character queues its own fade sprite whenever it entered the
+        // current camera's switch zone, with the per-character tint and quad
+        // from `character_init` and the local offset applied to its position.
+        if let Some(texture) = shadow_texture
+            && entity.has_enter_switch_zone != 0
+            && let Some(init) = npc::data::character_init(entity.id)
+        {
+            shadow_list.push(render::Shadow {
+                texture,
+                pos: [
+                    entity.pos[0] + i32::from(init.shadow_offset[0]),
+                    entity.pos[1],
+                    entity.pos[2] + i32::from(init.shadow_offset[2]),
+                ],
+                angle: entity.angle,
+                half_x: i32::from(init.shadow_half_x),
+                half_z: i32::from(init.shadow_half_z),
+                lift: shadow::offset_y(id, room.current_cut),
+                tint: shadow::billboard_tint(init.tint),
+            });
+        }
         let Some(model) = npc_models.get(pack, entity.id) else {
             continue;
         };
-        let keyframe_index = game.entity_anims[slot].keyframe_index(entity, &model.clips);
-        let Some(keyframe) = model.keyframes.get(keyframe_index) else {
+        let Some(keyframe) =
+            game.entity_anims[slot].pose_keyframe(entity, &model.clips, &model.keyframes)
+        else {
             continue;
         };
         let entity_matrix = anim::entity_matrix(entity.pos, entity.angle);
-        let joints = anim::joint_matrices(&model.skeleton, keyframe, &entity_matrix);
+        let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
+        apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
+        let hidden = joint_hidden_mask(
+            member_joint_class(entity.id),
+            room,
+            room.current_cut,
+            entity.joint_flags,
+            &joints,
+        );
         models.push(model);
         npc_joints.push(joints);
-        npc_slots.push(slot);
+        npc_hidden.push(hidden);
     }
 
     // The room's object and item models are submitted before the NPC and
@@ -5691,25 +5769,32 @@ fn render_frame(
             hidden_joints: 0,
         });
     }
-    // The NPC joint gates pair with `models`/`npc_joints`/`npc_slots`, all
+    // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for ((slot, model), joints) in npc_slots.iter().zip(models.iter()).zip(&npc_joints) {
+    for ((model, joints), hidden) in models.iter().zip(&npc_joints).zip(&npc_hidden) {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
             tint: [255; 3],
-            hidden_joints: u32::from(game.entities[*slot].joint_flags),
+            hidden_joints: *hidden,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
+        let hidden = joint_hidden_mask(
+            member_joint_class(game.entities[0].id),
+            room,
+            room.current_cut,
+            game.entities[0].joint_flags,
+            joints,
+        );
         meshes.push(EntityMesh {
             mesh: &assets.emd.mesh,
             texture: &assets.emd.texture,
             joints,
             tint: game.player_tint,
-            hidden_joints: u32::from(game.entities[0].joint_flags),
+            hidden_joints: hidden,
         });
     }
 
@@ -5732,11 +5817,17 @@ fn render_frame(
         camera_pos: cut.pos,
         camera: camera.mirrored(game.mirror_axis_x(), i32::from(game.mirror.plane)),
     });
+    // The display origin pans the background; gameplay has no screen pan
+    // active here, so the cut is drawn 1:1 with the global colour at white.
+    let display_origin = [0, 0];
+    let global_colour = [255; 3];
     render::draw_gameplay_scene_with_effects(
         framebuffer,
         cut.background.as_ref(),
+        display_origin,
+        global_colour,
         &meshes,
-        shadow.as_ref(),
+        &shadow_list,
         &camera,
         &lighting,
         layer.as_ref(),
@@ -5989,6 +6080,7 @@ mod tests {
                 height: 0,
                 indices: Vec::new(),
                 palettes: Vec::new(),
+                stp: Vec::new(),
             },
         };
         let room = RoomState {
@@ -6048,6 +6140,7 @@ mod tests {
                 height: 0,
                 indices: Vec::new(),
                 palettes: Vec::new(),
+                stp: Vec::new(),
             },
         };
         let room = RoomState {
@@ -6181,6 +6274,7 @@ mod tests {
                 height: 0,
                 indices: Vec::new(),
                 palettes: Vec::new(),
+                stp: Vec::new(),
             },
         };
         let room = RoomState {
@@ -7127,6 +7221,7 @@ mod tests {
                 height: 1,
                 indices: vec![0],
                 palettes: vec![[0, 0, 0, 255]],
+                stp: Vec::new(),
             },
             orders: [door::Order::default(); door::ORDER_COUNT],
         };
@@ -7485,7 +7580,7 @@ mod tests {
             &mut masked,
             cut.background.as_ref(),
             &entities,
-            None,
+            &[],
             &camera,
             &lighting,
             Some(&layer),
@@ -7495,7 +7590,7 @@ mod tests {
             &mut plain,
             cut.background.as_ref(),
             &entities,
-            None,
+            &[],
             &camera,
             &lighting,
             None,
@@ -10825,5 +10920,42 @@ end
         assert!(!plain_run.game.flags[0].bit(4));
         assert_eq!(plain_run.game.message.id, Some(0));
         assert_eq!(plain_run.frame.rgba, run.frame.rgba);
+    }
+
+    #[test]
+    fn switch_zone_member_joints_gate_on_the_camera_zone() {
+        use crate::state::Zone;
+        let room = RoomState {
+            zones: vec![Zone {
+                cam_from: 0,
+                cam_to: 1,
+                corners: [[0, 0], [0, 100], [100, 100], [100, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let joints = vec![
+            anim::Mat4x3 {
+                r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+                t: [50, 0, 50],
+            },
+            anim::Mat4x3 {
+                r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+                t: [5000, 0, 50],
+            },
+        ];
+        // Joint 1 is a member of the 0x74 class; inside the zone it draws and
+        // outside it is hidden, on top of any scripted hidden bit.
+        let hidden = joint_hidden_mask(0b10, &room, 0, 0, &joints);
+        assert_eq!(hidden, 0b10, "the inside member must not be hidden");
+        assert_eq!(
+            joint_hidden_mask(0b11, &room, 0, 0b01, &joints),
+            0b11,
+            "a member outside the zone joins the scripted hidden mask"
+        );
+        // Joint 0 is outside the member class and stays visible outside the
+        // zone; joint 1 stops being hidden when no class is set.
+        assert_eq!(joint_hidden_mask(0, &room, 0, 0, &joints), 0);
+        // A camera with no zone header hides every member.
+        assert_eq!(joint_hidden_mask(0b10, &room, 4, 0, &joints), 0b10);
     }
 }

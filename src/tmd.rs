@@ -184,6 +184,7 @@ fn decode_prim(
                 blend: command == GOURAUD_TEXTURED_TRIANGLE_BLEND,
                 raw_y: false,
                 flat_color: None,
+                quad: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -205,6 +206,7 @@ fn decode_prim(
                 blend: false,
                 raw_y: false,
                 flat_color: None,
+                quad: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -230,6 +232,7 @@ fn decode_prim(
                 blend: false,
                 raw_y: true,
                 flat_color: None,
+                quad: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -257,6 +260,7 @@ fn decode_prim(
                 blend: false,
                 raw_y: false,
                 flat_color: Some(colour),
+                quad: None,
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -301,6 +305,7 @@ fn decode_prim(
                     blend: false,
                     raw_y: false,
                     flat_color: None,
+                    quad: Some(vertices),
                 };
                 check_prim(&prim, vertex_count, normals.len())?;
                 prims.push(prim);
@@ -463,6 +468,7 @@ mod tests {
         assert!(prim.textured);
         assert!(!prim.blend);
         assert_eq!(prim.flat_color, None);
+        assert_eq!(prim.quad, None, "a triangle packet is no quad");
     }
 
     #[test]
@@ -582,6 +588,10 @@ mod tests {
         assert_eq!(first.clut, 0x7800);
         assert_eq!(first.tsb, 0x80);
         assert!(first.textured && second.textured);
+        // Both halves carry the full ring so the renderer can drop the quad
+        // whole when any corner is clipped.
+        assert_eq!(first.quad, Some([3, 2, 1, 0]));
+        assert_eq!(second.quad, Some([3, 2, 1, 0]));
     }
 
     #[test]
