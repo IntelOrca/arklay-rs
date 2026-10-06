@@ -62,7 +62,8 @@ fn item_action(game: &GameState, item: u8) -> Option<(u8, usize)> {
 }
 
 fn render(pack: &Pack, id: RoomId, sim: &SimulatedRoom, game: &GameState) -> Image {
-    render_game_frame(pack, id, &sim.room, game, &sim.player).unwrap()
+    let mut game = game.clone();
+    render_game_frame(pack, id, &sim.room, &mut game, &sim.player).unwrap()
 }
 
 /// Pixels that differ between two frames within `radius` of `center`.

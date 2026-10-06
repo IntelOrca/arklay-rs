@@ -187,13 +187,14 @@ fn booted(pack: &arklay::pack::Pack, id: RoomId) -> engine::SimulatedRoom {
 }
 
 fn render(pack: &arklay::pack::Pack, id: RoomId, sim: &engine::SimulatedRoom) -> Image {
-    engine::render_game_frame(pack, id, &sim.room, &sim.game, &sim.player).unwrap()
+    let mut game = sim.game.clone();
+    engine::render_game_frame(pack, id, &sim.room, &mut game, &sim.player).unwrap()
 }
 
 fn cleared_render(pack: &arklay::pack::Pack, id: RoomId, sim: &engine::SimulatedRoom) -> Image {
     let mut cleared = sim.game.clone();
     cleared.effects.clear();
-    engine::render_game_frame(pack, id, &sim.room, &cleared, &sim.player).unwrap()
+    engine::render_game_frame(pack, id, &sim.room, &mut cleared, &sim.player).unwrap()
 }
 
 /// A floor point inside the current camera's switch-zone header that projects
@@ -539,7 +540,7 @@ fn real_effect_outside_the_camera_zone_paints_nothing() {
     }
     assert_eq!(outside_only.effects.active_count(), 1);
     let outside_frame =
-        engine::render_game_frame(&pack, id, &sim.room, &outside_only, &sim.player).unwrap();
+        engine::render_game_frame(&pack, id, &sim.room, &mut outside_only, &sim.player).unwrap();
     assert_eq!(
         changed_pixels(&outside_frame, &without),
         0,

@@ -107,13 +107,13 @@ fn room_100_sword_key_builds_and_changes_the_capture() {
 
     // The rendered frame differs from the same state with every item hidden,
     // and two renders of one state agree.
-    let frame = render_game_frame(&pack, id, &sim.room, &sim.game, &sim.player).unwrap();
-    let again = render_game_frame(&pack, id, &sim.room, &sim.game, &sim.player).unwrap();
+    let frame = render_game_frame(&pack, id, &sim.room, &mut sim.game, &sim.player).unwrap();
+    let again = render_game_frame(&pack, id, &sim.room, &mut sim.game, &sim.player).unwrap();
     assert_eq!(frame.rgba, again.rgba, "the item pass is deterministic");
     for item in &mut sim.game.items.records {
         item.flag = 0;
     }
-    let hidden = render_game_frame(&pack, id, &sim.room, &sim.game, &sim.player).unwrap();
+    let hidden = render_game_frame(&pack, id, &sim.room, &mut sim.game, &sim.player).unwrap();
     let changed = frame
         .rgba
         .as_chunks::<4>()
@@ -470,7 +470,7 @@ fn room_406_map_palette_is_darkened_in_the_render() {
         return;
     };
     let id = RoomId::parse("4060").unwrap();
-    let sim = simulate(&pack, "4060");
+    let mut sim = simulate(&pack, "4060");
     let map = item_action(&sim.game, 0x52).expect("the guardhouse map registers");
     let pair = usize::from(map.item_model());
     assert!(item_record(&sim.game, map).unwrap().active());
@@ -519,8 +519,8 @@ fn room_406_map_palette_is_darkened_in_the_render() {
             .expect("the loaded map pair")
             .texture = darkened_texture.clone();
         let darkened =
-            render_game_frame(&pack, id, &darkened_room, &sim.game, &sim.player).unwrap();
-        let stock = render_game_frame(&pack, id, &stock_room, &sim.game, &sim.player).unwrap();
+            render_game_frame(&pack, id, &darkened_room, &mut sim.game, &sim.player).unwrap();
+        let stock = render_game_frame(&pack, id, &stock_room, &mut sim.game, &sim.player).unwrap();
         painted = painted.max(
             darkened
                 .rgba

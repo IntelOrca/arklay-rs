@@ -277,11 +277,11 @@ fn real_room1051_capture_shows_the_muzzle_pixels() {
             break;
         }
     }
-    let during = capture.expect("the muzzle and the secondary flash were live");
+    let mut during = capture.expect("the muzzle and the secondary flash were live");
     let mut cleared = during.clone();
     cleared.effects.clear();
-    let with = engine::render_game_frame(&pack, id, &room, &during, &sim.player).unwrap();
-    let without = engine::render_game_frame(&pack, id, &room, &cleared, &sim.player).unwrap();
+    let with = engine::render_game_frame(&pack, id, &room, &mut during, &sim.player).unwrap();
+    let without = engine::render_game_frame(&pack, id, &room, &mut cleared, &sim.player).unwrap();
     let painted = changed_pixels(&with, &without);
     assert!(
         painted >= 8,

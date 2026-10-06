@@ -234,9 +234,9 @@ fn room_401_desk_locked_refuses_then_opens_after_the_key_turns() {
     // The opened drawer paints in the desk camera; hiding the model again
     // removes those pixels.
     sim.room.current_cut = 3;
-    let opened = render_game_frame(&pack, sim.id, &sim.room, &sim.game, &sim.player).unwrap();
+    let opened = render_game_frame(&pack, sim.id, &sim.room, &mut sim.game, &sim.player).unwrap();
     sim.game.items.record_mut(model).unwrap().flag &= !1;
-    let closed = render_game_frame(&pack, sim.id, &sim.room, &sim.game, &sim.player).unwrap();
+    let closed = render_game_frame(&pack, sim.id, &sim.room, &mut sim.game, &sim.player).unwrap();
     let changed = opened
         .rgba
         .as_chunks::<4>()
@@ -504,12 +504,12 @@ fn real_room_401_ticks_captures_are_deterministic() {
     let mut painted = 0usize;
     for cut in 0..sim.room.cuts.len() {
         sim.room.current_cut = cut;
-        let shown = render_game_frame(&pack, id, &sim.room, &sim.game, &sim.player).unwrap();
+        let shown = render_game_frame(&pack, id, &sim.room, &mut sim.game, &sim.player).unwrap();
         let mut hidden = sim.game.clone();
         for record in &mut hidden.items.records {
             record.flag = 0;
         }
-        let blank = render_game_frame(&pack, id, &sim.room, &hidden, &sim.player).unwrap();
+        let blank = render_game_frame(&pack, id, &sim.room, &mut hidden, &sim.player).unwrap();
         painted = painted.max(
             shown
                 .rgba

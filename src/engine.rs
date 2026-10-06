@@ -337,7 +337,7 @@ pub fn run_with_voice_and_movie(
             loaded.id,
             &loaded.room,
             &player_state,
-            &game,
+            &mut game,
             loaded.player_assets.as_ref(),
             &mut npc_models,
             &mut MaskCache::default(),
@@ -1533,7 +1533,7 @@ impl GameSession {
                 self.loaded.id,
                 &self.loaded.room,
                 &self.player,
-                &self.game,
+                &mut self.game,
                 self.loaded.player_assets.as_ref(),
                 &mut self.npc_models,
                 &mut self.masks,
@@ -3357,7 +3357,7 @@ pub fn simulate_door(
         loaded.id,
         &loaded.room,
         &player_state,
-        &game,
+        &mut game,
         loaded.player_assets.as_ref(),
         &mut npc_models,
         &mut MaskCache::default(),
@@ -3524,12 +3524,14 @@ pub fn simulate_room_with_movie(
 /// This is the headless capture seam for effect probes: tests can tick a state
 /// by hand (create effects, step [`game::GameState::tick_effects`]) and render
 /// it without rebuilding the room. Player and NPC models are loaded from the
-/// pack when present.
+/// pack when present. The game is borrowed mutably because the frame's screen
+/// shake (when `MSF2_SCREEN_SHAKE` is set) consumes three values from its
+/// platform random stream.
 pub fn render_game_frame(
     pack: &Pack,
     id: RoomId,
     room: &RoomState,
-    game: &game::GameState,
+    game: &mut game::GameState,
     player_state: &player::PlayerState,
 ) -> Result<Image> {
     let assets = load_player_assets(pack, id);
@@ -3541,7 +3543,7 @@ pub fn render_game_frame(
         id,
         room,
         player_state,
-        game,
+        &mut *game,
         assets.as_ref(),
         &mut npc_models,
         &mut MaskCache::default(),
@@ -3778,7 +3780,7 @@ fn simulate_loaded_with(
         loaded.id,
         &loaded.room,
         &player_state,
-        &game,
+        &mut game,
         loaded.player_assets.as_ref(),
         &mut npc_models,
         &mut masks,
@@ -3805,7 +3807,7 @@ fn simulate_loaded_with(
         loaded.id,
         &loaded.room,
         &player_state,
-        &game,
+        &mut game,
         loaded.player_assets.as_ref(),
         &mut npc_models,
         &mut masks,
@@ -5579,7 +5581,7 @@ fn render_frame(
     id: RoomId,
     room: &RoomState,
     player_state: &player::PlayerState,
-    game: &game::GameState,
+    game: &mut game::GameState,
     assets: Option<&PlayerAssets>,
     npc_models: &mut npc::EntityModelCache,
     masks: &mut MaskCache,
@@ -5590,7 +5592,13 @@ fn render_frame(
         framebuffer.clear();
         return;
     };
-    let camera = Camera::from_cut(cut);
+    // The frame's screen shake: three draws from the platform stream while
+    // `MSF2_SCREEN_SHAKE` is set, cleared to zero otherwise. It shifts the
+    // camera projection and the background's display origin; the room's view
+    // matrix stays untouched.
+    let shake = game.shake_offset();
+    let mut camera = Camera::from_cut(cut);
+    camera.screen = shake;
     let lighting = Lighting::from_room(room);
 
     let page = if cut.masks.is_empty() || cut.mask_active == 0 {
@@ -5817,9 +5825,9 @@ fn render_frame(
         camera_pos: cut.pos,
         camera: camera.mirrored(game.mirror_axis_x(), i32::from(game.mirror.plane)),
     });
-    // The display origin pans the background; gameplay has no screen pan
-    // active here, so the cut is drawn 1:1 with the global colour at white.
-    let display_origin = [0, 0];
+    // The display origin pans the background; in gameplay it is the frame's
+    // screen-shake offset and the global colour stays white.
+    let display_origin = shake;
     let global_colour = [255; 3];
     render::draw_gameplay_scene_with_effects(
         framebuffer,
@@ -6455,7 +6463,7 @@ mod tests {
             id,
             &room,
             &player_state,
-            &game::GameState::new(id, &room),
+            &mut game::GameState::new(id, &room),
             Some(&assets),
             &mut npc_models,
             &mut masks,
@@ -6483,7 +6491,7 @@ mod tests {
             id,
             &room,
             &player_state,
-            &game::GameState::new(id, &room),
+            &mut game::GameState::new(id, &room),
             Some(&assets),
             &mut npc_models,
             &mut masks,
@@ -7161,6 +7169,25 @@ mod tests {
             "the entity height is not synced from the stair state"
         );
         assert_eq!(player_state.stairs.height, game.stair_height);
+    }
+
+    /// The M16 slice-2 acceptance: two `--ticks 60 --capture` runs of the
+    /// deterministic room are byte-identical under the exact camera and shake.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_room100_ticks_capture_is_deterministic() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let dir = TempDir::new();
+        let first_path = dir.0.join("m16_first.bmp");
+        let second_path = dir.0.join("m16_second.bmp");
+        let id = RoomId::parse("1000").unwrap();
+        run(Path::new(&path), id, Some(&first_path), 60).unwrap();
+        run(Path::new(&path), id, Some(&second_path), 60).unwrap();
+        let first = std::fs::read(&first_path).unwrap();
+        let second = std::fs::read(&second_path).unwrap();
+        assert_eq!(first, second, "two --ticks 60 captures differ");
     }
 
     #[test]
@@ -8655,7 +8682,7 @@ mod tests {
         assert_eq!(game.special_light_fill(), Some([0x80, 0x80, 0x80, 255]));
 
         let player_state = player::spawn(a, &room);
-        let image = render_game_frame(&pack, a, &room, &game, &player_state).unwrap();
+        let image = render_game_frame(&pack, a, &room, &mut game, &player_state).unwrap();
         assert_eq!(
             image.rgba[0..4],
             [0x80, 0x80, 0x80, 255],
@@ -10579,7 +10606,7 @@ end
         assert_eq!(quad.key, 960);
         // scale = 200 * 1 * 128 * 256 / (1000 + 1) = 6548 -> 204 px wide.
         assert_eq!(quad.size, [204, 204]);
-        assert_eq!(quad.pos, [78, 18]);
+        assert_eq!(quad.pos, [77, 18]);
         // depth_group 8 -> tint level 1 of colour record 1.
         assert_eq!(quad.tint, [0xB2, 0xB2, 0xB2]);
     }

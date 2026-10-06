@@ -44,12 +44,10 @@ const WIDTH: u32 = 320;
 const HEIGHT: u32 = 240;
 /// Fractional bits of the 4.12 fixed-point matrices.
 const FIXED_BITS: u32 = 12;
-/// 1.0 in the 4.12 fixed-point format.
-const FIXED_ONE: f64 = 4096.0;
 /// Horizontal screen centre in pixels.
-const CENTER_X: f64 = 160.0;
+const CENTER_X: i32 = 160;
 /// Vertical screen centre in pixels.
-const CENTER_Y: f64 = 120.0;
+const CENTER_Y: i32 = 120;
 /// Full scale of one colour channel.
 const CHANNEL_MAX: f64 = 255.0;
 
@@ -1536,8 +1534,8 @@ fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camer
     let inv_z = 1.0 / f64::from(view[2]);
     ShadowVertex {
         position: [
-            CENTER_X + f64::from(view[0]) * focal * inv_z,
-            CENTER_Y - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z,
+            f64::from(CENTER_X) + f64::from(view[0]) * focal * inv_z,
+            f64::from(CENTER_Y) - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z,
         ],
         inv_z,
         u: uv[0] / 4096.0,
@@ -1548,86 +1546,126 @@ fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camer
 /// A cut camera: a 4.12 view rotation, a world-unit translation and the cut's
 /// focal length in pixels.
 ///
-/// `from` and `look_at` are the source points the matrix was built from; the
-/// mirror pass needs them to rebuild the view from reflected points rather
-/// than composing a reflection into the matrix (the game rebuilds the camera
-/// from a reflected record and only then flips its X scale).
+/// `view` maps a world point to the screen's Y-down camera frame with a
+/// truncating 4.12 multiply (see [`Camera::view_position`]); `trans` holds the
+/// rotated eye. `roll` is the cut's 12-bit head roll and `screen` the frame's
+/// screen-shake offset, both applied at projection time so the view matrix
+/// stays the room's own. `from` and `look_at` are the source points the matrix
+/// was built from; the mirror pass needs them to rebuild the view from
+/// reflected points rather than composing a reflection into the matrix (the
+/// game rebuilds the camera from a reflected record and only then flips its X
+/// scale).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Camera {
     pub view: [[i32; 3]; 3],
     pub trans: [i32; 3],
     pub fov: i32,
+    /// The cut's head-roll angle in 12-bit units, composed into the view.
+    /// Every shipped RDT camera stores 0, so the path is synthetic-only.
+    pub roll: i32,
+    /// The frame's screen-shake offset in pixels, added at projection time.
+    pub screen: [i32; 2],
     pub from: [i32; 3],
     pub look_at: [i32; 3],
 }
 
+/// `a * b` for two 4.12 rotation matrices, each product truncated toward zero
+/// at 12 fractional bits and summed, the game's `MulMatrix0` composition.
+fn mul_fixed3(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let mut sum = 0i64;
+            for k in 0..3 {
+                let product = i64::from(a[i][k]) * i64::from(b[k][j]);
+                sum += (product + ((product >> 63) & 0xFFF)) >> FIXED_BITS;
+            }
+            sum as i32
+        })
+    })
+}
+
+/// The GTE-style integer square root of a non-negative length squared,
+/// clamped to at least 1 so a degenerate direction never divides by zero.
+fn direction_length(squared: i128) -> i64 {
+    let clamped = squared.min(i128::from(i32::MAX)) as i32;
+    i64::from(crate::sfx::integer_sqrt(clamped)).max(1)
+}
+
+/// A 12-bit angle from a sine and cosine numerator pair.
+fn angle12(sin_numerator: i64, cos_numerator: i64) -> i32 {
+    let radians = (sin_numerator as f64).atan2(cos_numerator as f64);
+    ((radians * (2048.0 / std::f64::consts::PI)) as i32) & 0x0FFF
+}
+
 impl Camera {
     /// Build the view rotation and translation from a from/to point pair. The
-    /// focal length is `fov`.
+    /// focal length is `fov`; the roll is 0 and the shake offset is zero.
     ///
     /// This is the door animation's `CAM_MATRIX` camera as well as the room
     /// cut camera: the same from/look-at construction the original's
     /// `MatrixToCamera` performs, with the scene's focal length in pixels.
     pub fn from_points(from: [i32; 3], to: [i32; 3], fov: i32) -> Self {
-        // TODO(parity): (visual) the original camera is a 4.12 fixed-point
-        // matrix projected with truncating integer math (`(vx*f)/vz + 160`),
-        // applies the cut's roll and the subpixel screen-shake offset; this
-        // f64, round-to-nearest camera ignores roll and shake, so projected
-        // pixels can differ by a unit and shake is absent.
-        let (source_from, source_to) = (from, to);
-        let from = [f64::from(from[0]), f64::from(from[1]), f64::from(from[2])];
-        let to = [f64::from(to[0]), f64::from(to[1]), f64::from(to[2])];
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
-        let h = (d[0] * d[0] + d[2] * d[2]).sqrt();
+        Self::from_points_rolled(from, to, fov, 0)
+    }
 
-        let (right, up, forward) = if len <= f64::EPSILON {
-            ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
-        } else if h <= f64::EPSILON {
-            let forward = [d[0] / len, -d[1] / len, d[2] / len];
-            let right = [1.0, 0.0, 0.0];
-            let up = [
-                forward[1] * right[2] - forward[2] * right[1],
-                forward[2] * right[0] - forward[0] * right[2],
-                forward[0] * right[1] - forward[1] * right[0],
-            ];
-            (right, up, forward)
-        } else {
-            (
-                [d[2] / h, 0.0, -d[0] / h],
-                [d[0] * d[1] / (h * len), h / len, d[1] * d[2] / (h * len)],
-                [d[0] / len, -d[1] / len, d[2] / len],
-            )
-        };
-
-        let rows = [right, up, forward];
+    /// [`Camera::from_points`] with the cut's head roll composed into the view.
+    ///
+    /// The original derives the view's pitch and yaw from the from/to vector,
+    /// builds the basis from its 14-bit trig tables and truncates the 4.12
+    /// result; the port does the same (`anim::rotation_matrix` with the
+    /// GTE-style integer lengths), then composes `rotation_matrix(0, 0, roll)`
+    /// into the view and computes the translation with a truncating `>>12`.
+    /// Every shipped camera stores roll 0, so the composition is exercised by
+    /// synthetic tests only.
+    pub fn from_points_rolled(from: [i32; 3], to: [i32; 3], fov: i32, roll: i32) -> Self {
+        let dx = i64::from(to[0]) - i64::from(from[0]);
+        let dy = i64::from(to[1]) - i64::from(from[1]);
+        let dz = i64::from(to[2]) - i64::from(from[2]);
+        // The original normalises the horizontal direction with the GTE's
+        // integer square root: h = sqrt(dx^2 + dz^2). The pitch is then
+        // atan2(dy, h), i.e. sin pitch = dy/len and cos pitch = h/len for the
+        // full length len = sqrt(dx^2 + dy^2 + dz^2).
+        let h = direction_length(i128::from(dx) * i128::from(dx) + i128::from(dz) * i128::from(dz));
+        // The view's rows are rotation_matrix(pitch, yaw, 0):
+        //   row 0 = (cos yaw, 0, sin yaw)
+        //   row 1 = (-sin pitch sin yaw, cos pitch, sin pitch cos yaw)
+        //   row 2 = (-cos pitch sin yaw, -sin pitch, cos pitch cos yaw)
+        // with sin yaw = -dx/h and sin pitch = dy/len, the original's basis.
+        let yaw = angle12(-dx, dz);
+        let pitch = angle12(dy, h);
+        let mut view = anim::rotation_matrix(pitch, yaw, 0);
         // The game projects a world point by negating its Y before the camera
         // rotation and using a Y-flipped translation (the world's Y axis grows
         // downwards while the camera basis is built for screen-down Y). Fold
         // that into the stored matrix: negate the Y column, then compute the
         // translation with the flipped rows so the camera's look-at point maps
         // to the screen centre. `project` then stays a plain `120 - vy`.
-        let view = rows.map(|row| [fixed(row[0]), fixed(-row[1]), fixed(row[2])]);
+        view = view.map(|row| [row[0], -row[1], row[2]]);
+        if roll != 0 {
+            view = mul_fixed3(&anim::rotation_matrix(0, 0, roll), &view);
+        }
         let trans = view.map(|row| {
-            (-(f64::from(row[0]) * from[0]
-                + f64::from(row[1]) * from[1]
-                + f64::from(row[2]) * from[2])
-                / 4096.0)
-                .round() as i32
+            let sum = i64::from(row[0]) * i64::from(from[0])
+                + i64::from(row[1]) * i64::from(from[1])
+                + i64::from(row[2]) * i64::from(from[2]);
+            // `trans = R * (-from)` with the sum truncated toward zero.
+            (-((sum + ((sum >> 63) & 0xFFF)) >> FIXED_BITS)) as i32
         });
         Self {
             view,
             trans,
             fov,
-            from: source_from,
-            look_at: source_to,
+            roll,
+            screen: [0, 0],
+            from,
+            look_at: to,
         }
     }
 
     /// Build the view rotation and translation from the cut's position and
-    /// look-at point. The focal length is `cut.fov`.
+    /// look-at point, composing its roll. The focal length is `cut.fov`.
     pub fn from_cut(cut: &Cut) -> Self {
-        Self::from_points(cut.pos, cut.look_at, cut.fov)
+        Self::from_points_rolled(cut.pos, cut.look_at, cut.fov, cut.roll)
     }
 
     /// The camera reflected about a room mirror plane, with the handedness
@@ -1635,7 +1673,8 @@ impl Camera {
     ///
     /// `axis_x` selects the plane `X = plane` (the X pair is folded) rather
     /// than `Z = plane` (the Z pair); `plane` is `g_mirrorPlaneCoord`. The view
-    /// matrix's X scale is negated to undo the reflection's handedness.
+    /// matrix's X scale is negated to undo the reflection's handedness. The
+    /// roll and screen offset carry over from the live camera.
     pub fn mirrored(&self, axis_x: bool, plane: i32) -> Camera {
         let fold = plane.wrapping_mul(2);
         let mirror = |point: [i32; 3]| {
@@ -1645,16 +1684,24 @@ impl Camera {
                 [point[0], point[1], fold.wrapping_sub(point[2])]
             }
         };
-        let mut camera = Camera::from_points(mirror(self.from), mirror(self.look_at), self.fov);
+        let mut camera = Camera::from_points_rolled(
+            mirror(self.from),
+            mirror(self.look_at),
+            self.fov,
+            self.roll,
+        );
+        camera.screen = self.screen;
         camera.view[0] = camera.view[0].map(|entry| -entry);
         camera.trans[0] = -camera.trans[0];
         camera
     }
 
-    /// Project a world-space point to screen pixels.
+    /// Project a world-space point to screen pixels with truncating integer
+    /// math: `sx = (vx*f)/vz + 160 + shake_x`, `sy = 120 + shake_y - (vy*f)/vz`,
+    /// every quotient truncated toward zero.
     ///
-    /// `None` when the point is not in front of the near plane
-    /// (`view_z < 2 * fov`).
+    /// `None` when the point is behind or inside the near plane
+    /// (`view_z < 2*fov`; the plane itself is accepted).
     pub fn project(&self, world: [i32; 3]) -> Option<[i32; 2]> {
         let [vx, vy, vz] = self.view_position(world);
         let fov = i64::from(self.fov);
@@ -1662,12 +1709,10 @@ impl Camera {
         if vz <= 0 || vz < 2 * fov {
             return None;
         }
-        let focal = fov as f64;
-        let inverse = focal / vz as f64;
-        let sx = CENTER_X + vx as f64 * inverse;
+        let sx = i64::from(vx) * fov / vz + i64::from(CENTER_X) + i64::from(self.screen[0]);
         // `vy` is already in the screen-down frame (see `from_cut`).
-        let sy = CENTER_Y - vy as f64 * inverse;
-        Some([sx.round() as i32, sy.round() as i32])
+        let sy = i64::from(CENTER_Y) + i64::from(self.screen[1]) - i64::from(vy) * fov / vz;
+        Some([sx as i32, sy as i32])
     }
 
     /// The 4.12 fixed-point view-space position of a world point.
@@ -2279,11 +2324,6 @@ fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
-/// Round a real quantity to the 4.12 fixed-point representation.
-fn fixed(value: f64) -> i32 {
-    (value * FIXED_ONE).round() as i32
-}
-
 /// Clamp an intermediate to the `i32` range.
 fn clamp_i32(value: i128) -> i32 {
     value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
@@ -2343,6 +2383,8 @@ mod tests {
             view: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
             trans: [0, 0, 0],
             fov: 200,
+            roll: 0,
+            screen: [0, 0],
             from: [0, 0, 0],
             look_at: [100, 0, 0],
         }
@@ -2444,6 +2486,25 @@ mod tests {
     }
 
     #[test]
+    fn project_truncates_toward_zero_for_both_signs() {
+        // With fov 200 and vz 1000 the focal term is `vx / 5`, so the quotient
+        // is hand-computable. `8 / 5 = 1.6` truncates to 1 (round-to-nearest
+        // would give 2) and `-8 / 5 = -1.6` truncates to -1 (flooring would
+        // give -2).
+        let camera = straight_camera();
+        assert_eq!(camera.project([8, -8, 1000]), Some([161, 121]));
+        assert_eq!(camera.project([-8, 8, 1000]), Some([159, 119]));
+        assert_eq!(camera.project([7, -7, 1000]), Some([161, 121]));
+        // `-14 / 5 = -2.8` truncates to -2 (flooring would give -3).
+        assert_eq!(camera.project([-14, 14, 1000]), Some([158, 118]));
+
+        // A non-zero screen-shake offset is added after the truncation.
+        let mut shaken = straight_camera();
+        shaken.screen = [1, -1];
+        assert_eq!(shaken.project([8, -8, 1000]), Some([162, 120]));
+    }
+
+    #[test]
     fn from_cut_centres_the_look_at_point() {
         let cut = Cut {
             pos: [0, 0, 0],
@@ -2462,6 +2523,49 @@ mod tests {
         };
         let camera = Camera::from_cut(&cut);
         assert_eq!(camera.project([0, 0, 0]), Some([160, 120]));
+
+        // A diagonal cut: the fixed-point basis still maps the look-at to the
+        // exact centre.
+        let cut = Cut {
+            pos: [0, 0, 0],
+            look_at: [1000, 0, 1000],
+            fov: 200,
+            ..Cut::default()
+        };
+        let camera = Camera::from_cut(&cut);
+        assert_eq!(camera.project([1000, 0, 1000]), Some([160, 120]));
+    }
+
+    #[test]
+    fn a_nineteen_degree_roll_maps_the_screen_axes() {
+        // 19 degrees in the game's 12-bit angle units.
+        let camera = Camera::from_points_rolled([0, 0, 0], [0, 0, 1000], 200, 216);
+        assert_eq!(camera.roll, 216);
+        // The unrolled camera puts the world +X axis on the screen's positive
+        // X axis (0 degrees from the centre) and the world -Y axis straight
+        // up (-90 degrees). The roll swings both by +19 degrees.
+        let angle = |point: [i32; 2]| {
+            f64::from(point[1] - CENTER_Y)
+                .atan2(f64::from(point[0] - CENTER_X))
+                .to_degrees()
+        };
+        let right = camera.project([10_000, 0, 4000]).unwrap();
+        let up = camera.project([0, -10_000, 4000]).unwrap();
+        assert!(
+            (angle(right) - 19.0).abs() < 1.0,
+            "+X axis at {right:?} ({} deg)",
+            angle(right)
+        );
+        assert!(
+            (angle(up) + 71.0).abs() < 1.0,
+            "-Y axis at {up:?} ({} deg)",
+            angle(up)
+        );
+
+        // No roll: the same points keep their axes.
+        let plain = Camera::from_points([0, 0, 0], [0, 0, 1000], 200);
+        assert!(angle(plain.project([10_000, 0, 4000]).unwrap()).abs() < 1e-9);
+        assert!((angle(plain.project([0, -10_000, 4000]).unwrap()) + 90.0).abs() < 1e-9);
     }
 
     #[test]

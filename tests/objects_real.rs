@@ -779,7 +779,7 @@ fn room_3031_obj_xfm_relights_the_room_and_the_capture() {
     game.sync_entity_from_player(&player);
 
     let before_lights = room.lights;
-    let before = arklay::engine::render_game_frame(&pack, id, &room, &game, &player).unwrap();
+    let before = arklay::engine::render_game_frame(&pack, id, &room, &mut game, &player).unwrap();
 
     // Event 1A's first block rewrites all three lights; start it directly
     // rather than waiting for the in-game trigger.
@@ -797,7 +797,7 @@ fn room_3031_obj_xfm_relights_the_room_and_the_capture() {
     assert_ne!(room.lights, before_lights, "obj_xfm never rewrote a light");
     println!("ROOM3031 lights {:?} -> {:?}", before_lights, room.lights);
 
-    let after = arklay::engine::render_game_frame(&pack, id, &room, &game, &player).unwrap();
+    let after = arklay::engine::render_game_frame(&pack, id, &room, &mut game, &player).unwrap();
     let changed = before
         .rgba
         .iter()
@@ -961,7 +961,7 @@ fn pushed_object_capture_is_deterministic() {
         "the shelf did not move"
     );
 
-    let frame = arklay::engine::render_game_frame(&pack, id, &room, &state, &player).unwrap();
+    let frame = arklay::engine::render_game_frame(&pack, id, &room, &mut state, &player).unwrap();
     assert!(
         frame.rgba.chunks(4).any(|pixel| pixel[3] != 0),
         "the pushed frame is blank"
@@ -974,7 +974,8 @@ fn pushed_object_capture_is_deterministic() {
         object_tick(&mut repeat_player, &room, &mut repeat_game, input);
     }
     let repeat =
-        arklay::engine::render_game_frame(&pack, id, &room, &repeat_game, &repeat_player).unwrap();
+        arklay::engine::render_game_frame(&pack, id, &room, &mut repeat_game, &repeat_player)
+            .unwrap();
     assert_eq!(
         frame.rgba, repeat.rgba,
         "the push capture is not deterministic"
@@ -1190,10 +1191,10 @@ fn room_30b_objs_hide_changes_the_rendered_tint() {
         let mut cut_room = room.clone();
         cut_room.current_cut = cut;
         let tinted =
-            arklay::engine::render_game_frame(&pack, id, &cut_room, &game, &player).unwrap();
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &mut game, &player).unwrap();
         game.player_tint = [255; 3];
         let plain =
-            arklay::engine::render_game_frame(&pack, id, &cut_room, &game, &player).unwrap();
+            arklay::engine::render_game_frame(&pack, id, &cut_room, &mut game, &player).unwrap();
         game.player_tint = [0x30, 0, 0];
         let changed = plain
             .rgba
