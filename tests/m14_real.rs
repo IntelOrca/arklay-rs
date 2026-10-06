@@ -6,12 +6,15 @@
 //!  ARKLAY_MOVIE_GOLDEN=... cargo test --test m14_real -- --ignored --nocapture`
 //!
 //! The playback tests additionally need the film pack: `ARKLAY_RE1_MOVIE`, or
-//! a sibling `<pack stem>.movie.akpak` next to `ARKLAY_RE1_PACK`. The
-//! integer-pixel comparison needs `ARKLAY_MOVIE_GOLDEN`, a directory of
-//! sampled BMPs and a `hashes_crc32.txt` produced by an independent decoder
-//! (never committed); without it the tests still decode the whole corpus and
-//! check determinism. Only an unset environment skips; a partial
-//! configuration fails loudly.
+//! a sibling `<pack stem>.movie.akpak` next to `ARKLAY_RE1_PACK`; a configured
+//! environment without one is a partial setup and fails. The integer-pixel
+//! comparison needs `ARKLAY_MOVIE_GOLDEN`, a directory of sampled BMPs and a
+//! `hashes_crc32.txt` (never committed). The golden sets used so far were
+//! produced by a same-author Python reimplementation of the codec, not a
+//! third-party decoder, so the comparison is a cross-implementation check
+//! rather than fully independent verification; see `docs/m14-deviations.md`
+//! item 8. A set variable with missing goldens fails; only an unset variable
+//! skips.
 
 mod common;
 
@@ -78,7 +81,8 @@ fn parse_film(root: &Path, name: &str) -> Avi {
     Avi::parse(bytes).unwrap_or_else(|error| panic!("failed to parse {path:?}: {error}"))
 }
 
-/// The independent-decoder directory, or `None` when not configured.
+/// The golden-decoder directory, or `None` when not configured. A set variable
+/// whose directory or hash file is missing fails rather than skipping.
 fn golden_dir() -> Option<PathBuf> {
     let dir = std::env::var("ARKLAY_MOVIE_GOLDEN").ok()?;
     let dir = PathBuf::from(dir);
@@ -87,12 +91,21 @@ fn golden_dir() -> Option<PathBuf> {
         "ARKLAY_MOVIE_GOLDEN is set but {} is not a directory",
         dir.display()
     );
+    let hashes = dir.join("hashes_crc32.txt");
+    assert!(
+        hashes.is_file(),
+        "ARKLAY_MOVIE_GOLDEN is set but {} is missing",
+        hashes.display()
+    );
     Some(dir)
 }
 
 /// The converted film pack: `ARKLAY_RE1_MOVIE`, or the sibling
 /// `<pack stem>.movie.akpak` beside `ARKLAY_RE1_PACK`.
-fn real_movie_pack(pack_path: &Path) -> Option<PathBuf> {
+///
+/// A configured asset environment without a movie pack is a partial setup and
+/// fails loudly; callers only reach this after [`common::asset_env`] succeeded.
+fn real_movie_pack(pack_path: &Path) -> PathBuf {
     if let Ok(path) = std::env::var("ARKLAY_RE1_MOVIE") {
         let path = PathBuf::from(path);
         assert!(
@@ -100,11 +113,19 @@ fn real_movie_pack(pack_path: &Path) -> Option<PathBuf> {
             "ARKLAY_RE1_MOVIE is set but {} is not a file",
             path.display()
         );
-        return Some(path);
+        return path;
     }
-    let stem = pack_path.file_stem()?.to_str()?;
+    let stem = pack_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or_else(|| panic!("pack path {} has no file stem", pack_path.display()));
     let sibling = pack_path.with_file_name(format!("{stem}.movie.akpak"));
-    sibling.is_file().then_some(sibling)
+    assert!(
+        sibling.is_file(),
+        "movie pack {} is missing; set ARKLAY_RE1_MOVIE or convert the sibling pack",
+        sibling.display()
+    );
+    sibling
 }
 
 /// A self-deleting temporary directory unique to this process and label.
@@ -232,16 +253,29 @@ fn every_frame_decodes_deterministically() {
 #[test]
 #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
 fn decoded_frames_match_the_independent_goldens() {
-    let Some((root, _pack)) = common::asset_env() else {
+    // A configured golden set without assets is a partial setup: fail before
+    // the asset skip could hide it.
+    let Some(golden) = golden_dir() else {
+        eprintln!(
+            "note: ARKLAY_MOVIE_GOLDEN is unset; skipping the golden comparison. \
+             The goldens used by this project come from a same-author \
+             reimplementation, not a third-party decoder \
+             (docs/m14-deviations.md item 8)."
+        );
         return;
     };
-    let Some(golden) = golden_dir() else {
-        return;
+    let Some((root, _pack)) = common::asset_env() else {
+        panic!("ARKLAY_MOVIE_GOLDEN is set but ARKLAY_RE1_ROOT/ARKLAY_RE1_PACK are not");
     };
     let hashes_path = golden.join("hashes_crc32.txt");
     let golden_hashes = fs::read_to_string(&hashes_path)
         .unwrap_or_else(|error| panic!("failed to read {hashes_path:?}: {error}"));
     let expected: std::collections::HashSet<&str> = golden_hashes.lines().collect();
+    assert_eq!(
+        expected.len(),
+        TOTAL_FRAMES,
+        "the golden hash file is incomplete"
+    );
     let mut matched = 0usize;
     for &(name, frames, _) in FILMS {
         let avi = parse_film(&root, name);
@@ -256,7 +290,7 @@ fn decoded_frames_match_the_independent_goldens() {
             let line = format!("{name} {index} {:08x}", crc32(decoder.rgb()));
             assert!(
                 expected.contains(line.as_str()),
-                "{name} frame {index} does not match the independent decoder ({line})"
+                "{name} frame {index} does not match the golden decoder ({line})"
             );
             matched += 1;
             if picks.contains(&index) {
@@ -284,10 +318,7 @@ fn pj_prologue_cut_resumes_at_the_second_cut_point() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&movie_path).unwrap();
 
     // Chris plays the whole 2261-frame intro.
@@ -333,10 +364,7 @@ fn every_shipped_movie_on_site_resolves_to_a_packed_film() {
     let Some((root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&movie_path).unwrap();
 
     let mut sites = 0usize;
@@ -412,10 +440,7 @@ fn the_movie_pack_carries_the_shipped_films() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&movie_path).unwrap();
     let mut expected = 0usize;
     for id in 0..=28u8 {
@@ -467,10 +492,7 @@ fn a_full_film_decodes_to_its_frame_count_with_a_stable_hash() {
     let Some((root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&movie_path).unwrap();
     for (id, frames) in [(23u8, 76usize), (4, 147)] {
         let first = session_hashes(&pack, id, 0);
@@ -494,15 +516,12 @@ fn a_full_film_decodes_to_its_frame_count_with_a_stable_hash() {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack; writes ~50 MiB of film audio"]
+#[ignore = "requires a converted movie pack"]
 fn a_short_audio_film_pads_silence_without_stalling() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&movie_path).unwrap();
     // `dm7` ships 60 audio chunks for 67 video frames.
     let mut session = MovieSession::open(&pack, 7, 0).unwrap();
@@ -534,10 +553,7 @@ fn standalone_fmv_capture_is_deterministic_and_not_blank() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("fmv");
     let first = dir.0.join("first.bmp");
     let second = dir.0.join("second.bmp");
@@ -644,10 +660,7 @@ fn movie_on_sites_start_and_resume_the_room_with_its_bgm() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&pack_path).unwrap();
     let movie = Pack::open(&movie_path).unwrap();
 
@@ -703,10 +716,7 @@ fn room_capture_is_unchanged_with_and_without_the_movie_pack() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("movie-capture");
     let with = dir.0.join("with.bmp");
     let without = dir.0.join("without.bmp");
@@ -794,10 +804,7 @@ fn ending_chain_captures_are_deterministic() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let Some(movie_path) = real_movie_pack(&pack_path) else {
-        eprintln!("skipping: set ARKLAY_RE1_MOVIE or convert the sibling movie pack");
-        return;
-    };
+    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("ending");
     let first = dir.0.join("first.bmp");
     let second = dir.0.join("second.bmp");

@@ -17,10 +17,13 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    content later needs no table change.
 
 2. **Skip grace at the port's tick rate.** The original's 100-count grace
-   window is transcribed exactly, but the port's fixed tick is 30 Hz rather
-   than the original's frame rate, so a film becomes skippable after ~3.3 s
-   instead of the original's interval. The grace and the per-film masks are
-   constants with unit tests; the interactive sweep confirms the feel.
+   window is transcribed exactly, but the port decrements it on its fixed
+   30 Hz tick, so every film becomes skippable after ~3.3 s. In the original
+   the counter advances with the main loop, which is paced at ~33 ms during
+   gameplay and ~16 ms on the boot, title and ending screens: a gameplay film
+   matches the port's ~3.3 s, while a boot/title/ending film becomes skippable
+   after ~1.7 s. The grace and the per-film masks are constants with unit
+   tests; the interactive sweep confirms the feel.
 
 3. **No subtitle or credits overlays.** The PS1 releases draw FMV subtitles and
    an ending-credits overlay over the films; neither ships in this PC install
@@ -59,3 +62,14 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    run without the movie pack logs each unavailable film and continues the
    room; the corpus audit asserts zero `0x29` placeholders, zero filtered ids
    and at least one drained request.
+
+8. **Golden decode oracle provenance.** The strongest decode test,
+   `decoded_frames_match_the_independent_goldens`, compares sampled frames
+   against CRC-32 hashes and BMPs selected by `ARKLAY_MOVIE_GOLDEN`. The
+   committed test cannot verify how those goldens were produced: the sets used
+   so far come from a same-author Python Cinepak reimplementation rather than a
+   third-party decoder (none is installed in this environment), so treat them
+   as a cross-check between two implementations sharing a spec, not as fully
+   independent verification. The test fails when the variable is set but the
+   golden directory, hash file or a sampled BMP is missing; it prints an
+   explicit notice and skips only when the variable is unset.

@@ -101,45 +101,44 @@ pub fn row(id: u8) -> Option<EndingRow> {
     ROWS.get(usize::from(id)).copied().filter(|_| id != 0)
 }
 
-/// Select the ending row (1-7) from the two survivor flags and the player.
+/// Select the ending row (1-7) from the two scenario flags and the player.
 ///
-/// The player always survives. `chris_survived` is the first survivor flag
-/// (the partner: Rebecca on a Chris run, Barry on a Jill run) and
-/// `jill_survived` the second (the other protagonist); the port names the pair
-/// after the two leads because the second flag is always one of them. The
-/// seven rows are:
+/// The player always survives. `partner_alive` is the original's
+/// `SCENARIO2_FLAG_PARTNER_ALIVE` bit (the partner: Rebecca on a Chris run,
+/// Barry on a Jill run) and `second_survivor` its `SCENARIO2_FLAG_SECOND_SURVIVOR`
+/// bit. The seven rows are:
 ///
-/// | first | second | Chris | Jill |
-/// |-------|--------|-------|------|
-/// | yes   | yes    | 1     | 2    |
-/// | yes   | no     | 3     | 3    |
-/// | no    | yes    | 4     | 5    |
-/// | no    | no     | 6     | 7    |
-pub fn select_id(chris_survived: bool, jill_survived: bool, character: u8) -> u8 {
+/// | partner_alive | second_survivor | Chris | Jill |
+/// |---------------|-----------------|-------|------|
+/// | yes           | no              | 1     | 2    |
+/// | yes           | yes             | 3     | 3    |
+/// | no            | no              | 4     | 5    |
+/// | no            | yes             | 6     | 7    |
+pub fn select_id(partner_alive: bool, second_survivor: bool, character: u8) -> u8 {
     let chris = character & 1 == 0;
-    match (chris_survived, jill_survived) {
-        (true, true) => {
-            if chris {
-                1
-            } else {
-                2
-            }
-        }
-        (true, false) => 3,
-        (false, true) => {
+    match (partner_alive, second_survivor) {
+        (false, false) => {
             if chris {
                 4
             } else {
                 5
             }
         }
-        (false, false) => {
+        (false, true) => {
             if chris {
                 6
             } else {
                 7
             }
         }
+        (true, false) => {
+            if chris {
+                1
+            } else {
+                2
+            }
+        }
+        (true, true) => 3,
     }
 }
 
@@ -181,21 +180,21 @@ mod tests {
 
     #[test]
     fn select_id_covers_the_seven_rows() {
-        // Both survivors.
-        assert_eq!(select_id(true, true, 0), 1);
-        assert_eq!(select_id(true, true, 1), 2);
-        // One survivor plus the partner.
-        assert_eq!(select_id(true, false, 0), 3);
-        assert_eq!(select_id(true, false, 1), 3);
-        // Alone.
-        assert_eq!(select_id(false, true, 0), 4);
-        assert_eq!(select_id(false, true, 1), 5);
-        // No survivors.
-        assert_eq!(select_id(false, false, 0), 6);
-        assert_eq!(select_id(false, false, 1), 7);
+        // Partner alive and the second survivor flag clear: both survive.
+        assert_eq!(select_id(true, false, 0), 1);
+        assert_eq!(select_id(true, false, 1), 2);
+        // Partner alive plus the second survivor: one survivor and the partner.
+        assert_eq!(select_id(true, true, 0), 3);
+        assert_eq!(select_id(true, true, 1), 3);
+        // Partner gone, second survivor flag clear: alone.
+        assert_eq!(select_id(false, false, 0), 4);
+        assert_eq!(select_id(false, false, 1), 5);
+        // Partner gone plus the second survivor: no survivors.
+        assert_eq!(select_id(false, true, 0), 6);
+        assert_eq!(select_id(false, true, 1), 7);
         // The character is masked to its low bit.
-        assert_eq!(select_id(true, true, 2), 1);
-        assert_eq!(select_id(true, true, 3), 2);
+        assert_eq!(select_id(true, false, 2), 1);
+        assert_eq!(select_id(true, false, 3), 2);
     }
 
     #[test]

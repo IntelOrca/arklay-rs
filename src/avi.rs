@@ -4,8 +4,9 @@
 //! The corpus is homogeneous: a `LIST hdrl` with one `vids`/`cvid` stream and
 //! one `auds` PCM stream, a `LIST movi` whose `LIST rec ` wrappers hold the
 //! `00dc` video and `01wb` audio chunks, and an `idx1` index. The index is
-//! preferred when it is present and validates against the chunk headers; the
-//! `movi` walk is the fallback. Video and audio chunks are paired by their
+//! preferred when every entry validates against the chunk it names (the
+//! shipped `rec ` container and `JUNK` entries included); the `movi` walk is
+//! the fallback. Video and audio chunks are paired by their
 //! ordinal position, which is the timestamp order: the corpus muxer writes a
 //! fixed lead of audio chunks before the first video chunk, so a rec-local
 //! pairing would drop the film's opening audio.
@@ -178,7 +179,10 @@ impl Avi {
                 audio.format_tag
             );
         }
-        let strh_us = video_strh.and_then(|strh| strh_frame_duration(&data, strh));
+        let strh_us = match video_strh {
+            Some(strh) => strh_frame_duration(&data, strh)?,
+            None => None,
+        };
         let frame_rate = frame_rate(avih_us, strh_us)?;
 
         let (videos, audios) = match (idx1, movi) {
@@ -382,14 +386,26 @@ fn parse_audio_format(data: &[u8], strf: &Range<usize>) -> Result<AudioFormat> {
 }
 
 /// The `strh` frame duration in microseconds, when `avih` does not carry one.
-fn strh_frame_duration(data: &[u8], strh: Range<usize>) -> Option<u32> {
-    let header = data.get(strh)?;
+///
+/// The `dwScale` and `dwRate` fields sit at offsets 20 and 24 of the
+/// `AVISTREAMHEADER`, so a truncated header is an error naming its size rather
+/// than an out-of-bounds read.
+fn strh_frame_duration(data: &[u8], strh: Range<usize>) -> Result<Option<u32>> {
+    let header = data.get(strh).context("video strh is out of bounds")?;
+    if header.len() < 28 {
+        bail!(
+            "video strh is only {} bytes, shorter than its 28-byte frame rate fields",
+            header.len()
+        );
+    }
     let scale = read_u32(header, 20);
     let rate = read_u32(header, 24);
     if rate == 0 || scale == 0 {
-        return None;
+        return Ok(None);
     }
-    Some((u64::from(scale) * u64::from(MICROS_PER_SECOND) / u64::from(rate)) as u32)
+    Ok(Some(
+        (u64::from(scale) * u64::from(MICROS_PER_SECOND) / u64::from(rate)) as u32,
+    ))
 }
 
 /// Frames per second, rounded to the nearest whole frame.
@@ -426,7 +442,10 @@ fn index_entries(
         let len = u32::from_le_bytes(data.get(pos + 12..pos + 16)?.try_into().ok()?) as usize;
         let chunk = movi_type.checked_add(offset)?;
         let header = data.get(chunk..chunk + 8)?;
-        if header[0..4] != id {
+        // The shipped muxer indexes every `LIST rec ` wrapper under the
+        // wrapper's type fourcc, so its chunk header reads `LIST`.
+        let header_id: [u8; 4] = if id == *b"rec " { *b"LIST" } else { id };
+        if header[0..4] != header_id {
             return None;
         }
         if u32::from_le_bytes(header[4..8].try_into().ok()?) as usize != len {
@@ -442,7 +461,13 @@ fn index_entries(
                 offset: chunk + 8,
                 len,
             }),
-            _ => {}
+            b"rec " => {
+                if data.get(chunk + 8..chunk + 12)? != b"rec " {
+                    return None;
+                }
+            }
+            b"JUNK" => {}
+            _ => return None,
         }
         pos += 16;
     }
@@ -627,6 +652,20 @@ mod tests {
         list(b"hdrl", &body)
     }
 
+    /// A `LIST hdrl` with a caller-supplied video `strh` chunk.
+    fn hdrl_with_video_strh(us_per_frame: u32, total_frames: u32, video_strh: Vec<u8>) -> Vec<u8> {
+        let mut body = avih(us_per_frame, total_frames);
+        let video = [video_strh, video_strf(b"cvid", 320, 240)].concat();
+        body.extend_from_slice(&list(b"strl", &video));
+        let audio = [
+            strh(b"auds", 4, 88_200, total_frames),
+            audio_strf(1, 2, 22_050, 16),
+        ]
+        .concat();
+        body.extend_from_slice(&list(b"strl", &audio));
+        list(b"hdrl", &body)
+    }
+
     /// A built file plus the idx1 `(fourcc, offset, len)` of every chunk.
     struct Fixture {
         hdrl: Vec<u8>,
@@ -657,40 +696,71 @@ mod tests {
             self.index.push((*id, start + 4, body.len()));
         }
 
-        /// Append a `LIST rec ` whose children were pushed as `(fourcc, body)`.
+        /// Append a `LIST rec ` whose children were pushed as `(fourcc, body)`,
+        /// recording the wrapper entry the shipped index carries too.
         fn push_rec(&mut self, children: &[(&[u8; 4], Vec<u8>)]) {
             let rec_start = self.movi_body.len();
             let mut inner = Vec::new();
+            let mut child_entries = Vec::new();
             for (id, body) in children {
                 let start = inner.len();
                 inner.extend_from_slice(&chunk(id, body));
                 // rec header 8 + type 4, then the child header.
-                self.index
-                    .push((**id, rec_start + 12 + start + 4, body.len()));
+                child_entries.push((**id, rec_start + 12 + start + 4, body.len()));
             }
             self.movi_body.extend_from_slice(&list(b"rec ", &inner));
+            self.index.push((*b"rec ", rec_start + 4, 4 + inner.len()));
+            self.index.extend(child_entries);
+        }
+
+        /// The `idx1` body for an explicit chunk order.
+        fn index_body(&self, order: &[[u8; 4]]) -> Vec<u8> {
+            let mut available = self.index.clone();
+            let mut body = Vec::new();
+            for id in order {
+                let at = available
+                    .iter()
+                    .position(|entry| entry.0 == *id)
+                    .expect("indexed chunk exists");
+                let (_, offset, len) = available.remove(at);
+                body.extend_from_slice(id);
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&(offset as u32).to_le_bytes());
+                body.extend_from_slice(&(len as u32).to_le_bytes());
+            }
+            body
+        }
+
+        /// The `idx1` body listing every recorded entry in order, including
+        /// the `LIST rec ` wrappers the shipped muxer indexes.
+        fn rec_index_body(&self) -> Vec<u8> {
+            let mut body = Vec::new();
+            for (id, offset, len) in &self.index {
+                body.extend_from_slice(id);
+                body.extend_from_slice(&0u32.to_le_bytes());
+                body.extend_from_slice(&(*offset as u32).to_le_bytes());
+                body.extend_from_slice(&(*len as u32).to_le_bytes());
+            }
+            body
         }
 
         /// The file bytes, with an `idx1` in the given chunk order when asked.
         fn build(&self, index_order: Option<&[[u8; 4]]>) -> Vec<u8> {
+            let index = index_order.map(|order| self.index_body(order));
+            self.assemble(index.as_deref())
+        }
+
+        /// The file bytes with a real `rec `-carrying `idx1`.
+        fn build_rec_index(&self) -> Vec<u8> {
+            self.assemble(Some(&self.rec_index_body()))
+        }
+
+        fn assemble(&self, index: Option<&[u8]>) -> Vec<u8> {
             let mut top = Vec::new();
             top.extend_from_slice(&self.hdrl);
             top.extend_from_slice(&list(b"movi", &self.movi_body));
-            if let Some(order) = index_order {
-                let mut available = self.index.clone();
-                let mut body = Vec::new();
-                for id in order {
-                    let at = available
-                        .iter()
-                        .position(|entry| entry.0 == *id)
-                        .expect("indexed chunk exists");
-                    let (_, offset, len) = available.remove(at);
-                    body.extend_from_slice(id);
-                    body.extend_from_slice(&0u32.to_le_bytes());
-                    body.extend_from_slice(&(offset as u32).to_le_bytes());
-                    body.extend_from_slice(&(len as u32).to_le_bytes());
-                }
-                top.extend_from_slice(&chunk(b"idx1", &body));
+            if let Some(body) = index {
+                top.extend_from_slice(&chunk(b"idx1", body));
             }
             // Top-level odd-sized JUNK and an unknown chunk, both padded.
             top.extend_from_slice(&chunk(b"JUNK", &[1, 2, 3]));
@@ -751,6 +821,54 @@ mod tests {
         assert_eq!(avi.video(1), Some([0x10].as_slice()));
         assert_eq!(avi.video(2), Some([0x11, 0x12].as_slice()));
         assert_eq!(avi.audio(0), Some([0xA0, 0xA1].as_slice()));
+    }
+
+    #[test]
+    fn rec_index_entries_are_validated_and_skipped() {
+        // The real corpus indexes each `LIST rec ` wrapper under `rec `; the
+        // index must be accepted and its container/JUNK entries skipped.
+        let avi = Avi::parse(interleaved().build_rec_index()).unwrap();
+        assert_eq!(avi.frame_count(), 3);
+        assert_eq!(avi.video(0), Some([0x10].as_slice()));
+        assert_eq!(avi.video(1), Some([0x11, 0x12].as_slice()));
+        assert_eq!(avi.video(2), Some([0x13, 0x14, 0x15].as_slice()));
+        assert_eq!(avi.audio(0), Some([0xA0, 0xA1].as_slice()));
+        assert_eq!(avi.audio(1), Some([0xA2, 0xA3].as_slice()));
+        assert_eq!(avi.audio(2), None);
+    }
+
+    #[test]
+    fn a_misdescribed_rec_index_falls_back_to_the_movi_walk() {
+        let mut file = interleaved().build_rec_index();
+        // Break the movi's first rec wrapper list type: the index entry then
+        // fails validation and the movi walk supplies the frames.
+        let movi = file
+            .windows(4)
+            .position(|window| window == b"movi")
+            .unwrap();
+        let list_type = file[movi..]
+            .windows(4)
+            .position(|window| window == b"rec ")
+            .unwrap()
+            + movi;
+        file[list_type..list_type + 4].copy_from_slice(b"junk");
+        let avi = Avi::parse(file).unwrap();
+        assert_eq!(avi.frame_count(), 3);
+        assert_eq!(avi.video(0), Some([0x10].as_slice()));
+        assert_eq!(avi.audio(0), Some([0xA0, 0xA1].as_slice()));
+    }
+
+    #[test]
+    fn truncated_strh_is_an_error_not_a_panic() {
+        let mut short_strh = vec![0u8; 24];
+        short_strh[0..4].copy_from_slice(b"vids");
+        short_strh[20..24].copy_from_slice(&1000u32.to_le_bytes());
+        let hdrl = hdrl_with_video_strh(100_000, 1, chunk(b"strh", &short_strh));
+        let mut fixture = Fixture::new().with_hdrl(hdrl);
+        fixture.push(b"00dc", &[1]);
+        let err = Avi::parse(fixture.build(None)).unwrap_err().to_string();
+        assert!(err.contains("strh"), "{err}");
+        assert!(err.contains("24"), "{err}");
     }
 
     #[test]

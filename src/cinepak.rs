@@ -4,8 +4,8 @@
 //! frames. One frame is a 10-byte big-endian header, then one 12-byte header
 //! per strip, then per strip a run of chunks: codebooks (`0x20`-`0x27`) and
 //! vector data (`0x30`-`0x32`). A frame is decoded into a scratch copy of the
-//! canvas and only committed on success, so a malformed frame leaves the
-//! previous picture intact.
+//! canvas and a cloned strip set, and only committed on success, so a
+//! malformed frame leaves the previous picture and its codebooks intact.
 //!
 //! The shipped corpus uses exactly: intra frames whose first strip carries a
 //! full `0x20`/`0x22` codebook and whose second strip inherits it, delta frames
@@ -87,8 +87,10 @@ impl Decoder {
 
     /// Decode one frame over the previous canvas.
     ///
-    /// On error the presented canvas is unchanged and the next decode still
-    /// uses the previous picture.
+    /// On error the presented canvas and the per-strip codebooks are both
+    /// unchanged: the frame is decoded into a copy of the strip set and only
+    /// committed on success, so the next decode still uses the previous
+    /// picture and its codebooks.
     pub fn decode(&mut self, frame: &[u8]) -> Result<()> {
         if frame.len() < FRAME_HEADER {
             bail!(
@@ -126,9 +128,10 @@ impl Decoder {
         if self.strips.len() < strip_count {
             self.strips.resize(strip_count, Strip::default());
         }
+        let mut strips = self.strips.clone();
         self.scratch.copy_from_slice(&self.rgb);
         decode_into(
-            &mut self.strips,
+            &mut strips,
             &mut self.scratch,
             self.width,
             self.height,
@@ -136,6 +139,7 @@ impl Decoder {
             strip_count,
             &frame[FRAME_HEADER..encoded],
         )?;
+        self.strips = strips;
         std::mem::swap(&mut self.rgb, &mut self.scratch);
         Ok(())
     }
@@ -866,6 +870,59 @@ mod tests {
         assert!(decoder.decode(&truncated_vectors).is_err());
 
         assert_eq!(decoder.rgb(), before.as_slice());
+    }
+
+    #[test]
+    fn a_failed_frame_rolls_back_the_codebooks() {
+        let mut decoder = Decoder::new(8, 8);
+        let codebook = chunk(0x26, &codebook(&[grey(100)], false));
+        let paint = chunk(VECTOR_V1, &[0, 0, 0, 0]);
+        let first = frame(
+            0,
+            8,
+            8,
+            &[strip(INTRA_STRIP, 0, 0, 8, 8, &[codebook, paint])],
+        );
+        decoder.decode(&first).unwrap();
+        assert_eq!(at(&decoder, 0, 0), 100);
+
+        // A selective codebook update followed by a truncated vector chunk:
+        // the codebook mutates before the frame fails.
+        let mut update = 0x8000_0000u32.to_be_bytes().to_vec();
+        update.extend_from_slice(&[55, 55, 55, 55, 0, 0]);
+        let failing = frame(
+            1,
+            8,
+            8,
+            &[strip(
+                INTER_STRIP,
+                0,
+                0,
+                8,
+                8,
+                &[chunk(0x27, &update), chunk(VECTOR_V1, &[0])],
+            )],
+        );
+        assert!(decoder.decode(&failing).is_err());
+        assert_eq!(at(&decoder, 0, 0), 100, "the canvas changed on error");
+
+        // A later delta frame without a codebook must still paint the
+        // pre-error entry, not the failed frame's update.
+        let reuse = frame(
+            1,
+            8,
+            8,
+            &[strip(
+                INTER_STRIP,
+                0,
+                0,
+                8,
+                8,
+                &[chunk(VECTOR_V1, &[0, 0, 0, 0])],
+            )],
+        );
+        decoder.decode(&reuse).unwrap();
+        assert_eq!(at(&decoder, 0, 0), 100, "the failed codebook was committed");
     }
 
     #[test]

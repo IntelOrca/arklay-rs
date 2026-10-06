@@ -31,6 +31,7 @@
 //!   only rendering, the camera-switch cull and effect attach compose the SCA
 //!   parent chain.
 
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_void};
 use std::path::{Path, PathBuf};
@@ -1618,10 +1619,8 @@ struct App {
     save_dir: PathBuf,
     /// The optional voice pack path, attached to every gameplay session.
     voice_path: Option<PathBuf>,
-    /// The optional movie pack path, attached to films and game sessions.
-    movie_path: Option<PathBuf>,
     /// The lazily opened movie pack (or the main pack when a film is embedded
-    /// and no sibling exists).
+    /// and no sibling exists), shared with every gameplay session.
     movie_pack: AuxiliaryPack,
     font: Option<font::Font>,
     text: Text,
@@ -1697,8 +1696,7 @@ impl App {
             pack,
             save_dir,
             voice_path,
-            movie_pack: AuxiliaryPack::new(movie_path.clone()),
-            movie_path,
+            movie_pack: AuxiliaryPack::new(movie_path),
             font,
             text,
             mode: Mode::Title(ui::title::TitleScreen::new()),
@@ -1921,7 +1919,9 @@ impl App {
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
         session.voice_pack = AuxiliaryPack::new(self.voice_path.clone());
-        session.movie_pack = AuxiliaryPack::new(self.movie_path.clone());
+        // The session shares the app's one movie pack, so an in-game film does
+        // not open a second copy.
+        session.movie_pack = self.movie_pack.share();
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -4014,10 +4014,14 @@ impl SfxCache {
 }
 
 /// A lazily opened optional pack (the voice pack, the movie pack).
+///
+/// The opened [`Pack`] lives in a shared cell so [`AuxiliaryPack::share`] can
+/// hand the same one copy to another owner (the app and a game session); only
+/// the first handle to need it opens the file.
 #[derive(Default)]
 struct AuxiliaryPack {
     path: Option<PathBuf>,
-    pack: Option<Pack>,
+    pack: Rc<OnceCell<Pack>>,
     attempted: bool,
 }
 
@@ -4025,19 +4029,38 @@ impl AuxiliaryPack {
     fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
-            pack: None,
+            pack: Rc::new(OnceCell::new()),
             attempted: false,
         }
+    }
+
+    /// A handle sharing this handle's one lazily opened copy, so the app and a
+    /// game session never hold two copies of the movie pack.
+    fn share(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            pack: Rc::clone(&self.pack),
+            attempted: self.attempted,
+        }
+    }
+
+    /// The number of live handles over this pack's cell. Test seam for the
+    /// one-copy assertion.
+    #[cfg(test)]
+    fn handles(&self) -> usize {
+        Rc::strong_count(&self.pack)
     }
 
     /// The pack, opened on first use. A failure is reported once with `label`
     /// and leaves the pack absent, so its lookups fall back to the main pack.
     fn open(&mut self, label: &str) -> Option<&Pack> {
-        if !self.attempted {
+        if !self.attempted && self.pack.get().is_none() {
             self.attempted = true;
             if let Some(path) = &self.path {
                 match Pack::open(path) {
-                    Ok(pack) => self.pack = Some(pack),
+                    Ok(pack) => {
+                        let _ = self.pack.set(pack);
+                    }
                     Err(err) => eprintln!(
                         "warning: failed to open {label} pack {}: {err:#}",
                         path.display()
@@ -4045,7 +4068,7 @@ impl AuxiliaryPack {
                 }
             }
         }
-        self.pack.as_ref()
+        self.pack.get()
     }
 }
 
@@ -4085,14 +4108,18 @@ fn movie_pack_path(main: &Path, explicit: Option<&Path>) -> Option<PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
-/// One tick's pad word for the film skip check: the accept buttons become a
-/// non-zero bit, so an unmasked edge ends a skippable film.
+/// One tick's pad word for the film skip check: every reachable accept button
+/// becomes a distinct non-zero bit inside the original's `0x0FFF` mask, so an
+/// unmasked edge ends a skippable film.
+///
+/// The port's keyboard has no L2/R2 keys; the run key shares the cancel/run
+/// button's bit, matching the original's B/Circle run binding.
 fn movie_buttons(ui: UiInput, input: player::Input) -> u16 {
     let mut word = 0u16;
-    if ui.confirm || input.action_pressed {
+    if ui.confirm || input.action_held || input.action_pressed {
         word |= 0x0001;
     }
-    if ui.cancel {
+    if ui.cancel || input.run {
         word |= 0x0002;
     }
     if ui.start {
@@ -4109,6 +4136,12 @@ fn movie_buttons(ui: UiInput, input: player::Input) -> u16 {
     }
     if ui.right {
         word |= 0x0080;
+    }
+    if ui.page_left {
+        word |= 0x0400;
+    }
+    if ui.page_right {
+        word |= 0x0800;
     }
     word
 }
@@ -7223,7 +7256,9 @@ mod tests {
         let _ = unsafe {
             sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
         };
-        let Some(mixer) = Mixer::open() else {
+        let mixer = Mixer::open();
+        let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER) };
+        let Some(mixer) = mixer else {
             eprintln!("skipping voice handshake test: no audio device");
             return;
         };
@@ -8411,7 +8446,9 @@ mod tests {
         let _ = unsafe {
             sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
         };
-        Mixer::open()
+        let mixer = Mixer::open();
+        let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER) };
+        mixer
     }
 
     #[test]
@@ -8535,6 +8572,147 @@ mod tests {
         }
         writer.write(&pack_path).unwrap();
         Pack::open(&pack_path).unwrap()
+    }
+
+    #[test]
+    fn the_app_and_a_game_session_share_one_movie_pack() {
+        let dir = TempDir::new();
+        let id = RoomId::parse("1000").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&dir.0.join("game.akpak")).unwrap();
+        let pack = Pack::open(&dir.0.join("game.akpak")).unwrap();
+
+        let movie_path = dir.0.join("game.movie.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add("movie/oj.avi", crate::movie::test_avi(4))
+            .unwrap();
+        writer.write(&movie_path).unwrap();
+
+        let mut app = App::new(pack, dir.0.clone(), None, Some(movie_path), false);
+        // The boot/title path opens the app's one copy first...
+        drop(app.open_movie(0, 0).unwrap());
+
+        // ...and the game session must reuse that allocation, not open a
+        // second 251.6 MiB pack.
+        let session = GameSession::from_room(&app.pack, id, &dir.0).unwrap();
+        app.start_session(session);
+        let session_ptr = {
+            let Mode::Play(session) = &mut app.mode else {
+                panic!("the session is not in play mode");
+            };
+            session.movie_pack.open("movie").unwrap() as *const Pack
+        };
+        let app_ptr = app.movie_pack.open("movie").unwrap() as *const Pack;
+        assert_eq!(session_ptr, app_ptr, "the session opened a second copy");
+        assert_eq!(app.movie_pack.handles(), 2, "one shared pack cell");
+    }
+
+    #[test]
+    fn movie_buttons_map_every_reachable_accept_button() {
+        assert_eq!(
+            movie_buttons(UiInput::default(), player::Input::default()),
+            0
+        );
+        let cases = [
+            UiInput {
+                confirm: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                cancel: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                start: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                up: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                down: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                left: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                right: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                page_left: true,
+                ..UiInput::default()
+            },
+            UiInput {
+                page_right: true,
+                ..UiInput::default()
+            },
+        ];
+        let mut seen = 0u16;
+        for ui in cases {
+            let word = movie_buttons(ui, player::Input::default());
+            assert_ne!(word, 0);
+            assert_eq!(word & !0x0FFF, 0, "a bit outside the accept mask");
+            assert_eq!(seen & word, 0, "two buttons share bit 0x{word:04X}");
+            seen |= word;
+        }
+        assert_eq!(seen, 0x0CFB, "the full reachable accept set");
+        assert_eq!(
+            movie_buttons(
+                UiInput::default(),
+                player::Input {
+                    action_held: true,
+                    ..player::Input::default()
+                }
+            ),
+            0x0001
+        );
+        assert_eq!(
+            movie_buttons(
+                UiInput::default(),
+                player::Input {
+                    run: true,
+                    ..player::Input::default()
+                }
+            ),
+            0x0002,
+            "the run key shares the cancel/run bit"
+        );
+    }
+
+    #[test]
+    fn a_shoulder_button_skips_a_film_after_the_grace() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("film.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add("movie/oj.avi", crate::movie::test_avi(400))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session = MovieSession::open(&pack, 0, 0).unwrap();
+        assert_eq!(session.tick(0, None), MovieTick::Waiting);
+        for _ in 0..150 {
+            session.tick(0, None);
+        }
+        let ui = UiInput {
+            page_left: true,
+            ..UiInput::default()
+        };
+        assert_eq!(
+            session.tick(movie_buttons(ui, player::Input::default()), None),
+            MovieTick::Skipped,
+            "L1 must be able to skip a skippable film"
+        );
     }
 
     /// Run the app until `predicate` holds, returning the film ids seen in

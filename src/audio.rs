@@ -318,8 +318,13 @@ pub(crate) struct MixState {
     /// The film's stereo audio, mixed alongside the game sounds.
     movie: Option<MovieAudio>,
     /// True while a film holds the game sounds: BGM, voice and one-shots are
-    /// skipped but keep their buffers and positions; the film still renders.
+    /// skipped but keep their buffers; the film still renders.
     game_paused: bool,
+    /// BGM channels that were sounding when a film paused them, so a resume
+    /// restarts exactly those from sample 0.
+    paused_bgm: [bool; 3],
+    /// Whether the voice bank was sounding when a film paused it.
+    paused_voice: bool,
 }
 
 impl MixState {
@@ -332,6 +337,8 @@ impl MixState {
             next_sfx_seq: 0,
             movie: None,
             game_paused: false,
+            paused_bgm: [false; 3],
+            paused_voice: false,
         }
     }
 
@@ -506,15 +513,53 @@ impl MixState {
         self.movie = None;
     }
 
-    /// Suspend the game sounds (BGM, voice, one-shots) for a film, keeping
-    /// every buffer and position so playback resumes where it stopped.
+    /// Suspend the game sounds (BGM, voice, one-shots) for a film.
+    ///
+    /// The original's `PauseSounds` stops the sounding BGM banks and the voice
+    /// bank; `ResumePausedSounds` starts exactly those again from sample 0. The
+    /// port does the same for the BGM channels and the voice channel. The
+    /// one-shot pool is the port's own model (the original has no pool), so it
+    /// is only frozen and keeps its position.
     pub(crate) fn pause_game_sounds(&mut self) {
         self.game_paused = true;
+        for (index, channel) in self.bgm_channels.iter_mut().enumerate() {
+            let Some(channel) = channel else { continue };
+            self.paused_bgm[index] = channel.playing;
+            if channel.playing {
+                channel.playing = false;
+                channel.pos = 0;
+            }
+        }
+        self.paused_voice = self
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.pos < voice.pcm.len());
+        if self.paused_voice
+            && let Some(voice) = &mut self.voice
+        {
+            voice.pos = 0;
+        }
     }
 
-    /// Undo [`MixState::pause_game_sounds`].
+    /// Undo [`MixState::pause_game_sounds`], restarting the banks it stopped
+    /// from sample 0.
     pub(crate) fn resume_game_sounds(&mut self) {
         self.game_paused = false;
+        let paused = self.paused_bgm;
+        self.paused_bgm = [false; 3];
+        for (channel, was_playing) in self.bgm_channels.iter_mut().zip(paused) {
+            if was_playing && let Some(channel) = channel {
+                channel.playing = true;
+                channel.pos = 0;
+            }
+        }
+        if self.paused_voice {
+            if let Some(voice) = &mut self.voice {
+                voice.pos = 0;
+            }
+            self.voice_finished = false;
+            self.paused_voice = false;
+        }
     }
 
     fn is_silent(&self) -> bool {
@@ -793,17 +838,23 @@ impl Mixer {
         self.state.movie_active()
     }
 
-    /// Drop the film-audio buffer and its counter.
+    /// Drop the film-audio buffer, its counter and any film audio already
+    /// queued on the device, so the tail cannot bleed past the film's end.
     pub fn stop_movie_audio(&mut self) {
         self.state.stop_movie_audio();
+        self.clear_stream();
     }
 
-    /// Suspend the game sounds while a film plays, keeping every position.
+    /// Suspend the game sounds while a film plays. The sounding banks are
+    /// stopped and will restart from sample 0 on resume, and the device queue
+    /// is cleared so queued game audio cannot bleed over the film's start.
     pub fn pause_game_sounds(&mut self) {
         self.state.pause_game_sounds();
+        self.clear_stream();
     }
 
-    /// Resume the game sounds after a film.
+    /// Resume the game sounds after a film, restarting the paused banks from
+    /// sample 0.
     pub fn resume_game_sounds(&mut self) {
         self.state.resume_game_sounds();
     }
@@ -884,6 +935,12 @@ impl Mixer {
     fn resume(&self) {
         let _ = unsafe { SDL_ResumeAudioStreamDevice(self.stream) };
     }
+
+    /// Drop every sample already queued on the device; the next
+    /// [`Mixer::update`] refills from the current mixer state.
+    fn clear_stream(&self) {
+        let _ = unsafe { SDL_ClearAudioStream(self.stream) };
+    }
 }
 
 impl Drop for Mixer {
@@ -899,7 +956,7 @@ pub type MusicPlayer = Mixer;
 mod tests {
     use super::*;
 
-    use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_SetHint};
+    use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_ResetHint, SDL_SetHint};
 
     fn chunk(id: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
@@ -1188,32 +1245,61 @@ mod tests {
     }
 
     #[test]
-    fn mixer_movie_sums_with_game_sounds_and_pause_keeps_them() {
+    fn mixer_movie_pauses_and_restarts_the_sound_banks() {
         let mut state = MixState::new();
         state.play_bgm_channel(0, vec![100, 200, 300, 400], true);
-        state.load_movie_audio(vec![1000, 1000, 2000, 2000]);
+        state.play_voice(vec![10, 20, 30, 40], 1.0, 0.0);
+        state.load_movie_audio(vec![1000, 1000, 2000, 2000, 3000, 3000]);
 
-        // Unpaused: the looping BGM and the film sum.
+        // Unpaused: the looping BGM, the voice bank and the film sum.
         let center = std::f32::consts::FRAC_1_SQRT_2;
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let bgm = (100.0 * center) as i16;
-        assert_eq!(out_samples(&out), vec![1000 + bgm, 1000 + bgm]);
+        let mixed = (100.0 * center + 10.0 * center) as i16;
+        assert_eq!(out_samples(&out), vec![1000 + mixed, 1000 + mixed]);
 
-        // Pausing skips the BGM and still renders the film; the bank keeps its
-        // position so a resume continues exactly where it stopped.
+        // Pausing stops the BGM and voice banks and rewinds them; the film
+        // still renders.
         state.pause_game_sounds();
         let mut out = Vec::new();
         state.render(1, &mut out);
         assert_eq!(out_samples(&out), vec![2000, 2000]);
-        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 1);
+        assert!(!state.bgm_channel_playing(0));
+        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 0);
 
+        // Resuming restarts the paused banks from sample 0, exactly like the
+        // original's stop/play pairs, so the first BGM and voice samples sound
+        // again rather than continuing at sample 1.
         state.resume_game_sounds();
         let mut out = Vec::new();
         state.render(1, &mut out);
-        let expected = (200.0 * center) as i16;
-        assert_eq!(out_samples(&out), vec![expected, expected]);
-        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 2);
+        assert_eq!(out_samples(&out), vec![3000 + mixed, 3000 + mixed]);
+        assert!(state.bgm_channel_playing(0));
+        assert_eq!(state.bgm_channels[0].as_ref().unwrap().pos, 1);
+        assert_eq!(state.voice.as_ref().unwrap().pos, 1);
+    }
+
+    #[test]
+    fn mixer_pause_only_restarts_the_banks_that_were_playing() {
+        let mut state = MixState::new();
+        state.play_bgm_channel(0, vec![100, 200, 300], true);
+        state.stop_bgm_channel(0);
+        state.play_bgm_channel(1, vec![400, 500, 600], true);
+        state.stop_bgm_channel(1);
+        state.play_voice(vec![7, 8, 9], 1.0, 0.0);
+        state.stop_voice();
+
+        state.pause_game_sounds();
+        state.resume_game_sounds();
+        assert!(
+            !state.bgm_channel_playing(0),
+            "a stopped bank stays stopped"
+        );
+        assert!(
+            !state.bgm_channel_playing(1),
+            "a stopped bank stays stopped"
+        );
+        assert!(!state.voice_playing(), "a stopped voice stays stopped");
     }
 
     #[test]
@@ -1355,6 +1441,7 @@ mod tests {
     fn dummy_driver_plays_loops_and_stops() {
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
         let mut player = Mixer::open().expect("dummy audio device should open");
+        let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
 
         let data: Vec<u8> = (0..2205).map(|i| (i % 251) as u8).collect();
         let wav = parse_wav(&wav_bytes(WavFormat::U8, 1, 22050, &data)).unwrap();
@@ -1372,6 +1459,23 @@ mod tests {
 
         player.stop_bgm();
         assert!(!player.is_playing());
+
+        // Stopping a film drops its queued tail from the device stream.
+        player.load_movie_audio(vec![1234; 512 * 4]);
+        player.update();
+        assert!(unsafe { SDL_GetAudioStreamQueued(player.stream) } > 0);
+        player.stop_movie_audio();
+        assert_eq!(unsafe { SDL_GetAudioStreamQueued(player.stream) }, 0);
+
+        // Pausing for a film drops the queued game audio too.
+        let wav = parse_wav(&wav_bytes(WavFormat::U8, 1, 22050, &data)).unwrap();
+        player.play_bgm(wav).unwrap();
+        player.update();
+        assert!(unsafe { SDL_GetAudioStreamQueued(player.stream) } > 0);
+        player.pause_game_sounds();
+        assert_eq!(unsafe { SDL_GetAudioStreamQueued(player.stream) }, 0);
+        player.resume_game_sounds();
+        assert!(player.is_playing());
     }
 
     #[test]
@@ -1397,6 +1501,7 @@ mod tests {
 
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
         let mut player = Mixer::open().expect("dummy audio device should open");
+        let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
         player.play_sfx(wav, 1.0, 0.0);
         player.update();
         player.update();
