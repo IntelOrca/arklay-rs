@@ -35,7 +35,8 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(label: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("arklay-m16ui-{}-{label}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("arklay-m16ui-{}-{label}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self(path)
@@ -291,11 +292,7 @@ fn golden_frames_match_the_sampled_set() {
         let expected = hashes
             .get(*name)
             .unwrap_or_else(|| panic!("the golden set has no hash for {name}"));
-        assert_eq!(
-            fnv1a_rgb(&bytes),
-            *expected,
-            "{name} frame hash ({args:?})"
-        );
+        assert_eq!(fnv1a_rgb(&bytes), *expected, "{name} frame hash ({args:?})");
         // An optional BMP golden is compared pixel for pixel as well.
         let golden_bmp = golden.join(format!("{name}.bmp"));
         if golden_bmp.is_file() {

@@ -4106,16 +4106,16 @@ mod tests {
     fn synthetic_text_and_map_exe() -> Vec<u8> {
         let mut pe = synthetic_text_exe();
         let tables = MapTables::default();
-        pe_place(&mut pe, MAP_STAGE_ROOM_OFFSETS_VA, &tables.stage_room_offsets);
+        pe_place(
+            &mut pe,
+            MAP_STAGE_ROOM_OFFSETS_VA,
+            &tables.stage_room_offsets,
+        );
         pe_place(&mut pe, MAP_ROOM_COUNTS_VA, &tables.room_counts);
         pe_place(&mut pe, MAP_AREA_VA, &tables.area);
         pe_place(&mut pe, MAP_LAYOUTS_VA, &tables.layouts);
         pe_place(&mut pe, MAP_GROUPS_VA, &tables.groups);
-        pe_place(
-            &mut pe,
-            MAP_LAYOUT_ROOM_COUNT_VA,
-            &tables.layout_room_count,
-        );
+        pe_place(&mut pe, MAP_LAYOUT_ROOM_COUNT_VA, &tables.layout_room_count);
         pe_place(&mut pe, MAP_LAYOUT_OFFSET_VA, &tables.layout_offset);
         pe
     }

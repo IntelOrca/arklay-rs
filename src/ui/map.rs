@@ -36,7 +36,12 @@ pub const TABLES_ENTRY: &str = "map/tables.bin";
 /// Pack entry of the map backdrop.
 pub const BLUE_ENTRY: &str = "map/blue.tim";
 /// The four browser floor-plan entries, indexed by layout.
-pub const TAB_ENTRIES: [&str; 4] = ["map/map0d.tim", "map/map0c.tim", "map/map00.tim", "map/map0e.tim"];
+pub const TAB_ENTRIES: [&str; 4] = [
+    "map/map0d.tim",
+    "map/map0c.tim",
+    "map/map00.tim",
+    "map/map0e.tim",
+];
 /// The eleven full-display floor-plan entries, indexed by area.
 pub const AREA_ENTRIES: [&str; 11] = [
     "map/map01.tim",
@@ -81,7 +86,9 @@ impl Default for MapTables {
         Self {
             stage_room_offsets: [0, 32, 63, 82, 100, 0],
             room_counts: [32, 31, 19, 18, 24, 0],
-            area: [2, 0, 1, 0xFF, 4, 3, 0xFF, 0xFF, 6, 5, 0xFF, 0xFF, 10, 9, 8, 7],
+            area: [
+                2, 0, 1, 0xFF, 4, 3, 0xFF, 0xFF, 6, 5, 0xFF, 0xFF, 10, 9, 8, 7,
+            ],
             layouts: [0, 0, 0, 1, 1, 2, 2, 3, 3, 3, 3, 0, 0, 0, 0, 0],
             groups: [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 4, 0, 3, 2, 2],
             layout_room_count: [0, 3, 2, 2],
@@ -143,10 +150,7 @@ impl MapTables {
 
     /// The area at a layout's room index (`0xFF` when the slot is empty).
     pub fn area_at(&self, layout: usize, room: usize) -> u8 {
-        self.area
-            .get(layout * 4 + room)
-            .copied()
-            .unwrap_or(0xFF)
+        self.area.get(layout * 4 + room).copied().unwrap_or(0xFF)
     }
 
     /// The layout a room flag group's visited bits live in.
@@ -265,9 +269,9 @@ impl MapTables {
         let mut index = [1u8, 1, 1, 3];
         let area = match group {
             0 => {
-                if room == 0x07 && (2..7).contains(&cut) {
-                    0
-                } else if room == 0x0F && (cut == 3 || cut == 4) {
+                if (room == 0x07 && (2..7).contains(&cut))
+                    || (room == 0x0F && (cut == 3 || cut == 4))
+                {
                     0
                 } else if room == 0x10 && cut == 0 {
                     2
@@ -287,9 +291,7 @@ impl MapTables {
                 }
             }
             2 => {
-                if room == 0x0B && (4..7).contains(&cut) {
-                    4
-                } else if room == 0x0F && cut == 6 {
+                if (room == 0x0B && (4..7).contains(&cut)) || (room == 0x0F && cut == 6) {
                     4
                 } else if room < 0x06 {
                     3
@@ -320,10 +322,10 @@ impl MapTables {
         };
         // The original overwrites each layout's index with the last room slot
         // whose area matches the current one.
-        for layout in 0..4 {
+        for (layout, slot) in index.iter_mut().enumerate() {
             for room in 0..4 {
                 if self.area_at(layout, room) == area {
-                    index[layout] = room as u8;
+                    *slot = room as u8;
                 }
             }
         }
@@ -392,7 +394,7 @@ impl MapScreen {
     /// Load the tables and art, and pick the initial view from `game`'s room.
     pub fn open(pack: &Pack, game: &GameState) -> Self {
         let tables = match pack.read(TABLES_ENTRY) {
-            Ok(data) => match MapTables::parse(&data) {
+            Ok(data) => match MapTables::parse(data) {
                 Ok(tables) => tables,
                 Err(err) => {
                     eprintln!("warning: invalid {TABLES_ENTRY}: {err:#}; the map tab stays blank");
@@ -416,9 +418,10 @@ impl MapScreen {
         };
         screen.backdrop = screen.load_backdrop(pack);
         let group = usize::from(game.id.stage.wrapping_sub(1) % 5).min(4);
-        let (area, layout, room) = screen
-            .tables
-            .initial_view(group, game.id.room, game.camera.current_cut as u8);
+        let (area, layout, room) =
+            screen
+                .tables
+                .initial_view(group, game.id.room, game.camera.current_cut as u8);
         screen.area = area;
         screen.layout = layout;
         screen.room = room;
@@ -493,7 +496,9 @@ impl MapScreen {
 
     /// Select the area under the current layout position.
     fn refresh_area(&mut self) {
-        let area = self.tables.area_at(usize::from(self.layout), usize::from(self.room_index()));
+        let area = self
+            .tables
+            .area_at(usize::from(self.layout), usize::from(self.room_index()));
         if area != 0xFF {
             self.area = area;
         }
@@ -505,13 +510,14 @@ impl MapScreen {
             MenuInput::Cancel => {
                 if self.zoomed {
                     self.zoomed = false;
-                    return MapEvent::Changed;
+                    MapEvent::Changed
+                } else {
+                    MapEvent::Close
                 }
-                return MapEvent::Close;
             }
             MenuInput::Confirm => {
                 self.zoomed = !self.zoomed;
-                return MapEvent::Changed;
+                MapEvent::Changed
             }
             MenuInput::Up | MenuInput::Down => {
                 if self.zoomed {
@@ -529,7 +535,7 @@ impl MapScreen {
                 }
                 self.room[layout] = room;
                 self.refresh_area();
-                return MapEvent::Changed;
+                MapEvent::Changed
             }
             MenuInput::Left | MenuInput::Right => {
                 if self.zoomed {
@@ -572,9 +578,9 @@ impl MapScreen {
                 }
                 self.layout = next;
                 self.refresh_area();
-                return MapEvent::Changed;
+                MapEvent::Changed
             }
-            _ => return MapEvent::None,
+            _ => MapEvent::None,
         }
     }
 
@@ -587,7 +593,8 @@ impl MapScreen {
         // The highlighted marker is the layout position when it matches the
         // current area, otherwise no marker is blanked (the original's
         // highlight page only shows the selected room).
-        let highlight = if self.tables.area_at(layout, usize::from(self.room_index())) == self.area {
+        let highlight = if self.tables.area_at(layout, usize::from(self.room_index())) == self.area
+        {
             Some(self.room_index())
         } else {
             None
@@ -815,9 +822,21 @@ mod tests {
         // Layout 0 room 0 is area 2, so with area 0 selected nothing is
         // highlighted and the unvisited room-0 markers are transparent.
         let image = screen(&flags, 0, 0, [0, 1, 1, 3]);
-        assert_eq!(image.rgba[4..8], [0, 0, 0, 0], "index 13 is a hidden marker");
-        assert_eq!(image.rgba[8..12], [0, 0, 0, 0], "index 14 is a hidden marker");
-        assert_eq!(image.rgba[12..16], [0, 0, 0, 0], "palette index 200 is black");
+        assert_eq!(
+            image.rgba[4..8],
+            [0, 0, 0, 0],
+            "index 13 is a hidden marker"
+        );
+        assert_eq!(
+            image.rgba[8..12],
+            [0, 0, 0, 0],
+            "index 14 is a hidden marker"
+        );
+        assert_eq!(
+            image.rgba[12..16],
+            [0, 0, 0, 0],
+            "palette index 200 is black"
+        );
         // Visited: the marker shows its palette colour.
         flags[usize::from(game::BANK_ROOM_FLAGS)].apply(0, 0);
         let image = screen(&flags, 0, 0, [0, 1, 1, 3]);
@@ -847,10 +866,7 @@ mod tests {
             ticks: 0,
         };
         assert_eq!(screen.room_index(), 1);
-        assert_eq!(
-            screen.handle_input(&game, MenuInput::Up),
-            MapEvent::Changed
-        );
+        assert_eq!(screen.handle_input(&game, MenuInput::Up), MapEvent::Changed);
         assert_eq!(screen.room_index(), 2);
         assert_eq!(screen.area(), 1);
         assert_eq!(

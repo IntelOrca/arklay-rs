@@ -561,7 +561,10 @@ mod tests {
         );
         // Lab key A (0x37) has no records: it opens at any pose, like every
         // item whose record has the top name bit set (the knife).
-        assert_eq!(examine_check(0x37, 0x123, 0x456, 0x789), ExamineOutcome::Open);
+        assert_eq!(
+            examine_check(0x37, 0x123, 0x456, 0x789),
+            ExamineOutcome::Open
+        );
         assert_eq!(examine_check(0x01, 0, 0, 0), ExamineOutcome::Open);
         // The red book's record 3 matches only around yaw 0x270..0x550.
         assert_eq!(examine_check(0x3E, 0x400, 0, 0), ExamineOutcome::Zoom);

@@ -165,14 +165,24 @@ impl CharSelectScreen {
     /// The live pose of `card` (0 Chris, 1 Jill), for tests.
     pub fn pose(&self, card: usize) -> (i32, i32, i32, u8, u8) {
         let pose = self.poses[card];
-        (pose.pos[0], pose.pos[1], pose.scale, pose.bright, pose.tpage)
+        (
+            pose.pos[0],
+            pose.pos[1],
+            pose.scale,
+            pose.bright,
+            pose.tpage,
+        )
     }
 
     /// Start the swap animation toward `dir` (`0` right, `1` left, the
     /// original's `g_selSwapDir`). The pick itself flips when the slide lands.
     pub fn start_swap(&mut self, dir: u8) {
         let dir = dir & 1;
-        let (ax, ay) = if dir == self.selected { (2, 1) } else { (-2, -1) };
+        let (ax, ay) = if dir == self.selected {
+            (2, 1)
+        } else {
+            (-2, -1)
+        };
         self.poses[0].acc = [ax, ay];
         self.poses[1].acc = [-ax, -ay];
         for pose in &mut self.poses {

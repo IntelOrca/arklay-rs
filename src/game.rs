@@ -9841,8 +9841,7 @@ mod tests {
             }
             assert!(state.pick_up_map(0), "item {item:#04x} picks up");
             assert!(
-                state.flags[usize::from(BANK_ROOM_FLAGS)]
-                    .bit(ROOM_FLAG_MAP_BASE + index),
+                state.flags[usize::from(BANK_ROOM_FLAGS)].bit(ROOM_FLAG_MAP_BASE + index),
                 "item {item:#04x} raises the owned bit {index}"
             );
             assert_eq!(state.last_picked_item, Some(item));

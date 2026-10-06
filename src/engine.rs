@@ -8795,9 +8795,7 @@ mod tests {
                 ui::map::MapTables::default().encode(),
             )
             .unwrap();
-        writer
-            .add("map/map0d.tim", synthetic_map_tim())
-            .unwrap();
+        writer.add("map/map0d.tim", synthetic_map_tim()).unwrap();
         writer
             .add(ui::map::BLUE_ENTRY, synthetic_map_tim())
             .unwrap();
