@@ -30,6 +30,7 @@ use sdl3_sys::audio::{
 use sdl3_sys::init::{SDL_INIT_AUDIO, SDL_InitSubSystem};
 
 use crate::budget;
+use crate::engine::SdlHandle;
 
 /// Sample rate of every mixer voice and of the output stream.
 pub const SAMPLE_RATE: u32 = 22050;
@@ -763,6 +764,10 @@ fn push_sample(out: &mut Vec<u8>, sample: f32) {
 pub struct Mixer {
     stream: *mut SDL_AudioStream,
     state: MixState,
+    /// A share of the SDL lifetime: declared last so [`Drop`] destroys the
+    /// stream before this releases the ref, and `SDL_Quit` cannot tear the
+    /// audio subsystem down under a live stream.
+    _sdl: SdlHandle,
 }
 
 impl Mixer {
@@ -793,6 +798,7 @@ impl Mixer {
         Some(Mixer {
             stream,
             state: MixState::new(),
+            _sdl: SdlHandle::retain(),
         })
     }
 

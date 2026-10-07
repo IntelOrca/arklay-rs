@@ -50,7 +50,7 @@ use sdl3_sys::events::{
 };
 use sdl3_sys::hints::{SDL_HINT_RENDER_DRIVER, SDL_HINT_VIDEO_DRIVER, SDL_SetHint};
 use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit};
-use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_ESCAPE, SDLK_PERIOD};
+use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
 use sdl3_sys::render::{
@@ -60,10 +60,10 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
-    SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
-    SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
-    SDL_Scancode,
+    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_LEFT,
+    SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT,
+    SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB,
+    SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -129,20 +129,22 @@ const TITLE_OPENING_ID: u8 = 0;
 /// The prologue film the character confirm requests before a new game.
 const PROLOGUE_ID: u8 = 1;
 
-/// The process-wide SDL video lifetime.
+/// The process-wide SDL lifetime.
 ///
 /// `SDL_Init` runs once for the first live handle and `SDL_Quit` when the last
 /// one drops, so several displays can coexist without one tearing SDL down
 /// under another. The interactive engine holds one handle for its whole run;
-/// the capture/UI test seams overlap in one test process.
+/// the capture/UI test seams overlap in one test process. An audio [`Mixer`]
+/// retains a share of the same lifetime, so its stream is always destroyed
+/// before `SDL_Quit` tears the audio subsystem down, whichever drops first.
 static SDL_REFS: AtomicUsize = AtomicUsize::new(0);
 static SDL_LIFETIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-struct SdlHandle;
+pub(crate) struct SdlHandle;
 
 impl SdlHandle {
     /// Initialize SDL video if this is the first live handle.
-    fn acquire() -> Result<Self> {
+    pub(crate) fn acquire() -> Result<Self> {
         let _guard = SDL_LIFETIME
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -154,6 +156,20 @@ impl SdlHandle {
         }
         SDL_REFS.fetch_add(1, Ordering::SeqCst);
         Ok(Self)
+    }
+
+    /// Retain the initialized SDL lifetime without initializing video.
+    ///
+    /// A mixer only exists once `SDL_InitSubSystem(SDL_INIT_AUDIO)` succeeded,
+    /// so SDL is up; the share keeps `SDL_Quit` from running until the resource
+    /// SDL owns (the audio stream) has been destroyed.
+    #[must_use]
+    pub(crate) fn retain() -> Self {
+        let _guard = SDL_LIFETIME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SDL_REFS.fetch_add(1, Ordering::SeqCst);
+        Self
     }
 }
 
@@ -4380,9 +4396,7 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
             let modifiers = unsafe { event.key.r#mod };
             let repeat = unsafe { event.key.repeat };
             input.key_down(scancode, repeat);
-            if key == SDLK_ESCAPE {
-                quit = true;
-            } else if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
+            if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
                 if key == SDLK_COMMA {
                     *cut_delta -= 1;
                 } else if key == SDLK_PERIOD {
@@ -5406,9 +5420,9 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
 
 /// One bit per physical key the engine maps.
 ///
-/// Confirm, cancel and run each accept two keys, so the bits stay per physical
-/// key: releasing Space while Return is still held must not clear confirm, and
-/// the same goes for X/Backspace and the two Shifts.
+/// Confirm, cancel and run each accept several keys, so the bits stay per
+/// physical key: releasing Space while Return is still held must not clear
+/// confirm, and the same goes for X/Backspace/Escape and the two Shifts.
 const KEY_UP: u32 = 1 << 0;
 const KEY_DOWN: u32 = 1 << 1;
 const KEY_LEFT: u32 = 1 << 2;
@@ -5422,10 +5436,11 @@ const KEY_RIGHTBRACKET: u32 = 1 << 9;
 const KEY_TAB: u32 = 1 << 10;
 const KEY_LSHIFT: u32 = 1 << 11;
 const KEY_RSHIFT: u32 = 1 << 12;
+const KEY_ESCAPE: u32 = 1 << 13;
 /// Confirm (Space or Return).
 const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
-/// Cancel (X or Backspace).
-const KEY_CANCEL: u32 = KEY_X | KEY_BACKSPACE;
+/// Cancel (X, Backspace or Escape).
+const KEY_CANCEL: u32 = KEY_X | KEY_BACKSPACE | KEY_ESCAPE;
 /// Run (either Shift).
 const KEY_RUN: u32 = KEY_LSHIFT | KEY_RSHIFT;
 
@@ -5445,6 +5460,7 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
         SDL_SCANCODE_TAB => KEY_TAB,
         SDL_SCANCODE_LSHIFT => KEY_LSHIFT,
         SDL_SCANCODE_RSHIFT => KEY_RSHIFT,
+        SDL_SCANCODE_ESCAPE => KEY_ESCAPE,
         _ => return None,
     })
 }
@@ -8675,6 +8691,13 @@ mod tests {
                 },
             ),
             (
+                SDL_SCANCODE_ESCAPE,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            (
                 SDL_SCANCODE_LEFTBRACKET,
                 UiInput {
                     page_left: true,
@@ -8762,6 +8785,24 @@ mod tests {
             input.key_up(scancode);
             assert!(input.tick().action, "scancode {}", scancode.0);
         }
+    }
+
+    /// The old teardown order dropped the display (calling `SDL_Quit`) before
+    /// the mixer, so the stream was freed twice and the process died under
+    /// Windows Error Reporting after a multi-second delay. The mixer's share
+    /// of the SDL lifetime keeps the subsystem up until the stream is gone.
+    #[test]
+    #[ignore = "requires SDL dummy video and audio drivers"]
+    fn a_display_can_drop_before_a_live_mixer() {
+        use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_ResetHint, SDL_SetHint};
+
+        let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
+        let display = Display::new("Arklay test", true).expect("offscreen display");
+        let mixer = Mixer::open().expect("dummy audio device should open");
+        let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
+
+        drop(display);
+        drop(mixer);
     }
 
     #[test]
