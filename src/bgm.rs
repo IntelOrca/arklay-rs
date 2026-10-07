@@ -192,15 +192,10 @@ impl BgmCache {
     ///
     /// `Bgm_*` names resolve through [`music::pack_path`]; every other group
     /// track (the `Se_*` tracks and the mixed dialogue `V110_00`) lives in the
-    /// install's `sound/` directory and is read from `se/`. A name that is not
-    /// in the main pack falls back to the optional voice pack only for its
-    /// `voice/` entry, the same second-pack rule the voice loader uses.
-    pub fn load(
-        &mut self,
-        pack: &Pack,
-        auxiliary: Option<&Pack>,
-        name: &str,
-    ) -> Option<audio::Wav> {
+    /// install's `sound/` directory and is read from `se/`. A track whose
+    /// `voice/` entry is the only one packed (the mixed dialogue) resolves
+    /// through the same pack as every other entry.
+    pub fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
         let mut candidates: Vec<String> = Vec::new();
         if let Some(path) = music::pack_path(name) {
             candidates.push(path);
@@ -223,7 +218,7 @@ impl BgmCache {
             if self.missing.contains(path) {
                 continue;
             }
-            let Some(bytes) = read_any(pack, auxiliary, path) else {
+            let Ok(bytes) = pack.read(path) else {
                 continue;
             };
             match audio::parse_wav(bytes) {
@@ -244,14 +239,6 @@ impl BgmCache {
         }
         None
     }
-}
-
-/// Read `path` from the main pack, falling back to the optional voice pack.
-fn read_any<'a>(pack: &'a Pack, auxiliary: Option<&'a Pack>, path: &str) -> Option<&'a [u8]> {
-    if let Ok(bytes) = pack.read(path) {
-        return Some(bytes);
-    }
-    auxiliary.and_then(|auxiliary| auxiliary.read(path).ok())
 }
 
 /// Apply the per-room BGM state machine for room `id`, entered from `from`.
@@ -441,7 +428,6 @@ pub fn apply_live(
     game: &mut GameState,
     cache: &mut BgmCache,
     pack: &Pack,
-    auxiliary: Option<&Pack>,
 ) {
     // The original runs the fade state machine before the decay ramp; both
     // advance once per tick even when no audio device is open, so scripts and
@@ -468,7 +454,7 @@ pub fn apply_live(
         if bank.pending_load {
             game.bgm.channels[index].pending_load = false;
             if let Some(name) = bank.name
-                && let Some(wav) = cache.load(pack, auxiliary, name)
+                && let Some(wav) = cache.load(pack, name)
             {
                 mixer.play_bgm_channel(index, wav);
                 mixer.set_bgm_channel_volume(index, sfx::volume_gain(bank.volume));
@@ -803,7 +789,7 @@ mod tests {
         assert_eq!(game.bgm.ramp.direction, (95 / 30) * 0x4E);
         assert_eq!(game.bgm.ramp.frames_left, 60);
         let mut cache = BgmCache::default();
-        apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        apply_live(&mut None, &mut game, &mut cache, &pack);
         assert!(
             game.bgm.channels[1].volume > -9999,
             "the first ramp tick raises the seed"
@@ -813,7 +799,7 @@ mod tests {
         // A ramp that passes silence stops the channel and resets the volume.
         game.bgm.channels[1].volume = -9999;
         start_volume_ramp(&mut game, 1, -95, 1);
-        apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        apply_live(&mut None, &mut game, &mut cache, &pack);
         assert!(!game.bgm.ramp.active());
         assert_eq!(game.bgm.channels[1].volume, -1);
         assert!(game.bgm.channels[1].stop);
@@ -839,7 +825,7 @@ mod tests {
         let mut cache = BgmCache::default();
         let steps = game.bgm.fade.steps[0];
         for _ in 0..steps {
-            apply_live(&mut None, &mut game, &mut cache, &pack, None);
+            apply_live(&mut None, &mut game, &mut cache, &pack);
         }
         assert_eq!(
             game.bgm.channels[0].volume,
@@ -851,7 +837,7 @@ mod tests {
 
         // The countdown stops the banks and finally clears them.
         for _ in 0..30 {
-            apply_live(&mut None, &mut game, &mut cache, &pack, None);
+            apply_live(&mut None, &mut game, &mut cache, &pack);
         }
         assert!(!game.bgm.fade.active());
         assert!(game.bgm.channels.iter().all(|bank| bank.name.is_none()));
@@ -922,7 +908,7 @@ mod tests {
 
         let mut music = Some(mixer);
         let mut cache = BgmCache::default();
-        apply_live(&mut music, &mut game, &mut cache, &pack, None);
+        apply_live(&mut music, &mut game, &mut cache, &pack);
         let mixer = music.as_ref().unwrap();
         assert!(
             !mixer.bgm_channel_playing(0),

@@ -1,8 +1,8 @@
 # M14 integration deviations
 
 The FMV milestone is complete for the scripted, no-enemy scope it set: the AVI
-demuxer, the Cinepak decoder, the optional movie pack, the playback session,
-the `movie_on` handshake and the opening/ending film chains. The following
+demuxer, the Cinepak decoder, the packed films, the playback session, the
+`movie_on` handshake and the opening/ending film chains. The following
 behaviours deliberately differ from the original; each one is a bounded
 approximation or an explicitly unreachable path rather than a silent failure.
 This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
@@ -59,9 +59,9 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
 
 7. **Headless drains.** A capture's `--ticks` loop and `simulate_room` take and
    drop every film request, so a `movie_on` can never stall a headless run. A
-   run without the movie pack logs each unavailable film and continues the
-   room; the corpus audit asserts zero `0x29` placeholders, zero filtered ids
-   and at least one drained request.
+   pack without the film logs each unavailable film and continues the room;
+   the corpus audit asserts zero `0x29` placeholders, zero filtered ids and at
+   least one drained request.
 
 8. **Golden decode oracle provenance.** The strongest decode test,
    `decoded_frames_match_the_independent_goldens`, compares sampled frames

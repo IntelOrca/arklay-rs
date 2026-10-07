@@ -3,8 +3,8 @@
 A milestone-by-milestone feature table, the parser/format coverage a fresh
 `arklay verify` reports, the verification-spine checklist with what is still
 missing, the known `TODO(parity)` sites and their dispositions, and the road to
-the enemy milestone. Numbers below were measured on 2026-10-06 with the
-workspace install (`/home/ted/openre/assets/re1`) and converted packs.
+the enemy milestone. Numbers below were measured on 2026-10-07 with the
+workspace install (`/home/ted/openre/assets/re1`) and its converted pack.
 
 ## Milestones
 
@@ -38,7 +38,7 @@ converted base pack on the reference install reports:
 
 ```
 pack: re1.akpak
-2541 entries, 408551500 bytes
+3085 entries, 761873608 bytes
 format       entries        ok    failed          bytes
 manifest           1         1         0            101
 rdt              348       320        28      107997096
@@ -50,12 +50,13 @@ ivm               77        77         0        6525012
 emd               19        19         0        2733776
 emw                2         2         0          28400
 dor               34        34         0        2279820
-wav              475       475         0       75972806
+wav              992       992         0      177670174
 text               5         5         0           6581
 maptables          1         1         0             72
 biocard            1         1         0           1052
+avi               27        27         0      251624740
 opaque             2         2         0          57988
-verify: 2541 entries, 2513 ok, 28 failed, 2 opaque
+verify: 3085 entries, 3057 ok, 28 failed, 2 opaque
 ```
 
 The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
@@ -65,9 +66,9 @@ engine cannot load. Every other entry parses. The two opaque entries are
 `data/core00.esp` and `data/core00.etm`, the effect tables whose pair parser is
 not in the path classifier; `--strict` turns them into failures by design.
 
-The companion packs verify clean too: the voice pack (`re1.voice.akpak`, 517
-`wav` entries, 101,697,368 bytes) and the movie pack (`re1.movie.akpak`, 27
-`avi` entries, 251,624,740 bytes).
+The one pack carries everything: the 517 referenced voice `wav` entries
+(101,697,368 bytes) and the 27 shipped `avi` films (251,624,740 bytes) sit
+beside the room, audio and UI entries, and all three formats verify clean.
 
 ## Verification spine
 

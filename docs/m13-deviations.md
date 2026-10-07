@@ -27,9 +27,9 @@ is a bounded no-op or a documented approximation rather than a silent failure.
    not reach them; the BGM and voice behaviour matches.
 
 5. **Unreferenced voice files.** 47 shipped `voice/*.WAV` files (6.0 MiB) are
-   not named by any stage table row and stay out of the voice pack. The
-   conversion summary lists them; a script that somehow named one records a
-   miss and never raises the F7 wait, so it cannot deadlock.
+   not named by any stage table row and stay out of the pack. The conversion
+   summary lists them; a script that somehow named one records a miss and never
+   raises the F7 wait, so it cannot deadlock.
 
 6. **FMV (`movie_on`, 0x29).** Films are out of scope: the opcode keeps its
    graceful no-op, so a scene that requests one advances instead of waiting.

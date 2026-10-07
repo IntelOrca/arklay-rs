@@ -42,18 +42,6 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "pack")]
     save_dir: Option<PathBuf>,
 
-    /// Voice pack (`voice/*.wav`); defaults to the sibling
-    /// `<pack stem>.voice.akpak` when present. A run without one skips every
-    /// voice line and never waits on F7.
-    #[arg(long, value_name = "PATH", requires = "pack")]
-    voice: Option<PathBuf>,
-
-    /// Movie pack (`movie/*.avi`); defaults to the sibling
-    /// `<pack stem>.movie.akpak` when present. A run without one advances
-    /// every film request instead of playing it.
-    #[arg(long, value_name = "PATH", requires = "pack")]
-    movie: Option<PathBuf>,
-
     /// Play one film id (0-28) standalone and exit; with `--capture` the
     /// frame after `--ticks` fixed ticks is written headlessly
     #[arg(
@@ -132,32 +120,6 @@ enum Command {
         /// Number of worker threads (default: one per available CPU)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
         jobs: Option<u16>,
-
-        /// Write the voice WAVs to a second pack
-        /// (default `<out stem>.voice.akpak`)
-        #[arg(long, value_name = "PATH", conflicts_with_all = ["no_voice", "with_voice"])]
-        voice_out: Option<PathBuf>,
-
-        /// Skip the voice pack entirely
-        #[arg(long, conflicts_with = "with_voice")]
-        no_voice: bool,
-
-        /// Embed the voice WAVs in the main pack instead of a second pack
-        #[arg(long)]
-        with_voice: bool,
-
-        /// Write the film AVIs to a second pack
-        /// (default `<out stem>.movie.akpak`)
-        #[arg(long, value_name = "PATH", conflicts_with_all = ["no_movie", "with_movie"])]
-        movie_out: Option<PathBuf>,
-
-        /// Skip the movie pack entirely
-        #[arg(long, conflicts_with = "with_movie")]
-        no_movie: bool,
-
-        /// Embed the film AVIs in the main pack instead of a second pack
-        #[arg(long)]
-        with_movie: bool,
     },
 
     /// Extract every entry of a game pack into a directory
@@ -502,36 +464,12 @@ fn main() -> Result<()> {
             out,
             exe,
             jobs,
-            voice_out,
-            no_voice,
-            with_voice,
-            movie_out,
-            no_movie,
-            with_movie,
-        }) => {
-            let voice = if no_voice {
-                arklay::convert::VoicePackOptions::Skip
-            } else if with_voice {
-                arklay::convert::VoicePackOptions::Embed
-            } else {
-                arklay::convert::VoicePackOptions::Sibling(voice_out)
-            };
-            let movie = if no_movie {
-                arklay::convert::MoviePackOptions::Skip
-            } else if with_movie {
-                arklay::convert::MoviePackOptions::Embed
-            } else {
-                arklay::convert::MoviePackOptions::Sibling(movie_out)
-            };
-            arklay::convert::convert_game_with_packs(
-                &root,
-                &out,
-                exe.as_deref(),
-                jobs.map_or(0, usize::from),
-                &voice,
-                &movie,
-            )
-        }
+        }) => arklay::convert::convert_game_with_options(
+            &root,
+            &out,
+            exe.as_deref(),
+            jobs.map_or(0, usize::from),
+        ),
         Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
         Some(Command::Verify { pack, mods, strict }) => verify_pack(&pack, &mods, strict),
@@ -561,7 +499,6 @@ fn main() -> Result<()> {
             if let Some(id) = cli.ending {
                 return arklay::engine::run_ending(
                     &pack,
-                    cli.movie.as_deref(),
                     id,
                     cli.character,
                     cli.capture.as_deref(),
@@ -573,7 +510,6 @@ fn main() -> Result<()> {
             if let Some(id) = cli.fmv {
                 return arklay::engine::run_fmv(
                     &pack,
-                    cli.movie.as_deref(),
                     id,
                     cli.character,
                     cli.capture.as_deref(),
@@ -583,27 +519,23 @@ fn main() -> Result<()> {
                 );
             }
             if let Some(screen) = cli.ui {
-                return arklay::engine::run_ui_with_voice_and_movie(
+                return arklay::engine::run_ui_with_mods(
                     &pack,
                     &screen,
                     cli.capture.as_deref(),
                     &save_dir,
                     cli.player,
-                    cli.voice.as_deref(),
-                    cli.movie.as_deref(),
                     &cli.mods,
                     cli.no_mods,
                 );
             }
             if let Some(room) = cli.room {
                 let id = arklay::state::RoomId::from_room_and_player(&room, cli.player)?;
-                return arklay::engine::run_with_voice_and_movie(
+                return arklay::engine::run_with_options(
                     &pack,
                     id,
                     cli.capture.as_deref(),
                     cli.ticks,
-                    cli.voice.as_deref(),
-                    cli.movie.as_deref(),
                     &cli.mods,
                     cli.no_mods,
                     cli.stats,
@@ -612,12 +544,10 @@ fn main() -> Result<()> {
             // No room and no `--ui`: boot the app root, whose interactive run
             // plays the logos, the title opening and the select prologue. A
             // capture still boots the title directly and plays no films.
-            arklay::engine::run_root_with_voice_and_movie(
+            arklay::engine::run_root(
                 &pack,
                 cli.capture.as_deref(),
                 &save_dir,
-                cli.voice.as_deref(),
-                cli.movie.as_deref(),
                 &cli.mods,
                 cli.no_mods,
             )

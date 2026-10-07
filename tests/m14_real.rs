@@ -1,20 +1,18 @@
-//! M14 real-asset tests: the AVI demuxer, the Cinepak decoder, the movie pack
-//! and the playback session.
+//! M14 real-asset tests: the AVI demuxer, the Cinepak decoder, the packed
+//! films and the playback session.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
 //!  ARKLAY_MOVIE_GOLDEN=... cargo test --test m14_real -- --ignored --nocapture`
 //!
-//! The playback tests additionally need the film pack: `ARKLAY_RE1_MOVIE`, or
-//! a sibling `<pack stem>.movie.akpak` next to `ARKLAY_RE1_PACK`; a configured
-//! environment without one is a partial setup and fails. The integer-pixel
-//! comparison needs `ARKLAY_MOVIE_GOLDEN`, a directory of sampled BMPs and a
-//! `hashes_crc32.txt` (never committed). The golden sets used so far were
-//! produced by a same-author Python reimplementation of the codec, not a
-//! third-party decoder, so the comparison is a cross-implementation check
-//! rather than fully independent verification; see `docs/m14-deviations.md`
-//! item 8. A set variable with missing goldens fails; only an unset variable
-//! skips.
+//! The playback tests read the films from `ARKLAY_RE1_PACK`, which must have
+//! been converted from the install. The integer-pixel comparison needs
+//! `ARKLAY_MOVIE_GOLDEN`, a directory of sampled BMPs and a `hashes_crc32.txt`
+//! (never committed). The golden sets used so far were produced by a
+//! same-author Python reimplementation of the codec, not a third-party
+//! decoder, so the comparison is a cross-implementation check rather than
+//! fully independent verification; see `docs/m14-deviations.md` item 8. A set
+//! variable with missing goldens fails; only an unset variable skips.
 
 mod common;
 
@@ -24,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use arklay::avi::Avi;
 use arklay::cinepak::Decoder;
-use arklay::convert::{MoviePackOptions, VoicePackOptions, convert_game_with_packs};
+use arklay::convert::convert_game_with_options;
 use arklay::engine::{simulate_room_with_input, simulate_room_with_movie};
 use arklay::movie::{self, MovieSession, MovieTick};
 use arklay::pack::Pack;
@@ -98,34 +96,6 @@ fn golden_dir() -> Option<PathBuf> {
         hashes.display()
     );
     Some(dir)
-}
-
-/// The converted film pack: `ARKLAY_RE1_MOVIE`, or the sibling
-/// `<pack stem>.movie.akpak` beside `ARKLAY_RE1_PACK`.
-///
-/// A configured asset environment without a movie pack is a partial setup and
-/// fails loudly; callers only reach this after [`common::asset_env`] succeeded.
-fn real_movie_pack(pack_path: &Path) -> PathBuf {
-    if let Ok(path) = std::env::var("ARKLAY_RE1_MOVIE") {
-        let path = PathBuf::from(path);
-        assert!(
-            path.is_file(),
-            "ARKLAY_RE1_MOVIE is set but {} is not a file",
-            path.display()
-        );
-        return path;
-    }
-    let stem = pack_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or_else(|| panic!("pack path {} has no file stem", pack_path.display()));
-    let sibling = pack_path.with_file_name(format!("{stem}.movie.akpak"));
-    assert!(
-        sibling.is_file(),
-        "movie pack {} is missing; set ARKLAY_RE1_MOVIE or convert the sibling pack",
-        sibling.display()
-    );
-    sibling
 }
 
 /// A self-deleting temporary directory unique to this process and label.
@@ -313,13 +283,12 @@ fn decoded_frames_match_the_independent_goldens() {
 const MOVIE_SITE_IDS: &[u8] = &[3, 4, 5, 6, 7, 8, 9, 11, 12, 13];
 
 #[test]
-#[ignore = "requires a converted movie pack"]
+#[ignore = "requires a converted game pack"]
 fn pj_prologue_cut_resumes_at_the_second_cut_point() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
-    let pack = Pack::open(&movie_path).unwrap();
+    let pack = Pack::open(&pack_path).unwrap();
 
     // Chris plays the whole 2261-frame intro.
     let chris = MovieSession::open(&pack, 1, 0).unwrap();
@@ -359,13 +328,12 @@ fn pj_prologue_cut_resumes_at_the_second_cut_point() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation and a converted movie pack"]
+#[ignore = "requires a real RE1 installation and a converted game pack"]
 fn every_shipped_movie_on_site_resolves_to_a_packed_film() {
     let Some((root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
-    let pack = Pack::open(&movie_path).unwrap();
+    let pack = Pack::open(&pack_path).unwrap();
 
     let mut sites = 0usize;
     let mut ids = HashSet::new();
@@ -435,13 +403,12 @@ fn every_shipped_movie_on_site_resolves_to_a_packed_film() {
 /// The film table ids the shipped install packs (every named film but the
 /// absent Virgin logo).
 #[test]
-#[ignore = "requires a converted movie pack"]
+#[ignore = "requires a converted game pack"]
 fn the_movie_pack_carries_the_shipped_films() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
-    let pack = Pack::open(&movie_path).unwrap();
+    let pack = Pack::open(&pack_path).unwrap();
     let mut expected = 0usize;
     for id in 0..=28u8 {
         let Some(name) = movie::name(id) else {
@@ -487,13 +454,12 @@ fn session_hashes(pack: &Pack, id: u8, character: u8) -> Vec<u32> {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack"]
+#[ignore = "requires a converted game pack"]
 fn a_full_film_decodes_to_its_frame_count_with_a_stable_hash() {
     let Some((root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
-    let pack = Pack::open(&movie_path).unwrap();
+    let pack = Pack::open(&pack_path).unwrap();
     for (id, frames) in [(23u8, 76usize), (4, 147)] {
         let first = session_hashes(&pack, id, 0);
         assert_eq!(first.len(), frames, "film id {id}");
@@ -516,13 +482,12 @@ fn a_full_film_decodes_to_its_frame_count_with_a_stable_hash() {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack"]
+#[ignore = "requires a converted game pack"]
 fn a_short_audio_film_pads_silence_without_stalling() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
-    let pack = Pack::open(&movie_path).unwrap();
+    let pack = Pack::open(&pack_path).unwrap();
     // `dm7` ships 60 audio chunks for 67 video frames.
     let mut session = MovieSession::open(&pack, 7, 0).unwrap();
     assert_eq!(session.frame_count(), 67);
@@ -546,14 +511,13 @@ fn a_short_audio_film_pads_silence_without_stalling() {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack and SDL's offscreen driver"]
+#[ignore = "requires a converted game pack and SDL's offscreen driver"]
 fn standalone_fmv_capture_is_deterministic_and_not_blank() {
     use std::process::Command;
 
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("fmv");
     let first = dir.0.join("first.bmp");
     let second = dir.0.join("second.bmp");
@@ -565,8 +529,6 @@ fn standalone_fmv_capture_is_deterministic_and_not_blank() {
         let status = Command::new(binary)
             .args([
                 pack_path.to_str().unwrap(),
-                "--movie",
-                movie_path.to_str().unwrap(),
                 "--fmv",
                 "23",
                 "--ticks",
@@ -655,14 +617,12 @@ fn real_m14_corpus_audit_drains_every_film_request() {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack"]
+#[ignore = "requires a converted game pack"]
 fn movie_on_sites_start_and_resume_the_room_with_its_bgm() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
     let pack = Pack::open(&pack_path).unwrap();
-    let movie = Pack::open(&movie_path).unwrap();
 
     // Room 5130's init requests `movie_on 11`, 5131's `movie_on 12` and 60A0's
     // event `movie_on 6` on a fresh boot; 71C0's main script needs the room
@@ -677,8 +637,7 @@ fn movie_on_sites_start_and_resume_the_room_with_its_bgm() {
     for (room, flags, film) in cases {
         let id = RoomId::parse(room).unwrap();
         let sim =
-            simulate_room_with_movie(&pack, &movie, id, flags, 900, |_| player::Input::default())
-                .unwrap();
+            simulate_room_with_movie(&pack, id, flags, 900, |_| player::Input::default()).unwrap();
         assert_eq!(
             sim.handoff.requested,
             vec![film],
@@ -709,72 +668,62 @@ fn movie_on_sites_start_and_resume_the_room_with_its_bgm() {
 }
 
 #[test]
-#[ignore = "requires a converted movie pack and SDL's offscreen driver"]
-fn room_capture_is_unchanged_with_and_without_the_movie_pack() {
+#[ignore = "requires a converted game pack and SDL's offscreen driver"]
+fn captures_stay_deterministic_with_the_films_in_the_pack() {
     use std::process::Command;
 
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("movie-capture");
-    let with = dir.0.join("with.bmp");
-    let without = dir.0.join("without.bmp");
+    let first = dir.0.join("first.bmp");
+    let second = dir.0.join("second.bmp");
     // Room 5130 requests `movie_on 11` from its init script; the capture loop
-    // drains the request, so the frame must not depend on the movie pack.
+    // drains the request, so the packed film never plays and the frame is
+    // stable across runs.
     let binary = env!("CARGO_BIN_EXE_arklay");
-    for (path, movie) in [(&with, Some(movie_path.as_path())), (&without, None)] {
-        let mut command = Command::new(binary);
-        command.args([
-            pack_path.to_str().unwrap(),
-            "--room",
-            "513",
-            "--player",
-            "0",
-            "--ticks",
-            "120",
-            "--capture",
-            path.to_str().unwrap(),
-        ]);
-        if let Some(movie) = movie {
-            command.args(["--movie", movie.to_str().unwrap()]);
-        }
-        let status = command.status().expect("failed to run the arklay binary");
+    for path in [&first, &second] {
+        let status = Command::new(binary)
+            .args([
+                pack_path.to_str().unwrap(),
+                "--room",
+                "513",
+                "--player",
+                "0",
+                "--ticks",
+                "120",
+                "--capture",
+                path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("failed to run the arklay binary");
         assert!(status.success(), "the room capture failed");
     }
     assert_eq!(
-        fs::read(&with).unwrap(),
-        fs::read(&without).unwrap(),
-        "the movie pack changed a drained room capture"
+        fs::read(&first).unwrap(),
+        fs::read(&second).unwrap(),
+        "the drained room capture is not deterministic"
     );
     println!(
-        "room 5130 capture: {} bytes, identical with and without the movie pack",
-        fs::metadata(&with).unwrap().len()
+        "room 5130 capture: {} bytes, identical across runs with the films packed",
+        fs::metadata(&first).unwrap().len()
     );
 
     // The title capture skips the boot/title films, so it is stable too, and
     // the bare root capture is the same frame.
-    let title_with = dir.0.join("title_with.bmp");
-    let title_without = dir.0.join("title_without.bmp");
+    let title = dir.0.join("title.bmp");
     let root = dir.0.join("root.bmp");
-    for (path, movie) in [
-        (&title_with, Some(movie_path.as_path())),
-        (&title_without, None),
-    ] {
-        let mut command = Command::new(binary);
-        command.args([
+    let status = Command::new(binary)
+        .args([
             pack_path.to_str().unwrap(),
             "--ui",
             "title",
             "--capture",
-            path.to_str().unwrap(),
-        ]);
-        if let Some(movie) = movie {
-            command.args(["--movie", movie.to_str().unwrap()]);
-        }
-        let status = command.status().expect("failed to run the arklay binary");
-        assert!(status.success(), "the title capture failed");
-    }
+            title.to_str().unwrap(),
+        ])
+        .status()
+        .expect("failed to run the arklay binary");
+    assert!(status.success(), "the title capture failed");
     let status = Command::new(binary)
         .args([
             pack_path.to_str().unwrap(),
@@ -785,26 +734,20 @@ fn room_capture_is_unchanged_with_and_without_the_movie_pack() {
         .expect("failed to run the arklay binary");
     assert!(status.success(), "the root capture failed");
     assert_eq!(
-        fs::read(&title_with).unwrap(),
-        fs::read(&title_without).unwrap(),
-        "the movie pack changed the title capture"
-    );
-    assert_eq!(
-        fs::read(&title_with).unwrap(),
+        fs::read(&title).unwrap(),
         fs::read(&root).unwrap(),
         "the root capture is the title capture"
     );
 }
 
 #[test]
-#[ignore = "requires a converted movie pack and SDL's offscreen driver"]
+#[ignore = "requires a converted game pack and SDL's offscreen driver"]
 fn ending_chain_captures_are_deterministic() {
     use std::process::Command;
 
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let movie_path = real_movie_pack(&pack_path);
     let dir = TempDir::new("ending");
     let first = dir.0.join("first.bmp");
     let second = dir.0.join("second.bmp");
@@ -815,8 +758,6 @@ fn ending_chain_captures_are_deterministic() {
         let status = Command::new(binary)
             .args([
                 pack_path.to_str().unwrap(),
-                "--movie",
-                movie_path.to_str().unwrap(),
                 "--ending",
                 "1",
                 "--ticks",
@@ -851,37 +792,35 @@ fn ending_chain_captures_are_deterministic() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation; writes ~660 MiB"]
-fn conversion_writes_the_shipped_movie_pack() {
+#[ignore = "requires a real RE1 installation; writes ~760 MiB"]
+fn conversion_packs_the_shipped_films_in_the_single_pack() {
     let Some((root, _pack)) = common::asset_env() else {
         return;
     };
     let dir = TempDir::new("convert");
-    let main_out = dir.0.join("re1.akpak");
-    let movie_out = dir.0.join("re1.movie.akpak");
-    convert_game_with_packs(
-        &root,
-        &main_out,
-        None,
-        0,
-        &VoicePackOptions::Skip,
-        &MoviePackOptions::Sibling(Some(movie_out.clone())),
-    )
-    .unwrap();
+    let out = dir.0.join("re1.akpak");
+    convert_game_with_options(&root, &out, None, 0).unwrap();
 
-    let pack = Pack::open(&movie_out).unwrap();
-    assert_eq!(pack.len(), 27, "one entry per shipped film");
-    let bytes: u64 = pack.entries().map(|entry| entry.size() as u64).sum();
+    let pack = Pack::open(&out).unwrap();
+    let film_paths: Vec<&str> = pack
+        .paths()
+        .filter(|path| path.starts_with("movie/"))
+        .collect();
+    assert_eq!(film_paths.len(), 27, "one entry per shipped film");
+    let bytes: u64 = film_paths
+        .iter()
+        .map(|path| pack.read(path).unwrap().len() as u64)
+        .sum();
     assert_eq!(bytes, TOTAL_BYTES);
     for &(name, _, _) in FILMS {
         assert!(pack.contains(&movie::pack_path(name)), "missing {name}");
     }
     assert!(!pack.contains("movie/vlogo.avi"));
-    let main = Pack::open(&main_out).unwrap();
-    assert!(!main.paths().any(|path| path.starts_with("movie/")));
+    // No companion pack is written beside the single game pack.
+    assert!(!dir.0.join("re1.movie.akpak").exists());
     println!(
-        "movie pack: {} entries, {bytes} bytes; main pack {} entries",
+        "single pack: {} entries, 27 films ({bytes} bytes) in {}",
         pack.len(),
-        main.len()
+        out.display()
     );
 }

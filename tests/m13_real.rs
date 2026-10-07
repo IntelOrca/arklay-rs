@@ -4,7 +4,7 @@
 //! `ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... cargo test --test m13_real -- --ignored --nocapture`
 //!
 //! Only an unset environment skips; a partial configuration fails loudly. The
-//! conversion test additionally writes a full pack pair and takes minutes.
+//! conversion test additionally writes a full pack and takes minutes.
 //! The deviations documentation test runs without assets.
 
 mod common;
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arklay::bgm;
-use arklay::convert::{VoicePackOptions, convert_game_with_voice};
+use arklay::convert::convert_game_with_options;
 use arklay::engine::simulate_room;
 use arklay::game::{BgmState, GameState, ScdGameHost, Snd3dPos};
 use arklay::message::MessageWindow;
@@ -815,7 +815,7 @@ fn room_3030s_fade_and_pan_volume_move_the_channel_gains() {
     let mut cache = bgm::BgmCache::default();
     let before = game.bgm.channels[0].volume;
     for _ in 0..8 {
-        bgm::apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        bgm::apply_live(&mut None, &mut game, &mut cache, &pack);
     }
     assert_ne!(
         game.bgm.channels[0].volume, before,
@@ -824,7 +824,7 @@ fn room_3030s_fade_and_pan_volume_move_the_channel_gains() {
 
     // The last `snd_fade_set` arms the teardown; enough ticks end it.
     for _ in 0..400 {
-        bgm::apply_live(&mut None, &mut game, &mut cache, &pack, None);
+        bgm::apply_live(&mut None, &mut game, &mut cache, &pack);
     }
     assert!(!game.bgm.fade.active(), "the scripted fade finishes");
     // The original leaves a stale ramp counter once its bank is destroyed
@@ -874,35 +874,36 @@ fn the_room_and_character_names_are_packed() {
 }
 
 #[test]
-#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT; writes ~470 MiB"]
-fn conversion_writes_the_referenced_voice_pack() {
+#[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT; writes ~760 MiB"]
+fn conversion_packs_the_referenced_voice_lines_in_the_single_pack() {
     let Some((root, _pack)) = common::asset_env() else {
         return;
     };
     let out = std::env::temp_dir().join(format!("arklay-m13-{}.akpak", std::process::id()));
-    let voice_out =
-        std::env::temp_dir().join(format!("arklay-m13-{}.voice.akpak", std::process::id()));
     let _ = fs::remove_file(&out);
-    let _ = fs::remove_file(&voice_out);
 
-    convert_game_with_voice(
-        &root,
-        &out,
-        None,
-        0,
-        &VoicePackOptions::Sibling(Some(voice_out.clone())),
-    )
-    .unwrap();
+    convert_game_with_options(&root, &out, None, 0).unwrap();
 
-    let pack = Pack::open(&voice_out).unwrap();
+    let pack = Pack::open(&out).unwrap();
     let referenced = voice::referenced_names();
+    let voice_entries: Vec<&str> = pack
+        .paths()
+        .filter(|path| path.starts_with("voice/"))
+        .collect();
     assert_eq!(
-        pack.len(),
+        voice_entries.len(),
         referenced.len(),
         "one voice entry per referenced name"
     );
-    let bytes: usize = pack.entries().map(|entry| entry.size()).sum();
-    println!("voice pack: {} entries, {bytes} bytes", pack.len());
+    let bytes: usize = voice_entries
+        .iter()
+        .map(|path| pack.read(path).unwrap().len())
+        .sum();
+    println!(
+        "voice entries: {} entries, {bytes} bytes in {}",
+        voice_entries.len(),
+        out.display()
+    );
     let mut missing = Vec::new();
     for name in &referenced {
         let path = voice::pack_path(name);
@@ -911,12 +912,19 @@ fn conversion_writes_the_referenced_voice_pack() {
         }
     }
     assert!(missing.is_empty(), "unpacked voice entries: {missing:?}");
+    // No companion pack is written beside the single game pack.
+    assert!(
+        !out.with_file_name(format!(
+            "{}.voice.akpak",
+            out.file_stem().unwrap().to_str().unwrap()
+        ))
+        .exists()
+    );
 
-    // The main pack gained the full room-table sound set, the 31 character
+    // The same pack gained the full room-table sound set, the 31 character
     // SFX and the non-Bgm BGM group tracks (the muted seeds among them).
-    let main = Pack::open(&out).unwrap();
     assert_eq!(
-        main.paths().filter(|path| path.starts_with("se/")).count(),
+        pack.paths().filter(|path| path.starts_with("se/")).count(),
         sfx::SE_NAMES.len() + arklay::music::se_track_names().len(),
         "every named effect and BGM group track is packed"
     );
@@ -928,14 +936,13 @@ fn conversion_writes_the_referenced_voice_pack() {
         .chain(arklay::music::se_track_names())
     {
         let path = format!("se/{}.wav", name.to_ascii_lowercase());
-        if !main.contains(&path) {
+        if !pack.contains(&path) {
             se_missing.push(path);
         }
     }
     assert!(se_missing.is_empty(), "missing se entries: {se_missing:?}");
 
     let _ = fs::remove_file(&out);
-    let _ = fs::remove_file(&voice_out);
 }
 
 /// The M13 opcodes the audio layer implements. A placeholder hit for any of
@@ -1082,18 +1089,6 @@ fn real_captures_stay_deterministic_and_audio_free() {
     let first = cli_capture(&pack_path, "100", 30, &[], &dir.join("first.bmp"));
     let second = cli_capture(&pack_path, "100", 30, &[], &dir.join("second.bmp"));
     assert_eq!(first, second, "two --ticks captures differ");
-
-    // Supplying a voice pack (here the main pack itself, a valid empty voice
-    // source) must not change a frame: the capture path never opens audio.
-    let voice_arg = pack_path.to_string_lossy().into_owned();
-    let with_voice = cli_capture(
-        &pack_path,
-        "100",
-        30,
-        &["--voice", &voice_arg],
-        &dir.join("voice.bmp"),
-    );
-    assert_eq!(first, with_voice, "a voice pack changed the capture");
 
     // The library seam reproduces the CLI frame exactly (the audio state
     // machine ran in both).

@@ -195,101 +195,16 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
     convert_game_with_options(root, out, exe, 0)
 }
 
-/// How `convert-game` distributes the referenced voice WAVs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VoicePackOptions {
-    /// Write a second v1 pack (default: `<out stem>.voice.akpak`, or the
-    /// given explicit path).
-    Sibling(Option<PathBuf>),
-    /// Embed the voice entries in the main pack for a single-file install.
-    Embed,
-    /// Do not pack voice at all.
-    Skip,
-}
-
-impl Default for VoicePackOptions {
-    fn default() -> Self {
-        Self::Sibling(None)
-    }
-}
-
-/// The default sibling voice-pack path for a main pack: `<stem>.voice.akpak`.
-pub fn voice_pack_path(out: &Path) -> PathBuf {
-    let stem = out
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("re1");
-    out.with_file_name(format!("{stem}.voice.akpak"))
-}
-
-/// How `convert-game` distributes the referenced film AVIs.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MoviePackOptions {
-    /// Write a second v1 pack (default: `<out stem>.movie.akpak`, or the
-    /// given explicit path).
-    Sibling(Option<PathBuf>),
-    /// Embed the film entries in the main pack for a single-file install
-    /// (~630 MiB).
-    Embed,
-    /// Do not pack film at all.
-    Skip,
-}
-
-impl Default for MoviePackOptions {
-    fn default() -> Self {
-        Self::Sibling(None)
-    }
-}
-
-/// The default sibling movie-pack path for a main pack: `<stem>.movie.akpak`.
-pub fn movie_pack_path(out: &Path) -> PathBuf {
-    let stem = out
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("re1");
-    out.with_file_name(format!("{stem}.movie.akpak"))
-}
-
 /// Like [`convert_game_with_exe`], but with an explicit worker count.
 ///
 /// A `jobs` of `0` selects one worker per available CPU, and the output is
-/// byte-identical whatever the worker count.
+/// byte-identical whatever the worker count. Every asset category — rooms,
+/// audio, voice and films — lands in the one output pack.
 pub fn convert_game_with_options(
     root: &Path,
     out: &Path,
     exe: Option<&Path>,
     jobs: usize,
-) -> Result<()> {
-    convert_game_with_voice(root, out, exe, jobs, &VoicePackOptions::default())
-}
-
-/// [`convert_game_with_options`] with the voice-pack distribution selected and
-/// the default movie-pack distribution.
-pub fn convert_game_with_voice(
-    root: &Path,
-    out: &Path,
-    exe: Option<&Path>,
-    jobs: usize,
-    voice_options: &VoicePackOptions,
-) -> Result<()> {
-    convert_game_with_packs(
-        root,
-        out,
-        exe,
-        jobs,
-        voice_options,
-        &MoviePackOptions::default(),
-    )
-}
-
-/// [`convert_game_with_voice`] with both optional pack distributions selected.
-pub fn convert_game_with_packs(
-    root: &Path,
-    out: &Path,
-    exe: Option<&Path>,
-    jobs: usize,
-    voice_options: &VoicePackOptions,
-    movie_options: &MoviePackOptions,
 ) -> Result<()> {
     let jobs = worker_count(jobs);
     let mut progress = Progress::new();
@@ -331,15 +246,13 @@ pub fn convert_game_with_packs(
     for warning in &warnings {
         println!("warning: {warning}");
     }
-    let voice_enabled = !matches!(voice_options, VoicePackOptions::Skip);
-    if voice_enabled && !voice_dir_found {
+    if !voice_dir_found {
         println!(
             "warning: no voice directory found; {} voice line(s) will be missing",
             voice::referenced_names().len()
         );
     }
-    let movie_enabled = !matches!(movie_options, MoviePackOptions::Skip);
-    if movie_enabled && !movie_dir_found {
+    if !movie_dir_found {
         println!(
             "warning: no movie directory found; {} film(s) will be missing",
             movie::name_count()
@@ -486,58 +399,17 @@ pub fn convert_game_with_packs(
     let (maptbl_count, maptbl_bytes) = copy_map_tables(exe.as_deref(), &mut writer, &mut progress)?;
     let (manifest_count, manifest_bytes) = copy_manifest(&mut writer)?;
 
-    // Voice: `--with-voice` embeds the entries in the main pack; the default
-    // writes a second plain v1 pack now, before the main pack streams.
-    let embed_voice =
-        voice_enabled && matches!(voice_options, VoicePackOptions::Embed) && !voice.is_empty();
-    let (voice_count, voice_bytes, voice_note) = if !voice_enabled || voice.is_empty() {
-        (0, 0, String::new())
-    } else if embed_voice {
-        let (count, bytes) = copy_voice(&voice, &mut writer, &mut progress, jobs)?;
-        (count, bytes, " (embedded)".to_string())
+    // Voice and film land in the same pack as every other category, so a
+    // converted game is a single self-contained `.akpak`.
+    let (voice_count, voice_bytes) = if voice.is_empty() {
+        (0, 0)
     } else {
-        let path = match voice_options {
-            VoicePackOptions::Sibling(Some(path)) => path.clone(),
-            _ => voice_pack_path(out),
-        };
-        let mut voice_writer = PackWriter::new();
-        let (count, bytes) = copy_voice(&voice, &mut voice_writer, &mut progress, jobs)?;
-        let voice_size = voice_writer.pack_size()?;
-        voice_writer
-            .write(&path)
-            .with_context(|| format!("failed to write voice pack {}", path.display()))?;
-        (
-            count,
-            bytes,
-            format!(" -> {} ({voice_size} bytes)", path.display()),
-        )
+        copy_voice(&voice, &mut writer, &mut progress, jobs)?
     };
-
-    // Film follows the same contract: `--with-movie` embeds the raw AVIs in
-    // the main pack, the default writes the secondary `<stem>.movie.akpak`.
-    let embed_movie =
-        movie_enabled && matches!(movie_options, MoviePackOptions::Embed) && !movie.is_empty();
-    let (movie_count, movie_bytes, movie_note) = if !movie_enabled || movie.is_empty() {
-        (0, 0, String::new())
-    } else if embed_movie {
-        let (count, bytes) = copy_movies(&movie, &mut writer, &mut progress, jobs)?;
-        (count, bytes, " (embedded)".to_string())
+    let (movie_count, movie_bytes) = if movie.is_empty() {
+        (0, 0)
     } else {
-        let path = match movie_options {
-            MoviePackOptions::Sibling(Some(path)) => path.clone(),
-            _ => movie_pack_path(out),
-        };
-        let mut movie_writer = PackWriter::new();
-        let (count, bytes) = copy_movies(&movie, &mut movie_writer, &mut progress, jobs)?;
-        let movie_size = movie_writer.pack_size()?;
-        movie_writer
-            .write(&path)
-            .with_context(|| format!("failed to write movie pack {}", path.display()))?;
-        (
-            count,
-            bytes,
-            format!(" -> {} ({movie_size} bytes)", path.display()),
-        )
+        copy_movies(&movie, &mut writer, &mut progress, jobs)?
     };
 
     for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
@@ -567,19 +439,15 @@ pub fn convert_game_with_packs(
         "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
         base_manifest().id
     );
-    if voice_enabled {
-        println!("voice: {voice_count} entries, {voice_bytes} bytes{voice_note}");
-        if !voice_unreferenced.is_empty() {
-            println!(
-                "voice: {} unreferenced file(s) not packed: {}",
-                voice_unreferenced.len(),
-                voice_unreferenced.join(", ")
-            );
-        }
+    println!("voice: {voice_count} entries, {voice_bytes} bytes");
+    if !voice_unreferenced.is_empty() {
+        println!(
+            "voice: {} unreferenced file(s) not packed: {}",
+            voice_unreferenced.len(),
+            voice_unreferenced.join(", ")
+        );
     }
-    if movie_enabled {
-        println!("movie: {movie_count} entries, {movie_bytes} bytes{movie_note}");
-    }
+    println!("movie: {movie_count} entries, {movie_bytes} bytes");
 
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
@@ -634,8 +502,8 @@ pub fn convert_game_with_packs(
         + map_count
         + maptbl_count
         + manifest_count
-        + if embed_voice { voice_count } else { 0 }
-        + if embed_movie { movie_count } else { 0 };
+        + voice_count
+        + movie_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -3301,20 +3169,6 @@ mod tests {
     }
 
     #[test]
-    fn movie_pack_paths_derive_from_the_main_pack() {
-        assert_eq!(
-            movie_pack_path(Path::new("/games/re1.akpak")),
-            PathBuf::from("/games/re1.movie.akpak")
-        );
-        assert_eq!(
-            movie_pack_path(Path::new("re1")),
-            PathBuf::from("re1.movie.akpak")
-        );
-        assert_eq!(MoviePackOptions::default(), MoviePackOptions::Sibling(None));
-        assert_ne!(MoviePackOptions::default(), MoviePackOptions::Skip);
-    }
-
-    #[test]
     fn resolves_movie_files_and_warns_for_missing() {
         let root = TempDir::new("movie-plan");
         make_stage_dirs(&root.path);
@@ -3350,7 +3204,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_movies_into_a_sibling_pack_and_embedded() {
+    fn converts_movies_into_the_single_pack() {
         let root = TempDir::new("movie-pack");
         make_stage_dirs(&root.path);
         write_npc_files(&root.path);
@@ -3364,71 +3218,17 @@ mod tests {
         fs::write(movie.join("oj.avi"), b"movie-oj").unwrap();
         fs::write(movie.join("capcom.AVI"), b"movie-capcom").unwrap();
 
-        // Default sibling: a second plain v1 pack beside the main one.
         let out = root.path.join("out.akpak");
-        let movie_out = root.path.join("out.movie.akpak");
-        convert_game_with_packs(
-            &root.path,
-            &out,
-            None,
-            1,
-            &VoicePackOptions::Skip,
-            &MoviePackOptions::Sibling(None),
-        )
-        .unwrap();
-        let film_pack = crate::pack::Pack::open(&movie_out).unwrap();
-        assert_eq!(film_pack.len(), 2);
-        assert_eq!(film_pack.read("movie/oj.avi").unwrap(), b"movie-oj");
-        assert_eq!(film_pack.read("movie/capcom.avi").unwrap(), b"movie-capcom");
-        let main = crate::pack::Pack::open(&out).unwrap();
-        assert!(!main.paths().any(|path| path.starts_with("movie/")));
-
-        // An explicit sibling path is honoured.
-        let explicit = root.path.join("explicit.movie.akpak");
-        convert_game_with_packs(
-            &root.path,
-            &out,
-            None,
-            1,
-            &VoicePackOptions::Skip,
-            &MoviePackOptions::Sibling(Some(explicit.clone())),
-        )
-        .unwrap();
-        assert!(explicit.is_file());
-
-        // Embed: the entries move into the main pack, no sibling is written.
-        let out = root.path.join("embed.akpak");
-        convert_game_with_packs(
-            &root.path,
-            &out,
-            None,
-            1,
-            &VoicePackOptions::Skip,
-            &MoviePackOptions::Embed,
-        )
-        .unwrap();
+        convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("movie/oj.avi").unwrap(), b"movie-oj");
-        assert!(!root.path.join("embed.movie.akpak").exists());
-
-        // Skip: no film entries anywhere.
-        let out = root.path.join("skip.akpak");
-        convert_game_with_packs(
-            &root.path,
-            &out,
-            None,
-            1,
-            &VoicePackOptions::Skip,
-            &MoviePackOptions::Skip,
-        )
-        .unwrap();
-        let main = crate::pack::Pack::open(&out).unwrap();
-        assert!(!main.paths().any(|path| path.starts_with("movie/")));
-        assert!(!root.path.join("skip.movie.akpak").exists());
+        assert_eq!(main.read("movie/capcom.avi").unwrap(), b"movie-capcom");
+        // No companion pack is written beside the main one.
+        assert!(!root.path.join("out.movie.akpak").exists());
     }
 
     #[test]
-    fn converts_voice_into_a_sibling_pack_and_embedded() {
+    fn converts_voice_into_the_single_pack() {
         let root = TempDir::new("voice-pack");
         make_stage_dirs(&root.path);
         write_npc_files(&root.path);
@@ -3444,25 +3244,14 @@ mod tests {
         fs::write(voice.join("V104_00.WAV"), b"voice-bb").unwrap();
         fs::write(voice.join("ANNOUNCE.WAV"), b"unused").unwrap();
 
-        // Default: a second plain v1 pack beside the main one.
         let out = root.path.join("out.akpak");
-        let voice_out = root.path.join("out.voice.akpak");
-        convert_game_with_voice(&root.path, &out, None, 1, &VoicePackOptions::Sibling(None))
-            .unwrap();
-        let voice_pack = crate::pack::Pack::open(&voice_out).unwrap();
-        assert_eq!(voice_pack.len(), 2);
-        assert_eq!(voice_pack.read("voice/v001_00.wav").unwrap(), b"voice-a");
-        assert_eq!(voice_pack.read("voice/v104_00.wav").unwrap(), b"voice-bb");
-        let main = crate::pack::Pack::open(&out).unwrap();
-        assert!(!main.paths().any(|path| path.starts_with("voice/")));
-
-        // Embed: the entries move into the main pack, no sibling is written.
-        let out = root.path.join("embed.akpak");
-        convert_game_with_voice(&root.path, &out, None, 1, &VoicePackOptions::Embed).unwrap();
+        convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("voice/v001_00.wav").unwrap(), b"voice-a");
         assert_eq!(main.read("voice/v104_00.wav").unwrap(), b"voice-bb");
-        assert!(!root.path.join("embed.voice.akpak").exists());
+        // The unreferenced file stays out and no companion pack is written.
+        assert!(!main.contains("voice/announce.wav"));
+        assert!(!root.path.join("out.voice.akpak").exists());
     }
 
     #[test]
