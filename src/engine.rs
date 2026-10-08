@@ -5,11 +5,13 @@
 //! The world-item milestone leaves these deliberate gaps:
 //! - the ground pick-up (menu mode 3) and scripted `give_item` (mode 4) item
 //!   viewers run the model intro, the model spin and the 0xC0/0xC1/0xC2
-//!   message round trip through [`PickupView`], but the original's reach
-//!   animation before the menu opens is not ported. The document handler
-//!   (`set_room_event_flag`, mode 8) shows global 0xC6 and files the entry
-//!   instead of running the original's file-list screen: the state-8 art,
-//!   layout and navigation are a separate slice;
+//!   message round trip through [`PickupView`]. A gated `item_aot_set` entry
+//!   (flags word bit 0) plays the 0x0c reach animation first through
+//!   [`crate::player::LockedAction::Interact`] and the viewer opens when it
+//!   completes; an ungated entry opens instantly, exactly like the original.
+//!   The document handler (`set_room_event_flag`, mode 8) shows global 0xC6
+//!   and files the entry instead of running the original's file-list screen:
+//!   the state-8 art, layout and navigation are a separate slice;
 //! - no map tab: a map pick-up raises its RoomFlags owned bit, but
 //!   `ITEM_M2`'s `MAP*.TIM` pages and `Map_blue.tim` stay unpacked and the map
 //!   screen is untouched;
@@ -5643,11 +5645,24 @@ fn tick_room_timed(
         pad.action_held = false;
         context.player.input = pad;
         if !frozen {
-            let clips: &[Clip] = context
+            let (emd_clips, emw_clips): (&[Clip], &[Clip]) = context
                 .player_assets
-                .map(|assets| assets.emd.clips.as_slice())
+                .map(|assets| (assets.emd.clips.as_slice(), assets.emw.clips.as_slice()))
+                .unwrap_or((&[], &[]));
+            let room_clips: &[Clip] = context
+                .room
+                .room_anim
+                .as_ref()
+                .map(|anim| anim.clips.as_slice())
                 .unwrap_or(&[]);
-            player_script::update(context.game, context.player, clips);
+            player_script::update(
+                context.game,
+                context.player,
+                context.room,
+                emd_clips,
+                emw_clips,
+                room_clips,
+            );
         }
     } else if let Some(assets) = context.player_assets {
         let room_clips = context
@@ -5666,6 +5681,12 @@ fn tick_room_timed(
         );
     }
     context.game.sync_entity_from_player(context.player);
+    // The gated reach finished this tick: raise the viewer flag the action
+    // entry selects, return the message ready bit and clear the health lock.
+    // The end-of-tick item-viewer hook then opens the viewer.
+    if let Some(request) = context.player.take_interact_finished() {
+        context.game.complete_reach(request);
+    }
     if let Some(phases) = phases.as_mut() {
         phases.update += update_start.elapsed();
     }
@@ -5694,6 +5715,12 @@ fn tick_room_timed(
     {
         let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, context.player.angle, probe_action);
+    }
+    // A gated action-key press queued its reach: hand it to the player's
+    // locked interact behaviour. The probe refuses while a locked action owns
+    // the tick, so the action edge cannot re-fire during the animation.
+    if let Some(request) = context.game.take_pending_reach() {
+        context.player.begin_interact(request);
     }
     // The room objects run after the player's physics and the player-side
     // probe: the push probe, the object-side action probe and the climb scan
@@ -10066,6 +10093,7 @@ end
             params: [2, 0x81, 0x41, 0x00, 0xFF, 0x00, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         let scripts = scd::ir::Scripts::default();
         let mut command_vm = scd::vm::CommandVm::new(&scripts);
@@ -10151,6 +10179,7 @@ end
             params: [2, 0x81, 0x41, 0x00, 0x00, 0x00, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         let scripts = scd::ir::Scripts::default();
         let mut command_vm = scd::vm::CommandVm::new(&scripts);
@@ -10528,6 +10557,7 @@ end
             flags: 0x81,
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
             params: [2, 0x81, 0x41, 0, 0, 0, 0, 0],
         });
 
@@ -11420,6 +11450,7 @@ end
             flags: 0x81,
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
             params: [ITEM_FIRST_AID_SPRAY, 1, 0, 0, 0, 0, 0, 0],
         });
         // Global id 0x7f (index 63) is the yes/no pickup stream.
@@ -11478,6 +11509,7 @@ end
             params: [item, quantity, 0, 0, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFE,
+            reach_animation: false,
         }
     }
 
@@ -11817,6 +11849,7 @@ end
             params: [0; 8],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         // The handler arms the lid; the ramp settles before the UI opens.
         for _ in 0..80 {

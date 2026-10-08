@@ -216,6 +216,7 @@ mod tests {
             ],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         }
     }
 

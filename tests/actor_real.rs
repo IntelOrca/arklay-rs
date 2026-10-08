@@ -231,3 +231,60 @@ fn real_corpus_rooms_tick_and_keep_moved_characters_in_bounds() {
     assert!(rooms >= 300, "only {rooms} rooms ran; the pack looks wrong");
     assert!(moved > 0, "no character moved in the whole corpus");
 }
+
+/// XZ distance between a player position and a scripted waypoint.
+fn waypoint_distance(pos: [i32; 3], waypoint: [i32; 2]) -> i32 {
+    let dx = i64::from(pos[0] - waypoint[0]);
+    let dz = i64::from(pos[2] - waypoint[1]);
+    ((dx * dx + dz * dz) as f64).sqrt() as i32
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1061").unwrap();
+
+    // The opening cutscene first aims Jill at (20900, 8500), retargets her at
+    // (24500, 12800) before she arrives, and her walk hands control back to
+    // state 1 on arrival with the script's system bit 0x20 raised. The run is
+    // deterministic; sample it around each waypoint.
+    let first = [20900, 8500];
+    let second = [24500, 12800];
+    let mut first_closest = i32::MAX;
+    let mut second_closest = i32::MAX;
+    let mut arrival: Option<usize> = None;
+    for ticks in (60..=200).step_by(2) {
+        let Ok(sim) = simulate_room(&pack, id, ticks, player::Input::default()) else {
+            return;
+        };
+        first_closest = first_closest.min(waypoint_distance(sim.player.pos, first));
+        let distance = waypoint_distance(sim.player.pos, second);
+        second_closest = second_closest.min(distance);
+        if distance < 0x96
+            && sim.game.entities[0].state() == 1
+            && sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x20)
+        {
+            arrival = Some(ticks);
+        }
+    }
+    assert!(
+        first_closest < 0x96,
+        "the walk only closed to {first_closest} units of (20900, 8500)"
+    );
+    assert!(
+        second_closest < 0x96,
+        "the walk only closed to {second_closest} units of (24500, 12800)"
+    );
+    let arrival = arrival.expect("the arrival never handed control back with bit 0x20");
+    let sim = simulate_room(&pack, id, arrival, player::Input::default()).unwrap();
+    assert_eq!(sim.game.entities[0].state(), 1, "state 1 on arrival");
+    assert_eq!(sim.game.entities[0].action_behavior, 0);
+    assert!(
+        sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x20),
+        "the script's completion bit is raised"
+    );
+}

@@ -907,6 +907,11 @@ pub struct RoomAction {
     /// that never built an item carry the `0xFF` default and no handler
     /// touches it.
     pub room_items_flag: u8,
+    /// The reach gate: when set, the action-key press plays the 0x0c reach
+    /// animation before the viewer opens. `item_aot_set` stores its flags
+    /// word masked to bit 0 here (the original's entry `+2` word); every other
+    /// action kind carries `false`.
+    pub reach_animation: bool,
 }
 
 impl RoomAction {
@@ -1119,6 +1124,21 @@ pub struct ItemViewRequest {
     pub slot: u8,
     /// Which viewer flow the flags selected.
     pub kind: ItemViewKind,
+}
+
+/// A reach animation queued by a gated action-key press.
+///
+/// The original's `set_key_flag`/`set_room_event_flag` return 1 when their
+/// entry's gating word is nonzero, which routes the press into
+/// `player_behavior_0c_interact`; the completion then re-raises the item
+/// viewer flag for the recorded entry. The request carries the entry's slot
+/// and handler byte so [`GameState::complete_reach`] can pick the right flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReachRequest {
+    /// Room action slot the reach belongs to.
+    pub slot: u8,
+    /// The entry's handler byte: 0x0D selects the document screen.
+    pub handler: u8,
 }
 
 /// One scripted entity.
@@ -1449,6 +1469,10 @@ pub struct GameState {
     /// The room action slot a scripted `0x2D` armed for the got-item viewer.
     /// The award runs when that viewer closes, not when the script runs.
     pub got_item_slot: Option<u8>,
+    /// The reach animation a gated action-key press queued. The engine hands
+    /// it to the player's locked interact behaviour, whose completion calls
+    /// [`GameState::complete_reach`]; cleared on room entry.
+    pub pending_reach: Option<ReachRequest>,
     /// `g_eventItemUsedFlag`: a door consumed a key logically and the physical
     /// removal waits for the key-turn prompt's dismissal.
     pub event_item_used: bool,
@@ -1657,6 +1681,7 @@ impl Default for GameState {
             frame: 0,
             selected_model: None,
             got_item_slot: None,
+            pending_reach: None,
             event_item_used: false,
             special_light_masks: [0; 3],
             dpad_held: 0,
@@ -2670,6 +2695,11 @@ impl GameState {
         // CRT default 1 and is never reseeded, not even by a room load.
         self.special_light_masks = [0; 3];
         self.got_item_slot = None;
+        self.pending_reach = None;
+        // The original's door-animation window clears the 0x80 reach lock when
+        // a transition runs, so an abandoned reach cannot freeze the
+        // destination's scripted walks.
+        self.health_status &= 0x7F;
         self.event_item_used = false;
         // The effect pool and the resolved sprite metadata reset with the room
         // (the original's effect init), so no billboard leaks across a door.
@@ -4045,18 +4075,21 @@ impl GameState {
     /// the yes branch awards through [`Self::pick_up`]. Returns whether an item
     /// action was armed.
     ///
-    /// # Documented deviation
-    ///
-    /// When the action's `(id, flag)` word is nonzero the original routes the
-    /// press through the 0x0c reach animation and re-raises the flag when the
-    /// animation completes; the port has no reach animation, so it raises the
-    /// flag directly.
+    /// When the action's reach gate is set (`item_aot_set`'s flags word bit 0)
+    /// the original returns 1 instead, which routes the press through the 0x0c
+    /// reach animation; the port raises the health lock and queues a
+    /// [`ReachRequest`] for the player's interact behaviour, and the flag is
+    /// raised by [`Self::complete_reach`] when it finishes.
     pub fn arm_item_pickup(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
         };
         if action.kind != RoomActionKind::Item {
             return false;
+        }
+        if action.reach_animation {
+            self.queue_reach(slot, action.handler);
+            return true;
         }
         self.message_item_slot = Some(slot);
         self.apply_flag(5, MSF_MENU_ITEM_VIEW, 0);
@@ -4075,7 +4108,9 @@ impl GameState {
     /// The port does not port the state-8 file-list screen (its art, layout and
     /// navigation are a separate slice); it shows the same observable result
     /// through global 0xC6 and files the entry through
-    /// [`Self::take_document`].
+    /// [`Self::take_document`]. The reach gate works exactly as in
+    /// [`Self::arm_item_pickup`], with the completion raising
+    /// `MSF_PICKUP_SCREEN`.
     pub fn arm_document(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -4083,9 +4118,54 @@ impl GameState {
         if action.kind != RoomActionKind::Item {
             return false;
         }
+        if action.reach_animation {
+            self.queue_reach(slot, action.handler);
+            return true;
+        }
         self.message_item_slot = Some(slot);
         self.apply_flag(5, MSF_PICKUP_SCREEN, 0);
         self.record_interaction(slot, RoomActionKind::Item, None);
+        true
+    }
+
+    /// The gated action-key path: raise the health lock, clear the message
+    /// ready bit and queue the reach for the player behaviour (the original's
+    /// `healthStatusFlags |= 0x80`, `g_message_flags &= ~0x40`, behavior 0x0c).
+    fn queue_reach(&mut self, slot: u8, handler: u8) {
+        self.health_status |= 0x80;
+        self.message_flags &= !0x0040;
+        self.pending_reach = Some(ReachRequest { slot, handler });
+    }
+
+    /// Take the queued reach request, if any, for the player behaviour.
+    pub fn take_pending_reach(&mut self) -> Option<ReachRequest> {
+        self.pending_reach.take()
+    }
+
+    /// The reach animation finished: raise the viewer flag the entry's handler
+    /// selects, record the interaction, return the message ready bit and clear
+    /// the health lock (the original's `player_behavior_0c_interact`
+    /// completion).
+    pub fn complete_reach(&mut self, request: ReachRequest) -> bool {
+        if !self
+            .room_actions
+            .get(usize::from(request.slot))
+            .is_some_and(Option::is_some)
+        {
+            // The entry vanished while the reach played; still release the
+            // lock so the player cannot stay frozen.
+            self.health_status &= 0x7F;
+            return false;
+        }
+        self.message_item_slot = Some(request.slot);
+        if request.handler == HANDLER_DOCUMENT {
+            self.apply_flag(5, MSF_PICKUP_SCREEN, 0);
+        } else {
+            self.apply_flag(5, MSF_MENU_ITEM_VIEW, 0);
+        }
+        self.record_interaction(request.slot, RoomActionKind::Item, None);
+        self.message_flags |= 0x0040;
+        self.health_status &= 0x7F;
         true
     }
 
@@ -5700,6 +5780,7 @@ impl ScdHost for ScdGameHost<'_> {
                     handler: HANDLER_DOOR,
                     flags: door.sub_type,
                     room_items_flag: 0xFF,
+                    reach_animation: false,
                     item_data: None,
                     params: [
                         door.lock,
@@ -5737,6 +5818,7 @@ impl ScdHost for ScdGameHost<'_> {
                     params,
                     item_data: None,
                     room_items_flag: 0xFF,
+                    reach_animation: false,
                 };
                 self.store_action(action);
                 StepResult::Continue
@@ -5909,6 +5991,11 @@ impl ScdHost for ScdGameHost<'_> {
                         params: [item, quantity, model, parent, x[0], x[1], z[0], z[1]],
                         item_data: Some([item, quantity, model, parent, x[0], x[1], z[0], z[1]]),
                         room_items_flag,
+                        // The original writes the flags word masked to bit 0
+                        // into the entry's +2 gating word, which
+                        // `set_key_flag`/`set_room_event_flag` test: nonzero
+                        // routes the press through the 0x0c reach animation.
+                        reach_animation: flags_word & 1 != 0,
                     };
                     self.store_action(action);
                 }
@@ -7212,6 +7299,7 @@ mod tests {
             params: [0; 8],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         // Inside the zone the frame's probe raises the bit.
         state.interact([50, 0, 50], 0, false);
@@ -8887,6 +8975,7 @@ mod tests {
             params: [item, quantity, 1, 0xFF, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         }
     }
 
@@ -8900,6 +8989,7 @@ mod tests {
             flags: door.sub_type,
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
             params: [
                 door.lock,
                 door.next_room,
@@ -8942,6 +9032,7 @@ mod tests {
             params: [0; 8],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         };
         assert!(action.contains(100, 200));
         assert!(action.contains(400, 600));
@@ -9489,6 +9580,125 @@ mod tests {
         assert_eq!(record.asset, Some(0));
         assert_eq!(record.sparkle, 0);
         assert_eq!(record.alt_rotation, 0x4000_0000);
+    }
+
+    #[test]
+    fn item_aot_set_captures_the_reach_gate() {
+        let room = RoomState {
+            item_count: 1,
+            ..RoomState::default()
+        };
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
+        state.apply_flag(7, 22, 0);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // The flags word's bit 0 is the entry's +2 gating word.
+            assert_eq!(
+                host.on_item(
+                    op(0x18),
+                    &operands(&[
+                        1, 4140, 7730, 1800, 1800, 0x2F, 3, 0, 255, 5040, -910, 8630, 0, 22, 0x81,
+                        1,
+                    ]),
+                ),
+                StepResult::Continue
+            );
+        }
+        assert!(state.room_actions[1].unwrap().reach_animation);
+
+        // Bit 0 clear (with other flags set) leaves the viewer instant.
+        let mut state = GameState::new(RoomId::parse("1000").unwrap(), &room);
+        state.apply_flag(7, 22, 0);
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_item(
+                    op(0x18),
+                    &operands(&[
+                        1, 4140, 7730, 1800, 1800, 0x2F, 3, 0, 255, 5040, -910, 8630, 0, 22, 0x81,
+                        0x8000,
+                    ]),
+                ),
+                StepResult::Continue
+            );
+        }
+        assert!(!state.room_actions[1].unwrap().reach_animation);
+    }
+
+    #[test]
+    fn a_gated_item_action_queues_the_reach_instead_of_the_viewer() {
+        let mut state = item_game("1000", 1);
+        let mut action = item_action(3, 0x33, 1, [0, 0, 10, 10]);
+        action.reach_animation = true;
+        state.room_actions[3] = Some(action);
+        state.message_flags = MESSAGE_FLAGS_INITIAL;
+
+        assert!(state.arm_item_pickup(3));
+        assert_eq!(state.health_status & 0x80, 0x80, "the reach lock is raised");
+        assert_eq!(state.message_flags & 0x40, 0, "the message ready bit drops");
+        assert!(
+            !state.flags[5].bit(MSF_MENU_ITEM_VIEW),
+            "the viewer flag is not raised yet"
+        );
+        assert_eq!(
+            state.take_pending_reach(),
+            Some(ReachRequest {
+                slot: 3,
+                handler: HANDLER_ITEM
+            })
+        );
+        assert!(state.take_pending_reach().is_none(), "the request is taken");
+    }
+
+    #[test]
+    fn an_ungated_item_action_opens_the_viewer_immediately() {
+        let mut state = item_game("1000", 1);
+        state.room_actions[3] = Some(item_action(3, 0x33, 1, [0, 0, 10, 10]));
+        state.message_flags = MESSAGE_FLAGS_INITIAL;
+
+        assert!(state.arm_item_pickup(3));
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert_eq!(state.health_status & 0x80, 0, "no reach lock");
+        assert!(state.pending_reach.is_none());
+    }
+
+    #[test]
+    fn complete_reach_raises_the_entrys_flag_and_releases_the_lock() {
+        let mut state = item_game("1000", 1);
+        state.room_actions[3] = Some(item_action(3, 0x33, 1, [0, 0, 10, 10]));
+        state.health_status = 0x80;
+        state.message_flags &= !0x0040;
+
+        assert!(state.complete_reach(ReachRequest {
+            slot: 3,
+            handler: HANDLER_ITEM
+        }));
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert_eq!(state.health_status & 0x80, 0, "the reach lock clears");
+        assert_eq!(state.message_flags & 0x40, 0x40, "the ready bit returns");
+
+        // The document handler raises the file screen instead.
+        state.clear_item_view_flags();
+        state.health_status = 0x80;
+        assert!(state.complete_reach(ReachRequest {
+            slot: 3,
+            handler: HANDLER_DOCUMENT
+        }));
+        assert!(state.flags[5].bit(MSF_PICKUP_SCREEN));
+        assert_eq!(state.health_status & 0x80, 0);
+    }
+
+    #[test]
+    fn room_entry_drops_a_pending_reach_and_its_lock() {
+        let mut state = item_game("1000", 1);
+        state.health_status = 0x80;
+        state.pending_reach = Some(ReachRequest {
+            slot: 3,
+            handler: HANDLER_ITEM,
+        });
+        state.enter_room(RoomId::parse("101").unwrap(), &RoomState::default());
+        assert!(state.pending_reach.is_none());
+        assert_eq!(state.health_status & 0x80, 0, "the reach lock clears");
     }
 
     #[test]
@@ -10761,6 +10971,7 @@ mod tests {
             params: [0; 8],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         state.interact([-550, 0, 50], 0, true);
         assert!(state.inventory.is_empty());
@@ -10787,6 +10998,7 @@ mod tests {
             params: [HANDLER_MESSAGE, 0x81, 170, 0, 79, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         state.interact([-550, 0, 50], 0, true);
         assert_eq!(state.message.id, Some(170));
@@ -12346,6 +12558,7 @@ mod tests {
             params: [2, 0, 7, 0, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         let mut player = push_player();
         player.pos = [0, 0, 0];
@@ -12371,6 +12584,7 @@ mod tests {
             params: [2, 0, 7, 0, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         let player = push_player();
         state.interact(player.pos, player.angle, false);
@@ -12469,6 +12683,7 @@ mod tests {
             params: [HANDLER_ITEMBOX, 0x01, 0, 0, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         // params word 1 (entry +4) is the lid slot: bytes 4/5.
         state.room_actions[0].as_mut().unwrap().params[4] = 0;
@@ -12528,6 +12743,7 @@ mod tests {
             params: [0; 8],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         assert!(state.open_itembox(0));
     }
@@ -12757,6 +12973,7 @@ mod tests {
             params: [HANDLER_DOOR_CHECK, 0x01, 0, 0, 0, 0, 0, 0],
             item_data: None,
             room_items_flag: 0xFF,
+            reach_animation: false,
         });
         // Right of centre (X >= width/2) facing +X picks the -1 side; the
         // entry's +2 word bit 0 is clear, so the turn-away bit lands.

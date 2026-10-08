@@ -34,6 +34,7 @@
 //! the behaviour functions).
 
 use crate::anim::AnimPlayer;
+use crate::game::ReachRequest;
 use crate::model::Clip;
 use crate::state::{Collision, CollisionRect, RoomId, RoomState};
 
@@ -58,6 +59,9 @@ const RUN_CLIP: usize = 3;
 /// EMD clip 3: the backward run. The original plays it from the body model,
 /// not the no-weapon EMW.
 const BACK_CLIP: usize = 3;
+/// EMW clip 4: the no-weapon reach animation of the 0x0c interaction
+/// (`player_behavior_0c_interact`, `attackAnim 4`).
+const INTERACT_CLIP: usize = 4;
 
 /// Ticks the settle pose is held before the breathe transition begins.
 const IDLE_SETTLE_TICKS: u32 = 100;
@@ -361,6 +365,9 @@ pub enum LockedAction {
     /// `action_behavior 0x0b`: the eight-state ladder climb selected by an
     /// action press inside a marked `set_stairs_zone` zone.
     Ladder,
+    /// `action_behavior 0x0c`: the object reach animation a gated action-key
+    /// press selects before its item viewer opens.
+    Interact,
 }
 
 /// The moving player: position, facing, collision radius and animation.
@@ -410,6 +417,11 @@ pub struct PlayerState {
     /// The ladder climb's state 8 ran: the room probe clears zone flag `0x10`
     /// and `MSF_LADDER_DOWN` and returns the message flag next tick.
     pub ladder_release: bool,
+    /// The reach request [`PlayerState::begin_interact`] armed, consumed when
+    /// the EMW reach clip finishes.
+    interact_request: Option<ReachRequest>,
+    /// The reach request handed to the engine when the reach clip finished.
+    interact_finished: Option<ReachRequest>,
     /// The last tick's input; `tick_objects` reads the action edges from here.
     pub input: Input,
     /// Slow-motion animation cadence counter (the original's `attackDirection`
@@ -468,6 +480,8 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         attack_direction: 0,
         move_speed_current: 0,
         ladder_release: false,
+        interact_request: None,
+        interact_finished: None,
         input: Input::default(),
         slow_counter: 0,
         run_stop_ticks: 0,
@@ -806,6 +820,22 @@ impl PlayerState {
         std::mem::take(&mut self.sounds)
     }
 
+    /// Select the gated object reach (`action_behavior 0x0c`) for `request`.
+    /// The original raises the health lock and message bit in the room action
+    /// layer and starts the behaviour with `animFrameId = 1`; the port starts
+    /// the locked action and reports the request back when the clip finishes.
+    pub fn begin_interact(&mut self, request: ReachRequest) {
+        self.locked = LockedAction::Interact;
+        self.action_state = 0;
+        self.interact_request = Some(request);
+    }
+
+    /// Take the reach request whose clip just finished, if any. The engine
+    /// raises the viewer flag through [`crate::game::GameState::complete_reach`].
+    pub fn take_interact_finished(&mut self) -> Option<ReachRequest> {
+        self.interact_finished.take()
+    }
+
     /// Queue a one-shot sound at the player's current position.
     fn queue_sound(&mut self, id: u16) {
         self.sounds.push(PlayerSound { id, pos: self.pos });
@@ -836,7 +866,53 @@ fn update_locked(
         LockedAction::Push => update_push(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::Vault => update_vault(player, emd_clips, emw_clips, room_clips),
         LockedAction::Ladder => update_ladder(player, room, emd_clips, emw_clips, room_clips),
+        LockedAction::Interact => update_interact(player, emd_clips, emw_clips, room_clips),
         LockedAction::None => {}
+    }
+}
+
+/// `player_behavior_0c_interact` (0x00495e00): the object reach a gated
+/// action-key press selects.
+///
+/// State 0 selects the no-weapon EMW reach clip (`attackAnim 4`, blend 3);
+/// state 1 plays it and, when it completes, hands the reach request to the
+/// engine (which raises the viewer flag and clears the health lock) and arms
+/// state 2; state 2 plays one EMD clip-0 tick and returns control.
+fn update_interact(
+    player: &mut PlayerState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    match player.action_state {
+        0 => {
+            player.set_clip(ClipSource::Emw, INTERACT_CLIP);
+            player.anim.frame = 0;
+            player.anim.display_frame = 0;
+            player.anim.timing = 0;
+            player.action_state = 1;
+        }
+        1 => {
+            if player.advance(emd_clips, emw_clips, room_clips) {
+                player.interact_finished = player.interact_request;
+                player.action_state = 2;
+                // The original switches to the body clip with a snap
+                // (`unk_8c = 0`) and frame 0.
+                player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+                player.anim.blend_counter = 0;
+                player.anim.frame = 0;
+                player.anim.display_frame = 0;
+                player.anim.timing = 0;
+            }
+        }
+        2 => {
+            // One body clip-0 tick, then back to the pad-driven control.
+            player.advance(emd_clips, emw_clips, room_clips);
+            player.locked = LockedAction::None;
+            player.action_state = 0;
+            player.enter_idle();
+        }
+        _ => {}
     }
 }
 
@@ -1773,6 +1849,8 @@ mod tests {
             attack_direction: 0,
             move_speed_current: 0,
             ladder_release: false,
+            interact_request: None,
+            interact_finished: None,
             input: Input::default(),
             slow_counter: 0,
             run_stop_ticks: 0,
@@ -3117,6 +3195,58 @@ mod tests {
         }
         assert!(grunts.contains(&SE_PUSH_GRUNT_HEAVY), "{grunts:?}");
         assert!(!grunts.contains(&SE_PUSH_GRUNT), "{grunts:?}");
+    }
+
+    #[test]
+    fn interact_plays_the_reach_then_returns_control() {
+        let room = RoomState::default();
+        let emd = clips();
+        let mut emw = clips();
+        emw.push(clip(2));
+        let request = ReachRequest {
+            slot: 3,
+            handler: 4,
+        };
+        let mut player = player_at(0, 0);
+        player.begin_interact(request);
+        assert_eq!(player.locked, LockedAction::Interact);
+        assert_eq!(player.action_state, 0);
+
+        // State 0 selects the no-weapon reach clip.
+        update_with_room(&mut player, &room, &emd, &emw, &[], Input::default());
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, INTERACT_CLIP);
+        assert_eq!(player.action_state, 1);
+        assert_eq!(player.locked, LockedAction::Interact, "still locked");
+
+        // The two-frame clip finishes: the request is handed back and state 2
+        // arms the body clip with a snap.
+        let mut finished = None;
+        for _ in 0..8 {
+            update_with_room(&mut player, &room, &emd, &emw, &[], Input::default());
+            if let Some(report) = player.take_interact_finished() {
+                finished = Some(report);
+                break;
+            }
+        }
+        assert_eq!(finished, Some(request), "the reach reported its request");
+        assert_eq!(
+            player.locked,
+            LockedAction::Interact,
+            "state 2 still owns the tick"
+        );
+        assert_eq!(
+            player.clip_source,
+            ClipSource::Emd,
+            "the body clip is armed"
+        );
+        assert_eq!(player.anim.blend_counter, 0, "the body clip snaps");
+
+        // State 2 plays one body tick and returns control.
+        update_with_room(&mut player, &room, &emd, &emw, &[], Input::default());
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.action_state, 0);
+        assert!(player.take_interact_finished().is_none());
     }
 
     #[test]
