@@ -120,6 +120,14 @@ const WINDOW_HEIGHT: i32 = HEIGHT * SCALE;
 const PIXEL_PITCH: i32 = WIDTH * 4;
 /// Fixed simulation step in milliseconds (30 Hz, the original frame rate).
 const TICK_MS: f64 = 1000.0 / 30.0;
+/// The original's non-gameplay frame-limiter period in milliseconds.
+///
+/// While a door transition owns the screen the original clears its
+/// game-active flag and drops from the 33 ms gameplay interval to the 16 ms
+/// one, and the door animation advances one frame per platform frame. The
+/// port ticks its transition VM once per step, so it must use this interval
+/// for the original's wall-clock timing.
+const TRANSITION_TICK_MS: f64 = 16.0;
 /// The absent Virgin logo the boot sequence requests first.
 const BOOT_VLOGO_ID: u8 = 28;
 /// The Capcom logo the boot sequence requests after the Virgin logo.
@@ -497,12 +505,27 @@ fn run_lua_tick_hooks(lua: Option<&lua::LuaVm>, game: &mut game::GameState, mess
     }
 }
 
+/// The fixed step the session loop uses for the current screen.
+///
+/// Gameplay runs at the original's 30 Hz interval; once a door transition
+/// owns the screen the original drops out of gameplay pacing and advances
+/// the door animation on its 16 ms non-gameplay limiter, so the port steps
+/// the transition VM at the same wall-clock rate.
+fn session_tick_interval(transition_active: bool) -> f64 {
+    if transition_active {
+        TRANSITION_TICK_MS
+    } else {
+        TICK_MS
+    }
+}
+
 /// The interactive gameplay loop shared by `--room` and the app's Play mode.
 fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -> Result<()> {
     let mut framebuffer = Framebuffer::new();
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
+    let mut last_poll = last_ticks;
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
@@ -520,7 +543,13 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         if accumulator > 250.0 {
             accumulator = 250.0;
         }
-        while accumulator >= TICK_MS {
+        // The film skip state advances on the render frame, not the gameplay
+        // tick, exactly like the original's platform-driven film update.
+        let poll_elapsed = now.saturating_sub(last_poll) as f64;
+        last_poll = now;
+        session.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
+        let tick_ms = session_tick_interval(session.transition.is_some());
+        while accumulator >= tick_ms {
             if session.transition_finished {
                 accumulator = 0.0;
                 break;
@@ -540,7 +569,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
                     break;
                 }
             }
-            accumulator -= TICK_MS;
+            accumulator -= tick_ms;
         }
 
         // The pass that ends a transition is drawn once before teardown.
@@ -1156,6 +1185,19 @@ impl GameSession {
                 mixer.stop_movie_audio();
                 mixer.resume_game_sounds();
             }
+        }
+    }
+
+    /// Poll the active film's skip input between ticks with the real elapsed
+    /// time since the last poll.
+    ///
+    /// The original's film state machine is driven once per platform frame,
+    /// not once per gameplay tick, so its skip grace runs on wall-clock time
+    /// at the film's own update period. The next [`Self::tick_movie`] picks
+    /// the skip up and tears the film down.
+    fn poll_movie_skip(&mut self, buttons: u16, elapsed_ms: f64) {
+        if let Some(session) = self.movie.as_mut() {
+            session.poll_skip(buttons, elapsed_ms);
         }
     }
 
@@ -2124,6 +2166,14 @@ impl App {
         }
     }
 
+    /// Poll the active app film's skip input between ticks; see
+    /// [`GameSession::poll_movie_skip`].
+    fn poll_movie_skip(&mut self, buttons: u16, elapsed_ms: f64) {
+        if let Mode::Movie(session) = &mut self.mode {
+            session.poll_skip(buttons, elapsed_ms);
+        }
+    }
+
     /// Build the shared screen context.
     fn context(&self) -> UiContext<'_> {
         UiContext {
@@ -2742,6 +2792,7 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
+    let mut last_poll = last_ticks;
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
@@ -2759,6 +2810,11 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
         if accumulator > 250.0 {
             accumulator = 250.0;
         }
+        // The film skip state advances on the render frame, not the fixed
+        // tick, exactly like the original's platform-driven film update.
+        let poll_elapsed = now.saturating_sub(last_poll) as f64;
+        last_poll = now;
+        app.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
         while accumulator >= TICK_MS {
             let tick = input.tick();
             if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
@@ -4432,6 +4488,45 @@ fn movie_buttons(ui: UiInput, input: player::Input) -> u16 {
     word
 }
 
+/// [`movie_buttons`] over the raw held keyboard word.
+///
+/// The original feeds the raw held pad into the film state machine, which
+/// does the edge detection itself, so the between-tick poll must not use the
+/// latched press edges: a tap held across one poll and released before the
+/// next would otherwise be missed. Presses not yet consumed by a tick are
+/// included so a quick tap still reaches the poll.
+fn movie_buttons_held(active: u32) -> u16 {
+    let mut word = 0u16;
+    if active & KEY_CONFIRM != 0 {
+        word |= 0x0001;
+    }
+    if active & (KEY_CANCEL | KEY_RUN) != 0 {
+        word |= 0x0002;
+    }
+    if active & KEY_TAB != 0 {
+        word |= 0x0008;
+    }
+    if active & KEY_UP != 0 {
+        word |= 0x0010;
+    }
+    if active & KEY_DOWN != 0 {
+        word |= 0x0020;
+    }
+    if active & KEY_LEFT != 0 {
+        word |= 0x0040;
+    }
+    if active & KEY_RIGHT != 0 {
+        word |= 0x0080;
+    }
+    if active & KEY_LEFTBRACKET != 0 {
+        word |= 0x0400;
+    }
+    if active & KEY_RIGHTBRACKET != 0 {
+        word |= 0x0800;
+    }
+    word
+}
+
 /// Decoded voice-line cache plus the one-slot pending request the scripts
 /// queue while a line is already sounding.
 #[derive(Default)]
@@ -5388,6 +5483,14 @@ impl InputState {
         self.held = 0;
         self.pressed = 0;
         self.any_pressed = false;
+    }
+
+    /// The held word including presses not yet consumed by a tick.
+    ///
+    /// The film skip check runs on the render loop, between fixed ticks, and
+    /// must see a tap that a tick has not consumed yet.
+    fn held_word(&self) -> u32 {
+        self.held | self.pressed
     }
 
     /// Consume the presses latched since the last tick.
@@ -10479,6 +10582,32 @@ end
             0x0002,
             "the run key shares the cancel/run bit"
         );
+    }
+
+    #[test]
+    fn the_held_movie_word_keeps_an_unconsumed_press() {
+        // A tap that no fixed tick has consumed yet must still reach the
+        // between-tick film poll; the original feeds the held pad word and
+        // edge-detects inside the film machine.
+        let input = InputState {
+            held: KEY_CONFIRM,
+            pressed: KEY_CANCEL | KEY_UP,
+            any_pressed: false,
+        };
+        assert_eq!(
+            movie_buttons_held(input.held_word()),
+            0x0001 | 0x0002 | 0x0010
+        );
+    }
+
+    #[test]
+    fn the_session_step_switches_to_the_door_interval() {
+        assert_eq!(session_tick_interval(false), TICK_MS);
+        assert_eq!(session_tick_interval(true), TRANSITION_TICK_MS);
+        // The original's door pass runs on the 16 ms non-gameplay limiter, so
+        // a 300-pass door file takes about 4.8 s rather than the 10 s the
+        // 30 Hz gameplay step would give.
+        assert!((TRANSITION_TICK_MS * 300.0 - 4800.0).abs() < 0.1);
     }
 
     #[test]

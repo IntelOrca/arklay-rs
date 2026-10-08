@@ -86,6 +86,14 @@ interactive loop accumulates real time and runs whole ticks, latching one
 input edge per tick. Rendering happens once per accumulated frame; a tick that
 opens a door hands control to the transition player until it finishes.
 
+While a door transition owns the screen the port steps at
+`TRANSITION_TICK_MS = 16 ms` instead: the original clears its game-active flag
+for the transition, which drops the frame limiter from the 33 ms gameplay
+interval to the 16 ms one, and the door interpreter advances one animation
+frame per platform frame. Gameplay pacing resumes when the transition ends.
+Film skip input is likewise polled once per platform frame (33 ms in gameplay,
+16 ms on the title and ending screens), not once per 30 Hz tick.
+
 One gameplay tick (`engine::tick_room`) runs this fixed order:
 
 1. Publish the remapped D-pad held/pressed words so `ck_bits` sees this

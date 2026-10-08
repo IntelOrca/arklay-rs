@@ -14,11 +14,13 @@
 //! frame and two per 15 fps frame. The session queues one frame of audio
 //! ahead of the presented frame and pads a short audio track with silence.
 //!
-//! The skip state is the original's: a per-film mask, a 100-tick grace counter
-//! and an edge-detected button latch. The first tick after playback starts
-//! latches the pad instead of comparing it, so a button held from before the
-//! film cannot skip it, and a press inside the grace window is only seen once
-//! its edge is gone. A mask of zero makes a film unskippable.
+//! The skip state is the original's: a per-film mask, a 100-update grace
+//! counter and an edge-detected button latch, updated once per platform frame
+//! (33 ms in gameplay, 16 ms on the title and ending screens) rather than once
+//! per 30 Hz gameplay tick. The first update after playback starts latches the
+//! pad instead of comparing it, so a button held from before the film cannot
+//! skip it, and a press inside the grace window is only seen once its edge is
+//! gone. A mask of zero makes a film unskippable.
 //!
 //! Id 1 (the intro) drops the Chris-only beat for Jill: the session presents
 //! up to the first cut point, decodes the removed frames to keep the Cinepak
@@ -77,6 +79,10 @@ const PROLOGUE_CUT_START_MS: u32 = 177_800;
 const PROLOGUE_CUT_END_MS: u32 = 188_500;
 /// The intro's id.
 const PROLOGUE_ID: u8 = 1;
+/// The gameplay frame limiter's film update period.
+pub const SKIP_PERIOD_GAMEPLAY_MS: f64 = 1000.0 / 30.0;
+/// The title/ending frame limiter's film update period.
+pub const SKIP_PERIOD_MENU_MS: f64 = 16.0;
 
 /// The lower-case basename of film `id`, or `None` for the null entry and ids
 /// past the table.
@@ -102,6 +108,22 @@ pub fn skip_mask(id: u8) -> u16 {
         0x0FFF
     } else {
         0x0000
+    }
+}
+
+/// The platform frame limiter period film `id` runs under: 33 ms during
+/// gameplay, 16 ms on the title and ending screens.
+///
+/// The original calls its film state machine once per platform frame, and the
+/// frame limiter halves its period when the game is not active. The title
+/// opening (id 0) and the endings (ids 15-22) run on those screens; every
+/// other film (boot logos, the prologue, the in-game cuts) runs from gameplay.
+/// The grace window is 100 updates, so the first accepted skip lands after
+/// about 1.6 s on the title and 3.3 s in gameplay.
+pub fn skip_period_ms(id: u8) -> f64 {
+    match id {
+        0 | 15..=22 => SKIP_PERIOD_MENU_MS,
+        _ => SKIP_PERIOD_GAMEPLAY_MS,
     }
 }
 
@@ -170,12 +192,24 @@ pub struct MovieSession {
     pending_audio: Vec<i16>,
     /// The film's accept/skip button mask.
     skip_mask: u16,
-    /// Grace ticks left before a skip edge can fire.
+    /// Grace updates left before a skip edge can fire.
     grace: u32,
-    /// Whether the first tick still has to latch the pad without an edge.
+    /// Whether the first poll still has to latch the pad without an edge.
     latch_pending: bool,
-    /// The pad word of the previous tick, for edge detection.
+    /// The pad word of the previous update period, for edge detection.
     last_buttons: u16,
+    /// Buttons held at any point in the current update period; the original
+    /// samples the pad once per period, so a tap between samples must still
+    /// produce an edge at the period boundary.
+    seen_buttons: u16,
+    /// Wall-clock pixels of the current period, carried between polls.
+    poll_accum_ms: f64,
+    /// The original's film update period: 33 ms in gameplay, 16 ms on the
+    /// title and ending screens.
+    skip_period_ms: f64,
+    /// Whether the skip state was already polled since the last [`Self::tick`];
+    /// the interactive loops poll between ticks, the tick itself otherwise.
+    skip_polled: bool,
     /// 30 Hz ticks advanced, the no-device clock.
     ticks: u64,
     /// Output samples one presented frame spans.
@@ -246,6 +280,10 @@ impl MovieSession {
             grace: 100,
             latch_pending: true,
             last_buttons: 0,
+            seen_buttons: 0,
+            poll_accum_ms: 0.0,
+            skip_period_ms: skip_period_ms(id),
+            skip_polled: false,
             ticks: 0,
             samples_per_frame,
             ticks_per_frame: ticks_per_frame(format.frame_rate),
@@ -312,12 +350,60 @@ impl MovieSession {
         out
     }
 
+    /// Poll the skip state with the real elapsed time since the last poll and
+    /// the currently held pad word. Returns `true` when the film was skipped.
+    ///
+    /// The original calls its film state machine once per platform frame
+    /// (16-33 ms, [`skip_period_ms`]), latching the pad on the first call and
+    /// then decrementing the 100-update grace once per period before testing
+    /// an unmasked button edge. Interactive loops call this between ticks
+    /// with the frame's real elapsed time; [`Self::tick`] drives it one period
+    /// per call for headless playback.
+    pub fn poll_skip(&mut self, buttons: u16, elapsed_ms: f64) -> bool {
+        if self.finished {
+            return self.skipped;
+        }
+        self.skip_polled = true;
+        if self.latch_pending {
+            self.latch_pending = false;
+            self.last_buttons = buttons;
+            self.seen_buttons = 0;
+            self.poll_accum_ms = 0.0;
+            return false;
+        }
+        self.seen_buttons |= buttons;
+        self.poll_accum_ms += elapsed_ms.max(0.0);
+        while self.poll_accum_ms >= self.skip_period_ms {
+            self.poll_accum_ms -= self.skip_period_ms;
+            self.grace = self.grace.saturating_sub(1);
+            let pressed = self.skip_mask & !self.last_buttons & self.seen_buttons;
+            self.last_buttons = self.seen_buttons;
+            self.seen_buttons = 0;
+            if pressed != 0 && self.grace == 0 {
+                self.finished = true;
+                self.skipped = true;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Override the film's skip update period; see [`skip_period_ms`].
+    pub fn set_skip_period_ms(&mut self, period_ms: f64) {
+        if period_ms > 0.0 {
+            self.skip_period_ms = period_ms;
+        }
+    }
+
     /// The next tick of the 30 Hz clock (or the audio-led clock when
     /// `samples_consumed` is given) and the pad word `buttons`.
     ///
     /// The first call latches `buttons` without an edge, exactly like the
-    /// original's start state; later calls decrement the 100-tick grace and
-    /// end the film on an unmasked button edge once the grace is spent.
+    /// original's start state; later calls spend one update period of the
+    /// 100-update grace and end the film on an unmasked button edge once the
+    /// grace is spent. An interactive loop that already polled the skip state
+    /// this frame reaches the same state through [`Self::poll_skip`], so the
+    /// grace is not spent twice.
     pub fn tick(&mut self, buttons: u16, samples_consumed: Option<u64>) -> MovieTick {
         if self.finished {
             return if self.skipped {
@@ -327,19 +413,10 @@ impl MovieSession {
             };
         }
 
-        if self.latch_pending {
-            self.latch_pending = false;
-            self.last_buttons = buttons;
-        } else {
-            self.grace = self.grace.saturating_sub(1);
-            let pressed = self.skip_mask & !self.last_buttons & buttons;
-            if pressed != 0 && self.grace == 0 {
-                self.finished = true;
-                self.skipped = true;
-                return MovieTick::Skipped;
-            }
-            self.last_buttons = buttons;
+        if !self.skip_polled && self.poll_skip(buttons, self.skip_period_ms) {
+            return MovieTick::Skipped;
         }
+        self.skip_polled = false;
 
         self.ticks += 1;
         let next = self.presented + 1;
@@ -766,6 +843,67 @@ mod tests {
         assert!(!session.skipped());
         session.tick(BUTTON, None);
         assert!(!session.skipped());
+    }
+
+    #[test]
+    fn the_skip_period_follows_the_screen_context() {
+        // Title opening and endings run on the 16 ms limiter; gameplay films,
+        // the boot logos and the prologue on the 33 ms one.
+        assert_eq!(skip_period_ms(0), SKIP_PERIOD_MENU_MS);
+        assert_eq!(skip_period_ms(15), SKIP_PERIOD_MENU_MS);
+        assert_eq!(skip_period_ms(22), SKIP_PERIOD_MENU_MS);
+        assert_eq!(skip_period_ms(1), SKIP_PERIOD_GAMEPLAY_MS);
+        assert_eq!(skip_period_ms(4), SKIP_PERIOD_GAMEPLAY_MS);
+        assert_eq!(skip_period_ms(23), SKIP_PERIOD_GAMEPLAY_MS);
+    }
+
+    #[test]
+    fn poll_skip_spends_the_grace_one_period_at_a_time() {
+        let mut session = session(4000, (10, 1), 4000);
+        let period = SKIP_PERIOD_MENU_MS;
+        // The first poll latches the pad without an edge.
+        assert!(!session.poll_skip(0, period));
+        // Ninety-nine more periods leave a single grace step...
+        for _ in 0..99 {
+            assert!(!session.poll_skip(0, period));
+        }
+        assert!(!session.skipped());
+        // ...and the hundredth period accepts the edge (steady state).
+        assert!(session.poll_skip(1, period));
+        assert!(session.skipped());
+    }
+
+    #[test]
+    fn a_tap_inside_one_period_reaches_the_period_boundary() {
+        let mut session = session(4000, (10, 1), 4000);
+        let period = SKIP_PERIOD_MENU_MS;
+        assert!(!session.poll_skip(0, period));
+        for _ in 0..100 {
+            assert!(!session.poll_skip(0, period));
+        }
+        // Press and release between two boundaries: the edge is still seen
+        // when the period that contained the tap closes.
+        assert!(!session.poll_skip(1, period / 2.0));
+        assert!(session.poll_skip(0, period / 2.0));
+        assert!(session.skipped());
+    }
+
+    #[test]
+    fn an_interactive_poll_stops_the_tick_from_spending_grace_twice() {
+        let mut session = session(4000, (10, 1), 4000);
+        let period = SKIP_PERIOD_GAMEPLAY_MS;
+        session.set_skip_period_ms(period);
+        assert!(!session.poll_skip(0, period));
+        // The paired ticks each frame must not spend a second grace step.
+        for _ in 0..99 {
+            assert!(!session.poll_skip(0, period));
+            assert!(matches!(
+                session.tick(0, None),
+                MovieTick::Waiting | MovieTick::Advanced
+            ));
+        }
+        assert!(session.poll_skip(1, period));
+        assert_eq!(session.tick(1, None), MovieTick::Skipped);
     }
 
     #[test]

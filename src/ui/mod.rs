@@ -57,7 +57,7 @@ pub struct UiInput {
     pub held_right: bool,
     /// Confirm (Space or Return).
     pub confirm: bool,
-    /// Cancel (X or Backspace).
+    /// Cancel (X, Backspace or Escape).
     pub cancel: bool,
     /// L1 (`[`): pages the item box back.
     pub page_left: bool,

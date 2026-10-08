@@ -16,14 +16,13 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    from M13. The film tables and skip masks carry every row, so packing the
    content later needs no table change.
 
-2. **Skip grace at the port's tick rate.** The original's 100-count grace
-   window is transcribed exactly, but the port decrements it on its fixed
-   30 Hz tick, so every film becomes skippable after ~3.3 s. In the original
-   the counter advances with the main loop, which is paced at ~33 ms during
-   gameplay and ~16 ms on the boot, title and ending screens: a gameplay film
-   matches the port's ~3.3 s, while a boot/title/ending film becomes skippable
-   after ~1.7 s. The grace and the per-film masks are constants with unit
-   tests; the interactive sweep confirms the feel.
+2. **Skip grace follows the screen's frame limiter (closed).** The original's
+   100-update grace advances once per platform frame: ~33 ms (3.3 s) during
+   gameplay, the prologue and the boot logos, and ~16 ms (1.6 s) on the title
+   opening and the ending screens. The port now polls the skip state once per
+   render frame at the film's own period (`movie::skip_period_ms`,
+   `MovieSession::poll_skip`) instead of once per 30 Hz tick, with the grace
+   and the per-film masks still unit-tested.
 
 3. **No subtitle or credits overlays.** The PS1 releases draw FMV subtitles and
    an ending-credits overlay over the films; neither ships in this PC install

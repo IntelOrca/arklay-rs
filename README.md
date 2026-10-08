@@ -119,10 +119,9 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 | `Space`, `Return` | Confirm / action / dismiss a message |
 | `Tab` | START: open/close the inventory (pause menu), cycle the top tabs |
 | `[`, `]` | L1/R1: page the item box |
-| `X`, `Backspace` | Cancel (menus, character select, load screen) |
+| `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `Esc` | Quit |
 
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm
