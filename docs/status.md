@@ -30,6 +30,10 @@ workspace install (`/home/ted/openre/assets/re1`) and its converted pack.
 Enemies, combat and the attract demo are explicitly out of scope so far; every
 deferred item is listed below or in the milestone deviations files.
 
+The `--debug-menu` F1 room-select overlay is a port-only development aid the
+retail game never shipped. It is off unless the flag is passed, so every run
+without it stays byte-identical and captures/goldens are unaffected.
+
 ## Format coverage
 
 `arklay verify <pack>` classifies every entry by path/extension, runs it

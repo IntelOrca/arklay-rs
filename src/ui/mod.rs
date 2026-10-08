@@ -14,6 +14,7 @@
 //! explicitly by the session.
 
 pub mod char_select;
+pub mod debug_menu;
 pub mod file;
 pub mod item_box;
 pub mod item_view;
@@ -66,6 +67,9 @@ pub struct UiInput {
     pub page_right: bool,
     /// START (Tab): opens the gameplay pause menu.
     pub start: bool,
+    /// F1: the port-only debug room overlay's edge, read only when
+    /// `--debug-menu` enabled it.
+    pub debug_menu: bool,
     /// Any key went down this tick.
     pub any: bool,
 }

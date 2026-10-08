@@ -65,6 +65,10 @@ cargo run -- re1.akpak --ui view --capture view.bmp
 # load/update/effect/render phase totals and the entity/effect high-water
 # marks. Needs no --capture; the budgets live in docs/performance.md
 cargo run -- re1.akpak --room 100 --ticks 600 --stats
+
+# Port-only debug room-select overlay: press F1 while playing to freeze the
+# room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes
+cargo run -- re1.akpak --room 100 --debug-menu
 ```
 
 Captures, assembled scripts and converted packs are written to a sibling
@@ -122,6 +126,7 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 | `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
+| `F1` | Port-only debug room-select overlay, with `--debug-menu`: freeze the room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes |
 
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm

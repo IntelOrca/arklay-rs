@@ -65,10 +65,10 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_LEFT,
-    SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT,
-    SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB,
-    SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
+    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_F1,
+    SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN,
+    SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE,
+    SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -112,6 +112,7 @@ use crate::stats;
 use crate::text::Text;
 use crate::tim;
 use crate::transition::{self, DoorStepper};
+use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
@@ -243,7 +244,7 @@ impl Drop for SurfaceHandle {
 /// is drawn, so a scripted NPC scene can be captured without a display; the
 /// same deterministic path [`simulate_room`] uses is taken, audio-free.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Result<()> {
-    run_with_options(pack, id, capture, ticks, &[], false, false)
+    run_with_options(pack, id, capture, ticks, &[], false, false, false)
 }
 
 /// [`run`] with the runtime layers and the `--stats` frame-time report.
@@ -252,7 +253,9 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 /// sibling `mods/` discovery, exactly like [`open_game_pack`]. With `stats` the
 /// fixed-tick run records a per-tick histogram and the load/update/effect/render
 /// phases and prints the [`crate::stats`] report to stdout at exit; it runs
-/// without a capture and without opening a display.
+/// without a capture and without opening a display. `debug_menu` enables the
+/// port-only F1 room-select overlay on the interactive path.
+#[allow(clippy::too_many_arguments)] // the CLI run options are all needed
 pub fn run_with_options(
     pack: &Path,
     id: RoomId,
@@ -261,6 +264,7 @@ pub fn run_with_options(
     mods: &[PathBuf],
     no_mods: bool,
     stats: bool,
+    debug_menu: bool,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let pack = open_game_pack(pack, mods, no_mods)?;
@@ -414,6 +418,7 @@ pub fn run_with_options(
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
+    session.set_debug_menu(debug_menu);
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
@@ -854,6 +859,15 @@ struct GameSession {
     /// The first fixed tick after arming must not advance the fade: the frame
     /// it was armed on has not been drawn yet, so that tick only clears this.
     room_fade_pending: bool,
+    /// Whether the port-only `--debug-menu` room overlay may open on F1. Off
+    /// by default, so every run without the flag is unchanged.
+    debug_menu_enabled: bool,
+    /// The open debug room-select overlay; the room stays frozen while it is
+    /// up and the last gameplay frame stays under it.
+    debug_menu: Option<DebugMenu>,
+    /// Debug jump destinations that failed to load, so the warning is logged
+    /// once per session instead of on every confirm.
+    debug_failed: HashSet<u16>,
 }
 
 /// New-game start position X (the original's `InitPlayerData`).
@@ -1008,6 +1022,9 @@ impl GameSession {
             swallow_action: false,
             room_fade: transition::Fade::inactive(),
             room_fade_pending: false,
+            debug_menu_enabled: false,
+            debug_menu: None,
+            debug_failed: HashSet::new(),
         };
         session.enter_room(pack, None);
         Ok(session)
@@ -1066,8 +1083,21 @@ impl GameSession {
             self.tick_save_screen(pack, ui);
             return Ok(());
         }
+        // The port-only debug room overlay owns the frozen tick while it is
+        // open; it is gameplay-only, so the pause menu and its modals below
+        // never see it and F1 cannot open it from them.
+        if self.debug_menu.is_some() {
+            self.tick_debug_menu(pack, ui);
+            return Ok(());
+        }
         if self.menu.is_some() {
             self.tick_menu(pack, ui, input, action);
+            return Ok(());
+        }
+        // F1 opens the debug room overlay while playing, exactly like START
+        // opens the pause menu; without `--debug-menu` the edge is ignored.
+        if self.debug_menu_enabled && ui.debug_menu {
+            self.debug_menu = Some(DebugMenu::open(pack, self.loaded.id));
             return Ok(());
         }
 
@@ -1268,6 +1298,7 @@ impl GameSession {
             || self.map.is_some()
             || self.save_screen.is_some()
             || self.modal.is_some()
+            || self.debug_menu.is_some()
     }
 
     /// One frozen tick of the active film: advance it against the wall clock
@@ -1391,6 +1422,73 @@ impl GameSession {
     fn close_menu(&mut self) {
         self.menu = None;
         self.game.message_menu = false;
+    }
+
+    /// Enable or disable the port-only debug room-select overlay (`--debug-menu`).
+    pub fn set_debug_menu(&mut self, enabled: bool) {
+        self.debug_menu_enabled = enabled;
+    }
+
+    /// One frozen tick of the debug room-select overlay: F1 or cancel closes
+    /// it, up/down move the cursor and confirm jumps to the selected room.
+    fn tick_debug_menu(&mut self, pack: &Pack, ui: UiInput) {
+        let event = self
+            .debug_menu
+            .as_mut()
+            .map_or(DebugMenuEvent::None, |menu| menu.handle_input(ui));
+        match event {
+            DebugMenuEvent::None => {}
+            DebugMenuEvent::Close => self.debug_menu = None,
+            DebugMenuEvent::Jump(target) => {
+                self.debug_menu = None;
+                if let Err(err) = self.debug_jump(pack, target)
+                    && self.debug_failed.insert(target.rdt_number())
+                {
+                    eprintln!(
+                        "warning: debug room {} unavailable: {err:#}",
+                        target.room3()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Jump to `target` through the normal room-load path: load the
+    /// destination, rebuild its VMs and run the room boot (init script, room
+    /// edits, camera, BGM handoff), then place the player.
+    ///
+    /// Placement prefers the destination's first door record spawn; a room
+    /// with no door record keeps the player's current position. The raw spawn
+    /// is left in place - the first gameplay tick's collision pass settles it,
+    /// exactly like a door arrival.
+    fn debug_jump(&mut self, pack: &Pack, target: RoomId) -> Result<()> {
+        let from = self.loaded.id;
+        let current_pos = self.player.pos;
+        let current_angle = self.player.angle;
+        let loaded = load_room(pack, target)?;
+        self.loaded = loaded;
+        let scripts = Rc::new(self.loaded.scripts.clone());
+        self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+        self.event_vm = scd::vm::EventVm::from_scripts(scripts);
+        self.game.enter_room(target, &self.loaded.room);
+        self.enter_room(pack, Some(from));
+        self.player = player::spawn(target, &self.loaded.room);
+        let spawn = self
+            .game
+            .doors
+            .iter()
+            .flatten()
+            .next()
+            .map(|door| (door.next_pos, door.next_angle as u16 & 0x0FFF));
+        let (pos, angle) = spawn.unwrap_or((current_pos, current_angle));
+        self.player.pos = pos;
+        self.player.angle = angle;
+        self.game.sync_entity_from_player(&self.player);
+        // The room boot picked the camera from the pre-jump position; re-run
+        // the switch-zone scan from where the player actually landed.
+        apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
+        self.arm_room_fade();
+        Ok(())
     }
 
     /// Open the item viewer as a gameplay modal over the frozen menu.
@@ -2109,6 +2207,11 @@ impl GameSession {
                 .message
                 .draw(&mut self.framebuffer, font, &self.text);
         }
+        // The debug overlay is drawn last so it stays legible over the frozen
+        // frame and any message the room raised before it opened.
+        if let Some(debug_menu) = self.debug_menu.as_mut() {
+            debug_menu.draw(&mut self.framebuffer, self.font.as_ref());
+        }
     }
 
     /// The last rendered frame; gameplay modals draw over it.
@@ -2400,6 +2503,9 @@ struct App {
     prologue_pending: bool,
     /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
     ui_sfx_cache: SfxCache,
+    /// Whether the port-only `--debug-menu` room overlay is enabled for the
+    /// gameplay sessions this app starts.
+    debug_menu: bool,
 }
 
 /// How one app tick ended.
@@ -2444,6 +2550,7 @@ impl App {
             opening_played: false,
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
+            debug_menu: false,
         }
     }
 
@@ -2682,6 +2789,7 @@ impl App {
 
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
+        session.set_debug_menu(self.debug_menu);
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -3066,11 +3174,22 @@ pub fn run_ui_with_options(
     save_dir: &Path,
     character: u8,
 ) -> Result<()> {
-    run_ui_with_mods(pack, screen, capture, save_dir, character, &[], false)
+    run_ui_with_mods(
+        pack,
+        screen,
+        capture,
+        save_dir,
+        character,
+        &[],
+        false,
+        false,
+    )
 }
 
 /// [`run_ui_with_options`] with the runtime layers; `mods`/`no_mods` behave
-/// exactly like [`open_game_pack`].
+/// exactly like [`open_game_pack`]. `debug_menu` enables the port-only F1
+/// room-select overlay for the gameplay screens.
+#[allow(clippy::too_many_arguments)] // the CLI boot options are all needed
 pub fn run_ui_with_mods(
     pack: &Path,
     screen: &str,
@@ -3079,6 +3198,7 @@ pub fn run_ui_with_mods(
     character: u8,
     mods: &[PathBuf],
     no_mods: bool,
+    debug_menu: bool,
 ) -> Result<()> {
     let boot = match screen {
         "font" => return run_font_ui(pack, capture, mods, no_mods),
@@ -3099,7 +3219,7 @@ pub fn run_ui_with_mods(
             )
         }
     };
-    run_ui_impl(pack, boot, capture, save_dir, mods, no_mods)
+    run_ui_impl(pack, boot, capture, save_dir, mods, no_mods, debug_menu)
 }
 
 /// The interactive root boot: the two logos, the title's opening film and the
@@ -3111,8 +3231,17 @@ pub fn run_root(
     save_dir: &Path,
     mods: &[PathBuf],
     no_mods: bool,
+    debug_menu: bool,
 ) -> Result<()> {
-    run_ui_impl(pack, AppBoot::Boot, capture, save_dir, mods, no_mods)
+    run_ui_impl(
+        pack,
+        AppBoot::Boot,
+        capture,
+        save_dir,
+        mods,
+        no_mods,
+        debug_menu,
+    )
 }
 
 /// The shared body of the `--ui` boot and the interactive root boot.
@@ -3123,10 +3252,12 @@ fn run_ui_impl(
     save_dir: &Path,
     mods: &[PathBuf],
     no_mods: bool,
+    debug_menu: bool,
 ) -> Result<()> {
     if let Some(capture_path) = capture {
         let pack = open_game_pack(pack, mods, no_mods)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
+        app.debug_menu = debug_menu;
         match boot {
             // A root-boot capture is the title capture: no automatic films.
             AppBoot::Boot | AppBoot::Title => {
@@ -3188,6 +3319,7 @@ fn run_ui_impl(
 
     let pack = open_game_pack(pack, mods, no_mods)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
+    app.debug_menu = debug_menu;
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
     run_app_loop(&mut app, &display)
@@ -5812,6 +5944,7 @@ const KEY_TAB: u32 = 1 << 10;
 const KEY_LSHIFT: u32 = 1 << 11;
 const KEY_RSHIFT: u32 = 1 << 12;
 const KEY_ESCAPE: u32 = 1 << 13;
+const KEY_F1: u32 = 1 << 14;
 /// Confirm (Space or Return).
 const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
 /// Cancel (X, Backspace or Escape).
@@ -5836,6 +5969,7 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
         SDL_SCANCODE_LSHIFT => KEY_LSHIFT,
         SDL_SCANCODE_RSHIFT => KEY_RSHIFT,
         SDL_SCANCODE_ESCAPE => KEY_ESCAPE,
+        SDL_SCANCODE_F1 => KEY_F1,
         _ => return None,
     })
 }
@@ -5940,6 +6074,7 @@ impl InputState {
                 page_left: pressed & KEY_LEFTBRACKET != 0,
                 page_right: pressed & KEY_RIGHTBRACKET != 0,
                 start: pressed & KEY_TAB != 0,
+                debug_menu: pressed & KEY_F1 != 0,
                 any: std::mem::take(&mut self.any_pressed),
             },
         }
@@ -6961,6 +7096,34 @@ mod tests {
         door_init_with_camera(0)
     }
 
+    /// `synthetic_rdt` plus one kind-1 collision rectangle around the origin.
+    ///
+    /// The rectangle is grown by the player radius in the collision query and
+    /// still does not reach the door spawn at `[555, 0, 666]`, so a placement
+    /// test can tell the blocked start from the clear arrival.
+    fn synthetic_rdt_with_blocking_collision(init: &[u8]) -> Vec<u8> {
+        const COLLISION_POINTER: usize = 0x48 + 4;
+
+        let mut data = synthetic_rdt(init);
+        while !data.len().is_multiple_of(4) {
+            data.push(0);
+        }
+        let offset = data.len();
+        // Cell origin, then one record in quadrant 0.
+        data.extend_from_slice(&0i16.to_le_bytes());
+        data.extend_from_slice(&0i16.to_le_bytes());
+        for count in [1i32, 0, 0, 0, 0] {
+            data.extend_from_slice(&count.to_le_bytes());
+        }
+        // x_max, z_max, x_min, z_min, kind 1, flags.
+        for value in [100u16, 100, 0, 0, 1, 0] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+        data[COLLISION_POINTER..COLLISION_POINTER + 4]
+            .copy_from_slice(&(offset as u32).to_le_bytes());
+        data
+    }
+
     /// `door_init` with a specific record camera byte (`+0x0B`).
     fn door_init_with_camera(camera: u8) -> Vec<u8> {
         let mut body = vec![0x0C, 0x00];
@@ -7297,6 +7460,190 @@ mod tests {
         assert_eq!(player_state.angle, 1024);
         assert!(game.doors[0].is_none());
         assert!(game.room_actions[0].is_none());
+    }
+
+    /// A two-room pack (`100` and `101`) whose rooms block the origin and
+    /// whose second room carries a door spawning at `[555, 0, 666]`.
+    fn debug_menu_pack(dir: &TempDir) -> (Pack, RoomId, RoomId) {
+        let pack_path = dir.0.join("game.akpak");
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &a.rdt_entry(),
+                synthetic_rdt_with_blocking_collision(&[0x00, 0x00]),
+            )
+            .unwrap();
+        writer
+            .add(
+                &b.rdt_entry(),
+                synthetic_rdt_with_blocking_collision(&door_init()),
+            )
+            .unwrap();
+        writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        (Pack::open(&pack_path).unwrap(), a, b)
+    }
+
+    #[test]
+    fn f1_latches_one_debug_menu_edge_per_press() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_F1, false);
+        assert!(input.tick().ui.debug_menu, "the press is one edge");
+        assert!(!input.tick().ui.debug_menu, "a held F1 does not repeat");
+        input.key_up(SDL_SCANCODE_F1);
+        input.key_down(SDL_SCANCODE_F1, false);
+        assert!(input.tick().ui.debug_menu, "a fresh press is a fresh edge");
+    }
+
+    #[test]
+    fn the_debug_overlay_never_opens_without_the_flag() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        let frame = session.game.frame;
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    debug_menu: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(session.debug_menu.is_none(), "the F1 edge is ignored");
+        assert_eq!(session.game.frame, frame + 1, "the room still ticks");
+    }
+
+    #[test]
+    fn the_open_debug_overlay_consumes_navigation_and_freezes_the_room() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.set_debug_menu(true);
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    debug_menu: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.debug_menu.is_some(), "F1 opens the overlay");
+        assert!(session.room_frozen(), "the room freezes while it is open");
+
+        let pos = session.player.pos;
+        let frame = session.game.frame;
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    down: true,
+                    ..UiInput::default()
+                },
+                player::Input {
+                    up: true,
+                    ..player::Input::default()
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.debug_menu.as_ref().unwrap().cursor(), 1);
+        assert_eq!(session.player.pos, pos, "the room does not move");
+        assert_eq!(session.game.frame, frame, "the room does not tick");
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    debug_menu: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.debug_menu.is_none(), "F1 closes the overlay");
+    }
+
+    #[test]
+    fn debug_jump_loads_the_room_and_places_the_player_at_the_door_spawn() {
+        let dir = TempDir::new();
+        let (pack, a, b) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        // The start position sits inside the blocking volume.
+        assert!(player::position_blocked(
+            &session.loaded.room,
+            session.player.pos,
+            session.player.radius
+        ));
+
+        session.set_debug_menu(true);
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    debug_menu: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    down: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(session.debug_menu.is_none(), "confirm closes the overlay");
+        assert_eq!(session.loaded.id, b);
+        assert_eq!(session.game.id, b);
+        assert_eq!(session.player.pos, [555, 0, 666], "the door spawn");
+        assert_eq!(session.player.angle, 1024);
+        assert!(
+            !player::position_blocked(
+                &session.loaded.room,
+                session.player.pos,
+                session.player.radius
+            ),
+            "the spawn lands outside collision"
+        );
     }
 
     #[test]

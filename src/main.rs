@@ -77,6 +77,12 @@ struct Cli {
     #[arg(long = "mod", value_name = "PATH", requires = "pack")]
     mods: Vec<PathBuf>,
 
+    /// Enable the port-only debug room-select overlay: F1 while playing
+    /// freezes the room and opens a list of the pack's rooms; confirm jumps
+    /// to the selected room, F1 or cancel closes it
+    #[arg(long, requires = "pack")]
+    debug_menu: bool,
+
     /// Ignore the `--mod` layers and the sibling `mods/` directory
     #[arg(long, requires = "pack")]
     no_mods: bool,
@@ -527,6 +533,7 @@ fn main() -> Result<()> {
                     cli.player,
                     &cli.mods,
                     cli.no_mods,
+                    cli.debug_menu,
                 );
             }
             if let Some(room) = cli.room {
@@ -539,6 +546,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.stats,
+                    cli.debug_menu,
                 );
             }
             // No room and no `--ui`: boot the app root, whose interactive run
@@ -550,6 +558,7 @@ fn main() -> Result<()> {
                 &save_dir,
                 &cli.mods,
                 cli.no_mods,
+                cli.debug_menu,
             )
         }
     }
@@ -835,6 +844,16 @@ entries:
             list.command,
             Some(Command::List { mods, .. }) if mods == [PathBuf::from("x.akpak")]
         ));
+    }
+
+    #[test]
+    fn the_cli_accepts_the_debug_menu_flag() {
+        let cli =
+            Cli::try_parse_from(["arklay", "game.akpak", "--room", "100", "--debug-menu"]).unwrap();
+        assert!(cli.debug_menu);
+
+        let cli = Cli::try_parse_from(["arklay", "game.akpak", "--room", "100"]).unwrap();
+        assert!(!cli.debug_menu);
     }
 
     #[test]
