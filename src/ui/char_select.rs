@@ -1,8 +1,10 @@
 //! The character-selection screen.
 //!
 //! `ui/sel_back.bmp` is the desk background. The two police cards come from
-//! `ui/select_b.bmp`: each card is a left 80x128 half and a right 112x128 half,
-//! with Chris on row 0 and Jill on row `0x80`. The selected card sits at its
+//! `ui/select_b.bmp`: the sheet holds one shared blue S.T.A.R.S. portrait half
+//! at `(0, 0)`, Chris's information half at `(0x50, 0)` and Jill's at
+//! `(0, 0x80)`, so both cards draw the shared portrait half next to their own
+//! information half. The selected card sits at its
 //! front position at full scale and brightness, the other at its back position
 //! scaled to `0.8125` and dimmed. While the pick changes the cards slide,
 //! overshoot and settle on the opposite poses over 34 ticks, exactly like the
@@ -328,7 +330,13 @@ impl CharSelectScreen {
         self.apply_position();
     }
 
-    /// Draw one card: its left portrait half then its information half.
+    /// Draw one card: the shared blue S.T.A.R.S. portrait half then this
+    /// character's information half.
+    ///
+    /// The left half is always the sheet's row-0 portrait: both cards share
+    /// it. Only the information half selects the character, at `(0x50, 0)`
+    /// for Chris and `(0, 0x80)` for Jill; the sheet's other columns are
+    /// padding and must not be sampled.
     fn draw_card(&self, framebuffer: &mut Framebuffer, card: usize) {
         let Some(cards) = &self.cards else {
             return;
@@ -338,19 +346,23 @@ impl CharSelectScreen {
         let y = pose.pos[1] - 0x98 + SCREEN_ORIGIN_Y;
         let scale = Self::compute_scale(pose.scale);
         let brightness = Self::panel_brightness(pose.bright);
-        let row = card as i32 * CARD_H;
+        let [info_x, info_y] = if card == 0 {
+            [CARD_LEFT_W, 0]
+        } else {
+            [0, CARD_H]
+        };
         let left_w = (CARD_LEFT_W * scale) >> 12;
         let right_w = (CARD_RIGHT_W * scale) >> 12;
         let height = (CARD_H * scale) >> 12;
         framebuffer.draw_rgba_sprite_scaled(
             cards,
-            [0, row, CARD_LEFT_W, CARD_H],
+            [0, 0, CARD_LEFT_W, CARD_H],
             [x, y, left_w, height],
             brightness,
         );
         framebuffer.draw_rgba_sprite_scaled(
             cards,
-            [CARD_LEFT_W, row, CARD_RIGHT_W, CARD_H],
+            [info_x, info_y, CARD_RIGHT_W, CARD_H],
             [x + left_w, y, right_w, height],
             brightness,
         );
@@ -713,5 +725,91 @@ mod tests {
             }
         }
         assert_eq!(result, ScreenResult::Done(ScreenAction::Title));
+    }
+
+    /// A card sheet with a distinct colour per usable region and opaque black
+    /// padding everywhere else, matching the converted 24-bit BMP.
+    fn card_sheet() -> Image {
+        let mut rgba = vec![0u8; 256 * 256 * 4];
+        for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
+            *pixel = [0, 0, 0, 255];
+        }
+        let mut fill = |x: usize, y: usize, w: usize, h: usize, color: [u8; 4]| {
+            for row in y..y + h {
+                for column in x..x + w {
+                    let offset = (row * 256 + column) * 4;
+                    rgba[offset..offset + 4].copy_from_slice(&color);
+                }
+            }
+        };
+        fill(
+            0,
+            0,
+            CARD_LEFT_W as usize,
+            CARD_H as usize,
+            [10, 10, 200, 255],
+        );
+        fill(
+            CARD_LEFT_W as usize,
+            0,
+            CARD_RIGHT_W as usize,
+            CARD_H as usize,
+            [30, 200, 30, 255],
+        );
+        fill(
+            0,
+            CARD_H as usize,
+            CARD_RIGHT_W as usize,
+            CARD_H as usize,
+            [200, 30, 30, 255],
+        );
+        Image {
+            width: 256,
+            height: 256,
+            rgba,
+        }
+    }
+
+    #[test]
+    fn each_card_draws_the_shared_portrait_half_with_its_own_information_half() {
+        let mut screen = CharSelectScreen::new();
+        screen.cards = Some(card_sheet());
+        // Force both cards onto the front pose so the sample points are fixed;
+        // the slide machine is not part of this test.
+        screen.poses[1] = CardPose {
+            pos: [FRONT_POS.0, FRONT_POS.1],
+            scale: FRONT_PANEL_SCALE,
+            bright: FRONT_PANEL_BRIGHT,
+            tpage: 2,
+            vel: [0; 2],
+            acc: [0; 2],
+        };
+        let x = FRONT_POS.0 - 0x100 + SCREEN_ORIGIN_X;
+        let y = FRONT_POS.1 - 0x98 + SCREEN_ORIGIN_Y;
+        let sample = |framebuffer: &Framebuffer, dx: i32, dy: i32| -> [u8; 4] {
+            let offset = ((y + dy) as usize * framebuffer.width as usize + (x + dx) as usize) * 4;
+            framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+        };
+
+        // Both cards sample the sheet's row-0 shared portrait half.
+        let mut chris = Framebuffer::new();
+        screen.draw_card(&mut chris, 0);
+        assert_eq!(sample(&chris, 8, 8), [10, 10, 200, 255]);
+        assert_eq!(sample(&chris, 0x50 + 8, 8), [30, 200, 30, 255]);
+        assert_eq!(
+            sample(&chris, 0x50 + 0x70 - 1, 8),
+            [30, 200, 30, 255],
+            "the last column is information, not padding"
+        );
+
+        let mut jill = Framebuffer::new();
+        screen.draw_card(&mut jill, 1);
+        assert_eq!(sample(&jill, 8, 8), [10, 10, 200, 255]);
+        assert_eq!(sample(&jill, 0x50 + 8, 8), [200, 30, 30, 255]);
+        assert_eq!(
+            sample(&jill, 0x50 + 0x70 - 1, 8),
+            [200, 30, 30, 255],
+            "Jill's card must not sample the sheet padding"
+        );
     }
 }

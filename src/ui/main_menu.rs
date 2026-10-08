@@ -65,6 +65,9 @@ pub const MESSAGE_HERB_MIX: u16 = 0xF5;
 pub const MESSAGE_NO_RECIPE: u16 = 0xF6;
 /// First refusal message; add the use-category index.
 pub const MESSAGE_USE_REFUSED: u16 = 0xF7;
+/// The menu's clear colour: the original's `setBackColor(0x199, 0x199,
+/// 0x199)`, a 12-bit 10% grey.
+const MENU_CLEAR: [u8; 4] = [25, 25, 25, 255];
 
 /// One discrete menu input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -419,6 +422,12 @@ impl MainMenu {
     }
 
     /// Draw the whole screen over the framebuffer's current contents.
+    ///
+    /// The layer order follows the original's depth sort (a lower depth draws
+    /// later, i.e. nearer the viewer): the background and its border masks,
+    /// then the tab highlight (drawn *behind* the tab art so the bar shows
+    /// through the tab's transparent pixels), then the frames, the inventory,
+    /// the portraits and the tabs. The item-slot cursor is the topmost layer.
     pub fn draw(
         &self,
         framebuffer: &mut Framebuffer,
@@ -427,6 +436,7 @@ impl MainMenu {
         game: &GameState,
     ) {
         self.draw_background(framebuffer);
+        self.draw_tab_cursor(framebuffer, assets);
         self.draw_frames(framebuffer, assets);
         self.draw_inventory(framebuffer, assets, game);
         self.draw_portrait(framebuffer, assets, game);
@@ -435,11 +445,25 @@ impl MainMenu {
         if self.mode != MenuMode::Navigation {
             self.draw_submenu(framebuffer, assets);
         }
-        self.draw_cursor(framebuffer, assets);
+        self.draw_slot_cursor(framebuffer, assets);
         self.draw_item_name(framebuffer, assets, text, game);
     }
 
+    /// Clear the whole screen to the original's menu clear colour and lay the
+    /// four black border masks over it.
+    ///
+    /// The centre viewport rect stays clear-coloured (the original renders the
+    /// character model there), so the frozen room never shows through the
+    /// menu.
     fn draw_background(&self, framebuffer: &mut Framebuffer) {
+        layout::fill_rect(
+            framebuffer,
+            layout::Rect {
+                pos: [0, 0],
+                size: [framebuffer.width as i16, framebuffer.height as i16],
+            },
+            MENU_CLEAR,
+        );
         for rect in layout::black_rects() {
             layout::fill_rect(framebuffer, rect, [0, 0, 0, 255]);
         }
@@ -554,7 +578,44 @@ impl MainMenu {
         }
     }
 
-    fn draw_cursor(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
+    /// The top-tab highlight: a solid red 48x16 bar at the cursor's tab.
+    ///
+    /// It is drawn behind the tab art (see [`Self::draw`]), so the tab's
+    /// transparent background reveals the bar while its glyph keeps the
+    /// button readable.
+    fn draw_tab_cursor(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
+        if self.mode != MenuMode::Navigation {
+            return;
+        }
+        let cursor = self.cursor;
+        if !layout::is_tab(cursor) {
+            return;
+        }
+        let Some(position) = layout::cursor_position(cursor, self.slots) else {
+            return;
+        };
+        framebuffer.draw_indexed_sprite(
+            &assets.status,
+            [
+                0,
+                0x50,
+                i32::from(layout::TAB_CURSOR_SIZE[0]),
+                i32::from(layout::TAB_CURSOR_SIZE[1]),
+            ],
+            [
+                i32::from(position[0]),
+                i32::from(position[1]),
+                i32::from(layout::TAB_CURSOR_SIZE[0]),
+                i32::from(layout::TAB_CURSOR_SIZE[1]),
+            ],
+            0,
+            0,
+            Tint::White,
+        );
+    }
+
+    /// The item-slot cursor, the topmost layer of the screen.
+    fn draw_slot_cursor(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
         let cursor = match self.mode {
             MenuMode::Move => self.move_cursor,
             MenuMode::Navigation => self.cursor,
@@ -564,34 +625,16 @@ impl MainMenu {
             return;
         };
         if layout::is_tab(cursor) {
-            framebuffer.draw_indexed_sprite(
-                &assets.status,
-                [
-                    0,
-                    0x50,
-                    i32::from(layout::TAB_CURSOR_SIZE[0]),
-                    i32::from(layout::TAB_CURSOR_SIZE[1]),
-                ],
-                [
-                    i32::from(position[0]),
-                    i32::from(position[1]),
-                    i32::from(layout::TAB_CURSOR_SIZE[0]),
-                    i32::from(layout::TAB_CURSOR_SIZE[1]),
-                ],
-                0,
-                0,
-                Tint::White,
-            );
-        } else {
-            framebuffer.draw_indexed_sprite(
-                &assets.status,
-                [0x80, 0xE0, 40, 30],
-                [i32::from(position[0]), i32::from(position[1]), 40, 30],
-                0,
-                0,
-                Tint::White,
-            );
+            return;
         }
+        framebuffer.draw_indexed_sprite(
+            &assets.status,
+            [0x80, 0xE0, 40, 30],
+            [i32::from(position[0]), i32::from(position[1]), 40, 30],
+            0,
+            0,
+            Tint::White,
+        );
     }
 
     fn draw_item_name(
@@ -1381,7 +1424,64 @@ mod tests {
         menu.draw(&mut framebuffer, &assets, &text, &game);
         // The action box lives at (0x90, 0x39) and samples status (0x30, ..),
         // which is black in the synthetic sheet; the surrounding pixel keeps
-        // the framebuffer's untouched state.
-        assert_eq!(pixel(&framebuffer, 0x90 + 5, 0x39 + 5), [0, 0, 0, 0]);
+        // the menu clear colour the background pass laid down.
+        assert_eq!(pixel(&framebuffer, 0x90 + 5, 0x39 + 5), MENU_CLEAR);
+    }
+
+    #[test]
+    fn the_menu_background_is_opaque_over_the_frozen_frame() {
+        let mut game = new_game();
+        let mut menu = MainMenu::new(8);
+        menu.open(&mut game);
+        let assets = assets();
+        let text = Text::default();
+        let mut framebuffer = Framebuffer::new();
+        for pixel in framebuffer.rgba.as_chunks_mut::<4>().0.iter_mut() {
+            *pixel = [99, 98, 97, 255];
+        }
+        menu.draw(&mut framebuffer, &assets, &text, &game);
+        // The centre viewport shows the menu's clear colour; the frozen
+        // gameplay frame must never bleed through.
+        assert_eq!(pixel(&framebuffer, 100, 100), MENU_CLEAR);
+    }
+
+    #[test]
+    fn the_tab_highlight_draws_behind_the_tab_art() {
+        let mut game = new_game();
+        let mut menu = MainMenu::new(8);
+        menu.open(&mut game);
+        menu.cursor = 0;
+        let tab = layout::tab_part(0);
+        // A sheet with an opaque white tab and the solid red highlight bar;
+        // the original's tab art is partly transparent so the bar shows only
+        // where the glyph does not cover it.
+        let mut assets = assets();
+        assets.status = solid_texture(
+            256,
+            256,
+            &[
+                (
+                    [
+                        u32::from(tab.uv[0]),
+                        u32::from(tab.uv[1]),
+                        u32::from(tab.size[0].max(0) as u16),
+                        u32::from(tab.size[1].max(0) as u16),
+                    ],
+                    1,
+                    [255, 255, 255, 255],
+                ),
+                ([0, 0x50, 48, 16], 2, [255, 0, 0, 255]),
+            ],
+        );
+        let text = Text::default();
+        let mut framebuffer = Framebuffer::new();
+        menu.draw(&mut framebuffer, &assets, &text, &game);
+        let [x, y] = layout::cursor_position(0, menu.slots).unwrap();
+        assert_eq!(tab.pos, [x, y], "the tab art sits on the highlight");
+        assert_eq!(
+            pixel(&framebuffer, x as usize + 4, y as usize + 4),
+            [255, 255, 255, 255],
+            "the tab art must stay on top of its highlight"
+        );
     }
 }
