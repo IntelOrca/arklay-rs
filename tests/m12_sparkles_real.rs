@@ -361,6 +361,11 @@ fn corpus_walk_spawns_all_43_shipped_sparkles_and_frees_them() {
             let action = game.room_actions[slot].expect("the item action");
             assert_eq!(action.item_model(), operand_u8(&operands, 7));
             game.run_room_action(slot as u8, action.handler);
+            // A reach-gated entry arms the bend-down animation instead of the
+            // viewer; the award follows the reach's completion.
+            if let Some(request) = game.take_pending_reach() {
+                assert!(game.complete_reach(request), "ROOM{name}: reach completes");
+            }
             match action.handler {
                 0x0D => {
                     assert!(game.take_document(slot as u8), "ROOM{name}: file it");
