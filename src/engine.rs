@@ -845,6 +845,13 @@ struct GameSession {
     /// the room tick keeps ignoring the action until the key is released,
     /// matching the original's cleared held/previous-held pad bits.
     swallow_action: bool,
+    /// The room-entry fade the original arms on every gameplay (re)entry after
+    /// a room load: type 2, accumulator `0x7FFF` and a negative counter that
+    /// steps the alpha down once per fixed tick.
+    room_fade: transition::Fade,
+    /// The first fixed tick after arming must not advance the fade: the frame
+    /// it was armed on has not been drawn yet, so that tick only clears this.
+    room_fade_pending: bool,
 }
 
 /// New-game start position X (the original's `InitPlayerData`).
@@ -997,6 +1004,8 @@ impl GameSession {
             pickup_view: None,
             viewed_item: None,
             swallow_action: false,
+            room_fade: transition::Fade::inactive(),
+            room_fade_pending: false,
         };
         session.enter_room(pack, None);
         Ok(session)
@@ -1043,6 +1052,7 @@ impl GameSession {
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        self.tick_room_fade();
         // A film owns the tick while it plays: the room's scripts, entities,
         // effects and the player stay frozen, exactly like the original's
         // main-loop jump.
@@ -1258,9 +1268,10 @@ impl GameSession {
             || self.modal.is_some()
     }
 
-    /// One frozen tick of the active film: advance it against the mixer's
-    /// audio-led clock (or the fixed tick when no device is open), queue the
-    /// frame of audio it produces and resume the room when it ends.
+    /// One frozen tick of the active film: advance it against the wall clock
+    /// with the mixer's audio cursor as a bounded secondary clock (or the wall
+    /// clock alone when no device is open), queue the frame of audio it
+    /// produces and resume the room when it ends.
     fn tick_movie(&mut self, ui: UiInput, input: player::Input) {
         let consumed = self
             .music
@@ -1270,7 +1281,7 @@ impl GameSession {
         let Some(session) = self.movie.as_mut() else {
             return;
         };
-        let tick = session.tick(movie_buttons(ui, input), consumed);
+        let tick = session.tick_timed(movie_buttons(ui, input), consumed, TICK_MS);
         let audio = session.take_audio();
         if !audio.is_empty()
             && let Some(mixer) = &mut self.music
@@ -1898,6 +1909,9 @@ impl GameSession {
         // The BGM state machine needs the source room to resolve the outgoing
         // group for a same-group toggle (`g_AttractMode_RoomCameraId`).
         let from = self.loaded.id;
+        // Only a full load re-enters the destination; a camera-only record
+        // keeps the room and must not arm the entry fade.
+        let arms_fade = session.destination.is_some();
         finish_transition(
             pack,
             &mut session,
@@ -1912,6 +1926,56 @@ impl GameSession {
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
         self.enter_room(pack, Some(from));
+        if arms_fade {
+            self.arm_room_fade();
+        }
+    }
+
+    /// Arm the room-entry fade the original runs whenever gameplay (re)enters
+    /// after a room load: type 2 (black), accumulator `0x7FFF` and the normal
+    /// counter `0xE800` (i16 -6144, alpha 255 down to 15 in six fixed ticks),
+    /// or the slow `0xFF5D` (i16 -163) while scenario flag `0x7D` is set.
+    fn arm_room_fade(&mut self) {
+        let slow = self.game.flag_test(
+            game::BANK_SCENARIO,
+            game::SCENARIO_FLAG_MENU_FADE_LATCH,
+            false,
+        );
+        self.room_fade
+            .set(2, if slow { -163 } else { -6144 }, 0x7FFF);
+        self.room_fade_pending = true;
+    }
+
+    /// Step the room-entry fade once per fixed tick. The tick after arming
+    /// only clears the pending flag: the frame it was armed on has not been
+    /// drawn, and the fade is draw-then-add, so its first drawn frame is the
+    /// full `0x7FFF` alpha. Once the accumulator goes negative the fade is
+    /// cleared until the next room entry.
+    fn tick_room_fade(&mut self) {
+        if self.room_fade.overlay().is_none() {
+            return;
+        }
+        if self.room_fade_pending {
+            self.room_fade_pending = false;
+            return;
+        }
+        self.room_fade.tick();
+        if self.room_fade.overlay().is_none() {
+            self.room_fade = transition::Fade::inactive();
+        }
+    }
+
+    /// Blend the room-entry fade over the frame just rendered.
+    fn draw_room_fade(&mut self) {
+        if let Some(overlay) = self.room_fade.overlay() {
+            self.framebuffer.fade_to_black(overlay.alpha);
+        }
+    }
+
+    /// The room-entry fade's current alpha, for the deterministic tests.
+    #[cfg(test)]
+    fn room_fade_alpha(&self) -> Option<u8> {
+        self.room_fade.overlay().map(|overlay| overlay.alpha)
     }
 
     /// Render the current frame into the session framebuffer: a transition
@@ -1946,6 +2010,9 @@ impl GameSession {
                 &mut self.shadows,
                 &mut self.effect_pages,
             );
+            // The room-entry fade (draw-then-add) sits over the freshly drawn
+            // scene and under the menu/message overlays.
+            self.draw_room_fade();
         }
         if self.menu.is_some() {
             self.ensure_menu_assets(pack);
@@ -2445,7 +2512,7 @@ impl App {
         let Mode::Movie(session) = &mut self.mode else {
             return Ok(AppFlow::Continue);
         };
-        let tick = session.tick(movie_buttons(ui, input), consumed);
+        let tick = session.tick_timed(movie_buttons(ui, input), consumed, TICK_MS);
         let audio = session.take_audio();
         if !audio.is_empty()
             && let Some(mixer) = &mut self.movie_music
@@ -2619,6 +2686,16 @@ impl App {
         self.mode = Mode::Play(Box::new(session));
     }
 
+    /// Start a session for a new game or a continue with the room-entry fade
+    /// armed: the original's `game_loop` re-arms the black fade on every
+    /// (re)entry, so the first gameplay frames fade up from black. The
+    /// deterministic `--ui new-game` capture builds its session directly and
+    /// stays unfaded.
+    fn start_faded_session(&mut self, mut session: GameSession) {
+        session.arm_room_fade();
+        self.start_session(session);
+    }
+
     /// Boot the pause-menu session over [`MENU_ROOM`] with the deterministic
     /// capture inventory and the menu already open.
     fn open_menu(&mut self) -> Result<()> {
@@ -2713,19 +2790,19 @@ impl App {
                             eprintln!("warning: intro film unavailable: {err:#}");
                             self.prologue_pending = false;
                             let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                            self.start_session(session);
+                            self.start_faded_session(session);
                         }
                     }
                 } else {
                     self.prologue_pending = false;
                     let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                    self.start_session(session);
+                    self.start_faded_session(session);
                 }
             }
             ScreenAction::LoadGame { slot } => {
                 let file = save::load(&self.save_dir, slot)?;
                 let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
-                self.start_session(session);
+                self.start_faded_session(session);
             }
             ScreenAction::Title => self.open_title()?,
             ScreenAction::Resume => {
@@ -9519,9 +9596,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn session_transition_swaps_rooms() {
-        let dir = TempDir::new();
+    /// A two-room pack whose first room carries the test door into the second,
+    /// both rooms carrying the colourful test background.
+    fn two_room_door_pack(dir: &TempDir) -> (Pack, RoomId, RoomId) {
         let pack_path = dir.0.join("game.akpak");
         let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
         let a = RoomId {
@@ -9544,9 +9621,13 @@ mod tests {
         writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
         writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
         writer.write(&pack_path).unwrap();
+        (Pack::open(&pack_path).unwrap(), a, b)
+    }
 
-        let pack = Pack::open(&pack_path).unwrap();
-        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+    /// Walk `session` into its test door, run the animation out and tear it
+    /// down into the destination exactly like the interactive loop: trigger,
+    /// tick the timeline, render the finished frame, then finish.
+    fn walk_through_test_door(pack: &Pack, session: &mut GameSession) {
         session.player.pos = [-450, 0, 250];
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
@@ -9554,7 +9635,7 @@ mod tests {
         for _ in 0..10 {
             session
                 .tick(
-                    &pack,
+                    pack,
                     UiInput::default(),
                     player::Input {
                         action_pressed: true,
@@ -9574,15 +9655,23 @@ mod tests {
         );
 
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(&pack, false);
+            session.tick_transition(pack, false);
             if session.transition_finished {
                 break;
             }
         }
         assert!(session.transition_finished, "the transition never finished");
         // The finished frame is rendered before teardown, as the loops do.
-        session.render(&pack);
-        session.finish_transition(&pack);
+        session.render(pack);
+        session.finish_transition(pack);
+    }
+
+    #[test]
+    fn session_transition_swaps_rooms() {
+        let dir = TempDir::new();
+        let (pack, a, b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        walk_through_test_door(&pack, &mut session);
 
         assert_eq!(session.loaded.id, b);
         assert_eq!(session.game.id, b);
@@ -9591,6 +9680,97 @@ mod tests {
         assert!(session.game.doors[0].is_none(), "the door table is rebuilt");
         assert!(!session.transition_finished);
         assert!(session.transition.is_none());
+    }
+
+    #[test]
+    fn a_door_transition_fades_the_destination_in_from_black() {
+        let dir = TempDir::new();
+        let (pack, a, b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        walk_through_test_door(&pack, &mut session);
+        assert_eq!(session.loaded.id, b);
+
+        // The room-entry fade is draw-then-add: the tick after the arm only
+        // clears the pending flag, so the first destination frame is the full
+        // `0x7FFF` black. The `0xE800` counter then steps the alpha down 48 a
+        // tick — 255, 207, 159, 111, 63, 15 — before the state goes negative.
+        let mut alphas = Vec::new();
+        for frame in 0..7 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            session.render(&pack);
+            alphas.push(session.room_fade_alpha());
+            if frame == 0 {
+                assert_eq!(alphas[0], Some(255));
+                assert!(
+                    session
+                        .frame()
+                        .rgba
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[..3] == [0, 0, 0]),
+                    "the first frame after the transition is black"
+                );
+            }
+        }
+        assert_eq!(
+            alphas,
+            [
+                Some(255),
+                Some(207),
+                Some(159),
+                Some(111),
+                Some(63),
+                Some(15),
+                None
+            ]
+        );
+        // The fade stays cleared after it has run out.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        session.render(&pack);
+        assert_eq!(session.room_fade_alpha(), None);
+    }
+
+    #[test]
+    fn the_menu_fade_latch_slows_the_room_entry_fade() {
+        let dir = TempDir::new();
+        let (pack, a, _b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session
+            .game
+            .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_MENU_FADE_LATCH, 0);
+        walk_through_test_door(&pack, &mut session);
+
+        // `0xFF5D` (-163) steps the alpha down by two rather than 48.
+        let mut alphas = Vec::new();
+        for _ in 0..3 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            session.render(&pack);
+            alphas.push(session.room_fade_alpha());
+        }
+        assert_eq!(alphas, [Some(255), Some(254), Some(253)]);
+        // The slow counter is still running where the normal one has cleared.
+        for _ in 0..3 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        session.render(&pack);
+        assert!(session.room_fade_alpha().is_some());
+        // It does run out eventually (about 200 frames).
+        for _ in 0..220 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        session.render(&pack);
+        assert_eq!(session.room_fade_alpha(), None);
     }
 
     #[cfg(feature = "lua")]

@@ -31,14 +31,17 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    next-cycle save carryover. `--ending` exists precisely because those
    screens are out of scope.
 
-4. **Audio-led tolerance.** With a real device the mixer keeps about 93 ms
-   (~2048 stereo frames) queued and presents each frame on the consumed-sample
-   clock with one frame queued ahead, so drift stays under one frame. Without
-   a device (captures, the SDL dummy driver) the fixed 30 Hz tick is the clock:
-   10 fps films advance every three ticks and 15 fps films every two. The
-   counters (`movie_samples_consumed`, `samples_before`) are exposed for tests,
-   and the audio/video relationship is an approximation of the original's
-   MCI-driven playback.
+4. **Wall-clock-mastered film pacing.** The film time comes from the elapsed
+   wall clock; with a real device the mixer's consumed-sample cursor is
+   followed only while it stays within the original's tolerance (-0.5 s behind
+   to +0.25 s ahead), and the session decodes forward to the frame due at the
+   adopted time, one or several at once. A lagging device queue therefore
+   cannot slow the picture past that window. Without a device (captures, the
+   SDL dummy driver) the wall clock / fixed 30 Hz ticks are the clock: 10 fps
+   films advance every three ticks and 15 fps films every two. The counters
+   (`movie_samples_consumed`, `samples_before`) are exposed for tests, and the
+   `samples_consumed` path of `MovieSession::tick` remains the deterministic
+   unit-test seam.
 
 5. **Endings unreachable through normal play.** Reaching an ending requires the
    excluded combat and bosses, so `ending::select_id` and `ending::chain` are

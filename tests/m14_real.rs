@@ -511,6 +511,42 @@ fn a_short_audio_film_pads_silence_without_stalling() {
 }
 
 #[test]
+#[ignore = "requires a converted game pack"]
+fn the_wall_clock_finishes_a_short_film_within_its_header_duration() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    // The opening film (id 0) is the shipped 128-frame 10 fps cut: 12.8 s.
+    let mut session = MovieSession::open(&pack, 0, 0).unwrap();
+    let frames = session.frame_count();
+    assert_eq!(frames, 128, "the opening film header");
+    let step_ms = 1000.0 / 30.0;
+    let expected_ms = frames as f64 * session.ticks_per_frame() as f64 * step_ms;
+
+    // A stalled audio cursor must not slow the picture: the wall clock is the
+    // master once the cursor has fallen outside the -0.5 s tolerance.
+    let mut elapsed_ms = 0.0f64;
+    let mut guard = 0u32;
+    loop {
+        let tick = session.tick_timed(0, Some(0), step_ms);
+        elapsed_ms += step_ms;
+        guard += 1;
+        assert!(guard < 10_000, "the film never finished");
+        match tick {
+            MovieTick::Finished | MovieTick::Skipped => break,
+            MovieTick::Waiting | MovieTick::Advanced => {}
+        }
+    }
+    let drift_ms = (elapsed_ms - expected_ms).abs();
+    assert!(
+        drift_ms <= 2.0 * step_ms,
+        "the film ran {elapsed_ms:.1} ms against a {expected_ms:.1} ms header"
+    );
+    println!("film 0 wall clock: {elapsed_ms:.1} ms vs {expected_ms:.1} ms header, {guard} ticks");
+}
+
+#[test]
 #[ignore = "requires a converted game pack and SDL's offscreen driver"]
 fn standalone_fmv_capture_is_deterministic_and_not_blank() {
     use std::process::Command;

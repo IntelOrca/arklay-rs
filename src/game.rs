@@ -211,6 +211,10 @@ const EFFECT_ITEM_SPARKLE: u8 = 0x0B;
 pub const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 /// Scenario flag raised when Jill has the lockpick.
 const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
+/// Scenario flag `0x7D`: the menu fade latch. The original slows the
+/// room-entry fade from the normal six-frame `0xE800` counter to `0xFF5D`
+/// while this flag is set.
+pub const SCENARIO_FLAG_MENU_FADE_LATCH: u8 = 0x7D;
 /// `main_state_flags` bit `0x2000`: the selected key was used up.
 const MSF_MENU_KEY_DEPLETED: u8 = 18;
 /// `g_message_flags` bit 8: the interactive-screen d-pad gate. While the bit

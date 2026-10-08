@@ -7,12 +7,15 @@
 //! film from the pack, decodes it frame by frame and produces the film's own
 //! PCM for the mixer.
 //!
-//! Pacing is audio-led while a device is open: kept frame *N* is presented
-//! once the mixer has consumed [`MovieSession::samples_before`]`(N)` output
-//! samples, so the film follows the sound. Without a device (captures, the
-//! SDL dummy driver) the fixed 30 Hz tick is the clock: three ticks per 10 fps
-//! frame and two per 15 fps frame. The session queues one frame of audio
-//! ahead of the presented frame and pads a short audio track with silence.
+//! Pacing is wall-clock-led while a device is open: the film time comes from
+//! the elapsed wall clock, and the mixer's consumed-sample cursor is accepted
+//! only while it sits within the original's tolerance of that clock (-0.5 s to
+//! +0.25 s), so a lagging device queue cannot slow the picture. The session
+//! decodes forward to the frame due at that time, one or several at once, and
+//! queues one frame of audio ahead of the presented frame, padding a short
+//! audio track with silence. The fixed 30 Hz tick ([`MovieSession::tick`]) is
+//! the deterministic no-device/capture clock: three ticks per 10 fps frame and
+//! two per 15 fps frame.
 //!
 //! The skip state is the original's: a per-film mask, a 100-update grace
 //! counter and an edge-detected button latch, updated once per platform frame
@@ -20,7 +23,9 @@
 //! per 30 Hz gameplay tick. The first update after playback starts latches the
 //! pad instead of comparing it, so a button held from before the film cannot
 //! skip it, and a press inside the grace window is only seen once its edge is
-//! gone. A mask of zero makes a film unskippable.
+//! gone. The edge is detected sample to sample and held until the next period
+//! boundary, so a tap between two samples and a release/re-press inside one
+//! period both survive. A mask of zero makes a film unskippable.
 //!
 //! Id 1 (the intro) drops the Chris-only beat for Jill: the session presents
 //! up to the first cut point, decodes the removed frames to keep the Cinepak
@@ -196,20 +201,26 @@ pub struct MovieSession {
     grace: u32,
     /// Whether the first poll still has to latch the pad without an edge.
     latch_pending: bool,
-    /// The pad word of the previous update period, for edge detection.
+    /// The pad word at the previous sample, for edge detection.
     last_buttons: u16,
-    /// Buttons held at any point in the current update period; the original
-    /// samples the pad once per period, so a tap between samples must still
-    /// produce an edge at the period boundary.
-    seen_buttons: u16,
-    /// Wall-clock pixels of the current period, carried between polls.
+    /// Fresh presses seen since the last period boundary, `mask & !previous
+    /// sample & current sample`. A press anywhere inside the period reaches the
+    /// boundary, including a release and re-press a held-state OR would lose.
+    pressed_buttons: u16,
+    /// Wall-clock milliseconds of the current period, carried between polls.
     poll_accum_ms: f64,
     /// The original's film update period: 33 ms in gameplay, 16 ms on the
     /// title and ending screens.
     skip_period_ms: f64,
-    /// Whether the skip state was already polled since the last [`Self::tick`];
-    /// the interactive loops poll between ticks, the tick itself otherwise.
-    skip_polled: bool,
+    /// Whether the interactive loops own the skip sampling. [`Self::poll_skip`]
+    /// sets it, so once a loop polls each render frame the session's own
+    /// [`Self::tick`] never samples as well; a headless caller that only ticks
+    /// leaves it clear and the tick drives the state machine.
+    external_poll: bool,
+    /// The AVI frame rate (num/den), the wall-clock film clock's frame length.
+    frame_rate: (u32, u32),
+    /// Elapsed wall clock for the timed path, in milliseconds.
+    wall_ms: f64,
     /// 30 Hz ticks advanced, the no-device clock.
     ticks: u64,
     /// Output samples one presented frame spans.
@@ -280,10 +291,12 @@ impl MovieSession {
             grace: 100,
             latch_pending: true,
             last_buttons: 0,
-            seen_buttons: 0,
+            pressed_buttons: 0,
             poll_accum_ms: 0.0,
             skip_period_ms: skip_period_ms(id),
-            skip_polled: false,
+            external_poll: false,
+            frame_rate: format.frame_rate,
+            wall_ms: 0.0,
             ticks: 0,
             samples_per_frame,
             ticks_per_frame: ticks_per_frame(format.frame_rate),
@@ -355,35 +368,48 @@ impl MovieSession {
     ///
     /// The original calls its film state machine once per platform frame
     /// (16-33 ms, [`skip_period_ms`]), latching the pad on the first call and
-    /// then decrementing the 100-update grace once per period before testing
-    /// an unmasked button edge. Interactive loops call this between ticks
-    /// with the frame's real elapsed time; [`Self::tick`] drives it one period
-    /// per call for headless playback.
+    /// then decrementing the 100-update grace once per period before testing an
+    /// unmasked button edge. Interactive loops call this between ticks with the
+    /// frame's real elapsed time; calling it makes the session the sampler, so
+    /// the fixed ticks of the same frame do not sample a second time
+    /// ([`Self::tick`] drives the state machine only for headless callers).
     pub fn poll_skip(&mut self, buttons: u16, elapsed_ms: f64) -> bool {
+        self.external_poll = true;
+        self.advance_skip(buttons, elapsed_ms)
+    }
+
+    /// One update of the skip state machine: latch the first sample, then
+    /// decrement the grace once per elapsed period and accept an accumulated
+    /// unmasked press edge when the grace reaches zero.
+    ///
+    /// The edge is detected sample to sample (`mask & !previous & current`) and
+    /// held until the period boundary, so a re-press inside a period after a
+    /// release is still a fresh edge even when the button was already held at
+    /// the previous boundary; a tap that started and ended between two samples
+    /// is caught by the same comparison.
+    fn advance_skip(&mut self, buttons: u16, elapsed_ms: f64) -> bool {
         if self.finished {
             return self.skipped;
         }
-        self.skip_polled = true;
         if self.latch_pending {
             self.latch_pending = false;
             self.last_buttons = buttons;
-            self.seen_buttons = 0;
+            self.pressed_buttons = 0;
             self.poll_accum_ms = 0.0;
             return false;
         }
-        self.seen_buttons |= buttons;
+        self.pressed_buttons |= self.skip_mask & !self.last_buttons & buttons;
+        self.last_buttons = buttons;
         self.poll_accum_ms += elapsed_ms.max(0.0);
         while self.poll_accum_ms >= self.skip_period_ms {
             self.poll_accum_ms -= self.skip_period_ms;
             self.grace = self.grace.saturating_sub(1);
-            let pressed = self.skip_mask & !self.last_buttons & self.seen_buttons;
-            self.last_buttons = self.seen_buttons;
-            self.seen_buttons = 0;
-            if pressed != 0 && self.grace == 0 {
+            if self.pressed_buttons != 0 && self.grace == 0 {
                 self.finished = true;
                 self.skipped = true;
                 return true;
             }
+            self.pressed_buttons = 0;
         }
         false
     }
@@ -395,15 +421,19 @@ impl MovieSession {
         }
     }
 
-    /// The next tick of the 30 Hz clock (or the audio-led clock when
+    /// The next tick of the 30 Hz clock (or the consumed-sample clock when
     /// `samples_consumed` is given) and the pad word `buttons`.
     ///
-    /// The first call latches `buttons` without an edge, exactly like the
-    /// original's start state; later calls spend one update period of the
-    /// 100-update grace and end the film on an unmasked button edge once the
-    /// grace is spent. An interactive loop that already polled the skip state
-    /// this frame reaches the same state through [`Self::poll_skip`], so the
-    /// grace is not spent twice.
+    /// This is the deterministic no-device/capture seam: without a device the
+    /// fixed tick clock presents every `ticks_per_frame` ticks, and the
+    /// consumed-sample counter remains a direct frame clock for the unit
+    /// tests. Interactive playback uses [`Self::tick_timed`], where the wall
+    /// clock is the master. The first call latches `buttons` without an edge,
+    /// exactly like the original's start state; later calls spend one update
+    /// period of the 100-update grace and end the film on an unmasked button
+    /// edge once the grace is spent. An interactive loop that already polled
+    /// the skip state reaches the same state through [`Self::poll_skip`], so
+    /// the grace is not spent twice.
     pub fn tick(&mut self, buttons: u16, samples_consumed: Option<u64>) -> MovieTick {
         if self.finished {
             return if self.skipped {
@@ -413,30 +443,94 @@ impl MovieSession {
             };
         }
 
-        if !self.skip_polled && self.poll_skip(buttons, self.skip_period_ms) {
+        if !self.external_poll && self.advance_skip(buttons, self.skip_period_ms) {
             return MovieTick::Skipped;
         }
-        self.skip_polled = false;
 
         self.ticks += 1;
-        let next = self.presented + 1;
         let due = match samples_consumed {
-            Some(consumed) => consumed >= self.samples_before(next),
-            None => self.ticks >= next as u64 * self.ticks_per_frame,
+            Some(consumed) => (consumed / self.samples_per_frame.max(1)) as usize,
+            None => (self.ticks / self.ticks_per_frame.max(1)) as usize,
         };
-        if !due {
+        self.advance_due(due)
+    }
+
+    /// One tick paced by the wall clock: `elapsed_ms` is the real time since
+    /// the previous call (the fixed step on the interactive path).
+    ///
+    /// The wall clock is the master, exactly like the original's platform film
+    /// tick: the film time is the elapsed wall time, and `samples_consumed`
+    /// (the mixer's rendered samples) is followed only while it lies within
+    /// the original's tolerance, `-0.5 s` to `+0.25 s`, of the wall clock. The
+    /// session then decodes forward to the frame due at that time, one or
+    /// several frames at once, so a stalled or lagging device queue can never
+    /// make the picture fall behind the wall clock.
+    pub fn tick_timed(
+        &mut self,
+        buttons: u16,
+        samples_consumed: Option<u64>,
+        elapsed_ms: f64,
+    ) -> MovieTick {
+        if self.finished {
+            return if self.skipped {
+                MovieTick::Skipped
+            } else {
+                MovieTick::Finished
+            };
+        }
+
+        let elapsed = elapsed_ms.max(0.0);
+        if !self.external_poll && self.advance_skip(buttons, elapsed) {
+            return MovieTick::Skipped;
+        }
+
+        self.wall_ms += elapsed;
+        let wall_seconds = self.wall_ms / 1000.0;
+        let seconds = match samples_consumed {
+            Some(consumed) => {
+                let audio_seconds = consumed as f64 / f64::from(SAMPLE_RATE);
+                if (wall_seconds - 0.5..=wall_seconds + 0.25).contains(&audio_seconds) {
+                    audio_seconds
+                } else {
+                    wall_seconds
+                }
+            }
+            None => wall_seconds,
+        };
+        // A tiny epsilon keeps an exact frame boundary (three fixed ticks, say)
+        // from landing just under it in floating point.
+        let fps = f64::from(self.frame_rate.0) / f64::from(self.frame_rate.1.max(1));
+        let due = (seconds * fps + 1e-6) as usize;
+        self.advance_due(due)
+    }
+
+    /// Present every kept frame due at `due`, ending the film when the target
+    /// has passed the last frame. A stall that jumps several frames (or the
+    /// line) is caught up in one call, and the prologue cut mapping applies
+    /// through [`Self::present_kept`] exactly as for a one-frame advance.
+    fn advance_due(&mut self, due: usize) -> MovieTick {
+        if due >= self.kept_frames {
+            // Show the last frame if the clock skipped over it, then end.
+            let last = self.kept_frames - 1;
+            if last > self.presented {
+                if let Err(err) = self.present_kept(last) {
+                    eprintln!("warning: film frame {last} failed to decode: {err:#}");
+                } else {
+                    self.ensure_audio_through(last + 2);
+                }
+            }
+            self.finished = true;
+            return MovieTick::Finished;
+        }
+        if due <= self.presented {
             return MovieTick::Waiting;
         }
-        if next >= self.kept_frames {
+        if let Err(err) = self.present_kept(due) {
+            eprintln!("warning: film frame {due} failed to decode: {err:#}");
             self.finished = true;
             return MovieTick::Finished;
         }
-        if let Err(err) = self.present_kept(next) {
-            eprintln!("warning: film frame {next} failed to decode: {err:#}");
-            self.finished = true;
-            return MovieTick::Finished;
-        }
-        self.ensure_audio_through(next + 2);
+        self.ensure_audio_through(due + 2);
         MovieTick::Advanced
     }
 
@@ -475,9 +569,10 @@ impl MovieSession {
         self.kept_frames
     }
 
-    /// Output samples presented before kept frame `index`, the audio-led
-    /// clock. For every 22050 Hz film this is `avi.samples_before(index)`; the
-    /// 44100 Hz 8-bit logo is converted to the mixer's rate first.
+    /// Output samples presented before kept frame `index`, the film's
+    /// sample-position reference for the audio cursor. For every 22050 Hz film
+    /// this is `avi.samples_before(index)`; the 44100 Hz 8-bit logo is
+    /// converted to the mixer's rate first.
     pub fn samples_before(&self, index: usize) -> u64 {
         index as u64 * self.samples_per_frame
     }
@@ -904,6 +999,84 @@ mod tests {
         }
         assert!(session.poll_skip(1, period));
         assert_eq!(session.tick(1, None), MovieTick::Skipped);
+    }
+
+    #[test]
+    fn a_frame_that_catches_up_two_ticks_spends_one_skip_period() {
+        let mut session = session(4000, (10, 1), 4000);
+        let period = SKIP_PERIOD_GAMEPLAY_MS;
+        session.set_skip_period_ms(period);
+        // The external poll owns the state machine for the whole session once
+        // it runs, so the render frame's extra ticks never spend the grace.
+        assert!(!session.poll_skip(0, period));
+        for _ in 0..49 {
+            assert!(!session.poll_skip(0, period));
+            session.tick(0, None);
+            session.tick(0, None);
+        }
+        // Half the grace window is left, so an edge now is still inside it.
+        // If the ticks had each spent a period the grace would be exhausted
+        // long ago and this edge would skip.
+        assert!(!session.poll_skip(1, period));
+        assert!(!session.skipped());
+    }
+
+    #[test]
+    fn a_release_and_re_press_inside_one_period_is_a_fresh_edge() {
+        let mut session = session(4000, (10, 1), 4000);
+        let period = SKIP_PERIOD_GAMEPLAY_MS;
+        session.set_skip_period_ms(period);
+        assert!(!session.poll_skip(0, period));
+        // Press during the grace and hold across a boundary: the edge lands
+        // while the grace still runs, so it is consumed without skipping.
+        for _ in 0..100 {
+            assert!(!session.poll_skip(1, period));
+            assert!(!session.skipped());
+        }
+        assert!(!session.poll_skip(1, period));
+        // Grace is spent and the button is held, but its edge is long gone.
+        // Release and re-press inside the next period: that is a fresh edge
+        // the old held-state accumulator would have swallowed.
+        assert!(!session.poll_skip(0, period / 2.0));
+        assert!(session.poll_skip(1, period / 2.0));
+        assert!(session.skipped());
+    }
+
+    #[test]
+    fn wall_time_masters_a_stalled_audio_cursor() {
+        let mut session = session(10, (10, 1), 10);
+        // The mixer never renders a sample. While the stalled cursor is inside
+        // the -0.5 s tolerance it is still followed, exactly like the
+        // original; once the wall clock has left it behind, the wall clock
+        // takes over and the film advances to the frame due now.
+        for _ in 0..5 {
+            assert_eq!(session.tick_timed(0, Some(0), 100.0), MovieTick::Waiting);
+        }
+        assert_eq!(session.frame_index(), 0);
+        assert_eq!(session.tick_timed(0, Some(0), 100.0), MovieTick::Advanced);
+        assert_eq!(session.frame_index(), 6);
+    }
+
+    #[test]
+    fn an_audio_cursor_ahead_of_wall_time_is_ignored() {
+        let mut session = session(3, (10, 1), 3);
+        // The cursor claims a full second with no wall time passed: outside
+        // the +0.25 s bound, so the picture stays where the wall clock is.
+        assert_eq!(
+            session.tick_timed(0, Some(u64::from(SAMPLE_RATE)), 0.0),
+            MovieTick::Waiting
+        );
+        assert_eq!(session.frame_index(), 0);
+    }
+
+    #[test]
+    fn a_stall_catches_up_every_due_frame_at_once() {
+        let mut session = session(5, (10, 1), 5);
+        // 350 ms of wall time is three 100 ms frames plus a bit: the film
+        // jumps straight from frame 0 to frame 3 (the original's decode
+        // forward to `target`).
+        assert_eq!(session.tick_timed(0, None, 350.0), MovieTick::Advanced);
+        assert_eq!(session.frame_index(), 3);
     }
 
     #[test]

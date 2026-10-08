@@ -92,7 +92,13 @@ for the transition, which drops the frame limiter from the 33 ms gameplay
 interval to the 16 ms one, and the door interpreter advances one animation
 frame per platform frame. Gameplay pacing resumes when the transition ends.
 Film skip input is likewise polled once per platform frame (33 ms in gameplay,
-16 ms on the title and ending screens), not once per 30 Hz tick.
+16 ms on the title and ending screens), not once per 30 Hz tick. Films are
+paced by the wall clock, with the mixer's consumed-sample cursor accepted only
+within the original's -0.5 s/+0.25 s tolerance; the session decodes forward to
+the frame due now. Whenever a room load completes, gameplay re-arms the
+original's entry fade: a black veil at accumulator `0x7FFF` whose alpha steps
+255, 207, ..., 15 over six fixed ticks (a slow `0xFF5D` counter while scenario
+flag `0x7D` is set).
 
 One gameplay tick (`engine::tick_room`) runs this fixed order:
 
