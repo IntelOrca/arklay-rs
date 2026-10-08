@@ -355,10 +355,22 @@ fn corpus_walk_spawns_all_43_shipped_sparkles_and_frees_them() {
                 .collect();
             assert!(!claimed.is_empty());
 
-            // Drive the handler the build derived, as the walk-up probe does.
+            // Drive the handler the build derived, as the walk-up probe does,
+            // then the award the viewer's prompt resolves to: the sparkle is
+            // freed by the take, not by the probe.
             let action = game.room_actions[slot].expect("the item action");
             assert_eq!(action.item_model(), operand_u8(&operands, 7));
             game.run_room_action(slot as u8, action.handler);
+            match action.handler {
+                0x0D => {
+                    assert!(game.take_document(slot as u8), "ROOM{name}: file it");
+                }
+                4 => {
+                    assert!(game.take_message_item(), "ROOM{name}: take it");
+                }
+                // The map handler (0x0F) awards in the probe itself.
+                _ => {}
+            }
             assert_eq!(
                 game.items.record(model).unwrap().sparkle,
                 0,

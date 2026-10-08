@@ -3,9 +3,13 @@
 //! # Documented deviations
 //!
 //! The world-item milestone leaves these deliberate gaps:
-//! - no pick-up viewer: `give_item` (0x2D), the ordinary pick-up handler and
-//!   the desk's take-item state award on the interaction frame, and the
-//!   original's menu mode-3/4 item viewer and key-item list screen stay absent;
+//! - the ground pick-up (menu mode 3) and scripted `give_item` (mode 4) item
+//!   viewers run the model intro, the model spin and the 0xC0/0xC1/0xC2
+//!   message round trip through [`PickupView`], but the original's reach
+//!   animation before the menu opens is not ported. The document handler
+//!   (`set_room_event_flag`, mode 8) shows global 0xC6 and files the entry
+//!   instead of running the original's file-list screen: the state-8 art,
+//!   layout and navigation are a separate slice;
 //! - no map tab: a map pick-up raises its RoomFlags owned bit, but
 //!   `ITEM_M2`'s `MAP*.TIM` pages and `Map_blue.tim` stay unpacked and the map
 //!   screen is untouched;
@@ -697,6 +701,53 @@ impl Display {
     }
 }
 
+/// Which item-viewer flow a [`PickupView`] is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickupKind {
+    /// A ground pick-up: the 0xC0 yes/no prompt (or 0xC2 when the inventory
+    /// is full and the item does not merge).
+    Take,
+    /// A scripted `give_item`: global 0xC1, with the award when the message
+    /// completes.
+    GotItem,
+    /// A document: global 0xC6 and the entry's consumption. The original's
+    /// file-list screen is not ported (documented deviation), so there is no
+    /// model viewer.
+    Document,
+}
+
+/// Where a [`PickupView`] is in its message round trip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickupPhase {
+    /// The model intro is still running.
+    Intro,
+    /// The prompt is on screen; the engine drives it through the game's
+    /// message window.
+    Message,
+    /// The model is spinning out; the mode closes when it finishes.
+    Exit,
+}
+
+/// The item-viewer flow the engine drives itself (the original's main-menu
+/// modes 3, 4 and 8).
+///
+/// Unlike the examine viewer (a boxed [`ui::Screen`] modal that owns all of
+/// its state) a pick-up shares the game's message window and the inventory
+/// panel, so the engine owns its state machine: the viewer's intro/exit
+/// animation steps in [`GameSession::tick_pickup_view`] and the message is
+/// resolved by [`game::GameState::update_message`] exactly like a menu
+/// message. The model viewer is absent for the document fallback.
+struct PickupView {
+    /// The room action slot being awarded or filed.
+    slot: u8,
+    /// Which prompt the flow runs.
+    kind: PickupKind,
+    /// The model viewer; `None` for the document fallback.
+    screen: Option<ui::item_view::ItemViewScreen>,
+    /// Where the flow is.
+    phase: PickupPhase,
+}
+
 /// One gameplay session: the loaded room, game state, player and VMs.
 ///
 /// `--room` builds one through [`GameSession::from_room`] and the app's Play
@@ -781,6 +832,10 @@ struct GameSession {
     /// the modal's draw and applying its [`ui::Screen::fade`] overlay. A modal
     /// closes by reporting [`ScreenAction::Resume`].
     modal: Option<Box<dyn ui::Screen>>,
+    /// The ground/scripted item pick-up viewer. It is engine-driven rather
+    /// than a boxed modal because it shares the game's message window and the
+    /// pause menu's inventory panel; see [`PickupView`].
+    pickup_view: Option<PickupView>,
     /// The item the open viewer was asked to examine; leaving the viewer
     /// marks it examined in [`game::GameState`].
     viewed_item: Option<u8>,
@@ -937,6 +992,7 @@ impl GameSession {
             transition: None,
             transition_finished: false,
             modal: None,
+            pickup_view: None,
             viewed_item: None,
             swallow_action: false,
         };
@@ -1156,6 +1212,14 @@ impl GameSession {
             }
         } else if self.game.take_itembox_open() {
             self.open_item_box(pack);
+        } else if let Some(request) = self.game.item_view_request() {
+            // A room action armed the item viewer: the original's main loop
+            // opens its menu over the frozen room. It waits for an active
+            // message to clear first (`do { ... } while (menu_choice & 0x80)`),
+            // so the pending flag can outlive this tick.
+            if !self.game.message.active {
+                self.open_pickup_view(pack, request);
+            }
         }
         Ok(())
     }
@@ -1307,6 +1371,178 @@ impl GameSession {
         }
     }
 
+    /// Open the pick-up viewer for a pending menu flag.
+    ///
+    /// The inventory panel (the original's main-menu background) opens under
+    /// the viewer. The ground and got-item modes add the model viewer with its
+    /// spin-in intro; the document fallback files the entry and shows global
+    /// 0xC6 directly.
+    fn open_pickup_view(&mut self, pack: &Pack, request: game::ItemViewRequest) {
+        if self.pickup_view.is_some() {
+            return;
+        }
+        let Some(action) = self
+            .game
+            .room_actions
+            .get(usize::from(request.slot))
+            .copied()
+            .flatten()
+        else {
+            self.game.clear_item_view_flags();
+            return;
+        };
+        let item = action.item_id();
+        let kind = match request.kind {
+            game::ItemViewKind::Take => PickupKind::Take,
+            game::ItemViewKind::GotItem => PickupKind::GotItem,
+            game::ItemViewKind::Document => PickupKind::Document,
+        };
+        self.open_menu(pack);
+        // The original sets `g_selectedItemId` to the item being taken as the
+        // mode opens, so the prompt's `\i` substitution names it.
+        self.game.select_item(Some(item));
+        let (screen, phase) = match kind {
+            PickupKind::Take | PickupKind::GotItem => {
+                let mut screen = if kind == PickupKind::Take {
+                    ui::item_view::ItemViewScreen::new_take(item)
+                } else {
+                    ui::item_view::ItemViewScreen::new_got_item(item)
+                };
+                screen.open_with(pack, &self.text, &self.game.examined_flags());
+                (Some(screen), PickupPhase::Intro)
+            }
+            PickupKind::Document => {
+                // The state-8 fallback: file the entry here (the original
+                // files it as the screen's fade completes) and show 0xC6.
+                self.game.mark_file_collected(item);
+                self.game.show_message(game::MESSAGE_FILE_FILED, 0);
+                (None, PickupPhase::Message)
+            }
+        };
+        self.pickup_view = Some(PickupView {
+            slot: request.slot,
+            kind,
+            screen,
+            phase,
+        });
+    }
+
+    /// One frozen tick of the pick-up viewer.
+    ///
+    /// The game's message window advances exactly like the menu's (`tick_menu`
+    /// hands it the same input), then the viewer's phase machine runs: the
+    /// intro steps until it settles and requests its prompt, the message
+    /// resolves (a confirmed 0xC0 already awarded through the message
+    /// post-action; the got-item mode awards here), and the exit animation
+    /// steps until the mode closes.
+    fn tick_pickup_view(&mut self, input: player::Input, action: bool) {
+        let was_active = self.game.message.active;
+        self.game.update_message(
+            MessageInput {
+                action,
+                left: input.left,
+                right: input.right,
+            },
+            &self.loaded.room,
+            &self.text,
+        );
+        // The dismissal bookkeeping mirrors the room tick: a press that
+        // closes the prompt is swallowed until the key comes up.
+        if was_active && !self.game.message.active && action {
+            self.swallow_action = true;
+        }
+        let Some(phase) = self.pickup_view.as_ref().map(|pickup| pickup.phase) else {
+            return;
+        };
+        match phase {
+            PickupPhase::Intro => {
+                let settled = match self.pickup_view.as_mut().and_then(|p| p.screen.as_mut()) {
+                    Some(screen) => screen.step_intro(),
+                    None => true,
+                };
+                if settled {
+                    self.start_pickup_message();
+                }
+            }
+            PickupPhase::Message => {
+                if !(was_active && !self.game.message.active) {
+                    return;
+                }
+                let kind = self.pickup_view.as_ref().map(|pickup| pickup.kind);
+                match kind {
+                    Some(PickupKind::GotItem) => {
+                        // The original's mode 4 awards as its message
+                        // completes and the exit animation takes over.
+                        self.game.close_got_item_viewer();
+                    }
+                    Some(PickupKind::Document) => {
+                        // The state-8 completion: consume the entry, record
+                        // the picked id. The yes/no take path has already run
+                        // through the message post-action.
+                        if let Some(slot) = self.pickup_view.as_ref().map(|pickup| pickup.slot) {
+                            self.game.take_document(slot);
+                        }
+                    }
+                    _ => {}
+                }
+                if let Some(pickup) = self.pickup_view.as_mut() {
+                    if let Some(screen) = pickup.screen.as_mut() {
+                        screen.begin_exit();
+                    }
+                    pickup.phase = PickupPhase::Exit;
+                }
+            }
+            PickupPhase::Exit => {
+                let finished = match self.pickup_view.as_mut().and_then(|p| p.screen.as_mut()) {
+                    Some(screen) => screen.step_exit(),
+                    None => true,
+                };
+                if finished {
+                    self.close_pickup_view();
+                }
+            }
+        }
+    }
+
+    /// Request the viewer's prompt once the model intro has settled.
+    ///
+    /// The ground mode picks 0xC0 when the inventory has room or the pick-up
+    /// merges into an existing stack, and 0xC2 when it does not; the got-item
+    /// mode always uses 0xC1.
+    fn start_pickup_message(&mut self) {
+        let Some((kind, slot)) = self
+            .pickup_view
+            .as_ref()
+            .map(|pickup| (pickup.kind, pickup.slot))
+        else {
+            return;
+        };
+        let message = match kind {
+            PickupKind::Take => {
+                if self.game.pickup_fits(slot) {
+                    game::MESSAGE_TAKE_PROMPT
+                } else {
+                    game::MESSAGE_INVENTORY_FULL
+                }
+            }
+            PickupKind::GotItem => game::MESSAGE_GOT_ITEM,
+            PickupKind::Document => game::MESSAGE_FILE_FILED,
+        };
+        self.game.show_message(message, 0);
+        if let Some(pickup) = self.pickup_view.as_mut() {
+            pickup.phase = PickupPhase::Message;
+        }
+    }
+
+    /// Close the pick-up viewer: clear the pending menu bits, drop the flow
+    /// and unfreeze the room. The inventory panel closes with it, exactly like
+    /// the original's `menu_restore_game_state` clearing the whole menu field.
+    fn close_pickup_view(&mut self) {
+        self.pickup_view = None;
+        self.game.clear_item_view_flags();
+        self.close_menu();
+    }
+
     /// Open the save screen over the frozen room after the typewriter prompt
     /// was confirmed. The last gameplay frame is painted first so the screen
     /// fades in over it; the pending block is the state snapshot plus the
@@ -1400,6 +1636,12 @@ impl GameSession {
     /// up; the item-box overlay and the FILE tab then own the pad, and
     /// otherwise one pad edge reaches the menu and its event is consumed.
     fn tick_menu(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) {
+        // The pick-up viewer owns the frozen menu while it runs; it drives the
+        // game's message window itself and consumes no menu input.
+        if self.pickup_view.is_some() {
+            self.tick_pickup_view(input, action);
+            return;
+        }
         let message_was_up = self.game.message.active;
         self.game.update_message(
             MessageInput {
@@ -1719,6 +1961,35 @@ impl GameSession {
                 ..
             } = self;
             if let Some(screen) = save_screen {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                };
+                screen.draw(&cx, framebuffer);
+                let fade = screen.fade();
+                framebuffer.fade_to_black(fade);
+            }
+        }
+        // The pick-up viewer draws over the inventory panel, before the
+        // message so its intro/exit fade never dims the prompt text.
+        if self.pickup_view.is_some() {
+            let Self {
+                pickup_view,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = pickup_view
+                .as_mut()
+                .and_then(|pickup| pickup.screen.as_mut())
+            {
                 let cx = UiContext {
                     pack,
                     save_dir,
@@ -9365,10 +9636,14 @@ end
         };
         let mut messages: Vec<Option<Vec<u8>>> =
             (0..64).map(|_| Some(vec![0x0C, 0x01, 0x00])).collect();
-        // Index 63 is the yes/no take-item stream used by the post-action
-        // test: "A" then confirm -> case 10 action 0, with the trailing `0x01`
-        // the text-table scanner needs.
-        messages[63] = Some(vec![0x0C, 0x08, 0x00, 0x0A, 0x00, 0x01, 0x00]);
+        // Index 0 is global 0xC0, the ground pick-up yes/no prompt: "A" then
+        // confirm. The branch record is `[no-offset 2][tag 10][arg 0]`: Yes
+        // runs the take action, No lands on the `0x01` terminator and does
+        // nothing.
+        messages[0] = Some(vec![0x0C, 0x08, 0x02, 0x0A, 0x00, 0x01, 0x00]);
+        // Index 63 is the same yes/no stream used by the direct post-action
+        // test.
+        messages[63] = Some(vec![0x0C, 0x08, 0x02, 0x0A, 0x00, 0x01, 0x00]);
         let mut writer = PackWriter::new();
         writer
             .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
@@ -9398,9 +9673,10 @@ end
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
 
-        // Global id 0x40 with the inspect pause word 0x00FF, which clears the
-        // player state-machine bit 0.
-        session.game.show_message(0x40, 0x00FF);
+        // Global id 0x41 with the inspect pause word 0x00FF, which clears the
+        // player state-machine bit 0. (Index 0 is the 0xC0 take prompt in this
+        // fixture.)
+        session.game.show_message(0x41, 0x00FF);
         assert!(session.game.message_locks_controls());
 
         let before = session.game.frame;
@@ -9902,7 +10178,7 @@ end
             status_flags: game::ENTITY_STATUS_ACTIVE,
             ..game::Entity::default()
         };
-        session.game.show_message(0x40, game::MESSAGE_FLAG_ENTITIES);
+        session.game.show_message(0x41, game::MESSAGE_FLAG_ENTITIES);
         assert!(session.game.message_freezes_entities());
 
         for _ in 0..4 {
@@ -10018,7 +10294,7 @@ end
         // Under the script-first order the dismissing tick's room probe runs
         // while the window is still up, so the zone's own request is refused;
         // the still-held key must not re-arm it once the window closes.
-        session.game.show_message(0x40, 0);
+        session.game.show_message(0x41, 0);
         for _ in 0..600 {
             if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
                 break;
@@ -10047,7 +10323,7 @@ end
         assert!(!session.game.message.active);
         assert_eq!(
             session.game.message.id,
-            Some(0x40),
+            Some(0x41),
             "the zone did not re-arm the window on the dismissal tick"
         );
 
@@ -10102,7 +10378,7 @@ end
 
         // Pause word 1 masks message_flags bit 0, so the dismissal is not
         // protected and must blank the held direction.
-        session.game.show_message(0x40, 1);
+        session.game.show_message(0x41, 1);
         let held_up = player::Input {
             up: true,
             ..player::Input::default()
@@ -10178,7 +10454,7 @@ end
                 .unwrap();
 
         // Pause word 0xFE leaves bit 0 set, the dismissal's protection bit.
-        session.game.show_message(0x40, 0xFE);
+        session.game.show_message(0x41, 0xFE);
         for _ in 0..600 {
             if session.game.message.phase() == crate::message::MessagePhase::WaitInput {
                 break;
@@ -10945,6 +11221,337 @@ end
             session.game.room_actions[3].is_none(),
             "the action is consumed"
         );
+    }
+
+    /// A room item action on the player's own position, fired by the action
+    /// key (`0xC1`: action-key probe at the entity position).
+    fn item_room_action(slot: u8, item: u8, quantity: u8, handler: u8) -> game::RoomAction {
+        game::RoomAction {
+            slot,
+            kind: game::RoomActionKind::Item,
+            zone: [0, 0, 10, 10],
+            sce: handler,
+            handler,
+            flags: 0xC1,
+            params: [item, quantity, 0, 0, 0, 0, 0, 0],
+            item_data: None,
+            room_items_flag: 0xFE,
+        }
+    }
+
+    /// Place the player at the origin so the entity-position item probes
+    /// match.
+    fn place_player(session: &mut GameSession) {
+        session.player.pos = [0, 0, 0];
+        session.player.angle = 0;
+        session.game.sync_entity_from_player(&session.player);
+    }
+
+    /// The action-key press edge and held level.
+    fn pressed() -> player::Input {
+        player::Input {
+            action_pressed: true,
+            action_held: true,
+            ..player::Input::default()
+        }
+    }
+
+    /// Tick `session` until `check` holds, panicking after `limit` ticks.
+    fn tick_until(
+        session: &mut GameSession,
+        pack: &Pack,
+        limit: usize,
+        what: &str,
+        mut check: impl FnMut(&GameSession) -> bool,
+    ) {
+        for _ in 0..limit {
+            if check(session) {
+                return;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("{what} never happened");
+    }
+
+    #[test]
+    fn a_ground_pickup_opens_the_viewer_and_a_confirmed_prompt_awards() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+
+        // The action key arms the flag; the engine opens the viewer over the
+        // inventory panel at the end of the same tick.
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.pickup_view.is_some(), "the flag opened the viewer");
+        assert!(session.menu.is_some(), "the inventory panel is underneath");
+        assert_eq!(
+            session
+                .pickup_view
+                .as_ref()
+                .and_then(|pickup| pickup.screen.as_ref())
+                .map(|screen| screen.item()),
+            Some(ITEM_FIRST_AID_SPRAY),
+            "the viewer loaded the picked item's model"
+        );
+        assert!(!session.game.has_item(ITEM_FIRST_AID_SPRAY));
+        assert!(session.game.room_actions[1].is_some());
+        assert!(session.game.menu_pending());
+
+        // The model intro settles and requests global 0xC0.
+        tick_until(&mut session, &pack, 300, "the take prompt", |session| {
+            session.game.message.id == Some(game::MESSAGE_TAKE_PROMPT)
+        });
+        assert!(session.game.message.active);
+
+        // The default choice is Yes; confirm it.
+        tick_until(&mut session, &pack, 300, "the yes/no phase", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::YesNo
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(
+            session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "the yes branch awarded the item"
+        );
+        assert!(
+            session.game.room_actions[1].is_none(),
+            "the take consumed the action"
+        );
+
+        // The exit animation plays out, then the mode closes and the room
+        // resumes.
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        assert!(session.menu.is_none());
+        assert!(!session.game.menu_pending());
+        assert_eq!(session.game.item_view_request(), None);
+    }
+
+    #[test]
+    fn the_viewer_waits_for_an_active_message_before_it_opens() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+
+        // A wait-for-input message that does not mask the control bit: the
+        // action key still probes and arms the viewer.
+        session.game.show_message(0x41, 0);
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(
+            session.game.item_view_request().is_some(),
+            "the probe armed the viewer"
+        );
+        assert!(
+            session.pickup_view.is_none(),
+            "the main loop waits for the message to clear"
+        );
+
+        // Dismissing the message lets the pending flag open the viewer.
+        tick_until(&mut session, &pack, 300, "the message wait", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::WaitInput
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.pickup_view.is_some());
+        assert!(!session.game.message.active);
+    }
+
+    #[test]
+    fn refusing_the_pickup_prompt_leaves_the_item_in_the_room() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+
+        tick_until(&mut session, &pack, 300, "the yes/no phase", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::YesNo
+        });
+        // Right flips the cursor to No; confirm resolves the prompt without
+        // an award.
+        session
+            .tick(
+                &pack,
+                UiInput::default(),
+                player::Input {
+                    right: true,
+                    ..player::Input::default()
+                },
+                false,
+            )
+            .unwrap();
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(!session.game.has_item(ITEM_FIRST_AID_SPRAY));
+        assert!(
+            session.game.room_actions[1].is_some(),
+            "the item stays in the room"
+        );
+
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        assert!(session.menu.is_none());
+        assert!(!session.game.menu_pending());
+    }
+
+    #[test]
+    fn a_full_inventory_turns_the_pickup_into_the_no_room_message() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        // Fill every slot with a distinct non-stackable item; the sword key
+        // then has neither a free slot nor a stack to merge into.
+        for item in [0x41, 0x42, 0x43, 0x44, 0x45, 0x46] {
+            session.game.add_item(item, 1);
+        }
+        assert_eq!(
+            session.game.inventory.len(),
+            session.game.inventory_capacity()
+        );
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_SWORD_KEY, 1, 4));
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.pickup_view.is_some());
+
+        tick_until(&mut session, &pack, 300, "the no-room message", |session| {
+            session.game.message.id == Some(game::MESSAGE_INVENTORY_FULL)
+        });
+        assert!(session.game.message.active);
+        tick_until(&mut session, &pack, 300, "the message wait", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::WaitInput
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        assert!(!session.game.has_item(ITEM_SWORD_KEY), "nothing was taken");
+        assert!(
+            session.game.room_actions[1].is_some(),
+            "the item stays in the room"
+        );
+        assert!(session.menu.is_none());
+        assert!(!session.game.menu_pending());
+    }
+
+    #[test]
+    fn a_scripted_give_item_shows_global_c1_and_awards_on_completion() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+        session.game.arm_got_item(1);
+
+        // The next tick opens the viewer; the award waits for the prompt.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(session.pickup_view.is_some());
+        assert!(session.menu.is_some());
+        assert!(session.game.menu_pending());
+
+        tick_until(
+            &mut session,
+            &pack,
+            300,
+            "the got-item message",
+            |session| session.game.message.id == Some(game::MESSAGE_GOT_ITEM),
+        );
+        assert!(
+            !session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "the award waits for the message"
+        );
+        tick_until(&mut session, &pack, 300, "the message wait", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::WaitInput
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(
+            session.game.has_item(ITEM_FIRST_AID_SPRAY),
+            "closing the read awarded the item"
+        );
+        assert!(session.game.room_actions[1].is_none());
+        assert!(!session.game.menu_pending());
+
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        assert!(session.menu.is_none());
+    }
+
+    #[test]
+    fn a_document_pickup_files_the_entry_without_an_inventory_award() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.game.room_actions[1] = Some(item_room_action(1, 0x60, 1, 0x0D));
+
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.pickup_view.is_some());
+        assert!(session.menu.is_some());
+        assert_eq!(session.game.message.id, Some(game::MESSAGE_FILE_FILED));
+        assert!(session.game.file_collected(1), "the entry is filed");
+        assert!(!session.game.has_item(0x60), "a document is not carried");
+
+        tick_until(&mut session, &pack, 300, "the message wait", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::WaitInput
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(
+            session.game.room_actions[1].is_none(),
+            "the entry is consumed"
+        );
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        assert!(session.menu.is_none());
+        assert!(!session.game.menu_pending());
     }
 
     #[test]

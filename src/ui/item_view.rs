@@ -2,8 +2,13 @@
 //!
 //! [`ItemViewScreen`] owns everything it draws: the selected item's `.ivm`
 //! model and texture, the item name and the `text/idesc.bin` description
-//! window. It is a [`Screen`] so the engine installs it as a gameplay modal
-//! over the frozen pause menu; leaving it returns to the menu unchanged.
+//! window. As an examine viewer it is a [`Screen`] the engine installs as a
+//! gameplay modal over the frozen pause menu; leaving it returns to the menu
+//! unchanged. The same screen also serves the engine's pick-up flow in
+//! [`ViewMode::Take`]/[`ViewMode::GotItem`]: those modes start on the model's
+//! spin-in intro ([`ItemViewScreen::step_intro`]) and the engine hands them
+//! back a closing animation ([`ItemViewScreen::begin_exit`]) once its message
+//! resolves, so they never read the pad themselves.
 //!
 //! The model renders through [`Framebuffer::draw_ivm_unlit`]: full-bright,
 //! one 256-colour CLUT row with direct UVs and backface culling disabled, one
@@ -54,6 +59,31 @@ pub const ROTATE_STEP: i32 = 0x20;
 const INGRAM_DESCRIPTION: u16 = 0x4E;
 /// The description table index the Minimi maps to (1-based).
 const MINIMI_DESCRIPTION: u16 = 0x4F;
+/// The intro/exit duration in 30 Hz frames.
+const INTRO_FRAMES: i32 = 0x40;
+/// The intro/exit model spin step per frame, in 12-bit angle units.
+const INTRO_YAW_STEP: i32 = 0xC0;
+/// The intro/exit model roll step per frame, in 12-bit angle units.
+const INTRO_ROLL_STEP: i32 = 0x80;
+/// The intro/exit translation step per frame. `0x40` frames of it land
+/// exactly on [`MODEL_REST_X`].
+const INTRO_ZOOM_STEP: i32 = 0x322;
+/// The model's translation before the intro starts, far from the camera.
+const INTRO_START_X: i32 = MODEL_REST_X - INTRO_FRAMES * INTRO_ZOOM_STEP;
+
+/// Which flow opened the viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// The pause-menu CHECK path: turntable input, examine check and the
+    /// description window. This is the default.
+    Examine,
+    /// A ground pick-up: the model intro, then the engine's global 0xC0
+    /// yes/no prompt. The viewer itself takes no pad input.
+    Take,
+    /// A scripted `give_item`: the model intro, then the engine's global 0xC1
+    /// line, with the award when the mode closes.
+    GotItem,
+}
 
 /// Where the viewer's model animation is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +93,11 @@ enum ViewStage {
     /// The red/doom book zoom: the entry spin-in runs to `0x300` degrees and
     /// then opens the description.
     Zoom,
+    /// The take/got-item opening animation: the model spins in from far away
+    /// while the screen fades up.
+    Intro,
+    /// The take/got-item closing animation: the intro in reverse.
+    Exit,
 }
 
 /// What the item examine check asked for.
@@ -82,6 +117,8 @@ pub enum ExamineOutcome {
 pub struct ItemViewScreen {
     /// The examined item id.
     item: u8,
+    /// Which flow opened the viewer.
+    mode: ViewMode,
     /// The item's encoded name (empty when the pack has no name table).
     name: Vec<u8>,
     /// The item's encoded description, resolved at open.
@@ -95,13 +132,16 @@ pub struct ItemViewScreen {
     /// Turntable roll in 12-bit angle units. The port has no roll key, but the
     /// examine windows test it, so it stays a field.
     pub roll: i32,
+    /// The model's translation toward the camera; the intro/exit animation
+    /// drives it between [`INTRO_START_X`] and [`MODEL_REST_X`].
+    model_x: i32,
     /// Which stage of the model animation is running.
     stage: ViewStage,
-    /// Ticks the zoom has run.
+    /// Ticks the zoom/intro/exit has run.
     zoom_timer: i32,
     /// The zoom's spin accumulator, the original's `DAT_00ae9f5e`.
     zoom_spin: i32,
-    /// The zoom's entry ramp, drawn as a black fade over the screen. The
+    /// The zoom/intro/exit ramp, drawn as a black fade over the screen. The
     /// original ramps its three viewer lights; the port approximates that
     /// with the screen fade.
     entry_fade: u8,
@@ -112,20 +152,55 @@ pub struct ItemViewScreen {
 impl ItemViewScreen {
     /// A viewer for `item`, still without any loaded art.
     pub fn new(item: u8) -> Self {
-        Self {
+        Self::with_mode(item, ViewMode::Examine)
+    }
+
+    /// A viewer for a ground pick-up: it opens on the model intro and the
+    /// engine ends it with [`ItemViewScreen::begin_exit`] once the yes/no
+    /// prompt resolves.
+    pub fn new_take(item: u8) -> Self {
+        Self::with_mode(item, ViewMode::Take)
+    }
+
+    /// A viewer for a scripted `give_item` award; same intro as
+    /// [`ItemViewScreen::new_take`] but the engine shows global 0xC1 instead
+    /// of the yes/no prompt.
+    pub fn new_got_item(item: u8) -> Self {
+        Self::with_mode(item, ViewMode::GotItem)
+    }
+
+    fn with_mode(item: u8, mode: ViewMode) -> Self {
+        let mut screen = Self {
             item,
+            mode,
             name: Vec::new(),
             description: None,
             model: None,
             yaw: 0,
             pitch: 0,
             roll: 0,
+            model_x: MODEL_REST_X,
             stage: ViewStage::Display,
             zoom_timer: 0,
             zoom_spin: 0,
             entry_fade: 0,
             message: MessageWindow::default(),
+        };
+        if mode != ViewMode::Examine {
+            screen.restart_intro();
         }
+        screen
+    }
+
+    /// Reset the state for the take/got-item opening animation.
+    fn restart_intro(&mut self) {
+        self.yaw = 0;
+        self.pitch = 0;
+        self.roll = 0;
+        self.model_x = INTRO_START_X;
+        self.stage = ViewStage::Intro;
+        self.zoom_timer = INTRO_FRAMES;
+        self.entry_fade = 255;
     }
 
     /// Load the item's model, name and description from `pack` and `text`.
@@ -168,13 +243,82 @@ impl ItemViewScreen {
         self.message.active
     }
 
+    /// Which flow opened the viewer.
+    pub fn mode(&self) -> ViewMode {
+        self.mode
+    }
+
     /// The root matrix of every model object: the turntable rotation and the
-    /// resting translation toward the camera.
+    /// model's current translation toward the camera (animated by the
+    /// intro/exit in the take/got-item modes).
     pub fn root_matrix(&self) -> Mat4x3 {
         Mat4x3 {
             r: anim::rotation_matrix(self.pitch, self.yaw, self.roll),
-            t: [MODEL_REST_X, 0, 0],
+            t: [self.model_x, 0, 0],
         }
+    }
+
+    /// Whether the take/got-item opening animation is still running.
+    pub fn in_intro(&self) -> bool {
+        self.stage == ViewStage::Intro
+    }
+
+    /// Advance the opening animation one frame; returns `true` when it has
+    /// finished and the model has settled on its resting pose.
+    ///
+    /// The original's `FUN_0044e1b0` state 1: `0x40` frames of translation
+    /// toward the camera, yaw and roll, with the lights ramping up. The port
+    /// approximates the light ramp with the full-screen fade.
+    pub fn step_intro(&mut self) -> bool {
+        if self.stage != ViewStage::Intro {
+            return true;
+        }
+        self.model_x += INTRO_ZOOM_STEP;
+        self.yaw = (self.yaw + INTRO_YAW_STEP) & 0x0FFF;
+        self.roll = (self.roll + INTRO_ROLL_STEP) & 0x0FFF;
+        self.zoom_timer -= 1;
+        self.entry_fade = (self.zoom_timer * 4).clamp(0, 255) as u8;
+        if self.zoom_timer > 0 {
+            return false;
+        }
+        // The intro's rotation is a whole number of turns, so it lands back
+        // on the identity pose; snap there in case of a stray angle.
+        self.model_x = MODEL_REST_X;
+        self.yaw = 0;
+        self.pitch = 0;
+        self.roll = 0;
+        self.entry_fade = 0;
+        self.stage = ViewStage::Display;
+        true
+    }
+
+    /// Start the closing animation: the reverse of the opener.
+    pub fn begin_exit(&mut self) {
+        self.stage = ViewStage::Exit;
+        self.zoom_timer = INTRO_FRAMES;
+    }
+
+    /// Whether the closing animation is running.
+    pub fn in_exit(&self) -> bool {
+        self.stage == ViewStage::Exit
+    }
+
+    /// Advance the closing animation one frame; returns `true` when it has
+    /// finished and the viewer may close.
+    pub fn step_exit(&mut self) -> bool {
+        if self.stage != ViewStage::Exit {
+            return true;
+        }
+        self.zoom_timer -= 1;
+        if self.zoom_timer <= 0 {
+            self.entry_fade = 255;
+            return true;
+        }
+        self.model_x -= INTRO_ZOOM_STEP;
+        self.yaw = (self.yaw - INTRO_YAW_STEP) & 0x0FFF;
+        self.roll = (self.roll - INTRO_ROLL_STEP) & 0x0FFF;
+        self.entry_fade = (self.zoom_timer * 4 - 1).clamp(0, 255) as u8;
+        false
     }
 
     /// The examine check's result for the model's current pose.
@@ -315,17 +459,29 @@ impl Screen for ItemViewScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         let empty = Text::default();
         self.open_with(cx.pack, cx.text.unwrap_or(&empty), &[0; 4]);
-        self.yaw = 0;
-        self.pitch = 0;
-        self.roll = 0;
-        self.stage = ViewStage::Display;
-        self.zoom_timer = 0;
         self.zoom_spin = 0;
-        self.entry_fade = 0;
+        if self.mode == ViewMode::Examine {
+            self.yaw = 0;
+            self.pitch = 0;
+            self.roll = 0;
+            self.model_x = MODEL_REST_X;
+            self.stage = ViewStage::Display;
+            self.zoom_timer = 0;
+            self.entry_fade = 0;
+        } else {
+            self.restart_intro();
+        }
         Ok(())
     }
 
     fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
+        // The take/got-item flows are driven by the engine, which steps the
+        // model intro/exit itself so it can show the game's message window
+        // between them; the viewer never reads the pad in these modes.
+        if self.mode != ViewMode::Examine {
+            return ScreenResult::Continue;
+        }
+
         // The description window owns the input while it is up: confirm
         // advances or dismisses it, and the model holds its pose.
         if self.message.active {
@@ -408,7 +564,8 @@ impl Screen for ItemViewScreen {
             let empty = Text::default();
             self.message
                 .draw(framebuffer, font, cx.text.unwrap_or(&empty));
-        } else if !self.name.is_empty() {
+        } else if self.mode == ViewMode::Examine && !self.name.is_empty() {
+            // The take/got-item flows name the item in their message instead.
             font.draw_text(
                 framebuffer,
                 font.metrics.left_margin,
@@ -762,6 +919,59 @@ mod tests {
             },
         );
         assert!(!screen.message_active(), "confirm dismissed the window");
+    }
+
+    #[test]
+    fn the_take_intro_settles_on_the_resting_pose_and_the_exit_mirrors_it() {
+        let mut screen = ItemViewScreen::new_take(1);
+        assert_eq!(screen.mode(), ViewMode::Take);
+        assert!(screen.in_intro());
+        assert_eq!(screen.fade(), 255, "the intro starts black");
+
+        let mut frames = 0;
+        while screen.in_intro() {
+            screen.step_intro();
+            frames += 1;
+            assert!(frames <= INTRO_FRAMES + 1, "the intro never finished");
+        }
+        assert_eq!(frames, INTRO_FRAMES, "the intro is 0x40 frames");
+        assert_eq!(
+            screen.root_matrix().t[0],
+            MODEL_REST_X,
+            "the model lands at its resting translation"
+        );
+        assert_eq!(screen.yaw, 0, "three whole turns land on the identity");
+        assert_eq!(screen.fade(), 0, "the intro reaches full brightness");
+
+        // The exit is the intro in reverse and reports completion.
+        screen.begin_exit();
+        assert!(screen.in_exit());
+        let mut frames = 0;
+        while !screen.step_exit() {
+            frames += 1;
+            assert!(frames <= INTRO_FRAMES + 1, "the exit never finished");
+        }
+        assert_eq!(frames, INTRO_FRAMES - 1);
+
+        // A got-item viewer opens the same intro but takes no pad input.
+        let dir = TempDir::new();
+        let pack = empty_pack(&dir);
+        let text = Text::default();
+        let cx = context(&pack, &text);
+        let mut screen = ItemViewScreen::new_got_item(1);
+        assert_eq!(screen.mode(), ViewMode::GotItem);
+        assert_eq!(
+            screen.update(
+                &cx,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+            ),
+            ScreenResult::Continue,
+            "the engine, not the pad, closes a pickup viewer"
+        );
+        assert!(screen.in_intro());
     }
 
     #[test]

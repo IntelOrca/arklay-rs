@@ -192,8 +192,19 @@ pub const ROOM_FLAG_MAP_BASE: u8 = 0x7C;
 /// 2F, courtyard + underground, guardhouse and laboratory. The bases are the
 /// running sum of the per-group room counts.
 pub const STAGE_ROOM_FLAG_OFFSETS: [u8; 6] = [0, 32, 63, 82, 100, 0];
+/// Global 0xC1: the "you got the item" line, shared by the include-key
+/// prompt and the scripted got-item viewer.
+pub const MESSAGE_GOT_ITEM: u8 = 0xC1;
 /// Prompt message the include-key handler shows before the pickup.
-const MESSAGE_INCLUDE_KEY: u8 = 0xC1;
+const MESSAGE_INCLUDE_KEY: u8 = MESSAGE_GOT_ITEM;
+/// Global 0xC0: the ground pick-up prompt's yes/no stream ("Will you take
+/// the item?"). The yes branch carries the take action.
+pub const MESSAGE_TAKE_PROMPT: u8 = 0xC0;
+/// Global 0xC2: the ground pick-up refusal when the inventory cannot hold
+/// the item.
+pub const MESSAGE_INVENTORY_FULL: u8 = 0xC2;
+/// Global 0xC6: the document pick-up "has been filed" line.
+pub const MESSAGE_FILE_FILED: u8 = 0xC6;
 /// Effect sprite the item build's `0x8000` flag spawns.
 const EFFECT_ITEM_SPARKLE: u8 = 0x0B;
 /// Scenario flag raised when the radio is taken.
@@ -1078,6 +1089,32 @@ pub struct RoomInteraction {
     pub kind: RoomActionKind,
     /// Message id when the interaction opens a message.
     pub message: Option<u16>,
+}
+
+/// Which item-viewer menu mode a pending main-state flag asks the engine to
+/// open (the original's `main_menu` modes 3, 4 and 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemViewKind {
+    /// A ground pick-up (`set_key_flag`, `MSF_MENU_ITEM_VIEW`): the item
+    /// model intro, then global 0xC0's yes/no prompt (or 0xC2 when the
+    /// inventory has no room).
+    Take,
+    /// A scripted `give_item` (`MSF_MENU_GOT_ITEM`): the item model intro,
+    /// then global 0xC1's "you got it" line, with the award when it closes.
+    GotItem,
+    /// A document (`set_room_event_flag`, `MSF_PICKUP_SCREEN`): the original
+    /// runs its file-list screen; the port shows global 0xC6 and files the
+    /// entry.
+    Document,
+}
+
+/// A pending item-viewer request read from the main-state flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ItemViewRequest {
+    /// The room action slot the viewer will award or file.
+    pub slot: u8,
+    /// Which viewer flow the flags selected.
+    pub kind: ItemViewKind,
 }
 
 /// One scripted entity.
@@ -3996,6 +4033,158 @@ impl GameState {
         self.pick_up(slot)
     }
 
+    /// `set_key_flag` (handler 4): arm the item viewer for the ground item in
+    /// `slot`.
+    ///
+    /// The original raises `MSF_MENU_ITEM_VIEW` and lets the main loop open
+    /// its mode-3 menu, which runs the model intro and the 0xC0 yes/no prompt;
+    /// the yes branch awards through [`Self::pick_up`]. Returns whether an item
+    /// action was armed.
+    ///
+    /// # Documented deviation
+    ///
+    /// When the action's `(id, flag)` word is nonzero the original routes the
+    /// press through the 0x0c reach animation and re-raises the flag when the
+    /// animation completes; the port has no reach animation, so it raises the
+    /// flag directly.
+    pub fn arm_item_pickup(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        self.message_item_slot = Some(slot);
+        self.apply_flag(5, MSF_MENU_ITEM_VIEW, 0);
+        self.record_interaction(slot, RoomActionKind::Item, None);
+        true
+    }
+
+    /// `set_room_event_flag` (handler 0x0D): arm the document pick-up screen
+    /// for the item in `slot`.
+    ///
+    /// The original raises `MSF_PICKUP_SCREEN` and opens main-menu state 8,
+    /// the file-list screen that files the entry and shows global 0xC6.
+    ///
+    /// # Documented deviation
+    ///
+    /// The port does not port the state-8 file-list screen (its art, layout and
+    /// navigation are a separate slice); it shows the same observable result
+    /// through global 0xC6 and files the entry through
+    /// [`Self::take_document`].
+    pub fn arm_document(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        self.message_item_slot = Some(slot);
+        self.apply_flag(5, MSF_PICKUP_SCREEN, 0);
+        self.record_interaction(slot, RoomActionKind::Item, None);
+        true
+    }
+
+    /// The pending item-viewer request, when one of the main-state menu bits
+    /// is raised and its action entry is still present.
+    ///
+    /// The original tests `MSF_PICKUP_SCREEN` before the mode scan, then
+    /// priority-encodes modes 4 (got item) and 3 (item view). `None` when no
+    /// viewer is pending.
+    pub fn item_view_request(&self) -> Option<ItemViewRequest> {
+        let request = if self.flags[5].bit(MSF_PICKUP_SCREEN) {
+            ItemViewRequest {
+                slot: self.message_item_slot?,
+                kind: ItemViewKind::Document,
+            }
+        } else if self.flags[5].bit(MSF_MENU_GOT_ITEM) {
+            ItemViewRequest {
+                slot: self.got_item_slot?,
+                kind: ItemViewKind::GotItem,
+            }
+        } else if self.flags[5].bit(MSF_MENU_ITEM_VIEW) {
+            ItemViewRequest {
+                slot: self.message_item_slot?,
+                kind: ItemViewKind::Take,
+            }
+        } else {
+            return None;
+        };
+        self.room_actions
+            .get(usize::from(request.slot))
+            .is_some_and(Option::is_some)
+            .then_some(request)
+    }
+
+    /// Consume the item-viewer menu bits and its armed slots when the mode
+    /// closes (the original's `menu_restore_game_state` clearing the whole
+    /// `MSF_MENU_BYTE` field).
+    pub fn clear_item_view_flags(&mut self) {
+        for sel in [MSF_PICKUP_SCREEN, MSF_MENU_GOT_ITEM, MSF_MENU_ITEM_VIEW] {
+            self.apply_flag(5, sel, 1);
+        }
+        self.message_item_slot = None;
+        self.got_item_slot = None;
+    }
+
+    /// Whether the ground pick-up armed for `slot` fits the inventory, which
+    /// decides between the 0xC0 prompt and the 0xC2 refusal.
+    ///
+    /// The original's mode-3 test: a free inventory slot, or a stackable item
+    /// that merges into an existing stack while staying under the 251 cap.
+    pub fn pickup_fits(&self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        if self.inventory.len() < self.inventory_capacity() {
+            return true;
+        }
+        let item = action.item_id();
+        if !items::is_stackable(item) {
+            return false;
+        }
+        let quantity = if item == items::ITEM_INK_RIBBONS {
+            3
+        } else {
+            action.item_quantity().max(1)
+        };
+        self.inventory
+            .iter()
+            .any(|stack| stack.id == item && u16::from(stack.quantity) + u16::from(quantity) < 251)
+    }
+
+    /// Raise the FILE-collected bit for a document item, so the FILE tab lists
+    /// it.
+    pub fn mark_file_collected(&mut self, item: u8) {
+        if let Some(index) = file_index(item) {
+            self.apply_flag(BANK_ROOM_FLAGS, ROOM_FLAG_FILE_BASE.wrapping_add(index), 0);
+        }
+    }
+
+    /// Consume a document pick-up: record the picked id, tear the model and
+    /// room-items bit down and leave the inventory untouched. This is the
+    /// original's state-8 completion; the FILE bit is raised by the caller when
+    /// the screen opens.
+    pub fn take_document(&mut self, slot: u8) -> bool {
+        let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
+            return false;
+        };
+        if action.kind != RoomActionKind::Item {
+            return false;
+        }
+        let item = action.item_id();
+        self.last_picked_item = Some(item);
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = item;
+        self.mark_file_collected(item);
+        // The state-8 screen clears the model byte and the room-items bit but
+        // never frees the sparkle pool slot.
+        self.tear_down_item(slot, action, false);
+        true
+    }
+
     /// `check_door` (handler 5) and `check_door_side` (handler 6): latch the
     /// side the player approaches a door zone from.
     ///
@@ -4581,9 +4770,11 @@ impl GameState {
 
     /// Run one room action handler by index, as `aot_on` and `give_item` do.
     ///
-    /// Handler `0` and any unimplemented handler are inert. Item handlers pick
-    /// the action up, the door handler transitions, the message handler shows
-    /// its message, and the menu-driven handlers record a placeholder.
+    /// Handler `0` and any unimplemented handler are inert. The ordinary item
+    /// handler arms the item viewer ([`Self::arm_item_pickup`]), the document
+    /// handler arms the filed screen ([`Self::arm_document`]), map items are
+    /// awarded by [`Self::pick_up_map`], the door handler transitions, and the
+    /// message handler shows its message.
     ///
     /// The desk handler (0x0E) runs the full lock/key/open/award flow through
     /// [`Self::check_desk`]; the effect-zone handler (0x0B) raises
@@ -4608,17 +4799,9 @@ impl GameState {
                 true
             }
             HANDLER_INCLUDE_KEY if action.kind == RoomActionKind::Item => self.include_key(slot),
-            HANDLER_ITEM if action.kind == RoomActionKind::Item => self.pick_up(slot),
+            HANDLER_ITEM if action.kind == RoomActionKind::Item => self.arm_item_pickup(slot),
             HANDLER_PICKUP_KEY if action.kind == RoomActionKind::Item => self.pick_up_map(slot),
-            HANDLER_DOCUMENT if action.kind == RoomActionKind::Item => {
-                // The original only arms the entry here and returns 1 to select
-                // the reach animation; the item is awarded as the message chain
-                // completes. The port keeps its immediate-award deviation and
-                // records the reach-animation return as the interaction.
-                let taken = self.pick_up(slot);
-                self.record_interaction(slot, RoomActionKind::Item, None);
-                taken
-            }
+            HANDLER_DOCUMENT if action.kind == RoomActionKind::Item => self.arm_document(slot),
             HANDLER_FLAG_BANK_SET => self.flag_bank_set(slot),
             HANDLER_DESK if action.kind == RoomActionKind::Desk => self.check_desk(slot),
             HANDLER_MESSAGE => {
@@ -4667,11 +4850,14 @@ impl GameState {
     /// Pick up the ordinary item action in `slot`: add it to the inventory,
     /// record it and tear the model down.
     ///
-    /// This is the original's `room_event_item_pickup` body; maps take
-    /// [`Self::pick_up_map`] and documents reach the same award through
-    /// handler 0x0D. The radio (0x4D) is not an inventory item: the original's
-    /// take path raises scenario flag 0x7F and awards nothing, so it takes the
-    /// flag-only branch here.
+    /// This is the original's `room_event_take_item`/`room_event_item_pickup`
+    /// award body. It runs when the yes/no prompt is confirmed (the message
+    /// post-action) or when the scripted got-item viewer closes; the room
+    /// handler itself only arms the viewer ([`Self::arm_item_pickup`]). Maps
+    /// take [`Self::pick_up_map`] and documents [`Self::take_document`]. The
+    /// radio (0x4D) is not an inventory item: the original's take path raises
+    /// scenario flag 0x7F and awards nothing, so it takes the flag-only branch
+    /// here.
     pub fn pick_up(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
@@ -9240,6 +9426,8 @@ mod tests {
         }
         assert!(state.room_actions[3].is_some());
         state.interact([-550, 0, 50], 0, true);
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW), "the probe arms it");
+        assert!(state.take_message_item(), "the prompt's award runs");
         assert_eq!(state.last_picked_item, Some(0x42));
         assert!(
             !state.room_item_present(23),
@@ -10120,10 +10308,23 @@ mod tests {
     }
 
     #[test]
-    fn set_key_flag_keeps_the_immediate_award() {
+    fn set_key_flag_arms_the_viewer_without_awarding() {
         let mut state = item_game("1000", 1);
         state.room_actions[0] = Some(item_action(0, 0x42, 2, [0, 0, 1, 1]));
         assert!(state.run_room_action(0, HANDLER_ITEM));
+        assert!(
+            state.flags[5].bit(MSF_MENU_ITEM_VIEW),
+            "the item-viewer menu mode is pending"
+        );
+        assert_eq!(state.message_item_slot, Some(0));
+        assert!(
+            state.inventory.is_empty(),
+            "the viewer owns the award now, not the probe"
+        );
+        assert!(state.room_actions[0].is_some());
+
+        // The yes/no prompt's post-action awards through `pick_up`.
+        assert!(state.take_message_item());
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
@@ -10132,6 +10333,64 @@ mod tests {
             }]
         );
         assert!(state.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn item_view_request_reads_the_pending_flags() {
+        let mut state = item_game("1000", 1);
+        state.room_actions[0] = Some(item_action(0, 0x42, 1, [0, 0, 1, 1]));
+        assert_eq!(state.item_view_request(), None);
+
+        assert!(state.arm_item_pickup(0));
+        assert_eq!(
+            state.item_view_request(),
+            Some(ItemViewRequest {
+                slot: 0,
+                kind: ItemViewKind::Take,
+            })
+        );
+        state.clear_item_view_flags();
+        assert_eq!(state.item_view_request(), None);
+
+        let mut action = item_action(1, 0x60, 1, [0, 0, 1, 1]);
+        action.handler = HANDLER_DOCUMENT;
+        state.room_actions[1] = Some(action);
+        assert!(state.arm_document(1));
+        assert_eq!(
+            state.item_view_request(),
+            Some(ItemViewRequest {
+                slot: 1,
+                kind: ItemViewKind::Document,
+            })
+        );
+        // A missing action clears the request instead of latching the flag.
+        state.room_actions[1] = None;
+        assert_eq!(state.item_view_request(), None);
+    }
+
+    #[test]
+    fn pickup_fits_follows_the_free_slot_and_merge_rules() {
+        let mut state = item_game("1000", 1);
+        state.room_actions[0] = Some(item_action(0, 0x33, 1, [0, 0, 1, 1]));
+        assert!(state.pickup_fits(0), "a free slot fits any item");
+
+        // Fill every slot with distinct non-stackable items.
+        for item in [0x41, 0x42, 0x43, 0x44, 0x45, 0x46] {
+            state.add_item(item, 1);
+        }
+        assert_eq!(state.inventory.len(), state.inventory_capacity());
+        assert!(!state.pickup_fits(0), "a full pack refuses a new stack");
+
+        // A stackable item that merges into an existing stack still fits.
+        state.room_actions[1] = Some(item_action(1, 0x0B, 5, [0, 0, 1, 1]));
+        assert!(!state.pickup_fits(1), "no clip stack is held");
+        state.inventory[0] = InventoryItem {
+            id: 0x0B,
+            quantity: 0xF8,
+        };
+        assert!(!state.pickup_fits(1), "the merge would pass the 251 cap");
+        state.inventory[0].quantity = 5;
+        assert!(state.pickup_fits(1), "the clip merges into its stack");
     }
 
     #[test]
@@ -10149,9 +10408,16 @@ mod tests {
         assert!(!state.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_RADIO, false));
         assert!(state.run_room_action(0, HANDLER_ITEM));
         assert!(
+            state.flags[5].bit(MSF_MENU_ITEM_VIEW),
+            "the probe arms the viewer first"
+        );
+        assert!(
             state.inventory.is_empty(),
             "the radio is never an inventory item"
         );
+        assert!(!state.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_RADIO, false));
+        // The prompt's award branch reaches the radio's flag-only path.
+        assert!(state.take_message_item());
         assert!(state.flag_test(BANK_SCENARIO, SCENARIO_FLAG_HAS_RADIO, false));
         assert_eq!(state.last_picked_item, None, "no picked-item record either");
         assert_eq!(
@@ -10320,7 +10586,7 @@ mod tests {
     }
 
     #[test]
-    fn document_handler_awards_and_raises_the_file_bit() {
+    fn document_handler_files_the_entry_without_an_inventory_award() {
         let mut state = item_game("1000", 1);
         {
             let mut host = ScdGameHost::new(&mut state);
@@ -10328,14 +10594,31 @@ mod tests {
         }
         assert_eq!(state.room_actions[0].unwrap().handler, HANDLER_DOCUMENT);
         assert!(state.run_room_action(0, HANDLER_DOCUMENT));
-        assert!(state.has_item(0x60));
+        assert!(
+            state.flags[5].bit(MSF_PICKUP_SCREEN),
+            "the pick-up screen mode is pending"
+        );
+        assert_eq!(state.message_item_slot, Some(0));
+        assert!(
+            state.inventory.is_empty(),
+            "a document never enters the inventory"
+        );
+        assert!(state.room_actions[0].is_some());
+
+        // The screen's completion files the entry and consumes the action.
+        assert!(state.take_document(0));
         assert!(state.file_collected(1), "the FILE bit is raised");
+        assert_eq!(
+            state.last_picked_item,
+            Some(0x60),
+            "the picked id is recorded"
+        );
         assert_eq!(state.items.record(0).unwrap().flag, 0, "the model clears");
         assert!(state.room_actions[0].is_none());
         assert_eq!(
             state.last_interaction.map(|interaction| interaction.kind),
             Some(RoomActionKind::Item),
-            "the reach-animation return is recorded as the interaction"
+            "the handler records the interaction"
         );
     }
 
@@ -10426,8 +10709,12 @@ mod tests {
         );
 
         // Action-key entries fire the first match only, as in the original;
-        // the next press reaches the second stack.
+        // the next press reaches the second stack. Each probe arms the item
+        // viewer; the prompt's post-action is what awards.
         state.interact([-550, 0, 50], 0, true);
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert!(state.inventory.is_empty(), "the probe only arms");
+        assert!(state.take_message_item());
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
@@ -10439,6 +10726,7 @@ mod tests {
         assert_eq!(state.item_events, vec![0x0B]);
 
         state.interact([-550, 0, 50], 0, true);
+        assert!(state.take_message_item());
         assert_eq!(
             state.inventory,
             vec![InventoryItem {
@@ -10781,6 +11069,14 @@ mod tests {
         assert!(state.flags[5].bit(MSF_MENU_GOT_ITEM));
         assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
         assert!(state.room_actions[2].is_some());
+        assert!(state.menu_pending(), "the pending bits gate other probes");
+        assert_eq!(
+            state.item_view_request(),
+            Some(ItemViewRequest {
+                slot: 2,
+                kind: ItemViewKind::GotItem,
+            })
+        );
 
         // Closing the viewer awards the item and consumes the action.
         assert!(state.close_got_item_viewer());
@@ -10799,7 +11095,7 @@ mod tests {
     }
 
     #[test]
-    fn aot_on_picks_up_an_item_action() {
+    fn aot_on_arms_the_viewer_for_an_item_action() {
         let mut state = game();
         state.room_actions[3] = Some(item_action(3, 0x42, 1, [0, 0, 1, 1]));
         {
@@ -10809,6 +11105,16 @@ mod tests {
                 StepResult::Continue
             );
         }
+        assert!(state.flags[5].bit(MSF_MENU_ITEM_VIEW));
+        assert_eq!(state.message_item_slot, Some(3));
+        assert!(
+            state.room_actions[3].is_some(),
+            "the probe does not take it"
+        );
+        assert!(
+            state.take_message_item(),
+            "the award path still consumes it"
+        );
         assert_eq!(state.last_picked_item, Some(0x42));
         assert!(state.room_actions[3].is_none());
     }
@@ -11680,6 +11986,7 @@ mod tests {
         state.room_actions[0] = Some(action);
         state.apply_flag(7, 7, 0);
         state.interact([-550, 0, 50], 0, true);
+        assert!(state.take_message_item(), "the armed prompt awards");
         assert_eq!(state.last_picked_item, Some(0x42));
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0x42);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_TOTAL_HELD)], 1);
@@ -12421,8 +12728,14 @@ mod tests {
         assert!(state.inventory.is_empty(), "the player pass skips bit 2");
 
         state.probe_actions([0, 0, 0], 0, 4, [0, 0, 50], false);
-        assert!(state.has_item(0x41), "the object pass dispatches bit 2");
-        assert!(state.room_actions[1].is_none(), "the pickup consumed it");
+        assert!(
+            state.flags[5].bit(MSF_MENU_ITEM_VIEW),
+            "the object pass dispatches bit 2"
+        );
+        assert!(state.inventory.is_empty(), "the viewer owns the award now");
+        assert!(state.pick_up(1), "the award path still consumes it");
+        assert!(state.has_item(0x41));
+        assert!(state.room_actions[1].is_none());
     }
 
     #[test]
