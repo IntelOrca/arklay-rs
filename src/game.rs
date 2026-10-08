@@ -3997,7 +3997,7 @@ impl GameState {
                 operand_u8(operands, base + 5),
             ],
             kind: u16::from(operand_u8(operands, base + 6)),
-            radius: operand_i16(operands, base + 7),
+            radius: operand_u16(operands, base + 7),
         };
         self.room_light_edits.push(RoomLightsEdit {
             lights: [light(1), light(9), light(17)],

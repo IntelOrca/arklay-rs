@@ -432,8 +432,12 @@ impl Screen for CharSelectScreen {
                 None
             }
         };
+        // The card sheet's transparency is stored as exact black (the
+        // original's BGR555 0x8000 cut-outs around the rounded corners and
+        // the arrows); the converted 24-bit BMP cannot carry alpha, so key
+        // black out here. The background sheet above keeps its black art.
         self.cards = match cx.pack.read("ui/select_b.bmp") {
-            Ok(bytes) => match bmp::decode(bytes) {
+            Ok(bytes) => match bmp::decode_mask(bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid character-select cards: {err:#}");

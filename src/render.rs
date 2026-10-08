@@ -1918,15 +1918,17 @@ impl Lighting {
                     entity_pos[1] - light.pos[1],
                     entity_pos[2] - light.pos[2],
                 ];
-                let radius = i32::from(light.radius);
-                let attenuation = if radius <= 0 {
+                // The original reads the radius as unsigned: 0xFFFF is the
+                // widest falloff, and only an exact zero disables the light.
+                let radius = i64::from(light.radius);
+                let attenuation = if radius == 0 {
                     0
                 } else {
                     let dx = i64::from(offset[0]);
                     let dz = i64::from(offset[2]);
-                    (i64::from(radius) - integer_sqrt(dx * dx + dz * dz)).max(0)
+                    (radius - integer_sqrt(dx * dx + dz * dz)).max(0)
                 };
-                let color = if radius <= 0 {
+                let color = if radius == 0 {
                     [0; 3]
                 } else {
                     light.color.map(|channel| {
@@ -4829,6 +4831,24 @@ mod tests {
         let light = zero.latched([0, 0, 0]);
         assert_eq!(light.sources[0].color, [0.0; 3]);
         assert_eq!(light.sources[0].direction, [0.0, 0.0, 0.0]);
+
+        // The radius is unsigned: 0xFFFF is the widest falloff, not -1, so a
+        // room whose lights store it stays lit at any in-room distance.
+        let wide = Lighting {
+            ambient: [0; 3],
+            lights: [
+                Light {
+                    pos: [0; 3],
+                    color: [255, 255, 255],
+                    kind: 0,
+                    radius: 0xFFFF,
+                },
+                Light::default(),
+                Light::default(),
+            ],
+        };
+        let light = wide.latched([0, 0, 1000]);
+        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
 
         // A directional light's position is its direction vector: it is
         // normalized, capped at 0x80 and reversed (the stored direction points

@@ -134,8 +134,9 @@ pub struct Light {
     /// Light type: 0 is a point light with radial falloff, anything else is
     /// directional.
     pub kind: u16,
-    /// Falloff radius, used by point lights.
-    pub radius: i16,
+    /// Falloff radius, used by point lights. The original consumes it as an
+    /// unsigned 16-bit value, so `0xFFFF` is the widest radius, not -1.
+    pub radius: u16,
 }
 
 /// One collision boundary rectangle, corners stored max-first.

@@ -122,6 +122,15 @@ impl TitleScreen {
         self.selection
     }
 
+    /// Whether confirming has handed the screen back to gameplay pacing.
+    ///
+    /// The original sets its game-active flag when NEW GAME or LOAD GAME is
+    /// confirmed, so the fade-out chain runs on the 33 ms gameplay limiter
+    /// while the PRESS and menu phases run on the 16 ms one.
+    pub fn game_active(&self) -> bool {
+        self.stage == Stage::FadeOut
+    }
+
     /// Move the menu cursor by `delta`. LOAD GAME is unreachable while no save
     /// exists, so the selection stays on NEW GAME.
     fn move_selection(&mut self, delta: i32) {

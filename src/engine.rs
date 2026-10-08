@@ -126,12 +126,13 @@ const PIXEL_PITCH: i32 = WIDTH * 4;
 const TICK_MS: f64 = 1000.0 / 30.0;
 /// The original's non-gameplay frame-limiter period in milliseconds.
 ///
-/// While a door transition owns the screen the original clears its
-/// game-active flag and drops from the 33 ms gameplay interval to the 16 ms
-/// one, and the door animation advances one frame per platform frame. The
-/// port ticks its transition VM once per step, so it must use this interval
-/// for the original's wall-clock timing.
-const TRANSITION_TICK_MS: f64 = 16.0;
+/// The original paces at 33 ms while the game is active and at 16 ms while
+/// it is not: door transitions, the title, character select, the pause menu
+/// and its modals, the endings and the save screens all run with the
+/// game-active flag clear, and their state machines advance one frame per
+/// platform frame. The port ticks those at this interval so their wall-clock
+/// timing matches.
+const UI_TICK_MS: f64 = 16.0;
 /// The absent Virgin logo the boot sequence requests first.
 const BOOT_VLOGO_ID: u8 = 28;
 /// The Capcom logo the boot sequence requests after the Virgin logo.
@@ -511,13 +512,14 @@ fn run_lua_tick_hooks(lua: Option<&lua::LuaVm>, game: &mut game::GameState, mess
 
 /// The fixed step the session loop uses for the current screen.
 ///
-/// Gameplay runs at the original's 30 Hz interval; once a door transition
-/// owns the screen the original drops out of gameplay pacing and advances
-/// the door animation on its 16 ms non-gameplay limiter, so the port steps
-/// the transition VM at the same wall-clock rate.
-fn session_tick_interval(transition_active: bool) -> f64 {
-    if transition_active {
-        TRANSITION_TICK_MS
+/// Gameplay runs at the original's 30 Hz interval; while a door transition
+/// or a pause-menu screen (menu, item box, pickup viewer, map, file, save
+/// screen or gameplay modal) owns the screen the original clears its
+/// game-active flag and runs on the 16 ms non-gameplay limiter, so the port
+/// steps those at the same wall-clock rate.
+fn session_tick_interval(transition_active: bool, menu_active: bool) -> f64 {
+    if transition_active || menu_active {
+        UI_TICK_MS
     } else {
         TICK_MS
     }
@@ -552,7 +554,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         let poll_elapsed = now.saturating_sub(last_poll) as f64;
         last_poll = now;
         session.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
-        let tick_ms = session_tick_interval(session.transition.is_some());
+        let tick_ms = session_tick_interval(session.transition.is_some(), session.room_frozen());
         while accumulator >= tick_ms {
             if session.transition_finished {
                 accumulator = 0.0;
@@ -1198,8 +1200,28 @@ impl GameSession {
             self.game.id.player_flag,
             slow,
         );
-        // The global SE bank (the lid's `0x20`) has no pack mapping yet.
-        self.game.sfx_requests.clear();
+        // Queued non-positional room SEs (`play_sfx(2, id)`) resolve through
+        // the current room's sound-table column, exactly like the original's
+        // bank-2 calls: the item-box lid (0x20), the locked-door rattles, the
+        // key turn and the desk cues all arrive here.
+        let requests = std::mem::take(&mut self.game.sfx_requests);
+        if !requests.is_empty() {
+            let row = sfx::room_row(self.loaded.room.stage, self.loaded.room.room);
+            for id in requests {
+                let Ok(column) = u8::try_from(id) else {
+                    continue;
+                };
+                let Some(name) = sfx::room_sound(row, usize::from(column)) else {
+                    continue;
+                };
+                let Some(wav) = self.sfx_cache.load(pack, name) else {
+                    continue;
+                };
+                if let Some(mixer) = &mut self.music {
+                    mixer.play_sfx_on_bank(sfx_bank_key(2, column), wav, 1.0, 0.0);
+                }
+            }
+        }
         // A script's `movie_on` request takes over after this tick: the film
         // owns the next tick and the game sounds pause until it ends. A
         // pending door transition wins and leaves the request for after it.
@@ -1222,6 +1244,18 @@ impl GameSession {
             }
         }
         Ok(())
+    }
+
+    /// Whether a pause-menu screen owns the tick, so the room is frozen and
+    /// the original runs on its 16 ms non-gameplay limiter.
+    fn room_frozen(&self) -> bool {
+        self.menu.is_some()
+            || self.item_box.is_some()
+            || self.pickup_view.is_some()
+            || self.file.is_some()
+            || self.map.is_some()
+            || self.save_screen.is_some()
+            || self.modal.is_some()
     }
 
     /// One frozen tick of the active film: advance it against the mixer's
@@ -2440,8 +2474,35 @@ impl App {
     /// Poll the active app film's skip input between ticks; see
     /// [`GameSession::poll_movie_skip`].
     fn poll_movie_skip(&mut self, buttons: u16, elapsed_ms: f64) {
-        if let Mode::Movie(session) = &mut self.mode {
-            session.poll_skip(buttons, elapsed_ms);
+        match &mut self.mode {
+            Mode::Movie(session) => {
+                session.poll_skip(buttons, elapsed_ms);
+            }
+            Mode::Play(session) => session.poll_movie_skip(buttons, elapsed_ms),
+            _ => {}
+        }
+    }
+
+    /// The fixed step the app loop uses for the current screen.
+    ///
+    /// The original runs the title, character select, load screen and every
+    /// in-game menu/modal with its game-active flag clear, i.e. on the 16 ms
+    /// non-gameplay limiter; gameplay and films use the 33 ms one. The title
+    /// switches to gameplay pacing once NEW GAME or LOAD GAME is confirmed.
+    fn tick_interval(&self) -> f64 {
+        match &self.mode {
+            Mode::Title(screen) => {
+                if screen.game_active() {
+                    TICK_MS
+                } else {
+                    UI_TICK_MS
+                }
+            }
+            Mode::Select(_) | Mode::Load(_) => UI_TICK_MS,
+            Mode::Play(session) => {
+                session_tick_interval(session.transition.is_some(), session.room_frozen())
+            }
+            Mode::Movie(_) => TICK_MS,
         }
     }
 
@@ -3086,12 +3147,13 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
         let poll_elapsed = now.saturating_sub(last_poll) as f64;
         last_poll = now;
         app.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
-        while accumulator >= TICK_MS {
+        let tick_ms = app.tick_interval();
+        while accumulator >= tick_ms {
             let tick = input.tick();
             if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
                 return Ok(());
             }
-            accumulator -= TICK_MS;
+            accumulator -= tick_ms;
         }
         app.draw();
         display.present(app.frame())?;
@@ -10878,12 +10940,13 @@ end
 
     #[test]
     fn the_session_step_switches_to_the_door_interval() {
-        assert_eq!(session_tick_interval(false), TICK_MS);
-        assert_eq!(session_tick_interval(true), TRANSITION_TICK_MS);
+        assert_eq!(session_tick_interval(false, false), TICK_MS);
+        assert_eq!(session_tick_interval(true, false), UI_TICK_MS);
+        assert_eq!(session_tick_interval(false, true), UI_TICK_MS);
         // The original's door pass runs on the 16 ms non-gameplay limiter, so
         // a 300-pass door file takes about 4.8 s rather than the 10 s the
         // 30 Hz gameplay step would give.
-        assert!((TRANSITION_TICK_MS * 300.0 - 4800.0).abs() < 0.1);
+        assert!((UI_TICK_MS * 300.0 - 4800.0).abs() < 0.1);
     }
 
     #[test]

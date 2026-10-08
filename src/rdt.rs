@@ -214,7 +214,7 @@ fn parse_light(data: &[u8], offset: usize) -> Result<Light> {
         ],
         color: [color[0], color[1], color[2]],
         kind: u16_at(data, offset + 0x10)?,
-        radius: i16_at(data, offset + 0x12)?,
+        radius: u16_at(data, offset + 0x12)?,
     })
 }
 
@@ -876,7 +876,7 @@ mod tests {
         assert_eq!(state.lights[0].radius, 7000);
         assert_eq!(state.lights[1].pos, [-4, -5, -6]);
         assert_eq!(state.lights[1].kind, 1);
-        assert_eq!(state.lights[1].radius, -1);
+        assert_eq!(state.lights[1].radius, 0xFFFF);
         assert_eq!(state.lights[2].color, [70, 80, 90]);
         assert_eq!(state.lights[2].radius, 100);
     }

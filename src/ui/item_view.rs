@@ -51,6 +51,9 @@ pub const CAMERA_FROM: [i32; 3] = [15000, 0, 0];
 pub const CAMERA_TO: [i32; 3] = [0, 0, 0];
 /// The model's resting translation on +X, in front of the camera.
 pub const MODEL_REST_X: i32 = 0x1980;
+/// The menu's projection centre (the original's `SetSubpixelOffset(112, 76)`
+/// while `main_menu` owns the screen).
+pub const MENU_CENTER: [i32; 2] = [112, 76];
 /// Viewer focal length in pixels.
 pub const VIEWER_FOV: i32 = 0xC0;
 /// Rotation step per 30 Hz frame, in 12-bit angle units.
@@ -342,8 +345,15 @@ impl ItemViewScreen {
     }
 
     /// The fixed viewer camera.
+    ///
+    /// The projection centre is the menu's `(112, 76)`, not the screen
+    /// centre: the model rests at the viewport box's centre rather than at
+    /// `(160, 120)`.
     pub fn camera(&self) -> Camera {
-        Camera::from_points(CAMERA_FROM, CAMERA_TO, VIEWER_FOV)
+        let mut camera = Camera::from_points(CAMERA_FROM, CAMERA_TO, VIEWER_FOV);
+        // The projection adds the offset to the screen centre (160, 120).
+        camera.screen = [MENU_CENTER[0] - 160, MENU_CENTER[1] - 120];
+        camera
     }
 
     /// Open the description window on the item's own line. Refused while one
@@ -669,6 +679,17 @@ mod tests {
             ticks: 0,
             cues: Default::default(),
         }
+    }
+
+    #[test]
+    fn the_viewer_camera_centres_the_model_in_the_menu_viewport() {
+        let screen = ItemViewScreen::new(0x01);
+        // The resting model's origin projects to the menu's projection centre
+        // (the original's SetSubpixelOffset(112, 76)), not the screen centre.
+        assert_eq!(
+            screen.camera().project([MODEL_REST_X, 0, 0]),
+            Some(MENU_CENTER)
+        );
     }
 
     #[test]
