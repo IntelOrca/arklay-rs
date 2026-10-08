@@ -7593,7 +7593,8 @@ mod tests {
         assert!(player::position_blocked(
             &session.loaded.room,
             session.player.pos,
-            session.player.radius
+            session.player.radius,
+            session.player.collision_flags
         ));
 
         session.set_debug_menu(true);
@@ -7640,7 +7641,8 @@ mod tests {
             !player::position_blocked(
                 &session.loaded.room,
                 session.player.pos,
-                session.player.radius
+                session.player.radius,
+                session.player.collision_flags
             ),
             "the spawn lands outside collision"
         );
