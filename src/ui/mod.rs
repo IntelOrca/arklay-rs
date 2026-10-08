@@ -32,6 +32,7 @@ use crate::font::Font;
 use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::text::Text;
+use crate::transition::FadeColor;
 
 /// One frame of UI input.
 ///
@@ -104,7 +105,7 @@ pub enum ScreenAction {
 /// device is open. Captures leave the queue drained and unplayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiCue {
-    /// The title's opening cue (`Evil01`, global bank 12).
+    /// The title's confirm voice line (`Evil01`, global bank 12 slot 0).
     Title,
     /// A cursor move (character-table slot 4).
     Cursor,
@@ -112,6 +113,14 @@ pub enum UiCue {
     Cancel,
     /// A confirm/decide (character-table slot 6).
     Decide,
+    /// The character-select cursor move (`Select06`, select bank slot 0).
+    SelectCursor,
+    /// The character-select confirm (`Select05`, select bank slot 1).
+    SelectConfirm,
+    /// The save/load cursor move (`type01`, title bank slot 14).
+    SaveCursor,
+    /// The save/load confirm (`type02`, title bank slot 15).
+    SaveConfirm,
 }
 
 impl UiCue {
@@ -123,6 +132,10 @@ impl UiCue {
             UiCue::Cursor => Some(crate::sfx::UI_CURSOR),
             UiCue::Cancel => Some(crate::sfx::UI_CANCEL),
             UiCue::Decide => Some(crate::sfx::UI_DECIDE),
+            UiCue::SelectCursor => crate::sfx::global_sfx(13, 0),
+            UiCue::SelectConfirm => crate::sfx::global_sfx(13, 1),
+            UiCue::SaveCursor => crate::sfx::global_sfx(12, 14),
+            UiCue::SaveConfirm => crate::sfx::global_sfx(12, 15),
         }
     }
 }
@@ -173,6 +186,19 @@ pub trait Screen {
     fn fade(&self) -> u8 {
         0
     }
+
+    /// The full-screen overlay to blend after the screen draws, or `None`
+    /// while the frame is clear.
+    ///
+    /// The default maps [`Screen::fade`] to a black overlay, so a screen that
+    /// only ever fades to black keeps implementing `fade`; screens with the
+    /// original's white flash override this to select the colour.
+    fn overlay(&self) -> Option<(FadeColor, u8)> {
+        match self.fade() {
+            0 => None,
+            alpha => Some((FadeColor::Black, alpha)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -185,5 +211,34 @@ mod tests {
         assert_eq!(UiCue::Cancel.name(), Some("cancel"));
         assert_eq!(UiCue::Decide.name(), Some("decide"));
         assert_eq!(UiCue::Title.name(), Some("Evil01"));
+        assert_eq!(UiCue::SelectCursor.name(), Some("Select06"));
+        assert_eq!(UiCue::SelectConfirm.name(), Some("Select05"));
+        assert_eq!(UiCue::SaveCursor.name(), Some("type01"));
+        assert_eq!(UiCue::SaveConfirm.name(), Some("type02"));
+    }
+
+    #[test]
+    fn the_default_overlay_is_the_black_fade() {
+        struct Black {
+            alpha: u8,
+        }
+        impl Screen for Black {
+            fn open(&mut self, _cx: &mut UiContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            fn update(&mut self, _cx: &UiContext<'_>, _input: UiInput) -> ScreenResult {
+                ScreenResult::Continue
+            }
+            fn draw(&mut self, _cx: &UiContext<'_>, _framebuffer: &mut Framebuffer) {}
+            fn fade(&self) -> u8 {
+                self.alpha
+            }
+        }
+
+        assert_eq!(Black { alpha: 0 }.overlay(), None);
+        assert_eq!(
+            Black { alpha: 128 }.overlay(),
+            Some((FadeColor::Black, 128))
+        );
     }
 }

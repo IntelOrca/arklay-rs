@@ -2004,8 +2004,7 @@ impl GameSession {
                     cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
-                let fade = screen.fade();
-                framebuffer.fade_to_black(fade);
+                framebuffer.fade_overlay(screen.overlay());
             }
         }
         // The pick-up viewer draws over the inventory panel, before the
@@ -2033,8 +2032,7 @@ impl GameSession {
                     cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
-                let fade = screen.fade();
-                framebuffer.fade_to_black(fade);
+                framebuffer.fade_overlay(screen.overlay());
             }
         }
         if let Some(font) = &self.font {
@@ -2858,7 +2856,7 @@ impl App {
                     cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
-                framebuffer.fade_to_black(screen.fade());
+                framebuffer.fade_overlay(screen.overlay());
             }
             Mode::Select(screen) => {
                 let cx = UiContext {
@@ -2870,7 +2868,7 @@ impl App {
                     cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
-                framebuffer.fade_to_black(screen.fade());
+                framebuffer.fade_overlay(screen.overlay());
             }
             Mode::Load(screen) => {
                 let cx = UiContext {
@@ -2882,7 +2880,7 @@ impl App {
                     cues: std::cell::RefCell::new(Vec::new()),
                 };
                 screen.draw(&cx, framebuffer);
-                framebuffer.fade_to_black(screen.fade());
+                framebuffer.fade_overlay(screen.overlay());
             }
             Mode::Play(session) => {
                 if session.modal.is_none() {
@@ -2899,8 +2897,7 @@ impl App {
                         cues: std::cell::RefCell::new(Vec::new()),
                     };
                     modal.draw(&cx, framebuffer);
-                    let fade = modal.fade();
-                    framebuffer.fade_to_black(fade);
+                    framebuffer.fade_overlay(modal.overlay());
                 }
             }
             Mode::Movie(session) => {
@@ -9120,8 +9117,10 @@ mod tests {
             run_until(&mut app, 256, |app| matches!(app.mode, Mode::Select(_))),
             "the title never opened character select"
         );
+        // The confirm flash chain holds the pick for 128 white-in ticks, 128
+        // white-out ticks and a 16-tick hold before the game starts.
         assert!(
-            run_until(&mut app, 256, |app| matches!(app.mode, Mode::Play(_))),
+            run_until(&mut app, 512, |app| matches!(app.mode, Mode::Play(_))),
             "character select never started the new game"
         );
         let Mode::Play(session) = &app.mode else {

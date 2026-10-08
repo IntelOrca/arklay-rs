@@ -382,15 +382,21 @@ impl Screen for SaveLoadScreen {
         match self.stage {
             Stage::Idle => {
                 if input.up {
-                    cx.play_cue(UiCue::Cursor);
+                    cx.play_cue(UiCue::SaveCursor);
                     self.move_cursor(-1);
                 }
                 if input.down {
-                    cx.play_cue(UiCue::Cursor);
+                    cx.play_cue(UiCue::SaveCursor);
                     self.move_cursor(1);
                 }
                 if input.confirm {
-                    cx.play_cue(UiCue::Decide);
+                    // The exit row uses the cancel slot; the slots use the
+                    // confirm slot (the original's `play_sfx` 29/31).
+                    if self.cursor == EXIT_ROW {
+                        cx.play_cue(UiCue::Cancel);
+                    } else {
+                        cx.play_cue(UiCue::SaveConfirm);
+                    }
                     self.confirm(cx);
                 } else if input.cancel {
                     cx.play_cue(UiCue::Cancel);
@@ -398,20 +404,18 @@ impl Screen for SaveLoadScreen {
                 }
             }
             Stage::ConfirmOverwrite => {
+                // The original's overwrite dialog is silent.
                 if input.left {
-                    cx.play_cue(UiCue::Cursor);
                     self.confirm_choice = 0;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
                 }
                 if input.right {
-                    cx.play_cue(UiCue::Cursor);
                     self.confirm_choice = 1;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
                 }
                 if input.confirm {
-                    cx.play_cue(UiCue::Decide);
                     if self.confirm_choice == 1 {
                         self.stage = Stage::Idle;
                         self.blink_state = false;
@@ -420,7 +424,6 @@ impl Screen for SaveLoadScreen {
                         self.begin_save(cx);
                     }
                 } else if input.cancel {
-                    cx.play_cue(UiCue::Cancel);
                     self.stage = Stage::Idle;
                     self.blink_state = false;
                     self.blink_timer = BLINK_TICKS;
@@ -1120,6 +1123,88 @@ mod tests {
             },
         );
         assert_eq!(screen.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn cue_queue_follows_the_original_bank_slots() {
+        let dir = TempDir::new("cues");
+        save::save(&dir.path, 0, &SaveFile::default()).unwrap();
+        let mut screen = SaveLoadScreen::load();
+        let mut cx = context(&dir.path);
+        screen.open(&mut cx).unwrap();
+
+        screen.update(
+            &cx,
+            UiInput {
+                down: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.cursor(), 1);
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveCursor]);
+        cx.cues.borrow_mut().clear();
+
+        // Slot 2 is empty, but the confirm slot still plays.
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+        assert_eq!(screen.stage, Stage::Idle, "an empty slot refuses");
+        cx.cues.borrow_mut().clear();
+
+        // The exit row confirms with the cancel slot.
+        screen.cursor = EXIT_ROW;
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Cancel]);
+    }
+
+    #[test]
+    fn the_overwrite_dialog_is_silent() {
+        let dir = TempDir::new("silent");
+        save::save(&dir.path, 0, &SaveFile::default()).unwrap();
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        let mut cx = context(&dir.path);
+        screen.open(&mut cx).unwrap();
+        cx.cues.borrow_mut().clear();
+
+        // Open the dialog (the slot-confirm cue is expected first).
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::ConfirmOverwrite);
+        cx.cues.borrow_mut().clear();
+
+        for input in [
+            UiInput {
+                left: true,
+                ..neutral()
+            },
+            UiInput {
+                right: true,
+                ..neutral()
+            },
+            UiInput {
+                cancel: true,
+                ..neutral()
+            },
+        ] {
+            screen.update(&cx, input);
+            assert!(cx.cues.borrow().is_empty(), "the dialog must be silent");
+        }
     }
 
     #[test]

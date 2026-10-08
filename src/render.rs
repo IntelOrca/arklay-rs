@@ -466,25 +466,45 @@ impl Framebuffer {
         }
     }
 
+    /// Blend the whole frame towards `color` by `alpha`/255.
+    ///
+    /// This is the screens' fade overlay: `0` leaves the frame untouched and
+    /// `255` paints it the overlay colour. Alpha is preserved.
+    pub fn fade_to_color(&mut self, color: crate::transition::FadeColor, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        let target: u8 = match color {
+            crate::transition::FadeColor::White => 255,
+            crate::transition::FadeColor::Black => 0,
+        };
+        if alpha == 255 {
+            for pixel in self.rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(target);
+            }
+            return;
+        }
+        let keep = u32::from(255 - alpha);
+        let add = u32::from(target) * u32::from(alpha);
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * keep + add) / 255) as u8;
+            }
+        }
+    }
+
     /// Blend the whole frame towards black by `alpha`/255.
     ///
     /// This is the screens' fade overlay: `0` leaves the frame untouched and
     /// `255` paints it black. Alpha is preserved.
     pub fn fade_to_black(&mut self, alpha: u8) {
-        if alpha == 0 {
-            return;
-        }
-        if alpha == 255 {
-            for pixel in self.rgba.as_chunks_mut::<4>().0 {
-                pixel[..3].fill(0);
-            }
-            return;
-        }
-        let keep = u32::from(255 - alpha);
-        for pixel in self.rgba.as_chunks_mut::<4>().0 {
-            for channel in &mut pixel[..3] {
-                *channel = (u32::from(*channel) * keep / 255) as u8;
-            }
+        self.fade_to_color(crate::transition::FadeColor::Black, alpha);
+    }
+
+    /// Blend a screen's full-frame overlay over the frame.
+    pub fn fade_overlay(&mut self, overlay: Option<(crate::transition::FadeColor, u8)>) {
+        if let Some((color, alpha)) = overlay {
+            self.fade_to_color(color, alpha);
         }
     }
 
@@ -5083,5 +5103,38 @@ mod tests {
             }
         }
         assert!(exercised, "no fixture made the corner mean non-integral");
+    }
+
+    #[test]
+    fn fade_to_color_blends_towards_white_or_black() {
+        use crate::transition::FadeColor;
+
+        let mut frame = Framebuffer::new();
+        frame.fill_rect([0, 0, 2, 1], [100, 50, 200, 255]);
+
+        // Alpha 0 leaves the frame untouched.
+        frame.fade_to_color(FadeColor::White, 0);
+        assert_eq!(&frame.rgba[..4], &[100, 50, 200, 255]);
+
+        // A mid white blends each channel towards 255.
+        frame.fade_to_color(FadeColor::White, 128);
+        assert_eq!(&frame.rgba[..4], &[177, 152, 227, 255]);
+
+        // Full alpha paints the overlay colour and preserves alpha.
+        frame.fade_to_color(FadeColor::White, 255);
+        assert_eq!(&frame.rgba[..4], &[255, 255, 255, 255]);
+
+        frame.fade_to_color(FadeColor::Black, 128);
+        assert_eq!(&frame.rgba[..4], &[127, 127, 127, 255]);
+        frame.fade_to_color(FadeColor::Black, 255);
+        assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
+
+        // The overlay helper maps `None` to no draw.
+        let mut clear = Framebuffer::new();
+        clear.fill_rect([0, 0, 1, 1], [1, 2, 3, 255]);
+        clear.fade_overlay(None);
+        assert_eq!(&clear.rgba[..4], &[1, 2, 3, 255]);
+        clear.fade_overlay(Some((FadeColor::White, 255)));
+        assert_eq!(&clear.rgba[..4], &[255, 255, 255, 255]);
     }
 }

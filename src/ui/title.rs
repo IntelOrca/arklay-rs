@@ -21,6 +21,7 @@ use crate::render::Framebuffer;
 use crate::save;
 use crate::state::Image;
 use crate::tim;
+use crate::transition::{Fade, FadeColor};
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
@@ -89,8 +90,12 @@ pub struct TitleScreen {
     any_saves: bool,
     /// PRESS brightness byte, `0..=0x80`.
     press_brightness: u8,
-    /// Black overlay: `255` is opaque, `0` fully visible.
-    fade: u8,
+    /// The full-screen overlay accumulator: the opening black fade-in, then
+    /// the confirm flash chain (white flash, white decay, black out).
+    fade: Fade,
+    /// Which leg of the confirm flash chain is running (the original's
+    /// `g_titleOptionsFading` 6..9 then 4).
+    fade_phase: u8,
     ticks: u32,
     /// Action reported once the fade-out finishes.
     exit: Option<ScreenAction>,
@@ -106,7 +111,8 @@ impl TitleScreen {
             selection: 1,
             any_saves: false,
             press_brightness: 0,
-            fade: 255,
+            fade: Fade::fade_in(FADE_STEP.into(), 0x7FFF, 2),
+            fade_phase: 0,
             ticks: 0,
             exit: None,
         }
@@ -153,10 +159,28 @@ impl TitleScreen {
         }
     }
 
-    /// Advance the black overlay; reports whether it reached full black.
-    fn fade_out_tick(&mut self) -> bool {
-        self.fade = self.fade.saturating_add(16);
-        self.fade == 255
+    /// Latch the next leg of the confirm flash chain (the original's
+    /// `g_titleOptionsFading` 7, 8, 9 then 4; leg 6 is the initial white
+    /// flash, set on confirm). The white legs decay from full white; the last
+    /// is the black-out. Returns `true` once the black-out completes.
+    fn advance_fade_phase(&mut self) -> bool {
+        self.fade_phase = self.fade_phase.saturating_add(1);
+        self.fade = match self.fade_phase {
+            // 7: white decay at `-0x4000`.
+            1 => Fade::fade_in(0x4000 >> 7, 0x7FFF, 1),
+            // 8: white decay at `-0x8000`.
+            2 => Fade::fade_in(256, 0x7FFF, 1),
+            // 9: white decay at `-0x800`.
+            3 => Fade::fade_in(0x800 >> 7, 0x7FFF, 1),
+            // 4: black-out at `+0x270`.
+            4 => {
+                let mut fade = Fade::inactive();
+                fade.set(2, 0x270, 0);
+                fade
+            }
+            _ => return true,
+        };
+        false
     }
 }
 
@@ -200,7 +224,8 @@ impl Screen for TitleScreen {
         self.any_saves = save::scan_slots(cx.save_dir).iter().any(Option::is_some);
         self.selection = if self.any_saves { 2 } else { 1 };
         self.press_brightness = 0;
-        self.fade = 255;
+        self.fade = Fade::fade_in(FADE_STEP.into(), 0x7FFF, 2);
+        self.fade_phase = 0;
         self.ticks = 0;
         self.stage = Stage::Press;
         self.exit = None;
@@ -209,42 +234,38 @@ impl Screen for TitleScreen {
 
     fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
-        self.fade = self.fade.saturating_sub(FADE_STEP);
         // TODO(parity): (UI) the original title runs an attract/demo timer
         // (`g_titleDemoTime`): idling on PRESS or on the option menu eventually
         // fades into the attract demo and back, the selection id cycles
-        // NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED submenu), and
-        // confirming plays EVIL01. The port waits on PRESS forever with only
-        // the two entries, but plays EVIL01 on the PRESS dismissal and the
-        // character cue slots on the option moves.
+        // NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED submenu). The port
+        // waits on PRESS forever with only the two entries. The PRESS phase
+        // and the option-menu moves are silent in the original; confirming
+        // NEW GAME or LOAD GAME plays EVIL01 and runs the white flash chain.
         match self.stage {
             Stage::Press => {
+                self.fade.tick();
                 self.press_brightness = self
                     .press_brightness
                     .saturating_add(PRESS_RAMP_STEP)
                     .min(PRESS_FULL);
                 if input.any || input.confirm || input.cancel {
-                    cx.play_cue(UiCue::Title);
                     self.stage = Stage::Menu;
                     self.ticks = 0;
                 }
             }
             Stage::Menu => {
+                self.fade.tick();
                 if input.left {
                     self.move_selection(-1);
-                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.right {
                     self.move_selection(1);
-                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.up {
                     self.move_selection(-1);
-                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.down {
                     self.move_selection(1);
-                    cx.play_cue(UiCue::Cursor);
                 }
                 if input.confirm {
                     let action = match self.selection {
@@ -253,14 +274,19 @@ impl Screen for TitleScreen {
                         _ => Some(ScreenAction::CharSelect),
                     };
                     if let Some(action) = action {
-                        cx.play_cue(UiCue::Decide);
+                        cx.play_cue(UiCue::Title);
                         self.exit = Some(action);
+                        // The original's state 6: a white flash at `+0x7F00`
+                        // that wraps the accumulator in two ticks.
+                        self.fade = Fade::fade_out(0x7F00 >> 7, 0, 1);
+                        self.fade_phase = 0;
                         self.stage = Stage::FadeOut;
                     }
                 }
             }
             Stage::FadeOut => {
-                if self.fade_out_tick() {
+                self.fade.tick();
+                if !self.fade.is_active() && self.advance_fade_phase() {
                     return ScreenResult::Done(self.exit.take().unwrap_or(ScreenAction::Title));
                 }
             }
@@ -309,7 +335,16 @@ impl Screen for TitleScreen {
     }
 
     fn fade(&self) -> u8 {
+        match self.fade.overlay() {
+            Some(overlay) if overlay.color == FadeColor::Black => overlay.alpha,
+            _ => 0,
+        }
+    }
+
+    fn overlay(&self) -> Option<(FadeColor, u8)> {
         self.fade
+            .overlay()
+            .map(|overlay| (overlay.color, overlay.alpha))
     }
 }
 
@@ -323,7 +358,7 @@ mod tests {
             stage: Stage::Menu,
             any_saves,
             selection: if any_saves { 2 } else { 1 },
-            fade: 0,
+            fade: Fade::inactive(),
             ..TitleScreen::new()
         }
     }
@@ -440,6 +475,117 @@ mod tests {
     }
 
     #[test]
+    fn only_the_confirm_plays_the_title_voice() {
+        let mut screen = TitleScreen::new();
+        let cx = test_context();
+        // The PRESS dismissal is silent.
+        screen.update(
+            &cx,
+            UiInput {
+                any: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::Menu);
+        assert!(cx.cues.borrow().is_empty(), "PRESS must not play a cue");
+
+        // The option-menu moves are silent in the original.
+        for input in [
+            UiInput {
+                left: true,
+                ..neutral()
+            },
+            UiInput {
+                right: true,
+                ..neutral()
+            },
+            UiInput {
+                up: true,
+                ..neutral()
+            },
+            UiInput {
+                down: true,
+                ..neutral()
+            },
+        ] {
+            screen.update(&cx, input);
+            assert!(cx.cues.borrow().is_empty(), "a menu move must be silent");
+        }
+
+        // Confirming NEW GAME or LOAD GAME plays the RE voice line.
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Title]);
+    }
+
+    #[test]
+    fn confirm_runs_the_white_flash_then_black_out() {
+        let mut screen = menu(false);
+        let cx = test_context();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.overlay(), Some((FadeColor::White, 0)));
+
+        // Leg 6: the flash reaches white in two ticks.
+        screen.update(&cx, neutral());
+        assert_eq!(screen.overlay(), Some((FadeColor::White, 254)));
+        screen.update(&cx, neutral());
+        assert_eq!(
+            screen.overlay(),
+            Some((FadeColor::White, 255)),
+            "leg 7 starts from full white"
+        );
+        screen.update(&cx, neutral());
+        assert_eq!(screen.overlay(), Some((FadeColor::White, 127)));
+        screen.update(&cx, neutral());
+        assert_eq!(
+            screen.overlay(),
+            Some((FadeColor::White, 255)),
+            "leg 8 starts from full white"
+        );
+        screen.update(&cx, neutral());
+        assert_eq!(
+            screen.overlay(),
+            Some((FadeColor::White, 255)),
+            "leg 9 starts from full white"
+        );
+
+        // Leg 9 decays 16 alpha steps a tick over 15 ticks.
+        screen.update(&cx, neutral());
+        assert_eq!(screen.overlay(), Some((FadeColor::White, 239)));
+        for _ in 0..14 {
+            screen.update(&cx, neutral());
+        }
+        assert_eq!(screen.overlay(), Some((FadeColor::White, 15)));
+
+        // Leg 4: the black-out rises to full.
+        screen.update(&cx, neutral());
+        assert_eq!(screen.overlay(), Some((FadeColor::Black, 0)));
+        screen.update(&cx, neutral());
+        assert_eq!(screen.overlay(), Some((FadeColor::Black, 4)));
+        let mut ticks = 1;
+        loop {
+            if let ScreenResult::Done(action) = screen.update(&cx, neutral()) {
+                assert_eq!(action, ScreenAction::CharSelect);
+                break;
+            }
+            ticks += 1;
+            assert!(ticks < 128, "the black-out never finished");
+        }
+        assert_eq!(ticks, 52, "the black-out holds for 52 more drawn ticks");
+    }
+
+    #[test]
     fn the_fade_in_reaches_clear_and_lifts_the_press_text() {
         let mut screen = TitleScreen::new();
         let cx = test_context();
@@ -460,7 +606,7 @@ mod tests {
     }
 
     fn run_to_result(screen: &mut TitleScreen, cx: &mut UiContext<'_>) -> ScreenAction {
-        for _ in 0..64 {
+        for _ in 0..256 {
             if let ScreenResult::Done(action) = screen.update(cx, neutral()) {
                 return action;
             }

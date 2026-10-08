@@ -25,6 +25,7 @@ use crate::model::Texture8;
 use crate::render::Framebuffer;
 use crate::state::Image;
 use crate::tim;
+use crate::transition::Fade;
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 
@@ -70,7 +71,14 @@ pub const SWAP_TICKS: u32 = 34;
 enum Stage {
     Idle,
     Swapping,
-    FadeOut,
+    /// The white flash-in after the pick is confirmed (the original's state 3).
+    ConfirmFadeIn,
+    /// The white fade-out from full (the original's state 4).
+    ConfirmFadeOut,
+    /// The 16-frame hold before the game starts (the original's state 5).
+    ConfirmHold,
+    /// The black fade-out back to the title (the original's state 7).
+    CancelFadeOut,
 }
 
 /// One card's live pose: the position, the panel scale/brightness fields, the
@@ -107,7 +115,11 @@ pub struct CharSelectScreen {
     swap_sub: u8,
     swap_timer: i8,
     swap_dir: u8,
-    fade: u8,
+    /// The full-screen overlay accumulator: black while the screen fades in,
+    /// then the original's white flash chain once the pick is confirmed.
+    fade: Fade,
+    /// Ticks left of the post-flash hold (the original's `g_selTimer`).
+    hold_timer: u8,
     ticks: u32,
     stage: Stage,
     exit: Option<ScreenAction>,
@@ -125,7 +137,8 @@ impl CharSelectScreen {
             swap_sub: 0,
             swap_timer: 0,
             swap_dir: 0,
-            fade: 255,
+            fade: Fade::fade_in(8, 0x7FFF, 2),
+            hold_timer: 0,
             ticks: 0,
             stage: Stage::Idle,
             exit: None,
@@ -467,7 +480,8 @@ impl Screen for CharSelectScreen {
         self.swap_sub = 0;
         self.swap_timer = 0;
         self.swap_dir = 0;
-        self.fade = 255;
+        self.fade = Fade::fade_in(8, 0x7FFF, 2);
+        self.hold_timer = 0;
         self.ticks = 0;
         self.stage = Stage::Idle;
         self.exit = None;
@@ -478,29 +492,56 @@ impl Screen for CharSelectScreen {
         self.ticks = self.ticks.saturating_add(1);
         match self.stage {
             Stage::Idle => {
-                self.fade = self.fade.saturating_sub(8);
+                self.fade.tick();
                 if input.left || input.right {
-                    cx.play_cue(UiCue::Cursor);
+                    cx.play_cue(UiCue::SelectCursor);
                     // The original: left (`g_selSwapDir` 1) or right (0). It
                     // enters the animation in the same tick (`goto case_2`).
                     self.start_swap(u8::from(input.left));
                     self.step_swap();
                 } else if input.confirm {
-                    cx.play_cue(UiCue::Decide);
+                    cx.play_cue(UiCue::SelectConfirm);
                     self.exit = Some(ScreenAction::NewGame {
                         character: self.selected,
                     });
-                    self.stage = Stage::FadeOut;
+                    // The original's state 3: the white flash rises two alpha
+                    // steps a tick for 128 ticks (`set_fading(1, 0x100)`).
+                    self.fade = Fade::fade_out(2, 0, 1);
+                    self.stage = Stage::ConfirmFadeIn;
                 } else if input.cancel {
-                    cx.play_cue(UiCue::Cancel);
+                    // The original's cancel is silent and black-fades
+                    // (`set_fading(2, 0xC00)`), ~11 ticks.
                     self.exit = Some(ScreenAction::Title);
-                    self.stage = Stage::FadeOut;
+                    self.fade = Fade::fade_out(24, 0, 2);
+                    self.stage = Stage::CancelFadeOut;
                 }
             }
             Stage::Swapping => self.step_swap(),
-            Stage::FadeOut => {
-                self.fade = self.fade.saturating_add(16);
-                if self.fade == 255 {
+            Stage::ConfirmFadeIn => {
+                self.fade.tick();
+                if !self.fade.is_active() {
+                    // The original's state 4: the full white decays from
+                    // `0x7FFF` at two alpha steps a tick.
+                    self.fade = Fade::fade_in(2, 0x7FFF, 1);
+                    self.stage = Stage::ConfirmFadeOut;
+                }
+            }
+            Stage::ConfirmFadeOut => {
+                self.fade.tick();
+                if !self.fade.is_active() {
+                    self.stage = Stage::ConfirmHold;
+                    self.hold_timer = 16;
+                }
+            }
+            Stage::ConfirmHold => {
+                self.hold_timer = self.hold_timer.saturating_sub(1);
+                if self.hold_timer == 0 {
+                    return ScreenResult::Done(self.exit.take().unwrap_or(ScreenAction::Title));
+                }
+            }
+            Stage::CancelFadeOut => {
+                self.fade.tick();
+                if !self.fade.is_active() {
                     return ScreenResult::Done(self.exit.take().unwrap_or(ScreenAction::Title));
                 }
             }
@@ -519,21 +560,33 @@ impl Screen for CharSelectScreen {
                 );
             }
         }
-        // The back card draws first, then its shadow, then the front card. The
-        // tpage owns the order, so the flip mid-slide changes it.
-        let (first, second) = if self.poses[0].in_front_of(&self.poses[1]) {
-            (1, 0)
-        } else {
-            (0, 1)
-        };
-        self.draw_card(framebuffer, first);
-        self.draw_shadow(framebuffer, first);
-        self.draw_card(framebuffer, second);
-        self.draw_cursors(framebuffer);
+        // The cards keep drawing while the white flash rises; they stop as
+        // soon as it completes, and the arrows stop the moment confirm is
+        // pressed (the original only draws them in its idle state).
+        if matches!(
+            self.stage,
+            Stage::Idle | Stage::Swapping | Stage::ConfirmFadeIn
+        ) {
+            // The back card draws first, then its shadow, then the front card.
+            // The tpage owns the order, so the flip mid-slide changes it.
+            let (first, second) = if self.poses[0].in_front_of(&self.poses[1]) {
+                (1, 0)
+            } else {
+                (0, 1)
+            };
+            self.draw_card(framebuffer, first);
+            self.draw_shadow(framebuffer, first);
+            self.draw_card(framebuffer, second);
+        }
+        if self.stage == Stage::Idle {
+            self.draw_cursors(framebuffer);
+        }
     }
 
-    fn fade(&self) -> u8 {
+    fn overlay(&self) -> Option<(crate::transition::FadeColor, u8)> {
         self.fade
+            .overlay()
+            .map(|overlay| (overlay.color, overlay.alpha))
     }
 }
 
@@ -674,7 +727,7 @@ mod tests {
             },
         );
         let mut result = ScreenResult::Continue;
-        for _ in 0..64 {
+        for _ in 0..400 {
             result = screen.update(&cx, neutral());
             if result != ScreenResult::Continue {
                 break;
@@ -697,7 +750,7 @@ mod tests {
                 ..neutral()
             },
         );
-        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Cursor]);
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SelectCursor]);
         cx.cues.borrow_mut().clear();
         settle(&mut screen);
         screen.update(
@@ -707,7 +760,119 @@ mod tests {
                 ..neutral()
             },
         );
-        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Decide]);
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SelectConfirm]);
+
+        // Cancel is silent in the original.
+        cx.cues.borrow_mut().clear();
+        screen.update(
+            &cx,
+            UiInput {
+                cancel: true,
+                ..neutral()
+            },
+        );
+        assert!(cx.cues.borrow().is_empty(), "cancel must not queue a cue");
+    }
+
+    /// The white overlay alpha at the current tick, or `None` when clear.
+    fn white(screen: &CharSelectScreen) -> Option<u8> {
+        match screen.overlay() {
+            Some((crate::transition::FadeColor::White, alpha)) => Some(alpha),
+            Some((crate::transition::FadeColor::Black, _)) => panic!("expected a white overlay"),
+            None => None,
+        }
+    }
+
+    #[test]
+    fn confirm_runs_the_white_flash_chain_before_the_new_game() {
+        let mut screen = CharSelectScreen::new();
+        let cx = context();
+        // Skip the opening black fade.
+        for _ in 0..40 {
+            screen.update(&cx, neutral());
+        }
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(white(&screen), Some(0), "the confirm tick starts clear");
+        assert_eq!(screen.stage, Stage::ConfirmFadeIn);
+
+        // The flash rises two alpha steps a tick; the 128th tick wraps the
+        // 16-bit accumulator and hands over to the fade-out.
+        screen.update(&cx, neutral());
+        assert_eq!(white(&screen), Some(2));
+        for _ in 0..126 {
+            screen.update(&cx, neutral());
+        }
+        assert_eq!(white(&screen), Some(254));
+        assert_eq!(screen.stage, Stage::ConfirmFadeIn);
+        screen.update(&cx, neutral());
+        assert_eq!(screen.stage, Stage::ConfirmFadeOut);
+        assert_eq!(white(&screen), Some(255), "the fade-out starts from full");
+
+        // The white decays two alpha steps a tick for 128 ticks.
+        screen.update(&cx, neutral());
+        assert_eq!(white(&screen), Some(253));
+        for _ in 0..126 {
+            screen.update(&cx, neutral());
+        }
+        assert_eq!(white(&screen), Some(1));
+        assert_eq!(screen.stage, Stage::ConfirmFadeOut);
+
+        // The 16-tick hold runs with the frame clear.
+        screen.update(&cx, neutral());
+        assert_eq!(screen.stage, Stage::ConfirmHold);
+        assert_eq!(screen.overlay(), None);
+        let mut result = ScreenResult::Continue;
+        for _ in 0..16 {
+            result = screen.update(&cx, neutral());
+            if result != ScreenResult::Continue {
+                break;
+            }
+        }
+        assert_eq!(
+            result,
+            ScreenResult::Done(ScreenAction::NewGame { character: 0 })
+        );
+    }
+
+    #[test]
+    fn cancel_black_fades_in_eleven_ticks_without_a_cue() {
+        let mut screen = CharSelectScreen::new();
+        let cx = context();
+        for _ in 0..40 {
+            screen.update(&cx, neutral());
+        }
+        screen.update(
+            &cx,
+            UiInput {
+                cancel: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::CancelFadeOut);
+        assert_eq!(
+            screen.overlay(),
+            Some((crate::transition::FadeColor::Black, 0))
+        );
+        screen.update(&cx, neutral());
+        assert_eq!(
+            screen.overlay(),
+            Some((crate::transition::FadeColor::Black, 24))
+        );
+        for _ in 0..9 {
+            screen.update(&cx, neutral());
+        }
+        assert_eq!(
+            screen.overlay(),
+            Some((crate::transition::FadeColor::Black, 240))
+        );
+        let result = screen.update(&cx, neutral());
+        assert_eq!(result, ScreenResult::Done(ScreenAction::Title));
     }
 
     #[test]
