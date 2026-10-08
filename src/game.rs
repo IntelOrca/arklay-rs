@@ -4716,7 +4716,7 @@ impl GameState {
             // 3. start the push on the ninth frame.
             let mut restore_position = true;
             if record.flag & objects::OBJECT_FLAG_NOT_PUSHABLE == 0 && record.push_counter == 9 {
-                if self.object_floor_probe(room, &record) {
+                if self.object_floor_probe(room, &mut record) {
                     // Parked at 10: a blocked object cannot re-trigger.
                     record.push_counter = 10;
                 } else {
@@ -4816,32 +4816,38 @@ impl GameState {
         player.object_push = push_started;
     }
 
-    /// The object's own floor probe: either declared boundary endpoint inside a
-    /// blocking collision record. Flag bit `0x04` skips the probe (objects that
-    /// cannot leave their footprint).
-    ///
-    /// # Documented deviation
-    ///
-    /// The original's two-point probe pushes the object out of the boundary
-    /// along the way and reports whether an end is still stuck; this port tests
-    /// the endpoints with the same classification the player resolver uses, so
-    /// the object is vetoed slightly earlier and never displaced by the probe.
-    fn object_floor_probe(&self, room: &RoomState, record: &crate::objects::ObjectRecord) -> bool {
+    /// The object's own floor probe, the original's `check_room_collision_two_point`:
+    /// both declared body endpoints are rotated by the object's yaw (the live
+    /// rotation) and by its mirror angle (`rotation_rollback[1]`), resolved
+    /// against the room with shapes 4 and 5 skipped, and the object is reported
+    /// blocked only when the accumulated `(flags & 0x300) >> 8` bits are
+    /// nonzero. A shape push moves the object's live position along the way,
+    /// exactly like the original's handlers. Flag bit `0x04` skips the probe
+    /// (objects that cannot leave their footprint).
+    fn object_floor_probe(
+        &self,
+        room: &RoomState,
+        record: &mut crate::objects::ObjectRecord,
+    ) -> bool {
         if record.flag & crate::objects::OBJECT_FLAG_SKIP_FLOOR_PROBE != 0 {
             return false;
         }
-        let rotation = crate::anim::rotation_matrix(0, i32::from(record.rotation[1]), 0);
-        for probe in record.probe {
-            let x = i64::from(probe[0] as i16);
-            let z = i64::from(probe[1] as i16);
-            let wx = ((i64::from(rotation[0][0]) * x + i64::from(rotation[0][2]) * z) >> 12) as i32;
-            let wz = ((i64::from(rotation[2][0]) * x + i64::from(rotation[2][2]) * z) >> 12) as i32;
-            let point = [record.pos[0] + wx, record.pos[1], record.pos[2] + wz];
-            if crate::player::position_blocked(room, point, i32::from(record.radius)) {
-                return true;
-            }
-        }
-        false
+        let mut pos = record.pos;
+        let bits = crate::player::object_two_point_probe(
+            &room.collision,
+            &mut pos,
+            [
+                i32::from(record.committed[0]),
+                record.pos[1],
+                i32::from(record.committed[2]),
+            ],
+            record.rotation[1] as u16,
+            record.rotation_rollback[1] as u16,
+            record.probe,
+            i32::from(record.radius),
+        );
+        record.pos = pos;
+        bits != 0
     }
 
     /// `room_action_effect` (handler 0x0B): raise the effect-zone bit, which
@@ -12520,6 +12526,58 @@ mod tests {
             state.tick_objects(&room, &mut player);
         }
         assert!(state.object_push);
+    }
+
+    #[test]
+    fn the_floor_probe_skips_soft_and_stair_volumes_and_pushes_endpoints() {
+        let state = game();
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(crate::state::CollisionRect {
+            x_max: 3000,
+            z_max: 3000,
+            x_min: 0,
+            z_min: 0,
+            kind: 5,
+            flags: 0x300,
+        });
+
+        // The shape-5 stair/corridor volume over the endpoint vetoes nothing.
+        let mut record = object_record([500, 0, 0], [100, 100, 100]);
+        record.probe = [[0, 0], [0, 0]];
+        record.radius = 100;
+        assert!(!state.object_floor_probe(&room, &mut record));
+        assert_eq!(record.pos, [500, 0, 0]);
+
+        // Nor does a shape-4 soft zone.
+        room.collision.quadrants[0][0].kind = 4;
+        let mut record = object_record([500, 0, 0], [100, 100, 100]);
+        record.probe = [[0, 0], [0, 0]];
+        record.radius = 100;
+        assert!(!state.object_floor_probe(&room, &mut record));
+        assert_eq!(record.pos, [500, 0, 0]);
+
+        // A push-only shape-1 record (no 0x300 flag bits) displaces the
+        // endpoint and the object but still reports clear.
+        room.collision.quadrants[0][0] = crate::state::CollisionRect {
+            x_max: 3000,
+            z_max: 3000,
+            x_min: 500,
+            z_min: 0,
+            kind: 1,
+            flags: 0,
+        };
+        let mut record = object_record([500, 0, 0], [100, 100, 100]);
+        record.probe = [[0, 0], [0, 0]];
+        record.radius = 100;
+        assert!(!state.object_floor_probe(&room, &mut record));
+        assert_eq!(record.pos, [500, 0, -118], "the endpoint push displaced it");
+
+        // With the blocking flag bits the same record vetoes the push.
+        room.collision.quadrants[0][0].flags = 0x300;
+        let mut record = object_record([500, 0, 0], [100, 100, 100]);
+        record.probe = [[0, 0], [0, 0]];
+        record.radius = 100;
+        assert!(state.object_floor_probe(&room, &mut record));
     }
 
     #[test]

@@ -78,7 +78,12 @@ fn follow_run(name: &str) {
         entity.pos
     );
     assert!(
-        !player::position_blocked(&run.room, entity.pos, i32::from(entity.sca_radius)),
+        !player::position_blocked(
+            &run.room,
+            entity.pos,
+            i32::from(entity.sca_radius),
+            entity.collision_flags,
+        ),
         "{name}: the character stands in a wall at {:?}",
         entity.pos
     );

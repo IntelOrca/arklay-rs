@@ -109,7 +109,12 @@ fn lab_stairway_ramps_height_up_and_down() {
     player.pos = [24000, 0, 3600];
     player.angle = 0x800; // west, up the ramp
     game.sync_entity_from_player(&player);
-    assert!(!player::position_blocked(&room, player.pos, player.radius));
+    assert!(!player::position_blocked(
+        &room,
+        player.pos,
+        player.radius,
+        player.collision_flags,
+    ));
 
     let start = player.pos;
     let mut last = start;
@@ -216,7 +221,12 @@ fn lab_ladder_zone_latches_flags_and_base() {
     player.pos = [22200, 0, 10250];
     player.angle = 0xC00;
     game.sync_entity_from_player(&player);
-    assert!(!player::position_blocked(&room, player.pos, player.radius));
+    assert!(!player::position_blocked(
+        &room,
+        player.pos,
+        player.radius,
+        player.collision_flags,
+    ));
 
     // Walking into the zone does not mark it: the entry is an action-key
     // probe, so only a press runs `set_stairs_zone`.
@@ -441,7 +451,12 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
     let sim = simulate_door(&pack, id, 0, None).unwrap();
     assert_eq!(sim.target, RoomId::parse("1060").unwrap());
     assert!(
-        !player::position_blocked(&sim.room, sim.player.pos, sim.player.radius),
+        !player::position_blocked(
+            &sim.room,
+            sim.player.pos,
+            sim.player.radius,
+            sim.player.collision_flags,
+        ),
         "the 106 arrival must be free: {:?}",
         sim.player.pos
     );
@@ -454,7 +469,8 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
     assert!(!player::position_blocked(
         &back.room,
         back.player.pos,
-        back.player.radius
+        back.player.radius,
+        back.player.collision_flags,
     ));
 }
 
@@ -487,15 +503,14 @@ fn west_stairwell_101_to_201_marks_the_climb() {
     assert!(game.transition.is_some());
     assert!(game.stair_climb);
 
-    // The destination placement still settles free (the raw arrival sits
-    // inside the stairwell collision, so `free_spawn` remains the fallback).
-    let sim = simulate_door(&pack, id, 3, None).unwrap();
+    // The destination placement is the raw arrival; the first collision pass
+    // settles it (the shape-5 stairwell volume no longer applies to the
+    // player, and the shape-3 circle nudges the point).
+    let mut sim = simulate_door(&pack, id, 3, None).unwrap();
     assert_eq!(sim.target, RoomId::parse("2010").unwrap());
-    assert!(!player::position_blocked(
-        &sim.room,
-        sim.player.pos,
-        sim.player.radius
-    ));
+    assert_eq!(sim.player.pos, [14100, 0, 11500]);
+    player::update(&mut sim.player, &sim.room, &[], &[], Input::default());
+    assert_eq!(sim.player.pos, [14098, 0, 11442]);
     assert!(sim.gameplay_frame.rgba.iter().any(|&byte| byte != 0));
 }
 

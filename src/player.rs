@@ -43,6 +43,12 @@ pub const CHRIS_RADIUS: i32 = 422;
 /// Collision radius of the Jill model.
 pub const JILL_RADIUS: i32 = 372;
 
+/// The player's collision callback flags as spawned. The original's player
+/// entity aliases this byte with `healthStatusFlags` and raises `0x10` on every
+/// player init; the collision pass skips shape-5 records while it is set
+/// ([`PlayerState::collision_flags`]).
+pub const PLAYER_COLLISION_FLAGS: u8 = 0x10;
+
 /// EMD clip 0: the three-frame idle settle pose.
 const SETTLE_CLIP: usize = 0;
 /// EMW clip 0: the transition from the settle pose into the breathe loop.
@@ -379,6 +385,16 @@ pub struct PlayerState {
     pub angle: u16,
     /// Chris 422, Jill 372.
     pub radius: i32,
+    /// The original's per-entity collision callback flags (`Entity.collisionFlags`)
+    /// as the room collision pass reads them for the player. The player's byte
+    /// aliases the health status flags, so its `0x10` bit is raised by the
+    /// player init on every room spawn; while it is set the collision pass
+    /// skips shape-5 records (the large stair/corridor floor volumes).
+    ///
+    /// TODO(parity): the original reads the live health byte here, so a script
+    /// that clears `0x10` stops skipping shape 5. The port keeps the spawn
+    /// value until the health byte's collision-flag aliasing is modelled.
+    pub collision_flags: u8,
     /// Clip playback state, interpreted against `clip_source`.
     pub anim: AnimPlayer,
     /// Which file's clips `anim` indexes.
@@ -463,6 +479,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         } else {
             JILL_RADIUS
         },
+        collision_flags: PLAYER_COLLISION_FLAGS,
         anim: AnimPlayer::new(SETTLE_CLIP),
         clip_source: ClipSource::Emd,
         behavior: BEHAVIOR_IDLE,
@@ -761,7 +778,13 @@ impl PlayerState {
         self.pos = if self.stairs.climbing {
             proposed
         } else {
-            resolve_collision(&room.collision, prev, proposed, self.radius)
+            resolve_collision(
+                &room.collision,
+                prev,
+                proposed,
+                self.radius,
+                self.collision_flags,
+            )
         };
         // `stairs_height_update` owns the player's height on the ramp.
         if let Some(height) = self.stairs.height {
@@ -846,7 +869,13 @@ impl PlayerState {
         let (dx, dz) = rotate_speed(self.angle, 0, speed);
         let prev = self.pos;
         let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
-        self.pos = resolve_collision(&room.collision, prev, proposed, self.radius);
+        self.pos = resolve_collision(
+            &room.collision,
+            prev,
+            proposed,
+            self.radius,
+            self.collision_flags,
+        );
     }
 }
 
@@ -1328,93 +1357,24 @@ impl PlayerState {
     }
 }
 
-/// Search step of [`free_spawn`], in room units.
-const SPAWN_SEARCH_STEP: i32 = 16;
-/// Farthest [`free_spawn`] searches from the requested spawn.
-const SPAWN_SEARCH_LIMIT: i32 = 4096;
-
-/// The eight grid directions, clockwise from `+X` (the engine's angle 0).
-const SPAWN_DIRECTIONS: [[i32; 2]; 8] = [
-    [1, 0],
-    [1, -1],
-    [0, -1],
-    [-1, -1],
-    [-1, 0],
-    [-1, 1],
-    [0, 1],
-    [1, 1],
-];
-
 /// Whether the collision resolver would push a body of `radius` at `pos`.
 ///
 /// Shape 4 records are soft zones and shapes 0/2 have no handler, so neither
-/// blocks. A shape 1/5 rectangle blocks whenever the grown box contains the
+/// blocks. A shape 1 rectangle blocks whenever the grown box contains the
 /// point; a shape 3 circle only when it actually overlaps (its grown box
-/// corner does not push).
-pub fn position_blocked(room: &RoomState, pos: [i32; 3], radius: i32) -> bool {
+/// corner does not push). A shape 5 rectangle blocks the same way as shape 1
+/// unless `collision_flags` has bit `0x10` set, the original's per-entity skip
+/// ([`PlayerState::collision_flags`]).
+pub fn position_blocked(room: &RoomState, pos: [i32; 3], radius: i32, collision_flags: u8) -> bool {
     room.collision
         .records(pos[0], pos[2])
         .iter()
         .any(|rect| match rect.kind & 0xFF {
-            1 | 5 => classify(pos[0], pos[2], rect, radius).is_some(),
+            1 => classify(pos[0], pos[2], rect, radius).is_some(),
+            5 => collision_flags & 0x10 == 0 && classify(pos[0], pos[2], rect, radius).is_some(),
             3 => circle_overlap(rect, pos[0], pos[2], radius).is_some(),
             _ => false,
         })
-}
-
-/// Move a transition spawn out of the collision volume it landed in.
-///
-/// A door arrival can legitimately sit inside a collision record. When the
-/// idle collision pass clears the point the raw arrival is kept - the first
-/// gameplay tick performs the same push. A point that pass cannot clear (both
-/// exit pushes point back into the record, or overlapping records wedge it)
-/// would leave the player stuck, so it is moved to the nearest position
-/// outside every blocking record. The original lets the stair/ladder climb
-/// carry the player through such a volume, but its climb ends when the room
-/// loads, so this fallback stays for arrivals the first collision pass cannot
-/// clear.
-///
-/// The search walks eight directions outward from the entry facing (so a tie
-/// at one distance prefers straight ahead) in [`SPAWN_SEARCH_STEP`] rings up
-/// to [`SPAWN_SEARCH_LIMIT`]. A free position is returned unchanged, as is a
-/// position with no free spot within the limit.
-pub fn free_spawn(room: &RoomState, pos: [i32; 3], angle: u16, radius: i32) -> [i32; 3] {
-    if !position_blocked(room, pos, radius) {
-        return pos;
-    }
-    // An idle collision pass that already frees the point is fine: the first
-    // gameplay tick runs the same push, so the raw arrival is left in place.
-    let resolved = resolve_collision(&room.collision, pos, pos, radius);
-    if !position_blocked(room, resolved, radius) {
-        return pos;
-    }
-
-    let directions = SPAWN_DIRECTIONS.len();
-    let facing = usize::from((angle & 0x0FFF) / 0x200) % directions;
-    for ring in 1..=(SPAWN_SEARCH_LIMIT / SPAWN_SEARCH_STEP) {
-        let mut best: Option<([i32; 3], i64)> = None;
-        for step in 0..directions {
-            let [dx, dz] = SPAWN_DIRECTIONS[(facing + step) % directions];
-            let candidate = [
-                pos[0] + dx * ring * SPAWN_SEARCH_STEP,
-                pos[1],
-                pos[2] + dz * ring * SPAWN_SEARCH_STEP,
-            ];
-            if position_blocked(room, candidate, radius) {
-                continue;
-            }
-            let ddx = i64::from(candidate[0] - pos[0]);
-            let ddz = i64::from(candidate[2] - pos[2]);
-            let distance = ddx * ddx + ddz * ddz;
-            if best.is_none_or(|(_, best_distance)| distance < best_distance) {
-                best = Some((candidate, distance));
-            }
-        }
-        if let Some((candidate, _)) = best {
-            return candidate;
-        }
-    }
-    pos
 }
 
 /// Pick the camera cut for the player position: find the zone group whose
@@ -1585,18 +1545,24 @@ fn saturate14(value: i32) -> i32 {
 /// Pass 1 classifies the incoming (already moved) position against the
 /// quadrant's records and lets each hit shape push the proposed position.
 /// Pass 2 re-classifies the pushed position and rolls the tick back to `prev`
-/// if it is still inside a blocking record.
+/// if it is still inside a blocking record. While `collision_flags` has bit
+/// `0x10` set, shape-5 records are skipped in both passes, the original's
+/// per-entity floor-volume skip ([`PlayerState::collision_flags`]).
 pub(crate) fn resolve_collision(
     collision: &Collision,
     prev: [i32; 3],
     proposed: [i32; 3],
     radius: i32,
+    collision_flags: u8,
 ) -> [i32; 3] {
     let records = collision.records(proposed[0], proposed[2]);
     let mut pos = proposed;
     let mut hit = 0u16;
 
     for rect in records {
+        if rect.kind & 0xFF == 5 && collision_flags & 0x10 != 0 {
+            continue;
+        }
         if let Some(shape) = classify(proposed[0], proposed[2], rect, radius) {
             match shape {
                 1 | 5 => push_rect(rect, prev, &mut pos, radius),
@@ -1615,7 +1581,7 @@ pub(crate) fn resolve_collision(
     let mut wedged = false;
     for rect in records {
         let shape = rect.kind & 0xFF;
-        if shape == 4 {
+        if shape == 4 || (shape == 5 && collision_flags & 0x10 != 0) {
             continue;
         }
         if let Some(inside) = classify(pos[0], pos[2], rect, radius) {
@@ -1631,6 +1597,68 @@ pub(crate) fn resolve_collision(
         return pos;
     }
     [prev[0], proposed[1], prev[2]]
+}
+
+/// The original's `check_room_collision_two_point` as the room-object pass
+/// uses it: push the two body-local floor-probe endpoints of a room object
+/// against the room.
+///
+/// Both endpoints rotate twice: by `yaw` around `pos` for the tested centre,
+/// and by `mirror` around `committed` (the last committed 16-bit position) for
+/// the value the shape pushes roll the centre back to. The original walks the
+/// second endpoint first, pushes accumulate on the entity's live position, and
+/// shapes 4 and 5 are skipped. Every record that classifies ORs its
+/// `(flags & 0x300) >> 8` bits into the result; the caller treats a nonzero
+/// result as blocked.
+pub(crate) fn object_two_point_probe(
+    collision: &Collision,
+    pos: &mut [i32; 3],
+    committed: [i32; 3],
+    yaw: u16,
+    mirror: u16,
+    probes: [[u16; 2]; 2],
+    radius: i32,
+) -> u16 {
+    let mut bits = 0u16;
+    // The original starts with end B (probe slot 1); a push moves the live
+    // position, so the next endpoint's centre is computed from the displacement.
+    for which in [1usize, 0] {
+        let x = i32::from(probes[which][0]);
+        let z = i32::from(probes[which][1]);
+        let (test_x, test_z) = rotate_xz(yaw, x, z);
+        let point = [pos[0] + test_x, pos[1], pos[2] + test_z];
+        let (world_x, world_z) = rotate_xz(mirror, x, z);
+        let prev = [committed[0] + world_x, committed[1], committed[2] + world_z];
+        // The point every record of this endpoint classifies against is fixed
+        // for the whole walk; only the push handlers' scratch `centre` drifts.
+        let mut centre = point;
+
+        for rect in collision.records(point[0], point[2]) {
+            let shape = rect.kind & 0xFF;
+            if shape == 4 || shape == 5 {
+                continue;
+            }
+            if classify(point[0], point[2], rect, radius).is_none() {
+                continue;
+            }
+            match shape {
+                1 => {
+                    if let Some((dx, dz)) = push_rect_probe(rect, prev, &mut centre, radius) {
+                        pos[0] += dx;
+                        pos[2] += dz;
+                    }
+                }
+                3 => {
+                    let (dx, dz) = circle_push_delta(rect, centre[0], centre[2], radius);
+                    pos[0] += dx;
+                    pos[2] += dz;
+                }
+                _ => {}
+            }
+            bits |= (rect.flags & 0x300) >> 8;
+        }
+    }
+    bits
 }
 
 /// Is the circle at `(x, z)` inside the record's grown bounds?
@@ -1662,13 +1690,14 @@ pub(crate) fn point_outside(x: i32, z: i32, x_hi: i32, z_hi: i32, x_lo: i32, z_l
     (a | b | c | d) < 0
 }
 
-/// Shapes 1 and 5: push the entity out of a rectangular obstacle.
+/// The rectangle push's four exit depths and selector.
 ///
 /// The four exit depths are computed in 16-bit modular arithmetic with the
 /// 18-unit skin. The axis whose push opposes this tick's movement is the face
 /// the entity entered through; when both or neither do, or when a single-axis
-/// push exceeds 400 units, the shallower correction wins.
-fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i32) {
+/// push exceeds 400 units, the shallower correction wins. The selector is bit
+/// 0: movement and push disagree in sign on X; bit 1: on Z.
+fn rect_push(rect: &CollisionRect, prev: [i32; 3], pos: &[i32; 3], radius: i32) -> (i16, i16, u8) {
     let r = radius as i16;
     let pos_x = pos[0] as i16;
     let pos_z = pos[2] as i16;
@@ -1701,11 +1730,17 @@ fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i
         push_z_hi
     };
 
-    // Selector bit 0: movement and push disagree in sign on X; bit 1: on Z.
     let movement_x = pos[0] - prev[0];
     let movement_z = pos[2] - prev[2];
     let selector = ((((movement_z >> 14) ^ (i32::from(push_z) >> 14)) & 2)
         | (((movement_x >> 15) ^ (i32::from(push_x) >> 15)) & 1)) as u8;
+
+    (push_x, push_z, selector)
+}
+
+/// Shapes 1 and 5: push the entity out of a rectangular obstacle.
+fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i32) {
+    let (push_x, push_z, selector) = rect_push(rect, prev, pos, radius);
 
     match selector {
         0 => {
@@ -1715,6 +1750,38 @@ fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i
         1 if push_within_limit(push_x) => pos[0] += i32::from(push_x),
         2 if push_within_limit(push_z) => pos[2] += i32::from(push_z),
         _ => push_shallow(push_x, push_z, pos),
+    }
+}
+
+/// Shapes 1 and 5 for [`object_two_point_probe`].
+///
+/// The probe point is the same scratch the handlers receive in the original's
+/// two-point path: only selector 0 rolls it back to `prev`, while the accepted
+/// corrections are returned for the caller to apply to the entity's live
+/// position (the original's handler writes the entity matrix, not the point).
+fn push_rect_probe(
+    rect: &CollisionRect,
+    prev: [i32; 3],
+    point: &mut [i32; 3],
+    radius: i32,
+) -> Option<(i32, i32)> {
+    let (push_x, push_z, selector) = rect_push(rect, prev, point, radius);
+
+    match selector {
+        0 => {
+            point[0] = prev[0];
+            point[2] = prev[2];
+            None
+        }
+        1 if push_within_limit(push_x) => Some((i32::from(push_x), 0)),
+        2 if push_within_limit(push_z) => Some((0, i32::from(push_z))),
+        _ => {
+            if i32::from(push_z).abs() > i32::from(push_x).abs() {
+                Some((i32::from(push_x), 0))
+            } else {
+                Some((0, i32::from(push_z)))
+            }
+        }
     }
 }
 
@@ -1743,21 +1810,30 @@ fn circle_overlap(
     (penetration >= 1).then_some((penetration, dx, dz, dist))
 }
 
+/// Shapes 3: the circle push correction for the point `(x, z)`, or `(0, 0)`
+/// when it does not overlap. The original's two-point path writes the
+/// correction straight to the entity's live position without moving the tested
+/// point, so [`object_two_point_probe`] consumes this delta directly.
+fn circle_push_delta(rect: &CollisionRect, x: i32, z: i32, radius: i32) -> (i32, i32) {
+    let Some((penetration, dx, dz, dist)) = circle_overlap(rect, x, z, radius) else {
+        return (0, 0);
+    };
+    if dist == 0 {
+        return (penetration, 0);
+    }
+
+    (
+        penetration.wrapping_mul(dx) / dist,
+        penetration.wrapping_mul(dz) / dist,
+    )
+}
+
 /// Shapes 3: push the entity out of a circular obstacle whose radius is the
 /// record's X half-width plus the entity radius, centred on the box centre.
 fn push_circle(rect: &CollisionRect, pos: &mut [i32; 3], radius: i32) {
-    let Some((penetration, dx, dz, dist)) = circle_overlap(rect, pos[0], pos[2], radius) else {
-        return;
-    };
-    if dist == 0 {
-        pos[0] += penetration;
-        return;
-    }
-
-    let push_x = penetration.wrapping_mul(dx) / dist;
-    let push_z = penetration.wrapping_mul(dz) / dist;
-    pos[2] += push_z;
-    pos[0] += push_x;
+    let (dx, dz) = circle_push_delta(rect, pos[0], pos[2], radius);
+    pos[2] += dz;
+    pos[0] += dx;
 }
 
 /// The original's `SquareRoot0`: integer square root, zero for non-positive.
@@ -1832,6 +1908,7 @@ mod tests {
             pos: [x, 0, z],
             angle: 0,
             radius: CHRIS_RADIUS,
+            collision_flags: PLAYER_COLLISION_FLAGS,
             anim: AnimPlayer::new(SETTLE_CLIP),
             clip_source: ClipSource::Emd,
             behavior: BEHAVIOR_IDLE,
@@ -2437,11 +2514,26 @@ mod tests {
             ..rect(10000, 10000, 0, 0, 4)
         });
 
-        assert!(position_blocked(&room, [1500, 0, 1000], CHRIS_RADIUS));
+        assert!(position_blocked(
+            &room,
+            [1500, 0, 1000],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
         // The soft zone covers the point but never pushes.
-        assert!(!position_blocked(&room, [5000, 0, 5000], CHRIS_RADIUS));
+        assert!(!position_blocked(
+            &room,
+            [5000, 0, 5000],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
         // Outside the grown rectangle.
-        assert!(!position_blocked(&room, [500, 0, 1000], CHRIS_RADIUS));
+        assert!(!position_blocked(
+            &room,
+            [500, 0, 1000],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
     }
 
     #[test]
@@ -2449,47 +2541,67 @@ mod tests {
         let room = room_with_quadrant(rect(2000, 2000, 1180, 0, 3));
 
         // Inside the grown box but far outside the circle: no push.
-        assert!(!position_blocked(&room, [800, 0, 2000], CHRIS_RADIUS));
+        assert!(!position_blocked(
+            &room,
+            [800, 0, 2000],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
         // The circle centre: pushed.
-        assert!(position_blocked(&room, [1590, 0, 410], CHRIS_RADIUS));
+        assert!(position_blocked(
+            &room,
+            [1590, 0, 410],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
     }
 
     #[test]
-    fn free_spawn_leaves_a_clear_position_alone() {
-        let room = RoomState::default();
+    fn player_resolution_skips_shape_five_in_both_passes() {
+        let mut room = RoomState::default();
+        // A shape-1 wall whose +x push lands inside a shape-5 floor volume.
+        room.collision.quadrants[0].push(rect(2000, 3000, 1000, 0, 1));
+        room.collision.quadrants[0].push(rect(4000, 3000, 2000, 0, 5));
+
+        // position_blocked: the floor volume blocks only without the player bit.
+        assert!(position_blocked(&room, [2440, 0, 1000], CHRIS_RADIUS, 0));
+        assert!(!position_blocked(
+            &room,
+            [2440, 0, 1000],
+            CHRIS_RADIUS,
+            PLAYER_COLLISION_FLAGS
+        ));
+
+        // Pass 1: a proposed point inside the shape-5 volume is left alone.
         assert_eq!(
-            free_spawn(&room, [1000, 5, 1000], 0, CHRIS_RADIUS),
-            [1000, 5, 1000]
+            resolve_collision(
+                &room.collision,
+                [4000, 0, 1000],
+                [2440, 0, 1000],
+                CHRIS_RADIUS,
+                PLAYER_COLLISION_FLAGS
+            ),
+            [2440, 0, 1000]
         );
-    }
 
-    #[test]
-    fn free_spawn_leaves_an_idle_cleared_spawn_alone() {
-        // Near the low faces the idle push exits the box, so the first
-        // gameplay tick frees the spawn without help.
-        let room = room_with_quadrant(rect(2000, 2000, 1180, 0, 1));
-        let pos = [1500, 0, 1000];
-        assert!(position_blocked(&room, pos, CHRIS_RADIUS));
-
-        assert_eq!(free_spawn(&room, pos, 0, CHRIS_RADIUS), pos);
-    }
-
-    #[test]
-    fn free_spawn_escapes_a_wedged_corner() {
-        // Near the high faces both pushes point further in, so the idle pass
-        // reverts and the player would never get out.
-        let room = room_with_quadrant(rect(2000, 2000, 0, 0, 1));
-        let pos = [1900, 0, 1900];
-        assert!(position_blocked(&room, pos, CHRIS_RADIUS));
-
-        let free = free_spawn(&room, pos, 0, CHRIS_RADIUS);
-
-        assert!(!position_blocked(&room, free, CHRIS_RADIUS));
-        assert_eq!(free[1], 0, "the spawn height is preserved");
-        let dx = free[0] - pos[0];
-        let dz = free[2] - pos[2];
-        // The +x face is 522 units away; the ring grid finds it within a step.
-        assert!(dx * dx + dz * dz <= 600 * 600, "moved too far: {free:?}");
+        // Pass 2: the shape-1 push lands inside the shape-5 volume; the player
+        // bit accepts the pushed point, clearing it rolls the tick back.
+        let prev = [1800, 0, 1000];
+        let proposed = [1900, 0, 1000];
+        assert_eq!(
+            resolve_collision(
+                &room.collision,
+                prev,
+                proposed,
+                CHRIS_RADIUS,
+                PLAYER_COLLISION_FLAGS
+            ),
+            [2440, 0, 1000]
+        );
+        assert_eq!(
+            resolve_collision(&room.collision, prev, proposed, CHRIS_RADIUS, 0),
+            prev
+        );
     }
 
     #[test]
@@ -2517,7 +2629,12 @@ mod tests {
         let room = room_with_quadrant(rect(4000, 2000, 2000, 0, 1));
         let clips = clips();
         let mut player = player_at(1500, 1000);
-        assert!(!position_blocked(&room, player.pos, player.radius));
+        assert!(!position_blocked(
+            &room,
+            player.pos,
+            player.radius,
+            player.collision_flags,
+        ));
 
         player.stairs.climbing = true;
         player.stairs.locked_angle = 0;
@@ -2539,7 +2656,7 @@ mod tests {
             player.pos
         );
         assert!(
-            position_blocked(&room, player.pos, player.radius),
+            position_blocked(&room, player.pos, player.radius, player.collision_flags),
             "the climb should have carried the player into the wall volume"
         );
         assert_eq!(player.angle, 0, "the climb holds the locked facing");
@@ -2564,7 +2681,12 @@ mod tests {
             );
         }
         let inside = player.pos;
-        assert!(position_blocked(&room, inside, player.radius));
+        assert!(position_blocked(
+            &room,
+            inside,
+            player.radius,
+            player.collision_flags,
+        ));
 
         player.stairs.climbing = false;
         for _ in 0..5 {
@@ -2583,7 +2705,12 @@ mod tests {
             "collision should stop the player once the climb releases: {:?}",
             player.pos
         );
-        assert!(!position_blocked(&room, player.pos, player.radius));
+        assert!(!position_blocked(
+            &room,
+            player.pos,
+            player.radius,
+            player.collision_flags,
+        ));
     }
 
     #[test]

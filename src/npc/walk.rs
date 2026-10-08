@@ -132,7 +132,7 @@ pub fn try_advance_xz(room: &RoomState, entity: &mut Entity, offset: u16, distan
     let saved = entity.pos;
     advance_xz(entity, offset, distance);
     let radius = i32::from(entity.sca_radius);
-    if player::position_blocked(room, entity.pos, radius) {
+    if player::position_blocked(room, entity.pos, radius, entity.collision_flags) {
         entity.pos = saved;
         return false;
     }
@@ -701,7 +701,7 @@ fn corridor_open(
     let diff = i32::from(hi) - i32::from(lo);
     let step = (diff >> 3).wrapping_add(0x280) as u16;
     let probe =
-        |first: i32, second: i32| player::position_blocked(room, [first, 0, second], radius);
+        |first: i32, second: i32| player::position_blocked(room, [first, 0, second], radius, 0);
     if flag == 0 {
         if probe(x, i32::from(lo as i16)) {
             lo = lo.wrapping_add(step);
@@ -739,7 +739,7 @@ fn clamp_corridor(
     let mut lo = lo as i16;
     let mut hi = hi as i16;
     let step = (hi.wrapping_sub(lo) >> 3).wrapping_add(0x280);
-    let blocked = |x: i32, z: i32| player::position_blocked(room, [x, 0, z], radius);
+    let blocked = |x: i32, z: i32| player::position_blocked(room, [x, 0, z], radius, 0);
     if probe_with_flag & 0x8000 != 0 {
         if blocked(i32::from(lo), probe) {
             lo = lo.wrapping_add(step);
@@ -1030,7 +1030,12 @@ fn choose_heading(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3]) -
 
             if !degenerate
                 && corridor_open(room, edge_flag, pos_x, pos_z, from, next, radius)
-                && !player::position_blocked(room, [pos_x, entity_pos[1], pos_z], radius)
+                && !player::position_blocked(
+                    room,
+                    [pos_x, entity_pos[1], pos_z],
+                    radius,
+                    entity.collision_flags,
+                )
             {
                 entity.player_pos_x = pos_x as i16;
                 entity.player_pos_z = pos_z as i16;
@@ -1648,6 +1653,7 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         prev_pos,
         entity.pos,
         i32::from(entity.sca_radius),
+        entity.collision_flags,
     );
     entity.saved_pos = Some(entity.pos);
 }
@@ -1748,14 +1754,20 @@ mod tests {
         advance_xz(&mut e, 0, 100);
         assert_eq!(e.pos, [999, 0, 500]);
         assert!(
-            player::position_blocked(&room, e.pos, 100),
+            player::position_blocked(&room, e.pos, 100, e.collision_flags),
             "the bare move can land inside geometry"
         );
 
         // The end-of-frame tail resolves it back out.
-        let resolved = player::resolve_collision(&room.collision, [900, 0, 500], e.pos, 100);
+        let resolved = player::resolve_collision(
+            &room.collision,
+            [900, 0, 500],
+            e.pos,
+            100,
+            e.collision_flags,
+        );
         assert!(
-            !player::position_blocked(&room, resolved, 100),
+            !player::position_blocked(&room, resolved, 100, e.collision_flags),
             "the collision pass pushes the character out: {resolved:?}"
         );
     }
@@ -1783,7 +1795,7 @@ mod tests {
         // kept - the character slides instead of freezing.
         let prev = [900, 0, 500];
         let proposed = [1000, 0, 600];
-        let resolved = player::resolve_collision(&room.collision, prev, proposed, 100);
+        let resolved = player::resolve_collision(&room.collision, prev, proposed, 100, 0);
         assert_eq!(resolved, [882, 0, 600], "X pushed out, Z kept");
         assert!(
             resolved[2] > prev[2],
@@ -2649,14 +2661,15 @@ mod tests {
         // into the wall.
         assert!(separate_from_player(&mut e, prev, [950, 0, 300], 0, 100, 0));
         assert!(
-            player::position_blocked(&room, e.pos, 100),
+            player::position_blocked(&room, e.pos, 100, e.collision_flags),
             "the SCA resolve itself does not consult the room: {:?}",
             e.pos
         );
         // The end-of-frame tail then pushes it clear.
-        let resolved = player::resolve_collision(&room.collision, prev, e.pos, 100);
+        let resolved =
+            player::resolve_collision(&room.collision, prev, e.pos, 100, e.collision_flags);
         assert!(
-            !player::position_blocked(&room, resolved, 100),
+            !player::position_blocked(&room, resolved, 100, e.collision_flags),
             "the room pass clears the pushed point: {resolved:?}"
         );
     }

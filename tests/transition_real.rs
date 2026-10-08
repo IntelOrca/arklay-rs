@@ -57,21 +57,17 @@ fn assert_spawn_is_playable(sim: &arklay::engine::SimulatedDoor) {
     );
     assert_eq!(sim.game.camera.current_cut, zone_cut);
 
-    // The first collision passes either leave the spawn alone (already free)
-    // or push it clear; it must never stay wedged.
+    // The first collision passes settle the spawn. A raw arrival may legally
+    // stay inside a record's grown bounds (the original's wedge accept keeps
+    // the circle-pushed point), so only stability is required: idle ticks must
+    // not keep moving it.
     let mut settled = sim.player.clone();
     step(&mut settled, &sim.room, Input::default(), 30);
-    assert!(
-        !player::position_blocked(&sim.room, settled.pos, settled.radius),
-        "spawn {:?} is still inside a blocking collision record after 30 idle ticks",
-        settled.pos
-    );
-
     let settled_pos = settled.pos;
     step(&mut settled, &sim.room, Input::default(), 30);
     assert_eq!(
         settled.pos, settled_pos,
-        "idle ticks moved a free spawn (collision is pushing)"
+        "idle ticks moved a settled spawn (collision is still pushing)"
     );
 
     let mut forward = settled.clone();
@@ -94,7 +90,7 @@ fn assert_spawn_is_playable(sim: &arklay::engine::SimulatedDoor) {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn stairs_101_to_201_spawns_free_with_the_zone_camera() {
+fn stairs_101_to_201_places_the_raw_spawn() {
     let Some(path) = pack_path() else {
         return;
     };
@@ -105,26 +101,22 @@ fn stairs_101_to_201_spawns_free_with_the_zone_camera() {
     std::fs::create_dir_all(&dir).unwrap();
     let sim = simulate_door(&pack, source, 3, Some(&dir)).unwrap();
 
-    // ROOM1010 slot 3 is the west staircase to ROOM2010.
+    // ROOM1010 slot 3 is the west staircase to ROOM2010. The record's raw
+    // arrival is placed untouched (the original does not resolve it on load);
+    // the shape-5 staircase volume no longer applies to the player, so no
+    // spawn hack and no warning fire.
     assert_eq!(sim.target, RoomId::parse("2010").unwrap());
     assert_eq!(sim.player.angle, 0);
-    // The record's raw arrival sits inside the stairwell collision; the
-    // placement moves it clear but keeps it nearby.
     let raw = [14100, 0, 11500];
-    assert!(
-        player::position_blocked(&sim.room, raw, sim.player.radius),
-        "the raw arrival is expected to be inside collision"
-    );
-    assert!(
-        squared_distance(sim.player.pos, raw) <= 4096 * 4096,
-        "spawn moved too far from the arrival: {:?}",
-        sim.player.pos
-    );
-    assert!(
-        !player::position_blocked(&sim.room, sim.player.pos, sim.player.radius),
-        "the wedged arrival was not moved clear: {:?}",
-        sim.player.pos
-    );
+    assert_eq!(sim.player.pos, raw, "the raw arrival must be placed as-is");
+
+    // The first idle tick's collision pass settles the arrival: the shape-1
+    // record rolls back, the shape-3 circle nudges it and the wedge check
+    // keeps the pushed point.
+    let mut settled = sim.player.clone();
+    step(&mut settled, &sim.room, Input::default(), 1);
+    assert_eq!(settled.pos, [14098, 0, 11442]);
+
     assert_spawn_is_playable(&sim);
 
     // The destination's first gameplay frame is deterministic and rendered
@@ -149,26 +141,44 @@ fn stairs_101_to_201_spawns_free_with_the_zone_camera() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn stairs_201_to_101_spawns_free_and_walks_back_down() {
+fn stairs_201_to_101_return_door_fires() {
     let Some(path) = pack_path() else {
         return;
     };
     let pack = Pack::open(&path).unwrap();
-    let source = RoomId::parse("2010").unwrap();
-    let sim = simulate_door(&pack, source, 3, None).unwrap();
+    // Arrive in ROOM201 through the west staircase from ROOM101.
+    let mut sim = simulate_door(&pack, RoomId::parse("1010").unwrap(), 3, None).unwrap();
+    assert_eq!(sim.target, RoomId::parse("2010").unwrap());
 
-    assert_eq!(sim.target, RoomId::parse("1010").unwrap());
-    assert_eq!(sim.player.angle, 2048, "facing back down the stairs");
-    let raw = [4300, 0, 3100];
+    // Turn back to face west and walk into the stairwell. The shape-1 wall
+    // stops the walk short of the return zone; the 600-unit reach probe still
+    // lands inside it (x 11345..13950), so the action press fires the return.
+    sim.player.angle = 0x800;
+    let input = Input {
+        up: true,
+        ..Input::default()
+    };
+    for _ in 0..30 {
+        player::update(&mut sim.player, &sim.room, &[], &[], input);
+        sim.game.sync_entity_from_player(&sim.player);
+        sim.game.interact(sim.player.pos, sim.player.angle, false);
+        sim.game.apply_stair_state(&mut sim.player);
+    }
+    let (dx, dz) = player::reach_offset(sim.player.angle);
+    let probe = [sim.player.pos[0] + dx, 0, sim.player.pos[2] + dz];
     assert!(
-        player::position_blocked(&sim.room, raw, sim.player.radius),
-        "the raw arrival is expected to be inside collision"
+        (11345..=13950).contains(&probe[0]) && (10300..=12800).contains(&probe[2]),
+        "the reach probe {probe:?} left the return zone from {:?}",
+        sim.player.pos
     );
-    assert!(squared_distance(sim.player.pos, raw) <= 4096 * 4096);
-    // The reverse arrival is only lightly inside the stairwell volume: the
-    // first collision pass clears it, so the placement stays at the record's
-    // own point and the helper only requires it to settle free.
-    assert_spawn_is_playable(&sim);
+
+    sim.game.sync_entity_from_player(&sim.player);
+    sim.game.interact(sim.player.pos, sim.player.angle, true);
+    let transition = sim
+        .game
+        .transition
+        .expect("the return stair door did not fire");
+    assert_eq!(transition.target, RoomId::parse("1010").unwrap());
 }
 
 #[test]

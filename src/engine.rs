@@ -3756,25 +3756,10 @@ fn finish_transition(
     player_state.angle = session.door.next_angle as u16 & 0x0FFF;
     // `enter_room` clears the source room's stair state and `spawn` starts the
     // fresh player with a clean climb, so the destination cannot inherit a
-    // suspended collision pass.
-    // A door arrival can sit inside a collision volume the collision pass
-    // cannot clear. The original places the record's point raw and lets the
-    // next frame's collision pass push it out; this engine models the
-    // stair/ladder climb (which suspends that pass) only while the animation
-    // runs, so a wedged arrival is still moved clear as a fallback.
-    let raw = player_state.pos;
-    player_state.pos = player::free_spawn(
-        &loaded.room,
-        player_state.pos,
-        player_state.angle,
-        player_state.radius,
-    );
-    if player_state.pos != raw {
-        eprintln!(
-            "warning: door spawn {raw:?} is inside collision; placed at {:?}",
-            player_state.pos
-        );
-    }
+    // suspended collision pass. The record's point is placed raw; the first
+    // gameplay tick's collision pass pushes it out, exactly like the original
+    // (the spawn's `collision_flags` skip the stairwell's shape-5 volume, so a
+    // stair arrival is not wedged by it).
     game.sync_entity_from_player(player_state);
 
     // A freshly loaded room starts at cut 0. The switch-zone scan runs in the
@@ -5758,12 +5743,6 @@ fn enter_transition(
     *player_state = player::spawn(transition.target, &loaded.room);
     player_state.pos = transition.pos;
     player_state.angle = transition.angle;
-    player_state.pos = player::free_spawn(
-        &loaded.room,
-        player_state.pos,
-        player_state.angle,
-        player_state.radius,
-    );
     game.sync_entity_from_player(player_state);
     // Place the destination camera before the first frame is drawn; the
     // original runs the zone switch during the transition load.

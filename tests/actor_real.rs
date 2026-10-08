@@ -124,7 +124,12 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
         // layer's pre-check + rollback for this driver: the scripted walk
         // slides against walls instead of crossing them.
         assert!(
-            !player::position_blocked(&sim.room, entity.pos, i32::from(entity.sca_radius)),
+            !player::position_blocked(
+                &sim.room,
+                entity.pos,
+                i32::from(entity.sca_radius),
+                entity.collision_flags,
+            ),
             "the walk crossed a collision rect at {:?}",
             entity.pos
         );
@@ -211,7 +216,7 @@ fn real_corpus_rooms_tick_and_keep_moved_characters_in_bounds() {
             moved += 1;
             let radius = i32::from(entity.sca_radius);
             assert!(
-                !player::position_blocked(&sim.room, entity.pos, radius),
+                !player::position_blocked(&sim.room, entity.pos, radius, entity.collision_flags),
                 "{id:?} slot {slot} moved into collision at {:?}",
                 entity.pos
             );

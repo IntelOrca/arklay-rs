@@ -1321,3 +1321,125 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
     );
     assert_eq!(best_cut, 1, "the tank capture moved off cut 1");
 }
+
+/// Load a room from the pack and run its init script.
+fn pack_room(pack: &Pack, id: RoomId) -> (arklay::state::RoomState, game::GameState) {
+    let data = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = scd::reader::parse(data).unwrap();
+    let mut game = game::GameState::new(id, &room);
+    {
+        let mut vm = scd::vm::CommandVm::new(&scripts);
+        let mut host = game::ScdGameHost::new(&mut game);
+        vm.run_init(&mut host);
+    }
+    (room, game)
+}
+
+/// Whether the player body overlaps an object box on the XZ plane, with the
+/// `ChkEntitySlide` grown extents.
+fn player_inside_object(player: [i32; 3], object: &objects::ObjectRecord, radius: i32) -> bool {
+    let ext_x = i32::from(object.half_extents[0]) + radius;
+    let ext_z = i32::from(object.half_extents[2]) + radius;
+    (player[0] - object.pos[0]).abs() < ext_x && (player[2] - object.pos[2]).abs() < ext_z
+}
+
+/// Hold forward into the object from `direction` for `ticks` ticks and return
+/// the final object position. Panics if the player ever enters the object box.
+fn push_object(
+    id: RoomId,
+    room: &arklay::state::RoomState,
+    game: &game::GameState,
+    slot: usize,
+    direction: [i32; 2],
+    ticks: usize,
+) -> [i32; 3] {
+    let object = *game.objects.record(slot).unwrap();
+    let radius = arklay::player::spawn(id, room).radius;
+    let distance = radius + i32::from(object.half_extents[0].max(object.half_extents[2])) + 80;
+    let mut player = player_facing(id, room, object.pos, direction, distance);
+    let mut state = game.clone();
+    let input = arklay::player::Input {
+        up: true,
+        ..arklay::player::Input::default()
+    };
+    for _ in 0..ticks {
+        object_tick(&mut player, room, &mut state, input);
+        let current = state.objects.records[slot];
+        assert!(
+            !player_inside_object(player.pos, &current, radius),
+            "player {:?} passed into slot {slot} at {:?}",
+            player.pos,
+            current.pos
+        );
+    }
+    state.objects.records[slot].pos
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_202_statue_slides_from_the_open_side() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("2020").unwrap();
+    let (room, game) = pack_room(&pack, id);
+
+    let statue = *game.objects.record(0).unwrap();
+    assert!(statue.active(), "ROOM202 slot 0 is not active");
+    assert_eq!(statue.pos, [23263, 0, 3510]);
+
+    // The open side is +X: the statue slides east until its own probe wedges
+    // it against the room's east wall, and the player stays outside the box
+    // the whole way (no pass-through while the push animation runs).
+    let final_pos = push_object(id, &room, &game, 0, [1, 0], 600);
+    let dx = final_pos[0] - statue.pos[0];
+    println!(
+        "ROOM202 statue: {:?} -> {final_pos:?} (dx {dx})",
+        statue.pos
+    );
+    assert!(dx > 1000, "the statue barely moved: dx {dx}");
+    assert_eq!(final_pos[2], statue.pos[2], "the slide left the long axis");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_108_cabinets_push_along_their_long_axes() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1080").unwrap();
+    let (room, game) = pack_room(&pack, id);
+
+    // Slot 0's long axis is X (1400 against 650): both X pushes slide it.
+    let cabinet = *game.objects.record(0).unwrap();
+    assert_eq!(cabinet.half_extents, [1400, 544, 650]);
+    let east = push_object(id, &room, &game, 0, [1, 0], 600);
+    let west = push_object(id, &room, &game, 0, [-1, 0], 600);
+    println!("ROOM108 slot 0: east {east:?}, west {west:?}");
+    assert!(
+        east[0] - cabinet.pos[0] > 500,
+        "slot 0 did not slide east: {east:?}"
+    );
+    assert!(
+        cabinet.pos[0] - west[0] > 500,
+        "slot 0 did not slide west: {west:?}"
+    );
+
+    // Slot 1's long axis is Z (1400 against 650): both Z pushes slide it.
+    let cabinet = *game.objects.record(1).unwrap();
+    assert_eq!(cabinet.half_extents, [650, 544, 1400]);
+    let north = push_object(id, &room, &game, 1, [0, -1], 600);
+    let south = push_object(id, &room, &game, 1, [0, 1], 600);
+    println!("ROOM108 slot 1: north {north:?}, south {south:?}");
+    assert!(
+        cabinet.pos[2] - north[2] > 500,
+        "slot 1 did not slide north: {north:?}"
+    );
+    assert!(
+        south[2] - cabinet.pos[2] > 500,
+        "slot 1 did not slide south: {south:?}"
+    );
+}
