@@ -534,3 +534,79 @@ fn room_406_map_palette_is_darkened_in_the_render() {
     }
     assert!(painted > 0, "the darkened map palette painted no pixels");
 }
+
+/// ROOM11A's crest wall: five handler-7 `aot_set` entries on the wall zone.
+/// The four flag-1 entries probe every frame and arm the crest items' use
+/// flags; the flag-0x81 entry raises the SYS bit only on the action press.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_11a_crest_wall_probes_arm_the_item_use_flags() {
+    let Some(pack) = assets() else {
+        return;
+    };
+    let id = RoomId::parse("11a1").unwrap();
+    let data = pack.read(&id.rdt_entry()).expect("room/11a1.rdt");
+    let room = rdt::parse(data, id).unwrap();
+    let scripts = arklay::scd::reader::parse(data).unwrap();
+    let mut state = GameState::new(id, &room);
+    {
+        let mut vm = arklay::scd::vm::CommandVm::new(&scripts);
+        let mut host = arklay::game::ScdGameHost::new(&mut state);
+        vm.run_init(&mut host);
+    }
+
+    // Slot 2 is the action-press entry (bank 4 selector 32); slots 3-6 probe
+    // every frame and arm the four crest items in the item-use flags
+    // (selectors 19/17/18/14 -> items 0x2E/0x2C/0x2D/0x29).
+    let press = state.room_actions[2].expect("the press entry");
+    assert_eq!(
+        (press.handler, press.flags, press.zone),
+        (7, 0x81, [6500, 27200, 2000, 1000])
+    );
+    assert_eq!(press.param_word(0), 4);
+    assert_eq!(press.param_word(1), 32);
+    let probes: Vec<RoomAction> = state.room_actions[3..=6]
+        .iter()
+        .flatten()
+        .copied()
+        .collect();
+    assert_eq!(probes.len(), 4, "the four per-frame crest probes");
+    for (action, selector) in probes.iter().zip([19u16, 17, 18, 14]) {
+        assert_eq!((action.handler, action.flags), (7, 0x01));
+        assert_eq!(action.param_word(0), 9);
+        assert_eq!(action.param_word(1), selector);
+        assert_eq!(action.param_word(2), 1);
+        assert_eq!(action.zone, [6500, 27200, 2000, 1000]);
+    }
+
+    // Stand so the 600-unit forward reach lands in the wall zone.
+    let zone = press.zone;
+    let (dx, dz) = player::reach_offset(0);
+    let pos = [
+        i32::from(zone[0]) + i32::from(zone[2]) / 2 - dx,
+        0,
+        i32::from(zone[1]) + i32::from(zone[3]) / 2 - dz,
+    ];
+
+    // The per-frame probes arm all four crest flags; the press entry waits.
+    state.interact(pos, 0, false);
+    for item in [0x2E, 0x2C, 0x2D, 0x29] {
+        assert!(state.item_use_flag(item), "item {item:#04x} was not armed");
+    }
+    assert!(
+        !state.flags[4].bit(32),
+        "the SYS bit needs the action press"
+    );
+    assert_eq!(
+        state.use_item(0x2E),
+        arklay::game::UseResult::Used {
+            healed: false,
+            cured: false,
+        },
+        "the armed crest is usable"
+    );
+
+    // The press entry raises the SYS bit.
+    state.interact(pos, 0, true);
+    assert!(state.flags[4].bit(32), "the press set the SYS bit");
+}

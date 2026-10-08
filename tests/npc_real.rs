@@ -71,42 +71,16 @@ fn character(pack: &Pack, game: &arklay::game::GameState, id: u8) -> Option<(usi
     Some((slot, *entity, model))
 }
 
-/// Render `meshes` over the cut background and return the frame.
-fn render_cut(
-    room: &arklay::state::RoomState,
-    cut_index: usize,
-    meshes: &[EntityMesh<'_>],
-) -> Image {
-    let cut = &room.cuts[cut_index];
-    let camera = Camera::from_cut(cut);
-    let lighting = Lighting::from_room(room);
-    let mut framebuffer = Framebuffer::new();
-    arklay::render::draw_gameplay_scene(
-        &mut framebuffer,
-        cut.background.as_ref(),
-        meshes,
-        &[],
-        &camera,
-        &lighting,
-        None,
-    );
-    Image {
-        width: framebuffer.width,
-        height: framebuffer.height,
-        rgba: framebuffer.rgba,
-    }
-}
-
-/// Render ROOM20D0's two spawned characters over the first cut that frames
-/// their spawn region and return `(cut index, changed pixels, changed pixels
-/// near each spawn)`.
+/// Render ROOM20D0's two spawned characters at the first cut that frames
+/// their spawn region, through the engine's real render path, and return
+/// `(cut index, changed pixels, changed pixels near each spawn)`.
 ///
 /// At the boot camera (cut 0) both characters project off screen. The cuts
 /// that frame them (1-2) are not the cuts whose switch zone contains them, so
-/// the old whole-entity zone cull would have hidden them; the original draws
-/// every active entity and only gates individual joints on the zone. This
-/// renders the framing cut through the scene path so the pose and paint path
-/// can be checked independently of the camera.
+/// the original's whole-entity gate hides every joint: the frame must match
+/// one with both character slots deactivated. The helper still locates the
+/// framing cut, so the render exercises the real `render_frame` gate rather
+/// than a hand-built mesh list.
 fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [usize; 2]) {
     let characters: Vec<(usize, Entity, Emd)> = [0x27u8, 0x23]
         .iter()
@@ -133,46 +107,31 @@ fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [u
         "the framing cut must not contain the spawns in its switch zone"
     );
 
-    // Pose each model at the frame the driver's clock applied last.
-    let mut models: Vec<&Emd> = Vec::new();
-    let mut joint_sets: Vec<Vec<anim::Mat4x3>> = Vec::new();
-    for (slot, entity, emd) in &characters {
-        let keyframe = sim.game.entity_anims[*slot].keyframe_index(entity, &emd.clips);
-        let matrix = anim::entity_matrix(entity.pos, entity.angle);
-        joint_sets.push(anim::joint_matrices(
-            &emd.skeleton,
-            &emd.keyframes[keyframe],
-            &matrix,
-        ));
-        models.push(emd);
+    // Render the framing cut with the characters live and with their slots
+    // deactivated; the switch-zone gate must make the two frames identical.
+    let mut room = sim.room.clone();
+    room.current_cut = cut_index;
+    let mut with = sim.game.clone();
+    let with_frame =
+        arklay::engine::render_game_frame(pack, sim.id, &room, &mut with, &sim.player).unwrap();
+    let mut without = sim.game.clone();
+    for (slot, _, _) in &characters {
+        without.entities[*slot].set_active(false);
     }
-    let meshes: Vec<EntityMesh<'_>> = models
-        .iter()
-        .zip(&joint_sets)
-        .map(|(model, joints)| EntityMesh {
-            mesh: &model.mesh,
-            texture: &model.texture,
-            joints,
-            tint: [255; 3],
-            blend_weight: None,
-            hidden_joints: 0,
-        })
-        .collect();
-
-    let with = render_cut(&sim.room, cut_index, &meshes);
-    let without = render_cut(&sim.room, cut_index, &[]);
-    let changed = changed_pixels(&with, &without);
+    let without_frame =
+        arklay::engine::render_game_frame(pack, sim.id, &room, &mut without, &sim.player).unwrap();
+    let changed = changed_pixels(&with_frame, &without_frame);
 
     let camera = Camera::from_cut(&sim.room.cuts[cut_index]);
     let mut near = [0usize; 2];
     for (index, (_, entity, _)) in characters.iter().enumerate() {
         let [cx, cy] = camera.project(entity.pos).unwrap();
-        near[index] = with
+        near[index] = with_frame
             .rgba
             .as_chunks::<4>()
             .0
             .iter()
-            .zip(without.rgba.as_chunks::<4>().0)
+            .zip(without_frame.rgba.as_chunks::<4>().0)
             .enumerate()
             .filter(|(index, (a, b))| {
                 a != b && {
@@ -188,7 +147,7 @@ fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [u
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_room20d0_characters_paint_in_the_spawn_region() {
+fn real_room20d0_off_zone_spawns_are_culled() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
@@ -208,13 +167,11 @@ fn real_room20d0_characters_paint_in_the_spawn_region() {
     assert_eq!(rebecca.state(), 1, "Rebecca is idle");
 
     let (_, changed, near) = render_room20d0_spawns(&pack, &first);
-    assert!(
-        changed > 500,
-        "the characters only repainted {changed} pixels"
+    assert_eq!(
+        (changed, near),
+        (0, [0, 0]),
+        "the off-zone spawns painted in the framing cut"
     );
-    for (index, count) in near.iter().enumerate() {
-        assert!(*count > 50, "no character pixels near spawn {index}");
-    }
 }
 
 #[test]
@@ -254,7 +211,7 @@ fn real_room1060_new_game_capture_includes_the_main_hall_characters() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_room20d0_ticks_capture_is_stable_and_shows_the_characters() {
+fn real_room20d0_ticks_capture_is_stable_and_culls_off_zone_spawns() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
@@ -276,24 +233,24 @@ fn real_room20d0_ticks_capture_is_stable_and_shows_the_characters() {
         "the CLI capture does not match the simulated frame"
     );
 
-    // The characters painted. At the boot camera (cut 0) they project off
-    // screen, so the default capture cannot contain them; the delta is
-    // measured at the first cut that frames the spawns (outside that cut's
-    // switch zone, which the renderer no longer culls), over the exact
-    // simulation the CLI capture ran.
-    let (_, changed, _) = render_room20d0_spawns(&pack, &sim);
-    assert!(
-        changed > 500,
-        "the characters only repainted {changed} pixels"
+    // At the boot camera (cut 0) the spawns project off screen, and the cuts
+    // that frame them are outside their switch zone, so the whole-entity gate
+    // hides them from both views.
+    let (_, changed, near) = render_room20d0_spawns(&pack, &sim);
+    assert_eq!(
+        (changed, near),
+        (0, [0, 0]),
+        "the off-zone spawns painted in the framing cut"
     );
 }
 
-/// A character outside the current camera's switch zone must still paint when
-/// it projects on screen: the original's entity render loop draws every active
-/// entity and only gates individual joints (flag byte 0x74) on the zone.
+/// A character outside the current camera's switch zone draws no joints: the
+/// original's entity render loop gates the whole entity on the
+/// `has_enter_switch_zone` bit and only keeps `0x74`-class joints, which no
+/// shipped character model sets.
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_room40c1_off_zone_character_paints_on_screen() {
+fn real_room40c1_off_zone_character_is_culled() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
@@ -305,6 +262,10 @@ fn real_room40c1_off_zone_character_paints_on_screen() {
     // zone does not contain it, but it projects to (178, 132) on screen.
     let (_, entity, _) = character(&pack, &sim.game, 0x2B).expect("ROOM40C1 spawns 0x2B");
     assert_eq!(entity.pos, [10000, 0, 30000]);
+    assert_eq!(
+        entity.has_enter_switch_zone, 0,
+        "the fixture character must not have entered the switch zone"
+    );
     assert!(
         !arklay::npc::in_camera_zone(&sim.room, sim.room.current_cut, entity.pos),
         "the fixture character must be outside the current switch zone"
@@ -316,12 +277,12 @@ fn real_room40c1_off_zone_character_paints_on_screen() {
         "the fixture must project on screen, got ({x}, {y})"
     );
 
-    // The simulated frame runs engine::render_frame; the baseline hides every
-    // character slot, so the delta is exactly the off-zone character.
+    // The simulated frame and the same state with the fixture slot deactivated
+    // must be identical: the off-zone character contributes no pixels.
     let changed = changed_pixels(&sim.frame, &sim.baseline);
-    assert!(
-        changed > 0,
-        "the off-zone character never painted in the simulated frame"
+    assert_eq!(
+        changed, 0,
+        "the off-zone character painted {changed} pixels"
     );
     let near = sim
         .frame
@@ -339,9 +300,58 @@ fn real_room40c1_off_zone_character_paints_on_screen() {
             }
         })
         .count();
+    assert_eq!(near, 0, "no changed pixel may be near the fixture");
+}
+
+/// ROOM109 cut 4 spawns Barry at the origin with `has_enter_switch_zone == 0`,
+/// so the whole-entity gate must hide him even though his model would project.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room109_cut4_barry_is_culled_by_the_switch_zone() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1091").unwrap();
+    let mut sim = simulate_room(&pack, id, 0, player::Input::default()).unwrap();
+    assert!(sim.room.cuts.len() > 4, "ROOM1091 has a cut 4");
+
+    let (slot, barry, _) = character(&pack, &sim.game, 0x22).expect("ROOM1091 spawns Barry");
+    assert_eq!(slot, 1, "Barry is the first character slot");
+    assert_eq!(barry.pos, [0, 0, 0]);
     assert_eq!(
-        near, changed,
-        "the frame delta is not the off-zone character's pixels"
+        barry.has_enter_switch_zone, 0,
+        "cut 4 leaves Barry outside the switch zone"
+    );
+    assert!(
+        !arklay::npc::in_camera_zone(&sim.room, 4, barry.pos),
+        "cut 4's switch zone must not contain the origin"
+    );
+
+    // Render cut 4 with Barry live and with his slot deactivated; the gate must
+    // make the two frames identical.
+    sim.room.current_cut = 4;
+    let mut with = sim.game.clone();
+    let frame =
+        arklay::engine::render_game_frame(&pack, id, &sim.room, &mut with, &sim.player).unwrap();
+    let mut without = sim.game.clone();
+    without.entities[slot].set_active(false);
+    let baseline =
+        arklay::engine::render_game_frame(&pack, id, &sim.room, &mut without, &sim.player).unwrap();
+    assert_eq!(
+        frame.rgba, baseline.rgba,
+        "Barry leaked into the cut-4 frame"
+    );
+
+    // Control: force the entered bit and the same cut paints Barry, so the
+    // empty diff above is the gate, not a model that cannot project.
+    let mut forced = sim.game.clone();
+    forced.entities[slot].has_enter_switch_zone = 1;
+    let painted =
+        arklay::engine::render_game_frame(&pack, id, &sim.room, &mut forced, &sim.player).unwrap();
+    assert!(
+        changed_pixels(&painted, &baseline) > 0,
+        "the control render must paint Barry"
     );
 }
 

@@ -833,6 +833,10 @@ pub enum RoomActionKind {
     /// A door approach-side latch (`check_door`/`check_door_side`, handlers
     /// 5/6) that feeds the door animation instead of opening anything.
     DoorCheck,
+    /// A flag-bank bit write (`flag_bank_set`, handler 7). Room scripts use it
+    /// as a probed zone entry (room 11A's crest wall), so the probe must
+    /// dispatch it like every other handler.
+    FlagBankSet,
     /// Anything else; stores its parameters but does not act yet.
     Other,
 }
@@ -853,6 +857,7 @@ impl RoomActionKind {
             HANDLER_DESK => Self::Desk,
             HANDLER_STAIRS_ZONE => Self::StairsZone,
             HANDLER_STAIRS_HEIGHT => Self::StairsHeight,
+            HANDLER_FLAG_BANK_SET => Self::FlagBankSet,
             _ => Self::Other,
         }
     }
@@ -3729,6 +3734,9 @@ impl GameState {
                     room_action.slot,
                     room_action.handler == HANDLER_DOOR_CHECK_SIDE,
                 );
+            }
+            RoomActionKind::FlagBankSet => {
+                self.flag_bank_set(room_action.slot);
             }
             RoomActionKind::Typewriter | RoomActionKind::Other => {
                 self.record_interaction(room_action.slot, room_action.kind, None);
@@ -9083,10 +9091,11 @@ mod tests {
 
     #[test]
     fn aot_set_classifies_the_sce_byte() {
-        let cases: [(u8, RoomActionKind); 11] = [
+        let cases: [(u8, RoomActionKind); 12] = [
             (1, RoomActionKind::Door),
             (2, RoomActionKind::Message),
             (4, RoomActionKind::Item),
+            (7, RoomActionKind::FlagBankSet),
             (8, RoomActionKind::ItemBox),
             (9, RoomActionKind::Event),
             (10, RoomActionKind::Other),
@@ -10989,6 +10998,47 @@ mod tests {
                 message: None,
             })
         );
+    }
+
+    #[test]
+    fn probed_flag_bank_actions_arm_the_item_use_flags() {
+        // The room 11A crest wall: an `aot_set` entry with flags 1 writing
+        // bank 9 selector 19 arms crest item 0x2E's use flag on every probe.
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            assert_eq!(
+                host.on_room_action(
+                    op(0x0D),
+                    &operands(&[3, 0, 0, 100, 100, 7, 0x01, 9, 19, 1,])
+                ),
+                StepResult::Continue
+            );
+        }
+        let crest = state.room_actions[3].expect("the crest probe entry");
+        assert_eq!(crest.kind, RoomActionKind::FlagBankSet);
+        state.interact([-550, 0, 50], 0, false);
+        assert!(state.item_use_flag(0x2E), "the probe armed the crest flag");
+        assert_eq!(
+            state.use_item(0x2E),
+            UseResult::Used {
+                healed: false,
+                cured: false,
+            },
+            "the armed crest is usable"
+        );
+
+        // The action-press variant (flags 0x81) writes bank 4 selector 32 only
+        // on the press edge.
+        let mut state = game();
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            host.on_room_action(op(0x0D), &operands(&[3, 0, 0, 100, 100, 7, 0x81, 4, 32, 1]));
+        }
+        state.interact([-550, 0, 50], 0, false);
+        assert!(!state.flags[4].bit(32), "0x81 waits for the action press");
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.flags[4].bit(32), "the press set the SYS bit");
     }
 
     #[test]

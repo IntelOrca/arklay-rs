@@ -6123,18 +6123,28 @@ fn apply_look_at(joints: &mut [anim::Mat4x3], entity: &game::Entity, clock: &npc
 }
 
 /// The switch-zone member class of a character model: the original's joint
-/// flag bits `0x74`, whose joints draw only inside the current camera's switch
-/// zone. No shipped character model sets the class, so the gate is dormant for
-/// the corpus and exercised by the synthetic tests.
+/// flag bits `0x74`, whose joints are the only ones a character outside the
+/// current camera's switch zone still draws, and then only when the joint
+/// itself sits inside the zone. No shipped character model sets the class, so
+/// an off-zone character contributes no joints at all; the synthetic tests
+/// exercise a non-empty class.
 fn member_joint_class(id: u8) -> u32 {
     let _ = id;
     0
 }
 
-/// The hidden-joint mask for one character: the scripted hidden bits plus
-/// every member-class joint whose world position is outside the current
-/// camera's switch zone.
+/// The hidden-joint mask for one character: the scripted hidden bits plus the
+/// original's whole-entity switch-zone gate.
+///
+/// `entity_in_switch_zone` is whether `has_enter_switch_zone & 0x7f` is
+/// non-zero (the character has entered the current camera's switch zone). The
+/// original's `render_entity` computes that once per entity and then walks its
+/// joints: an entity that has NOT entered the zone drops every joint except
+/// the member class (`0x74`), and even a member joint draws only when its own
+/// world position is inside the zone; an entity inside the zone draws every
+/// non-member joint and position-tests only the members.
 fn joint_hidden_mask(
+    entity_in_switch_zone: bool,
     members: u32,
     room: &RoomState,
     camera: usize,
@@ -6143,14 +6153,19 @@ fn joint_hidden_mask(
 ) -> u32 {
     let mut hidden = u32::from(joint_flags);
     for (index, joint) in joints.iter().enumerate() {
-        if index >= 32
-            || members & (1 << index) == 0
-            || hidden & (1 << index) != 0
-            || npc::in_camera_zone(room, camera, joint.t)
-        {
-            continue;
+        if index >= 32 {
+            break;
         }
-        hidden |= 1 << index;
+        let member = members & (1 << index) != 0;
+        let in_zone = npc::in_camera_zone(room, camera, joint.t);
+        let draws = if entity_in_switch_zone {
+            !member || in_zone
+        } else {
+            member && in_zone
+        };
+        if !draws {
+            hidden |= 1 << index;
+        }
     }
     hidden
 }
@@ -6159,12 +6174,13 @@ fn joint_hidden_mask(
 /// character, the player model, the player's ground shadow and the camera's
 /// room-mask layer, depth-sorted together.
 ///
-/// Every active character is drawn, exactly like the original's entity render
-/// loop; the camera switch zone gates only the per-joint `0x74` draw flag and
-/// the character's own shadow (`has_enter_switch_zone`), never the whole
-/// entity, so a character outside the zone still paints when it projects on
-/// screen. The meshes are submitted in entity-slot order with the player last,
-/// because the original queues the enemies before the player; the shared
+/// Every active character enters the loop, exactly like the original's entity
+/// render loop, but its joints are gated by `has_enter_switch_zone`: a
+/// character that has not entered the current camera's switch zone draws only
+/// its `0x74` member joints, and those only while inside the zone, so an
+/// off-zone character contributes nothing. A character inside the zone draws
+/// as before. The meshes are submitted in entity-slot order with the player
+/// last, because the original queues the enemies before the player; the shared
 /// far-to-near sort is stable, so equal-depth triangles keep that submission
 /// order and the player paints over an NPC at an exact tie. The mask page and
 /// the shadow page are loaded lazily and cached.
@@ -6308,6 +6324,7 @@ fn render_frame(
         let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
         apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
         let hidden = joint_hidden_mask(
+            entity.has_enter_switch_zone & 0x7f != 0,
             member_joint_class(entity.id),
             room,
             room.current_cut,
@@ -6389,7 +6406,11 @@ fn render_frame(
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
+        // The port does not model the player's own switch-zone bit (the
+        // original recomputes it for the player every frame); keep the player
+        // mesh on the inside-the-zone path so only member joints are gated.
         let hidden = joint_hidden_mask(
+            true,
             member_joint_class(game.entities[0].id),
             room,
             room.current_cut,
@@ -12864,17 +12885,142 @@ end
         ];
         // Joint 1 is a member of the 0x74 class; inside the zone it draws and
         // outside it is hidden, on top of any scripted hidden bit.
-        let hidden = joint_hidden_mask(0b10, &room, 0, 0, &joints);
+        let hidden = joint_hidden_mask(true, 0b10, &room, 0, 0, &joints);
         assert_eq!(hidden, 0b10, "the inside member must not be hidden");
         assert_eq!(
-            joint_hidden_mask(0b11, &room, 0, 0b01, &joints),
+            joint_hidden_mask(true, 0b11, &room, 0, 0b01, &joints),
             0b11,
             "a member outside the zone joins the scripted hidden mask"
         );
         // Joint 0 is outside the member class and stays visible outside the
         // zone; joint 1 stops being hidden when no class is set.
-        assert_eq!(joint_hidden_mask(0, &room, 0, 0, &joints), 0);
+        assert_eq!(joint_hidden_mask(true, 0, &room, 0, 0, &joints), 0);
         // A camera with no zone header hides every member.
-        assert_eq!(joint_hidden_mask(0b10, &room, 4, 0, &joints), 0b10);
+        assert_eq!(joint_hidden_mask(true, 0b10, &room, 4, 0, &joints), 0b10);
+        // An entity that has not entered the zone drops every non-member joint;
+        // a member joint still draws while it sits inside the zone.
+        assert_eq!(
+            joint_hidden_mask(false, 0, &room, 0, 0, &joints),
+            0b11,
+            "an off-zone entity with no member class draws no joint"
+        );
+        assert_eq!(
+            joint_hidden_mask(false, 0b01, &room, 0, 0, &joints),
+            0b10,
+            "only the in-zone member joint survives"
+        );
+        assert_eq!(
+            joint_hidden_mask(false, 0b10, &room, 4, 0, &joints),
+            0b11,
+            "an off-zone entity draws no joint without a zone header"
+        );
+    }
+
+    /// A one-joint character mesh with a single textured triangle: enough for
+    /// `render_frame` to pose and paint an NPC slot without a pack. The
+    /// triangle's winding faces the `effect_test_room` cut camera.
+    fn synthetic_npc_model() -> Emd {
+        Emd {
+            skeleton: Skeleton {
+                relative: vec![[0, 0, 0]],
+                children: vec![Vec::new()],
+            },
+            keyframes: vec![Keyframe::default()],
+            clips: vec![Clip {
+                frames: vec![ClipFrame {
+                    keyframe: 0,
+                    timing: 1,
+                }],
+            }],
+            mesh: Tmd {
+                objects: vec![crate::model::TmdObject {
+                    vertices: vec![[0, 0, 0], [1000, 0, 0], [0, 1000, 0]],
+                    normals: vec![[0, 0, 4096]],
+                    prims: vec![crate::model::TmdPrim {
+                        vertices: [0, 1, 2],
+                        normals: [0, 0, 0],
+                        uv: [[0, 0]; 3],
+                        clut: 0x7800,
+                        tsb: 0x80,
+                        textured: true,
+                        blend: false,
+                        raw_y: false,
+                        flat_color: None,
+                        quad: None,
+                    }],
+                }],
+            },
+            texture: Texture8 {
+                width: 1,
+                height: 1,
+                indices: vec![0],
+                palettes: vec![[200, 80, 80, 255]],
+                stp: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn an_npc_outside_the_camera_switch_zone_renders_no_triangles() {
+        let id = RoomId::parse("1000").unwrap();
+        let mut room = effect_test_room();
+        room.ambient = [4095; 3];
+        let mut game = game::GameState::new(id, &room);
+        let entity = &mut game.entities[1];
+        entity.status_flags |= game::ENTITY_STATUS_ACTIVE;
+        entity.id = 0x21;
+        entity.pos = [500, 0, 1500];
+        entity.angle = 0;
+
+        let model = synthetic_npc_model();
+        let mut npc_models = npc::EntityModelCache::default();
+        npc_models.models.insert(0x21, Arc::new(model));
+        let pack = Pack::from_bytes(PackWriter::new().to_bytes().unwrap()).unwrap();
+        let player_state = player::spawn(id, &room);
+
+        let render =
+            |game: &mut game::GameState, npc_models: &mut npc::EntityModelCache| -> Framebuffer {
+                let mut framebuffer = Framebuffer::new();
+                render_frame(
+                    &mut framebuffer,
+                    &pack,
+                    id,
+                    &room,
+                    &player_state,
+                    game,
+                    None,
+                    npc_models,
+                    &mut MaskCache::default(),
+                    &mut ShadowCache::default(),
+                    &mut EffectPageCache::default(),
+                );
+                framebuffer
+            };
+
+        // Inside the zone: the mesh paints as before.
+        game.entities[1].has_enter_switch_zone = 1;
+        let inside = render(&mut game, &mut npc_models);
+        assert!(
+            inside
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the in-zone NPC painted nothing"
+        );
+
+        // Outside: every joint is hidden, so the frame is empty.
+        game.entities[1].has_enter_switch_zone = 0;
+        let outside = render(&mut game, &mut npc_models);
+        assert!(
+            outside
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[..3] == [0, 0, 0]),
+            "the off-zone NPC still painted"
+        );
     }
 }

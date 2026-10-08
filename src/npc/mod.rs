@@ -245,9 +245,10 @@ pub fn update_entity(
 ///
 /// This is the room's zone test the player's ground shadow already uses: the
 /// first zone whose `cam_from` names `camera` is that camera's header quad.
-/// The original uses it for the per-joint `0x74` draw flag and the
-/// character's `has_enter_switch_zone` shadow bit; it never culls a whole
-/// character from the frame.
+/// The original's character driver stores the result in the entity's
+/// `has_enter_switch_zone` shadow bit every frame; the renderer then uses that
+/// bit as a whole-entity gate, hiding every non-member joint (and off-zone
+/// member joints) of a character that has not entered the zone.
 pub fn in_camera_zone(room: &RoomState, camera: usize, pos: [i32; 3]) -> bool {
     room.zones
         .iter()
