@@ -346,11 +346,11 @@ fn room_406_guardhouse_map_raises_its_room_flag() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn simulate_new_game_in_room_100_registers_the_three_item_actions() {
+fn simulate_new_game_in_room_106_registers_the_ink_ribbon() {
     let Some(pack) = assets() else {
         return;
     };
-    let sim = simulate_new_game(&pack, 0, 60, player::Input::default()).expect("ROOM1000 loads");
+    let sim = simulate_new_game(&pack, 0, 60, player::Input::default()).expect("ROOM1060 loads");
     let mut items: Vec<u8> = sim
         .game
         .room_actions
@@ -362,10 +362,10 @@ fn simulate_new_game_in_room_100_registers_the_three_item_actions() {
     items.sort_unstable();
     assert_eq!(
         items,
-        vec![0x33, 0x42, 0x42],
-        "the new-game room-items bank registers all three builds"
+        vec![0x2F],
+        "the main hall's new-game bank registers the ink ribbon"
     );
-    assert_eq!(sim.game.items.built, 3);
+    assert_eq!(sim.game.items.built, 1);
 }
 
 #[test]

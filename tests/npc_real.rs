@@ -219,32 +219,37 @@ fn real_room20d0_characters_paint_in_the_spawn_region() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_room1000_new_game_capture_includes_rebecca() {
+fn real_room1060_new_game_capture_includes_the_main_hall_characters() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
 
-    // The main-hall scene needs the intro event to run; 30 ticks bring the
-    // player into the camera that frames Rebecca.
+    // The main-hall opening event spawns Wesker and Jill; 30 ticks bring the
+    // player into the camera that frames them.
     let first = simulate_new_game(&pack, 0, 30, player::Input::default()).unwrap();
     let second = simulate_new_game(&pack, 0, 30, player::Input::default()).unwrap();
     assert_eq!(
         first.frame.rgba, second.frame.rgba,
         "the new-game capture differs between runs"
     );
-    assert!(
-        first
-            .game
-            .entities
-            .iter()
-            .skip(1)
-            .any(|entity| entity.id == 0x23 && entity.active()),
-        "ROOM1000 init spawns Rebecca"
-    );
+    for id in [0x24, 0x21] {
+        assert!(
+            first
+                .game
+                .entities
+                .iter()
+                .skip(1)
+                .any(|entity| entity.id == id && entity.active()),
+            "ROOM1060 init spawns character 0x{id:02X}"
+        );
+    }
 
     let changed = changed_pixels(&first.frame, &first.baseline);
-    assert!(changed > 500, "Rebecca only repainted {changed} pixels");
+    assert!(
+        changed > 100,
+        "the main-hall characters only repainted {changed} pixels"
+    );
 }
 
 #[test]

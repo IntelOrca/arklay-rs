@@ -247,6 +247,15 @@ impl SaveFile {
         file.room_items.copy_from_slice(state.flags[7].bytes());
         file.room_flags
             .copy_from_slice(&state.flags[8].bytes()[..20]);
+        // The 12 slot bytes are one contiguous run: the player's slots first,
+        // then Rebecca's. Rebecca's block goes down first so a Jill inventory
+        // (up to eight slots) overwrites the two slots it shares with her.
+        for (slot, stack) in file.player_slots[6..]
+            .iter_mut()
+            .zip(state.rebecca_inventory.iter())
+        {
+            *slot = *stack;
+        }
         for (slot, stack) in file.player_slots.iter_mut().zip(state.inventory.iter()) {
             *slot = *stack;
         }
@@ -271,6 +280,27 @@ impl SaveFile {
         }
         self.prefix.copy_from_slice(&data[..PREFIX_LEN]);
         Ok(())
+    }
+
+    /// Apply the shipped card's new-game state, the original's `InitializeGame`
+    /// 1052-byte memcpy: the BioCard state image, the flag banks, the item box,
+    /// Rebecca's slots and the room-BGM table. The character-specific fields
+    /// (player inventory, room items, pickup quantities, health and model id)
+    /// are overwritten by the new-game seed that follows.
+    pub fn apply_new_game_card(&self, state: &mut GameState) {
+        state.state_bytes = self.state_bytes;
+        state.flags[0].bytes_mut()[..16].copy_from_slice(&self.scenario);
+        state.flags[1].bytes_mut().copy_from_slice(&self.scenario2);
+        state.flags[2].bytes_mut()[..8].copy_from_slice(&self.locks);
+        state.flags[3].bytes_mut().copy_from_slice(&self.enemies);
+        state.flags[7].bytes_mut().copy_from_slice(&self.room_items);
+        state.flags[8].bytes_mut()[..20].copy_from_slice(&self.room_flags);
+        state.message.examined = self.examined;
+        state.item_box = self.item_box;
+        state
+            .rebecca_inventory
+            .copy_from_slice(&self.player_slots[6..12]);
+        state.room_bgm = self.room_bgm;
     }
 
     /// Apply the parsed block to a game state.
@@ -321,6 +351,9 @@ impl SaveFile {
             .filter(|stack| stack.id != 0)
             .collect();
         state.item_box = self.item_box;
+        state
+            .rebecca_inventory
+            .copy_from_slice(&self.player_slots[6..12]);
         // The per-room BGM table round-trips through the block; the live state
         // byte is not saved, so it resets to the nothing-playing value and the
         // destination room's entry rebuilds the channels on load.
@@ -713,6 +746,23 @@ mod tests {
         let file = filled();
         let bytes = file.to_bytes();
         assert_eq!(SaveFile::from_bytes(&bytes).unwrap(), file);
+    }
+
+    #[test]
+    fn rebecca_slots_round_trip_through_the_state() {
+        let mut state = GameState::new(RoomId::parse("1060").unwrap(), &RoomState::default());
+        state.rebecca_inventory[0] = InventoryItem {
+            id: 0x02,
+            quantity: 15,
+        };
+        let file = SaveFile::from_state(&state);
+        assert_eq!(file.player_slots[6].id, 0x02);
+        assert_eq!(file.player_slots[6].quantity, 15);
+
+        let mut restored = GameState::default();
+        file.apply_to(&mut restored);
+        assert_eq!(restored.rebecca_inventory[0].id, 0x02);
+        assert_eq!(restored.rebecca_inventory[0].quantity, 15);
     }
 
     #[test]

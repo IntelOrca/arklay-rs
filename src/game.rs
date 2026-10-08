@@ -55,6 +55,10 @@ pub const STATE_BYTE_MENU_CHOICE: u8 = 5;
 pub const STATE_BYTE_SELECTED_ITEM: u8 = 6;
 /// State byte holding the number of held inventory slots (BioCard 0x207).
 pub const STATE_BYTE_TOTAL_HELD: u8 = 7;
+/// State byte holding the character's model id (BioCard 0x209). `InitializeGame`
+/// writes the selected character here on a new game; the alternate outfit is
+/// model id + 8.
+pub const STATE_BYTE_CHARACTER_MODEL: u8 = 9;
 /// State byte holding the action hit by the forward position probe.
 pub const STATE_BYTE_FWD_ACTION: u8 = 16;
 /// State byte holding the action hit by the entity position probe.
@@ -69,6 +73,8 @@ pub const STATE_BYTE_SAVES: u8 = 40;
 pub const STATE_BYTE_EQUIPPED: u8 = 41;
 /// State byte holding the selected character (BioCard 0x22B).
 pub const STATE_BYTE_CHARACTER: u8 = 43;
+/// First state byte of the player's health copy (BioCard 0x21E, a short).
+pub const STATE_BYTE_HEALTH_COPY: u8 = 0x1E;
 /// State byte holding the health status flags (BioCard 0x232).
 pub const STATE_BYTE_HEALTH_STATUS: u8 = 50;
 /// Inventory slots Chris can use (the first half of the 12 slot bytes).
@@ -216,6 +222,8 @@ pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
 const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
 /// Scenario/state flag bank index.
 pub const BANK_SCENARIO: u8 = 0;
+/// Second scenario flag bank index (`g_ScenarioFlags2`).
+pub const BANK_SCENARIO2: u8 = 1;
 /// Door lock flag bank index.
 const BANK_LOCKS: u8 = 2;
 /// `room_check_actions` index of the item pickup handler.
@@ -324,6 +332,12 @@ pub const MESSAGE_TYPEWRITER_RIBBON_PROMPT: u8 = 0xDF;
 pub const MESSAGE_TYPEWRITER_SAVE_PROMPT: u8 = 0xE0;
 /// Scenario-2 flag cleared when a `0x10` cure removes the poison bit `0x20`.
 pub const SCENARIO2_FLAG_YAWN_POISONED: u8 = 0x43;
+/// Scenario-2 flag marking Jill's first playthrough (with the main hall's
+/// ink-ribbon room-items bit). `InitializeGame` raises both on a new Jill game.
+pub const SCENARIO2_FLAG_JILL_FIRST_RUN: u8 = 0x0B;
+/// Room-items bit `InitializeGame` raises for Jill's first playthrough to
+/// disable the main hall's ink ribbon.
+pub const ROOM_ITEM_FLAG_MAIN_HALL_RIBBON: u8 = 0x34;
 /// Item-use flag bit of the red book.
 pub const ITEM_RED_BOOK_FLAG: u8 = 0x23;
 /// Item id of the red book.
@@ -1348,6 +1362,12 @@ pub struct GameState {
     pub fmv: FmvState,
     /// The player's inventory.
     pub inventory: Vec<InventoryItem>,
+    /// Rebecca's six inventory slots (`g_RebeccaItemSlots`), parallel to the
+    /// player's. `SetInitialItems` gives her a Beretta with 15 rounds in
+    /// Chris's game and the original swaps `g_ItemSlotsPointer` to these while
+    /// the player model is Rebecca; the port records them so the save block
+    /// round-trips.
+    pub rebecca_inventory: [InventoryItem; INVENTORY_SLOTS_CHRIS],
     /// The room's action table.
     pub room_actions: [Option<RoomAction>; ROOM_ACTION_SLOTS],
     /// Door records, one per door action slot.
@@ -1558,6 +1578,7 @@ impl Default for GameState {
             voice: VoiceState::default(),
             fmv: FmvState::default(),
             inventory: Vec::new(),
+            rebecca_inventory: [InventoryItem::default(); INVENTORY_SLOTS_CHRIS],
             room_actions: [None; ROOM_ACTION_SLOTS],
             doors: [None; ROOM_ACTION_SLOTS],
             stair_zones: StairZones::default(),
@@ -3108,6 +3129,13 @@ impl GameState {
     pub fn set_health_status(&mut self, status: u8) {
         self.health_status = status;
         self.state_bytes[usize::from(STATE_BYTE_HEALTH_STATUS)] = status;
+    }
+
+    /// Mirror the player's health into the BioCard short (`g_PlayerHealthCopy`,
+    /// state byte 0x1E) that `InitializeGame` and the save block maintain.
+    pub fn set_health_copy(&mut self, health: i16) {
+        let offset = usize::from(STATE_BYTE_HEALTH_COPY);
+        self.state_bytes[offset..offset + 2].copy_from_slice(&health.to_le_bytes());
     }
 
     /// Clear the per-frame item-use flag bank. The original zeroes both

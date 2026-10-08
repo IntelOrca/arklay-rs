@@ -768,6 +768,10 @@ pub const NEW_GAME_POS_Z: i32 = 5000;
 pub const NEW_GAME_ANGLE: u16 = 3072;
 /// New-game starting health: Chris then Jill.
 pub const NEW_GAME_HEALTH: [i16; 2] = [140, 96];
+/// Fallback new-game start room (stage 1, the main hall) when the pack ships
+/// no `data/bio_card.dat`. The shipped card names the real start room; this is
+/// the same room the original's card carries.
+pub const NEW_GAME_ROOM: u8 = 0x06;
 /// New-game carried room-pickup quantities (BioCard 0x20C..0x20E): ROOM1160's
 /// shotgun shells and ROOM30B0/ROOM3080's flamethrower fuel.
 pub const NEW_GAME_PICKUP_QUANTITIES: [u8; 3] = [7, 240, 240];
@@ -792,19 +796,15 @@ const ITEM_SWORD_KEY: u8 = 0x33;
 const ITEM_COMM_RADIO: u8 = 0x4D;
 
 impl GameSession {
-    /// A new game as `character` (`0` Chris, `1` Jill): stage 1 room 0 with
-    /// the original's start position, health, items and room-item flags, then
-    /// the room init/main/event VMs.
+    /// A new game as `character` (`0` Chris, `1` Jill): the shipped card's
+    /// start room (the main hall), the original's start position, health,
+    /// items and room-item flags, then the room init/main/event VMs.
     fn new(pack: &Pack, character: u8, save_dir: &Path) -> Result<Self> {
         let character = character & 1;
-        let id = RoomId {
-            stage: 1,
-            room: 0,
-            player_flag: character,
-        };
+        let id = new_game_id(pack, character);
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
-        seed_new_game(&mut game, character);
+        seed_new_game(pack, &mut game, character);
         let mut player_state = player::spawn(id, &loaded.room);
         player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
         player_state.angle = NEW_GAME_ANGLE;
@@ -834,6 +834,12 @@ impl GameSession {
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
         file.apply_to(&mut game);
+        // `InitializeGame`'s continue branch: a zero save counter also zeroes
+        // the play timer, then every load advances the counter.
+        if game.state_bytes[usize::from(game::STATE_BYTE_SAVES)] == 0 {
+            game.state_bytes[0x24..0x28].fill(0);
+        }
+        game.increment_saves();
         let mut player_state = player::spawn(id, &loaded.room);
         player_state.pos = [
             i32::from(file.pos_x),
@@ -1766,12 +1772,63 @@ fn seed_room_items(game: &mut game::GameState) {
         .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
 }
 
-/// Apply the shipped new-game state: health, room-item flags, save counter
-/// and starting inventory (knife, spray, and Jill's Beretta with 15 rounds).
-fn seed_new_game(game: &mut game::GameState, character: u8) {
+/// The shipped new-game card (`data/bio_card.dat`), when the pack carries one.
+///
+/// `InitializeGame` loads this file and memcpys its 1052 bytes over the
+/// BioCard block on every new game; the port reads it for the same purpose.
+fn bio_card(pack: &Pack) -> Option<save::SaveFile> {
+    let bytes = pack.read(save::SAVE_PREFIX_ENTRY).ok()?;
+    match save::SaveFile::from_bytes(bytes) {
+        Ok(card) => Some(card),
+        Err(err) => {
+            eprintln!("warning: invalid {}: {err:#}", save::SAVE_PREFIX_ENTRY);
+            None
+        }
+    }
+}
+
+/// The new-game identity: the shipped card's stage/room (its stage byte is
+/// 0-based, the port's is the RDT file digit), else the main hall.
+fn new_game_id(pack: &Pack, character: u8) -> RoomId {
+    let fallback = RoomId {
+        stage: 1,
+        room: NEW_GAME_ROOM,
+        player_flag: character & 1,
+    };
+    let Some(card) = bio_card(pack) else {
+        return fallback;
+    };
+    let stage = card.stage.saturating_add(1);
+    if stage > RoomId::MAX_STAGE || card.room > RoomId::MAX_ROOM {
+        return fallback;
+    }
+    RoomId {
+        stage,
+        room: card.room,
+        player_flag: character & 1,
+    }
+}
+
+/// Apply the shipped new-game state: the `bio_card.dat` copy
+/// (`InitializeGame`'s 1052-byte memcpy), then `SetInitialItems` and the
+/// explicit overrides that follow it.
+fn seed_new_game(pack: &Pack, game: &mut game::GameState, character: u8) {
     let character = character & 1;
+    let card = bio_card(pack);
+    if let Some(card) = &card {
+        card.apply_new_game_card(game);
+        // The card copy restates the room bytes; the port's state image uses
+        // the 1-based stage digit, so put the identity back.
+        game.state_bytes[0] = game.id.stage;
+        game.state_bytes[1] = game.id.room;
+    }
+    // `InitializeGame` writes the selected character into the model-id and
+    // selected-character bytes after the card copy.
+    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)] = character;
+    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER)] = character;
     game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
     game.max_health = game::character_max_health(character);
+    game.set_health_copy(NEW_GAME_HEALTH[usize::from(character)]);
     // `set_health_status` also mirrors the byte the scripts read with `cmpb 50`.
     game.set_health_status(0x10);
     seed_room_items(game);
@@ -1781,13 +1838,44 @@ fn seed_new_game(game: &mut game::GameState, character: u8) {
     game.state_bytes[0x0C] = NEW_GAME_PICKUP_QUANTITIES[0];
     game.state_bytes[0x0D] = NEW_GAME_PICKUP_QUANTITIES[1];
     game.state_bytes[0x0E] = NEW_GAME_PICKUP_QUANTITIES[2];
-    game.state_bytes[usize::from(game::STATE_BYTE_SAVES)] = 0;
+    // The shipped card starts the counter at 1 (its save screen shows that
+    // first count); a pack without one falls back to 0.
+    game.state_bytes[usize::from(game::STATE_BYTE_SAVES)] =
+        card.as_ref().map_or(0, |card| card.saves);
+    // `InitializeGame` zeroes the play timer on a new game.
     game.state_bytes[0x24..0x28].fill(0);
+    // `SetInitialItems` writes the character's whole slot run (six for Chris,
+    // eight for Jill) and clears the rest. The port keeps the player's slots
+    // in `inventory` and the contiguous block's last six in
+    // `rebecca_inventory`; Jill's two extra slots overlap Rebecca's first two.
+    game.inventory.clear();
     game.add_item(ITEM_KNIFE, 0);
     if character == 1 {
         game.add_item(ITEM_BERETTA, 15);
     }
     game.add_item(ITEM_FIRST_AID_SPRAY, 1);
+    if character == 0 {
+        // Chris's run is six slots, so Rebecca's card beretta survives.
+        game.rebecca_inventory[0] = game::InventoryItem {
+            id: ITEM_BERETTA,
+            quantity: 15,
+        };
+    } else {
+        // Jill's eight-slot run clears Rebecca's first two slots.
+        let overlap = game::INVENTORY_SLOTS_JILL - game::INVENTORY_SLOTS_CHRIS;
+        game.rebecca_inventory[..overlap].fill(game::InventoryItem::default());
+    }
+    // `InitializeGame`'s Jill block: the first playthrough raises the main
+    // hall's ink-ribbon room-items bit and the Jill first-run scenario bit.
+    let second_playthrough = game.flag_test(
+        game::BANK_SCENARIO,
+        game::SCENARIO_FLAG_SECOND_PLAYTHROUGH,
+        false,
+    );
+    if character == 1 && !second_playthrough {
+        game.apply_flag(7, game::ROOM_ITEM_FLAG_MAIN_HALL_RIBBON, 0);
+        game.apply_flag(game::BANK_SCENARIO2, game::SCENARIO2_FLAG_JILL_FIRST_RUN, 0);
+    }
 }
 
 /// Which screen `--ui` boots or the app opens first.
@@ -3564,9 +3652,10 @@ pub fn render_game_frame(
     })
 }
 
-/// Drive the new-game start (stage 1 room 0) headlessly: the original's start
-/// position, facing and seed, then the same init/ticks/render path as
-/// [`simulate_room`]. `character` selects Chris (0) or Jill (1).
+/// Drive the new-game start (the shipped card's room, the main hall) headlessly:
+/// the original's start position, facing and seed, then the same
+/// init/ticks/render path as [`simulate_room`]. `character` selects Chris (0)
+/// or Jill (1).
 pub fn simulate_new_game(
     pack: &Pack,
     character: u8,
@@ -3574,14 +3663,10 @@ pub fn simulate_new_game(
     input: player::Input,
 ) -> Result<SimulatedRoom> {
     let character = character & 1;
-    let id = RoomId {
-        stage: 1,
-        room: 0,
-        player_flag: character,
-    };
+    let id = new_game_id(pack, character);
     let loaded = load_room(pack, id)?;
     let mut game = new_game_state(pack, id, &loaded.room);
-    seed_new_game(&mut game, character);
+    seed_new_game(pack, &mut game, character);
     let mut player_state = player::spawn(id, &loaded.room);
     player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
     player_state.angle = NEW_GAME_ANGLE;
@@ -8203,8 +8288,9 @@ mod tests {
         assert!(non_black_pixels(&decoded) > 5000);
     }
 
-    /// A one-room pack with both character variants of RDT 100. Title and
-    /// select art are intentionally absent: the screens log and continue.
+    /// A one-room pack with both character variants of RDT 106 (the main hall)
+    /// and the shipped-style bio card. Title and select art are intentionally
+    /// absent: the screens log and continue.
     fn new_game_pack(dir: &TempDir) -> PathBuf {
         let pack_path = dir.0.join("game.akpak");
         let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
@@ -8212,7 +8298,7 @@ mod tests {
         for player_flag in 0..=1u8 {
             let id = RoomId {
                 stage: 1,
-                room: 0,
+                room: NEW_GAME_ROOM,
                 player_flag,
             };
             writer
@@ -8223,15 +8309,50 @@ mod tests {
             .add(
                 &RoomId {
                     stage: 1,
-                    room: 0,
+                    room: NEW_GAME_ROOM,
                     player_flag: 0,
                 }
                 .cut_entry(0),
                 bmp_bytes.clone(),
             )
             .unwrap();
+        writer
+            .add(save::SAVE_PREFIX_ENTRY, synthetic_bio_card())
+            .unwrap();
         writer.write(&pack_path).unwrap();
         pack_path
+    }
+
+    /// A serialized bio card carrying the shipped new-game fields: the main
+    /// hall, the starting item box and the counter at 1.
+    fn synthetic_bio_card() -> Vec<u8> {
+        let mut card = save::SaveFile {
+            room: NEW_GAME_ROOM,
+            saves: 1,
+            total_held: 2,
+            ..save::SaveFile::default()
+        };
+        card.item_box[0] = game::InventoryItem {
+            id: ITEM_HANDGUN_AMMO,
+            quantity: 15,
+        };
+        card.item_box[1] = game::InventoryItem {
+            id: ITEM_HANDGUN_AMMO,
+            quantity: 15,
+        };
+        card.player_slots[0] = game::InventoryItem {
+            id: ITEM_KNIFE,
+            quantity: 0,
+        };
+        card.player_slots[1] = game::InventoryItem {
+            id: ITEM_FIRST_AID_SPRAY,
+            quantity: 1,
+        };
+        card.player_slots[6] = game::InventoryItem {
+            id: ITEM_BERETTA,
+            quantity: 15,
+        };
+        card.to_bytes().to_vec()
     }
 
     fn confirm_input() -> UiInput {
@@ -8542,7 +8663,7 @@ mod tests {
             session.game.id,
             RoomId {
                 stage: 1,
-                room: 0,
+                room: NEW_GAME_ROOM,
                 player_flag: 0
             }
         );
@@ -8557,7 +8678,7 @@ mod tests {
         std::fs::create_dir_all(&saves).unwrap();
         let mut file = save::SaveFile {
             stage: 1,
-            room: 0,
+            room: NEW_GAME_ROOM,
             character: 0,
             health: 77,
             pos_x: 1234,
@@ -8603,6 +8724,11 @@ mod tests {
         );
         assert_eq!(session.player.pos, [1234, 0, 5678]);
         assert_eq!(session.player.angle, 1024);
+        assert_eq!(
+            session.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
+            1,
+            "the continue path advances the save counter"
+        );
     }
 
     /// A modal that counts its updates and draws nothing.
@@ -8760,9 +8886,16 @@ mod tests {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
-        let mut session =
-            GameSession::from_room(&pack, RoomId::parse("1000").unwrap(), Path::new("saves"))
-                .unwrap();
+        let mut session = GameSession::from_room(
+            &pack,
+            RoomId {
+                stage: 1,
+                room: NEW_GAME_ROOM,
+                player_flag: 0,
+            },
+            Path::new("saves"),
+        )
+        .unwrap();
         session.open_menu(&pack);
         session.handle_tab(&pack, 0);
         assert!(session.map.is_none(), "no radio: the map tab is inert");
@@ -9813,13 +9946,29 @@ end
     /// A pack carrying a room and one synthetic film per `(id, name)` entry.
     fn film_pack(dir: &TempDir, films: &[(u8, &str)]) -> Pack {
         let pack_path = dir.0.join("films.akpak");
-        let id = RoomId::parse("1001").unwrap();
         let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
         let mut writer = PackWriter::new();
+        for player_flag in 0..=1u8 {
+            let id = RoomId {
+                stage: 1,
+                room: NEW_GAME_ROOM,
+                player_flag,
+            };
+            writer
+                .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+                .unwrap();
+        }
         writer
-            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .add(
+                &RoomId {
+                    stage: 1,
+                    room: NEW_GAME_ROOM,
+                    player_flag: 0,
+                }
+                .cut_entry(0),
+                bmp_bytes,
+            )
             .unwrap();
-        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
         for &(film_id, name) in films {
             let _ = film_id;
             writer
@@ -10535,7 +10684,7 @@ end
                 session.game.id,
                 RoomId {
                     stage: 1,
-                    room: 0,
+                    room: NEW_GAME_ROOM,
                     player_flag: character
                 }
             );
@@ -10550,17 +10699,34 @@ end
                 NEW_GAME_HEALTH[usize::from(character)]
             );
             assert_eq!(session.game.flags[7].bytes(), &NEW_GAME_ROOM_ITEMS);
+            // The card's counter rides the new game; its first save shows 1.
             assert_eq!(
                 session.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
-                0
+                1
             );
             assert_eq!(&session.game.state_bytes[0x24..0x28], &[0; 4]);
-            // The starting health status reaches the `cmpb 50` state byte.
+            // The starting health status reaches the `cmpb 50` state byte and
+            // the health copy short.
             assert_eq!(session.game.health_status, 0x10);
             assert_eq!(
                 session.game.state_bytes[usize::from(game::STATE_BYTE_HEALTH_STATUS)],
                 0x10
             );
+            assert_eq!(
+                &session.game.state_bytes[usize::from(game::STATE_BYTE_HEALTH_COPY)
+                    ..usize::from(game::STATE_BYTE_HEALTH_COPY) + 2],
+                &NEW_GAME_HEALTH[usize::from(character)].to_le_bytes()
+            );
+            // `InitializeGame` writes the selected character into the model id.
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)],
+                character
+            );
+            // The card's item box carries two Handgun Ammo stacks of 15.
+            for slot in 0..2 {
+                assert_eq!(session.game.item_box[slot].id, ITEM_HANDGUN_AMMO);
+                assert_eq!(session.game.item_box[slot].quantity, 15);
+            }
             // SetInitialItems seeds the three carried room-pickup quantities.
             assert_eq!(
                 &session.game.state_bytes[0x0C..0x0F],
@@ -10569,54 +10735,91 @@ end
             let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
             if character == 0 {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
+                // Chris's six-slot run leaves Rebecca's card beretta in place.
+                assert_eq!(session.game.rebecca_inventory[0].id, ITEM_BERETTA);
+                assert_eq!(session.game.rebecca_inventory[0].quantity, 15);
             } else {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_BERETTA, ITEM_FIRST_AID_SPRAY]);
                 assert_eq!(session.game.item_count(ITEM_BERETTA), 15);
+                // Jill's eight-slot run clears Rebecca's first two slots.
+                assert!(
+                    session
+                        .game
+                        .rebecca_inventory
+                        .iter()
+                        .all(|slot| slot.id == 0)
+                );
             }
             assert_eq!(session.game.item_count(ITEM_FIRST_AID_SPRAY), 1);
         }
     }
 
-    /// The real pack must boot each new game into room 100 with the shipped
-    /// inventory, health and room-item flags.
+    /// The real pack must boot each new game into room 106 (the main hall)
+    /// with the shipped inventory, health, item box and room-item flags.
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
-    fn real_new_game_lands_in_room_100_for_both_characters() {
+    fn real_new_game_lands_in_room_106_for_both_characters() {
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         for character in 0..=1u8 {
             let session = GameSession::new(&pack, character, Path::new("saves")).unwrap();
-            assert_eq!(session.loaded.id.room3(), "100");
+            assert_eq!(session.loaded.id.room3(), "106");
             assert_eq!(
                 session.game.id,
                 RoomId {
                     stage: 1,
-                    room: 0,
+                    room: NEW_GAME_ROOM,
                     player_flag: character
                 }
             );
-            assert_eq!(session.player.pos, [17000, 0, 5000]);
-            assert_eq!(session.player.angle, 3072);
+            // The main hall's init script repositions the player for the
+            // opening scene, so the InitPlayerData start only holds until the
+            // room boot runs.
             assert_eq!(
                 session.game.entities[0].health,
                 NEW_GAME_HEALTH[usize::from(character)]
             );
-            // Jill's first playthrough clears the ink-ribbon build's
-            // room-items bit (ROOM1001's 0x16, shared with the sword key in
-            // the Chris variant), exactly like the original's skip.
+            // The shipped card starts the counter at 1.
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
+                1
+            );
+            // The card's item box carries two Handgun Ammo stacks of 15.
+            assert_eq!(session.game.item_box[0].id, ITEM_HANDGUN_AMMO);
+            assert_eq!(session.game.item_box[0].quantity, 15);
+            assert_eq!(session.game.item_box[1].id, ITEM_HANDGUN_AMMO);
+            assert_eq!(session.game.item_box[1].quantity, 15);
+            // `InitializeGame` writes the selected character into the model id.
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)],
+                character
+            );
+            // Jill's first playthrough raises the main hall's ink-ribbon
+            // room-items bit, which the shipped bank already carries; the
+            // ribbon itself is skipped by the `item_aot_set` first-run rule.
             let mut expected_items = game::FlagBank::new();
             expected_items
                 .bytes_mut()
                 .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
-            if character == 1 {
-                expected_items.apply(0x16, 1);
-            }
             assert_eq!(session.game.flags[7].bytes(), expected_items.bytes());
+            if character == 1 {
+                assert!(
+                    session.game.flag_test(
+                        game::BANK_SCENARIO2,
+                        game::SCENARIO2_FLAG_JILL_FIRST_RUN,
+                        false
+                    ),
+                    "Jill's first run raises the scenario-2 marker"
+                );
+            }
             let ids: Vec<u8> = session.game.inventory.iter().map(|slot| slot.id).collect();
             if character == 0 {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_FIRST_AID_SPRAY]);
+                // Chris's six-slot run leaves Rebecca's card beretta in place.
+                assert_eq!(session.game.rebecca_inventory[0].id, ITEM_BERETTA);
+                assert_eq!(session.game.rebecca_inventory[0].quantity, 15);
             } else {
                 assert_eq!(ids, [ITEM_KNIFE, ITEM_BERETTA, ITEM_FIRST_AID_SPRAY]);
             }
@@ -10663,7 +10866,8 @@ end
         );
         assert_eq!(
             continued.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
-            0
+            2,
+            "the saved 1 plus the continue path's increment"
         );
     }
 

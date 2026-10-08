@@ -78,8 +78,8 @@ fn real_typewriter_save_consumes_a_ribbon_and_reloads() {
     );
     assert_eq!(
         sim.state_after_load.state_bytes[usize::from(STATE_BYTE_SAVES)],
-        0,
-        "the block stores the pre-increment counter, as the original does"
+        1,
+        "the block stores the pre-increment counter and the continue path advances it"
     );
 
     // The reloaded gameplay state matches the state that was saved.
