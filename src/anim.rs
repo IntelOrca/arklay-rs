@@ -6,6 +6,7 @@
 //! [`joint_matrices`] composes the skeleton hierarchy from one keyframe, and
 //! [`AnimPlayer`] is the 30 Hz clip clock driven by the player state machine.
 
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
 use crate::model;
@@ -267,6 +268,15 @@ pub(crate) fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
     Mat4x3 { r, t }
 }
 
+/// One consuming tick whose blended pose has not been materialized yet: the
+/// keyframe the tick blended toward and the weights it applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoseStep {
+    keyframe: usize,
+    blend: u16,
+    step: u16,
+}
+
 /// Clip playback state. One `update` is one 30 Hz tick.
 ///
 /// `frame` is the index of the next frame the game applies and
@@ -289,13 +299,22 @@ pub struct AnimPlayer {
     /// The step the blend weights are derived from (0x400 for the player
     /// clips). `0x1000 / blend_step - 1` is the counter a switch arms.
     pub blend_step: u16,
-    /// The keyframe displayed before the latest consuming tick; it is the
-    /// blend's source pose, so a clip change blends from the pose on screen
-    /// rather than from the new clip's frame table.
+    /// The keyframe displayed before the latest consuming tick. The blend
+    /// source is [`AnimPlayer::applied`]; this is kept for diagnostics and the
+    /// within-clip tests that inspect the pending frame transition.
     pub previous_keyframe: usize,
     /// The blend counter the latest consuming tick applied (before the
     /// decrement), or 0 when that tick snapped.
     pub blend_used: u16,
+    /// The pose actually shown after the last materialized consuming tick. A
+    /// clip switch leaves it alone, so the next consuming tick eases from the
+    /// pose on screen instead of from the new clip's frame table. The original
+    /// accumulates this into the joint structs on every tick.
+    applied: RefCell<Option<model::Keyframe>>,
+    /// Consuming ticks whose blended pose has not been folded into `applied`
+    /// yet, oldest first. A direct (counter 0) step replaces the list because
+    /// it does not depend on the previous pose.
+    pending_pose: RefCell<Vec<PoseStep>>,
 }
 
 impl AnimPlayer {
@@ -311,19 +330,25 @@ impl AnimPlayer {
             blend_step: 0x400,
             previous_keyframe: 0,
             blend_used: 0,
+            applied: RefCell::new(None),
+            pending_pose: RefCell::new(Vec::new()),
         }
     }
 
     /// Switch clips and restart playback from frame 0. The direction is left
     /// alone; callers that need reverse set it explicitly. The switch arms the
-    /// clip blend over `0x1000 / blend_step - 1` steps, so the previous pose
-    /// eases into the new clip's first keyframe.
+    /// clip blend over `0x1000 / blend_step - 1` steps, so the pose already on
+    /// screen eases into the new clip's first keyframe. The stored pose is
+    /// left alone: it is the blend's source.
     pub fn set_clip(&mut self, clip: usize) {
         self.clip = clip;
         self.frame = 0;
         self.display_frame = 0;
         self.timing = 0;
         self.blend_counter = self.full_blend_counter();
+        // Pending steps name keyframes of the clip that was playing; they
+        // cannot be resolved against the new clip's table.
+        self.pending_pose.get_mut().clear();
     }
 
     /// The blend counter a clip change arms for the configured step.
@@ -405,6 +430,22 @@ impl AnimPlayer {
         } else {
             clip.frames[index]
         };
+        // Queue the pose this consume blends toward. The pose itself is
+        // materialized by [`AnimPlayer::pose_keyframe`], which is the first
+        // place with the keyframe table in hand; the queue replays every
+        // consuming tick since the last read, so skipping renders cannot skip
+        // blend steps.
+        let keyframe = usize::from(data.keyframe);
+        let mut pending = self.pending_pose.borrow_mut();
+        if self.blend_used == 0 {
+            pending.clear();
+        }
+        pending.push(PoseStep {
+            keyframe,
+            blend: self.blend_used,
+            step: self.blend_step,
+        });
+        drop(pending);
         self.timing = data.timing;
         self.frame = index + 1;
         if self.frame >= clip.frames.len() {
@@ -414,31 +455,48 @@ impl AnimPlayer {
         false
     }
 
-    /// The pose to display for the frame applied last.
+    /// The pose to display for the frames applied since the last read.
     ///
-    /// When a blend is active the previous and current frames' keyframes are
-    /// interpolated with the weights the counter applied. The batch-tick
-    /// accumulation the original gets from writing the interpolated rotations
-    /// back into the joint structs is not modelled; each step independently
-    /// interpolates from the previous applied keyframe.
+    /// Every consuming tick queued its target keyframe and blend weights; they
+    /// are folded from the pose on screen at the time, one `blend_keyframes`
+    /// step each, exactly like the original writing the interpolated
+    /// rotations into the joint structs. The result becomes the new source
+    /// pose, so a flip between clips eases out of the pose on screen and the
+    /// steps accumulate over a batch of unrendered ticks. A held tick queues
+    /// nothing and the stored pose is returned. Reading twice in a row is
+    /// idempotent: the queue is drained by the first read.
     pub fn pose_keyframe(
         &self,
         clips: &[model::Clip],
         keyframes: &[model::Keyframe],
     ) -> Option<model::Keyframe> {
         let current = keyframes.get(self.keyframe_index(clips))?;
-        if self.blend_used == 0 || self.blend_step == 0 {
-            return Some(current.clone());
+        let steps = std::mem::take(&mut *self.pending_pose.borrow_mut());
+        if steps.is_empty() {
+            return Some(
+                self.applied
+                    .borrow()
+                    .clone()
+                    .unwrap_or_else(|| current.clone()),
+            );
         }
-        let Some(previous) = keyframes.get(self.previous_keyframe) else {
-            return Some(current.clone());
-        };
-        Some(blend_keyframes(
-            previous,
-            current,
-            self.blend_used,
-            self.blend_step,
-        ))
+        let mut pose = self.applied.borrow().clone();
+        for step in steps {
+            let Some(target) = keyframes.get(step.keyframe) else {
+                continue;
+            };
+            pose = match pose.take() {
+                Some(source) if step.blend != 0 && step.step != 0 => {
+                    Some(blend_keyframes(&source, target, step.blend, step.step))
+                }
+                // A direct step needs no source; a blend with no pose on
+                // screen (a fresh spawn) starts from the target instead of
+                // truncating it against itself.
+                _ => Some(target.clone()),
+            };
+        }
+        *self.applied.borrow_mut() = pose.clone();
+        Some(pose.unwrap_or_else(|| current.clone()))
     }
 }
 
@@ -825,11 +883,12 @@ mod tests {
             player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
             [0x80, 0, 0]
         );
-        // Frame 2 with counter 1: 0.75 * 0x200 + 0.25 * 0x100 = 0x1C0.
+        // Frame 2 with counter 1 accumulates on the previous pose:
+        // 0.75 * 0x200 + 0.25 * 0x80 = 0x1A0.
         player.update(&clips);
         assert_eq!(
             player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
-            [0x1C0, 0, 0]
+            [0x1A0, 0, 0]
         );
         // Frame 3 with counter 0 snaps to the keyframe.
         player.update(&clips);
@@ -837,6 +896,87 @@ mod tests {
             player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
             [0x300, 0, 0]
         );
+    }
+
+    #[test]
+    fn a_cross_clip_switch_blends_from_the_pose_on_screen() {
+        // Clip A plays a pose distinct from clip B's first frame. The two clip
+        // sets stand in for different model files: the blend must use the
+        // keyframe data actually on screen, not an index into the new clip's
+        // table. B has an extra joint, exercising the differing joint counts.
+        let clips_a = vec![timing_clip(&[1])];
+        let clips_b = vec![Clip {
+            frames: vec![
+                ClipFrame {
+                    keyframe: 0,
+                    timing: 1,
+                };
+                4
+            ],
+        }];
+        let keyframes_a = vec![Keyframe {
+            offset: [0, 200, 0],
+            rotations: vec![[0x300, 0, 0]],
+        }];
+        let keyframes_b = vec![Keyframe {
+            offset: [0, 0, 0],
+            rotations: vec![[0, 0, 0], [0x100, 0, 0]],
+        }];
+
+        let mut player = AnimPlayer::new(0);
+        // Play A to its pose and show it once, so it is the pose on screen.
+        player.update(&clips_a);
+        let a_pose = player.pose_keyframe(&clips_a, &keyframes_a).unwrap();
+        assert_eq!(a_pose.rotations[0], [0x300, 0, 0]);
+
+        // Switching clips leaves the on-screen pose alone. The first consuming
+        // tick eases 3/4 of it towards B frame 0 (counter 3, inverse 1); A has
+        // no second joint, so that one comes from B alone.
+        player.set_clip(0);
+        player.update(&clips_b);
+        let pose = player.pose_keyframe(&clips_b, &keyframes_b).unwrap();
+        assert_eq!(pose.rotations[0], [0x240, 0, 0]);
+        assert_eq!(pose.rotations[1], [0x40, 0, 0]);
+        assert_eq!(pose.offset[1], 150);
+
+        // Counter 2 accumulates halfway from the previous pose.
+        player.update(&clips_b);
+        let pose = player.pose_keyframe(&clips_b, &keyframes_b).unwrap();
+        assert_eq!(pose.rotations[0], [0x120, 0, 0]);
+        assert_eq!(pose.rotations[1], [0xA0, 0, 0]);
+        assert_eq!(pose.offset[1], 75);
+
+        // Counter 1: another quarter of the way in.
+        player.update(&clips_b);
+        let pose = player.pose_keyframe(&clips_b, &keyframes_b).unwrap();
+        assert_eq!(pose.rotations[0], [0x48, 0, 0]);
+        assert_eq!(pose.rotations[1], [0xE8, 0, 0]);
+        assert_eq!(pose.offset[1], 18);
+
+        // Counter 0 snaps to B's frame keyframe exactly.
+        player.update(&clips_b);
+        let pose = player.pose_keyframe(&clips_b, &keyframes_b).unwrap();
+        assert_eq!(pose.rotations[0], [0, 0, 0]);
+        assert_eq!(pose.rotations[1], [0x100, 0, 0]);
+        assert_eq!(pose.offset[1], 0);
+    }
+
+    #[test]
+    fn pose_reads_are_idempotent_within_a_tick() {
+        let clips = vec![timing_clip(&[1, 1])];
+        let keyframes = vec![
+            Keyframe::default(),
+            Keyframe {
+                offset: [0, 100, 0],
+                rotations: vec![[0x200, 0, 0]],
+            },
+        ];
+        let mut player = AnimPlayer::new(0);
+        player.set_clip(0);
+        player.update(&clips);
+        let first = player.pose_keyframe(&clips, &keyframes).unwrap();
+        let second = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(first, second, "a second read must not blend again");
     }
 
     #[test]

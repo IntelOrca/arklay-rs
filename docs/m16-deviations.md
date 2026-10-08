@@ -113,7 +113,7 @@ Every other `TODO(parity)` from the M16 inventory is closed by its slice:
 the camera/projection/roll, the platform random and BioCard word, the packet
 ABE/STP/cull/gouraud/near-plane rules, the per-vertex latched lighting and
 background modulation, the `room_sprite_hide` (0x49) sprite-mask pass, the
-sprite blend/mirror and text/NPC shadows, the animation blends
+sprite blend/mirror and text/NPC shadows, the within-clip animation blends
 and joint gates, the item searches and condition semantics, the scripted room
 effects and player ops, the message order, the character-select slide, the
 item-view examine combos, the map tab, the herb combine refusal, the raw-slot

@@ -45,16 +45,13 @@
 //! - **RNG is deterministic.** The look-at scheduling reads the platform
 //!   stream's per-frame draw (`GameState::rand_seed`); only the consumer call
 //!   order within a frame is the port's own.
-//! - **Blend snapping.** `blend_counter` and the derived step are computed and
-//!   published, but the renderer poses whole keyframes; it does not
-//!   interpolate between them.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::emd;
 use crate::game::{ENTITY_COUNT, ENTITY_STATUS_ACTIVE, GameState};
-use crate::model::{Clip, Emd};
+use crate::model::{Clip, Emd, Keyframe};
 use crate::pack::Pack;
 use crate::state::RoomState;
 
@@ -94,9 +91,24 @@ const IDLE_BLEND_STEP: u16 = 0x400;
 pub struct EntityModelCache {
     pub(crate) models: HashMap<u8, Arc<Emd>>,
     pub(crate) missing: HashSet<u8>,
+    /// Keyframe-only views of the loaded models, so every entity's animation
+    /// clock can share one table without cloning it each tick.
+    pub(crate) keyframe_sets: HashMap<u8, Arc<Vec<Keyframe>>>,
 }
 
 impl EntityModelCache {
+    /// The keyframe table of character `id`, built once per loaded model and
+    /// shared with the animation clocks.
+    pub fn keyframes(&mut self, pack: &Pack, id: u8) -> Option<Arc<Vec<Keyframe>>> {
+        if let Some(set) = self.keyframe_sets.get(&id) {
+            return Some(Arc::clone(set));
+        }
+        let model = self.get(pack, id)?;
+        let set = Arc::new(model.keyframes.clone());
+        self.keyframe_sets.insert(id, Arc::clone(&set));
+        Some(set)
+    }
+
     /// The parsed model for character `id`, loading it from the pack on first
     /// use. Ids outside the character range yield `None` without a warning.
     pub fn get(&mut self, pack: &Pack, id: u8) -> Option<Arc<Emd>> {
@@ -149,7 +161,11 @@ pub fn update_all(
             continue;
         }
         let target = live_look_at_target(game, slot);
-        let model = models.get(pack, game.entities[slot].id);
+        let id = game.entities[slot].id;
+        let model = models.get(pack, id);
+        if let Some(keyframes) = models.keyframes(pack, id) {
+            game.entity_anims[slot].keyframes = Some(keyframes);
+        }
         let clips: &[Clip] = model.as_ref().map_or(&[], |model| &model.clips);
         update_entity(game, slot, room, clips, target);
         updated += 1;

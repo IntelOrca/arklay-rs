@@ -99,6 +99,22 @@ const BEHAVIOR_TURN: u8 = 2;
 const BEHAVIOR_BACK: u8 = 3;
 /// `Input.up + Input.run` selects the run.
 const BEHAVIOR_RUN: u8 = 4;
+/// Transient value that forces the next tick through the entry path, so a
+/// released stop re-arms its blend instead of continuing the old animation.
+const BEHAVIOR_ENTRY: u8 = 0xFF;
+
+/// Ticks of the run's decelerating stop segment.
+const RUN_STOP_TICKS: u8 = 4;
+/// Speed shed by each tick of the run's stop segment.
+const RUN_STOP_DECEL: u16 = 0x1e;
+/// Frame the run clip starts on when there is no walk stride to continue.
+const RUN_ENTRY_FRAME: usize = 1;
+/// Run entry frame that continues a walk whose pending frame is mid-stride.
+const RUN_ENTRY_FRAME_STRIDE: usize = 0x0C;
+/// Walk re-entry frame for a run at the start of its stride.
+const WALK_REENTRY_FRAME: usize = 10;
+/// Walk re-entry frame that continues a run late in its stride.
+const WALK_REENTRY_FRAME_LATE: usize = 0x19;
 
 /// Per-character footfall speed table: two frame windows and two reductions.
 const CHRIS_FOOTFALL: [u8; 4] = [0x15, 0x17, 0x0D, 0x0E];
@@ -399,6 +415,14 @@ pub struct PlayerState {
     /// Slow-motion animation cadence counter (the original's `attackDirection`
     /// reuse): 0 applies the frame and re-arms to 1, 1 skips the frame.
     pub slow_counter: i16,
+    /// Remaining ticks of the run's four-tick decelerating stop; 0 outside a
+    /// stop. The first stop tick switches the animation to the body idle clip
+    /// with a fresh blend and sheds [`RUN_STOP_DECEL`] from the run speed.
+    pub run_stop_ticks: u8,
+    /// The next tick selects its behavior through the normal entry path even
+    /// when the requested behavior matches the current one; a finished run
+    /// stop sets it so idle re-arms a fresh blend.
+    pub fresh_entry: bool,
     /// One-shot sound requests emitted since the last
     /// [`PlayerState::take_sounds`].
     sounds: Vec<PlayerSound>,
@@ -446,6 +470,8 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         ladder_release: false,
         input: Input::default(),
         slow_counter: 0,
+        run_stop_ticks: 0,
+        fresh_entry: false,
         sounds: Vec::new(),
         footsteps: Vec::new(),
         screen_effects: Vec::new(),
@@ -490,13 +516,56 @@ pub fn update_with_room(
         return;
     }
 
+    // The run's stop segment owns the tick until its four decelerating ticks
+    // have played; no input cancels it (the original's action_state 3).
+    if player.run_stop_ticks != 0 {
+        run_stop_tick(player, room, emd_clips, emw_clips, room_clips);
+        return;
+    }
+    // A finished stop hands control back to idle on the next tick, which must
+    // re-arm the clip blend even when the requested behavior is unchanged.
+    if player.fresh_entry {
+        player.fresh_entry = false;
+        player.behavior = BEHAVIOR_ENTRY;
+    }
+
     let behavior = behavior_for(input);
+
+    // Walk release: the original's walk handler keeps the walk speed and the
+    // walk pose for one tick (no frame is consumed), then idle takes over.
+    if player.behavior == BEHAVIOR_WALK && behavior != BEHAVIOR_WALK && !input.up {
+        player.locomotion_tick(room, BEHAVIOR_WALK, i32::from(player.move_speed_current));
+        player.enter_behavior(BEHAVIOR_IDLE);
+        player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+        return;
+    }
+    // Turn release: the original's turn handler also releases through
+    // behavior 0 without consuming a frame, so the turn pose stays one tick.
+    if player.behavior == BEHAVIOR_TURN && behavior != BEHAVIOR_TURN && !input.left && !input.right
+    {
+        player.enter_behavior(BEHAVIOR_IDLE);
+        player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+        return;
+    }
+    // Run release: the original's run handler starts its four-tick
+    // decelerating stop towards the body idle clip.
+    if player.behavior == BEHAVIOR_RUN && behavior != BEHAVIOR_RUN && !input.up {
+        player.run_stop_ticks = RUN_STOP_TICKS;
+        run_stop_tick(player, room, emd_clips, emw_clips, room_clips);
+        return;
+    }
+
     if behavior != player.behavior {
-        player.behavior = behavior;
-        player.idle_ticks = 0;
-        player.idle_phase = 0;
-        player.slow_counter = 0;
+        // A walk/run flip keeps the stride: the entry frame is the one that
+        // continues the phase the abandoned clip was about to reach.
+        let stride = player.entry_stride(behavior, emw_clips);
+        player.enter_behavior(behavior);
         player.set_clip(entry_clip_source(behavior), entry_clip(behavior));
+        if let Some(frame) = stride {
+            player.anim.frame = frame;
+        } else if behavior == BEHAVIOR_RUN {
+            player.anim.frame = RUN_ENTRY_FRAME;
+        }
     }
 
     // The stair/ladder climb behaviour locks the facing towards its target;
@@ -521,31 +590,18 @@ pub fn update_with_room(
     if slow_locomotion {
         speed /= 2;
     }
+    // The released walk keeps the last walk tick's speed (the original's
+    // `move_speed_current`), so the release tick and the stop segment can read
+    // it back.
+    if matches!(behavior, BEHAVIOR_WALK | BEHAVIOR_RUN) {
+        player.move_speed_current = speed.max(0) as u16;
+    }
     // The original checks the pending animation frame and plays the footstep
     // before `Joint_move` applies it and before the tick's movement, so the
     // sound uses the pre-move position.
     player.emit_footsteps(behavior, emd_clips, emw_clips, room_clips);
 
-    let offset = if behavior == BEHAVIOR_BACK {
-        BACK_OFFSET
-    } else {
-        0
-    };
-
-    let prev = player.pos;
-    let (dx, dz) = rotate_speed(player.angle, offset, speed);
-    let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
-    // The climb behaviour suspends the collision boundary pass, exactly like
-    // the original's `update_player_anim` does for action behaviour 0x11.
-    player.pos = if player.stairs.climbing {
-        proposed
-    } else {
-        resolve_collision(&room.collision, prev, proposed, player.radius)
-    };
-    // `stairs_height_update` owns the player's height on the ramp.
-    if let Some(height) = player.stairs.height {
-        player.pos[1] = height;
-    }
+    player.locomotion_tick(room, behavior, speed);
 
     if behavior == BEHAVIOR_IDLE {
         player.slow_counter = 0;
@@ -583,6 +639,36 @@ pub fn update_with_room(
     }
 }
 
+/// One tick of the run's stop segment.
+///
+/// The original's run handler switches to the body idle clip on the first
+/// stop tick and sheds [`RUN_STOP_DECEL`] from `move_speed_current` on each of
+/// the four ticks (`0xD2` eases out as 180/150/120/90), steering with the run
+/// step. The fourth tick hands control back to idle through [`BEHAVIOR_ENTRY`],
+/// so the next tick re-arms a fresh three-step blend into the settle pose.
+fn run_stop_tick(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    if player.run_stop_ticks == RUN_STOP_TICKS {
+        player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+    }
+    if !player.stairs.climbing {
+        player.angle = turned_angle(player.angle, BEHAVIOR_RUN, player.input);
+    }
+    player.move_speed_current = player.move_speed_current.saturating_sub(RUN_STOP_DECEL);
+    player.locomotion_tick(room, BEHAVIOR_RUN, i32::from(player.move_speed_current));
+    player.advance(emd_clips, emw_clips, room_clips);
+    player.run_stop_ticks -= 1;
+    if player.run_stop_ticks == 0 {
+        player.enter_behavior(BEHAVIOR_IDLE);
+        player.fresh_entry = true;
+    }
+}
+
 impl PlayerState {
     fn set_clip(&mut self, source: ClipSource, clip: usize) {
         self.clip_source = source;
@@ -594,6 +680,78 @@ impl PlayerState {
             ClipSource::Emd => self.anim.update(emd_clips),
             ClipSource::Emw => self.anim.update(emw_clips),
             ClipSource::Room => self.anim.update(room_clips),
+        }
+    }
+
+    /// Select a locomotion behavior with its entry state: the idle sequence
+    /// and the slow-motion cadence restart, exactly like the original's
+    /// action state 0.
+    fn enter_behavior(&mut self, behavior: u8) {
+        self.behavior = behavior;
+        self.idle_ticks = 0;
+        self.idle_phase = 0;
+        self.slow_counter = 0;
+    }
+
+    /// The run or walk entry frame that continues the current stride, when the
+    /// behavior change crosses the walk and run clips.
+    ///
+    /// The original reads the frame after the tick the handler would have
+    /// played: a consuming tick advances the pending frame (wrapping at the
+    /// clip end), a held tick leaves it. A walk headed into the stride's
+    /// middle (10..=0x19) enters the run at `0x0C`, everything else at frame
+    /// 1; a run whose next frame is early (1..=0x0B) re-enters the walk at
+    /// `0x19`, everything else at frame 10.
+    fn entry_stride(&self, behavior: u8, emw_clips: &[Clip]) -> Option<usize> {
+        if self.clip_source != ClipSource::Emw {
+            return None;
+        }
+        let next = if self.anim.timing > 1 {
+            self.anim.frame
+        } else {
+            match emw_clips.get(self.anim.clip) {
+                Some(clip) if self.anim.frame + 1 >= clip.frames.len() => 0,
+                _ => self.anim.frame + 1,
+            }
+        };
+        if behavior == BEHAVIOR_RUN && self.anim.clip == WALK_CLIP {
+            Some(if (10..=0x19).contains(&next) {
+                RUN_ENTRY_FRAME_STRIDE
+            } else {
+                RUN_ENTRY_FRAME
+            })
+        } else if behavior == BEHAVIOR_WALK && self.anim.clip == RUN_CLIP {
+            Some(if next != 0 && next < 0x0C {
+                WALK_REENTRY_FRAME_LATE
+            } else {
+                WALK_REENTRY_FRAME
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Move one tick for a locomotion behavior, with the room collision pass
+    /// and the ramp height the room scripts own.
+    fn locomotion_tick(&mut self, room: &RoomState, behavior: u8, speed: i32) {
+        let offset = if behavior == BEHAVIOR_BACK {
+            BACK_OFFSET
+        } else {
+            0
+        };
+        let prev = self.pos;
+        let (dx, dz) = rotate_speed(self.angle, offset, speed);
+        let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
+        // The climb behaviour suspends the collision boundary pass, exactly
+        // like the original's `update_player_anim` does for 0x11.
+        self.pos = if self.stairs.climbing {
+            proposed
+        } else {
+            resolve_collision(&room.collision, prev, proposed, self.radius)
+        };
+        // `stairs_height_update` owns the player's height on the ramp.
+        if let Some(height) = self.stairs.height {
+            self.pos[1] = height;
         }
     }
 
@@ -1086,6 +1244,10 @@ impl PlayerState {
         self.behavior = BEHAVIOR_IDLE;
         self.idle_phase = 0;
         self.idle_ticks = 0;
+        // A locked behaviour interrupts a stop (or a stop hand-off) and owns
+        // the next selection: neither survives the return to idle.
+        self.run_stop_ticks = 0;
+        self.fresh_entry = false;
         self.set_clip(ClipSource::Emd, SETTLE_CLIP);
     }
 }
@@ -1548,7 +1710,8 @@ fn push_shallow(push_x: i16, push_z: i16, pos: &mut [i32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ClipFrame;
+    use crate::anim::blend_keyframes;
+    use crate::model::{ClipFrame, Keyframe};
     use crate::state::{Cut, WalkZone, Zone};
 
     fn clip(frames: usize) -> Clip {
@@ -1612,6 +1775,8 @@ mod tests {
             ladder_release: false,
             input: Input::default(),
             slow_counter: 0,
+            run_stop_ticks: 0,
+            fresh_entry: false,
             sounds: Vec::new(),
             footsteps: Vec::new(),
             screen_effects: Vec::new(),
@@ -1621,6 +1786,265 @@ mod tests {
     /// Drive one tick with the same clip set standing in for EMD and EMW.
     fn step(player: &mut PlayerState, room: &RoomState, clips: &[Clip], input: Input) {
         update(player, room, clips, clips, input);
+    }
+
+    /// Distinct poses per clip source for the blend and stride tests: the body
+    /// settle (EMD 0) is keyframe 0, the no-weapon walk (EMW 2) keyframe 1 and
+    /// the no-weapon run (EMW 3) keyframe 2.
+    fn blend_fixture() -> (Vec<Clip>, Vec<Clip>, Vec<Keyframe>) {
+        fn looping(keyframe: u16, frames: usize) -> Clip {
+            Clip {
+                frames: vec![
+                    ClipFrame {
+                        keyframe,
+                        timing: 1,
+                    };
+                    frames
+                ],
+            }
+        }
+        let keyframes = vec![
+            Keyframe {
+                offset: [0, 0, 0],
+                rotations: vec![[0, 0, 0]],
+            },
+            Keyframe {
+                offset: [0, 200, 0],
+                rotations: vec![[0x200, 0, 0]],
+            },
+            Keyframe {
+                offset: [0, 400, 0],
+                rotations: vec![[0x400, 0, 0]],
+            },
+        ];
+        let emd = vec![looping(0, 3)];
+        let emw = vec![looping(1, 2), looping(1, 2), looping(1, 35), looping(2, 28)];
+        (emd, emw, keyframes)
+    }
+
+    /// One tick against the split EMD/EMW fixture.
+    fn blend_step(
+        player: &mut PlayerState,
+        room: &RoomState,
+        emd: &[Clip],
+        emw: &[Clip],
+        input: Input,
+    ) {
+        update_with_room(player, room, emd, emw, &[], input);
+    }
+
+    /// The pose the player currently shows, read against the fixture's clips.
+    fn shown_pose(
+        player: &PlayerState,
+        emd: &[Clip],
+        emw: &[Clip],
+        keyframes: &[Keyframe],
+    ) -> Keyframe {
+        let clips = match player.clip_source {
+            ClipSource::Emd => emd,
+            ClipSource::Emw => emw,
+            ClipSource::Room => &[],
+        };
+        player.anim.pose_keyframe(clips, keyframes).unwrap()
+    }
+
+    #[test]
+    fn walk_release_holds_the_walk_pose_then_eases_into_settle() {
+        let room = RoomState::default();
+        let (emd, emw, keyframes) = blend_fixture();
+        let mut player = player_at(1000, 0);
+        let walk = Input {
+            up: true,
+            ..Input::default()
+        };
+        for _ in 0..5 {
+            blend_step(&mut player, &room, &emd, &emw, walk);
+        }
+        let walk_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        assert_eq!(walk_pose, keyframes[1]);
+        let speed = i32::from(player.move_speed_current);
+        assert!(speed > 0, "the walk set move_speed_current");
+
+        // Release tick: no frame is consumed, so the walk pose stays on screen
+        // and the player still moves at the last walk speed.
+        let before = player.pos;
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
+        assert_eq!(player.clip_source, ClipSource::Emd);
+        assert_eq!(
+            shown_pose(&player, &emd, &emw, &keyframes),
+            walk_pose,
+            "release tick keeps the walk pose"
+        );
+        let (dx, dz) = rotate_speed(player.angle, 0, speed);
+        assert_eq!(player.pos, [before[0] + dx, before[1], before[2] + dz]);
+
+        // The four following ticks ease the walk pose into the settle keyframe
+        // with the fresh three-step blend: 3/4, 1/2, 1/4, then direct.
+        let settle = keyframes[0].clone();
+        let mut expected = walk_pose.clone();
+        for counter in (1..=3).rev() {
+            blend_step(&mut player, &room, &emd, &emw, Input::default());
+            assert_eq!(player.anim.blend_used, counter);
+            expected = blend_keyframes(&expected, &settle, counter, 0x400);
+            assert_eq!(shown_pose(&player, &emd, &emw, &keyframes), expected);
+        }
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.anim.blend_used, 0);
+        assert_eq!(shown_pose(&player, &emd, &emw, &keyframes), settle);
+    }
+
+    #[test]
+    fn run_release_decelerates_and_rearms_the_idle_blend() {
+        let room = RoomState::default();
+        let (emd, emw, keyframes) = blend_fixture();
+        let mut player = player_at(1000, 0);
+        let run = Input {
+            up: true,
+            run: true,
+            ..Input::default()
+        };
+
+        // Enter the run and read its pose.
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.behavior, BEHAVIOR_RUN);
+        assert_eq!(player.move_speed_current, RUN_SPEED as u16);
+        let run_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        assert_eq!(run_pose, keyframes[2]);
+        blend_step(&mut player, &room, &emd, &emw, run);
+
+        // Release: four decelerating ticks on body clip 0, moving at
+        // 180/150/120/90.
+        let settle = keyframes[0].clone();
+        let mut expected = run_pose;
+        for (tick, (speed, counter)) in [(180u16, 3u16), (150, 2), (120, 1), (90, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            let before = player.pos;
+            blend_step(&mut player, &room, &emd, &emw, Input::default());
+            assert_eq!(player.move_speed_current, speed, "stop tick {tick}");
+            assert_eq!(player.anim.blend_used, counter, "stop tick {tick}");
+            assert_eq!(player.clip_source, ClipSource::Emd);
+            assert_eq!(player.anim.clip, SETTLE_CLIP);
+            let (dx, dz) = rotate_speed(player.angle, 0, i32::from(speed));
+            assert_eq!(
+                player.pos,
+                [before[0] + dx, before[1], before[2] + dz],
+                "stop tick {tick} step"
+            );
+            expected = if counter == 0 {
+                settle.clone()
+            } else {
+                blend_keyframes(&expected, &settle, counter, 0x400)
+            };
+            assert_eq!(shown_pose(&player, &emd, &emw, &keyframes), expected);
+        }
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
+        assert!(player.fresh_entry);
+
+        // Idle re-arms a fresh three-step blend into the settle pose.
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.anim.blend_used, 3);
+        assert_eq!(player.anim.blend_counter, 2);
+        assert_eq!(shown_pose(&player, &emd, &emw, &keyframes), settle);
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.anim.blend_used, 2);
+    }
+
+    #[test]
+    fn walk_run_flips_keep_the_stride() {
+        let room = RoomState::default();
+        let (emd, emw, keyframes) = blend_fixture();
+        let walk = Input {
+            up: true,
+            ..Input::default()
+        };
+        let run = Input {
+            up: true,
+            run: true,
+            ..Input::default()
+        };
+
+        // Walk headed into the stride's middle enters the run at 0x0C.
+        let mut player = player_at(1000, 0);
+        for _ in 0..10 {
+            blend_step(&mut player, &room, &emd, &emw, walk);
+        }
+        assert_eq!(player.anim.frame, 10);
+        let walk_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.behavior, BEHAVIOR_RUN);
+        assert_eq!(player.anim.display_frame, RUN_ENTRY_FRAME_STRIDE);
+        assert_eq!(player.anim.blend_used, 3);
+        assert_eq!(
+            shown_pose(&player, &emd, &emw, &keyframes),
+            blend_keyframes(&walk_pose, &keyframes[2], 3, 0x400)
+        );
+
+        // A walk early in its cycle enters the run on frame 1.
+        let mut player = player_at(1000, 0);
+        for _ in 0..2 {
+            blend_step(&mut player, &room, &emd, &emw, walk);
+        }
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.anim.display_frame, RUN_ENTRY_FRAME);
+        assert_eq!(player.anim.blend_used, 3);
+
+        // A run early in its stride re-enters the walk at 0x19.
+        let mut player = player_at(1000, 0);
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.anim.frame, 2);
+        let run_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        blend_step(&mut player, &room, &emd, &emw, walk);
+        assert_eq!(player.behavior, BEHAVIOR_WALK);
+        assert_eq!(player.anim.display_frame, WALK_REENTRY_FRAME_LATE);
+        assert_eq!(player.anim.blend_used, 3);
+        assert_eq!(
+            shown_pose(&player, &emd, &emw, &keyframes),
+            blend_keyframes(&run_pose, &keyframes[1], 3, 0x400)
+        );
+
+        // A run late in its stride re-enters the walk at frame 10.
+        let mut player = player_at(1000, 0);
+        for _ in 0..10 {
+            blend_step(&mut player, &room, &emd, &emw, run);
+        }
+        assert_eq!(player.anim.frame, 11);
+        blend_step(&mut player, &room, &emd, &emw, walk);
+        assert_eq!(player.anim.display_frame, WALK_REENTRY_FRAME);
+        assert_eq!(player.anim.blend_used, 3);
+    }
+
+    #[test]
+    fn turn_release_holds_the_pose_then_eases_into_settle() {
+        let room = RoomState::default();
+        let (emd, emw, keyframes) = blend_fixture();
+        let mut player = player_at(1000, 0);
+        blend_step(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            Input {
+                left: true,
+                ..Input::default()
+            },
+        );
+        let turn_pose = shown_pose(&player, &emd, &emw, &keyframes);
+        assert_eq!(player.behavior, BEHAVIOR_TURN);
+
+        // Release holds the turn pose for one tick, then the idle entry eases
+        // it into the settle pose with a fresh three-step blend.
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
+        assert_eq!(shown_pose(&player, &emd, &emw, &keyframes), turn_pose);
+        blend_step(&mut player, &room, &emd, &emw, Input::default());
+        assert_eq!(player.anim.blend_used, 3);
+        assert_eq!(
+            shown_pose(&player, &emd, &emw, &keyframes),
+            blend_keyframes(&turn_pose, &keyframes[0], 3, 0x400)
+        );
     }
 
     #[test]
@@ -2118,6 +2542,12 @@ mod tests {
         assert_eq!(player.anim.clip, RUN_CLIP);
         assert_eq!(player.clip_source, ClipSource::Emw);
 
+        // Forward release begins the run's four-tick stop; it plays out before
+        // the next direction is selected.
+        for _ in 0..RUN_STOP_TICKS {
+            step(&mut player, &room, &clips, Input::default());
+        }
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
         step(
             &mut player,
             &room,
@@ -2222,6 +2652,9 @@ mod tests {
         );
         assert_eq!(player.angle, 0x0028);
 
+        // Release the walk first: the original holds the walk pose for a tick
+        // before the next direction is selected.
+        step(&mut player, &room, &clips, Input::default());
         player.angle = 0;
         step(
             &mut player,
@@ -2389,12 +2822,12 @@ mod tests {
             },
             30,
         );
-        // The fixture's run clip has 28 frames: its first and tenth frames
-        // contact, and frame 0 wraps around once more inside the 30 ticks.
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert_eq!(events[0].frame, 0x00);
-        assert_eq!(events[1].frame, 0x0A);
-        assert_eq!(events[2].frame, 0x00);
+        // The run starts on frame 1 (the original's run state 0 skips frame
+        // 0), so the fixture's 28-frame clip contacts on 0x0A and, after the
+        // wrap, on frame 0 inside the 30 ticks.
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(events[0].frame, 0x0A);
+        assert_eq!(events[1].frame, 0x00);
         assert!(events.iter().all(|event| event.sound_type == 1));
     }
 

@@ -16,9 +16,11 @@
 //! interpolation by ([`blend_step`]); it decrements once per frame-consuming
 //! tick, exactly like the original clock's blending branch.
 
+use std::sync::Arc;
+
 use crate::anim::AnimPlayer;
 use crate::game::Entity;
-use crate::model::Clip;
+use crate::model::{Clip, Keyframe};
 
 /// The animation clock state of one entity slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -30,6 +32,11 @@ pub struct EntityAnim {
     pub look_at_yaw: i16,
     /// Tracking joint pitch (`rotDeltaY`), slewed toward the look-at target.
     pub look_at_pitch: i16,
+    /// The entity model's keyframe table, shared with the model cache. The
+    /// clock needs it to materialize the blended pose on every consuming tick
+    /// (the original writes the interpolated rotations straight into the
+    /// joints), so a clip switch eases from the pose on screen.
+    pub keyframes: Option<Arc<Vec<Keyframe>>>,
 }
 
 impl Default for EntityAnim {
@@ -38,6 +45,7 @@ impl Default for EntityAnim {
             player: AnimPlayer::new(0),
             look_at_yaw: 0,
             look_at_pitch: 0,
+            keyframes: None,
         }
     }
 }
@@ -87,6 +95,12 @@ impl EntityAnim {
         entity.animation_frame_id = self.player.frame as u8;
         entity.timing_control = self.player.timing.min(u16::from(u8::MAX)) as u8;
         entity.blend_counter = self.player.blend_counter.min(u16::from(u8::MAX)) as u8;
+        // Materialize the pose this tick blended toward, exactly like the
+        // original's joint write-back: the next tick (and a clip switch later)
+        // eases from the pose currently on screen.
+        if let Some(keyframes) = self.keyframes.as_deref() {
+            let _ = self.player.pose_keyframe(clips, keyframes);
+        }
         completed
     }
 
@@ -122,31 +136,21 @@ impl EntityAnim {
 
     /// The pose to display for the entity's current frame.
     ///
-    /// When the entity is mid-ease (`blend_counter` armed on its consuming
-    /// ticks) the previous and current keyframes are interpolated with the
-    /// published blend step; otherwise the applied keyframe is used directly.
+    /// The clock materializes its blended pose on every consuming tick (see
+    /// [`EntityAnim::advance`]), so this returns the pose on screen. A script
+    /// that changed the entity's animation without advancing the clock keeps
+    /// its own frame until the next tick; a clock without a stored keyframe
+    /// table folds its pending steps against the table passed here.
     pub fn pose_keyframe(
         &self,
         entity: &Entity,
         clips: &[Clip],
-        keyframes: &[crate::model::Keyframe],
-    ) -> Option<crate::model::Keyframe> {
-        let current = keyframes.get(self.keyframe_index(entity, clips))?;
-        if self.player.blend_used == 0
-            || self.player.blend_step == 0
-            || self.player.clip != usize::from(entity.animation_id)
-        {
-            return Some(current.clone());
+        keyframes: &[Keyframe],
+    ) -> Option<Keyframe> {
+        if self.player.clip != usize::from(entity.animation_id) {
+            return keyframes.get(self.keyframe_index(entity, clips)).cloned();
         }
-        let Some(previous) = keyframes.get(self.player.previous_keyframe) else {
-            return Some(current.clone());
-        };
-        Some(crate::anim::blend_keyframes(
-            previous,
-            current,
-            self.player.blend_used,
-            self.player.blend_step,
-        ))
+        self.player.pose_keyframe(clips, keyframes)
     }
 
     /// Slew the tracking joint's yaw and pitch toward the entity's stored
@@ -483,6 +487,51 @@ mod tests {
         let pose = clock.pose_keyframe(&entity, &clips, &keyframes).unwrap();
         assert_eq!(pose.rotations[0], [0x100, 0, 0]);
         assert_eq!(pose.offset[1], 150, "the root Y interpolates too");
+    }
+
+    #[test]
+    fn a_clip_switch_blends_from_the_pose_on_screen() {
+        use crate::model::Keyframe;
+        use std::sync::Arc;
+
+        let clips = vec![clip(&[(0, 1)]), clip(&[(1, 1), (1, 1)])];
+        let keyframes = vec![
+            Keyframe {
+                offset: [0, 0, 0],
+                rotations: vec![[0, 0, 0]],
+            },
+            Keyframe {
+                offset: [0, 800, 0],
+                rotations: vec![[0x400, 0, 0]],
+            },
+        ];
+        let mut clock = EntityAnim {
+            keyframes: Some(Arc::new(keyframes)),
+            ..EntityAnim::default()
+        };
+        let mut entity = entity(0, 0, 0);
+        entity.blend_counter = 7;
+
+        // Play clip 0 so its pose is the pose on screen.
+        clock.advance(&mut entity, &clips, false, 0x200);
+        let first = clock
+            .pose_keyframe(&entity, &clips, clock.keyframes.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(first.rotations[0], [0, 0, 0]);
+
+        // A script switches the animation id and re-arms the blend. The first
+        // tick of clip 1 mixes the old pose with the new frame 0 at counter 7:
+        // 7/8 old, 1/8 new.
+        entity.animation_id = 1;
+        entity.animation_frame_id = 0;
+        entity.timing_control = 0;
+        entity.blend_counter = 7;
+        clock.advance(&mut entity, &clips, false, 0x200);
+        let pose = clock
+            .pose_keyframe(&entity, &clips, clock.keyframes.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(pose.rotations[0], [0x80, 0, 0]);
+        assert_eq!(pose.offset[1], 100);
     }
 
     #[test]
