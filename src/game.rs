@@ -202,10 +202,17 @@ pub const SCENARIO_FLAG_HAS_RADIO: u8 = 0x7F;
 const SCENARIO_FLAG_HAS_LOCKPICK: u8 = 0x7C;
 /// `main_state_flags` bit `0x2000`: the selected key was used up.
 const MSF_MENU_KEY_DEPLETED: u8 = 18;
-/// `g_message_flags` bit 8: gameplay control. A message's pause word is
-/// masked out of [`GameState::message_flags`] while it is displayed; when the
-/// bit is clear the original blanks the player's d-pad for the frame.
+/// `g_message_flags` bit 8: the interactive-screen d-pad gate. While the bit
+/// is clear (and the player is not inside a stairs zone) the original blanks
+/// the direction word its position pass reads. It is NOT the message freeze:
+/// that is [`MESSAGE_FLAG_PLAYER_STATE`].
 pub const MESSAGE_FLAG_CONTROLS: u16 = 0x100;
+/// `g_message_flags` bit 0: the player state-machine gate. The original only
+/// dispatches the player's animation state while this bit is set, and a
+/// message's pause word masks it out, so the whole player state machine (pad
+/// mapping, movement, footsteps, idle) is skipped until the message is
+/// dismissed. The inspect/locked-door messages pass pause word `0x00FF`.
+pub const MESSAGE_FLAG_PLAYER_STATE: u16 = 0x0001;
 /// `g_message_flags` bit 1: entities may think. This is a different bit from
 /// [`MESSAGE_FLAG_CONTROLS`]: a pause word can freeze the characters without
 /// locking the player (and vice versa), so the entity tick gates on this one.
@@ -1343,8 +1350,8 @@ pub struct GameState {
     pub message_menu: bool,
     /// The original's `g_message_flags`: [`GameState::show_message`] masks the
     /// request's pause word into it and the dismissal restores the captured
-    /// backup. [`MESSAGE_FLAG_CONTROLS`] clear means the room tick must ignore
-    /// the player's movement and action input.
+    /// backup. [`MESSAGE_FLAG_PLAYER_STATE`] clear means the room tick must
+    /// skip the player's whole animation state machine.
     pub message_flags: u16,
     /// The `message_flags` captured when the active message was requested.
     message_flags_backup: u16,
@@ -3710,17 +3717,22 @@ impl GameState {
     /// word's high byte; the opcode is its low byte), so the action state is
     /// `(behavior + 2) & 0xFF` with the action behavior byte 0, exactly the
     /// original's `(val + 0x200) & 0xFF00` split. `param` carries the attack
-    /// animation in its low byte and the animation frame id in its high byte.
+    /// animation in its low byte and the animation frame id in its high byte,
+    /// and the opcode writes the player's state byte to 8.
     pub fn attack_anim_set(&mut self, behavior: u8, param: u16) {
         let adj = (u16::from(behavior).wrapping_add(2) << 8) & 0xFF00;
         let entity = &mut self.entities[0];
+        entity.set_state(8);
+        // The player's +0xBD byte is the scripted clip index (`attackAnim`);
+        // the port records it in `animation_id` for the scripted driver and
+        // mirrors it into `attack_anim` for the player-only writers.
         entity.attack_anim = param as u8;
+        entity.animation_id = param as u8;
         entity.action_behavior = adj as u8;
         entity.action_state = (adj >> 8) as u8;
         entity.animation_frame_id = (param >> 8) as u8;
         entity.unk_bf = 0;
         entity.unk_8c = 0;
-        entity.animation_id = 8;
     }
 
     /// `sys_multi` (0x33): the player property setter.
@@ -3736,7 +3748,9 @@ impl GameState {
         match sub {
             0 => {
                 self.set_equipped(None);
-                self.entities[0].attack_anim = 0;
+                let entity = &mut self.entities[0];
+                entity.attack_anim = 0;
+                entity.animation_id = 0;
             }
             1 => {
                 let entity = &mut self.entities[0];
@@ -3747,7 +3761,13 @@ impl GameState {
                 entity.attacking_direction = 100;
                 entity.move_speed_current = 0;
                 entity.attack_anim = 0;
-                entity.animation_id = 1;
+                entity.animation_id = 0;
+                // The original's `*(unsigned int*)&animationId = 0x01000001`:
+                // state 1, frame word 0, behavior 0, action state 1.
+                entity.set_state(1);
+                entity.set_ignore(0);
+                entity.action_behavior = 0;
+                entity.action_state = 1;
                 entity.unk_8c = 3;
             }
             3 => {
@@ -3772,13 +3792,17 @@ impl GameState {
             }
             7 => {
                 let entity = &mut self.entities[0];
-                entity.animation_id = 1;
+                // The original writes state 1 and the frame word 0, behavior 0,
+                // action state 2, and clears the scripted clip index (+0xBD).
+                entity.set_state(1);
+                entity.set_ignore(0);
                 entity.animation_frame_id = 0;
                 entity.action_behavior = 0;
                 entity.action_state = 2;
                 entity.is_being_attacked = 0;
                 entity.unk_bf = 0;
                 entity.attack_anim = 0;
+                entity.animation_id = 0;
                 entity.unk_8c = 3;
             }
             8 => {
@@ -4958,11 +4982,12 @@ impl GameState {
         true
     }
 
-    /// Whether the displayed message's pause word masked the control bit, so
-    /// the engine must ignore the player's movement and action input for this
-    /// tick, exactly like the original's blanked d-pad word.
+    /// Whether the displayed message's pause word masked the player
+    /// state-machine bit, so the engine must skip the player's locomotion
+    /// update (pad mapping included) for this tick, exactly like the original's
+    /// `g_message_flags & 1` gate on `update_player_anim`.
     pub fn message_locks_controls(&self) -> bool {
-        self.message_flags & MESSAGE_FLAG_CONTROLS == 0
+        self.message_flags & MESSAGE_FLAG_PLAYER_STATE == 0
     }
 
     /// Whether the displayed message's pause word masked the entity-think bit,
@@ -6589,18 +6614,19 @@ mod tests {
     }
 
     #[test]
-    fn message_pause_word_masks_and_restores_the_control_flags() {
+    fn message_pause_word_masks_and_restores_the_player_state_flags() {
         let room = room_with_messages(&[&[0x0C, 0x01, 0x00]]);
         let text = Text::default();
         let mut state = game();
         assert!(!state.message_locks_controls());
         assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
 
-        // 0x145 includes the control bit: movement locks until the window
-        // dismisses, then the flags are restored.
-        state.show_message(0, 0x145);
+        // 0xFF masks the whole low byte, clearing the player-state bit 0:
+        // the state machine locks until the window dismisses, then the flags
+        // are restored.
+        state.show_message(0, 0xFF);
         assert!(state.message_locks_controls());
-        assert_eq!(state.message_flags & MESSAGE_FLAG_CONTROLS, 0);
+        assert_eq!(state.message_flags & MESSAGE_FLAG_PLAYER_STATE, 0);
         for _ in 0..4 {
             state.update_message(MessageInput::default(), &room, &text);
         }
@@ -6621,13 +6647,14 @@ mod tests {
         assert!(!state.message_locks_controls());
         assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
 
-        // 0xFF only masks the low byte, so the control bit stays set, and a
-        // zero pause word changes nothing at all.
-        state.show_message(0, 0xFF);
+        // A pause word that clears only the d-pad gate (0x100) does not touch
+        // bit 0, so the state machine keeps running; the door-animation and
+        // typewriter flow uses exactly that shape.
+        state.show_message(0, MESSAGE_FLAG_CONTROLS);
         assert!(!state.message_locks_controls());
         assert_eq!(
-            state.message_flags & MESSAGE_FLAG_CONTROLS,
-            MESSAGE_FLAG_CONTROLS
+            state.message_flags & MESSAGE_FLAG_PLAYER_STATE,
+            MESSAGE_FLAG_PLAYER_STATE
         );
         state.cancel_message();
         assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
@@ -8175,10 +8202,10 @@ mod tests {
         assert!(state.message_freezes_entities());
         assert_eq!(state.tick_entities(&room, &mut models, &pack), 0);
 
-        // The player-control bit is a different one: a message that only masks
+        // The player-state bit is a different one: a message that only masks
         // it keeps the characters running.
         state.cancel_message();
-        state.show_message(1, MESSAGE_FLAG_CONTROLS);
+        state.show_message(1, MESSAGE_FLAG_PLAYER_STATE);
         assert!(state.message_locks_controls());
         assert!(!state.message_freezes_entities());
         assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
@@ -12649,11 +12676,12 @@ mod tests {
         );
         {
             let entity = &host.state().entities[0];
+            assert_eq!(entity.state(), 8);
             assert_eq!(entity.action_behavior, 0);
             assert_eq!(entity.action_state, 4);
             assert_eq!(entity.attack_anim, 40);
+            assert_eq!(entity.animation_id, 40, "the state driver reads this");
             assert_eq!(entity.animation_frame_id, 3);
-            assert_eq!(entity.animation_id, 8);
         }
 
         // 0x33 sub 0 clears the equipped item.
@@ -12678,8 +12706,19 @@ mod tests {
         host.on_player(op(0x33), &operands(&[5, 0x0800]));
         assert_eq!(host.state().entities[0].angle, 0x0800);
         host.on_player(op(0x33), &operands(&[7, 0]));
-        assert_eq!(host.state().entities[0].animation_id, 1);
+        assert_eq!(host.state().entities[0].state(), 1);
         assert_eq!(host.state().entities[0].action_state, 2);
+        assert_eq!(host.state().entities[0].animation_id, 0);
+
+        // sub 1 enters the being-attacked state: state 1, frame word 0,
+        // behavior 0 and action state 1.
+        host.on_player(op(0x33), &operands(&[1, 0x20]));
+        let entity = host.state().entities[0];
+        assert_eq!(entity.state(), 1);
+        assert_eq!(entity.is_being_attacked, 0x20);
+        assert_eq!(entity.action_behavior, 0);
+        assert_eq!(entity.action_state, 1);
+        assert_eq!(entity.animation_id, 0);
 
         // sub 8 writes/or/xors the health-status flags.
         host.state_mut().set_health_status(0x02);
@@ -12896,7 +12935,12 @@ mod tests {
         );
         assert_eq!(state.special_light_masks, [0xFF, 0xFF, 0xFF]);
         assert_eq!(state.entities[0].attack_anim, 40, "0x2B ran");
-        assert_eq!(state.entities[0].animation_id, 8);
+        assert_eq!(
+            state.entities[0].state(),
+            8,
+            "0x2B entered the script state"
+        );
+        assert_eq!(state.entities[0].animation_id, 40);
         assert_eq!(state.entities[0].animation_frame_id, 3);
         assert_eq!(state.entities[0].action_behavior, 1, "0x33 sub 4 ran");
         assert_eq!(state.entities[0].action_state, 6);

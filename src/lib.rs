@@ -31,6 +31,7 @@ pub mod npc;
 pub mod objects;
 pub mod pack;
 pub mod player;
+pub mod player_script;
 pub mod progress;
 pub mod rdt;
 pub mod render;

@@ -86,12 +86,13 @@ use crate::items;
 use crate::lua;
 use crate::mask;
 use crate::message::MessageInput;
-use crate::model::Emd;
+use crate::model::{Clip, Emd};
 use crate::movie::{MovieSession, MovieTick};
 use crate::npc;
 use crate::objects;
 use crate::pack::Pack;
 use crate::player;
+use crate::player_script;
 use crate::rdt;
 use crate::render::{
     self, Camera, EffectLayer, EffectQuad, EntityMesh, Framebuffer, Lighting, MaskLayer,
@@ -972,7 +973,6 @@ impl GameSession {
         }
 
         let was_active = self.game.message.active;
-        let was_locked = self.game.message_locks_controls();
 
         // START opens the pause menu while no message owns the tick. The
         // window advances after the script pass, so the frame's start state
@@ -1007,7 +1007,11 @@ impl GameSession {
         if self.game.dpad_blanked & 0x8 != 0 {
             input.right = false;
         }
-        let input = if was_locked || self.swallow_action {
+        // The message freeze is applied inside the room tick, at the original's
+        // point: the scripts still see the raw pad this frame, and the player's
+        // state machine is skipped after the entity update. Only the dismissed
+        // action edge is swallowed here.
+        let input = if self.swallow_action {
             player::Input::default()
         } else {
             input
@@ -5116,26 +5120,47 @@ fn tick_room_timed(
     // motion); mirror that onto the visible player before physics run.
     context.game.sync_player(context.player);
     context.game.advance_frame();
-    if let Some(assets) = context.player_assets {
+    // The original gates the whole player animation state machine on
+    // `g_message_flags & 1`: a message's pause word clears the bit, so no pad
+    // mapping, movement or animation advance runs until the message is
+    // dismissed. Otherwise the state byte dispatches the machine: state 1 is
+    // the pad-driven locomotion and every other state is a scripted window
+    // that ignores the pad. The frozen and scripted paths still publish the
+    // direction pad so the object probe sees it; only the action edge, which
+    // belongs to the skipped input state, is withheld.
+    let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
+    let state = context.game.entities[0].state();
+    let mut pad = input;
+    // The effect-zone flag (raised by the 0x0B handler at the end of the
+    // previous probe) halves walk/run speed and the animation cadence this
+    // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
+    // locomotion handlers.
+    pad.slow_motion = context.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
+    if state != 1 || frozen {
+        pad.action_pressed = false;
+        pad.action_held = false;
+        context.player.input = pad;
+        if !frozen {
+            let clips: &[Clip] = context
+                .player_assets
+                .map(|assets| assets.emd.clips.as_slice())
+                .unwrap_or(&[]);
+            player_script::update(context.game, context.player, clips);
+        }
+    } else if let Some(assets) = context.player_assets {
         let room_clips = context
             .room
             .room_anim
             .as_ref()
             .map(|anim| anim.clips.as_slice())
             .unwrap_or(&[]);
-        // The effect-zone flag (raised by the 0x0B handler at the end of the
-        // previous probe) halves walk/run speed and the animation cadence this
-        // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
-        // locomotion handlers.
-        let mut input = input;
-        input.slow_motion = context.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
         player::update_with_room(
             context.player,
             context.room,
             &assets.emd.clips,
             &assets.emw.clips,
             room_clips,
-            input,
+            pad,
         );
     }
     context.game.sync_entity_from_player(context.player);
@@ -5156,10 +5181,16 @@ fn tick_room_timed(
     // entries (bit 0x80, including `set_stairs_zone`) belong to the input path:
     // a locked action behaviour does not read a new press, so the probe sees
     // only the every-frame entries while the vault/push/ladder owns the tick.
+    // The action-object probe is only reachable from the input path of the
+    // player state machine: a message freeze or any non-control state skips
+    // `player_input_to_behavior`, so no new press probes the table.
+    let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
+    let probe_action = input.action_pressed
+        && !frozen
+        && context.game.entities[0].state() == 1
+        && context.player.locked == player::LockedAction::None;
     {
         let mut host = game::ScdGameHost::new(context.game);
-        let probe_action =
-            input.action_pressed && context.player.locked == player::LockedAction::None;
         host.interact(context.player.pos, context.player.angle, probe_action);
     }
     // The room objects run after the player's physics and the player-side
@@ -6064,6 +6095,7 @@ fn capture_bmp(image: &Image, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ClipFrame, Emw, Keyframe, Skeleton, Texture8, Tmd};
     use crate::pack::PackWriter;
 
     struct TempDir(std::path::PathBuf);
@@ -9263,8 +9295,9 @@ end
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
 
-        // Global id 0x40 with a pause word that masks the control bit.
-        session.game.show_message(0x40, 0x145);
+        // Global id 0x40 with the inspect pause word 0x00FF, which clears the
+        // player state-machine bit 0.
+        session.game.show_message(0x40, 0x00FF);
         assert!(session.game.message_locks_controls());
 
         let before = session.game.frame;
@@ -9281,8 +9314,11 @@ end
         assert!(session.game.message.active);
         assert!(
             session.game.message_locks_controls(),
-            "the held movement never reached the room tick"
+            "the window is still masking the player-state bit"
         );
+        // The scripts still see the raw pad while the player is frozen; only
+        // the player's own state machine is skipped.
+        assert_eq!(session.game.dpad_held & 1, 1, "the raw pad was published");
 
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
@@ -9292,6 +9328,396 @@ end
             .unwrap();
         assert!(!session.game.message.active, "the action key dismissed it");
         assert!(!session.game.message_locks_controls());
+    }
+
+    /// A player model with flat one-keyframe clips: enough for the locomotion
+    /// and the scripted clip driver without packing real assets.
+    fn synthetic_player_assets() -> PlayerAssets {
+        fn clip_bank(count: usize) -> Vec<Clip> {
+            vec![
+                Clip {
+                    frames: (0..3)
+                        .map(|_| ClipFrame {
+                            keyframe: 0,
+                            timing: 1,
+                        })
+                        .collect(),
+                };
+                count
+            ]
+        }
+        let keyframes = vec![Keyframe::default()];
+        PlayerAssets {
+            emd: Emd {
+                skeleton: Skeleton::default(),
+                keyframes: keyframes.clone(),
+                clips: clip_bank(0x24),
+                mesh: Tmd::default(),
+                texture: Texture8 {
+                    width: 0,
+                    height: 0,
+                    indices: Vec::new(),
+                    palettes: Vec::new(),
+                    stp: Vec::new(),
+                },
+            },
+            emw: Emw {
+                skeleton: Skeleton::default(),
+                keyframes,
+                clips: clip_bank(6),
+                mesh: Tmd::default(),
+            },
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // the seam already takes this many
+    fn tick_scripted_room(
+        pack: &Pack,
+        room: &mut RoomState,
+        game: &mut game::GameState,
+        player_state: &mut player::PlayerState,
+        assets: &PlayerAssets,
+        command_vm: &mut scd::vm::CommandVm,
+        event_vm: &mut scd::vm::EventVm,
+        input: player::Input,
+    ) {
+        let mut npc_models = npc::EntityModelCache::default();
+        let _ = tick_room(
+            command_vm,
+            event_vm,
+            RoomContext {
+                room,
+                game,
+                player: player_state,
+                player_assets: Some(assets),
+                pack,
+                npc_models: &mut npc_models,
+            },
+            input,
+        );
+    }
+
+    /// The player-side fixture shared by the message and scripted-state tests:
+    /// a room with one cut and one walk zone, the player at the origin and an
+    /// empty pack for the models.
+    fn scripted_room_fixture() -> (
+        Pack,
+        RoomId,
+        RoomState,
+        game::GameState,
+        player::PlayerState,
+        PlayerAssets,
+    ) {
+        let pack = Pack::from_bytes(PackWriter::new().to_bytes().unwrap()).unwrap();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let room = effect_test_room();
+        let mut game = game::GameState::new(id, &room);
+        // The player is past its one-frame spawn init, exactly like every
+        // tick after a room boot.
+        game.entities[0].set_state(1);
+        let mut player_state = player::spawn(id, &room);
+        player_state.pos = [0, 0, 0];
+        player_state.angle = 0;
+        game.sync_entity_from_player(&player_state);
+        (
+            pack,
+            id,
+            room,
+            game,
+            player_state,
+            synthetic_player_assets(),
+        )
+    }
+
+    #[test]
+    fn an_inspect_message_freezes_the_player_until_dismissed() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        game.room_actions[2] = Some(game::RoomAction {
+            slot: 2,
+            kind: game::RoomActionKind::Message,
+            zone: [0, 0, 2000, 2000],
+            sce: 2,
+            handler: 2,
+            flags: 0x81,
+            params: [2, 0x81, 0x41, 0x00, 0xFF, 0x00, 0, 0],
+            item_data: None,
+            room_items_flag: 0xFF,
+        });
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        let start = player_state.pos;
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input {
+                up: true,
+                action_pressed: true,
+                action_held: true,
+                ..player::Input::default()
+            },
+        );
+        assert!(game.message.active, "the inspect probe raised the window");
+        assert!(game.message_locks_controls());
+        let frozen = player_state.pos;
+        assert_ne!(
+            frozen, start,
+            "the probe fires after the locomotion, so the raise tick still moved"
+        );
+
+        // From the next tick the pad no longer reaches the locomotion.
+        let hold = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        for _ in 0..5 {
+            tick_scripted_room(
+                &pack,
+                &mut room,
+                &mut game,
+                &mut player_state,
+                &assets,
+                &mut command_vm,
+                &mut event_vm,
+                hold,
+            );
+        }
+        assert_eq!(
+            player_state.pos, frozen,
+            "the inspect message froze the player"
+        );
+        assert_eq!(game.dpad_held & 1, 1, "the scripts still see the held pad");
+
+        // Dismissing restores the pad-driven locomotion.
+        game.cancel_message();
+        assert!(!game.message_locks_controls());
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            hold,
+        );
+        assert_ne!(
+            player_state.pos, frozen,
+            "movement resumed once the window was dismissed"
+        );
+    }
+
+    #[test]
+    fn an_inspect_message_without_a_pause_word_keeps_control() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        game.room_actions[2] = Some(game::RoomAction {
+            slot: 2,
+            kind: game::RoomActionKind::Message,
+            zone: [0, 0, 2000, 2000],
+            sce: 2,
+            handler: 2,
+            flags: 0x81,
+            // Pause word 0 changes nothing at all.
+            params: [2, 0x81, 0x41, 0x00, 0x00, 0x00, 0, 0],
+            item_data: None,
+            room_items_flag: 0xFF,
+        });
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        let hold = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input {
+                action_pressed: true,
+                action_held: true,
+                ..hold
+            },
+        );
+        assert!(game.message.active);
+        assert!(!game.message_locks_controls());
+        let before = player_state.pos;
+        for _ in 0..3 {
+            tick_scripted_room(
+                &pack,
+                &mut room,
+                &mut game,
+                &mut player_state,
+                &assets,
+                &mut command_vm,
+                &mut event_vm,
+                hold,
+            );
+        }
+        assert_ne!(
+            player_state.pos, before,
+            "a zero pause word leaves the locomotion running"
+        );
+    }
+
+    #[test]
+    fn a_script_message_freezes_the_player_on_the_same_tick() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        let container = scd::asm::assemble(
+            "\
+.version 1
+
+.main
+.block
+    message                 0x45, 0x00FF
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+        let scripts = scd::reader::parse(&container).unwrap();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        let hold = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        let start = player_state.pos;
+        // The command pass runs before the player's update, so the window the
+        // script raises this tick freezes this tick.
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            hold,
+        );
+        assert!(game.message.active, "the main script raised the window");
+        assert!(game.message_locks_controls());
+        assert_eq!(
+            player_state.pos, start,
+            "the same tick's locomotion was already frozen"
+        );
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            hold,
+        );
+        assert_eq!(player_state.pos, start, "and it stays frozen");
+    }
+
+    #[test]
+    fn a_scripted_player_state_locks_movement_until_state_one_returns() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        let container = scd::asm::assemble(
+            "\
+.version 1
+
+.main
+
+.event event_00
+    evt_actor_begin
+    act_anim_flags          0x20, 0x21, 0
+    act_end
+    evt_finish
+
+.event event_01
+    evt_actor_begin
+    act_idle
+    act_end
+    evt_finish
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+        let scripts = scd::reader::parse(&container).unwrap();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        let hold = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        let start = player_state.pos;
+        // Event 0 poses the scripted clip on the player slot; the player update
+        // runs the state-8 driver instead of the locomotion.
+        event_vm.start(0, 0);
+        for _ in 0..12 {
+            tick_scripted_room(
+                &pack,
+                &mut room,
+                &mut game,
+                &mut player_state,
+                &assets,
+                &mut command_vm,
+                &mut event_vm,
+                hold,
+            );
+        }
+        assert_eq!(game.entities[0].state(), 8);
+        assert_eq!(game.entities[0].animation_id, 0x20);
+        assert_eq!(player_state.anim.clip, 0x20, "the scripted clip is posed");
+        assert_eq!(
+            player_state.pos, start,
+            "the scripted state ignores the pad"
+        );
+        assert!(
+            game.flags[usize::from(game::BANK_SYSTEM)].bit(0x21),
+            "the scripted completion flag was raised"
+        );
+
+        // `act_idle` hands the player back to state 1 and the pad drives again.
+        event_vm.start(1, 1);
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            hold,
+        );
+        assert_eq!(game.entities[0].state(), 1);
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            hold,
+        );
+        assert_ne!(
+            player_state.pos, start,
+            "the locomotion resumed once state 1 returned"
+        );
     }
 
     #[test]
@@ -9437,9 +9863,9 @@ end
             ..player::Input::default()
         };
 
-        // The control bit clear is the message freeze: the press never reaches
-        // the climb scan.
-        session.game.message_flags &= !game::MESSAGE_FLAG_CONTROLS;
+        // The player-state bit clear is the message freeze: the press never
+        // reaches the climb scan.
+        session.game.message_flags &= !game::MESSAGE_FLAG_PLAYER_STATE;
         assert!(session.game.message_locks_controls());
         session
             .tick(&pack, UiInput::default(), press, true)
@@ -9448,7 +9874,7 @@ end
         assert!(!session.player.vault_bit);
 
         // Releasing the freeze lets the same press latch the vault.
-        session.game.message_flags |= game::MESSAGE_FLAG_CONTROLS;
+        session.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
