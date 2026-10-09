@@ -774,6 +774,20 @@ struct PickupView {
 /// (the Tab key cycles it). The boxed modal hook is kept for screens that own
 /// all of their state (the item viewer); it still freezes the room and draws
 /// over the last gameplay frame exactly as before.
+/// The pause-menu open/close fade phase.
+///
+/// The original fades the frozen frame to black before revealing the menu
+/// (`Out`), fades the menu in from black before it accepts input (`In`), and
+/// fades the menu out again before the room unfreezes (`Closing`). `None`
+/// means the menu (or gameplay) runs normally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuFadePhase {
+    None,
+    Out,
+    In,
+    Closing,
+}
+
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -807,6 +821,13 @@ struct GameSession {
     /// The paused inventory/status menu; the room tick is frozen while it is
     /// up and the last gameplay frame stays under it.
     menu: Option<MainMenu>,
+    /// The pause menu's open/close fade and which phase it is in.
+    menu_fade: transition::Fade,
+    /// The pause-menu fade phase; `None` means the menu accepts input.
+    menu_fade_phase: MenuFadePhase,
+    /// The first fixed tick after arming a fade must not advance it: the frame
+    /// it was armed on has not been drawn yet.
+    menu_fade_pending: bool,
     /// The item-box overlay opened by a room `item_box` action. It shares the
     /// session's state and draws over the inventory panel the menu underneath
     /// provides; the room stays frozen while it is up.
@@ -1022,6 +1043,9 @@ impl GameSession {
             swallow_action: false,
             room_fade: transition::Fade::inactive(),
             room_fade_pending: false,
+            menu_fade: transition::Fade::inactive(),
+            menu_fade_phase: MenuFadePhase::None,
+            menu_fade_pending: false,
             debug_menu_enabled: false,
             debug_menu: None,
             debug_failed: HashSet::new(),
@@ -1090,6 +1114,10 @@ impl GameSession {
             self.tick_debug_menu(pack, ui);
             return Ok(());
         }
+        if self.menu_fade_phase != MenuFadePhase::None {
+            self.tick_menu_fade();
+            return Ok(());
+        }
         if self.menu.is_some() {
             self.tick_menu(pack, ui, input, action);
             return Ok(());
@@ -1107,7 +1135,7 @@ impl GameSession {
         // window advances after the script pass, so the frame's start state
         // decides; the press that dismissed a window is spent on it.
         if ui.start && !was_active {
-            self.open_menu(pack);
+            self.begin_menu_open(pack);
             return Ok(());
         }
 
@@ -1291,7 +1319,8 @@ impl GameSession {
     /// Whether a pause-menu screen owns the tick, so the room is frozen and
     /// the original runs on its 16 ms non-gameplay limiter.
     fn room_frozen(&self) -> bool {
-        self.menu.is_some()
+        self.menu_fade_phase != MenuFadePhase::None
+            || self.menu.is_some()
             || self.item_box.is_some()
             || self.pickup_view.is_some()
             || self.file.is_some()
@@ -1422,6 +1451,78 @@ impl GameSession {
     fn close_menu(&mut self) {
         self.menu = None;
         self.game.message_menu = false;
+    }
+
+    /// Open the pause menu through the original's fade: the frozen frame
+    /// darkens over `0xC00` (24 alpha per tick), then the menu fades in over
+    /// `0xE800` (48 per tick) before it accepts input.
+    fn begin_menu_open(&mut self, pack: &Pack) {
+        if self.menu.is_some() || self.menu_fade_phase != MenuFadePhase::None {
+            return;
+        }
+        self.open_menu(pack);
+        self.menu_fade.set(2, 24 << 7, 0);
+        self.menu_fade_pending = true;
+        self.menu_fade_phase = MenuFadePhase::Out;
+    }
+
+    /// Close the pause menu through the original's fade: the cancel cue
+    /// plays, the menu darkens over `0xC00`, then the room unfreezes and
+    /// fades back in.
+    fn begin_menu_close(&mut self, pack: &Pack) {
+        if self.menu.is_none() || self.menu_fade_phase != MenuFadePhase::None {
+            return;
+        }
+        if let Some(wav) = self.sfx_cache.load(pack, "cancel")
+            && let Some(mixer) = &mut self.music
+        {
+            mixer.play_sfx_on_bank(sfx_bank_key(3, 5), wav, 1.0, 0.0);
+        }
+        self.menu_fade.set(2, 24 << 7, 0);
+        self.menu_fade_pending = true;
+        self.menu_fade_phase = MenuFadePhase::Closing;
+    }
+
+    /// One tick of the pause-menu fade. The first tick after arming only
+    /// clears the pending flag (draw-then-add); when the accumulator runs
+    /// negative the phase either starts the fade-in, finishes opening, or
+    /// closes the menu and arms the room-entry fade.
+    fn tick_menu_fade(&mut self) {
+        if self.menu_fade_pending {
+            self.menu_fade_pending = false;
+            return;
+        }
+        self.menu_fade.tick();
+        if self.menu_fade.overlay().is_some() {
+            return;
+        }
+        match self.menu_fade_phase {
+            MenuFadePhase::Out => {
+                // Armed inside this tick: the frame drawn after it is the
+                // first fade-in frame, so the next tick advances straight
+                // away (no pending frame).
+                self.menu_fade.set(2, -6144, 0x7FFF);
+                self.menu_fade_phase = MenuFadePhase::In;
+            }
+            MenuFadePhase::In => {
+                self.menu_fade = transition::Fade::inactive();
+                self.menu_fade_phase = MenuFadePhase::None;
+            }
+            MenuFadePhase::Closing => {
+                self.menu_fade = transition::Fade::inactive();
+                self.menu_fade_phase = MenuFadePhase::None;
+                self.close_menu();
+                self.arm_room_fade();
+            }
+            MenuFadePhase::None => {}
+        }
+    }
+
+    /// Blend the pause-menu fade over the frame just rendered.
+    fn draw_menu_fade(&mut self) {
+        if let Some(overlay) = self.menu_fade.overlay() {
+            self.framebuffer.fade_to_color(overlay.color, overlay.alpha);
+        }
     }
 
     /// Enable or disable the port-only debug room-select overlay (`--debug-menu`).
@@ -1878,7 +1979,7 @@ impl GameSession {
         let event = menu.handle_input(&mut self.game, event_input);
         match event {
             MenuEvent::None => {}
-            MenuEvent::Close => self.close_menu(),
+            MenuEvent::Close => self.begin_menu_close(pack),
             MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
             // CHECK opens the item viewer over the frozen menu.
             MenuEvent::ViewItem(item) => self.open_item_view(pack, item),
@@ -2078,6 +2179,12 @@ impl GameSession {
         self.room_fade.overlay().map(|overlay| overlay.alpha)
     }
 
+    /// The pause-menu fade's current alpha, for the deterministic tests.
+    #[cfg(test)]
+    fn menu_fade_alpha(&self) -> Option<u8> {
+        self.menu_fade.overlay().map(|overlay| overlay.alpha)
+    }
+
     /// Render the current frame into the session framebuffer: a transition
     /// frame while one runs, the gameplay scene otherwise, with the pause
     /// menu and then the message window drawn on top. The message is painted
@@ -2114,7 +2221,9 @@ impl GameSession {
             // scene and under the menu/message overlays.
             self.draw_room_fade();
         }
-        if self.menu.is_some() {
+        // The menu is hidden while the opening fade-out darkens the frozen
+        // frame; it is revealed for the fade-in.
+        if self.menu.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
             self.ensure_menu_assets(pack);
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw(&mut self.framebuffer, assets, &self.text, &self.game);
@@ -2202,6 +2311,8 @@ impl GameSession {
                 framebuffer.fade_overlay(screen.overlay());
             }
         }
+        // The pause-menu open/close fade sits over the menu and its overlays.
+        self.draw_menu_fade();
         if let Some(font) = &self.font {
             self.game
                 .message
@@ -11175,6 +11286,7 @@ end
         assert!(session.menu.is_some(), "START opens the menu");
         assert!(session.game.message_menu, "menu messages use the menu line");
         assert_eq!(session.game.frame, before, "the menu froze the room");
+        settle_menu_fade(&mut session, &pack);
 
         for _ in 0..5 {
             session
@@ -11203,6 +11315,7 @@ end
                 false,
             )
             .unwrap();
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none(), "X closes the menu");
         assert!(!session.game.message_menu);
 
@@ -11212,6 +11325,78 @@ end
         assert_eq!(session.game.frame, before + 1, "the room resumes");
     }
 
+    #[test]
+    fn the_pause_menu_fades_out_then_in_and_closes_through_the_room_fade() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        // Draw-then-add: the arming frame is still transparent, then the
+        // frozen frame darkens by 24 alpha a tick.
+        assert_eq!(session.menu_fade_alpha(), Some(0));
+        let mut out = Vec::new();
+        while session.menu_fade_phase == MenuFadePhase::Out {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.menu_fade_phase == MenuFadePhase::Out
+                && let Some(alpha) = session.menu_fade_alpha()
+            {
+                out.push(alpha);
+            }
+        }
+        assert_eq!(out, vec![0, 24, 48, 72, 96, 120, 144, 168, 192, 216, 240]);
+
+        // The menu fades in from full black over 0xE800 (48 a tick).
+        let mut fade_in = Vec::new();
+        while session.menu_fade_phase == MenuFadePhase::In {
+            if let Some(alpha) = session.menu_fade_alpha() {
+                fade_in.push(alpha);
+            }
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(fade_in, vec![255, 207, 159, 111, 63, 15]);
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::None);
+        assert!(session.menu.is_some(), "the menu accepts input afterwards");
+
+        // Cancel darkens the menu, then unfreezes the room through the
+        // room-entry fade.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
+        settle_menu_fade(&mut session, &pack);
+        assert!(session.menu.is_none());
+        assert_eq!(
+            session.room_fade_alpha(),
+            Some(255),
+            "the room fades back in after the menu closes"
+        );
+    }
     #[test]
     fn a_film_freezes_the_room_and_resumes_when_it_ends() {
         let dir = TempDir::new();
@@ -11266,6 +11451,19 @@ end
         let mixer = Mixer::open();
         let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER) };
         mixer
+    }
+
+    /// Advance the pause-menu open/close fade to completion.
+    fn settle_menu_fade(session: &mut GameSession, pack: &Pack) {
+        for _ in 0..64 {
+            if session.menu_fade_phase == MenuFadePhase::None {
+                return;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("the pause-menu fade did not settle");
     }
 
     #[test]
@@ -11684,6 +11882,7 @@ end
             )
             .unwrap();
         assert!(session.menu.is_some());
+        settle_menu_fade(&mut session, &pack);
 
         // Slot 0 holds the knife: confirm opens the action submenu, down
         // selects CHECK, confirm installs the viewer.
@@ -12296,6 +12495,7 @@ end
             )
             .unwrap();
         assert!(session.menu.is_some());
+        settle_menu_fade(&mut session, &pack);
 
         // The first Tab lands on the map tab, which is inert.
         session
@@ -12425,6 +12625,7 @@ end
             )
             .unwrap();
         assert!(session.menu.is_some());
+        settle_menu_fade(&mut session, &pack);
         session
             .tick(
                 &pack,
