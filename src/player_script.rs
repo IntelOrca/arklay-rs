@@ -31,6 +31,12 @@
 //! The arrival gate that hands control back to state 1 is the player's
 //! `health_status & 0x80` lock, not the NPC `collision_flags` bit.
 //!
+//! The handlers move the player with the original's un-collided `Add_speedXZ`
+//! step; [`scripted_animation`] then runs the room collision pass over the
+//! tick's movement, pushing the player out of any obstruction the step
+//! crossed. (The NPC state-8 drivers keep their pre-check + rollback instead;
+//! see [`crate::npc::walk::advance_xz_blocked`].)
+//!
 //! # Documented deviations from the original
 //!
 //! - **The damage bank is absent.** A clip id of 0x3E and up selects the
@@ -141,11 +147,15 @@ pub fn update(
     }
 }
 
-/// Dispatch one state-8 tick on `action_behavior`, then mirror the entity's
-/// position and facing onto the visible player.
+/// Dispatch one state-8 tick on `action_behavior`, resolve the tick's movement
+/// against the room collision, then mirror the entity's position and facing
+/// onto the visible player.
 ///
 /// The original runs the handler a second time when `flags` bit 1 is set,
 /// re-reading `action_behavior` for the repeat, exactly like the NPC driver.
+/// The handlers step with the un-collided `Add_speedXZ`, so this tail is the
+/// player's only collision pass: it pushes the player out of any obstruction
+/// the step crossed, anchored at the pre-dispatch position.
 fn scripted_animation(
     game: &mut GameState,
     player: &mut PlayerState,
@@ -154,6 +164,7 @@ fn scripted_animation(
     emw_clips: &[Clip],
     room_clips: &[Clip],
 ) {
+    let prev_pos = game.entities[0].pos;
     let behavior = game.entities[0].action_behavior;
     dispatch_behavior(
         game, player, room, emd_clips, emw_clips, room_clips, behavior,
@@ -162,7 +173,14 @@ fn scripted_animation(
         let repeat = game.entities[0].action_behavior;
         dispatch_behavior(game, player, room, emd_clips, emw_clips, room_clips, repeat);
     }
-    let entity = &game.entities[0];
+    let entity = &mut game.entities[0];
+    entity.pos = crate::player::resolve_collision(
+        &room.collision,
+        prev_pos,
+        entity.pos,
+        i32::from(entity.sca_radius),
+        entity.collision_flags,
+    );
     player.pos = entity.pos;
     player.angle = entity.angle;
 }
@@ -486,9 +504,9 @@ fn behavior_run(
             entity.blend_counter = 3;
             entity.unk_8c = 3;
             entity.action_ticks_counter = 0;
-            run_stop_step(entity, clock, room, emd_clips);
+            run_stop_step(entity, clock, emd_clips);
         }
-        5 => run_stop_step(entity, clock, room, emd_clips),
+        5 => run_stop_step(entity, clock, emd_clips),
         6 => {
             return_to_control(entity);
             system.apply(entity.scd_anim_param, 0);
@@ -544,7 +562,7 @@ fn behavior_backward(
     if frame == 8 || frame == 0x16 {
         walk::footstep(entity_sounds, room, entity, 0, slow);
     }
-    backward_step(entity, clock, room, clips, system, health_locked, speed);
+    backward_step(entity, clock, clips, system, health_locked, speed);
     publish(entity, clock, player, ClipSource::Emd);
 }
 
@@ -588,7 +606,6 @@ fn behavior_backward_slow(
     backward_step(
         entity,
         clock,
-        room,
         clips,
         system,
         health_locked,
@@ -604,7 +621,6 @@ fn behavior_backward_slow(
 fn backward_step(
     entity: &mut Entity,
     clock: &mut EntityAnim,
-    room: &RoomState,
     clips: &[Clip],
     system: &mut FlagBank,
     health_locked: bool,
@@ -618,7 +634,7 @@ fn backward_step(
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     entity.angle = entity.angle.wrapping_sub(0x800);
     clock.advance(entity, clips, entity.flags & 1 != 0, MOVE_BLEND_STEP);
-    walk::advance_xz_blocked(room, entity, 0x800, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0x800, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 100 {
         system.apply(entity.scd_anim_param, 0);
         if !health_locked {
@@ -794,7 +810,7 @@ fn walk_move_step(
     walk::entity_apply_walk_speed(entity, 0x5D);
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, MOVE_BLEND_STEP);
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0x96 {
         system.apply(entity.scd_anim_param, 0);
         if !health_locked {
@@ -824,7 +840,7 @@ fn run_move_step(
     }
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, MOVE_BLEND_STEP);
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0xFA {
         if health_locked {
             system.apply(entity.scd_anim_param, 0);
@@ -836,14 +852,14 @@ fn run_move_step(
 
 /// Behavior 3's deceleration: advance the stop clip, count four ticks, shed
 /// 0x1E speed each tick and keep moving.
-fn run_stop_step(entity: &mut Entity, clock: &mut EntityAnim, room: &RoomState, clips: &[Clip]) {
+fn run_stop_step(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     clock.advance(entity, clips, entity.flags & 1 != 0, MOVE_BLEND_STEP);
     entity.action_ticks_counter = entity.action_ticks_counter.wrapping_add(1);
     if (entity.action_ticks_counter as i16) > 3 {
         entity.action_state = 6;
     }
     entity.move_speed_current = (entity.move_speed_current as i16).wrapping_sub(0x1E) as u16;
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
 }
 
 /// The scripted walk target (`unk_c6`, 0, `unk_c8`).

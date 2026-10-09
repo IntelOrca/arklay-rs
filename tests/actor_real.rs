@@ -292,4 +292,92 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
         sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x20),
         "the script's completion bit is raised"
     );
+
+    // The cutscene's final leg is a scripted run to (2338, 17850) that carries
+    // Jill into door AOT 2's zone. The un-collided step plus the driver's
+    // collision pass must keep her moving: sample the run and assert it closes
+    // on the target.
+    let final_target = [2338, 17850];
+    let mut final_closest = i32::MAX;
+    for ticks in (980..=1100).step_by(2) {
+        let Ok(sim) = simulate_room(&pack, id, ticks, player::Input::default()) else {
+            return;
+        };
+        final_closest = final_closest.min(waypoint_distance(sim.player.pos, final_target));
+    }
+    assert!(
+        final_closest < 0x96,
+        "the final run only closed to {final_closest} units of (2338, 17850)"
+    );
+
+    // Behavior 3's deceleration hands control back with the script's system bit
+    // 0x20 raised; the run's target stays latched on the entity.
+    let sim = simulate_room(&pack, id, 1080, player::Input::default()).unwrap();
+    assert_eq!(
+        sim.game.entities[0].state(),
+        1,
+        "state 1 when the run completes"
+    );
+    assert_eq!(sim.game.entities[0].action_behavior, 0);
+    assert!(
+        sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x20),
+        "the final run raises the script's completion bit"
+    );
+    let entity = sim.game.entities[0];
+    assert_eq!([entity.unk_c6, entity.unk_c8], [2338, 17850]);
+
+    // With control back, the walk-in door fires and swaps in Jill's room 105.
+    // The door load resets the player animation, so no scripted state survives
+    // into the destination.
+    let sim = simulate_room(&pack, id, 1400, player::Input::default()).unwrap();
+    assert_eq!(
+        sim.transitions,
+        vec![RoomId::from_room_and_player("105", 1).unwrap()],
+        "door AOT 2 enters room 105"
+    );
+    assert_eq!(
+        sim.game.entities[0].state(),
+        1,
+        "the door load re-initialises pad control"
+    );
+    assert_eq!(sim.game.entities[0].action_behavior, 0);
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room_1060_chris_cutscene_drops_the_stale_walk_after_the_door() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1060").unwrap();
+
+    // Chris's opening cutscene ends in the same walk into door AOT 2. Unlike
+    // Jill's run, the walk hands pad control back before the door fires.
+    let sim = simulate_room(&pack, id, 800, player::Input::default()).unwrap();
+    assert_eq!(
+        sim.game.entities[0].state(),
+        1,
+        "the walk returns pad control"
+    );
+    assert_eq!(sim.game.entities[0].action_behavior, 0);
+
+    // The door load resets the player animation before the destination boots,
+    // so the source room's scripted walk (target 2388,17600) is gone after the
+    // transition instead of continuing into room 105's geometry.
+    let sim = simulate_room(&pack, id, 1100, player::Input::default()).unwrap();
+    assert_eq!(
+        sim.transitions,
+        vec![RoomId::from_room_and_player("105", 0).unwrap()],
+        "door AOT 2 enters room 105"
+    );
+    assert_eq!(
+        sim.game.entities[0].state(),
+        1,
+        "the door load re-initialises pad control"
+    );
+    assert_eq!(
+        sim.game.entities[0].action_behavior, 0,
+        "the stale scripted walk is gone after the transition"
+    );
 }

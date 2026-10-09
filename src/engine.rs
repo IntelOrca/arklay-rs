@@ -370,9 +370,11 @@ pub fn run_with_options(
                 tick_voice(&mut no_mixer, &mut voice_cache, &mut game, &pack);
                 // No input is fed headlessly, so release a message's menu
                 // choice the way an auto-confirm would; the F7 wait must not
-                // outlive the frame that raised it.
+                // outlive the frame that raised it. The scripts read the
+                // release through the BioCard state byte, so mirror it.
                 let choice = game.message.menu_choice_id();
                 game.message.set_menu_choice_id(choice & 0x7F);
+                game.sync_message_choice();
                 drain_mask_toggles(&mut loaded.room, &mut game);
                 // A capture never plays a film: the request is taken and
                 // dropped so a `movie_on` cannot stall the headless run.
@@ -1591,6 +1593,12 @@ impl GameSession {
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
+        // A jump is a door load: reset the player's animation id so the next
+        // update re-initialises pad control instead of resuming a scripted
+        // state from the source room (see `finish_transition`).
+        self.game.entities[0].set_state(0);
+        self.game.entities[0].action_behavior = 0;
+        self.game.entities[0].action_state = 0;
         self.game.enter_room(target, &self.loaded.room);
         self.enter_room(pack, Some(from));
         self.player = player::spawn(target, &self.loaded.room);
@@ -4098,6 +4106,13 @@ fn finish_transition(
     };
     *loaded = destination;
     loaded.room.room_sfx = session.door.sfx;
+    // The original's door load resets the player's animation id before the
+    // destination room boots, so the next update re-initialises state 0 back
+    // to the pad-driven state 1 instead of resuming the source room's scripted
+    // state 8 behaviour over its stale target.
+    game.entities[0].set_state(0);
+    game.entities[0].action_behavior = 0;
+    game.entities[0].action_state = 0;
     game.enter_room(session.target, &loaded.room);
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
@@ -4651,9 +4666,12 @@ fn simulate_loaded_with(
         bgm::apply_live(&mut no_mixer, &mut game, &mut bgm_cache, pack);
         tick_voice(&mut no_mixer, &mut voice_cache, &mut game, pack);
         // Headless runs feed no input; release a message's menu choice the way
-        // an auto-confirm would so a script's F7 cannot stall on it.
+        // an auto-confirm would so a script's F7 cannot stall on it. The
+        // scripts read the release through the BioCard state byte, so mirror
+        // it.
         let choice = game.message.menu_choice_id();
         game.message.set_menu_choice_id(choice & 0x7F);
+        game.sync_message_choice();
         drain_mask_toggles(&mut loaded.room, &mut game);
         // A script's `movie_on` takes over the next tick. A run that does not
         // play films takes and drops the request, so it never stalls.
@@ -6033,19 +6051,17 @@ fn tick_room_timed(
     }
     // The original runs the room action probe after the player's movement, so
     // `stairs_height_update` measures the frame's final position and the climb
-    // behaviour starts from where the player actually is. The action-key
-    // entries (bit 0x80, including `set_stairs_zone`) belong to the input path:
-    // a locked action behaviour does not read a new press, so the probe sees
-    // only the every-frame entries while the vault/push/ladder owns the tick.
-    // The action-object probe is only reachable from the input path of the
-    // player state machine: a message freeze or any non-control state skips
-    // `player_input_to_behavior`, so no new press probes the table.
+    // behaviour starts from where the player actually is. The probe belongs to
+    // the player's control path: the original gates the movement, forward reach
+    // and collision pass on the player's scripted flag, so a scripted state
+    // never refreshes the reach point it tests. Probe only from state 1; the
+    // action-key entries (bit 0x80, including `set_stairs_zone`) additionally
+    // need a clear message lock and no locked action, because a locked action
+    // behaviour does not read a new press.
     let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
-    let probe_action = input.action_pressed
-        && !frozen
-        && context.game.entities[0].state() == 1
-        && context.player.locked == player::LockedAction::None;
-    {
+    if context.game.entities[0].state() == 1 {
+        let probe_action =
+            input.action_pressed && !frozen && context.player.locked == player::LockedAction::None;
         let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, context.player.angle, probe_action);
     }
@@ -6087,6 +6103,10 @@ fn enter_transition(
     transition: &game::RoomTransition,
 ) -> Result<LoadedRoom> {
     let mut loaded = load_room(pack, transition.target)?;
+    // A door load resets the player's animation id (see `finish_transition`).
+    game.entities[0].set_state(0);
+    game.entities[0].action_behavior = 0;
+    game.entities[0].action_state = 0;
     game.enter_room(transition.target, &loaded.room);
     *player_state = player::spawn(transition.target, &loaded.room);
     player_state.pos = transition.pos;

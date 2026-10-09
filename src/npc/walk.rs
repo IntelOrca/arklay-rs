@@ -6,9 +6,10 @@
 //! frames with `entity_apply_walk_speed`, and move with `Add_speedXZ`; state 9
 //! reuses the same helpers. `Add_speedXZ` is a bare un-collided add: a
 //! character walks into geometry and is only pushed back out by the pass that
-//! runs later in its own driver ([`update`]'s state-9 tail, or the room-object
-//! pass). [`try_advance_xz`] keeps the rollback only for the idle walk-01
-//! probe, where the original saves the moved words, probes, and restores them.
+//! runs later in its own driver ([`update`]'s state-9 tail, the player's
+//! [`crate::player_script`] tail, or the room-object pass). [`try_advance_xz`]
+//! keeps the rollback only for the idle walk-01 probe, where the original
+//! saves the moved words, probes, and restores them.
 //!
 //! State 9 adds the walk-zone graph the room data provides: [`walk_zone_find`]
 //! locates the zone containing a point, [`walk_zone_shared_edge`] names the
@@ -111,13 +112,16 @@ pub fn advance_xz(entity: &mut Entity, offset: u16, distance: i16) {
     entity.pos[2] += dz;
 }
 
-/// The state-8 scripted walks: `Add_speedXZ` with a pre-move collision probe.
+/// The NPC state-8 scripted walks: `Add_speedXZ` with a pre-move collision
+/// probe.
 ///
-/// The original's state-8 handlers have no end-of-frame room resolve at all,
-/// so an un-collided step can walk a scripted character straight through
+/// The original's NPC state-8 handlers have no end-of-frame room resolve at
+/// all, so an un-collided step can walk a scripted character straight through
 /// geometry with nothing to push it back out. The port keeps the pre-check +
-/// rollback for this driver only (documented deviation); state 9 mirrors the
-/// original's un-collided move and resolves in its own tail.
+/// rollback for the NPC drivers only (documented deviation); the player's
+/// state-8 driver moves un-collided and resolves in its own tail
+/// ([`crate::player_script`]), and state 9 mirrors the original's un-collided
+/// move and resolves in its own tail.
 pub fn advance_xz_blocked(room: &RoomState, entity: &mut Entity, offset: u16, distance: i16) {
     let _ = try_advance_xz(room, entity, offset, distance);
 }
