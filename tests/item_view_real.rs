@@ -198,6 +198,14 @@ fn real_view_capture_is_deterministic() {
 
     let decoded = arklay::bmp::decode(&first).unwrap();
     assert_eq!((decoded.width, decoded.height), (320, 240));
+    // The viewport around the model keeps the original's pure-black screen
+    // clear; only the model and the name line may paint over it.
+    let viewport = |x: usize, y: usize| -> [u8; 4] {
+        let offset = (y * decoded.width as usize + x) * 4;
+        decoded.rgba[offset..offset + 4].try_into().unwrap()
+    };
+    assert_eq!(viewport(35, 60), [0, 0, 0, 255]);
+    assert_eq!(viewport(170, 100), [0, 0, 0, 255]);
     let content = decoded
         .rgba
         .as_chunks::<4>()

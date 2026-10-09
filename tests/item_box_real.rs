@@ -143,6 +143,15 @@ fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
         non_black(&image)
     );
 
+    // The viewport left of the box overlay keeps the original's pure-black
+    // screen clear.
+    let viewport = |x: usize, y: usize| -> [u8; 4] {
+        let offset = (y * image.width as usize + x) * 4;
+        image.rgba[offset..offset + 4].try_into().unwrap()
+    };
+    assert_eq!(viewport(35, 60), [0, 0, 0, 255]);
+    assert_eq!(viewport(170, 100), [0, 0, 0, 255]);
+
     // The box overlay must add a large, known delta over the inventory panel
     // beneath it: a capture that lost the box layer would be the menu capture.
     let menu = bmp::decode(&std::fs::read(&menu_path).unwrap()).unwrap();

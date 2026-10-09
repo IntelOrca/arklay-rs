@@ -73,6 +73,15 @@ fn menu_over_room1001_is_deterministic_and_draws_the_ship_art() {
     menu.draw(&mut second, &assets, &text, &game);
     assert_eq!(first.rgba, second.rgba, "two menu renders differ");
 
+    // The centre viewport is the original's pure-black screen clear, not a
+    // grey: sample points away from the panel art and the item slots.
+    let viewport = |framebuffer: &Framebuffer, x: usize, y: usize| -> [u8; 4] {
+        let offset = (y * framebuffer.width as usize + x) * 4;
+        framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+    };
+    assert_eq!(viewport(&first, 35, 60), [0, 0, 0, 255]);
+    assert_eq!(viewport(&first, 170, 100), [0, 0, 0, 255]);
+
     let changed = first
         .rgba
         .as_chunks::<4>()

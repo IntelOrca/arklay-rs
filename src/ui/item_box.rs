@@ -98,6 +98,18 @@ pub const SHADOW_BOTTOM: Rect = rect([42, 0x40], [126, 0x10]);
 pub const SHADOW_LIST: Rect = rect([42, 34], [126, 0x2E]);
 /// The browse-mode shadow over the preview slot.
 pub const SHADOW_SLOT: Rect = rect([0x5C, 0x58], [40, 0x1E]);
+/// The shadow dim, the original's `0x70` grey blend over the list panel.
+pub const SHADOW_ALPHA: u8 = 0x70;
+/// The label the original prints on an item-box slot row that holds nothing.
+pub const NOTHING_LABEL: &[u8] = b"_Nothing_";
+/// The "box is full" warning line's left edge.
+pub const FULL_LINE_X: i16 = 0x2A;
+/// The "box is full" warning line's right edge (inclusive).
+pub const FULL_LINE_END_X: i16 = 0xA8;
+/// The "box is full" warning line's colour: the original's `ff ef 00`.
+pub const FULL_LINE_COLOR: [u8; 4] = [0xFF, 0xEF, 0x00, 255];
+/// The "box is full" line's base y (the last cursor's row).
+pub const FULL_LINE_Y: i16 = 0x31;
 /// The dark scrollbar track above the list.
 pub const TRACK_TOP: Rect = rect([0xD2, 0x10], [0x5E, 0x10]);
 /// The dark scrollbar track beside the list.
@@ -190,11 +202,11 @@ impl Default for ItemBox {
 
 impl ItemBox {
     /// Open the box for the current character: the original resets the box
-    /// cursor and starts on the first inventory slot.
-    pub fn open(&mut self, game: &GameState) {
+    /// cursor and adopts the inventory panel's shared cursor.
+    pub fn open(&mut self, game: &GameState, player_cursor: u8) {
         self.mode = ItemBoxMode::Browse;
         self.box_cursor = 0;
-        self.player_cursor = 8;
+        self.player_cursor = player_cursor;
         self.slots = game.inventory_capacity();
         self.slide_dir = 0;
         self.slide_step = 0;
@@ -326,6 +338,11 @@ impl ItemBox {
     }
 
     /// Draw the box overlay over the already-drawn inventory panel.
+    ///
+    /// The layer order follows the original's depth sort: the list interior
+    /// panel first, the shadows that dim its name rows, the bright green frame
+    /// pieces and the slot icon/quantity, the name rows, the full-box warning
+    /// line, then the near masks that clip the list, and the page ticks.
     pub fn draw(
         &self,
         framebuffer: &mut Framebuffer,
@@ -334,28 +351,34 @@ impl ItemBox {
         text: &Text,
         game: &GameState,
     ) {
-        // Mask the box area out of the dark background, then lay the shadows.
-        for rect in FRAME_MASKS {
-            fill_rect(framebuffer, rect, [0, 0, 0, 255]);
-        }
-        framebuffer.blend_black_rect(rect_dst(SHADOW_TOP), 128);
-        framebuffer.blend_black_rect(rect_dst(SHADOW_BOTTOM), 128);
+        // The list interior piece carries the blue background and the green
+        // side columns that close the frame rectangle.
+        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[2]);
+        // The shadows sit on the panel and dim its first/third name rows; in
+        // browse mode they also dim the whole list and the preview slot.
+        framebuffer.blend_black_rect(rect_dst(SHADOW_TOP), SHADOW_ALPHA);
+        framebuffer.blend_black_rect(rect_dst(SHADOW_BOTTOM), SHADOW_ALPHA);
         if self.mode == ItemBoxMode::Browse {
-            framebuffer.blend_black_rect(rect_dst(SHADOW_LIST), 128);
-            framebuffer.blend_black_rect(rect_dst(SHADOW_SLOT), 128);
+            framebuffer.blend_black_rect(rect_dst(SHADOW_LIST), SHADOW_ALPHA);
+            framebuffer.blend_black_rect(rect_dst(SHADOW_SLOT), SHADOW_ALPHA);
         }
         fill_rect(framebuffer, TRACK_TOP, [0, 0, 0, 255]);
         fill_rect(framebuffer, TRACK_SIDE, [0, 0, 0, 255]);
-
+        // The bright frame pieces draw over the shadows so they stay green.
         for part in FRAME_PARTS_A {
             draw_part(framebuffer, &assets.itemboxn, part);
         }
-        for part in FRAME_PARTS_C {
-            draw_part(framebuffer, &assets.itemboxn, part);
-        }
+        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[0]);
+        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[1]);
 
         self.draw_slot(framebuffer, menu, game);
         self.draw_names(framebuffer, menu, text, game);
+        self.draw_full_line(framebuffer);
+        // The masks are the nearest layer: they clip the sliding list content
+        // and cover the inventory panel around the box.
+        for rect in FRAME_MASKS {
+            fill_rect(framebuffer, rect, [0, 0, 0, 255]);
+        }
         self.draw_ticks(framebuffer, assets);
     }
 
@@ -413,7 +436,8 @@ impl ItemBox {
         }
     }
 
-    /// The three-row item name list ending at the box cursor.
+    /// The three-row item name list ending at the box cursor. Rows whose slot
+    /// holds nothing print the original's `_Nothing_` label.
     fn draw_names(
         &self,
         framebuffer: &mut Framebuffer,
@@ -426,24 +450,28 @@ impl ItemBox {
         } else {
             ITEMBOX_SLOTS_TOTAL as u8 - 1
         };
+        // A page change slides the whole list upward, exactly like the
+        // original's `nameY = 0x23 - state` walk.
         let shift = if self.slide_dir == 0 {
             0
         } else {
-            i32::from(self.slide_dir) * (i32::from(SLIDE_TICKS) - i32::from(self.slide_step))
+            -(i32::from(SLIDE_TICKS) - i32::from(self.slide_step))
         };
         for row in 0..3 {
             let stack = game.item_box[usize::from(slot)];
-            if stack.id != 0
-                && let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags())
-            {
+            let y = i32::from(NAME_Y) + row * i32::from(NAME_STEP) + shift;
+            if stack.id == 0 {
                 menu.font.draw_text(
                     framebuffer,
                     i32::from(NAME_X),
-                    i32::from(NAME_Y) + row * i32::from(NAME_STEP) + shift,
+                    y,
                     Tint::White,
                     0,
-                    name,
+                    NOTHING_LABEL,
                 );
+            } else if let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags()) {
+                menu.font
+                    .draw_text(framebuffer, i32::from(NAME_X), y, Tint::White, 0, name);
             }
             slot = if slot >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
                 0
@@ -451,6 +479,29 @@ impl ItemBox {
                 slot + 1
             };
         }
+    }
+
+    /// The "box is full" warning line the original draws under the name list
+    /// while the box cursor sits on the last two slots (`0x2E`/`0x2F`). The
+    /// row follows the cursor so it stays under the list's last row.
+    fn draw_full_line(&self, framebuffer: &mut Framebuffer) {
+        if self.box_cursor < 0x2E {
+            return;
+        }
+        let slide = if self.slide_dir == 0 {
+            0
+        } else {
+            i32::from(SLIDE_TICKS) - i32::from(self.slide_step)
+        };
+        let y = i32::from(FULL_LINE_Y) - slide + (0x30 - i32::from(self.box_cursor)) * 0x0F;
+        fill_rect(
+            framebuffer,
+            Rect {
+                pos: [FULL_LINE_X, y as i16],
+                size: [FULL_LINE_END_X - FULL_LINE_X + 1, 1],
+            },
+            FULL_LINE_COLOR,
+        );
     }
 
     /// The three page-position ticks following the box cursor.
@@ -522,12 +573,50 @@ fn fill_rect(framebuffer: &mut Framebuffer, rect: Rect, rgba: [u8; 4]) {
 mod tests {
     use super::*;
     use crate::game::{InventoryItem, STATE_BYTE_EQUIPPED};
-    use crate::state::{RoomId, RoomState};
+    use crate::model::{PALETTE_ROW_LEN, Texture8};
+    use crate::render::Framebuffer;
+    use crate::state::{Image, RoomId, RoomState};
+    use crate::ui::layout;
+    use crate::ui::main_menu::MainMenu;
 
     fn game() -> GameState {
         let mut state = GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default());
         state.max_health = 96;
         state
+    }
+
+    fn solid_texture(width: u32, height: u32, index: u8, color: [u8; 4]) -> Texture8 {
+        let mut palettes = vec![[0u8; 4]; PALETTE_ROW_LEN];
+        palettes[usize::from(index)] = color;
+        Texture8 {
+            width,
+            height,
+            indices: vec![index; (width * height) as usize],
+            palettes,
+            stp: Vec::new(),
+        }
+    }
+
+    /// Menu art whose font paints every glyph solid, so a drawn label is
+    /// detectable in the framebuffer.
+    fn test_menu_assets() -> MenuAssets {
+        MenuAssets {
+            status: solid_texture(256, 256, 1, [50, 60, 70, 255]),
+            blue: solid_texture(64, 64, 1, [0, 0, 255, 255]),
+            statface: solid_texture(64, 64, 1, [255, 255, 0, 255]),
+            staitem: solid_texture(64, 64, 1, [1, 2, 3, 255]),
+            item_all: Image {
+                width: 40,
+                height: 2160,
+                rgba: vec![0; (40 * 2160 * 4) as usize],
+            },
+            font: crate::font::Font::new(solid_texture(768, 256, 1, [1, 2, 3, 255])),
+        }
+    }
+
+    fn pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
+        let offset = (y * framebuffer.width as usize + x) * 4;
+        framebuffer.rgba[offset..offset + 4].try_into().unwrap()
     }
 
     #[test]
@@ -588,7 +677,7 @@ mod tests {
             quantity: 12,
         };
         let mut item_box = ItemBox::default();
-        item_box.open(&state);
+        item_box.open(&state, 8);
 
         assert_eq!(
             item_box.handle_input(&mut state, MenuInput::Confirm),
@@ -626,7 +715,7 @@ mod tests {
         state.add_item(0x41, 1);
         state.set_equipped(Some(0x02));
         let mut item_box = ItemBox::default();
-        item_box.open(&state);
+        item_box.open(&state, 8);
 
         item_box.handle_input(&mut state, MenuInput::Confirm);
         assert_eq!(
@@ -644,7 +733,7 @@ mod tests {
         let mut state = game();
         state.add_item(0x41, 1);
         let mut item_box = ItemBox::default();
-        item_box.open(&state);
+        item_box.open(&state, 8);
         assert_eq!(
             item_box.handle_input(&mut state, MenuInput::Cancel),
             ItemBoxEvent::Close
@@ -664,12 +753,148 @@ mod tests {
     fn an_empty_armed_slot_does_not_change_the_state() {
         let mut state = game();
         let mut item_box = ItemBox::default();
-        item_box.open(&state);
+        item_box.open(&state, 8);
         item_box.handle_input(&mut state, MenuInput::Confirm);
         assert_eq!(
             item_box.handle_input(&mut state, MenuInput::Confirm),
             ItemBoxEvent::None
         );
         assert!(state.item_box.iter().all(|slot| slot.id == 0));
+    }
+
+    #[test]
+    fn open_adopts_the_shared_inventory_cursor() {
+        let mut state = game();
+        state.add_item(0x41, 1); // slot 0
+        state.add_item(0x44, 1); // slot 1
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 10);
+        assert_eq!(item_box.player_cursor, 10);
+        assert_eq!(item_box.player_slot(), Some(1));
+        assert_eq!(item_box.selected_item(&state), 0x44);
+    }
+
+    #[test]
+    fn the_box_cursor_keeps_the_menu_cursor_and_name_in_step() {
+        let mut state = game();
+        state.add_item(0x41, 1); // slot 0
+        state.add_item(0x44, 1); // slot 1
+        state.add_item(0x02, 15); // slot 2
+        let mut menu = MainMenu::new(state.inventory_capacity());
+        menu.open(&mut state);
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, menu.cursor);
+        assert_eq!(item_box.player_cursor, menu.cursor);
+
+        // The four directions walk the shared cursor; the menu's drawn cursor
+        // and item name always follow the box's acted-on slot.
+        for input in [
+            MenuInput::Right,
+            MenuInput::Down,
+            MenuInput::Left,
+            MenuInput::Up,
+        ] {
+            item_box.handle_input(&mut state, input);
+            menu.move_cursor_to(&mut state, item_box.player_cursor);
+            assert_eq!(menu.cursor, item_box.player_cursor);
+            let slot = item_box.player_slot().expect("the cursor stays on a slot");
+            assert_eq!(layout::slot_of_cursor(menu.cursor), Some(slot));
+            assert_eq!(menu.selected_item, item_box.selected_item(&state));
+            let expected = state.inventory.get(slot).map_or(0, |stack| stack.id);
+            assert_eq!(menu.selected_item, expected);
+        }
+    }
+
+    #[test]
+    fn confirm_swaps_the_slot_under_the_drawn_cursor() {
+        let mut state = game();
+        state.add_item(0x41, 1); // slot 0
+        state.add_item(0x44, 1); // slot 1
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 8);
+        // Move the shared cursor onto slot 1 and arm the swap there.
+        item_box.handle_input(&mut state, MenuInput::Right);
+        assert_eq!(item_box.player_cursor, 10);
+        assert_eq!(
+            item_box.handle_input(&mut state, MenuInput::Confirm),
+            ItemBoxEvent::None
+        );
+        assert_eq!(
+            item_box.handle_input(&mut state, MenuInput::Confirm),
+            ItemBoxEvent::Changed
+        );
+        assert_eq!(
+            state.item_box[0].id, 0x44,
+            "the slot under the cursor moved"
+        );
+        assert!(!state.has_item(0x44));
+        assert_eq!(
+            item_box.player_cursor, 10,
+            "a swap does not move the cursor"
+        );
+    }
+
+    #[test]
+    fn empty_name_rows_draw_the_nothing_label() {
+        let state = game();
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 8);
+        let assets = ItemBoxAssets {
+            itemboxn: solid_texture(128, 208, 1, [9, 9, 9, 255]),
+        };
+        let menu = test_menu_assets();
+        let text = Text::default();
+        let mut framebuffer = Framebuffer::new();
+        item_box.draw(&mut framebuffer, &assets, &menu, &text, &state);
+
+        // Each empty row prints `_Nothing_` from `NAME_X`; the solid test font
+        // paints the first glyph's top-left texel.
+        let x = usize::from(NAME_X as u16) + 7;
+        let y = usize::from(NAME_Y as u16) + 7;
+        assert_eq!(pixel(&framebuffer, x, y), [1, 2, 3, 255]);
+        let step = usize::from(NAME_STEP as u16);
+        assert_eq!(pixel(&framebuffer, x, y + step), [1, 2, 3, 255]);
+        assert_eq!(pixel(&framebuffer, x, y + 2 * step), [1, 2, 3, 255]);
+    }
+
+    #[test]
+    fn the_box_full_line_only_draws_on_the_last_slots() {
+        let state = game();
+        let mut item_box = ItemBox::default();
+        let assets = ItemBoxAssets {
+            itemboxn: solid_texture(128, 208, 1, [9, 9, 9, 255]),
+        };
+        let menu = test_menu_assets();
+        let text = Text::default();
+        let line_pixels = |item_box: &ItemBox| {
+            let mut framebuffer = Framebuffer::new();
+            item_box.draw(&mut framebuffer, &assets, &menu, &text, &state);
+            let mut count = 0;
+            for y in 0..framebuffer.height as usize {
+                for x in 0..framebuffer.width as usize {
+                    if pixel(&framebuffer, x, y) == FULL_LINE_COLOR {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+
+        item_box.open(&state, 8);
+        assert_eq!(line_pixels(&item_box), 0, "no line on the first slot");
+        item_box.box_cursor = 0x2D;
+        assert_eq!(line_pixels(&item_box), 0, "no line before the last slots");
+        item_box.box_cursor = 0x2E;
+        assert_eq!(
+            line_pixels(&item_box),
+            usize::from((FULL_LINE_END_X - FULL_LINE_X + 1) as u16),
+            "the whole warning line draws on slot 0x2E"
+        );
+        item_box.box_cursor = 0x2F;
+        assert_eq!(
+            line_pixels(&item_box),
+            usize::from((FULL_LINE_END_X - FULL_LINE_X + 1) as u16),
+            "the whole warning line draws on slot 0x2F"
+        );
     }
 }

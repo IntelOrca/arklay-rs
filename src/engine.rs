@@ -1495,14 +1495,38 @@ impl GameSession {
         if self.menu.is_none() || self.menu_fade_phase != MenuFadePhase::None {
             return;
         }
-        if let Some(wav) = self.sfx_cache.load(pack, "cancel")
-            && let Some(mixer) = &mut self.music
-        {
-            mixer.play_sfx_on_bank(sfx_bank_key(3, 5), wav, 1.0, 0.0);
+        self.play_character_bank_cue(pack, sfx::UI_CANCEL, 5);
+        self.begin_menu_closing_fade();
+    }
+
+    /// Close the pause menu through the same darkening fade without playing
+    /// the cancel cue. The pick-up flow uses this: its prompt already played
+    /// its own yes/no cue when it resolved.
+    fn begin_menu_close_silent(&mut self) {
+        self.begin_menu_closing_fade();
+    }
+
+    /// Arm the menu's closing fade: the panel darkens over `0xC00` and
+    /// [`Self::tick_menu_fade`] then closes the menu and arms the room-entry
+    /// fade.
+    fn begin_menu_closing_fade(&mut self) {
+        if self.menu.is_none() || self.menu_fade_phase != MenuFadePhase::None {
+            return;
         }
         self.menu_fade.set(2, 24 << 7, 0);
         self.menu_fade_pending = true;
         self.menu_fade_phase = MenuFadePhase::Closing;
+    }
+
+    /// Play one character-bank (bank 3) cue through the mixer. The cue is
+    /// keyed by its bank slot so a repeated cue restarts that bank's voice,
+    /// exactly like the original's `play_sfx(3, slot)`.
+    fn play_character_bank_cue(&mut self, pack: &Pack, name: &str, slot: u8) {
+        if let Some(wav) = self.sfx_cache.load(pack, name)
+            && let Some(mixer) = &mut self.music
+        {
+            mixer.play_sfx_on_bank(sfx_bank_key(3, slot), wav, 1.0, 0.0);
+        }
     }
 
     /// One tick of the pause-menu fade. The first tick after arming only
@@ -1708,9 +1732,12 @@ impl GameSession {
     /// intro steps until it settles and requests its prompt, the message
     /// resolves (a confirmed 0xC0 already awarded through the message
     /// post-action; the got-item mode awards here), and the exit animation
-    /// steps until the mode closes.
-    fn tick_pickup_view(&mut self, input: player::Input, action: bool) {
+    /// steps until the mode closes. The yes/no prompt's answer plays the
+    /// character bank's confirm/cancel cue as it resolves, exactly like the
+    /// original's viewer.
+    fn tick_pickup_view(&mut self, pack: &Pack, input: player::Input, action: bool) {
         let was_active = self.game.message.active;
+        let was_yes_no = self.game.message.phase() == crate::message::MessagePhase::YesNo;
         self.game.update_message(
             MessageInput {
                 action,
@@ -1744,6 +1771,18 @@ impl GameSession {
                 }
                 let kind = self.pickup_view.as_ref().map(|pickup| pickup.kind);
                 match kind {
+                    Some(PickupKind::Take) => {
+                        // The original plays the character bank's confirm cue
+                        // on Yes and cancel cue on No as the prompt resolves.
+                        if was_yes_no {
+                            let (name, slot) = if self.game.message.menu_choice_id() & 1 == 0 {
+                                (sfx::UI_DECIDE, 6)
+                            } else {
+                                (sfx::UI_CANCEL, 5)
+                            };
+                            self.play_character_bank_cue(pack, name, slot);
+                        }
+                    }
                     Some(PickupKind::GotItem) => {
                         // The original's mode 4 awards as its message
                         // completes and the exit animation takes over.
@@ -1809,12 +1848,15 @@ impl GameSession {
     }
 
     /// Close the pick-up viewer: clear the pending menu bits, drop the flow
-    /// and unfreeze the room. The inventory panel closes with it, exactly like
-    /// the original's `menu_restore_game_state` clearing the whole menu field.
+    /// and darken the inventory panel through the pause menu's closing fade.
+    /// The original's menu cleanup fades the whole menu to black, restores the
+    /// game state and only then unfreezes; [`Self::tick_menu_fade`] runs that
+    /// completion and arms the room-entry fade. No cue plays here: the prompt
+    /// already played its own yes/no cue when it resolved.
     fn close_pickup_view(&mut self) {
         self.pickup_view = None;
         self.game.clear_item_view_flags();
-        self.close_menu();
+        self.begin_menu_close_silent();
     }
 
     /// Open the save screen over the frozen room after the typewriter prompt
@@ -1913,7 +1955,7 @@ impl GameSession {
         // The pick-up viewer owns the frozen menu while it runs; it drives the
         // game's message window itself and consumes no menu input.
         if self.pickup_view.is_some() {
-            self.tick_pickup_view(input, action);
+            self.tick_pickup_view(pack, input, action);
             return;
         }
         let message_was_up = self.game.message.active;
@@ -1931,24 +1973,34 @@ impl GameSession {
         }
 
         // The item-box overlay is a sub-screen of the inventory panel: it
-        // freezes the room with the menu open underneath.
+        // freezes the room with the menu open underneath. It owns its copy of
+        // the inventory cursor, so after its input the menu's cursor (which
+        // draws the slot highlight and the item name) is mirrored onto the
+        // box's cursor to keep the drawn slot and the acted-on slot equal.
         if self.item_box.is_some() {
             if let Some(item_box) = self.item_box.as_mut() {
                 item_box.tick();
             }
-            let Some(event_input) = menu_input(ui) else {
-                return;
-            };
-            let event = self
+            if let Some(event_input) = menu_input(ui) {
+                let event = self
+                    .item_box
+                    .as_mut()
+                    .map(|item_box| item_box.handle_input(&mut self.game, event_input));
+                if event == Some(ItemBoxEvent::Close) {
+                    self.item_box = None;
+                    self.close_menu();
+                    // The original restores the lid angle (state 4) once the box
+                    // menu is closed.
+                    self.game.reset_itembox();
+                }
+            }
+            if let Some(cursor) = self
                 .item_box
-                .as_mut()
-                .map(|item_box| item_box.handle_input(&mut self.game, event_input));
-            if event == Some(ItemBoxEvent::Close) {
-                self.item_box = None;
-                self.close_menu();
-                // The original restores the lid angle (state 4) once the box
-                // menu is closed.
-                self.game.reset_itembox();
+                .as_ref()
+                .map(|item_box| item_box.player_cursor)
+                && let Some(menu) = self.menu.as_mut()
+            {
+                menu.move_cursor_to(&mut self.game, cursor);
             }
             return;
         }
@@ -2074,8 +2126,14 @@ impl GameSession {
         }
         self.ensure_item_box_assets(pack);
         self.open_menu(pack);
+        // The box shares the inventory panel's cursor: it opens on whatever
+        // slot the menu is showing, and `tick_menu` keeps the two in step.
+        let cursor = self
+            .menu
+            .as_ref()
+            .map_or(ui::layout::FIRST_SLOT_CURSOR, |menu| menu.cursor);
         let mut item_box = ItemBox::default();
-        item_box.open(&self.game);
+        item_box.open(&self.game, cursor);
         self.item_box = Some(item_box);
     }
 
@@ -12348,14 +12406,82 @@ end
             "the take consumed the action"
         );
 
-        // The exit animation plays out, then the mode closes and the room
-        // resumes.
+        // The exit animation plays out, then the menu darkens and closes and
+        // the room resumes.
         tick_until(&mut session, &pack, 300, "the viewer close", |session| {
             session.pickup_view.is_none()
         });
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
         assert_eq!(session.game.item_view_request(), None);
+    }
+
+    #[test]
+    fn a_resolved_pickup_closes_through_the_menu_fade_and_arms_the_room_fade() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+
+        tick_until(&mut session, &pack, 300, "the yes/no phase", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::YesNo
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.game.has_item(ITEM_FIRST_AID_SPRAY));
+
+        // The exit animation plays out; when it finishes the inventory panel
+        // starts its closing fade instead of vanishing.
+        tick_until(
+            &mut session,
+            &pack,
+            300,
+            "the menu closing fade",
+            |session| session.menu_fade_phase == MenuFadePhase::Closing,
+        );
+        assert!(session.pickup_view.is_none());
+        assert!(
+            session.menu.is_some(),
+            "the panel stays up while it darkens"
+        );
+        assert_eq!(session.menu_fade_alpha(), Some(0));
+
+        // The panel darkens by 24 alpha a tick before the menu drops and the
+        // room-entry fade is re-armed at full black.
+        let mut alphas = Vec::new();
+        while session.menu_fade_phase == MenuFadePhase::Closing {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.menu_fade_phase == MenuFadePhase::Closing
+                && let Some(alpha) = session.menu_fade_alpha()
+            {
+                alphas.push(alpha);
+            }
+        }
+        assert_eq!(
+            alphas,
+            vec![0, 24, 48, 72, 96, 120, 144, 168, 192, 216, 240]
+        );
+        assert!(
+            session.menu.is_none(),
+            "the menu closes only after the panel has darkened"
+        );
+        assert!(!session.game.menu_pending());
+        assert_eq!(
+            session.room_fade_alpha(),
+            Some(255),
+            "the room fades back in"
+        );
     }
 
     #[test]
@@ -12437,6 +12563,7 @@ end
         tick_until(&mut session, &pack, 300, "the viewer close", |session| {
             session.pickup_view.is_none()
         });
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
     }
@@ -12484,6 +12611,7 @@ end
             session.game.room_actions[1].is_some(),
             "the item stays in the room"
         );
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
     }
@@ -12534,6 +12662,7 @@ end
         tick_until(&mut session, &pack, 300, "the viewer close", |session| {
             session.pickup_view.is_none()
         });
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
     }
 
@@ -12570,6 +12699,7 @@ end
         tick_until(&mut session, &pack, 300, "the viewer close", |session| {
             session.pickup_view.is_none()
         });
+        settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
     }
@@ -12665,6 +12795,65 @@ end
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert_eq!(session.game.frame, frozen + 1, "the room resumed");
+    }
+
+    #[test]
+    fn the_item_box_cursor_drives_the_menu_cursor_and_name() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.game.add_item(ITEM_FIRST_AID_SPRAY, 1);
+        session.game.add_item(ITEM_HANDGUN_AMMO, 30);
+        session.open_item_box(&pack);
+
+        // Right moves the box's cursor; the menu that draws the slot
+        // highlight and the item name mirrors it.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    right: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            session
+                .item_box
+                .as_ref()
+                .map(|item_box| item_box.player_cursor),
+            Some(10)
+        );
+        let menu = session.menu.as_ref().expect("the panel stays open");
+        assert_eq!(menu.cursor, 10, "the drawn cursor follows the box");
+        assert_eq!(
+            menu.selected_item, ITEM_HANDGUN_AMMO,
+            "the drawn name follows"
+        );
+
+        // Confirm arms and confirms the swap under the drawn cursor: the ammo
+        // in inventory slot 1 goes into box slot 0.
+        for _ in 0..2 {
+            session
+                .tick(
+                    &pack,
+                    UiInput {
+                        confirm: true,
+                        ..UiInput::default()
+                    },
+                    player::Input::default(),
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(session.game.item_box[0].id, ITEM_HANDGUN_AMMO);
+        assert!(!session.game.has_item(ITEM_HANDGUN_AMMO));
+        assert_eq!(session.menu.as_ref().unwrap().cursor, 10);
     }
 
     #[test]

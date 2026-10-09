@@ -65,9 +65,15 @@ pub const MESSAGE_HERB_MIX: u16 = 0xF5;
 pub const MESSAGE_NO_RECIPE: u16 = 0xF6;
 /// First refusal message; add the use-category index.
 pub const MESSAGE_USE_REFUSED: u16 = 0xF7;
-/// The menu's clear colour: the original's `setBackColor(0x199, 0x199,
-/// 0x199)`, a 12-bit 10% grey.
-const MENU_CLEAR: [u8; 4] = [25, 25, 25, 255];
+/// The menu model's dim ambient light: the original's `setBackColor(0x199,
+/// 0x199, 0x199)`, a 12-bit 10% grey. It lights the character model in the
+/// viewport; it is not a screen clear and never paints the framebuffer.
+pub const MENU_AMBIENT: u16 = 0x199;
+
+/// The screen clear behind the menu panels: pure black, the same clear the
+/// original uses before the menu frame is drawn. The centre viewport (the
+/// inventory, item-view and item-box background) is this black.
+const MENU_CLEAR: [u8; 4] = [0, 0, 0, 255];
 
 /// One discrete menu input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +227,18 @@ impl MainMenu {
     pub fn tick(&mut self, game: &mut GameState) {
         self.health_bar
             .update(game.entities[0].health, game.max_health, game.health_status);
+        if self.mode == MenuMode::Navigation {
+            self.refresh_selection(game);
+        }
+    }
+
+    /// Move the cursor to `cursor` and re-read the item under it.
+    ///
+    /// The item-box overlay drives its own copy of the inventory cursor; the
+    /// engine mirrors it here so the slot cursor, the item name and the
+    /// selected item stay on the same slot.
+    pub fn move_cursor_to(&mut self, game: &mut GameState, cursor: u8) {
+        self.cursor = cursor;
         if self.mode == MenuMode::Navigation {
             self.refresh_selection(game);
         }
@@ -449,12 +467,12 @@ impl MainMenu {
         self.draw_item_name(framebuffer, assets, text, game);
     }
 
-    /// Clear the whole screen to the original's menu clear colour and lay the
-    /// four black border masks over it.
+    /// Clear the whole screen to black and lay the four black border masks
+    /// over it.
     ///
-    /// The centre viewport rect stays clear-coloured (the original renders the
-    /// character model there), so the frozen room never shows through the
-    /// menu.
+    /// The centre viewport rect stays black (the original renders the
+    /// character model over the same screen clear), so the frozen room never
+    /// shows through the menu.
     fn draw_background(&self, framebuffer: &mut Framebuffer) {
         layout::fill_rect(
             framebuffer,
@@ -1423,9 +1441,9 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         menu.draw(&mut framebuffer, &assets, &text, &game);
         // The action box lives at (0x90, 0x39) and samples status (0x30, ..),
-        // which is black in the synthetic sheet; the surrounding pixel keeps
-        // the menu clear colour the background pass laid down.
-        assert_eq!(pixel(&framebuffer, 0x90 + 5, 0x39 + 5), MENU_CLEAR);
+        // which is black in the synthetic sheet; the surrounding pixel is the
+        // black screen clear the background pass laid down.
+        assert_eq!(pixel(&framebuffer, 0x90 + 5, 0x39 + 5), [0, 0, 0, 255]);
     }
 
     #[test]
@@ -1440,9 +1458,9 @@ mod tests {
             *pixel = [99, 98, 97, 255];
         }
         menu.draw(&mut framebuffer, &assets, &text, &game);
-        // The centre viewport shows the menu's clear colour; the frozen
-        // gameplay frame must never bleed through.
-        assert_eq!(pixel(&framebuffer, 100, 100), MENU_CLEAR);
+        // The centre viewport is the original's pure-black screen clear; the
+        // frozen gameplay frame must never bleed through.
+        assert_eq!(pixel(&framebuffer, 100, 100), [0, 0, 0, 255]);
     }
 
     #[test]
