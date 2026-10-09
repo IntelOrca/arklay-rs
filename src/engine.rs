@@ -6076,6 +6076,9 @@ fn tick_room_timed(
     // all read the frame's final player state.
     context.game.tick_objects(context.room, context.player);
     context.game.apply_stair_state(context.player);
+    // The stair probe wrote `player.pos[1]`; mirror it onto entity 0 so the
+    // renderer and the next script tick see the resolved height.
+    context.game.sync_entity_from_player(context.player);
     // The climb's camera-scroll consumer is not ported; drop the queued
     // screen-effect rectangles each tick so the list cannot grow unbounded.
     context.player.take_screen_effects();

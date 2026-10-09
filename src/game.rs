@@ -4782,11 +4782,20 @@ impl GameState {
                         }
                     }
 
-                    if !vetoed && was_pushing && player.locked == crate::player::LockedAction::Push
-                    {
-                        // The animation is already running: keep the probe's
-                        // displacement, which is what slides the object.
-                        restore_position = false;
+                    if !vetoed {
+                        if self.entities[0].is_being_attacked != 0
+                            || player.locked == crate::player::LockedAction::Push
+                        {
+                            // The animation is already running (or the player
+                            // is otherwise committed): keep the probe's
+                            // displacement, which is what slides the object.
+                            restore_position = false;
+                        } else {
+                            // The starting frame: lock the menu out and undo
+                            // the probe - the object holds still while the
+                            // wind-up animation plays.
+                            self.message_flags &= !0x0040;
+                        }
                     }
                 }
             }
@@ -4835,6 +4844,10 @@ impl GameState {
             // run its release state, and the original returns the message flag.
             self.message_flags |= 0x0040;
         }
+        // The object pass resolves the LIVE player entity; this port keeps the
+        // authoritative copy in `player`, so mirror the resolved position back
+        // before the next frame's `sync_player` reads it.
+        self.sync_entity_from_player(player);
         player.object_push = push_started;
     }
 
@@ -7645,9 +7658,18 @@ mod tests {
             assert_eq!(record.committed, [100, -200, 300]);
             assert_eq!(record.entry_flags, 0x1234);
             assert_eq!(record.rotation, [0, 0x1234, 0]);
-            assert_eq!(record.probe, [[0x2211, 0x4433], [0x6655, 0x8877]]);
-            assert_eq!(record.radius, 0xAA99);
-            assert_eq!(record.half_extents, [0xEEDD, 0xCCBB, 0x00FF]);
+            assert_eq!(
+                record.probe,
+                [
+                    [0x2211u16 as i16, 0x4433u16 as i16],
+                    [0x6655u16 as i16, 0x8877u16 as i16]
+                ]
+            );
+            assert_eq!(record.radius, 0xAA99u16 as i16);
+            assert_eq!(
+                record.half_extents,
+                [0xEEDDu16 as i16, 0xCCBBu16 as i16, 0x00FF]
+            );
             assert_eq!(record.asset, Some(0));
         }
         assert!(state.placeholders.is_empty());
@@ -12498,7 +12520,7 @@ mod tests {
     // Pushables, climbables and the item-box lid.
     // ------------------------------------------------------------------
 
-    fn object_record(pos: [i32; 3], extents: [u16; 3]) -> crate::objects::ObjectRecord {
+    fn object_record(pos: [i32; 3], extents: [i16; 3]) -> crate::objects::ObjectRecord {
         crate::objects::ObjectRecord {
             flag: crate::objects::OBJECT_FLAG_ACTIVE,
             pos,
@@ -12759,6 +12781,37 @@ mod tests {
             state.objects.records[0].committed[0] as i32,
             state.objects.records[0].pos[0]
         );
+    }
+
+    #[test]
+    fn the_object_pass_mirrors_the_resolved_player_onto_entity_zero() {
+        // The object pass resolves the live player entity in the original; the
+        // port must mirror the corrected `player` back onto entity 0 or the
+        // next frame's `sync_player` puts the player back inside the object.
+        let room = RoomState::default();
+        let mut state = pushed_game(vec![object_record([500, 0, 0], [100, 100, 100])]);
+        let mut player = push_player();
+        for _ in 0..9 {
+            state.tick_objects(&room, &mut player);
+        }
+        assert!(state.object_push);
+        player.locked = crate::player::LockedAction::Push;
+        player.object_push = true;
+
+        for tick in 0..40 {
+            player.pos[0] += 40;
+            state.tick_objects(&room, &mut player);
+            assert_eq!(
+                state.entities[0].pos, player.pos,
+                "entity 0 must hold the resolved player (tick {tick})"
+            );
+            assert!(
+                player.pos[0] <= state.objects.records[0].pos[0],
+                "the player crossed the object centre (tick {tick}): {:?} vs {:?}",
+                player.pos,
+                state.objects.records[0].pos
+            );
+        }
     }
 
     #[test]

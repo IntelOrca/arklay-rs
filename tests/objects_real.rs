@@ -323,7 +323,10 @@ fn player_facing(
     player
 }
 
-/// One engine-ordered gameplay tick with the object pass.
+/// One engine-ordered gameplay tick with the object pass: the scripted entity
+/// mirror, the player's physics, the physics mirror back onto entity 0, then
+/// the room-object pass. Dropping either mirror is what lets this helper pass
+/// while the game fails.
 fn object_tick(
     player: &mut arklay::player::PlayerState,
     room: &arklay::state::RoomState,
@@ -335,6 +338,7 @@ fn object_tick(
         .as_ref()
         .map(|anim| anim.clips.as_slice())
         .unwrap_or(&[]);
+    game.sync_player(player);
     arklay::player::update_with_room(player, room, &[], &[], room_clips, input);
     game.sync_entity_from_player(player);
     game.tick_objects(room, player);
@@ -380,6 +384,7 @@ fn room_107_shelf_slides_and_wedges_against_the_wall() {
     for direction in APPROACHES {
         let mut player = player_facing(id, &room, shelf.pos, direction, distance);
         let mut state = game.clone();
+        state.sync_entity_from_player(&player);
         for _ in 0..180 {
             object_tick(&mut player, &room, &mut state, input);
         }
@@ -397,6 +402,7 @@ fn room_107_shelf_slides_and_wedges_against_the_wall() {
     // and stays put while the player keeps leaning in.
     let mut player = player_facing(id, &room, shelf.pos, direction, distance);
     let mut state = game.clone();
+    state.sync_entity_from_player(&player);
     let mut last = shelf.pos;
     let mut stopped_at = None;
     for tick in 0..3000 {
@@ -464,6 +470,7 @@ fn room_107_vault_lands_the_player_on_the_far_side() {
         0,
         ladder.pos[2] + (radians.sin() * f64::from(reach)) as i32,
     ];
+    game.sync_entity_from_player(&player);
     // Press action: the climb scan latches the vault.
     object_tick(
         &mut player,
@@ -954,6 +961,7 @@ fn pushed_object_capture_is_deterministic() {
     for direction in APPROACHES {
         let mut player = player_facing(id, &room, shelf.pos, direction, distance);
         let mut state = game.clone();
+        state.sync_entity_from_player(&player);
         for _ in 0..180 {
             object_tick(&mut player, &room, &mut state, input);
         }
@@ -967,6 +975,7 @@ fn pushed_object_capture_is_deterministic() {
     let (direction, _) = best.unwrap();
     let mut player = player_facing(id, &room, shelf.pos, direction, distance);
     let mut state = game.clone();
+    state.sync_entity_from_player(&player);
     for _ in 0..400 {
         object_tick(&mut player, &room, &mut state, input);
     }
@@ -984,6 +993,7 @@ fn pushed_object_capture_is_deterministic() {
     // The same drive reaches the same pixels.
     let mut repeat_game = build(&pack);
     let mut repeat_player = player_facing(id, &room, shelf.pos, direction, distance);
+    repeat_game.sync_entity_from_player(&repeat_player);
     for _ in 0..400 {
         object_tick(&mut repeat_player, &room, &mut repeat_game, input);
     }
@@ -1359,6 +1369,7 @@ fn push_object(
     let distance = radius + i32::from(object.half_extents[0].max(object.half_extents[2])) + 80;
     let mut player = player_facing(id, room, object.pos, direction, distance);
     let mut state = game.clone();
+    state.sync_entity_from_player(&player);
     let input = arklay::player::Input {
         up: true,
         ..arklay::player::Input::default()
@@ -1366,6 +1377,11 @@ fn push_object(
     for _ in 0..ticks {
         object_tick(&mut player, room, &mut state, input);
         let current = state.objects.records[slot];
+        assert_eq!(
+            state.entities[0].pos, player.pos,
+            "entity 0 must hold the resolved player ({:?})",
+            player.pos
+        );
         assert!(
             !player_inside_object(player.pos, &current, radius),
             "player {:?} passed into slot {slot} at {:?}",
@@ -1405,6 +1421,46 @@ fn room_202_statue_slides_from_the_open_side() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_202_statue_blocks_a_running_player() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("2020").unwrap();
+    let (room, game) = pack_room(&pack, id);
+
+    let statue = *game.objects.record(0).unwrap();
+    let radius = arklay::player::spawn(id, &room).radius;
+    let distance = radius + i32::from(statue.half_extents[0].max(statue.half_extents[2])) + 80;
+    let mut player = player_facing(id, &room, statue.pos, [1, 0], distance);
+    let input = arklay::player::Input {
+        up: true,
+        run: true,
+        ..arklay::player::Input::default()
+    };
+    let mut state = game.clone();
+    state.sync_entity_from_player(&player);
+
+    // Run straight into the statue's west face: the object pass must keep the
+    // player outside the box and leave entity 0 holding the resolved position,
+    // or the next frame's mirror puts the player inside the statue.
+    for tick in 0..40 {
+        object_tick(&mut player, &room, &mut state, input);
+        assert_eq!(
+            state.entities[0].pos, player.pos,
+            "entity 0 must hold the resolved player (tick {tick})"
+        );
+        assert!(
+            player.pos[0] <= state.objects.records[0].pos[0],
+            "the player crossed the statue centre on tick {tick}: {:?} vs {:?}",
+            player.pos,
+            state.objects.records[0].pos
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn room_108_cabinets_push_along_their_long_axes() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
@@ -1427,6 +1483,7 @@ fn room_108_cabinets_push_along_their_long_axes() {
         cabinet.pos[0] - west[0] > 500,
         "slot 0 did not slide west: {west:?}"
     );
+    assert!(west[0] >= 12_700, "slot 0 overshot west: {west:?}");
 
     // Slot 1's long axis is Z (1400 against 650): both Z pushes slide it.
     let cabinet = *game.objects.record(1).unwrap();
@@ -1442,4 +1499,5 @@ fn room_108_cabinets_push_along_their_long_axes() {
         south[2] - cabinet.pos[2] > 500,
         "slot 1 did not slide south: {south:?}"
     );
+    assert!(north[2] >= 11_960, "slot 1 overshot north: {north:?}");
 }

@@ -216,14 +216,17 @@ pub struct ObjectRecord {
     pub rotation: [i16; 3],
     /// The rotation copy the push rollback reads (record +0x78).
     pub rotation_rollback: [i16; 3],
-    /// Collision half-extents X/Y/Z (record +0x8A/+0x8C/+0x8E).
-    pub half_extents: [u16; 3],
+    /// Collision half-extents X/Y/Z (record +0x8A/+0x8C/+0x8E), signed like
+    /// the original's shorts.
+    pub half_extents: [i16; 3],
     /// The entity-side extent word (record +0x90, the second Y copy).
     pub extent_word: u16,
-    /// The entity-side radius word (record +0x92).
-    pub radius: u16,
-    /// The two floor-probe X/Z endpoints (record +0x94..+0xA0).
-    pub probe: [[u16; 2]; 2],
+    /// The entity-side radius word (record +0x92), signed like the original's
+    /// short.
+    pub radius: i16,
+    /// The two floor-probe X/Z endpoints (record +0x94..+0xA0). The original
+    /// reads each endpoint as a signed short pair.
+    pub probe: [[i16; 2]; 2],
     /// The push-hold counter (record +0x86), compared by `ck_anim`.
     pub push_counter: u16,
     /// Index of the bound asset in [`crate::state::RoomState::object_models`];
@@ -380,15 +383,21 @@ impl ObjectTable {
             rotation: [0, entry as i16, 0],
             rotation_rollback: [0, entry as i16, 0],
             half_extents: [
-                operand_word(operands, 19),
-                operand_word(operands, 17),
-                operand_word(operands, 21),
+                operand_word(operands, 19) as i16,
+                operand_word(operands, 17) as i16,
+                operand_word(operands, 21) as i16,
             ],
             extent_word: operand_word(operands, 17),
-            radius: operand_word(operands, 15),
+            radius: operand_word(operands, 15) as i16,
             probe: [
-                [operand_word(operands, 7), operand_word(operands, 9)],
-                [operand_word(operands, 11), operand_word(operands, 13)],
+                [
+                    operand_word(operands, 7) as i16,
+                    operand_word(operands, 9) as i16,
+                ],
+                [
+                    operand_word(operands, 11) as i16,
+                    operand_word(operands, 13) as i16,
+                ],
             ],
             push_counter: 0,
             asset: Some(slot as u8),
@@ -1073,8 +1082,8 @@ pub fn chk_pl_reach_entity(
         dx + i32::from(player_pos[0] as i16),
         dz + i32::from(player_pos[2] as i16),
     ];
-    let ext_x = i32::from(obj.half_extents[0] as i16);
-    let ext_z = i32::from(obj.half_extents[2] as i16);
+    let ext_x = i32::from(obj.half_extents[0]);
+    let ext_z = i32::from(obj.half_extents[2]);
 
     if (ext_x.wrapping_mul(2) as u32) < (ext_x - obj.pos[0] + probe[0]) as u32 {
         return None;
@@ -1361,9 +1370,18 @@ mod tests {
         assert_eq!(record.entry_flags, 0x1234);
         assert_eq!(record.rotation, [0, 0x1234, 0]);
         assert_eq!(record.rotation_rollback, [0, 0x1234, 0]);
-        assert_eq!(record.probe, [[0x2211, 0x4433], [0x6655, 0x8877]]);
-        assert_eq!(record.radius, 0xAA99);
-        assert_eq!(record.half_extents, [0xEEDD, 0xCCBB, 0x00FF]);
+        assert_eq!(
+            record.probe,
+            [
+                [0x2211u16 as i16, 0x4433u16 as i16],
+                [0x6655u16 as i16, 0x8877u16 as i16]
+            ]
+        );
+        assert_eq!(record.radius, 0xAA99u16 as i16);
+        assert_eq!(
+            record.half_extents,
+            [0xEEDDu16 as i16, 0xCCBBu16 as i16, 0x00FF]
+        );
         assert_eq!(record.extent_word, 0xCCBB);
         assert_eq!(record.asset, Some(1));
         assert_eq!(record.push_counter, 0);
@@ -1633,7 +1651,7 @@ mod tests {
         assert!(!light_edit(&operands(&[4, 0, 0, 0, 0, 0, 0, 0])).apply(&mut room));
     }
 
-    fn collision_record(pos: [i32; 3], extents: [u16; 3]) -> ObjectRecord {
+    fn collision_record(pos: [i32; 3], extents: [i16; 3]) -> ObjectRecord {
         ObjectRecord {
             flag: OBJECT_FLAG_ACTIVE,
             pos,

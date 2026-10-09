@@ -1610,13 +1610,16 @@ pub(crate) fn resolve_collision(
 /// shapes 4 and 5 are skipped. Every record that classifies ORs its
 /// `(flags & 0x300) >> 8` bits into the result; the caller treats a nonzero
 /// result as blocked.
+///
+/// The endpoints are signed 16-bit values: a negative endpoint points behind
+/// the record's centre, and zero-extending it would test a bogus far point.
 pub(crate) fn object_two_point_probe(
     collision: &Collision,
     pos: &mut [i32; 3],
     committed: [i32; 3],
     yaw: u16,
     mirror: u16,
-    probes: [[u16; 2]; 2],
+    probes: [[i16; 2]; 2],
     radius: i32,
 ) -> u16 {
     let mut bits = 0u16;
@@ -2405,6 +2408,50 @@ mod tests {
 
         assert_eq!(player.pos[0], 160);
         assert!(player.pos[2] < 1000, "slid z {}", player.pos[2]);
+    }
+
+    #[test]
+    fn the_object_probe_reads_signed_endpoints() {
+        // The two probe endpoints are signed shorts. `real` encloses the true
+        // -576 endpoint; `bogus` sits where zero-extending it (0xFD80 ->
+        // 64960) would land. Only the signed read reports `real`'s 0x200 bit:
+        // the unsigned read would classify `bogus`'s 0x100 instead.
+        let mut room = RoomState::default();
+        let real = CollisionRect {
+            x_max: 3000,
+            z_max: 100,
+            x_min: 0,
+            z_min: 0,
+            kind: 1,
+            flags: 0x0200,
+        };
+        let bogus = CollisionRect {
+            x_max: 3000,
+            z_max: 65036,
+            x_min: 0,
+            z_min: 64836,
+            kind: 1,
+            flags: 0x0100,
+        };
+        for quadrant in room.collision.quadrants.iter_mut() {
+            quadrant.push(real);
+            quadrant.push(bogus);
+        }
+
+        let mut pos = [0, 0, 0];
+        let bits = object_two_point_probe(
+            &room.collision,
+            &mut pos,
+            [0, 0, 0],
+            0,
+            0,
+            [[0, 576], [0, -576]],
+            600,
+        );
+        assert_eq!(
+            bits, 2,
+            "the signed -576 endpoint classified the real record"
+        );
     }
 
     #[test]
