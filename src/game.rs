@@ -2693,19 +2693,27 @@ impl GameState {
         }
     }
 
+    /// The original's room-state reset: the picked and used item ids, the
+    /// forward action probe and the second word of the system flags
+    /// (`g_SysFlags[1]`) do not survive a frame. It runs once per gameplay
+    /// frame after the command functions and the room-events check, so the
+    /// action-press pulse and a used item are visible to exactly one main-script
+    /// pass; the same clear runs at the top of a room load.
+    pub fn room_state_reset(&mut self) {
+        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 0;
+        self.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = 0;
+        self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = 0;
+        self.flags[usize::from(BANK_SYSTEM)].bytes_mut()[4..8].fill(0);
+    }
+
     /// Move into `id`: the flags, state blocks and inventory survive a room
     /// change; the room action table, message, camera and per-room requests do
     /// not. The player entity slot survives; the other entity slots reset. The
     /// identity bytes are reseeded from the new room.
     pub fn enter_room(&mut self, id: RoomId, room: &RoomState) {
-        // `room_state_reset`: the picked/used item ids, the forward action
-        // probe and the second system-flag word do not survive a door. (The
-        // original also runs this every frame; the port's per-room reset is
-        // the behaviour the scripts in the corpus depend on.)
-        self.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 0;
-        self.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = 0;
-        self.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = 0;
-        self.flags[usize::from(BANK_SYSTEM)].bytes_mut()[4..8].fill(0);
+        // A room load runs the same per-frame reset before reseeding the rest
+        // of the room state.
+        self.room_state_reset();
         // `room_set` parks the special-room-light state at -1 (no overlay) and
         // clears the delta and the scripted channel masks.
         self.state_words[1] = 0xFFFF;
@@ -13083,22 +13091,20 @@ mod tests {
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 3);
     }
 
-    #[test]
-    fn enter_room_resets_the_room_state_fields() {
+    /// A state with the four [`GameState::room_state_reset`] fields seeded and
+    /// the first system-flag word armed so its survival is observable.
+    fn seeded_room_state() -> GameState {
         let mut state = game();
         state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)] = 9;
         state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)] = 8;
         state.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)] = 7;
         state.flags[usize::from(BANK_SYSTEM)].bytes_mut()[4] = 0xAA;
         state.flags[usize::from(BANK_SYSTEM)].bytes_mut()[0] = 0x55;
-        state.state_words[1] = 5;
-        state.special_light_masks = [1, 2, 3];
-        state.rand_state = 0x1234_5678;
-        state.got_item_slot = Some(4);
-        state.event_item_used = true;
+        state
+    }
 
-        state.enter_room(RoomId::parse("1010").unwrap(), &RoomState::default());
-
+    /// The shared assertions for the per-frame reset and the room load.
+    fn assert_room_state_cleared(state: &GameState) {
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_PICKED_ITEM)], 0);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_USED_ITEM)], 0);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_FWD_ACTION)], 0);
@@ -13112,6 +13118,26 @@ mod tests {
             0x55,
             "the first system word survives (room_state_reset only clears [1])"
         );
+    }
+
+    #[test]
+    fn enter_room_resets_the_room_state_fields() {
+        // The four clears are [`GameState::room_state_reset`], shared with the
+        // per-frame reset; assert the method directly and then through a load.
+        let mut state = seeded_room_state();
+        state.room_state_reset();
+        assert_room_state_cleared(&state);
+
+        let mut state = seeded_room_state();
+        state.state_words[1] = 5;
+        state.special_light_masks = [1, 2, 3];
+        state.rand_state = 0x1234_5678;
+        state.got_item_slot = Some(4);
+        state.event_item_used = true;
+
+        state.enter_room(RoomId::parse("1010").unwrap(), &RoomState::default());
+
+        assert_room_state_cleared(&state);
         assert_eq!(state.state_words[1], 0xFFFF, "the light parks at -1");
         assert_eq!(state.state_words[2], 0);
         assert_eq!(state.special_light_masks, [0; 3]);

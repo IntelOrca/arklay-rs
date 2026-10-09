@@ -6227,6 +6227,12 @@ fn tick_room_timed(
         let mut host = game::ScdGameHost::new(context.game);
         event_vm.step(&mut host);
     }
+    // The original's per-frame room-state reset runs right after the command
+    // functions and the room-events check: the picked/used item ids, the
+    // forward action probe and the second system word are visible to one main
+    // pass and wiped here. The native passes below may write after this point
+    // (the action probe sets the press pulse the next frame consumes).
+    context.game.room_state_reset();
     // Scripted room writes (`inst_cfg` collision boxes, `obj_xfm` lights)
     // become visible here, before the player's physics and before the
     // renderer reads the lighting.
@@ -11338,6 +11344,141 @@ end
             player_state.pos, frozen,
             "movement resumed once the window was dismissed"
         );
+    }
+
+    #[test]
+    fn a_room_tick_wipes_the_per_frame_room_state_fields() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        game.state_bytes[usize::from(game::STATE_BYTE_PICKED_ITEM)] = 9;
+        game.state_bytes[usize::from(game::STATE_BYTE_USED_ITEM)] = 8;
+        game.state_bytes[usize::from(game::STATE_BYTE_FWD_ACTION)] = 7;
+        game.flags[usize::from(game::BANK_SYSTEM)].bytes_mut()[5] = 0xAB;
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        // Empty scripts write nothing, so only the tick's own reset can clear
+        // the seeded fields.
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+
+        assert_eq!(
+            game.state_bytes[usize::from(game::STATE_BYTE_PICKED_ITEM)],
+            0
+        );
+        assert_eq!(game.state_bytes[usize::from(game::STATE_BYTE_USED_ITEM)], 0);
+        assert_eq!(
+            game.state_bytes[usize::from(game::STATE_BYTE_FWD_ACTION)],
+            0
+        );
+        assert_eq!(
+            game.flags[usize::from(game::BANK_SYSTEM)].bytes()[4..8],
+            [0; 4],
+            "the second system word is cleared"
+        );
+    }
+
+    #[test]
+    fn an_action_press_pulse_reaches_the_next_frame_only() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        game.room_actions[2] = Some(game::RoomAction {
+            slot: 2,
+            kind: game::RoomActionKind::FlagBankSet,
+            zone: [0, 0, 2000, 2000],
+            sce: 7,
+            handler: 7,
+            flags: 0x81,
+            params: [7, 0x81, 4, 0, 32, 0, 1, 0],
+            item_data: None,
+            room_items_flag: 0xFF,
+            reach_animation: false,
+        });
+        let container = scd::asm::assemble(
+            "\
+.version 1
+
+.main
+.block
+    if                      off_0010
+    ck                      FG_ROOM, 32, 0
+    message                 0x41, 0x00FF
+off_0010:
+    endif                   0
+    end                     0
+",
+        )
+        .unwrap()
+        .to_container()
+        .unwrap();
+        let scripts = scd::reader::parse(&container).unwrap();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        // The probe runs after the main script, so the press frame's main pass
+        // does not see the pulse it sets.
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input {
+                action_pressed: true,
+                action_held: true,
+                ..player::Input::default()
+            },
+        );
+        assert!(
+            !game.message.active,
+            "the press frame's script ran before its own probe"
+        );
+        assert!(
+            game.flags[usize::from(game::BANK_SYSTEM)].bit(32),
+            "the probe set the pulse"
+        );
+
+        // The next frame's main pass sees the pulse, and the room-state reset
+        // after the event pass wipes it.
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert!(game.message.active, "the main script saw the pulse");
+        assert_eq!(game.message.id, Some(0x41));
+        assert!(
+            !game.flags[usize::from(game::BANK_SYSTEM)].bit(32),
+            "the reset wiped the pulse"
+        );
+
+        // No press, no pulse: the following frame raises nothing new.
+        game.cancel_message();
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert!(!game.message.active, "the pulse does not latch");
     }
 
     #[test]

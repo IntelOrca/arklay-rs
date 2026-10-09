@@ -255,14 +255,16 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
 
     // The opening cutscene first aims Jill at (20900, 8500), retargets her at
     // (24500, 12800) before she arrives, and her walk hands control back to
-    // state 1 on arrival with the script's system bit 0x20 raised. The run is
-    // deterministic; sample it around each waypoint.
+    // state 1 on arrival with the script's system bit 0x20 raised. The
+    // completion bit lives for one frame only (the per-frame room-state reset
+    // clears it after the script pass), so the arrival is sampled on every
+    // tick: at the second waypoint it is raised on the completing tick.
     let first = [20900, 8500];
     let second = [24500, 12800];
     let mut first_closest = i32::MAX;
     let mut second_closest = i32::MAX;
     let mut arrival: Option<usize> = None;
-    for ticks in (60..=200).step_by(2) {
+    for ticks in 60..=200 {
         let Ok(sim) = simulate_room(&pack, id, ticks, player::Input::default()) else {
             return;
         };
@@ -299,7 +301,7 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
     // on the target.
     let final_target = [2338, 17850];
     let mut final_closest = i32::MAX;
-    for ticks in (980..=1100).step_by(2) {
+    for ticks in (1100..=1200).step_by(2) {
         let Ok(sim) = simulate_room(&pack, id, ticks, player::Input::default()) else {
             return;
         };
@@ -311,8 +313,10 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
     );
 
     // Behavior 3's deceleration hands control back with the script's system bit
-    // 0x20 raised; the run's target stays latched on the entity.
-    let sim = simulate_room(&pack, id, 1080, player::Input::default()).unwrap();
+    // 0x20 raised; the run's target stays latched on the entity. The hand-back
+    // raises the bit in the same tick the room-state reset has already passed,
+    // so the completion tick still ends with it set.
+    let sim = simulate_room(&pack, id, 1178, player::Input::default()).unwrap();
     assert_eq!(
         sim.game.entities[0].state(),
         1,
@@ -329,7 +333,7 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
     // With control back, the walk-in door fires and swaps in Jill's room 105.
     // The door load resets the player animation, so no scripted state survives
     // into the destination.
-    let sim = simulate_room(&pack, id, 1400, player::Input::default()).unwrap();
+    let sim = simulate_room(&pack, id, 1500, player::Input::default()).unwrap();
     assert_eq!(
         sim.transitions,
         vec![RoomId::from_room_and_player("105", 1).unwrap()],
@@ -353,8 +357,10 @@ fn real_room_1060_chris_cutscene_drops_the_stale_walk_after_the_door() {
     let id = RoomId::parse("1060").unwrap();
 
     // Chris's opening cutscene ends in the same walk into door AOT 2. Unlike
-    // Jill's run, the walk hands pad control back before the door fires.
-    let sim = simulate_room(&pack, id, 800, player::Input::default()).unwrap();
+    // Jill's run, the walk hands pad control back before the door fires (the
+    // per-frame reset shortens the window in which the completion bit is
+    // visible, so the return is sampled at its completing tick).
+    let sim = simulate_room(&pack, id, 848, player::Input::default()).unwrap();
     assert_eq!(
         sim.game.entities[0].state(),
         1,
@@ -365,7 +371,7 @@ fn real_room_1060_chris_cutscene_drops_the_stale_walk_after_the_door() {
     // The door load resets the player animation before the destination boots,
     // so the source room's scripted walk (target 2388,17600) is gone after the
     // transition instead of continuing into room 105's geometry.
-    let sim = simulate_room(&pack, id, 1100, player::Input::default()).unwrap();
+    let sim = simulate_room(&pack, id, 1150, player::Input::default()).unwrap();
     assert_eq!(
         sim.transitions,
         vec![RoomId::from_room_and_player("105", 0).unwrap()],

@@ -538,6 +538,9 @@ fn room_406_map_palette_is_darkened_in_the_render() {
 /// ROOM11A's crest wall: five handler-7 `aot_set` entries on the wall zone.
 /// The four flag-1 entries probe every frame and arm the crest items' use
 /// flags; the flag-0x81 entry raises the SYS bit only on the action press.
+/// That press pulse feeds the main script's `ck FG_ROOM,32,0` gate for
+/// exactly one frame: the per-frame room-state reset wipes it after the
+/// event pass, so dismissing the raised message does not re-raise it.
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn room_11a_crest_wall_probes_arm_the_item_use_flags() {
@@ -549,10 +552,32 @@ fn room_11a_crest_wall_probes_arm_the_item_use_flags() {
     let room = rdt::parse(data, id).unwrap();
     let scripts = arklay::scd::reader::parse(data).unwrap();
     let mut state = GameState::new(id, &room);
+    let mut command_vm = arklay::scd::vm::CommandVm::new(&scripts);
+    let mut event_vm = arklay::scd::vm::EventVm::new(&scripts);
     {
-        let mut vm = arklay::scd::vm::CommandVm::new(&scripts);
         let mut host = arklay::game::ScdGameHost::new(&mut state);
-        vm.run_init(&mut host);
+        command_vm.run_init(&mut host);
+    }
+
+    // One gameplay frame in the engine's order: main script, queued event
+    // starts, event pass, then the per-frame room-state reset.
+    fn frame(
+        state: &mut GameState,
+        command_vm: &mut arklay::scd::vm::CommandVm,
+        event_vm: &mut arklay::scd::vm::EventVm,
+    ) {
+        {
+            let mut host = arklay::game::ScdGameHost::new(state);
+            command_vm.run_main(&mut host);
+        }
+        for request in std::mem::take(&mut state.pending_event_requests) {
+            event_vm.apply(request);
+        }
+        {
+            let mut host = arklay::game::ScdGameHost::new(state);
+            event_vm.step(&mut host);
+        }
+        state.room_state_reset();
     }
 
     // Slot 2 is the action-press entry (bank 4 selector 32); slots 3-6 probe
@@ -605,8 +630,43 @@ fn room_11a_crest_wall_probes_arm_the_item_use_flags() {
         },
         "the armed crest is usable"
     );
+    // The used-item byte would be consumed by the frame-end reset in the real
+    // loop; clear it so the test's next frame is not a crest insertion.
+    state.room_state_reset();
 
     // The press entry raises the SYS bit.
     state.interact(pos, 0, true);
     assert!(state.flags[4].bit(32), "the press set the SYS bit");
+
+    // The next frame's main script consumes the pulse: with no scenario crest
+    // bits set the room raises event_00 (message 138), and the reset wipes the
+    // pulse so the event cannot re-exec.
+    frame(&mut state, &mut command_vm, &mut event_vm);
+    assert_eq!(state.message.id, Some(138), "the press raised message 138");
+    assert!(state.message.active);
+    assert!(
+        !state.flags[4].bit(32),
+        "the frame-end reset wiped the pulse"
+    );
+
+    // Dismissing the message raises nothing new; the event finishes.
+    state.cancel_message();
+    frame(&mut state, &mut command_vm, &mut event_vm);
+    assert!(!state.message.active, "message 138 did not re-raise");
+    assert_eq!(event_vm.active_slots(), 0, "event_00 finished");
+
+    // With the crest bits set, a press raises event_01's message 131 once.
+    // (The same frame's last main block also starts the door-open event_07,
+    // so the slot count is not zero here.)
+    for bit in [105, 106, 107, 108] {
+        state.flags[0].apply(bit, 0);
+    }
+    state.interact(pos, 0, true);
+    assert!(state.flags[4].bit(32), "the press set the SYS bit");
+    frame(&mut state, &mut command_vm, &mut event_vm);
+    assert_eq!(state.message.id, Some(131), "event_01 raised message 131");
+    assert!(state.message.active);
+    state.cancel_message();
+    frame(&mut state, &mut command_vm, &mut event_vm);
+    assert_eq!(state.message.id, None, "message 131 did not re-raise");
 }
