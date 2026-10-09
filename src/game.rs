@@ -5211,6 +5211,35 @@ impl GameState {
         true
     }
 
+    /// Decode a door record's destination byte relative to the room the record
+    /// was read in.
+    ///
+    /// Values below `0x20` name a room in `from`'s stage; higher values also
+    /// change stage as `(dest >> 5) - 1`, remapped by `+5` for the two mansion
+    /// stages once `SCENARIO_FLAG_STAGE_VARIANT` is set. `0xFF` names no room.
+    pub fn door_destination(&self, from: RoomId, dest: u8) -> Option<RoomId> {
+        if dest == 0xFF {
+            return None;
+        }
+        if dest < 0x20 {
+            Some(RoomId {
+                stage: from.stage,
+                room: dest,
+                player_flag: from.player_flag,
+            })
+        } else {
+            let mut stage = (dest >> 5) - 1;
+            if stage < 2 && self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_STAGE_VARIANT, false) {
+                stage += 5;
+            }
+            Some(RoomId {
+                stage: stage + 1,
+                room: dest & 0x1F,
+                player_flag: from.player_flag,
+            })
+        }
+    }
+
     /// Arm the transition described by `door`, decoding the destination's
     /// stage change when the room byte is `>= 0x20`.
     ///
@@ -5221,27 +5250,10 @@ impl GameState {
         let target = if camera_only {
             self.id
         } else {
-            let dest = door.next_room;
-            if dest == 0xFF {
+            let Some(target) = self.door_destination(self.id, door.next_room) else {
                 return false;
-            }
-            if dest < 0x20 {
-                RoomId {
-                    stage: self.id.stage,
-                    room: dest,
-                    player_flag: self.id.player_flag,
-                }
-            } else {
-                let mut stage = (dest >> 5) - 1;
-                if stage < 2 && self.flag_test(BANK_SCENARIO, SCENARIO_FLAG_STAGE_VARIANT, false) {
-                    stage += 5;
-                }
-                RoomId {
-                    stage: stage + 1,
-                    room: dest & 0x1F,
-                    player_flag: self.id.player_flag,
-                }
-            }
+            };
+            target
         };
         self.transition = Some(RoomTransition {
             target,

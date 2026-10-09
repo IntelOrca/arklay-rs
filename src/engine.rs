@@ -962,14 +962,20 @@ impl GameSession {
     }
 
     /// Boot `id` directly, the `--room` path. A direct boot is a fresh game
-    /// state, so the shipped room-items bank is seeded like a new game's.
+    /// state, so the shipped room-items bank and the selected character's
+    /// start health are seeded like a new game's, and the player is placed at
+    /// the room's paired-door entry once the room boot has built the door
+    /// table.
     fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Self> {
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
         seed_room_items(&mut game);
+        seed_start_health(&mut game, id.player_flag);
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(pack, loaded, game, player_state, save_dir)
+        let mut session = Self::from_loaded(pack, loaded, game, player_state, save_dir)?;
+        session.place_room_entry(pack, id);
+        Ok(session)
     }
 
     /// Continue from a parsed save: the block replaces the state, the saved
@@ -1101,6 +1107,19 @@ impl GameSession {
         // room's data is loaded.
         bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
         bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
+    }
+
+    /// Place the player for an arbitrary room start: the room's paired-door
+    /// entry when it has one, otherwise the walk-zone spawn [`player::spawn`]
+    /// already set. Runs after the room boot has built the door table and
+    /// re-runs the camera switch-zone scan from the final position.
+    fn place_room_entry(&mut self, pack: &Pack, id: RoomId) {
+        if let Some((pos, angle)) = room_entry_placement(pack, &self.loaded.room, &self.game, id) {
+            self.player.pos = pos;
+            self.player.angle = angle;
+            self.game.sync_entity_from_player(&self.player);
+        }
+        apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
     }
 
     /// One fixed 30 Hz tick: scripts/entities, the message window, interaction,
@@ -1667,16 +1686,13 @@ impl GameSession {
 
     /// Jump to `target` through the normal room-load path: load the
     /// destination, rebuild its VMs and run the room boot (init script, room
-    /// edits, camera, BGM handoff), then place the player.
-    ///
-    /// Placement prefers the destination's first door record spawn; a room
-    /// with no door record keeps the player's current position. The raw spawn
-    /// is left in place - the first gameplay tick's collision pass settles it,
-    /// exactly like a door arrival.
+    /// edits, camera, BGM handoff), then place the player at the target's
+    /// paired-door entry ([`room_entry_placement`]). A room with no door
+    /// record keeps the walk-zone spawn [`player::spawn`] set. The raw
+    /// placement is left in place - the first gameplay tick's collision pass
+    /// settles it, exactly like a door arrival.
     fn debug_jump(&mut self, pack: &Pack, target: RoomId) -> Result<()> {
         let from = self.loaded.id;
-        let current_pos = self.player.pos;
-        let current_angle = self.player.angle;
         let loaded = load_room(pack, target)?;
         self.loaded = loaded;
         let scripts = Rc::new(self.loaded.scripts.clone());
@@ -1691,20 +1707,7 @@ impl GameSession {
         self.game.enter_room(target, &self.loaded.room);
         self.enter_room(pack, Some(from));
         self.player = player::spawn(target, &self.loaded.room);
-        let spawn = self
-            .game
-            .doors
-            .iter()
-            .flatten()
-            .next()
-            .map(|door| (door.next_pos, door.next_angle as u16 & 0x0FFF));
-        let (pos, angle) = spawn.unwrap_or((current_pos, current_angle));
-        self.player.pos = pos;
-        self.player.angle = angle;
-        self.game.sync_entity_from_player(&self.player);
-        // The room boot picked the camera from the pre-jump position; re-run
-        // the switch-zone scan from where the player actually landed.
-        apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
+        self.place_room_entry(pack, target);
         self.arm_room_fade();
         Ok(())
     }
@@ -2643,6 +2646,141 @@ fn seed_room_items(game: &mut game::GameState) {
         .copy_from_slice(&NEW_GAME_ROOM_ITEMS);
 }
 
+/// Apply the selected character's playable start: the model-id and
+/// selected-character bytes, full health, the character's maximum, the BioCard
+/// health copy and the `0x10` status byte.
+///
+/// `InitializeGame` writes these after the BioCard copy on every new game; the
+/// arbitrary-room boot seeds the same block so a directly booted room starts
+/// with a live character rather than a zeroed one.
+fn seed_start_health(game: &mut game::GameState, character: u8) {
+    let character = character & 1;
+    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)] = character;
+    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER)] = character;
+    game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
+    game.max_health = game::character_max_health(character);
+    game.set_health_copy(NEW_GAME_HEALTH[usize::from(character)]);
+    // `set_health_status` also mirrors the byte the scripts read with `cmpb 50`.
+    game.set_health_status(0x10);
+}
+
+/// The player placement for a room booted directly rather than through a door
+/// (`--room` and the debug jump's target).
+///
+/// The original takes the room's first stairwell door entry when it has one (a
+/// stairwell room's landing is its real entry) and otherwise the first door
+/// record. It decodes where that door leads, loads the neighbour's RDT and
+/// finds the neighbour's record whose destination decodes back to `target`;
+/// that record's arrival is the exact spot the game uses when the player walks
+/// in through the paired door. With no pair the placement falls back to a free
+/// spot at the first walk zone's edge, and `None` when even that finds no
+/// free spot.
+pub fn room_entry_placement(
+    pack: &Pack,
+    room: &RoomState,
+    game: &game::GameState,
+    target: RoomId,
+) -> Option<([i32; 3], u16)> {
+    let door = entry_door(&game.doors);
+    if let Some(door) = door
+        && let Some(dest) = game.door_destination(target, door.next_room)
+        && dest != target
+        && let Ok(neighbour) = room_door_state(pack, dest)
+        && let Some(back) = neighbour
+            .doors
+            .iter()
+            .flatten()
+            .find(|back| game.door_destination(dest, back.next_room) == Some(target))
+    {
+        return Some((back.next_pos, back.next_angle as u16 & 0x0FFF));
+    }
+    fallback_room_entry(room, door)
+}
+
+/// The door the arbitrary start treats as the room's entry.
+///
+/// A stairwell landing is a stairwell room's real entry, so the first
+/// stair/ladder record wins; every other room uses its first door entry.
+fn entry_door(doors: &[Option<game::Door>; game::ROOM_ACTION_SLOTS]) -> Option<game::Door> {
+    doors
+        .iter()
+        .flatten()
+        .copied()
+        .find(|door| crate::door::is_stair_type(door.door_type))
+        .or_else(|| doors.iter().flatten().copied().next())
+}
+
+/// Build a neighbour room's door table: parse its RDT and SCD override and run
+/// the init script, without loading backgrounds or player assets, and return
+/// the state the `door_aot_set` records landed in.
+fn room_door_state(pack: &Pack, id: RoomId) -> Result<game::GameState> {
+    let rdt_bytes = pack.read(&id.rdt_entry())?;
+    let room = rdt::parse(rdt_bytes, id)?;
+    let scripts = match pack.read(&id.scd_entry()) {
+        Ok(bytes) => scd::reader::parse(bytes)?,
+        Err(_) => scd::reader::parse(rdt_bytes)?,
+    };
+    let mut game = game::GameState::new(id, &room);
+    let mut vm = scd::vm::CommandVm::new(&scripts);
+    let mut host = game::ScdGameHost::new(&mut game);
+    vm.run_init(&mut host);
+    Ok(game)
+}
+
+/// The paired-arrival miss fallback: a free spot at the first walk zone's
+/// edge, picked from the entry door's direction, then the zone centre and
+/// three inset edge spots. `None` when the room has no walk zone or every
+/// candidate is blocked.
+fn fallback_room_entry(room: &RoomState, door: Option<game::Door>) -> Option<([i32; 3], u16)> {
+    let zone = room.walk_zones.first()?;
+    let x = i32::from(zone.x1);
+    let z = i32::from(zone.z1);
+    let width = i32::from(zone.x2) - x;
+    let depth = i32::from(zone.z2) - z;
+    let (cx, cz) = (x + width / 2, z + depth / 2);
+    let primary = match door.map_or(3, |door| door.direction & 3) {
+        0 => ([cx, 0, z + depth + 300], 0xC00),
+        1 => ([x + width + 300, 0, cz], 0),
+        2 => ([x - 300, 0, cz], 0x800),
+        _ => ([cx, 0, z - 300], 0x400),
+    };
+    if entry_spot_free(room, primary.0) {
+        return Some(primary);
+    }
+    [
+        ([cx, 0, cz], 0),
+        ([x + width + 200, 0, cz], 0),
+        ([x - 200, 0, cz], 0x800),
+        ([cx, 0, z - 200], 0x400),
+    ]
+    .into_iter()
+    .find(|(pos, _)| entry_spot_free(room, *pos))
+}
+
+/// The original's arbitrary-start free check: the point must sit in a walk
+/// zone, and no collision record with both blocking bits (`flags & 0x300`)
+/// may contain its radius-0 position or any of its four 160-unit body
+/// offsets.
+fn entry_spot_free(room: &RoomState, pos: [i32; 3]) -> bool {
+    const BODY_OFFSETS: [[i32; 2]; 5] = [[0, 0], [160, 0], [-160, 0], [0, 160], [0, -160]];
+    npc::walk::walk_zone_find(room, pos[0], pos[2]).is_some()
+        && !BODY_OFFSETS.iter().any(|[dx, dz]| {
+            let x = pos[0] + dx;
+            let z = pos[2] + dz;
+            room.collision.records(x, z).iter().any(|rect| {
+                rect.flags & 0x300 == 0x300
+                    && !player::point_outside(
+                        x,
+                        z,
+                        i32::from(rect.x_max),
+                        i32::from(rect.z_max),
+                        i32::from(rect.x_min),
+                        i32::from(rect.z_min),
+                    )
+            })
+        })
+}
+
 /// The shipped new-game card (`data/bio_card.dat`), when the pack carries one.
 ///
 /// `InitializeGame` loads this file and memcpys its 1052 bytes over the
@@ -2694,14 +2832,9 @@ fn seed_new_game(pack: &Pack, game: &mut game::GameState, character: u8) {
         game.state_bytes[1] = game.id.room;
     }
     // `InitializeGame` writes the selected character into the model-id and
-    // selected-character bytes after the card copy.
-    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)] = character;
-    game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER)] = character;
-    game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
-    game.max_health = game::character_max_health(character);
-    game.set_health_copy(NEW_GAME_HEALTH[usize::from(character)]);
-    // `set_health_status` also mirrors the byte the scripts read with `cmpb 50`.
-    game.set_health_status(0x10);
+    // selected-character bytes after the card copy, then seeds the playable
+    // start health; the arbitrary-room boot applies the same block.
+    seed_start_health(game, character);
     seed_room_items(game);
     // The three carried room-pickup quantities SetInitialItems seeds
     // (BioCard 0x20C..0x20E): ROOM1160's shotgun shells and the two
@@ -7500,13 +7633,20 @@ mod tests {
 
     /// `door_init` with a specific record camera byte (`+0x0B`).
     fn door_init_with_camera(camera: u8) -> Vec<u8> {
+        door_init_record(1, [555, 0, 666], 1024, camera)
+    }
+
+    /// A `door_aot_set` with the given destination, arrival and angle:
+    /// `door_aot_set(0, 100, 200, 300, 400, 0, 0, 0, camera, 0, next_room,
+    /// x, y, z, angle, 0, 0x81)`.
+    fn door_init_record(next_room: u8, next_pos: [i16; 3], angle: i16, camera: u8) -> Vec<u8> {
         let mut body = vec![0x0C, 0x00];
         for value in [100i16, 200, 300, 400] {
             body.extend_from_slice(&value.to_le_bytes());
         }
         body.extend_from_slice(&[0, 0, 0, camera, 0]);
-        body.push(1);
-        for value in [555i16, 0, 666, 1024] {
+        body.push(next_room);
+        for value in [next_pos[0], next_pos[1], next_pos[2], angle] {
             body.extend_from_slice(&value.to_le_bytes());
         }
         // Required item 0, probe flags 0x81 (action key, forward reach probe).
@@ -7837,7 +7977,8 @@ mod tests {
     }
 
     /// A two-room pack (`100` and `101`) whose rooms block the origin and
-    /// whose second room carries a door spawning at `[555, 0, 666]`.
+    /// whose doors pair: A's door arrives in B at `[777, 0, 888]` and B's door
+    /// arrives in A at `[555, 0, 666]`.
     fn debug_menu_pack(dir: &TempDir) -> (Pack, RoomId, RoomId) {
         let pack_path = dir.0.join("game.akpak");
         let a = RoomId {
@@ -7855,13 +7996,18 @@ mod tests {
         writer
             .add(
                 &a.rdt_entry(),
-                synthetic_rdt_with_blocking_collision(&[0x00, 0x00]),
+                synthetic_rdt_with_blocking_collision(&door_init_record(
+                    1,
+                    [777, 0, 888],
+                    0x200,
+                    0,
+                )),
             )
             .unwrap();
         writer
             .add(
                 &b.rdt_entry(),
-                synthetic_rdt_with_blocking_collision(&door_init()),
+                synthetic_rdt_with_blocking_collision(&door_init_record(0, [555, 0, 666], 1024, 0)),
             )
             .unwrap();
         writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
@@ -7997,18 +8143,26 @@ mod tests {
         assert!(session.debug_menu.is_none(), "F1 closes the overlay");
     }
 
+    /// The arbitrary start and the debug jump place the player at the
+    /// neighbour's paired door record, not at the target's own first door
+    /// spawn (which is an arrival in the neighbour).
     #[test]
-    fn debug_jump_loads_the_room_and_places_the_player_at_the_door_spawn() {
+    fn debug_jump_places_the_player_at_the_paired_door_arrival() {
         let dir = TempDir::new();
         let (pack, a, b) = debug_menu_pack(&dir);
         let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
-        // The start position sits inside the blocking volume.
-        assert!(player::position_blocked(
-            &session.loaded.room,
-            session.player.pos,
-            session.player.radius,
-            session.player.collision_flags
-        ));
+        // A's entry is B's record: its arrival for A is `[555, 0, 666]`.
+        assert_eq!(session.player.pos, [555, 0, 666], "A's paired arrival");
+        assert_eq!(session.player.angle, 1024);
+        assert!(
+            !player::position_blocked(
+                &session.loaded.room,
+                session.player.pos,
+                session.player.radius,
+                session.player.collision_flags
+            ),
+            "the start lands outside collision"
+        );
 
         session.set_debug_menu(true);
         session
@@ -8048,8 +8202,10 @@ mod tests {
         assert!(session.debug_menu.is_none(), "confirm closes the overlay");
         assert_eq!(session.loaded.id, b);
         assert_eq!(session.game.id, b);
-        assert_eq!(session.player.pos, [555, 0, 666], "the door spawn");
-        assert_eq!(session.player.angle, 1024);
+        // B's entry is A's record: its arrival for B is `[777, 0, 888]`, not
+        // B's own record arrival `[555, 0, 666]`.
+        assert_eq!(session.player.pos, [777, 0, 888], "B's paired arrival");
+        assert_eq!(session.player.angle, 0x200);
         assert!(
             !player::position_blocked(
                 &session.loaded.room,
@@ -8057,7 +8213,7 @@ mod tests {
                 session.player.radius,
                 session.player.collision_flags
             ),
-            "the spawn lands outside collision"
+            "the arrival lands outside collision"
         );
     }
 
@@ -13439,6 +13595,126 @@ end
                 );
             }
             assert_eq!(session.game.item_count(ITEM_FIRST_AID_SPRAY), 1);
+        }
+    }
+
+    /// A directly booted room starts with the same playable health block a new
+    /// game seeds: full health, the character's maximum, the `0x10` status
+    /// byte, the BioCard health copy and the character's model byte.
+    #[test]
+    fn arbitrary_room_boot_seeds_the_character_health_and_status() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+
+        for character in 0..=1u8 {
+            let id = RoomId {
+                stage: 1,
+                room: NEW_GAME_ROOM,
+                player_flag: character,
+            };
+            let session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+            let health = NEW_GAME_HEALTH[usize::from(character)];
+            assert_eq!(session.game.entities[0].health, health);
+            assert_eq!(
+                session.game.max_health,
+                game::character_max_health(character)
+            );
+            assert_eq!(session.game.health_status, 0x10);
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_HEALTH_STATUS)],
+                0x10
+            );
+            assert_eq!(
+                &session.game.state_bytes[usize::from(game::STATE_BYTE_HEALTH_COPY)
+                    ..usize::from(game::STATE_BYTE_HEALTH_COPY) + 2],
+                &health.to_le_bytes()
+            );
+            assert_eq!(
+                session.game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)],
+                character
+            );
+        }
+    }
+
+    /// Without a paired door the arbitrary start falls back to the first walk
+    /// zone's edge, picked from the entry door's direction, and rejects a spot
+    /// a fully-blocking collision record covers.
+    #[test]
+    fn arbitrary_entry_falls_back_to_the_walk_zone_edge() {
+        use crate::state::{CollisionRect, WalkZone};
+
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let target = RoomId::parse("100").unwrap();
+        let mut room = RoomState {
+            walk_zones: vec![
+                WalkZone {
+                    x1: 0,
+                    z1: 0,
+                    x2: 1000,
+                    z2: 1000,
+                    field_08: 0,
+                    flags: 0,
+                },
+                WalkZone {
+                    x1: 0,
+                    z1: 1000,
+                    x2: 1000,
+                    z2: 1600,
+                    field_08: 0,
+                    flags: 0,
+                },
+            ],
+            ..RoomState::default()
+        };
+        let mut game = game::GameState::new(target, &room);
+        // The destination room is absent from the pack, so no pair is found
+        // and the direction heuristic runs.
+        game.doors[0] = Some(game::Door {
+            slot: 0,
+            direction: 0,
+            next_room: 0x1F,
+            ..game::Door::default()
+        });
+
+        let (pos, angle) = room_entry_placement(&pack, &room, &game, target).unwrap();
+        assert_eq!(pos, [500, 0, 1300], "dir 0: south of the first zone");
+        assert_eq!(angle, 0xC00);
+
+        // A fully-blocking rectangle over the primary spot rejects it; the
+        // zone centre is used instead.
+        room.collision.quadrants[0].push(CollisionRect {
+            x_max: 1000,
+            z_max: 1500,
+            x_min: 0,
+            z_min: 1150,
+            kind: 1,
+            flags: 0x300,
+        });
+        let (pos, angle) = room_entry_placement(&pack, &room, &game, target).unwrap();
+        assert_eq!(pos, [500, 0, 500], "the zone centre");
+        assert_eq!(angle, 0);
+    }
+
+    /// The real pack's `--room` boot places the two reported stairwell rooms
+    /// on the landing their paired door arrives at.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_arbitrary_room_start_lands_on_the_stair_landing() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        for (room, pos, angle) in [
+            ("2070", [8600, 2885, 19000], 0u16),
+            ("2030", [17100, 0, 25300], 0xC00),
+        ] {
+            let id = RoomId::parse(room).unwrap();
+            let session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+            assert_eq!(session.player.pos, pos, "{room} placement");
+            assert_eq!(session.player.angle, angle, "{room} angle");
         }
     }
 

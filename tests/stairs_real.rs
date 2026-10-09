@@ -82,6 +82,45 @@ fn ladder_tick(
     game.apply_stair_state(player);
 }
 
+/// Face the door in `slot` and walk with periodic action presses until the
+/// transition fires. Returns whether it fired.
+fn drive_to_door(
+    player: &mut PlayerState,
+    room: &RoomState,
+    game: &mut GameState,
+    slot: usize,
+) -> bool {
+    let door = game.doors[slot].expect("door registered");
+    let cx = i32::from(door.zone[0]) + i32::from(door.zone[2]) / 2;
+    let cz = i32::from(door.zone[1]) + i32::from(door.zone[3]) / 2;
+    for i in 0..900 {
+        let dx = cx - player.pos[0];
+        let dz = cz - player.pos[2];
+        // Angle 0 walks +X, 0x400 -Z, 0x800 -X, 0xC00 +Z.
+        player.angle = if dx.abs() >= dz.abs() {
+            if dx >= 0 { 0 } else { 0x800 }
+        } else if dz < 0 {
+            0x400
+        } else {
+            0xC00
+        };
+        tick(
+            player,
+            room,
+            game,
+            Input {
+                up: true,
+                ..Input::default()
+            },
+            i % 4 == 0,
+        );
+        if game.transition.is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn lab_stairway_ramps_height_up_and_down() {
@@ -434,11 +473,20 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
     assert_eq!(door.door_type, 0x16);
     assert!(door::is_stair_type(door.door_type));
 
+    // Start where the arbitrary room entry places the player (106's stair
+    // arrival), not on a hand-picked point in front of the staircase.
+    let (entry, _) =
+        arklay::engine::room_entry_placement(&pack, &room, &game, id).expect("203 room entry");
+    assert_eq!(entry, [17100, 0, 25300]);
     let mut player = player::spawn(id, &room);
-    player.pos = [17000, 0, 24000];
+    player.pos = entry;
     player.angle = 0x400; // north, facing the staircase
     game.sync_entity_from_player(&player);
-    tick(&mut player, &room, &mut game, Input::default(), true);
+    assert!(
+        drive_to_door(&mut player, &room, &mut game, 0),
+        "never reached the staircase from the room entry: {:?}",
+        player.pos
+    );
 
     let transition = game.transition.expect("stair transition");
     assert_eq!(transition.target, RoomId::parse("1060").unwrap());
@@ -472,6 +520,52 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
         back.player.radius,
         back.player.collision_flags,
     ));
+}
+
+/// `--room` boots a stairwell room on the landing the paired door arrives at,
+/// and the stair door fires from there.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn arbitrary_start_lands_on_the_stair_landing_and_the_door_fires() {
+    let Some(path) = pack_path() else {
+        return;
+    };
+    let pack = Pack::open(&path).unwrap();
+    for (room, slot, arrival, angle, target) in [
+        ("2070", 3usize, [8600, 2885, 19000], 0x000u16, "10B0"),
+        ("2030", 0usize, [17100, 0, 25300], 0xC00u16, "1060"),
+    ] {
+        let id = RoomId::parse(room).unwrap();
+        let (room_state, mut game) = load(&pack, id);
+        let (pos, facing) = arklay::engine::room_entry_placement(&pack, &room_state, &game, id)
+            .unwrap_or_else(|| panic!("{room} has no room entry"));
+        assert_eq!(pos, arrival, "{room} start position");
+        assert_eq!(facing, angle, "{room} start angle");
+        // The raw arrival can sit inside a record's radius-grown bounds (the
+        // same is true of a normal door arrival), so the free check uses the
+        // radius-0 point the placement itself validates with.
+        assert!(
+            !player::position_blocked(&room_state, pos, 0, player::PLAYER_COLLISION_FLAGS,),
+            "{room}: the entry point is inside a blocking record"
+        );
+
+        let mut player = player::spawn(id, &room_state);
+        player.pos = pos;
+        player.angle = facing;
+        game.sync_entity_from_player(&player);
+        assert!(
+            drive_to_door(&mut player, &room_state, &mut game, slot),
+            "{room}: the stair door never fired from the room entry: {:?}",
+            player.pos
+        );
+        assert_eq!(
+            game.transition.expect("transition").target,
+            RoomId::parse(target).unwrap()
+        );
+
+        let sim = simulate_door(&pack, id, slot as u8, None).unwrap();
+        assert_eq!(sim.target, RoomId::parse(target).unwrap());
+    }
 }
 
 #[test]
