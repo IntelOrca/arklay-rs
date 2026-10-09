@@ -8642,6 +8642,7 @@ mod tests {
 
     #[test]
     fn same_bank_entity_footsteps_restart_the_engine_voice() {
+        let _sdl = crate::audio::test_lock::sdl();
         let dir = TempDir::new();
         let path = dir.0.join("footsteps.akpak");
         let mut writer = PackWriter::new();
@@ -8914,6 +8915,7 @@ mod tests {
 
     #[test]
     fn voice_tick_handshakes_pending_requests() {
+        let _sdl = crate::audio::test_lock::sdl();
         let dir = TempDir::new();
         let path = dir.0.join("voice.akpak");
         let mut writer = PackWriter::new();
@@ -9546,6 +9548,7 @@ mod tests {
     #[test]
     #[ignore = "requires SDL dummy video and audio drivers"]
     fn a_display_can_drop_before_a_live_mixer() {
+        let _sdl = crate::audio::test_lock::sdl();
         use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_ResetHint, SDL_SetHint};
 
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
@@ -11267,6 +11270,7 @@ end
 
     #[test]
     fn a_movie_on_request_starts_the_film_and_resumes_the_sounds() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Some(mixer) = dummy_mixer() else {
             eprintln!("skipping film hand-off test: no audio device");
             return;

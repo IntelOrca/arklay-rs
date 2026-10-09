@@ -1074,6 +1074,24 @@ impl Drop for Mixer {
 /// Compatibility alias for the engine's music path.
 pub type MusicPlayer = Mixer;
 
+/// Serializes the tests that open SDL audio or video.
+///
+/// SDL's lifetime and the dummy-driver hint are process-wide globals, so
+/// tests that open devices concurrently race on SDL's setup and teardown.
+/// Every test that opens a [`Mixer`] or a display must hold this lock for its
+/// whole body.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    pub(crate) fn sdl() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

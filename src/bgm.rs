@@ -876,6 +876,7 @@ mod tests {
 
     #[test]
     fn ff_room_target_stops_the_mixer_banks() {
+        let _sdl = crate::audio::test_lock::sdl();
         let (_path, pack) = empty_pack("ff-stop");
         let id = RoomId::parse("1000").unwrap();
         let mut game = game_for(id);
