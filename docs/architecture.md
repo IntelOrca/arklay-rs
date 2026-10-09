@@ -77,7 +77,7 @@ responsibility.
 | `font` | Presentation | Glyph decoding, metrics and tinted drawing |
 | `text` | Presentation | Executable text tables: messages, names, descriptions, save strings |
 | `mask` | Presentation | Room mask (foreground overlay) sprites and depth ordering |
-| `ui` | UI | `Screen` contract, title, character select, pause menu, item box, FILE, map, item viewer, save/load; the port-only `--debug-menu` F1 room-select overlay (`ui/debug_menu.rs`) |
+| `ui` | UI | `Screen` contract, title, character select, pause menu, item box, FILE, map, item viewer, save/load; the port-only F1 room-select overlay (`ui/debug_menu.rs`) and the F9 return-to-title prompt (`ui/return_title.rs`) |
 
 ## The fixed 30 Hz tick and the frame data flow
 

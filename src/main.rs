@@ -77,9 +77,9 @@ struct Cli {
     #[arg(long = "mod", value_name = "PATH", requires = "pack")]
     mods: Vec<PathBuf>,
 
-    /// Enable the port-only debug room-select overlay: F1 while playing
-    /// freezes the room and opens a list of the pack's rooms; confirm jumps
-    /// to the selected room, F1 or cancel closes it
+    /// Accepted for compatibility; the port-only debug room-select overlay
+    /// (F1 while playing) is always enabled and this flag no longer changes
+    /// anything
     #[arg(long, requires = "pack")]
     debug_menu: bool,
 

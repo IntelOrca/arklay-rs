@@ -21,6 +21,7 @@ pub mod item_view;
 pub mod layout;
 pub mod main_menu;
 pub mod map;
+pub mod return_title;
 pub mod save_load;
 pub mod status;
 pub mod title;
@@ -67,9 +68,12 @@ pub struct UiInput {
     pub page_right: bool,
     /// START (Tab): opens the gameplay pause menu.
     pub start: bool,
-    /// F1: the port-only debug room overlay's edge, read only when
-    /// `--debug-menu` enabled it.
+    /// F1: the port-only debug room overlay's edge. The overlay is always
+    /// available; `--debug-menu` is accepted for compatibility only.
     pub debug_menu: bool,
+    /// F9: the in-game return-to-title prompt's edge. A second F9 confirms
+    /// the return and any other key cancels.
+    pub return_title: bool,
     /// Any key went down this tick.
     pub any: bool,
 }

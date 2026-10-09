@@ -68,7 +68,7 @@ cargo run -- re1.akpak --room 100 --ticks 600 --stats
 
 # Port-only debug room-select overlay: press F1 while playing to freeze the
 # room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes
-cargo run -- re1.akpak --room 100 --debug-menu
+cargo run -- re1.akpak --room 100
 ```
 
 Captures, assembled scripts and converted packs are written to a sibling
@@ -126,7 +126,8 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 | `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `F1` | Port-only debug room-select overlay, with `--debug-menu`: freeze the room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes |
+| `F1` | Port-only debug room-select overlay: freeze the room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes |
+| `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
 
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm

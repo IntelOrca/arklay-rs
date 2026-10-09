@@ -1,13 +1,13 @@
 //! The port-only debug room-select overlay.
 //!
-//! This is a development aid the retail game never shipped. With
-//! `--debug-menu`, F1 while playing freezes the room and opens a scrollable
-//! list of the rooms present in the pack (`room/%04x.rdt`, deduped to the
-//! stage/room form and sorted). Up/down move the cursor, confirm jumps to the
-//! selected room and F1 or cancel closes the overlay. The engine drives the
-//! overlay like the pause menu - it shares the session's frozen frame and
-//! performs the jump itself - rather than running it as a boxed
-//! [`crate::ui::Screen`] modal.
+//! This is a development aid the retail game never shipped. F1 while playing
+//! freezes the room and opens a scrollable list of the rooms present in the
+//! pack (`room/%04x.rdt`, deduped to the stage/room form and sorted). Up/down
+//! move the cursor, confirm jumps to the selected room and F1 or cancel closes
+//! the overlay. The overlay is always available (`--debug-menu` is accepted
+//! for compatibility only). The engine drives the overlay like the pause menu
+//! (it shares the session's frozen frame and performs the jump itself) rather
+//! than running it as a boxed [`crate::ui::Screen`] modal.
 
 use std::collections::BTreeMap;
 
@@ -199,16 +199,20 @@ pub fn room_entries(pack: &Pack, preferred_player: u8) -> Vec<RoomId> {
         .collect()
 }
 
-/// Encode one line of plain uppercase ASCII into the shared font's glyph
-/// bytes: letters and digits use the font's ASCII grid, with the punctuation
-/// the overlay's hints need.
+/// Encode one line of plain ASCII into the shared font's glyph bytes: letters
+/// and digits use the font's ASCII grid, with the punctuation the overlays
+/// need. The period uses the shipped sheet's own period cell (0x17); the USA
+/// sheet's period index (0x9D) lands on a kana cell on the Japanese-width
+/// sheet, so it would not stay legible.
 pub fn encode_ascii(text: &str) -> Vec<u8> {
     text.chars()
         .map(|c| match c {
             'A'..='Z' => 0x1D + (c as u8 - b'A'),
+            'a'..='z' => 0x3D + (c as u8 - b'a'),
             '0'..='9' => 0x0C + (c as u8 - b'0'),
             ' ' => 0x00,
             ':' => 0x16,
+            '.' => 0x17,
             '-' => 0x3B,
             '/' => 0x38,
             _ => 0x1B,
@@ -317,5 +321,6 @@ mod tests {
             encode_ascii("F1/ESC: X"),
             [0x22, 0x0D, 0x38, 0x21, 0x2F, 0x1F, 0x16, 0x00, 0x34]
         );
+        assert_eq!(encode_ascii("a z."), [0x3D, 0x00, 0x56, 0x17]);
     }
 }

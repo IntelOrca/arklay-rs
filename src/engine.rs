@@ -66,9 +66,9 @@ use sdl3_sys::render::{
 };
 use sdl3_sys::scancode::{
     SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_F1,
-    SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN,
-    SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE,
-    SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
+    SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT,
+    SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT,
+    SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -116,6 +116,7 @@ use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
+use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 use crate::voice;
 
@@ -253,8 +254,9 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 /// sibling `mods/` discovery, exactly like [`open_game_pack`]. With `stats` the
 /// fixed-tick run records a per-tick histogram and the load/update/effect/render
 /// phases and prints the [`crate::stats`] report to stdout at exit; it runs
-/// without a capture and without opening a display. `debug_menu` enables the
-/// port-only F1 room-select overlay on the interactive path.
+/// without a capture and without opening a display. `_debug_menu` is retained
+/// for CLI compatibility: the port-only F1 room-select overlay is always
+/// enabled.
 #[allow(clippy::too_many_arguments)] // the CLI run options are all needed
 pub fn run_with_options(
     pack: &Path,
@@ -264,7 +266,7 @@ pub fn run_with_options(
     mods: &[PathBuf],
     no_mods: bool,
     stats: bool,
-    debug_menu: bool,
+    _debug_menu: bool,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let pack = open_game_pack(pack, mods, no_mods)?;
@@ -420,7 +422,6 @@ pub fn run_with_options(
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
-    session.set_debug_menu(debug_menu);
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
@@ -891,12 +892,18 @@ struct GameSession {
     /// The bank-5 `MSF_SCREEN_INTENSITY` flag ramps it 16 a frame: up to `0xF0`
     /// while the flag is set, back down to zero while it is clear.
     sprite_anim_intensity: i16,
-    /// Whether the port-only `--debug-menu` room overlay may open on F1. Off
-    /// by default, so every run without the flag is unchanged.
+    /// Whether the port-only room overlay may open on F1. Enabled by default;
+    /// `--debug-menu` is retained for CLI compatibility and no longer changes
+    /// the behaviour.
     debug_menu_enabled: bool,
     /// The open debug room-select overlay; the room stays frozen while it is
     /// up and the last gameplay frame stays under it.
     debug_menu: Option<DebugMenu>,
+    /// The open F9 return-to-title prompt; the room stays frozen and the game
+    /// sounds are paused while it is up.
+    return_title: Option<ReturnTitlePrompt>,
+    /// A confirmed return to the title screen, taken once by the app.
+    return_title_requested: bool,
     /// Debug jump destinations that failed to load, so the warning is logged
     /// once per session instead of on every confirm.
     debug_failed: HashSet<u16>,
@@ -1059,8 +1066,10 @@ impl GameSession {
             menu_fade_phase: MenuFadePhase::None,
             menu_fade_pending: false,
             sprite_anim_intensity: 0,
-            debug_menu_enabled: false,
+            debug_menu_enabled: true,
             debug_menu: None,
+            return_title: None,
+            return_title_requested: false,
             debug_failed: HashSet::new(),
         };
         session.enter_room(pack, None);
@@ -1129,11 +1138,24 @@ impl GameSession {
             self.tick_save_screen(pack, ui);
             return Ok(());
         }
+        // The F9 return-to-title prompt owns the frozen tick while it is open;
+        // a second F9 confirms and any other key cancels, exactly like the
+        // original's prompt.
+        if self.return_title.is_some() {
+            self.tick_return_title(ui);
+            return Ok(());
+        }
         // The port-only debug room overlay owns the frozen tick while it is
         // open; it is gameplay-only, so the pause menu and its modals below
         // never see it and F1 cannot open it from them.
         if self.debug_menu.is_some() {
             self.tick_debug_menu(pack, ui);
+            return Ok(());
+        }
+        // F9 opens the return-to-title prompt before the pause-menu checks so
+        // it works over the pause menu, exactly like the original.
+        if ui.return_title {
+            self.open_return_title();
             return Ok(());
         }
         if self.menu_fade_phase != MenuFadePhase::None {
@@ -1145,7 +1167,7 @@ impl GameSession {
             return Ok(());
         }
         // F1 opens the debug room overlay while playing, exactly like START
-        // opens the pause menu; without `--debug-menu` the edge is ignored.
+        // opens the pause menu.
         if self.debug_menu_enabled && ui.debug_menu {
             self.debug_menu = Some(DebugMenu::open(pack, self.loaded.id));
             return Ok(());
@@ -1350,6 +1372,7 @@ impl GameSession {
             || self.save_screen.is_some()
             || self.modal.is_some()
             || self.debug_menu.is_some()
+            || self.return_title.is_some()
     }
 
     /// One frozen tick of the active film: advance it against the wall clock
@@ -1571,9 +1594,51 @@ impl GameSession {
         }
     }
 
-    /// Enable or disable the port-only debug room-select overlay (`--debug-menu`).
+    /// Override whether the port-only debug room-select overlay may open on
+    /// F1. The overlay is enabled by default; this seam lets a caller force
+    /// it off.
     pub fn set_debug_menu(&mut self, enabled: bool) {
         self.debug_menu_enabled = enabled;
+    }
+
+    /// Open the F9 return-to-title prompt: pause the game sounds and freeze
+    /// the room until a second F9 confirms or any other key cancels.
+    fn open_return_title(&mut self) {
+        if self.return_title.is_none() {
+            if let Some(mixer) = &mut self.music {
+                mixer.pause_game_sounds();
+            }
+            self.return_title = Some(ReturnTitlePrompt::new());
+        }
+    }
+
+    /// One frozen tick of the F9 return-to-title prompt: a second F9 sets the
+    /// pending return request and any other key cancels and resumes the
+    /// sounds.
+    fn tick_return_title(&mut self, ui: UiInput) {
+        let event = self
+            .return_title
+            .as_ref()
+            .map_or(ReturnTitleEvent::None, |prompt| prompt.handle_input(ui));
+        match event {
+            ReturnTitleEvent::None => {}
+            ReturnTitleEvent::Confirm => {
+                self.return_title = None;
+                self.return_title_requested = true;
+            }
+            ReturnTitleEvent::Cancel => {
+                self.return_title = None;
+                if let Some(mixer) = &mut self.music {
+                    mixer.resume_game_sounds();
+                }
+            }
+        }
+    }
+
+    /// Take the pending return-to-title request, so the app routes to the
+    /// title screen exactly once.
+    fn take_return_title_request(&mut self) -> bool {
+        std::mem::take(&mut self.return_title_requested)
     }
 
     /// One frozen tick of the debug room-select overlay: F1 or cancel closes
@@ -2492,6 +2557,11 @@ impl GameSession {
         if let Some(debug_menu) = self.debug_menu.as_mut() {
             debug_menu.draw(&mut self.framebuffer, self.font.as_ref());
         }
+        // The return-to-title prompt draws over everything, including the
+        // debug overlay, with its own full-screen dim.
+        if let Some(return_title) = self.return_title.as_ref() {
+            return_title.draw(&mut self.framebuffer, self.font.as_ref());
+        }
     }
 
     /// The last rendered frame; gameplay modals draw over it.
@@ -2783,8 +2853,9 @@ struct App {
     prologue_pending: bool,
     /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
     ui_sfx_cache: SfxCache,
-    /// Whether the port-only `--debug-menu` room overlay is enabled for the
-    /// gameplay sessions this app starts.
+    /// Whether the port-only debug room overlay is enabled for the gameplay
+    /// sessions this app starts. Enabled by default; `--debug-menu` is
+    /// retained for CLI compatibility.
     debug_menu: bool,
 }
 
@@ -2830,7 +2901,7 @@ impl App {
             opening_played: false,
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
-            debug_menu: false,
+            debug_menu: true,
         }
     }
 
@@ -3262,6 +3333,7 @@ impl App {
     /// Tick the gameplay session or its modal.
     fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         let mut cues: Vec<ui::UiCue> = Vec::new();
+        let mut return_title = false;
         {
             let App {
                 pack,
@@ -3296,9 +3368,13 @@ impl App {
                 } else {
                     session.tick(pack, ui, input, action)?;
                 }
+                return_title = session.take_return_title_request();
             }
         }
         self.play_ui_cues(cues);
+        if return_title {
+            return self.apply(ScreenAction::Title);
+        }
         Ok(AppFlow::Continue)
     }
 
@@ -3469,8 +3545,8 @@ pub fn run_ui_with_options(
 }
 
 /// [`run_ui_with_options`] with the runtime layers; `mods`/`no_mods` behave
-/// exactly like [`open_game_pack`]. `debug_menu` enables the port-only F1
-/// room-select overlay for the gameplay screens.
+/// exactly like [`open_game_pack`]. `_debug_menu` is retained for CLI
+/// compatibility: the port-only F1 room-select overlay is always enabled.
 #[allow(clippy::too_many_arguments)] // the CLI boot options are all needed
 pub fn run_ui_with_mods(
     pack: &Path,
@@ -3480,7 +3556,7 @@ pub fn run_ui_with_mods(
     character: u8,
     mods: &[PathBuf],
     no_mods: bool,
-    debug_menu: bool,
+    _debug_menu: bool,
 ) -> Result<()> {
     let boot = match screen {
         "font" => return run_font_ui(pack, capture, mods, no_mods),
@@ -3501,7 +3577,7 @@ pub fn run_ui_with_mods(
             )
         }
     };
-    run_ui_impl(pack, boot, capture, save_dir, mods, no_mods, debug_menu)
+    run_ui_impl(pack, boot, capture, save_dir, mods, no_mods, _debug_menu)
 }
 
 /// The interactive root boot: the two logos, the title's opening film and the
@@ -3513,7 +3589,7 @@ pub fn run_root(
     save_dir: &Path,
     mods: &[PathBuf],
     no_mods: bool,
-    debug_menu: bool,
+    _debug_menu: bool,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -3522,7 +3598,7 @@ pub fn run_root(
         save_dir,
         mods,
         no_mods,
-        debug_menu,
+        _debug_menu,
     )
 }
 
@@ -3534,12 +3610,11 @@ fn run_ui_impl(
     save_dir: &Path,
     mods: &[PathBuf],
     no_mods: bool,
-    debug_menu: bool,
+    _debug_menu: bool,
 ) -> Result<()> {
     if let Some(capture_path) = capture {
         let pack = open_game_pack(pack, mods, no_mods)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
-        app.debug_menu = debug_menu;
         match boot {
             // A root-boot capture is the title capture: no automatic films.
             AppBoot::Boot | AppBoot::Title => {
@@ -3601,7 +3676,6 @@ fn run_ui_impl(
 
     let pack = open_game_pack(pack, mods, no_mods)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
-    app.debug_menu = debug_menu;
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
     run_app_loop(&mut app, &display)
@@ -6242,6 +6316,7 @@ const KEY_LSHIFT: u32 = 1 << 11;
 const KEY_RSHIFT: u32 = 1 << 12;
 const KEY_ESCAPE: u32 = 1 << 13;
 const KEY_F1: u32 = 1 << 14;
+const KEY_F9: u32 = 1 << 15;
 /// Confirm (Space or Return).
 const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
 /// Cancel (X, Backspace or Escape).
@@ -6267,6 +6342,7 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
         SDL_SCANCODE_RSHIFT => KEY_RSHIFT,
         SDL_SCANCODE_ESCAPE => KEY_ESCAPE,
         SDL_SCANCODE_F1 => KEY_F1,
+        SDL_SCANCODE_F9 => KEY_F9,
         _ => return None,
     })
 }
@@ -6372,6 +6448,7 @@ impl InputState {
                 page_right: pressed & KEY_RIGHTBRACKET != 0,
                 start: pressed & KEY_TAB != 0,
                 debug_menu: pressed & KEY_F1 != 0,
+                return_title: pressed & KEY_F9 != 0,
                 any: std::mem::take(&mut self.any_pressed),
             },
         }
@@ -7805,7 +7882,21 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_overlay_never_opens_without_the_flag() {
+    fn f9_latches_one_return_title_edge_per_press() {
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_F9, false);
+        assert!(input.tick().ui.return_title, "the press is one edge");
+        assert!(!input.tick().ui.return_title, "a held F9 does not repeat");
+        input.key_up(SDL_SCANCODE_F9);
+        input.key_down(SDL_SCANCODE_F9, false);
+        assert!(
+            input.tick().ui.return_title,
+            "a fresh press is a fresh edge"
+        );
+    }
+
+    #[test]
+    fn f1_opens_the_debug_overlay_by_default() {
         let dir = TempDir::new();
         let (pack, a, _) = debug_menu_pack(&dir);
         let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
@@ -7823,8 +7914,33 @@ mod tests {
             )
             .unwrap();
 
-        assert!(session.debug_menu.is_none(), "the F1 edge is ignored");
-        assert_eq!(session.game.frame, frame + 1, "the room still ticks");
+        assert!(
+            session.debug_menu.is_some(),
+            "the F1 edge opens the overlay"
+        );
+        assert_eq!(session.game.frame, frame, "the overlay freezes the room");
+    }
+
+    #[test]
+    fn f1_still_opens_the_debug_overlay_when_the_flag_is_passed() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.set_debug_menu(true);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    debug_menu: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(session.debug_menu.is_some(), "F1 opens the overlay");
     }
 
     #[test]
@@ -7943,6 +8059,155 @@ mod tests {
             ),
             "the spawn lands outside collision"
         );
+    }
+
+    #[test]
+    fn f9_opens_the_return_prompt_and_freezes_the_room() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        let frame = session.game.frame;
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    return_title: true,
+                    any: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(session.return_title.is_some(), "F9 opens the prompt");
+        assert!(session.room_frozen(), "the room freezes while it is up");
+        assert_eq!(session.game.frame, frame, "the room does not tick");
+
+        // The prompt holds the freeze on the following ticks.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(session.return_title.is_some());
+        assert_eq!(session.game.frame, frame, "the room stays frozen");
+    }
+
+    #[test]
+    fn the_second_f9_requests_the_return_once() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        let f9 = UiInput {
+            return_title: true,
+            any: true,
+            ..UiInput::default()
+        };
+
+        session
+            .tick(&pack, f9, player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.return_title.is_some(),
+            "the first F9 opens the prompt"
+        );
+
+        session
+            .tick(&pack, f9, player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.return_title.is_none(),
+            "the second F9 closes the prompt"
+        );
+        assert!(
+            session.take_return_title_request(),
+            "the second F9 sets the return request"
+        );
+        assert!(
+            !session.take_return_title_request(),
+            "the request is taken once"
+        );
+    }
+
+    #[test]
+    fn any_other_key_cancels_the_return_prompt_and_resumes_the_sounds() {
+        let _sdl = crate::audio::test_lock::sdl();
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping return-title audio test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.music = Some(mixer);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    return_title: true,
+                    any: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            session.music.as_ref().unwrap().game_sounds_paused(),
+            "F9 pauses the game sounds"
+        );
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    any: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            session.return_title.is_none(),
+            "the cancel closes the prompt"
+        );
+        assert!(
+            !session.music.as_ref().unwrap().game_sounds_paused(),
+            "the cancel resumes the game sounds"
+        );
+        assert!(!session.return_title_requested, "no return was requested");
+    }
+
+    #[test]
+    fn f9_opens_the_return_prompt_over_the_pause_menu() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.open_menu(&pack);
+        assert!(session.menu.is_some(), "the pause menu is up");
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    return_title: true,
+                    any: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            session.return_title.is_some(),
+            "F9 opens over the pause menu"
+        );
+        assert!(session.menu.is_some(), "the menu stays underneath");
+        assert!(session.room_frozen(), "the room stays frozen");
     }
 
     #[test]
@@ -9888,6 +10153,55 @@ mod tests {
             }
         );
         assert_eq!(session.game.entities[0].health, NEW_GAME_HEALTH[0]);
+    }
+
+    #[test]
+    fn starting_a_session_keeps_the_debug_overlay_enabled() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        assert!(app.debug_menu, "the overlay is enabled by default");
+
+        let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(
+            session.debug_menu_enabled,
+            "start_session propagates the enabled overlay"
+        );
+    }
+
+    #[test]
+    fn app_f9_twice_returns_to_the_title() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+
+        let f9 = UiInput {
+            return_title: true,
+            any: true,
+            ..UiInput::default()
+        };
+        app.update(f9, player::Input::default(), false).unwrap();
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(
+            session.return_title.is_some(),
+            "the first F9 opens the prompt"
+        );
+
+        app.update(f9, player::Input::default(), false).unwrap();
+        assert!(
+            matches!(app.mode, Mode::Title(_)),
+            "the second F9 returns to the title"
+        );
     }
 
     #[test]

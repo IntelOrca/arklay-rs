@@ -30,9 +30,14 @@ workspace install (`/home/ted/openre/assets/re1`) and its converted pack.
 Enemies, combat and the attract demo are explicitly out of scope so far; every
 deferred item is listed below or in the milestone deviations files.
 
-The `--debug-menu` F1 room-select overlay is a port-only development aid the
-retail game never shipped. It is off unless the flag is passed, so every run
-without it stays byte-identical and captures/goldens are unaffected.
+The F1 room-select overlay is a port-only development aid the retail game
+never shipped. It is always available (`--debug-menu` is accepted for
+compatibility only); it opens only on F1, so captures and goldens that never
+press the key are unaffected.
+
+The in-game F9 return-to-title prompt follows the original: the first F9
+freezes the room, dims the frame and pauses the game sounds; a second F9
+returns to the title screen and any other key cancels and resumes the sounds.
 
 ## Format coverage
 
