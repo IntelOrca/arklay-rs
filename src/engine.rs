@@ -873,6 +873,11 @@ struct GameSession {
     /// the room tick keeps ignoring the action until the key is released,
     /// matching the original's cleared held/previous-held pad bits.
     swallow_action: bool,
+    /// The loading narration a new game or a continue shows before the first
+    /// room tick: a global message over a black screen. While it is set the
+    /// room stays frozen and the room-entry fade is not armed until the
+    /// message's encoded delay dismisses it.
+    boot_message: Option<u8>,
     /// The room-entry fade the original arms on every gameplay (re)entry after
     /// a room load: type 2, accumulator `0x7FFF` and a negative counter that
     /// steps the alpha down once per fixed tick.
@@ -880,6 +885,10 @@ struct GameSession {
     /// The first fixed tick after arming must not advance the fade: the frame
     /// it was armed on has not been drawn yet, so that tick only clears this.
     room_fade_pending: bool,
+    /// The cutscene screen-intensity value the letterbox bars blend with.
+    /// The bank-5 `MSF_SCREEN_INTENSITY` flag ramps it 16 a frame: up to `0xF0`
+    /// while the flag is set, back down to zero while it is clear.
+    sprite_anim_intensity: i16,
     /// Whether the port-only `--debug-menu` room overlay may open on F1. Off
     /// by default, so every run without the flag is unchanged.
     debug_menu_enabled: bool,
@@ -1041,11 +1050,13 @@ impl GameSession {
             pickup_view: None,
             viewed_item: None,
             swallow_action: false,
+            boot_message: None,
             room_fade: transition::Fade::inactive(),
             room_fade_pending: false,
             menu_fade: transition::Fade::inactive(),
             menu_fade_phase: MenuFadePhase::None,
             menu_fade_pending: false,
+            sprite_anim_intensity: 0,
             debug_menu_enabled: false,
             debug_menu: None,
             debug_failed: HashSet::new(),
@@ -1095,6 +1106,15 @@ impl GameSession {
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        // The loading narration owns the tick while it is up: the room stays
+        // frozen on a black screen and only the message window advances. The
+        // tick the message clears arms the room-entry fade, so the first room
+        // frames fade up from black exactly like the original.
+        if self.boot_message.is_some() {
+            self.tick_boot_message(input, action);
+            return Ok(());
+        }
+        self.tick_screen_intensity();
         self.tick_room_fade();
         // A film owns the tick while it plays: the room's scripts, entities,
         // effects and the player stay frozen, exactly like the original's
@@ -2173,6 +2193,67 @@ impl GameSession {
         }
     }
 
+    /// Request the loading narration `id` (a global message) and hold the room
+    /// frozen until it clears. The original shows this black-screen typewriter
+    /// message between the intro film and the first room frame, then arms the
+    /// room-entry fade; the encoded action byte in the message stream is what
+    /// dismisses it.
+    fn request_boot_message(&mut self, id: u8) {
+        self.game.show_message(id, 0);
+        self.boot_message = Some(id);
+    }
+
+    /// One tick of the loading narration: advance the message window and, the
+    /// tick its encoded delay clears it, arm the room-entry fade. No room
+    /// script, entity, effect or player tick runs while the narration is up.
+    fn tick_boot_message(&mut self, input: player::Input, action: bool) {
+        self.game.update_message(
+            MessageInput {
+                action,
+                left: input.left,
+                right: input.right,
+            },
+            &self.loaded.room,
+            &self.text,
+        );
+        if !self.game.message.active {
+            self.boot_message = None;
+            self.arm_room_fade();
+        }
+    }
+
+    /// Step the cutscene screen-intensity value once per fixed tick. The bank-5
+    /// selector `MSF_SCREEN_INTENSITY` (the original's "screen intensity
+    /// ramping up" flag) drives its low byte: while the bit is set the value
+    /// climbs 16 a frame to `0xF0`, and while it is clear it falls 16 a frame
+    /// back to zero.
+    fn tick_screen_intensity(&mut self) {
+        let ramping = self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY);
+        let byte = self.sprite_anim_intensity as u8;
+        if ramping {
+            if byte < 0xF0 {
+                self.sprite_anim_intensity = self.sprite_anim_intensity.wrapping_add(16);
+            }
+        } else if byte > 0x0F {
+            self.sprite_anim_intensity = self.sprite_anim_intensity.wrapping_sub(16);
+        }
+    }
+
+    /// Blend the cutscene letterbox bars over the freshly drawn scene. The
+    /// original draws the top span `[-4,-10,328,38]` and the bottom span
+    /// `[-4,212,328,38]` — slightly past the frame edges — whenever the
+    /// intensity is non-zero, with the intensity byte as the blend weight
+    /// except at the `0xF0` ceiling, where the bars are fully opaque.
+    fn draw_screen_intensity_bars(&mut self) {
+        let byte = self.sprite_anim_intensity as u8;
+        if byte == 0 {
+            return;
+        }
+        let alpha = if byte == 0xF0 { 255 } else { byte };
+        self.framebuffer.blend_black_rect([-4, -10, 328, 38], alpha);
+        self.framebuffer.blend_black_rect([-4, 212, 328, 38], alpha);
+    }
+
     /// The room-entry fade's current alpha, for the deterministic tests.
     #[cfg(test)]
     fn room_fade_alpha(&self) -> Option<u8> {
@@ -2191,6 +2272,26 @@ impl GameSession {
     /// after the scene (and outside the transition path) so it is never
     /// covered by the menu and never dimmed by a fade or door overlay.
     fn render(&mut self, pack: &Pack) {
+        // The loading narration shows only its typewriter message over black;
+        // no world frame is drawn under it.
+        if self.boot_message.is_some() {
+            self.framebuffer.clear();
+            self.framebuffer.fill_rect(
+                [
+                    0,
+                    0,
+                    self.framebuffer.width as i32,
+                    self.framebuffer.height as i32,
+                ],
+                [0, 0, 0, 255],
+            );
+            if let Some(font) = &self.font {
+                self.game
+                    .message
+                    .draw(&mut self.framebuffer, font, &self.text);
+            }
+            return;
+        }
         if let Some(movie) = &self.movie {
             let rgba = movie.frame_rgba();
             self.framebuffer.rgba.copy_from_slice(rgba);
@@ -2217,8 +2318,10 @@ impl GameSession {
                 &mut self.shadows,
                 &mut self.effect_pages,
             );
-            // The room-entry fade (draw-then-add) sits over the freshly drawn
-            // scene and under the menu/message overlays.
+            // The cutscene letterbox bars sit on the scene; the room-entry
+            // fade (draw-then-add) then darkens both, and the menu/message
+            // overlays stay above all of it.
+            self.draw_screen_intensity_bars();
             self.draw_room_fade();
         }
         // The menu is hidden while the opening fade-out darkens the frozen
@@ -2907,13 +3010,15 @@ impl App {
         self.mode = Mode::Play(Box::new(session));
     }
 
-    /// Start a session for a new game or a continue with the room-entry fade
-    /// armed: the original's `game_loop` re-arms the black fade on every
-    /// (re)entry, so the first gameplay frames fade up from black. The
-    /// deterministic `--ui new-game` capture builds its session directly and
-    /// stays unfaded.
-    fn start_faded_session(&mut self, mut session: GameSession) {
-        session.arm_room_fade();
+    /// Start a session for a new game or a continue through the original's
+    /// loading narration: a black screen with the global typewriter message
+    /// `message` (0x5B for a new game, 0x5C for a continue) until the encoded
+    /// action byte dismisses it. The room-entry fade is armed when the message
+    /// clears, so the first gameplay frames fade up from black. The
+    /// deterministic `--ui` captures build their sessions directly and stay
+    /// unnarrated and unfaded.
+    fn start_narrated_session(&mut self, mut session: GameSession, message: u8) {
+        session.request_boot_message(message);
         self.start_session(session);
     }
 
@@ -3011,19 +3116,19 @@ impl App {
                             eprintln!("warning: intro film unavailable: {err:#}");
                             self.prologue_pending = false;
                             let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                            self.start_faded_session(session);
+                            self.start_narrated_session(session, game::MESSAGE_BOOT_NEW_GAME);
                         }
                     }
                 } else {
                     self.prologue_pending = false;
                     let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                    self.start_faded_session(session);
+                    self.start_narrated_session(session, game::MESSAGE_BOOT_NEW_GAME);
                 }
             }
             ScreenAction::LoadGame { slot } => {
                 let file = save::load(&self.save_dir, slot)?;
                 let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
-                self.start_faded_session(session);
+                self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
             }
             ScreenAction::Title => self.open_title()?,
             ScreenAction::Resume => {
@@ -10263,6 +10368,62 @@ mod tests {
         assert_eq!(session.room_fade_alpha(), None);
     }
 
+    /// The cutscene letterbox bars ramp in while the bank-5 intensity flag is
+    /// set and ramp back out when it clears.
+    #[test]
+    fn screen_intensity_bars_ramp_over_the_scene() {
+        let dir = TempDir::new();
+        let (pack, a, _b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        let pixel = |session: &GameSession, x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * session.framebuffer.width as usize + x) * 4;
+            session.framebuffer.rgba[offset..offset + 4]
+                .try_into()
+                .unwrap()
+        };
+
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        for _ in 0..16 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        session.render(&pack);
+        assert_eq!(
+            &pixel(&session, 160, 10)[..3],
+            &[0, 0, 0],
+            "the top bar is opaque at the ramp ceiling"
+        );
+        assert_eq!(
+            &pixel(&session, 160, 220)[..3],
+            &[0, 0, 0],
+            "the bottom bar is opaque at the ramp ceiling"
+        );
+        assert_ne!(
+            &pixel(&session, 160, 100)[..3],
+            &[0, 0, 0],
+            "the scene still shows between the bars"
+        );
+
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 1);
+        for _ in 0..16 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        session.render(&pack);
+        assert_ne!(
+            &pixel(&session, 160, 10)[..3],
+            &[0, 0, 0],
+            "the top bar ramped away"
+        );
+        assert_ne!(
+            &pixel(&session, 160, 220)[..3],
+            &[0, 0, 0],
+            "the bottom bar ramped away"
+        );
+    }
+
     #[cfg(feature = "lua")]
     #[test]
     fn a_transition_reruns_on_room_load_for_the_destination() {
@@ -11828,6 +11989,16 @@ end
             unreachable!();
         };
         assert_eq!(session.game.id.player_flag, 1, "Jill's session");
+        assert_eq!(
+            session.boot_message,
+            Some(game::MESSAGE_BOOT_NEW_GAME),
+            "the session starts on the new-game loading narration"
+        );
+        assert_eq!(
+            session.room_fade_alpha(),
+            None,
+            "the room-entry fade waits for the narration to clear"
+        );
         assert!(!app.prologue_pending);
 
         // A later confirm queues the prologue again, like the original.
@@ -12859,6 +13030,50 @@ end
             continued.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
             2,
             "the saved 1 plus the continue path's increment"
+        );
+    }
+
+    /// The real new-game loading narration holds the room frozen until the
+    /// encoded action byte in global 0x5B dismisses it, then arms the
+    /// room-entry fade.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_boot_narration_holds_the_room_until_it_clears() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let mut session = GameSession::new(&pack, 0, Path::new("saves")).unwrap();
+        session.request_boot_message(game::MESSAGE_BOOT_NEW_GAME);
+
+        let room_frame = session.game.frame;
+        for _ in 0..5 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(
+            session.game.message.active,
+            "the narration is still revealing after five ticks"
+        );
+        assert_eq!(session.game.frame, room_frame, "the room must stay frozen");
+
+        let mut ticks = 5;
+        while session.game.message.active && ticks < 600 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            ticks += 1;
+        }
+        assert!(
+            !session.game.message.active,
+            "the narration never dismissed"
+        );
+        assert!(ticks > 5, "the dismissal came from the message's own delay");
+        assert_eq!(
+            session.room_fade_alpha(),
+            Some(255),
+            "the room-entry fade arms the tick the narration clears"
         );
     }
 

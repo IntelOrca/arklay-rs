@@ -550,6 +550,21 @@ impl Screen for CharSelectScreen {
     }
 
     fn draw(&mut self, _cx: &UiContext<'_>, framebuffer: &mut Framebuffer) {
+        // The original blanks the background and both cards the instant the
+        // confirm flash fills the screen: state 4 decays the white over flat
+        // black, and the standalone cancel fade runs over black too. The
+        // caller's overlay supplies the fading colour.
+        if matches!(
+            self.stage,
+            Stage::ConfirmFadeOut | Stage::ConfirmHold | Stage::CancelFadeOut
+        ) {
+            framebuffer.clear();
+            framebuffer.fill_rect(
+                [0, 0, framebuffer.width as i32, framebuffer.height as i32],
+                [0, 0, 0, 255],
+            );
+            return;
+        }
         match &self.background {
             Some(background) => framebuffer.blit(background),
             None => {
@@ -979,6 +994,47 @@ mod tests {
             sample(&jill, 0x50 + 0x70 - 1, 8),
             [200, 30, 30, 255],
             "Jill's card must not sample the sheet padding"
+        );
+    }
+
+    /// The confirm fade-out/hold and the standalone cancel fade blank the
+    /// background and both cards, so only the caller's overlay shows.
+    #[test]
+    fn the_confirm_and_cancel_fades_draw_over_black() {
+        let mut screen = CharSelectScreen::new();
+        let cx = context();
+        screen.background = Some(card_sheet());
+        screen.cards = Some(card_sheet());
+        for stage in [
+            Stage::ConfirmFadeOut,
+            Stage::ConfirmHold,
+            Stage::CancelFadeOut,
+        ] {
+            screen.stage = stage;
+            let mut framebuffer = Framebuffer::new();
+            screen.draw(&cx, &mut framebuffer);
+            assert!(
+                framebuffer
+                    .rgba
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[..3] == [0, 0, 0]),
+                "{stage:?} must blank the background and cards"
+            );
+        }
+        // The idle stage still draws the desk and the cards.
+        screen.stage = Stage::Idle;
+        let mut framebuffer = Framebuffer::new();
+        screen.draw(&cx, &mut framebuffer);
+        assert!(
+            framebuffer
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the idle stage keeps its art"
         );
     }
 }

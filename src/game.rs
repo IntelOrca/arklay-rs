@@ -205,6 +205,14 @@ pub const MESSAGE_TAKE_PROMPT: u8 = 0xC0;
 pub const MESSAGE_INVENTORY_FULL: u8 = 0xC2;
 /// Global 0xC6: the document pick-up "has been filed" line.
 pub const MESSAGE_FILE_FILED: u8 = 0xC6;
+/// Global 0x5B: the new-game loading narration shown on a black screen once
+/// the intro film ends and before the first room tick.
+pub const MESSAGE_BOOT_NEW_GAME: u8 = 0x5B;
+/// Global 0x5C: the continue loading narration shown the same way.
+pub const MESSAGE_BOOT_CONTINUE: u8 = 0x5C;
+/// Global 0x5D: the attract-mode loading narration. The port has no attract
+/// mode yet, so nothing requests it (documented deviation).
+pub const MESSAGE_BOOT_ATTRACT: u8 = 0x5D;
 /// Effect sprite the item build's `0x8000` flag spawns.
 const EFFECT_ITEM_SPARKLE: u8 = 0x0B;
 /// Scenario flag raised when the radio is taken.
@@ -294,6 +302,12 @@ pub const MSF_VOICE_PLAYING: u8 = 14;
 /// is pending and the engine's gameplay tick must take it. The mask is bit 18
 /// of the first dword, i.e. selector 13 in the MSB-first flag bank.
 pub const MSF_FMV_REQUEST: u8 = 13;
+/// `main_state_flags` bit 0x10000 (`MSF_SCREEN_INTENSITY`): the cutscene
+/// screen-intensity ramp. While the bit is set the letterbox intensity climbs
+/// 16 a frame to its `0xF0` ceiling; while it is clear the intensity falls 16
+/// a frame back to zero. The mask is bit 16 of the first dword, i.e. selector
+/// `0x0F` in the MSB-first flag bank.
+pub const MSF_SCREEN_INTENSITY: u8 = 0x0F;
 /// `main_state_flags` bit 0x100: the pick-up screen is pending.
 const MSF_PICKUP_SCREEN: u8 = 23;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
