@@ -822,7 +822,7 @@ local function run(e)
         -- The player's whole state dword: animation id 1, frame 3, behaviour
         -- 0x14, state 0 or 3.
         local player_state = e.player_animation_id
-            | (e.player_animation_frame_id << 8)
+            | (e.player_anim_frame_id << 8)
             | (e.player_action_behavior << 16)
             | (e.player_action_state << 24)
         if (player_state == 0x0140301 or player_state == 0x03140301)

@@ -1501,8 +1501,10 @@ impl GameState {
         player.unk_c6 = x;
         player.unk_c8 = z;
         player.is_being_attacked = 1;
-        player.animation_id = 5;
-        player.animation_frame_id = 7;
+        // The original writes animationId/animFrameId as one dword at +0x84:
+        // the state-5 window's frame id 7 selects the crawl pin.
+        player.set_state(5);
+        player.set_ignore(7);
         player.action_behavior = 0;
         player.action_state = 0;
     }

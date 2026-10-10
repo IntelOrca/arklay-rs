@@ -1623,10 +1623,14 @@ mod imp {
                 Ok(())
             });
             fields.add_field_method_get("player_attack_anim", |_lua, api| {
-                Ok(api.game_ref().entities[0].animation_id)
+                Ok(api.game_ref().entities[0].attack_anim)
             });
             fields.add_field_method_set("player_attack_anim", |_lua, api, value: i64| {
-                api.game().entities[0].animation_id = value as u8;
+                // The original's dword store leaves both the generic clip id
+                // and the player's `attackAnim` name on the same value.
+                let player = &mut api.game().entities[0];
+                player.attack_anim = value as u8;
+                player.animation_id = value as u8;
                 Ok(())
             });
             fields.add_field_method_get("player_attack_direction", |_lua, api| {
@@ -1658,9 +1662,11 @@ mod imp {
             });
             // The player's animation id and frame, the two bytes the crow's
             // perched-scatter cue reads as part of the state dword and the grab
-            // peck cadence tests against `% 0x14`.
+            // peck cadence tests against `% 0x14`: `player_animation_id` is the
+            // original's animationId (+0x84, the entity state byte) and
+            // `player_animation_frame_id` the clip frame (+0xBE).
             fields.add_field_method_get("player_animation_id", |_lua, api| {
-                Ok(api.game_ref().entities[0].animation_id)
+                Ok(api.game_ref().entities[0].state())
             });
             fields.add_field_method_get("player_animation_frame_id", |_lua, api| {
                 Ok(api.game_ref().entities[0].animation_frame_id)
@@ -2406,13 +2412,15 @@ mod imp {
                 Ok(())
             });
 
-            // The player animation overrides the attacks write.
+            // The player animation overrides the attacks write: the original's
+            // dword store at +0x84 writes animationId and animFrameId, the
+            // entity's state and ignore bytes.
             methods.add_method_mut(
                 "set_player_animation",
                 |_lua, api, (id, frame): (i64, i64)| {
                     let player = &mut api.game().entities[0];
-                    player.animation_id = id as u8;
-                    player.animation_frame_id = frame as u8;
+                    player.set_state(id as u8);
+                    player.set_ignore(frame as u8);
                     Ok(())
                 },
             );
@@ -4999,8 +5007,15 @@ end
         assert_eq!(game.entities[0].health, 1, "clamped to one");
         assert_eq!(game.health_status & 0x02, 0x02);
         assert_eq!(game.poison_timer, crate::combat::POISON_TIMER);
-        assert_eq!(game.entities[0].animation_id, 5);
-        assert_eq!(game.entities[0].animation_frame_id, 7);
+        // The overrides write the state block's animationId/animFrameId bytes
+        // (state 5 / ignore 7), not the clip id and clip frame.
+        assert_eq!(game.entities[0].state(), 5);
+        assert_eq!(game.entities[0].ignore(), 7);
+        assert_eq!(game.entities[0].animation_id, 0, "the clip id is untouched");
+        assert_eq!(
+            game.entities[0].animation_frame_id, 0,
+            "the clip frame is untouched"
+        );
         assert_eq!(game.entities[0].is_being_attacked, 1);
         assert_eq!(game.entities[0].unk_c6, 123);
         assert_eq!(game.entities[0].unk_c8, (-456i16) as u16);
@@ -7463,7 +7478,7 @@ end
         assert!(wasp_step(&mut host, &mut game, &pack, &clips));
         let player = &game.entities[0];
         assert_eq!(player.health, -1);
-        assert_eq!((player.animation_id, player.animation_frame_id), (3, 0));
+        assert_eq!((player.state(), player.ignore()), (3, 0));
         assert_eq!((player.action_behavior, player.action_state), (200, 0));
         assert_eq!(
             game.entities[1].action_behavior, 3,
@@ -7508,7 +7523,9 @@ end
         assert_eq!(player.unk_c6, 1234);
         assert_eq!(player.unk_c8, 5678);
         assert_eq!(player.is_being_attacked, 1);
-        assert_eq!((player.animation_id, player.animation_frame_id), (5, 7));
+        // The grab writes animationId 5 / animFrameId 7 (the state-5 window's
+        // crawl pin), not the clip id and frame.
+        assert_eq!((player.state(), player.ignore()), (5, 7));
         assert_eq!((player.action_behavior, player.action_state), (0, 0));
 
         // Frame 4 queues the character-bank sting cue at the player.
@@ -8194,8 +8211,8 @@ end
                 e.angle = 0;
             }
             let player = &mut game.entities[0];
-            player.animation_id = 1;
-            player.animation_frame_id = 3;
+            player.set_state(1);
+            player.set_ignore(3);
             player.action_behavior = 0x14;
             player.action_state = player_state;
 
@@ -8233,8 +8250,8 @@ end
         game.entities[1].set_ignore(0);
         game.entities[1].action_behavior = 0;
         game.entities[1].action_state = 0;
-        game.entities[0].animation_id = 1;
-        game.entities[0].animation_frame_id = 3;
+        game.entities[0].set_state(1);
+        game.entities[0].set_ignore(3);
         game.entities[0].action_behavior = 0x14;
         game.entities[0].action_state = 0;
         game.rand_state = 7;
@@ -8258,8 +8275,8 @@ end
         game.entities[1].action_state = 1;
         game.entities[1].action_ticks_counter = 7;
         let before = game.rand_state;
-        game.entities[0].animation_id = 1;
-        game.entities[0].animation_frame_id = 3;
+        game.entities[0].set_state(1);
+        game.entities[0].set_ignore(3);
         game.entities[0].action_behavior = 0x14;
         assert!(crow_step(&mut host, &mut game, &pack, &clips));
         assert_eq!(game.entities[1].action_ticks_counter, 7, "frozen");
@@ -8605,8 +8622,8 @@ end
             assert_eq!(entity.roll, 0);
             assert_eq!(game.entities[0].health, 100 - damage as i16);
             assert_eq!(game.entities[0].is_being_attacked, 1);
-            assert_eq!(game.entities[0].animation_id, 6);
-            assert_eq!(game.entities[0].animation_frame_id, 5);
+            assert_eq!(game.entities[0].state(), 6, "the grab window");
+            assert_eq!(game.entities[0].ignore(), 5, "the grab sub-window");
             assert_eq!(game.entities[0].action_behavior, 0);
             assert_eq!(game.entity_sounds.len(), 1, "the bite cue at the player");
             assert_eq!(game.entity_sounds[0].bank, 3);
@@ -9093,8 +9110,8 @@ end
             game.entities[0].pos = [1500, 0, 1000];
             game.entities[0].action_behavior = 0x14;
             game.entities[0].action_state = 0;
-            game.entities[0].animation_id = 1;
-            game.entities[0].animation_frame_id = 3;
+            game.entities[0].set_state(1);
+            game.entities[0].set_ignore(3);
             game.rand_state = 0x1234;
         }
         let mut cached = LuaEnemyHost::new();
@@ -10878,6 +10895,35 @@ mod zombie_tests {
         assert!(step(&mut host, &mut game, &pack));
         let timer2 = (game.entities[1].reaction_timer as u16 >> 8) as u8;
         assert_eq!(timer2, timer.wrapping_sub(6));
+
+        // The latched player runs the state-5 window's recoil machine from the
+        // damage bank the loaded monster model installs (its second EDD
+        // chunk): the shot is the grabbed-offset snap and the bite clip.
+        game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+            keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+            clips: std::sync::Arc::new(
+                (0..12)
+                    .map(|_| crate::model::Clip {
+                        frames: (0..3)
+                            .map(|_| crate::model::ClipFrame {
+                                keyframe: 0,
+                                timing: 1,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }));
+        let mut player = crate::player::spawn(game.id, &RoomState::default());
+        player.pos = game.entities[0].pos;
+        crate::player_script::update(&mut game, &mut player, &RoomState::default(), &[], &[], &[]);
+        assert_eq!(game.entities[0].state(), 5);
+        assert_eq!(player.clip_source, crate::player::ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0, "the bite's grabbed clip");
+        assert_eq!(
+            player.pos, game.entities[0].pos,
+            "the snap reached the visible player"
+        );
     }
 
     #[test]
@@ -11867,8 +11913,8 @@ mod cerberus_tests {
         assert_eq!(entity.move_speed_current, 0);
         assert_eq!(game.player_flags & 6, 6, "no-control flags");
         assert_eq!(game.entities[0].angle, entity.angle, "facing latched");
-        assert_eq!(game.entities[0].animation_id, 7);
-        assert_eq!(game.entities[0].animation_frame_id, 2);
+        assert_eq!(game.entities[0].state(), 7, "the mauled pose word");
+        assert_eq!(game.entities[0].ignore(), 2);
         assert_eq!(game.entities[0].action_behavior, 0);
         assert_eq!(game.entities[0].action_state, 0);
 
@@ -12372,8 +12418,8 @@ mod chimera_tests {
         assert_eq!(entity.groan_timer(), 0x5A);
         assert_eq!(entity.status_flags & 2, 2, "intangible while grabbing");
         assert_eq!(entity.animation_id, 5);
-        assert_eq!(game.entities[0].animation_id, 6);
-        assert_eq!(game.entities[0].animation_frame_id, 9);
+        assert_eq!(game.entities[0].state(), 6, "the grab window");
+        assert_eq!(game.entities[0].ignore(), 9, "the grab sub-window");
         assert_eq!(game.entities[0].action_behavior, 0);
         assert_eq!(game.entities[0].is_being_attacked, 1);
 
