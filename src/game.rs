@@ -3498,9 +3498,19 @@ impl Default for GameState {
             entities: initial_entities(),
             entity_anims: std::array::from_fn(|_| crate::enemy::EntityAnim::default()),
             joint_worlds: std::array::from_fn(|_| Vec::new()),
-            web_clones: Box::new(std::array::from_fn(|_| None)),
+            // Build these arenas through a heap `Vec` so the (large) `Option`
+            // slots are never materialised as one stack temporary: the debug
+            // build's `Box::new(array::from_fn(..))` costs a stack copy of the
+            // whole arena, which is what overflows a 1 MiB thread stack.
+            web_clones: vec![None; crate::enemy::web::CLONE_CAP]
+                .into_boxed_slice()
+                .try_into()
+                .expect("the web clone arena is a fixed-size block"),
             web_joint_registry: [[0; 8]; 2],
-            companions: Box::new(std::array::from_fn(|_| None)),
+            companions: vec![None; crate::enemy::companion::COMPANION_CAP]
+                .into_boxed_slice()
+                .try_into()
+                .expect("the companion arena is a fixed-size block"),
             plant42_shared_body: None,
             plant42_capture: crate::anim::Mat4x3::default(),
             yawn_capture: crate::anim::Mat4x3::default(),
