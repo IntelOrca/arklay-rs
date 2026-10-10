@@ -158,10 +158,11 @@ pub fn update(
         // with animFrameId 0x0F, whose entry in the animation-function table
         // is the three-state hold table; Plant 42's sweep and release write
         // animationId 6 with animFrameId 8, whose entry is the attacked-flag
-        // table (knockdown / grabbed / thrown). The prelude the hold windows
-        // share runs first: a held pose raises the message bit while the
-        // object push or the health lock is up, then clears the lock.
-        6 => anim_window1(game, player, room, emd_clips),
+        // table (knockdown / grabbed / thrown); the crow, chimera and Neptune
+        // each own another entry. The prelude the hold windows share runs
+        // first: a held pose raises the message bit while the object push or
+        // the health lock is up, then clears the lock.
+        6 => anim_window1(game, player, room, emd_clips, emw_clips),
         // The swallow window. Yawn writes animationId 7 with animFrameId
         // 0x0D, whose entry in the animation-function table is the swallowed
         // player's own machine.
@@ -376,15 +377,36 @@ const ATTACKED_FLAG_INDEX: u8 = 8 + WINDOW1_BASE;
 /// `action_behavior`.
 const TYRANT_STAGGER_INDEX: u8 = 0x0C + WINDOW1_BASE;
 
+/// The crow's peck-grab table index: its strike writes animationId 6 with
+/// animFrameId 5, and `5 + 0x13` selects `player_anim_multi_attack`, the
+/// three-clip peck machine the crow's own struggle counter releases.
+const CROW_PECK_INDEX: u8 = 5 + WINDOW1_BASE;
+
+/// The chimera's grabhold table index: its maul writes animationId 6 with
+/// animFrameId 9, and `9 + 0x13` selects `player_anim_dispatch_4c10b0`, the
+/// maul / crawl-away / death machine.
+const CHIMERA_GRAB_INDEX: u8 = 9 + WINDOW1_BASE;
+
+/// The Neptune jaw-hold table index: the shark writes animationId 6 with
+/// animFrameId `0x0B`, and `0x0B + 0x13` selects `player_anim_poison_death`,
+/// the shark's own poison animation the shark script releases.
+const NEPTUNE_JAW_INDEX: u8 = 0x0B + WINDOW1_BASE;
+
 /// Player state 6 (the original's animation window 1).
 ///
 /// The window prelude runs on the entry frame only: a held pose raises the
 /// message bit while the object push or the health lock is up, then clears
-/// the lock. The entry selected by `animFrameId` then runs once per tick. The
-/// monster plant's hold table, Plant 42's attacked-flag table and the Tyrant's
-/// stagger/knock-down table are wired; the other windows (the Yawn swallow)
-/// keep their pose until their groups land.
-fn anim_window1(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clips: &[Clip]) {
+/// the lock. The entry selected by `animFrameId` then runs once per tick: the
+/// monster plant's hold table, Plant 42's attacked-flag table, the Tyrant's
+/// stagger/knock-down table, the crow's peck-grab, the chimera's grabhold and
+/// the Neptune jaw hold. An unwired entry holds the pose.
+fn anim_window1(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+) {
     if game.entities[0].action_state == 0 {
         if game.object_push || game.health_status & 0x80 != 0 {
             game.message_flags |= 0x40;
@@ -393,13 +415,255 @@ fn anim_window1(game: &mut GameState, player: &mut PlayerState, room: &RoomState
         game.set_health_status(status);
     }
     let index = game.entities[0].ignore().wrapping_add(WINDOW1_BASE);
-    if index == PLANT_HOLD_INDEX {
-        plant_hold(game, player, clips);
+    if index == CROW_PECK_INDEX {
+        multi_attack(game, player, emd_clips);
+    } else if index == CHIMERA_GRAB_INDEX {
+        chimera_grabhold(game, player, room, emd_clips, emw_clips);
+    } else if index == NEPTUNE_JAW_INDEX {
+        poison_death(game, player, room, emd_clips);
+    } else if index == PLANT_HOLD_INDEX {
+        plant_hold(game, player, emd_clips);
     } else if index == ATTACKED_FLAG_INDEX {
-        attacked_flag(game, player, room, clips);
+        attacked_flag(game, player, room, emd_clips);
     } else if index == TYRANT_STAGGER_INDEX {
-        tyrant_stagger(game, player, room, clips);
+        tyrant_stagger(game, player, room, emd_clips);
     }
+}
+
+/// The crow's peck-grab (the original's `player_anim_multi_attack`).
+///
+/// The crow latches the player with animationId 6 / animFrameId 5. Case 0
+/// selects the first peck clip and falls through into case 1; case 1's
+/// completion advances to the hold (case 2, which falls through into case 3),
+/// and there the crow script's own struggle counter releases the player by
+/// writing `action_state = 4` - case 3 ignores the held clip's completion.
+/// Case 4 selects the last clip and falls through into case 5, whose
+/// completion hands control back. The original's post-switch
+/// `EntityUpdateWeaponJoint` calls are the documented held-weapon deferral
+/// and stay skipped.
+fn multi_attack(game: &mut GameState, player: &mut PlayerState, emd_clips: &[Clip]) {
+    let bank = game.player_damage.clone();
+    let bank = bank.as_deref();
+    match game.entities[0].action_state {
+        0 | 1 => {
+            if game.entities[0].action_state == 0 {
+                let entity = &mut game.entities[0];
+                entity.action_state = 1;
+                entity.unk_8c = 3;
+                entity.move_speed_current = 0;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+                entity.attack_anim = 0;
+            }
+            let completed = advance_mirrored_clip(game, player, bank, emd_clips);
+            game.entities[0].action_state = game.entities[0]
+                .action_state
+                .wrapping_add(u8::from(completed));
+        }
+        2 | 3 => {
+            if game.entities[0].action_state == 2 {
+                let entity = &mut game.entities[0];
+                entity.attack_anim = 1;
+                entity.action_state = 3;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+            }
+            advance_mirrored_clip(game, player, bank, emd_clips);
+        }
+        4 | 5 => {
+            if game.entities[0].action_state == 4 {
+                let entity = &mut game.entities[0];
+                entity.attack_anim = 2;
+                entity.action_state = 5;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+            }
+            if advance_mirrored_clip(game, player, bank, emd_clips) {
+                release_to_control(game);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The chimera's grabhold (the original's `player_anim_dispatch_4c10b0`).
+///
+/// The maul rides the player: case 1 applies the damage clip's root vertex
+/// while the maul is under frame 0x24 and switches to a plain `Add_speedXZ(0)`
+/// push after it, case 2 raises the attacked flag to 2, and case 3 screams on
+/// the first live frame and runs the mashed countdown. Once the countdown
+/// crosses zero the machine plays the second maul clip (cases 4/5) and then
+/// case 7, the reverse weapon-EMW playback: a live player is handed back to
+/// state 1, a dead one runs the ground death pool (cases 8/9) into the
+/// terminal state 10.
+///
+/// The original's `PlayEntitySnd(2)` screams map to [`play_entity_thud`], the
+/// port's entity-floor sound cue (the same mapping the death fall uses); the
+/// cases 8/9 push-velocity billboards map to the player's ground-quad shadow
+/// fields, the port's render contract for that billboard (as in
+/// [`death_fall`]).
+fn chimera_grabhold(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+) {
+    let bank = game.player_damage.clone();
+    let bank = bank.as_deref();
+    match game.entities[0].action_state {
+        0 | 1 => {
+            if game.entities[0].action_state == 0 {
+                let entity = &mut game.entities[0];
+                entity.action_state = 1;
+                entity.attack_anim = 2;
+                entity.unk_8c = 3;
+                entity.move_speed_current = 200;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+            }
+            let completed = if game.entities[0].animation_frame_id < 0x24 {
+                advance_reaction_clip(game, player, bank, emd_clips)
+            } else {
+                game.entities[0].animation_id = game.entities[0].attack_anim;
+                let speed = game.entities[0].move_speed_current as i16;
+                walk::advance_xz(&mut game.entities[0], 0, speed);
+                player.pos = game.entities[0].pos;
+                advance_mirrored_clip(game, player, bank, emd_clips)
+            };
+            if completed {
+                game.entities[0].action_state = 2;
+            }
+        }
+        2 | 3 => {
+            if game.entities[0].action_state == 2 {
+                let entity = &mut game.entities[0];
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+                entity.is_being_attacked = 2;
+                entity.action_state = 3;
+                entity.attack_anim = 3;
+                entity.unk_8c = 3;
+            }
+            if game.entities[0].is_being_attacked > 1 && game.entities[0].animation_frame_id > 3 {
+                play_player_sound(game, room, 3, 2);
+                play_entity_thud(game, room);
+                game.entities[0].is_being_attacked = 1;
+            }
+            if game.entities[0].health < 0 && game.entities[0].animation_frame_id > 10 {
+                play_entity_thud(game, room);
+                game.entities[0].action_state = 8;
+                return;
+            }
+            chimera_mash_step(game, player, bank, emd_clips, 4);
+        }
+        4 | 5 => {
+            if game.entities[0].action_state == 4 {
+                let entity = &mut game.entities[0];
+                entity.unk_8c = 3;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+                entity.action_state = 5;
+                entity.attack_anim = 5;
+            }
+            chimera_mash_step(game, player, bank, emd_clips, 6);
+        }
+        6 | 7 => {
+            if game.entities[0].action_state == 6 {
+                let entity = &mut game.entities[0];
+                entity.action_state = 7;
+                entity.attack_anim = 4;
+                entity.unk_8c = 3;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+            }
+            // The original's reverse `Joint_move` over the held weapon's
+            // `jointMoveData0/1` pair: the port plays the EMW bank backwards.
+            game.entities[0].animation_id = game.entities[0].attack_anim;
+            let completed =
+                advance_player_clip(game, player, ClipSource::Emw, emw_clips, None, true, 0x400);
+            if completed {
+                if game.entities[0].health >= 0 {
+                    release_to_control(game);
+                } else {
+                    game.entities[0].action_state = 8;
+                }
+            }
+        }
+        8 | 9 => {
+            if game.entities[0].action_state == 8 {
+                play_player_sound(game, room, 3, 3);
+                let entity = &mut game.entities[0];
+                entity.action_state = 9;
+                entity.action_ticks_counter = 0x5A;
+                player.shadow_tint = 0x00FF_FF50;
+                player.shadow_half_x = 0;
+                player.shadow_half_z = 0;
+            }
+            player.shadow_half_x = player.shadow_half_x.wrapping_add(0x14);
+            player.shadow_half_z = player.shadow_half_z.wrapping_add(0x14);
+            let counter = game.entities[0].action_ticks_counter;
+            game.entities[0].action_ticks_counter = counter.wrapping_sub(1);
+            if counter == 0 {
+                game.entities[0].action_state = 10;
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The chimera maul's mashed clip advance (its states 3 and 5): the mash
+/// bleeds three off the attack countdown each tick, and a negative countdown
+/// advances the clip and moves to `next` on completion. The original advances
+/// the clip once inside the mash branch and once after it, so a negative
+/// countdown whose first advance does not complete still advances the clip
+/// twice this tick; the mash branch's own advance gates the transition.
+fn chimera_mash_step(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    bank: Option<&PlayerDamageBank>,
+    emd_clips: &[Clip],
+    next: u8,
+) {
+    let mashed = game.player_mashing();
+    game.entities[0].action_ticks_counter = game.entities[0]
+        .action_ticks_counter
+        .wrapping_sub(if mashed { 3 } else { 0 });
+    if (game.entities[0].action_ticks_counter as i16) < 0
+        && advance_mirrored_clip(game, player, bank, emd_clips)
+    {
+        game.entities[0].action_state = next;
+        return;
+    }
+    if advance_mirrored_clip(game, player, bank, emd_clips) {
+        game.entities[0].action_state = next;
+    }
+}
+
+/// The Neptune jaw hold (the original's `player_anim_poison_death`).
+///
+/// Case 0 selects damage clip 0, pins the speed and raises the attacked flag,
+/// then every tick advances the clip with no completion handling: the shark
+/// script owns the release.
+fn poison_death(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+) {
+    if game.entities[0].action_state == 0 {
+        let entity = &mut game.entities[0];
+        entity.action_state = 1;
+        entity.attack_anim = 0;
+        entity.move_speed_current = 0;
+        entity.animation_frame_id = 0;
+        entity.unk_bf = 0;
+        entity.unk_8c = 3;
+        entity.is_being_attacked = 1;
+        play_player_sound(game, room, 3, 0);
+    }
+    let bank = game.player_damage.clone();
+    advance_mirrored_clip(game, player, bank.as_deref(), emd_clips);
 }
 
 /// Player state 5 (the original's animation window 0).
@@ -559,6 +823,36 @@ fn advance_reaction_clip(
         player.pos = entities[0].pos;
     }
     advance_player_clip(game, player, source, clips, keyframes, false, 0x400)
+}
+
+/// One live tick of a state-6 reaction that advances the damage bank without
+/// the root-motion vertex [`advance_reaction_clip`] applies (the crow peck,
+/// the Neptune jaw hold and the chimera's maul states that never call the
+/// original's `entity_apply_anim_vertex`). `attackAnim` is still mirrored into
+/// the entity's clip id, because the original's `Joint_move` reads +0xBD for
+/// the player while the render clock poses +0xBE.
+fn advance_mirrored_clip(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    bank: Option<&PlayerDamageBank>,
+    emd_clips: &[Clip],
+) -> bool {
+    game.entities[0].animation_id = game.entities[0].attack_anim;
+    let (source, clips, keyframes) = reaction_bank(bank, emd_clips);
+    advance_player_clip(game, player, source, clips, keyframes, false, 0x400)
+}
+
+/// The reaction windows' shared release to the pad-driven state: the
+/// original's `animationId = 1; animFrameId = 0; action_behavior = 0;
+/// action_state = 0; isBeingAttackedFlag = 0` dword sequence.
+fn release_to_control(game: &mut GameState) {
+    let entity = &mut game.entities[0];
+    entity.animation_frame_id = 0;
+    entity.action_behavior = 0;
+    entity.action_state = 0;
+    entity.is_being_attacked = 0;
+    entity.set_state(1);
+    entity.set_ignore(0);
 }
 
 /// The player's reaction clip bank: the damage scratch pair when a monster
@@ -3128,7 +3422,8 @@ mod tests {
     fn other_state_six_windows_hold_the_pose_until_their_groups_land() {
         let emd = vec![clip(0x40, 1); 4];
         let mut game = test_game(6, 5, 2);
-        game.entities[0].set_ignore(0x09);
+        // Index 0x13 (animFrameId 0) names no handler: the pose holds.
+        game.entities[0].set_ignore(0x00);
         let mut player = test_player();
         update(
             &mut game,
@@ -3496,6 +3791,290 @@ mod tests {
         }
         assert_eq!(game.entities[0].action_state, 3, "the held loop stays");
         assert_eq!(game.entities[0].animation_id, 1);
+    }
+
+    /// The crow's peck-grab (state 6, animFrameId 5): the three peck clips run
+    /// in order from the damage bank, the hold's state 3 ignores the clip's
+    /// completion, and the crow's own release write (`action_state = 4`) runs
+    /// the last clip out and hands control back.
+    #[test]
+    fn the_crow_peck_grab_runs_its_three_clips_and_releases() {
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(5);
+        game.entities[0].is_being_attacked = 1;
+        let mut player = test_player();
+
+        // Case 0 selects the first peck clip and falls through into case 1.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(game.entities[0].move_speed_current, 0);
+        assert_eq!(game.entities[0].attack_anim, 0);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0);
+
+        // The three-frame clip completes on its third advance; case 2 then
+        // falls into case 3 and selects clip 1.
+        run(&mut game, &mut player, &[], &[], &[]);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 3, "the held peck");
+        assert_eq!(game.entities[0].attack_anim, 1);
+        assert_eq!(player.anim.clip, 1);
+
+        // Case 3 ignores the clip completion: the pose keeps advancing.
+        for _ in 0..4 {
+            run(&mut game, &mut player, &[], &[], &[]);
+        }
+        assert_eq!(game.entities[0].action_state, 3, "completion is ignored");
+        assert_eq!(game.entities[0].attack_anim, 1);
+
+        // The crow's struggle counter releases by writing action_state 4;
+        // case 4 selects the last peck clip and case 5 runs it out.
+        game.entities[0].action_state = 4;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 5);
+        assert_eq!(game.entities[0].attack_anim, 2);
+        assert_eq!(player.anim.clip, 2);
+        for _ in 0..3 {
+            run(&mut game, &mut player, &[], &[], &[]);
+        }
+        assert_eq!(game.entities[0].state(), 1, "control returns");
+        assert_eq!(game.entities[0].ignore(), 0);
+        assert_eq!(game.entities[0].action_behavior, 0);
+        assert_eq!(game.entities[0].action_state, 0);
+        assert_eq!(game.entities[0].is_being_attacked, 0);
+    }
+
+    /// A chimera reaction bank: clip 2 is the long maul, clip 3 the second
+    /// maul and the rest one-tick clips, so the machine reaches its release
+    /// quickly once the maul clip is jumped to its last frame.
+    fn chimera_damage_bank() -> PlayerDamageBank {
+        let mut clips = vec![clip(1, 1); 12];
+        clips[2] = clip(0x40, 1);
+        clips[3] = clip(0x10, 1);
+        PlayerDamageBank {
+            keyframes: Arc::new(vec![Keyframe::default()]),
+            clips: Arc::new(clips),
+        }
+    }
+
+    /// The chimera's grabhold (state 6, animFrameId 9) entry: the maul selects
+    /// damage clip 2, rides the grab offsets through the root-motion vertex
+    /// under frame 0x24 and switches to the 200-unit push after it, then case
+    /// 2 raises the attacked flag to 2 and falls into the clip-3 maul.
+    #[test]
+    fn the_chimera_grabhold_mauls_with_root_motion_then_the_push() {
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(chimera_damage_bank()));
+        game.entities[0].set_ignore(9);
+        game.entities[0].health = 100;
+        game.entities[0].angle = 0;
+        game.entities[0].unk_c6 = 100;
+        game.entities[0].unk_c8 = 200;
+        let mut player = test_player();
+
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].attack_anim, 2);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(game.entities[0].move_speed_current, 200);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2);
+        assert_eq!(
+            game.entities[0].pos,
+            [100, 0, 200],
+            "the grab offsets carry the maul"
+        );
+        assert_eq!(player.pos, game.entities[0].pos);
+
+        // Past frame 0x24 the root motion gives way to the 200-unit push.
+        game.entities[0].animation_frame_id = 0x24;
+        game.entities[0].timing_control = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        let (push_x, push_z) = crate::player::rotate_speed(0, 0, 200);
+        assert_eq!(
+            game.entities[0].pos,
+            [100 + push_x, 0, 200 + push_z],
+            "the push runs along the facing"
+        );
+        assert_eq!(player.pos, game.entities[0].pos);
+
+        // The maul clip completes on its last frame; case 2 raises the
+        // attacked flag to 2 and falls into the clip-3 maul.
+        game.entities[0].animation_frame_id = 0x3F;
+        game.entities[0].timing_control = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 3);
+        assert_eq!(game.entities[0].attack_anim, 3);
+        assert_eq!(game.entities[0].is_being_attacked, 2);
+        assert_eq!(player.anim.clip, 3);
+    }
+
+    /// The chimera maul's mash: the countdown bleeds three per tick, the
+    /// negative countdown advances the maul clip twice in one tick, the scream
+    /// fires once past frame 3, and the release runs the weapon EMW bank
+    /// backwards before handing control back.
+    #[test]
+    fn the_chimera_grabhold_mash_releases_and_the_emw_runs_back() {
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(chimera_damage_bank()));
+        game.entities[0].set_ignore(9);
+        game.entities[0].health = 100;
+        game.entities[0].action_state = 1;
+        game.entities[0].attack_anim = 2;
+        game.entities[0].animation_frame_id = 0x3F;
+        game.entities[0].timing_control = 0;
+        let emw = vec![clip(1, 1); 8];
+        let mut player = test_player();
+
+        // Case 1's push branch completes the maul into case 2.
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 3);
+        assert_eq!(game.entities[0].attack_anim, 3);
+        assert_eq!(game.entities[0].is_being_attacked, 2);
+        assert_eq!(player.anim.clip, 3);
+
+        // The scream fires on the first frame past 3 and drops the flag to 1.
+        game.entity_sounds.clear();
+        game.entities[0].animation_frame_id = 4;
+        game.entities[0].timing_control = 0;
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].is_being_attacked, 1);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 3),
+            "the player scream"
+        );
+
+        // The mash bleeds three a tick; with the countdown negative the clip
+        // advances twice (the mash branch's advance and the tail's).
+        game.dpad_held = crate::game::PAD_ACTION_HELD;
+        game.entities[0].action_ticks_counter = 2;
+        let frame = game.entities[0].animation_frame_id;
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 3);
+        assert_eq!(game.entities[0].action_ticks_counter, 0xFFFF);
+        assert_eq!(
+            game.entities[0].animation_frame_id,
+            frame + 2,
+            "the negative countdown advances the clip twice"
+        );
+
+        // Jump to the maul clip's last frame: the mash branch's advance
+        // completes and moves to case 4 without the tail advance.
+        game.entities[0].animation_frame_id = 0x0F;
+        game.entities[0].timing_control = 0;
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 4);
+
+        // Case 4 selects clip 5 and falls through into case 5, whose
+        // one-tick advance completes into case 6.
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 6);
+        assert_eq!(game.entities[0].attack_anim, 5);
+
+        // Case 6 selects the weapon clip 4 and falls through into case 7,
+        // whose reverse EMW advance completes and hands control back.
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].state(), 1, "the live release");
+        assert_eq!(game.entities[0].ignore(), 0);
+        assert_eq!(game.entities[0].action_behavior, 0);
+        assert_eq!(game.entities[0].action_state, 0);
+        assert_eq!(game.entities[0].is_being_attacked, 0);
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, 4);
+    }
+
+    /// The chimera's death paths: case 3's low-health branch and the reverse
+    /// EMW completion both route to case 8, whose push-velocity billboard maps
+    /// to the player's ground-quad shadow, and case 9's 0x5A-frame countdown
+    /// parks in the terminal state 10.
+    #[test]
+    fn the_chimera_grabhold_death_pools_the_shadow_into_state_ten() {
+        // Case 3's low-health abort.
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(chimera_damage_bank()));
+        game.entities[0].set_ignore(9);
+        game.entities[0].action_state = 3;
+        game.entities[0].attack_anim = 3;
+        game.entities[0].animation_frame_id = 11;
+        game.entities[0].is_being_attacked = 1;
+        game.entities[0].health = -1;
+        let emw = vec![clip(1, 1); 8];
+        let mut player = test_player();
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 8, "the low-health abort");
+
+        // Case 8 recolours and zeroes the ground quad, then falls into case 9.
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 9);
+        assert_eq!(game.entities[0].action_ticks_counter, 0x59);
+        assert_eq!(player.shadow_tint, 0x00FF_FF50);
+        assert_eq!(player.shadow_half_x, 0x14);
+        let mut ticks = 0;
+        while game.entities[0].action_state != 10 && ticks < 200 {
+            run(&mut game, &mut player, &[], &emw, &[]);
+            ticks += 1;
+        }
+        assert_eq!(game.entities[0].action_state, 10, "the terminal state");
+        assert_eq!(ticks, 0x5A, "the death countdown");
+        assert!(player.shadow_half_x > 0x14, "the pool grew");
+
+        // The reverse EMW completion also routes a dead player to case 8.
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(chimera_damage_bank()));
+        game.entities[0].set_ignore(9);
+        game.entities[0].action_state = 6;
+        game.entities[0].health = -1;
+        let mut player = test_player();
+        run(&mut game, &mut player, &[], &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 8, "the dead release");
+    }
+
+    /// The Neptune jaw hold (state 6, animFrameId 0x0B): the damage bank's
+    /// clip 0 is selected once with the attack sound, then advanced with no
+    /// completion handling - the shark script owns the release.
+    #[test]
+    fn the_neptune_jaw_hold_advances_without_releasing() {
+        let mut game = test_game(6, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 1)));
+        game.entities[0].set_ignore(0x0B);
+        let mut player = test_player();
+
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].attack_anim, 0);
+        assert_eq!(game.entities[0].move_speed_current, 0);
+        assert_eq!(
+            game.entities[0].animation_frame_id, 0,
+            "the one-tick clip wraps on the entry advance"
+        );
+        assert_eq!(game.entities[0].unk_bf, 0);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(game.entities[0].is_being_attacked, 1);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0);
+        assert_eq!(game.entity_sounds.len(), 1, "the jaw bite sound");
+        assert_eq!(game.entity_sounds[0].bank, 3);
+
+        // The one-tick clip keeps wrapping; the state never leaves the hold.
+        for _ in 0..4 {
+            run(&mut game, &mut player, &[], &[], &[]);
+        }
+        assert_eq!(game.entities[0].state(), 6);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(
+            game.entities[0].is_being_attacked, 1,
+            "the shark owns the release"
+        );
+        assert_eq!(player.anim.clip, 0);
     }
 
     /// The state-1 entry checks: the death trigger (with the back-shot flip

@@ -8628,6 +8628,77 @@ end
             assert_eq!(game.entity_sounds.len(), 1, "the bite cue at the player");
             assert_eq!(game.entity_sounds[0].bank, 3);
             assert_eq!(game.effects.active_count(), 2, "feather and blood");
+
+            // The latched player's own state-6 peck machine now runs: the
+            // damage bank's clip 0 wraps into the hold and clip 1 becomes the
+            // held peck the crow's release gate reads.
+            game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+                keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+                clips: std::sync::Arc::new(
+                    (0..4)
+                        .map(|_| crate::model::Clip {
+                            frames: (0..1)
+                                .map(|_| crate::model::ClipFrame {
+                                    keyframe: 0,
+                                    timing: 1,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
+            }));
+            let mut player = crate::player::spawn(game.id, &RoomState::default());
+            player.pos = game.entities[0].pos;
+            crate::player_script::update(
+                &mut game,
+                &mut player,
+                &RoomState::default(),
+                &[],
+                &[],
+                &[],
+            );
+            assert_eq!(
+                game.entities[0].action_state, 2,
+                "clip 0 wraps into the hold"
+            );
+            assert_eq!(player.clip_source, crate::player::ClipSource::Damage);
+            assert_eq!(player.anim.clip, 0, "the first peck clip");
+            crate::player_script::update(
+                &mut game,
+                &mut player,
+                &RoomState::default(),
+                &[],
+                &[],
+                &[],
+            );
+            assert_eq!(game.entities[0].action_state, 3, "the held peck");
+            assert_eq!(player.anim.clip, 1);
+
+            // The crow's struggle counter releases by writing action_state 4;
+            // the player's window runs the last clip out and hands control
+            // back.
+            game.entities[1].action_state = 1;
+            game.entities[1].struggle = 1;
+            game.dpad_held = 1;
+            assert!(crow_step(&mut host, &mut game, &pack, &clips));
+            assert_eq!(game.entities[0].action_state, 4, "the crow's release write");
+            for _ in 0..8 {
+                crate::player_script::update(
+                    &mut game,
+                    &mut player,
+                    &RoomState::default(),
+                    &[],
+                    &[],
+                    &[],
+                );
+                if game.entities[0].state() == 1 {
+                    break;
+                }
+            }
+            assert_eq!(game.entities[0].state(), 1, "the player returns control");
+            assert_eq!(game.entities[0].ignore(), 0);
+            assert_eq!(game.entities[0].action_behavior, 0);
+            assert_eq!(game.entities[0].is_being_attacked, 0);
         }
 
         // A crow that reaches the landing while the player is already in a
@@ -12436,6 +12507,56 @@ mod chimera_tests {
         let health = game.entities[0].health;
         assert!(step(&mut host, &mut game, &pack));
         assert_eq!(game.entities[0].health, health - 10);
+
+        // The grabbed player's own state-6 machine now runs: the root-motion
+        // maul, the mashed countdown and the reverse EMW playback hand
+        // control back once the player mashes free.
+        game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+            keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+            clips: std::sync::Arc::new(
+                (0..12)
+                    .map(|_| crate::model::Clip {
+                        frames: (0..3)
+                            .map(|_| crate::model::ClipFrame {
+                                keyframe: 0,
+                                timing: 1,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }));
+        let emw: Vec<crate::model::Clip> = (0..8)
+            .map(|_| crate::model::Clip {
+                frames: (0..3)
+                    .map(|_| crate::model::ClipFrame {
+                        keyframe: 0,
+                        timing: 1,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let mut player = crate::player::spawn(game.id, &RoomState::default());
+        player.pos = game.entities[0].pos;
+        for _ in 0..40 {
+            crate::player_script::update(
+                &mut game,
+                &mut player,
+                &RoomState::default(),
+                &[],
+                &emw,
+                &[],
+            );
+            if game.entities[0].state() == 1 {
+                break;
+            }
+        }
+        assert_eq!(game.entities[0].state(), 1, "the player mauls free");
+        assert_eq!(game.entities[0].ignore(), 0);
+        assert_eq!(game.entities[0].action_behavior, 0);
+        assert_eq!(game.entities[0].is_being_attacked, 0);
+        assert_eq!(player.clip_source, crate::player::ClipSource::Emw);
+        assert_eq!(player.anim.clip, 4, "the reverse weapon clip");
     }
 
     #[test]
