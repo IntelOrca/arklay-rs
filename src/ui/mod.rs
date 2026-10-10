@@ -14,6 +14,7 @@
 //! explicitly by the session.
 
 pub mod char_select;
+pub mod death;
 pub mod debug_menu;
 pub mod file;
 pub mod item_box;

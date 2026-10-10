@@ -111,6 +111,10 @@ fn run_save(data: &[u8]) {
     let _ = SaveFile::from_bytes(data);
 }
 
+fn run_combat(data: &[u8]) {
+    let _ = arklay::combat::CombatTables::parse(data);
+}
+
 fn run_mask(data: &[u8]) {
     let _ = mask::MaskTable::parse(data, 4);
 }
@@ -426,6 +430,15 @@ fn seed_save() -> Vec<u8> {
     SaveFile::default().to_bytes().to_vec()
 }
 
+/// A structurally valid combat table blob with synthetic (zero) payload, so
+/// the seed carries no game data.
+fn seed_combat() -> Vec<u8> {
+    let mut data = vec![0u8; arklay::combat::COMBAT_BYTES];
+    data[..4].copy_from_slice(b"ARCB");
+    data[4] = 1;
+    data
+}
+
 fn seed_bmp() -> Vec<u8> {
     let width = 4u32;
     let height = 4u32;
@@ -695,6 +708,11 @@ fn targets() -> Vec<Target> {
             run: run_save,
         },
         Target {
+            name: "combat",
+            seed: seed_combat,
+            run: run_combat,
+        },
+        Target {
             name: "mask",
             seed: seed_mask,
             run: run_mask,
@@ -902,7 +920,7 @@ fn torture_matrix_never_panics() {
         total >= 10_000,
         "torture matrix ran {total} cases, below the 10,000 floor"
     );
-    assert_eq!(per_format.len(), 17, "every target must run");
+    assert_eq!(per_format.len(), 18, "every target must run");
 }
 
 /// Regenerate the committed cargo-fuzz seed corpus from these builders.

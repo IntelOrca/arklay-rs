@@ -102,16 +102,25 @@ fn real_room1000_init_spawns_rebecca_and_the_guard_skips_the_record() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_monster_spawns_allocate_nothing() {
+fn real_room1010_monster_spawns_allocate_their_slots() {
     let Some((root, _pack)) = common::asset_env() else {
         return;
     };
     // ROOM1010's init spawns three zombies (id 0x00) with guard bits 0x09,
-    // 0x0A and 0x0B; every one must parse but leave its slot free.
+    // 0x0A and 0x0B; every one allocates its recorded slot.
     let (_room, _scripts, state) = load_room(&root, "1010");
-    assert_eq!(state.enemy_count, 0, "monster ids allocate no entity");
+    assert_eq!(state.enemy_count, 3, "three monster records allocate");
+    let zombies: Vec<&Entity> = state.entities[1..]
+        .iter()
+        .filter(|entity| entity.active())
+        .collect();
+    assert_eq!(zombies.len(), 3, "three active monster slots");
     assert!(
-        state.entities[1..].iter().all(|entity| !entity.active()),
-        "monster ids leave every enemy slot free"
+        zombies.iter().all(|entity| entity.id == 0x00),
+        "every spawn is a zombie"
+    );
+    assert!(
+        zombies.iter().all(|entity| entity.state() == 0),
+        "the spawn leaves the script's init state"
     );
 }

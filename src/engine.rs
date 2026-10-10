@@ -65,10 +65,11 @@ use sdl3_sys::render::{
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_F1,
-    SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT,
-    SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT,
-    SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X, SDL_Scancode,
+    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_C, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE,
+    SDL_SCANCODE_F1, SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
+    SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
+    SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+    SDL_SCANCODE_Z, SDL_Scancode,
 };
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
@@ -86,15 +87,15 @@ use crate::door;
 use crate::effects;
 use crate::emd;
 use crate::ending;
+use crate::enemy;
 use crate::font;
 use crate::game;
 use crate::items;
 use crate::lua;
 use crate::mask;
 use crate::message::MessageInput;
-use crate::model::{Clip, Emd};
+use crate::model::{Clip, Emd, Texture8};
 use crate::movie::{MovieSession, MovieTick};
-use crate::npc;
 use crate::objects;
 use crate::pack::Pack;
 use crate::player;
@@ -287,7 +288,8 @@ pub fn run_with_options(
         bgm::update_room_bgm(&mut game, id, None);
         timings.phases.load = load_start.elapsed();
 
-        let mut npc_models = npc::EntityModelCache::default();
+        let mut npc_models = enemy::EntityModelCache::default();
+        let mut enemy_lua = enemy::LuaEnemyHost::new();
         if ticks > 0 {
             let scripts = Rc::new(loaded.scripts.clone());
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -352,6 +354,7 @@ pub fn run_with_options(
                         player_assets: loaded.player_assets.as_ref(),
                         pack: &pack,
                         npc_models: &mut npc_models,
+                        enemy_lua: Some(&mut enemy_lua),
                     },
                     player::Input::default(),
                     Some(&mut timings.phases),
@@ -809,8 +812,11 @@ struct GameSession {
     /// only the film advances; scripts, entities, effects and the player are
     /// frozen.
     movie: Option<MovieSession>,
-    /// Parsed NPC models, loaded lazily from the pack by the NPC driver.
-    npc_models: npc::EntityModelCache,
+    /// Parsed entity models, loaded lazily from the pack by the entity driver.
+    npc_models: enemy::EntityModelCache,
+    /// The enemy-script VM hosting the pack's `enemy/em{id:02x}.lua` update
+    /// functions; one VM per session, reset only by tests.
+    enemy_lua: enemy::LuaEnemyHost,
     music: Option<Mixer>,
     /// Decoded pack text tables (messages, item names, descriptions).
     text: Text,
@@ -904,6 +910,13 @@ struct GameSession {
     return_title: Option<ReturnTitlePrompt>,
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
+    /// The player's death sequence: the delay, the fades and the DIED screen.
+    death: ui::death::DeathSequence,
+    /// The decoded `ui/died.tim` page, loaded when the DIED screen first opens.
+    died_texture: Option<Texture8>,
+    /// Whether the died-page load was attempted; a missing entry is not
+    /// retried on every frame.
+    died_texture_tried: bool,
     /// Debug jump destinations that failed to load, so the warning is logged
     /// once per session instead of on every confirm.
     debug_failed: HashSet<u16>,
@@ -1042,7 +1055,8 @@ impl GameSession {
             bgm_cache: bgm::BgmCache::default(),
             voice_cache: VoiceCache::default(),
             movie: None,
-            npc_models: npc::EntityModelCache::default(),
+            npc_models: enemy::EntityModelCache::default(),
+            enemy_lua: enemy::LuaEnemyHost::new(),
             music: None,
             text: Text::load(pack),
             font,
@@ -1076,6 +1090,9 @@ impl GameSession {
             debug_menu: None,
             return_title: None,
             return_title_requested: false,
+            death: ui::death::DeathSequence::idle(),
+            died_texture: None,
+            died_texture_tried: false,
             debug_failed: HashSet::new(),
         };
         session.enter_room(pack, None);
@@ -1088,6 +1105,14 @@ impl GameSession {
     /// `from` is the room the player came from, used by the BGM state machine
     /// to resolve the outgoing group; `None` for a direct boot or save load.
     fn enter_room(&mut self, pack: &Pack, from: Option<RoomId>) {
+        // The original stores the outgoing room id in
+        // `g_AttractMode_RoomCameraId` on a same-stage door; a fresh or
+        // stage-change load resets it to 0x1F. The hunter's scripted intro
+        // reads it as a camera selector.
+        self.game.attract_room_camera_id = match from {
+            Some(source) if source.stage == self.game.id.stage => source.room,
+            _ => 0x1F,
+        };
         {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.command_vm.run_init(&mut host);
@@ -1142,6 +1167,13 @@ impl GameSession {
         // frames fade up from black exactly like the original.
         if self.boot_message.is_some() {
             self.tick_boot_message(input, action);
+            return Ok(());
+        }
+        // The DIED screen owns the whole tick while it is up: the room stays
+        // frozen and the screen's state machine, fade and spinning corpse
+        // advance on their own, exactly like the original's display loop.
+        if self.death.screen_open() {
+            self.tick_death_screen(ui, input);
             return Ok(());
         }
         self.tick_screen_intensity();
@@ -1248,6 +1280,7 @@ impl GameSession {
                 player_assets: self.loaded.player_assets.as_ref(),
                 pack,
                 npc_models: &mut self.npc_models,
+                enemy_lua: Some(&mut self.enemy_lua),
             },
             input,
         );
@@ -1376,7 +1409,101 @@ impl GameSession {
                 self.open_pickup_view(pack, request);
             }
         }
+        // The death machine runs at the end of the gameplay frame, after the
+        // room tick noticed the health drop, exactly like the original.
+        self.tick_death();
         Ok(())
+    }
+
+    /// The game-over machine's pre-screen phase: notice a dead player, raise
+    /// the dead flag, start the sequence and advance its delay/fade. Once the
+    /// fade completes the DIED screen opens over the corpse.
+    fn tick_death(&mut self) {
+        if self.death.finished || self.death.screen_open() {
+            return;
+        }
+        if self.game.entities[0].health < 0 && !self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO) {
+            self.game.apply_flag(5, game::MSF_PLAYER_DEAD, 0);
+        }
+        if !self.game.flags[5].bit(game::MSF_PLAYER_DEAD) {
+            return;
+        }
+        if self.death.is_idle() {
+            let variant = self.game.flags[5].bit(game::MSF2_DEATH_VARIANT)
+                || self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO);
+            self.death
+                .start(ui::death::immediate_fade(self.loaded.id), variant);
+            return;
+        }
+        match self.death.tick() {
+            ui::death::DeathTick::OpenScreen => self.open_death_screen(),
+            ui::death::DeathTick::Finished => self.finish_death(),
+            ui::death::DeathTick::None => {}
+        }
+    }
+
+    /// The DIED screen's own tick: advance the screen machine and spin the
+    /// corpse 8 angle units, exactly like the original's display loop. The
+    /// confirm button skips the rest of the screen.
+    fn tick_death_screen(&mut self, ui: UiInput, input: player::Input) {
+        let confirm = ui.confirm || input.action_held;
+        let finished = self
+            .death
+            .screen
+            .as_mut()
+            .is_some_and(|screen| screen.tick(confirm));
+        if finished {
+            self.finish_death();
+            return;
+        }
+        // The original spins the corpse's facing 8 units a frame.
+        if let Some(screen) = self.death.screen.as_mut() {
+            screen.spin = screen.spin.wrapping_add(8);
+            self.player.angle = screen.spin;
+            self.game.entities[0].angle = screen.spin & 0x0FFF;
+        }
+    }
+
+    /// Open the DIED screen over the fallen player: the fixed camera anchors
+    /// on the corpse, the head one-shot is consumed and the room's BGM stops.
+    fn open_death_screen(&mut self) {
+        // The shared grab/death one-shot hides the head joint on the first
+        // death screen, exactly like the original's image value.
+        if self.game.hunter_grab_one_shot {
+            let entity = &mut self.game.entities[0];
+            entity.set_joint_flag(1, entity.joint_flag(1) & 0xFE);
+        }
+        self.game.hunter_grab_one_shot = false;
+        let anchor = self.player.pos;
+        let angle = self.player.angle;
+        let fov = self
+            .loaded
+            .room
+            .cuts
+            .get(self.loaded.room.current_cut)
+            .map_or(320, |cut| cut.fov);
+        self.death.screen = Some(ui::death::DeathScreen::open(anchor, angle, fov));
+        if let Some(mixer) = &mut self.music {
+            mixer.stop_all_bgm();
+        }
+    }
+
+    /// The original's `die_state` teardown: clear the screen flags and the
+    /// special-light state, then hand back to the app, which returns to the
+    /// title.
+    fn finish_death(&mut self) {
+        self.death.screen = None;
+        self.death.finished = true;
+        self.sprite_anim_intensity = 0;
+        self.game.message.set_menu_choice_id(0);
+        self.game.sync_message_choice();
+        self.game.message_flags &= !0x100;
+        // The screen-mode pair: standalone set, rebuild cleared, and the
+        // intensity ramp off.
+        self.game.apply_flag(5, 0, 1);
+        self.game.apply_flag(5, 1, 0);
+        self.game.apply_flag(5, 15, 1);
+        self.return_title_requested = true;
     }
 
     /// Whether a pause-menu screen owns the tick, so the room is frozen and
@@ -1698,9 +1825,13 @@ impl GameSession {
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
-        // A jump is a door load: reset the player's animation id so the next
-        // update re-initialises pad control instead of resuming a scripted
-        // state from the source room (see `finish_transition`).
+        // A jump is a door load: snapshot the outgoing enemies, then reset
+        // the player's animation id so the next update re-initialises pad
+        // control instead of resuming a scripted state from the source room
+        // (see `finish_transition`).
+        self.game
+            .snapshot_enemies(target.room as i8 != self.game.id.room as i8);
+        self.game.clear_room_entities();
         self.game.entities[0].set_state(0);
         self.game.entities[0].action_behavior = 0;
         self.game.entities[0].action_state = 0;
@@ -2327,6 +2458,76 @@ impl GameSession {
         }
     }
 
+    /// Blend the death fade (the white-out or the screen's final fade) over
+    /// the frame just rendered.
+    fn draw_death_fade(&mut self) {
+        if let Some(overlay) = self.death.overlay() {
+            self.framebuffer.fade_to_color(overlay.color, overlay.alpha);
+        }
+    }
+
+    /// Load and decode `ui/died.tim` once, when the DIED screen first opens.
+    fn ensure_died_texture(&mut self, pack: &Pack) {
+        if self.died_texture_tried {
+            return;
+        }
+        self.died_texture_tried = true;
+        match pack.read("ui/died.tim") {
+            Ok(bytes) => match tim::decode_8bpp(bytes) {
+                Ok(texture) => self.died_texture = Some(texture),
+                Err(err) => eprintln!("warning: invalid ui/died.tim: {err:#}"),
+            },
+            Err(err) => eprintln!("warning: missing ui/died.tim: {err:#}"),
+        }
+    }
+
+    /// Draw the DIED screen: the static backdrop, the corpse posed at the
+    /// fall's terminal frame through the fixed orbit camera, the black
+    /// overlay, the wavy strip and the screen's own fade.
+    fn render_death_screen(&mut self, pack: &Pack) {
+        self.ensure_died_texture(pack);
+        let Some(screen) = self.death.screen.as_ref() else {
+            return;
+        };
+        let Some(texture) = self.died_texture.as_ref() else {
+            self.framebuffer.clear();
+            ui::death::draw_overlay(&mut self.framebuffer, screen.overlay());
+            return;
+        };
+        self.framebuffer.clear();
+        ui::death::draw_backdrop(&mut self.framebuffer, texture);
+        if let Some(assets) = self.loaded.player_assets.as_ref()
+            && let Some(keyframe) = self
+                .player
+                .anim
+                .pose_keyframe(&assets.emd.clips, &assets.emd.keyframes)
+        {
+            let entity = crate::anim::entity_matrix(self.player.pos, self.player.angle);
+            let mut joints = crate::anim::joint_matrices(&assets.emd.skeleton, &keyframe, &entity);
+            apply_look_at(
+                &mut joints,
+                &self.game.entities[0],
+                &self.game.entity_anims[0],
+            );
+            let camera = Camera::from_points(screen.camera_from, screen.camera_to, screen.fov);
+            let lighting = Lighting::from_room(&self.loaded.room);
+            let hidden = self.game.entities[0].joint_flags;
+            self.framebuffer.draw_model_hidden(
+                &assets.emd.mesh,
+                &assets.emd.texture,
+                &joints,
+                &camera,
+                &lighting,
+                hidden,
+            );
+        }
+        ui::death::draw_rect(&mut self.framebuffer, screen.rect_alpha());
+        if let Some(param) = screen.strip_param() {
+            ui::death::draw_strip(&mut self.framebuffer, texture, param);
+        }
+        ui::death::draw_overlay(&mut self.framebuffer, screen.overlay());
+    }
+
     /// Request the loading narration `id` (a global message) and hold the room
     /// frozen until it clears. The original shows this black-screen typewriter
     /// message between the intro film and the first room frame, then arms the
@@ -2435,6 +2636,12 @@ impl GameSession {
             render_transition(&mut self.framebuffer, transition);
             return;
         }
+        // The DIED screen owns the frame while it is up: the static backdrop,
+        // the spinning corpse, the wavy strip and the screen's own fades.
+        if self.death.screen_open() {
+            self.render_death_screen(pack);
+            return;
+        }
         // While the menu is up the room is frozen: keep the frame it was
         // opened over instead of re-rendering the scene, then draw the menu
         // and the window over it.
@@ -2453,10 +2660,12 @@ impl GameSession {
                 &mut self.effect_pages,
             );
             // The cutscene letterbox bars sit on the scene; the room-entry
-            // fade (draw-then-add) then darkens both, and the menu/message
-            // overlays stay above all of it.
+            // fade (draw-then-add) then darkens both, the death fade overlays
+            // the falling room, and the menu/message overlays stay above all
+            // of it.
             self.draw_screen_intensity_bars();
             self.draw_room_fade();
+            self.draw_death_fade();
         }
         // The menu is hidden while the opening fade-out darkens the frozen
         // frame; it is revealed for the fade-in.
@@ -2763,7 +2972,7 @@ fn fallback_room_entry(room: &RoomState, door: Option<game::Door>) -> Option<([i
 /// offsets.
 fn entry_spot_free(room: &RoomState, pos: [i32; 3]) -> bool {
     const BODY_OFFSETS: [[i32; 2]; 5] = [[0, 0], [160, 0], [-160, 0], [0, 160], [0, -160]];
-    npc::walk::walk_zone_find(room, pos[0], pos[2]).is_some()
+    enemy::walk::walk_zone_find(room, pos[0], pos[2]).is_some()
         && !BODY_OFFSETS.iter().any(|[dx, dz]| {
             let x = pos[0] + dx;
             let z = pos[2] + dz;
@@ -2909,11 +3118,19 @@ pub enum AppBoot {
     Map,
     /// The item viewer over the deterministic capture room's combat knife.
     View,
+    /// The DIED screen over the deterministic capture room, with the player
+    /// killed through the real damage helper (`--ui death`).
+    Death(u8),
 }
 
 /// The room `--ui menu` and its capture boot into, with the known capture
 /// inventory added on top of the room boot.
 pub const MENU_ROOM: &str = "1001";
+
+/// The room `--ui death` boots into: a mansion room whose player variants do
+/// not run a scripted intro, so the fall and the DIED screen show the fallen
+/// corpse.
+pub const DEATH_ROOM: &str = "101";
 
 /// Fixed ticks the headless menu capture settles before the frame is drawn.
 const MENU_CAPTURE_TICKS: u32 = 30;
@@ -2923,6 +3140,10 @@ const ITEM_BOX_CAPTURE_TICKS: u32 = 30;
 const FILE_CAPTURE_TICKS: u32 = 30;
 /// Fixed ticks the headless save-screen capture settles before the frame.
 const SAVE_CAPTURE_TICKS: u32 = 36;
+/// Fixed ticks the headless DIED-screen capture settles before the frame:
+/// enough to run the 90-frame delay, the white-out, the reveal ramp and part
+/// of the settled-text hold.
+const DEATH_CAPTURE_TICKS: u32 = 400;
 
 /// The app's current screen.
 enum Mode {
@@ -3225,6 +3446,7 @@ impl App {
             AppBoot::File => self.open_file_capture(),
             AppBoot::Map => self.open_map_capture(),
             AppBoot::View => self.open_view(),
+            AppBoot::Death(character) => self.open_death_capture(character),
         }
     }
 
@@ -3349,6 +3571,18 @@ impl App {
         session.game.add_item(ITEM_KNIFE, 0);
         session.open_menu(&self.pack);
         session.open_item_view(&self.pack, ITEM_KNIFE);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the deterministic `--ui death` capture: a session over
+    /// [`DEATH_ROOM`] as the selected character, killed through the shared
+    /// damage helper so the whole fall → fade → DIED flow runs headlessly.
+    fn open_death_capture(&mut self, character: u8) -> Result<()> {
+        let mut id = RoomId::parse(DEATH_ROOM)?;
+        id.player_flag = character & 1;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
+        session.game.apply_player_hurt(i16::MAX, 0);
         self.start_session(session);
         Ok(())
     }
@@ -3703,10 +3937,11 @@ pub fn run_ui_with_mods(
         "file" => AppBoot::File,
         "map" => AppBoot::Map,
         "view" => AppBoot::View,
+        "death" => AppBoot::Death(character & 1),
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu`, `box`, `file`, `map`, `view`, `save` or `load`"
+                 `menu`, `box`, `file`, `map`, `view`, `save`, `load` or `death`"
             )
         }
     };
@@ -3798,6 +4033,10 @@ fn run_ui_impl(
             AppBoot::View => {
                 app.open_view()?;
                 app.settle(MENU_CAPTURE_TICKS)?;
+            }
+            AppBoot::Death(character) => {
+                app.open_death_capture(character)?;
+                app.settle(DEATH_CAPTURE_TICKS)?;
             }
         }
         // A queued film is drained, never played, on the capture path: the
@@ -4371,6 +4610,12 @@ fn finish_transition(
     };
     *loaded = destination;
     loaded.room.room_sfx = session.door.sfx;
+    // The original snapshots the outgoing room's live enemies and tears the
+    // list down before the destination's `room_set` wipes the slots. The
+    // snapshot ages only when the destination room differs from the source.
+    let destination_changed = session.door.next_room as i8 != game.id.room as i8;
+    game.snapshot_enemies(destination_changed);
+    game.clear_room_entities();
     // The original's door load resets the player's animation id before the
     // destination room boots, so the next update re-initialises state 0 back
     // to the pad-driven state 1 instead of resuming the source room's scripted
@@ -4529,7 +4774,7 @@ pub fn simulate_door(
     // The destination's first gameplay frame, drawn from the placed player and
     // the zone-selected cut, exactly as the engine's render loop would.
     let mut gameplay = Framebuffer::new();
-    let mut npc_models = npc::EntityModelCache::default();
+    let mut npc_models = enemy::EntityModelCache::default();
     render_frame(
         &mut gameplay,
         pack,
@@ -4660,6 +4905,30 @@ pub fn simulate_room_seeded(
     simulate_loaded(pack, loaded, game, player_state, ticks, move |_| input)
 }
 
+/// [`simulate_room_seeded`] with a setup hook before the first tick: a test
+/// can arm the player (equip a weapon, fill the inventory) and then run a
+/// per-tick input schedule through the real gameplay tick.
+pub fn simulate_room_prepared(
+    pack: &Pack,
+    id: RoomId,
+    flags: &[(u8, u8)],
+    ticks: usize,
+    prepare: impl FnOnce(&mut game::GameState, &mut player::PlayerState),
+    input: impl FnMut(usize) -> player::Input,
+) -> Result<SimulatedRoom> {
+    let loaded = load_room(pack, id)?;
+    let mut game = new_game_state(pack, id, &loaded.room);
+    seed_room_items(&mut game);
+    for &(bank, bit) in flags {
+        game.apply_flag(bank, bit, 0);
+    }
+    let mut player_state = player::spawn(id, &loaded.room);
+    game.sync_entity_from_player(&player_state);
+    prepare(&mut game, &mut player_state);
+    game.sync_entity_from_player(&player_state);
+    simulate_loaded(pack, loaded, game, player_state, ticks, input)
+}
+
 /// [`simulate_room_seeded`] with the film hand-off live.
 ///
 /// This is the real-asset seam for the `movie_on` handshake: a request opens a
@@ -4712,7 +4981,7 @@ pub fn render_game_frame(
     player_state: &player::PlayerState,
 ) -> Result<Image> {
     let assets = load_player_assets(pack, id);
-    let mut npc_models = npc::EntityModelCache::default();
+    let mut npc_models = enemy::EntityModelCache::default();
     let mut framebuffer = Framebuffer::new();
     render_frame(
         &mut framebuffer,
@@ -4838,7 +5107,8 @@ fn simulate_loaded_with(
     let mut masks = MaskCache::default();
     let mut shadows = ShadowCache::default();
     let mut effect_pages = EffectPageCache::default();
-    let mut npc_models = npc::EntityModelCache::default();
+    let mut npc_models = enemy::EntityModelCache::default();
+    let mut enemy_lua = enemy::LuaEnemyHost::new();
     let mut framebuffer = Framebuffer::new();
     // Headless runs have no device: a voice wait clears the tick it is raised,
     // but the BGM state machine, its ramps/fades and the 3D SE dispatch still
@@ -4911,6 +5181,7 @@ fn simulate_loaded_with(
                 player_assets: loaded.player_assets.as_ref(),
                 pack,
                 npc_models: &mut npc_models,
+                enemy_lua: Some(&mut enemy_lua),
             },
             input(tick),
         );
@@ -5111,6 +5382,74 @@ pub fn simulate_typewriter(
         saved,
         state_after_save,
         state_after_load: loaded.game,
+    })
+}
+
+/// The result of [`simulate_death`]: the state after the fixed ticks, the
+/// final rendered frame, and whether the DIED screen was reached and the
+/// sequence returned to the title.
+pub struct SimulatedDeath {
+    /// Room the death ran in.
+    pub id: RoomId,
+    /// Game state after the ticks.
+    pub game: game::GameState,
+    /// Player after the ticks.
+    pub player: player::PlayerState,
+    /// The final frame: the room during the fall, or the DIED screen.
+    pub frame: Image,
+    /// The DIED screen opened during the run.
+    pub screen_open: bool,
+    /// A frame captured while the DIED screen was up (in its reveal/hold
+    /// phase), or `None` when the screen never opened.
+    pub screen_frame: Option<Image>,
+    /// The sequence finished and requested the title.
+    pub finished: bool,
+}
+
+/// Drive the player's death flow headlessly through the real session tick:
+/// kill the player through the shared damage helper, run `ticks` fixed ticks
+/// and report whether the DIED screen opened and whether the sequence
+/// returned to the title. `hurt` is the damage the killing blow applies.
+pub fn simulate_death(pack: &Pack, id: RoomId, ticks: usize, hurt: i16) -> Result<SimulatedDeath> {
+    let save_dir = PathBuf::from("saves");
+    let mut session = GameSession::from_room(pack, id, &save_dir)?;
+    session.game.apply_player_hurt(hurt, 0);
+    let mut screen_open = false;
+    let mut screen_frame = None;
+    let mut screen_ticks = 0usize;
+    for _ in 0..ticks {
+        session.tick(pack, UiInput::default(), player::Input::default(), false)?;
+        if session.death.screen_open() {
+            screen_open = true;
+            screen_ticks += 1;
+            // Capture the reveal once the strip has started drawing.
+            if screen_ticks == 120 {
+                session.render(pack);
+                screen_frame = Some(Image {
+                    width: session.framebuffer.width,
+                    height: session.framebuffer.height,
+                    rgba: session.framebuffer.rgba.clone(),
+                });
+            }
+        }
+        if session.death.finished {
+            break;
+        }
+    }
+    session.render(pack);
+    let frame = Image {
+        width: session.framebuffer.width,
+        height: session.framebuffer.height,
+        rgba: session.framebuffer.rgba.clone(),
+    };
+    Ok(SimulatedDeath {
+        id,
+        game: session.game,
+        player: session.player,
+        frame,
+        screen_open,
+        screen_frame,
+        finished: session.death.finished,
     })
 }
 
@@ -5394,7 +5733,7 @@ fn play_entity_sounds(
             continue;
         };
         let (gain, pan) = sfx::sound_gain_pan(cut.pos, cut.look_at, sound.pos);
-        mixer.play_sfx_on_bank(sfx_bank_key(2, sound.column), wav, gain, pan);
+        mixer.play_sfx_on_bank(sfx_bank_key(sound.bank, sound.column), wav, gain, pan);
     }
 }
 
@@ -6121,6 +6460,7 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
 /// declared sprites and the `core00` types.
 fn new_game_state(pack: &Pack, id: RoomId, room: &RoomState) -> game::GameState {
     let mut game = game::GameState::new(id, room);
+    game.set_combat_tables(crate::combat::CombatTables::load(pack));
     let weapon = effects::WeaponEffects::load(pack);
     if pack.contains(effects::room::CORE_ESP_ENTRY) || pack.contains(effects::room::CORE_ETM_ENTRY)
     {
@@ -6164,10 +6504,13 @@ struct RoomContext<'a> {
     game: &'a mut game::GameState,
     player: &'a mut player::PlayerState,
     player_assets: Option<&'a PlayerAssets>,
-    /// Pack the NPC model cache reads from.
+    /// Pack the entity model cache and the enemy scripts read from.
     pack: &'a Pack,
-    /// Parsed NPC models, shared with the renderer.
-    npc_models: &'a mut npc::EntityModelCache,
+    /// Parsed entity models, shared with the renderer.
+    npc_models: &'a mut enemy::EntityModelCache,
+    /// The enemy-script VM, when the caller owns one. A test fixture may pass
+    /// `None`, which parks every monster slot.
+    enemy_lua: Option<&'a mut enemy::LuaEnemyHost>,
 }
 
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
@@ -6237,11 +6580,14 @@ fn tick_room_timed(
     // become visible here, before the player's physics and before the
     // renderer reads the lighting.
     context.game.apply_room_edits(context.room);
-    // The scripted characters think after the event scripts and before the
-    // player's physics, exactly like the original's `update_entities`.
-    context
-        .game
-        .tick_entities(context.room, context.npc_models, context.pack);
+    // The entities think after the event scripts and before the player's
+    // physics, exactly like the original's `update_entities`.
+    context.game.tick_entities(
+        context.room,
+        context.npc_models,
+        context.pack,
+        context.enemy_lua,
+    );
     // Scripts may have moved the player entity directly (dir_set, actor
     // motion); mirror that onto the visible player before physics run.
     context.game.sync_player(context.player);
@@ -6262,6 +6608,10 @@ fn tick_room_timed(
     // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
     // locomotion handlers.
     pad.slow_motion = context.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
+    // The player's collision callback byte aliases the health-status byte:
+    // mirror the live status before any physics or scripted movement runs.
+    context.player.collision_flags = context.game.health_status;
+    context.game.entities[0].collision_flags = context.game.health_status;
     if state != 1 || frozen {
         pad.action_pressed = false;
         pad.action_held = false;
@@ -6286,21 +6636,42 @@ fn tick_room_timed(
                 room_clips,
             );
         }
-    } else if let Some(assets) = context.player_assets {
+    } else if !player_script::control_gate(context.game, context.player)
+        && let Some(assets) = context.player_assets
+    {
         let room_clips = context
             .room
             .room_anim
             .as_ref()
             .map(|anim| anim.clips.as_slice())
             .unwrap_or(&[]);
-        player::update_with_room(
-            context.player,
-            context.room,
-            &assets.emd.clips,
-            &assets.emw.clips,
-            room_clips,
-            pad,
-        );
+        // The active weapon's bank: the machine's loaded file while it runs,
+        // otherwise the equipped item's, so the frame the aim starts reads the
+        // right clips.
+        let weapon_file = context.player.weapon.weapon_file.or_else(|| {
+            context.game.equipped.and_then(|item| {
+                crate::weapons::weapon_emw_id(context.game.id.player_flag & 3, item)
+            })
+        });
+        let weapon = assets.weapon(weapon_file);
+        let no_weapon = crate::model::Emw {
+            skeleton: Default::default(),
+            keyframes: Vec::new(),
+            clips: Vec::new(),
+            mesh: Default::default(),
+        };
+        let weapon = weapon.unwrap_or(&no_weapon);
+        let clips = crate::weapons::WeaponClips {
+            emd: &assets.emd.clips,
+            emw: &assets.emw.clips,
+            room: room_clips,
+            weapon: &weapon.clips,
+            emd_keyframes: &assets.emd.keyframes,
+            emd_skeleton: &assets.emd.skeleton,
+            weapon_keyframes: &weapon.keyframes,
+            weapon_skeleton: &weapon.skeleton,
+        };
+        crate::weapons::update(context.game, context.player, context.room, &clips, pad);
     }
     context.game.sync_entity_from_player(context.player);
     // The gated reach finished this tick: raise the viewer flag the action
@@ -6377,6 +6748,10 @@ fn enter_transition(
     transition: &game::RoomTransition,
 ) -> Result<LoadedRoom> {
     let mut loaded = load_room(pack, transition.target)?;
+    // A door load snapshots the outgoing enemies and clears the live list
+    // before the destination boots (see `finish_transition`).
+    game.snapshot_enemies(transition.target.room as i8 != game.id.room as i8);
+    game.clear_room_entities();
     // A door load resets the player's animation id (see `finish_transition`).
     game.entities[0].set_state(0);
     game.entities[0].action_behavior = 0;
@@ -6456,6 +6831,8 @@ const KEY_RSHIFT: u32 = 1 << 12;
 const KEY_ESCAPE: u32 = 1 << 13;
 const KEY_F1: u32 = 1 << 14;
 const KEY_F9: u32 = 1 << 15;
+const KEY_AIM: u32 = 1 << 16;
+const KEY_FIRE: u32 = 1 << 17;
 /// Confirm (Space or Return).
 const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
 /// Cancel (X, Backspace or Escape).
@@ -6482,6 +6859,8 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
         SDL_SCANCODE_ESCAPE => KEY_ESCAPE,
         SDL_SCANCODE_F1 => KEY_F1,
         SDL_SCANCODE_F9 => KEY_F9,
+        SDL_SCANCODE_C => KEY_AIM,
+        SDL_SCANCODE_Z => KEY_FIRE,
         _ => return None,
     })
 }
@@ -6569,6 +6948,10 @@ impl InputState {
                 run: active & KEY_RUN != 0,
                 action_held: active & KEY_CONFIRM != 0,
                 action_pressed: pressed & KEY_CONFIRM != 0,
+                aim: active & KEY_AIM != 0,
+                aim_pressed: pressed & KEY_AIM != 0,
+                fire: active & KEY_FIRE != 0,
+                fire_pressed: pressed & KEY_FIRE != 0,
                 slow_motion: false,
             },
             action: active & KEY_CONFIRM != 0,
@@ -6622,6 +7005,16 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
 struct PlayerAssets {
     emd: Emd,
     emw: crate::model::Emw,
+    /// The character block's weapon animations by EMW file id, loaded from the
+    /// row of [`crate::weapons::WEAPON_EMW`]. A missing file is absent.
+    weapons: std::collections::HashMap<u8, crate::model::Emw>,
+}
+
+impl PlayerAssets {
+    /// The active weapon's clips and mesh for an EMW file id.
+    fn weapon(&self, file: Option<u8>) -> Option<&crate::model::Emw> {
+        self.weapons.get(&file?)
+    }
 }
 
 /// The room objects to submit for `camera`, in declared slot order.
@@ -6657,7 +7050,7 @@ fn visible_objects<'a>(
         // The camera-switch cull uses the composed world translation, the
         // original's `is_entity_in_switch_zone(record + 0x54)`.
         let mut world = objects::world_matrix(objects, slot, player_pos, player_angle);
-        if !npc::in_camera_zone(room, camera, world.t) {
+        if !enemy::in_camera_zone(room, camera, world.t) {
             continue;
         }
         if object_render_skipped(room, camera, record) {
@@ -6707,7 +7100,7 @@ fn visible_items<'a>(
         };
         let world =
             objects::item_world_matrix(items, objects, lighting, slot, player_pos, player_angle);
-        if !npc::in_camera_zone(room, camera, world.t) {
+        if !enemy::in_camera_zone(room, camera, world.t) {
             continue;
         }
         visible.push((asset, record, world));
@@ -6760,12 +7153,17 @@ fn object_render_skipped(room: &RoomState, camera: usize, record: &objects::Obje
 /// original composes `RotMatrixYXZ(0, yaw, pitch)` onto its world matrix
 /// whenever the look-at flags are non-zero, so a cleared slew-enable bit
 /// freezes the last aim in place.
-fn apply_look_at(joints: &mut [anim::Mat4x3], entity: &game::Entity, clock: &npc::EntityAnim) {
-    if entity.look_at_flags == 0 || joints.len() < 2 {
+fn apply_look_at(joints: &mut [anim::Mat4x3], entity: &game::Entity, clock: &enemy::EntityAnim) {
+    if entity.look_at_flags == 0 {
         return;
     }
-    joints[1] = anim::compose(
-        &joints[1],
+    // The character models' tracking joint is 1; the Tyrant names joint 2.
+    let index = usize::from(entity.look_at_joint.max(1));
+    let Some(joint) = joints.get_mut(index) else {
+        return;
+    };
+    *joint = anim::compose(
+        joint,
         &anim::look_at_matrix(clock.look_at_yaw, clock.look_at_pitch),
     );
 }
@@ -6796,16 +7194,16 @@ fn joint_hidden_mask(
     members: u32,
     room: &RoomState,
     camera: usize,
-    joint_flags: u16,
+    joint_flags: u32,
     joints: &[anim::Mat4x3],
 ) -> u32 {
-    let mut hidden = u32::from(joint_flags);
+    let mut hidden = joint_flags;
     for (index, joint) in joints.iter().enumerate() {
         if index >= 32 {
             break;
         }
         let member = members & (1 << index) != 0;
-        let in_zone = npc::in_camera_zone(room, camera, joint.t);
+        let in_zone = enemy::in_camera_zone(room, camera, joint.t);
         let draws = if entity_in_switch_zone {
             !member || in_zone
         } else {
@@ -6841,7 +7239,7 @@ fn render_frame(
     player_state: &player::PlayerState,
     game: &mut game::GameState,
     assets: Option<&PlayerAssets>,
-    npc_models: &mut npc::EntityModelCache,
+    npc_models: &mut enemy::EntityModelCache,
     masks: &mut MaskCache,
     shadows: &mut ShadowCache,
     effect_cache: &mut EffectPageCache,
@@ -6885,10 +7283,10 @@ fn render_frame(
             texture,
             pos: player_state.pos,
             angle: player_state.angle,
-            half_x: shadow::PLAYER_HALF_X,
-            half_z: shadow::PLAYER_HALF_Z,
+            half_x: player_state.shadow_half_x,
+            half_z: player_state.shadow_half_z,
             lift: shadow::offset_y(id, room.current_cut),
-            tint: shadow::billboard_tint(shadow::PLAYER_COLOR),
+            tint: shadow::billboard_tint(player_state.shadow_tint),
         });
     }
 
@@ -6919,6 +7317,14 @@ fn render_frame(
                     &assets.emd.clips,
                 ),
             },
+            player::ClipSource::Weapon => match assets.weapon(player_state.weapon.weapon_file) {
+                Some(weapon) => (&weapon.skeleton, &weapon.keyframes, &weapon.clips),
+                None => (
+                    &assets.emd.skeleton,
+                    &assets.emd.keyframes,
+                    &assets.emd.clips,
+                ),
+            },
         };
         // The blended pose the clock shows for the applied frame, then the
         // tracking joint's aim composed onto it.
@@ -6934,43 +7340,86 @@ fn render_frame(
     let mut models: Vec<Arc<Emd>> = Vec::new();
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut npc_hidden: Vec<u32> = Vec::new();
+    let mut npc_tints: Vec<[u8; 3]> = Vec::new();
+    let mut npc_weapon_ids: Vec<Option<u16>> = Vec::new();
+    let mut npc_zone_gate: Vec<bool> = Vec::new();
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
         if !entity.active() {
             continue;
         }
-        // A character queues its own fade sprite whenever it entered the
-        // current camera's switch zone, with the per-character tint and quad
-        // from `character_init` and the local offset applied to its position.
+        // A Yawn body segment draws no mesh (the original's entity renderer
+        // returns early for id 0x0D/0x12 with sub-type 1), but it still
+        // queues its ground quad - except the tail segment, whose own quad the
+        // original's whole-body shadow pass never reaches.
+        let yawn_segment = matches!(entity.id, 0x0D | 0x12) && entity.behavior_flags == 1;
+        let shadow_gate = entity.has_enter_switch_zone & 0x7F != 0
+            && !(yawn_segment && entity.yawn_joint == 0x0E);
+        // An entity queues its own ground quad whenever it entered the current
+        // camera's switch zone: characters read the per-character tint and
+        // quad from `character_init`, monsters the scripted override.
         if let Some(texture) = shadow_texture
-            && entity.has_enter_switch_zone != 0
-            && let Some(init) = npc::data::character_shadow(entity.id, &game.flags)
+            && shadow_gate
         {
-            shadow_list.push(render::Shadow {
-                texture,
-                pos: [
-                    entity.pos[0] + i32::from(init.shadow_offset[0]),
-                    entity.pos[1],
-                    entity.pos[2] + i32::from(init.shadow_offset[2]),
-                ],
-                angle: entity.angle,
-                half_x: i32::from(init.shadow_half_x),
-                half_z: i32::from(init.shadow_half_z),
-                lift: shadow::offset_y(id, room.current_cut),
-                tint: shadow::billboard_tint(init.tint),
-            });
+            let shadow = if let Some(init) = enemy::data::character_shadow(entity.id, &game.flags) {
+                Some(render::Shadow {
+                    texture,
+                    pos: [
+                        entity.pos[0] + i32::from(init.shadow_offset[0]),
+                        entity.pos[1],
+                        entity.pos[2] + i32::from(init.shadow_offset[2]),
+                    ],
+                    angle: entity.angle,
+                    half_x: i32::from(init.shadow_half_x),
+                    half_z: i32::from(init.shadow_half_z),
+                    lift: shadow::offset_y(id, room.current_cut),
+                    tint: shadow::billboard_tint(init.tint),
+                })
+            } else if !entity.shadow_suppressed
+                && (entity.shadow_half_x != 0 || entity.shadow_half_z != 0)
+            {
+                Some(render::Shadow {
+                    texture,
+                    pos: [
+                        entity.pos[0] + i32::from(entity.shadow_offset[0]),
+                        entity.pos[1] + i32::from(entity.shadow_offset[1]),
+                        entity.pos[2] + i32::from(entity.shadow_offset[2]),
+                    ],
+                    angle: entity.angle,
+                    half_x: i32::from(entity.shadow_half_x),
+                    half_z: i32::from(entity.shadow_half_z),
+                    lift: shadow::offset_y(id, room.current_cut),
+                    tint: shadow::billboard_tint(entity.shadow_tint),
+                })
+            } else {
+                None
+            };
+            if let Some(shadow) = shadow {
+                shadow_list.push(shadow);
+            }
         }
-        let Some(model) = npc_models.get(pack, entity.id) else {
+        if yawn_segment {
+            continue;
+        }
+        let Some(model) = npc_models.get(pack, entity.id, id.player_flag & 1) else {
             continue;
         };
-        let Some(keyframe) =
-            game.entity_anims[slot].pose_keyframe(entity, &model.clips, &model.keyframes)
-        else {
-            continue;
+        // A Yawn head draws from its own fixed-point chain; every other
+        // monster poses from the shared clock's keyframe.
+        let mut joints = if let Some(worlds) = game.entity_anims[slot].yawn_render_worlds(entity) {
+            worlds
+        } else {
+            let Some(keyframe) =
+                game.entity_anims[slot].pose_keyframe(entity, &model.clips, &model.keyframes)
+            else {
+                continue;
+            };
+            let entity_matrix =
+                anim::entity_matrix_scaled(entity.pos, entity.angle, entity.joint_scale);
+            let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
+            apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
+            joints
         };
-        let entity_matrix = anim::entity_matrix(entity.pos, entity.angle);
-        let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
-        apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
         let hidden = joint_hidden_mask(
             entity.has_enter_switch_zone & 0x7f != 0,
             member_joint_class(entity.id),
@@ -6980,8 +7429,14 @@ fn render_frame(
             &joints,
         );
         models.push(model);
-        npc_joints.push(joints);
+        npc_joints.push(std::mem::take(&mut joints));
         npc_hidden.push(hidden);
+        npc_tints.push(entity.model_tint_rgb());
+        npc_weapon_ids.push(crate::weapons::character_weapon_id(
+            entity.id,
+            entity.behavior_flags,
+        ));
+        npc_zone_gate.push(entity.has_enter_switch_zone & 0x7F != 0);
     }
 
     // The room's object and item models are submitted before the NPC and
@@ -7043,14 +7498,52 @@ fn render_frame(
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for ((model, joints), hidden) in models.iter().zip(&npc_joints).zip(&npc_hidden) {
+    for (((model, joints), hidden), tint) in models
+        .iter()
+        .zip(&npc_joints)
+        .zip(&npc_hidden)
+        .zip(&npc_tints)
+    {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
-            tint: [255; 3],
+            tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+        });
+    }
+    // The held-weapon meshes of the scripted characters draw with the
+    // character pass: the `WS*.TMD` object rides the character's hand joint
+    // and reuses the character model's texture page, exactly like the
+    // original's weapon-slot TMD.
+    let mut held_weapons: Vec<(usize, Arc<crate::model::Tmd>, Vec<anim::Mat4x3>)> = Vec::new();
+    for (index, weapon_id) in npc_weapon_ids.iter().enumerate() {
+        let Some(file) = *weapon_id else {
+            continue;
+        };
+        // The held weapon is hidden with its character outside the switch
+        // zone, exactly like the body's joint gate.
+        if !npc_zone_gate[index] {
+            continue;
+        }
+        let Some(tmd) = npc_models.weapon_tmd(pack, file) else {
+            continue;
+        };
+        let Some(hand) = npc_joints[index].get(crate::weapons::WEAPON_JOINT) else {
+            continue;
+        };
+        held_weapons.push((index, tmd, vec![*hand]));
+    }
+    for (index, tmd, joints) in &held_weapons {
+        let texture = &models[*index].texture;
+        meshes.push(EntityMesh {
+            mesh: tmd,
+            texture,
+            joints,
+            tint: npc_tints[*index],
+            blend_weight: None,
+            hidden_joints: 0,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -7072,6 +7565,248 @@ fn render_frame(
             tint: game.player_tint,
             blend_weight: None,
             hidden_joints: hidden,
+        });
+    }
+    // The held weapon's mesh draws at the hand joint while the weapon bank
+    // poses the body: the EMW's single mesh object is authored in joint 14's
+    // space, exactly like the original's weapon-slot TMD.
+    let mut weapon_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    if let (Some(assets), Some(joints)) = (assets, &player_joints)
+        && player_state.clip_source == player::ClipSource::Weapon
+        && let Some(weapon) = assets.weapon(player_state.weapon.weapon_file)
+        && let Some(hand) = joints.get(crate::weapons::WEAPON_JOINT)
+    {
+        weapon_joints.push(vec![*hand]);
+        meshes.push(EntityMesh {
+            mesh: &weapon.mesh,
+            // The EMW mesh carries no texture block; its primitives sample the
+            // player's own texture page, like the original's page-7 bank.
+            texture: &assets.emd.texture,
+            joints: &weapon_joints[0],
+            tint: [255; 3],
+            blend_weight: None,
+            hidden_joints: 0,
+        });
+    }
+
+    // The web-thread clones draw after the entity pass and the player, the
+    // point the original's 2D sprite list is flushed. Only clones whose parent
+    // script ticked them this frame are live; each is posed from its frozen
+    // spawn-time animation snapshot with the clone's own transform. A spent
+    // clone also queues its web-coloured ground shadow.
+    let mut web_models: Vec<Arc<Emd>> = Vec::new();
+    let mut web_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    let mut web_hidden: Vec<u32> = Vec::new();
+    let mut web_tints: Vec<[u8; 3]> = Vec::new();
+    for clone in game.web_clones.iter().flatten() {
+        if !clone.live || clone.entity.has_enter_switch_zone == 0 {
+            continue;
+        }
+        if clone.entity.status_flags == 0
+            && (clone.entity.shadow_half_x != 0 || clone.entity.shadow_half_z != 0)
+            && let Some(texture) = shadow_texture
+        {
+            shadow_list.push(render::Shadow {
+                texture,
+                pos: [
+                    clone.entity.pos[0] + i32::from(clone.entity.shadow_offset[0]),
+                    clone.entity.pos[1] + i32::from(clone.entity.shadow_offset[1]),
+                    clone.entity.pos[2] + i32::from(clone.entity.shadow_offset[2]),
+                ],
+                angle: clone.entity.angle,
+                half_x: i32::from(clone.entity.shadow_half_x),
+                half_z: i32::from(clone.entity.shadow_half_z),
+                lift: shadow::offset_y(id, room.current_cut),
+                tint: shadow::billboard_tint(clone.entity.shadow_tint),
+            });
+        }
+        let Some(model) = npc_models.get(pack, clone.entity.id, id.player_flag & 1) else {
+            continue;
+        };
+        let joints = clone.anim.joint_worlds(&clone.entity, &model.clips);
+        if joints.is_empty() {
+            continue;
+        }
+        let hidden = joint_hidden_mask(
+            true,
+            member_joint_class(clone.entity.id),
+            room,
+            room.current_cut,
+            clone.entity.joint_flags,
+            &joints,
+        );
+        web_models.push(model);
+        web_joints.push(joints);
+        web_hidden.push(hidden);
+        web_tints.push(clone.entity.model_tint_rgb());
+    }
+    for (((model, joints), hidden), tint) in web_models
+        .iter()
+        .zip(&web_joints)
+        .zip(&web_hidden)
+        .zip(&web_tints)
+    {
+        meshes.push(EntityMesh {
+            mesh: &model.mesh,
+            texture: &model.texture,
+            joints,
+            tint: *tint,
+            blend_weight: None,
+            hidden_joints: *hidden,
+        });
+    }
+
+    // The Plant 42 companions draw after the entity pass: each is the plant
+    // model's own extra mesh object (the flower body and the root ball) at the
+    // companion's transform and scale, with every other object hidden. Only
+    // companions whose plant ticked them this frame are live; the flower body
+    // also queues its ground quad.
+    let mut companion_models: Vec<Arc<Emd>> = Vec::new();
+    let mut companion_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    let mut companion_hidden: Vec<u32> = Vec::new();
+    let mut companion_tints: Vec<[u8; 3]> = Vec::new();
+    for companion in game.companions.iter().flatten() {
+        let heart = companion.kind == enemy::companion::CompanionKind::Heart;
+        if !companion.live
+            || !game
+                .entities
+                .get(usize::from(companion.owner))
+                .is_some_and(|entity| entity.active())
+            // The heart's `live` bit already carries the owner's switch-zone
+            // entry (its own draw gate); the plant companions are gated on the
+            // companion's own zone membership instead.
+            || (!heart && !enemy::in_camera_zone(room, room.current_cut, companion.entity.pos))
+        {
+            continue;
+        }
+        if companion.kind == enemy::companion::CompanionKind::Body
+            && (companion.entity.shadow_half_x != 0 || companion.entity.shadow_half_z != 0)
+            && let Some(texture) = shadow_texture
+        {
+            shadow_list.push(render::Shadow {
+                texture,
+                pos: [
+                    companion.entity.pos[0] + i32::from(companion.entity.shadow_offset[0]),
+                    companion.entity.pos[1] + i32::from(companion.entity.shadow_offset[1]),
+                    companion.entity.pos[2] + i32::from(companion.entity.shadow_offset[2]),
+                ],
+                angle: companion.entity.angle,
+                half_x: i32::from(companion.entity.shadow_half_x),
+                half_z: i32::from(companion.entity.shadow_half_z),
+                lift: shadow::offset_y(id, room.current_cut),
+                tint: shadow::billboard_tint(companion.entity.shadow_tint),
+            });
+        }
+        let Some(model) = npc_models.get(pack, companion.entity.id, id.player_flag & 1) else {
+            continue;
+        };
+        let object = companion.mesh_object();
+        let mut matrix = companion.matrix.unwrap_or_else(|| {
+            anim::entity_matrix_rotated(
+                companion.entity.pos,
+                companion.entity.pitch,
+                companion.entity.angle,
+                companion.entity.roll,
+            )
+        });
+        enemy::custom_anim::scale_columns_xyz(&mut matrix, companion.render_scale());
+        // One identity matrix per joint, with the companion's transform at
+        // its own mesh object; every other object is hidden.
+        let count = model.skeleton.relative.len().max(object + 1);
+        let identity = anim::Mat4x3 {
+            r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            t: [0, 0, 0],
+        };
+        let mut joints = vec![identity; count];
+        if let Some(slot) = joints.get_mut(object) {
+            *slot = matrix;
+        }
+        companion_models.push(model);
+        companion_joints.push(joints);
+        companion_hidden.push(!(1u32 << object));
+        companion_tints.push(companion.entity.model_tint_rgb());
+    }
+    for (((model, joints), hidden), tint) in companion_models
+        .iter()
+        .zip(&companion_joints)
+        .zip(&companion_hidden)
+        .zip(&companion_tints)
+    {
+        meshes.push(EntityMesh {
+            mesh: &model.mesh,
+            texture: &model.texture,
+            joints,
+            tint: *tint,
+            blend_weight: None,
+            hidden_joints: *hidden,
+        });
+    }
+
+    // The Tyrant's claw ghosts and severed limbs draw after the companion
+    // pass: each is one mesh object of the Tyrant model at a scratch matrix
+    // (the ghost copies of the claw, the free limbs the rocket death
+    // launched). The live pose of those joints is already hidden by the
+    // script's joint flags, so nothing double-draws.
+    let mut tyrant_models: Vec<Arc<Emd>> = Vec::new();
+    let mut tyrant_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    let mut tyrant_hidden: Vec<u32> = Vec::new();
+    let mut tyrant_tints: Vec<[u8; 3]> = Vec::new();
+    for slot in 1..game::ENTITY_COUNT {
+        let entity = &game.entities[slot];
+        if !entity.active() || !matches!(entity.id, 0x0C | 0x10) {
+            continue;
+        }
+        let mut draws: Vec<(usize, anim::Mat4x3)> = Vec::new();
+        if entity.id != 0x0C && entity.ty_flags() & 8 == 0 && game.tyrant.ghost.live {
+            draws.push((enemy::tyrant::CLAW_OBJECT, game.tyrant.ghost.matrices[0]));
+            draws.push((enemy::tyrant::CLAW_OBJECT, game.tyrant.ghost.matrices[1]));
+        }
+        for (index, limb) in game.tyrant.limbs.iter().enumerate() {
+            if limb.live {
+                draws.push((enemy::tyrant::LIMB_JOINTS[index], limb.world));
+            }
+        }
+        if draws.is_empty() {
+            continue;
+        }
+        let Some(model) = npc_models.get(pack, entity.id, id.player_flag & 1) else {
+            continue;
+        };
+        let count = model.skeleton.relative.len().max(
+            draws
+                .iter()
+                .map(|(object, _)| object + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        for (object, matrix) in draws {
+            let identity = anim::Mat4x3 {
+                r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+                t: [0, 0, 0],
+            };
+            let mut joints = vec![identity; count];
+            if let Some(target) = joints.get_mut(object) {
+                *target = matrix;
+            }
+            tyrant_models.push(Arc::clone(&model));
+            tyrant_joints.push(joints);
+            tyrant_hidden.push(!(1u32 << object));
+            tyrant_tints.push(entity.model_tint_rgb());
+        }
+    }
+    for (((model, joints), hidden), tint) in tyrant_models
+        .iter()
+        .zip(&tyrant_joints)
+        .zip(&tyrant_hidden)
+        .zip(&tyrant_tints)
+    {
+        meshes.push(EntityMesh {
+            mesh: &model.mesh,
+            texture: &model.texture,
+            joints,
+            tint: *tint,
+            blend_weight: None,
+            hidden_joints: *hidden,
         });
     }
 
@@ -7187,7 +7922,31 @@ fn load_player_assets(pack: &Pack, id: RoomId) -> Option<PlayerAssets> {
             return None;
         }
     };
-    Some(PlayerAssets { emd, emw })
+    // Load the character block's weapon animations: every distinct EMW file
+    // id the weapon table names. A missing file is logged and skipped, and the
+    // weapon machine falls back to the locomotion pose.
+    let mut weapons = std::collections::HashMap::new();
+    for weapon in 0..=0x0Du8 {
+        let Some(file) = crate::weapons::weapon_emw_id(character, weapon) else {
+            continue;
+        };
+        if weapons.contains_key(&file) {
+            continue;
+        }
+        let Some(entry) = crate::weapons::weapon_emw_entry(character, weapon) else {
+            continue;
+        };
+        match pack.read(&entry) {
+            Ok(bytes) => match emd::parse_emw(bytes) {
+                Ok(model) => {
+                    weapons.insert(file, model);
+                }
+                Err(err) => eprintln!("warning: invalid weapon clips {entry}: {err:#}"),
+            },
+            Err(err) => eprintln!("warning: missing weapon clips {entry}: {err:#}"),
+        }
+    }
+    Some(PlayerAssets { emd, emw, weapons })
 }
 
 /// Load the room's shipped primary track from the pack, if the table names
@@ -7732,7 +8491,7 @@ mod tests {
         let mut player_state = player::spawn(id, &room);
         let mut masks = MaskCache::default();
         let mut shadows = ShadowCache::default();
-        let mut npc_models = npc::EntityModelCache::default();
+        let mut npc_models = enemy::EntityModelCache::default();
 
         let mut idle = Framebuffer::new();
         render_frame(
@@ -7931,7 +8690,7 @@ mod tests {
             }
             assert!(game.doors[0].is_some(), "init should register the door");
 
-            let mut npc_models = npc::EntityModelCache::default();
+            let mut npc_models = enemy::EntityModelCache::default();
             let idle = tick_room(
                 &mut command_vm,
                 &mut event_vm,
@@ -7942,6 +8701,7 @@ mod tests {
                     player_assets: None,
                     pack: &pack,
                     npc_models: &mut npc_models,
+                    enemy_lua: None,
                 },
                 player::Input::default(),
             );
@@ -7956,6 +8716,7 @@ mod tests {
                     player_assets: None,
                     pack: &pack,
                     npc_models: &mut npc_models,
+                    enemy_lua: None,
                 },
                 player::Input {
                     action_pressed: true,
@@ -7980,6 +8741,108 @@ mod tests {
         assert_eq!(player_state.angle, 1024);
         assert!(game.doors[0].is_none());
         assert!(game.room_actions[0].is_none());
+    }
+
+    #[test]
+    fn a_door_transition_snapshots_and_restores_an_enemy() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("game.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let a = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let b = RoomId {
+            stage: 1,
+            room: 1,
+            player_flag: 0,
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(&a.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer
+            .add(&b.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&a.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&b.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut loaded = load_room(&pack, a).unwrap();
+        let mut game = game::GameState::new(a, &loaded.room);
+        let mut player_state = player::spawn(a, &loaded.room);
+        // One live, non-force monster in room A.
+        let entity = &mut game.entities[1];
+        entity.id = 0x13;
+        entity.set_active(true);
+        entity.status_flags = 0x41;
+        entity.behavior_flags = 3;
+        entity.health = 55;
+        entity.pos = [111, 0, 222];
+        entity.angle = 0x400;
+        entity.variant = 0x30;
+        entity.death_event_id = 2;
+        game.enemy_count = 1;
+
+        // A -> B snapshots the monster and clears the live list.
+        let to_b = game::RoomTransition {
+            target: b,
+            pos: [0, 0, 0],
+            angle: 0,
+        };
+        loaded = enter_transition(&pack, &mut game, &mut player_state, &to_b).unwrap();
+        assert_eq!(loaded.id, b);
+        assert_eq!(game.enemy_count, 0);
+        let saved = game.saved_enemies[0];
+        assert!(saved.occupied());
+        assert_eq!(saved.room, a.room);
+        assert_eq!(saved.enemy_type, 0x30);
+        assert_eq!(saved.pos, [111, 0, 222]);
+
+        // B -> A ages the snapshot; the destination's no-force record
+        // restores it instead of using the record's position.
+        let to_a = game::RoomTransition {
+            target: a,
+            pos: [0, 0, 0],
+            angle: 0,
+        };
+        loaded = enter_transition(&pack, &mut game, &mut player_state, &to_a).unwrap();
+        assert_eq!(loaded.id, a);
+        assert_eq!(
+            game.saved_enemies[0].valid, 4,
+            "one room change aged the TTL"
+        );
+        let operands: Vec<scd::ir::Operand> = [
+            0x13u8 as i64, // id
+            3,             // behavior
+            0xFF,          // guard
+            0,             // force off
+            2,             // SCA words
+            0,             // rotation X
+            0,             // yaw
+            0,             // rotation Z
+            999,           // X (ignored on a restore hit)
+            0,             // Y
+            999,           // Z
+            0,             // slot nibble
+            0,             // animation id
+            0,             // animation frame
+            3,             // variant high nibble
+        ]
+        .into_iter()
+        .map(|value| scd::ir::Operand {
+            value,
+            target: None,
+        })
+        .collect();
+        assert!(game.spawn_enemy(&operands));
+        assert_eq!(game.entities[1].pos, [111, 0, 222], "restored position");
+        assert_eq!(game.entities[1].angle, 0x400);
+        assert_eq!(game.entities[1].behavior_flags, 3);
+        assert_eq!(game.entities[1].id, 0x13, "the reset block writes the id");
+        assert!(!game.saved_enemies[0].occupied(), "the slot was consumed");
     }
 
     /// A two-room pack (`100` and `101`) whose rooms block the origin and
@@ -8589,7 +9452,7 @@ mod tests {
             let scripts = &loaded.scripts;
             let mut command_vm = scd::vm::CommandVm::new(scripts);
             let mut event_vm = scd::vm::EventVm::new(scripts);
-            let mut npc_models = npc::EntityModelCache::default();
+            let mut npc_models = enemy::EntityModelCache::default();
             for _ in 0..2 {
                 tick_room(
                     &mut command_vm,
@@ -8601,6 +9464,7 @@ mod tests {
                         player_assets: None,
                         pack: &pack,
                         npc_models: &mut npc_models,
+                        enemy_lua: None,
                     },
                     player::Input::default(),
                 );
@@ -8693,7 +9557,7 @@ mod tests {
 
         let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
         let mut event_vm = scd::vm::EventVm::new(&loaded.scripts);
-        let mut npc_models = npc::EntityModelCache::default();
+        let mut npc_models = enemy::EntityModelCache::default();
         tick_room(
             &mut command_vm,
             &mut event_vm,
@@ -8704,6 +9568,7 @@ mod tests {
                 player_assets: None,
                 pack: &pack,
                 npc_models: &mut npc_models,
+                enemy_lua: None,
             },
             player::Input {
                 action_pressed: true,
@@ -8803,7 +9668,7 @@ mod tests {
         player_state.angle = 0x800;
         game.sync_entity_from_player(&player_state);
         let start = player_state.pos;
-        let mut npc_models = npc::EntityModelCache::default();
+        let mut npc_models = enemy::EntityModelCache::default();
         for _ in 0..30 {
             tick_room(
                 &mut command_vm,
@@ -8815,6 +9680,7 @@ mod tests {
                     player_assets: loaded.player_assets.as_ref(),
                     pack: &pack,
                     npc_models: &mut npc_models,
+                    enemy_lua: None,
                 },
                 player::Input {
                     up: true,
@@ -9017,21 +9883,26 @@ mod tests {
     #[test]
     fn entity_model_cache_remembers_missing_and_invalid_models() {
         let mut writer = PackWriter::new();
-        writer.add("npc/23.emd", b"not-an-emd".to_vec()).unwrap();
+        writer
+            .add("enemy/em23.emd", b"not-an-emd".to_vec())
+            .unwrap();
         let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
 
-        let mut cache = npc::EntityModelCache::default();
+        let mut cache = enemy::EntityModelCache::default();
         // An absent entry yields None and is remembered so the pack is only
         // read once.
-        assert!(cache.get(&pack, 0x20).is_none());
-        assert!(cache.get(&pack, 0x20).is_none());
-        assert!(cache.missing.contains(&0x20));
+        assert!(cache.get(&pack, 0x20, 0).is_none());
+        assert!(cache.get(&pack, 0x20, 0).is_none());
+        assert!(cache.missing.contains(&(0x20, 0)));
         // A present but invalid entry yields None too.
-        assert!(cache.get(&pack, 0x23).is_none());
-        assert!(cache.missing.contains(&0x23));
-        // Ids outside the character range have no model path and no warning.
-        assert!(cache.get(&pack, 0x1F).is_none());
-        assert!(cache.get(&pack, 0xFF).is_none());
+        assert!(cache.get(&pack, 0x23, 0).is_none());
+        assert!(cache.missing.contains(&(0x23, 0)));
+        // A monster id tries its scenario and generic entries and is
+        // remembered as absent when neither exists.
+        assert!(cache.get(&pack, 0x1F, 0).is_none());
+        assert!(cache.missing.contains(&(0x1F, 0)));
+        // An id outside the dispatch range has no model path and no warning.
+        assert!(cache.get(&pack, 0xFF, 0).is_none());
     }
 
     #[test]
@@ -9041,21 +9912,25 @@ mod tests {
             return;
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
-        let mut cache = npc::EntityModelCache::default();
+        let mut cache = enemy::EntityModelCache::default();
 
-        for id in crate::npc::FIRST_ID..=crate::npc::LAST_ID {
+        for id in crate::enemy::FIRST_ID..=crate::enemy::LAST_ID {
             let model = cache
-                .get(&pack, id)
-                .unwrap_or_else(|| panic!("npc/{id:02x}.emd missing from the pack"));
-            assert_eq!(model.skeleton.relative.len(), 15, "npc/{id:02x}.emd joints");
-            assert!(!model.mesh.objects.is_empty(), "npc/{id:02x}.emd mesh");
+                .get(&pack, id, 0)
+                .unwrap_or_else(|| panic!("enemy/em{id:02x}.emd missing from the pack"));
+            assert_eq!(
+                model.skeleton.relative.len(),
+                15,
+                "enemy/em{id:02x}.emd joints"
+            );
+            assert!(!model.mesh.objects.is_empty(), "enemy/em{id:02x}.emd mesh");
         }
 
         // A second request returns the same parsed model, not a re-parse.
-        let first = cache.get(&pack, 0x23).unwrap();
-        let second = cache.get(&pack, 0x23).unwrap();
+        let first = cache.get(&pack, 0x23, 0).unwrap();
+        let second = cache.get(&pack, 0x23, 0).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
-        assert!(cache.get(&pack, 0x1F).is_none());
+        assert!(cache.get(&pack, 0x1F, 0).is_none());
     }
 
     /// The save round-trip the full-game soak asserts: capture the state,
@@ -9280,7 +10155,7 @@ mod tests {
         assert!(!cut.masks.is_empty(), "room 1000 cut 0 has mask sprites");
         let assets = loaded.player_assets.as_ref().expect("player assets");
         let (keyframes, clips) = match player_state.clip_source {
-            player::ClipSource::Emd | player::ClipSource::Room => {
+            player::ClipSource::Emd | player::ClipSource::Room | player::ClipSource::Weapon => {
                 (&assets.emd.keyframes, &assets.emd.clips)
             }
             player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
@@ -9351,6 +10226,7 @@ mod tests {
 
         let mut sounds = vec![game::EntitySound {
             name: "ft_wdA",
+            bank: 2,
             column: 45,
             pos: [0, 0, 0],
         }];
@@ -9408,6 +10284,7 @@ mod tests {
         ) {
             let mut sounds = vec![game::EntitySound {
                 name: "ft_wdA",
+                bank: 2,
                 column,
                 pos: [1000, 0, 0],
             }];
@@ -11195,6 +12072,7 @@ end
                 clips: clip_bank(6),
                 mesh: Tmd::default(),
             },
+            weapons: std::collections::HashMap::new(),
         }
     }
 
@@ -11209,7 +12087,7 @@ end
         event_vm: &mut scd::vm::EventVm,
         input: player::Input,
     ) {
-        let mut npc_models = npc::EntityModelCache::default();
+        let mut npc_models = enemy::EntityModelCache::default();
         let _ = tick_room(
             command_vm,
             event_vm,
@@ -11220,6 +12098,7 @@ end
                 player_assets: Some(assets),
                 pack,
                 npc_models: &mut npc_models,
+                enemy_lua: None,
             },
             input,
         );
@@ -14685,13 +15564,13 @@ end
         entity.angle = 0;
 
         let model = synthetic_npc_model();
-        let mut npc_models = npc::EntityModelCache::default();
-        npc_models.models.insert(0x21, Arc::new(model));
+        let mut npc_models = enemy::EntityModelCache::default();
+        npc_models.models.insert((0x21, 0), Arc::new(model));
         let pack = Pack::from_bytes(PackWriter::new().to_bytes().unwrap()).unwrap();
         let player_state = player::spawn(id, &room);
 
         let render =
-            |game: &mut game::GameState, npc_models: &mut npc::EntityModelCache| -> Framebuffer {
+            |game: &mut game::GameState, npc_models: &mut enemy::EntityModelCache| -> Framebuffer {
                 let mut framebuffer = Framebuffer::new();
                 render_frame(
                     &mut framebuffer,
@@ -14733,6 +15612,154 @@ end
                 .iter()
                 .all(|pixel| pixel[..3] == [0, 0, 0]),
             "the off-zone NPC still painted"
+        );
+    }
+
+    /// A synthetic 8bpp `ui/died.tim`: a 2-pixel-wide, 256-row page whose
+    /// palette entry 1 is white and whose index-1 texels sit in both the
+    /// strip region (row 0) and the backdrop region (row 0x40).
+    fn synthetic_died_tim() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0x10u32.to_le_bytes());
+        bytes.extend_from_slice(&0x9u32.to_le_bytes());
+        // CLUT block: 256 entries, entry 1 white.
+        bytes.extend_from_slice(&524u32.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&256u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        for entry in 0..256u16 {
+            let word = if entry == 1 { 0x7FFFu16 } else { 0x0000 };
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        // Image block: 1 unit (2 pixels) wide, 256 rows.
+        bytes.extend_from_slice(&524u32.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&0i16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&256u16.to_le_bytes());
+        for row in 0..256u16 {
+            if row == 0 || row == 0x40 {
+                bytes.extend_from_slice(&[1u8, 0]);
+            } else {
+                bytes.extend_from_slice(&[0u8, 0]);
+            }
+        }
+        bytes
+    }
+
+    /// A synthetic damage schedule: kill the player, run the fall, the
+    /// 90-frame delay, the white-out, the DIED screen and the return to the
+    /// title through the real session tick.
+    #[test]
+    fn a_synthetic_damage_schedule_runs_the_fall_fade_died_and_title() {
+        let dir = TempDir::new();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let pack_path = dir.0.join("death.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &id.rdt_entry(),
+                synthetic_rdt_with_blocking_collision(&door_init_record(
+                    1,
+                    [777, 0, 888],
+                    0x200,
+                    0,
+                )),
+            )
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add("ui/died.tim", synthetic_died_tim()).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+        session.game.apply_player_hurt(i16::MAX, 0);
+        assert!(session.game.entities[0].health < 0, "the player died");
+
+        let mut screen_open_at = None;
+        let mut title_at = None;
+        for tick in 0..900 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.death.screen_open() {
+                screen_open_at.get_or_insert(tick);
+            }
+            if session.take_return_title_request() {
+                title_at = Some(tick);
+                break;
+            }
+        }
+
+        // The fall runs while the delay counts down: the player is in the
+        // death state from the first tick. The synthetic pack carries no
+        // player model, so the fall clip never completes and the state stays
+        // 3; the game-over machine still runs to the title.
+        assert_eq!(session.game.entities[0].state(), 3, "the fall state");
+        let screen_open_at = screen_open_at.expect("the DIED screen opened");
+        // 90 delay frames + 128 fade frames, plus the trigger tick.
+        assert_eq!(screen_open_at, 219);
+        let title_at = title_at.expect("the title returned");
+        assert!(title_at > screen_open_at, "the screen ran before the title");
+        assert!(!session.death.screen_open());
+        assert!(session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
+    }
+
+    /// The DIED screen draws its backdrop and wavy strip from the packed page
+    /// once the machine reaches the settled hold.
+    #[test]
+    fn the_died_screen_draws_the_packed_page() {
+        let dir = TempDir::new();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let pack_path = dir.0.join("death-art.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &id.rdt_entry(),
+                synthetic_rdt_with_blocking_collision(&door_init_record(
+                    1,
+                    [777, 0, 888],
+                    0x200,
+                    0,
+                )),
+            )
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add("ui/died.tim", synthetic_died_tim()).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+        session.game.apply_player_hurt(i16::MAX, 0);
+        // Run into the screen's settled hold (the screen opens at 219; the
+        // hold begins ~78 screen ticks later).
+        for _ in 0..320 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.death.screen_open(), "the screen is up");
+        session.render(&pack);
+        assert!(
+            session
+                .framebuffer
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3] != [0, 0, 0]),
+            "the packed page painted"
         );
     }
 }

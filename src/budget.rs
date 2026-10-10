@@ -46,6 +46,7 @@
 //! | [`MAX_LUA_CHUNKS`] | 256 | a handful | loaded Lua chunks |
 //! | [`MAX_LUA_CHUNK`] | 1 MiB | a few KiB | one Lua chunk |
 //! | [`MAX_SAVE_BYTES`] | 1 MiB | 2 KiB | save slot file |
+//! | [`MAX_COMBAT_TABLE_BYTES`] | 64 KiB | ~7 KiB | `data/combat.bin` |
 //!
 //! Raising a cap is a policy change: measure the new corpus peak, update the
 //! constant and this table, and rerun the budget tests.
@@ -119,6 +120,8 @@ pub const MAX_LUA_CHUNKS: usize = 256;
 pub const MAX_LUA_CHUNK: usize = 1 << 20;
 /// Largest save slot file accepted.
 pub const MAX_SAVE_BYTES: usize = 1 << 20;
+/// Largest combat table blob accepted (`data/combat.bin`).
+pub const MAX_COMBAT_TABLE_BYTES: usize = 1 << 16;
 /// Largest cinepak canvas, in pixels.
 pub const MAX_CINEPAK_PIXELS: usize = MAX_PIXELS;
 

@@ -6,9 +6,9 @@
 mod common;
 
 use arklay::audio;
+use arklay::enemy::walk::{xz_distance_to, zone_path_find};
 use arklay::engine::{SimulatedRoom, simulate_room_seeded};
 use arklay::game::GameState;
-use arklay::npc::walk::{xz_distance_to, zone_path_find};
 use arklay::pack::Pack;
 use arklay::player::{self, Input};
 use arklay::rdt;

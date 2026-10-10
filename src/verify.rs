@@ -49,6 +49,8 @@ pub enum Format {
     Emd,
     /// `*.emw`, a weapon model.
     Emw,
+    /// `*.tmd`, a held-weapon mesh.
+    Tmd,
     /// `*.dor`, a door animation.
     Dor,
     /// `*.wav`, a RIFF/WAVE sample.
@@ -57,10 +59,14 @@ pub enum Format {
     Text,
     /// `map/tables.bin`, the map tables blob.
     MapTables,
+    /// `data/combat.bin`, the shared combat table blob.
+    Combat,
     /// `data/bio_card.dat`, the save prefix.
     BioCard,
     /// `movie/*.avi`, a film.
     Avi,
+    /// `*.lua`, a sandboxed script source.
+    Lua,
     /// Any entry outside the known table.
     Opaque,
 }
@@ -79,12 +85,15 @@ impl Format {
             Self::Ivm => "ivm",
             Self::Emd => "emd",
             Self::Emw => "emw",
+            Self::Tmd => "tmd",
             Self::Dor => "dor",
             Self::Wav => "wav",
             Self::Text => "text",
             Self::MapTables => "maptables",
+            Self::Combat => "combat",
             Self::BioCard => "biocard",
             Self::Avi => "avi",
+            Self::Lua => "lua",
             Self::Opaque => "opaque",
         }
     }
@@ -103,6 +112,9 @@ pub fn classify(path: &str) -> Format {
     }
     if lower == "map/tables.bin" {
         return Format::MapTables;
+    }
+    if lower == "data/combat.bin" {
+        return Format::Combat;
     }
     if lower == "data/bio_card.dat" {
         return Format::BioCard;
@@ -146,9 +158,11 @@ pub fn classify(path: &str) -> Format {
         Some((_, "ivm")) => Format::Ivm,
         Some((_, "emd")) => Format::Emd,
         Some((_, "emw")) => Format::Emw,
+        Some((_, "tmd")) => Format::Tmd,
         Some((_, "dor")) => Format::Dor,
         Some((_, "wav")) => Format::Wav,
         Some((_, "avi")) => Format::Avi,
+        Some((_, "lua")) => Format::Lua,
         _ => Format::Opaque,
     }
 }
@@ -368,6 +382,9 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
         Format::Emw => {
             crate::emd::parse_emw(data)?;
         }
+        Format::Tmd => {
+            crate::tmd::parse(data)?;
+        }
         Format::Dor => {
             crate::door::parse(data)?;
         }
@@ -392,6 +409,9 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
         Format::MapTables => {
             crate::ui::map::MapTables::parse(data)?;
         }
+        Format::Combat => {
+            crate::combat::CombatTables::parse(data)?;
+        }
         Format::BioCard => {
             if data.len() < crate::save::PREFIX_LEN {
                 bail!(
@@ -403,6 +423,9 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
         }
         Format::Avi => {
             crate::avi::Avi::parse(data.to_vec())?;
+        }
+        Format::Lua => {
+            crate::lua::verify_source(data)?;
         }
         Format::Opaque => unreachable!("opaque entries are handled by the caller"),
     }
@@ -468,15 +491,19 @@ mod tests {
         assert_eq!(classify("roommask/100_000.bmp"), Format::Mask);
         assert_eq!(classify("ui/blue.tim"), Format::Tim);
         assert_eq!(classify("item/i00v.ivm"), Format::Ivm);
-        assert_eq!(classify("npc/20.emd"), Format::Emd);
+        assert_eq!(classify("enemy/em20.emd"), Format::Emd);
         assert_eq!(classify("player/00.emw"), Format::Emw);
+        assert_eq!(classify("player/ws202.tmd"), Format::Tmd);
         assert_eq!(classify("door/door00.dor"), Format::Dor);
         assert_eq!(classify("se/a_mcn03.wav"), Format::Wav);
         assert_eq!(classify("text/messages.bin"), Format::Text);
         assert_eq!(classify("text/save.bin"), Format::Text);
         assert_eq!(classify("map/tables.bin"), Format::MapTables);
+        assert_eq!(classify("data/combat.bin"), Format::Combat);
         assert_eq!(classify("data/bio_card.dat"), Format::BioCard);
         assert_eq!(classify("movie/00.avi"), Format::Avi);
+        assert_eq!(classify("enemy/em13.lua"), Format::Lua);
+        assert_eq!(classify("lua/demo.lua"), Format::Lua);
         assert_eq!(classify("data/core00.esp"), Format::Opaque);
         // A future text table or a room the loader can never request stays
         // opaque instead of breaking the command.
@@ -554,6 +581,29 @@ mod tests {
     }
 
     #[test]
+    fn a_held_weapon_tmd_entry_parses() {
+        // An empty TMD: magic, flags, zero objects.
+        let mut tmd = Vec::new();
+        tmd.extend_from_slice(&0x41u32.to_le_bytes());
+        tmd.extend_from_slice(&0u32.to_le_bytes());
+        tmd.extend_from_slice(&0u32.to_le_bytes());
+        let mut writer = PackWriter::new();
+        writer.add("player/ws202.tmd", tmd).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let report = verify_pack(&pack, false);
+        assert!(report.valid(), "failures: {:?}", report.failures);
+        assert_eq!(report.formats[&Format::Tmd].ok, 1);
+
+        // A truncated TMD fails.
+        let mut writer = PackWriter::new();
+        writer.add("player/ws202.tmd", vec![0x41, 0, 0]).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let report = verify_pack(&pack, false);
+        assert!(!report.valid());
+        assert_eq!(report.formats[&Format::Tmd].failed, 1);
+    }
+
+    #[test]
     fn a_good_pack_reports_every_format_and_zero_failures() {
         let mut writer = PackWriter::new();
         writer
@@ -605,13 +655,16 @@ mod tests {
 
         let lenient = verify_pack(&pack, false);
         assert!(lenient.valid());
-        assert_eq!(lenient.opaque, 2);
-        assert_eq!(lenient.ok, 2);
+        assert_eq!(lenient.opaque, 1);
+        assert_eq!(
+            lenient.ok, 2,
+            "the Lua source compiles and the opaque entry passes leniently"
+        );
 
         let strict = verify_pack(&pack, true);
         assert!(!strict.valid());
-        assert_eq!(strict.failed, 2);
-        assert_eq!(strict.opaque, 2);
+        assert_eq!(strict.failed, 1);
+        assert_eq!(strict.opaque, 1);
         assert!(
             strict
                 .failures

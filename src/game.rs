@@ -112,6 +112,10 @@ pub const BANK_SYSTEM: u8 = 4;
 /// Collision radius the `enemy` spawn gives an entity before its own init
 /// overrides it.
 pub const DEFAULT_ENEMY_RADIUS: i16 = 422;
+/// Half-height of the default collision record the `enemy` spawn installs.
+pub const DEFAULT_ENEMY_HALF_HEIGHT: i16 = 0x05FA;
+/// Local centre of the default collision record the `enemy` spawn installs.
+pub const DEFAULT_ENEMY_SCA_OFFSET: [i16; 3] = [0, -0x05FA, 0];
 /// First entity id that is a scripted character.
 pub const CHARACTER_ID_MIN: u8 = 0x20;
 /// Last entity id that is a scripted character.
@@ -240,6 +244,11 @@ pub const MESSAGE_FLAG_PLAYER_STATE: u16 = 0x0001;
 /// [`MESSAGE_FLAG_CONTROLS`]: a pause word can freeze the characters without
 /// locking the player (and vice versa), so the entity tick gates on this one.
 pub const MESSAGE_FLAG_ENTITIES: u16 = 0x002;
+/// `g_message_flags` bit 2: monsters may think. The monster update functions
+/// gate their own state dispatch on this bit (the spider web is the documented
+/// exception: its update has no gate at all), so it is separate from the
+/// character bit [`MESSAGE_FLAG_ENTITIES`].
+pub const MESSAGE_FLAG_MONSTERS: u16 = 0x004;
 /// `g_message_flags` bit 3: effects update. The per-slot behaviour dispatch,
 /// velocity integration and sprite animation all pause while a message's pause
 /// word masks this bit; the billboards themselves stay on screen at their last
@@ -318,6 +327,9 @@ const MSF_MENU_ITEM_VIEW: u8 = 20;
 const MSF_MENU_MODE_ITEMBOX: u8 = 19;
 /// `main_state_flags` bit 0x80: the climb/vault transition is latched.
 const MSF_DOOR_TRANSITION: u8 = 24;
+/// `main_state_flags` bit 0x01000000: the player is dead and the game-over
+/// machine runs. Selector `31 - 24 = 7` in flag bank 5.
+pub const MSF_PLAYER_DEAD: u8 = 7;
 /// `main_state_flags` bit 0x40: `update_room_objects` is pushing an object.
 const MSF_OBJECT_PUSH: u8 = 25;
 /// `main_state_flags` bit 0x10: `set_stairs_zone` saw a ladder entry, so the
@@ -339,10 +351,19 @@ pub const MSF2_SCREEN_SHAKE: u8 = 0x3E;
 /// `check_door` handler latched the approach side this frame. Selector
 /// `0x20 + (31 - 22) = 0x29` in flag bank 5.
 pub const MSF2_DOOR_TURN_PENDING: u8 = 0x29;
+/// `main_state_flags2` bit 0x10000000 (`MSF2_ATTRACT_DEMO`): attract-mode
+/// demo playback. Selector 3 in flag bank 5.
+pub const MSF2_ATTRACT_DEMO: u8 = 3;
+/// `main_state_flags2` bit 0x80000000 (`MSF2_DEATH_VARIANT`): the scripted
+/// death variant that skips the DIED screen. Selector 0 in flag bank 5.
+pub const MSF2_DEATH_VARIANT: u8 = 0;
 /// The four D-pad direction bits of the held/pressed pad word the scripts read
 /// with `ck_bits` (0x38) and that a message dismissal blanks. `up` is bit 0
 /// because the original's walk behaviour tests `dpadHeld & 1` for forward.
 pub const DPAD_DIRECTIONS: u16 = 0x000F;
+/// The action button's bit in the remapped held-pad word ([`dpad_word`]): the
+/// port's closest analogue of the original's masked face-button half.
+pub const PAD_ACTION_HELD: u16 = 0x0080;
 /// State word index of `g_PlayerDpadHeld` (BioCard 0x220).
 pub const STATE_WORD_DPAD_HELD: u8 = 6;
 /// State word index of `g_PlayerDpadPressed` (BioCard 0x222).
@@ -356,6 +377,10 @@ const BIO_BLOCK_BYTES: usize = 52;
 pub const BANK_ITEM_USE: u8 = 9;
 /// Scenario flag raised by the chemical combine effect.
 pub const SCENARIO_FLAG_CHEMICAL_COMBINE: u8 = 0x16;
+
+/// `SCENARIO_FLAG_PLANT42_DEAD` (0x29): Plant 42 defeated; the award raises it
+/// when the last vine falls.
+pub const SCENARIO_FLAG_PLANT42_DEAD: u8 = 0x29;
 /// Scenario flag marking a second (hard) playthrough. While it is clear, a
 /// typewriter may be used without an ink ribbon and the save prompt asks
 /// "Will you save your progress?" instead of naming the ribbon.
@@ -1102,6 +1127,9 @@ fn special_light_suppressed(id: RoomId, camera: usize) -> bool {
 pub struct EntitySound {
     /// Room sound name resolved from the footstep zone.
     pub name: &'static str,
+    /// The mixer bank the cue plays through: 0 room SFX, 2 enemy/room table,
+    /// 3 character table.
+    pub bank: u8,
     /// The entity bank slot (room sound column) the cue plays through.
     pub column: u8,
     /// World position the sound plays at.
@@ -1158,6 +1186,20 @@ pub struct ReachRequest {
     pub slot: u8,
     /// The entry's handler byte: 0x0D selects the document screen.
     pub handler: u8,
+}
+
+/// One SCA collision volume record: the cylinder radius, half-height and the
+/// entity-local centre offset. The first volume of an entity lives in its
+/// `sca_radius`/`sca_half_height`/`sca_offset` fields; a second profile
+/// volume is stored in [`Entity::sca2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScaVolume {
+    /// Cylinder radius.
+    pub radius: i16,
+    /// Cylinder half-height.
+    pub half_height: i16,
+    /// Entity-local centre offset.
+    pub offset: [i16; 3],
 }
 
 /// One scripted entity.
@@ -1221,6 +1263,10 @@ pub struct Entity {
     pub state_field: u16,
     /// Damage hit state (`tw_set_8a`).
     pub hit_state: u8,
+    /// The hit/death reaction countdown at entity +0xBC (`death_timer`). The
+    /// adder zeroes it when a reaction setup starts; the projectile arc
+    /// helpers count airborne ticks in it.
+    pub death_timer: u8,
     /// Last `tw_set_sel` selector.
     pub selector: u16,
     /// Health word written by `tw_set_sel` selector 3 and `tw_set_field`.
@@ -1249,6 +1295,10 @@ pub struct Entity {
     pub action_ticks_counter: u16,
     /// Look-at control byte set by `act_motion`.
     pub look_at_flags: u8,
+    /// The joint the look-at slew aims (`lookAtJointIdx`). `0` means the
+    /// shared default (joint 1, the character models' head pivot); the Tyrant
+    /// sets 2.
+    pub look_at_joint: u8,
     /// Look-at target position; for an entity target this is refreshed every
     /// tick from the target's current position.
     pub target: [i32; 3],
@@ -1271,6 +1321,15 @@ pub struct Entity {
     pub death_event_id: u8,
     /// Collision radius in room units.
     pub sca_radius: i16,
+    /// SCA volume centre height offset (the record's local Y).
+    pub sca_half_height: i16,
+    /// SCA volume local centre offset X/Y/Z (the record's local position).
+    pub sca_offset: [i16; 3],
+    /// World-space bias added to the primary SCA volume's rotated centre, the
+    /// port's model of a per-frame `pSca_hit_data` retarget (the monster
+    /// plant's head and the other bosses' segmented hitboxes). Zero for every
+    /// entity whose collision record is not overridden.
+    pub sca_hit_delta: [i16; 3],
     /// Whether the entity has entered a camera switch zone (behaviour
     /// scratch).
     pub has_enter_switch_zone: u8,
@@ -1302,13 +1361,1238 @@ pub struct Entity {
     /// state-9 walk layer reuses the slot as the walk heading (the target yaw
     /// of the current path step), exactly like the original.
     pub reaction_timer: i16,
+    /// The four state bytes at entity +0x184 (`state_mirror`,
+    /// `ignore_player_flag_mirror`, `action_behavior_mirror`,
+    /// `attack_behavior_mirror`), read and written as one dword. The zombie
+    /// update mirrors its live state block here every frame and the damage
+    /// reaction restores it byte-for-byte.
+    pub state_mirror: u32,
+    /// The behaviour byte at entity +0x180 (`move_speed`), distinct from the
+    /// tween step array: the zombie's chase speed and the short-push-back
+    /// upgrade write it.
+    pub move_speed_byte: u8,
+    /// The behaviour byte at entity +0x181 (`turn_speed`).
+    pub turn_speed: u8,
+    /// The behaviour byte at entity +0x182 (`internal_timer`), the zombie's
+    /// 150-frame moan gate.
+    pub internal_timer: u8,
+    /// The behaviour byte at entity +0x188 (`stagger_timer`), the poise
+    /// budget the bullet counter spends.
+    pub stagger_timer: u8,
+    /// The 16-bit weave timer at entity +0xE2 (`next_turn_timer`; the player
+    /// entity reinterprets the same offset as `attackTimer`).
+    pub next_turn_timer: u16,
+    /// The mirror-angle backup at entity +0x7E the two-point floor probe
+    /// stores on acceptance and reads on rollback.
+    pub mirror_angle: u16,
+    /// The hunter's partner slot at entity +0x174 (the original stores an
+    /// `Entity*` there): the pair the spawn sets up. `pick_partner` writes the
+    /// enemy-list head, or the next slot when this hunter is the head. Only
+    /// the hunter reads it, and only after its init has picked the partner.
+    pub hunter_partner: u8,
+    /// The hunter's strafe direction byte at entity +0x185 (`H_STRAFE_DIR`).
+    pub scratch_185: u8,
+    /// The cross-slot joint-1 world translation the hunter's track helpers
+    /// write (the original's `joints[1].world.t[0..2]` plus its `unk_64`
+    /// word): the held-player and scripted-bite tracking contract. The port
+    /// stores it for the render-side consumer instead of a joint matrix the
+    /// animation clock would immediately recompose.
+    pub joint_track: [i32; 4],
+    /// Bits 1-7 of each joint's flag byte (entity `joints[i] + 0`), the gore
+    /// state `joint_setup_attack_effect` and the zombie limb handlers write.
+    /// Bit 0 (the active/hidden bit) lives in [`Entity::joint_flags`].
+    pub joint_flags_hi: [u8; 32],
+    /// The per-joint blood-scratch block `blood_splatter_physics` drives:
+    /// counter, flags, X velocity and Y acceleration of the bleeding joint.
+    pub joint_blood: [JointBlood; 32],
     /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
-    /// joint `i`'s flag bit.
-    pub joint_flags: u16,
+    /// joint `i`'s flag bit. Scripted enemies set or clear the same bits
+    /// through the `set_joint_visible` script helper. The spiders carry 20
+    /// joints, so the mask is 32 bits wide.
+    pub joint_flags: u32,
+    /// Joints whose active flag bit 0 was cleared by an armed attack effect
+    /// (`joint_setup_attack_effect`): bit `i` means joint `i` is armed. The
+    /// spiders' `leg_reach` treats an armed joint as inactive and zeroes the
+    /// stride; `reset_joints` clears the mask.
+    pub joint_armed: u32,
+    /// The second SCA volume of a two-record profile (the Black Tiger's walk
+    /// and approach boxes). `None` means the single-volume record; the first
+    /// volume always lives in `sca_radius`/`sca_half_height`/`sca_offset`.
+    pub sca2: Option<ScaVolume>,
+    /// The first clone of this entity's web-thread chain, when the spider has
+    /// shot one. The chain lives in `GameState::web_clones`; the parent's
+    /// script passes the thread count to each update.
+    pub clone_head: Option<u16>,
+    /// The number of clones the current chain holds (the spawned count the
+    /// update walks, capped by the script's requested count).
+    pub clone_count: u8,
+    /// Scripted ground-shadow queue gate: when set the renderer does not queue
+    /// this entity's scripted shadow quad, the original's per-enemy
+    /// `entity_add_fade_sprite` test. Defaults to queued.
+    pub shadow_suppressed: bool,
+    /// Joint world-matrix scale (`pad_ca`, offset 0xCA); `0` means identity
+    /// (0x1000) for entities that never set it.
+    pub joint_scale: u16,
+    /// Scripted ground-shadow quad half-extents; `0` means the entity has no
+    /// dynamic quad (characters read theirs from the character table).
+    pub shadow_half_x: i16,
+    /// Scripted ground-shadow quad half-extent along Z.
+    pub shadow_half_z: i16,
+    /// Scripted ground-shadow quad local offset (X/Y/Z).
+    pub shadow_offset: [i16; 3],
+    /// Scripted ground-shadow tint (`0xRRGGBB`).
+    pub shadow_tint: u32,
     /// The obstacle pathfinder's state byte (entity +0x164): bits 0-4 are the
     /// frame counter, bit 5 the last line-of-sight result. State 9's
     /// `entity_pathfind_update` cycles it and latches the player waypoint.
     pub pathfind_state: u8,
+    /// Low byte of the shared sound-cue timer word (entity +0x17C); see
+    /// [`Entity::groan_timer`].
+    pub action_speed: u8,
+    /// High byte of the shared sound-cue timer word (entity +0x17D).
+    pub hit_threshold: u8,
+    /// Low byte of the shared wobble word (entity +0x17E); see
+    /// [`Entity::sink_wobble`].
+    pub behavior_step: u8,
+    /// High byte of the shared wobble word (entity +0x17F).
+    pub action_counter: u8,
+    /// High byte of the scratch word at entity +0x182 (`internal_timer` is the
+    /// low byte); the hound's blood-billboard counter re-views the pair.
+    pub scratch_183: u8,
+    /// First byte of the scratch word at entity +0x186, the hound's behaviour
+    /// flags word.
+    pub scratch_186: u8,
+    /// Second byte of the scratch word at entity +0x186.
+    pub scratch_187: u8,
+    /// High byte of the scratch word at entity +0x188 (`stagger_timer` is the
+    /// low byte); the hound's AI flags re-view the pair.
+    pub scratch_189: u8,
+    /// The 32-bit fixed accumulator at entity +0x178. The roots machine pins
+    /// this through [`Entity::stored_pos_z`]; the wasp re-views its two halves
+    /// as the player-distance and room-collision scratch words
+    /// ([`Entity::wasp_distance`], [`Entity::wasp_collision`]).
+    pub subpixel_pos_x: i32,
+    /// The wasp's animation-completion word at entity +0x180: the `Joint_move`
+    /// loop flag the sting waits on (`WA_ANIM_DONE`).
+    pub wasp_anim_done: u16,
+    /// The wasp's big-wasp flag at entity +0x182, consumed from spawn-kind
+    /// bit 1 at init. Doubles the shadow, the health and the sting damage and
+    /// blocks the grab attack.
+    pub wasp_big: u8,
+    /// The wasp's nest respawn counter at entity +0x184; the tenth respawn
+    /// comes back as nest kind `0x12` (the big wasp).
+    pub wasp_respawns: u8,
+    /// The wasp's one-shot sound latch at entity +0x18A, so the knockdown
+    /// crush cue plays once.
+    pub wasp_sound_latch: u8,
+    /// The crow's stored `Add_speedXZ` velocity at entity +0x78: the last
+    /// rotated speed vector. Y stays zero for the yaw-only rotate; a later
+    /// [`crate::enemy::walk::advance_speed`] can re-add the vector without
+    /// recomputing the yaw.
+    pub speed: [i16; 3],
+    /// The crow's floor/step height at entity +0x8E (`CR_FLOOR_STEP`): the step
+    /// the room resolver reports when `collision_flags` bit 2 asks for floor
+    /// zones, or `0`/`1` when none was crossed.
+    pub floor_step: i16,
+    /// The crow's swerve angle held by the obstacle steering at entity +0x182
+    /// (`CR_SWERVE`).
+    pub swerve: i16,
+    /// The crow's swerve latch at entity +0x184 (`CR_SWERVE_LATCH`): bit 7
+    /// means no swerve is pending, bits 0-6 the frames left.
+    pub swerve_latch: u8,
+    /// The crow's grab struggle counter at entity +0x186 (`CR_STRUGGLE`), a
+    /// signed byte tested `< 0`.
+    pub struggle: i8,
+    /// The crow's altitude bias at entity +0x18A (`CR_ALT_BIAS`): `0` normally,
+    /// `-400` for the scripted, unkillable variant.
+    pub alt_bias: i16,
+    /// Live model tint, one signed delta per RGB channel in units of 1/31
+    /// from white (`0` untinted, `-31` fully dark). The shared additive tint
+    /// accumulates here; the renderer shades the mesh with
+    /// [`Entity::model_tint_rgb`].
+    pub model_tint: [i8; 3],
+    /// The model tint queue entry's RGB accumulator bytes, clamped `+/-31`.
+    /// The queue record is bound to the entity rather than to a shared
+    /// four-slot model-load pool; see [`Entity::queue_model_tint`].
+    pub tint_queue: [i8; 3],
+    /// The tint queue entry's first parameter word.
+    pub tint_queue_word_a: u16,
+    /// The tint queue entry's second parameter word.
+    pub tint_queue_word_b: u16,
+    /// Whether the tint queue entry is armed.
+    pub tint_queue_armed: bool,
+    /// Plant 42's flower-body companion handle (the port's model of the
+    /// `scd_target_ptr` clone pointer at entity +0xB8). `None` for a
+    /// split-vine record, which reads the room-shared body instead.
+    pub plant42_body: Option<u16>,
+    /// Plant 42's root-ball companion handle (the port's model of the clone
+    /// pointer at entity +0x178).
+    pub plant42_roots: Option<u16>,
+    /// The Yawn head slot a body segment mirrors (the port's model of the
+    /// segment clone's `scd_target_ptr` back to the head). `None` on the head
+    /// itself and on every non-Yawn entity.
+    pub yawn_head: Option<u8>,
+    /// The joint index (0..14) a Yawn body segment mirrors; only meaningful
+    /// when `yawn_head` is set. The clone at enemy-list index `k` tracks
+    /// joint `k + 2`.
+    pub yawn_joint: u8,
+    /// The Tyrant's exposed-heart companion handle (the port's model of the
+    /// clone pointer at entity +0x170). `None` for a Tyrant whose init has
+    /// not run and for every other entity.
+    pub tyrant_heart: Option<u16>,
+}
+
+/// The per-joint blood-splatter scratch `blood_splatter_physics` keeps at
+/// joint offsets +2 (counter), +3 (flags), +4 (X velocity) and +6 (Y
+/// acceleration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct JointBlood {
+    /// The joint's `field_02` byte: the at-rest gravity accumulator step.
+    pub counter: u8,
+    /// The joint's `pad_03` byte: bits 0-4 are the fall frame counter, bit 6
+    /// the horizontal bounce direction and bit 7 the stuck latch.
+    pub flags: u8,
+    /// The joint translation's X word, halved on each wall hit.
+    pub vel_x: i16,
+    /// The joint translation's Y word, the falling velocity.
+    pub vel_y: i16,
+    /// The joint translation's Z word, the blood direction's second axis.
+    pub rot_z: i16,
+}
+
+impl Entity {
+    /// The four state bytes at offset 0x84 as one dword (little-endian:
+    /// state, ignore, action_behavior, action_state).
+    pub fn state_word(&self) -> u32 {
+        u32::from_le_bytes([
+            self.state(),
+            self.ignore(),
+            self.action_behavior,
+            self.action_state,
+        ])
+    }
+
+    /// Store the four state bytes at offset 0x84 from one dword.
+    pub fn set_state_word(&mut self, value: u32) {
+        let bytes = value.to_le_bytes();
+        self.set_state(bytes[0]);
+        self.set_ignore(bytes[1]);
+        self.action_behavior = bytes[2];
+        self.action_state = bytes[3];
+    }
+
+    /// The joint flag byte at the joint struct's offset 0: bit 0 is the live
+    /// active bit (inverted into the hidden mask) and bits 1-7 come from the
+    /// gore-state store.
+    pub fn joint_flag(&self, joint: usize) -> u8 {
+        let active = u8::from(self.joint_flags & (1u32 << (joint & 31)) == 0);
+        active | self.joint_flags_hi[joint & 31]
+    }
+
+    /// Store the joint flag byte: bit 0 drives the hidden mask, bits 1-7 the
+    /// gore-state store.
+    pub fn set_joint_flag(&mut self, joint: usize, value: u8) {
+        let bit = 1u32 << (joint & 31);
+        if value & 1 == 0 {
+            self.joint_flags |= bit;
+        } else {
+            self.joint_flags &= !bit;
+        }
+        self.joint_flags_hi[joint & 31] = value & 0xFE;
+    }
+
+    /// The signed 16-bit turn accumulator at entity +0x170
+    /// (`angle_turn_delta` + `move_timer`).
+    pub fn zombie_turn_delta(&self) -> i16 {
+        i16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the turn accumulator at entity +0x170.
+    pub fn set_zombie_turn_delta(&mut self, value: i16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// The 16-bit movement word at entity +0x172 (`is_moving` +
+    /// `move_max_steps`), which the zombie tests and ORs as one word.
+    pub fn zombie_move_word(&self) -> u16 {
+        u16::from_le_bytes([self.is_moving, self.move_max_steps])
+    }
+
+    /// Store the movement word at entity +0x172.
+    pub fn set_zombie_move_word(&mut self, value: u16) {
+        [self.is_moving, self.move_max_steps] = value.to_le_bytes();
+    }
+
+    /// The 16-bit part word at entity +0x174 (`splatter_flag` +
+    /// `bob_speed`), the zombie's blood-physics gate.
+    pub fn zombie_part_word(&self) -> u16 {
+        u16::from_le_bytes([self.splatter_flag, self.bob_speed])
+    }
+
+    /// Store the part word at entity +0x174.
+    pub fn set_zombie_part_word(&mut self, value: u16) {
+        [self.splatter_flag, self.bob_speed] = value.to_le_bytes();
+    }
+
+    /// The 16-bit wander word at entity +0x17A, the high half of the
+    /// fixed-position dword; the zombie reads it as `entity_update_wander_turn`'s
+    /// `movement_dist`.
+    pub fn zombie_wander_word(&self) -> u16 {
+        (self.subpixel_pos_x as u32 >> 16) as u16
+    }
+
+    /// Store the wander word at entity +0x17A, preserving the two bytes below.
+    pub fn set_zombie_wander_word(&mut self, value: u16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & 0xFFFF) | ((u32::from(value) << 16) as i32);
+    }
+
+    /// Byte 0x178 of the fixed-position dword, the zombie's `subpixel_pos_x[0]`.
+    pub fn zombie_unk_178(&self) -> u8 {
+        self.subpixel_pos_x as u8
+    }
+
+    /// Store byte 0x178.
+    pub fn set_zombie_unk_178(&mut self, value: u8) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0xFF) | i32::from(value);
+    }
+
+    /// Byte 0x179 of the fixed-position dword, the zombie's wander turn
+    /// counter (an out-parameter of `entity_update_wander_turn`).
+    pub fn zombie_unk_179(&self) -> u8 {
+        (self.subpixel_pos_x as u32 >> 8) as u8
+    }
+
+    /// Store byte 0x179.
+    pub fn set_zombie_unk_179(&mut self, value: u8) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0xFF00) | (i32::from(value) << 8);
+    }
+
+    /// The 32-bit value four adjacent scratch bytes spell, the view the
+    /// fixed-point monster scratch re-reads byte fields through.
+    fn scratch_i32(bytes: [u8; 4]) -> i32 {
+        i32::from_le_bytes(bytes)
+    }
+
+    /// Store a 32-bit value over four adjacent scratch bytes.
+    fn store_scratch_i32(a: &mut u8, b: &mut u8, c: &mut u8, d: &mut u8, value: i32) {
+        let bytes = value.to_le_bytes();
+        *a = bytes[0];
+        *b = bytes[1];
+        *c = bytes[2];
+        *d = bytes[3];
+    }
+
+    /// The monster plant's signed 32-bit Manhattan distance at entity +0x16C
+    /// (`MP_DIST`), a full-dword view over `attacking_direction` onward.
+    pub fn mp_dist(&self) -> i32 {
+        Self::scratch_i32([
+            self.attacking_direction,
+            self.dir_control_flags,
+            self.tex_bank,
+            self.seq_counter,
+        ])
+    }
+
+    /// Store the plant's distance dword at entity +0x16C.
+    pub fn set_mp_dist(&mut self, value: i32) {
+        Self::store_scratch_i32(
+            &mut self.attacking_direction,
+            &mut self.dir_control_flags,
+            &mut self.tex_bank,
+            &mut self.seq_counter,
+            value,
+        );
+    }
+
+    /// The plant's 16-bit re-engage lockout at entity +0x170 (`MP_HOLDOFF`).
+    pub fn mp_holdoff(&self) -> i16 {
+        i16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the plant's holdoff word at entity +0x170.
+    pub fn set_mp_holdoff(&mut self, value: i16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// The plant's 16-bit animation-end latch at entity +0x172 (`MP_ANIM_END`).
+    pub fn mp_anim_end(&self) -> i16 {
+        i16::from_le_bytes([self.is_moving, self.move_max_steps])
+    }
+
+    /// Store the plant's animation-end latch at entity +0x172.
+    pub fn set_mp_anim_end(&mut self, value: i16) {
+        [self.is_moving, self.move_max_steps] = value.to_le_bytes();
+    }
+
+    /// The plant's signed 16-bit segment cursor at entity +0x174 (`MP_SEG`).
+    pub fn mp_seg(&self) -> i16 {
+        i16::from_le_bytes([self.splatter_flag, self.bob_speed])
+    }
+
+    /// Store the plant's segment cursor at entity +0x174.
+    pub fn set_mp_seg(&mut self, value: i16) {
+        [self.splatter_flag, self.bob_speed] = value.to_le_bytes();
+    }
+
+    /// The plant's signed 16-bit strike/drain timer at entity +0x176
+    /// (`MP_TIMER_A`), the `reaction_timer` word.
+    pub fn mp_timer_a(&self) -> i16 {
+        self.reaction_timer
+    }
+
+    /// Store the plant's first timer at entity +0x176.
+    pub fn set_mp_timer_a(&mut self, value: i16) {
+        self.reaction_timer = value;
+    }
+
+    /// The plant's signed 16-bit tint timer at entity +0x178 (`MP_TIMER_B`),
+    /// the low half of the fixed-position dword.
+    pub fn mp_timer_b(&self) -> i16 {
+        self.subpixel_pos_x as u16 as i16
+    }
+
+    /// Store the plant's second timer at entity +0x178.
+    pub fn set_mp_timer_b(&mut self, value: i16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0xFFFF) | (u32::from(value as u16) as i32);
+    }
+
+    /// The plant's signed 16-bit idle-sway countdown at entity +0x17A
+    /// (`MP_FIDGET`), the high half of the fixed-position dword.
+    pub fn mp_fidget(&self) -> i16 {
+        (self.subpixel_pos_x >> 16) as u16 as i16
+    }
+
+    /// Store the plant's fidget countdown at entity +0x17A.
+    pub fn set_mp_fidget(&mut self, value: i16) {
+        self.subpixel_pos_x =
+            (self.subpixel_pos_x & 0xFFFF) | ((u32::from(value as u16)) << 16) as i32;
+    }
+
+    /// The plant's signed 16-bit alerted latch at entity +0x17C (`MP_ALERTED`).
+    pub fn mp_alerted(&self) -> i16 {
+        i16::from_le_bytes([self.action_speed, self.hit_threshold])
+    }
+
+    /// Store the plant's alerted latch at entity +0x17C.
+    pub fn set_mp_alerted(&mut self, value: i16) {
+        [self.action_speed, self.hit_threshold] = value.to_le_bytes();
+    }
+
+    /// The plant's saved yaw / tint steps at entity +0x17E (`MP_ANGLE_BK`).
+    pub fn mp_angle_bk(&self) -> i16 {
+        i16::from_le_bytes([self.behavior_step, self.action_counter])
+    }
+
+    /// Store the plant's saved yaw at entity +0x17E.
+    pub fn set_mp_angle_bk(&mut self, value: i16) {
+        [self.behavior_step, self.action_counter] = value.to_le_bytes();
+    }
+
+    /// The plant's lunge side / green tint steps at entity +0x180
+    /// (`MP_SWERVE`).
+    pub fn mp_swerve(&self) -> i16 {
+        i16::from_le_bytes([self.move_speed_byte, self.turn_speed])
+    }
+
+    /// Store the plant's lunge side at entity +0x180.
+    pub fn set_mp_swerve(&mut self, value: i16) {
+        [self.move_speed_byte, self.turn_speed] = value.to_le_bytes();
+    }
+
+    /// The plant's ground-shadow word at entity +0x182 (`MP_SHADOW`), bit 0
+    /// gating the fade sprite.
+    pub fn mp_shadow(&self) -> i16 {
+        i16::from_le_bytes([self.internal_timer, self.scratch_183])
+    }
+
+    /// Store the plant's shadow word at entity +0x182.
+    pub fn set_mp_shadow(&mut self, value: i16) {
+        [self.internal_timer, self.scratch_183] = value.to_le_bytes();
+    }
+
+    /// The plant's signed 16-bit hit counter at entity +0x188 (`MP_HITS`).
+    pub fn mp_hits(&self) -> i16 {
+        i16::from_le_bytes([self.stagger_timer, self.scratch_189])
+    }
+
+    /// Store the plant's hit counter at entity +0x188.
+    pub fn set_mp_hits(&mut self, value: i16) {
+        [self.stagger_timer, self.scratch_189] = value.to_le_bytes();
+    }
+
+    /// The plant's behaviour/step word at entity +0x86 (`MP_STEP16`), written
+    /// as one 16-bit store in three places.
+    pub fn mp_step_word(&self) -> u16 {
+        u16::from_le_bytes([self.action_behavior, self.action_state])
+    }
+
+    /// Store the plant's behaviour/step word at entity +0x86.
+    pub fn set_mp_step_word(&mut self, value: u16) {
+        [self.action_behavior, self.action_state] = value.to_le_bytes();
+    }
+
+    /// The computer arm's X velocity at entity +0x16C (16.16 fixed point).
+    pub fn arm_vel_x(&self) -> i32 {
+        Self::scratch_i32([
+            self.attacking_direction,
+            self.dir_control_flags,
+            self.tex_bank,
+            self.seq_counter,
+        ])
+    }
+
+    /// Store the arm's X velocity at entity +0x16C.
+    pub fn set_arm_vel_x(&mut self, value: i32) {
+        Self::store_scratch_i32(
+            &mut self.attacking_direction,
+            &mut self.dir_control_flags,
+            &mut self.tex_bank,
+            &mut self.seq_counter,
+            value,
+        );
+    }
+
+    /// The computer arm's Z velocity at entity +0x170 (16.16 fixed point).
+    pub fn arm_vel_z(&self) -> i32 {
+        Self::scratch_i32([
+            self.angle_turn_delta,
+            self.move_timer,
+            self.is_moving,
+            self.move_max_steps,
+        ])
+    }
+
+    /// Store the arm's Z velocity at entity +0x170.
+    pub fn set_arm_vel_z(&mut self, value: i32) {
+        Self::store_scratch_i32(
+            &mut self.angle_turn_delta,
+            &mut self.move_timer,
+            &mut self.is_moving,
+            &mut self.move_max_steps,
+            value,
+        );
+    }
+
+    /// The computer arm's X position at entity +0x174 (16.16 fixed point).
+    pub fn arm_pos_x(&self) -> i32 {
+        let timer = self.reaction_timer.to_le_bytes();
+        Self::scratch_i32([self.splatter_flag, self.bob_speed, timer[0], timer[1]])
+    }
+
+    /// Store the arm's X position at entity +0x174.
+    pub fn set_arm_pos_x(&mut self, value: i32) {
+        let bytes = value.to_le_bytes();
+        self.splatter_flag = bytes[0];
+        self.bob_speed = bytes[1];
+        self.reaction_timer = i16::from_le_bytes([bytes[2], bytes[3]]);
+    }
+
+    /// The computer arm's Z position at entity +0x178 (16.16 fixed point),
+    /// the fixed-position dword.
+    pub fn arm_pos_z(&self) -> i32 {
+        self.subpixel_pos_x
+    }
+
+    /// Store the arm's Z position at entity +0x178.
+    pub fn set_arm_pos_z(&mut self, value: i32) {
+        self.subpixel_pos_x = value;
+    }
+
+    /// The left arm's Y position at entity +0x17C (16.16 fixed point, em1015
+    /// command 7's floor drop).
+    pub fn arm_y(&self) -> i32 {
+        Self::scratch_i32([
+            self.action_speed,
+            self.hit_threshold,
+            self.behavior_step,
+            self.action_counter,
+        ])
+    }
+
+    /// Store the arm's Y position at entity +0x17C.
+    pub fn set_arm_y(&mut self, value: i32) {
+        Self::store_scratch_i32(
+            &mut self.action_speed,
+            &mut self.hit_threshold,
+            &mut self.behavior_step,
+            &mut self.action_counter,
+            value,
+        );
+    }
+
+    /// The left arm's Y velocity at entity +0x180 (16.16 fixed point).
+    pub fn arm_vel_y(&self) -> i32 {
+        Self::scratch_i32([
+            self.move_speed_byte,
+            self.turn_speed,
+            self.internal_timer,
+            self.scratch_183,
+        ])
+    }
+
+    /// Store the arm's Y velocity at entity +0x180.
+    pub fn set_arm_vel_y(&mut self, value: i32) {
+        Self::store_scratch_i32(
+            &mut self.move_speed_byte,
+            &mut self.turn_speed,
+            &mut self.internal_timer,
+            &mut self.scratch_183,
+            value,
+        );
+    }
+
+    /// The arm's signed frame-gate word at entity +0x184 (`ARM_GATE`), the low
+    /// half of the state-mirror dword.
+    pub fn arm_gate(&self) -> i16 {
+        self.state_mirror as u16 as i16
+    }
+
+    /// Store the arm's frame-gate word at entity +0x184, preserving the two
+    /// bytes above.
+    pub fn set_arm_gate(&mut self, value: i16) {
+        self.state_mirror = (self.state_mirror & !0xFFFF) | u32::from(value as u16);
+    }
+}
+
+impl Entity {
+    /// Plant 42's signed 8-bit idle yaw jitter at entity +0x16C
+    /// (`attacking_direction` re-read at byte width).
+    pub fn p42_yaw_jitter(&self) -> i8 {
+        self.attacking_direction as i8
+    }
+
+    /// Store the idle yaw jitter at entity +0x16C.
+    pub fn set_p42_yaw_jitter(&mut self, value: i8) {
+        self.attacking_direction = value as u8;
+    }
+
+    /// Plant 42's signed 8-bit idle roll jitter at entity +0x16D.
+    pub fn p42_roll_jitter(&self) -> i8 {
+        self.dir_control_flags as i8
+    }
+
+    /// Store the idle roll jitter at entity +0x16D.
+    pub fn set_p42_roll_jitter(&mut self, value: i8) {
+        self.dir_control_flags = value as u8;
+    }
+
+    /// Plant 42's signed 16-bit suspend oscillator A at entity +0x16E.
+    pub fn p42_osc_a(&self) -> i16 {
+        i16::from_le_bytes([self.tex_bank, self.seq_counter])
+    }
+
+    /// Store the suspend oscillator A at entity +0x16E.
+    pub fn set_p42_osc_a(&mut self, value: i16) {
+        [self.tex_bank, self.seq_counter] = value.to_le_bytes();
+    }
+
+    /// Plant 42's signed 16-bit suspend oscillator B at entity +0x170.
+    pub fn p42_osc_b(&self) -> i16 {
+        i16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the suspend oscillator B at entity +0x170.
+    pub fn set_p42_osc_b(&mut self, value: i16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// Plant 42's signed 16-bit sweep step at entity +0x172.
+    pub fn p42_step(&self) -> i16 {
+        i16::from_le_bytes([self.is_moving, self.move_max_steps])
+    }
+
+    /// Store the sweep step at entity +0x172.
+    pub fn set_p42_step(&mut self, value: i16) {
+        [self.is_moving, self.move_max_steps] = value.to_le_bytes();
+    }
+
+    /// Plant 42's sweep direction byte at entity +0x174.
+    pub fn p42_sweep_dir(&self) -> u8 {
+        self.splatter_flag
+    }
+
+    /// Store the sweep direction at entity +0x174.
+    pub fn set_p42_sweep_dir(&mut self, value: u8) {
+        self.splatter_flag = value;
+    }
+
+    /// Plant 42's active grab joint (a signed byte) at entity +0x175.
+    pub fn p42_grab_joint(&self) -> i8 {
+        self.bob_speed as i8
+    }
+
+    /// Store the active grab joint at entity +0x175.
+    pub fn set_p42_grab_joint(&mut self, value: i8) {
+        self.bob_speed = value as u8;
+    }
+
+    /// Plant 42's first effect timer at entity +0x176 (the low byte of the
+    /// shared reaction word).
+    pub fn p42_fx_timer_a(&self) -> u8 {
+        self.reaction_timer as u8
+    }
+
+    /// Store the first effect timer at entity +0x176.
+    pub fn set_p42_fx_timer_a(&mut self, value: u8) {
+        self.reaction_timer = (self.reaction_timer & !0xFF) | i16::from(value);
+    }
+
+    /// Plant 42's second effect timer at entity +0x177.
+    pub fn p42_fx_timer_b(&self) -> u8 {
+        (self.reaction_timer >> 8) as u8
+    }
+
+    /// Store the second effect timer at entity +0x177.
+    pub fn set_p42_fx_timer_b(&mut self, value: u8) {
+        self.reaction_timer = (self.reaction_timer & 0x00FF) | ((u16::from(value) << 8) as i16);
+    }
+
+    /// Plant 42's 32-bit player distance at entity +0x17C (`p42_dist`, read as
+    /// a full dword over the four scratch bytes).
+    pub fn p42_dist(&self) -> u32 {
+        u32::from_le_bytes([
+            self.action_speed,
+            self.hit_threshold,
+            self.behavior_step,
+            self.action_counter,
+        ])
+    }
+
+    /// Store the player distance dword at entity +0x17C.
+    pub fn set_p42_dist(&mut self, value: u32) {
+        let bytes = value.to_le_bytes();
+        self.action_speed = bytes[0];
+        self.hit_threshold = bytes[1];
+        self.behavior_step = bytes[2];
+        self.action_counter = bytes[3];
+    }
+
+    /// Plant 42's signed 16-bit ambient life timer at entity +0x180.
+    pub fn p42_life(&self) -> i16 {
+        i16::from_le_bytes([self.move_speed_byte, self.turn_speed])
+    }
+
+    /// Store the ambient life timer at entity +0x180.
+    pub fn set_p42_life(&mut self, value: i16) {
+        [self.move_speed_byte, self.turn_speed] = value.to_le_bytes();
+    }
+
+    /// Plant 42's signed death-phase counter at entity +0x182.
+    pub fn p42_death_counter(&self) -> i8 {
+        self.internal_timer as i8
+    }
+
+    /// Store the death-phase counter at entity +0x182.
+    pub fn set_p42_death_counter(&mut self, value: i8) {
+        self.internal_timer = value as u8;
+    }
+
+    /// Plant 42's signed bounce counter at entity +0x183.
+    pub fn p42_pod_counter(&self) -> i8 {
+        self.scratch_183 as i8
+    }
+
+    /// Store the bounce counter at entity +0x183.
+    pub fn set_p42_pod_counter(&mut self, value: i8) {
+        self.scratch_183 = value as u8;
+    }
+
+    /// Plant 42's signed 16-bit frame timer at entity +0xC4 (`action_ticks`
+    /// re-read at word width).
+    pub fn p42_ticks(&self) -> i16 {
+        self.action_ticks_counter as i16
+    }
+
+    /// Store the frame timer at entity +0xC4.
+    pub fn set_p42_ticks(&mut self, value: i16) {
+        self.action_ticks_counter = value as u16;
+    }
+}
+
+impl Entity {
+    /// Yawn's signed 8-bit turn accelerator at entity +0x16C.
+    pub fn yawn_turn_accel(&self) -> i8 {
+        self.attacking_direction as i8
+    }
+
+    /// Store the turn accelerator at entity +0x16C.
+    pub fn set_yawn_turn_accel(&mut self, value: i8) {
+        self.attacking_direction = value as u8;
+    }
+
+    /// Yawn's form byte at entity +0x16E (`0` juvenile, `1` grown).
+    pub fn yawn_form(&self) -> u8 {
+        self.tex_bank
+    }
+
+    /// Store the form byte at entity +0x16E.
+    pub fn set_yawn_form(&mut self, value: u8) {
+        self.tex_bank = value;
+    }
+
+    /// Yawn's consecutive-bite counter at entity +0x16F.
+    pub fn yawn_bites(&self) -> u8 {
+        self.seq_counter
+    }
+
+    /// Store the bite counter at entity +0x16F.
+    pub fn set_yawn_bites(&mut self, value: u8) {
+        self.seq_counter = value;
+    }
+
+    /// Yawn's signed 16-bit model scale ramp at entity +0x170 (the swallow
+    /// grab and the death shrink).
+    pub fn yawn_scale_ramp(&self) -> i16 {
+        i16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the scale ramp at entity +0x170.
+    pub fn set_yawn_scale_ramp(&mut self, value: i16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// Yawn's signed 16-bit XZ speed at entity +0x172, driven by the turn
+    /// accelerator.
+    pub fn yawn_speed(&self) -> i16 {
+        i16::from_le_bytes([self.is_moving, self.move_max_steps])
+    }
+
+    /// Store the XZ speed at entity +0x172.
+    pub fn set_yawn_speed(&mut self, value: i16) {
+        [self.is_moving, self.move_max_steps] = value.to_le_bytes();
+    }
+
+    /// Yawn's signed 16-bit ground height at entity +0x174, captured from
+    /// joint 7's world Y at init and re-read by the animator's anchor.
+    pub fn yawn_ground_y(&self) -> i16 {
+        i16::from_le_bytes([self.splatter_flag, self.bob_speed])
+    }
+
+    /// Store the ground height at entity +0x174.
+    pub fn set_yawn_ground_y(&mut self, value: i16) {
+        [self.splatter_flag, self.bob_speed] = value.to_le_bytes();
+    }
+
+    /// Yawn's signed 16-bit death shrink ramp at entity +0x176.
+    pub fn yawn_shrink(&self) -> i16 {
+        self.reaction_timer
+    }
+
+    /// Store the death shrink ramp at entity +0x176.
+    pub fn set_yawn_shrink(&mut self, value: i16) {
+        self.reaction_timer = value;
+    }
+
+    /// Yawn's saved state word at entity +0x178, restored when a hit reaction
+    /// ends.
+    pub fn yawn_state_bk(&self) -> u32 {
+        self.subpixel_pos_x as u32
+    }
+
+    /// Store the saved state word at entity +0x178.
+    pub fn set_yawn_state_bk(&mut self, value: u32) {
+        self.subpixel_pos_x = value as i32;
+    }
+
+    /// Yawn's signed bite direction byte at entity +0x17C (`0xFF` right after
+    /// a connect).
+    pub fn yawn_bite_dir(&self) -> i8 {
+        self.action_speed as i8
+    }
+
+    /// Store the bite direction at entity +0x17C.
+    pub fn set_yawn_bite_dir(&mut self, value: i8) {
+        self.action_speed = value as u8;
+    }
+
+    /// Yawn's post-bite recovery timer at entity +0x17D (bit 7 marks an
+    /// interrupted bite).
+    pub fn yawn_recovery(&self) -> u8 {
+        self.hit_threshold
+    }
+
+    /// Store the recovery timer at entity +0x17D.
+    pub fn set_yawn_recovery(&mut self, value: u8) {
+        self.hit_threshold = value;
+    }
+
+    /// Yawn's waypoint index at entity +0x17E (the patrol/flee/retreat
+    /// paths).
+    pub fn yawn_path_index(&self) -> u8 {
+        self.behavior_step
+    }
+
+    /// Store the waypoint index at entity +0x17E.
+    pub fn set_yawn_path_index(&mut self, value: u8) {
+        self.behavior_step = value;
+    }
+
+    /// Yawn's "player nearly dead" flag at entity +0x17F, forcing the
+    /// rear-up.
+    pub fn yawn_nearly_dead(&self) -> u8 {
+        self.action_counter
+    }
+
+    /// Store the nearly-dead flag at entity +0x17F.
+    pub fn set_yawn_nearly_dead(&mut self, value: u8) {
+        self.action_counter = value;
+    }
+
+    /// Yawn's unsigned 16-bit death sparkle timer at entity +0x180.
+    pub fn yawn_sparkle(&self) -> u16 {
+        u16::from_le_bytes([self.move_speed_byte, self.turn_speed])
+    }
+
+    /// Store the sparkle timer at entity +0x180.
+    pub fn set_yawn_sparkle(&mut self, value: u16) {
+        [self.move_speed_byte, self.turn_speed] = value.to_le_bytes();
+    }
+
+    /// Yawn's signed wall-stuck counter at entity +0x182.
+    pub fn yawn_stuck(&self) -> i8 {
+        self.internal_timer as i8
+    }
+
+    /// Store the wall-stuck counter at entity +0x182.
+    pub fn set_yawn_stuck(&mut self, value: i8) {
+        self.internal_timer = value as u8;
+    }
+
+    /// Yawn's signed wall-stuck cooldown at entity +0x183.
+    pub fn yawn_stuck_cool(&self) -> i8 {
+        self.scratch_183 as i8
+    }
+
+    /// Store the wall-stuck cooldown at entity +0x183.
+    pub fn set_yawn_stuck_cool(&mut self, value: i8) {
+        self.scratch_183 = value as u8;
+    }
+
+    /// Yawn's signed hiss/dust timer at entity +0x184.
+    pub fn yawn_hiss(&self) -> i8 {
+        self.wasp_respawns as i8
+    }
+
+    /// Store the hiss/dust timer at entity +0x184.
+    pub fn set_yawn_hiss(&mut self, value: i8) {
+        self.wasp_respawns = value as u8;
+    }
+
+    /// Yawn's signed bite cooldown at entity +0x185, decremented by the
+    /// gated head update.
+    pub fn yawn_bite_cool(&self) -> i8 {
+        self.scratch_185 as i8
+    }
+
+    /// Store the bite cooldown at entity +0x185.
+    pub fn set_yawn_bite_cool(&mut self, value: i8) {
+        self.scratch_185 = value as u8;
+    }
+
+    /// The Tyrant's pad phase counter at entity +0x16D, incremented and wrapped
+    /// at `0x1D` every gated frame.
+    pub fn ty_pad_counter(&self) -> u8 {
+        self.dir_control_flags
+    }
+
+    /// Store the pad phase counter at entity +0x16D.
+    pub fn set_ty_pad_counter(&mut self, value: u8) {
+        self.dir_control_flags = value;
+    }
+
+    /// The Tyrant's hit mask at entity +0x16E: which attack has already
+    /// connected this swing, plus the `0x80` "would have killed" latch.
+    pub fn ty_hit_mask(&self) -> u8 {
+        self.tex_bank
+    }
+
+    /// Store the hit mask at entity +0x16E.
+    pub fn set_ty_hit_mask(&mut self, value: u8) {
+        self.tex_bank = value;
+    }
+
+    /// The Tyrant's look-at mode / attack repause byte at entity +0x16F.
+    pub fn ty_look_mode(&self) -> u8 {
+        self.seq_counter
+    }
+
+    /// Store the look-at mode at entity +0x16F.
+    pub fn set_ty_look_mode(&mut self, value: u8) {
+        self.seq_counter = value;
+    }
+
+    /// The Tyrant's state-word backup at entity +0x174: the dword state 2
+    /// restores. It re-views `splatter_flag`/`bob_speed`/`reaction_timer`, the
+    /// zombie's stored position.
+    pub fn ty_state_bk(&self) -> u32 {
+        self.stored_pos_x() as u32
+    }
+
+    /// Store the state-word backup at entity +0x174.
+    pub fn set_ty_state_bk(&mut self, value: u32) {
+        self.set_stored_pos_x(value as i32);
+    }
+
+    /// The Tyrant's render/AI flags at entity +0x179 (bit 0 the ground shadow,
+    /// bit 1 the live look-at, bit 2 the connected-sound latch, bit 3 hidden).
+    pub fn ty_flags(&self) -> u8 {
+        (self.subpixel_pos_x >> 8) as u8
+    }
+
+    /// Store the Tyrant's render/AI flags at entity +0x179.
+    pub fn set_ty_flags(&mut self, value: u8) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0x0000_FF00) | (i32::from(value) << 8);
+    }
+
+    /// The Tyrant's attack repause at entity +0x17F (`0x5A` after init).
+    pub fn ty_repause(&self) -> i8 {
+        self.action_counter as i8
+    }
+
+    /// Store the attack repause at entity +0x17F.
+    pub fn set_ty_repause(&mut self, value: i8) {
+        self.action_counter = value as u8;
+    }
+
+    /// The Tyrant's rocket-launcher latch at entity +0x180 (`| 0x80` once the
+    /// player equips item 10).
+    pub fn ty_rocket_flag(&self) -> u8 {
+        self.move_speed_byte
+    }
+
+    /// Store the rocket-launcher latch at entity +0x180.
+    pub fn set_ty_rocket_flag(&mut self, value: u8) {
+        self.move_speed_byte = value;
+    }
+
+    /// The Tyrant's combo cooldown at entity +0x181 (set to `0xD2` when an
+    /// attack connects or repauses).
+    pub fn ty_cooldown(&self) -> u8 {
+        self.turn_speed
+    }
+
+    /// Store the combo cooldown at entity +0x181.
+    pub fn set_ty_cooldown(&mut self, value: u8) {
+        self.turn_speed = value;
+    }
+
+    /// The Tyrant's crowd counter at entity +0x182: a signed byte counting the
+    /// frames the player has stayed inside 4000, wedging above `0x78`.
+    pub fn ty_crowd(&self) -> i8 {
+        self.internal_timer as i8
+    }
+
+    /// Store the crowd counter at entity +0x182.
+    pub fn set_ty_crowd(&mut self, value: i8) {
+        self.internal_timer = value as u8;
+    }
+
+    /// The Tyrant's close-range counter at entity +0x183 (`0x3C` once wedged;
+    /// the double-turn and forced-slash gate).
+    pub fn ty_close(&self) -> u8 {
+        self.scratch_183
+    }
+
+    /// Store the close-range counter at entity +0x183.
+    pub fn set_ty_close(&mut self, value: u8) {
+        self.scratch_183 = value;
+    }
+
+    /// The Tyrant's movement-distance word at entity +0x17C: the room
+    /// collision's travelled distance, read unsigned, and the SCD walk's
+    /// heading store.
+    pub fn ty_walk_dist(&self) -> u16 {
+        self.groan_timer() as u16
+    }
+
+    /// Store the movement-distance word at entity +0x17C.
+    pub fn set_ty_walk_dist(&mut self, value: u16) {
+        self.set_groan_timer(value as i16);
+    }
+}
+
+impl Entity {
+    /// The hunter's signed speed view at entity +0xC2 (`H_SPEED_W`): the
+    /// original reads the same word as a `short` in the ballistic calls.
+    pub fn hunter_speed(&self) -> i16 {
+        self.move_speed_current as i16
+    }
+
+    /// Store `H_SPEED_W`.
+    pub fn set_hunter_speed(&mut self, value: i16) {
+        self.move_speed_current = value as u16;
+    }
+
+    /// The hunter's signed tick word at entity +0xC4 (`H_TICKS`).
+    pub fn hunter_ticks(&self) -> i16 {
+        self.action_ticks_counter as i16
+    }
+
+    /// Store `H_TICKS`.
+    pub fn set_hunter_ticks(&mut self, value: i16) {
+        self.action_ticks_counter = value as u16;
+    }
+
+    /// The hunter's path latch at entity +0x170 (`H_PATH_LATCH`), a signed
+    /// word over `angle_turn_delta`/`move_timer`; the behaviour driver latches
+    /// the pathfinder result here and the variant code reads it.
+    pub fn hunter_path_latch(&self) -> i16 {
+        self.zombie_turn_delta()
+    }
+
+    /// Store `H_PATH_LATCH`.
+    pub fn set_hunter_path_latch(&mut self, value: i16) {
+        self.set_zombie_turn_delta(value);
+    }
+
+    /// The hunter's grab word at entity +0x172 (`H_GRAB_WORD`), a signed word
+    /// over `is_moving`/`move_max_steps`.
+    pub fn hunter_grab_word(&self) -> i16 {
+        self.zombie_move_word() as i16
+    }
+
+    /// Store `H_GRAB_WORD`.
+    pub fn set_hunter_grab_word(&mut self, value: i16) {
+        self.set_zombie_move_word(value as u16);
+    }
+
+    /// The hunter's pounce target X at entity +0x178 (`H_TARGET_X`), the low
+    /// signed half of the fixed-position dword.
+    pub fn hunter_target_x(&self) -> i16 {
+        self.subpixel_pos_x as u16 as i16
+    }
+
+    /// Store `H_TARGET_X`, preserving the target-Z half above it.
+    pub fn set_hunter_target_x(&mut self, value: i16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0xFFFF) | i32::from(value as u16);
+    }
+
+    /// The hunter's pounce target Z at entity +0x17A (`H_TARGET_Z`), the high
+    /// signed half of the fixed-position dword.
+    pub fn hunter_target_z(&self) -> i16 {
+        (self.subpixel_pos_x as u32 >> 16) as u16 as i16
+    }
+
+    /// Store `H_TARGET_Z`, preserving the target-X half below it.
+    pub fn set_hunter_target_z(&mut self, value: i16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & 0xFFFF) | ((i32::from(value as u16)) << 16);
+    }
+
+    /// The hunter's mouth-joint selector at entity +0x17C (`H_JOINT_SEL`).
+    pub fn hunter_joint_sel(&self) -> u16 {
+        u16::from_le_bytes([self.action_speed, self.hit_threshold])
+    }
+
+    /// Store `H_JOINT_SEL`.
+    pub fn set_hunter_joint_sel(&mut self, value: u16) {
+        [self.action_speed, self.hit_threshold] = value.to_le_bytes();
+    }
+
+    /// The hunter's wander movement word at entity +0x17E (`H_STEP_WORD`),
+    /// the room resolver's travel distance.
+    pub fn hunter_step_word(&self) -> u16 {
+        u16::from_le_bytes([self.behavior_step, self.action_counter])
+    }
+
+    /// Store `H_STEP_WORD`.
+    pub fn set_hunter_step_word(&mut self, value: u16) {
+        [self.behavior_step, self.action_counter] = value.to_le_bytes();
+    }
+
+    /// The hunter's room-hit latch at entity +0x180 (`H_ROOM_HIT`), which the
+    /// chase also passes to the wander-turn steering as its control byte.
+    pub fn hunter_room_hit(&self) -> u8 {
+        self.move_speed_byte
+    }
+
+    /// Store `H_ROOM_HIT`.
+    pub fn set_hunter_room_hit(&mut self, value: u8) {
+        self.move_speed_byte = value;
+    }
+
+    /// The hunter's low-health pounce latch at entity +0x182.
+    pub fn hunter_pounce_latch(&self) -> u8 {
+        self.internal_timer
+    }
+
+    /// Store the pounce latch.
+    pub fn set_hunter_pounce_latch(&mut self, value: u8) {
+        self.internal_timer = value;
+    }
+
+    /// The hunter's damage-latch counter A at entity +0x183, decremented as a
+    /// signed byte every frame.
+    pub fn hunter_death_cnt_a(&self) -> u8 {
+        self.scratch_183
+    }
+
+    /// Store the damage-latch counter A.
+    pub fn set_hunter_death_cnt_a(&mut self, value: u8) {
+        self.scratch_183 = value;
+    }
+
+    /// The hunter's damage-latch counter B at entity +0x184: two hits inside
+    /// the A window break the swipe off into the sidestep.
+    pub fn hunter_death_cnt_b(&self) -> u8 {
+        self.wasp_respawns
+    }
+
+    /// Store the damage-latch counter B.
+    pub fn set_hunter_death_cnt_b(&mut self, value: u8) {
+        self.wasp_respawns = value;
+    }
+
+    /// The hunter's sidestep direction at entity +0x185, stored as the signed
+    /// turn rolled `+ 2` and read back signed.
+    pub fn hunter_strafe_dir(&self) -> u8 {
+        self.scratch_185
+    }
+
+    /// Store the sidestep direction.
+    pub fn set_hunter_strafe_dir(&mut self, value: u8) {
+        self.scratch_185 = value;
+    }
+
+    /// The hunter's approach counter at entity +0x187, the 90-frame cap.
+    pub fn hunter_approach_cnt(&self) -> u8 {
+        self.scratch_187
+    }
+
+    /// Store the approach counter.
+    pub fn set_hunter_approach_cnt(&mut self, value: u8) {
+        self.scratch_187 = value;
+    }
+
+    /// The hunter's poise byte at entity +0x188, zeroed by the pouncer roll.
+    pub fn hunter_poise(&self) -> u8 {
+        self.stagger_timer
+    }
+
+    /// Store the poise byte.
+    pub fn set_hunter_poise(&mut self, value: u8) {
+        self.stagger_timer = value;
+    }
+
+    /// The hunter's re-pause latch at entity +0x189, 0x3C after a fresh path.
+    pub fn hunter_repause(&self) -> u8 {
+        self.scratch_189
+    }
+
+    /// Store the re-pause latch.
+    pub fn set_hunter_repause(&mut self, value: u8) {
+        self.scratch_189 = value;
+    }
+
+    /// The hunter's leap flag at entity +0x18A, the low byte of the shared
+    /// word the crow uses as its altitude bias.
+    pub fn hunter_leap_flag(&self) -> u8 {
+        self.alt_bias as u16 as u8
+    }
+
+    /// Store the leap flag, preserving the byte above it.
+    pub fn set_hunter_leap_flag(&mut self, value: u8) {
+        self.alt_bias = ((self.alt_bias as u16 & 0xFF00) | u16::from(value)) as i16;
+    }
 }
 
 impl Entity {
@@ -1360,6 +2644,446 @@ impl Entity {
             _ => return false,
         }
         true
+    }
+
+    /// The signed scratch word at entity +0x16C (low byte
+    /// `attacking_direction`, high byte `dir_control_flags`). The original
+    /// re-views the byte pair as one `short`; scripts use this accessor so the
+    /// little-endian composition stays in Rust.
+    pub fn writhe_velocity(&self) -> i16 {
+        i16::from_le_bytes([self.attacking_direction, self.dir_control_flags])
+    }
+
+    /// Store the scratch word at entity +0x16C.
+    pub fn set_writhe_velocity(&mut self, value: i16) {
+        [self.attacking_direction, self.dir_control_flags] = value.to_le_bytes();
+    }
+
+    /// The signed scratch word at entity +0x16E (low byte `tex_bank`, high
+    /// byte `seq_counter`).
+    pub fn writhe_amplitude(&self) -> i16 {
+        i16::from_le_bytes([self.tex_bank, self.seq_counter])
+    }
+
+    /// Store the scratch word at entity +0x16E.
+    pub fn set_writhe_amplitude(&mut self, value: i16) {
+        [self.tex_bank, self.seq_counter] = value.to_le_bytes();
+    }
+
+    /// The signed scratch word at entity +0x170 (low byte
+    /// `angle_turn_delta`, high byte `move_timer`).
+    pub fn tint_flashes(&self) -> i16 {
+        i16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the scratch word at entity +0x170.
+    pub fn set_tint_flashes(&mut self, value: i16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// The signed sound-cue timer word at entity +0x17C (low byte
+    /// `action_speed`, high byte `hit_threshold`).
+    pub fn groan_timer(&self) -> i16 {
+        i16::from_le_bytes([self.action_speed, self.hit_threshold])
+    }
+
+    /// Store the sound-cue timer word at entity +0x17C.
+    pub fn set_groan_timer(&mut self, value: i16) {
+        [self.action_speed, self.hit_threshold] = value.to_le_bytes();
+    }
+
+    /// The signed wobble word at entity +0x17E (low byte `behavior_step`,
+    /// high byte `action_counter`).
+    pub fn sink_wobble(&self) -> i16 {
+        i16::from_le_bytes([self.behavior_step, self.action_counter])
+    }
+
+    /// Store the wobble word at entity +0x17E.
+    pub fn set_sink_wobble(&mut self, value: i16) {
+        [self.behavior_step, self.action_counter] = value.to_le_bytes();
+    }
+
+    /// The 32-bit scratch dword at entity +0x174, little-endian over
+    /// `splatter_flag`, `bob_speed` and `reaction_timer`. The original stores
+    /// a frozen position here; scripts use this accessor so the three-field
+    /// composition stays in Rust.
+    pub fn stored_pos_x(&self) -> i32 {
+        let timer = self.reaction_timer.to_le_bytes();
+        i32::from_le_bytes([self.splatter_flag, self.bob_speed, timer[0], timer[1]])
+    }
+
+    /// Store the scratch dword at entity +0x174.
+    pub fn set_stored_pos_x(&mut self, value: i32) {
+        let bytes = value.to_le_bytes();
+        self.splatter_flag = bytes[0];
+        self.bob_speed = bytes[1];
+        self.reaction_timer = i16::from_le_bytes([bytes[2], bytes[3]]);
+    }
+
+    /// The 32-bit scratch dword at entity +0x178.
+    pub fn stored_pos_z(&self) -> i32 {
+        self.subpixel_pos_x
+    }
+
+    /// Store the scratch dword at entity +0x178.
+    pub fn set_stored_pos_z(&mut self, value: i32) {
+        self.subpixel_pos_x = value;
+    }
+
+    /// The wasp's player-distance word at entity +0x178: the low half of the
+    /// shared dword, written with a 16-bit store the way the original's
+    /// `ADD SI,AX` sum lands.
+    pub fn wasp_distance(&self) -> u16 {
+        self.subpixel_pos_x as u16
+    }
+
+    /// Store the wasp's player-distance word at entity +0x178, preserving the
+    /// room-collision word above it.
+    pub fn set_wasp_distance(&mut self, value: u16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0xFFFF) | i32::from(value);
+    }
+
+    /// The wasp's room-collision result word at entity +0x17A: the high half
+    /// of the shared dword.
+    pub fn wasp_collision(&self) -> u16 {
+        (self.subpixel_pos_x as u32 >> 16) as u16
+    }
+
+    /// Store the wasp's room-collision result word at entity +0x17A,
+    /// preserving the player-distance word below it.
+    pub fn set_wasp_collision(&mut self, value: u16) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & 0xFFFF) | (i32::from(value) << 16);
+    }
+
+    /// The adder's collision/attack-enable word at entity +0x174 (low byte
+    /// `splatter_flag`, high byte `bob_speed`). The original gates its whole
+    /// SCA block on this word, so a hidden snake keeps it zero until it
+    /// emerges.
+    pub fn sca_active(&self) -> u16 {
+        u16::from_le_bytes([self.splatter_flag, self.bob_speed])
+    }
+
+    /// Store the collision/attack-enable word at entity +0x174.
+    pub fn set_sca_active(&mut self, value: u16) {
+        [self.splatter_flag, self.bob_speed] = value.to_le_bytes();
+    }
+
+    /// The adder's SCA touch word at entity +0x16E (low byte `tex_bank`, high
+    /// byte `seq_counter`): the previous frame's entity-vs-player volume hit.
+    pub fn sca_touch(&self) -> i16 {
+        i16::from_le_bytes([self.tex_bank, self.seq_counter])
+    }
+
+    /// Store the SCA touch word at entity +0x16E.
+    pub fn set_sca_touch(&mut self, value: i16) {
+        [self.tex_bank, self.seq_counter] = value.to_le_bytes();
+    }
+
+    /// The adder's room-collision result word at entity +0x172 (low byte
+    /// `is_moving`, high byte `move_max_steps`): the code the previous frame's
+    /// wall resolve returned.
+    pub fn room_collision(&self) -> u16 {
+        u16::from_le_bytes([self.is_moving, self.move_max_steps])
+    }
+
+    /// Store the room-collision result word at entity +0x172.
+    pub fn set_room_collision(&mut self, value: u16) {
+        [self.is_moving, self.move_max_steps] = value.to_le_bytes();
+    }
+
+    /// The hound's 32-bit Manhattan distance to the player at entity +0x16C,
+    /// spanning `attacking_direction`, `dir_control_flags`, `tex_bank` and
+    /// `seq_counter`.
+    pub fn cb_dist(&self) -> i32 {
+        i32::from_le_bytes([
+            self.attacking_direction,
+            self.dir_control_flags,
+            self.tex_bank,
+            self.seq_counter,
+        ])
+    }
+
+    /// Store the hound's distance dword at entity +0x16C.
+    pub fn set_cb_dist(&mut self, value: i32) {
+        let bytes = value.to_le_bytes();
+        self.attacking_direction = bytes[0];
+        self.dir_control_flags = bytes[1];
+        self.tex_bank = bytes[2];
+        self.seq_counter = bytes[3];
+    }
+
+    /// The hound's signed turn step at entity +0x172 (the adder's
+    /// `room_collision` word re-viewed as a `short`).
+    pub fn cb_turn_step(&self) -> i16 {
+        self.room_collision() as i16
+    }
+
+    /// Store the hound's turn step at entity +0x172.
+    pub fn set_cb_turn_step(&mut self, value: i16) {
+        self.set_room_collision(value as u16);
+    }
+
+    /// The hound's launch vertical velocity at entity +0x174 (the adder's
+    /// `sca_active` word re-viewed as a `short`).
+    pub fn cb_launch_vy(&self) -> i16 {
+        self.sca_active() as i16
+    }
+
+    /// Store the hound's launch vertical velocity at entity +0x174.
+    pub fn set_cb_launch_vy(&mut self, value: i16) {
+        self.set_sca_active(value as u16);
+    }
+
+    /// The hound's collision-probe history at entity +0x178, the signed view
+    /// of the wasp's player-distance half of the shared dword.
+    pub fn cb_probe(&self) -> i16 {
+        self.subpixel_pos_x as u16 as i16
+    }
+
+    /// Store the hound's probe history at entity +0x178, preserving the path
+    /// byte above it.
+    pub fn set_cb_probe(&mut self, value: i16) {
+        self.set_wasp_distance(value as u16);
+    }
+
+    /// The hound's pathfinder result byte at entity +0x17A (the low byte of
+    /// the wasp's room-collision half of the shared dword).
+    pub fn cb_path(&self) -> u8 {
+        (self.subpixel_pos_x as u32 >> 16) as u8
+    }
+
+    /// Store the hound's pathfinder result at entity +0x17A.
+    pub fn set_cb_path(&mut self, value: u8) {
+        self.subpixel_pos_x = (self.subpixel_pos_x & !0x00FF_0000) | (i32::from(value) << 16);
+    }
+
+    /// The hound's swerve/head-track angle at entity +0x180 (`move_speed_byte`
+    /// + `turn_speed` as one signed word).
+    pub fn cb_swerve(&self) -> i16 {
+        i16::from_le_bytes([self.move_speed_byte, self.turn_speed])
+    }
+
+    /// Store the hound's swerve angle at entity +0x180.
+    pub fn set_cb_swerve(&mut self, value: i16) {
+        [self.move_speed_byte, self.turn_speed] = value.to_le_bytes();
+    }
+
+    /// The hound's owed blood-billboard count at entity +0x182
+    /// (`internal_timer` + `scratch_183` as one signed word).
+    pub fn cb_blood(&self) -> i16 {
+        i16::from_le_bytes([self.internal_timer, self.scratch_183])
+    }
+
+    /// Store the hound's blood-billboard count at entity +0x182.
+    pub fn set_cb_blood(&mut self, value: i16) {
+        [self.internal_timer, self.scratch_183] = value.to_le_bytes();
+    }
+
+    /// The hound's alert latch byte at entity +0x184, shared with the wasp's
+    /// respawn counter.
+    pub fn cb_alert(&self) -> u8 {
+        self.wasp_respawns
+    }
+
+    /// Store the hound's alert latch at entity +0x184.
+    pub fn set_cb_alert(&mut self, value: u8) {
+        self.wasp_respawns = value;
+    }
+
+    /// The hound's behaviour-flags word at entity +0x186 (run/hunting/gave-up
+    /// bits).
+    pub fn cb_behflags(&self) -> i16 {
+        i16::from_le_bytes([self.scratch_186, self.scratch_187])
+    }
+
+    /// Store the hound's behaviour-flags word at entity +0x186.
+    pub fn set_cb_behflags(&mut self, value: i16) {
+        [self.scratch_186, self.scratch_187] = value.to_le_bytes();
+    }
+
+    /// The low byte of the hound's behaviour-flags word at entity +0x186.
+    pub fn cb_behflags_byte(&self) -> u8 {
+        self.scratch_186
+    }
+
+    /// Store the low byte of the hound's behaviour-flags word at entity
+    /// +0x186, preserving the high byte.
+    pub fn set_cb_behflags_byte(&mut self, value: u8) {
+        self.scratch_186 = value;
+    }
+
+    /// The hound's AI flags word at entity +0x188 (`stagger_timer` +
+    /// `scratch_189`).
+    pub fn cb_aiflags(&self) -> i16 {
+        i16::from_le_bytes([self.stagger_timer, self.scratch_189])
+    }
+
+    /// Store the hound's AI flags word at entity +0x188.
+    pub fn set_cb_aiflags(&mut self, value: i16) {
+        [self.stagger_timer, self.scratch_189] = value.to_le_bytes();
+    }
+
+    /// The hound's re-target pause at entity +0x18A, shared with the crow's
+    /// altitude bias storage.
+    pub fn cb_repause(&self) -> i16 {
+        self.alt_bias
+    }
+
+    /// Store the hound's re-target pause at entity +0x18A.
+    pub fn set_cb_repause(&mut self, value: i16) {
+        self.alt_bias = value;
+    }
+
+    /// The chimera's re-target pause at entity +0x172 (the signed view of the
+    /// adder's `room_collision` word).
+    pub fn c_repause(&self) -> i16 {
+        self.room_collision() as i16
+    }
+
+    /// Store the chimera's re-target pause at entity +0x172.
+    pub fn set_c_repause(&mut self, value: i16) {
+        self.set_room_collision(value as u16);
+    }
+
+    /// The chimera's fade-freeze word at entity +0x174 (the signed view of the
+    /// adder's `sca_active` word).
+    pub fn c_fade_freeze(&self) -> i16 {
+        self.sca_active() as i16
+    }
+
+    /// Store the chimera's fade-freeze word at entity +0x174.
+    pub fn set_c_fade_freeze(&mut self, value: i16) {
+        self.set_sca_active(value as u16);
+    }
+
+    /// The chimera's wall-stuck frame count at entity +0x178 (the signed view
+    /// of the wasp's player-distance half of the shared dword).
+    pub fn c_wall_frames(&self) -> i16 {
+        self.subpixel_pos_x as u16 as i16
+    }
+
+    /// Store the chimera's wall-stuck frame count at entity +0x178.
+    pub fn set_c_wall_frames(&mut self, value: i16) {
+        self.set_wasp_distance(value as u16);
+    }
+
+    /// The chimera's far-target latch at entity +0x17A (the signed view of the
+    /// wasp's room-collision half of the shared dword).
+    pub fn c_far_latch(&self) -> i16 {
+        (self.subpixel_pos_x as u32 >> 16) as u16 as i16
+    }
+
+    /// Store the chimera's far-target latch at entity +0x17A.
+    pub fn set_c_far_latch(&mut self, value: i16) {
+        self.set_wasp_collision(value as u16);
+    }
+
+    /// The crow's lower altitude bound at entity +0x172 (`CR_FLOOR_LIMIT`): the
+    /// signed view of the adder's `room_collision` word.
+    pub fn crow_floor_limit(&self) -> i16 {
+        self.room_collision() as i16
+    }
+
+    /// Store the crow's lower altitude bound at entity +0x172.
+    pub fn set_crow_floor_limit(&mut self, value: i16) {
+        self.set_room_collision(value as u16);
+    }
+
+    /// The crow's upper altitude bound at entity +0x174 (`CR_CEIL_LIMIT`): the
+    /// signed view of the adder's `sca_active` word.
+    pub fn crow_ceil_limit(&self) -> i16 {
+        self.sca_active() as i16
+    }
+
+    /// Store the crow's upper altitude bound at entity +0x174.
+    pub fn set_crow_ceil_limit(&mut self, value: i16) {
+        self.set_sca_active(value as u16);
+    }
+
+    /// The adder's consecutive-blocked counter at entity +0x176, the shared
+    /// `reaction_timer` word read unsigned.
+    pub fn stuck_frames(&self) -> u16 {
+        self.reaction_timer as u16
+    }
+
+    /// Store the consecutive-blocked counter at entity +0x176.
+    pub fn set_stuck_frames(&mut self, value: u16) {
+        self.reaction_timer = value as i16;
+    }
+
+    /// The adder's player-distance word at entity +0x170 (low byte
+    /// `angle_turn_delta`, high byte `move_timer`): `|dx| + |dz|` truncated to
+    /// 16 bits, or the flat 4999 when the player is on another floor.
+    pub fn player_distance(&self) -> u16 {
+        u16::from_le_bytes([self.angle_turn_delta, self.move_timer])
+    }
+
+    /// Store the player-distance word at entity +0x170.
+    pub fn set_player_distance(&mut self, value: u16) {
+        [self.angle_turn_delta, self.move_timer] = value.to_le_bytes();
+    }
+
+    /// Add one signed RGB delta through the shared additive model tint.
+    ///
+    /// The per-channel arithmetic mirrors the original's `TmdObjectTintAdd`
+    /// on a single object: the red and green deltas are rebased so the
+    /// brighter one moves by zero, the result accumulates on the stored
+    /// multiplier and clamps into the `0..=1.0` window (31 steps), green is
+    /// forced to zero unconditionally, and blue snaps to zero below 0.36
+    /// (`11/31`, so the `31 + delta < 12` test). Each delta is an integer
+    /// number of 1/31 steps; the original's float accumulation of exact
+    /// multiples cannot cross those thresholds.
+    pub fn add_model_tint(&mut self, r: i16, g: i16, b: i16) {
+        let (r, g, b) = (i32::from(r), i32::from(g), i32::from(b));
+        let brightest = r.max(g);
+        for (channel, delta) in
+            self.model_tint
+                .iter_mut()
+                .zip([r - brightest, g - brightest, b - brightest])
+        {
+            let level = (31 + i32::from(*channel) + delta).clamp(0, 31);
+            *channel = (level - 31) as i8;
+        }
+        self.model_tint[1] = -31;
+        if 31 + i32::from(self.model_tint[2]) < 12 {
+            self.model_tint[2] = -31;
+        }
+    }
+
+    /// The packed `0x00RRGGBB`-style tint the renderer multiplies the mesh
+    /// by, derived from [`Entity::model_tint`] as the original packs the
+    /// first object's multiplier: `trunc(level / 31 * 255)`.
+    pub fn model_tint_rgb(&self) -> [u8; 3] {
+        self.model_tint.map(|delta| {
+            let level = 31 + i32::from(delta);
+            (level * 255 / 31) as u8
+        })
+    }
+
+    /// Accumulate one model tint queue update: the signed byte deltas (the
+    /// low byte of each parameter, interpreted as a signed byte) are added
+    /// with 8-bit wrap and clamped into `+/-31`, and the two parameter words
+    /// are stored and the entry armed. The queue record's first parameter is
+    /// what [`Entity::add_model_tint`] receives live; this only maintains the
+    /// record a later texture reload would read.
+    pub fn queue_model_tint(&mut self, r: i16, g: i16, b: i16, word_a: u16, word_b: u16) {
+        for (queued, delta) in self.tint_queue.iter_mut().zip([r as i8, g as i8, b as i8]) {
+            let wrapped = ((i32::from(*queued) + i32::from(delta)) & 0xFF) as u8 as i8;
+            *queued = i32::from(wrapped).clamp(-31, 31) as i8;
+        }
+        self.tint_queue_word_a = word_a;
+        self.tint_queue_word_b = word_b;
+        self.tint_queue_armed = true;
+    }
+
+    /// Retarget the tint queue entry without touching the live model: the
+    /// explicit bytes overwrite the accumulators and the parameter words are
+    /// stored, arming the entry.
+    pub fn retarget_model_tint(&mut self, r: i16, g: i16, b: i16, word_a: u16, word_b: u16) {
+        self.tint_queue = [r as i8, g as i8, b as i8];
+        self.tint_queue_word_a = word_a;
+        self.tint_queue_word_b = word_b;
+        self.tint_queue_armed = true;
     }
 }
 
@@ -1475,9 +3199,61 @@ pub struct GameState {
     /// Per-slot animation clocks for the scripted entities, parallel to
     /// [`GameState::entities`]. The entity words stay authoritative; the clock
     /// remembers which frame the pose shows for the renderer.
-    pub entity_anims: [crate::npc::EntityAnim; ENTITY_COUNT],
+    pub entity_anims: [crate::enemy::EntityAnim; ENTITY_COUNT],
+    /// Per-slot joint world matrices of the posed monster skeletons, computed
+    /// by the enemy drivers at the end of every update (the original's
+    /// `EntityComputeJointWorldMatrices` runs in the render pass, which is the
+    /// same point between two updates). The bite reach test, the ground-shadow
+    /// heights and the joint-attached billboards read these. Empty for slots
+    /// whose model or script has not run.
+    pub joint_worlds: [Vec<crate::anim::Mat4x3>; ENTITY_COUNT],
+    /// The web-thread clone arena shared by the WebSpinner and the Black
+    /// Tiger: full entity copies allocated outside the 30-slot enemy list,
+    /// walked by [`crate::enemy::web::update`] and drawn by the clone render
+    /// pass. Cleared on every room load.
+    pub web_clones: Box<[Option<crate::enemy::web::WebClone>; crate::enemy::web::CLONE_CAP]>,
+    /// The per-type web-joint registries (WebSpinner, Black Tiger): the leg
+    /// joints already carrying a web thread. Reset on every room load.
+    pub web_joint_registry: [[u8; 8]; 2],
+    /// The Plant 42 companion arena: the flower-body and root-ball clones
+    /// allocated outside the enemy list, ticked by the plant script and drawn
+    /// by the companion render pass. Cleared on every room load.
+    pub companions:
+        Box<[Option<crate::enemy::companion::Companion>; crate::enemy::companion::COMPANION_CAP]>,
+    /// The shared Plant 42 body companion handle every split-vine record reads
+    /// (the port's model of the original's `scd_target_ptr` distribution).
+    pub plant42_shared_body: Option<u16>,
+    /// The shared Plant 42 capture matrix (`g_plant42CaptureMatrix`): the hold
+    /// transform built from a grabbing joint, whose `t[0]` also doubles as the
+    /// knock-back facing the thrown player reads.
+    pub plant42_capture: crate::anim::Mat4x3,
+    /// The shared Yawn capture matrix: the swallow-attack transform built from
+    /// the head joint, recomposed by the swallowed player's own state machine
+    /// every frame.
+    pub yawn_capture: crate::anim::Mat4x3,
+    /// The Tyrant's render-only scratch: the slash ribbon, the two claw
+    /// ghosts and the five rocket-death limbs. One Tyrant is alive at a time,
+    /// and the block resets with the room.
+    pub tyrant: crate::enemy::tyrant::TyrantState,
+    /// The entity slot the player latched as "who hit me" (the original's
+    /// `g_playerEntity.unk_b8` pointer). The Tyrant stagger windows read the
+    /// attacker's yaw; cleared on room entry.
+    pub player_attacker: Option<u8>,
+    /// The grab speed vector the plant's hold behaviours write onto the player
+    /// (`g_playerEntity.speed.y/z/pad`), added to the player position by
+    /// [`GameState::add_player_speed`].
+    pub player_speed: [i16; 3],
+    /// Whether a spawn over the clone arena cap has been logged this session.
+    pub web_cap_logged: bool,
     /// Number of character entity slots an `enemy` spawn has allocated.
     pub enemy_count: u8,
+    /// The saved-enemy snapshots the door transition builds and
+    /// [`GameState::spawn_enemy`] restores.
+    pub saved_enemies: [crate::combat::SavedEnemyState; crate::combat::SAVED_ENEMY_SLOTS],
+    /// The shared combat tables: weapon ranges, hit records, reactions and
+    /// the per-type init data. The engine loads the pack's `data/combat.bin`;
+    /// the built-in fallback carries the documented values.
+    pub combat: crate::combat::CombatTables,
     /// The `behavior_flags` read by the last `get_eml_state`.
     pub last_enemy_flags: u8,
     /// Entity slot the current event operates on, or [`ENTITY_NONE`].
@@ -1519,6 +3295,46 @@ pub struct GameState {
     /// state bits. Combat does not raise the aim bits yet, so this stays `0`;
     /// the effect flag-stage behaviours latch it for their follow-on phases.
     pub player_flags: u8,
+    /// The hounds' shared "a dog has already barked its approach" latch. The
+    /// original keeps one file-scope int for every hound in the room and
+    /// `cerberus_init` clears it, so a second hound spawning resets the latch
+    /// of the first; a room load never touches it.
+    pub cerberus_barked: bool,
+    /// The shared probe/position scratch vector (`g_playerPosScratch`): the
+    /// hound's forward probe leaves its resolved probe point here and the
+    /// leap recovery steers at the previous frame's value.
+    pub scratch_vec: [i32; 3],
+    /// `g_playerDisplacement`: the shared per-frame scratch the hunter stores
+    /// its Manhattan distance to the player in before deciding. The value is
+    /// only meaningful within one entity update.
+    pub player_displacement: i32,
+    /// `player_distance_z`: the shared scratch `check_line_of_sight` writes
+    /// its result byte into. The hunter also stores the partner's Manhattan
+    /// distance here before its line-of-sight call overwrites it mid-frame,
+    /// a load-bearing original quirk the call order preserves.
+    pub player_distance_z: i32,
+    /// `g_scaled_down_dist`: generic shared scratch the hunter saves its
+    /// current action byte in before overwriting the byte.
+    pub scaled_down_dist: i32,
+    /// `hunter_scream_latch`: one death-howl latch shared by every hunter in
+    /// the room, so the fall and the scream behaviour each play the cue once.
+    pub hunter_scream_latch: u8,
+    /// `hunter_intro_jump_kind`: the stage/room-selected row of the scripted
+    /// intro walk, written once when the intro behaviour starts.
+    pub hunter_intro_jump_kind: u8,
+    /// The pounce grab's one-shot flag (`DAT_004bd2b0`): the grab raises it
+    /// and the player's death screen consumes it while hiding the head. The
+    /// original's image value is non-zero, so the first death screen hides
+    /// the head even without a grab.
+    pub hunter_grab_one_shot: bool,
+    /// `s_mpLastSides`: the shared monster-plant shift register of the sides
+    /// previously chosen, so two consecutive poison-plant lunges do not pick
+    /// the same side three times running. Reset by the plant's init.
+    pub monster_plant_sides: u32,
+    /// `g_AttractMode_RoomCameraId`: the outgoing room id a same-stage door
+    /// transition stores (0x1F after a fresh room/stage init), read by the
+    /// hunter's scripted-intro camera selector.
+    pub attract_room_camera_id: u8,
     /// The alternate-outfit selector (`g_bCostumeVariant`): `costume_set`
     /// (0x4F) stores the operand's low bit and `costume_ck` (0x50) tests it.
     /// The original's `LoadEntityEMD` reads it to pick the alternate player
@@ -1532,6 +3348,9 @@ pub struct GameState {
     pub max_health: i16,
     /// Health status flags (bit `0x20`/`0x02` poison).
     pub health_status: u8,
+    /// The player's poison countdown (`pad_174`), armed by
+    /// [`GameState::poison_player`].
+    pub poison_timer: u16,
     /// The typewriter save prompt state (`g_typewriter_state`).
     pub typewriter: TypewriterFlow,
     /// The 48 item-box slots.
@@ -1677,18 +3496,43 @@ impl Default for GameState {
             stair_entry: None,
             stair_climb: false,
             entities: initial_entities(),
-            entity_anims: std::array::from_fn(|_| crate::npc::EntityAnim::default()),
+            entity_anims: std::array::from_fn(|_| crate::enemy::EntityAnim::default()),
+            joint_worlds: std::array::from_fn(|_| Vec::new()),
+            web_clones: Box::new(std::array::from_fn(|_| None)),
+            web_joint_registry: [[0; 8]; 2],
+            companions: Box::new(std::array::from_fn(|_| None)),
+            plant42_shared_body: None,
+            plant42_capture: crate::anim::Mat4x3::default(),
+            yawn_capture: crate::anim::Mat4x3::default(),
+            tyrant: crate::enemy::tyrant::TyrantState::default(),
+            player_attacker: None,
+            player_speed: [0; 3],
+            web_cap_logged: false,
             enemy_count: 0,
+            saved_enemies: [crate::combat::SavedEnemyState::default();
+                crate::combat::SAVED_ENEMY_SLOTS],
+            combat: crate::combat::CombatTables::default(),
             last_enemy_flags: 0,
             selected_entity: 0,
             last_picked_item: None,
             last_used_item: None,
             equipped: None,
             player_flags: 0,
+            cerberus_barked: false,
+            scratch_vec: [0; 3],
+            player_displacement: 0,
+            player_distance_z: 0,
+            scaled_down_dist: 0,
+            hunter_scream_latch: 0,
+            hunter_intro_jump_kind: 0,
+            hunter_grab_one_shot: true,
+            monster_plant_sides: 0,
+            attract_room_camera_id: 0x1F,
             costume_variant: 0,
             selected_item: None,
             max_health: 0,
             health_status: 0,
+            poison_timer: 0,
             typewriter: TypewriterFlow::Idle,
             item_box: [InventoryItem::default(); ITEM_BOX_SLOTS],
             transition: None,
@@ -2096,86 +3940,91 @@ impl GameState {
     /// animation frame, `+21` variant high nibble.
     ///
     /// A guard bit other than `0xFF` skips the whole record when the bank-3
-    /// bit is already set. Ids outside `0x20..=0x2E` are parsed by the reader
-    /// but allocate nothing this milestone.
+    /// bit is already set. Monster ids (`0x00..=0x16`), the filler range and
+    /// the scripted characters (`0x20..=0x2E`) all allocate; ids above the
+    /// original's dispatch table are parsed by the reader but allocate
+    /// nothing.
     ///
-    /// # Documented deviation
-    ///
-    /// The original's force-init byte also gates the `FUN_0048f330` saved-state
-    /// restore: without it, an occupied slot is only re-initialised when no
-    /// saved enemy state matches. The port has no enemy snapshot store yet, so
-    /// an occupied slot is left alone instead of being re-initialised. Every
-    /// shipped character record sets the force byte, so the corpus never
-    /// reaches this path.
+    /// The force-init byte gates the saved-state restore: without it, a
+    /// matching [`GameState::saved_enemies`] entry is copied into the slot
+    /// and the spawn init block is skipped. The always-run reset block then
+    /// clears the state/action/animation bytes and (re)counts the slot,
+    /// exactly like the original.
     pub fn spawn_enemy(&mut self, operands: &[Operand]) -> bool {
         let guard = operand_u8(operands, 2);
         if guard != 0xFF && self.flags[usize::from(BANK_ENEMIES)].bit(guard) {
             return false;
         }
         let id = operand_u8(operands, 0);
-        if !(CHARACTER_ID_MIN..=CHARACTER_ID_MAX).contains(&id) {
-            // TODO(parity): (gameplay) the original allocates and runs the
-            // monster entity for ids below 0x20 (and the DC-only ids above);
-            // the port parses the record but creates nothing, so rooms that
-            // spawn zombies alongside a character look emptier and their
-            // scripts' get_eml_state/eml_state on those slots are inert.
+        if id > CHARACTER_ID_MAX {
             return false;
         }
         let slot = 1 + usize::from(operand_u8(operands, 11) & 0x0F);
         let force_init = operand_u8(operands, 3) != 0;
         let occupied = self.entities[slot].active();
-        // TODO(parity): (scripting) without the force-init byte the original still
-        // re-initialises an occupied slot when no saved enemy state matches
-        // (FUN_0048f330); this always leaves the occupied slot untouched.
-        if occupied && !force_init {
-            // TODO(parity): (gameplay) the original still runs the re-init block
-            // whenever the slot's status bit is set, even when the saved-state
-            // check suppressed shouldInit: it overwrites state/id/anim and
-            // increments g_enemy_count anyway. The port leaves the occupied
-            // slot untouched (no enemy snapshot store yet) and only counts a
-            // new allocation. Add the saved-state restore before relying on
-            // re-spawning an occupied slot.
-            return false;
-        }
 
-        let entity = &mut self.entities[slot];
-        entity.id = id;
-        entity.set_active(true);
-        entity.behavior_flags = operand_u8(operands, 1);
-        entity.pitch = operand_i16(operands, 5) as u16;
-        entity.angle = operand_u16(operands, 6);
-        entity.roll = operand_u16(operands, 7);
-        // The record's X and Z are zero-extended, Y is sign-extended.
-        entity.pos = [
-            i32::from(operand_u16(operands, 8)),
-            i32::from(operand_i16(operands, 9)),
-            i32::from(operand_u16(operands, 10)),
-        ];
-        // `cmd_enemy_set` writes the SVECTOR position from the same operands.
-        entity.saved_pos = Some(entity.pos);
-        entity.animation_id = operand_u8(operands, 12);
-        entity.animation_frame_id = operand_u8(operands, 13);
-        entity.timing_control = 1;
-        entity.set_state(0);
-        entity.set_ignore(0);
-        entity.action_behavior = 0;
-        entity.action_state = 0;
-        entity.hit_state = 0;
-        entity.look_at_flags = 0;
-        entity.collision_flags = 0;
-        entity.death_event_id = operand_u8(operands, 2);
-        entity.variant = (operand_u8(operands, 11) & 0x0F)
+        // The pre-block always writes the record's Y, the packed spawn-type
+        // byte and the force marker before the restore runs.
+        let variant = (operand_u8(operands, 11) & 0x0F)
             | ((operand_u8(operands, 14) & 0x0F) << 4)
             | if force_init { 0x80 } else { 0 };
-        // The original points the new entity at the SCA record g_scaDataTable[0]
-        // (Chris' radius/hit box) until the character's state-0 init swaps in
-        // its own record. The port stores the same initial radius; the
-        // per-character volume (offset, half-height and radius) is derived from
-        // `npc::data` wherever the collision layer needs it
-        // (see npc/walk.rs ScaHit).
-        entity.sca_radius = DEFAULT_ENEMY_RADIUS;
-        if !occupied {
-            self.enemy_count = self.enemy_count.saturating_add(1);
+        self.entities[slot].pos[1] = i32::from(operand_i16(operands, 9));
+        self.entities[slot].variant = variant;
+
+        // Without the force byte, a matching saved snapshot suppresses the
+        // init block; the record's position is then ignored.
+        let restored = !force_init && self.restore_saved_enemy(slot, variant);
+
+        if !restored {
+            let entity = &mut self.entities[slot];
+            entity.id = id;
+            // The init block writes exactly 1, clearing any bits an occupied
+            // slot carried.
+            entity.status_flags = ENTITY_STATUS_ACTIVE;
+            entity.behavior_flags = operand_u8(operands, 1);
+            entity.pitch = operand_i16(operands, 5) as u16;
+            entity.angle = operand_u16(operands, 6);
+            entity.roll = operand_u16(operands, 7);
+            // The record's X and Z are zero-extended, Y is sign-extended.
+            entity.pos[0] = i32::from(operand_u16(operands, 8));
+            entity.pos[2] = i32::from(operand_u16(operands, 10));
+            // `cmd_enemy_set` writes the SVECTOR position from the same
+            // operands.
+            entity.saved_pos = Some(entity.pos);
+            entity.animation_id = operand_u8(operands, 12);
+            entity.animation_frame_id = operand_u8(operands, 13);
+            entity.timing_control = 1;
+        }
+
+        // The reset block runs whenever the status bit is set, on a restore
+        // hit too: it overwrites the id/state/animation words from the record
+        // but keeps the restored position.
+        if self.entities[slot].status_flags & ENTITY_STATUS_ACTIVE != 0 {
+            let entity = &mut self.entities[slot];
+            entity.set_state(0);
+            entity.set_ignore(0);
+            entity.action_behavior = 0;
+            entity.action_state = 0;
+            entity.id = id;
+            entity.death_event_id = operand_u8(operands, 2);
+            entity.pitch = operand_i16(operands, 5) as u16;
+            entity.roll = operand_u16(operands, 7);
+            entity.hit_state = 0;
+            entity.joint_scale = 0;
+            entity.collision_flags = 0;
+            entity.look_at_flags = 0;
+            // The original points the new entity at the SCA record
+            // g_scaDataTable[0] (Chris' radius/hit box) until the character's
+            // state-0 init swaps in its own record. The port stores the same
+            // default record; per-character volumes are derived from
+            // `enemy::data` wherever the collision layer needs it, and
+            // monster scripts overwrite the live fields with `e:set_sca`.
+            entity.sca_radius = DEFAULT_ENEMY_RADIUS;
+            entity.sca_half_height = DEFAULT_ENEMY_HALF_HEIGHT;
+            entity.sca_offset = DEFAULT_ENEMY_SCA_OFFSET;
+            if !occupied {
+                self.enemy_count = self.enemy_count.saturating_add(1);
+            }
         }
         true
     }
@@ -2226,14 +4075,26 @@ impl GameState {
                 entity.action_state = 0;
             }
             9 => {
-                // TODO(parity): (gameplay) the original XORs each joint's own
-                // flag bit (bit i toggles joint i's flags byte); the port only
-                // records the bitfield. No renderer support for per-joint
-                // hiding yet, so scripts that hide a joint are inert.
-                entity.joint_flags ^= param;
+                // The original XORs each joint's own flag bit (bit i toggles
+                // joint i's flags byte); the port records the same bitfield
+                // and the renderer folds it into the hidden-joint mask.
+                entity.joint_flags ^= u32::from(param);
             }
             10 => entity.action_state = param as u8,
             _ => {}
+        }
+    }
+
+    /// Add the raw tint deltas to every enemy slot of the given id, within
+    /// the live enemy count - the original's shared additive-tint enemy scan.
+    /// Slot `1 + enemy` is the port's stand-in for enemy-list index `enemy`.
+    pub fn tint_enemies_by_id(&mut self, id: u8, r: i16, g: i16, b: i16) {
+        let count = usize::from(self.enemy_count).min(ENTITY_COUNT - 1);
+        for enemy in 0..count {
+            let entity = &mut self.entities[1 + enemy];
+            if entity.id == id {
+                entity.add_model_tint(r, g, b);
+            }
         }
     }
 
@@ -2249,38 +4110,33 @@ impl GameState {
     }
 
     /// One native update per active entity slot (1..), called after the event
-    /// VM and before the player's physics mirror. A displayed message that
-    /// masks the entity-think bit pauses the characters with the room; that is
-    /// a different bit from the player-control one, so the gate is
-    /// [`GameState::message_freezes_entities`]. Returns the number of slots
-    /// visited.
+    /// VM and before the player's physics mirror. Monster slots run the pack's
+    /// enemy scripts; character slots run the native driver and pause while a
+    /// message masks [`MESSAGE_FLAG_ENTITIES`]. The original draws `rand()`
+    /// once at the top of every gameplay frame, before any entity thinks; the
+    /// look-at scheduling and the effect behaviours read that frame's value and
+    /// the scripts read it back through the BioCard word that `cmpw 3` indexes.
+    /// Returns the number of slots updated.
     pub fn tick_entities(
         &mut self,
         room: &RoomState,
-        models: &mut crate::npc::EntityModelCache,
+        models: &mut crate::enemy::EntityModelCache,
         pack: &crate::pack::Pack,
+        lua: Option<&mut crate::enemy::LuaEnemyHost>,
     ) -> usize {
-        // TODO(parity): (gameplay) monster ids 0x00..=0x1F allocate no entity at
-        // all, so rooms that spawn zombies alongside a character stay empty and
-        // their scripts' `get_eml_state`/`eml_state` on those slots are inert.
-        // The state-8 weapon-fire handler dispatches for real and releases the
-        // scenes that wait on it.
-        // The original draws `rand()` once at the top of every gameplay frame,
-        // before any entity thinks; the look-at scheduling and the effect
-        // behaviours read that frame's value and the scripts read it back
-        // through the BioCard word that `cmpw 3` indexes.
         let frame_rand = platform_rand(&mut self.rand_state);
         self.rand_seed = frame_rand;
         self.state_words[3] = frame_rand;
-        if self.message_freezes_entities() {
-            // TODO(parity): (gameplay) the original still runs the state
-            // dispatch when the message bit is set and always updates the
-            // switch-zone bit and queues the fade sprite afterwards; the port
-            // skips the whole NPC update, so a frozen character's
-            // has_enter_switch_zone (and its shadow) stops tracking the camera.
-            return 0;
+        // The clone chains only draw on the frames their parent script ticks
+        // them; clear the live marks before the scripts run and let
+        // `enemy::web::update` re-raise them.
+        for clone in self.web_clones.iter_mut().flatten() {
+            clone.live = false;
         }
-        crate::npc::update_all(self, room, models, pack)
+        for companion in self.companions.iter_mut().flatten() {
+            companion.live = false;
+        }
+        crate::enemy::update_all(self, room, models, pack, lua)
     }
 
     /// The frame's screen-shake offset: the original's `ApplyScreenShake`.
@@ -2762,7 +4618,20 @@ impl GameState {
         let player_entity = self.entities[0];
         self.entities = initial_entities();
         self.entities[0] = player_entity;
-        self.entity_anims = std::array::from_fn(|_| crate::npc::EntityAnim::default());
+        self.entity_anims = std::array::from_fn(|_| crate::enemy::EntityAnim::default());
+        // The web-clone arena and the per-type web-joint registries reset with
+        // the room (the original's room-data buffer is rebuilt on load), so no
+        // thread or used-leg record leaks across a door.
+        *self.web_clones = std::array::from_fn(|_| None);
+        self.web_joint_registry = [[0; 8]; 2];
+        self.web_cap_logged = false;
+        // The Plant 42 companions live in the room-data buffer too: they reset
+        // with the room and the shared body handle dies with them. The Tyrant
+        // ribbon/ghost/limb scratch resets with it.
+        *self.companions = std::array::from_fn(|_| None);
+        self.plant42_shared_body = None;
+        self.tyrant = crate::enemy::tyrant::TyrantState::default();
+        self.player_attacker = None;
         self.enemy_count = 0;
         self.selected_entity = 0;
         self.transition = None;
@@ -3918,7 +5787,7 @@ impl GameState {
                 self.set_health_status(status);
             }
             9 => {
-                self.entities[0].joint_flags ^= param;
+                self.entities[0].joint_flags ^= u32::from(param);
             }
             10 => {
                 if param & 0xFF00 == 0 {
@@ -4719,7 +6588,7 @@ impl GameState {
                 if !entity.active() {
                     continue;
                 }
-                let hit = crate::npc::walk::ScaHit::character(entity.id, entity.sca_radius);
+                let hit = crate::enemy::walk::ScaHit::character(entity.id, entity.sca_radius);
                 let ext = objects::EntityCollision {
                     flag: entity.status_flags,
                     radius: hit.radius,
@@ -4762,7 +6631,8 @@ impl GameState {
                         if !entity.active() {
                             continue;
                         }
-                        let hit = crate::npc::walk::ScaHit::character(entity.id, entity.sca_radius);
+                        let hit =
+                            crate::enemy::walk::ScaHit::character(entity.id, entity.sca_radius);
                         let ext = objects::EntityCollision {
                             flag: entity.status_flags,
                             radius: hit.radius,
@@ -5330,6 +7200,61 @@ impl GameState {
         self.message_flags & MESSAGE_FLAG_ENTITIES == 0
     }
 
+    /// Whether the displayed message's pause word masked the monster-think
+    /// bit. Each monster script gates its own state dispatch on this; the
+    /// original's `spiderweb_update` has no gate and keeps running behind the
+    /// window.
+    pub fn message_freezes_monsters(&self) -> bool {
+        self.message_flags & MESSAGE_FLAG_MONSTERS == 0
+    }
+
+    /// `GetPlayerInputMasked`: any d-pad direction or face button held. The
+    /// port's remapped held-pad word carries the directions in the low nibble
+    /// and the action button at `0x80`, so the mask is exactly those bits.
+    pub fn player_mashing(&self) -> bool {
+        self.dpad_held & (DPAD_DIRECTIONS | PAD_ACTION_HELD) != 0
+    }
+
+    /// `reduce_attack_time_by_btn_press`: how many frames the held controls
+    /// shorten the zombie bite. The original reads the two button quartets of
+    /// its pad word (3 for the face buttons, +2 for the directions); the
+    /// port's remapped word carries the directions in the low nibble and the
+    /// action button at `0x80`, so those two sources stand in for the
+    /// quartets.
+    pub fn mash_reduce(&self) -> u8 {
+        let mut reduce = 0;
+        if self.dpad_held & PAD_ACTION_HELD != 0 {
+            reduce = 3;
+        }
+        if self.dpad_held & DPAD_DIRECTIONS != 0 {
+            reduce += 2;
+        }
+        reduce
+    }
+
+    /// `srand(seed)`: reseed the platform random stream. The bosses that
+    /// re-roll a whole sequence of debris/limb draws call it before the loop,
+    /// so the sequence is fixed per scripted action.
+    pub fn srand(&mut self, seed: u32) {
+        self.rand_state = seed;
+    }
+
+    /// `neptune_lfsr_bit`: one Fibonacci-LFSR step on the stored frame seed
+    /// (`g_RandSeed`), taps at bits 1 and 9, feeding bit 15 when they agree,
+    /// and returning the shifted seed's low byte. Mutating the stored frame
+    /// seed, not a copy, is load-bearing: later readers in the same frame see
+    /// the stepped value.
+    pub fn lfsr_step(&mut self) -> u8 {
+        let prev = self.rand_seed;
+        let mut seed = prev >> 1;
+        let taps = prev & 0x0202;
+        if (taps >> 8) == (taps & 0xFF) {
+            seed |= 0x8000;
+        }
+        self.rand_seed = seed;
+        (self.rand_seed & 0xFF) as u8
+    }
+
     /// Request a message and arm the room action its post-action pickup takes.
     pub fn show_message_for_action(&mut self, slot: u8, id: u8, pause: u16) {
         self.message_item_slot = Some(slot);
@@ -5479,8 +7404,9 @@ impl GameState {
 ///
 /// The layout is the port's documented approximation of `g_PlayerDpadHeld`:
 /// bit 0 up/forward (the walk behaviour's `held & 1`), bit 1 down, bit 2 left,
-/// bit 3 right, bit 4 run, bit 7 action. Skipped mid-`dpad_word` bits are the
-/// original's button remap slots this port does not surface to scripts.
+/// bit 3 right, bit 4 run, bit 6 fire, bit 7 action, bit 8 aim. Skipped
+/// `dpad_word` bits are the original's button remap slots this port does not
+/// surface to scripts.
 pub fn dpad_word(input: &crate::player::Input) -> u16 {
     let mut word = 0u16;
     if input.up {
@@ -5498,8 +7424,14 @@ pub fn dpad_word(input: &crate::player::Input) -> u16 {
     if input.run {
         word |= 0x0010;
     }
+    if input.fire {
+        word |= 0x0040;
+    }
     if input.action_held {
         word |= 0x0080;
+    }
+    if input.aim {
+        word |= 0x0100;
     }
     word
 }
@@ -8340,6 +10272,8 @@ mod tests {
         assert_eq!(entity.death_event_id, 0xFF);
         assert_eq!(entity.variant, 0x30 | 0x80);
         assert_eq!(entity.sca_radius, DEFAULT_ENEMY_RADIUS);
+        assert_eq!(entity.sca_half_height, DEFAULT_ENEMY_HALF_HEIGHT);
+        assert_eq!(entity.sca_offset, DEFAULT_ENEMY_SCA_OFFSET);
         assert_eq!(entity.state(), 0);
         assert_eq!(entity.ignore(), 0);
         assert_eq!(entity.action_behavior, 0);
@@ -8388,16 +10322,48 @@ mod tests {
     /// Documented deviation: the original's no-force path runs the saved-state
     /// restore and re-initialises when it misses; the port has no snapshot
     /// store, so it keeps the occupied slot. Every shipped character record
-    /// sets force, so the corpus never reaches this branch.
+    /// Without a matching saved snapshot, a no-force record re-initialises
+    /// the occupied slot in place (the original's reset block); with one, the
+    /// snapshot is restored and the record's position is ignored.
     #[test]
-    fn enemy_spawn_keeps_an_occupied_slot_without_force_init() {
+    fn enemy_spawn_without_force_reinitialises_an_occupied_slot() {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
         host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 1, 0));
         host.on_enemy(op(0x1B), &enemy_record(0x27, 0x02, 0xFF, 0, 0));
         let entity = host.state().entities[1];
-        assert_eq!(entity.id, 0x23, "the occupied slot keeps its entity");
+        assert_eq!(entity.id, 0x27, "the record re-initialised the slot");
+        assert_eq!(entity.behavior_flags, 0x02);
+        assert_eq!(host.state().enemy_count, 1);
+        assert!(
+            host.state()
+                .saved_enemies
+                .iter()
+                .all(|enemy| !enemy.occupied())
+        );
+    }
+
+    #[test]
+    fn enemy_spawn_without_force_restores_a_matching_snapshot() {
+        let mut state = game();
+        state.saved_enemies[0] = crate::combat::SavedEnemyState {
+            status_flags: 1,
+            behavior_flags: 0x06,
+            room: state.id.room,
+            enemy_type: 0x30,
+            state: 1,
+            pos: [700, -20, 900],
+            angle: 0x123,
+            valid: 5,
+        };
+        let mut host = ScdGameHost::new(&mut state);
+        host.on_enemy(op(0x1B), &enemy_record(0x23, 0x06, 0xFF, 0, 0));
+        let entity = host.state().entities[1];
+        assert_eq!(entity.id, 0x23, "the reset block still writes the id");
+        assert_eq!(entity.pos, [700, 0, 900], "the saved X/Z were restored");
+        assert_eq!(entity.angle, 0x123);
         assert_eq!(entity.behavior_flags, 0x06);
+        assert!(!host.state().saved_enemies[0].occupied());
         assert_eq!(host.state().enemy_count, 1);
     }
 
@@ -8425,21 +10391,28 @@ mod tests {
     }
 
     #[test]
-    fn enemy_monster_ids_allocate_nothing() {
+    fn enemy_monster_ids_allocate_and_out_of_range_ids_do_not() {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
-        for id in [0x00, 0x11, 0x15, 0x16, 0x1F, 0x2F] {
+        // Monster ids allocate like characters; 0x2F and above are outside the
+        // original's dispatch table and allocate nothing.
+        for id in [0x00, 0x11, 0x15, 0x16, 0x1F] {
             assert_eq!(
                 host.on_enemy(op(0x1B), &enemy_record(id, 0, 0xFF, 1, 0)),
                 StepResult::Continue
             );
         }
-        assert!(
-            host.state().entities[1..]
-                .iter()
-                .all(|entity| !entity.active())
+        assert!(host.state().entities[1].active());
+        assert_eq!(
+            host.state().entities[1].id,
+            0x1F,
+            "the last monster id wins"
         );
-        assert_eq!(host.state().enemy_count, 0);
+        assert_eq!(host.state().enemy_count, 1, "the slot was re-initialised");
+
+        host.on_enemy(op(0x1B), &enemy_record(0x2F, 0, 0xFF, 1, 1));
+        assert!(!host.state().entities[2].active());
+        assert_eq!(host.state().enemy_count, 1);
     }
 
     #[test]
@@ -8533,22 +10506,24 @@ mod tests {
     #[test]
     fn tick_entities_walks_active_slots_and_freezes_with_a_message() {
         let mut state = game();
+        state.entities[1].id = crate::enemy::FIRST_ID;
+        state.entities[3].id = crate::enemy::FIRST_ID + 1;
         state.entities[1].set_active(true);
         state.entities[3].set_active(true);
         let room = RoomState::default();
         let pack =
             crate::pack::Pack::from_bytes(crate::pack::PackWriter::new().to_bytes().unwrap())
                 .unwrap();
-        let mut models = crate::npc::EntityModelCache::default();
-        assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
+        let mut models = crate::enemy::EntityModelCache::default();
+        assert_eq!(state.tick_entities(&room, &mut models, &pack, None), 2);
         assert!(state.entities[1].active());
         assert!(state.entities[3].active());
 
-        // A message whose pause word masks the entity-think bit freezes the
-        // characters, and the entity tick must not run behind the window.
+        // A message whose pause word masks the character-think bit freezes the
+        // characters, and the character driver must not run behind the window.
         state.show_message(1, MESSAGE_FLAG_ENTITIES);
         assert!(state.message_freezes_entities());
-        assert_eq!(state.tick_entities(&room, &mut models, &pack), 0);
+        assert_eq!(state.tick_entities(&room, &mut models, &pack, None), 0);
 
         // The player-state bit is a different one: a message that only masks
         // it keeps the characters running.
@@ -8556,7 +10531,409 @@ mod tests {
         state.show_message(1, MESSAGE_FLAG_PLAYER_STATE);
         assert!(state.message_locks_controls());
         assert!(!state.message_freezes_entities());
-        assert_eq!(state.tick_entities(&room, &mut models, &pack), 2);
+        assert_eq!(state.tick_entities(&room, &mut models, &pack, None), 2);
+    }
+
+    #[test]
+    fn scratch_word_accessors_compose_adjacent_bytes_little_endian() {
+        let mut entity = Entity::default();
+        entity.set_writhe_velocity(-0x1234);
+        assert_eq!(
+            (entity.attacking_direction, entity.dir_control_flags),
+            (0xCC, 0xED)
+        );
+        assert_eq!(entity.writhe_velocity(), -0x1234);
+
+        entity.set_writhe_amplitude(0x1600);
+        assert_eq!((entity.tex_bank, entity.seq_counter), (0x00, 0x16));
+        assert_eq!(entity.writhe_amplitude(), 0x1600);
+
+        entity.set_tint_flashes(-1);
+        assert_eq!((entity.angle_turn_delta, entity.move_timer), (0xFF, 0xFF));
+        assert_eq!(entity.tint_flashes(), -1);
+
+        entity.set_groan_timer(0x0028);
+        assert_eq!((entity.action_speed, entity.hit_threshold), (0x28, 0x00));
+        assert_eq!(entity.groan_timer(), 0x28);
+
+        entity.set_sink_wobble(0x0200);
+        assert_eq!((entity.behavior_step, entity.action_counter), (0x00, 0x02));
+        assert_eq!(entity.sink_wobble(), 0x0200);
+    }
+
+    #[test]
+    fn wasp_scratch_words_share_the_dword_and_keep_their_neighbour() {
+        let mut entity = Entity::default();
+        entity.set_wasp_distance(0x1234);
+        assert_eq!(entity.wasp_distance(), 0x1234);
+        assert_eq!(entity.wasp_collision(), 0, "the high half starts clear");
+        entity.set_wasp_collision(0xABCD);
+        assert_eq!(entity.wasp_collision(), 0xABCD);
+        assert_eq!(entity.wasp_distance(), 0x1234, "the low half is preserved");
+        assert_eq!(entity.subpixel_pos_x, 0xABCD_1234u32 as i32);
+        entity.set_wasp_distance(0xFFF0);
+        assert_eq!(
+            entity.wasp_distance(),
+            0xFFF0,
+            "the distance word is a raw u16 view"
+        );
+        assert_eq!(
+            entity.wasp_collision(),
+            0xABCD,
+            "and does not disturb the top"
+        );
+        assert_eq!(entity.stored_pos_z(), 0xABCD_FFF0u32 as i32);
+    }
+
+    #[test]
+    fn stored_position_words_compose_three_fields_and_a_dword() {
+        let mut entity = Entity::default();
+        entity.set_stored_pos_x(-0x0007_1234);
+        assert_eq!(entity.splatter_flag, 0xCC);
+        assert_eq!(entity.bob_speed, 0xED);
+        assert_eq!(entity.reaction_timer, -8);
+        assert_eq!(entity.stored_pos_x(), -0x0007_1234);
+
+        entity.set_stored_pos_z(0x1234_5678);
+        assert_eq!(entity.subpixel_pos_x, 0x1234_5678);
+        assert_eq!(entity.stored_pos_z(), 0x1234_5678);
+    }
+
+    #[test]
+    fn adder_scratch_words_compose_the_shared_bytes() {
+        let mut entity = Entity::default();
+        entity.set_sca_active(0x0201);
+        assert_eq!((entity.splatter_flag, entity.bob_speed), (0x01, 0x02));
+        assert_eq!(entity.sca_active(), 0x0201);
+
+        entity.set_sca_touch(-2);
+        assert_eq!((entity.tex_bank, entity.seq_counter), (0xFE, 0xFF));
+        assert_eq!(entity.sca_touch(), -2);
+
+        entity.set_room_collision(0x0102);
+        assert_eq!((entity.is_moving, entity.move_max_steps), (0x02, 0x01));
+        assert_eq!(entity.room_collision(), 0x0102);
+
+        entity.set_stuck_frames(0x00FF);
+        assert_eq!(entity.reaction_timer, 0x00FF);
+        assert_eq!(entity.stuck_frames(), 0x00FF);
+
+        // The dword view over the same bytes still composes over the words.
+        entity.set_stored_pos_x(0x1234_5678);
+        assert_eq!(entity.sca_active(), 0x5678);
+        assert_eq!(entity.stuck_frames(), 0x1234);
+        assert_eq!(entity.stored_pos_x(), 0x1234_5678);
+    }
+
+    #[test]
+    fn monster_plant_scratch_views_compose_the_shared_bytes() {
+        let mut e = Entity::default();
+        e.set_mp_dist(-0x0001_2345);
+        assert_eq!(
+            (
+                e.attacking_direction,
+                e.dir_control_flags,
+                e.tex_bank,
+                e.seq_counter,
+            ),
+            (0xBB, 0xDC, 0xFE, 0xFF)
+        );
+        assert_eq!(e.mp_dist(), -0x0001_2345);
+
+        e.set_mp_holdoff(-0x1234);
+        assert_eq!((e.angle_turn_delta, e.move_timer), (0xCC, 0xED));
+        assert_eq!(e.mp_holdoff(), -0x1234);
+
+        e.set_mp_anim_end(0x1234);
+        assert_eq!((e.is_moving, e.move_max_steps), (0x34, 0x12));
+        assert_eq!(e.mp_anim_end(), 0x1234);
+
+        e.set_mp_seg(-2);
+        assert_eq!((e.splatter_flag, e.bob_speed), (0xFE, 0xFF));
+        assert_eq!(e.mp_seg(), -2);
+
+        e.set_mp_timer_a(-0x0C);
+        assert_eq!(e.reaction_timer, -0x0C);
+        assert_eq!(e.mp_timer_a(), -0x0C);
+
+        // The timer/fidget pair shares the fixed-position dword and neither
+        // half disturbs the other.
+        e.set_mp_timer_b(0x003C);
+        assert_eq!(e.mp_timer_b(), 0x003C);
+        assert_eq!(e.mp_fidget(), 0);
+        e.set_mp_fidget(-3);
+        assert_eq!(e.mp_fidget(), -3);
+        assert_eq!(e.mp_timer_b(), 0x003C);
+        assert_eq!(e.subpixel_pos_x, 0xFFFD_003C_u32 as i32);
+
+        e.set_mp_alerted(0x0102);
+        assert_eq!((e.action_speed, e.hit_threshold), (0x02, 0x01));
+        assert_eq!(e.mp_alerted(), 0x0102);
+
+        e.set_mp_angle_bk(-0x1234);
+        assert_eq!((e.behavior_step, e.action_counter), (0xCC, 0xED));
+        assert_eq!(e.mp_angle_bk(), -0x1234);
+
+        e.set_mp_swerve(3);
+        assert_eq!((e.move_speed_byte, e.turn_speed), (0x03, 0x00));
+        assert_eq!(e.mp_swerve(), 3);
+
+        e.set_mp_shadow(0x0101);
+        assert_eq!((e.internal_timer, e.scratch_183), (0x01, 0x01));
+        assert_eq!(e.mp_shadow(), 0x0101);
+
+        e.set_mp_hits(5);
+        assert_eq!((e.stagger_timer, e.scratch_189), (5, 0));
+        assert_eq!(e.mp_hits(), 5);
+
+        e.set_mp_step_word(0x0304);
+        assert_eq!((e.action_behavior, e.action_state), (0x04, 0x03));
+        assert_eq!(e.mp_step_word(), 0x0304);
+    }
+
+    #[test]
+    fn computer_arm_scratch_views_compose_the_shared_bytes() {
+        let mut e = Entity::default();
+        e.set_arm_vel_x(-1);
+        assert_eq!(e.arm_vel_x(), -1);
+        e.set_arm_vel_z(-0x0001_2345);
+        assert_eq!((e.angle_turn_delta, e.move_timer), (0xBB, 0xDC));
+        assert_eq!(e.arm_vel_z(), -0x0001_2345);
+        e.set_arm_pos_x(0x1234_5678);
+        assert_eq!(
+            (e.splatter_flag, e.bob_speed, e.reaction_timer),
+            (0x78, 0x56, 0x1234)
+        );
+        assert_eq!(e.arm_pos_x(), 0x1234_5678);
+        e.set_arm_pos_z(-2);
+        assert_eq!(e.arm_pos_z(), -2);
+        assert_eq!(e.subpixel_pos_x, -2);
+        e.set_arm_y(0x0001_0203);
+        assert_eq!(e.arm_y(), 0x0001_0203);
+        assert_eq!(
+            (
+                e.action_speed,
+                e.hit_threshold,
+                e.behavior_step,
+                e.action_counter
+            ),
+            (0x03, 0x02, 0x01, 0x00)
+        );
+        e.set_arm_vel_y(-0x0002_0304);
+        assert_eq!(e.arm_vel_y(), -0x0002_0304);
+
+        // The gate word is the low half of the state-mirror dword and leaves
+        // the bytes above it alone.
+        e.state_mirror = 0xFFFF_FFFF;
+        e.set_arm_gate(0x0032);
+        assert_eq!(e.arm_gate(), 0x0032);
+        assert_eq!(e.state_mirror, 0xFFFF_0032);
+        e.set_arm_gate(-1);
+        assert_eq!(e.arm_gate(), -1);
+    }
+
+    #[test]
+    fn srand_reseeds_the_stream_and_the_frame_seed_steps_the_lfsr() {
+        let mut state = GameState::default();
+        state.srand(0xB23);
+        assert_eq!(state.rand_state, 0xB23, "the stream is reseeded");
+        state.rand_seed = 0x0020;
+        // prev = 0x0020: taps = 0x0000, they agree, so bit 15 is fed back and
+        // the shifted seed becomes 0x8010.
+        assert_eq!(state.lfsr_step(), 0x10);
+        assert_eq!(state.rand_seed, 0x8010);
+        // prev = 0x0006: taps = bit 1 set, bit 9 clear, they disagree; the
+        // shifted seed keeps bit 15 clear.
+        state.rand_seed = 0x0006;
+        assert_eq!(state.lfsr_step(), 0x03);
+        assert_eq!(state.rand_seed, 0x0003);
+        assert_eq!(
+            state.monster_plant_sides, 0,
+            "the shared register starts clear"
+        );
+    }
+
+    #[test]
+    fn crow_altitude_bounds_are_signed_views_of_the_adder_words() {
+        let mut entity = Entity::default();
+        entity.set_crow_floor_limit(-0x0BB8);
+        assert_eq!(entity.room_collision(), 0xF448, "the raw word wraps");
+        assert_eq!(entity.crow_floor_limit(), -0x0BB8);
+        entity.set_room_collision(0x0102);
+        assert_eq!(entity.crow_floor_limit(), 0x0102, "the shared word");
+
+        entity.set_crow_ceil_limit(-0x1194);
+        assert_eq!(entity.sca_active(), 0xEE6C);
+        assert_eq!(entity.crow_ceil_limit(), -0x1194);
+        assert_eq!(
+            entity.room_collision(),
+            0x0102,
+            "the two bounds occupy independent words"
+        );
+
+        // The crow's own typed fields and the stored velocity keep their
+        // widths.
+        entity.floor_step = -3399;
+        entity.swerve = -0x40;
+        entity.swerve_latch = 4;
+        entity.struggle = -1;
+        entity.alt_bias = -400;
+        entity.speed = [1, 0, -2];
+        assert_eq!(
+            (
+                entity.floor_step,
+                entity.swerve,
+                entity.swerve_latch,
+                entity.struggle,
+                entity.alt_bias,
+                entity.speed,
+            ),
+            (-3399, -0x40, 4, -1, -400, [1, 0, -2])
+        );
+    }
+
+    #[test]
+    fn player_mashing_masks_the_directions_and_the_action_bit() {
+        let mut state = GameState::default();
+        assert!(!state.player_mashing(), "a quiet pad is no mash");
+        state.dpad_held = 0x0010;
+        assert!(!state.player_mashing(), "the run bit alone is not a mash");
+        state.dpad_held = 0x0004;
+        assert!(state.player_mashing(), "a d-pad direction counts");
+        state.dpad_held = PAD_ACTION_HELD;
+        assert!(state.player_mashing(), "the action button counts");
+        state.dpad_held = 0x0040 | 0x0100;
+        assert!(!state.player_mashing(), "unmapped bits do not");
+    }
+
+    #[test]
+    fn mash_reduce_counts_buttons_and_directions() {
+        let mut state = GameState::default();
+        assert_eq!(state.mash_reduce(), 0);
+        state.dpad_held = PAD_ACTION_HELD;
+        assert_eq!(state.mash_reduce(), 3, "the face button");
+        state.dpad_held = 0x0004;
+        assert_eq!(state.mash_reduce(), 2, "a direction");
+        state.dpad_held = PAD_ACTION_HELD | 0x0004;
+        assert_eq!(state.mash_reduce(), 5, "both");
+    }
+
+    #[test]
+    fn zombie_scratch_views_compose_and_round_trip() {
+        let mut e = Entity::default();
+        // The four state bytes and the mirror dword.
+        e.set_state_word(0x03020101);
+        assert_eq!(
+            (e.state(), e.ignore(), e.action_behavior, e.action_state),
+            (1, 1, 2, 3)
+        );
+        e.state_mirror = 0x07060504;
+        e.set_state_word(e.state_mirror);
+        assert_eq!(
+            (e.state(), e.ignore(), e.action_behavior, e.action_state),
+            (4, 5, 6, 7)
+        );
+
+        // The +0x170 turn accumulator and the +0x172 movement word.
+        e.set_zombie_turn_delta(-8);
+        assert_eq!(e.zombie_turn_delta(), -8);
+        assert_eq!((e.angle_turn_delta, e.move_timer), (0xF8, 0xFF));
+        e.set_zombie_move_word(0x0201);
+        assert_eq!((e.is_moving, e.move_max_steps), (1, 2));
+        assert_eq!(e.zombie_move_word(), 0x0201);
+
+        // The +0x174 part word and the +0x178..0x17B byte/word aliases.
+        e.set_zombie_part_word(0x0102);
+        assert_eq!((e.splatter_flag, e.bob_speed), (2, 1));
+        e.set_zombie_unk_178(9);
+        e.set_zombie_unk_179(8);
+        e.set_zombie_wander_word(0x1234);
+        assert_eq!((e.zombie_unk_178(), e.zombie_unk_179()), (9, 8));
+        assert_eq!(e.zombie_wander_word(), 0x1234);
+        assert_eq!(e.stored_pos_z(), 0x1234_0809);
+
+        // The joint flag byte: bit 0 is the active/hidden bit, bits 1-7 the
+        // gore state.
+        e.set_joint_flag(4, 0x0D);
+        assert_eq!(e.joint_flag(4), 0x0D);
+        assert_eq!(e.joint_flags_hi[4], 0x0C);
+        assert_eq!(e.joint_flags & (1 << 4), 0, "visible");
+        e.set_joint_flag(4, 0x0C);
+        assert_eq!(e.joint_flag(4), 0x0C);
+        assert_eq!(e.joint_flags & (1 << 4), 1 << 4, "hidden");
+        // Other joints are untouched.
+        assert_eq!(e.joint_flag(5), 1);
+    }
+
+    #[test]
+    fn additive_model_tint_rebases_green_and_accumulates() {
+        let mut entity = Entity::default();
+        assert_eq!(entity.model_tint_rgb(), [255, 255, 255]);
+
+        // (0, -1, -2): the brighter of red/green is red, so green drops one
+        // step and blue two; green is then forced off and blue stays above
+        // the 0.36 floor.
+        entity.add_model_tint(0, -1, -2);
+        assert_eq!(entity.model_tint, [0, -31, -2]);
+        assert_eq!(entity.model_tint_rgb(), [255, 0, (29 * 255 / 31) as u8]);
+
+        // Five more flashes walk blue down to 19/31; green stays off.
+        for _ in 0..5 {
+            entity.add_model_tint(0, -1, -2);
+        }
+        assert_eq!(entity.model_tint[2], -12);
+        assert_eq!(entity.model_tint_rgb()[2], (19 * 255 / 31) as u8);
+
+        // Enough flashes pin the channels at the dark end.
+        for _ in 0..20 {
+            entity.add_model_tint(0, -1, -2);
+        }
+        assert_eq!(entity.model_tint, [0, -31, -31]);
+        assert_eq!(entity.model_tint_rgb(), [255, 0, 0]);
+
+        // The blue floor snaps the channel off below 12/31.
+        let mut entity = Entity::default();
+        entity.model_tint[2] = -20;
+        entity.add_model_tint(0, 0, 0);
+        assert_eq!(entity.model_tint[2], -31);
+    }
+
+    #[test]
+    fn tint_queue_clamps_signed_bytes_and_stores_the_words() {
+        let mut entity = Entity::default();
+        entity.queue_model_tint(0, -6, -12, 0, 0x100);
+        assert_eq!(entity.tint_queue, [0, -6, -12]);
+        assert_eq!(entity.tint_queue_word_a, 0);
+        assert_eq!(entity.tint_queue_word_b, 0x100);
+        assert!(entity.tint_queue_armed);
+
+        // The add wraps through the signed byte before the clamp, exactly
+        // like the original's byte store.
+        entity.tint_queue[0] = 127;
+        entity.queue_model_tint(1, 0, 0, 0, 0);
+        assert_eq!(entity.tint_queue[0], -31, "0x80 wraps to -128, then clamps");
+
+        entity.retarget_model_tint(5, 6, 7, 1, 2);
+        assert_eq!(entity.tint_queue, [5, 6, 7]);
+        assert_eq!((entity.tint_queue_word_a, entity.tint_queue_word_b), (1, 2));
+        assert!(entity.tint_queue_armed);
+    }
+
+    #[test]
+    fn tint_scan_matches_by_id_within_the_enemy_count() {
+        let mut state = game();
+        state.entities[1].id = 0x0e;
+        state.entities[2].id = 0x0e;
+        state.entities[3].id = 0x13;
+        state.enemy_count = 2;
+        state.tint_enemies_by_id(0x0e, 0, -1, -2);
+        assert_eq!(state.entities[1].model_tint, [0, -31, -2]);
+        assert_eq!(state.entities[2].model_tint, [0, -31, -2]);
+        assert_eq!(
+            state.entities[3].model_tint,
+            [0, 0, 0],
+            "an id past the live count is not scanned"
+        );
     }
 
     #[test]
@@ -8580,8 +10957,8 @@ mod tests {
         let pack =
             crate::pack::Pack::from_bytes(crate::pack::PackWriter::new().to_bytes().unwrap())
                 .unwrap();
-        let mut models = crate::npc::EntityModelCache::default();
-        state.tick_entities(&room, &mut models, &pack);
+        let mut models = crate::enemy::EntityModelCache::default();
+        state.tick_entities(&room, &mut models, &pack, None);
 
         // The frame draw is the stream's first value from the CRT default 1.
         let draw = 41u16;
@@ -13691,5 +16068,71 @@ mod tests {
         assert_eq!(state.entities[0].animation_frame_id, 3);
         assert_eq!(state.entities[0].action_behavior, 1, "0x33 sub 4 ran");
         assert_eq!(state.entities[0].action_state, 6);
+    }
+
+    #[test]
+    fn hunter_scratch_views_compose_and_preserve_their_neighbours() {
+        let mut entity = Entity::default();
+
+        // The two target halves share the fixed-position dword.
+        entity.set_hunter_target_x(-0x1234);
+        assert_eq!(entity.hunter_target_x(), -0x1234);
+        entity.set_hunter_target_z(0x1234);
+        assert_eq!(entity.hunter_target_z(), 0x1234);
+        assert_eq!(entity.hunter_target_x(), -0x1234, "the Z store preserved X");
+
+        // The word views over adjacent bytes.
+        entity.set_hunter_joint_sel(0xABCD);
+        assert_eq!(entity.hunter_joint_sel(), 0xABCD);
+        assert_eq!(entity.action_speed, 0xCD);
+        assert_eq!(entity.hit_threshold, 0xAB);
+        entity.set_hunter_step_word(0x1234);
+        assert_eq!(entity.hunter_step_word(), 0x1234);
+        assert_eq!((entity.behavior_step, entity.action_counter), (0x34, 0x12));
+
+        // The signed views and the one-byte aliases.
+        entity.set_hunter_speed(-5);
+        assert_eq!(entity.hunter_speed(), -5);
+        entity.set_hunter_ticks(-2);
+        assert_eq!(entity.hunter_ticks(), -2);
+        entity.set_hunter_path_latch(-0x1234);
+        assert_eq!(entity.hunter_path_latch(), -0x1234);
+        entity.set_hunter_grab_word(-3);
+        assert_eq!(entity.hunter_grab_word(), -3);
+        entity.set_hunter_room_hit(0xFF);
+        assert_eq!(entity.hunter_room_hit(), 0xFF);
+        entity.set_hunter_pounce_latch(9);
+        assert_eq!(entity.hunter_pounce_latch(), 9);
+        entity.set_hunter_death_cnt_a(0xFF);
+        assert_eq!(entity.hunter_death_cnt_a(), 0xFF);
+        entity.set_hunter_death_cnt_b(0xFF);
+        assert_eq!(entity.hunter_death_cnt_b(), 0xFF);
+        entity.set_hunter_strafe_dir(0xFF);
+        assert_eq!(entity.hunter_strafe_dir(), 0xFF);
+        entity.set_hunter_approach_cnt(0xFF);
+        assert_eq!(entity.hunter_approach_cnt(), 0xFF);
+        entity.set_hunter_poise(7);
+        assert_eq!(entity.hunter_poise(), 7);
+        entity.set_hunter_repause(0x3C);
+        assert_eq!(entity.hunter_repause(), 0x3C);
+
+        // The leap flag shares the crow's altitude word; the byte above it
+        // survives.
+        entity.alt_bias = 0x1200;
+        entity.set_hunter_leap_flag(0xFF);
+        assert_eq!(entity.hunter_leap_flag(), 0xFF);
+        assert_eq!(entity.alt_bias as u16 & 0xFF00, 0x1200);
+
+        // The shared one-shot and scratch defaults. The grab/death one-shot
+        // starts set: the original's image value is non-zero, so the first
+        // death screen hides the head even before any hunter grab.
+        let state = GameState::default();
+        assert_eq!(state.attract_room_camera_id, 0x1F);
+        assert!(state.hunter_grab_one_shot);
+        assert_eq!(state.player_distance_z, 0);
+        assert_eq!(state.player_displacement, 0);
+        assert_eq!(state.scaled_down_dist, 0);
+        assert_eq!(state.hunter_scream_latch, 0);
+        assert_eq!(state.hunter_intro_jump_kind, 0);
     }
 }

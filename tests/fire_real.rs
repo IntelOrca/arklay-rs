@@ -19,8 +19,8 @@ mod common;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use arklay::enemy::EntityModelCache;
 use arklay::game::{BANK_SYSTEM, GameState, ScdGameHost};
-use arklay::npc::EntityModelCache;
 use arklay::pack::Pack;
 use arklay::player;
 use arklay::render::Camera;
@@ -96,7 +96,8 @@ impl FireScene {
         if self.game.camera.locked && self.game.camera.current_cut < self.room.cuts.len() {
             self.room.current_cut = self.game.camera.current_cut;
         }
-        self.game.tick_entities(&self.room, &mut self.models, pack);
+        self.game
+            .tick_entities(&self.room, &mut self.models, pack, None);
         self.game.tick_effects(&self.room);
     }
 }
@@ -262,7 +263,7 @@ fn real_room1051_capture_shows_the_muzzle_pixels() {
     let mut models = EntityModelCache::default();
     let mut capture = None;
     for _ in 0..8 {
-        game.tick_entities(&room, &mut models, &pack);
+        game.tick_entities(&room, &mut models, &pack, None);
         game.tick_effects(&room);
         let muzzle = game
             .effects
@@ -322,11 +323,16 @@ fn real_room40c1_flamethrower_runs_without_the_wait_flag() {
     let mut game = sim.game;
 
     // The room's flamethrower character (behavior_flags 5 -> weapon 3) as its
-    // own script poses it. Nothing here seeds the wait bit.
+    // own script poses it. The count filters out same-flag monster records.
+    // Nothing here seeds the wait bit.
     let slot = game
         .entities
         .iter()
-        .position(|entity| entity.active() && entity.behavior_flags == 5)
+        .position(|entity| {
+            entity.active()
+                && entity.id >= arklay::enemy::CHARACTER_ID_MIN
+                && entity.behavior_flags == 5
+        })
         .expect("ROOM40C1 spawns the flamethrower character");
     {
         let entity = &mut game.entities[slot];
@@ -340,7 +346,7 @@ fn real_room40c1_flamethrower_runs_without_the_wait_flag() {
     let mut models = EntityModelCache::default();
     let mut sprayed = false;
     for _ in 0..200 {
-        game.tick_entities(&room, &mut models, &pack);
+        game.tick_entities(&room, &mut models, &pack, None);
         game.tick_effects(&room);
         sprayed |= game
             .effects

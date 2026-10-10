@@ -2,35 +2,35 @@
 //! behaviour dispatch.
 //!
 //! Entity ids `0x20..=0x2E` are the game's human characters. Their EMD models
-//! are packed raw under `npc/{id:02x}.emd`, each carries the collision radius
-//! the room collision pass reads while the character walks, and each falls into
-//! one of three shadow-tint classes. The idle behaviour byte selects one of the
-//! state-1 handlers from [`IdleBehavior`].
+//! are packed raw under `enemy/em{id:02x}.emd`, each carries the collision
+//! radius the room collision pass reads while the character walks, and each
+//! falls into one of three shadow-tint classes. The idle behaviour byte selects
+//! one of the state-1 handlers from [`IdleBehavior`].
 
 use crate::game::{FLAG_BANK_COUNT, FlagBank};
 
-/// First entity id backed by an `npc/*.emd` model.
+/// First entity id backed by an `enemy/*.emd` model.
 pub const FIRST_ID: u8 = 0x20;
-/// Last entity id backed by an `npc/*.emd` model.
+/// Last entity id backed by an `enemy/*.emd` model.
 pub const LAST_ID: u8 = 0x2E;
 
 /// Character-model pack paths, indexed by `id - FIRST_ID`.
 const MODEL_PATHS: [&str; 15] = [
-    "npc/20.emd",
-    "npc/21.emd",
-    "npc/22.emd",
-    "npc/23.emd",
-    "npc/24.emd",
-    "npc/25.emd",
-    "npc/26.emd",
-    "npc/27.emd",
-    "npc/28.emd",
-    "npc/29.emd",
-    "npc/2a.emd",
-    "npc/2b.emd",
-    "npc/2c.emd",
-    "npc/2d.emd",
-    "npc/2e.emd",
+    "enemy/em20.emd",
+    "enemy/em21.emd",
+    "enemy/em22.emd",
+    "enemy/em23.emd",
+    "enemy/em24.emd",
+    "enemy/em25.emd",
+    "enemy/em26.emd",
+    "enemy/em27.emd",
+    "enemy/em28.emd",
+    "enemy/em29.emd",
+    "enemy/em2a.emd",
+    "enemy/em2b.emd",
+    "enemy/em2c.emd",
+    "enemy/em2d.emd",
+    "enemy/em2e.emd",
 ];
 
 /// Character names, indexed by `id - FIRST_ID`; diagnostics only.
@@ -405,7 +405,7 @@ mod tests {
     fn model_paths_cover_the_character_id_range() {
         for id in FIRST_ID..=LAST_ID {
             let path = model_path(id).unwrap_or_else(|| panic!("id {id:#04x} has no path"));
-            assert_eq!(path, format!("npc/{id:02x}.emd"));
+            assert_eq!(path, format!("enemy/em{id:02x}.emd"));
         }
         assert_eq!(model_path(FIRST_ID - 1), None);
         assert_eq!(model_path(LAST_ID + 1), None);

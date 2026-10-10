@@ -76,7 +76,7 @@ Residual scope:
 the two blocking bits and writes the result back, discarding the low byte's
 floor/step fine value for the rest of the room's life. The port reads the
 shared `RoomState` immutably from the pathfind driver and drops that
-destructive side effect (the note on `npc::walk::room_check_sight_blocked`
+destructive side effect (the note on `enemy::walk::room_check_sight_blocked`
 carries the same caveat). This is a real divergence for a room whose collision
 resolve reads a floor/step record after a sight check; no port test currently
 orders those two operations over a step record, and the state-driven captures
@@ -100,6 +100,38 @@ are unaffected.
 - All other ABE records in the shipped corpus use ABR 0 or 2, whose `0x80`
   weight produces the identical `(source + destination) / 2` pixel the M16
   path already drew, so their captures do not move.
+
+## Documented remainder: the death-screen variants
+
+E11b lands the full death flow; these variants stay deferred with their
+reasons:
+
+- **The Plant 42 DIED-screen pose.** The original's screen special-cases a
+  player killed by the monster plant (enemy id `0x08` with its death-animation
+  flag): joints 0 and 2 are hidden, only the torso draws, and a fixed
+  rotation/offset is applied. The port does not model the plant's five-state
+  kill animation (`player_anim_dispatch_4c2ac8`) or its flag yet, so the
+  standard corpse draws in that case. The head one-shot still applies.
+- **The attract-demo and countdown death branches.** The machine wires the
+  `MSF2_ATTRACT_DEMO`/`MSF2_DEATH_VARIANT` skips and the room dispatch
+  exactly, but the port has no attract-demo replay and no self-destruct
+  countdown timer, so those branches are never taken.
+- **The sound fade.** `BuildSndFadeTbl`'s volume ramp is not modelled: the
+  screen stops the room BGM through the mixer when it opens instead of fading
+  it out over the delay. Gameplay audio ends abruptly rather than ramping.
+- **The blood-pool extents.** The pool follows the port's existing ground-quad
+  half extents (500x700) with the original's -100 shrink and +16/frame growth;
+  the original's quad starts at 512x640, so the absolute pool size differs by
+  the same pre-existing shadow-baseline difference.
+- **The dead full-strip quad.** The original's screen carries a second
+  255x64 strip template whose draw is gated on a byte that is only ever set
+  negative, so it never paints; the port reproduces the per-column strip and
+  omits the unreachable draw.
+- **The head one-shot's lifetime.** The original's grab/death flag is a
+  process-global whose non-zero image value hides the head on the process's
+  first death only. The port keeps it per session (each new game or load
+  starts set), so every session's first death hides the head; the in-session
+  behaviour is identical.
 
 ## Verification
 

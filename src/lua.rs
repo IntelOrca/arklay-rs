@@ -98,14 +98,14 @@ mod imp {
 
     /// The per-call instruction budget, shared with the VM's hook callback.
     #[derive(Debug, Default)]
-    struct Budget {
+    pub(crate) struct Budget {
         /// Instructions left in the current call.
         remaining: Cell<u64>,
     }
 
     impl Budget {
         /// Start a fresh call budget.
-        fn begin(&self) {
+        pub(crate) fn begin(&self) {
             self.remaining.set(CALL_BUDGET);
         }
 
@@ -119,6 +119,43 @@ mod imp {
                 .set(remaining.saturating_sub(u64::from(HOOK_INTERVAL)));
             false
         }
+    }
+
+    /// Create the sandboxed state every scripting VM shares: base, `string`
+    /// and `table` only, the filesystem/loader globals removed, the 16 MiB
+    /// allocation ceiling and the instruction-budget hook installed.
+    ///
+    /// Returns the state and the per-call budget the caller resets before each
+    /// script call. Shared by the mod-hook VM ([`LuaVm`]) and the enemy-script
+    /// host so both enforce exactly the same sandbox.
+    pub(crate) fn new_sandboxed_state() -> Result<(Lua, Rc<Budget>)> {
+        let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE, LuaOptions::default())
+            .map_err(|err| anyhow::anyhow!("failed to create the Lua state: {err}"))?;
+        {
+            let globals = lua.globals();
+            for name in REMOVED_GLOBALS {
+                globals.set(name, Value::Nil).map_err(|err| {
+                    anyhow::anyhow!("failed to remove the Lua global {name}: {err}")
+                })?;
+            }
+        }
+        lua.set_memory_limit(MEMORY_LIMIT)
+            .map_err(|err| anyhow::anyhow!("failed to set the Lua memory limit: {err}"))?;
+        let budget = Rc::new(Budget::default());
+        let hook_budget = Rc::clone(&budget);
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(HOOK_INTERVAL),
+            move |_lua, _debug| {
+                if hook_budget.charge() {
+                    Err(mlua::Error::RuntimeError(
+                        "instruction budget exceeded".to_string(),
+                    ))
+                } else {
+                    Ok(VmState::Continue)
+                }
+            },
+        );
+        Ok((lua, budget))
     }
 
     /// The hook functions looked up once after every chunk has run.
@@ -149,32 +186,7 @@ mod imp {
                 return Ok(None);
             }
             budget::check_len(paths.len(), budget::MAX_LUA_CHUNKS, "lua chunk count")?;
-            let lua = Lua::new_with(StdLib::STRING | StdLib::TABLE, LuaOptions::default())
-                .map_err(|err| anyhow::anyhow!("failed to create the Lua state: {err}"))?;
-            {
-                let globals = lua.globals();
-                for name in REMOVED_GLOBALS {
-                    globals.set(name, Value::Nil).map_err(|err| {
-                        anyhow::anyhow!("failed to remove the Lua global {name}: {err}")
-                    })?;
-                }
-            }
-            lua.set_memory_limit(MEMORY_LIMIT)
-                .map_err(|err| anyhow::anyhow!("failed to set the Lua memory limit: {err}"))?;
-            let budget = Rc::new(Budget::default());
-            let hook_budget = Rc::clone(&budget);
-            lua.set_hook(
-                HookTriggers::new().every_nth_instruction(HOOK_INTERVAL),
-                move |_lua, _debug| {
-                    if hook_budget.charge() {
-                        Err(mlua::Error::RuntimeError(
-                            "instruction budget exceeded".to_string(),
-                        ))
-                    } else {
-                        Ok(VmState::Continue)
-                    }
-                },
-            );
+            let (lua, budget) = new_sandboxed_state()?;
 
             for path in &paths {
                 let bytes = match pack.read(path) {
@@ -344,6 +356,28 @@ mod imp {
 }
 
 pub use imp::LuaVm;
+
+#[cfg(feature = "lua")]
+pub(crate) use imp::{Budget, new_sandboxed_state};
+
+/// Compile a Lua source entry without running it, for the pack verifier.
+///
+/// The check the engine's reader performs is "the sandboxed state can compile
+/// this chunk"; the source-size cap is applied by the caller. Without the
+/// `lua` feature there is no Lua runtime, so every source verifies.
+pub fn verify_source(bytes: &[u8]) -> anyhow::Result<()> {
+    crate::budget::check_len(bytes.len(), crate::budget::MAX_LUA_CHUNK, "lua source")?;
+    #[cfg(feature = "lua")]
+    {
+        let (lua, _budget) = new_sandboxed_state()?;
+        lua.load(bytes)
+            .into_function()
+            .map_err(|err| anyhow::anyhow!("lua compile: {err}"))?;
+    }
+    #[cfg(not(feature = "lua"))]
+    let _ = bytes;
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests {

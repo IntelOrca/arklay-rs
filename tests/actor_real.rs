@@ -7,9 +7,9 @@
 mod common;
 
 use arklay::emd;
+use arklay::enemy;
 use arklay::engine::simulate_room;
 use arklay::game::{BANK_SYSTEM, ScdGameHost};
-use arklay::npc;
 use arklay::pack::Pack;
 use arklay::player;
 use arklay::scd::ir::Scripts;
@@ -99,7 +99,7 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
         .position(|entity| entity.id == 0x27 && entity.active())
         .expect("ROOM20D0 spawns Richard");
 
-    let model = emd::parse(pack.read("npc/27.emd").unwrap()).unwrap();
+    let model = emd::parse(pack.read("enemy/em27.emd").unwrap()).unwrap();
     let mut game = arklay::game::GameState::default();
     let mut richard = sim.game.entities[slot];
     // ROOM20D0's own walk script: behaviour 3, target (7380, 2440), turn step
@@ -118,7 +118,7 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
     let mut min_distance = i32::MAX;
     let mut completed = false;
     for _ in 0..600 {
-        npc::scd::update(&mut game, slot, &sim.room, &model.clips);
+        enemy::scd::update(&mut game, slot, &sim.room, &model.clips);
         let entity = game.entities[slot];
         // State 8 has no end-of-frame resolve, so the port keeps the walk
         // layer's pre-check + rollback for this driver: the scripted walk
@@ -133,7 +133,7 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
             "the walk crossed a collision rect at {:?}",
             entity.pos
         );
-        min_distance = min_distance.min(npc::walk::xz_distance_to(&entity, target));
+        min_distance = min_distance.min(enemy::walk::xz_distance_to(&entity, target));
         if entity.action_behavior == 0 {
             completed = true;
             break;

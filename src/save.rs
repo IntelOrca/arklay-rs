@@ -856,6 +856,28 @@ mod tests {
         assert!(SaveFile::from_bytes(&bytes).is_ok());
     }
 
+    /// The save layout did not grow an enemy-snapshot block: an existing slot
+    /// loads, and the destination's own combat tables survive the restore.
+    #[test]
+    fn existing_saves_load_without_touching_the_combat_tables() {
+        let state = GameState::new(RoomId::parse("11C1").unwrap(), &RoomState::default());
+        let file = SaveFile::from_state(&state);
+        let bytes = file.to_bytes();
+        assert!(bytes.len() >= SAVE_LAYOUT_SIZE);
+
+        let mut restored = GameState::default();
+        restored.combat.weapon_ranges[0][0] = 12_345;
+        restored.saved_enemies[3].valid = 2;
+        SaveFile::from_bytes(&bytes)
+            .unwrap()
+            .apply_to(&mut restored);
+        assert_eq!(
+            restored.combat.weapon_ranges[0][0], 12_345,
+            "apply_to must not clobber the loaded combat tables"
+        );
+        assert_eq!(restored.saved_enemies[3].valid, 2);
+    }
+
     #[test]
     fn from_bytes_rejects_a_block_over_the_cap() {
         let bytes = vec![0u8; budget::MAX_SAVE_BYTES + 1];

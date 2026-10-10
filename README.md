@@ -45,7 +45,7 @@ cargo run -- extract re1.akpak --out extracted/
 # Launch room 100 as player 0 (RDT 1000)
 cargo run -- re1.akpak --room 100 --player 0
 
-# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|font)
+# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font)
 cargo run -- re1.akpak
 
 # Headless capture (no display)
@@ -60,6 +60,8 @@ cargo run -- re1.akpak --ui box --capture box.bmp
 cargo run -- re1.akpak --ui file --capture file.bmp
 cargo run -- re1.akpak --ui map --capture map.bmp
 cargo run -- re1.akpak --ui view --capture view.bmp
+# Kill the player and capture the DIED screen (--character 0|1)
+cargo run -- re1.akpak --ui death --character 1 --capture died.bmp
 
 # Frame-time report for a 600-tick room run: per-tick min/avg/p95/max, the
 # load/update/effect/render phase totals and the entity/effect high-water
@@ -121,6 +123,8 @@ elapsed time. `extract` rejects packs whose entry paths are absolute, contain
 | --- | --- |
 | Arrow keys | Move / menu selection |
 | `Space`, `Return` | Confirm / action / dismiss a message |
+| `C` | Aim the equipped weapon (hold) |
+| `Z` | Fire / reload with the weapon aimed |
 | `Tab` | START: open/close the inventory (pause menu), cycle the top tabs |
 | `[`, `]` | L1/R1: page the item box |
 | `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |

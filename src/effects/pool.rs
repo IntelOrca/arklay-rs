@@ -96,6 +96,12 @@ impl EffectBlock {
 /// produce it): a pick-up sparkle attaches to the item's own composed
 /// transform, so it rides the item's parent chain too; a missing item record
 /// falls back to identity.
+///
+/// [`Self::Joint`] is the monster joint-attached billboard: the original's
+/// spawn stores a joint's world matrix as the slot's `spriteInfo`, so the
+/// effect follows the posed skeleton. The port resolves it from
+/// [`GameState::joint_worlds`], the per-frame matrices the enemy drivers
+/// compute; a missing slot or joint falls back to identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Attach {
     /// Identity transform (parent 0).
@@ -109,6 +115,16 @@ pub enum Attach {
     Omodel(u8),
     /// An item record's own composed transform (item-model index).
     Item(u8),
+    /// One joint of a scripted entity's posed skeleton: the entity slot and
+    /// the joint index.
+    Joint(u8, u8),
+    /// One web-thread clone of the arena: the clone slot's entity transform.
+    /// The clone billboards are the spider's web-stick and contact sprays.
+    WebClone(u16),
+    /// One Plant 42 companion (the flower body or root ball): the companion
+    /// slot's entity transform. The body's shrivel/fall sprays and the root
+    /// ball's ambient billboards attach here.
+    Companion(u16),
 }
 
 impl Attach {

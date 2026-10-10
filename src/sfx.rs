@@ -2621,6 +2621,103 @@ pub fn entity_sound_column(
     Some(entity_sound_index(zone as u8, sound_type, slow))
 }
 
+/// One `Snd_em` cue: `(wav name, enemy bank record)`.
+///
+/// The original accepts only the group-relative ids `0..=9`, adds
+/// `group * 10` from the spawn record's sound-group nibble, and drops the cue
+/// when the resulting record reaches the 48-entry bank. An id outside that
+/// range queues nothing.
+pub fn enemy_sound(room: &RoomState, id: u8, group: u8) -> Option<(&'static str, u8)> {
+    if id >= 10 {
+        return None;
+    }
+    let record = id.checked_add(group.checked_mul(10)?)?;
+    if record >= 48 {
+        return None;
+    }
+    let name = room_sound(room_row(room.stage, room.room), usize::from(record))?;
+    Some((name, record))
+}
+
+/// The weapon bank's per-weapon sound sub-tables, one row per shipped bank id.
+///
+/// The bank is loaded by the equipped item id (`LoadSoundBank(weapon, ...)`),
+/// so each weapon names its own samples; an empty slot queues nothing. Rows 0
+/// and 1 are the knife bank, 2..=10 the firearms (5 Magnum01, 6 Flame01, 7
+/// Grbomb01, 8 Gracid01, 9 Grfire01, 10 Rocket01), 11..=14 the menu banks and
+/// 15 the machine-gun bank the two special item ids clamp to.
+#[rustfmt::skip]
+const WEAPON_SFX_ROWS: [&[&str]; 16] = [
+    &["Knife01", "Knife02", "Knife03"],
+    &["Knife01", "Knife02", "Knife03"],
+    &["", "", "", "", "", "Gun04", "", "Gun01", "", "Gun02", "Gun03"],
+    &["", "", "", "", "", "", "", "Shot01", "", "Shot04", "Shot02", "Shot03"],
+    &["", "", "", "", "", "", "", "Magnum01", "", "Magnum02", "Magnum03"],
+    &["", "", "", "", "", "", "", "Magnum01", "", "Magnum02", "Magnum03"],
+    &["", "", "", "Flame01", "Flame02", "", "", "", "", "Flame03"],
+    &["", "", "", "", "", "Grbomb01", "", "Grbomb02", "", "Grbomb04", "", "", "Grbomb03"],
+    &["", "", "", "", "", "Gracid01", "", "Gracid02", "", "Gracid04", "", "", "", "Gracid03"],
+    &["", "", "", "", "", "Grfire01", "", "Grfire02", "", "Grfire04", "", "", "Grfire03"],
+    &["", "", "", "", "", "", "", "Rocket01", "", "Rocket02", "", "", "", "", "", "Rocket03"],
+    &["Bio01", "", "", "", "", "", "", "", "", "", "", "", "", "cancel", "type01", "type02"],
+    &["Evil01", "", "", "", "", "", "", "", "", "", "", "", "", "cancel", "type01", "type02"],
+    &["Select06", "Select05"],
+    &["Ending07", "", "Ending06", "", "", "", "", "", "", "", "", "", "", "cancel", "type01", "type02"],
+    &["", "", "", "", "", "", "", "Win95_mg", "", "", "A_mcn03"],
+];
+
+/// The weapon bank's sample for an equipped weapon and sound id.
+///
+/// The bank is indexed by the raw item id; an id above the shipped table
+/// clamps to row 15 (the machine-gun bank), exactly like `LoadSoundBank`. An
+/// id beyond the 16 loaded slots names nothing.
+pub fn weapon_sound(weapon: u8, id: u8) -> Option<&'static str> {
+    let row = if weapon > 110 {
+        15
+    } else {
+        usize::from(weapon)
+    };
+    let row = WEAPON_SFX_ROWS.get(row)?;
+    let name = row.get(usize::from(id)).copied()?;
+    (!name.is_empty()).then_some(name)
+}
+
+/// One `Play3DSnd` cue resolved to a queueable one-shot: `(wav name, mixer
+/// bank, bank slot)`.
+///
+/// Bank 0 names the room's door SFX pair, bank 2 the per-room table (the
+/// enemy bank), bank 3 the character table. Bank 1 is the weapon/menu bank
+/// ([`weapon_sound`]), and bank 4 is the BGM channel's pan/restart path, which
+/// is not a one-shot; both queue nothing.
+pub fn play_3d_cue(
+    room: &RoomState,
+    character: u8,
+    bank: u8,
+    id: u8,
+) -> Option<(&'static str, u8, u8)> {
+    match bank {
+        0 => {
+            if id > 1 {
+                return None;
+            }
+            room_sfx(usize::from(room.room_sfx), usize::from(id)).map(|name| (name, 0, id))
+        }
+        2 => {
+            if id > 0x2F {
+                return None;
+            }
+            room_sound(room_row(room.stage, room.room), usize::from(id)).map(|name| (name, 2, id))
+        }
+        3 => {
+            if id > 0x0F {
+                return None;
+            }
+            character_sfx(character & 7, id).map(|name| (name, 3, id))
+        }
+        _ => None,
+    }
+}
+
 /// Resolve the footstep sound for `pos` in `room`: look up the floor zone,
 /// apply the entity sound type and name the resulting column.
 pub fn footstep_sound(
@@ -3033,6 +3130,53 @@ mod tests {
         assert_eq!(room_sound(61, 6), None);
         assert_eq!(room_sound(203, 23), None);
         assert_eq!(room_sound(0, 47 + 1), None);
+    }
+
+    #[test]
+    fn enemy_sound_offsets_the_group_and_bounds_the_bank() {
+        // Plant 42's roots room (stage 4, room 0x0F, table row 102) names the
+        // enemy columns the roots machine uses.
+        let room = RoomState {
+            stage: 4,
+            room: 0x0F,
+            ..RoomState::default()
+        };
+        // The pre-group id is bounded 0..=9; the roots cycle-start cue 0x18
+        // is out of range and queues nothing.
+        assert_eq!(enemy_sound(&room, 0x18, 0), None);
+        assert_eq!(enemy_sound(&room, 10, 0), None);
+        // The group nibble shifts the record by ten per step.
+        assert_eq!(enemy_sound(&room, 4, 2), Some(("pakiA", 24)));
+        assert_eq!(enemy_sound(&room, 5, 2), Some(("pakiB", 25)));
+        assert_eq!(enemy_sound(&room, 5, 4), Some(("ft_concA", 45)));
+        // Past the 48-record bank, and a row with no name, drop.
+        assert_eq!(enemy_sound(&room, 8, 4), None);
+        assert_eq!(enemy_sound(&room, 9, 7), None);
+        assert_eq!(enemy_sound(&room, 3, 0), None);
+    }
+
+    #[test]
+    fn play_3d_cue_resolves_the_room_and_character_banks() {
+        let room = RoomState {
+            stage: 4,
+            room: 0x0F,
+            ..RoomState::default()
+        };
+        assert_eq!(play_3d_cue(&room, 0, 2, 0x19), Some(("pakiB", 2, 0x19)));
+        assert_eq!(play_3d_cue(&room, 0, 2, 0x30), None, "past the enemy bank");
+        // The unloaded weapon bank and the BGM pan channel are not one-shots.
+        assert_eq!(play_3d_cue(&room, 0, 1, 0), None);
+        assert_eq!(play_3d_cue(&room, 0, 4, 0), None);
+        assert_eq!(play_3d_cue(&room, 0, 5, 0), None);
+        // Bank 0 names the room's door SFX pair (the default row).
+        assert_eq!(play_3d_cue(&room, 0, 0, 0), Some(("Dr_wd01", 0, 0)));
+        assert_eq!(play_3d_cue(&room, 0, 0, 2), None);
+        // Bank 3 follows the character table, keyed by the character index.
+        assert_eq!(
+            play_3d_cue(&room, 2, 3, 1),
+            character_sfx(2, 1).map(|name| (name, 3, 1))
+        );
+        assert_eq!(play_3d_cue(&room, 0, 3, 0x10), None);
     }
 
     #[test]

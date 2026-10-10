@@ -102,6 +102,13 @@ pub fn init(
     entity.health = -1;
     entity.sca_radius = data::collision_radius(entity.id)
         .unwrap_or(i32::from(crate::game::DEFAULT_ENEMY_RADIUS)) as i16;
+    // Store the character's SCA volume on the entity as the Lua port's data
+    // files do; the collision layer still resolves the volume by id until it
+    // is ported, so this is a preparatory, behaviour-neutral store.
+    if let Some(volume) = data::sca_volume(entity.id) {
+        entity.sca_half_height = volume.half_height;
+        entity.sca_offset = volume.offset;
+    }
 
     // The three corpse props restart on animation 0 frame 0 instead of the
     // spawned pose.

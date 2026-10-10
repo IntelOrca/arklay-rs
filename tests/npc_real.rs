@@ -66,7 +66,7 @@ fn character(pack: &Pack, game: &arklay::game::GameState, id: u8) -> Option<(usi
         .iter()
         .enumerate()
         .find(|(_, entity)| entity.id == id && entity.active())?;
-    let path = arklay::npc::model_path(id)?;
+    let path = arklay::enemy::model_path(id)?;
     let model = arklay::emd::parse(pack.read(path).ok()?).ok()?;
     Some((slot, *entity, model))
 }
@@ -103,7 +103,7 @@ fn render_room20d0_spawns(pack: &Pack, sim: &SimulatedRoom) -> (usize, usize, [u
     assert!(
         characters
             .iter()
-            .all(|(_, entity, _)| !arklay::npc::in_camera_zone(&sim.room, cut_index, entity.pos)),
+            .all(|(_, entity, _)| !arklay::enemy::in_camera_zone(&sim.room, cut_index, entity.pos)),
         "the framing cut must not contain the spawns in its switch zone"
     );
 
@@ -260,14 +260,15 @@ fn real_room40c1_off_zone_character_is_culled() {
 
     // The Jill variant spawns id 0x2B at (10000, 0, 30000); cut 0's switch
     // zone does not contain it, but it projects to (178, 132) on screen.
-    let (_, entity, _) = character(&pack, &sim.game, 0x2B).expect("ROOM40C1 spawns 0x2B");
+    let (fixture_slot, entity, _) =
+        character(&pack, &sim.game, 0x2B).expect("ROOM40C1 spawns 0x2B");
     assert_eq!(entity.pos, [10000, 0, 30000]);
     assert_eq!(
         entity.has_enter_switch_zone, 0,
         "the fixture character must not have entered the switch zone"
     );
     assert!(
-        !arklay::npc::in_camera_zone(&sim.room, sim.room.current_cut, entity.pos),
+        !arklay::enemy::in_camera_zone(&sim.room, sim.room.current_cut, entity.pos),
         "the fixture character must be outside the current switch zone"
     );
     let camera = Camera::from_cut(&sim.room.cuts[sim.room.current_cut]);
@@ -277,20 +278,31 @@ fn real_room40c1_off_zone_character_is_culled() {
         "the fixture must project on screen, got ({x}, {y})"
     );
 
-    // The simulated frame and the same state with the fixture slot deactivated
-    // must be identical: the off-zone character contributes no pixels.
-    let changed = changed_pixels(&sim.frame, &sim.baseline);
+    // The simulated frame and the same state with the fixture slot
+    // deactivated must be identical: the off-zone character contributes no
+    // pixels. The room's Plant 42 vines are scripted now and legitimately
+    // paint this cut, so only the fixture slot is deactivated (the
+    // all-entities-off baseline of `simulate_room` includes the vines).
+    let mut with = sim.game.clone();
+    let with_frame =
+        arklay::engine::render_game_frame(&pack, sim.id, &sim.room, &mut with, &sim.player)
+            .unwrap();
+    let mut without = sim.game.clone();
+    without.entities[fixture_slot].set_active(false);
+    let without_frame =
+        arklay::engine::render_game_frame(&pack, sim.id, &sim.room, &mut without, &sim.player)
+            .unwrap();
+    let changed = changed_pixels(&with_frame, &without_frame);
     assert_eq!(
         changed, 0,
         "the off-zone character painted {changed} pixels"
     );
-    let near = sim
-        .frame
+    let near = with_frame
         .rgba
         .as_chunks::<4>()
         .0
         .iter()
-        .zip(sim.baseline.rgba.as_chunks::<4>().0)
+        .zip(without_frame.rgba.as_chunks::<4>().0)
         .enumerate()
         .filter(|(index, (a, b))| {
             a != b && {
@@ -324,7 +336,7 @@ fn real_room109_cut4_barry_is_culled_by_the_switch_zone() {
         "cut 4 leaves Barry outside the switch zone"
     );
     assert!(
-        !arklay::npc::in_camera_zone(&sim.room, 4, barry.pos),
+        !arklay::enemy::in_camera_zone(&sim.room, 4, barry.pos),
         "cut 4's switch zone must not contain the origin"
     );
 
@@ -401,7 +413,7 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
         if entity.has_enter_switch_zone == 0 {
             continue;
         }
-        let Some(init) = arklay::npc::character_init(entity.id) else {
+        let Some(init) = arklay::enemy::character_init(entity.id) else {
             continue;
         };
         shadows.push(arklay::render::Shadow {

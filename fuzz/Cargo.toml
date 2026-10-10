@@ -111,6 +111,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "combat"
+path = "fuzz_targets/combat.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "mask"
 path = "fuzz_targets/mask.rs"
 test = false

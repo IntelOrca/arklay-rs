@@ -44,7 +44,7 @@ responsibility.
 | `transition` | Runtime | The door-transition timeline (screen space, masks, camera, `.dor` stepper hand-off) |
 | `stairs` | Runtime | `stairs_height_update` and `set_stairs_zone` room actions |
 | `objects` | Runtime | RDT-embedded object TMD/TIM pairs, runtime object records and transforms |
-| `npc` | Runtime | Scripted characters: model driver, clips, walking, idle, script commands |
+| `enemy` | Runtime | Entities: the shared character/monster runtime, the pack-script host, movement/pathfinding/SCA helpers, the scripted-character and monster machines |
 | `effects` | Runtime | The 64-slot billboard effect pool, per-room sprite tables, packed texture pages, behaviours |
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
 | `message` | Runtime | The seven-state message window and its byte grammar |
@@ -110,11 +110,103 @@ One gameplay tick (`engine::tick_room`) runs this fixed order:
 4. Command VM `run_main` over the current block, then the event VM step.
 5. Apply scripted room edits (collision boxes, `obj_xfm` lights).
 6. NPC/entity update (`game.tick_entities`).
-7. Mirror scripts' player-entity writes onto the visible player, then
-   `player::update_with_room` (movement, collision, animation).
+7. Mirror scripts' player-entity writes onto the visible player, mirror the
+   live health-status byte into the player's collision-callback byte, then run
+   the player state machine: a scripted/held state runs `player_script::update`,
+   otherwise the state-1 entry checks (`player_script::control_gate`: death,
+   hit pre-emption, poison) run before `weapons::update` (the aim/fire/reload
+   machine when a weapon is raised, otherwise the locomotion fall-through into
+   `player::update_with_room`).
 8. Effect pool update (`game.tick_effects`).
 9. Room action probe and object update (probes read the frame's final state).
 10. Camera cut switch and mask/shadow bookkeeping.
+11. The game-over machine (`tick_death`): notice a dead player, raise the
+    dead flag and advance the delay/fade; once the fade completes the DIED
+    screen owns the tick and draws its own frame.
+
+### Death frame order
+
+The game-over machine runs at the end of the gameplay tick, after the room
+tick noticed the health drop. Its trigger sets the 90-frame delay (or arms the
+white fade at once in the two Yawn rooms and the water tank); the delay
+expires into the same fade, which ramps 2 alpha a frame to white and opens the
+DIED screen when the 16-bit accumulator wraps negative (~128 frames). The
+attract-demo and scripted-death-variant flags skip the screen and return to
+the title directly.
+
+While the DIED screen owns the tick the room stays frozen; one screen tick
+runs:
+
+1. The display state machine: 0 arms the white flash (accumulator `0x7FFF`,
+   counter `-384`), 1 waits for it to clear, 2 ramps the black overlay 3 a
+   frame and, past `0x3F`, draws and steps the wave amplitude down from 59,
+   3 holds the settled strip for 49 frames, 4 arms the black fade-out
+   (counter `0x180`), 5 re-waves the strip while the fade runs and finishes.
+2. The fade accumulator advances once per tick (the arm tick only draws).
+3. The corpse's facing spins 8 units; the confirm button skips to the title.
+
+The frame is painted back to front in the original's ordering-table order:
+the `died.tim` static backdrop (four mirrored 160x120 quadrants of the page's
+lower region, colour-keyed on black), the corpse (the player mesh posed at the
+fall's terminal frame through the fixed camera built from the death position),
+the black overlay, the 256-column sine strip (phase `0x100` per column,
+amplitude `param^2`, baseline from the same amplitude), and the screen's own
+white/black fade on top. The first death screen also hides the player's head
+joint through the shared grab/death one-shot.
+
+### Weapon frame order
+
+`weapons::update` takes the tick whenever the aim input is held with a weapon
+equipped and no locked action owns the player; otherwise it calls
+`player::update_with_room` unchanged, so the locomotion machine is untouched.
+While the machine owns the tick, one 30 Hz step runs:
+
+1. The behavior dispatch on `WeaponState.behavior` (0x12 aim, 0x13 raise/hold,
+   0x14 auto-aim fire, 0x15/0x16 quick-fire and reverse recover, 0x17 holster,
+   0x18 reload, 0x19 empty click, 0x1a lock-on fire; the knife's 0x12 aim,
+   0x13 hold, 0x14 swing, 0x15 holster, 0x16 turn). The handler advances the
+   weapon `W*.EMW` clip through the same `AnimPlayer` clock as the body
+   (`Joint_move`'s blend step 0x400/0x200/0x100 and its wrap-completion flag),
+   selects the per-weapon motion id, and runs the reticle/lock-on scan
+   (`player_reticle_enemy`, the all-quadrant aim-cone test) where the original
+   does.
+2. The fire cycle: the ammo-decrement/muzzle-billboard frame, the damage and
+   sound frame (`apply_weapon_damage_with` for the slots the original damages
+   at a fire frame), the big muzzle flash on the player matrix, the second
+   flash at the hand joint and the shotgun's second damage frame. The reload
+   cycle instead runs the per-weapon FX routine (volley latch, ejected shell,
+   ammo transfer from the matching stack).
+3. The shared tail: the posed hand joint's world matrix is stored into
+   `joint_worlds[0]` so the effects pass resolves `Attach::Joint(0, 14)`, and
+   the flamethrower refreshes the aim pitch byte the damage cone reads.
+
+The weapon bank's `W*.EMW` clips pose the body (its skeleton is the player
+EMD's) and the EMW's single mesh object draws at joint 14 with the player's
+own texture page, exactly like the original's weapon-slot TMD; the scripted
+characters' `WS*.TMD` held meshes draw the same way off their character
+texture page. The fire data (fire frames, sound ids, FX offsets, end frames,
+special frame windows, aim heights), the weapon-file table and the held-weapon
+table live in `src/weapons.rs`; the pack entries are `player/w{id:02x}.emw`
+(the no-weapon pair stays `player/{character}.emw`) and
+`player/ws{id:03x}.tmd`.
+
+The shared damage layer rides this order without adding a tick step. A fired
+weapon calls `GameState::apply_weapon_damage_with` from the weapon machine's
+fire frame (the tests use the same entry): the pipeline scans the active enemy
+list in the original's slot order, runs the per-class detector (knife reach,
+gun cone, projectile origin), applies the line-of-sight rule below weapon slot
+5, looks the hit record up for the active playthrough, subtracts the damage
+with a 16-bit wrap, composes `hit_state`, runs the post-hit callback (which
+dispatches the per-enemy reaction FX), and writes the `state = 3` / surviving
+`state = 2` contract with `ignore`/`action_behavior`/`action_state` zeroed. A
+killing blow also raises the spawn record's `death_event_id` in the enemy
+bank. Monster scripts consume states 2/3 on their next update and run their
+own reaction/death handlers, exactly like every other piece of scripted
+behaviour. A door transition snapshots the outgoing room's live enemies into
+the 16-slot TTL table (keyed by room and spawn-type byte, force spawns
+skipped, death events permanent) and clears the list before the destination
+loads; `spawn_enemy` restores a matching snapshot when the record lacks the
+force byte.
 
 After the tick comes `render_frame`: the 320x240 `Framebuffer` is cleared with
 the room's fade/ambient state, the cut background and masks are blitted, the
@@ -149,13 +241,25 @@ Arklay's input class determines what the code may assume:
 - **The game installation is semi-trusted.** `convert-game` may assume the
   shipped file layout, but a missing or surprising file is a reported warning
   or a category error, never a panic; conversion skips what it does not know.
+  The shared combat tables are decoded from the executable by matching the
+  documented table shapes and cross-checking the pointer partitions; a region
+  that does not validate is a warning and the pack simply omits
+  `data/combat.bin`.
+- **The packed combat tables are untrusted.** `combat::CombatTables::parse`
+  checks the fixed blob size, magic and version against
+  `MAX_COMBAT_TABLE_BYTES` and fails cleanly; a pack without the entry (or a
+  mod's replacement) falls back to the built-in documented tables. The
+  torture matrix and `fuzz/combat` hammer the parser.
 - **Save blocks are semi-trusted.** The block is fixed 0x800 bytes; a short or
   malformed slot is refused, and a save never writes outside its save
   directory.
 - **Lua is sandboxed.** `lua/**.lua` runs in one 16 MiB-limited VM with the
   documented hook API and no filesystem, package or `os` access; a failing
-  hook logs and disables itself rather than failing the session. With
-  `--no-default-features` every hook compiles to a no-op.
+  hook logs and disables itself rather than failing the session. Enemy scripts
+  (`enemy/em{id:02x}.lua` plus shared `enemy/lib/**.lua`) run in a second,
+  identical sandbox owned by the session; they must hold no state of their own,
+  so resetting that VM between two updates cannot change behaviour. With
+  `--no-default-features` every hook and script compiles to a no-op.
 
 ## Format inventory
 
@@ -183,8 +287,9 @@ claims about the original.
 | Save block | `save::SaveFile::from_bytes` | fixed 0x800 layout | `save` unit tests, `tests/save_real.rs`, `tests/soak_real.rs`, `fuzz/save` |
 | Mask table | `mask::parse` | sprite/group counts | `mask` unit tests, `tests/mask_render_real.rs`, `fuzz/mask` |
 | WAV | `audio::parse_wav` | sample count bounded by the `data` chunk | `audio` unit tests, `fuzz/wav`, `tests/m13_real.rs` |
-| Lua source | `lua::LuaVm::load` | 16 MiB VM, source-size cap | `lua` unit tests, `fuzz/lua` |
+| Lua source | `lua::LuaVm::load`, `lua::verify_source` | 16 MiB VM, source-size cap | `lua` unit tests, `fuzz/lua`, `arklay verify` |
 | Map tables | `ui::map::MapTables::parse` | fixed blob size/magic | `ui::map` unit tests, `tests/m16_ui_real.rs` |
+| Combat tables | `combat::CombatTables::parse` | fixed blob size/magic/version, `MAX_COMBAT_TABLE_BYTES` (64 KiB) | `combat` unit tests, `tests/combat_real.rs`, `tests/torture`, `fuzz/combat` |
 | BioCard prefix | `data/bio_card.dat` | 0x200 required | `save` unit tests, `arklay verify` |
 | `roomcut`/`roommask` BMP | `bmp::decode`, `decode_mask` | BMP caps | `arklay verify`, `tests/soak_real.rs` |
 
@@ -202,9 +307,10 @@ These hold across every milestone and are the regression gate:
   rendered frame is byte-identical across runs and platforms; the RNG streams,
   animation phases and camera state are all driven by the fixed tick, never by
   wall time.
-- **Index-stable entity slots.** Entity slot 0 is the player; scripted
-  characters occupy their scripted slots and are never compacted. No entity id
-  `0x00`-`0x1F` allocates (the no-enemy constraint).
+- **Index-stable entity slots.** Entity slot 0 is the player; characters and
+  monsters occupy their scripted slots and are never compacted. Every id the
+  original dispatches (`0x00..=0x2E`) allocates; an id whose pack script or
+  model is missing parks inert.
 - **A fixed save layout.** `SaveFile` is the original 0x800-byte block field
   for field; capture, serialization, parsing and apply are round-trip stable
   (`tests/save_real.rs`, the soak).

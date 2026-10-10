@@ -23,6 +23,17 @@ pub struct Mat4x3 {
     pub t: [i32; 3],
 }
 
+impl Default for Mat4x3 {
+    /// The zero matrix the original's `MATRIX` globals start as (the capture
+    /// scratch is a zeroed `MATRIX`, not an identity).
+    fn default() -> Self {
+        Mat4x3 {
+            r: [[0; 3]; 3],
+            t: [0; 3],
+        }
+    }
+}
+
 /// Entity matrix: rotation from a 12-bit direction angle with translation `pos`.
 ///
 /// The game feeds its rotation builder `(0x1000 - x, y, 0x1000 - z)`; a
@@ -37,29 +48,73 @@ pub fn entity_matrix(pos: [i32; 3], angle: u16) -> Mat4x3 {
     }
 }
 
-/// Compose world matrices for every joint:
-/// `world[0] = entity * transform[0]`; `world[i] = world[parent] * transform[i]`.
-///
-/// `transform[i]` rotates by `keyframe.rotations[i]` (or the zero rotation when
-/// the keyframe has fewer entries) and translates by `skeleton.relative[i]`.
-/// The parent of each joint is derived from `skeleton.children`; out-of-range
-/// child indices and joints with no parent are treated as roots, and a parent
-/// cycle falls back to treating the remaining joints as roots. Joints beyond
-/// the relative list are not produced, so the result length equals
+/// Scale an entity matrix's rotation columns by `scale` in 4.12 fixed point
+/// (the original's `pad_ca` joint world-matrix scale). `0` leaves the matrix
+/// alone, matching the original's "no scale" sentinel; otherwise every
+/// component is `(value * scale) >> 12` with truncation toward zero and the
+/// original's 16-bit store width. The translation is untouched.
+pub fn scale_columns(matrix: &mut Mat4x3, scale: u16) {
+    if scale == 0 {
+        return;
+    }
+    let scale = i32::from(scale);
+    for row in matrix.r.iter_mut() {
+        for value in row.iter_mut() {
+            let product = *value * scale;
+            *value = i32::from(((product + ((product >> 31) & 0xFFF)) >> 12) as i16);
+        }
+    }
+}
+
+/// Entity matrix with the optional joint world-matrix scale applied.
+pub fn entity_matrix_scaled(pos: [i32; 3], angle: u16, scale: u16) -> Mat4x3 {
+    let mut matrix = entity_matrix(pos, angle);
+    scale_columns(&mut matrix, scale);
+    matrix
+}
+
+/// Entity matrix from the full rotation triple: the original's
+/// `EntityComputeJointWorldMatrices` rebuilds the entity's local matrix from
+/// the rotation vector at entity `+0x72` (`pitch`, `angle`, `roll`) before
+/// composing the joint hierarchy, so a tilted or spinning model composes its
+/// joints from the aimed pose, not the flat one.
+pub fn entity_matrix_rotated(pos: [i32; 3], pitch: u16, angle: u16, roll: u16) -> Mat4x3 {
+    Mat4x3 {
+        r: rotation_matrix(i32::from(pitch), i32::from(angle), i32::from(roll)),
+        t: pos,
+    }
+}
+
+/// [`entity_matrix_rotated`] with the optional joint world-matrix scale.
+pub fn entity_matrix_rotated_scaled(
+    pos: [i32; 3],
+    pitch: u16,
+    angle: u16,
+    roll: u16,
+    scale: u16,
+) -> Mat4x3 {
+    let mut matrix = entity_matrix_rotated(pos, pitch, angle, roll);
+    scale_columns(&mut matrix, scale);
+    matrix
+}
+
+/// The local transform of every joint for `keyframe` (the original's
+/// `JointStruct.transform`): `transform[i]` rotates by
+/// `keyframe.rotations[i]` (or the zero rotation when the keyframe has fewer
+/// entries) and translates by `skeleton.relative[i]`, except the root joint,
+/// whose translation comes from the keyframe (root motion). Joints beyond the
+/// relative list are not produced, so the result length equals
 /// `skeleton.relative.len()`.
-pub fn joint_matrices(
+pub fn joint_local_transforms(
     skeleton: &model::Skeleton,
     keyframe: &model::Keyframe,
-    entity: &Mat4x3,
 ) -> Vec<Mat4x3> {
-    let local: Vec<Mat4x3> = skeleton
+    skeleton
         .relative
         .iter()
         .enumerate()
         .map(|(index, relative)| {
             let rotation = keyframe.rotations.get(index).copied().unwrap_or([0, 0, 0]);
-            // The root joint's translation comes from the keyframe (root motion);
-            // every other joint keeps its relative bind-pose translation.
             let translation = if index == 0 {
                 keyframe.offset
             } else {
@@ -74,7 +129,23 @@ pub fn joint_matrices(
                 t: translation.map(i32::from),
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Compose world matrices for every joint:
+/// `world[0] = entity * transform[0]`; `world[i] = world[parent] * transform[i]`.
+///
+/// The parent of each joint is derived from `skeleton.children`; out-of-range
+/// child indices and joints with no parent are treated as roots, and a parent
+/// cycle falls back to treating the remaining joints as roots. Joints beyond
+/// the relative list are not produced, so the result length equals
+/// `skeleton.relative.len()`.
+pub fn joint_matrices(
+    skeleton: &model::Skeleton,
+    keyframe: &model::Keyframe,
+    entity: &Mat4x3,
+) -> Vec<Mat4x3> {
+    let local = joint_local_transforms(skeleton, keyframe);
 
     let count = local.len();
     let mut parent: Vec<Option<usize>> = vec![None; count];
@@ -498,6 +569,20 @@ impl AnimPlayer {
         *self.applied.borrow_mut() = pose.clone();
         Some(pose.unwrap_or_else(|| current.clone()))
     }
+
+    /// The pose on screen (the blend source the custom Plant 42 clock folds
+    /// from), or `None` before the first materialized tick.
+    pub(crate) fn applied_pose(&self) -> Option<model::Keyframe> {
+        self.applied.borrow().clone()
+    }
+
+    /// Store the pose on screen for the custom clock. The standard clock's
+    /// pending blend queue names keyframes of a clip it is not playing here,
+    /// so it is cleared with the store.
+    pub(crate) fn set_applied_pose(&self, pose: Option<model::Keyframe>) {
+        self.pending_pose.borrow_mut().clear();
+        *self.applied.borrow_mut() = pose;
+    }
 }
 
 /// Interpolate `current` towards `target` with the original's fixed-point
@@ -666,6 +751,47 @@ mod tests {
             entity_matrix([123, -456, 789], 0x1400),
             "angles wrap modulo 0x1000"
         );
+    }
+
+    #[test]
+    fn joint_scale_scales_the_rotation_columns_only() {
+        let zero = entity_matrix([123, -456, 789], 0x200);
+        let mut identity = zero;
+        scale_columns(&mut identity, 0);
+        assert_eq!(identity, zero, "scale 0 is the no-scale sentinel");
+        scale_columns(&mut identity, 0x1000);
+        assert_eq!(identity, zero, "0x1000 is exactly one");
+
+        let mut shrunk = zero;
+        scale_columns(&mut shrunk, 0x9C4);
+        for (before, after) in zero.r.iter().flatten().zip(shrunk.r.iter().flatten()) {
+            let product = before * 0x9C4;
+            assert_eq!(
+                *after,
+                (product + ((product >> 31) & 0xFFF)) >> 12,
+                "truncating 4.12 product"
+            );
+        }
+        assert_eq!(shrunk.t, zero.t, "the translation is untouched");
+    }
+
+    #[test]
+    fn joint_scale_truncates_like_the_original_sixteen_bit_store() {
+        // A full-scale u16 far past 1.0 overflows the 16-bit matrix cell the
+        // same way the original's `short` store does.
+        let mut matrix = Mat4x3 {
+            r: [[4095, 0, 0], [0, 4095, 0], [0, 0, 4095]],
+            t: [0; 3],
+        };
+        scale_columns(&mut matrix, 0xFFFF);
+        assert_eq!(matrix.r[0][0], -17, "65519 wraps into the short cell");
+
+        let mut negative = Mat4x3 {
+            r: [[-4095, 0, 0], [0, 0, 0], [0, 0, 0]],
+            t: [0; 3],
+        };
+        scale_columns(&mut negative, 0x1000);
+        assert_eq!(negative.r[0][0], -4095, "negative 4.12 identity");
     }
 
     #[test]

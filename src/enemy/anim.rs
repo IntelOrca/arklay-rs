@@ -37,6 +37,16 @@ pub struct EntityAnim {
     /// (the original writes the interpolated rotations straight into the
     /// joints), so a clip switch eases from the pose on screen.
     pub keyframes: Option<Arc<Vec<Keyframe>>>,
+    /// The entity model's joint hierarchy, shared with the model cache. The
+    /// monster drivers need it to compose the per-frame joint world matrices
+    /// (the original's `EntityComputeJointWorldMatrices`).
+    pub skeleton: Option<Arc<crate::model::Skeleton>>,
+    /// The Yawn custom-skeleton pose: the fixed-point chain the head's own
+    /// animator maintains. When present it replaces the shared clock's joint
+    /// worlds entirely (the original's Yawn joints are marked so the render
+    /// pass never recomposes them); `reset_joints` clears it with the rest of
+    /// the clock.
+    pub yawn: Option<Box<crate::enemy::custom_anim::YawnPose>>,
 }
 
 impl Default for EntityAnim {
@@ -46,6 +56,8 @@ impl Default for EntityAnim {
             look_at_yaw: 0,
             look_at_pitch: 0,
             keyframes: None,
+            skeleton: None,
+            yawn: None,
         }
     }
 }
@@ -151,6 +163,117 @@ impl EntityAnim {
             return keyframes.get(self.keyframe_index(entity, clips)).cloned();
         }
         self.player.pose_keyframe(clips, keyframes)
+    }
+
+    /// The per-frame joint world matrices of the entity's posed skeleton, the
+    /// computation the original runs in its render pass
+    /// (`EntityComputeJointWorldMatrices`): rebuild the entity local matrix
+    /// from the `pitch`/`angle`/`roll` rotation triple, apply the
+    /// `joint_scale` column scale, then compose the skeleton hierarchy from
+    /// the pose on screen. Returns an empty list when the model or keyframes
+    /// are not available.
+    ///
+    /// The driver calls this at the end of every update, so the next tick's
+    /// script - and the same tick's effect pass, which runs after the entity
+    /// updates - reads the matrices of the pose left by the previous frame,
+    /// exactly the original's order.
+    pub fn joint_worlds(&self, entity: &Entity, clips: &[Clip]) -> Vec<crate::anim::Mat4x3> {
+        // A Yawn's worlds are the chain its own animator maintains; the
+        // shared clock never poses it.
+        if let Some(pose) = self.yawn.as_deref() {
+            return pose.world.to_vec();
+        }
+        let Some(skeleton) = self.skeleton.as_deref() else {
+            return Vec::new();
+        };
+        let Some(keyframes) = self.keyframes.as_deref() else {
+            return Vec::new();
+        };
+        let Some(pose) = self.pose_keyframe(entity, clips, keyframes) else {
+            return Vec::new();
+        };
+        let matrix = crate::anim::entity_matrix_rotated_scaled(
+            entity.pos,
+            entity.pitch,
+            entity.angle,
+            entity.roll,
+            entity.joint_scale,
+        );
+        crate::anim::joint_matrices(skeleton, &pose, &matrix)
+    }
+
+    /// The render-time joint worlds of a Yawn: the chain worlds the animator
+    /// maintains, with joints 0-2 recomposed from their transforms the way the
+    /// original's render pass does (the chain joints 3-14 are marked so the
+    /// pass leaves them alone). `None` for every entity without a Yawn pose.
+    pub fn yawn_render_worlds(&self, entity: &Entity) -> Option<Vec<crate::anim::Mat4x3>> {
+        let pose = self.yawn.as_deref()?;
+        let skeleton = self.skeleton.as_deref()?;
+        Some(pose.render_worlds(skeleton, entity))
+    }
+
+    /// The displayed pose's per-joint local transforms (the original's
+    /// `JointStruct.transform`), the chain the zombie's body-part physics
+    /// multiplies. Empty when the model or keyframes are unavailable.
+    pub fn local_transforms(&self, entity: &Entity, clips: &[Clip]) -> Vec<crate::anim::Mat4x3> {
+        let Some(skeleton) = self.skeleton.as_deref() else {
+            return Vec::new();
+        };
+        let Some(keyframes) = self.keyframes.as_deref() else {
+            return Vec::new();
+        };
+        let Some(pose) = self.pose_keyframe(entity, clips, keyframes) else {
+            return Vec::new();
+        };
+        crate::anim::joint_local_transforms(skeleton, &pose)
+    }
+
+    /// `entity_apply_anim_vertex`: set the entity's X/Z translation from the
+    /// current animation frame's root vertex plus the `unk_c6`/`unk_c8`
+    /// offsets the grab pose latched.
+    ///
+    /// The original extracts the vertex of the frame the clip is showing:
+    /// while a hold is running (`timing_control > 1`) that is the frame just
+    /// applied, one behind the entity's pending word, wrapping to the clip's
+    /// last frame at zero; otherwise it is the pending frame itself, because
+    /// the same tick's `Joint_move` is about to apply it. The vertex is
+    /// rotated by the entity's yaw through the shared 4.12 pipeline and only
+    /// X/Z are written; Y stays put. The base offsets zero-extend through
+    /// their 16-bit fields, exactly like the original's `(unsigned int)` cast.
+    pub fn apply_anim_vertex(&self, entity: &mut Entity, clips: &[Clip]) {
+        let Some((x, z)) = self.root_vertex(entity, clips) else {
+            return;
+        };
+        entity.pos[0] = i32::from(entity.unk_c6).wrapping_add(x);
+        entity.pos[2] = i32::from(entity.unk_c8).wrapping_add(z);
+    }
+
+    /// The root vertex of the clip frame the entity is showing, rotated by the
+    /// entity's yaw (`entity_extract_anim_vertex` plus the `ApplyMatrixSV`
+    /// yaw rotation). `None` when the model carries no frame table.
+    pub fn root_vertex(&self, entity: &Entity, clips: &[Clip]) -> Option<(i32, i32)> {
+        let keyframes = self.keyframes.as_deref()?;
+        let clip = clips.get(usize::from(entity.animation_id))?;
+        if clip.frames.is_empty() {
+            return None;
+        }
+        let pending = usize::from(entity.animation_frame_id);
+        let index = if entity.timing_control > 1 {
+            if pending == 0 {
+                clip.frames.len() - 1
+            } else {
+                pending - 1
+            }
+        } else {
+            pending
+        };
+        let frame = clip.frames.get(index)?;
+        let keyframe = keyframes.get(usize::from(frame.keyframe))?;
+        Some(crate::player::rotate_xz(
+            entity.angle,
+            i32::from(keyframe.offset[0]),
+            i32::from(keyframe.offset[2]),
+        ))
     }
 
     /// Slew the tracking joint's yaw and pitch toward the entity's stored
@@ -450,6 +573,51 @@ mod tests {
     }
 
     #[test]
+    fn joint_worlds_compose_the_entity_matrix_and_the_pose() {
+        use crate::model::{Keyframe, Skeleton};
+        use std::sync::Arc;
+
+        let clips = vec![clip(&[(0, 1)])];
+        let keyframes = vec![Keyframe {
+            offset: [10, 0, 0],
+            rotations: vec![[0, 0, 0], [0, 0, 0]],
+        }];
+        let skeleton = Skeleton {
+            relative: vec![[0, 0, 0], [20, 0, 0]],
+            children: vec![vec![1], vec![]],
+        };
+        let mut clock = EntityAnim {
+            keyframes: Some(Arc::new(keyframes)),
+            skeleton: Some(Arc::new(skeleton)),
+            ..EntityAnim::default()
+        };
+        let mut entity = entity(0, 0, 0);
+        entity.pos = [100, 0, 0];
+
+        // The same composition the render path uses: the root keyframe
+        // offset and each joint's relative translation fold through the
+        // saturated entity diagonal.
+        let worlds = clock.joint_worlds(&entity, &clips);
+        assert_eq!(worlds.len(), 2);
+        assert_eq!(worlds[0].t, [109, 0, 0]);
+        assert_eq!(worlds[1].t, [128, 0, 0]);
+
+        // The entity joint scale multiplies the rotation columns, tripling
+        // the composed root translation.
+        entity.joint_scale = 0x3000;
+        let scaled = clock.joint_worlds(&entity, &clips);
+        assert_eq!(scaled[0].t, [129, 0, 0]);
+        assert_eq!(scaled[1].t, [188, 0, 0]);
+
+        // Without a skeleton or keyframes the list is empty.
+        let bare = EntityAnim {
+            keyframes: clock.keyframes.take(),
+            ..EntityAnim::default()
+        };
+        assert!(bare.joint_worlds(&entity, &clips).is_empty());
+    }
+
+    #[test]
     fn npc_keyframe_pose_interpolates_by_the_published_step() {
         use crate::model::Keyframe;
         let clips = vec![clip(&[(0, 1), (1, 1), (2, 1), (3, 1)])];
@@ -532,6 +700,83 @@ mod tests {
             .unwrap();
         assert_eq!(pose.rotations[0], [0x80, 0, 0]);
         assert_eq!(pose.offset[1], 100);
+    }
+
+    #[test]
+    fn apply_anim_vertex_reads_the_frame_and_offsets() {
+        use crate::model::{Keyframe, Skeleton};
+        use std::sync::Arc;
+
+        let clips = vec![clip(&[(0, 1), (1, 3)])];
+        let keyframes = vec![
+            Keyframe {
+                offset: [10, 0, 20],
+                rotations: vec![[0, 0, 0]],
+            },
+            Keyframe {
+                offset: [30, 0, 40],
+                rotations: vec![[0, 0, 0]],
+            },
+        ];
+        let clock = EntityAnim {
+            keyframes: Some(Arc::new(keyframes)),
+            skeleton: Some(Arc::new(Skeleton::default())),
+            ..EntityAnim::default()
+        };
+        let mut wasp = entity(0, 0, 0);
+        wasp.unk_c6 = 100;
+        wasp.unk_c8 = 0x0032;
+        wasp.pos = [500, 7, 500];
+        wasp.angle = 0x400;
+
+        // A spent hold reads the pending frame, the one the same tick's
+        // advance is about to apply.
+        clock.apply_anim_vertex(&mut wasp, &clips);
+        let (x, z) = crate::player::rotate_xz(0x400, 10, 20);
+        assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z], "X/Z only");
+
+        // A running hold reads the frame just shown.
+        wasp.timing_control = 2;
+        wasp.pos = [0, 7, 0];
+        clock.apply_anim_vertex(&mut wasp, &clips);
+        let (x, z) = crate::player::rotate_xz(0x400, 30, 40);
+        assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z]);
+
+        // The step-back wraps from pending frame 0 to the clip's last frame.
+        wasp.animation_frame_id = 0;
+        wasp.pos = [0, 7, 0];
+        clock.apply_anim_vertex(&mut wasp, &clips);
+        assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z]);
+
+        // A spent hold at frame 1 reads frame 1 itself.
+        wasp.animation_frame_id = 1;
+        wasp.timing_control = 0;
+        wasp.pos = [0, 7, 0];
+        clock.apply_anim_vertex(&mut wasp, &clips);
+        let (x, z) = crate::player::rotate_xz(0x400, 30, 40);
+        assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z]);
+
+        // The base offsets zero-extend through their 16-bit fields, like the
+        // original's `(unsigned int)` cast.
+        let mut wrapped = entity(0, 0, 0);
+        wrapped.unk_c6 = 0xFFCE;
+        wrapped.unk_c8 = 0;
+        wrapped.angle = 0;
+        clock.apply_anim_vertex(&mut wrapped, &clips);
+        let (x, _) = crate::player::rotate_xz(0, 10, 20);
+        assert_eq!(wrapped.pos[0], 0xFFCE + x, "the u16 base zero-extends");
+
+        // No keyframe table or an out-of-range frame changes nothing.
+        let bare = EntityAnim::default();
+        let mut untouched = entity(0, 0, 0);
+        untouched.pos = [1, 2, 3];
+        bare.apply_anim_vertex(&mut untouched, &clips);
+        assert_eq!(untouched.pos, [1, 2, 3]);
+        let mut untouched = entity(0, 0, 0);
+        untouched.animation_frame_id = 9;
+        untouched.pos = [1, 2, 3];
+        clock.apply_anim_vertex(&mut untouched, &clips);
+        assert_eq!(untouched.pos, [1, 2, 3]);
     }
 
     #[test]

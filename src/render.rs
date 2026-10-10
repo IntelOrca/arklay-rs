@@ -727,6 +727,40 @@ impl Framebuffer {
         self.rasterize_triangles(texture, triangles);
     }
 
+    /// [`Framebuffer::draw_model`] with a joint visibility mask: an object
+    /// whose joint's bit is set is skipped entirely. The DIED screen hides
+    /// the player's head joint through this path.
+    pub fn draw_model_hidden(
+        &mut self,
+        mesh: &Tmd,
+        texture: &Texture8,
+        joints: &[anim::Mat4x3],
+        camera: &Camera,
+        lighting: &Lighting,
+        hidden: u32,
+    ) {
+        let mut triangles: Vec<Triangle> = Vec::new();
+        let light = lighting.latched(root_position(joints));
+        for (index, (object, joint)) in mesh.objects.iter().zip(joints).enumerate() {
+            if hidden & (1 << index) != 0 {
+                continue;
+            }
+            collect_triangles(
+                object,
+                joint,
+                camera,
+                Some(lighting),
+                Some(light),
+                true,
+                0,
+                [255; 3],
+                None,
+                &mut triangles,
+            );
+        }
+        self.rasterize_triangles(texture, triangles);
+    }
+
     /// Draw a TMD mesh full-bright, with backface culling.
     ///
     /// This is the door animation's path: panels are drawn over black with the

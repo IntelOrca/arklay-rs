@@ -321,9 +321,35 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
             );
             return std::array::from_fn(|slot| world.r[slot / 3][slot % 3] as i16);
         }
+        Attach::Joint(entity, joint) => {
+            let Some(world) = game
+                .joint_worlds
+                .get(usize::from(entity))
+                .and_then(|joints| joints.get(usize::from(joint)))
+            else {
+                return IDENTITY_MATRIX;
+            };
+            return std::array::from_fn(|slot| world.r[slot / 3][slot % 3] as i16);
+        }
         Attach::Player => &game.entities[0],
         Attach::Entity(slot) => match game.entities.get(usize::from(slot)) {
             Some(entity) => entity,
+            None => return IDENTITY_MATRIX,
+        },
+        Attach::WebClone(slot) => match game
+            .web_clones
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+        {
+            Some(clone) => &clone.entity,
+            None => return IDENTITY_MATRIX,
+        },
+        Attach::Companion(slot) => match game
+            .companions
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+        {
+            Some(companion) => &companion.entity,
             None => return IDENTITY_MATRIX,
         },
     };
@@ -368,11 +394,26 @@ fn attach_translation(game: &GameState, attach: Attach) -> [i32; 3] {
             )
             .t
         }
+        Attach::Joint(entity, joint) => game
+            .joint_worlds
+            .get(usize::from(entity))
+            .and_then(|joints| joints.get(usize::from(joint)))
+            .map_or([0, 0, 0], |world| world.t),
         Attach::Player => game.entities[0].pos,
         Attach::Entity(slot) => game
             .entities
             .get(usize::from(slot))
             .map_or([0, 0, 0], |entity| entity.pos),
+        Attach::WebClone(slot) => game
+            .web_clones
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+            .map_or([0, 0, 0], |clone| clone.entity.pos),
+        Attach::Companion(slot) => game
+            .companions
+            .get(usize::from(slot))
+            .and_then(Option::as_ref)
+            .map_or([0, 0, 0], |companion| companion.entity.pos),
     }
 }
 
@@ -1912,6 +1953,35 @@ mod tests {
         assert_eq!(attach_translation(&game, Attach::Omodel(0)), [0, 0, 0]);
         assert_eq!(attach_matrix(&game, Attach::Omodel(9)), IDENTITY_MATRIX);
         assert_eq!(attach_translation(&game, Attach::Omodel(9)), [0, 0, 0]);
+    }
+
+    #[test]
+    fn joint_attach_resolves_to_the_stored_joint_world_matrix() {
+        let mut game = GameState::default();
+        game.joint_worlds[2] = vec![
+            crate::anim::Mat4x3 {
+                r: [[4095, 0, 0], [0, 4095, 0], [0, 0, 4095]],
+                t: [100, -200, 300],
+            },
+            crate::anim::Mat4x3 {
+                r: [[0, 0, 4095], [0, 4095, 0], [-4095, 0, 0]],
+                t: [400, -500, 600],
+            },
+        ];
+        assert_eq!(
+            attach_matrix(&game, Attach::Joint(2, 1)),
+            [0, 0, 4095, 0, 4095, 0, -4095, 0, 0]
+        );
+        assert_eq!(
+            attach_translation(&game, Attach::Joint(2, 1)),
+            [400, -500, 600]
+        );
+
+        // A missing slot or joint falls back to identity and zero.
+        assert_eq!(attach_matrix(&game, Attach::Joint(3, 0)), IDENTITY_MATRIX);
+        assert_eq!(attach_translation(&game, Attach::Joint(3, 0)), [0, 0, 0]);
+        assert_eq!(attach_matrix(&game, Attach::Joint(2, 9)), IDENTITY_MATRIX);
+        assert_eq!(attach_translation(&game, Attach::Joint(2, 9)), [0, 0, 0]);
     }
 
     #[test]

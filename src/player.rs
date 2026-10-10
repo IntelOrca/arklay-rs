@@ -149,6 +149,15 @@ pub struct Input {
     pub run: bool,
     pub action_held: bool,
     pub action_pressed: bool,
+    /// The aim button (the original's D-pad bit `0x100`): raises the weapon.
+    pub aim: bool,
+    /// The aim button's press edge.
+    pub aim_pressed: bool,
+    /// The fire button (the original's D-pad bit `0x40`): fires, reloads or
+    /// clicks with the aim held.
+    pub fire: bool,
+    /// The fire button's press edge.
+    pub fire_pressed: bool,
     /// `MSF2_EFFECT_ZONE` this tick: walk/run speeds halve and the locomotion
     /// animation advances only every other tick (the original's slow-motion
     /// variant).
@@ -247,6 +256,8 @@ pub enum ClipSource {
     Emw,
     /// The RDT-embedded room player-animation pair (push, vault, ladders).
     Room,
+    /// The equipped weapon's `W*.EMW` (aim, fire, reload motions).
+    Weapon,
 }
 
 /// Room-animation clip of the push wind-up (the original's `attackAnim 0x30`).
@@ -389,11 +400,10 @@ pub struct PlayerState {
     /// as the room collision pass reads them for the player. The player's byte
     /// aliases the health status flags, so its `0x10` bit is raised by the
     /// player init on every room spawn; while it is set the collision pass
-    /// skips shape-5 records (the large stair/corridor floor volumes).
-    ///
-    /// TODO(parity): the original reads the live health byte here, so a script
-    /// that clears `0x10` stops skipping shape 5. The port keeps the spawn
-    /// value until the health byte's collision-flag aliasing is modelled.
+    /// skips shape-5 records (the large stair/corridor floor volumes). The
+    /// engine mirrors the live health-status byte into this field before the
+    /// player's physics each tick, so a script that clears `0x10` stops
+    /// skipping shape 5 exactly like the original.
     pub collision_flags: u8,
     /// Clip playback state, interpreted against `clip_source`.
     pub anim: AnimPlayer,
@@ -440,6 +450,9 @@ pub struct PlayerState {
     interact_finished: Option<ReachRequest>,
     /// The last tick's input; `tick_objects` reads the action edges from here.
     pub input: Input,
+    /// The player's weapon sub-machine (aim, fire, reload). Inactive while the
+    /// locomotion machine owns the tick.
+    pub weapon: crate::weapons::WeaponState,
     /// Slow-motion animation cadence counter (the original's `attackDirection`
     /// reuse): 0 applies the frame and re-arms to 1, 1 skips the frame.
     pub slow_counter: i16,
@@ -451,6 +464,14 @@ pub struct PlayerState {
     /// when the requested behavior matches the current one; a finished run
     /// stop sets it so idle re-arms a fresh blend.
     pub fresh_entry: bool,
+    /// The ground quad's half extent along the entity's local X. The death
+    /// blood pool shrinks it by 100 and then grows it 16 a frame.
+    pub shadow_half_x: i32,
+    /// The ground quad's half extent along the entity's local Z.
+    pub shadow_half_z: i32,
+    /// The ground quad's tint: the living shadow grey or the pool's
+    /// `0x00FFFF50`.
+    pub shadow_tint: u32,
     /// One-shot sound requests emitted since the last
     /// [`PlayerState::take_sounds`].
     sounds: Vec<PlayerSound>,
@@ -500,9 +521,13 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         interact_request: None,
         interact_finished: None,
         input: Input::default(),
+        weapon: crate::weapons::WeaponState::default(),
         slow_counter: 0,
         run_stop_ticks: 0,
         fresh_entry: false,
+        shadow_half_x: crate::shadow::PLAYER_HALF_X,
+        shadow_half_z: crate::shadow::PLAYER_HALF_Z,
+        shadow_tint: crate::shadow::PLAYER_COLOR,
         sounds: Vec::new(),
         footsteps: Vec::new(),
         screen_effects: Vec::new(),
@@ -711,6 +736,8 @@ impl PlayerState {
             ClipSource::Emd => self.anim.update(emd_clips),
             ClipSource::Emw => self.anim.update(emw_clips),
             ClipSource::Room => self.anim.update(room_clips),
+            // The weapon machine advances the weapon bank itself.
+            ClipSource::Weapon => false,
         }
     }
 
@@ -819,6 +846,7 @@ impl PlayerState {
             ClipSource::Emd => emd_clips,
             ClipSource::Emw => emw_clips,
             ClipSource::Room => room_clips,
+            ClipSource::Weapon => return,
         };
         let Some(clip) = clips.get(rule.clip) else {
             return;
@@ -1355,6 +1383,12 @@ impl PlayerState {
         self.fresh_entry = false;
         self.set_clip(ClipSource::Emd, SETTLE_CLIP);
     }
+
+    /// Hand control back to the locomotion machine after the weapon machine
+    /// finishes its holster/reload exit.
+    pub(crate) fn return_from_weapon(&mut self) {
+        self.enter_idle();
+    }
 }
 
 /// Whether the collision resolver would push a body of `radius` at `pos`.
@@ -1555,11 +1589,66 @@ pub(crate) fn resolve_collision(
     radius: i32,
     collision_flags: u8,
 ) -> [i32; 3] {
+    resolve_collision_code(collision, prev, proposed, radius, collision_flags).0
+}
+
+/// [`resolve_collision`] with the original's result code and floor step: `0`
+/// when nothing blocked, `1` when pass 1 pushed out of geometry and pass 2 was
+/// clear, `2` when the pushed position was still stuck and the tick rolled
+/// back to `prev`, `3` when a floor/step zone was crossed with its step in the
+/// third value. While `collision_flags` bit 2 is set, boundary records whose
+/// `flags` bit 8 is clear are floor records: they carry a height step in the
+/// type word instead of a shape and never push.
+///
+/// The caller that only wants the resolved position uses
+/// [`resolve_collision`]; the monsters that count consecutive blocked frames
+/// keep the code in their scratch word, and the flying crow keeps the step as
+/// its ground reference.
+pub(crate) fn resolve_collision_code(
+    collision: &Collision,
+    prev: [i32; 3],
+    proposed: [i32; 3],
+    radius: i32,
+    collision_flags: u8,
+) -> ([i32; 3], u8, i16) {
+    let full = resolve_collision_full(collision, prev, proposed, radius, collision_flags);
+    (full.pos, full.code, full.floor_step)
+}
+
+/// [`resolve_collision_code`] with the original's `g_playerPosScratch`
+/// snapshot: the incoming point, replaced by the pass-1 pushed point when
+/// anything was hit. The hound's probe stores this shared scratch.
+pub(crate) struct CollisionResolution {
+    /// The resolved position (pushed, clear, or rolled back to `prev`).
+    pub pos: [i32; 3],
+    /// The original's result code: `0` clear, `1` pushed clear, `2` rolled
+    /// back, `3` with a floor step in `floor_step`.
+    pub code: u8,
+    /// The crossed floor/step value.
+    pub floor_step: i16,
+    /// The original's `g_playerPosScratch` after the resolve.
+    pub scratch: [i32; 3],
+}
+
+/// The two-pass resolve with the scratch snapshot [`CollisionResolution`]
+/// carries; see [`resolve_collision_code`] for the semantics.
+pub(crate) fn resolve_collision_full(
+    collision: &Collision,
+    prev: [i32; 3],
+    proposed: [i32; 3],
+    radius: i32,
+    collision_flags: u8,
+) -> CollisionResolution {
     let records = collision.records(proposed[0], proposed[2]);
     let mut pos = proposed;
     let mut hit = 0u16;
+    let mut floor_step = 0i16;
 
     for rect in records {
+        if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
+            floor_step = floor_record_step(rect);
+            continue;
+        }
         if rect.kind & 0xFF == 5 && collision_flags & 0x10 != 0 {
             continue;
         }
@@ -1574,14 +1663,23 @@ pub(crate) fn resolve_collision(
     }
 
     if hit == 0 {
-        return pos;
+        return CollisionResolution {
+            pos,
+            code: accept_code(floor_step, 0),
+            floor_step,
+            scratch: proposed,
+        };
     }
 
+    let scratch = pos;
     let mut still_hit = 0u16;
     let mut wedged = false;
     for rect in records {
         let shape = rect.kind & 0xFF;
         if shape == 4 || (shape == 5 && collision_flags & 0x10 != 0) {
+            continue;
+        }
+        if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
             continue;
         }
         if let Some(inside) = classify(pos[0], pos[2], rect, radius) {
@@ -1593,10 +1691,48 @@ pub(crate) fn resolve_collision(
         }
     }
 
-    if wedged || still_hit == 0 {
-        return pos;
+    if wedged {
+        return CollisionResolution {
+            pos,
+            code: accept_code(floor_step, 0),
+            floor_step,
+            scratch,
+        };
     }
-    [prev[0], proposed[1], prev[2]]
+    if still_hit == 0 {
+        return CollisionResolution {
+            pos,
+            code: accept_code(floor_step, 1),
+            floor_step,
+            scratch,
+        };
+    }
+    CollisionResolution {
+        pos: [prev[0], proposed[1], prev[2]],
+        code: accept_code(floor_step, 2),
+        floor_step,
+        scratch,
+    }
+}
+
+/// The original's floor/step decode: the type word's high byte carries tens
+/// and the low `flags` byte units, both times a hundred, and bit 15 of the
+/// type is the sign. An "up" floor reports the bare `1` sentinel, exactly like
+/// the original's `(down ? -step : 0) | 1`.
+fn floor_record_step(rect: &CollisionRect) -> i16 {
+    let step = ((((rect.kind & 0x7F00) >> 8) as i32) * 10 + i32::from(rect.flags & 0xFF)) * 100;
+    let step = step as i16;
+    ((if rect.kind & 0x8000 != 0 {
+        -i32::from(step)
+    } else {
+        0
+    }) | 1) as i16
+}
+
+/// The collision-accept return: a crossed floor/step zone reports code `3`,
+/// otherwise the pass's own `0`/`1`/`2`.
+fn accept_code(floor_step: i16, clear_result: u8) -> u8 {
+    if floor_step != 0 { 3 } else { clear_result }
 }
 
 /// The original's `check_room_collision_two_point` as the room-object pass
@@ -1622,7 +1758,39 @@ pub(crate) fn object_two_point_probe(
     probes: [[i16; 2]; 2],
     radius: i32,
 ) -> u16 {
-    let mut bits = 0u16;
+    let split = two_point_probe_split(collision, pos, committed, yaw, mirror, probes, radius);
+    split.bits_a | split.bits_b
+}
+
+/// The endpoints' flag bits and the end-B quadrant from [`two_point_probe_split`].
+pub(crate) struct TwoPointProbe {
+    /// `(flags & 0x300) >> 8` bits of end A (the second endpoint walked).
+    pub bits_a: u16,
+    /// The same bits of end B (the first endpoint walked).
+    pub bits_b: u16,
+    /// The boundary quadrant end B's tested centre fell in.
+    pub cell_b: u8,
+    /// End B's tested centre after its own pass, the point the two-point
+    /// pass's blocked re-walk re-tests.
+    pub point_b: [i32; 3],
+}
+
+/// [`object_two_point_probe`]'s walk, keeping the two endpoints' results
+/// separate: the original's enemy two-point pass accepts on end A clear,
+/// returns end B's bits, and on end A blocked re-tests end B in its previous
+/// quadrant before rolling back.
+pub(crate) fn two_point_probe_split(
+    collision: &Collision,
+    pos: &mut [i32; 3],
+    committed: [i32; 3],
+    yaw: u16,
+    mirror: u16,
+    probes: [[i16; 2]; 2],
+    radius: i32,
+) -> TwoPointProbe {
+    let mut bits = [0u16; 2];
+    let mut cell_b = 0u8;
+    let mut point_b = [0i32; 3];
     // The original starts with end B (probe slot 1); a push moves the live
     // position, so the next endpoint's centre is computed from the displacement.
     for which in [1usize, 0] {
@@ -1635,6 +1803,9 @@ pub(crate) fn object_two_point_probe(
         // The point every record of this endpoint classifies against is fixed
         // for the whole walk; only the push handlers' scratch `centre` drifts.
         let mut centre = point;
+        if which == 1 {
+            cell_b = quadrant(collision, point[0], point[2]);
+        }
 
         for rect in collision.records(point[0], point[2]) {
             let shape = rect.kind & 0xFF;
@@ -1658,10 +1829,96 @@ pub(crate) fn object_two_point_probe(
                 }
                 _ => {}
             }
-            bits |= (rect.flags & 0x300) >> 8;
+            bits[which] |= (rect.flags & 0x300) >> 8;
+        }
+        if which == 1 {
+            point_b = centre;
         }
     }
+    TwoPointProbe {
+        bits_a: bits[0],
+        bits_b: bits[1],
+        cell_b,
+        point_b,
+    }
+}
+
+/// The blocked two-point pass's re-walk: classify the already-tested end-B
+/// centre against the records of the PREVIOUS quadrant, with the zero offset
+/// the pass left behind and the full push. Returns any further flag bits.
+pub(crate) fn two_point_retest_previous(
+    collision: &Collision,
+    point: [i32; 3],
+    committed_world: [i32; 3],
+    cell_b: u8,
+    radius: i32,
+) -> u16 {
+    let mut bits = 0u16;
+    if cell_b == 0 {
+        return 0;
+    }
+    let records = &collision.quadrants[usize::from(cell_b - 1)];
+    let mut centre = point;
+    for rect in records {
+        let shape = rect.kind & 0xFF;
+        if shape == 4 || shape == 5 {
+            continue;
+        }
+        if classify(point[0], point[2], rect, radius).is_none() {
+            continue;
+        }
+        match shape {
+            1 => {
+                let _ = push_rect_probe(rect, committed_world, &mut centre, radius);
+            }
+            3 => {
+                let _ = circle_push_delta(rect, centre[0], centre[2], radius);
+            }
+            _ => {}
+        }
+        bits |= (rect.flags & 0x300) >> 8;
+    }
     bits
+}
+
+/// The boundary quadrant `(x, z)` falls in, the same selection
+/// [`Collision::records`] makes.
+pub(crate) fn quadrant(collision: &Collision, x: i32, z: i32) -> u8 {
+    (u8::from(z < i32::from(collision.cell_z)) << 1) | u8::from(x < i32::from(collision.cell_x))
+}
+
+/// `room_collision_check_0047da50`: the radius-zero point query. Returns 1 as
+/// soon as a fully-blocking record (`flags & 0x300 == 0x300`) contains
+/// `position + offset`; otherwise the ORed `0x300` bits of every record the
+/// point is inside. No push and no position mutation.
+pub(crate) fn point_blocked_flags(
+    collision: &Collision,
+    position: [i32; 3],
+    offset: [i32; 3],
+) -> i16 {
+    let point = [
+        position[0].wrapping_add(offset[0]),
+        position[1].wrapping_add(offset[1]),
+        position[2].wrapping_add(offset[2]),
+    ];
+    let mut bits = 0u16;
+    for rect in collision.records(point[0], point[2]) {
+        if point_outside(
+            point[0],
+            point[2],
+            i32::from(rect.x_max),
+            i32::from(rect.z_max),
+            i32::from(rect.x_min),
+            i32::from(rect.z_min),
+        ) {
+            continue;
+        }
+        if (rect.flags & 0x300) >> 8 == 3 {
+            return 1;
+        }
+        bits |= rect.flags & 0x300;
+    }
+    bits as i16
 }
 
 /// Is the circle at `(x, z)` inside the record's grown bounds?
@@ -1932,9 +2189,13 @@ mod tests {
             interact_request: None,
             interact_finished: None,
             input: Input::default(),
+            weapon: crate::weapons::WeaponState::default(),
             slow_counter: 0,
             run_stop_ticks: 0,
             fresh_entry: false,
+            shadow_half_x: crate::shadow::PLAYER_HALF_X,
+            shadow_half_z: crate::shadow::PLAYER_HALF_Z,
+            shadow_tint: crate::shadow::PLAYER_COLOR,
             sounds: Vec::new(),
             footsteps: Vec::new(),
             screen_effects: Vec::new(),
@@ -2002,6 +2263,7 @@ mod tests {
             ClipSource::Emd => emd,
             ClipSource::Emw => emw,
             ClipSource::Room => &[],
+            ClipSource::Weapon => &[],
         };
         player.anim.pose_keyframe(clips, keyframes).unwrap()
     }
@@ -2649,6 +2911,114 @@ mod tests {
             resolve_collision(&room.collision, prev, proposed, CHRIS_RADIUS, 0),
             prev
         );
+    }
+
+    #[test]
+    fn resolve_collision_code_reports_clear_push_and_rollback() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(rect(2000, 3000, 1000, 0, 1));
+
+        // Nothing in the way: code 0.
+        let (_, code, step) =
+            resolve_collision_code(&room.collision, [0, 0, 0], [500, 0, 500], CHRIS_RADIUS, 0);
+        assert_eq!(code, 0);
+        assert_eq!(step, 0);
+
+        // Inside the wall: pass 1 pushes, pass 2 is clear -> code 1.
+        let (pos, code, step) = resolve_collision_code(
+            &room.collision,
+            [900, 0, 500],
+            [1000, 0, 600],
+            CHRIS_RADIUS,
+            0,
+        );
+        assert_eq!(code, 1);
+        assert_eq!(step, 0);
+        assert!(!position_blocked(&room, pos, CHRIS_RADIUS, 0));
+
+        // The shape-5 trap rolls the tick back to `prev` -> code 2.
+        let mut trap = RoomState::default();
+        trap.collision.quadrants[0].push(rect(2000, 3000, 1000, 0, 1));
+        trap.collision.quadrants[0].push(rect(4000, 3000, 2000, 0, 5));
+        let (pos, code, step) = resolve_collision_code(
+            &trap.collision,
+            [1800, 0, 1000],
+            [1900, 0, 1000],
+            CHRIS_RADIUS,
+            0,
+        );
+        assert_eq!(code, 2);
+        assert_eq!(step, 0);
+        assert_eq!(pos, [1800, 0, 1000]);
+    }
+
+    #[test]
+    fn floor_records_report_their_step_and_never_push() {
+        // A down-step: type bit 15 set, high byte 3 and low flags byte 4, so
+        // the step is -(3*10 + 4)*100 = -3400, reported as (-3400 | 1).
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(CollisionRect {
+            x_max: 2000,
+            z_max: 2000,
+            x_min: 0,
+            z_min: 0,
+            kind: 0x8300,
+            flags: 0x0004,
+        });
+
+        let (pos, code, step) = resolve_collision_code(
+            &room.collision,
+            [500, 0, 500],
+            [1000, 0, 1000],
+            CHRIS_RADIUS,
+            0x04,
+        );
+        assert_eq!(pos, [1000, 0, 1000], "a floor record never pushes");
+        assert_eq!(code, 3, "a crossed floor step reports code 3");
+        assert_eq!(step, -3399, "(-3400) | 1, like the original");
+
+        // The same record without the floor-reporting flag is a plain wall.
+        let (_, code, step) = resolve_collision_code(
+            &room.collision,
+            [500, 0, 500],
+            [1000, 0, 1000],
+            CHRIS_RADIUS,
+            0,
+        );
+        assert_eq!(code, 0, "the low byte 0 has no shape handler, so clear");
+        assert_eq!(step, 0);
+
+        // An up-step reports the bare 1 sentinel.
+        room.collision.quadrants[0][0].kind = 0x0300;
+        let (_, code, step) = resolve_collision_code(
+            &room.collision,
+            [500, 0, 500],
+            [1000, 0, 1000],
+            CHRIS_RADIUS,
+            0x04,
+        );
+        assert_eq!((code, step), (3, 1));
+
+        // A blocking record that also has the floor flag bit is a wall, and a
+        // wall push beside a floor record still reports the step.
+        room.collision.quadrants[0].push(CollisionRect {
+            x_max: 3000,
+            z_max: 3000,
+            x_min: 1500,
+            z_min: 1500,
+            kind: 0x0001,
+            flags: 0x0100,
+        });
+        let (pos, code, step) = resolve_collision_code(
+            &room.collision,
+            [500, 0, 500],
+            [1400, 0, 1400],
+            CHRIS_RADIUS,
+            0x04,
+        );
+        assert_ne!(pos, [1400, 0, 1400], "the wall still pushed: {pos:?}");
+        assert_eq!(code, 3, "the crossed floor step wins the code");
+        assert_eq!(step, 1);
     }
 
     #[test]
@@ -3833,5 +4203,106 @@ mod tests {
             (SE_LADDER_STEP, SE_LADDER_END, SE_LADDER_GRUNT),
             (0x23, 0x2D, 0x17)
         );
+    }
+
+    #[test]
+    fn two_point_probe_split_reports_per_end_bits() {
+        use crate::state::{Collision, CollisionRect};
+        // Two flag-only records (shape 0, no handler): one around the +600
+        // end, one around the -600 end, with the entity at x=1000.
+        let mut collision = Collision::default();
+        collision.quadrants[0] = vec![
+            CollisionRect {
+                x_max: 700,
+                z_max: 200,
+                x_min: 300,
+                z_min: 0,
+                kind: 0,
+                flags: 0x300,
+            },
+            CollisionRect {
+                x_max: 1700,
+                z_max: 200,
+                x_min: 1500,
+                z_min: 0,
+                kind: 0,
+                flags: 0x100,
+            },
+        ];
+        let mut pos = [1000, 0, 0];
+        let split = two_point_probe_split(
+            &collision,
+            &mut pos,
+            [1000, 0, 0],
+            0,
+            0,
+            [[-600, 0], [600, 0]],
+            100,
+        );
+        assert_eq!(split.bits_a, 3, "the -600 end's full block");
+        assert_eq!(split.bits_b, 1, "the +600 end's partial flag");
+        assert_eq!(split.cell_b, 0);
+        assert_eq!(pos, [1000, 0, 0], "shape 0 never pushes");
+
+        // The blocked re-walk of end B's previous quadrant is empty at cell 0.
+        assert_eq!(
+            two_point_retest_previous(&collision, split.point_b, [0, 0, 0], 0, 100),
+            0
+        );
+    }
+
+    #[test]
+    fn point_blocked_flags_reads_the_300_bits() {
+        use crate::state::{Collision, CollisionRect};
+        let mut collision = Collision::default();
+        collision.quadrants[0] = vec![
+            CollisionRect {
+                x_max: 900,
+                z_max: 200,
+                x_min: 500,
+                z_min: 0,
+                kind: 1,
+                flags: 0x100,
+            },
+            CollisionRect {
+                x_max: 1500,
+                z_max: 200,
+                x_min: 1100,
+                z_min: 0,
+                kind: 1,
+                flags: 0x300,
+            },
+        ];
+        // Inside the partial record: the bits OR through.
+        assert_eq!(
+            point_blocked_flags(&collision, [600, 0, 100], [0, 0, 0]),
+            0x100
+        );
+        // Inside the full record: the immediate 1.
+        assert_eq!(
+            point_blocked_flags(&collision, [1200, 0, 100], [0, 0, 0]),
+            1
+        );
+        // The offset moves the tested point.
+        assert_eq!(
+            point_blocked_flags(&collision, [0, 0, 100], [600, 0, 0]),
+            0x100
+        );
+        // Outside every record.
+        assert_eq!(point_blocked_flags(&collision, [300, 0, 100], [0, 0, 0]), 0);
+    }
+
+    #[test]
+    fn quadrant_splits_around_the_cell() {
+        use crate::state::Collision;
+        let collision = Collision {
+            cell_x: 100,
+            cell_z: 200,
+            ..Collision::default()
+        };
+        assert_eq!(quadrant(&collision, 100, 200), 0, "the high side of both");
+        assert_eq!(quadrant(&collision, 99, 200), 1);
+        assert_eq!(quadrant(&collision, 100, 199), 2);
+        assert_eq!(quadrant(&collision, 99, 199), 3);
     }
 }

@@ -21,12 +21,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 
+use crate::enemy;
 use crate::items;
 use crate::manifest;
 use crate::model::Texture8;
 use crate::movie;
 use crate::music;
-use crate::npc;
 use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
 use crate::sfx;
@@ -214,7 +214,9 @@ pub fn convert_game_with_options(
         item_m1,
         item_m2,
         players,
+        weapons,
         npc,
+        enemy_models,
         roommask,
         effects,
         data,
@@ -374,13 +376,14 @@ pub fn convert_game_with_options(
 
     let (bgm_count, bgm_bytes) = copy_music(&sound, &mut writer, &mut progress, jobs)?;
     let (se_count, se_bytes) = copy_se(&sound, &mut writer, &mut progress, jobs)?;
-    // TODO(parity): (conversion) the original installs more than this pack
-    // carries: the held-weapon TMDs under `players/ws*.tmd`. Those systems are
-    // unimplemented, so the conversion is complete only for the modelled
-    // categories; add their copy phase when the runtime grows them.
     let (door_count, door_bytes) = copy_doors(&item_m1, &mut writer, &mut progress, jobs)?;
     let (player_count, player_bytes) = copy_players(&players, &mut writer, &mut progress, jobs)?;
+    let (weapon_count, weapon_bytes) =
+        copy_weapon_assets(&weapons, &mut writer, &mut progress, jobs)?;
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress, jobs)?;
+    let (enemy_count, enemy_bytes) =
+        copy_enemy_models(&enemy_models, &mut writer, &mut progress, jobs)?;
+    let (enemylua_count, enemylua_bytes) = copy_enemy_scripts(&mut writer, &mut progress)?;
     let (effect_count, effect_bytes) =
         copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
     let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
@@ -397,6 +400,8 @@ pub fn convert_game_with_options(
     let (map_count, map_bytes) =
         copy_map_art(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
     let (maptbl_count, maptbl_bytes) = copy_map_tables(exe.as_deref(), &mut writer, &mut progress)?;
+    let (combat_count, combat_bytes) =
+        copy_combat_tables(exe.as_deref(), &mut writer, &mut progress)?;
     let (manifest_count, manifest_bytes) = copy_manifest(&mut writer)?;
 
     // Voice and film land in the same pack as every other category, so a
@@ -422,7 +427,10 @@ pub fn convert_game_with_options(
     println!("se: {se_count} entries, {se_bytes} bytes");
     println!("door: {door_count} entries, {door_bytes} bytes");
     println!("player: {player_count} entries, {player_bytes} bytes");
-    println!("npc: {npc_count} entries, {npc_bytes} bytes");
+    println!("weapon: {weapon_count} entries, {weapon_bytes} bytes");
+    println!("enemy: {npc_count} entries, {npc_bytes} bytes");
+    println!("monster: {enemy_count} entries, {enemy_bytes} bytes");
+    println!("enemylua: {enemylua_count} entries, {enemylua_bytes} bytes");
     println!("effspr: {effect_count} entries, {effect_bytes} bytes");
     println!("font: {font_count} entries, {font_bytes} bytes");
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
@@ -435,6 +443,7 @@ pub fn convert_game_with_options(
     println!("file: {file_count} entries, {file_bytes} bytes");
     println!("map: {map_count} entries, {map_bytes} bytes");
     println!("maptbl: {maptbl_count} entry, {maptbl_bytes} bytes");
+    println!("combat: {combat_count} entry, {combat_bytes} bytes");
     println!(
         "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
         base_manifest().id
@@ -488,7 +497,10 @@ pub fn convert_game_with_options(
         + se_count
         + door_count
         + player_count
+        + weapon_count
         + npc_count
+        + enemy_count
+        + enemylua_count
         + effect_count
         + ui_count
         + item_count
@@ -501,6 +513,7 @@ pub fn convert_game_with_options(
         + file_count
         + map_count
         + maptbl_count
+        + combat_count
         + manifest_count
         + voice_count
         + movie_count;
@@ -703,6 +716,20 @@ fn copy_players(
     copy_raw_files(files, "player", writer, progress, jobs)
 }
 
+/// Add every resolved weapon animation and held-weapon model to the pack.
+fn copy_weapon_assets(
+    weapons: &[WeaponAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    let files = weapons
+        .iter()
+        .map(|asset| (asset.entry.clone(), asset.source.clone()))
+        .collect();
+    copy_raw_files(files, "weapon", writer, progress, jobs)
+}
+
 /// The 33 shipped effect-sheet names: `esp000`, `esp001` and `esp200`..`esp230`.
 ///
 /// The room→sheet map references 31 of them; `esp221` and `esp224` ship
@@ -735,7 +762,7 @@ fn copy_npc_models(
     progress: &mut Progress,
     jobs: usize,
 ) -> Result<(usize, usize)> {
-    progress.begin("npc", assets.len() as u64, "files");
+    progress.begin("enemy", assets.len() as u64, "files");
     let results = parallel_map(assets.len(), jobs, progress, |index| {
         let asset = &assets[index];
         let data = fs::read(&asset.source).with_context(|| {
@@ -754,6 +781,59 @@ fn copy_npc_models(
         count += 1;
         writer
             .add(&entry, data)
+            .with_context(|| format!("failed to add {entry}"))?;
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
+/// Add every resolved monster model of both scenario blocks to the pack raw.
+fn copy_enemy_models(
+    assets: &[EnemyAsset],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    progress.begin("monster", assets.len() as u64, "files");
+    let results = parallel_map(assets.len(), jobs, progress, |index| {
+        let asset = &assets[index];
+        let data = fs::read(&asset.source).with_context(|| {
+            format!(
+                "failed to read monster model {:#04x} block {} ({})",
+                asset.id,
+                asset.player,
+                asset.source.display()
+            )
+        })?;
+        Ok((asset.entry.clone(), 1, data))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, data) in results {
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(&entry, data)
+            .with_context(|| format!("failed to add {entry}"))?;
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
+/// Add the checked-in enemy scripts to the pack under their `enemy/` entries.
+fn copy_enemy_scripts(writer: &mut PackWriter, progress: &mut Progress) -> Result<(usize, usize)> {
+    progress.begin(
+        "enemylua",
+        crate::enemy::ENEMY_SCRIPTS.len() as u64,
+        "files",
+    );
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (entry, source) in crate::enemy::ENEMY_SCRIPTS {
+        bytes += source.len();
+        count += 1;
+        writer
+            .add(entry, source.as_bytes().to_vec())
             .with_context(|| format!("failed to add {entry}"))?;
     }
     progress.end_phase();
@@ -1054,6 +1134,7 @@ const UI_ASSETS: &[(&str, &str, UiKind)] = &[
     ("ui/blue.tim", "BLUE.TIM", UiKind::Raw),
     ("ui/staitem.tim", "STAITEM.TIM", UiKind::Raw),
     ("ui/itemboxn.tim", "ITEMBOXN.TIM", UiKind::Raw),
+    ("ui/died.tim", "DIED.TIM", UiKind::Raw),
     (
         "ui/title.bmp",
         "TITLE.PIX",
@@ -1367,6 +1448,290 @@ fn extract_map_tables(data: &[u8]) -> Result<MapTables> {
         groups: read(MAP_GROUPS_VA, 16)?.try_into().unwrap(),
         layout_room_count: read(MAP_LAYOUT_ROOM_COUNT_VA, 4)?.try_into().unwrap(),
         layout_offset: read(MAP_LAYOUT_OFFSET_VA, 4)?.try_into().unwrap(),
+    })
+}
+
+/// The distinctive 48-byte blood-spurt joint list that heads the weapon
+/// block in the executable's data segment.
+const COMBAT_HIT_JOINT_PATTERN: [u8; 48] = [
+    2, 3, 4, 5, 7, 8, 3, 4, 5, 6, 7, 8, 2, 3, 4, 5, 6, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
+    4, 5, 8, 9, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0,
+];
+
+/// The 32-byte reference-type init profile (health roll followed by the
+/// initial-animation table).
+const COMBAT_TYPE_PROFILE_PATTERN: [u8; 32] = [
+    59, 59, 79, 59, 59, 39, 59, 79, 79, 99, 59, 79, 59, 59, 79, 59, 0, 0, 9, 9, 0, 12, 9, 29, 0, 0,
+    9, 0, 0, 0, 0, 0,
+];
+
+/// The documented shared player collision records, used to confirm the
+/// adjacent triple the executable stores.
+const COMBAT_CHRIS_SCA: [u8; 16] = [
+    0x00, 0x80, 0x00, 0x00, 0x06, 0xFA, 0x00, 0x00, 0xFA, 0x05, 0xA6, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
+const COMBAT_DATA2_SCA: [u8; 16] = [
+    0x00, 0x80, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const COMBAT_JILL_SCA: [u8; 16] = [
+    0x00, 0x80, 0x00, 0x00, 0xBA, 0xFA, 0x00, 0x00, 0x46, 0x05, 0x74, 0x01, 0x00, 0x00, 0x00, 0x00,
+];
+
+/// Find the single occurrence of `needle` in the executable, naming it on
+/// failure.
+fn find_unique_combat_table(data: &[u8], needle: &[u8], what: &str) -> Result<usize> {
+    let mut matches = data
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(_, window)| *window == needle)
+        .map(|(index, _)| index);
+    let first = matches
+        .next()
+        .with_context(|| format!("the {what} was not found in the executable"))?;
+    if matches.next().is_some() {
+        bail!("the {what} is not unique in the executable");
+    }
+    Ok(first)
+}
+
+/// Find the entity-model path table by its four model names and 17-byte
+/// stride.
+fn find_combat_model_table(data: &[u8]) -> Result<usize> {
+    let needle = b"enemy/char10.emd";
+    let mut found = None;
+    for index in 0..data.len().saturating_sub(needle.len()) {
+        if &data[index..index + needle.len()] != needle {
+            continue;
+        }
+        let usable = (0..crate::combat::MODEL_ENTRIES).all(|entry| {
+            let start = index + entry * crate::combat::MODEL_ENTRY_LEN;
+            let Some(bytes) = data.get(start..start + crate::combat::MODEL_ENTRY_LEN) else {
+                return false;
+            };
+            bytes.starts_with(b"enemy/") && bytes[6..].contains(&0)
+        });
+        if usable {
+            if found.is_some() {
+                bail!("the entity-model path table is not unique in the executable");
+            }
+            found = Some(index);
+        }
+    }
+    found.context("the entity-model path table was not found in the executable")
+}
+
+fn read_combat_bytes<'a>(
+    data: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &str,
+) -> Result<&'a [u8]> {
+    data.get(offset..offset + len)
+        .with_context(|| format!("the {what} at file offset 0x{offset:X} is truncated"))
+}
+
+/// Decode the shared combat tables from the executable image, validating
+/// every region's shape and cross-checking the pointer tables before any
+/// value is trusted. This is also the public decode seam the real-asset
+/// verification test compares the packed `data/combat.bin` against.
+pub fn extract_combat_tables(data: &[u8]) -> Result<crate::combat::CombatTables> {
+    use crate::combat::{HIT_RECORD_ROWS, MODEL_ENTRIES, MODEL_ENTRY_LEN, WEAPON_SLOTS};
+
+    let image = PeImage::parse(data)?;
+    let joints = find_unique_combat_table(
+        data,
+        &COMBAT_HIT_JOINT_PATTERN,
+        "blood-spurt joint list table",
+    )?;
+    let ranges_offset = joints + 0x78;
+    let first_offset = joints + 0xC8;
+    let second_offset = first_offset + HIT_RECORD_ROWS * 12 + 6;
+
+    let mut weapon_ranges = [[0u32; WEAPON_SLOTS]; 2];
+    let range_bytes = read_combat_bytes(data, ranges_offset, WEAPON_SLOTS * 2 * 4, "hit ranges")?;
+    for (index, slot) in weapon_ranges.iter_mut().flatten().enumerate() {
+        *slot = u32::from_le_bytes(range_bytes[index * 4..index * 4 + 4].try_into().unwrap());
+        if *slot == 0 || *slot > 0x10000 {
+            bail!("decoded hit range {index} is implausible: {slot}");
+        }
+    }
+
+    // The reaction pointer table sits ahead of the joint list; its pointer
+    // partition must match the documented per-id reaction classes.
+    const EXPECTED_REACTIONS: [u8; 20] =
+        [4, 4, 4, 1, 1, 1, 2, 1, 3, 0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0];
+    let reaction_bytes = read_combat_bytes(data, joints - 0x50, 80, "hit reaction table")?;
+    let mut reaction_pointers = [0u32; 20];
+    for (index, pointer) in reaction_pointers.iter_mut().enumerate() {
+        *pointer = u32::from_le_bytes(reaction_bytes[index * 4..index * 4 + 4].try_into().unwrap());
+        if image.va_to_offset(*pointer).is_none() {
+            bail!("the hit reaction pointer {index} does not point into the executable image");
+        }
+    }
+    for i in 0..20 {
+        for j in i + 1..20 {
+            let same = reaction_pointers[i] == reaction_pointers[j];
+            if same != (EXPECTED_REACTIONS[i] == EXPECTED_REACTIONS[j]) {
+                bail!(
+                    "the hit reaction pointer layout does not match the documented per-type table \
+                     (ids {i} and {j})"
+                );
+            }
+        }
+    }
+
+    let record_bytes =
+        read_combat_bytes(data, first_offset, HIT_RECORD_ROWS * 12, "hit record table")?;
+    let mut first_run = [crate::combat::HitRecordFirst::default(); HIT_RECORD_ROWS];
+    for (index, record) in first_run.iter_mut().enumerate() {
+        let bytes = &record_bytes[index * 12..index * 12 + 12];
+        record.knockback = [
+            i16::from_le_bytes(bytes[0..2].try_into().unwrap()),
+            i16::from_le_bytes(bytes[2..4].try_into().unwrap()),
+            i16::from_le_bytes(bytes[4..6].try_into().unwrap()),
+        ];
+        record.damage = i16::from_le_bytes(bytes[6..8].try_into().unwrap());
+        record.effect_type = bytes[8];
+        record.effect_data = bytes[9];
+        record.hit = bytes[10];
+    }
+    let mut second_run = [crate::combat::HitRecordSecond::default(); HIT_RECORD_ROWS];
+    let second_bytes = read_combat_bytes(
+        data,
+        second_offset,
+        HIT_RECORD_ROWS * 12,
+        "second-run hit records",
+    )?;
+    for (index, record) in second_run.iter_mut().enumerate() {
+        let bytes = &second_bytes[index * 12..index * 12 + 12];
+        record.damage = i16::from_le_bytes(bytes[0..2].try_into().unwrap());
+        record.hit = bytes[4];
+    }
+    if !first_run.iter().any(|record| record.damage != 0)
+        || !second_run.iter().any(|record| record.damage != 0)
+    {
+        bail!("the hit records decode to all-zero damage");
+    }
+
+    let hit_joints = std::array::from_fn(|id| {
+        let start = id * 6;
+        data[joints + start..joints + start + 6].try_into().unwrap()
+    });
+    let reactions = std::array::from_fn(|id| match EXPECTED_REACTIONS[id] {
+        1 => crate::combat::HitReaction::Basic,
+        2 => crate::combat::HitReaction::Head,
+        3 => crate::combat::HitReaction::Blood,
+        4 => crate::combat::HitReaction::Zombie,
+        _ => crate::combat::HitReaction::None,
+    });
+
+    let model_offset = find_combat_model_table(data)?;
+    let model_bytes = read_combat_bytes(
+        data,
+        model_offset,
+        MODEL_ENTRIES * MODEL_ENTRY_LEN,
+        "model table",
+    )?;
+    let model_entries: [[u8; MODEL_ENTRY_LEN]; MODEL_ENTRIES] = std::array::from_fn(|entry| {
+        model_bytes[entry * MODEL_ENTRY_LEN..(entry + 1) * MODEL_ENTRY_LEN]
+            .try_into()
+            .unwrap()
+    });
+    if &model_entries[0][..16] != b"enemy/char10.emd"
+        || &model_entries[53][..16] != b"enemy/char10.emd"
+        || &model_entries[89][..16] != b"enemy/em1020.emd"
+    {
+        bail!("the entity-model path table's scenario blocks are not aligned as expected");
+    }
+
+    let profile_offset = find_unique_combat_table(
+        data,
+        &COMBAT_TYPE_PROFILE_PATTERN,
+        "reference-type init profile",
+    )?;
+    let sca_offset = profile_offset
+        .checked_sub(0x28)
+        .context("the reference-type collision records precede the executable image")?;
+    let sca_bytes = read_combat_bytes(data, sca_offset, 32, "reference-type collision records")?;
+    let type_sca: [[i16; 8]; 2] = std::array::from_fn(|record| {
+        std::array::from_fn(|value| {
+            i16::from_le_bytes(
+                sca_bytes[record * 16 + value * 2..record * 16 + value * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+    });
+    if type_sca[0][0] >= 0 || type_sca[1][0] >= 0 || type_sca[0][5] <= 0 || type_sca[1][5] <= 0 {
+        bail!("the reference-type collision records are malformed");
+    }
+    // The pointer pair ahead of the profile must name the two records.
+    let pointer_bytes = read_combat_bytes(data, profile_offset - 8, 8, "type collision pointers")?;
+    let first_pointer = u32::from_le_bytes(pointer_bytes[0..4].try_into().unwrap());
+    let second_pointer = u32::from_le_bytes(pointer_bytes[4..8].try_into().unwrap());
+    if image.va_to_offset(first_pointer) != Some(sca_offset)
+        || image.va_to_offset(second_pointer) != Some(sca_offset + 16)
+    {
+        bail!("the reference-type collision pointers do not name the adjacent records");
+    }
+    let type_health = data[profile_offset..profile_offset + 16]
+        .try_into()
+        .unwrap();
+    let type_anim = data[profile_offset + 16..profile_offset + 32]
+        .try_into()
+        .unwrap();
+    let type_stagger = data[profile_offset + 32..profile_offset + 64]
+        .try_into()
+        .unwrap();
+    if !data[profile_offset..profile_offset + 16]
+        .iter()
+        .all(|&health| health > 0)
+        || !data[profile_offset + 32..profile_offset + 64]
+            .iter()
+            .all(|&value| (3..=5).contains(&value))
+    {
+        bail!("the reference-type init profile's value ranges are implausible");
+    }
+
+    // The shared player collision records: a unique adjacent triple that must
+    // match the documented constants.
+    let mut player_offset = None;
+    for index in 0..data.len().saturating_sub(48) {
+        if data[index..index + 16] == COMBAT_CHRIS_SCA
+            && data[index + 16..index + 32] == COMBAT_DATA2_SCA
+            && data[index + 32..index + 48] == COMBAT_JILL_SCA
+        {
+            if player_offset.is_some() {
+                bail!("the shared player collision records are not unique in the executable");
+            }
+            player_offset = Some(index);
+        }
+    }
+    let player_offset =
+        player_offset.context("the shared player collision records were not found")?;
+    let player_bytes = read_combat_bytes(data, player_offset, 48, "player collision records")?;
+    let player_sca: [[i16; 8]; 3] = std::array::from_fn(|record| {
+        std::array::from_fn(|value| {
+            i16::from_le_bytes(
+                player_bytes[record * 16 + value * 2..record * 16 + value * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+    });
+
+    Ok(crate::combat::CombatTables {
+        weapon_ranges,
+        first_run,
+        second_run,
+        hit_joints,
+        reactions,
+        model_entries,
+        player_sca,
+        type_sca,
+        type_health,
+        type_anim,
+        type_stagger,
     })
 }
 
@@ -1716,9 +2081,52 @@ fn copy_map_tables(
     Ok((1, len))
 }
 
+/// Decode the shared combat tables from the executable into
+/// `data/combat.bin`.
+///
+/// A missing or undecodable executable is a warning: the engine falls back to
+/// its built-in tables, exactly like the original data on this install.
+fn copy_combat_tables(
+    exe: Option<&Path>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let Some(path) = exe else {
+        return Ok((0, 0));
+    };
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(error) => {
+            println!(
+                "warning: failed to read executable {}: {error}; the combat tables will use the built-in data",
+                path.display()
+            );
+            return Ok((0, 0));
+        }
+    };
+    let tables = match extract_combat_tables(&data) {
+        Ok(tables) => tables,
+        Err(error) => {
+            println!(
+                "warning: failed to decode the combat tables from {}: {error:#}; the built-in tables are used",
+                path.display()
+            );
+            return Ok((0, 0));
+        }
+    };
+    let bytes = tables.encode();
+    let len = bytes.len();
+    writer
+        .add(crate::combat::COMBAT_ENTRY, bytes)
+        .with_context(|| format!("failed to add {}", crate::combat::COMBAT_ENTRY))?;
+    progress.begin("combat", 1, "files");
+    progress.advance(crate::combat::COMBAT_ENTRY);
+    progress.end_phase();
+    Ok((1, len))
+}
+
 /// The id of the pack `convert-game` writes.
 pub const BASE_PACK_ID: &str = "re1";
-
 /// The base pack's self-description.
 fn base_manifest() -> manifest::Manifest {
     manifest::Manifest {
@@ -1912,12 +2320,34 @@ struct PlayerAsset {
     source: PathBuf,
 }
 
+/// One weapon asset (`W*.EMW` / `WS*.TMD`) resolved to its pack entry.
+#[derive(Debug)]
+struct WeaponAsset {
+    /// Pack entry, e.g. `player/w02.emw`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
 /// One scripted-character (NPC) model resolved to its pack entry.
 #[derive(Debug)]
 struct NpcAsset {
     /// Entity id (`0x20..=0x2E`).
     id: u8,
-    /// Pack entry, e.g. `npc/23.emd`.
+    /// Pack entry, e.g. `enemy/em23.emd`.
+    entry: String,
+    /// Source file in the installation.
+    source: PathBuf,
+}
+
+/// One monster model resolved to its pack entry, one per scenario block.
+#[derive(Debug)]
+struct EnemyAsset {
+    /// Entity id (`0x00..=0x15`).
+    id: u8,
+    /// Scenario block: 0 Chris, 1 Jill.
+    player: u8,
+    /// Pack entry, e.g. `enemy/em130.emd`.
     entry: String,
     /// Source file in the installation.
     source: PathBuf,
@@ -1982,8 +2412,13 @@ struct Plan {
     item_m1: Option<PathBuf>,
     item_m2: Option<PathBuf>,
     players: Vec<PlayerAsset>,
+    /// The `W*.EMW` weapon animations and `WS*.TMD` held-weapon models,
+    /// resolved by shipped file number.
+    weapons: Vec<WeaponAsset>,
     /// The fifteen scripted-character models, resolved by entity id.
     npc: Vec<NpcAsset>,
+    /// The monster models of both scenario blocks, resolved by entity id.
+    enemy_models: Vec<EnemyAsset>,
     roommask: Vec<RoomMask>,
     /// The 33 effect-sheet TIMs, resolved by shipped name.
     effects: Vec<EffectSheet>,
@@ -2016,6 +2451,7 @@ fn build_plan(root: &Path) -> Result<Plan> {
 fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -> Result<Plan> {
     let layout = discover_layout(root)?;
     let (npc, npc_warnings) = resolve_npc_assets(&layout)?;
+    let (enemy_models, enemy_warnings) = resolve_enemy_assets(&layout)?;
     let Layout {
         stages,
         sound,
@@ -2269,6 +2705,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
 
     warnings.extend(data.warnings.iter().cloned());
     warnings.extend(npc_warnings);
+    warnings.extend(enemy_warnings);
     if let Some(font_warning) = font_warning {
         warnings.push(font_warning);
     }
@@ -2278,7 +2715,9 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         item_m1,
         item_m2,
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
+        weapons: resolve_weapon_assets(players.as_deref())?,
         npc,
+        enemy_models,
         roommask,
         effects,
         data,
@@ -2303,12 +2742,12 @@ fn resolve_npc_assets(layout: &Layout) -> Result<(Vec<NpcAsset>, Vec<String>)> {
 
     let mut assets = Vec::new();
     let mut missing = Vec::new();
-    for id in npc::FIRST_ID..=npc::LAST_ID {
+    for id in enemy::FIRST_ID..=enemy::LAST_ID {
         let file = format!("em10{id:02x}.emd");
         match index.as_ref().and_then(|index| index.get(&file)) {
             Some(source) => assets.push(NpcAsset {
                 id,
-                entry: npc::model_path(id)
+                entry: enemy::model_path(id)
                     .expect("every character id maps to a pack path")
                     .to_string(),
                 source: source.clone(),
@@ -2327,6 +2766,51 @@ fn resolve_npc_assets(layout: &Layout) -> Result<(Vec<NpcAsset>, Vec<String>)> {
         } else {
             warnings.push(format!(
                 "missing {} NPC model file(s): {}",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+    }
+    Ok((assets, warnings))
+}
+
+/// Resolve the monster models of both scenario blocks by entity id:
+/// `ENEMY/EM10xx.EMD` (Chris) to `enemy/em{id:02x}0.emd` and
+/// `ENEMY/EM11xx.EMD` (Jill) to `enemy/em{id:02x}1.emd`, for ids `0x00..=0x15`.
+///
+/// Missing files are an optional-category warning, like the character models:
+/// an id without a model renders nothing while its script still runs.
+fn resolve_enemy_assets(layout: &Layout) -> Result<(Vec<EnemyAsset>, Vec<String>)> {
+    let index = layout.enemy.as_deref().map(index_dir).transpose()?;
+
+    let mut assets = Vec::new();
+    let mut missing = Vec::new();
+    for id in 0x00u8..=0x15 {
+        for player in 0..=1u8 {
+            let block = 10 + player;
+            let file = format!("em{block}{id:02x}.emd");
+            match index.as_ref().and_then(|index| index.get(&file)) {
+                Some(source) => assets.push(EnemyAsset {
+                    id,
+                    player,
+                    entry: format!("enemy/em{id:02x}{player}.emd"),
+                    source: source.clone(),
+                }),
+                None => missing.push(format!("ENEMY/EM{block}{id:02X}.EMD")),
+            }
+        }
+    }
+
+    let mut warnings = Vec::new();
+    if !missing.is_empty() {
+        if layout.enemy.is_none() {
+            warnings.push(format!(
+                "no enemy directory found; {} monster model(s) will be missing",
+                missing.len()
+            ));
+        } else {
+            warnings.push(format!(
+                "missing {} monster model file(s): {}",
                 missing.len(),
                 missing.join(", ")
             ));
@@ -2371,6 +2855,57 @@ fn resolve_players(enemy: Option<&Path>, players: Option<&Path>) -> Result<Vec<P
             missing.join(", ")
         );
     }
+    Ok(assets)
+}
+
+/// Resolve the shipped weapon files under `PLAYERS/`: every `W*.EMW` weapon
+/// animation and every `WS*.TMD` held-weapon model.
+///
+/// The two no-weapon locomotion clips (`W00.EMW` for Chris, `W10.EMW` for
+/// Jill) stay under their existing `player/00.emw`/`player/01.emw` entries;
+/// every other `W` file is packed as `player/w{file:02x}.emw`, and the TMDs as
+/// `player/ws{file:03x}.tmd`. A missing directory or file is a warning, not a
+/// failure: the weapon runtime falls back to the no-weapon pose.
+fn resolve_weapon_assets(players: Option<&Path>) -> Result<Vec<WeaponAsset>> {
+    let Some(dir) = players else {
+        return Ok(Vec::new());
+    };
+    let index = index_dir(dir)?;
+    let mut assets = Vec::new();
+    for name in index.keys() {
+        let lower = name.to_ascii_lowercase();
+        if let Some(stem) = lower.strip_prefix('w').and_then(|s| s.strip_suffix(".emw")) {
+            if stem.len() != 2 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let id = u8::from_str_radix(stem, 16)
+                .with_context(|| format!("invalid weapon animation name {name}"))?;
+            // The no-weapon locomotion pair is packed by `resolve_players`.
+            if id == 0x00 || id == 0x10 {
+                continue;
+            }
+            let source = index[name].clone();
+            assets.push(WeaponAsset {
+                entry: format!("player/w{id:02x}.emw"),
+                source,
+            });
+        } else if let Some(stem) = lower
+            .strip_prefix("ws")
+            .and_then(|s| s.strip_suffix(".tmd"))
+        {
+            if stem.len() != 3 || !stem.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let id = u16::from_str_radix(stem, 16)
+                .with_context(|| format!("invalid held-weapon name {name}"))?;
+            let source = index[name].clone();
+            assets.push(WeaponAsset {
+                entry: format!("player/ws{id:03x}.tmd"),
+                source,
+            });
+        }
+    }
+    assets.sort_by(|a, b| a.entry.cmp(&b.entry));
     Ok(assets)
 }
 
@@ -2509,7 +3044,7 @@ mod tests {
     fn write_npc_files(root: &Path) {
         let enemy = root.join("ENEMY");
         fs::create_dir_all(&enemy).unwrap();
-        for id in npc::FIRST_ID..=npc::LAST_ID {
+        for id in enemy::FIRST_ID..=enemy::LAST_ID {
             fs::write(
                 enemy.join(format!("EM10{id:02X}.EMD")),
                 format!("npc-{id:02x}"),
@@ -2734,17 +3269,27 @@ mod tests {
 
         assert_eq!(plan.npc.len(), 15);
         for (offset, asset) in plan.npc.iter().enumerate() {
-            let id = npc::FIRST_ID + offset as u8;
+            let id = enemy::FIRST_ID + offset as u8;
             assert_eq!(asset.id, id);
-            assert_eq!(asset.entry, format!("npc/{id:02x}.emd"));
+            assert_eq!(asset.entry, format!("enemy/em{id:02x}.emd"));
         }
 
         let out = root.path.join("out.akpak");
         convert_game(&root.path, &out).unwrap();
         let pack = crate::pack::Pack::open(&out).unwrap();
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
-        assert_eq!(count("npc/"), 15);
-        assert_eq!(pack.read("npc/23.emd").unwrap(), b"npc-23");
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("enemy/") && path.ends_with(".emd"))
+                .count(),
+            15
+        );
+        assert_eq!(
+            count("enemy/em13.lua"),
+            1,
+            "the checked-in script is packed"
+        );
+        assert_eq!(pack.read("enemy/em23.emd").unwrap(), b"npc-23");
     }
 
     /// Write all 33 effect-sheet files under `EFFSPR` with mixed-case names.
@@ -2895,7 +3440,7 @@ mod tests {
         make_stage_dirs(&root.path);
 
         // No NPC files at all: one aggregated warning, and the conversion
-        // still succeeds with no `npc/` entries.
+        // still succeeds with no `enemy/` entries.
         let plan = build_plan(&root.path).unwrap();
         assert!(plan.npc.is_empty());
         let warnings: Vec<&String> = plan
@@ -2911,7 +3456,17 @@ mod tests {
         let out = root.path.join("out.akpak");
         convert_game(&root.path, &out).unwrap();
         let pack = crate::pack::Pack::open(&out).unwrap();
-        assert!(!pack.paths().any(|path| path.starts_with("npc/")));
+        assert!(
+            !pack
+                .paths()
+                .any(|path| path.starts_with("enemy/") && path.ends_with(".emd")),
+            "no character model entries"
+        );
+        assert_eq!(
+            pack.paths().filter(|path| path.ends_with(".lua")).count(),
+            crate::enemy::ENEMY_SCRIPTS.len(),
+            "the checked-in scripts are independent of the install"
+        );
 
         // Present files resolve; only the missing two are named.
         write_npc_files(&root.path);
@@ -3036,6 +3591,33 @@ mod tests {
     }
 
     #[test]
+    fn weapon_assets_resolve_to_their_entries() {
+        let root = TempDir::new("weapons");
+        make_stage_dirs(&root.path);
+        let players = root.path.join("PLAYERS");
+        fs::write(players.join("W02.EMW"), b"emw2").unwrap();
+        fs::write(players.join("w11.emw"), b"emw11").unwrap();
+        fs::write(players.join("WS202.TMD"), b"tmd202").unwrap();
+        fs::write(players.join("ws236.tmd"), b"tmd236").unwrap();
+        // The locomotion pair stays out of the weapon set.
+        let assets = resolve_weapon_assets(Some(&players)).unwrap();
+        let entries: Vec<&str> = assets.iter().map(|asset| asset.entry.as_str()).collect();
+        assert_eq!(
+            entries,
+            vec![
+                "player/w02.emw",
+                "player/w11.emw",
+                "player/ws202.tmd",
+                "player/ws236.tmd"
+            ]
+        );
+        assert_eq!(assets[0].source, players.join("W02.EMW"));
+
+        // No PLAYERS directory is an empty weapon set, not an error.
+        assert!(resolve_weapon_assets(None).unwrap().is_empty());
+    }
+
+    #[test]
     fn converts_synthetic_game_and_dedupes_variants() {
         let root = TempDir::new("synthetic-full");
         make_stage_dirs(&root.path);
@@ -3078,8 +3660,8 @@ mod tests {
         assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
         assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
         // The NPC phase copies the fifteen character models raw, lower-cased.
-        assert_eq!(pack.read("npc/20.emd").unwrap(), b"npc-20");
-        assert_eq!(pack.read("npc/2e.emd").unwrap(), b"npc-2e");
+        assert_eq!(pack.read("enemy/em20.emd").unwrap(), b"npc-20");
+        assert_eq!(pack.read("enemy/em2e.emd").unwrap(), b"npc-2e");
 
         let manifest = manifest::Manifest::parse(
             std::str::from_utf8(pack.read(manifest::ENTRY).unwrap()).unwrap(),
@@ -3102,7 +3684,17 @@ mod tests {
         );
         assert_eq!(count("door/"), 34);
         assert_eq!(count("player/"), 6);
-        assert_eq!(count("npc/"), 15);
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("enemy/") && path.ends_with(".emd"))
+                .count(),
+            15
+        );
+        assert_eq!(
+            count("enemy/em13.lua"),
+            1,
+            "the checked-in script is packed"
+        );
         assert_eq!(
             pack.paths()
                 .filter(|path| path.starts_with("player/") && path.ends_with(".emd"))
@@ -4193,6 +4785,52 @@ mod tests {
     }
 
     #[test]
+    fn unique_combat_table_search_rejects_missing_and_duplicate_patterns() {
+        let missing = find_unique_combat_table(&[0u8; 16], &COMBAT_HIT_JOINT_PATTERN, "test table");
+        assert!(missing.is_err(), "a missing pattern must error");
+
+        let mut duplicated = Vec::new();
+        duplicated.extend_from_slice(&COMBAT_HIT_JOINT_PATTERN);
+        duplicated.extend_from_slice(&[0u8; 8]);
+        duplicated.extend_from_slice(&COMBAT_HIT_JOINT_PATTERN);
+        let ambiguous =
+            find_unique_combat_table(&duplicated, &COMBAT_HIT_JOINT_PATTERN, "test table");
+        assert!(ambiguous.is_err(), "a duplicated pattern must error");
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn extracts_real_combat_tables() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let path = PathBuf::from(root).join("Bio.exe");
+        let data = fs::read(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+
+        let tables = extract_combat_tables(&data).unwrap();
+        // The shared tables decode to the documented values on this install.
+        let default = crate::combat::CombatTables::default();
+        assert_eq!(tables.weapon_ranges, default.weapon_ranges);
+        assert_eq!(tables.first_run, default.first_run);
+        assert_eq!(tables.second_run, default.second_run);
+        assert_eq!(tables.hit_joints, default.hit_joints);
+        assert_eq!(tables.reactions, default.reactions);
+        assert_eq!(tables.model_entries, default.model_entries);
+        assert_eq!(tables.type_sca, default.type_sca);
+        assert_eq!(tables.type_health, default.type_health);
+        assert_eq!(tables.type_anim, default.type_anim);
+        assert_eq!(tables.type_stagger, default.type_stagger);
+        assert_eq!(tables.player_sca, default.player_sca);
+        // And the packed entry round-trips through the engine parser.
+        let encoded = tables.encode();
+        assert_eq!(
+            crate::combat::CombatTables::parse(&encoded).unwrap(),
+            tables
+        );
+    }
+
+    #[test]
     #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
     fn packs_real_item_and_file_art() {
         let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
@@ -4261,13 +4899,20 @@ mod tests {
             "one pack entry per named effect and per non-Bgm group track"
         );
         assert_eq!(count("door/"), 34);
-        assert_eq!(count("npc/"), 15);
+        assert_eq!(
+            count("enemy/"),
+            15 + 44 + crate::enemy::ENEMY_SCRIPTS.len(),
+            "15 character models, 44 monster models and the checked-in scripts"
+        );
         assert_eq!(count("effspr/"), 33);
         assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
         let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
         assert_eq!(tables, MapTables::default(), "the installed tables match");
-        assert!(pack.contains("npc/20.emd"));
-        assert!(pack.contains("npc/2e.emd"));
+        assert!(pack.contains("enemy/em20.emd"));
+        assert!(pack.contains("enemy/em2e.emd"));
+        assert!(pack.contains("enemy/em000.emd"));
+        assert!(pack.contains("enemy/em151.emd"));
+        assert!(pack.contains("enemy/em13.lua"));
         assert!(pack.contains("effspr/esp000.tim"));
         assert!(pack.contains("effspr/esp224.tim"));
         assert!(pack.contains(crate::effects::room::CORE_ESP_ENTRY));
@@ -4440,7 +5085,7 @@ mod tests {
         assert_eq!(assets.len(), 15);
         assert_eq!(
             assets.iter().map(|asset| asset.id).collect::<Vec<_>>(),
-            (npc::FIRST_ID..=npc::LAST_ID).collect::<Vec<_>>()
+            (enemy::FIRST_ID..=enemy::LAST_ID).collect::<Vec<_>>()
         );
 
         let mut writer = PackWriter::new();
@@ -4459,7 +5104,7 @@ mod tests {
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         let entries: Vec<&str> = pack
             .paths()
-            .filter(|path| path.starts_with("npc/"))
+            .filter(|path| path.starts_with("enemy/"))
             .collect();
         assert_eq!(entries.len(), 15, "{entries:?}");
 

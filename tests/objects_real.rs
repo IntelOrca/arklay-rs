@@ -192,16 +192,16 @@ fn room_107_objects_build_with_expected_fields() {
     println!(
         "start cut {cut}; ladder {:?} in zone: {}; shelf {:?} in zone: {}",
         ladder.pos,
-        arklay::npc::in_camera_zone(&room, cut, ladder.pos),
+        arklay::enemy::in_camera_zone(&room, cut, ladder.pos),
         shelf.pos,
-        arklay::npc::in_camera_zone(&room, cut, shelf.pos)
+        arklay::enemy::in_camera_zone(&room, cut, shelf.pos)
     );
     assert!(
-        arklay::npc::in_camera_zone(&room, cut, ladder.pos),
+        arklay::enemy::in_camera_zone(&room, cut, ladder.pos),
         "ladder is outside the starting camera zone"
     );
     assert!(
-        arklay::npc::in_camera_zone(&room, cut, shelf.pos),
+        arklay::enemy::in_camera_zone(&room, cut, shelf.pos),
         "shelf is outside the starting camera zone"
     );
 }

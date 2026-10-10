@@ -29,7 +29,7 @@ struct Cli {
 
     /// UI screen to boot straight into instead of a room:
     /// `title`, `select`, `game`, `menu`, `box`, `file`, `map`, `view`, `save`,
-    /// `load` or `font`
+    /// `load`, `death` or `font`
     #[arg(
         long,
         value_name = "SCREEN",
@@ -63,7 +63,8 @@ struct Cli {
     )]
     ending: Option<u8>,
 
-    /// Character for the `--fmv` prologue cut and the `--ending` chain
+    /// Character for the `--ui game`/`--ui death` boot, the `--fmv` prologue
+    /// cut and the `--ending` chain
     /// (0 Chris, 1 Jill)
     #[arg(
         long,
@@ -530,7 +531,7 @@ fn main() -> Result<()> {
                     &screen,
                     cli.capture.as_deref(),
                     &save_dir,
-                    cli.player,
+                    cli.character,
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,

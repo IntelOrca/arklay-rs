@@ -135,12 +135,17 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         let repeat = game.entities[slot].action_behavior;
         run(game, slot, room, clips, repeat);
     }
-    // `scd_entity_flags` bit 2 refreshes the held-weapon joint; the weapon
-    // TMDs stay unpacked this milestone, so the bit is inert.
-    // TODO(parity): (gameplay) the original runs EntityUpdateWeaponJoint on
-    // `scd_entity_flags & 4` (hand selected by bit 3); without the held-weapon
-    // TMDs the joint is never updated, so a script that raises the bit is a
-    // no-op.
+    // `scd_entity_flags` bit 2 refreshes the held-weapon joint (bit 3 selects
+    // the hand). The original's `EntityUpdateWeaponJoint` anchors the entity
+    // against the previous frame's hand chain; the port composes the current
+    // pose's joints every tick, so the refresh stores the posed matrices the
+    // held-weapon TMD and the muzzle/secondary flashes attach to.
+    if game.entities[slot].flags & 4 != 0 {
+        let worlds = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
+        if !worlds.is_empty() {
+            game.joint_worlds[slot] = worlds;
+        }
+    }
 }
 
 /// Run one behaviour handler with the entity, its clock, the system flag bank
@@ -637,7 +642,7 @@ fn handler_10(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], syste
 /// The flamethrower's two looping 3D sound cues (enemy bank ids 0x1E and
 /// 0x1F) are not queued: the pack ships no enemy sound bank, so only the cue
 /// timing is modelled.
-fn handler_08(game: &mut GameState, slot: usize, _room: &RoomState, clips: &[Clip]) {
+fn handler_08(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
     let state = game.entities[slot].action_state;
     let weapon = game.entities[slot].behavior_flags.wrapping_sub(2);
     match state {
@@ -677,10 +682,24 @@ fn handler_08(game: &mut GameState, slot: usize, _room: &RoomState, clips: &[Cli
                 entity.blend_counter = 3;
                 entity.action_ticks_counter = FLAME_CUE_TICKS;
             }
-            fire_flame_step(game, slot, clips);
+            fire_flame_step(game, slot, room, clips);
         }
-        5 => fire_flame_step(game, slot, clips),
+        5 => fire_flame_step(game, slot, room, clips),
         _ => {}
+    }
+}
+
+/// The attach target for the held-weapon FX: the weapon hand (joint 14) once
+/// the script has refreshed the posed joints, else the entity matrix.
+fn weapon_attach(game: &GameState, slot: usize) -> Attach {
+    if game
+        .joint_worlds
+        .get(slot)
+        .is_some_and(|joints| joints.get(14).is_some())
+    {
+        Attach::Joint(slot as u8, 14)
+    } else {
+        Attach::Entity(slot as u8)
     }
 }
 
@@ -696,7 +715,7 @@ fn fire_fx_spawns(game: &mut GameState, slot: usize, weapon: u8) {
     }
     let entity = game.entities[slot];
     let frame = entity.animation_frame_id;
-    let attach = Attach::Entity(slot as u8);
+    let attach = weapon_attach(game, slot);
     let room_effects = Rc::clone(&game.room_effects);
     let row = FIRE_FX_MUZZLE[usize::from(weapon)];
 
@@ -733,12 +752,14 @@ fn fire_fx_spawns(game: &mut GameState, slot: usize, weapon: u8) {
         let lift = i32::from(entity.id & 1) * (1 - i32::from(weapon)) * 300;
         let pos = [i32::from(row.x), lift + i32::from(row.y), i32::from(row.z)];
         let yaw = if weapon == 8 { 0 } else { 0x555 };
+        // The shell rides the entity matrix, like the original's localMatrix
+        // spawn.
         if let Some(child) = effects::create_attached(
             game,
             &room_effects,
             row.effect_type,
             row.depth,
-            attach,
+            Attach::Entity(slot as u8),
             pos,
             yaw,
             0,
@@ -786,7 +807,7 @@ fn fire_play_anim(game: &mut GameState, slot: usize, clips: &[Clip]) {
 
 /// State 5: spray a type-0x0C billboard every sixth frame, count the looping
 /// sound cue down, advance the clip and sweep the yaw by `scd_timer`.
-fn fire_flame_step(game: &mut GameState, slot: usize, clips: &[Clip]) {
+fn fire_flame_step(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
     if game.entities[slot].animation_frame_id.is_multiple_of(6) {
         let attach = Attach::Entity(slot as u8);
         let room_effects = Rc::clone(&game.room_effects);
@@ -796,9 +817,20 @@ fn fire_flame_step(game: &mut GameState, slot: usize, clips: &[Clip]) {
     game.entities[slot].action_ticks_counter = ticks.wrapping_sub(1);
     if ticks == 0 {
         game.entities[slot].action_ticks_counter = FLAME_CUE_TICKS;
-        // TODO(parity): (audio) the original queues the two flamethrower 3D
-        // cues here (enemy bank ids 0x1E/0x1F); the pack ships no enemy sound
-        // bank, so the cue reload is modelled and the audio is deferred.
+        // The original queues the two flamethrower cues on the enemy/room bank
+        // (`Play3DSnd(2, 0x1E/0x1F, ...)`); the per-room sound table names
+        // them and the entity-sound queue plays them.
+        let pos = game.entities[slot].pos;
+        for id in [0x1E, 0x1F] {
+            if let Some((name, bank, column)) = crate::sfx::play_3d_cue(room, 0, 2, id) {
+                game.entity_sounds.push(EntitySound {
+                    name,
+                    bank,
+                    column,
+                    pos,
+                });
+            }
+        }
     }
     let (entities, anims) = (&mut game.entities, &mut game.entity_anims);
     anims[slot].advance(&mut entities[slot], clips, false, 0x400);
@@ -1353,6 +1385,38 @@ mod tests {
         update(&mut game, 1, &room, &clips);
         assert_eq!(game.entities[1].action_ticks_counter, FLAME_CUE_TICKS);
         assert_eq!(game.entities[1].action_state, 5, "the loop never exits");
+        assert_eq!(game.entity_sounds.len(), 2, "the two flamethrower cues");
+        assert_eq!(game.entity_sounds[0].name, "type01");
+        assert_eq!(game.entity_sounds[1].name, "type02");
+        assert_eq!(game.entity_sounds[0].bank, 2, "the enemy/room bank");
+    }
+
+    #[test]
+    fn the_state8_tail_refreshes_the_held_weapon_joint() {
+        use crate::model::{Keyframe, Skeleton};
+        use std::sync::Arc;
+
+        let mut entity = state8(0);
+        entity.flags = 4;
+        let mut game = game_with(entity);
+        game.entity_anims[1].skeleton = Some(Arc::new(Skeleton {
+            relative: vec![[0, 0, 0]; 15],
+            children: (1..15).map(|index| vec![index as u8]).collect(),
+        }));
+        game.entity_anims[1].keyframes = Some(Arc::new(vec![Keyframe {
+            offset: [100, -200, 300],
+            rotations: vec![[0, 0, 0]; 15],
+        }]));
+        game.entities[1].pos = [1000, 0, 2000];
+        update(&mut game, 1, &RoomState::default(), &clips());
+        assert!(!game.joint_worlds[1].is_empty(), "the pose was composed");
+        // The 4.12 trig table saturates one unit below 1.0, so the root
+        // offset lands one unit short on X/Z; Y passes through untransformed.
+        assert_eq!(
+            game.joint_worlds[1][14].t,
+            [1099, -199, 2299],
+            "the weapon hand's world position"
+        );
     }
 
     #[test]

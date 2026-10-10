@@ -27,7 +27,6 @@ pub fn rdt(data: &[u8]) {
     let _ = rdt::parse(data, RoomId::parse("1000").unwrap());
     let _ = scd::reader::parse(data);
 }
-
 pub fn scd(data: &[u8]) {
     let _ = scd::reader::parse(data);
 }
@@ -81,6 +80,10 @@ pub fn bmp(data: &[u8]) {
 
 pub fn save(data: &[u8]) {
     let _ = SaveFile::from_bytes(data);
+}
+
+pub fn combat(data: &[u8]) {
+    let _ = arklay::combat::CombatTables::parse(data);
 }
 
 pub fn mask(data: &[u8]) {
