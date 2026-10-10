@@ -16,13 +16,16 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    from M13. The film tables and skip masks carry every row, so packing the
    content later needs no table change.
 
-2. **Skip grace follows the screen's frame limiter (closed).** The original's
-   100-update grace advances once per platform frame: ~33 ms (3.3 s) during
-   gameplay, the prologue and the boot logos, and ~16 ms (1.6 s) on the title
-   opening and the ending screens. The port now polls the skip state once per
-   render frame at the film's own period (`movie::skip_period_ms`,
-   `MovieSession::poll_skip`) instead of once per 30 Hz tick, with the grace
-   and the per-film masks still unit-tested.
+2. **Skip grace spent at the film gate's rate.** The original's 100-update
+   grace advances once per platform loop iteration, and while a film owns the
+   screen the platform loop runs its film gate instead of the frame limiter, so
+   the grace expires within milliseconds of playback starting. The port polls
+   the skip state once per render frame (`MovieSession::poll_skip`), latches
+   the pad on the first poll and accepts an unmasked press on any later poll,
+   which is the reference's observable behaviour; a button held from before
+   the film cannot skip it. The per-film masks stay unit-tested, and the
+   fixed-tick `MovieSession::tick` path spends one update per call for headless
+   playback.
 
 3. **No subtitle or credits overlays.** The PS1 releases draw FMV subtitles and
    an ending-credits overlay over the films; neither ships in this PC install
@@ -32,14 +35,18 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    screens are out of scope.
 
 4. **Wall-clock-mastered film pacing.** The film time comes from the elapsed
-   wall clock; with a real device the mixer's consumed-sample cursor is
-   followed only while it stays within the original's tolerance (-0.5 s behind
-   to +0.25 s ahead), and the session decodes forward to the frame due at the
-   adopted time, one or several at once. A lagging device queue therefore
-   cannot slow the picture past that window. Without a device (captures, the
-   SDL dummy driver) the wall clock / fixed 30 Hz ticks are the clock: 10 fps
-   films advance every three ticks and 15 fps films every two. The counters
-   (`movie_samples_consumed`, `samples_before`) are exposed for tests, and the
+   wall clock; with a real device the mixer's device-playback cursor (frames
+   written to the stream minus frames still queued, the port's equivalent of
+   the original's `waveOutGetPosition`) is followed only while it stays within
+   the original's tolerance (-0.5 s behind to +0.25 s ahead), and the session
+   decodes forward to the frame due at the adopted time, one or several at
+   once. The session keeps a two second audio lead queued ahead of the due
+   frame, so the playback cursor never starves while the picture waits on a
+   decode; a lagging device queue therefore cannot slow the picture past the
+   tolerance window. Without a device (captures, the SDL dummy driver) the wall
+   clock / fixed 30 Hz ticks are the clock: 10 fps films advance every three
+   ticks and 15 fps films every two. The counters (`movie_samples_played`,
+   `movie_samples_consumed`, `samples_before`) are exposed for tests, and the
    `samples_consumed` path of `MovieSession::tick` remains the deterministic
    unit-test seam.
 

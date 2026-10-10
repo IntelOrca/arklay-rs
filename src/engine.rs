@@ -544,7 +544,6 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut last_poll = last_ticks;
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
@@ -564,9 +563,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         }
         // The film skip state advances on the render frame, not the gameplay
         // tick, exactly like the original's platform-driven film update.
-        let poll_elapsed = now.saturating_sub(last_poll) as f64;
-        last_poll = now;
-        session.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
+        session.poll_movie_skip(movie_buttons_held(input.held_word()));
         let tick_ms = session_tick_interval(session.transition.is_some(), session.room_frozen());
         while accumulator >= tick_ms {
             if session.transition_finished {
@@ -1527,15 +1524,15 @@ impl GameSession {
     }
 
     /// One frozen tick of the active film: advance it against the wall clock
-    /// with the mixer's audio cursor as a bounded secondary clock (or the wall
-    /// clock alone when no device is open), queue the frame of audio it
-    /// produces and resume the room when it ends.
+    /// with the mixer's device-playback cursor as a bounded secondary clock
+    /// (or the wall clock alone when no device is open), queue the frame of
+    /// audio it produces and resume the room when it ends.
     fn tick_movie(&mut self, ui: UiInput, input: player::Input) {
         let consumed = self
             .music
             .as_ref()
             .filter(|mixer| !mixer.is_dummy())
-            .map(Mixer::movie_samples_consumed);
+            .map(Mixer::movie_samples_played);
         let Some(session) = self.movie.as_mut() else {
             return;
         };
@@ -1555,16 +1552,15 @@ impl GameSession {
         }
     }
 
-    /// Poll the active film's skip input between ticks with the real elapsed
-    /// time since the last poll.
+    /// Poll the active film's skip input between ticks.
     ///
-    /// The original's film state machine is driven once per platform frame,
-    /// not once per gameplay tick, so its skip grace runs on wall-clock time
-    /// at the film's own update period. The next [`Self::tick_movie`] picks
-    /// the skip up and tears the film down.
-    fn poll_movie_skip(&mut self, buttons: u16, elapsed_ms: f64) {
+    /// The original's film state machine is driven once per platform loop
+    /// iteration, not once per gameplay tick, so its grace runs on the film
+    /// gate's own schedule. The next [`Self::tick_movie`] picks the skip up
+    /// and tears the film down.
+    fn poll_movie_skip(&mut self, buttons: u16) {
         if let Some(session) = self.movie.as_mut() {
-            session.poll_skip(buttons, elapsed_ms);
+            session.poll_skip(buttons);
         }
     }
 
@@ -3327,7 +3323,7 @@ impl App {
     /// One tick of the active film. When it ends, the queued action runs (or
     /// the app quits for a standalone `--fmv`).
     fn tick_movie(&mut self, ui: UiInput, input: player::Input) -> Result<AppFlow> {
-        let consumed = self.movie_music.as_ref().map(Mixer::movie_samples_consumed);
+        let consumed = self.movie_music.as_ref().map(Mixer::movie_samples_played);
         let Mode::Movie(session) = &mut self.mode else {
             return Ok(AppFlow::Continue);
         };
@@ -3355,14 +3351,14 @@ impl App {
         }
     }
 
-    /// Poll the active app film's skip input between ticks; see
+    /// Poll the active film's skip input between ticks; see
     /// [`GameSession::poll_movie_skip`].
-    fn poll_movie_skip(&mut self, buttons: u16, elapsed_ms: f64) {
+    fn poll_movie_skip(&mut self, buttons: u16) {
         match &mut self.mode {
             Mode::Movie(session) => {
-                session.poll_skip(buttons, elapsed_ms);
+                session.poll_skip(buttons);
             }
-            Mode::Play(session) => session.poll_movie_skip(buttons, elapsed_ms),
+            Mode::Play(session) => session.poll_movie_skip(buttons),
             _ => {}
         }
     }
@@ -4083,7 +4079,6 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut last_poll = last_ticks;
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
@@ -4103,9 +4098,7 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
         }
         // The film skip state advances on the render frame, not the fixed
         // tick, exactly like the original's platform-driven film update.
-        let poll_elapsed = now.saturating_sub(last_poll) as f64;
-        last_poll = now;
-        app.poll_movie_skip(movie_buttons_held(input.held_word()), poll_elapsed);
+        app.poll_movie_skip(movie_buttons_held(input.held_word()));
         let tick_ms = app.tick_interval();
         while accumulator >= tick_ms {
             let tick = input.tick();
@@ -13479,7 +13472,7 @@ off_0010:
     }
 
     #[test]
-    fn a_shoulder_button_skips_a_film_after_the_grace() {
+    fn a_shoulder_button_skips_a_film() {
         let dir = TempDir::new();
         let pack_path = dir.0.join("film.akpak");
         let mut writer = PackWriter::new();

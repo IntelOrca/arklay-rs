@@ -582,7 +582,10 @@ impl MixState {
         }
     }
 
-    /// Stereo frames the movie channel has rendered, the audio-led film clock.
+    /// Stereo frames the movie channel has rendered. The engine's film clock
+    /// uses [`Mixer::movie_samples_played`] instead; this render-ahead count
+    /// stays the deterministic test seam.
+    #[cfg(test)]
     pub(crate) fn movie_samples_consumed(&self) -> u64 {
         self.movie.as_ref().map_or(0, |movie| movie.consumed)
     }
@@ -764,6 +767,9 @@ fn push_sample(out: &mut Vec<u8>, sample: f32) {
 pub struct Mixer {
     stream: *mut SDL_AudioStream,
     state: MixState,
+    /// Stereo frames put into the stream since it was last cleared. The
+    /// device-playback cursor is this minus what is still queued.
+    written_frames: u64,
     /// A share of the SDL lifetime: declared last so [`Drop`] destroys the
     /// stream before this releases the ref, and `SDL_Quit` cannot tear the
     /// audio subsystem down under a live stream.
@@ -798,6 +804,7 @@ impl Mixer {
         Some(Mixer {
             stream,
             state: MixState::new(),
+            written_frames: 0,
             _sdl: SdlHandle::retain(),
         })
     }
@@ -871,6 +878,7 @@ impl Mixer {
         if !unsafe { SDL_ClearAudioStream(self.stream) } {
             bail!("SDL_ClearAudioStream failed");
         }
+        self.written_frames = 0;
         self.state.play_bgm(to_mono(&wav)?);
         self.resume();
         self.update();
@@ -881,6 +889,7 @@ impl Mixer {
     pub fn stop_bgm(&mut self) {
         self.state.stop_bgm();
         let _ = unsafe { SDL_ClearAudioStream(self.stream) };
+        self.written_frames = 0;
     }
 
     /// Set channel 0's gain; negative values are clamped to zero.
@@ -944,9 +953,19 @@ impl Mixer {
         self.resume();
     }
 
-    /// Stereo frames the movie channel has rendered, the audio-led film clock.
-    pub fn movie_samples_consumed(&self) -> u64 {
-        self.state.movie_samples_consumed()
+    /// Stereo frames the device has actually played since the stream was last
+    /// cleared: everything put into the stream minus what is still queued on
+    /// it. This is the film clock with a real device, the port's equivalent of
+    /// the original's `waveOutGetPosition` cursor, so the picture follows the
+    /// audible position rather than the mixer's render-ahead.
+    pub fn movie_samples_played(&self) -> u64 {
+        let queued = unsafe { SDL_GetAudioStreamQueued(self.stream) };
+        let queued_frames = if queued > 0 {
+            queued as u64 / BYTES_PER_FRAME as u64
+        } else {
+            0
+        };
+        self.written_frames.saturating_sub(queued_frames)
     }
 
     /// Whether a film-audio buffer is loaded.
@@ -1016,7 +1035,9 @@ impl Mixer {
         let Ok(len) = c_int::try_from(pcm.len()) else {
             return;
         };
-        let _ = unsafe { SDL_PutAudioStreamData(self.stream, pcm.as_ptr().cast(), len) };
+        if unsafe { SDL_PutAudioStreamData(self.stream, pcm.as_ptr().cast(), len) } {
+            self.written_frames += frames as u64;
+        }
     }
 
     /// Advance the mixer state by `frames` without the queued-frames throttle,
@@ -1059,9 +1080,11 @@ impl Mixer {
     }
 
     /// Drop every sample already queued on the device; the next
-    /// [`Mixer::update`] refills from the current mixer state.
-    fn clear_stream(&self) {
+    /// [`Mixer::update`] refills from the current mixer state. The playback
+    /// cursor rewinds to zero with the queue.
+    fn clear_stream(&mut self) {
         let _ = unsafe { SDL_ClearAudioStream(self.stream) };
+        self.written_frames = 0;
     }
 }
 
