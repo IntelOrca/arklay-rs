@@ -3514,6 +3514,28 @@ impl App {
         self.start_session(session);
     }
 
+    /// Build a new game's session and start it through the loading narration.
+    ///
+    /// The session lives here rather than in [`Self::apply`]: a debug build
+    /// materialises every by-value `GameSession` temporary as a stack slot, and
+    /// `apply`'s arms used to add up to most of a megabyte of them, over the
+    /// Windows main thread's 1 MiB stack. Keeping the moves in this small
+    /// helper bounds the frame.
+    fn start_new_game(&mut self, character: u8) -> Result<()> {
+        let session = GameSession::new(&self.pack, character, &self.save_dir)?;
+        self.start_narrated_session(session, game::MESSAGE_BOOT_NEW_GAME);
+        Ok(())
+    }
+
+    /// Load save `slot` and start its session through the loading narration.
+    /// See [`Self::start_new_game`] for why this is not inlined into `apply`.
+    fn continue_from_slot(&mut self, slot: usize) -> Result<()> {
+        let file = save::load(&self.save_dir, slot)?;
+        let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
+        self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
+        Ok(())
+    }
+
     /// Boot the pause-menu session over [`MENU_ROOM`] with the deterministic
     /// capture inventory and the menu already open.
     fn open_menu(&mut self) -> Result<()> {
@@ -3619,20 +3641,16 @@ impl App {
                         Err(err) => {
                             eprintln!("warning: intro film unavailable: {err:#}");
                             self.prologue_pending = false;
-                            let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                            self.start_narrated_session(session, game::MESSAGE_BOOT_NEW_GAME);
+                            self.start_new_game(character)?;
                         }
                     }
                 } else {
                     self.prologue_pending = false;
-                    let session = GameSession::new(&self.pack, character, &self.save_dir)?;
-                    self.start_narrated_session(session, game::MESSAGE_BOOT_NEW_GAME);
+                    self.start_new_game(character)?;
                 }
             }
             ScreenAction::LoadGame { slot } => {
-                let file = save::load(&self.save_dir, slot)?;
-                let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
-                self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
+                self.continue_from_slot(slot)?;
             }
             ScreenAction::Title => self.open_title()?,
             ScreenAction::Resume => {
