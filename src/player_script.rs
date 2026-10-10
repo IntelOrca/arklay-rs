@@ -425,9 +425,9 @@ fn anim_window1(
     } else if index == PLANT_HOLD_INDEX {
         plant_hold(game, player, emd_clips);
     } else if index == ATTACKED_FLAG_INDEX {
-        attacked_flag(game, player, room, emd_clips);
+        attacked_flag(game, player, room, emd_clips, emw_clips);
     } else if index == TYRANT_STAGGER_INDEX {
-        tyrant_stagger(game, player, room, emd_clips);
+        tyrant_stagger(game, player, room, emd_clips, emw_clips);
     }
 }
 
@@ -820,6 +820,9 @@ fn advance_reaction_clip(
         } = game;
         entities[0].animation_id = entities[0].attack_anim;
         entity_anims[0].keyframes = keyframes.cloned();
+        // The original's `entity_apply_anim_vertex` reads the +0xBF hold
+        // through the generic name; keep it equal to the player's `unk_bf`.
+        sync_player_bytes_to_clock(&mut entities[0]);
         entity_anims[0].apply_anim_vertex(&mut entities[0], clips);
         player.pos = entities[0].pos;
     }
@@ -880,11 +883,15 @@ fn reaction_bank<'a>(
 ///
 /// The grabber owns the exit: the drain step writes `action_state = 2` and the
 /// release handler returns the player to the pad-driven state 1, spins a
-/// player grabbed from behind (`animFrameId 2`) and clears the grabbed flag
-/// bits. The clip played is the grab attack's own (`animationId`, the
+/// player grabbed from behind (`attackAnim 2`) and clears the grabbed flag
+/// bits. The clip played is the grab attack's own (`attackAnim`, the
 /// grabber's per-facing pick), exactly like the original's `Joint_move` index
-/// for the player.
-fn plant_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
+/// for the player. The advances run over the damage scratch pair (the loaded
+/// enemy model's second EDD chunk), the body EMD bank being the documented
+/// fallback.
+fn plant_hold(game: &mut GameState, player: &mut PlayerState, emd_clips: &[Clip]) {
+    let bank = game.player_damage.clone();
+    let (source, clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
     let GameState {
         entities,
         entity_anims,
@@ -893,26 +900,32 @@ fn plant_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
     } = game;
     let entity = &mut entities[0];
     let clock = &mut entity_anims[0];
+    clock.keyframes = keyframes.cloned();
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    entity.animation_id = entity.attack_anim;
     match entity.action_state {
         0 => {
             entity.action_state = 1;
             entity.animation_frame_id = 0;
-            entity.timing_control = 0;
+            entity.unk_bf = 0;
             entity.unk_8c = 0;
+            sync_player_bytes_to_clock(entity);
             clock.apply_anim_vertex(entity, clips);
-            publish_pose(entity, clock, player, ClipSource::Emd);
+            publish_pose(entity, clock, player, source);
         }
         1 => {
+            sync_player_bytes_to_clock(entity);
             clock.apply_anim_vertex(entity, clips);
-            clock.advance(entity, clips, false, HOLD_BLEND_STEP);
+            advance_player_clock(entity, clock, clips, false, HOLD_BLEND_STEP);
             // The struggle loop's frames past 0x18 wrap back to 10 so the
             // hold cycles instead of running off the end of the clip.
             if entity.animation_frame_id > 0x18 {
                 entity.animation_frame_id = 0x0A;
             }
-            publish(entity, clock, player, ClipSource::Emd);
+            publish(entity, clock, player, source);
         }
         2 => {
+            sync_player_bytes_to_clock(entity);
             clock.apply_anim_vertex(entity, clips);
             if entity.animation_frame_id == 0x27 || entity.health < 0 {
                 entity.set_state(1);
@@ -921,15 +934,15 @@ fn plant_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
                 entity.action_state = 0;
                 entity.is_being_attacked = 0;
                 // A grab from behind spun the player around on entry.
-                if entity.animation_id == 2 {
+                if entity.attack_anim == 2 {
                     entity.angle = entity.angle.wrapping_add(0x800);
                 }
                 // The grabber's grabbed/step flags live in the shared player
                 // flag byte; the release clears bits 1 and 3.
                 *player_flags &= 0xF5;
             }
-            clock.advance(entity, clips, false, HOLD_BLEND_STEP);
-            publish(entity, clock, player, ClipSource::Emd);
+            advance_player_clock(entity, clock, clips, false, HOLD_BLEND_STEP);
+            publish(entity, clock, player, source);
         }
         _ => {}
     }
@@ -999,8 +1012,17 @@ fn yawn_head(game: &GameState) -> Option<usize> {
 /// The swallowed player's own state machine (`player_anim_death_alt`):
 /// action_state 0/1 advance the carried animation, 2 recomposes the player
 /// matrix from the head joint and the shared capture transform every frame,
-/// and the head's death hands the player back.
-fn swallow_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
+/// and the head's death hands the player back. The original reaches the body
+/// only through the table's single `action_behavior == 0` entry, so any other
+/// behavior holds the pose. The carried animation plays over the damage
+/// scratch pair (the loaded model's second EDD chunk), the body EMD bank
+/// being the documented fallback.
+fn swallow_hold(game: &mut GameState, player: &mut PlayerState, emd_clips: &[Clip]) {
+    if game.entities[0].action_behavior != 0 {
+        return;
+    }
+    let bank = game.player_damage.clone();
+    let (source, clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
     let state = game.entities[0].action_state;
     if state == 0 {
         let entity = &mut game.entities[0];
@@ -1008,12 +1030,12 @@ fn swallow_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) 
         entity.animation_frame_id = 0;
         entity.unk_bf = 0;
         entity.is_being_attacked = 1;
-        entity.animation_id = 2;
+        // `attackAnim = 2`: the original's `Joint_move` index.
+        set_clip(entity, 2);
         entity.unk_8c = 3;
     }
     if state == 0 || state == 1 {
-        let completed =
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+        let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
         game.entities[0].action_state = game.entities[0]
             .action_state
             .wrapping_add(u8::from(completed));
@@ -1093,6 +1115,7 @@ fn simple_recovery(
         // The original applies the root vertex only while the player lives;
         // the death machine outside runs a dead player.
         if entities[0].health >= 0 {
+            sync_player_bytes_to_clock(&mut entities[0]);
             entity_anims[0].apply_anim_vertex(&mut entities[0], bank_clips);
             player.pos = entities[0].pos;
         }
@@ -1501,20 +1524,24 @@ fn hit_react_common(
     }
     let (source, bank_clips, keyframes) = reaction_bank(bank.as_deref(), clips);
     if advance_player_clip(game, player, source, bank_clips, keyframes, false, 0x400) {
-        let entity = &mut game.entities[0];
-        return_to_control(entity);
-        entity.is_being_attacked = 0;
+        release_to_control(game);
     }
 }
 
 /// The state-6 attacked-flag table (`player_anim_set_attacked_flag`),
 /// dispatched on the player's `action_behavior`: the fall/get-up chain, the
 /// grabbed hold and the thrown drop.
-fn attacked_flag(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clips: &[Clip]) {
+fn attacked_flag(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+) {
     match game.entities[0].action_behavior {
-        0 => knockdown_recover(game, player, room, clips),
-        1 => grabbed(game, player, clips),
-        2 => thrown(game, player, room, clips),
+        0 => knockdown_recover(game, player, room, emd_clips, emw_clips),
+        1 => grabbed(game, player, emd_clips),
+        2 => thrown(game, player, room, emd_clips),
         _ => {}
     }
 }
@@ -1525,8 +1552,11 @@ fn knockdown_recover(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    clips: &[Clip],
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
 ) {
+    let bank = game.player_damage.clone();
+    let (source, clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
     let state = game.entities[0].action_state;
     match state {
         0 | 1 => {
@@ -1546,7 +1576,7 @@ fn knockdown_recover(
             game.entities[0].move_speed_current =
                 game.entities[0].move_speed_current.wrapping_add(step);
             let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
@@ -1571,7 +1601,7 @@ fn knockdown_recover(
                 play_player_sound(game, room, 2, 0x1D);
             }
             let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
@@ -1584,9 +1614,7 @@ fn knockdown_recover(
             }
         }
         4 => {
-            let entity = &mut game.entities[0];
-            return_to_control(entity);
-            entity.is_being_attacked = 0;
+            release_to_control(game);
         }
         5 | 6 => {
             if state == 5 {
@@ -1601,7 +1629,11 @@ fn knockdown_recover(
                 play_player_sound(game, room, 2, 0x1A);
                 play_player_sound(game, room, 3, 2);
             }
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+            let completed =
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
+            game.entities[0].action_state = game.entities[0]
+                .action_state
+                .wrapping_add(u8::from(completed));
         }
         7 | 8 => {
             if state == 7 {
@@ -1611,7 +1643,11 @@ fn knockdown_recover(
                 set_clip(entity, 5);
                 entity.unk_8c = 3;
             }
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+            let completed =
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
+            game.entities[0].action_state = game.entities[0]
+                .action_state
+                .wrapping_add(u8::from(completed));
         }
         9 | 10 => {
             if state == 9 {
@@ -1621,17 +1657,21 @@ fn knockdown_recover(
                 set_clip(entity, 4);
                 entity.unk_8c = 3;
             }
-            let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, true, 0x400);
+            // The original's reverse playback runs through `jointMoveData0/1`,
+            // the held weapon's EMW pair; the body bank is the fallback when
+            // no weapon clip is loaded (the port's usual bank substitution).
+            let clip = game.entities[0].animation_id;
+            let (source, clips) = bank_for(ClipSource::Emw, clip, emd_clips, emw_clips, &[], &[]);
+            let completed = advance_player_clip(game, player, source, clips, None, true, 0x400);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
         }
         0x0B => {
-            let entity = &mut game.entities[0];
-            return_to_control(entity);
-            entity.is_being_attacked = 0;
-            entity.flags &= 0xFD;
+            release_to_control(game);
+            // The original clears combat flag bit 1 on the player's +0x00
+            // status byte.
+            game.player_flags &= 0xFD;
         }
         _ => {}
     }
@@ -1639,8 +1679,11 @@ fn knockdown_recover(
 }
 
 /// Behavior 1: the held/grabbed pose, advanced entirely by the clip clock
-/// while the grabber drives the position.
-fn grabbed(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
+/// while the grabber drives the position. The advances run over the damage
+/// scratch pair, the body EMD bank being the documented fallback.
+fn grabbed(game: &mut GameState, player: &mut PlayerState, emd_clips: &[Clip]) {
+    let bank = game.player_damage.clone();
+    let (source, clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
     let state = game.entities[0].action_state;
     match state {
         0 | 1 => {
@@ -1653,7 +1696,7 @@ fn grabbed(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
                 set_clip(entity, 0);
             }
             let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
@@ -1667,7 +1710,7 @@ fn grabbed(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
                 entity.action_state = 3;
                 entity.unk_8c = 3;
             }
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+            advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             return;
         }
         4 | 5 => {
@@ -1679,7 +1722,7 @@ fn grabbed(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
                 entity.animation_frame_id = 0;
                 entity.unk_bf = 0;
             }
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+            advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             return;
         }
         6 => {
@@ -1696,8 +1739,11 @@ fn grabbed(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
 }
 
 /// Behavior 2: the thrown/dropped pose. The slide reads the capture matrix's
-/// `t[0]` the sweep stored as the knock-back facing.
-fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clips: &[Clip]) {
+/// `t[0]` the sweep stored as the knock-back facing. The advances run over the
+/// damage scratch pair, the body EMD bank being the documented fallback.
+fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, emd_clips: &[Clip]) {
+    let bank = game.player_damage.clone();
+    let (source, clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
     let state = game.entities[0].action_state;
     match state {
         0 | 1 => {
@@ -1719,7 +1765,7 @@ fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clip
                     entity.action_state = 8;
                 }
             }
-            advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+            advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
         }
         2 => {
             let pressed = game.player_mashing();
@@ -1733,7 +1779,7 @@ fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clip
         }
         3 => {
             let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
@@ -1760,7 +1806,7 @@ fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clip
                 play_player_sound(game, room, 2, 0x19);
             }
             let completed =
-                advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x200);
+                advance_player_clip(game, player, source, clips, keyframes, false, 0x200);
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
@@ -1798,12 +1844,15 @@ fn tyrant_stagger(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    clips: &[Clip],
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
 ) {
+    let bank_owner = game.player_damage.clone();
+    let bank = reaction_bank(bank_owner.as_deref(), emd_clips);
     match game.entities[0].action_behavior {
-        0 => tyrant_stagger_common(game, player, room, clips, 600, -0x28, -0x514, 0xDF4),
-        1 => tyrant_stagger_common(game, player, room, clips, 500, -0x1E, -0x5DC, 500),
-        2 => tyrant_knockback(game, player, room, clips),
+        0 => tyrant_stagger_common(game, player, room, bank, 600, -0x28, -0x514, 0xDF4),
+        1 => tyrant_stagger_common(game, player, room, bank, 500, -0x1E, -0x5DC, 500),
+        2 => tyrant_knockback(game, player, room, bank, emd_clips, emw_clips),
         _ => {}
     }
 }
@@ -1817,12 +1866,13 @@ fn tyrant_stagger_common(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    clips: &[Clip],
+    bank: ReactionBank<'_>,
     start_speed: u16,
     decay: i32,
     blood_y: i32,
     push_bias: i32,
 ) {
+    let (source, clips, keyframes) = bank;
     let sub = game.entities[0].action_state;
     if sub == 0 {
         let entity = &mut game.entities[0];
@@ -1836,14 +1886,7 @@ fn tyrant_stagger_common(
         if sub == 2 {
             // `animationId = 1` hands the player back to the ordinary machine
             // (the port's state 1, with the window frame cleared).
-            let entity = &mut game.entities[0];
-            entity.animation_id = 1;
-            entity.animation_frame_id = 0;
-            entity.action_behavior = 0;
-            entity.action_state = 0;
-            entity.is_being_attacked = 0;
-            entity.set_state(1);
-            entity.set_ignore(0);
+            release_to_control(game);
         }
         tyrant_stagger_slide(game, decay, push_bias);
         publish_player(game, player);
@@ -1868,7 +1911,9 @@ fn tyrant_stagger_common(
         spawn_player_blood(game, [0, blood_y, 0]);
     }
 
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
+    let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
@@ -1904,7 +1949,9 @@ fn tyrant_knockback(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    clips: &[Clip],
+    bank: ReactionBank<'_>,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
 ) {
     match game.entities[0].action_state {
         0 => {
@@ -1916,9 +1963,9 @@ fn tyrant_knockback(
             entity.attack_anim = 5;
             entity.unk_8c = 4;
             entity.move_speed_current = 900;
-            tyrant_knockback_slide(game, player, room, clips);
+            tyrant_knockback_slide(game, player, room, bank);
         }
-        1 => tyrant_knockback_slide(game, player, room, clips),
+        1 => tyrant_knockback_slide(game, player, room, bank),
         2 => {
             {
                 let entity = &mut game.entities[0];
@@ -1928,19 +1975,10 @@ fn tyrant_knockback(
                 entity.attack_anim = 6;
             }
             play_player_sound(game, room, 2, 0x1F);
-            tyrant_knockback_ground(game, player, clips);
+            tyrant_knockback_ground(game, player, bank);
         }
-        3 => tyrant_knockback_ground(game, player, clips),
-        4 => {
-            let entity = &mut game.entities[0];
-            entity.animation_id = 1;
-            entity.animation_frame_id = 0;
-            entity.action_behavior = 0;
-            entity.action_state = 0;
-            entity.is_being_attacked = 0;
-            entity.set_state(1);
-            entity.set_ignore(0);
-        }
+        3 => tyrant_knockback_ground(game, player, bank),
+        4 => release_to_control(game),
         5 => {
             {
                 let entity = &mut game.entities[0];
@@ -1958,18 +1996,18 @@ fn tyrant_knockback(
             // is not the held pose, so one body sheet at the same offset is
             // the documented approximation.
             spawn_player_blood(game, [-400, 0, 0]);
-            tyrant_knockback_slam(game, player, clips);
+            tyrant_knockback_slam(game, player, bank);
         }
-        6 => tyrant_knockback_slam(game, player, clips),
+        6 => tyrant_knockback_slam(game, player, bank),
         7 => {
             let entity = &mut game.entities[0];
             entity.action_state = 8;
             entity.unk_bf = 0;
             entity.attack_anim = 4;
             entity.unk_8c = 3;
-            tyrant_knockback_getup(game, player, clips);
+            tyrant_knockback_getup(game, player, bank);
         }
-        8 => tyrant_knockback_getup(game, player, clips),
+        8 => tyrant_knockback_getup(game, player, bank),
         9 => {
             let entity = &mut game.entities[0];
             entity.action_state = 10;
@@ -1977,19 +2015,14 @@ fn tyrant_knockback(
             entity.attack_anim = 4;
             entity.unk_8c = 3;
             // Case 9 falls into case 10: the get-up plays backwards.
-            tyrant_knockback_getup_reverse(game, player, clips);
+            tyrant_knockback_getup_reverse(game, player, emd_clips, emw_clips);
         }
-        10 => tyrant_knockback_getup_reverse(game, player, clips),
+        10 => tyrant_knockback_getup_reverse(game, player, emd_clips, emw_clips),
         11 => {
-            let entity = &mut game.entities[0];
-            entity.animation_id = 1;
-            entity.animation_frame_id = 0;
-            entity.action_behavior = 0;
-            entity.action_state = 0;
-            entity.is_being_attacked = 0;
-            entity.set_state(1);
-            entity.set_ignore(0);
-            entity.flags &= 0xFD;
+            release_to_control(game);
+            // The original clears combat flag bit 1 on the player's +0x00
+            // status byte.
+            game.player_flags &= 0xFD;
         }
         _ => {}
     }
@@ -2001,14 +2034,17 @@ fn tyrant_knockback_slide(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    clips: &[Clip],
+    bank: ReactionBank<'_>,
 ) {
+    let (source, clips, keyframes) = bank;
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
     let step = u16::from(game.entities[0].animation_frame_id).wrapping_mul(0xFFF4); // * -0xc
     game.entities[0].move_speed_current = game.entities[0].move_speed_current.wrapping_add(step);
     if game.entities[0].animation_frame_id == 3 {
         play_player_sound(game, room, 3, 2);
     }
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+    let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
@@ -2025,12 +2061,16 @@ fn tyrant_knockback_slide(
     }
 }
 
-/// Knock-back states 2/3: the ground slide with the joint blood sheets.
-fn tyrant_knockback_ground(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
+/// Knock-back states 2/3: the ground slide with the joint blood sheets
+/// (joints 5/8, depth 0x16, collapsed to one body sheet as documented).
+fn tyrant_knockback_ground(game: &mut GameState, player: &mut PlayerState, bank: ReactionBank<'_>) {
+    let (source, clips, keyframes) = bank;
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
     if game.entities[0].animation_frame_id & 1 == 0 && game.entities[0].animation_frame_id < 10 {
         spawn_player_blood(game, [0, 0, 0]);
     }
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+    let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
@@ -2042,26 +2082,41 @@ fn tyrant_knockback_ground(game: &mut GameState, player: &mut PlayerState, clips
 }
 
 /// Knock-back states 5/6: the wall slam, held on the impact frame.
-fn tyrant_knockback_slam(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+fn tyrant_knockback_slam(game: &mut GameState, player: &mut PlayerState, bank: ReactionBank<'_>) {
+    let (source, clips, keyframes) = bank;
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
+    let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
 }
 
 /// Knock-back states 7..10: the get-up.
-fn tyrant_knockback_getup(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, false, 0x400);
+fn tyrant_knockback_getup(game: &mut GameState, player: &mut PlayerState, bank: ReactionBank<'_>) {
+    let (source, clips, keyframes) = bank;
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
+    let completed = advance_player_clip(game, player, source, clips, keyframes, false, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
 }
 
 /// Knock-back states 9/10: the get-up played backwards (the original's
-/// reverse `Joint_move` through the joint-move pair; the port plays the body
-/// bank backwards, the documented fallback).
-fn tyrant_knockback_getup_reverse(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
-    let completed = advance_player_clip(game, player, ClipSource::Emd, clips, None, true, 0x400);
+/// reverse `Joint_move` through the joint-move pair; the port plays the
+/// held-weapon EMW pair, the body bank the documented fallback).
+fn tyrant_knockback_getup_reverse(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+) {
+    // The original's `Joint_move` reads the clip index from `attackAnim`.
+    game.entities[0].animation_id = game.entities[0].attack_anim;
+    let clip = game.entities[0].animation_id;
+    let (source, clips) = bank_for(ClipSource::Emw, clip, emd_clips, emw_clips, &[], &[]);
+    let completed = advance_player_clip(game, player, source, clips, None, true, 0x400);
     game.entities[0].action_state = game.entities[0]
         .action_state
         .wrapping_add(u8::from(completed));
@@ -2115,6 +2170,39 @@ fn play_player_sound(game: &mut GameState, room: &RoomState, bank: u8, id: u8) {
     }
 }
 
+/// The player's `unk_bf`/`unk_8c` scratch names alias the generic entity's
+/// `timing_control`/`blend_counter`: in the original both are bytes +0xBF and
+/// +0x8C of the same cast. The player handlers write the player names while
+/// the animation clock reads the generic ones, so a player clock step copies
+/// the pair into the clock first.
+fn sync_player_bytes_to_clock(entity: &mut Entity) {
+    entity.timing_control = entity.unk_bf;
+    entity.blend_counter = entity.unk_8c;
+}
+
+/// Publish the clock's hold and blend counter back onto the player names,
+/// the original's single-byte write-back after `Joint_move`.
+fn sync_player_bytes_from_clock(entity: &mut Entity) {
+    entity.unk_bf = entity.timing_control;
+    entity.unk_8c = entity.blend_counter;
+}
+
+/// One player clock step with the +0xBF/+0x8C alias pair kept equal: the
+/// handler's `unk_bf`/`unk_8c` writes reach the clock and the clock's
+/// published hold/blend stay visible through the player names.
+fn advance_player_clock(
+    entity: &mut Entity,
+    clock: &mut EntityAnim,
+    clips: &[Clip],
+    reverse: bool,
+    step: u16,
+) -> bool {
+    sync_player_bytes_to_clock(entity);
+    let completed = clock.advance(entity, clips, reverse, step);
+    sync_player_bytes_from_clock(entity);
+    completed
+}
+
 /// Advance the player's reaction clip one tick and publish the words. The
 /// original reads the clip index from `attackAnim` and the animation pair
 /// from the damage scratch; `source`/`clips`/`keyframes` select the bank —
@@ -2138,19 +2226,21 @@ fn advance_player_clip(
     let entity = &mut entities[0];
     let clock = &mut entity_anims[0];
     clock.keyframes = keyframes.cloned();
-    let completed = clock.advance(entity, clips, reverse, step);
+    let completed = advance_player_clock(entity, clock, clips, reverse, step);
     publish(entity, clock, player, source);
     completed
 }
 
-/// Publish the player's current scripted words to the render clock.
+/// Publish the player's current scripted words to the render clock, keeping
+/// the bank the last reaction advance selected.
 fn publish_player(game: &mut GameState, player: &mut PlayerState) {
     let GameState {
         entities,
         entity_anims,
         ..
     } = game;
-    publish(&entities[0], &mut entity_anims[0], player, ClipSource::Emd);
+    let source = player.clip_source;
+    publish(&entities[0], &mut entity_anims[0], player, source);
 }
 
 /// Dispatch one state-8 tick on `action_behavior`, resolve the tick's movement
@@ -3170,7 +3260,10 @@ mod tests {
         // The entry selects clip 0 and falls into the shared tick.
         run(&mut game, &mut player, &[], &[], &[]);
         assert_eq!(game.entities[0].action_state, 1);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].move_speed_current, 0);
         assert_eq!(game.entities[0].attack_anim, 0, "the crawl clip");
         assert_eq!(game.entities[0].is_being_attacked, 1);
@@ -3718,6 +3811,7 @@ mod tests {
         game.entities[0].animation_frame_id = 0x10;
         game.entities[0].health = -1;
         game.entities[0].animation_id = 1;
+        game.entities[0].attack_anim = 1;
         let mut player = test_player();
         update(
             &mut game,
@@ -3770,7 +3864,11 @@ mod tests {
             "the entry falls through into the carried tick"
         );
         assert_eq!(game.entities[0].animation_id, 2, "the carried clip");
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(game.entities[0].attack_anim, 2, "the carried clip");
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].is_being_attacked, 1);
     }
 
@@ -3971,7 +4069,10 @@ mod tests {
             "the attacked flag minus one"
         );
         assert_eq!(game.entities[0].death_timer, 0xB4);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].health, -1, "the bite kills");
         assert_eq!(game.message_flags & 0x40, 0, "the message bit clears");
         assert_eq!(game.entities[0].joint_flag(1) & 8, 8, "joint 1's gore flag");
@@ -4028,7 +4129,10 @@ mod tests {
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].attack_anim, 2);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(
             game.entities[0].action_ticks_counter, 0xE,
             "the entry tick counts down"
@@ -4058,7 +4162,10 @@ mod tests {
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].action_state, 3, "case 2 falls into case 3");
         assert_eq!(game.entities[0].attack_anim, 0);
-        assert_eq!(game.entities[0].unk_8c, 0xF);
+        assert_eq!(
+            game.entities[0].unk_8c, 0xE,
+            "the drop advance spends one blend step"
+        );
         assert_eq!(game.entities[0].health, -1, "the drop kills");
         assert_eq!(player.clip_source, ClipSource::Emd, "the body bank");
         assert_eq!(player.anim.clip, 0);
@@ -4067,7 +4174,10 @@ mod tests {
         game.entities[0].action_state = 4;
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].action_state, 5);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the case-4 advance spends one blend step"
+        );
         run(&mut game, &mut player, &emd, &[], &[]);
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].action_state, 6);
@@ -4216,7 +4326,10 @@ mod tests {
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].animation_id, 1, "the ordinary clip");
         assert_eq!(game.entities[0].move_speed_current, 0);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         // Two-frame clip: the second advance wraps and returns control.
         for _ in 0..4 {
             update(
@@ -4296,7 +4409,10 @@ mod tests {
         );
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].animation_id, 6, "the fall clip");
-        assert_eq!(game.entities[0].unk_8c, 4);
+        assert_eq!(
+            game.entities[0].unk_8c, 3,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].move_speed_current, 1000);
         for _ in 0..40 {
             update(
@@ -4398,7 +4514,10 @@ mod tests {
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].is_being_attacked, 1);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(
             game.entities[0].move_speed_current,
             500 - 0x1E,
@@ -4459,6 +4578,7 @@ mod tests {
         game.entities[2].set_active(true);
         game.entities[2].angle = 0;
         game.player_attacker = Some(2);
+        game.player_flags = 0x02;
         let room = tyrant_walled_room();
         let mut player = test_player();
         update(&mut game, &mut player, &room, &emd, &[], &[]);
@@ -4476,6 +4596,11 @@ mod tests {
         }
         assert_eq!(game.entities[0].state(), 1, "the get-up returns control");
         assert_eq!(game.entities[0].is_being_attacked, 0);
+        assert_eq!(
+            game.player_flags & 0x02,
+            0,
+            "the case-11 release clears the combat bit"
+        );
     }
 
     /// The knock-back's own state 4 also returns control when no wall is hit.
@@ -4497,7 +4622,7 @@ mod tests {
             }
         }
         assert_eq!(game.entities[0].state(), 1);
-        assert_eq!(game.entities[0].flags & 2, 0, "the combat flag clears");
+        assert_eq!(game.player_flags & 2, 0, "the combat byte stays clear");
     }
 
     /// The attacked-flag table's behavior 1: the grabbed hold advances its
@@ -4563,7 +4688,10 @@ mod tests {
         // Case 0 selects the first peck clip and falls through into case 1.
         run(&mut game, &mut player, &[], &[], &[]);
         assert_eq!(game.entities[0].action_state, 1);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].move_speed_current, 0);
         assert_eq!(game.entities[0].attack_anim, 0);
         assert_eq!(player.clip_source, ClipSource::Damage);
@@ -4634,7 +4762,10 @@ mod tests {
         run(&mut game, &mut player, &[], &[], &[]);
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].attack_anim, 2);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].move_speed_current, 200);
         assert_eq!(player.clip_source, ClipSource::Damage);
         assert_eq!(player.anim.clip, 2);
@@ -4811,8 +4942,14 @@ mod tests {
             game.entities[0].animation_frame_id, 0,
             "the one-tick clip wraps on the entry advance"
         );
-        assert_eq!(game.entities[0].unk_bf, 0);
-        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].unk_bf, 1,
+            "the applied frame's timing is published back"
+        );
+        assert_eq!(
+            game.entities[0].unk_8c, 2,
+            "the entry advance spends one blend step"
+        );
         assert_eq!(game.entities[0].is_being_attacked, 1);
         assert_eq!(player.clip_source, ClipSource::Damage);
         assert_eq!(player.anim.clip, 0);
@@ -4991,5 +5128,260 @@ mod tests {
                 "{room_text} keeps the shadow tint"
             );
         }
+    }
+
+    /// The wall-hit knockdown: the fall probe aborts into state 5, whose chain
+    /// (6, 8 and 10 each apply `Joint_move`'s completion) must run
+    /// 5 -> 6 -> 7 -> 8 -> 9 -> 10 -> 0x0B and hand control back. Dropping the
+    /// completion in states 6/8 parks the get-up forever.
+    #[test]
+    fn the_knockdown_wall_hit_chain_gets_up() {
+        let emd = vec![clip(2, 1); 12];
+        let emw = vec![clip(2, 1); 12];
+        let mut game = test_game(6, 0, 6);
+        game.entities[0].set_ignore(8);
+        game.entities[0].pos = [1500, 0, 1500];
+        game.entities[0].saved_pos = Some([1500, 0, 1500]);
+        game.entities[0].sca_radius = 422;
+        game.entities[0].status_flags &= !4;
+        game.entities[0].collision_flags = 0x10;
+        game.player_flags = 0x02;
+        let room = tyrant_walled_room();
+        let mut player = test_player();
+        update(&mut game, &mut player, &room, &emd, &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 5, "the wall aborts the fall");
+        for _ in 0..200 {
+            update(&mut game, &mut player, &room, &emd, &emw, &[]);
+            if game.entities[0].state() == 1 {
+                break;
+            }
+        }
+        assert_eq!(game.entities[0].state(), 1, "the get-up returns control");
+        assert_eq!(game.entities[0].ignore(), 0, "the window frame clears");
+        assert_eq!(game.entities[0].is_being_attacked, 0);
+        assert_eq!(game.entities[0].action_behavior, 0);
+        assert_eq!(
+            game.player_flags & 0x02,
+            0,
+            "the 0x0B release clears the combat bit"
+        );
+    }
+
+    /// The knockdown's reverse get-up (states 9/10) plays the held-weapon
+    /// `jointMoveData0/1` pair, the port's EMW bank, not the body bank.
+    #[test]
+    fn the_knockdown_getup_reverse_plays_the_weapon_bank() {
+        let emd = vec![clip(2, 1); 12];
+        let emw = vec![clip(2, 1); 12];
+        let mut game = test_game(6, 0, 6);
+        game.entities[0].set_ignore(8);
+        game.entities[0].action_state = 9;
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 10);
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, 4, "the reverse get-up clip");
+    }
+
+    /// The state-6 attacked-flag windows advance over the damage scratch pair
+    /// (the loaded enemy model's second bank), the body EMD bank being the
+    /// fallback: knockdown 6, grabbed 0 and thrown 3.
+    #[test]
+    fn the_attacked_flag_windows_advance_the_damage_bank() {
+        let emd = vec![clip(0x40, 1); 12];
+
+        let mut game = test_game(6, 0, 6);
+        game.player_damage = Some(Arc::new(damage_bank(12, 3)));
+        game.entities[0].set_ignore(8);
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 6, "the fall clip");
+
+        let mut game = test_game(6, 1, 0);
+        game.player_damage = Some(Arc::new(damage_bank(12, 3)));
+        game.entities[0].set_ignore(8);
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0, "the grab clip");
+
+        let mut game = test_game(6, 2, 3);
+        game.player_damage = Some(Arc::new(damage_bank(12, 3)));
+        game.entities[0].set_ignore(8);
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 3, "the thrown clip");
+    }
+
+    /// A non-advancing reaction tick (the thrown on-floor countdown) keeps the
+    /// bank the last advance selected instead of forcing the body EMD bank.
+    #[test]
+    fn a_non_advancing_reaction_tick_keeps_the_damage_bank() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = test_game(6, 2, 3);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(8);
+        let mut player = test_player();
+        // The entry advance selects the damage bank...
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 3);
+        // ...and the on-floor countdown consumes no frame but must keep it.
+        game.entities[0].action_state = 2;
+        game.entities[0].action_ticks_counter = 0x5A;
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 3);
+    }
+
+    /// The monster plant's hold plays the grab clip from the damage scratch
+    /// pair, not the body bank.
+    #[test]
+    fn the_plant_hold_plays_the_damage_bank() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = plant_hold_game(0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        let mut player = test_player();
+        update(
+            &mut game,
+            &mut player,
+            &RoomState::default(),
+            &emd,
+            &[],
+            &[],
+        );
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2, "the grab clip");
+    }
+
+    /// Yawn's swallow plays the carried clip from the damage scratch pair, and
+    /// the original's single `action_behavior == 0` entry parks any other
+    /// behavior.
+    #[test]
+    fn the_swallow_hold_plays_the_damage_bank_and_needs_behavior_zero() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = swallow_game(0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        let mut player = test_player();
+        update(
+            &mut game,
+            &mut player,
+            &RoomState::default(),
+            &emd,
+            &[],
+            &[],
+        );
+        assert_eq!(game.entities[0].action_state, 1, "the entry advances");
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2, "the carried clip");
+
+        let mut game = swallow_game(1);
+        game.entities[0].action_behavior = 1;
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        let mut player = test_player();
+        update(
+            &mut game,
+            &mut player,
+            &RoomState::default(),
+            &emd,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            game.entities[0].action_state, 1,
+            "a nonzero behavior reaches no table entry"
+        );
+        assert_eq!(game.entities[0].animation_frame_id, 0, "nothing advanced");
+    }
+
+    /// The Tyrant knock-back runs its launch clip from the damage bank and its
+    /// reverse get-up from the held-weapon EMW bank.
+    #[test]
+    fn the_tyrant_knockback_uses_the_damage_bank_and_weapon_getup() {
+        let emd = vec![clip(0x40, 1); 12];
+        let emw = vec![clip(2, 1); 12];
+        let mut game = test_game(6, 2, 6);
+        game.player_damage = Some(Arc::new(damage_bank(12, 3)));
+        game.entities[0].set_ignore(0x0C);
+        game.entities[2].id = 0x0C;
+        game.entities[2].set_active(true);
+        game.entities[2].angle = 0;
+        game.player_attacker = Some(2);
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &emw, &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 5, "the launch clip");
+
+        game.entities[0].action_state = 9;
+        game.entities[0].attack_anim = 4;
+        // The reference keeps the clip frame across the transition; pin it so
+        // the two-frame EMW clip does not complete on the first advance.
+        game.entities[0].animation_frame_id = 0;
+        run(&mut game, &mut player, &emd, &emw, &[]);
+        assert_eq!(game.entities[0].action_state, 10);
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, 4, "the reverse get-up clip");
+    }
+
+    /// The death fall's body thud reads the +0xBF hold through `unk_bf`: the
+    /// clock publishes the applied frame's timing back onto the player name,
+    /// so the frame-0x19 check fires on the tick before the frame applies.
+    #[test]
+    fn the_death_fall_thud_reads_the_published_hold() {
+        use crate::state::FootstepZone;
+        let room = RoomState {
+            stage: 1,
+            room: 0,
+            footstep_zones: vec![FootstepZone {
+                base_x: 0,
+                base_z: 0,
+                width: 0x8000,
+                height: 0x8000,
+                sound_data: 0x2D,
+            }],
+            ..RoomState::default()
+        };
+        let emd = vec![clip(0x20, 1); 8];
+        let mut game = test_game(3, 200, 0);
+        game.entities[0].action_state = 1;
+        game.entities[0].animation_frame_id = 0x18;
+        game.entities[0].timing_control = 0;
+        game.entities[0].unk_bf = 0;
+        let mut player = test_player();
+        // Applying frame 0x18 publishes its timing onto the player's `unk_bf`
+        // and leaves 0x19 pending.
+        update(&mut game, &mut player, &room, &emd, &[], &[]);
+        assert_eq!(game.entities[0].animation_frame_id, 0x19);
+        assert_eq!(game.entities[0].unk_bf, 1);
+        game.entity_sounds.clear();
+        update(&mut game, &mut player, &room, &emd, &[], &[]);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 2),
+            "the body thud fires before frame 0x19 applies"
+        );
+    }
+
+    /// The player's `unk_bf`/`unk_8c` names alias the animation clock's
+    /// +0xBF/+0x8C bytes: a reaction entry's `unk_bf = 0` clears a stale hold
+    /// and its blend counter is published back through `unk_8c`.
+    #[test]
+    fn a_reaction_entry_clears_the_clock_through_the_player_bytes() {
+        let emd = vec![clip(2, 1); 12];
+        let mut game = test_game(6, 0, 6);
+        game.entities[0].set_ignore(8);
+        // Stale clock state from the previous clip: a live hold and a spent
+        // blend. The entry handler's writes must reach the clock this tick.
+        game.entities[0].timing_control = 2;
+        game.entities[0].blend_counter = 7;
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].animation_frame_id, 1, "the frame consumed");
+        assert_eq!(game.entities[0].timing_control, 1, "the published hold");
+        assert_eq!(game.entities[0].blend_counter, 3, "4 spent one step");
+        assert_eq!(game.entities[0].unk_bf, 1, "the alias pair stays equal");
+        assert_eq!(game.entities[0].unk_8c, 3, "the alias pair stays equal");
     }
 }
