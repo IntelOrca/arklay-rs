@@ -1435,6 +1435,11 @@ impl GameSession {
                 .start(ui::death::immediate_fade(self.loaded.id), variant);
             return;
         }
+        // A scripted death (the hunter pounce) arms the fade itself at its own
+        // countdown; consume the request before the delay ticks.
+        if std::mem::take(&mut self.game.death_fade_request) {
+            self.death.arm_fade_now();
+        }
         match self.death.tick() {
             ui::death::DeathTick::OpenScreen => self.open_death_screen(),
             ui::death::DeathTick::Finished => self.finish_death(),
@@ -15742,6 +15747,56 @@ end
         assert!(title_at > screen_open_at, "the screen ran before the title");
         assert!(!session.death.screen_open());
         assert!(session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
+    }
+
+    /// A scripted death's fade request skips the 90-frame delay: the screen
+    /// opens one fade (128 ticks) after the request is consumed.
+    #[test]
+    fn a_scripted_fade_request_skips_the_death_delay() {
+        let dir = TempDir::new();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let pack_path = dir.0.join("death-fade.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &id.rdt_entry(),
+                synthetic_rdt_with_blocking_collision(&door_init_record(
+                    1,
+                    [777, 0, 888],
+                    0x200,
+                    0,
+                )),
+            )
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer.add("ui/died.tim", synthetic_died_tim()).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, id, Path::new("saves")).unwrap();
+        session.game.apply_player_hurt(i16::MAX, 0);
+        assert!(session.game.entities[0].health < 0, "the player died");
+
+        let mut screen_open_at = None;
+        for tick in 0..400 {
+            if tick == 1 {
+                session.game.death_fade_request = true;
+            }
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            if session.death.screen_open() {
+                screen_open_at = Some(tick);
+                break;
+            }
+        }
+        let screen_open_at = screen_open_at.expect("the DIED screen opened");
+        assert_eq!(screen_open_at, 128, "the delay is skipped");
     }
 
     /// The DIED screen draws its backdrop and wavy strip from the packed page

@@ -219,6 +219,18 @@ impl DeathSequence {
         self.fade.set(fade_type, counter, state);
     }
 
+    /// Arm the white death fade now, skipping the rest of the 90-frame delay.
+    /// A scripted death (the hunter pounce's `player_anim_dispatch_4c2ac8`)
+    /// calls the original's `fade_update` itself at its own countdown; a fade
+    /// already running makes this a no-op, exactly like the original's
+    /// `g_fading_state <= 0` guard.
+    pub fn arm_fade_now(&mut self) {
+        if self.state == 1 || self.state == 2 {
+            self.arm_fade(1, DEATH_FADE_OUT_COUNTER);
+            self.state = 3;
+        }
+    }
+
     /// The full-screen overlay the death fade draws, if any.
     pub fn overlay(&self) -> Option<Overlay> {
         self.fade.overlay()
@@ -544,6 +556,26 @@ mod tests {
         let overlay = sequence.overlay().unwrap();
         assert_eq!(overlay.color, FadeColor::White);
         assert_eq!(overlay.alpha, 0);
+    }
+
+    #[test]
+    fn a_scripted_death_arms_the_fade_ahead_of_the_delay() {
+        // A normal room starts the 90-frame delay; the request skips it.
+        let mut sequence = DeathSequence::idle();
+        sequence.start(false, false);
+        assert_eq!(sequence.delay, DEATH_DELAY);
+        assert!(sequence.overlay().is_none());
+        sequence.arm_fade_now();
+        let overlay = sequence.overlay().unwrap();
+        assert_eq!(overlay.color, FadeColor::White);
+        assert_eq!(overlay.alpha, 0);
+        assert_eq!(sequence.state, 3);
+        // The fade advances on the next tick (the delay is gone).
+        assert_eq!(sequence.tick(), DeathTick::None);
+        assert_eq!(sequence.overlay().unwrap().alpha, 2);
+        // A running fade is not re-armed.
+        sequence.arm_fade_now();
+        assert_eq!(sequence.overlay().unwrap().alpha, 2);
     }
 
     #[test]

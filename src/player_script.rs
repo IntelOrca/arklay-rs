@@ -163,10 +163,11 @@ pub fn update(
         // first: a held pose raises the message bit while the object push or
         // the health lock is up, then clears the lock.
         6 => anim_window1(game, player, room, emd_clips, emw_clips),
-        // The swallow window. Yawn writes animationId 7 with animFrameId
-        // 0x0D, whose entry in the animation-function table is the swallowed
-        // player's own machine.
-        7 => anim_window2(game, player, emd_clips),
+        // The animation window 2. Yawn's swallow writes animationId 7 with
+        // animFrameId 0x0D, the dog's maul frame 2, the hunter's pounce bite
+        // frame 6, Plant 42's eat frame 8, the Neptune's devour frame 0x0B
+        // and the Tyrant's impale frame 0x0C.
+        7 => anim_window2(game, player, room, emd_clips),
         // States 2/3 (hit reaction, death) hold the player still: only state 1
         // reads the pad.
         _ => {}
@@ -942,9 +943,45 @@ const WINDOW2_BASE: u8 = 0x26;
 /// with animFrameId `0x0D`.
 const YAWN_SWALLOW_INDEX: u8 = 0x0D + WINDOW2_BASE;
 
+/// The dog maul's table index: the hound's kill latch writes animationId 7
+/// with animFrameId 2.
+const DOG_MAUL_INDEX: u8 = 2 + WINDOW2_BASE;
+
+/// The hunter pounce bite's table index: the hunter's airborne bite writes
+/// animationId 7 with animFrameId 6.
+const HUNTER_POUNCE_INDEX: u8 = 6 + WINDOW2_BASE;
+
+/// Plant 42's eat table index: the plant's kill behavior writes animationId 7
+/// with animFrameId 8.
+const PLANT42_EAT_INDEX: u8 = 8 + WINDOW2_BASE;
+
+/// The Neptune devour's table index: the shark writes animationId 7 with
+/// animFrameId `0x0B`.
+const NEPTUNE_DEVOUR_INDEX: u8 = 0x0B + WINDOW2_BASE;
+
+/// The Tyrant impale's table index: the live impale writes animationId 7 with
+/// animFrameId `0x0C`.
+const TYRANT_IMPALE_INDEX: u8 = 0x0C + WINDOW2_BASE;
+
 /// Player state 7 (the original's animation window 2).
-fn anim_window2(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
-    if game.entities[0].ignore().wrapping_add(WINDOW2_BASE) == YAWN_SWALLOW_INDEX {
+///
+/// The window dispatches `animFrameId + 0x26` into the animation-function
+/// table: the dog maul, the hunter pounce bite, Plant 42's eat, the Neptune
+/// devour, the Tyrant impale and Yawn's swallow. An unwired entry holds the
+/// pose.
+fn anim_window2(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clips: &[Clip]) {
+    let index = game.entities[0].ignore().wrapping_add(WINDOW2_BASE);
+    if index == DOG_MAUL_INDEX {
+        simple_recovery(game, player, room, clips);
+    } else if index == HUNTER_POUNCE_INDEX {
+        hunter_pounce_bite(game, player, room, clips);
+    } else if index == PLANT42_EAT_INDEX {
+        plant42_eat(game, player, room, clips);
+    } else if index == NEPTUNE_DEVOUR_INDEX {
+        neptune_devour(game, player, clips);
+    } else if index == TYRANT_IMPALE_INDEX {
+        tyrant_impale(game, player, room, clips);
+    } else if index == YAWN_SWALLOW_INDEX {
         swallow_hold(game, player, clips);
     }
 }
@@ -1008,6 +1045,371 @@ fn swallow_hold(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) 
         // documented approximation.
         game.entities[0].pos = held.t;
         player.pos = held.t;
+    }
+}
+
+/// The dog maul (the original's `player_anim_simple_recovery`, the state-7
+/// window's animFrameId 2 entry).
+///
+/// Case 0 pins the recovery pose and plays the bite cue; case 1 screams at
+/// frame 0xF, applies the damage clip's root vertex while the player is alive
+/// and advances damage clip 2 at step 0x200. Completion spins the facing a
+/// half turn and parks in the terminal state 2; the hound's own script owns
+/// the kill and the state-1 death trigger owns the corpse.
+fn simple_recovery(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+) {
+    let state = game.entities[0].action_state;
+    if state > 1 {
+        return;
+    }
+    if state == 0 {
+        let entity = &mut game.entities[0];
+        entity.action_state = 1;
+        entity.move_speed_current = 0;
+        entity.animation_frame_id = 0;
+        entity.unk_bf = 0;
+        entity.unk_8c = 0;
+        entity.attack_anim = 2;
+        play_player_sound(game, room, 3, 2);
+        return;
+    }
+    if game.entities[0].animation_frame_id == 0xF {
+        play_entity_thud(game, room);
+    }
+    let bank = game.player_damage.clone();
+    let (source, bank_clips, keyframes) = reaction_bank(bank.as_deref(), emd_clips);
+    {
+        let GameState {
+            entities,
+            entity_anims,
+            ..
+        } = game;
+        entities[0].animation_id = entities[0].attack_anim;
+        entity_anims[0].keyframes = keyframes.cloned();
+        // The original applies the root vertex only while the player lives;
+        // the death machine outside runs a dead player.
+        if entities[0].health >= 0 {
+            entity_anims[0].apply_anim_vertex(&mut entities[0], bank_clips);
+            player.pos = entities[0].pos;
+        }
+    }
+    if advance_player_clip(game, player, source, bank_clips, keyframes, false, 0x200) {
+        let entity = &mut game.entities[0];
+        entity.angle = entity.angle.wrapping_add(0x800);
+        entity.action_state = entity.action_state.wrapping_add(1);
+    }
+}
+
+/// The hunter's pounce bite (the original's `player_anim_dispatch_4c2ac8`, the
+/// state-7 window's animFrameId 6 entry) - a death.
+///
+/// Case 0 latches the killed pose (`attackAnim = isBeingAttackedFlag - 1`),
+/// raises joint 1's flag, spawns the entry blood and kills the player; case 1
+/// sprays the ground billboard under frame 10, screams at frame 0x2A and
+/// advances the damage clip; case 2 recolours and shrinks the death billboard
+/// and raises the attacked flag to 0x80; case 3 grows the pool, arms the
+/// death fade at `death_timer == 0xA0` and parks in the blocked state 4 at
+/// 0x20.
+///
+/// Deviations: the original's `unk_bc` byte maps to `death_timer`; the
+/// per-joint tints have no port renderer (the same deferral the enemy
+/// scripts' `tint_joint` documents); the two entry sheets attached to joint 1
+/// collapse to the player transform's ground sheets; the case-2 rotated
+/// -900 billboard shift has no port analogue because the ground quad carries
+/// no local offset, so only its recolour and shrink are kept; and case 1's
+/// trailing `EntityUpdateWeaponJoint(0)` stays with the held-weapon deferral.
+fn hunter_pounce_bite(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+) {
+    match game.entities[0].action_state {
+        0 | 1 => {
+            if game.entities[0].action_state == 0 {
+                let entity = &mut game.entities[0];
+                entity.action_state = 1;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+                entity.attack_anim = entity.is_being_attacked.wrapping_sub(1);
+                entity.death_timer = 0xB4;
+                entity.unk_8c = 3;
+                let flag = entity.joint_flag(1) | 8;
+                entity.set_joint_flag(1, flag);
+                entity.health = -1;
+                game.message_flags &= !0x40;
+                // The original's two entry sheets attach to joint 1 and the
+                // shared identity transform; both collapse to the player
+                // transform here.
+                spawn_player_blood(game, [0, 0, 0]);
+                spawn_player_blood(game, [0, 0, 0]);
+            }
+            if game.entities[0].animation_frame_id < 10 {
+                spawn_player_blood(game, [0, -0x898, 0]);
+            }
+            if game.entities[0].animation_frame_id == 0x2A {
+                play_entity_thud(game, room);
+            }
+            let bank = game.player_damage.clone();
+            if advance_mirrored_clip(game, player, bank.as_deref(), emd_clips) {
+                game.entities[0].action_state = game.entities[0].action_state.wrapping_add(1);
+            }
+        }
+        2 => {
+            // The original also shifts the billboard by the yaw-rotated
+            // (-900, 0, 0) vector; the port's ground quad has no local offset.
+            player.shadow_tint = 0x00FF_FF50;
+            player.shadow_half_x = player.shadow_half_x.wrapping_sub(200);
+            player.shadow_half_z = player.shadow_half_z.wrapping_sub(200);
+            let entity = &mut game.entities[0];
+            entity.action_state = 3;
+            entity.is_being_attacked = 0x80;
+        }
+        3 => {
+            player.shadow_half_x = player.shadow_half_x.wrapping_add(0x10);
+            player.shadow_half_z = player.shadow_half_z.wrapping_add(0x10);
+            if game.entities[0].death_timer == 0xA0 {
+                game.death_fade_request = true;
+            }
+            let counter = game.entities[0].death_timer.wrapping_sub(1);
+            game.entities[0].death_timer = counter;
+            if counter == 0x20 {
+                game.entities[0].set_state(4);
+            }
+        }
+        4 => game.entities[0].set_state(4),
+        _ => {}
+    }
+}
+
+/// Plant 42's eat (the original's `player_anim_dispatch_4ba360`, the state-7
+/// window's animFrameId 8 entry).
+///
+/// Case 0 pins the eaten pose, plays the two cues and raises `flags` bit 2;
+/// case 1 runs the 0xF-frame grip countdown and advances damage clip 2; case 2
+/// arms the drop with the body clip and case 3 plays it at step 0x100; cases
+/// 4/5 run the damage clip out into case 6, whose body playback is the
+/// terminal pose.
+///
+/// The original's post-switch physics bounces the body's joint 0 off the
+/// ground and kills the player when it drops below 700. The port has no
+/// per-joint velocity state, so `death_timer` carries the original's joint-0
+/// `velX` (bit 0x80 airborne, low three bits the bounce counter) and
+/// `move_speed[1]` its `velY`; the vertical drop, the kill, the bounce and
+/// the 30-unit slide are ported against the entity position. The case-0/1
+/// per-joint velocities, the joint-0 rotation curl, the joint-2 limb bounce
+/// and every `JointApplyColorTint` call are not modeled: the port's pose is
+/// clip-driven and has no per-joint colour pipeline (the same deferral the
+/// enemy scripts' `tint_joint` documents), so the case-1 joint-2 billboard
+/// that fires when its rotation crosses 0x100 is skipped with them.
+/// `g_deathAnimationFlag` (the Plant 42 corpse pose on the DIED screen) has
+/// no port field; the death screen renders the ordinary corpse.
+fn plant42_eat(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+) {
+    let state = game.entities[0].action_state;
+    match state {
+        0 | 1 => {
+            if state == 0 {
+                {
+                    let entity = &mut game.entities[0];
+                    entity.animation_frame_id = 0;
+                    entity.unk_bf = 0;
+                    entity.action_state = 1;
+                    entity.attack_anim = 2;
+                    entity.unk_8c = 3;
+                    entity.flags |= 4;
+                    entity.action_ticks_counter = 0xF;
+                    entity.death_timer = 0;
+                    entity.move_speed[1] = 0;
+                }
+                play_player_sound(game, room, 3, 3);
+                // Bank 4 is the original's special/BGM pan update; the port
+                // has no `g_SndBank[0]` pan contract, so the call is inert.
+                play_player_sound(game, room, 4, 0);
+                // The original's three entry sheets attach to joints 0/1/2;
+                // the port's player skeleton is not the held pose, so one
+                // body sheet at the player transform is the approximation the
+                // Tyrant's joint sprays already document.
+                spawn_player_blood(game, [0, 0, 0]);
+            }
+            if game.entities[0].action_ticks_counter != 0 {
+                game.entities[0].action_ticks_counter =
+                    game.entities[0].action_ticks_counter.wrapping_sub(1);
+                let bank = game.player_damage.clone();
+                advance_mirrored_clip(game, player, bank.as_deref(), emd_clips);
+            }
+        }
+        2 | 3 => {
+            if state == 2 {
+                {
+                    let entity = &mut game.entities[0];
+                    entity.animation_frame_id = 0;
+                    entity.unk_bf = 0;
+                    entity.attack_anim = 0;
+                    entity.action_state = 3;
+                    entity.unk_8c = 0xF;
+                    // The original's `joints[0].velX = 0x8002`: the airborne
+                    // flag plus the bounce counter's start value 2.
+                    entity.death_timer = 0x82;
+                }
+                spawn_player_blood(game, [0, 0, 0]);
+            }
+            // Case 2 falls through into case 3's body playback.
+            let clip = game.entities[0].attack_anim;
+            advance_player_body_clip(game, player, emd_clips, clip, false, 0x100);
+        }
+        4 | 5 => {
+            if state == 4 {
+                let entity = &mut game.entities[0];
+                entity.action_state = 5;
+                entity.unk_8c = 3;
+                entity.animation_frame_id = 0;
+                entity.unk_bf = 0;
+            }
+            let bank = game.player_damage.clone();
+            if advance_mirrored_clip(game, player, bank.as_deref(), emd_clips) {
+                let entity = &mut game.entities[0];
+                entity.unk_bf = 0;
+                entity.attack_anim = 0;
+                entity.action_state = 6;
+                entity.unk_8c = 3;
+            }
+        }
+        6 => {
+            let clip = game.entities[0].attack_anim;
+            advance_player_body_clip(game, player, emd_clips, clip, false, 0x400);
+            // The original raises `g_deathAnimationFlag` here; the port's
+            // DIED screen has no Plant 42 corpse pose (documented above).
+        }
+        _ => {}
+    }
+    plant_eat_physics(game, player);
+}
+
+/// The Plant 42 eat's post-switch drop: one frame of the original's joint-0
+/// bounce against the entity position. `death_timer` stands in for the joint's
+/// `velX` (0x80 airborne, low bits the bounce counter) and `move_speed[1]` for
+/// its `velY`.
+fn plant_eat_physics(game: &mut GameState, player: &mut PlayerState) {
+    if game.entities[0].death_timer & 0x80 == 0 || game.entities[0].pos[1] >= 700 {
+        return;
+    }
+    let bounced = {
+        let entity = &mut game.entities[0];
+        entity.health = -1;
+        let vy = entity.move_speed[1];
+        entity.pos[1] = entity.pos[1].wrapping_add(i32::from(vy));
+        let grown = vy.wrapping_add(2);
+        entity.move_speed[1] = if grown > 0x20 {
+            vy.wrapping_add(12)
+        } else {
+            grown
+        };
+        if entity.pos[1] > 700 && entity.death_timer & 7 != 0 {
+            entity.pos[1] = 0x28A;
+            let neg = entity.move_speed[1].wrapping_neg();
+            entity.move_speed[1] = ((i32::from(neg) + (i32::from(neg) >> 31 & 7)) >> 3) as i16;
+            entity.death_timer = entity.death_timer.wrapping_sub(1);
+            entity.action_state = 4;
+            true
+        } else {
+            false
+        }
+    };
+    if bounced {
+        spawn_player_blood(game, [0, 0, 0]);
+    }
+    let entity = &mut game.entities[0];
+    if entity.death_timer & 7 != 2 {
+        entity.move_speed_current = 30;
+        let speed = entity.move_speed_current as i16;
+        walk::advance_xz(entity, 0x800, speed);
+    }
+    player.pos = entity.pos;
+}
+
+/// The Neptune's devour (the original's `player_anim_death_billboard`, the
+/// state-7 window's animFrameId 0x0B entry).
+///
+/// Case 0 selects damage clip 3 and the swallowed pose, case 1 advances the
+/// clip and clamps its last frame back to 13 so the corpse holds, and case 2
+/// recomposes the player matrix from the shark's capture transform every
+/// frame.
+///
+/// The Neptune is not scripted in this port and has no capture matrix, so
+/// case 2's recomposition (the original composes the shark's local matrix and
+/// its joint 0 through the shared `neptune_capture_matrix` the devour script
+/// fills in) is the documented deferral; the grabbed zone flag is kept.
+fn neptune_devour(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
+    match game.entities[0].action_state {
+        0 => {
+            let entity = &mut game.entities[0];
+            entity.action_state = 1;
+            entity.animation_frame_id = 0;
+            entity.unk_bf = 0;
+            entity.attack_anim = 3;
+            entity.is_being_attacked = 1;
+            entity.unk_8c = 0;
+        }
+        1 => {
+            let bank = game.player_damage.clone();
+            advance_mirrored_clip(game, player, bank.as_deref(), clips);
+            if game.entities[0].animation_frame_id == 14 {
+                game.entities[0].animation_frame_id = 13;
+            }
+        }
+        2 => {
+            game.entities[0].zone_flags |= 0x80;
+        }
+        _ => {}
+    }
+}
+
+/// The Tyrant's impale (the original's `player_anim_enemy_interact`, the
+/// state-7 window's animFrameId 0x0C entry).
+///
+/// Case 0 pins the impaled pose and raises the attack/combat flags; case 1
+/// plays the cue and tints at frame 8, sprays the ground sheet below frame 9
+/// and past frame 0x5F, applies the damage clip's root vertex and advances it,
+/// and case 2 kills the player. The per-joint tints are the documented
+/// no-renderer deferral.
+fn tyrant_impale(game: &mut GameState, player: &mut PlayerState, room: &RoomState, clips: &[Clip]) {
+    match game.entities[0].action_state {
+        0 => {
+            let entity = &mut game.entities[0];
+            entity.action_state = 1;
+            entity.attack_anim = 2;
+            entity.is_being_attacked = 0x80;
+            entity.flags |= 6;
+            entity.animation_frame_id = 0;
+            entity.unk_bf = 0;
+            entity.unk_8c = 0;
+        }
+        1 => {
+            if game.entities[0].animation_frame_id == 8 {
+                play_player_sound(game, room, 3, 3);
+            }
+            if game.entities[0].animation_frame_id < 9 {
+                spawn_player_blood(game, [0, -0x5DC, 0]);
+            }
+            if game.entities[0].animation_frame_id > 0x5F {
+                spawn_player_blood(game, [0, 0, 0]);
+            }
+            let bank = game.player_damage.clone();
+            if advance_reaction_clip(game, player, bank.as_deref(), clips) {
+                game.entities[0].action_state = game.entities[0].action_state.wrapping_add(1);
+            }
+        }
+        2 => game.entities[0].health = -1,
+        _ => {}
     }
 }
 
@@ -3440,6 +3842,359 @@ mod tests {
         );
         assert_eq!(game.entities[0].action_behavior, 5);
         assert_eq!(game.entities[0].action_state, 0);
+    }
+
+    #[test]
+    fn other_state_seven_windows_hold_the_pose() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = test_game(7, 0, 0);
+        // Index 0x26 (animFrameId 0) names no handler: the pose holds.
+        game.entities[0].set_ignore(0);
+        let mut player = test_player();
+        update(
+            &mut game,
+            &mut player,
+            &RoomState::default(),
+            &emd,
+            &[],
+            &[],
+        );
+        assert_eq!(
+            game.entities[0].state(),
+            7,
+            "the unknown window stays parked"
+        );
+        assert_eq!(game.entities[0].action_state, 0);
+        assert_eq!(game.entities[0].attack_anim, 0);
+    }
+
+    /// The dog maul (state 7, animFrameId 2): the entry pins the recovery
+    /// pose and cues, the damage bank's clip 2 runs at step 0x200, and its
+    /// completion spins the facing and parks in the terminal state 2.
+    #[test]
+    fn the_dog_maul_recovers_and_spins_on_completion() {
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(2);
+        game.entities[0].health = 100;
+        let mut player = test_player();
+
+        // Case 0 returns: no clip advance on the entry tick.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].move_speed_current, 0);
+        assert_eq!(game.entities[0].animation_frame_id, 0);
+        assert_eq!(game.entities[0].unk_bf, 0);
+        assert_eq!(game.entities[0].unk_8c, 0);
+        assert_eq!(game.entities[0].attack_anim, 2);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 3),
+            "the bite cue"
+        );
+
+        // The first case-1 tick publishes the damage clip.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2);
+
+        // The three-frame clip runs out; completion spins a half turn.
+        game.entities[0].angle = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2, "the terminal state");
+        assert_eq!(game.entities[0].angle, 0x800, "the half-turn spin");
+
+        // The terminal state ignores later ticks.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+    }
+
+    /// The dog maul's frame 0xF scream and the dead-player vertex skip.
+    #[test]
+    fn the_dog_maul_screams_and_skips_the_dead_vertex() {
+        use crate::state::FootstepZone;
+        let room = RoomState {
+            stage: 1,
+            room: 0,
+            footstep_zones: vec![FootstepZone {
+                base_x: 0,
+                base_z: 0,
+                width: 0x8000,
+                height: 0x8000,
+                sound_data: 0x2D,
+            }],
+            ..RoomState::default()
+        };
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 0x40)));
+        game.entities[0].set_ignore(2);
+        game.entities[0].action_state = 1;
+        game.entities[0].attack_anim = 2;
+        game.entities[0].animation_frame_id = 0xF;
+        game.entities[0].health = -1;
+        game.entities[0].unk_c6 = 100;
+        game.entities[0].unk_c8 = 200;
+        game.entities[0].pos = [5, 0, 6];
+        let mut player = test_player();
+        player.pos = [5, 0, 6];
+        update(&mut game, &mut player, &room, &[], &[], &[]);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 2),
+            "the entity scream"
+        );
+        assert_eq!(
+            game.entities[0].pos,
+            [5, 0, 6],
+            "a dead player keeps the entity position"
+        );
+    }
+
+    /// The hunter pounce bite (state 7, animFrameId 6): the entry kills and
+    /// latches the fall, the damage clip runs, the pool recolours, and the
+    /// countdown arms the fade and parks in the blocked state.
+    #[test]
+    fn the_hunter_pounce_bite_kills_and_pools_into_the_blocked_state() {
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(6);
+        game.entities[0].is_being_attacked = 1;
+        game.message_flags = 0x40;
+        let mut player = test_player();
+
+        // Case 0 falls into case 1: the pose, the kill and the first advance.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].animation_frame_id, 1, "the entry advances");
+        assert_eq!(
+            game.entities[0].attack_anim, 0,
+            "the attacked flag minus one"
+        );
+        assert_eq!(game.entities[0].death_timer, 0xB4);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(game.entities[0].health, -1, "the bite kills");
+        assert_eq!(game.message_flags & 0x40, 0, "the message bit clears");
+        assert_eq!(game.entities[0].joint_flag(1) & 8, 8, "joint 1's gore flag");
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0);
+
+        // The three-frame clip completes into case 2.
+        run(&mut game, &mut player, &[], &[], &[]);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+
+        // Case 2 recolours and shrinks the death billboard and falls into 3.
+        let (half_x, half_z) = (player.shadow_half_x, player.shadow_half_z);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 3);
+        assert_eq!(game.entities[0].is_being_attacked, 0x80);
+        assert_eq!(player.shadow_tint, 0x00FF_FF50);
+        assert_eq!(player.shadow_half_x, half_x - 200);
+        assert_eq!(player.shadow_half_z, half_z - 200);
+
+        // The 0xB4 countdown arms the fade at 0xA0 and parks at 0x20.
+        game.entities[0].death_timer = 0xA0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert!(game.death_fade_request, "the fade is requested at 0xA0");
+        assert_eq!(game.entities[0].death_timer, 0x9F);
+        assert_eq!(
+            game.entities[0].state(),
+            7,
+            "the countdown is still running"
+        );
+        game.death_fade_request = false;
+        game.entities[0].death_timer = 0x21;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].state(), 4, "the blocked state");
+        assert_eq!(game.entities[0].death_timer, 0x20);
+        assert!(!game.death_fade_request, "0xA0 is long past");
+    }
+
+    /// Plant 42's eat (state 7, animFrameId 8): the grip countdown runs
+    /// damage clip 2, the drop arms and plays the body clip, the damage clip
+    /// runs out into the terminal body playback, and the post-switch drop
+    /// kills the player.
+    #[test]
+    fn the_plant42_eat_runs_its_body_and_damage_clips() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(8);
+        game.entities[0].health = 100;
+        let mut player = test_player();
+
+        // Case 0 falls into case 1: the pose, the cues, the flags and the
+        // grip countdown, whose tick also advances damage clip 2.
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].attack_anim, 2);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        assert_eq!(
+            game.entities[0].action_ticks_counter, 0xE,
+            "the entry tick counts down"
+        );
+        assert_eq!(game.entities[0].flags & 4, 4);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 3),
+            "the grip cue"
+        );
+
+        // The grip runs out and stops advancing the clip.
+        for _ in 0..0xE {
+            run(&mut game, &mut player, &emd, &[], &[]);
+        }
+        assert_eq!(game.entities[0].action_ticks_counter, 0);
+        let frame = game.entities[0].animation_frame_id;
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].animation_frame_id, frame);
+        assert_eq!(game.entities[0].action_state, 1, "the plant writes case 2");
+
+        // Case 2 arms the drop: the body clip is selected, the airborne flag
+        // is raised and the post-switch physics kills the player.
+        game.entities[0].action_state = 2;
+        game.entities[0].pos[1] = -1000;
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 3, "case 2 falls into case 3");
+        assert_eq!(game.entities[0].attack_anim, 0);
+        assert_eq!(game.entities[0].unk_8c, 0xF);
+        assert_eq!(game.entities[0].health, -1, "the drop kills");
+        assert_eq!(player.clip_source, ClipSource::Emd, "the body bank");
+        assert_eq!(player.anim.clip, 0);
+
+        // Cases 4/5 run the damage clip out into case 6.
+        game.entities[0].action_state = 4;
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 5);
+        assert_eq!(game.entities[0].unk_8c, 3);
+        run(&mut game, &mut player, &emd, &[], &[]);
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 6);
+        assert_eq!(player.clip_source, ClipSource::Damage);
+
+        // Case 6 holds the body playback.
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].action_state, 6);
+        assert_eq!(player.clip_source, ClipSource::Emd);
+        assert_eq!(player.anim.clip, 0);
+    }
+
+    /// The Plant 42 drop's bounce: the body falls from the held height, the
+    /// kill lands on the first airborne frame, and the ground bounce returns
+    /// to the case-4 body playback with the 30-unit slide.
+    #[test]
+    fn the_plant42_drop_bounces_off_the_ground() {
+        let emd = vec![clip(0x40, 1); 4];
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 3)));
+        game.entities[0].set_ignore(8);
+        game.entities[0].health = 100;
+        game.entities[0].action_state = 2;
+        game.entities[0].pos = [0, 0, 0];
+        let mut player = test_player();
+        // One tick arms the drop from ground level; the body falls and
+        // bounces back into the case-4 body playback.
+        for _ in 0..200 {
+            run(&mut game, &mut player, &emd, &[], &[]);
+            if game.entities[0].pos[1] == 0x28A {
+                break;
+            }
+        }
+        assert_eq!(game.entities[0].health, -1);
+        assert_eq!(game.entities[0].pos[1], 0x28A, "the bounce lands at 650");
+        assert_eq!(
+            game.entities[0].action_state, 4,
+            "the bounce re-arms case 4"
+        );
+        assert_ne!(game.entities[0].move_speed_current, 0);
+    }
+
+    /// The Neptune devour (state 7, animFrameId 0x0B): clip 3 plays and its
+    /// last frame clamps back to 13; case 2 raises the grabbed zone flag.
+    #[test]
+    fn the_neptune_devour_clamps_its_last_frame_and_holds() {
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(5, 0x20)));
+        game.entities[0].set_ignore(0x0B);
+        let mut player = test_player();
+
+        // Case 0 selects clip 3 and the swallowed pose without advancing.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].attack_anim, 3);
+        assert_eq!(game.entities[0].is_being_attacked, 1);
+        assert_eq!(game.entities[0].unk_8c, 0);
+
+        // Case 1 advances clip 3; the last frame clamps back to 13.
+        game.entities[0].animation_frame_id = 13;
+        game.entities[0].timing_control = 0;
+        game.entities[0].blend_counter = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(
+            game.entities[0].animation_frame_id, 13,
+            "frame 14 clamps back"
+        );
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 3);
+
+        // Case 2 raises the grabbed zone flag.
+        game.entities[0].action_state = 2;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].zone_flags & 0x80, 0x80);
+    }
+
+    /// The Tyrant impale (state 7, animFrameId 0x0C): the entry pins the pose
+    /// and flags, the clip's root vertex carries the grab offsets, and the
+    /// completion kills.
+    #[test]
+    fn the_tyrant_impale_applies_root_motion_and_kills() {
+        let mut game = test_game(7, 0, 0);
+        game.player_damage = Some(Arc::new(damage_bank(4, 0x40)));
+        game.entities[0].set_ignore(0x0C);
+        game.entities[0].health = 100;
+        game.entities[0].unk_c6 = 100;
+        game.entities[0].unk_c8 = 200;
+        game.entities[0].pos = [1, 0, 2];
+        let mut player = test_player();
+        player.pos = [1, 0, 2];
+
+        // Case 0 pins the pose and the flags; no clip advance.
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1);
+        assert_eq!(game.entities[0].attack_anim, 2);
+        assert_eq!(game.entities[0].is_being_attacked, 0x80);
+        assert_eq!(game.entities[0].flags & 6, 6);
+        assert_eq!(game.entities[0].animation_frame_id, 0);
+        assert_eq!(game.entities[0].unk_bf, 0);
+        assert_eq!(game.entities[0].unk_8c, 0);
+
+        // Case 1 at frame 8: the cue, the root vertex and the clip advance.
+        game.entities[0].animation_frame_id = 8;
+        game.entities[0].timing_control = 0;
+        game.entities[0].blend_counter = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(
+            game.entities[0].pos,
+            [100, 0, 200],
+            "the root vertex carries the grab offsets"
+        );
+        assert_eq!(player.pos, game.entities[0].pos);
+        assert!(
+            game.entity_sounds.iter().any(|sound| sound.bank == 3),
+            "the impale cue"
+        );
+        assert_eq!(player.clip_source, ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2);
+
+        // The clip's last frame completes into case 2, which kills.
+        game.entities[0].animation_frame_id = 0x3F;
+        game.entities[0].timing_control = 0;
+        game.entities[0].blend_counter = 0;
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 2);
+        run(&mut game, &mut player, &[], &[], &[]);
+        assert_eq!(game.entities[0].health, -1);
     }
 
     /// Plant 42's acid spit writes player state 2 / behavior 0x64; the

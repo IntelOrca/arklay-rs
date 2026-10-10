@@ -3256,6 +3256,12 @@ pub struct GameState {
     /// windows play their clips from here; `None` (no enemy model with a
     /// second bank has loaded yet) falls back to the body bank.
     pub player_damage: Option<std::sync::Arc<PlayerDamageBank>>,
+    /// A scripted death asked for the white death fade ahead of the 90-frame
+    /// delay: the original's `player_anim_dispatch_4c2ac8` case 3 calls
+    /// `fade_update` at `unk_bc == 0xA0`. The engine's game-over machine
+    /// consumes it and arms the fade at once (a fade already running makes it
+    /// a no-op, like the original's `g_fading_state` guard).
+    pub death_fade_request: bool,
     /// The grab speed vector the plant's hold behaviours write onto the player
     /// (`g_playerEntity.speed.y/z/pad`), added to the player position by
     /// [`GameState::add_player_speed`].
@@ -3534,6 +3540,7 @@ impl Default for GameState {
             tyrant: crate::enemy::tyrant::TyrantState::default(),
             player_attacker: None,
             player_damage: None,
+            death_fade_request: false,
             player_speed: [0; 3],
             web_cap_logged: false,
             enemy_count: 0,

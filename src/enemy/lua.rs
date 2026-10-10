@@ -12004,6 +12004,41 @@ mod cerberus_tests {
             game.entity_sounds.iter().any(|sound| sound.bank == 3),
             "the 3D kill cue at the player"
         );
+
+        // The mauled player's own state-7 window runs the recovery: the
+        // damage bank's clip 2 is selected, and its completion spins the
+        // facing into the terminal state.
+        game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+            keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+            clips: std::sync::Arc::new(
+                (0..4)
+                    .map(|_| crate::model::Clip {
+                        frames: (0..3)
+                            .map(|_| crate::model::ClipFrame {
+                                keyframe: 0,
+                                timing: 1,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }));
+        game.entities[0].health = 100;
+        game.entities[0].action_state = 0;
+        game.entities[0].angle = 0;
+        let mut player = crate::player::spawn(game.id, &RoomState::default());
+        player.pos = game.entities[0].pos;
+        crate::player_script::update(&mut game, &mut player, &dog_room(), &[], &[], &[]);
+        assert_eq!(game.entities[0].action_state, 1, "the recovery entry");
+        assert_eq!(game.entities[0].attack_anim, 2, "the maul recovery clip");
+        crate::player_script::update(&mut game, &mut player, &dog_room(), &[], &[], &[]);
+        assert_eq!(player.clip_source, crate::player::ClipSource::Damage);
+        assert_eq!(player.anim.clip, 2);
+        for _ in 0..2 {
+            crate::player_script::update(&mut game, &mut player, &dog_room(), &[], &[], &[]);
+        }
+        assert_eq!(game.entities[0].action_state, 2, "the maul parks");
+        assert_eq!(game.entities[0].angle, 0x800, "the facing spins");
     }
 
     #[test]
@@ -13237,6 +13272,33 @@ mod hunter_tests {
             [100 + rx, 0, 200 + rz, 0],
             "the held head follows the mouth joint"
         );
+
+        // The bitten player's own state-7 window is the pounce death: the
+        // entry kills, latches the fall countdown and advances the damage
+        // clip.
+        game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+            keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+            clips: std::sync::Arc::new(
+                (0..4)
+                    .map(|_| crate::model::Clip {
+                        frames: (0..3)
+                            .map(|_| crate::model::ClipFrame {
+                                keyframe: 0,
+                                timing: 1,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }));
+        let mut player = crate::player::spawn(game.id, &RoomState::default());
+        player.pos = game.entities[0].pos;
+        crate::player_script::update(&mut game, &mut player, &room(), &[], &[], &[]);
+        assert_eq!(game.entities[0].health, -1, "the pounce bite kills");
+        assert_eq!(game.entities[0].death_timer, 0xB4, "the fall countdown");
+        assert_eq!(game.entities[0].attack_anim, 0);
+        assert_eq!(player.clip_source, crate::player::ClipSource::Damage);
+        assert_eq!(player.anim.clip, 0);
     }
 
     #[cfg(feature = "lua")]
@@ -15350,6 +15412,57 @@ mod computer_arms_tests {
         }
 
         #[test]
+        fn plant42_kill_feeds_the_player_into_the_eat_window() {
+            let pack = pack();
+            let mut game = plant(0);
+            let mut host = LuaEnemyHost::new();
+            head_low(&mut game);
+            assert!(step(&mut host, &mut game, &pack)); // init
+            // Park the kill at its random-turn sub-state with the timer
+            // expiring, which opens the player's eat window.
+            game.entities[1].state_field = 1;
+            game.entities[1].set_ignore(1);
+            game.entities[1].action_behavior = 8;
+            game.entities[1].action_state = 2;
+            game.entities[1].set_p42_grab_joint(15);
+            game.entities[1].set_p42_ticks(0);
+            head_low(&mut game);
+            assert!(step(&mut host, &mut game, &pack));
+            let player = game.entities[0];
+            assert_eq!(player.state(), 7, "the eat window");
+            assert_eq!(player.ignore(), 8, "the eat frame");
+            assert_eq!(player.action_behavior, 0);
+            assert_eq!(player.action_state, 0);
+
+            // The player's own state-7 window pins the eaten pose, plays the
+            // cues and raises the flags.
+            game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+                keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+                clips: std::sync::Arc::new(
+                    (0..4)
+                        .map(|_| crate::model::Clip {
+                            frames: (0..3)
+                                .map(|_| crate::model::ClipFrame {
+                                    keyframe: 0,
+                                    timing: 1,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
+            }));
+            let mut player_state = crate::player::spawn(game.id, &RoomState::default());
+            player_state.pos = game.entities[0].pos;
+            crate::player_script::update(&mut game, &mut player_state, &room(), &[], &[], &[]);
+            assert_eq!(game.entities[0].action_state, 1);
+            assert_eq!(game.entities[0].attack_anim, 2, "the eaten clip");
+            assert_eq!(game.entities[0].action_ticks_counter, 0xE);
+            assert_eq!(game.entities[0].flags & 4, 4);
+            assert_eq!(player_state.clip_source, crate::player::ClipSource::Damage);
+            assert_eq!(player_state.anim.clip, 2);
+        }
+
+        #[test]
         fn plant42_award_kill_raises_the_flag_and_withers_the_slots() {
             let pack = pack();
             let mut game = plant(0);
@@ -16386,6 +16499,38 @@ mod computer_arms_tests {
             assert_eq!(player.animation_id, 7);
             assert_eq!(game.player_attacker, Some(2));
             assert_eq!(game.entities[2].ty_hit_mask(), 0);
+
+            // The impaled player's own state-7 window pins the pose and
+            // raises the attack/combat flags.
+            game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+                keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+                clips: std::sync::Arc::new(
+                    (0..4)
+                        .map(|_| crate::model::Clip {
+                            frames: (0..0x40)
+                                .map(|_| crate::model::ClipFrame {
+                                    keyframe: 0,
+                                    timing: 1,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
+            }));
+            let mut player_state = crate::player::spawn(game.id, &RoomState::default());
+            player_state.pos = game.entities[0].pos;
+            crate::player_script::update(
+                &mut game,
+                &mut player_state,
+                &RoomState::default(),
+                &[],
+                &[],
+                &[],
+            );
+            assert_eq!(game.entities[0].action_state, 1);
+            assert_eq!(game.entities[0].attack_anim, 2, "the impale clip");
+            assert_eq!(game.entities[0].is_being_attacked, 0x80);
+            assert_eq!(game.entities[0].flags & 6, 6);
         }
 
         // -----------------------------------------------------------------
