@@ -157,3 +157,53 @@ fn the_packed_tables_drive_a_deterministic_hit() {
     }
     assert_eq!(outcome[0], outcome[1], "the fire entry is deterministic");
 }
+
+/// The dining room's zombies install the damage bank and a latched bite plays
+/// it: the player's state-5 window runs the real 4-direction bite clips the
+/// zombie model ships in its second EDD chunk.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room101_zombie_bite_plays_the_damage_bank() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("101").unwrap();
+    let run = arklay::engine::simulate_room_prepared(
+        &pack,
+        id,
+        &[],
+        3,
+        |game, player| {
+            // Latch the player the way the zombie's attack does, before the
+            // first tick loads the enemy model.
+            let pos = game.entities[0].pos;
+            game.entities[0].set_state(5);
+            game.entities[0].set_ignore(0);
+            game.entities[0].attack_anim = 0;
+            game.entities[0].is_being_attacked = 1;
+            game.entities[0].unk_c6 = pos[0] as i16 as u16;
+            game.entities[0].unk_c8 = pos[2] as i16 as u16;
+            player.pos = pos;
+        },
+        |_| player::Input::default(),
+    )
+    .unwrap();
+
+    let bank = run
+        .game
+        .player_damage
+        .as_ref()
+        .expect("the loaded zombie model repoints the damage scratch pair");
+    assert_eq!(
+        bank.clips.len(),
+        12,
+        "4 bite directions x hold/loop/break-free"
+    );
+    assert_eq!(
+        run.player.clip_source,
+        arklay::player::ClipSource::Damage,
+        "the bite plays from the damage bank"
+    );
+    assert_eq!(run.player.anim.clip, 0, "direction 0's grabbed clip");
+}

@@ -683,6 +683,22 @@ E11b closed the health-byte aliasing site: the engine mirrors
 physics each tick, so a script that clears the spawn's `0x10` bit stops
 skipping the shape-5 floor volumes exactly like the original.
 
+The player's reaction windows are complete. The EMD directory's first chunk
+(the original's damage scratch pair, `emdScratchPtr1/2`) is parsed as
+`Emd::damage_clips`; the model loader repoints `GameState::player_damage` at
+the last loaded monster model, exactly like the original's global pointer, and
+`ClipSource::Damage` poses those clips on the player's own skeleton. All
+thirteen entries of the original's animation-function table run: the zombie
+bite and wasp pin (state 5), the monster plant, Plant 42, Tyrant, crow,
+chimera and Neptune holds (state 6), and the hound maul, hunter pounce, Plant
+42 eat, Neptune devour and Yawn swallow (state 7), plus the state-2 hit
+reactions from the same bank. The Lua surface writes the original's field
+pairs (`set_player_animation`/`player_state`/`player_anim_frame_id` at
+`+0x84`, `player_attack_anim` at `+0xBD`), so a bite, grab or strike plays its
+recorded clips and always releases the player. The per-joint tints, joint
+billboards and joint-velocity physics those handlers use in the original stay
+the documented render-contract approximations.
+
 ## Road to enemies
 
 The enemy milestone is complete. Every monster id the corpus spawns is

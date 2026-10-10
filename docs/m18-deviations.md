@@ -109,9 +109,10 @@ reasons:
 - **The Plant 42 DIED-screen pose.** The original's screen special-cases a
   player killed by the monster plant (enemy id `0x08` with its death-animation
   flag): joints 0 and 2 are hidden, only the torso draws, and a fixed
-  rotation/offset is applied. The port does not model the plant's five-state
-  kill animation (`player_anim_dispatch_4c2ac8`) or its flag yet, so the
-  standard corpse draws in that case. The head one-shot still applies.
+  rotation/offset is applied. The player's eat machine
+  (`player_anim_dispatch_4ba360`) now runs, but the port has no
+  `g_deathAnimationFlag` field for the screen to read, so the standard corpse
+  draws in that case. The head one-shot still applies.
 - **The attract-demo and countdown death branches.** The machine wires the
   `MSF2_ATTRACT_DEMO`/`MSF2_DEATH_VARIANT` skips and the room dispatch
   exactly, but the port has no attract-demo replay and no self-destruct

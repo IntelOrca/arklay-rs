@@ -497,26 +497,31 @@ identically:
   150-frame poison timer.
 - `e:grab_player()` is the wasp grab pose: both the player's and the calling
   entity's animation offsets latch to the player's X/Z, and the player enters
-  the grabbed animation (attacked flag, animation id 5, frame 7).
-- `e:set_player_animation(id, frame)` and `e:set_player_action(behavior,
-  state)` write the player's animation words an attack overrides (e.g. the
-  sting kill's `200` behavior). The adder's bite writes only the behavior
-  byte, so `e.player_action_behavior` and `e.player_action_state` expose the
-  two bytes individually as well.
+  the grabbed animation (attacked flag, animation id 5, animFrameId 7, the
+  state-5 window's crawl pin).
+- `e:set_player_animation(id, frame)` writes the player's `animationId`/
+  `animFrameId` bytes at `+0x84` (the state and ignore bytes, selecting the
+  reaction window) and `e:set_player_action(behavior, state)` the behavior and
+  action-state bytes (e.g. the sting kill's `200` behavior). The adder's bite
+  writes only the behavior byte, so `e.player_action_behavior` and
+  `e.player_action_state` expose the two bytes individually as well.
 - `e:player_mashing()` is `GetPlayerInputMasked`: true while any d-pad
   direction or face button is held (the crow grab's struggle-shake gate).
 - Properties: `e.player_health` (i16, read/write), `e.player_attacked`,
   `e.player_health_status`, `e.player_poison_timer` (read-only),
   `e.player_angle` (the facing a grab latches; writable),
   `e.player_move_speed` (read-only, the knockdown crush's "moving" gate),
-  `e.player_animation_id` and `e.player_animation_frame_id` (read-only, the
-  perched crow's scatter cue and the grab peck cadence),
+  `e.player_animation_id` (read-only, the original's `animationId`, i.e. the
+  state byte the perched crow's scatter cue reads) and
+  `e.player_animation_frame_id` (read-only, the clip's current frame, the grab
+  peck cadence),
   `e.second_playthrough` (read-only, `g_ScenarioFlags` bit `0x7B`, selecting
   the sting's and grab's harder damage rows) and the animation words above.
   The zombie bite writes the player's own state and attack words:
   `e.player_state`/`e.player_anim_frame_id` (read/write, the `animationId`/
-  `animFrameId` bytes at `+0x84`), `e.player_attack_anim` (`attackAnim`),
-  `e.player_attack_direction` (the `+0xC4` word) and `e.player_attack_timer`
+  `animFrameId` bytes at `+0x84`), `e.player_attack_anim` (`attackAnim`; its
+  setter mirrors the clip id the reaction windows advance), `e.player_attack_direction`
+  (the `+0xC4` word) and `e.player_attack_timer`
   (the `+0xE2` word the bite reads back), and `e:snap_grab()` pins the
   player's grab offsets to the zombie's root-motion vertex. The hound's bite
   and maul additionally write the player's `PlayerEntity` flags byte
@@ -552,6 +557,29 @@ the shake yaw with `e:yawn_capture_rotate_y(angle)`, stepped with
 `e:yawn_capture_t_step(dx, dy, dz)` and re-applied through the head joint with
 `e:yawn_hold_player()` (writes the player position and raises the grabbed zone
 bit).
+
+Every other reaction entry the original's animation-function table populates
+is wired too, and the clips play from the loaded enemy model's second EDD
+chunk (the damage bank, `emdScratchPtr1/2` in the original):
+
+- State 5 (`e.player_state = 5`): the zombie's bite writes `animFrameId 0`
+  and `e.player_attack_anim` (0/3/6/9 by attacking direction); the recoil
+  machine snaps the player to the grab offsets, plays the hold/loop clips and
+  plays the break-free clip when the zombie flags `e.player_action_state = 3`.
+  The wasp's grab writes `animFrameId 7` (the crawl pin), which plays damage
+  clip 0 out.
+- State 6 (`e.player_state = 6`): besides the plant/Plant 42/Tyrant entries,
+  the crow's peck-grab writes `animFrameId 5` (three clips, released by the
+  crow's own `e.player_action_state = 4`), the chimera's grabhold writes
+  `animFrameId 9` (the mash meter runs the maul, the reverse weapon-EMW
+  recovery and the low-health death pool) and Neptune's jaw writes
+  `animFrameId 0x0B`.
+- State 7 (`e.player_state = 7`): the hound's maul writes `animFrameId 2`
+  (the recovery clip and spin), the hunter's pounce bite writes `animFrameId
+  6` (the kill, the ground pool and the scripted death fade), Plant 42's eat
+  writes `animFrameId 8` (body/damage clip phases with the drop and bounce),
+  Neptune's devour writes `animFrameId 0x0B` and the Tyrant's impale writes
+  `animFrameId 0x0C` (the kill).
 
 ### Plant 42's companion arena and custom animator
 

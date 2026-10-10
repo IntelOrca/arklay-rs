@@ -116,7 +116,11 @@ One gameplay tick (`engine::tick_room`) runs this fixed order:
    otherwise the state-1 entry checks (`player_script::control_gate`: death,
    hit pre-emption, poison) run before `weapons::update` (the aim/fire/reload
    machine when a weapon is raised, otherwise the locomotion fall-through into
-   `player::update_with_room`).
+   `player::update_with_room`). States 2 and 5-7 are the original's hit and
+   animation windows: the attacker-written `animFrameId` selects a handler and
+   the reaction clips play from `GameState::player_damage`, the damage scratch
+   pair repointed at the last loaded enemy model's second EDD chunk
+   (`ClipSource::Damage`).
 8. Effect pool update (`game.tick_effects`).
 9. Room action probe and object update (probes read the frame's final state).
 10. Camera cut switch and mask/shadow bookkeeping.
