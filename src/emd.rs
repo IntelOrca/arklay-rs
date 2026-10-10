@@ -44,6 +44,15 @@ pub fn parse(data: &[u8]) -> Result<Emd> {
     let skeleton = parse_skeleton(data, emr_offset, edd_offset)?;
     let keyframes = parse_keyframes(data, emr_offset, edd_offset)?;
     let clips = parse_clips(data, edd_offset, tmd_offset)?;
+    // The directory's first chunk is the damage-scratch bank the original
+    // points `emdScratchPtr2` at (`(dir[0] & ~3) + file base`, bounded by the
+    // EMR chunk). A zero offset leaves the player's pointers untouched.
+    let damage_offset = directory[0] & !3;
+    let damage_clips = if damage_offset != 0 && damage_offset < emr_offset {
+        parse_clips(data, damage_offset, emr_offset)?
+    } else {
+        Vec::new()
+    };
     let mesh = tmd::parse(
         data.get(tmd_offset..)
             .context("EMD mesh offset is out of range")?,
@@ -57,6 +66,7 @@ pub fn parse(data: &[u8]) -> Result<Emd> {
         skeleton,
         keyframes,
         clips,
+        damage_clips,
         mesh,
         texture,
     })
@@ -533,6 +543,48 @@ mod tests {
         assert_eq!(emd.texture.indices, [0, 1]);
         assert_eq!(emd.texture.palette(0, 0), [255, 0, 0, 255]);
         assert_eq!(emd.texture.palette(0, 1), [0, 255, 0, 255]);
+        assert!(
+            emd.damage_clips.is_empty(),
+            "a zero directory[0] has no damage bank"
+        );
+    }
+
+    #[test]
+    fn parses_the_emd_damage_bank() {
+        // The directory's first chunk sits before the EMR header and carries
+        // the player's reaction clips; a non-zero offset selects it.
+        let mut data = vec![0u8; 0x10];
+        let damage_offset = data.len();
+        data.extend_from_slice(&minimal_edd());
+        let emr_offset = data.len();
+        data.extend_from_slice(&minimal_emr());
+        let edd_offset = data.len();
+        data.extend_from_slice(&minimal_edd());
+        let tmd_offset = data.len();
+        data.extend_from_slice(&minimal_tmd());
+        let tim_offset = data.len();
+        data.extend_from_slice(&minimal_tim());
+        for value in [
+            damage_offset as u32,
+            emr_offset as u32,
+            edd_offset as u32,
+            tmd_offset as u32,
+            tim_offset as u32,
+        ] {
+            data.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let emd = parse(&data).unwrap();
+
+        assert_eq!(emd.damage_clips.len(), 1);
+        assert_eq!(
+            emd.damage_clips[0].frames,
+            [ClipFrame {
+                keyframe: 0,
+                timing: 7
+            }]
+        );
+        assert_eq!(emd.clips.len(), 1, "the main bank is still parsed");
     }
 
     #[test]
@@ -700,6 +752,10 @@ mod tests {
             assert_eq!(emd.skeleton.children.len(), 15, "{name}: child list count");
             assert_eq!(emd.keyframes.len(), 123, "{name}: keyframe count");
             assert_eq!(emd.clips.len(), 35, "{name}: clip count");
+            assert!(
+                emd.damage_clips.is_empty(),
+                "{name}: player models ship no damage bank"
+            );
             assert_eq!(
                 (emd.texture.width, emd.texture.height),
                 (256, 256),
@@ -707,6 +763,34 @@ mod tests {
             );
             assert_eq!(emd.texture.palettes.len(), 512, "{name}: palette size");
             assert_eq!(prims, triangles, "{name}: triangle count");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
+    fn parses_real_enemy_damage_banks() {
+        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        // The zombie ships the 4 bite directions x hold/loop/break-free; the
+        // dog and crow the three reaction clips their handlers use.
+        let cases = [
+            ("Em1000.emd", 12),
+            ("EM1002.EMD", 3),
+            ("EM1005.EMD", 3),
+            ("Em1006.emd", 3),
+        ];
+        for (name, clips) in cases {
+            let path = real_file(&root, "ENEMY", name)
+                .unwrap_or_else(|| panic!("{name} not found under {}", root.display()));
+            let data = std::fs::read(&path).unwrap();
+            let emd = parse(&data).unwrap();
+            assert_eq!(emd.damage_clips.len(), clips, "{name}: damage clip count");
+            assert!(
+                !emd.clips.is_empty(),
+                "{name}: the main bank is still parsed"
+            );
         }
     }
 

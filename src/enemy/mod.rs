@@ -235,6 +235,30 @@ impl EntityModelCache {
     }
 }
 
+/// Repoint the player's damage scratch pair at a freshly loaded enemy model,
+/// the original's `LoadEntityEMD` store at `EntityModelLoader.cpp:555-558`.
+/// The last model with a second bank wins; a model without one leaves the
+/// pair untouched, exactly like the original's `if (*puVar2 != 0)` guard.
+pub(crate) fn note_player_damage_bank(
+    game: &mut GameState,
+    model: Option<&Emd>,
+    keyframes: Option<Arc<Vec<Keyframe>>>,
+) {
+    let Some(model) = model else {
+        return;
+    };
+    let Some(keyframes) = keyframes else {
+        return;
+    };
+    if model.damage_clips.is_empty() {
+        return;
+    }
+    game.player_damage = Some(Arc::new(crate::game::PlayerDamageBank {
+        keyframes,
+        clips: Arc::new(model.damage_clips.clone()),
+    }));
+}
+
 /// One native update per active entity slot, called after the event VM and
 /// before the player's physics mirror. Returns the number of slots updated.
 ///
@@ -262,7 +286,8 @@ pub fn update_all(
         if id < CHARACTER_ID_MIN {
             let model = models.get(pack, id, player);
             if let Some(keyframes) = models.keyframes(pack, id, player) {
-                game.entity_anims[slot].keyframes = Some(keyframes);
+                game.entity_anims[slot].keyframes = Some(Arc::clone(&keyframes));
+                note_player_damage_bank(game, model.as_deref(), Some(keyframes));
             }
             if let Some(skeleton) = models.skeleton(pack, id, player) {
                 game.entity_anims[slot].skeleton = Some(skeleton);
@@ -401,6 +426,47 @@ pub(crate) fn live_look_at_target(game: &GameState, slot: usize) -> Option<[i32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn model_with_damage(clips: usize) -> Emd {
+        Emd {
+            skeleton: crate::model::Skeleton::default(),
+            keyframes: vec![Keyframe::default()],
+            clips: Vec::new(),
+            damage_clips: vec![Clip::default(); clips],
+            mesh: crate::model::Tmd::default(),
+            texture: crate::model::Texture8 {
+                width: 0,
+                height: 0,
+                indices: Vec::new(),
+                palettes: Vec::new(),
+                stp: Vec::new(),
+            },
+        }
+    }
+
+    /// The damage-scratch store: a model with a second bank repoints the
+    /// player pair; one without leaves the last bank in place.
+    #[test]
+    fn a_model_with_a_damage_bank_repoints_the_player_pair() {
+        let mut game = GameState::default();
+        let keyframes = Arc::new(vec![Keyframe::default()]);
+        note_player_damage_bank(
+            &mut game,
+            Some(&model_with_damage(2)),
+            Some(Arc::clone(&keyframes)),
+        );
+        let bank = game.player_damage.as_ref().expect("the bank is set");
+        assert_eq!(bank.clips.len(), 2);
+        assert!(Arc::ptr_eq(&bank.keyframes, &keyframes));
+
+        let plain = model_with_damage(0);
+        note_player_damage_bank(&mut game, Some(&plain), Some(keyframes));
+        assert_eq!(
+            game.player_damage.as_ref().unwrap().clips.len(),
+            2,
+            "a model without a second bank leaves the pair untouched"
+        );
+    }
 
     #[test]
     fn live_look_at_target_follows_the_named_entity() {

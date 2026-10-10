@@ -2010,6 +2010,9 @@ fn bank_clips<'a>(
         ClipSource::Emw => emw,
         ClipSource::Room => room,
         ClipSource::Weapon => &[],
+        // The damage bank is resolved from `GameState::player_damage`; the
+        // state machine paths that play from it do not go through this helper.
+        ClipSource::Damage => &[],
     }
 }
 

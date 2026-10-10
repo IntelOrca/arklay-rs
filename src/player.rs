@@ -258,6 +258,10 @@ pub enum ClipSource {
     Room,
     /// The equipped weapon's `W*.EMW` (aim, fire, reload motions).
     Weapon,
+    /// The damage scratch pair: the reaction clips of the most recently loaded
+    /// enemy model (hit, bite and grab holds), posed on the player's own
+    /// skeleton with that model's keyframes.
+    Damage,
 }
 
 /// Room-animation clip of the push wind-up (the original's `attackAnim 0x30`).
@@ -738,6 +742,8 @@ impl PlayerState {
             ClipSource::Room => self.anim.update(room_clips),
             // The weapon machine advances the weapon bank itself.
             ClipSource::Weapon => false,
+            // The scripted reaction windows advance the damage bank themselves.
+            ClipSource::Damage => false,
         }
     }
 
@@ -847,6 +853,7 @@ impl PlayerState {
             ClipSource::Emw => emw_clips,
             ClipSource::Room => room_clips,
             ClipSource::Weapon => return,
+            ClipSource::Damage => return,
         };
         let Some(clip) = clips.get(rule.clip) else {
             return;
@@ -2264,6 +2271,7 @@ mod tests {
             ClipSource::Emw => emw,
             ClipSource::Room => &[],
             ClipSource::Weapon => &[],
+            ClipSource::Damage => &[],
         };
         player.anim.pose_keyframe(clips, keyframes).unwrap()
     }

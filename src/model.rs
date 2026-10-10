@@ -128,6 +128,11 @@ pub struct Emd {
     pub skeleton: Skeleton,
     pub keyframes: Vec<Keyframe>,
     pub clips: Vec<Clip>,
+    /// The EMD directory's first chunk: the second EDD clip bank the original
+    /// loads into the player's damage scratch pair (`emdScratchPtr1/2`). On
+    /// enemy models it carries the player's hit/bite/grab reaction clips; the
+    /// player models ship no second bank and parse an empty list.
+    pub damage_clips: Vec<Clip>,
     pub mesh: Tmd,
     pub texture: Texture8,
 }

@@ -658,7 +658,9 @@ fn capture_player_partway_up_the_lab_stairway() {
     let lighting = Lighting::from_room(&room);
     let entity = anim::entity_matrix(player.pos, player.angle);
     let (keyframes, clips) = match player.clip_source {
-        ClipSource::Emd | ClipSource::Room | ClipSource::Weapon => (&emd.keyframes, &emd.clips),
+        ClipSource::Emd | ClipSource::Room | ClipSource::Weapon | ClipSource::Damage => {
+            (&emd.keyframes, &emd.clips)
+        }
         ClipSource::Emw => (&emw.keyframes, &emw.clips),
     };
     let keyframe = &keyframes[player.anim.keyframe_index(clips)];

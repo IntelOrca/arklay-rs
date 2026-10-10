@@ -7343,6 +7343,18 @@ fn render_frame(
                     &assets.emd.clips,
                 ),
             },
+            player::ClipSource::Damage => match &game.player_damage {
+                Some(bank) => (
+                    &assets.emd.skeleton,
+                    bank.keyframes.as_ref(),
+                    bank.clips.as_ref(),
+                ),
+                None => (
+                    &assets.emd.skeleton,
+                    &assets.emd.keyframes,
+                    &assets.emd.clips,
+                ),
+            },
         };
         // The blended pose the clock shows for the applied frame, then the
         // tracking joint's aim composed onto it.
@@ -10173,9 +10185,10 @@ mod tests {
         assert!(!cut.masks.is_empty(), "room 1000 cut 0 has mask sprites");
         let assets = loaded.player_assets.as_ref().expect("player assets");
         let (keyframes, clips) = match player_state.clip_source {
-            player::ClipSource::Emd | player::ClipSource::Room | player::ClipSource::Weapon => {
-                (&assets.emd.keyframes, &assets.emd.clips)
-            }
+            player::ClipSource::Emd
+            | player::ClipSource::Room
+            | player::ClipSource::Weapon
+            | player::ClipSource::Damage => (&assets.emd.keyframes, &assets.emd.clips),
             player::ClipSource::Emw => (&assets.emw.keyframes, &assets.emw.clips),
         };
         let keyframe = &keyframes[player_state.anim.keyframe_index(clips)];
@@ -12075,6 +12088,7 @@ end
                 skeleton: Skeleton::default(),
                 keyframes: keyframes.clone(),
                 clips: clip_bank(0x24),
+                damage_clips: Vec::new(),
                 mesh: Tmd::default(),
                 texture: Texture8 {
                     width: 0,
@@ -15541,6 +15555,7 @@ end
                     timing: 1,
                 }],
             }],
+            damage_clips: Vec::new(),
             mesh: Tmd {
                 objects: vec![crate::model::TmdObject {
                     vertices: vec![[0, 0, 0], [1000, 0, 0], [0, 1000, 0]],
