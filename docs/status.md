@@ -688,7 +688,7 @@ The player's reaction windows are complete. The EMD directory's first chunk
 `Emd::damage_clips`; the model loader repoints `GameState::player_damage` at
 the last loaded monster model, exactly like the original's global pointer, and
 `ClipSource::Damage` poses those clips on the player's own skeleton. All
-thirteen entries of the original's animation-function table run: the zombie
+fourteen entries of the original's animation-function table run: the zombie
 bite and wasp pin (state 5), the monster plant, Plant 42, Tyrant, crow,
 chimera and Neptune holds (state 6), and the hound maul, hunter pounce, Plant
 42 eat, Neptune devour and Yawn swallow (state 7), plus the state-2 hit
