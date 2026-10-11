@@ -3635,6 +3635,10 @@ impl App {
                 // session; a missing film falls through directly.
                 if self.films && !self.prologue_pending {
                     self.prologue_pending = true;
+                    // The reference's `DisplayIntroAndStartGame` hard-stops the
+                    // confirmation cue (`sounds_reset`) the moment the film
+                    // starts; the UI mixer is that cue's home.
+                    self.ui_music = None;
                     match self.open_movie(PROLOGUE_ID, character) {
                         Ok(session) => {
                             self.queue_movie(session, Some(ScreenAction::NewGame { character }))
@@ -6559,9 +6563,12 @@ fn tick_room_timed(
 ) -> Option<game::RoomTransition> {
     let update_start = Instant::now();
     // The original publishes the remapped D-pad held/pressed words before the
-    // scripts run, so a `ck_bits` (0x38) condition sees this frame's pad.
+    // scripts run, so a `ck_bits` (0x38) condition sees this frame's pad. The
+    // press edge is the current word minus the previous frame's *raw* word
+    // (`~prevRaw & held`), so the later controls blanking never re-mints a
+    // held button as a fresh press.
     let held = game::dpad_word(&input);
-    let pressed = held & !game::dpad_word(&context.player.input);
+    let pressed = held & !context.game.dpad_held;
     context.game.dpad_held = held;
     context.game.state_words[usize::from(game::STATE_WORD_DPAD_HELD)] = held;
     context.game.state_words[usize::from(game::STATE_WORD_DPAD_PRESSED)] = pressed;
@@ -6619,6 +6626,27 @@ fn tick_room_timed(
     let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
     let state = context.game.entities[0].state();
     let mut pad = input;
+    // The original's `game_loop` blanking (0x00480e89): outside an action
+    // zone, or while the script's controls latch is clear (`set FG_6, 23, 1`
+    // clears `g_message_flags` bit 0x100), the held and pressed pad words are
+    // masked to zero before the player machine, so no direction, run, aim,
+    // fire or action input reaches the locomotion, the weapon machine or the
+    // room-action probe. The scripts still see the raw pad published above.
+    let controls_locked = context.game.entities[0].zone_flags & 0x20 != 0
+        || context.game.message_flags & game::MESSAGE_FLAG_CONTROLS == 0;
+    if controls_locked {
+        pad.up = false;
+        pad.down = false;
+        pad.left = false;
+        pad.right = false;
+        pad.run = false;
+        pad.aim = false;
+        pad.aim_pressed = false;
+        pad.fire = false;
+        pad.fire_pressed = false;
+        pad.action_held = false;
+        pad.action_pressed = false;
+    }
     // The effect-zone flag (raised by the 0x0B handler at the end of the
     // previous probe) halves walk/run speed and the animation cadence this
     // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
@@ -6628,6 +6656,9 @@ fn tick_room_timed(
     // mirror the live status before any physics or scripted movement runs.
     context.player.collision_flags = context.game.health_status;
     context.game.entities[0].collision_flags = context.game.health_status;
+    // The frame-start position the entity/room collision passes anchor their
+    // rollbacks at.
+    let pre_move = context.player.pos;
     if state != 1 || frozen {
         pad.action_pressed = false;
         pad.action_held = false;
@@ -6689,7 +6720,24 @@ fn tick_room_timed(
         };
         crate::weapons::update(context.game, context.player, context.room, &clips, pad);
     }
+    // `update_player_anim`'s tail: the moved player is mirrored onto entity 0,
+    // then `HandleEnemyPlayerCollisions` pushes the player out of every active
+    // entity's SCA volume and the room collision resolves the result with the
+    // frame-start position as its rollback anchor. Skipped in player state 5
+    // (the grab hold), matching the original's `animationId != 5` gate; the
+    // scripted door sequence's other arm never runs the room tick in the port.
     context.game.sync_entity_from_player(context.player);
+    if context.game.entities[0].state() != 5 {
+        enemy::walk::separate_player_from_entities(context.game, pre_move);
+        context.player.pos = player::resolve_collision(
+            &context.room.collision,
+            pre_move,
+            context.game.entities[0].pos,
+            context.player.radius,
+            context.player.collision_flags,
+        );
+        context.game.entities[0].pos = context.player.pos;
+    }
     // The gated reach finished this tick: raise the viewer flag the action
     // entry selects, return the message ready bit and clear the health lock.
     // The end-of-tick item-viewer hook then opens the viewer.
@@ -6718,8 +6766,10 @@ fn tick_room_timed(
     // behaviour does not read a new press.
     let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
     if context.game.entities[0].state() == 1 {
-        let probe_action =
-            input.action_pressed && !frozen && context.player.locked == player::LockedAction::None;
+        let probe_action = input.action_pressed
+            && !controls_locked
+            && !frozen
+            && context.player.locked == player::LockedAction::None;
         let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, context.player.angle, probe_action);
     }
@@ -6815,6 +6865,14 @@ fn update_window_title(
 /// camera-zone walk to re-home there. `None` keeps the current cut when no
 /// position is available yet (room load and capture).
 fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i32; 3]>) {
+    // `game_loop` consumes a pending deferred redisplay before it tests the
+    // zones: the cut the previous frame's walk chose is the one drawn this
+    // frame, and no new switch is tested until the frame after.
+    if game.flags[5].bit(game::MSF_CAMERA_REDRAW) {
+        game.flags[5].apply(game::MSF_CAMERA_REDRAW, 1);
+        room.current_cut = game.camera.current_cut;
+        return;
+    }
     let selected = if game.camera.locked && game.camera.current_cut < room.cuts.len() {
         game.camera.current_cut
     } else if let Some(pos) = pos {
@@ -6822,7 +6880,21 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
     } else {
         room.current_cut
     };
-    game.camera.current_cut = selected;
+    // `check_camera_switch` writes `g_roomCameraId = camTo` and, while
+    // `MSF_CAMERA_DEFER` (a script's `set FG_STATUS, 29, 0`) is set, raises
+    // `MSF_CAMERA_REDRAW` and returns without redisplaying, so the script can
+    // observe the new camera id and react (room 104's `movie_on`) before the
+    // frame switches.
+    if pos.is_some()
+        && selected != game.camera.current_cut
+        && game.flags[5].bit(game::MSF_CAMERA_DEFER)
+        && selected < room.cuts.len()
+    {
+        game.set_camera_cut(selected);
+        game.flags[5].apply(game::MSF_CAMERA_REDRAW, 0);
+        return;
+    }
+    game.set_camera_cut(selected);
     room.current_cut = selected;
 }
 
@@ -9808,8 +9880,8 @@ mod tests {
             texture: Texture8 {
                 width: 1,
                 height: 1,
-                indices: vec![0],
-                palettes: vec![[0, 0, 0, 255]],
+                indices: vec![1],
+                palettes: vec![[0, 0, 0, 255], [0, 0, 0, 255]],
                 stp: Vec::new(),
             },
             orders: [door::Order::default(); door::ORDER_COUNT],
@@ -15575,8 +15647,8 @@ end
             texture: Texture8 {
                 width: 1,
                 height: 1,
-                indices: vec![0],
-                palettes: vec![[200, 80, 80, 255]],
+                indices: vec![1],
+                palettes: vec![[0, 0, 0, 255], [200, 80, 80, 255]],
                 stp: Vec::new(),
             },
         }

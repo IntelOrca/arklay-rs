@@ -901,6 +901,15 @@ impl Framebuffer {
                         let Some(&palette_index) = texture.indices.get(index) else {
                             continue;
                         };
+                        // Palette entry zero is the PSX colour key: the PC's
+                        // model-texture conversion maps an indexed page's
+                        // entry 0 to alpha 0, so the texel is skipped instead
+                        // of painted (the room-105 blood decals' black
+                        // background). The untextured path has no index and
+                        // stays opaque.
+                        if palette_index == 0 {
+                            continue;
+                        }
                         (
                             texture.palette(triangle.palette_row, palette_index),
                             Some(palette_index),
@@ -2653,11 +2662,12 @@ mod tests {
     }
 
     fn solid_texture(pixel: [u8; 4]) -> Texture8 {
+        // Index 0 is the colour key, so the fixture samples entry 1.
         Texture8 {
             width: 1,
             height: 1,
-            indices: vec![0],
-            palettes: vec![pixel],
+            indices: vec![1],
+            palettes: vec![[0, 0, 0, 255], pixel],
             stp: Vec::new(),
         }
     }
@@ -4411,7 +4421,7 @@ mod tests {
         let mut mesh = mesh_at(1000, false);
         mesh.objects[0].prims[0].clut = 0x8000;
         let mut texture = solid_texture([255, 255, 255, 255]);
-        texture.stp = vec![true];
+        texture.stp = vec![false, true];
         let joints = [identity()];
         let lighting = Lighting {
             ambient: [0; 3],
@@ -4549,7 +4559,7 @@ mod tests {
     #[test]
     fn a_record_blend_weight_scales_the_per_texel_mix() {
         let mut texture = solid_texture([255, 255, 255, 255]);
-        texture.stp = vec![true];
+        texture.stp = vec![false, true];
         let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
             position,
             inv_z: 1.0 / 1000.0,

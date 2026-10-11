@@ -2092,14 +2092,14 @@ fn integer_sqrt(value: i32) -> i32 {
     }
 }
 
-/// The shared volume-list resolve. `entity` is the original's `entB` (the one
-/// pushed) and the other entity is `entA`; the original's guards are
-/// `entB->state == 4` (the eating/headless state) and status bit 1 on either
-/// side (the deactivation bit, e.g. the lab power-room Wesker).
+/// The shared volume-list resolve. `own` is the pushed side's volume list
+/// (the original's `entB`) and `other` the pusher's (`entA`); the original's
+/// guards are `entB->state == 4` (the eating/headless state) and status bit 1
+/// on either side (the deactivation bit, e.g. the lab power-room Wesker).
 ///
 /// Both volume lists are walked as nested loops, the other entity's record
 /// outer and the pushed entity's inner, exactly like the original: every
-/// volume pair that overlaps contributes its push to `entity` in order.
+/// volume pair that overlaps contributes its push to `pos` in order.
 ///
 /// The penetration test is the volume model: XZ distance between the two
 /// rotated volume centres against the summed radii, then the vertical centres
@@ -2107,33 +2107,37 @@ fn integer_sqrt(value: i32) -> i32 {
 /// character moved across the other this frame is corrected from the pre-move
 /// `position`, exactly like the original's degenerate-overlap branch. Returns
 /// the pair hit flag.
-fn resolve_sca_collision(
-    entity: &mut Entity,
+#[allow(clippy::too_many_arguments)] // the original's routine takes the pair unpacked
+fn resolve_sca_volumes(
+    own: &[ScaHit],
+    own_angle: u16,
+    pos: &mut [i32; 3],
+    own_state: u8,
+    own_status: u8,
     prev_pos: [i32; 3],
     other_pos: [i32; 3],
     other_angle: u16,
     other: &[ScaHit],
     other_status: u8,
 ) -> bool {
-    if entity.state() == 4 || (entity.status_flags | other_status) & 2 != 0 {
+    if own_state == 4 || (own_status | other_status) & 2 != 0 {
         return false;
     }
 
-    let (own, own_count) = entity_sca_volumes(entity);
     let mut hit = false;
     for a_volume in other {
         let a = a_volume.world_offset(other_angle);
-        for b_volume in &own[..own_count] {
-            let b = b_volume.world_offset(entity.angle);
-            let dx = (b[0] - a[0]) - other_pos[0] + entity.pos[0];
-            let dz = (b[2] - a[2]) - other_pos[2] + entity.pos[2];
+        for b_volume in own {
+            let b = b_volume.world_offset(own_angle);
+            let dx = (b[0] - a[0]) - other_pos[0] + pos[0];
+            let dz = (b[2] - a[2]) - other_pos[2] + pos[2];
             let dist = integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
             let penetration = i32::from(a_volume.radius) + i32::from(b_volume.radius) - (dist + 1);
             if penetration <= 0 {
                 continue;
             }
 
-            let dy = b[1] + (entity.pos[1] - a[1]) - other_pos[1];
+            let dy = b[1] + (pos[1] - a[1]) - other_pos[1];
             let max_height = i32::from(a_volume.half_height) + i32::from(b_volume.half_height);
             if -max_height >= dy || dy >= max_height {
                 continue;
@@ -2151,8 +2155,8 @@ fn resolve_sca_collision(
             if dy2 <= -max_height || max_height <= dy2 {
                 let other_radius = i32::from(a_volume.radius);
                 let pos_xa = other_pos[0];
-                if (prev_pos[0] < pos_xa && pos_xa < entity.pos[0])
-                    || (pos_xa < prev_pos[0] && entity.pos[0] < pos_xa)
+                if (prev_pos[0] < pos_xa && pos_xa < pos[0])
+                    || (pos_xa < prev_pos[0] && pos[0] < pos_xa)
                 {
                     if -push_x < 1 {
                         push_x = -(-push_x + other_radius * 2);
@@ -2161,8 +2165,8 @@ fn resolve_sca_collision(
                     }
                 }
                 let pos_za = other_pos[2];
-                if (prev_pos[2] < pos_za && pos_za < entity.pos[2])
-                    || (pos_za < prev_pos[2] && entity.pos[2] < pos_za)
+                if (prev_pos[2] < pos_za && pos_za < pos[2])
+                    || (pos_za < prev_pos[2] && pos[2] < pos_za)
                 {
                     if -push_z < 1 {
                         push_z = -(-push_z + other_radius * 2);
@@ -2172,10 +2176,89 @@ fn resolve_sca_collision(
                 }
             }
 
-            entity.pos[0] += push_x;
-            entity.pos[2] += push_z;
+            pos[0] += push_x;
+            pos[2] += push_z;
             hit = true;
         }
+    }
+    hit
+}
+
+/// [`resolve_sca_volumes`] with the pushed entity unpacked: its own record
+/// volume list and live state fields.
+fn resolve_sca_collision(
+    entity: &mut Entity,
+    prev_pos: [i32; 3],
+    other_pos: [i32; 3],
+    other_angle: u16,
+    other: &[ScaHit],
+    other_status: u8,
+) -> bool {
+    let (own, own_count) = entity_sca_volumes(entity);
+    let own_angle = entity.angle;
+    let own_state = entity.state();
+    let own_status = entity.status_flags;
+    resolve_sca_volumes(
+        &own[..own_count],
+        own_angle,
+        &mut entity.pos,
+        own_state,
+        own_status,
+        prev_pos,
+        other_pos,
+        other_angle,
+        other,
+        other_status,
+    )
+}
+
+/// `HandleEnemyPlayerCollisions` (0x00489e10) with the player as `ENTITY`:
+/// push the player out of every active entity's SCA volume, in ascending slot
+/// order, anchored at `prev_pos` (the frame-start position the room collision
+/// accepted). This is the mirror of [`separate_all`]: that pass pushes the
+/// character out of the player, this one pushes the player out of the
+/// characters, exactly like the original's shared `ResolveEntityScaCollision`
+/// with `entB = g_playerEntity`.
+///
+/// The player's single volume is the record `check_room_collision` reads its
+/// radius from. The Yawn-only displacement pushback the original also runs in
+/// this function is not ported yet.
+pub fn separate_player_from_entities(game: &mut GameState, prev_pos: [i32; 3]) -> bool {
+    let radius = player_radius(game.id.player_flag);
+    let others: Vec<SeparationTarget> = game
+        .entities
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|(_, other)| other.status_flags != 0)
+        .map(|(_, other)| {
+            (
+                other.pos,
+                other.angle,
+                entity_sca_volumes(other),
+                other.status_flags,
+            )
+        })
+        .collect();
+    let player = &mut game.entities[0];
+    let player_state = player.state();
+    let player_status = player.status_flags;
+    let player_angle = player.angle;
+    let volume = ScaHit::player(radius);
+    let mut hit = false;
+    for (other_pos, other_angle, (other, other_count), other_status) in others {
+        hit |= resolve_sca_volumes(
+            std::slice::from_ref(&volume),
+            player_angle,
+            &mut player.pos,
+            player_state,
+            player_status,
+            prev_pos,
+            other_pos,
+            other_angle,
+            &other[..other_count],
+            other_status,
+        );
     }
     hit
 }
@@ -3067,6 +3150,46 @@ mod tests {
         game.entities[1] = entity([5000, 0, 500], 0, 0);
         game.entities[1].set_active(true);
         assert!(!separate_all(&mut game, 1), "a distant player is no touch");
+    }
+
+    #[test]
+    fn separate_player_from_entities_pushes_the_player_out_of_a_character() {
+        // The player (Chris radius 422) overlapping Barry (radius 422) from
+        // 700 units away is pushed out to the summed radii.
+        let mut game = GameState::default();
+        game.entities[0].pos = [500, 0, 500];
+        game.entities[0].set_active(true);
+        let mut barry = entity([1200, 0, 500], 0, 0);
+        barry.sca_radius = 422;
+        game.entities[1] = barry;
+        game.entities[1].set_active(true);
+
+        assert!(separate_player_from_entities(&mut game, [500, 0, 500]));
+        let distance = game.entities[0].pos[0] - 1200;
+        assert!(
+            distance.abs() >= 422 + 422 - 2,
+            "the player stayed inside Barry's volume: {:?}",
+            game.entities[0].pos
+        );
+
+        // A distant character and an inactive one are both no-ops.
+        let mut game = GameState::default();
+        game.entities[0].pos = [500, 0, 500];
+        let mut far = entity([5000, 0, 500], 0, 0);
+        far.sca_radius = 422;
+        game.entities[1] = far;
+        game.entities[1].set_active(true);
+        assert!(!separate_player_from_entities(&mut game, [500, 0, 500]));
+        assert_eq!(game.entities[0].pos, [500, 0, 500]);
+
+        let mut game = GameState::default();
+        game.entities[0].pos = [500, 0, 500];
+        let mut asleep = entity([500, 0, 500], 0, 0);
+        asleep.sca_radius = 422;
+        asleep.status_flags = 0;
+        game.entities[1] = asleep;
+        assert!(!separate_player_from_entities(&mut game, [500, 0, 500]));
+        assert_eq!(game.entities[0].pos, [500, 0, 500]);
     }
 
     fn blocked_room() -> RoomState {

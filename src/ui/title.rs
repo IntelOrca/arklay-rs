@@ -39,8 +39,6 @@ const PRESS_RAMP_STEP: u8 = 4;
 const PRESS_FULL: u8 = 0x80;
 /// Ticks per PRESS blink phase.
 const BLINK_TICKS: u32 = 32;
-/// Fade step per tick for the screen fades.
-const FADE_STEP: u8 = 8;
 
 /// One prompt row's UV: sheet row, sprite height and descriptor screen-y.
 struct PromptRow {
@@ -111,7 +109,11 @@ impl TitleScreen {
             selection: 1,
             any_saves: false,
             press_brightness: 0,
-            fade: Fade::fade_in(FADE_STEP.into(), 0x7FFF, 2),
+            // The title has no entry fade: the reference only arms the
+            // `0xFC00` black fade-in when the attract demo returns to the
+            // title, which this port does not run. The PRESS brightness ramp
+            // below is the whole entry animation.
+            fade: Fade::inactive(),
             fade_phase: 0,
             ticks: 0,
             exit: None,
@@ -224,7 +226,7 @@ impl Screen for TitleScreen {
         self.any_saves = save::scan_slots(cx.save_dir).iter().any(Option::is_some);
         self.selection = if self.any_saves { 2 } else { 1 };
         self.press_brightness = 0;
-        self.fade = Fade::fade_in(FADE_STEP.into(), 0x7FFF, 2);
+        self.fade = Fade::inactive();
         self.fade_phase = 0;
         self.ticks = 0;
         self.stage = Stage::Press;
@@ -586,9 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn the_fade_in_reaches_clear_and_lifts_the_press_text() {
+    fn the_title_appears_clear_and_ramps_the_press_text() {
         let mut screen = TitleScreen::new();
         let cx = test_context();
+        // No entry fade: the first frame is clear, only the PRESS text ramps.
+        screen.update(&cx, neutral());
+        assert_eq!(screen.fade(), 0);
+        assert_eq!(screen.overlay(), None);
         for _ in 0..64 {
             screen.update(&cx, neutral());
         }

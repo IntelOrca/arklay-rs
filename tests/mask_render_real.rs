@@ -33,11 +33,12 @@ const PLAYER_LIT: [u8; 4] = [199, 39, 39, 255];
 const BACK_INSET: f64 = 1500.0;
 
 fn player_texture() -> Texture8 {
+    // Index 0 is the model-texture colour key, so the stand-in samples entry 1.
     Texture8 {
         width: 1,
         height: 1,
-        indices: vec![0],
-        palettes: vec![PLAYER],
+        indices: vec![1],
+        palettes: vec![[0, 0, 0, 255], PLAYER],
         stp: Vec::new(),
     }
 }

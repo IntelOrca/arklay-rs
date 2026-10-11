@@ -308,22 +308,23 @@ impl ItemViewScreen {
 
     /// Advance the closing animation one frame; returns `true` when it has
     /// finished and the viewer may close.
+    ///
+    /// The original's exit (`FUN_0044e1b0` state 5) dims the item model's three
+    /// viewer lights; it does not paint a screen fade. The engine's menu fade
+    /// (`set_fading(2, 0xC00)` from `menu_exit_cleanup`) is the only screen
+    /// fade after the viewer closes, so the model slides back out over a clear
+    /// screen and the menu fade darkens from there.
     pub fn step_exit(&mut self) -> bool {
         if self.stage != ViewStage::Exit {
             return true;
         }
         self.zoom_timer -= 1;
         if self.zoom_timer <= 0 {
-            self.entry_fade = 255;
             return true;
         }
         self.model_x -= INTRO_ZOOM_STEP;
         self.yaw = (self.yaw - INTRO_YAW_STEP) & 0x0FFF;
         self.roll = (self.roll - INTRO_ROLL_STEP) & 0x0FFF;
-        // The original's exit dims the model's three viewer lights: the
-        // screen fade is the port's stand-in, so it must grow from clear to
-        // black as the timer counts down, never flash bright first.
-        self.entry_fade = (255 - ((self.zoom_timer << 2) - 1)).clamp(0, 255) as u8;
         false
     }
 
@@ -967,24 +968,18 @@ mod tests {
         assert_eq!(screen.yaw, 0, "three whole turns land on the identity");
         assert_eq!(screen.fade(), 0, "the intro reaches full brightness");
 
-        // The exit is the intro in reverse and reports completion. Its fade
-        // grows from clear to black, never flashing bright first.
+        // The exit is the intro in reverse and reports completion. It never
+        // touches the screen fade: the closing sequence slides the model back
+        // out over a clear frame and the engine's menu fade takes over.
         screen.begin_exit();
         assert!(screen.in_exit());
         let mut frames = 0;
-        let mut fade = 0;
         while !screen.step_exit() {
-            assert!(
-                screen.entry_fade >= fade,
-                "the exit fade went backwards: {} after {fade}",
-                screen.entry_fade
-            );
-            fade = screen.entry_fade;
+            assert_eq!(screen.fade(), 0, "the exit must not paint a screen fade");
             frames += 1;
             assert!(frames <= INTRO_FRAMES + 1, "the exit never finished");
         }
-        assert_eq!(fade, 252, "the last step before the close is nearly black");
-        assert_eq!(screen.entry_fade, 255, "the exit reaches full black");
+        assert_eq!(screen.fade(), 0, "the close leaves the screen clear");
         assert_eq!(frames, INTRO_FRAMES - 1);
 
         // A got-item viewer opens the same intro but takes no pad input.

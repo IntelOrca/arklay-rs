@@ -7,7 +7,7 @@ mod common;
 
 use arklay::audio;
 use arklay::enemy::walk::{xz_distance_to, zone_path_find};
-use arklay::engine::{SimulatedRoom, simulate_room_seeded};
+use arklay::engine::{SimulatedRoom, simulate_room_prepared, simulate_room_seeded};
 use arklay::game::GameState;
 use arklay::pack::Pack;
 use arklay::player::{self, Input};
@@ -93,6 +93,47 @@ fn follow_run(name: &str) {
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_room5000_follow_closes_distance_in_the_walk_zones() {
     follow_run("5000");
+}
+
+/// The player is pushed out of a character's SCA volume: walking straight into
+/// ROOM109's Barry stops at the summed radii instead of passing through him.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_player_cannot_walk_through_a_character() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1091").unwrap();
+    let boot = simulate_room_seeded(&pack, id, &[], 1, Input::default()).unwrap();
+    let Some(slot) = character_slot(&boot.game) else {
+        return;
+    };
+    let npc = boot.game.entities[slot].pos;
+    let start = [npc[0] + 1500, 0, npc[2]];
+    let angle = sfx::angle_between_xz(start[0], start[2], npc[0], npc[2]);
+    let run = simulate_room_prepared(
+        &pack,
+        id,
+        &[],
+        200,
+        move |_game, player| {
+            player.pos = start;
+            player.angle = angle;
+        },
+        |_| walking(),
+    )
+    .unwrap();
+
+    let radius = i32::from(run.game.entities[slot].sca_radius);
+    let contact = player::JILL_RADIUS + radius - 2;
+    let dist = xz_distance_to(&run.game.entities[slot], run.player.pos);
+    assert!(
+        dist >= contact,
+        "the player walked through the character: {dist} < {contact} ({:?} vs {:?})",
+        run.player.pos,
+        npc
+    );
 }
 
 /// Every shipped room's zone graph is walked from every zone to every zone

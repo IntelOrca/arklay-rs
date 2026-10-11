@@ -704,6 +704,49 @@ fn movie_on_sites_start_and_resume_the_room_with_its_bgm() {
 }
 
 #[test]
+#[ignore = "requires a converted game pack"]
+fn room_104s_deferred_camera_switch_starts_its_film_and_wakes_the_zombie() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1041").unwrap();
+    // The room's `main` script fires on the deferred-camera redraw bit the
+    // engine raises on the cut-1 -> cut-4 zone switch. Walk east to cut 1,
+    // back west, turn south and walk into the cut-4 zone.
+    let schedule = |tick: usize| {
+        let mut input = player::Input::default();
+        match tick {
+            0..=59 => input.up = true,
+            60..=84 => input.down = true,
+            85..=96 => input.left = true,
+            _ => input.up = true,
+        }
+        input
+    };
+    let sim = simulate_room_with_movie(&pack, id, &[], 900, schedule).unwrap();
+    assert_eq!(
+        sim.handoff.requested,
+        vec![3],
+        "the cut-4 zone switch must start film 3"
+    );
+    assert_eq!(sim.handoff.played, vec![3], "film 3 must run to completion");
+    // The film's post-event clears the spawn's SCD-controlled bit (0x80) and
+    // sets the eating flags, so the researcher zombie leaves its inert
+    // `0x85` state; the eating behaviour itself may already have handed over
+    // to the standing machine by the end of the run.
+    assert_eq!(
+        sim.room.game.entities[1].behavior_flags & 0x80,
+        0,
+        "the film's post-event must clear the SCD-controlled bit"
+    );
+    assert!(
+        sim.room.game.flags[1].bit(2),
+        "the film-done room flag must be raised"
+    );
+}
+
+#[test]
 #[ignore = "requires a converted game pack and SDL's offscreen driver"]
 fn captures_stay_deterministic_with_the_films_in_the_pack() {
     use std::process::Command;

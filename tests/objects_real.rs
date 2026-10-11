@@ -1047,8 +1047,8 @@ fn room_112_mirror_renders_reflection_pixels() {
     let blue = arklay::model::Texture8 {
         width: 1,
         height: 1,
-        indices: vec![0],
-        palettes: vec![[0, 0, 255, 255]],
+        indices: vec![1],
+        palettes: vec![[0, 0, 0, 255], [0, 0, 255, 255]],
         stp: Vec::new(),
     };
     let object_meshes = [
@@ -1500,4 +1500,56 @@ fn room_108_cabinets_push_along_their_long_axes() {
         "slot 1 did not slide south: {south:?}"
     );
     assert!(north[2] >= 11_960, "slot 1 overshot north: {north:?}");
+}
+
+/// Jill's room-105 floor blood pools are TMD quads whose TIM background is
+/// palette index 0. The model rasteriser keys entry zero, so the decals paint
+/// only the red splatter instead of an opaque black square.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_105_jill_blood_decals_keep_their_colour_key() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1051").unwrap();
+    let sim =
+        arklay::engine::simulate_room(&pack, id, 0, arklay::player::Input::default()).unwrap();
+    let mut room = sim.room.clone();
+    // Camera 3 is the fireplace cut whose zone covers both pools.
+    room.current_cut = 3;
+    let game = sim.game.clone();
+
+    // The two blood records are slots 0 and 1 (the init script activates them
+    // for Jill only).
+    assert!(
+        game.objects.records[0].active() && game.objects.records[1].active(),
+        "Jill's room 105 activates both blood records"
+    );
+    let mut with_blood = game.clone();
+    let painted =
+        arklay::engine::render_game_frame(&pack, id, &room, &mut with_blood, &sim.player).unwrap();
+
+    let mut without = game;
+    for record in &mut without.objects.records[..2] {
+        record.flag = 0;
+    }
+    let bare =
+        arklay::engine::render_game_frame(&pack, id, &room, &mut without, &sim.player).unwrap();
+
+    let mut changed = 0usize;
+    let mut black = 0usize;
+    for (a, b) in painted.rgba.chunks(4).zip(bare.rgba.chunks(4)) {
+        if a != b {
+            changed += 1;
+            if a[..3] == [0, 0, 0] {
+                black += 1;
+            }
+        }
+    }
+    assert!(changed > 0, "the blood decals painted nothing");
+    assert_eq!(
+        black, 0,
+        "the blood decals painted {black} opaque black background pixels"
+    );
 }

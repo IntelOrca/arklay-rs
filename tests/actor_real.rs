@@ -349,6 +349,65 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room_106_jill_cutscene_ignores_held_directions() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1061").unwrap();
+    let held = player::Input {
+        up: true,
+        ..player::Input::default()
+    };
+
+    // The cutscene latches the script's controls lock (`set FG_6, 23, 1`), so
+    // the engine must blank the held pad: a direction held through the scene
+    // may not walk the player in the gaps between the scripted commands.
+    for ticks in [60usize, 88, 91, 94, 120, 200, 528] {
+        let quiet = simulate_room(&pack, id, ticks, player::Input::default()).unwrap();
+        let pushed = simulate_room(&pack, id, ticks, held).unwrap();
+        assert_eq!(
+            pushed.player.pos, quiet.player.pos,
+            "tick {ticks}: the held pad moved the player off the scripted path"
+        );
+        assert_eq!(pushed.player.angle, quiet.player.angle, "tick {ticks}");
+    }
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room1051_cut2_barry_completes_the_scripted_run() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1051").unwrap();
+
+    // The cut-2 beat sends Barry on a scripted run from (30700, 9200) to the
+    // blood pool at (7000, 12400). The state-8 handlers step with the
+    // un-collided `Add_speedXZ` and the driver resolves the room collision
+    // after dispatch, so the run slides along the furniture; before the fix
+    // the pre-check rolled every step back at ~(26748, 9714) and the whole
+    // scene stalled behind it.
+    let sim = simulate_room(&pack, id, 400, player::Input::default()).unwrap();
+    let barry = sim.game.entities[1];
+    assert!(
+        barry.pos[0] < 13000,
+        "Barry's scripted run jammed at {:?}",
+        barry.pos
+    );
+
+    // The scene's completion bit (system bank 0x21) is up once the sequence
+    // finishes, so the wait after the run released.
+    let sim = simulate_room(&pack, id, 600, player::Input::default()).unwrap();
+    assert!(
+        sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x21),
+        "the cut-2 wait never released"
+    );
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_room_1060_chris_cutscene_drops_the_stale_walk_after_the_door() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;

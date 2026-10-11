@@ -23,6 +23,14 @@
 //! `scd_anim_param` in the system flag bank, and the event script's `bit_test`
 //! proceeds. A handler that finishes clears `action_behavior`/`action_state`
 //! unless the `act_anim_seq` collision flag bit 7 asks it to keep running.
+//!
+//! The movement handlers step with the original's un-collided `Add_speedXZ`;
+//! [`update`] then runs one room collision pass over the tick's movement,
+//! anchored at the pre-dispatch position, exactly like the player's scripted
+//! state-8 tail. A scripted path that clips geometry slides along it instead
+//! of freezing the whole step (a pre-check that rolled the step back could
+//! deadlock a script waiting on the walk's completion bit, e.g. Barry's run
+//! to the blood in room 105).
 
 use std::rc::Rc;
 
@@ -123,6 +131,7 @@ const FLAME_CUE_TICKS: u16 = 0x0F;
 /// behaviour handler and then runs it a second time when `scd_entity_flags`
 /// bit 1 is set, re-reading `action_behavior` for the repeat.
 pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip]) {
+    let prev_pos = game.entities[slot].pos;
     let behavior = game.entities[slot].action_behavior;
     if behavior >= 11 {
         // The original reports the NULL table slot and dispatches nothing; the
@@ -146,6 +155,19 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
             game.joint_worlds[slot] = worlds;
         }
     }
+    // The handlers move with the un-collided `Add_speedXZ`, so this tail is
+    // the scripted driver's only room-collision pass: it pushes the character
+    // out of any obstruction the step crossed and rolls back to the
+    // pre-dispatch position when still stuck, the same shape the player's
+    // scripted animation tail uses.
+    let entity = &mut game.entities[slot];
+    entity.pos = crate::player::resolve_collision(
+        &room.collision,
+        prev_pos,
+        entity.pos,
+        i32::from(entity.sca_radius),
+        entity.collision_flags,
+    );
 }
 
 /// Run one behaviour handler with the entity, its clock, the system flag bank
@@ -328,7 +350,7 @@ fn handler_02_walk(
     walk::entity_apply_walk_speed(entity, 0x5D);
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0x96 {
         finish_walk(entity, system);
     }
@@ -374,9 +396,9 @@ fn handler_03(
             entity.action_state = 5;
             entity.blend_counter = 7;
             entity.action_ticks_counter = 0;
-            handler_03_stop(entity, clock, clips, room);
+            handler_03_stop(entity, clock, clips);
         }
-        5 => handler_03_stop(entity, clock, clips, room),
+        5 => handler_03_stop(entity, clock, clips),
         6 => {
             entity.action_behavior = 0;
             entity.action_state = 0;
@@ -413,7 +435,7 @@ fn handler_03_walk(
     }
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 0xFA {
         entity.action_state = 4;
         if entity.collision_flags & 0x80 != 0 {
@@ -423,14 +445,14 @@ fn handler_03_walk(
     }
 }
 
-fn handler_03_stop(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip], room: &RoomState) {
+fn handler_03_stop(entity: &mut Entity, clock: &mut EntityAnim, clips: &[Clip]) {
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
     entity.action_ticks_counter = entity.action_ticks_counter.wrapping_add(1);
     if (entity.action_ticks_counter as i16) > 3 {
         entity.action_state = 6;
     }
     entity.move_speed_current = (entity.move_speed_current as i16).wrapping_sub(0x1E) as u16;
-    walk::advance_xz_blocked(room, entity, 0, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0, entity.move_speed_current as i16);
 }
 
 /// The shared state 0/1 body of the backward walks: flip the facing 180
@@ -440,7 +462,6 @@ fn backward_step(
     entity: &mut Entity,
     clock: &mut EntityAnim,
     clips: &[Clip],
-    room: &RoomState,
     system: &mut FlagBank,
     target: [i32; 3],
 ) {
@@ -448,7 +469,7 @@ fn backward_step(
     walk::rotate_toward_target(entity, target, entity.scd_timer);
     entity.angle = entity.angle.wrapping_sub(0x800);
     clock.advance(entity, clips, entity.flags & 1 != 0, 0x200);
-    walk::advance_xz_blocked(room, entity, 0x800, entity.move_speed_current as i16);
+    walk::advance_xz(entity, 0x800, entity.move_speed_current as i16);
     if walk::xz_distance_to(entity, target) < 100 {
         finish_walk(entity, system);
     }
@@ -486,7 +507,7 @@ fn handler_04(
     if frame > 4 || frame < 8 {
         entity.move_speed_current = (entity.move_speed_current as i16).wrapping_add(4) as u16;
     }
-    backward_step(entity, clock, clips, room, system, target);
+    backward_step(entity, clock, clips, system, target);
 }
 
 /// Behaviour 5: walk backwards at the slow pace (animation 2). The footsteps
@@ -516,7 +537,7 @@ fn handler_05(
     if (frame == 7 || frame == 0x1B) && entity.timing_control as i8 == 2 {
         walk::footstep(sounds, room, entity, 0, slow);
     }
-    backward_step(entity, clock, clips, room, system, target);
+    backward_step(entity, clock, clips, system, target);
 }
 
 /// Behaviour 6: turn in place toward the scripted target, finishing once

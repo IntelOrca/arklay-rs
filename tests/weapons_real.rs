@@ -141,7 +141,10 @@ fn a_held_weapon_changes_the_captured_frame() {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let id = RoomId::parse("1000").unwrap();
+    // Room 101 has no cutscene that latches the script's controls lock, so
+    // the aim input reaches the weapon machine; the main hall's intro
+    // (`set FG_6, 23, 1`) blanks the pad for its whole scene.
+    let id = RoomId::parse("1010").unwrap();
 
     let idle = arklay::engine::simulate_room(&pack, id, 8, Input::default()).unwrap();
     let aiming = arklay::engine::simulate_room_prepared(

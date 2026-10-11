@@ -257,6 +257,24 @@ pub const MESSAGE_FLAG_EFFECTS: u16 = 0x008;
 /// The original's gameplay seed for `g_message_flags` (`game_loop` writes
 /// `0xFD3F` when it (re)enters the play state).
 pub const MESSAGE_FLAGS_INITIAL: u16 = 0xFD3F;
+
+/// Decode a bank-6 selector the way the original's `cmd_bit_test`/`cmd_bit_op`
+/// do: bank 6 is the address of `g_message_flags`, cast to a dword, so the
+/// selector's high three bits step the dword pointer and its low five bits
+/// index the mask MSB-first. With the pointer at its base, selectors 16..=31
+/// address `message_flags` bits 15..=0 and 0..=15 the adjacent
+/// `g_short_message_flags` word. Selectors past the first dword would step
+/// past the two words; the port refuses them instead of reading whatever
+/// global follows.
+///
+/// Returns `(main_word, mask)`: `true` when the selector addresses
+/// `GameState::message_flags`, `false` for `short_message_flags`.
+fn message_bank_selector(sel: u8) -> Option<(bool, u16)> {
+    if sel & 0xE0 != 0 {
+        return None;
+    }
+    Some((sel >= 16, 0x8000 >> (sel & 0x0F)))
+}
 /// Scenario flag selecting the second-visit stage variants.
 const SCENARIO_FLAG_STAGE_VARIANT: u8 = 0x00;
 /// Scenario/state flag bank index.
@@ -317,6 +335,15 @@ pub const MSF_FMV_REQUEST: u8 = 13;
 /// a frame back to zero. The mask is bit 16 of the first dword, i.e. selector
 /// `0x0F` in the MSB-first flag bank.
 pub const MSF_SCREEN_INTENSITY: u8 = 0x0F;
+/// `main_state_flags` bit 0x04 (`MSF_CAMERA_DEFER`): a camera-zone switch
+/// raises the redraw bit instead of redisplaying immediately. Mask bit 2 of
+/// the first dword, i.e. selector 29 in the MSB-first flag bank.
+pub const MSF_CAMERA_DEFER: u8 = 29;
+/// `main_state_flags` bit 0x20 (`MSF_CAMERA_REDRAW`): a deferred camera
+/// redisplay is pending and `game_loop` consumes it once, drawing the cut
+/// chosen by the previous frame's zone walk. Mask bit 5 of the first dword,
+/// i.e. selector 26 in the MSB-first flag bank.
+pub const MSF_CAMERA_REDRAW: u8 = 26;
 /// `main_state_flags` bit 0x100: the pick-up screen is pending.
 const MSF_PICKUP_SCREEN: u8 = 23;
 /// `main_state_flags` bit 0x400, raised when `give_item` runs.
@@ -3170,6 +3197,12 @@ pub struct GameState {
     pub message_flags: u16,
     /// The `message_flags` captured when the active message was requested.
     message_flags_backup: u16,
+    /// The original's `g_short_message_flags`, the word adjacent to
+    /// `g_message_flags` that the SCD bank-6 dword view addresses with
+    /// selectors 0..=15 (see [`message_bank_selector`]). The port's menu flow
+    /// does not back up and restore through it yet, so it only holds what the
+    /// scripts' `set FG_6, 0, ..` sites write.
+    short_message_flags: u16,
     /// Message state.
     pub message: MessageWindow,
     /// BGM state.
@@ -3505,6 +3538,7 @@ impl Default for GameState {
             message_menu: false,
             message_flags: MESSAGE_FLAGS_INITIAL,
             message_flags_backup: MESSAGE_FLAGS_INITIAL,
+            short_message_flags: 0xFFFF,
             message: MessageWindow::default(),
             bgm: BgmState::default(),
             room_bgm: [0; ROOM_BGM_LEN],
@@ -3686,7 +3720,22 @@ impl GameState {
 
     /// The `ck` condition: true when the selected bit differs from `expected`.
     /// An out-of-range bank is false, matching the original handler.
+    ///
+    /// Bank 6 is not a standalone bank in the original: its SCD handlers cast
+    /// `&g_message_flags` to a dword, so selectors 16..=31 address
+    /// `message_flags` and 0..=15 the adjacent short-word backup. See
+    /// [`message_bank_selector`].
     pub fn flag_test(&self, bank: u8, sel: u8, expected: bool) -> bool {
+        if bank == 6
+            && let Some((main_word, mask)) = message_bank_selector(sel)
+        {
+            let word = if main_word {
+                self.message_flags
+            } else {
+                self.short_message_flags
+            };
+            return (word & mask != 0) != expected;
+        }
         match self.flags.get(usize::from(bank)) {
             Some(bank) => bank.bit(sel) != expected,
             None => false,
@@ -3694,7 +3743,24 @@ impl GameState {
     }
 
     /// Apply a `set` operation to a flag bank. `false` for a bad bank or mode.
+    /// Bank 6 routes into the message words like [`GameState::flag_test`].
     pub fn apply_flag(&mut self, bank: u8, sel: u8, mode: u8) -> bool {
+        if bank == 6
+            && let Some((main_word, mask)) = message_bank_selector(sel)
+        {
+            let word = if main_word {
+                &mut self.message_flags
+            } else {
+                &mut self.short_message_flags
+            };
+            match mode {
+                0 => *word |= mask,
+                1 => *word &= !mask,
+                2 => *word ^= mask,
+                _ => return false,
+            }
+            return true;
+        }
         match self.flags.get_mut(usize::from(bank)) {
             Some(bank) => bank.apply(sel, mode),
             None => false,
@@ -4684,6 +4750,7 @@ impl GameState {
             self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = choice;
             self.message_item_slot = None;
             self.message_flags = MESSAGE_FLAGS_INITIAL;
+            self.short_message_flags = 0xFFFF;
         }
         self.camera = CameraState::default();
         self.typewriter = TypewriterFlow::Idle;
@@ -7025,6 +7092,23 @@ impl GameState {
             action.param_word(1)
         };
         let mode = if action.param_word(2) != 0 { 0 } else { 1 };
+        // Bank 6 shares the SCD bit handlers' dword view of the message words.
+        if bank == 6
+            && let Ok(sel) = u8::try_from(sel)
+            && let Some((main_word, mask)) = message_bank_selector(sel)
+        {
+            let word = if main_word {
+                &mut self.message_flags
+            } else {
+                &mut self.short_message_flags
+            };
+            match mode {
+                0 => *word |= mask,
+                1 => *word &= !mask,
+                _ => return false,
+            }
+            return true;
+        }
         self.flags
             .get_mut(usize::from(bank))
             .is_some_and(|flags| flags.apply_wide(sel, mode))
@@ -8697,6 +8781,36 @@ mod tests {
         assert!(!state.flag_test(0, 0, true));
         assert!(!state.flag_test(10, 0, true));
         assert!(!state.flag_test(10, 0, false));
+    }
+
+    #[test]
+    fn bank_six_addresses_the_message_words() {
+        let mut state = game();
+        // Selector 23 is the dword's MSB-first mask 0x100 of `message_flags`;
+        // the initial seed has it set.
+        assert!(state.flag_test(6, 23, false), "0xFD3F has bit 8 set");
+        assert!(state.apply_flag(6, 23, 1), "the controls clear");
+        assert_eq!(state.message_flags & MESSAGE_FLAG_CONTROLS, 0);
+        assert!(!state.flag_test(6, 23, false), "the clear is visible to ck");
+        assert!(state.apply_flag(6, 23, 0), "the controls restore");
+        assert_ne!(state.message_flags & MESSAGE_FLAG_CONTROLS, 0);
+        // Selector 29 is the dword's MSB-first mask 0x4 (the monster-think
+        // bit); selector 28 is 0x8 (the effects bit).
+        assert!(state.apply_flag(6, 29, 1));
+        assert_eq!(state.message_flags & MESSAGE_FLAG_MONSTERS, 0);
+        assert!(state.apply_flag(6, 28, 1));
+        assert_eq!(state.message_flags & MESSAGE_FLAG_EFFECTS, 0);
+        // Selectors 0..=15 address the adjacent short-word backup.
+        assert!(state.apply_flag(6, 0, 1));
+        assert_eq!(state.short_message_flags & 0x8000, 0, "sel 0 sets MSB");
+        assert!(state.apply_flag(6, 0, 0));
+        assert_eq!(state.short_message_flags & 0x8000, 0x8000);
+        // A selector past the first dword does not alias the message words;
+        // the port parks it in the standalone bank instead of writing past
+        // them.
+        let before = (state.message_flags, state.short_message_flags);
+        assert!(state.apply_flag(6, 0x25, 0));
+        assert_eq!((state.message_flags, state.short_message_flags), before);
     }
 
     #[test]
@@ -13180,8 +13294,14 @@ mod tests {
             } else {
                 bit
             };
-            assert!(state.flags[usize::from(bank)].bit(sel));
-            if bank == 5 || bank == 6 {
+            if bank == 6 {
+                // Bank 6 is the dword view over the message words: selector 5
+                // is the MSB-first mask `0x400` of `g_short_message_flags`.
+                assert_eq!(state.short_message_flags & 0x400, 0x400);
+            } else {
+                assert!(state.flags[usize::from(bank)].bit(sel));
+            }
+            if bank == 5 {
                 assert!(
                     !state.flags[usize::from(bank)].bit(bit),
                     "bank {bank} reached past its first dword"
@@ -13208,7 +13328,11 @@ mod tests {
                 );
             }
             assert!(state.run_room_action(0, HANDLER_FLAG_BANK_SET));
-            assert!(!state.flags[usize::from(bank)].bit(sel));
+            if bank == 6 {
+                assert_eq!(state.short_message_flags & 0x400, 0, "the clear landed");
+            } else {
+                assert!(!state.flags[usize::from(bank)].bit(sel));
+            }
         }
 
         // The default arm folds unknown banks onto the item-use bank.

@@ -75,7 +75,7 @@ enum Stage {
     ConfirmFadeIn,
     /// The white fade-out from full (the original's state 4).
     ConfirmFadeOut,
-    /// The 16-frame hold before the game starts (the original's state 5).
+    /// The post-flash hold before the game starts (the original's state 5).
     ConfirmHold,
     /// The black fade-out back to the title (the original's state 7).
     CancelFadeOut,
@@ -118,8 +118,10 @@ pub struct CharSelectScreen {
     /// The full-screen overlay accumulator: black while the screen fades in,
     /// then the original's white flash chain once the pick is confirmed.
     fade: Fade,
-    /// Ticks left of the post-flash hold (the original's `g_selTimer`).
-    hold_timer: u8,
+    /// Ticks left of the post-flash hold (the original's `g_selTimer`). The
+    /// original stores `-16` in a signed byte and decrements to zero, so the
+    /// hold is 240 ticks, not 16.
+    hold_timer: u16,
     ticks: u32,
     stage: Stage,
     exit: Option<ScreenAction>,
@@ -530,7 +532,7 @@ impl Screen for CharSelectScreen {
                 self.fade.tick();
                 if !self.fade.is_active() {
                     self.stage = Stage::ConfirmHold;
-                    self.hold_timer = 16;
+                    self.hold_timer = 240;
                 }
             }
             Stage::ConfirmHold => {
@@ -742,12 +744,18 @@ mod tests {
             },
         );
         let mut result = ScreenResult::Continue;
-        for _ in 0..400 {
+        let mut ticks = 0usize;
+        loop {
             result = screen.update(&cx, neutral());
+            ticks += 1;
             if result != ScreenResult::Continue {
                 break;
             }
+            assert!(ticks < 700, "the confirm chain never finished");
         }
+        // 128 fade-in + 128 fade-out + the 240-tick `g_selTimer` hold, matching
+        // the reference's case 6 at frame 496.
+        assert_eq!(ticks, 496, "the confirm chain's fixed length");
         assert_eq!(
             result,
             ScreenResult::Done(ScreenAction::NewGame { character: 1 })
@@ -838,12 +846,13 @@ mod tests {
         assert_eq!(white(&screen), Some(1));
         assert_eq!(screen.stage, Stage::ConfirmFadeOut);
 
-        // The 16-tick hold runs with the frame clear.
+        // The 240-tick hold runs with the frame clear: `g_selTimer` starts at
+        // -16 and decrements to zero through the signed-byte wrap.
         screen.update(&cx, neutral());
         assert_eq!(screen.stage, Stage::ConfirmHold);
         assert_eq!(screen.overlay(), None);
         let mut result = ScreenResult::Continue;
-        for _ in 0..16 {
+        for _ in 0..240 {
             result = screen.update(&cx, neutral());
             if result != ScreenResult::Continue {
                 break;
