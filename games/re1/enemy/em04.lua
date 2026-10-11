@@ -424,7 +424,7 @@ end
 local function action_runner(e)
     local px, _, pz = e:player_pos()
     local path = e:pathfind_update(px, pz)
-    e:pathfind_keep(path)
+    e:spider_path_keep(path)
 
     local b = e.action_behavior
     if b == 0 then

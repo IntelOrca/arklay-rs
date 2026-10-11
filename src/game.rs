@@ -2657,22 +2657,6 @@ impl Entity {
         }
     }
 
-    /// `tw_set_field`: store one byte of the entity state block at 0x84 plus
-    /// `offset`. Returns `false` for an offset with no modelled field.
-    fn set_state_byte(&mut self, offset: u8, value: u8) -> bool {
-        match offset {
-            0 => self.set_state(value),
-            1 => self.set_ignore(value),
-            2 => self.action_behavior = value,
-            3 => self.action_state = value,
-            4 => self.health = (self.health & !0x00FF) | i16::from(value),
-            5 => self.health = (self.health & 0x00FF) | (i16::from(value) << 8),
-            6 => self.hit_state = value,
-            _ => return false,
-        }
-        true
-    }
-
     /// The signed scratch word at entity +0x16C (low byte
     /// `attacking_direction`, high byte `dir_control_flags`). The original
     /// re-views the byte pair as one `short`; scripts use this accessor so the
@@ -4306,11 +4290,14 @@ impl GameState {
     /// `evt_tween_begin`: reset the selected entity as it enters the movement
     /// state (ignore flag 2, behavior and action state cleared).
     pub fn reset_tween_entity(&mut self) {
-        if let Some(entity) = self.selected_entity_mut() {
-            entity.set_ignore(2);
-            entity.action_behavior = 0;
-            entity.action_state = 0;
-        }
+        let mut fields = match self.tween_fields() {
+            Some(fields) => fields,
+            None => return,
+        };
+        fields.set_state_byte(1, 2);
+        fields.action_behavior = 0;
+        fields.action_state = 0;
+        self.write_tween_fields(fields);
     }
 
     /// Apply one actor sub-ISA instruction to the selected entity.
@@ -4546,100 +4533,104 @@ impl GameState {
         StepResult::Continue
     }
 
-    /// Apply one tween sub-ISA instruction to the selected entity. The tween
-    /// state never yields.
+    /// Apply one tween sub-ISA instruction to the selected entity or model
+    /// record. The tween state never yields.
+    ///
+    /// The original's state-2 movement handlers take an `Entity*`, and its
+    /// room object and item records ARE entity heads, so the same handlers
+    /// animate furniture as well as characters. The port carries the selected
+    /// target through [`TweenFields`] and folds the result back into whichever
+    /// record it came from.
     fn apply_tween_op(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.mnemonic {
             "tw_nop" | "tw_end" => StepResult::Continue,
-            "tw_pos_add" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    for axis in 0..3 {
-                        entity.pos[axis] =
-                            entity.pos[axis].wrapping_add(i32::from(entity.move_speed[axis]));
+            "tw_pos_add" | "tw_pos_rot_add" | "tw_rot_add" => {
+                if let Some(mut fields) = self.tween_fields() {
+                    if op.mnemonic != "tw_rot_add" {
+                        for axis in 0..3 {
+                            fields.pos[axis] =
+                                fields.pos[axis].wrapping_add(i32::from(fields.speed[axis]));
+                        }
                     }
-                }
-                StepResult::Continue
-            }
-            "tw_rot_add" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.pitch = entity.pitch.wrapping_add(entity.move_step[0] as u16);
-                    entity.angle = entity.angle.wrapping_add(entity.move_step[2] as u16);
-                    entity.roll = entity.roll.wrapping_add(entity.state_field);
-                }
-                StepResult::Continue
-            }
-            "tw_pos_rot_add" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    for axis in 0..3 {
-                        entity.pos[axis] =
-                            entity.pos[axis].wrapping_add(i32::from(entity.move_speed[axis]));
+                    if op.mnemonic != "tw_pos_add" {
+                        fields.rotation[0] = fields.rotation[0].wrapping_add(fields.move_step[0]);
+                        fields.rotation[1] = fields.rotation[1].wrapping_add(fields.move_step[2]);
+                        fields.rotation[2] =
+                            fields.rotation[2].wrapping_add(fields.state_field as i16);
                     }
-                    entity.pitch = entity.pitch.wrapping_add(entity.move_step[0] as u16);
-                    entity.angle = entity.angle.wrapping_add(entity.move_step[2] as u16);
-                    entity.roll = entity.roll.wrapping_add(entity.state_field);
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_set_pos" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.move_speed = [
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.speed = [
                         i16::from(operand_i8(operands, 0)),
                         i16::from(operand_i8(operands, 1)),
                         i16::from(operand_i8(operands, 2)),
                     ];
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_set_rot" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.move_step[0] = i16::from(operand_i8(operands, 0));
-                    entity.move_step[2] = i16::from(operand_i8(operands, 1));
-                    entity.state_field = operand_i8(operands, 2) as i16 as u16;
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.move_step[0] = i16::from(operand_i8(operands, 0));
+                    fields.move_step[2] = i16::from(operand_i8(operands, 1));
+                    fields.state_field = operand_i8(operands, 2) as i16 as u16;
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_abs_pos" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.pos = [
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.pos = [
                         i32::from(operand_i16(operands, 0)),
                         i32::from(operand_i16(operands, 1)),
                         i32::from(operand_i16(operands, 2)),
                     ];
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_set_field" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.set_state_byte(operand_u8(operands, 0), operand_u8(operands, 1));
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.set_state_byte(operand_u8(operands, 0), operand_u8(operands, 1));
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_set_8a" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.hit_state = operand_u8(operands, 0);
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.hit_state = operand_u8(operands, 0);
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_set_sel" => {
-                if let Some(entity) = self.selected_entity_mut() {
+                if let Some(mut fields) = self.tween_fields() {
                     let selector = operand_u8(operands, 0);
                     let value = operand_u16(operands, 1);
-                    entity.selector = u16::from(selector);
+                    fields.selector = u16::from(selector);
                     match selector {
-                        0..=2 => entity.pos[usize::from(selector)] = i32::from(value as i16),
-                        3 => entity.health = value as i16,
-                        4 => entity.unk_c6 = value,
-                        5 => entity.unk_c8 = value,
+                        0..=2 => fields.pos[usize::from(selector)] = i32::from(value as i16),
+                        3 => fields.health = value as i16,
+                        4 => fields.unk_c6 = value,
+                        5 => fields.unk_c8 = value,
                         _ => {}
                     }
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
             "tw_abs_rot" => {
-                if let Some(entity) = self.selected_entity_mut() {
-                    entity.pitch = operand_u16(operands, 0);
-                    entity.angle = operand_u16(operands, 1);
-                    entity.roll = operand_u16(operands, 2);
+                if let Some(mut fields) = self.tween_fields() {
+                    fields.rotation = [
+                        operand_u16(operands, 0) as i16,
+                        operand_u16(operands, 1) as i16,
+                        operand_u16(operands, 2) as i16,
+                    ];
+                    self.write_tween_fields(fields);
                 }
                 StepResult::Continue
             }
@@ -4647,6 +4638,48 @@ impl GameState {
                 self.record_placeholder(op.op);
                 StepResult::Placeholder
             }
+        }
+    }
+
+    /// The tween view of the current selection: the selected entity slot, or
+    /// the selected room object/item record. `None` for no selection.
+    fn tween_fields(&self) -> Option<TweenFields> {
+        if self.selected_entity != ENTITY_NONE {
+            return self.selected_entity().map(TweenFields::from_entity);
+        }
+        match self.selected_model {
+            Some(ModelTarget::Object(index)) => self
+                .objects
+                .record(usize::from(index))
+                .map(TweenFields::from_object),
+            Some(ModelTarget::Item(index)) => self
+                .items
+                .record(usize::from(index))
+                .map(TweenFields::from_item),
+            None => None,
+        }
+    }
+
+    /// Fold a mutated tween view back into the record it came from.
+    fn write_tween_fields(&mut self, fields: TweenFields) {
+        if self.selected_entity != ENTITY_NONE {
+            if let Some(entity) = self.selected_entity_mut() {
+                fields.write_entity(entity);
+            }
+            return;
+        }
+        match self.selected_model {
+            Some(ModelTarget::Object(index)) => {
+                if let Some(record) = self.objects.record_mut(usize::from(index)) {
+                    fields.write_object(record);
+                }
+            }
+            Some(ModelTarget::Item(index)) => {
+                if let Some(record) = self.items.record_mut(usize::from(index)) {
+                    fields.write_item(record);
+                }
+            }
+            None => {}
         }
     }
 
@@ -7616,6 +7649,144 @@ impl<'a> ScdGameHost<'a> {
         if let Some(slot) = self.state.doors.get_mut(usize::from(door.slot)) {
             *slot = Some(door);
         }
+    }
+}
+
+/// The record-shaped fields the event VM's tween sub-ISA reads and writes.
+///
+/// The original's state-2 movement handlers take an `Entity*`, and its room
+/// object and item records are entity heads, so the same handlers drive
+/// characters and furniture. The port's selection is either a live entity
+/// slot or a model record, so the handlers work on this view and
+/// [`GameState::write_tween_fields`] folds it back.
+struct TweenFields {
+    /// Live 32-bit position.
+    pos: [i32; 3],
+    /// Rotation triple (pitch, yaw, roll).
+    rotation: [i16; 3],
+    /// `tw_set_pos` step added by `tw_pos_add`.
+    speed: [i16; 3],
+    /// `tw_set_rot` step added by `tw_rot_add`.
+    move_step: [i16; 3],
+    /// The packed `+0x84` word: low byte state, high byte ignore.
+    state_field: u16,
+    /// State-block byte `+0x86`.
+    action_behavior: u8,
+    /// State-block byte `+0x87`.
+    action_state: u8,
+    /// State-block word `+0x88`.
+    health: i16,
+    /// State-block byte `+0x8A`.
+    hit_state: u8,
+    /// The `+0xC6` word `tw_set_sel` selector 4 writes.
+    unk_c6: u16,
+    /// The `+0xC8` word `tw_set_sel` selector 5 writes.
+    unk_c8: u16,
+    /// The last `tw_set_sel` selector.
+    selector: u16,
+}
+
+impl TweenFields {
+    fn from_entity(entity: &Entity) -> Self {
+        Self {
+            pos: entity.pos,
+            rotation: [entity.pitch as i16, entity.angle as i16, entity.roll as i16],
+            speed: entity.move_speed,
+            move_step: entity.move_step,
+            state_field: entity.state_field,
+            action_behavior: entity.action_behavior,
+            action_state: entity.action_state,
+            health: entity.health,
+            hit_state: entity.hit_state,
+            unk_c6: entity.unk_c6,
+            unk_c8: entity.unk_c8,
+            selector: entity.selector,
+        }
+    }
+
+    fn write_entity(self, entity: &mut Entity) {
+        entity.pos = self.pos;
+        entity.pitch = self.rotation[0] as u16;
+        entity.angle = self.rotation[1] as u16;
+        entity.roll = self.rotation[2] as u16;
+        entity.move_speed = self.speed;
+        entity.move_step = self.move_step;
+        entity.state_field = self.state_field;
+        entity.action_behavior = self.action_behavior;
+        entity.action_state = self.action_state;
+        entity.health = self.health;
+        entity.hit_state = self.hit_state;
+        entity.unk_c6 = self.unk_c6;
+        entity.unk_c8 = self.unk_c8;
+        entity.selector = self.selector;
+    }
+
+    fn from_object(record: &objects::ObjectRecord) -> Self {
+        Self::from_scratch(record.pos, record.rotation, &record.tween)
+    }
+
+    fn write_object(self, record: &mut objects::ObjectRecord) {
+        let (pos, rotation) = self.write_scratch(&mut record.tween);
+        record.pos = pos;
+        record.rotation = rotation;
+    }
+
+    fn from_item(record: &objects::ItemRecord) -> Self {
+        Self::from_scratch(record.pos, record.rotation, &record.tween)
+    }
+
+    fn write_item(self, record: &mut objects::ItemRecord) {
+        let (pos, rotation) = self.write_scratch(&mut record.tween);
+        record.pos = pos;
+        record.rotation = rotation;
+    }
+
+    fn from_scratch(pos: [i32; 3], rotation: [i16; 3], tween: &objects::TweenScratch) -> Self {
+        Self {
+            pos,
+            rotation,
+            speed: tween.speed,
+            move_step: tween.move_step,
+            state_field: tween.state_field,
+            action_behavior: tween.action_behavior,
+            action_state: tween.action_state,
+            health: tween.health,
+            hit_state: tween.hit_state,
+            unk_c6: tween.unk_c6,
+            unk_c8: tween.unk_c8,
+            selector: tween.selector,
+        }
+    }
+
+    /// Split the view back into the record's position/rotation and the tween
+    /// scratch, which is left updated in `tween`.
+    fn write_scratch(self, tween: &mut objects::TweenScratch) -> ([i32; 3], [i16; 3]) {
+        tween.speed = self.speed;
+        tween.move_step = self.move_step;
+        tween.state_field = self.state_field;
+        tween.action_behavior = self.action_behavior;
+        tween.action_state = self.action_state;
+        tween.health = self.health;
+        tween.hit_state = self.hit_state;
+        tween.unk_c6 = self.unk_c6;
+        tween.unk_c8 = self.unk_c8;
+        tween.selector = self.selector;
+        (self.pos, self.rotation)
+    }
+
+    /// `scd_event_state2_movement` case 0x08: one byte into the state block.
+    fn set_state_byte(&mut self, offset: u8, value: u8) -> bool {
+        match offset {
+            0 => self.state_field = (self.state_field & 0xFF00) | u16::from(value),
+            1 => self.state_field = (self.state_field & 0x00FF) | (u16::from(value) << 8),
+            2 => self.action_behavior = value,
+            3 => self.action_state = value,
+            4 => self.health = (self.health & !0x00FF) | i16::from(value),
+            5 => self.health = (self.health & 0x00FF) | (i16::from(value) << 8),
+            6 => self.hit_state = value,
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -11507,6 +11678,42 @@ mod tests {
         assert_eq!(entity.pitch, 5);
         assert_eq!(entity.angle, 7);
         assert_eq!(entity.roll, 9);
+    }
+
+    #[test]
+    fn tween_ops_drive_a_selected_model_record() {
+        let mut state = game();
+        state.objects = ObjectTable::new(1);
+        state.selected_entity = ENTITY_NONE;
+        state.selected_model = Some(ModelTarget::Object(0));
+        {
+            let mut host = ScdGameHost::new(&mut state);
+            // `tw_set_rot 0, 0x3C, 0` then two `tw_rot_add`s: two yaw steps.
+            let set_rot = tween_op(0x06).unwrap();
+            assert_eq!(
+                host.on_misc(set_rot, &operands(&[0, 0x3C, 0])),
+                StepResult::Continue
+            );
+            let rot_add = tween_op(0x03).unwrap();
+            assert_eq!(host.on_misc(rot_add, &operands(&[])), StepResult::Continue);
+            assert_eq!(host.on_misc(rot_add, &operands(&[])), StepResult::Continue);
+            // `tw_set_pos 0, 0, 10` then `tw_pos_add`: the record's live
+            // position integrates the scratch speed.
+            let set_pos = tween_op(0x05).unwrap();
+            assert_eq!(
+                host.on_misc(set_pos, &operands(&[0, 0, 10])),
+                StepResult::Continue
+            );
+            let pos_add = tween_op(0x02).unwrap();
+            assert_eq!(host.on_misc(pos_add, &operands(&[])), StepResult::Continue);
+        }
+        let record = &state.objects.records[0];
+        assert_eq!(record.rotation[1], 0x78, "two 60-unit yaw steps");
+        assert_eq!(record.pos[2], 10, "the position step integrated");
+        assert_eq!(
+            record.tween.move_step[2], 0x3C,
+            "the rotation step persists on the record"
+        );
     }
 
     #[test]

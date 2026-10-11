@@ -254,7 +254,7 @@ fn real_room30c0_black_tiger_initialises_through_the_script() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(&pack_path).unwrap();
+    let pack = common::enemy_scripts_pack(&pack_path);
     let id = RoomId::parse("30C0").unwrap();
     let model = pack
         .read(&format!("enemy/em04{}.emd", id.player_flag & 1))
@@ -744,7 +744,7 @@ fn real_room210_yawn_initialises_with_its_twelve_segments() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
-    let pack = Pack::open(&pack_path).unwrap();
+    let pack = common::enemy_scripts_pack(&pack_path);
     let id = RoomId::parse("210").unwrap();
     let model = pack
         .read(&format!("enemy/em0d{}.emd", id.player_flag & 1))
@@ -790,6 +790,114 @@ fn real_room210_yawn_initialises_with_its_twelve_segments() {
         .count();
     assert_eq!(segments, 12, "the twelve body slots");
     assert_eq!(first.enemy_count, 13, "head plus body");
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room210_yawn_crawls_in_and_emerges_after_the_zone_trigger() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = common::enemy_scripts_pack(&pack_path);
+    let id = RoomId::parse("210").unwrap();
+
+    // The shipped init script parks the hidden entrance at (4500, 24500).
+    // The room's event zone starts the emerge script once the player steps
+    // inside it on camera 2, the cut the attic entrance arrives on; the
+    // script then clears the park bit and the snake crawls the entry path
+    // and rears up.
+    let run = |ticks| {
+        arklay::engine::simulate_room_prepared(
+            &pack,
+            id,
+            &[],
+            ticks,
+            |game, player| {
+                player.pos = [4500, 0, 24500];
+                game.entities[0].pos = player.pos;
+                game.set_camera_cut(2);
+            },
+            |_| player::Input::default(),
+        )
+        .unwrap()
+    };
+    let first = run(200);
+    let second = run(200);
+    assert_eq!(
+        first.frame.rgba, second.frame.rgba,
+        "the run differs between boots"
+    );
+
+    let head = first
+        .game
+        .entities
+        .iter()
+        .skip(1)
+        .find(|entity| entity.active() && entity.id == 0x0d && entity.behavior_flags != 1)
+        .copied()
+        .expect("ROOM210 spawns the Yawn head");
+    assert_eq!(
+        head.behavior_flags & 0x80,
+        0,
+        "the zone entry clears the parked-entrance bit"
+    );
+    assert_eq!(
+        head.state(),
+        1,
+        "the crawl handed back to the state machine"
+    );
+    assert_eq!(head.yawn_form(), 1, "the entry crawl reached the emerge");
+    let travelled = (head.pos[0] - 4500).abs() + (head.pos[2] - 24500).abs();
+    assert!(
+        travelled > 5000,
+        "the entry crawl moves at move_speed_current: travelled {travelled}"
+    );
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room30c0_black_tiger_spits_at_the_player() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = common::enemy_scripts_pack(&pack_path);
+    let id = RoomId::parse("30c").unwrap();
+
+    // The tiger spawns at (5547, 6785). The picker spits only while the
+    // pathfinder reports line of sight (bit 0 of the +0x16E word), it faces
+    // the player and the flat distance sits in the 5000..9000 band, so place
+    // the player 6000 units along +X.
+    let mut spat = false;
+    let mut saw_los = false;
+    for ticks in [80usize, 120, 200, 300, 400] {
+        let run = arklay::engine::simulate_room_prepared(
+            &pack,
+            id,
+            &[],
+            ticks,
+            |game, player| {
+                player.pos = [5547 + 6000, 0, 6785];
+                game.entities[0].pos = player.pos;
+            },
+            |_| player::Input::default(),
+        )
+        .unwrap();
+        let tiger = run
+            .game
+            .entities
+            .iter()
+            .skip(1)
+            .find(|entity| entity.active() && entity.id == 0x04)
+            .copied()
+            .expect("ROOM30C0 spawns the Black Tiger");
+        saw_los |= tiger.writhe_amplitude() & 1 != 0;
+        spat |= tiger.action_behavior == 0x0D;
+    }
+    assert!(
+        saw_los,
+        "the pathfinder's line-of-sight bit never reached the +0x16E word"
+    );
+    assert!(spat, "the Black Tiger never reached the spit behaviour");
 }
 
 #[test]
