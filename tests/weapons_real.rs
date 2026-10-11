@@ -177,3 +177,67 @@ fn a_held_weapon_changes_the_captured_frame() {
         "the aim pose and held weapon painted no pixels"
     );
 }
+
+/// A handgun trigger cycle through the real packed clips queues the
+/// weapon-bank fire sample (`Gun01`, the reference's sfx id 7), and every
+/// queued name resolves in the pack (which must carry the weapon bank).
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn handgun_fire_queues_weapon_bank_sounds_that_are_packed() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse(WEB_ROOM).unwrap();
+    let mut run = arklay::engine::simulate_room(&pack, id, 4, Input::default()).unwrap();
+
+    run.game.inventory.push(arklay::game::InventoryItem {
+        id: 2,
+        quantity: 15,
+    });
+    run.game.set_equipped(Some(2));
+
+    let character = run.game.id.player_flag & 3;
+    let emd =
+        arklay::emd::parse(pack.read(&format!("player/{character:02}.emd")).unwrap()).unwrap();
+    let emw =
+        arklay::emd::parse_emw(pack.read(&format!("player/{character:02}.emw")).unwrap()).unwrap();
+    let weapon_entry = weapons::weapon_emw_entry(character, 2).unwrap();
+    let weapon = arklay::emd::parse_emw(pack.read(&weapon_entry).unwrap()).unwrap();
+    let clips = WeaponClips {
+        emd: &emd.clips,
+        emw: &emw.clips,
+        room: &[],
+        weapon: &weapon.clips,
+        emd_keyframes: &emd.keyframes,
+        emd_skeleton: &emd.skeleton,
+        weapon_keyframes: &weapon.keyframes,
+        weapon_skeleton: &weapon.skeleton,
+    };
+
+    let mut queued: Vec<&str> = Vec::new();
+    for tick in 0..70 {
+        let input = Input {
+            aim: true,
+            fire: tick < 30,
+            fire_pressed: tick == 0,
+            ..Input::default()
+        };
+        let before = run.game.entity_sounds.len();
+        weapons::update(&mut run.game, &mut run.player, &run.room, &clips, input);
+        queued.extend(
+            run.game.entity_sounds[before..]
+                .iter()
+                .map(|sound| sound.name),
+        );
+    }
+
+    assert!(
+        queued.contains(&"Gun01"),
+        "the fire frame queued the handgun sample: {queued:?}"
+    );
+    for name in queued {
+        let path = format!("se/{}.wav", name.to_ascii_lowercase());
+        assert!(pack.contains(&path), "{path} is missing from the pack");
+    }
+}

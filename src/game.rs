@@ -1154,8 +1154,8 @@ fn special_light_suppressed(id: RoomId, camera: usize) -> bool {
 pub struct EntitySound {
     /// Room sound name resolved from the footstep zone.
     pub name: &'static str,
-    /// The mixer bank the cue plays through: 0 room SFX, 2 enemy/room table,
-    /// 3 character table.
+    /// The mixer bank the cue plays through: 0 room SFX, 1 weapon/menu,
+    /// 2 enemy/room table, 3 character table.
     pub bank: u8,
     /// The entity bank slot (room sound column) the cue plays through.
     pub column: u8,

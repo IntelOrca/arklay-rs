@@ -1606,7 +1606,9 @@ fn fire_weapon_fx(game: &mut GameState, player: &mut PlayerState, weapon: u8) {
             }
             if frame == 0x1C && active {
                 fire_consume_ammo_stack(game);
-                play_weapon_sound(game, weapon, 0x0A);
+                // The reference's `Play3DSnd(1, 9, 0xa, ...)` is bank 1, sound
+                // id 9, volume 0xa: the python/magnum reload names Magnum02.
+                play_weapon_sound(game, weapon, 9);
             }
         }
         _ => {

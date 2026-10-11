@@ -3120,6 +3120,39 @@ mod tests {
     }
 
     #[test]
+    fn every_weapon_bank_name_is_packed_and_resolves() {
+        // The weapon bank is loaded by the equipped item id; every named slot
+        // must exist in SE_NAMES so the converter packs it (names that differ
+        // only by case share the one lowercased pack entry). The handgun fire
+        // data's ids select Gun01 (id 7) and the silent slot 8.
+        let packed: std::collections::HashSet<String> = SE_NAMES
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+        let mut named = 0usize;
+        for (weapon, row) in WEAPON_SFX_ROWS.iter().enumerate() {
+            for (id, name) in row.iter().enumerate() {
+                if name.is_empty() {
+                    continue;
+                }
+                named += 1;
+                assert!(
+                    packed.contains(&name.to_ascii_lowercase()),
+                    "weapon {weapon} id {id}: {name} is not in SE_NAMES"
+                );
+                assert_eq!(weapon_sound(weapon as u8, id as u8), Some(*name));
+            }
+        }
+        assert_eq!(named, 55, "the weapon bank's named slots");
+        assert_eq!(weapon_sound(2, 7), Some("Gun01"));
+        assert_eq!(weapon_sound(2, 8), None, "the handgun's id 8 is silent");
+        // Ids above the shipped table clamp to the machine-gun bank, and an
+        // in-range-but-unshipped bank loads nothing.
+        assert_eq!(weapon_sound(200, 7), Some("Win95_mg"));
+        assert_eq!(weapon_sound(50, 7), None);
+    }
+
+    #[test]
     fn character_tables_select_by_id_and_share_the_tail() {
         assert_eq!(character_sfx(0, 0), Some("Chris01"));
         assert_eq!(character_sfx(0, 3), Some("Chris04"));
