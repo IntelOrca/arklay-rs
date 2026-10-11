@@ -2847,6 +2847,68 @@ pub fn body_part_speed(game: &mut GameState, clips: &[Clip], slot: usize, param:
     game.entities[slot].move_speed_current = magnitude as u16;
 }
 
+/// `EntityUpdateWeaponJoint` (0x00459de0): anchor the held-weapon hand.
+///
+/// The entity's local matrix is rebuilt from its rotation triple, composed
+/// through the root (`joint 0`), joint 2 and the three transforms of weapon
+/// chain `weapon_idx` (joints `3*idx + 3 ..= 5*idx + 5`), and the composed
+/// translation is made relative to that chain's end joint's world
+/// translation. Y is dropped and the entity's X/Z are shifted by the
+/// difference, so the current pose's hand lands exactly where the previous
+/// frame's hand was - the original's held-weapon root-motion compensation.
+///
+/// The chain-end world comes from [`GameState::joint_worlds`], which the
+/// driver stores at the end of every update, exactly like the original's
+/// render pass: during this tick it still holds the previous frame's pose.
+pub fn entity_update_weapon_joint(
+    game: &mut GameState,
+    clips: &[Clip],
+    slot: usize,
+    weapon_idx: usize,
+) {
+    let entity = &game.entities[slot];
+    let locals = game.entity_anims[slot].local_transforms(entity, clips);
+    let stored = game
+        .joint_worlds
+        .get(slot)
+        .and_then(|worlds| worlds.get(weapon_idx * 3 + 5))
+        .map(|world| world.t);
+    let entity = &mut game.entities[slot];
+    weapon_joint_anchor(entity, &locals, stored, weapon_idx);
+}
+
+/// The field-agnostic core of `EntityUpdateWeaponJoint`: `locals` are the
+/// displayed pose's joint transforms and `stored` the previous frame's
+/// composed hand world (zero when none was composed yet, like the original's
+/// zeroed `.bss`). Shifts the entity's X/Z so the composed chain end lands on
+/// the stored hand.
+pub fn weapon_joint_anchor(
+    entity: &mut Entity,
+    locals: &[crate::anim::Mat4x3],
+    stored: Option<[i32; 3]>,
+    weapon_idx: usize,
+) {
+    let mut scratch =
+        crate::anim::entity_matrix_rotated(entity.pos, entity.pitch, entity.angle, entity.roll);
+    for index in [0usize, 2] {
+        if let Some(transform) = locals.get(index) {
+            scratch = compose(&scratch, transform);
+        }
+    }
+    let first = weapon_idx * 3 + 3;
+    for index in first..first + 3 {
+        if let Some(transform) = locals.get(index) {
+            scratch = compose(&scratch, transform);
+        }
+    }
+    scratch.t[1] = 0;
+    let stored = stored.unwrap_or([0, 0, 0]);
+    scratch.t[0] = scratch.t[0].wrapping_sub(stored[0]);
+    scratch.t[2] = scratch.t[2].wrapping_sub(stored[2]);
+    entity.pos[0] = entity.pos[0].wrapping_sub(scratch.t[0]);
+    entity.pos[2] = entity.pos[2].wrapping_sub(scratch.t[2]);
+}
+
 /// The hunter's body recenter (`hunter_recenter_on_joint`): recompose the
 /// death joint chain from the entity's local rotation matrix through the
 /// displayed pose's joint transforms, drop the composed Y, subtract the
@@ -3338,10 +3400,11 @@ mod tests {
         assert!(!try_advance_xz(&room, &mut e, 0, 100));
         assert_eq!(e.pos, [900, 0, 500], "the probe rolls the move back");
 
-        // Walking away is clear: the move stays committed.
+        // Walking away is clear: the move stays committed. At yaw 0x800 the
+        // GTE cosine scale truncates toward zero, so 100 units become 99.
         let mut e = entity([900, 0, 500], 0x800, 0);
         assert!(try_advance_xz(&room, &mut e, 0, 100));
-        assert_eq!(e.pos, [800, 0, 500]);
+        assert_eq!(e.pos, [801, 0, 500]);
     }
 
     #[test]
@@ -4189,7 +4252,8 @@ mod tests {
     fn sca_volume_offset_rotates_with_the_yaw() {
         // Forest's record volume centres 0x258 along local +X and -0xC8 along
         // local Z. At yaw 0x400 local +X faces -Z and local +Z faces +X, so
-        // the rotated centre is (-0xC8, -0xB4, -0x258).
+        // the rotated centre is (-0xC8, -0xB4, -0x257): the GTE scale truncates
+        // the 0x258 step toward zero by one.
         let volume = data::sca_volume(0x26).unwrap();
         let hit = ScaHit {
             offset: volume.offset,
@@ -4198,7 +4262,7 @@ mod tests {
             world_bias: [0; 3],
         };
         assert_eq!(hit.world_offset(0), [0x257, -0xB4, -0xC7]);
-        assert_eq!(hit.world_offset(0x400), [-0xC7, -0xB4, -0x258]);
+        assert_eq!(hit.world_offset(0x400), [-0xC7, -0xB4, -0x257]);
     }
 
     #[test]
@@ -4211,8 +4275,9 @@ mod tests {
         e.sca_hit_delta = [10, 5, -20];
         let hit = ScaHit::of(&e);
         // The record offset rotates first (local +X to -Z at yaw 0x400), then
-        // the world bias is added unrotated.
-        assert_eq!(hit.world_offset(0x400), [10, 5, -120]);
+        // the world bias is added unrotated. The GTE scale truncates the 100
+        // toward zero to 99.
+        assert_eq!(hit.world_offset(0x400), [10, 5, -119]);
 
         // The bias makes a volume that just missed the player overlap it.
         let prev = e.pos;
@@ -4835,8 +4900,9 @@ mod tests {
         assert_eq!(game.entities[1].move_speed_current, 100);
 
         // The scratch carries the probe point: the turn step first moved the
-        // entity 100 along angle 0x400 (-Z), then the probe stepped 500 +X.
-        assert_eq!(game.scratch_vec, [499, 0, -100]);
+        // entity 100 along angle 0x400 (-Z; the GTE scale truncates toward
+        // zero), then the probe stepped 500 +X.
+        assert_eq!(game.scratch_vec, [499, 0, -99]);
     }
 
     #[test]

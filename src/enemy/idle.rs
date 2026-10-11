@@ -743,16 +743,17 @@ mod tests {
         assert_eq!(walker.action_state, 1);
         assert_eq!(
             walker.pos,
-            [1500, 0, 500],
-            "the walker stepped 1000 units along the reversed facing"
+            [1501, 0, 500],
+            "the walker stepped 999 units along the reversed facing (the GTE \
+             scale truncates the 1000 toward zero)"
         );
 
         // The next tick trims 15 off the speed (frame 1) and steps 985, which
-        // would cross into the wall at x=1000: the move is rolled back and the
-        // knock state is entered.
+        // would cross into the wall at x=1000: the move is rolled back to the
+        // tick's start and the knock state is entered.
         tick(&mut walker, &mut clock, &clips(), &room);
         assert_eq!(walker.action_state, 2);
-        assert_eq!(walker.pos, [1500, 0, 500], "the blocked move rolled back");
+        assert_eq!(walker.pos, [1501, 0, 500], "the blocked move rolled back");
     }
 
     #[test]

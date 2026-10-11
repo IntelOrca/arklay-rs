@@ -188,6 +188,11 @@ pub struct EventVm {
     insns: HashMap<usize, Rc<Insn>>,
     payloads: HashMap<usize, Vec<Rc<Insn>>>,
     slots: [EventSlot; SLOT_COUNT],
+    /// The original's room-events gate (`g_message_flags & 0x80`): while it is
+    /// clear `room_events_check` only drains queued starts/kills and does not
+    /// step any slot. The room boot keeps it clear until the entry fade's
+    /// accumulator goes negative; every other caller leaves it enabled.
+    enabled: bool,
 }
 
 impl EventVm {
@@ -224,7 +229,13 @@ impl EventVm {
             insns,
             payloads,
             slots: [EventSlot::default(); SLOT_COUNT],
+            enabled: true,
         }
+    }
+
+    /// Set the original's room-events gate (`g_message_flags & 0x80`).
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 
     /// Start event `index` in the first free slot (or the given slot).
@@ -258,6 +269,13 @@ impl EventVm {
     /// loop: a kill an event issues stops a later slot in the same pass, and a
     /// start lands in time for a later slot to run.
     pub fn step(&mut self, host: &mut impl ScdHost) {
+        // The original's gate: a closed room-events pass still applies the
+        // command code's ordered starts/kills (they become active entries),
+        // but no slot executes.
+        if !self.enabled {
+            self.apply_requests(host);
+            return;
+        }
         for index in 0..SLOT_COUNT {
             self.apply_requests(host);
             if !self.slots[index].active {
@@ -660,6 +678,13 @@ impl EventVm {
 
     /// One tick of the `[F8][F9][count]` sleep idiom: the instruction stays at
     /// the same pc and decrements its counter until it reaches zero.
+    ///
+    /// The original's F9 always yields the frame, including the one where the
+    /// counter reaches zero: the instruction pointer advances past the sleep
+    /// but the next opcode does not run until the following frame
+    /// (`RoomEvents.cpp` case 0xF9 falls through to `event_next_entry` even on
+    /// the zero hit). Returning `true` there would run the next opcode in the
+    /// same tick and shift every scripted wait one frame early.
     fn tick_sleep(&mut self, index: usize, insn: &Insn) -> bool {
         if self.slots[index].depth == 0 {
             self.slots[index].sleeping = None;
@@ -680,7 +705,7 @@ impl EventVm {
             self.slots[index].depth = top;
             self.slots[index].sleeping = None;
             self.slots[index].pc = insn.offset + insn.bytes.len();
-            true
+            false
         } else {
             self.slots[index].pc = insn.offset;
             false
@@ -1488,10 +1513,13 @@ mod tests {
         let mut vm = EventVm::new(&scripts);
         vm.start(0, 0);
         let mut host = RecordingHost::default();
-        // count 2: the first tick decrements to 1 and yields, the second
-        // reaches zero and continues into the finish opcode.
+        // The original's F9 yields the frame even on the zero hit: the first
+        // tick decrements to 1 and yields, the second reaches zero and yields
+        // with the pc on the finish, and the third runs the finish.
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 1);
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1, "the zero hit still yields the frame");
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
     }
@@ -1505,7 +1533,10 @@ mod tests {
         let mut vm = EventVm::new(&scripts);
         vm.start(0, 0);
         let mut host = RecordingHost::default();
-        // count 1: the single tick reaches zero and continues into finish.
+        // count 1: the tick reaches zero and yields with the pc on the finish;
+        // the finish runs on the next tick.
+        vm.step(&mut host);
+        assert_eq!(vm.active_slots(), 1, "the zero hit still yields the frame");
         vm.step(&mut host);
         assert_eq!(vm.active_slots(), 0);
     }

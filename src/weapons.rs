@@ -546,6 +546,9 @@ pub fn update(
     if player.weapon.behavior == 0 {
         return;
     }
+    // The weapon machine owns the tick: the pad-driven idle did not run, so
+    // its reference scratch must not be mirrored after this tick.
+    player.idle_trace = None;
     tick(game, player, room, clips, input);
 }
 

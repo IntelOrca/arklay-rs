@@ -295,10 +295,13 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
         "the script's completion bit is raised"
     );
 
-    // The cutscene's final leg is a scripted run to (2338, 17850) that carries
-    // Jill into door AOT 2's zone. The un-collided step plus the driver's
-    // collision pass must keep her moving: sample the run and assert it closes
-    // on the target.
+    // The cutscene's final leg is a scripted run toward (2338, 17850) that
+    // carries Jill into door AOT 2's reach. The original's forward reach probe
+    // runs every frame, scripted states included, so the door fires while the
+    // run is still in progress: the run never reaches its scripted target (the
+    // headless driver freezes the player at the fire position, about 1200
+    // units short) and the head-back completion bit never comes up for this
+    // leg. The run must still carry her into the reach - sample the leg.
     let final_target = [2338, 17850];
     let mut final_closest = i32::MAX;
     for ticks in (1100..=1200).step_by(2) {
@@ -308,31 +311,13 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
         final_closest = final_closest.min(waypoint_distance(sim.player.pos, final_target));
     }
     assert!(
-        final_closest < 0x96,
+        final_closest < 0x600,
         "the final run only closed to {final_closest} units of (2338, 17850)"
     );
 
-    // Behavior 3's deceleration hands control back with the script's system bit
-    // 0x20 raised; the run's target stays latched on the entity. The hand-back
-    // raises the bit in the same tick the room-state reset has already passed,
-    // so the completion tick still ends with it set.
-    let sim = simulate_room(&pack, id, 1178, player::Input::default()).unwrap();
-    assert_eq!(
-        sim.game.entities[0].state(),
-        1,
-        "state 1 when the run completes"
-    );
-    assert_eq!(sim.game.entities[0].action_behavior, 0);
-    assert!(
-        sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x20),
-        "the final run raises the script's completion bit"
-    );
-    let entity = sim.game.entities[0];
-    assert_eq!([entity.unk_c6, entity.unk_c8], [2338, 17850]);
-
-    // With control back, the walk-in door fires and swaps in Jill's room 105.
-    // The door load resets the player animation, so no scripted state survives
-    // into the destination.
+    // With control gone, the reach-triggered door completes and swaps in
+    // Jill's room 105. The door load resets the player animation, so no
+    // scripted state survives into the destination.
     let sim = simulate_room(&pack, id, 1500, player::Input::default()).unwrap();
     assert_eq!(
         sim.transitions,
@@ -398,8 +383,10 @@ fn real_room1051_cut2_barry_completes_the_scripted_run() {
     );
 
     // The scene's completion bit (system bank 0x21) is up once the sequence
-    // finishes, so the wait after the run released.
-    let sim = simulate_room(&pack, id, 600, player::Input::default()).unwrap();
+    // finishes, so the wait after the run released. The F9 sleep fix makes the
+    // zero-hit frame yield, so every scripted wait is one frame longer than the
+    // old timing: the bit lands by tick 650.
+    let sim = simulate_room(&pack, id, 650, player::Input::default()).unwrap();
     assert!(
         sim.game.flags[usize::from(BANK_SYSTEM)].bit(0x21),
         "the cut-2 wait never released"
@@ -416,21 +403,16 @@ fn real_room_1060_chris_cutscene_drops_the_stale_walk_after_the_door() {
     let id = RoomId::parse("1060").unwrap();
 
     // Chris's opening cutscene ends in the same walk into door AOT 2. Unlike
-    // Jill's run, the walk hands pad control back before the door fires (the
-    // per-frame reset shortens the window in which the completion bit is
-    // visible, so the return is sampled at its completing tick).
-    let sim = simulate_room(&pack, id, 848, player::Input::default()).unwrap();
-    assert_eq!(
-        sim.game.entities[0].state(),
-        1,
-        "the walk returns pad control"
-    );
-    assert_eq!(sim.game.entities[0].action_behavior, 0);
-
+    // Jill's run, the walk does not reach its target either: the original's
+    // forward reach probe runs every frame, scripted states included, so the
+    // door fires while the walk is active (the player stands at (3505,17251)
+    // with the walk still latched when the headless driver freezes it behind
+    // the .dor timeline). The transition completes by tick 1300.
+    //
     // The door load resets the player animation before the destination boots,
     // so the source room's scripted walk (target 2388,17600) is gone after the
     // transition instead of continuing into room 105's geometry.
-    let sim = simulate_room(&pack, id, 1150, player::Input::default()).unwrap();
+    let sim = simulate_room(&pack, id, 1300, player::Input::default()).unwrap();
     assert_eq!(
         sim.transitions,
         vec![RoomId::from_room_and_player("105", 0).unwrap()],

@@ -4357,6 +4357,17 @@ impl GameState {
                     entity.scd_timer = 0x28;
                     entity.flags = 0;
                 }
+                // The player's collision-callback byte aliases
+                // `healthStatusFlags` (`PlayerEntity` +0xDC), so the scripted
+                // animation's 0x80 control lock has to land in the canonical
+                // health status too: the behavior-2/3 arrival gate reads it
+                // back on the following tick, and the tick-start mirror would
+                // otherwise drop it.
+                if self.selected_entity == 0 {
+                    let locked = self.entities[0].collision_flags & 0x80;
+                    let status = (self.health_status & !0x80) | locked;
+                    self.set_health_status(status);
+                }
                 StepResult::Continue
             }
             "act_anim_flags" => {
@@ -4750,8 +4761,25 @@ impl GameState {
         self.doors = [None; ROOM_ACTION_SLOTS];
         self.clear_stairs();
         let player_entity = self.entities[0];
+        let previous_entities = self.entities;
         self.entities = initial_entities();
         self.entities[0] = player_entity;
+        // `g_EnemiesList` is a static array: a room load only tears the live
+        // status bits down (the snapshot/clear pass), so a slot respawned in
+        // the destination inherits every field the outgoing room left behind.
+        // The original's `cmd_enemy_set` overwrites only the record's own
+        // words, so stale scratch (the action-tick counter, the look-at
+        // fields, ...) survives the door exactly like this.
+        for (index, entity) in previous_entities.iter().enumerate().skip(1) {
+            if let Some(slot) = self.entities.get_mut(index) {
+                *slot = *entity;
+                // The web-thread arena and its per-entity head/count are
+                // port-owned scratch that dies with the room (the arena is
+                // reset just below), so they do not survive the copy.
+                slot.clone_head = None;
+                slot.clone_count = 0;
+            }
+        }
         self.entity_anims = std::array::from_fn(|_| crate::enemy::EntityAnim::default());
         // The web-clone arena and the per-type web-joint registries reset with
         // the room (the original's room-data buffer is rebuilt on load), so no
@@ -14632,6 +14660,33 @@ mod tests {
         assert!(state.doors.iter().all(Option::is_none));
         assert_eq!(state.message.id, None);
         assert_eq!(state.camera.current_cut, 0);
+    }
+
+    /// `g_EnemiesList` is a static array: a room load only tears the live
+    /// status bits down, so a slot respawned in the destination inherits the
+    /// scratch the outgoing room left behind (the original's `cmd_enemy_set`
+    /// never clears it).
+    #[test]
+    fn enter_room_keeps_the_enemy_slots_scratch() {
+        let mut state = game();
+        state.entities[1].id = 0x24;
+        state.entities[1].action_ticks_counter = 1;
+        state.entities[1].move_speed_current = 93;
+        state.entities[1].status_flags = 1;
+        state.clear_room_entities();
+
+        state.enter_room(
+            RoomId {
+                stage: 1,
+                room: 5,
+                player_flag: 0,
+            },
+            &RoomState::default(),
+        );
+
+        assert_eq!(state.entities[1].action_ticks_counter, 1);
+        assert_eq!(state.entities[1].move_speed_current, 93);
+        assert_eq!(state.entities[1].status_flags, 0, "the teardown cleared it");
     }
 
     #[test]

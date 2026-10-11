@@ -811,8 +811,9 @@ local function scd_run(e, behavior)
 end
 
 -- State 8: run the handler, then run it again when entity flag bit 1 is set,
--- re-reading the behaviour byte for the repeat. An out-of-range behaviour is
--- reported before any dispatch.
+-- re-reading the behaviour byte for the repeat. Flag bit 2 re-anchors the
+-- entity against the previous frame's held-weapon chain end (bit 3 selects the
+-- hand). An out-of-range behaviour is reported before any dispatch.
 local function scd(e)
     local behavior = e.action_behavior
     if behavior >= 11 then
@@ -822,6 +823,9 @@ local function scd(e)
     scd_run(e, behavior)
     if e.flags & 2 ~= 0 then
         scd_run(e, e.action_behavior)
+    end
+    if e.flags & 4 ~= 0 then
+        e:update_weapon_joint((e.flags >> 3) & 1)
     end
 end
 

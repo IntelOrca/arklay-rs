@@ -195,12 +195,13 @@ mod imp {
                     function.call::<()>(e)
                 })
             };
-            // The monster joint world matrices, computed from the pose this
+            // The entity's joint world matrices, computed from the pose this
             // update leaves behind: the original's render pass does the same
-            // between two entity updates, so the next tick's script and this
+            // between two entity updates, so the next tick's script (the
+            // state-8 `EntityUpdateWeaponJoint` anchor reads them) and this
             // tick's later effect pass read exactly these matrices.
-            if id < crate::enemy::CHARACTER_ID_MIN {
-                let worlds = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
+            let worlds = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
+            if !worlds.is_empty() {
                 game.joint_worlds[slot] = worlds;
             }
             match result {
@@ -2518,6 +2519,20 @@ mod imp {
             // frames.
             methods.add_method_mut("apply_walk_speed", |_lua, api, speed: i64| {
                 crate::enemy::walk::entity_apply_walk_speed(api.entity_mut(), speed as i16);
+                Ok(())
+            });
+
+            // `EntityUpdateWeaponJoint`: re-anchor the entity's X/Z against the
+            // previous frame's held-weapon chain end (the SCD state-8 tail's
+            // `scd_entity_flags` bit 2, with bit 3 selecting the hand).
+            methods.add_method_mut("update_weapon_joint", |_lua, api, hand: i64| {
+                let clips = api.clips;
+                let slot = api.slot;
+                let game = api.game();
+                // SAFETY: the clips pointer borrows the caller's model for the
+                // whole call (see the type-level comment).
+                let clips = unsafe { &*clips };
+                crate::enemy::walk::entity_update_weapon_joint(game, clips, slot, hand as usize);
                 Ok(())
             });
 
@@ -5434,6 +5449,67 @@ end
         assert!(saw_effect, "the fire handler spawned effects");
         assert!(saw_sound, "the walk handlers queued footsteps");
         assert!(saw_placeholder, "out-of-range behaviours were counted");
+    }
+
+    /// The real NPC script's state-8 tail: `scd_entity_flags` bit 2 runs the
+    /// held-weapon anchor, shifting the entity so the displayed pose's hand
+    /// chain end lands on the previous frame's hand world.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn npc_state_eight_flag_two_anchors_the_held_weapon_hand() {
+        use crate::model::{Clip, ClipFrame, Keyframe, Skeleton};
+        use std::sync::Arc;
+
+        let source = |path: &str| {
+            crate::enemy::ENEMY_SCRIPTS
+                .iter()
+                .find(|(entry, _)| *entry == path)
+                .unwrap_or_else(|| panic!("the checked-in {path}"))
+                .1
+        };
+        let pack = pack(&[
+            ("enemy/em24.lua", source("enemy/em24.lua")),
+            ("enemy/lib/npc.lua", source("enemy/lib/npc.lua")),
+        ]);
+
+        let mut game = GameState::default();
+        let entity = &mut game.entities[1];
+        entity.id = 0x24;
+        entity.set_active(true);
+        entity.set_state(8);
+        entity.action_behavior = 1;
+        entity.action_state = 1;
+        entity.flags = 4;
+        entity.pos = [1000, 0, 2000];
+        game.entity_anims[1].skeleton = Some(Arc::new(Skeleton {
+            relative: vec![[0, 0, 0]; 15],
+            children: (1..15).map(|index| vec![index as u8]).collect(),
+        }));
+        game.entity_anims[1].keyframes = Some(Arc::new(vec![Keyframe {
+            offset: [100, -200, 300],
+            rotations: vec![[0, 0, 0]; 15],
+        }]));
+        let clips = vec![Clip {
+            frames: vec![ClipFrame {
+                keyframe: 0,
+                timing: 1,
+            }],
+        }];
+
+        let mut host = LuaEnemyHost::new();
+        assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+        // First tick: no stored hand world yet, so the entity is pulled back
+        // until the current pose's hand chain end sits at the origin on X/Z.
+        assert_ne!(game.entities[1].pos, [1000, 0, 2000], "the anchor moved");
+        let hand = game.joint_worlds[1][5].t;
+        assert_eq!(hand[0], 0, "the hand anchored on X");
+        assert_eq!(hand[2], 0, "the hand anchored on Z");
+
+        // Second tick: the stored hand world is the current pose's, so the
+        // anchor is a no-op and the position holds.
+        let anchored = game.entities[1].pos;
+        assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+        assert_eq!(game.entities[1].pos, anchored, "the anchor is stable");
     }
 
     /// The ported NPC state-9 follow/pathfind driver must match the native

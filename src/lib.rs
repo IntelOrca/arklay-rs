@@ -46,6 +46,7 @@ pub mod stats;
 pub mod text;
 pub mod tim;
 pub mod tmd;
+pub mod trace;
 pub mod transition;
 pub mod ui;
 pub mod verify;

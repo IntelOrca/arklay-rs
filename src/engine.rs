@@ -112,6 +112,7 @@ use crate::state::{Image, RoomId, RoomState};
 use crate::stats;
 use crate::text::Text;
 use crate::tim;
+use crate::trace;
 use crate::transition::{self, DoorStepper};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
@@ -246,7 +247,17 @@ impl Drop for SurfaceHandle {
 /// is drawn, so a scripted NPC scene can be captured without a display; the
 /// same deterministic path [`simulate_room`] uses is taken, audio-free.
 pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Result<()> {
-    run_with_options(pack, id, capture, ticks, &[], false, false, false)
+    run_with_options(
+        pack,
+        id,
+        capture,
+        ticks,
+        &[],
+        false,
+        false,
+        false,
+        trace::TraceOptions::default(),
+    )
 }
 
 /// [`run`] with the runtime layers and the `--stats` frame-time report.
@@ -257,7 +268,9 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 /// phases and prints the [`crate::stats`] report to stdout at exit; it runs
 /// without a capture and without opening a display. `_debug_menu` is retained
 /// for CLI compatibility: the port-only F1 room-select overlay is always
-/// enabled.
+/// enabled. `trace` enables the oracle trace of `oracle/trace-v1.md`: one line
+/// per fixed tick (rendering each tick so the frame hash exists) plus the
+/// `--capture-every` BMP cadence.
 #[allow(clippy::too_many_arguments)] // the CLI run options are all needed
 pub fn run_with_options(
     pack: &Path,
@@ -268,11 +281,12 @@ pub fn run_with_options(
     no_mods: bool,
     stats: bool,
     _debug_menu: bool,
+    trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let pack = open_game_pack(pack, mods, no_mods)?;
 
-    if capture.is_some() || stats {
+    if capture.is_some() || stats || trace.path.is_some() {
         let mut timings = stats::Stats::new();
         let load_start = Instant::now();
         let mut loaded = load_room(&pack, id)?;
@@ -290,6 +304,18 @@ pub fn run_with_options(
 
         let mut npc_models = enemy::EntityModelCache::default();
         let mut enemy_lua = enemy::LuaEnemyHost::new();
+        let mut masks = MaskCache::default();
+        let mut shadows = ShadowCache::default();
+        let mut effect_pages = EffectPageCache::default();
+        let mut trace_writer = trace.path.map(trace::TraceWriter::create).transpose()?;
+        if trace_writer.is_some()
+            && trace.capture_every > 0
+            && let Some(dir) = trace.capture_dir
+        {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        let mut framebuffer = Framebuffer::new();
         if ticks > 0 {
             let scripts = Rc::new(loaded.scripts.clone());
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -339,58 +365,101 @@ pub fn run_with_options(
                     } else {
                         door_transition = Some(session);
                     }
-                    timings.record_tick(tick_start.elapsed());
-                    timings.observe_high_water(active_entities(&game), game.effects.active_count());
-                    continue;
+                } else {
+                    let message_before = game.message.menu_choice_id() & 0x80 != 0;
+                    let requested = tick_room_timed(
+                        &mut command_vm,
+                        &mut event_vm,
+                        RoomContext {
+                            room: &mut loaded.room,
+                            game: &mut game,
+                            player: &mut player_state,
+                            player_assets: loaded.player_assets.as_ref(),
+                            pack: &pack,
+                            npc_models: &mut npc_models,
+                            enemy_lua: Some(&mut enemy_lua),
+                        },
+                        player::Input::default(),
+                        Some(&mut timings.phases),
+                    );
+                    run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
+                    if let Some(request) = requested {
+                        let record = game.transition_door.take().unwrap_or_default();
+                        door_transition = Some(start_transition(&pack, &record, &request)?);
+                    }
+                    play_snd3d_requests(
+                        &mut no_mixer,
+                        &mut snd3d_cache,
+                        &pack,
+                        &loaded.room,
+                        &mut game,
+                    );
+                    bgm::apply_live(&mut no_mixer, &mut game, &mut bgm_cache, &pack);
+                    tick_voice(&mut no_mixer, &mut voice_cache, &mut game, &pack);
+                    // No input is fed headlessly, so release a message's menu
+                    // choice the way an auto-confirm would; the F7 wait must not
+                    // outlive the frame that raised it. The scripts read the
+                    // release through the BioCard state byte, so mirror it.
+                    let choice = game.message.menu_choice_id();
+                    game.message.set_menu_choice_id(choice & 0x7F);
+                    game.sync_message_choice();
+                    drain_mask_toggles(&mut loaded.room, &mut game);
+                    // A capture never plays a film: the request is taken and
+                    // dropped so a `movie_on` cannot stall the headless run.
+                    game.take_fmv_request();
                 }
-                let message_before = game.message.menu_choice_id() & 0x80 != 0;
-                let requested = tick_room_timed(
-                    &mut command_vm,
-                    &mut event_vm,
-                    RoomContext {
-                        room: &mut loaded.room,
-                        game: &mut game,
-                        player: &mut player_state,
-                        player_assets: loaded.player_assets.as_ref(),
-                        pack: &pack,
-                        npc_models: &mut npc_models,
-                        enemy_lua: Some(&mut enemy_lua),
-                    },
-                    player::Input::default(),
-                    Some(&mut timings.phases),
-                );
-                run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
-                if let Some(request) = requested {
-                    let record = game.transition_door.take().unwrap_or_default();
-                    door_transition = Some(start_transition(&pack, &record, &request)?);
-                }
-                play_snd3d_requests(
-                    &mut no_mixer,
-                    &mut snd3d_cache,
-                    &pack,
-                    &loaded.room,
-                    &mut game,
-                );
-                bgm::apply_live(&mut no_mixer, &mut game, &mut bgm_cache, &pack);
-                tick_voice(&mut no_mixer, &mut voice_cache, &mut game, &pack);
-                // No input is fed headlessly, so release a message's menu
-                // choice the way an auto-confirm would; the F7 wait must not
-                // outlive the frame that raised it. The scripts read the
-                // release through the BioCard state byte, so mirror it.
-                let choice = game.message.menu_choice_id();
-                game.message.set_menu_choice_id(choice & 0x7F);
-                game.sync_message_choice();
-                drain_mask_toggles(&mut loaded.room, &mut game);
-                // A capture never plays a film: the request is taken and
-                // dropped so a `movie_on` cannot stall the headless run.
-                game.take_fmv_request();
                 timings.record_tick(tick_start.elapsed());
                 timings.observe_high_water(active_entities(&game), game.effects.active_count());
+                // The room boot path arms no room-entry fade (that is a
+                // session behaviour), so the trace reports the port's inactive
+                // fade: step 0, accumulator -1.
+                if let Some(writer) = trace_writer.as_mut() {
+                    let index = writer.tick_index();
+                    render_frame(
+                        &mut framebuffer,
+                        &pack,
+                        loaded.id,
+                        &loaded.room,
+                        &player_state,
+                        &mut game,
+                        loaded.player_assets.as_ref(),
+                        &mut npc_models,
+                        &mut masks,
+                        &mut shadows,
+                        &mut effect_pages,
+                    );
+                    let inactive = transition::Fade::inactive();
+                    writer.write_tick(&trace::TraceTick {
+                        room: loaded.id,
+                        rng: game.rand_state,
+                        rseed: game.rand_seed,
+                        fade_counter: inactive.counter() as i16,
+                        fade_state: inactive.state(),
+                        cam: loaded.room.current_cut as u8,
+                        entities: &game.entities,
+                        frame_hash: trace::frame_hash(&framebuffer),
+                    })?;
+                    if trace.capture_every > 0
+                        && index % trace.capture_every == 0
+                        && let Some(dir) = trace.capture_dir
+                    {
+                        capture_bmp(
+                            &Image {
+                                width: framebuffer.width,
+                                height: framebuffer.height,
+                                rgba: framebuffer.rgba.clone(),
+                            },
+                            &dir.join(format!("f{index:05}.bmp")),
+                        )?;
+                    }
+                }
             }
+        }
+        if let Some(writer) = trace_writer.as_mut() {
+            writer.flush()?;
         }
 
         let render_start = Instant::now();
-        let mut framebuffer = Framebuffer::new();
         render_frame(
             &mut framebuffer,
             &pack,
@@ -400,9 +469,9 @@ pub fn run_with_options(
             &mut game,
             loaded.player_assets.as_ref(),
             &mut npc_models,
-            &mut MaskCache::default(),
-            &mut ShadowCache::default(),
-            &mut EffectPageCache::default(),
+            &mut masks,
+            &mut shadows,
+            &mut effect_pages,
         );
         timings.phases.render += render_start.elapsed();
 
@@ -895,6 +964,18 @@ struct GameSession {
     /// The first fixed tick after arming must not advance the fade: the frame
     /// it was armed on has not been drawn yet, so that tick only clears this.
     room_fade_pending: bool,
+    /// The original's room-events gate (`g_message_flags & 0x80`) for a
+    /// new-game boot: the boot's entry fade keeps the bit clear, so
+    /// `room_events_check` does not step an event the room's init script
+    /// queued until the accumulator goes negative. The port normally leaves
+    /// the gate open; only [`GameSession::arm_new_game_boot`] closes it.
+    room_boot_gate: bool,
+    /// The first fixed tick after arming the room-entry fade still runs the
+    /// player's state machine: the reference's inner-loop state machine clears
+    /// `g_message_flags` only after that tick, so the spawn init (player state
+    /// 0 to 1) runs while the gate is still nominally closed. The freeze
+    /// starts one tick later.
+    room_boot_grace: bool,
     /// The cutscene screen-intensity value the letterbox bars blend with.
     /// The bank-5 `MSF_SCREEN_INTENSITY` flag ramps it 16 a frame: up to `0xF0`
     /// while the flag is set, back down to zero while it is clear.
@@ -1103,6 +1184,8 @@ impl GameSession {
             boot_message: None,
             room_fade: transition::Fade::inactive(),
             room_fade_pending: false,
+            room_boot_gate: false,
+            room_boot_grace: false,
             menu_fade: transition::Fade::inactive(),
             menu_fade_phase: MenuFadePhase::None,
             menu_fade_pending: false,
@@ -1207,6 +1290,36 @@ impl GameSession {
             return Ok(());
         }
         self.tick_screen_intensity();
+        // The original's room-events gate (`g_message_flags` bit 0x80): the
+        // entry fade's state machine restores the bit on the tick its
+        // accumulator drops below 1, and until then `room_events_check` does
+        // not step. The accumulator is read before this tick's fade step
+        // because the original draws and tests it before `main_loop` adds the
+        // counter.
+        let events_enabled = !self.room_boot_gate || self.room_fade.state() < 1;
+        if events_enabled {
+            if self.room_boot_gate {
+                self.room_boot_gate = false;
+                self.room_boot_grace = false;
+                // The inner-loop state machine restores the saved word the
+                // tick the entry fade's accumulator drops below 1. The port
+                // only mirrors the player-state bit here (its other message
+                // bits have their own consumers); the reference's word is
+                // `g_short_message_flags | 0x200` = 0xFFFF.
+                self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
+            }
+        } else {
+            // While the entry fade runs the reference's `g_message_flags` is
+            // cleared, which freezes the whole player animation state machine:
+            // the post-door idle countdown must not start until the gate opens.
+            // The clearing starts the tick AFTER the entry, so the spawn init
+            // (player state 0 to 1) still runs under the closed gate.
+            if !self.room_boot_grace {
+                self.game.message_flags &= !game::MESSAGE_FLAG_PLAYER_STATE;
+            }
+            self.room_boot_grace = false;
+        }
+        self.event_vm.set_enabled(events_enabled);
         self.tick_room_fade();
         // A film owns the tick while it plays: the room's scripts, entities,
         // effects and the player stay frozen, exactly like the original's
@@ -1314,6 +1427,21 @@ impl GameSession {
             },
             input,
         );
+        // While the pad-driven idle behavior owns the player, mirror its
+        // reference scratch into entity 0: `player_behavior_00_idle` keeps
+        // `action_state` as the idle phase and `attackDirection` as the
+        // 100-tick settle countdown, and scripts plus the oracle trace read
+        // those bytes. The room-entry gate (the original's `g_message_flags`
+        // freeze) keeps the player machine from running until the fade has
+        // stepped, exactly like the reference's post-load window.
+        if !self.room_boot_gate
+            && self.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE != 0
+            && self.game.entities[0].state() == 1
+            && let Some((action_state, ticks)) = self.player.idle_trace
+        {
+            self.game.entities[0].action_state = action_state;
+            self.game.entities[0].action_ticks_counter = ticks;
+        }
         // The Lua hooks run after the room tick: `on_tick` sees the whole
         // tick's state and `on_message` may rewrite a message the tick raised
         // before the window resolves its bytes.
@@ -1425,9 +1553,14 @@ impl GameSession {
         // A script's `movie_on` request takes over after this tick: the film
         // owns the next tick and the game sounds pause until it ends. A
         // pending door transition wins and leaves the request for after it.
+        // A door request raised by the destination's gameplay while its own
+        // transition still draws is dropped: the original reads no gameplay
+        // during the door task, and the running timeline owns the overlay.
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
-            self.transition = Some(start_transition(pack, &record, &transition)?);
+            if self.transition.is_none() {
+                self.transition = Some(start_transition(pack, &record, &transition)?);
+            }
         } else if let Some(id) = self.game.take_fmv_request() {
             if let Err(err) = self.start_movie(pack, id, self.game.id.player_flag) {
                 eprintln!("warning: film id {id} unavailable: {err:#}");
@@ -2068,7 +2201,7 @@ impl GameSession {
                 }
             }
             PickupPhase::Message => {
-                if !(was_active && !self.game.message.active) {
+                if !was_active || self.game.message.active {
                     return;
                 }
                 let kind = self.pickup_view.as_ref().map(|pickup| pickup.kind);
@@ -2517,14 +2650,30 @@ impl GameSession {
         session.transition.set_sound_busy(false);
         self.transition_finished = frame.finished;
         self.transition = Some(session);
+        // The original's `main_loop` ramps the cutscene screen intensity once
+        // per platform frame regardless of the door task, and only skips
+        // *drawing* the bars while the transition owns the screen. The room's
+        // gameplay tick is paused here, so the ramp must run on the animation
+        // frame or the bars would still be fading when the destination's
+        // first traced tick is drawn.
+        self.tick_screen_intensity();
     }
 
-    /// Tear the finished transition down, swap the destination room in and
-    /// rebuild its scripts/VMs.
+    /// Tear the finished transition down.
+    ///
+    /// A full load was already entered at the transition's start (the
+    /// original's `room_transition_load` runs `room_set` before it waits the
+    /// animation task out), so this only drops the timeline. A camera-only
+    /// record never entered (its branch re-tests the switch zones after the
+    /// wait), so its teardown happens here.
     fn finish_transition(&mut self, pack: &Pack) {
         let Some(mut session) = self.transition.take() else {
             return;
         };
+        self.transition_finished = false;
+        if session.entered {
+            return;
+        }
         // The BGM state machine needs the source room to resolve the outgoing
         // group for a same-group toggle (`g_AttractMode_RoomCameraId`).
         let from = self.loaded.id;
@@ -2540,14 +2689,81 @@ impl GameSession {
             &mut self.music,
             &mut self.sfx_cache,
         );
-        self.transition_finished = false;
+        if arms_fade {
+            let scripts = Rc::new(self.loaded.scripts.clone());
+            self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
+            self.event_vm = scd::vm::EventVm::from_scripts(scripts);
+            self.enter_room(pack, Some(from));
+            // `room_set` runs `room_events_check` once with the message gate
+            // forced open, so an event the init script queued executes exactly
+            // one opcode during the load (RoomInit.cpp 0x00477c45), the same
+            // pass the new-game boot models.
+            {
+                let mut host = game::ScdGameHost::new(&mut self.game);
+                self.event_vm.step(&mut host);
+            }
+            self.arm_room_entry_fade();
+        }
+    }
+
+    /// Enter a full-load transition's destination while the `.dor` timeline
+    /// keeps playing.
+    ///
+    /// The original's `room_transition_load` latches the door record, spawns
+    /// the animation task, places the player and then loads the destination
+    /// (`room_set` plus one forced-open `room_events_check`) before waiting
+    /// the animation out, so the destination's init script and its flag
+    /// effects run while the animation still owns the screen; no gameplay tick
+    /// runs until the task finishes. The camera-only record (bit `0x80`) has
+    /// no destination and keeps the room frozen until the timeline ends,
+    /// exactly like the original's camera-only branch.
+    fn enter_transition_destination(&mut self, pack: &Pack) {
+        let Some(mut session) = self.transition.take() else {
+            return;
+        };
+        if session.camera_only || session.entered {
+            self.transition = Some(session);
+            return;
+        }
+        let from = self.loaded.id;
+        finish_transition(
+            pack,
+            &mut session,
+            &mut self.game,
+            &mut self.player,
+            &mut self.loaded,
+            &mut self.music,
+            &mut self.sfx_cache,
+        );
+        session.entered = true;
+        self.transition = Some(session);
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
         self.enter_room(pack, Some(from));
-        if arms_fade {
-            self.arm_room_fade();
+        // `room_set` runs `room_events_check` once with the message gate
+        // forced open, so an event the init script queued executes exactly one
+        // opcode during the load (RoomInit.cpp 0x00477c45), the same pass the
+        // new-game boot models.
+        {
+            let mut host = game::ScdGameHost::new(&mut self.game);
+            self.event_vm.step(&mut host);
         }
+        self.arm_room_entry_fade();
+    }
+
+    /// Arm the room-entry fade exactly like `game_loop`'s outer loop plus the
+    /// first `main_loop` step: the accumulator starts at `0x7FFF` and the
+    /// counter's first step is already applied, and the room-events gate stays
+    /// closed until the accumulator drops below 1. The `room_fade_pending`
+    /// flag would otherwise delay the step by a tick, which shifts the gate
+    /// five ticks late.
+    fn arm_room_entry_fade(&mut self) {
+        self.arm_room_fade();
+        self.room_fade.tick();
+        self.room_fade_pending = false;
+        self.room_boot_gate = true;
+        self.room_boot_grace = true;
     }
 
     /// Arm the room-entry fade the original runs whenever gameplay (re)enters
@@ -2563,6 +2779,29 @@ impl GameSession {
         self.room_fade
             .set(2, if slow { -163 } else { -6144 }, 0x7FFF);
         self.room_fade_pending = true;
+    }
+
+    /// The new-game boot sequence the oracle trace compares against: one
+    /// room-events pass for the original's `room_set` call and the entry fade
+    /// armed with its first accumulator step already applied, exactly as
+    /// `game_loop`'s outer loop and the first `main_loop` leave it before the
+    /// first gameplay tick. The room-events gate stays closed until the fade
+    /// accumulator drops below 1 (the frame `g_message_flags` bit 0x80 is
+    /// restored), so the event the init script queued does not step until
+    /// then. Only the trace path arms this; the interactive narration has its
+    /// own sequence.
+    fn arm_new_game_boot(&mut self) {
+        // `room_set` runs `room_events_check` once with the message gate
+        // forced open, so an event the init script queued executes exactly one
+        // opcode during the room load (RoomInit.cpp 0x00477c45).
+        {
+            let mut host = game::ScdGameHost::new(&mut self.game);
+            self.event_vm.step(&mut host);
+        }
+        // `game_loop`'s outer loop arms the entry fade and `main_loop` steps
+        // it once before the first inner-loop tick, so tick 0's in-tick
+        // accumulator is `0x7FFF - 0x1800` (26623).
+        self.arm_room_entry_fade();
     }
 
     /// Step the room-entry fade once per fixed tick. The tick after arming
@@ -2732,6 +2971,21 @@ impl GameSession {
     #[cfg(test)]
     fn menu_fade_alpha(&self) -> Option<u8> {
         self.menu_fade.overlay().map(|overlay| overlay.alpha)
+    }
+
+    /// The per-tick oracle-trace snapshot (`oracle/trace-v1.md`): the live
+    /// room, game and room-entry fade state plus the rendered frame's hash.
+    fn trace_tick<'a>(&'a self, frame: &Framebuffer) -> trace::TraceTick<'a> {
+        trace::TraceTick {
+            room: self.loaded.id,
+            rng: self.game.rand_state,
+            rseed: self.game.rand_seed,
+            fade_counter: self.room_fade.counter() as i16,
+            fade_state: self.room_fade.state(),
+            cam: self.loaded.room.current_cut as u8,
+            entities: &self.game.entities,
+            frame_hash: trace::frame_hash(frame),
+        }
     }
 
     /// Render the current frame into the session framebuffer: a transition
@@ -3110,6 +3364,11 @@ fn seed_start_health(game: &mut game::GameState, character: u8) {
     let character = character & 1;
     game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER_MODEL)] = character;
     game.state_bytes[usize::from(game::STATE_BYTE_CHARACTER)] = character;
+    // `InitializeGame` also writes the selected character into the player
+    // entity's id (`g_playerEntity.id = g_SelectedCharactedId`, GameStart.cpp
+    // 0x0047...); the room load's model switch then leaves it alone because
+    // the id already equals `g_CharacterModelId`.
+    game.entities[0].id = character;
     game.entities[0].health = NEW_GAME_HEALTH[usize::from(character)];
     game.max_health = game::character_max_health(character);
     game.set_health_copy(NEW_GAME_HEALTH[usize::from(character)]);
@@ -3995,6 +4254,11 @@ impl App {
                 cues = cx.cues.into_inner();
             } else if !session.transition_finished {
                 if session.transition.is_some() {
+                    // The original's `room_transition_load` blocks the gameplay
+                    // loop while the door-animation task runs: the room is
+                    // loaded behind the animation but no gameplay tick happens
+                    // until the task finishes, and the first tick after it runs
+                    // in the destination. Input stays gated exactly the same.
                     session.tick_transition(pack, action || input.run);
                 } else {
                     session.tick(pack, ui, input, action)?;
@@ -4102,11 +4366,15 @@ impl App {
         Ok(())
     }
 
-    /// After presenting: tear down a finished transition and feed the mixer.
+    /// After presenting: enter a door's destination (the tick after the door
+    /// fired, while the animation still plays) and tear down a finished
+    /// transition; then feed the mixer.
     fn post_present(&mut self) {
         if let Mode::Play(session) = &mut self.mode {
             if session.transition_finished {
                 session.finish_transition(&self.pack);
+            } else if session.transition.as_ref().is_some_and(|t| !t.entered) {
+                session.enter_transition_destination(&self.pack);
             }
             session.update_audio();
         }
@@ -4172,12 +4440,15 @@ pub fn run_ui_with_options(
         &[],
         false,
         false,
+        trace::TraceOptions::default(),
     )
 }
 
 /// [`run_ui_with_options`] with the runtime layers; `mods`/`no_mods` behave
 /// exactly like [`open_game_pack`]. `_debug_menu` is retained for CLI
 /// compatibility: the port-only F1 room-select overlay is always enabled.
+/// `trace` enables the `--ui game` oracle run: `ticks` fixed updates with a
+/// trace line per tick and the `capture_every` BMP cadence.
 #[allow(clippy::too_many_arguments)] // the CLI boot options are all needed
 pub fn run_ui_with_mods(
     pack: &Path,
@@ -4188,6 +4459,7 @@ pub fn run_ui_with_mods(
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
+    trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
     let boot = match screen {
         "font" => return run_font_ui(pack, capture, mods, no_mods),
@@ -4209,7 +4481,16 @@ pub fn run_ui_with_mods(
             )
         }
     };
-    run_ui_impl(pack, boot, capture, save_dir, mods, no_mods, _debug_menu)
+    run_ui_impl(
+        pack,
+        boot,
+        capture,
+        save_dir,
+        mods,
+        no_mods,
+        _debug_menu,
+        trace,
+    )
 }
 
 /// The interactive root boot: the two logos, the title's opening film and the
@@ -4231,10 +4512,12 @@ pub fn run_root(
         mods,
         no_mods,
         _debug_menu,
+        trace::TraceOptions::default(),
     )
 }
 
 /// The shared body of the `--ui` boot and the interactive root boot.
+#[allow(clippy::too_many_arguments)] // the boot options are all needed
 fn run_ui_impl(
     pack: &Path,
     boot: AppBoot,
@@ -4243,8 +4526,9 @@ fn run_ui_impl(
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
+    trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
-    if let Some(capture_path) = capture {
+    if capture.is_some() || trace.path.is_some() {
         let pack = open_game_pack(pack, mods, no_mods)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
@@ -4277,6 +4561,7 @@ fn run_ui_impl(
             AppBoot::NewGame(character) => {
                 let session = GameSession::new(&app.pack, character, &app.save_dir)?;
                 app.start_session(session);
+                run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Menu => {
                 app.open_menu()?;
@@ -4307,7 +4592,10 @@ fn run_ui_impl(
         // frames stay deterministic and audio-free.
         app.pending_movie = None;
         app.draw();
-        return app.capture(capture_path);
+        if let Some(capture_path) = capture {
+            return app.capture(capture_path);
+        }
+        return Ok(());
     }
 
     let pack = open_game_pack(pack, mods, no_mods)?;
@@ -4315,6 +4603,81 @@ fn run_ui_impl(
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
     run_app_loop(&mut app, &display)
+}
+
+/// The `--ui game` oracle run (`oracle/trace-v1.md`): `options.ticks` fixed
+/// updates, each followed by a draw, one trace line and, on the
+/// `capture_every` cadence, a `f%05d.bmp` frame. The room swap a finished door
+/// transition defers to runs after each frame, exactly like the interactive
+/// loop's `post_present`.
+fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()> {
+    let Some(path) = options.path else {
+        return Ok(());
+    };
+    // The trace starts at the first tick of the new-game room, so the boot
+    // sequence's hidden state (the room_set event pass and the entry fade's
+    // in-flight accumulator) is installed before tick 0 exactly like the
+    // reference's hook sees it.
+    if let Mode::Play(session) = &mut app.mode {
+        session.arm_new_game_boot();
+    }
+    let mut writer = trace::TraceWriter::create(path)?;
+    if options.capture_every > 0
+        && let Some(dir) = options.capture_dir
+    {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    // A door transition's animation frames are not gameplay ticks: the
+    // reference's `room_transition_load` blocks its gameplay loop until the
+    // door-animation task finishes, so those frames produce no trace line.
+    // `--ticks` counts gameplay ticks, so the loop keeps iterating (with a
+    // safety bound) until that many lines have been written.
+    let mut emitted = 0u32;
+    let mut iterations = 0u32;
+    let bound = options
+        .ticks
+        .saturating_mul(2)
+        .saturating_add(MAX_TRANSITION_FRAMES);
+    while emitted < options.ticks {
+        iterations += 1;
+        if iterations > bound {
+            break;
+        }
+        let in_transition =
+            matches!(&app.mode, Mode::Play(session) if session.transition.is_some());
+        if let AppFlow::Quit = app.update(UiInput::default(), player::Input::default(), false)? {
+            break;
+        }
+        app.draw();
+        if let Mode::Play(session) = &app.mode
+            && !in_transition
+        {
+            let index = writer.tick_index();
+            writer.write_tick(&session.trace_tick(&app.framebuffer))?;
+            emitted += 1;
+            if options.capture_every > 0 && index % options.capture_every == 0 {
+                write_trace_capture(app, options, index)?;
+            }
+        }
+        app.post_present();
+    }
+    writer.flush()
+}
+
+/// Write one `capture_every` frame from the app framebuffer.
+fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32) -> Result<()> {
+    let Some(dir) = options.capture_dir else {
+        return Ok(());
+    };
+    capture_bmp(
+        &Image {
+            width: app.framebuffer.width,
+            height: app.framebuffer.height,
+            rgba: app.framebuffer.rgba.clone(),
+        },
+        &dir.join(format!("f{index:05}.bmp")),
+    )
 }
 
 /// The interactive app loop shared by `--ui` and the standalone `--fmv`
@@ -4618,9 +4981,12 @@ const SAMPLE_SPACING: &[u8] = &[
 
 /// A running door transition.
 ///
-/// The destination room is loaded when the transition starts so it is ready
-/// behind the leading black frames; [`finish_transition`] swaps it in and
-/// places the player when the timeline finishes.
+/// The destination room is loaded and booted when the transition starts so it
+/// is ready behind the leading black frames, exactly like the original's
+/// `room_transition_load`, which loads and boots the room before waiting the
+/// animation task out. Gameplay stays blocked for the whole animation; the
+/// destination's first gameplay tick is the first one after the timeline
+/// finishes.
 struct TransitionMode {
     /// The animation timeline.
     transition: transition::Transition<DoorAnimation>,
@@ -4634,6 +5000,9 @@ struct TransitionMode {
     silent: bool,
     /// Destination room loaded behind the black frames.
     destination: Option<LoadedRoom>,
+    /// The destination was swapped in and booted at the transition's start;
+    /// the timeline now only owns the overlay and the input gate.
+    entered: bool,
     /// The most recent timeline frame, for rendering.
     frame: transition::TransitionFrame,
 }
@@ -4769,6 +5138,7 @@ fn start_transition(
         camera_only,
         silent,
         destination,
+        entered: false,
         frame: transition::TransitionFrame {
             black: true,
             ..transition::TransitionFrame::default()
@@ -6893,6 +7263,10 @@ fn tick_room_timed(
     // tick, exactly like the original's `MSF2_EFFECT_ZONE` check in the
     // locomotion handlers.
     pad.slow_motion = context.game.flags[5].bit(game::MSF2_EFFECT_ZONE);
+    // `g_message_flags` bit 8 clear means a displayed message holds the idle
+    // settle from blending into the breathe loop (the original's
+    // `player_behavior_00_idle` gate).
+    pad.message_blocked = context.game.message_flags & game::MESSAGE_FLAG_CONTROLS == 0;
     // The player's collision callback byte aliases the health-status byte:
     // mirror the live status before any physics or scripted movement runs.
     context.player.collision_flags = context.game.health_status;
@@ -6901,6 +7275,9 @@ fn tick_room_timed(
     // rollbacks at.
     let pre_move = context.player.pos;
     if state != 1 || frozen {
+        // The pad-driven idle did not run this tick, so its reference scratch
+        // is stale: the trace mirror must not reapply it.
+        context.player.idle_trace = None;
         pad.action_pressed = false;
         pad.action_held = false;
         context.player.input = pad;
@@ -6915,14 +7292,30 @@ fn tick_room_timed(
                 .as_ref()
                 .map(|anim| anim.clips.as_slice())
                 .unwrap_or(&[]);
-            player_script::update(
-                context.game,
-                context.player,
-                context.room,
+            let empty_keyframes: &[crate::model::Keyframe] = &[];
+            let banks = player_script::AnimationBanks {
                 emd_clips,
                 emw_clips,
                 room_clips,
-            );
+                emd_keyframes: context
+                    .player_assets
+                    .map_or(empty_keyframes, |assets| assets.emd.keyframes.as_slice()),
+                emw_keyframes: context
+                    .player_assets
+                    .map_or(empty_keyframes, |assets| assets.emw.keyframes.as_slice()),
+                room_keyframes: context
+                    .room
+                    .room_anim
+                    .as_ref()
+                    .map_or(empty_keyframes, |anim| anim.keyframes.as_slice()),
+                emd_skeleton: context.player_assets.map(|assets| &assets.emd.skeleton),
+                room_skeleton: context
+                    .room
+                    .room_anim
+                    .as_ref()
+                    .map(|anim| &anim.skeleton),
+            };
+            player_script::update_banks(context.game, context.player, context.room, &banks);
         }
     } else if !player_script::control_gate(context.game, context.player)
         && let Some(assets) = context.player_assets
@@ -7001,6 +7394,15 @@ fn tick_room_timed(
         context.game.entities[0].pos,
     ));
     context.game.entities[0].zone_flags = (context.game.entities[0].zone_flags & !0x01) | in_zone;
+    // The render loop's `EntityComputeJointWorldMatrices` for the player:
+    // composed after the physics so the next tick's held-weapon anchor reads
+    // the previous frame's hand, exactly like the original's frame order.
+    store_player_joint_worlds(
+        context.game,
+        context.player,
+        context.player_assets,
+        context.room,
+    );
     // The gated reach finished this tick: raise the viewer flag the action
     // entry selects, return the message ready bit and clear the health lock.
     // The end-of-tick item-viewer hook then opens the viewer.
@@ -7020,19 +7422,19 @@ fn tick_room_timed(
     }
     // The original runs the room action probe after the player's movement, so
     // `stairs_height_update` measures the frame's final position and the climb
-    // behaviour starts from where the player actually is. The probe belongs to
-    // the player's control path: the original gates the movement, forward reach
-    // and collision pass on the player's scripted flag, so a scripted state
-    // never refreshes the reach point it tests. Probe only from state 1; the
-    // action-key entries (bit 0x80, including `set_stairs_zone`) additionally
-    // need a clear message lock and no locked action, because a locked action
-    // behaviour does not read a new press.
+    // behaviour starts from where the player actually is. `update_player_position`
+    // walks the whole action table every frame, scripted states included - the
+    // mansion intro's scripted walk is what carries the player into the main
+    // hall door's reach, so gating the probe on the pad-driven state would fire
+    // the door several ticks late. Only the action-key entries (flags bit 0x80)
+    // belong to the control path and need a live press.
     let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
-    if context.game.entities[0].state() == 1 {
-        let probe_action = input.action_pressed
-            && !controls_locked
-            && !frozen
-            && context.player.locked == player::LockedAction::None;
+    let probe_action = input.action_pressed
+        && !controls_locked
+        && !frozen
+        && context.game.entities[0].state() == 1
+        && context.player.locked == player::LockedAction::None;
+    {
         let mut host = game::ScdGameHost::new(context.game);
         host.interact(context.player.pos, context.player.angle, probe_action);
     }
@@ -7304,6 +7706,7 @@ impl InputState {
                 fire: active & KEY_FIRE != 0,
                 fire_pressed: pressed & KEY_FIRE != 0,
                 slow_motion: false,
+                message_blocked: false,
             },
             action: active & KEY_CONFIRM != 0,
             ui: UiInput {
@@ -7382,6 +7785,75 @@ impl PlayerAssets {
     /// The active weapon's clips and mesh for an EMW file id.
     fn weapon(&self, file: Option<u8>) -> Option<&crate::model::Emw> {
         self.weapons.get(&file?)
+    }
+}
+
+/// The player's `EntityComputeJointWorldMatrices` pass: compose the displayed
+/// pose's joint worlds into `joint_worlds[0]` at the end of every tick, exactly
+/// like the original's render loop, so the next tick's state-8 held-weapon
+/// anchor (and the effect pass) reads the previous frame's hand. The bank
+/// selection mirrors the renderer's.
+fn store_player_joint_worlds(
+    game: &mut game::GameState,
+    player: &player::PlayerState,
+    assets: Option<&PlayerAssets>,
+    room: &RoomState,
+) {
+    let Some(assets) = assets else {
+        return;
+    };
+    let (skeleton, keyframes, clips) = match player.clip_source {
+        player::ClipSource::Emd => (
+            &assets.emd.skeleton,
+            &assets.emd.keyframes,
+            &assets.emd.clips,
+        ),
+        player::ClipSource::Emw => (
+            &assets.emd.skeleton,
+            &assets.emw.keyframes,
+            &assets.emw.clips,
+        ),
+        player::ClipSource::Room => match &room.room_anim {
+            Some(anim) if !anim.clips.is_empty() => {
+                (&anim.skeleton, &anim.keyframes, &anim.clips)
+            }
+            _ => (
+                &assets.emd.skeleton,
+                &assets.emd.keyframes,
+                &assets.emd.clips,
+            ),
+        },
+        player::ClipSource::Weapon => match assets.weapon(player.weapon.weapon_file) {
+            Some(weapon) => (&weapon.skeleton, &weapon.keyframes, &weapon.clips),
+            None => (
+                &assets.emd.skeleton,
+                &assets.emd.keyframes,
+                &assets.emd.clips,
+            ),
+        },
+        player::ClipSource::Damage => match &game.player_damage {
+            Some(bank) => (
+                &assets.emd.skeleton,
+                bank.keyframes.as_ref(),
+                bank.clips.as_ref(),
+            ),
+            None => (
+                &assets.emd.skeleton,
+                &assets.emd.keyframes,
+                &assets.emd.clips,
+            ),
+        },
+    };
+    // Materialize the pose on the live clock, not the published snapshot: the
+    // clock's `applied` pose is the port's `joints[].transform`, which persists
+    // until the next consuming tick exactly like the original's joint structs.
+    let Some(keyframe) = game.entity_anims[0].player.pose_keyframe(clips, keyframes) else {
+        return;
+    };
+    let entity = crate::anim::entity_matrix(player.pos, player.angle);
+    let worlds = crate::anim::joint_matrices(skeleton, &keyframe, &entity);
+    if !worlds.is_empty() {
+        game.joint_worlds[0] = worlds;
     }
 }
 
@@ -10813,6 +11285,7 @@ mod tests {
             camera_only: true,
             silent: true,
             destination: None,
+            entered: false,
             frame: transition::TransitionFrame::default(),
         };
         let mut music: Option<Mixer> = None;
@@ -10858,6 +11331,7 @@ mod tests {
                 script_source: ScriptSource::Rdt,
                 player_assets: None,
             }),
+            entered: false,
             frame: transition::TransitionFrame::default(),
         };
         finish_transition(
@@ -12166,42 +12640,22 @@ mod tests {
         walk_through_test_door(&pack, &mut session);
         assert_eq!(session.loaded.id, b);
 
-        // The room-entry fade is draw-then-add: the tick after the arm only
-        // clears the pending flag, so the first destination frame is the full
-        // `0x7FFF` black. The `0xE800` counter then steps the alpha down 48 a
-        // tick — 255, 207, 159, 111, 63, 15 — before the state goes negative.
+        // The destination's entry fade is armed like `game_loop`'s outer loop
+        // plus the first `main_loop` step: the accumulator starts at `0x7FFF`
+        // and `0xE800` is already subtracted, so the first drawn alpha is
+        // `26623 >> 7` = 159. The counter then steps the alpha down 48 a tick:
+        // 159, 111, 63, 15, before the state goes negative.
         let mut alphas = Vec::new();
-        for frame in 0..7 {
+        for _ in 0..7 {
             session
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
             session.render(&pack);
             alphas.push(session.room_fade_alpha());
-            if frame == 0 {
-                assert_eq!(alphas[0], Some(255));
-                assert!(
-                    session
-                        .frame()
-                        .rgba
-                        .as_chunks::<4>()
-                        .0
-                        .iter()
-                        .all(|pixel| pixel[..3] == [0, 0, 0]),
-                    "the first frame after the transition is black"
-                );
-            }
         }
         assert_eq!(
             alphas,
-            [
-                Some(255),
-                Some(207),
-                Some(159),
-                Some(111),
-                Some(63),
-                Some(15),
-                None
-            ]
+            [Some(159), Some(111), Some(63), Some(15), None, None, None]
         );
         // The fade stays cleared after it has run out.
         session
@@ -12221,7 +12675,9 @@ mod tests {
             .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_MENU_FADE_LATCH, 0);
         walk_through_test_door(&pack, &mut session);
 
-        // `0xFF5D` (-163) steps the alpha down by two rather than 48.
+        // `0xFF5D` (-163) steps the alpha down by one or two rather than 48;
+        // the accumulator already carries the entry's first step, so the first
+        // drawn alpha is 253.
         let mut alphas = Vec::new();
         for _ in 0..3 {
             session
@@ -12230,7 +12686,7 @@ mod tests {
             session.render(&pack);
             alphas.push(session.room_fade_alpha());
         }
-        assert_eq!(alphas, [Some(255), Some(254), Some(253)]);
+        assert_eq!(alphas, [Some(253), Some(252), Some(250)]);
         // The slow counter is still running where the normal one has cleared.
         for _ in 0..3 {
             session

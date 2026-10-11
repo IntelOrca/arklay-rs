@@ -144,16 +144,13 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         let repeat = game.entities[slot].action_behavior;
         run(game, slot, room, clips, repeat);
     }
-    // `scd_entity_flags` bit 2 refreshes the held-weapon joint (bit 3 selects
-    // the hand). The original's `EntityUpdateWeaponJoint` anchors the entity
-    // against the previous frame's hand chain; the port composes the current
-    // pose's joints every tick, so the refresh stores the posed matrices the
-    // held-weapon TMD and the muzzle/secondary flashes attach to.
+    // `scd_entity_flags` bit 2 runs `EntityUpdateWeaponJoint` (bit 3 selects
+    // the hand): the entity's X/Z are re-anchored so the current pose's
+    // weapon-chain end lands on the previous frame's hand world, the
+    // original's held-weapon root motion.
     if game.entities[slot].flags & 4 != 0 {
-        let worlds = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
-        if !worlds.is_empty() {
-            game.joint_worlds[slot] = worlds;
-        }
+        let hand = usize::from((game.entities[slot].flags >> 3) & 1);
+        crate::enemy::walk::entity_update_weapon_joint(game, clips, slot, hand);
     }
     // The handlers move with the un-collided `Add_speedXZ`, so this tail is
     // the scripted driver's only room-collision pass: it pushes the character
@@ -168,6 +165,14 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         i32::from(entity.sca_radius),
         entity.collision_flags,
     );
+    // The render-pass equivalent: compose and store the pose's joint worlds
+    // after the collision tail, so the next tick's `EntityUpdateWeaponJoint`
+    // (and the effect pass) reads the previous frame's pose, exactly like the
+    // original's render pass between two updates.
+    let worlds = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
+    if !worlds.is_empty() {
+        game.joint_worlds[slot] = worlds;
+    }
 }
 
 /// Run one behaviour handler with the entity, its clock, the system flag bank
@@ -1413,7 +1418,7 @@ mod tests {
     }
 
     #[test]
-    fn the_state8_tail_refreshes_the_held_weapon_joint() {
+    fn the_state8_weapon_joint_tail_anchors_the_entity_to_the_previous_hand() {
         use crate::model::{Keyframe, Skeleton};
         use std::sync::Arc;
 
@@ -1429,15 +1434,19 @@ mod tests {
             rotations: vec![[0, 0, 0]; 15],
         }]));
         game.entities[1].pos = [1000, 0, 2000];
+
+        // First tick: no stored hand world yet, so the entity is pulled back
+        // until the current pose's hand chain end sits at the origin on X/Z.
         update(&mut game, 1, &RoomState::default(), &clips());
-        assert!(!game.joint_worlds[1].is_empty(), "the pose was composed");
-        // The 4.12 trig table saturates one unit below 1.0, so the root
-        // offset lands one unit short on X/Z; Y passes through untransformed.
-        assert_eq!(
-            game.joint_worlds[1][14].t,
-            [1099, -199, 2299],
-            "the weapon hand's world position"
-        );
+        let hand = game.joint_worlds[1][5].t;
+        assert_eq!(hand[0], 0, "the hand anchored on X");
+        assert_eq!(hand[2], 0, "the hand anchored on Z");
+        let anchored = game.entities[1].pos;
+
+        // Second tick: the stored hand world is the current pose's, so the
+        // anchor is a no-op and the position holds.
+        update(&mut game, 1, &RoomState::default(), &clips());
+        assert_eq!(game.entities[1].pos, anchored, "the anchor is stable");
     }
 
     #[test]

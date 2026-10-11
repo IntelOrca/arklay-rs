@@ -1859,10 +1859,11 @@ mod tests {
         let far = collision_record([700, 0, 0], [100, 100, 100]);
         assert!(chk_pl_reach_entity([0, 0, 0], 0, &far).is_none());
 
-        // Straight behind the player (0x400 faces -Z): X is zeroed.
+        // Straight behind the player (0x400 faces -Z): X is zeroed. The GTE
+        // scale truncates the 470 toward zero to 469.
         let north = collision_record([0, 0, -400], [50, 100, 100]);
         let probe = chk_pl_reach_entity([0, 0, 0], 0x400, &north).unwrap();
-        assert_eq!(probe, [0, -470]);
+        assert_eq!(probe, [0, -469]);
 
         // A diagonal probe keeps only its dominant axis (X here).
         let diagonal = collision_record([400, 0, -100], [100, 100, 100]);

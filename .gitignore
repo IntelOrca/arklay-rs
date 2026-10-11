@@ -1,2 +1,3 @@
 /target
 *.akpak
+__pycache__/

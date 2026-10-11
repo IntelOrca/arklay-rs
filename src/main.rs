@@ -94,9 +94,28 @@ struct Cli {
 
     /// Run N fixed 30 Hz ticks before a capture frame is drawn, so scripted
     /// NPC scenes and `--fmv` frames can be captured deterministically and
-    /// audio-free
-    #[arg(long, value_name = "N", default_value_t = 0, conflicts_with = "ui")]
+    /// audio-free; with `--ui game` and `--trace` it runs the oracle ticks
+    #[arg(long, value_name = "N", default_value_t = 0)]
     ticks: u32,
+
+    /// Write the oracle trace v1 (one line per fixed tick) of a `--room` or
+    /// `--ui game` headless run to FILE
+    #[arg(long, value_name = "FILE", requires = "pack")]
+    trace: Option<PathBuf>,
+
+    /// Write a frame BMP every N traced ticks; requires `--capture-dir` and
+    /// `--trace`
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "pack",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    capture_every: Option<u32>,
+
+    /// Directory the `--capture-every` frames are written to as `f%05d.bmp`
+    #[arg(long, value_name = "DIR", requires = "pack")]
+    capture_dir: Option<PathBuf>,
 
     /// Print a frame-time report after the run: per-tick min/avg/p95/max, the
     /// load/update/effect/render phase totals and the entity/effect high-water
@@ -494,12 +513,40 @@ fn main() -> Result<()> {
             let Some(pack) = cli.pack else {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
-            if cli.ticks > 0 && cli.capture.is_none() && !cli.stats {
+            let tracing = cli.trace.is_some();
+            if let Some(screen) = &cli.ui
+                && cli.ticks > 0
+                && (screen != "game" || !tracing)
+            {
+                bail!("--ticks with --ui is only supported for `--ui game` with --trace");
+            }
+            if cli.ticks > 0 && cli.capture.is_none() && !cli.stats && !tracing {
                 bail!("--ticks requires --capture (or --stats)");
             }
             if cli.stats && cli.room.is_none() {
                 bail!("--stats requires --room");
             }
+            if cli.capture_every.is_some() && cli.capture_dir.is_none() {
+                bail!("--capture-every requires --capture-dir");
+            }
+            if cli.capture_every.is_some() && !tracing {
+                bail!("--capture-every requires --trace");
+            }
+            if cli.capture_every.is_some() && cli.ticks == 0 {
+                bail!("--capture-every requires --ticks > 0");
+            }
+            if cli.capture_dir.is_some() && cli.capture_every.is_none() {
+                bail!("--capture-dir requires --capture-every");
+            }
+            if tracing && cli.room.is_none() && !matches!(cli.ui.as_deref(), Some("game")) {
+                bail!("--trace is only supported for --room or --ui game");
+            }
+            let trace_options = arklay::trace::TraceOptions {
+                path: cli.trace.as_deref(),
+                capture_every: cli.capture_every.unwrap_or(0),
+                capture_dir: cli.capture_dir.as_deref(),
+                ticks: cli.ticks,
+            };
             let save_dir = cli
                 .save_dir
                 .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
@@ -535,6 +582,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,
+                    trace_options,
                 );
             }
             if let Some(room) = cli.room {
@@ -548,6 +596,7 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.stats,
                     cli.debug_menu,
+                    trace_options,
                 );
             }
             // No room and no `--ui`: boot the app root, whose interactive run

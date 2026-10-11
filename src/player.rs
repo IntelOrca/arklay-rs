@@ -162,6 +162,10 @@ pub struct Input {
     /// animation advances only every other tick (the original's slow-motion
     /// variant).
     pub slow_motion: bool,
+    /// `g_message_flags` bit 8 clear this tick: a displayed message blocks the
+    /// idle settle from blending into the breathe loop (the original's
+    /// `player_behavior_00_idle` gate).
+    pub message_blocked: bool,
 }
 
 /// A footstep sound request emitted when a locomotion clip is about to apply
@@ -419,6 +423,12 @@ pub struct PlayerState {
     pub idle_phase: u8,
     /// Ticks spent in the idle behavior.
     pub idle_ticks: u32,
+    /// The reference's idle scratch while the pad-driven idle behavior owns
+    /// the tick: `(action_state, attackDirection)` of
+    /// `player_behavior_00_idle`. `None` when another behavior ran. The
+    /// engine mirrors it into `entities[0]` so scripts and the oracle trace
+    /// see the same bytes the reference writes at +0x87/+0xC4.
+    pub idle_trace: Option<(u8, u16)>,
     /// Stair/ladder state set by the room's action probes.
     pub stairs: StairState,
     /// The locked action behaviour owning the tick, if any.
@@ -510,6 +520,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         behavior: BEHAVIOR_IDLE,
         idle_phase: 0,
         idle_ticks: 0,
+        idle_trace: None,
         stairs: StairState::default(),
         locked: LockedAction::None,
         action_state: 0,
@@ -565,6 +576,7 @@ pub fn update_with_room(
     input: Input,
 ) {
     player.input = input;
+    player.idle_trace = None;
     // The push bit raised by `tick_objects` last tick forces the push
     // behaviour this tick, the original's one-frame hand-off.
     if player.object_push && player.locked == LockedAction::None {
@@ -666,10 +678,14 @@ pub fn update_with_room(
     if behavior == BEHAVIOR_IDLE {
         player.slow_counter = 0;
         player.idle_ticks = player.idle_ticks.saturating_add(1);
+        // The original's `attackDirection` countdown: set to 100 on the settle
+        // entry and decremented every tick; a 16-bit field, so it wraps past
+        // zero when a displayed message keeps the transition gate closed.
+        let counter = (IDLE_SETTLE_TICKS as u16).wrapping_sub(player.idle_ticks as u16);
         match player.idle_phase {
             0 => {
                 player.advance(emd_clips, emw_clips, room_clips);
-                if player.idle_ticks >= IDLE_SETTLE_TICKS {
+                if counter == 0 && !input.message_blocked {
                     player.idle_phase = 1;
                     player.set_clip(ClipSource::Emw, BREATHE_IN_CLIP);
                 }
@@ -684,6 +700,16 @@ pub fn update_with_room(
                 player.advance(emd_clips, emw_clips, room_clips);
             }
         }
+        // The reference's `player_behavior_00_idle` scratch as of the tick's
+        // end: `action_state` is the idle phase (post-transition) and
+        // `attackDirection` the settle countdown (only decremented in the
+        // settle state; the breathe states leave it parked at zero). It is
+        // captured after the phase advance so the transition tick reports the
+        // new phase, exactly like the reference writes it in the same tick.
+        player.idle_trace = Some((
+            player.idle_phase.saturating_add(1),
+            if player.idle_phase == 0 { counter } else { 0 },
+        ));
     } else if slow_locomotion {
         // The original keeps a counter in `attackDirection`: a frame applies
         // when it was 0, then the counter re-arms to 1 and the next tick skips.
@@ -1580,12 +1606,14 @@ pub fn reach_offset(angle: u16) -> (i32, i32) {
 ///
 /// Convention: angle 0 walks along +X; increasing the yaw turns the movement
 /// toward -Z. The fixed-point pipeline is the original's: the 14-bit trig
-/// values build a 4.12 matrix element, and the matrix-vector product is
-/// truncated back down by 12.
+/// values build a 4.12 matrix element through `RotMatrixY`'s
+/// `GteFixedMul14(value, 0x1000)` (truncation toward zero, not an arithmetic
+/// shift, so a negative cosine rounds up a unit), and the matrix-vector
+/// product is truncated back down by 12.
 pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
     let angle = angle.wrapping_add(offset) & 0x0FFF;
-    let m00 = cos14(angle) >> 2;
-    let m20 = (-sin14(angle)) >> 2;
+    let m00 = scale14_to_4_12(cos14(angle));
+    let m20 = scale14_to_4_12(-sin14(angle));
     (fixed_mul_12(m00, speed), fixed_mul_12(m20, speed))
 }
 
@@ -1594,14 +1622,22 @@ pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
 /// `SetEntityScaHitData` applies the entity's `RotMatrixY` to each part).
 pub(crate) fn rotate_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
     let angle = angle & 0x0FFF;
-    let m00 = cos14(angle) >> 2;
-    let m02 = sin14(angle) >> 2;
-    let m20 = (-sin14(angle)) >> 2;
-    let m22 = cos14(angle) >> 2;
+    let m00 = scale14_to_4_12(cos14(angle));
+    let m02 = scale14_to_4_12(sin14(angle));
+    let m20 = scale14_to_4_12(-sin14(angle));
+    let m22 = scale14_to_4_12(cos14(angle));
     (
         fixed_mul_12(m00, x) + fixed_mul_12(m02, z),
         fixed_mul_12(m20, x) + fixed_mul_12(m22, z),
     )
+}
+
+/// The original's `GteFixedMul14(value, 0x1000)`: a 14-bit table value scaled
+/// into the 4.12 matrix. The negative-product correction truncates toward
+/// zero, so this is not `value >> 2` for negative values.
+fn scale14_to_4_12(value: i32) -> i32 {
+    let product = value << 12;
+    (product + ((product >> 31) & 0x3FFF)) >> 14
 }
 
 /// 4.12 matrix element times the speed, truncated back to an integer.
@@ -2225,6 +2261,7 @@ mod tests {
             behavior: BEHAVIOR_IDLE,
             idle_phase: 0,
             idle_ticks: 0,
+            idle_trace: None,
             stairs: StairState::default(),
             locked: LockedAction::None,
             action_state: 0,
@@ -3282,6 +3319,31 @@ mod tests {
         }
         assert_eq!(player.anim.clip, BREATHE_CLIP);
         assert_eq!(player.behavior, BEHAVIOR_IDLE);
+    }
+
+    /// A displayed message (`g_message_flags` bit 8 clear) holds the settle
+    /// from blending into the breathe loop, and the 16-bit countdown wraps
+    /// past zero exactly like the reference's `attackDirection`.
+    #[test]
+    fn idle_settle_waits_for_the_message_gate_and_wraps() {
+        let room = RoomState::default();
+        let clips = clips();
+        let mut player = player_at(0, 0);
+        let blocked = Input {
+            message_blocked: true,
+            ..Input::default()
+        };
+
+        for _ in 0..IDLE_SETTLE_TICKS + 5 {
+            step(&mut player, &room, &clips, blocked);
+        }
+        assert_eq!(player.idle_phase, 0, "the gate holds the settle");
+        assert_eq!(player.anim.clip, SETTLE_CLIP);
+        assert_eq!(
+            player.idle_trace,
+            Some((1, 0xFFFF - 4)),
+            "the countdown wrapped past zero"
+        );
     }
 
     #[test]

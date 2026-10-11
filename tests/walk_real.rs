@@ -52,7 +52,11 @@ fn follow_run(name: &str) {
     let id = RoomId::parse(name).unwrap();
     let input = walking();
 
-    let first = simulate_room_seeded(&pack, id, &LAB_FOLLOW_FLAGS, 1, input).unwrap();
+    // The F9 sleep yields the frame its counter reaches zero, so every
+    // scripted wait is one frame longer than the old timing: the spawn is
+    // live at tick 1 and the init event's follow-state command lands on
+    // tick 2.
+    let first = simulate_room_seeded(&pack, id, &LAB_FOLLOW_FLAGS, 2, input).unwrap();
     let slot = character_slot(&first.game).unwrap_or_else(|| panic!("{name} spawns a follower"));
     assert_eq!(
         first.game.entities[slot].state(),

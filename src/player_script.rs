@@ -41,8 +41,8 @@
 //!
 //! - **Weapon animations are absent.** Behavior 0's per-state weapon loads are
 //!   inert without the held-weapon clip tables; the scripted body frame is
-//!   posed directly. State 8's held-weapon joint refresh (`flags` bit 2) is
-//!   inert for the same reason.
+//!   posed directly. State 8's held-weapon joint anchor (`flags` bit 2) runs
+//!   against whichever bank the scripted animation selected.
 //! - **A missing clip bank falls back to the body bank.** When the selected
 //!   pair has no playable clip (a room without its player-animation pair, or
 //!   the damage scratch before a monster model installed one), the port
@@ -56,7 +56,7 @@ use crate::enemy::walk;
 use crate::game::{
     BANK_SYSTEM, Entity, EntitySound, FlagBank, GameState, MSF2_EFFECT_ZONE, PlayerDamageBank,
 };
-use crate::model::{Clip, Keyframe};
+use crate::model::{Clip, Keyframe, Skeleton};
 use crate::player::{ClipSource, PlayerState};
 use crate::state::RoomState;
 
@@ -113,6 +113,30 @@ const BACK_RUN_CLIP: u8 = 3;
 /// EMD clip the run's decelerating stop plays.
 const STOP_CLIP: u8 = 0;
 
+/// The player animation banks the scripted state-8 driver plays from: the
+/// body EMD, the no-weapon EMW and the RDT room-animation pair. The held-weapon
+/// anchor composes the selected bank's pose, so each bank carries its keyframes
+/// and (optionally) the skeleton the pose walks.
+#[derive(Clone, Copy)]
+pub struct AnimationBanks<'a> {
+    /// Body EMD clips.
+    pub emd_clips: &'a [Clip],
+    /// No-weapon EMW clips.
+    pub emw_clips: &'a [Clip],
+    /// RDT room-animation clips.
+    pub room_clips: &'a [Clip],
+    /// Body EMD keyframes.
+    pub emd_keyframes: &'a [Keyframe],
+    /// No-weapon EMW keyframes (posed on the EMD skeleton, like the renderer).
+    pub emw_keyframes: &'a [Keyframe],
+    /// RDT room-animation keyframes.
+    pub room_keyframes: &'a [Keyframe],
+    /// Body EMD skeleton; the EMW and damage banks pose on it too.
+    pub emd_skeleton: Option<&'a Skeleton>,
+    /// RDT room-animation skeleton.
+    pub room_skeleton: Option<&'a Skeleton>,
+}
+
 /// Advance the player's scripted state one tick.
 ///
 /// The caller only calls this when the player is not running the pad-driven
@@ -128,6 +152,33 @@ pub fn update(
     emd_clips: &[Clip],
     emw_clips: &[Clip],
     room_clips: &[Clip],
+) {
+    update_banks(
+        game,
+        player,
+        room,
+        &AnimationBanks {
+            emd_clips,
+            emw_clips,
+            room_clips,
+            emd_keyframes: &[],
+            emw_keyframes: &[],
+            room_keyframes: &[],
+            emd_skeleton: None,
+            room_skeleton: None,
+        },
+    );
+}
+
+/// [`update`] with the full animation banks: the scripted state-8 held-weapon
+/// anchor (`flags` bit 2) composes the selected bank's pose, so it needs the
+/// bank's keyframes and skeleton. The clip-only entry point leaves the anchor
+/// inert for callers with no assets.
+pub fn update_banks(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    room: &RoomState,
+    banks: &AnimationBanks<'_>,
 ) {
     player.input.action_pressed = false;
     player.input.action_held = false;
@@ -150,21 +201,21 @@ pub fn update(
             entity.move_speed_current = 0;
             entity.is_being_attacked = 0;
         }
-        8 => scripted_animation(game, player, room, emd_clips, emw_clips, room_clips),
+        8 => scripted_animation(game, player, room, banks),
         // The original's state 4 suppresses every message/input flag.
         4 => game.message_flags = 0,
         // The generic hit reaction. Plant 42's acid spit writes state 2 with
         // `action_behavior = 0x64` and the plant's sweep/throw reactions hand
         // over to state 6 below; both must run or the player freezes.
-        2 => hit_reaction(game, player, room, emd_clips),
+        2 => hit_reaction(game, player, room, banks.emd_clips),
         // The death fall: the scream, the fall clip, the sliding corpse and
         // the blood pool, ending in the blocked state the DIED screen runs.
-        3 => death_fall(game, player, room, emd_clips),
+        3 => death_fall(game, player, room, banks.emd_clips),
         // The bitten/grab hold (the original's animation window 0): the shared
         // window prelude runs first, then `animFrameId` selects the handler.
         // The zombie bite writes frame id 0 (the recoil machine) and the wasp
         // grab frame id 7 (the crawl pin); an unrecognised id holds the pose.
-        5 => anim_window0(game, player, room, emd_clips),
+        5 => anim_window0(game, player, room, banks.emd_clips),
         // The grabbed-hold window. The monster plant writes animationId 6
         // with animFrameId 0x0F, whose entry in the animation-function table
         // is the three-state hold table; Plant 42's sweep and release write
@@ -173,12 +224,12 @@ pub fn update(
         // each own another entry. The prelude the hold windows share runs
         // first: a held pose raises the message bit while the object push or
         // the health lock is up, then clears the lock.
-        6 => anim_window1(game, player, room, emd_clips, emw_clips),
+        6 => anim_window1(game, player, room, banks.emd_clips, banks.emw_clips),
         // The animation window 2. Yawn's swallow writes animationId 7 with
         // animFrameId 0x0D, the dog's maul frame 2, the hunter's pounce bite
         // frame 6, Plant 42's eat frame 8, the Neptune's devour frame 0x0B
         // and the Tyrant's impale frame 0x0C.
-        7 => anim_window2(game, player, room, emd_clips),
+        7 => anim_window2(game, player, room, banks.emd_clips),
         // States 2/3 (hit reaction, death) hold the player still: only state 1
         // reads the pad.
         _ => {}
@@ -2260,6 +2311,8 @@ fn publish_player(game: &mut GameState, player: &mut PlayerState) {
 ///
 /// The original runs the handler a second time when `flags` bit 1 is set,
 /// re-reading `action_behavior` for the repeat, exactly like the NPC driver.
+/// Flag bit 2 runs `EntityUpdateWeaponJoint` (bit 3 selects the hand), which
+/// re-anchors the player against the previous frame's held-weapon chain end.
 /// The handlers step with the un-collided `Add_speedXZ`, so this tail is the
 /// player's only collision pass: it pushes the player out of any obstruction
 /// the step crossed, anchored at the pre-dispatch position.
@@ -2267,18 +2320,34 @@ fn scripted_animation(
     game: &mut GameState,
     player: &mut PlayerState,
     room: &RoomState,
-    emd_clips: &[Clip],
-    emw_clips: &[Clip],
-    room_clips: &[Clip],
+    banks: &AnimationBanks<'_>,
 ) {
     let prev_pos = game.entities[0].pos;
     let behavior = game.entities[0].action_behavior;
     dispatch_behavior(
-        game, player, room, emd_clips, emw_clips, room_clips, behavior,
+        game,
+        player,
+        room,
+        banks.emd_clips,
+        banks.emw_clips,
+        banks.room_clips,
+        behavior,
     );
     if game.entities[0].flags & 2 != 0 {
         let repeat = game.entities[0].action_behavior;
-        dispatch_behavior(game, player, room, emd_clips, emw_clips, room_clips, repeat);
+        dispatch_behavior(
+            game,
+            player,
+            room,
+            banks.emd_clips,
+            banks.emw_clips,
+            banks.room_clips,
+            repeat,
+        );
+    }
+    if game.entities[0].flags & 4 != 0 {
+        let hand = usize::from((game.entities[0].flags >> 3) & 1);
+        player_weapon_joint_anchor(game, player, banks, hand);
     }
     let entity = &mut game.entities[0];
     entity.pos = crate::player::resolve_collision(
@@ -2290,6 +2359,52 @@ fn scripted_animation(
     );
     player.pos = entity.pos;
     player.angle = entity.angle;
+}
+
+/// The player's `EntityUpdateWeaponJoint`: compose the selected bank's
+/// displayed pose through the held-weapon chain and re-anchor the player's
+/// X/Z on the previous frame's hand world. The bank selection mirrors the
+/// renderer's (the room pair falls back to the body bank, the damage bank
+/// poses on the body skeleton).
+fn player_weapon_joint_anchor(
+    game: &mut GameState,
+    player: &PlayerState,
+    banks: &AnimationBanks<'_>,
+    hand: usize,
+) {
+    let damage = game.player_damage.clone();
+    let (clips, keyframes, skeleton): (&[Clip], &[Keyframe], Option<&Skeleton>) =
+        match player.clip_source {
+            ClipSource::Emw => (banks.emw_clips, banks.emw_keyframes, banks.emd_skeleton),
+            ClipSource::Room if !banks.room_clips.is_empty() => {
+                (banks.room_clips, banks.room_keyframes, banks.room_skeleton)
+            }
+            ClipSource::Damage => {
+                let Some(bank) = damage.as_deref() else {
+                    return;
+                };
+                (
+                    bank.clips.as_ref(),
+                    bank.keyframes.as_ref(),
+                    banks.emd_skeleton,
+                )
+            }
+            _ => (banks.emd_clips, banks.emd_keyframes, banks.emd_skeleton),
+        };
+    let Some(skeleton) = skeleton else {
+        return;
+    };
+    let Some(keyframe) = player.anim.pose_keyframe(clips, keyframes) else {
+        return;
+    };
+    let locals = crate::anim::joint_local_transforms(skeleton, &keyframe);
+    let stored = game
+        .joint_worlds
+        .first()
+        .and_then(|worlds| worlds.get(hand * 3 + 5))
+        .map(|world| world.t);
+    let entity = &mut game.entities[0];
+    crate::enemy::walk::weapon_joint_anchor(entity, &locals, stored, hand);
 }
 
 /// Run one behavior handler. The original's `flags` bit 2 refreshes the
@@ -2407,7 +2522,10 @@ fn behavior_remapped(
                 entity.action_state = 4;
                 set_clip(entity, incoming - 0x3E);
             }
-            entity.attacking_direction = 1;
+            // The hold counter is the player's +0xC4 scratch (`attackDirection`
+            // in the original), so scripts and the oracle trace see the same
+            // byte the reference's `player_scd_behavior_01` writes.
+            entity.action_ticks_counter = 1;
             // No frame is consumed on the pitch tick; show the scripted frame.
             publish_pose(entity, clock, player, state_source(entity.action_state));
         }
@@ -2416,10 +2534,10 @@ fn behavior_remapped(
             // counter decrements each tick and the hold runs whenever it
             // enters on zero, exactly the original's post-decrement test.
             if entity.flags & 0x80 != 0 {
-                let entry = entity.attacking_direction;
-                entity.attacking_direction = entity.attacking_direction.wrapping_sub(1);
+                let entry = entity.action_ticks_counter;
+                entity.action_ticks_counter = entity.action_ticks_counter.wrapping_sub(1);
                 if entry == 0 {
-                    entity.attacking_direction = 1;
+                    entity.action_ticks_counter = 1;
                     publish_pose(entity, clock, player, state_source(state));
                     return;
                 }
@@ -3196,6 +3314,57 @@ mod tests {
             "the scripted completion flag was raised"
         );
         assert_eq!(game.entities[0].scd_timer, 0, "the turn step is consumed");
+    }
+
+    /// The player's `scd_entity_flags` bit 2: the state-8 tail runs
+    /// `EntityUpdateWeaponJoint`, re-anchoring the player so the displayed
+    /// pose's hand chain end lands on the previous frame's hand world.
+    #[test]
+    fn behavior_one_flag_two_anchors_the_held_weapon_hand() {
+        use crate::model::Skeleton;
+        use std::sync::Arc;
+
+        let emd = vec![clip(1, 1); 4];
+        let skeleton = Skeleton {
+            relative: vec![[0, 0, 0]; 15],
+            children: (1..15).map(|index| vec![index as u8]).collect(),
+        };
+        let keyframes = vec![Keyframe {
+            offset: [100, -200, 300],
+            rotations: vec![[0, 0, 0]; 15],
+        }];
+        let banks = AnimationBanks {
+            emd_clips: &emd,
+            emw_clips: &[],
+            room_clips: &[],
+            emd_keyframes: &keyframes,
+            emw_keyframes: &[],
+            room_keyframes: &[],
+            emd_skeleton: Some(&skeleton),
+            room_skeleton: None,
+        };
+
+        let mut game = test_game(8, 1, 0);
+        let mut player = test_player();
+        game.entities[0].flags = 4;
+        game.entities[0].pos = [1000, 0, 2000];
+        player.pos = [1000, 0, 2000];
+
+        // First tick: no stored hand world yet, so the anchor pulls the player
+        // back until the pose's hand chain end sits at the origin on X/Z.
+        update_banks(&mut game, &mut player, &RoomState::default(), &banks);
+        assert_ne!(game.entities[0].pos, [1000, 0, 2000], "the anchor moved");
+        assert_eq!(player.pos, game.entities[0].pos, "the player mirrors it");
+
+        // Store the pose's worlds like the engine's render-pass pass does.
+        let entity_matrix = crate::anim::entity_matrix(player.pos, player.angle);
+        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity_matrix);
+
+        // Second tick: the stored hand world matches the current pose, so the
+        // anchor is a no-op and the position holds.
+        let anchored = game.entities[0].pos;
+        update_banks(&mut game, &mut player, &RoomState::default(), &banks);
+        assert_eq!(game.entities[0].pos, anchored, "the anchor is stable");
     }
 
     /// A reaction bank of `count` clips, each `frames` one-tick frames long,
@@ -5130,10 +5299,10 @@ mod tests {
         run(&mut game, &mut player, &emd, &[], &[]);
         assert_eq!(game.entities[0].move_speed_current, 0xF, "Jill's crawl");
         assert_eq!(game.entities[0].speed[0], 0);
-        assert!(
-            (-0x10..=-0xF).contains(&game.entities[0].speed[2]),
-            "a quarter turn off the facing: {:?}",
-            game.entities[0].speed
+        assert_eq!(
+            game.entities[0].speed[2], -0xE,
+            "a quarter turn off the facing (the GTE scale truncates the 15 \
+             toward zero)"
         );
     }
 

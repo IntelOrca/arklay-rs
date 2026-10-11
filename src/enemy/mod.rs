@@ -307,6 +307,9 @@ pub fn update_all(
         if let Some(keyframes) = models.keyframes(pack, id, player) {
             game.entity_anims[slot].keyframes = Some(keyframes);
         }
+        if let Some(skeleton) = models.skeleton(pack, id, player) {
+            game.entity_anims[slot].skeleton = Some(skeleton);
+        }
         let clips: &[Clip] = model.as_ref().map_or(&[], |model| &model.clips);
         // The ported states of the character driver run from the pack's
         // script when one exists (states 0, 1, 8 and 9); the native driver
