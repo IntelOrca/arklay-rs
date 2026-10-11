@@ -2014,9 +2014,12 @@ impl GameSession {
                 if exit_done {
                     // The reader's slide-out completed: the original fades its
                     // black overlay and raises 0xC6 while the entry is still
-                    // pending, then consumes it once the message clears.
+                    // pending, then consumes it once the message clears. The
+                    // reader layer drops with the slide, revealing the panel
+                    // the 0xC6 line belongs to.
                     self.game.show_message(game::MESSAGE_FILE_FILED, 0);
                     if let Some(pickup) = self.pickup_view.as_mut() {
+                        pickup.reader = None;
                         pickup.phase = PickupPhase::Message;
                     }
                 }
@@ -14396,6 +14399,13 @@ off_0010:
             session.game.message.id == Some(game::MESSAGE_FILE_FILED)
         });
         assert!(session.game.message.active);
+        assert!(
+            session
+                .pickup_view
+                .as_ref()
+                .is_some_and(|pickup| pickup.reader.is_none()),
+            "the reader layer drops with its exit slide"
+        );
         assert!(
             session.game.room_actions[1].is_some(),
             "the entry is consumed only once the message clears"
