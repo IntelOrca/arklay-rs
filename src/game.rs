@@ -6630,7 +6630,11 @@ impl GameState {
 
         // The action press drives `check_climb_object` exactly where the
         // original's input path calls it. A second press mid-climb verifies
-        // the facing: settling flips the vault to the return side.
+        // the facing: settling flips the vault to the return side. The
+        // transition bit stays latched after a climb up (the original's
+        // `check_climb_object` only clears it on the verify pass), so the next
+        // press restarts the sequence on the return side instead of climbing
+        // up again.
         if player.input.action_pressed {
             if player.vault_bit {
                 let facing = player
@@ -6639,27 +6643,31 @@ impl GameState {
                     .is_some_and(|record| objects::verify_climb_object(record, player.angle));
                 if facing {
                     // The verification branch clears the transition bit and
-                    // re-raises it through the input handler, which also
-                    // restarts the sequence on state 0; the return clip is
-                    // selected from zone flag 0x10 when state 1 runs.
-                    player.vault_bit = false;
+                    // the input handler immediately re-raises it: behavior 10
+                    // restarts from state 0 with zone flag 0x10 set, so the
+                    // warp takes the return side and consumes the bit.
                     player.vault_return = true;
+                    player.locked = crate::player::LockedAction::Vault;
                     player.action_state = 0;
                     player.move_speed_current = 0;
                     self.entities[0].zone_flags |= 0x10;
-                    self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
+                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
                 }
             } else if player.locked == crate::player::LockedAction::None {
                 if let Some(candidate) =
                     objects::check_climb_object(&self.objects, player.pos, player.angle)
                 {
                     player.vault_bit = true;
+                    player.vault_return = false;
                     player.climb_object = Some(candidate.slot as u8);
                     player.attack_direction = candidate.attack_direction;
                     player.locked = crate::player::LockedAction::Vault;
                     player.action_state = 0;
                     player.move_speed_current = 0;
-                    self.flags[5].apply(MSF_DOOR_TRANSITION, 0);
+                    // `check_climb_object` clears the approach-side flag on the
+                    // scan pass; it is re-raised by the verify pass.
+                    self.entities[0].zone_flags &= !0x10;
+                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
                 } else if self.entities[0].zone_flags & 0x20 != 0 && self.ladder_down() {
                     // `player_input_to_behavior`'s zone branch: the action-key
                     // probe above ran `set_stairs_zone`, so the marked zone and
@@ -6671,6 +6679,9 @@ impl GameState {
                 }
             }
         }
+        // The transition bit tracks the vault latch: the warp clears both
+        // together on the return side, so a completed vault releases it.
+        self.flags[5].apply(MSF_DOOR_TRANSITION, if player.vault_bit { 0 } else { 1 });
 
         let was_pushing = self.object_push;
         let mut push_started = false;
@@ -15410,11 +15421,12 @@ mod tests {
         assert!(state.flags[5].bit(MSF_DOOR_TRANSITION));
 
         // A second press with the player turned onto the object's facing
-        // settles onto the return side and restarts the sequence.
+        // settles onto the return side and restarts the sequence, keeping the
+        // transition bit latched until the return warp consumes it.
         player.angle = 0x800;
         player.input.action_pressed = true;
         state.tick_objects(&room, &mut player);
-        assert!(!player.vault_bit);
+        assert!(player.vault_bit);
         assert!(player.vault_return);
         assert_eq!(player.action_state, 0, "the sequence restarts");
         assert_eq!(state.entities[0].zone_flags & 0x10, 0x10);

@@ -1355,8 +1355,10 @@ impl PlayerState {
 
     /// The vault's warp: `0x73A` sideways (X for an X-facing approach, Z
     /// otherwise, negated for the vault), `0x708` vertically (positive on the
-    /// return side). The transition bit and the return-side flag are consumed
-    /// and control returns to the locomotion machine.
+    /// return side). The transition bit stays latched after the climb up -
+    /// the original only clears `MSF_DOOR_TRANSITION` on the return warp - so
+    /// the next action press re-runs the verify pass and climbs back down
+    /// instead of stacking another climb (which sent the player skywards).
     fn warp_through_object(&mut self) {
         let dir = i32::from(self.attack_direction);
         let sideways = self.angle & 0x400 != 0;
@@ -1371,8 +1373,10 @@ impl PlayerState {
             -VAULT_ACROSS
         };
         self.pos = [self.pos[0] + x, self.pos[1] + y, self.pos[2] + z];
-        self.vault_bit = false;
-        self.vault_return = false;
+        if self.vault_return {
+            self.vault_bit = false;
+            self.vault_return = false;
+        }
         self.locked = LockedAction::None;
         self.action_state = 0;
         self.move_speed_current = 0;
@@ -3877,8 +3881,37 @@ mod tests {
             sounds.iter().filter(|id| **id == SE_VAULT_STEP).count() >= 2,
             "vault cues missing: {sounds:?}"
         );
-        assert!(!player.vault_bit, "the vault must clear the transition bit");
+        assert!(
+            player.vault_bit,
+            "the climb up keeps the transition bit latched"
+        );
+        assert!(player.vault_return == false);
         assert_eq!(player.clip_source, ClipSource::Emd);
+
+        // The verified second press restarts on the return side: the vault
+        // comes back down to the starting height instead of stacking another
+        // 0x708 of altitude.
+        player.locked = LockedAction::Vault;
+        player.vault_return = true;
+        for _ in 0..200 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+        assert_eq!(player.pos, [1000 + 2 * VAULT_SIDE, 0, 1000]);
+        assert!(
+            !player.vault_bit,
+            "the return warp consumes the transition bit"
+        );
+        assert!(!player.vault_return);
     }
 
     #[test]

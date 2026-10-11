@@ -515,6 +515,48 @@ fn room_107_vault_lands_the_player_on_the_far_side() {
         player.pos
     );
     assert_eq!(player.pos[1], -0x708, "the vault's vertical warp");
+
+    // The latch keeps the transition bit after the climb up: with the player
+    // turned back onto the record's facing, a second action press runs the
+    // return-side vault and brings the player back to the floor instead of
+    // stacking another climb.
+    player.angle = (ladder.rotation[1] as u16) & 0x0FFF;
+    game.sync_entity_from_player(&player);
+    object_tick(
+        &mut player,
+        &room,
+        &mut game,
+        arklay::player::Input {
+            action_pressed: true,
+            action_held: true,
+            ..arklay::player::Input::default()
+        },
+    );
+    assert!(
+        player.vault_return,
+        "the second press did not flip to the return side"
+    );
+    for _ in 0..2000 {
+        object_tick(
+            &mut player,
+            &room,
+            &mut game,
+            arklay::player::Input::default(),
+        );
+        if player.locked == arklay::player::LockedAction::None {
+            break;
+        }
+    }
+    assert_eq!(
+        player.locked,
+        arklay::player::LockedAction::None,
+        "return vault stuck"
+    );
+    assert_eq!(player.pos[1], 0, "the return vault lands back on the floor");
+    assert!(
+        !player.vault_bit,
+        "the return vault consumes the transition"
+    );
 }
 
 /// Build the player's posed mesh from the shipped character model, or `None`
