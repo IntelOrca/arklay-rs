@@ -2008,7 +2008,7 @@ pub fn global_sfx(bank: u8, id: u8) -> Option<&'static str> {
 /// the shared character/menu tables, the door pairs and the UI cues. Names
 /// that differ only by case share one lowercased pack entry and appear once.
 #[rustfmt::skip]
-pub static SE_NAMES: [&str; 389] = [
+pub static SE_NAMES: [&str; 420] = [
     "40S&W",
     "A_mcn03",
     "BEEP",
@@ -2066,6 +2066,9 @@ pub static SE_NAMES: [&str; 389] = [
     "FL_out",
     "FL_slash",
     "FL_walk",
+    "Flame01",
+    "Flame02",
+    "Flame03",
     "GV_bite",
     "GV_blood",
     "GV_dino",
@@ -2075,6 +2078,22 @@ pub static SE_NAMES: [&str; 389] = [
     "GV_move",
     "GV_p_at",
     "GV_swing",
+    "Gracid01",
+    "Gracid02",
+    "Gracid03",
+    "Gracid04",
+    "Grbomb01",
+    "Grbomb02",
+    "Grbomb03",
+    "Grbomb04",
+    "Grfire01",
+    "Grfire02",
+    "Grfire03",
+    "Grfire04",
+    "Gun01",
+    "Gun02",
+    "Gun03",
+    "Gun04",
     "Gutspose",
     "HUNTER",
     "HU_Nout",
@@ -2101,7 +2120,12 @@ pub static SE_NAMES: [&str; 389] = [
     "Jill_ef02",
     "Jill_ef03",
     "Jill_ef04",
+    "Knife01",
+    "Knife02",
+    "Knife03",
     "Ladder01",
+    "Magnum02",
+    "Magnum03",
     "Mapled",
     "PY_fall",
     "PY_hit2",
@@ -2128,9 +2152,16 @@ pub static SE_NAMES: [&str; 389] = [
     "Reb_ef02",
     "Reb_ef03",
     "Reb_ef04",
+    "Rocket01",
+    "Rocket02",
+    "Rocket03",
     "S&W+1",
     "Select05",
     "Select06",
+    "Shot01",
+    "Shot02",
+    "Shot03",
+    "Shot04",
     "St_mtl01",
     "St_wcp01",
     "St_wd01",
@@ -3050,7 +3081,7 @@ mod tests {
 
     #[test]
     fn se_names_are_sorted_and_unique() {
-        assert_eq!(SE_NAMES.len(), 389);
+        assert_eq!(SE_NAMES.len(), 420);
         assert!(SE_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
         let lowered: std::collections::HashSet<String> = SE_NAMES
             .iter()
