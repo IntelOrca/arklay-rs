@@ -3837,15 +3837,18 @@ mod imp {
             );
 
             // Refresh the live look-at target and slew the tracking joint,
-            // the character driver's shared tail.
+            // the character driver's shared tail. The pitch slope reads the
+            // tracking joint's world translation from the matrices the
+            // previous update stored.
             methods.add_method_mut("update_look_at", |_lua, api, ()| {
                 let slot = api.slot;
                 let game = api.game();
                 if let Some(target) = live_look_at_target(game, slot) {
                     game.entities[slot].target = target;
                 }
+                let origin = crate::enemy::look_at_joint_origin(game, slot);
                 let target = game.entities[slot];
-                game.entity_anims[slot].slew_look_at(&target);
+                game.entity_anims[slot].slew_look_at(&target, origin);
                 Ok(())
             });
 

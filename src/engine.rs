@@ -1640,9 +1640,18 @@ impl GameSession {
     }
 
     /// Close the pause menu and unfreeze the room.
+    ///
+    /// The original's mode-7 exit restore runs with the close: the player's
+    /// animation words return to pad control and one body `Joint_move`
+    /// pre-applies the idle pose while the fade still covers the screen (see
+    /// [`player::PlayerState::menu_exit_restore`]).
     fn close_menu(&mut self) {
         self.menu = None;
         self.game.message_menu = false;
+        if let Some(assets) = self.loaded.player_assets.as_ref() {
+            self.player
+                .menu_exit_restore(&mut self.game, &assets.emd.clips);
+        }
     }
 
     /// Open the pause menu through the original's fade: the frozen frame
@@ -6720,6 +6729,16 @@ fn tick_room_timed(
         };
         crate::weapons::update(context.game, context.player, context.room, &clips, pad);
     }
+    // `update_player_anim` runs `EntityUpdateLookAtAngles` after the state
+    // function and before the collision pass, whether or not the message gate
+    // let the state run. The pitch slope reads the tracking joint's world
+    // translation the previous frame's composed matrices carry; those matrices
+    // are refreshed by the render pass below.
+    if let Some(target) = enemy::live_look_at_target(context.game, 0) {
+        context.game.entities[0].target = target;
+    }
+    let look_at_origin = enemy::look_at_joint_origin(context.game, 0);
+    context.game.entity_anims[0].slew_look_at(&context.game.entities[0], look_at_origin);
     // `update_player_anim`'s tail: the moved player is mirrored onto entity 0,
     // then `HandleEnemyPlayerCollisions` pushes the player out of every active
     // entity's SCA volume and the room collision resolves the result with the
@@ -7434,6 +7453,12 @@ fn render_frame(
         apply_look_at(&mut joints, &game.entities[0], &game.entity_anims[0]);
         Some(joints)
     });
+    // The composed player matrices stand in for the original's render-pass
+    // `joint->world`: the next tick's look-at pitch slope and the Lua joint
+    // reads see exactly what was drawn.
+    if let Some(joints) = player_joints.as_ref() {
+        game.joint_worlds[0] = joints.clone();
+    }
 
     // The parsed NPC models are held in `models` so the mesh references built
     // below stay alive for the draw call.
@@ -12462,6 +12487,54 @@ off_0010:
         assert!(!game.message.active, "the pulse does not latch");
     }
 
+    /// The player runs `EntityUpdateLookAtAngles` every tick after the state
+    /// machine, exactly like `update_player_anim`. Before the port only the
+    /// NPC/monster drivers slewed, so a cutscene that aimed the player's head
+    /// with `s1_lookat` left it facing straight ahead.
+    #[test]
+    fn the_player_runs_the_look_at_slew_every_tick() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        game.entities[0].angle = 0;
+        game.entities[0].look_at_flags = 0x13; // slew + yaw + absolute target
+        game.entities[0].look_at_yaw_step = 0x40;
+        game.entities[0].look_at_pitch_step = 0x40;
+        game.entities[0].target = [1000, 0, 1000];
+
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert_eq!(
+            game.entity_anims[0].look_at_yaw, -0x40,
+            "the player's tracking joint slewed"
+        );
+
+        // Clearing the slew bit freezes the angle in place (the render pass
+        // still composes the last aim).
+        game.entities[0].look_at_flags = 0;
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert_eq!(game.entity_anims[0].look_at_yaw, -0x40);
+    }
+
     #[test]
     fn an_inspect_message_without_a_pause_word_keeps_control() {
         let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
@@ -14007,6 +14080,72 @@ off_0010:
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
         assert_eq!(session.game.item_view_request(), None);
+    }
+
+    /// The pause-menu / item-viewer exit restore: the opening scene's
+    /// scripted kneel (state 8, behaviour 1 parked at its completion) must not
+    /// survive the pick-up prompt's menu close. The original's mode-7 exit
+    /// resets the animation words and pre-applies the body idle pose; without
+    /// it the player stayed bent over after the item was awarded (the pick-up
+    /// "no stand-up" look).
+    #[test]
+    fn the_menu_exit_restores_the_scripted_kneel_to_pad_control() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        session.loaded.player_assets = Some(synthetic_player_assets());
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+
+        // The event script's kneel: state 8, behaviour 1, parked at the clip's
+        // completion (action_state 5) with the scripted clip showing.
+        {
+            let entity = &mut session.game.entities[0];
+            entity.set_state(8);
+            entity.action_behavior = 1;
+            entity.action_state = 5;
+            entity.animation_id = 4;
+            entity.attack_anim = 4;
+        }
+        session.player.clip_source = player::ClipSource::Room;
+        session.player.anim.clip = 4;
+        session.player.anim.frame = 0;
+        session.player.anim.display_frame = 0;
+
+        session.game.arm_item_pickup(1);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(session.pickup_view.is_some(), "the viewer opened");
+        tick_until(&mut session, &pack, 300, "the yes/no phase", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::YesNo
+        });
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.game.has_item(ITEM_FIRST_AID_SPRAY));
+        tick_until(&mut session, &pack, 300, "the viewer close", |session| {
+            session.pickup_view.is_none()
+        });
+        settle_menu_fade(&mut session, &pack);
+
+        // Pad control is back and the body idle pose has been pre-applied:
+        // one `Joint_move` consumes frame 0 and arms frame 1's timing.
+        let entity = session.game.entities[0];
+        assert_eq!(entity.state(), 1, "the scripted state released");
+        assert_eq!(entity.action_behavior, 0);
+        assert_eq!(entity.action_state, 0);
+        assert_eq!(entity.animation_id, 0, "attackAnim cleared");
+        assert_eq!(entity.unk_8c, 0, "the clock snapped");
+        assert_eq!(session.player.clip_source, player::ClipSource::Emd);
+        assert_eq!(session.player.anim.clip, 0, "the body idle clip");
+        assert_eq!(
+            session.player.anim.frame, 1,
+            "the exit restore ran the first body Joint_move"
+        );
     }
 
     #[test]

@@ -1396,6 +1396,42 @@ impl PlayerState {
     pub(crate) fn return_from_weapon(&mut self) {
         self.enter_idle();
     }
+
+    /// The pause-menu / item-viewer exit restore (`MainMenu` mode 7,
+    /// 0x00463c10).
+    ///
+    /// The original resets the player's animation words to the pad-driven
+    /// state and runs one `Joint_move` over the body clip while the close fade
+    /// still covers the screen. Without it the last scripted pose stays on
+    /// screen until the next controller tick: an event-scripted kneel (the
+    /// main hall's gun pick-up) or the 0x0c reach left the player bent over
+    /// after the menu closed - the original's comment on the same sequence
+    /// calls it the pick-up "no stand-up" look.
+    pub(crate) fn menu_exit_restore(&mut self, game: &mut crate::game::GameState, emd_clips: &[Clip]) {
+        {
+            let entity = &mut game.entities[0];
+            entity.unk_8c = 0;
+            entity.animation_frame_id = 0;
+            entity.unk_bf = 0;
+            entity.is_being_attacked = 0;
+            entity.attack_anim = 0;
+            entity.animation_id = 0;
+            entity.set_state(1);
+            entity.set_ignore(0);
+            entity.action_behavior = 0;
+            entity.action_state = 0;
+        }
+        self.locked = LockedAction::None;
+        self.enter_idle();
+        // `unk_8c = 0` is the animation clock's direct (non-blended) mode; the
+        // single `Joint_move` then applies the first idle pose and arms its
+        // timing.
+        self.anim.blend_counter = 0;
+        self.anim.frame = 0;
+        self.anim.display_frame = 0;
+        self.anim.timing = 0;
+        self.advance(emd_clips, &[], &[]);
+    }
 }
 
 /// Whether the collision resolver would push a body of `radius` at `pos`.
