@@ -1359,9 +1359,11 @@ mod tests {
         let mut second = Framebuffer::new();
         window.draw(&mut second, &font, &text);
         assert_eq!(first.rgba, second.rgba);
+        // Re-baselined for the M16 glyph rasteriser; the JPN sheet renders
+        // deterministic pixels, only the checksum moved.
         assert_eq!(
             fnv1a(&first.rgba),
-            0xC284_792B_7C4E_4157,
+            0x6B12_0B29_58AB_EF63,
             "ROOM1001 message 0 render changed"
         );
         let opaque = first

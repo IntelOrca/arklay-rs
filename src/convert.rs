@@ -4994,10 +4994,11 @@ mod tests {
         let expected = bmp::encode_texture8_to_vec(&texture).unwrap();
         assert_eq!(pack.read("roommask/100_000.bmp").unwrap(), expected);
 
-        // Four character models (Char10..Char13) plus the two no-weapon
-        // locomotion clips (W00, W10). player/01 is Jill, the character that
-        // owns ROOM1001.
-        assert_eq!(count("player/"), 6);
+        // Four character models (Char10..Char13), the two no-weapon locomotion
+        // clips (W00, W10) and the shipped weapon animations/models under
+        // `PLAYERS/` (every other `W*.EMW` and `WS*.TMD`). player/01 is Jill,
+        // the character that owns ROOM1001.
+        assert_eq!(count("player/"), 4 + 2 + 37);
         assert!(pack.contains("player/01.emd"));
         assert!(pack.contains("player/01.emw"));
 
