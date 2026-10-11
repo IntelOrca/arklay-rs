@@ -329,7 +329,8 @@ impl EntityAnim {
             pitch_enable * i32::from(entity.target[1] as i16)
         };
         self.look_at_yaw = slew_yaw(self.look_at_yaw, yaw_target, entity.look_at_yaw_step);
-        self.look_at_pitch = slew_pitch(self.look_at_pitch, pitch_target, entity.look_at_pitch_step);
+        self.look_at_pitch =
+            slew_pitch(self.look_at_pitch, pitch_target, entity.look_at_pitch_step);
     }
 }
 

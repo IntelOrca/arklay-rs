@@ -6768,8 +6768,7 @@ fn tick_room_timed(
         context.room.current_cut,
         context.game.entities[0].pos,
     ));
-    context.game.entities[0].zone_flags =
-        (context.game.entities[0].zone_flags & !0x01) | in_zone;
+    context.game.entities[0].zone_flags = (context.game.entities[0].zone_flags & !0x01) | in_zone;
     // The gated reach finished this tick: raise the viewer flag the action
     // entry selects, return the message ready bit and clear the health lock.
     // The end-of-tick item-viewer hook then opens the viewer.

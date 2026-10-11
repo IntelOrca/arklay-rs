@@ -1407,7 +1407,11 @@ impl PlayerState {
     /// main hall's gun pick-up) or the 0x0c reach left the player bent over
     /// after the menu closed - the original's comment on the same sequence
     /// calls it the pick-up "no stand-up" look.
-    pub(crate) fn menu_exit_restore(&mut self, game: &mut crate::game::GameState, emd_clips: &[Clip]) {
+    pub(crate) fn menu_exit_restore(
+        &mut self,
+        game: &mut crate::game::GameState,
+        emd_clips: &[Clip],
+    ) {
         {
             let entity = &mut game.entities[0];
             entity.unk_8c = 0;
