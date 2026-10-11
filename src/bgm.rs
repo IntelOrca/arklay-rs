@@ -456,7 +456,7 @@ pub fn apply_live(
             if let Some(name) = bank.name
                 && let Some(wav) = cache.load(pack, name)
             {
-                mixer.play_bgm_channel(index, wav);
+                mixer.play_bgm_channel(index, wav, bank.looping);
                 mixer.set_bgm_channel_volume(index, sfx::volume_gain(bank.volume));
                 mixer.set_bgm_channel_pan(index, sfx::pan_from_raw(bank.pan));
                 if !enabled {
@@ -777,6 +777,87 @@ mod tests {
         (path, pack)
     }
 
+    /// An on-disk pack carrying one `se/{name}.wav` entry.
+    fn pack_with_se(name: &str, bytes: &[u8]) -> (std::path::PathBuf, Pack) {
+        let path =
+            std::env::temp_dir().join(format!("arklay-bgm-{}-{name}.akpak", std::process::id()));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut writer = crate::pack::PackWriter::new();
+        writer
+            .add(&format!("se/{name}.wav"), bytes.to_vec())
+            .unwrap();
+        writer.write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+        (path, pack)
+    }
+
+    /// A minimal 16-bit mono PCM wav.
+    fn wav_bytes(samples: &[i16]) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&(36u32 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&22050u32.to_le_bytes());
+        out.extend_from_slice(&(22050u32 * 2).to_le_bytes());
+        out.extend_from_slice(&2u16.to_le_bytes());
+        out.extend_from_slice(&16u16.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn a_non_looping_bgm_channel_stops_at_the_end_of_its_buffer() {
+        let _sdl = crate::audio::test_lock::sdl();
+        // The guardhouse control room's water-drain cue: group 0x29's channel
+        // 1 (`Se_4b`) carries loop flag 0, so `bgm_play 1` plays it once and
+        // the channel falls silent. The mixer wrapper used to force every
+        // channel to loop, so the drain sound restarted forever after the
+        // action's cutscene.
+        let (_path, pack) = pack_with_se("se_4b", &wav_bytes(&[100, 200, 300, 400]));
+        let id = RoomId::parse("411").unwrap();
+        let mut game = game_for(id);
+        game.bgm.channels[1] = BgmChannelState {
+            name: Some("Se_4b"),
+            looping: false,
+            volume: -1,
+            pan: 0,
+            pan_pair: (0, 0),
+            restart: false,
+            pending_load: true,
+            stop: false,
+        };
+        game.bgm.state = 0x10;
+
+        let _ = unsafe {
+            sdl3_sys::hints::SDL_SetHint(sdl3_sys::hints::SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr())
+        };
+        let Some(mixer) = Mixer::open() else {
+            eprintln!("skipping non-looping BGM test: no audio device");
+            return;
+        };
+        let mut music = Some(mixer);
+        let mut cache = BgmCache::default();
+        apply_live(&mut music, &mut game, &mut cache, &pack);
+        let mixer = music.as_mut().unwrap();
+        assert!(mixer.bgm_channel_playing(1), "the drain cue started");
+
+        // Render past the four-sample buffer: a non-looping bank stops itself.
+        mixer.render_for_test(4);
+        assert!(
+            !mixer.bgm_channel_playing(1),
+            "the non-looping cue must stop at its buffer's end"
+        );
+    }
+
     #[test]
     fn volume_ramp_steps_towards_silence_and_stops() {
         let (_path, pack) = empty_pack("ramp");
@@ -896,6 +977,7 @@ mod tests {
                 sample_rate: 22050,
                 data: vec![0, 0, 1, 0, 2, 0],
             },
+            true,
         );
         assert!(mixer.bgm_channel_playing(0), "the fake bank is sounding");
 

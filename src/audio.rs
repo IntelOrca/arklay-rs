@@ -811,24 +811,33 @@ impl Mixer {
 
     /// Load `wav` into BGM channel `index` and start it from sample 0.
     ///
+    /// `looping` is the channel's whole-buffer loop flag, the original's
+    /// `g_BgmLoopTable[group][channel]` value stored in `g_SndBank[channel].slot`
+    /// and handed to `SetSndSlot`. A non-looping track (the water-drain
+    /// `Se_4b`, the `Se_53`/`Se_54` cues) plays once and stops; hardcoding it
+    /// here made every BGM channel repeat forever.
+    ///
     /// The stream is fed on the next [`Mixer::update`], so the caller can set
     /// the channel's volume and pan before the first samples are rendered (a
     /// bank that loads muted must not leak a full-gain burst).
-    pub fn play_bgm_channel(&mut self, index: usize, wav: Wav) {
+    pub fn play_bgm_channel(&mut self, index: usize, wav: Wav, looping: bool) {
         let Some(mono) = mono_or_warn(&wav) else {
             return;
         };
-        self.state.load_bgm_channel(index, mono, true);
+        self.state.load_bgm_channel(index, mono, looping);
         self.state.restart_bgm_channel(index);
         self.resume();
     }
 
     /// Load `wav` into BGM channel `index` without starting it.
-    pub fn load_bgm_channel(&mut self, index: usize, wav: Wav) {
+    ///
+    /// `looping` is the channel's whole-buffer loop flag; see
+    /// [`Mixer::play_bgm_channel`].
+    pub fn load_bgm_channel(&mut self, index: usize, wav: Wav, looping: bool) {
         let Some(mono) = mono_or_warn(&wav) else {
             return;
         };
-        self.state.load_bgm_channel(index, mono, true);
+        self.state.load_bgm_channel(index, mono, looping);
         self.resume();
     }
 
