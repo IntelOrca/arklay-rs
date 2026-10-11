@@ -323,7 +323,7 @@ impl EntityAnim {
             if horizontal != 0 {
                 angle_quadrant_value((i32::from(dy) << 12) / horizontal) * pitch_enable
             } else {
-                i32::from((if dy > 0 { 0x800 } else { 0 }) + 0x400) * pitch_enable
+                ((if dy > 0 { 0x800 } else { 0 }) + 0x400) * pitch_enable
             }
         } else {
             pitch_enable * i32::from(entity.target[1] as i16)
