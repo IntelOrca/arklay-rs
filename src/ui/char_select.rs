@@ -743,7 +743,7 @@ mod tests {
                 ..neutral()
             },
         );
-        let mut result = ScreenResult::Continue;
+        let mut result;
         let mut ticks = 0usize;
         loop {
             result = screen.update(&cx, neutral());

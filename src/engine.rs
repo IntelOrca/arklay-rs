@@ -722,9 +722,8 @@ enum PickupKind {
     /// A scripted `give_item`: global 0xC1, with the award when the message
     /// completes.
     GotItem,
-    /// A document: global 0xC6 and the entry's consumption. The original's
-    /// file-list screen is not ported (documented deviation), so there is no
-    /// model viewer.
+    /// A document: the original's state-8 file screen shows the document's
+    /// pages, then global 0xC6 as it closes and the entry is consumed.
     Document,
 }
 
@@ -733,6 +732,8 @@ enum PickupKind {
 enum PickupPhase {
     /// The model intro is still running.
     Intro,
+    /// The document reader owns the screen; global 0xC6 follows its exit.
+    Reader,
     /// The prompt is on screen; the engine drives it through the game's
     /// message window.
     Message,
@@ -748,14 +749,17 @@ enum PickupPhase {
 /// panel, so the engine owns its state machine: the viewer's intro/exit
 /// animation steps in [`GameSession::tick_pickup_view`] and the message is
 /// resolved by [`game::GameState::update_message`] exactly like a menu
-/// message. The model viewer is absent for the document fallback.
+/// message. A document pick-up runs the FILE reader on the picked entry
+/// instead of the model viewer.
 struct PickupView {
     /// The room action slot being awarded or filed.
     slot: u8,
     /// Which prompt the flow runs.
     kind: PickupKind,
-    /// The model viewer; `None` for the document fallback.
+    /// The model viewer; `None` for the document reader flow.
     screen: Option<ui::item_view::ItemViewScreen>,
+    /// The document reader; `None` for the model-viewer flows.
+    reader: Option<ui::file::FileScreen>,
     /// Where the flow is.
     phase: PickupPhase,
 }
@@ -1396,7 +1400,7 @@ impl GameSession {
                 eprintln!("warning: film id {id} unavailable: {err:#}");
             }
         } else if self.game.take_itembox_open() {
-            self.open_item_box(pack);
+            self.begin_item_box_open(pack);
         } else if let Some(request) = self.game.item_view_request() {
             // A room action armed the item viewer: the original's main loop
             // opens its menu over the frozen room. It waits for an active
@@ -1639,9 +1643,11 @@ impl GameSession {
         self.menu = Some(menu);
     }
 
-    /// Close the pause menu and unfreeze the room.
+    /// Close the pause menu and unfreeze the room. Any item-box overlay is
+    /// part of the menu and drops with it.
     fn close_menu(&mut self) {
         self.menu = None;
+        self.item_box = None;
         self.game.message_menu = false;
     }
 
@@ -1653,6 +1659,20 @@ impl GameSession {
             return;
         }
         self.open_menu(pack);
+        self.menu_fade.set(2, 24 << 7, 0);
+        self.menu_fade_pending = true;
+        self.menu_fade_phase = MenuFadePhase::Out;
+    }
+
+    /// Open the item box through the same fade the START menu uses: the
+    /// original's `check_itembox_state` raises the same menu-request flag, so
+    /// the frozen frame darkens, the panel (with its box overlay) fades in and
+    /// only then accepts input.
+    fn begin_item_box_open(&mut self, pack: &Pack) {
+        if self.item_box.is_some() || self.menu_fade_phase != MenuFadePhase::None {
+            return;
+        }
+        self.open_item_box(pack);
         self.menu_fade.set(2, 24 << 7, 0);
         self.menu_fade_pending = true;
         self.menu_fade_phase = MenuFadePhase::Out;
@@ -1899,7 +1919,7 @@ impl GameSession {
         // The original sets `g_selectedItemId` to the item being taken as the
         // mode opens, so the prompt's `\i` substitution names it.
         self.game.select_item(Some(item));
-        let (screen, phase) = match kind {
+        let (screen, reader, phase) = match kind {
             PickupKind::Take | PickupKind::GotItem => {
                 let mut screen = if kind == PickupKind::Take {
                     ui::item_view::ItemViewScreen::new_take(item)
@@ -1907,20 +1927,25 @@ impl GameSession {
                     ui::item_view::ItemViewScreen::new_got_item(item)
                 };
                 screen.open_with(pack, &self.text, &self.game.examined_flags());
-                (Some(screen), PickupPhase::Intro)
+                (Some(screen), None, PickupPhase::Intro)
             }
             PickupKind::Document => {
-                // The state-8 fallback: file the entry here (the original
-                // files it as the screen's fade completes) and show 0xC6.
+                // The original's state-8 screen files the entry as it opens
+                // (`file_set_collected_flag`) and runs the document reader on
+                // it (`menu_update_status_screen`'s key-item scan); global
+                // 0xC6 arrives once the reader's exit slide has finished.
                 self.game.mark_file_collected(item);
-                self.game.show_message(game::MESSAGE_FILE_FILED, 0);
-                (None, PickupPhase::Message)
+                self.ensure_file_assets(pack);
+                let mut reader = ui::file::FileScreen::default();
+                reader.open_pickup(&self.game, item);
+                (None, Some(reader), PickupPhase::Reader)
             }
         };
         self.pickup_view = Some(PickupView {
             slot: request.slot,
             kind,
             screen,
+            reader,
             phase,
         });
     }
@@ -1929,13 +1954,14 @@ impl GameSession {
     ///
     /// The game's message window advances exactly like the menu's (`tick_menu`
     /// hands it the same input), then the viewer's phase machine runs: the
-    /// intro steps until it settles and requests its prompt, the message
-    /// resolves (a confirmed 0xC0 already awarded through the message
+    /// intro steps until it settles and requests its prompt, the document
+    /// reader owns the pad until its exit slide finishes and raises 0xC6, the
+    /// message resolves (a confirmed 0xC0 already awarded through the message
     /// post-action; the got-item mode awards here), and the exit animation
     /// steps until the mode closes. The yes/no prompt's answer plays the
     /// character bank's confirm/cancel cue as it resolves, exactly like the
     /// original's viewer.
-    fn tick_pickup_view(&mut self, pack: &Pack, input: player::Input, action: bool) {
+    fn tick_pickup_view(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) {
         let was_active = self.game.message.active;
         let was_yes_no = self.game.message.phase() == crate::message::MessagePhase::YesNo;
         self.game.update_message(
@@ -1963,6 +1989,36 @@ impl GameSession {
                 };
                 if settled {
                     self.start_pickup_message();
+                }
+            }
+            PickupPhase::Reader => {
+                let (exit_done, missing) = {
+                    let Self {
+                        pickup_view, game, ..
+                    } = self;
+                    match pickup_view.as_mut().and_then(|p| p.reader.as_mut()) {
+                        Some(reader) => {
+                            reader.tick();
+                            if let Some(event_input) = menu_input(ui) {
+                                reader.handle_input(game, event_input);
+                            }
+                            (reader.take_reader_exit(), false)
+                        }
+                        None => (false, true),
+                    }
+                };
+                if missing {
+                    self.close_pickup_view();
+                    return;
+                }
+                if exit_done {
+                    // The reader's slide-out completed: the original fades its
+                    // black overlay and raises 0xC6 while the entry is still
+                    // pending, then consumes it once the message clears.
+                    self.game.show_message(game::MESSAGE_FILE_FILED, 0);
+                    if let Some(pickup) = self.pickup_view.as_mut() {
+                        pickup.phase = PickupPhase::Message;
+                    }
                 }
             }
             PickupPhase::Message => {
@@ -2155,7 +2211,7 @@ impl GameSession {
         // The pick-up viewer owns the frozen menu while it runs; it drives the
         // game's message window itself and consumes no menu input.
         if self.pickup_view.is_some() {
-            self.tick_pickup_view(pack, input, action);
+            self.tick_pickup_view(pack, ui, input, action);
             return;
         }
         let message_was_up = self.game.message.active;
@@ -2178,6 +2234,12 @@ impl GameSession {
         // draws the slot highlight and the item name) is mirrored onto the
         // box's cursor to keep the drawn slot and the acted-on slot equal.
         if self.item_box.is_some() {
+            // The original's item-box state 3 calls `menu_draw_health_bar`
+            // every frame, which keeps the face and the EKG heartbeat sweeping
+            // while the box is up.
+            if let Some(menu) = self.menu.as_mut() {
+                menu.tick(&mut self.game);
+            }
             if let Some(item_box) = self.item_box.as_mut() {
                 item_box.tick();
             }
@@ -2187,11 +2249,12 @@ impl GameSession {
                     .as_mut()
                     .map(|item_box| item_box.handle_input(&mut self.game, event_input));
                 if event == Some(ItemBoxEvent::Close) {
-                    self.item_box = None;
-                    self.close_menu();
-                    // The original restores the lid angle (state 4) once the box
-                    // menu is closed.
+                    // The original restores the lid angle (state 4) once the
+                    // box menu is closed, then runs the menu's closing fade
+                    // (`menu_exit_cleanup`'s `set_fading(2, 0xC00)`): the panel
+                    // and box darken before the room unfreezes.
                     self.game.reset_itembox();
+                    self.begin_menu_close_silent();
                 }
             }
             if let Some(cursor) = self
@@ -2270,20 +2333,16 @@ impl GameSession {
 
     /// Run the action of a selected top tab.
     ///
-    /// The map tab (cursor 0) opens the floor-plan browser when the carried
-    /// radio's scenario flag is up (the same flag the radio tab reads); without
-    /// it the tab is inert. The file tab (cursor 2) opens the document
-    /// selector/reader. The radio tab (cursor 4) uses the carried radio when
-    /// its scenario flag is up: the used-item byte 0x4D reaches the room
-    /// scripts and the menu closes, as the original's radio tab does; without
-    /// the radio the tab is inert.
+    /// The map tab (cursor 0) always opens the floor-plan browser: the
+    /// original's `menu_tab_map` runs its state machine without any scenario
+    /// check (`DAT_00ae9f1f` gates only the radio tab). The file tab (cursor 2)
+    /// opens the document selector/reader. The radio tab (cursor 4) uses the
+    /// carried radio when its scenario flag is up: the used-item byte 0x4D
+    /// reaches the room scripts and the menu closes, as the original's radio
+    /// tab does; without the radio the tab is inert.
     fn handle_tab(&mut self, pack: &Pack, cursor: u8) {
         match cursor {
-            0 => {
-                if self.game.has_radio() {
-                    self.open_map(pack);
-                }
-            }
+            0 => self.open_map(pack),
             2 => self.open_file(pack),
             4 => {
                 if self.game.has_radio() {
@@ -2672,11 +2731,22 @@ impl GameSession {
         // frame; it is revealed for the fade-in.
         if self.menu.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
             self.ensure_menu_assets(pack);
+            // The 0xBA item-name line belongs to whatever owns the screen: a
+            // message window, the examine viewer or a pick-up prompt draws
+            // there, so the menu must not paint its own name under it.
+            let show_item_name =
+                !self.game.message.active && self.pickup_view.is_none() && self.modal.is_none();
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
-                menu.draw(&mut self.framebuffer, assets, &self.text, &self.game);
+                menu.draw_with_name(
+                    &mut self.framebuffer,
+                    assets,
+                    &self.text,
+                    &self.game,
+                    show_item_name,
+                );
             }
         }
-        if self.item_box.is_some() {
+        if self.item_box.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
             self.ensure_item_box_assets(pack);
             if let (Some(item_box), Some(item_box_assets), Some(menu_assets)) =
                 (&self.item_box, &self.item_box_assets, &self.menu_assets)
@@ -2731,10 +2801,14 @@ impl GameSession {
             }
         }
         // The pick-up viewer draws over the inventory panel, before the
-        // message so its intro/exit fade never dims the prompt text.
+        // message so its intro/exit fade never dims the prompt text. A
+        // document pick-up draws the FILE reader instead of the model viewer.
         if self.pickup_view.is_some() {
+            self.ensure_file_assets(pack);
             let Self {
                 pickup_view,
+                file_assets,
+                menu_assets,
                 save_dir,
                 font,
                 text,
@@ -2742,20 +2816,25 @@ impl GameSession {
                 framebuffer,
                 ..
             } = self;
-            if let Some(screen) = pickup_view
-                .as_mut()
-                .and_then(|pickup| pickup.screen.as_mut())
-            {
-                let cx = UiContext {
-                    pack,
-                    save_dir,
-                    font: font.as_ref(),
-                    text: Some(text),
-                    ticks: game.frame,
-                    cues: std::cell::RefCell::new(Vec::new()),
-                };
-                screen.draw(&cx, framebuffer);
-                framebuffer.fade_overlay(screen.overlay());
+            if let Some(pickup) = pickup_view.as_mut() {
+                if let Some(screen) = pickup.screen.as_mut() {
+                    let cx = UiContext {
+                        pack,
+                        save_dir,
+                        font: font.as_ref(),
+                        text: Some(text),
+                        ticks: game.frame,
+                        cues: std::cell::RefCell::new(Vec::new()),
+                    };
+                    screen.draw(&cx, framebuffer);
+                    framebuffer.fade_overlay(screen.overlay());
+                }
+                if let Some(reader) = pickup.reader.as_mut()
+                    && let (Some(file_assets), Some(menu_assets)) =
+                        (file_assets.as_ref(), menu_assets.as_ref())
+                {
+                    reader.draw(framebuffer, file_assets, menu_assets, text, game);
+                }
             }
         }
         // The pause-menu open/close fade sits over the menu and its overlays.
@@ -3571,15 +3650,13 @@ impl App {
         Ok(())
     }
 
-    /// Boot the map tab capture over [`MENU_ROOM`] with the capture inventory
-    /// and the radio's scenario flag up, so the tab is available.
+    /// Boot the map tab capture over [`MENU_ROOM`] with the capture inventory.
+    /// The tab is always available (only the radio tab reads the scenario
+    /// flag), so no extra flag is seeded.
     fn open_map_capture(&mut self) -> Result<()> {
         let id = RoomId::parse(MENU_ROOM)?;
         let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_menu_capture();
-        session
-            .game
-            .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_HAS_RADIO, 0);
         session.open_map(&self.pack);
         self.start_session(session);
         Ok(())
@@ -11556,7 +11633,7 @@ mod tests {
     }
 
     #[test]
-    fn map_tab_is_gated_by_the_radio_flag() {
+    fn the_map_tab_opens_without_the_radio_flag() {
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
@@ -11570,14 +11647,17 @@ mod tests {
             Path::new("saves"),
         )
         .unwrap();
+        assert!(
+            !session.game.has_radio(),
+            "the scenario starts without the radio"
+        );
         session.open_menu(&pack);
         session.handle_tab(&pack, 0);
-        assert!(session.map.is_none(), "no radio: the map tab is inert");
-        session
-            .game
-            .apply_flag(game::BANK_SCENARIO, game::SCENARIO_FLAG_HAS_RADIO, 0);
-        session.handle_tab(&pack, 0);
-        assert!(session.map.is_some(), "the radio flag opens the map tab");
+        assert!(
+            session.map.is_some(),
+            "the original's map tab needs no radio (DAT_00ae9f1f gates only \
+             the radio tab)"
+        );
     }
 
     #[test]
@@ -14259,7 +14339,7 @@ off_0010:
     }
 
     #[test]
-    fn a_document_pickup_files_the_entry_without_an_inventory_award() {
+    fn a_document_pickup_opens_the_reader_and_files_the_entry_on_close() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
@@ -14274,9 +14354,52 @@ off_0010:
             .unwrap();
         assert!(session.pickup_view.is_some());
         assert!(session.menu.is_some());
-        assert_eq!(session.game.message.id, Some(game::MESSAGE_FILE_FILED));
+        // The document reader owns the screen instead of the model viewer,
+        // and the 0xC6 line waits for its exit slide.
+        assert!(
+            session
+                .pickup_view
+                .as_ref()
+                .is_some_and(|pickup| pickup.reader.is_some()),
+            "the state-8 flow opens the document reader"
+        );
+        assert_eq!(session.game.message.id, None);
         assert!(session.game.file_collected(1), "the entry is filed");
         assert!(!session.game.has_item(0x60), "a document is not carried");
+
+        // The reader's entry slide settles, then cancel starts the exit slide.
+        tick_until(
+            &mut session,
+            &pack,
+            64,
+            "the reader entry slide",
+            |session| {
+                session.pickup_view.as_ref().is_some_and(|pickup| {
+                    pickup.reader.as_ref().is_some_and(|reader| {
+                        reader.reader_anim == crate::ui::file::ReaderAnim::Idle
+                    })
+                })
+            },
+        );
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        tick_until(&mut session, &pack, 64, "the reader exit", |session| {
+            session.game.message.id == Some(game::MESSAGE_FILE_FILED)
+        });
+        assert!(session.game.message.active);
+        assert!(
+            session.game.room_actions[1].is_some(),
+            "the entry is consumed only once the message clears"
+        );
 
         tick_until(&mut session, &pack, 300, "the message wait", |session| {
             session.game.message.phase() == crate::message::MessagePhase::WaitInput
@@ -14339,6 +14462,10 @@ off_0010:
                 .all(|record| record.rotation[2] < 0),
             "the lid record ramped open"
         );
+        // The box opens through the menu's fade (darken, then fade in), and
+        // only accepts input once it has settled.
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Out);
+        settle_menu_fade(&mut session, &pack);
         let before = session.game.frame;
 
         // Confirm arms the swap, confirm again deposits the spray.
@@ -14368,7 +14495,8 @@ off_0010:
         assert!(session.game.inventory.is_empty());
         assert_eq!(session.game.frame, before, "the room stayed frozen");
 
-        // Cancel closes the box and the menu; the room resumes.
+        // Cancel darkens the panel and box, then closes both and resumes the
+        // room through the room-entry fade.
         session
             .tick(
                 &pack,
@@ -14380,6 +14508,12 @@ off_0010:
                 false,
             )
             .unwrap();
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
+        assert!(
+            session.item_box.is_some(),
+            "the box stays up while it darkens"
+        );
+        settle_menu_fade(&mut session, &pack);
         assert!(session.item_box.is_none());
         assert!(session.menu.is_none());
         let frozen = session.game.frame;
@@ -14449,6 +14583,93 @@ off_0010:
     }
 
     #[test]
+    fn the_item_box_keeps_the_heartbeat_sweeping() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.game.add_item(ITEM_FIRST_AID_SPRAY, 1);
+        session.open_item_box(&pack);
+
+        // A fresh monitor has not run yet: the original's item-box state 3
+        // calls `menu_draw_health_bar` every frame, so the first box tick
+        // initialises the EKG and the following ticks sweep its head.
+        assert_eq!(session.menu.as_ref().unwrap().health_bar.state, 0);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(
+            session.menu.as_ref().unwrap().health_bar.state,
+            1,
+            "the item box starts the EKG sweep"
+        );
+        let first = session.menu.as_ref().unwrap().health_bar.primary_span();
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        let second = session.menu.as_ref().unwrap().health_bar.primary_span();
+        assert_ne!(first, second, "the EKG head advances while the box is up");
+    }
+
+    #[test]
+    fn using_a_key_item_closes_the_inventory() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.game.add_item(ITEM_SWORD_KEY, 1);
+        session.game.set_item_use_flag(ITEM_SWORD_KEY, true);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_menu_fade(&mut session, &pack);
+        // Confirm opens the submenu, confirm again uses the key: the original
+        // sets the close bit and the menu exits through its fade.
+        for _ in 0..2 {
+            session
+                .tick(
+                    &pack,
+                    UiInput {
+                        confirm: true,
+                        ..UiInput::default()
+                    },
+                    player::Input::default(),
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            session.game.last_picked_item, None,
+            "the key is used, not picked"
+        );
+        assert!(
+            !session.game.has_item(ITEM_SWORD_KEY),
+            "the key was consumed"
+        );
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
+        settle_menu_fade(&mut session, &pack);
+        assert!(session.menu.is_none(), "the inventory closed after the use");
+        assert_eq!(
+            session.room_fade_alpha(),
+            Some(255),
+            "the room fades back in"
+        );
+    }
+
+    #[test]
     fn tab_cycles_the_menu_tabs_and_the_file_tab_lists_documents() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
@@ -14472,7 +14693,8 @@ off_0010:
         assert!(session.menu.is_some());
         settle_menu_fade(&mut session, &pack);
 
-        // The first Tab lands on the map tab, which is inert.
+        // The first Tab lands on the map tab, which opens the floor plan
+        // (the tab needs no radio).
         session
             .tick(
                 &pack,
@@ -14484,7 +14706,22 @@ off_0010:
                 false,
             )
             .unwrap();
+        assert!(session.map.is_some(), "the map tab opens");
         assert!(session.file.is_none());
+
+        // Cancel closes the map back to the inventory.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.map.is_none());
 
         // The second Tab reaches the file tab and opens the selector on the
         // collected document.
@@ -14503,8 +14740,9 @@ off_0010:
         assert_eq!(file.slot, 0);
         assert!(session.menu.is_some(), "the menu stays open underneath");
 
-        // Confirm opens the reader; cancel returns to the selector and a
-        // second cancel closes only the tab.
+        // Confirm opens the reader; let its entry slide settle, then cancel
+        // slides it back out to the selector and a second cancel closes only
+        // the tab.
         session
             .tick(
                 &pack,
@@ -14520,6 +14758,18 @@ off_0010:
             session.file.as_ref().unwrap().mode,
             crate::ui::file::FileMode::Reader
         );
+        tick_until(
+            &mut session,
+            &pack,
+            64,
+            "the reader entry slide",
+            |session| {
+                session
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.reader_anim == crate::ui::file::ReaderAnim::Idle)
+            },
+        );
         session
             .tick(
                 &pack,
@@ -14531,6 +14781,18 @@ off_0010:
                 false,
             )
             .unwrap();
+        tick_until(
+            &mut session,
+            &pack,
+            64,
+            "the reader exit slide",
+            |session| {
+                session.file.as_ref().is_some_and(|file| {
+                    file.mode == crate::ui::file::FileMode::List
+                        && file.reader_anim == crate::ui::file::ReaderAnim::Idle
+                })
+            },
+        );
         assert_eq!(
             session.file.as_ref().unwrap().mode,
             crate::ui::file::FileMode::List

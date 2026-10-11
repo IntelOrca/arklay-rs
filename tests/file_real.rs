@@ -21,7 +21,8 @@ use arklay::render::Framebuffer;
 use arklay::state::{Image, RoomId};
 use arklay::text::Text;
 use arklay::ui::file::{
-    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, page_count, page_index,
+    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, ReaderAnim, page_count,
+    page_index,
 };
 use arklay::ui::main_menu::MenuAssets;
 
@@ -92,9 +93,12 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     );
 
     // Open the reader and walk every half-page; each one draws content and
-    // consecutive pages differ.
+    // consecutive pages differ. Each page change runs the original's slide
+    // animation, so settle it before drawing.
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
     assert_eq!(screen.mode, FileMode::Reader);
+    assert_eq!(screen.reader_anim, ReaderAnim::InRight);
+    settle_reader(&mut screen);
     let count = page_count(0x0F);
     let mut previous: Option<Vec<u8>> = None;
     for page in 0..count {
@@ -116,6 +120,8 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
         previous = Some(frame.rgba);
         if page + 1 < count {
             screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Down);
+            assert_eq!(screen.reader_anim, ReaderAnim::OutLeft);
+            settle_reader(&mut screen);
         }
     }
     // Leave a deterministic reader capture behind for inspection.
@@ -133,12 +139,26 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     .unwrap();
     println!("wrote {}", capture.display());
 
+    // Confirm exits on the last page through the reader's exit slide.
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
+    assert_eq!(screen.reader_anim, ReaderAnim::Exit);
+    settle_reader(&mut screen);
     assert_eq!(
         screen.mode,
         FileMode::List,
         "confirm exits on the last page"
     );
+}
+
+/// Advance the toggle-only reader until its slide animation settles.
+fn settle_reader(screen: &mut FileScreen) {
+    for _ in 0..64 {
+        if screen.reader_anim == ReaderAnim::Idle {
+            return;
+        }
+        screen.tick();
+    }
+    panic!("the reader slide did not settle");
 }
 
 #[test]

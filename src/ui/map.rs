@@ -1,14 +1,15 @@
 //! The pause menu's map tab.
 //!
-//! The tab is gated by the same scenario flag the radio tab reads: without the
-//! radio the map tab is inert. With it, the tab browser draws the selected
-//! floor plan (`map/map0d.tim`, `map0c`, `map00` or `map0e`, one per available
-//! layout) and tints its room markers from the visited-room bits in the
-//! room-flags bank: unvisited rooms are hidden, the current room is
-//! highlighted. Up/down step the room index inside the current layout (only
-//! when the neighbouring area is known), left/right step between the layouts
-//! the owned maps unlock. Confirm switches to the full floor-plan view of the
-//! current area; cancel returns to the browser and then closes the tab.
+//! The tab is always available: the original's `menu_tab_map` runs the map
+//! state machine without a scenario check (the radio's flag gates only the
+//! radio tab). The tab browser draws the selected floor plan
+//! (`map/map0d.tim`, `map0c`, `map00` or `map0e`, one per available layout)
+//! and tints its room markers from the visited-room bits in the room-flags
+//! bank: unvisited rooms are hidden, the current room is highlighted. Up/down
+//! step the room index inside the current layout (only when the neighbouring
+//! area is known), left/right step between the layouts the owned maps unlock.
+//! Confirm switches to the full floor-plan view of the current area; cancel
+//! returns to the browser and then closes the tab.
 //!
 //! The area/layout/room tables come from `map/tables.bin`, extracted from the
 //! executable by the converter exactly like the text tables. The full-display
