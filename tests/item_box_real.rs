@@ -166,5 +166,20 @@ fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
         changed > 15000,
         "the item-box overlay only repainted {changed} pixels over the menu"
     );
+
+    // The item box keeps the status panel's heartbeat sweeping (the original's
+    // state 3 calls `menu_draw_health_bar` every frame): the capture must show
+    // the full-health green EKG inside its window.
+    let ekg = (0x80..=0xB0usize)
+        .flat_map(|y| (0x54..=0x83usize).map(move |x| (x, y)))
+        .filter(|&(x, y)| {
+            let offset = (y * image.width as usize + x) * 4;
+            image.rgba[offset..offset + 4] == [0, 255, 0, 255]
+        })
+        .count();
+    assert!(
+        ekg > 8,
+        "the item box drew no heartbeat EKG: {ekg} green pixels"
+    );
     println!("wrote {}", first.display());
 }

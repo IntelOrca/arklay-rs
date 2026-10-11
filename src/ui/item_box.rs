@@ -285,6 +285,17 @@ impl ItemBox {
                 self.mode = ItemBoxMode::Browse;
                 ItemBoxEvent::None
             }
+            // The original's state 2 pages the box grid with the D-pad: down
+            // slides forward one slot, up slides back one (0x004941f0's
+            // `g_button_pressed_id & 0x5000` walk). L1/R1 stay aliases.
+            MenuInput::Up => {
+                self.page(-1);
+                ItemBoxEvent::None
+            }
+            MenuInput::Down => {
+                self.page(1);
+                ItemBoxEvent::None
+            }
             MenuInput::PageLeft => {
                 self.page(-1);
                 ItemBoxEvent::None
@@ -309,9 +320,7 @@ impl ItemBox {
                     ItemBoxEvent::None
                 }
             }
-            MenuInput::Up | MenuInput::Down | MenuInput::Left | MenuInput::Right => {
-                ItemBoxEvent::None
-            }
+            MenuInput::Left | MenuInput::Right => ItemBoxEvent::None,
         }
     }
 
@@ -706,6 +715,50 @@ mod tests {
         assert_eq!(state.item_box[2].id, 0x41);
         assert_eq!(state.inventory[0].id, 0x0B);
         assert_eq!(state.inventory[0].quantity, 12);
+    }
+
+    #[test]
+    fn armed_up_and_down_page_the_box_cursor() {
+        let mut state = game();
+        state.add_item(0x41, 1); // spray in slot 0
+        state.item_box[2] = InventoryItem {
+            id: 0x0B,
+            quantity: 12,
+        };
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 8);
+        item_box.handle_input(&mut state, MenuInput::Confirm);
+        assert_eq!(item_box.mode, ItemBoxMode::Armed);
+
+        // Down walks the box cursor forward one slot with the slide, and the
+        // inventory cursor stays put.
+        item_box.handle_input(&mut state, MenuInput::Down);
+        assert_eq!(item_box.box_cursor, 1);
+        assert_eq!(item_box.slide_dir, 1);
+        item_box.handle_input(&mut state, MenuInput::Down);
+        assert_eq!(item_box.box_cursor, 2);
+        assert_eq!(item_box.player_cursor, 8, "the inventory cursor is fixed");
+
+        // Up walks it back, wrapping at the first slot.
+        item_box.handle_input(&mut state, MenuInput::Up);
+        assert_eq!(item_box.box_cursor, 1);
+        assert_eq!(item_box.slide_dir, -1);
+        item_box.handle_input(&mut state, MenuInput::Up);
+        item_box.handle_input(&mut state, MenuInput::Up);
+        assert_eq!(item_box.box_cursor, 47, "past the first slot wraps");
+        assert_eq!(item_box.mode, ItemBoxMode::Armed, "paging keeps the arm");
+
+        // The paged-to slot is what the next confirm swaps with.
+        item_box.page(1);
+        item_box.page(1);
+        item_box.page(1);
+        assert_eq!(item_box.box_cursor, 2);
+        assert_eq!(
+            item_box.handle_input(&mut state, MenuInput::Confirm),
+            ItemBoxEvent::Changed
+        );
+        assert_eq!(state.item_box[2].id, 0x41);
+        assert_eq!(state.inventory[0].id, 0x0B);
     }
 
     #[test]

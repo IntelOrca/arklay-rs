@@ -278,6 +278,34 @@ pub enum FileMode {
     Reader,
 }
 
+/// Which reader slide animation is running.
+///
+/// The original's reader (`pickup_screen_render` 0x004823a0 /
+/// `jpn_file_screen_render` 0x0042c080) slides the page texture in and out on
+/// every change: entry eases it in from the right, a page-down first slides it
+/// out to the left and then eases the next page in from the right, a page-up
+/// mirrors that, and the close slides it out to the left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderAnim {
+    /// No animation; the reader accepts input.
+    Idle,
+    /// The page eases in from the right (entry / page-down second half).
+    InRight,
+    /// The page slides out to the left (page-down first half).
+    OutLeft,
+    /// The page eases in from the left (page-up second half).
+    InLeft,
+    /// The page slides out to the right (page-up first half).
+    OutRight,
+    /// The reader slides out to the left on close.
+    Exit,
+}
+
+/// The reader's entry/exit slide start offset (the original's `0x128`).
+pub const READER_SLIDE_START: i16 = 0x128;
+/// The reader's entry/exit slide start speed (the original's `300`).
+const READER_SLIDE_SPEED: i16 = 300;
+
 /// What a handled FILE input asks the engine to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileEvent {
@@ -306,6 +334,17 @@ pub struct FileScreen {
     pub slide_x: i16,
     /// Vertical slide of the current view in pixels (opening/closing).
     pub slide_y: i16,
+    /// Which reader slide animation is running.
+    pub reader_anim: ReaderAnim,
+    /// The reader page's x offset (the original's `state[0xc]`).
+    pub reader_slide: i16,
+    /// The reader slide's speed (the original's `state[0xa]`).
+    reader_speed: i16,
+    /// Whether the reader was opened for a document pick-up: its exit ends the
+    /// whole flow instead of returning to the selector.
+    pickup: bool,
+    /// Set when a pick-up reader's exit slide has finished.
+    reader_exit_done: bool,
 }
 
 impl Default for FileScreen {
@@ -319,6 +358,11 @@ impl Default for FileScreen {
             blink: 0,
             slide_x: 0,
             slide_y: 0,
+            reader_anim: ReaderAnim::Idle,
+            reader_slide: 0,
+            reader_speed: 1,
+            pickup: false,
+            reader_exit_done: false,
         }
     }
 }
@@ -335,6 +379,68 @@ impl FileScreen {
         self.blink = 0;
         self.slide_x = 0;
         self.slide_y = 0;
+        self.reader_anim = ReaderAnim::Idle;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
+        self.pickup = false;
+        self.reader_exit_done = false;
+    }
+
+    /// Open the reader directly on the document item `item` (`0x5F..=0x6E`),
+    /// for the room pick-up flow: the original finds the key-item list slot
+    /// holding the picked index and enters the reader on it (`menu_update_
+    /// status_screen`'s `g_pickupKeyItemList` scan).
+    pub fn open_pickup(&mut self, game: &GameState, item: u8) {
+        self.mode = FileMode::Reader;
+        self.character = game.id.player_flag & 1;
+        self.pickup = true;
+        self.reader_exit_done = false;
+        let index = item.wrapping_sub(FILE_ITEM_BASE);
+        let list = key_item_list(self.character);
+        let found = list
+            .iter()
+            .position(|&raw| resolve_entry(game, raw) == Some(index));
+        let (book, slot) = found.map_or((0, 0), |i| {
+            ((i / SLOTS_PER_BOOK) as u8, (i % SLOTS_PER_BOOK) as u8)
+        });
+        self.book = book;
+        self.slot = slot;
+        self.page = 0;
+        self.blink = 0;
+        self.slide_x = 0;
+        self.slide_y = 0;
+        self.start_reader_entry();
+    }
+
+    /// Whether a pick-up reader has finished its exit slide.
+    pub fn take_reader_exit(&mut self) -> bool {
+        std::mem::take(&mut self.reader_exit_done)
+    }
+
+    /// Start the reader's entry slide (also used by the page-down second half):
+    /// the page eases in from the right at 300 speed, halving each tick.
+    fn start_reader_entry(&mut self) {
+        self.reader_anim = ReaderAnim::InRight;
+        self.reader_slide = READER_SLIDE_START;
+        self.reader_speed = READER_SLIDE_SPEED;
+    }
+
+    fn start_reader_next(&mut self) {
+        self.reader_anim = ReaderAnim::OutLeft;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
+    }
+
+    fn start_reader_prev(&mut self) {
+        self.reader_anim = ReaderAnim::OutRight;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
+    }
+
+    fn start_reader_exit(&mut self) {
+        self.reader_anim = ReaderAnim::Exit;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
     }
 
     /// Whether the current book has a selectable document.
@@ -342,13 +448,73 @@ impl FileScreen {
         self.slot != 0xFF
     }
 
-    /// Advance one tick: blink and the book-change slide.
+    /// Advance one tick: blink, the book-change slide and the reader slide.
     pub fn tick(&mut self) {
         self.blink = self.blink.wrapping_add(1);
         if self.slide_x > 0 {
             self.slide_x = (self.slide_x - 9).max(0);
         } else if self.slide_x < 0 {
             self.slide_x = (self.slide_x + 9).min(0);
+        }
+        self.tick_reader_slide();
+    }
+
+    /// Advance the reader's slide animation one frame, transcribed from the
+    /// original's `pickup_screen_render` states 2-14.
+    fn tick_reader_slide(&mut self) {
+        match self.reader_anim {
+            ReaderAnim::Idle => {}
+            ReaderAnim::InRight => {
+                self.reader_speed /= 2;
+                self.reader_slide -= self.reader_speed;
+                if self.reader_slide < 1 {
+                    self.reader_slide = 0;
+                    self.reader_speed = 1;
+                    self.reader_anim = ReaderAnim::Idle;
+                }
+            }
+            ReaderAnim::OutLeft => {
+                self.reader_slide -= self.reader_speed;
+                self.reader_speed = self.reader_speed.saturating_mul(2);
+                if self.reader_slide < -0x127 {
+                    self.page = self.page.saturating_add(1);
+                    self.start_reader_entry();
+                }
+            }
+            ReaderAnim::InLeft => {
+                self.reader_speed /= 2;
+                self.reader_slide += self.reader_speed;
+                if self.reader_slide > -1 {
+                    self.reader_slide = 0;
+                    self.reader_speed = 1;
+                    self.reader_anim = ReaderAnim::Idle;
+                }
+            }
+            ReaderAnim::OutRight => {
+                self.reader_slide += self.reader_speed;
+                self.reader_speed = self.reader_speed.saturating_mul(2);
+                if self.reader_slide > 0x127 {
+                    self.page = self.page.saturating_sub(1);
+                    self.reader_anim = ReaderAnim::InLeft;
+                    self.reader_slide = -READER_SLIDE_START;
+                    self.reader_speed = READER_SLIDE_SPEED;
+                }
+            }
+            ReaderAnim::Exit => {
+                self.reader_slide -= self.reader_speed;
+                self.reader_speed = self.reader_speed.saturating_mul(2);
+                if self.reader_slide < -0x127 {
+                    self.reader_slide = 0;
+                    self.reader_speed = 1;
+                    self.reader_anim = ReaderAnim::Idle;
+                    if self.pickup {
+                        self.reader_exit_done = true;
+                    } else {
+                        self.mode = FileMode::List;
+                        self.page = 0;
+                    }
+                }
+            }
         }
     }
 
@@ -410,6 +576,7 @@ impl FileScreen {
                 if self.has_selection() {
                     self.mode = FileMode::Reader;
                     self.page = 0;
+                    self.start_reader_entry();
                 }
                 FileEvent::None
             }
@@ -429,27 +596,34 @@ impl FileScreen {
             self.mode = FileMode::List;
             return FileEvent::None;
         }
+        // A running slide owns the reader: the original locks its input while
+        // `state[9]` is set.
+        if self.reader_anim != ReaderAnim::Idle {
+            return FileEvent::None;
+        }
         let count = page_count(entry);
         match input {
             MenuInput::Cancel => {
-                self.mode = FileMode::List;
+                self.start_reader_exit();
                 FileEvent::None
             }
             MenuInput::Down | MenuInput::Right | MenuInput::PageRight => {
                 if self.page + 1 < count {
-                    self.page += 1;
+                    self.start_reader_next();
                 }
                 FileEvent::None
             }
             MenuInput::Up | MenuInput::Left | MenuInput::PageLeft => {
-                self.page = self.page.saturating_sub(1);
+                if self.page > 0 {
+                    self.start_reader_prev();
+                }
                 FileEvent::None
             }
             MenuInput::Confirm => {
                 if self.page + 1 >= count {
-                    self.mode = FileMode::List;
+                    self.start_reader_exit();
                 } else {
-                    self.page += 1;
+                    self.start_reader_next();
                 }
                 FileEvent::None
             }
@@ -609,7 +783,7 @@ impl FileScreen {
                 page,
                 [0, half, i32::from(PAGE_SIZE[0]), i32::from(PAGE_SIZE[1])],
                 [
-                    i32::from(PAGE_POS[0]),
+                    i32::from(PAGE_POS[0]) + i32::from(self.reader_slide),
                     i32::from(PAGE_POS[1]),
                     i32::from(PAGE_SIZE[0]),
                     i32::from(PAGE_SIZE[1]),
@@ -807,17 +981,21 @@ mod tests {
         screen.open(&state);
         screen.handle_input(&mut state, MenuInput::Confirm);
         assert_eq!(screen.mode, FileMode::Reader);
+        settle_reader(&mut screen);
 
         // List slot 0's raw entry is file index 0x0F, whose page-count table
         // entry is 5 half-pages. Walk to the last page and confirm.
         let count = page_count(0x0F);
         for page in 1..count {
             screen.handle_input(&mut state, MenuInput::Down);
+            settle_reader(&mut screen);
             assert_eq!(screen.page, page);
         }
         screen.handle_input(&mut state, MenuInput::Down);
+        settle_reader(&mut screen);
         assert_eq!(screen.page, count - 1, "the last page holds");
         screen.handle_input(&mut state, MenuInput::Confirm);
+        settle_reader(&mut screen);
         assert_eq!(
             screen.mode,
             FileMode::List,
@@ -826,12 +1004,122 @@ mod tests {
 
         // Cancel from the reader returns to the list too.
         screen.handle_input(&mut state, MenuInput::Confirm);
+        settle_reader(&mut screen);
         assert_eq!(screen.mode, FileMode::Reader);
         screen.handle_input(&mut state, MenuInput::Cancel);
+        settle_reader(&mut screen);
         assert_eq!(screen.mode, FileMode::List);
         assert_eq!(
             screen.handle_input(&mut state, MenuInput::Cancel),
             FileEvent::Close
         );
+    }
+
+    /// Advance the toggle-only screen until its reader slide settles.
+    fn settle_reader(screen: &mut FileScreen) {
+        for _ in 0..64 {
+            if screen.reader_anim == ReaderAnim::Idle {
+                return;
+            }
+            screen.tick();
+        }
+        panic!("the reader slide did not settle");
+    }
+
+    #[test]
+    fn the_reader_slides_the_page_on_and_off() {
+        let mut state = game(0);
+        state.set_file_collected(0x0F, true);
+        let mut screen = FileScreen::default();
+        screen.open(&state);
+
+        // Opening the reader starts the page at the original's 0x128 offset
+        // and eases it onto the page box over a decelerating slide.
+        screen.handle_input(&mut state, MenuInput::Confirm);
+        assert_eq!(screen.reader_anim, ReaderAnim::InRight);
+        assert_eq!(screen.reader_slide, READER_SLIDE_START);
+        let mut positions = Vec::new();
+        while screen.reader_anim != ReaderAnim::Idle {
+            screen.tick();
+            positions.push(screen.reader_slide);
+        }
+        assert_eq!(screen.reader_slide, 0, "the page settles on the box");
+        assert_eq!(positions[0], 146, "300 / 2 slides the first step");
+        assert_eq!(positions.last(), Some(&0));
+
+        // A page-down first slides the current page off to the left, then
+        // eases the next one in from the right; the page advances only once
+        // the old one is clear.
+        screen.handle_input(&mut state, MenuInput::Down);
+        assert_eq!(screen.reader_anim, ReaderAnim::OutLeft);
+        let mut min_slide = 0;
+        while screen.reader_anim == ReaderAnim::OutLeft {
+            screen.tick();
+            min_slide = min_slide.min(screen.reader_slide);
+            if screen.reader_anim == ReaderAnim::OutLeft {
+                assert_eq!(screen.page, 0, "the old page holds through the slide-out");
+            }
+        }
+        assert!(min_slide < -0x80, "the old page left through the left edge");
+        assert_eq!(screen.page, 1);
+        assert_eq!(screen.reader_anim, ReaderAnim::InRight);
+        while screen.reader_anim != ReaderAnim::Idle {
+            screen.tick();
+        }
+        assert_eq!(screen.reader_slide, 0);
+
+        // A page-up mirrors it: out to the right, then in from the left.
+        screen.handle_input(&mut state, MenuInput::Up);
+        assert_eq!(screen.reader_anim, ReaderAnim::OutRight);
+        while screen.reader_anim != ReaderAnim::Idle {
+            screen.tick();
+        }
+        assert_eq!(screen.page, 0);
+
+        // Cancel starts the exit slide; the mode only returns to the list once
+        // the page has left the screen.
+        screen.handle_input(&mut state, MenuInput::Cancel);
+        assert_eq!(screen.reader_anim, ReaderAnim::Exit);
+        assert_eq!(screen.mode, FileMode::Reader);
+        while screen.reader_anim != ReaderAnim::Idle {
+            screen.tick();
+        }
+        assert_eq!(screen.mode, FileMode::List);
+    }
+
+    #[test]
+    fn a_pickup_reader_reports_its_exit_instead_of_returning_to_the_list() {
+        let mut state = game(0);
+        state.set_file_collected(0, true);
+        state.set_file_collected(1, true);
+        let mut screen = FileScreen::default();
+        // Item 0x5F is document 0; its list slot is the 0xFE marker, resolved
+        // to 0 once the document is collected.
+        screen.open_pickup(&state, 0x5F);
+        assert_eq!(screen.mode, FileMode::Reader);
+        assert_eq!(screen.book, 0);
+        assert_eq!(screen.slot, 2, "the 0xFE list slot resolves to file 0");
+        assert!(!screen.take_reader_exit());
+        settle_reader(&mut screen);
+
+        // The reader's first half-page is document 0's first page; walking
+        // past its last half-page ends the flow through the exit slide.
+        let count = page_count(0);
+        for _ in 1..count {
+            screen.handle_input(&mut state, MenuInput::Down);
+            settle_reader(&mut screen);
+        }
+        screen.handle_input(&mut state, MenuInput::Confirm);
+        settle_reader(&mut screen);
+        assert!(
+            screen.take_reader_exit(),
+            "the pick-up reader reports its finished exit"
+        );
+        assert_eq!(
+            screen.mode,
+            FileMode::Reader,
+            "a pick-up reader never falls back to the selector"
+        );
+        assert!(!screen.take_reader_exit(), "the flag is consumed once");
     }
 }

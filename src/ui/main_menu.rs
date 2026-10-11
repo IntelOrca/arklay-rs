@@ -353,6 +353,13 @@ impl MainMenu {
 
     /// Use the selected item: apply the effect, consume one, record the used
     /// item and kick the EKG flush.
+    ///
+    /// A successful key/special/chemical/book use sets the original's
+    /// `DAT_00ae9f13 & 0x80` close bit (`menu_item_use_if_flag` /
+    /// `menu_item_use_red_book`), so once the submenu's close animation has run
+    /// the whole menu exits (`main_menu` case 1's `DAT_00ae9f13 & 0x41` test
+    /// with `menu_item_submenu`'s state-3 `| 1`). The port reports the same
+    /// outcome as [`MenuEvent::Close`].
     fn use_selected(&mut self, game: &mut GameState) -> MenuEvent {
         let item = self.selected_item;
         if item == 0 {
@@ -365,6 +372,10 @@ impl MainMenu {
                 consume_slot(game, slot);
                 self.health_bar.start_flush(healed, cured);
                 self.refresh_selection(game);
+                if closes_inventory(item) {
+                    self.mode = MenuMode::Navigation;
+                    return MenuEvent::Close;
+                }
                 if self.selected_item == 0 {
                     self.mode = MenuMode::Navigation;
                 }
@@ -453,6 +464,23 @@ impl MainMenu {
         text: &Text,
         game: &GameState,
     ) {
+        self.draw_with_name(framebuffer, assets, text, game, true);
+    }
+
+    /// [`MainMenu::draw`] with the item-name line optional.
+    ///
+    /// The original draws the 0xBA line from `menu_handle_input` and the
+    /// submenu states that still own the screen; while a message, the examine
+    /// viewer or a pick-up owns the line, the menu must not paint its name over
+    /// them (`menu_item_submenu` case 4's jump past the name draw).
+    pub fn draw_with_name(
+        &self,
+        framebuffer: &mut Framebuffer,
+        assets: &MenuAssets,
+        text: &Text,
+        game: &GameState,
+        show_item_name: bool,
+    ) {
         self.draw_background(framebuffer);
         self.draw_tab_cursor(framebuffer, assets);
         self.draw_frames(framebuffer, assets);
@@ -464,7 +492,9 @@ impl MainMenu {
             self.draw_submenu(framebuffer, assets);
         }
         self.draw_slot_cursor(framebuffer, assets);
-        self.draw_item_name(framebuffer, assets, text, game);
+        if show_item_name {
+            self.draw_item_name(framebuffer, assets, text, game);
+        }
     }
 
     /// Clear the whole screen to black and lay the four black border masks
@@ -683,6 +713,21 @@ impl MainMenu {
 /// above the non-infinite maximum).
 pub fn is_equippable(item: u8) -> bool {
     !(0x0B..=0x6E).contains(&item)
+}
+
+/// Whether a successful use of `item` closes the inventory afterwards: the
+/// key, special, chemical and book dispatch slots set the original's
+/// `DAT_00ae9f13` bit 0x80, which the main menu's case-1 test turns into a
+/// full menu exit. (Books only reach here as the red book, the only usable
+/// one.)
+pub fn closes_inventory(item: u8) -> bool {
+    matches!(
+        items::use_category(item),
+        items::UseCategory::Chemicals
+            | items::UseCategory::Special
+            | items::UseCategory::Keys
+            | items::UseCategory::Books
+    )
 }
 
 /// The original use-category dispatch index (weapons through unusable).
@@ -1157,7 +1202,8 @@ mod tests {
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
             menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Changed
+            MenuEvent::Close,
+            "a key use closes the inventory"
         );
         assert!(game.inventory.is_empty());
         assert_eq!(game.last_used_item, Some(0x33));
@@ -1179,9 +1225,23 @@ mod tests {
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
             menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Changed
+            MenuEvent::Close,
+            "a book use closes the inventory"
         );
         assert!(game.inventory.is_empty());
+    }
+
+    #[test]
+    fn closes_inventory_follows_the_use_dispatch() {
+        // Key, special, chemical and book slots set the close bit; heal,
+        // ammo, weapons and always-usable items do not.
+        assert!(closes_inventory(0x33)); // sword key
+        assert!(closes_inventory(0x1D)); // crank (special)
+        assert!(closes_inventory(0x15)); // UMB No.2 (chemical)
+        assert!(closes_inventory(0x3E)); // red book
+        assert!(!closes_inventory(0x44)); // green herb
+        assert!(!closes_inventory(0x02)); // beretta
+        assert!(!closes_inventory(0x0B)); // handgun ammo
     }
 
     #[test]
@@ -1346,6 +1406,59 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         menu.draw(&mut framebuffer, &assets, &text, &game);
         assert_eq!(pixel(&framebuffer, 280, 70), [255, 0, 255, 255]);
+    }
+
+    #[test]
+    fn the_item_name_line_can_be_suppressed_for_a_message() {
+        use crate::pack::{Pack, PackWriter};
+
+        // A names table with one real name for the green herb, so the name
+        // draw has something to paint.
+        let dir = std::env::temp_dir().join(format!("arklay-menu-name-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("game.akpak");
+        let mut names: Vec<Option<Vec<u8>>> = (0..0x45).map(|_| None).collect();
+        names[0x43] = Some(vec![0xAA, 0x07]);
+        let mut writer = PackWriter::new();
+        writer
+            .add(crate::text::NAMES_ENTRY, crate::text::encode_table(&names))
+            .unwrap();
+        writer.write(&path).unwrap();
+        let pack = Pack::open(&path).unwrap();
+        let text = Text::load(&pack);
+
+        let mut game = new_game();
+        game.add_item(0x44, 1);
+        let mut menu = MainMenu::new(8);
+        menu.open(&mut game);
+        let mut assets = assets();
+        assets.font = Font::new(solid_texture(
+            768,
+            256,
+            &[([0, 0, 768, 256], 1, [1, 2, 3, 255])],
+        ));
+        let name_pixels = |show_name: bool| {
+            let mut framebuffer = Framebuffer::new();
+            menu.draw_with_name(&mut framebuffer, &assets, &text, &game, show_name);
+            let mut count = 0;
+            for y in 0..framebuffer.height {
+                for x in 0..framebuffer.width {
+                    if pixel(&framebuffer, x as usize, y as usize) == [1, 2, 3, 255] {
+                        count += 1;
+                    }
+                }
+            }
+            count
+        };
+        assert!(
+            name_pixels(true) > 0,
+            "the name draws on the menu when the menu owns the line"
+        );
+        assert_eq!(
+            name_pixels(false),
+            0,
+            "the name is suppressed while a message owns the line"
+        );
     }
 
     #[test]

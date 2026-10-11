@@ -21,7 +21,8 @@ use arklay::render::Framebuffer;
 use arklay::state::{Image, RoomId};
 use arklay::text::Text;
 use arklay::ui::file::{
-    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, page_count, page_index,
+    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, ReaderAnim, page_count,
+    page_index,
 };
 use arklay::ui::main_menu::MenuAssets;
 
@@ -92,9 +93,12 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     );
 
     // Open the reader and walk every half-page; each one draws content and
-    // consecutive pages differ.
+    // consecutive pages differ. Each page change runs the original's slide
+    // animation, so settle it before drawing.
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
     assert_eq!(screen.mode, FileMode::Reader);
+    assert_eq!(screen.reader_anim, ReaderAnim::InRight);
+    settle_reader(&mut screen);
     let count = page_count(0x0F);
     let mut previous: Option<Vec<u8>> = None;
     for page in 0..count {
@@ -116,6 +120,8 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
         previous = Some(frame.rgba);
         if page + 1 < count {
             screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Down);
+            assert_eq!(screen.reader_anim, ReaderAnim::OutLeft);
+            settle_reader(&mut screen);
         }
     }
     // Leave a deterministic reader capture behind for inspection.
@@ -133,12 +139,47 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     .unwrap();
     println!("wrote {}", capture.display());
 
+    // Confirm exits on the last page through the reader's exit slide.
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
+    assert_eq!(screen.reader_anim, ReaderAnim::Exit);
+    settle_reader(&mut screen);
     assert_eq!(
         screen.mode,
         FileMode::List,
         "confirm exits on the last page"
     );
+
+    // The document pick-up path (`open_pickup`) enters the reader directly on
+    // the picked entry: item 0x5F is document 0, whose shared 0xFE list slot
+    // resolves to it once collected.
+    game.set_file_collected(0, true);
+    let mut pickup = FileScreen::default();
+    pickup.open_pickup(&game, FILE_ITEM_MIN);
+    assert_eq!(pickup.mode, FileMode::Reader);
+    assert_eq!(pickup.book, 0);
+    assert_eq!(pickup.slot, 2, "the 0xFE list slot holds document 0");
+    assert_eq!(pickup.reader_anim, ReaderAnim::InRight);
+    settle_reader(&mut pickup);
+    assert_eq!(pickup.page, 0);
+    let mut frame = Framebuffer::new();
+    pickup.draw(&mut frame, &assets, &menu, &text, &game);
+    let drawn = non_black(&Image {
+        width: frame.width,
+        height: frame.height,
+        rgba: frame.rgba.clone(),
+    });
+    assert!(drawn > 5000, "the pick-up reader drew only {drawn} pixels");
+}
+
+/// Advance the toggle-only reader until its slide animation settles.
+fn settle_reader(screen: &mut FileScreen) {
+    for _ in 0..64 {
+        if screen.reader_anim == ReaderAnim::Idle {
+            return;
+        }
+        screen.tick();
+    }
+    panic!("the reader slide did not settle");
 }
 
 #[test]
