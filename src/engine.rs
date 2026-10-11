@@ -116,7 +116,7 @@ use crate::transition::{self, DoorStepper};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
-use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput};
+use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 use crate::voice;
@@ -2290,10 +2290,14 @@ impl GameSession {
                 item_box.tick();
             }
             if let Some(event_input) = menu_input(ui) {
+                let cue = menu_cue(event_input);
                 let event = self
                     .item_box
                     .as_mut()
                     .map(|item_box| item_box.handle_input(&mut self.game, event_input));
+                if let Some(cue) = cue {
+                    self.play_ui_cue_names(pack, vec![cue]);
+                }
                 if event == Some(ItemBoxEvent::Close) {
                     // The original restores the lid angle (state 4) once the
                     // box menu is closed, then runs the menu's closing fade
@@ -2322,10 +2326,14 @@ impl GameSession {
             let Some(event_input) = menu_input(ui) else {
                 return;
             };
+            let cue = menu_cue(event_input);
             let event = self
                 .map
                 .as_mut()
                 .map(|map| map.handle_input(&self.game, event_input));
+            if let Some(cue) = cue {
+                self.play_ui_cue_names(pack, vec![cue]);
+            }
             if event == Some(ui::map::MapEvent::Close) {
                 self.map = None;
             }
@@ -2340,10 +2348,14 @@ impl GameSession {
             let Some(event_input) = menu_input(ui) else {
                 return;
             };
+            let cue = menu_cue(event_input);
             let event = self
                 .file
                 .as_mut()
                 .map(|file| file.handle_input(&mut self.game, event_input));
+            if let Some(cue) = cue {
+                self.play_ui_cue_names(pack, vec![cue]);
+            }
             if event == Some(FileEvent::Close) {
                 self.file = None;
             }
@@ -2365,7 +2377,22 @@ impl GameSession {
         let Some(event_input) = menu_input(ui) else {
             return;
         };
+        let was_navigation = menu.mode == MenuMode::Navigation;
         let event = menu.handle_input(&mut self.game, event_input);
+        let mode = menu.mode;
+        // A confirm that did nothing (an empty slot) stays silent, exactly like
+        // the original's `goto input_blink` path.
+        let cue = match event_input {
+            MenuInput::Confirm
+                if event == MenuEvent::None && was_navigation && mode == MenuMode::Navigation =>
+            {
+                None
+            }
+            _ => menu_cue(event_input),
+        };
+        if let Some(cue) = cue {
+            self.play_ui_cue_names(pack, vec![cue]);
+        }
         match event {
             MenuEvent::None => {}
             MenuEvent::Close => self.begin_menu_close(pack),
@@ -7325,6 +7352,23 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
     }
 }
 
+/// The cue a menu pad input plays.
+///
+/// The original's menu handlers call `play_sfx(3, ...)`: slot 4 is the cursor
+/// blip on a D-pad move, slot 6 the decide chime on confirm and slot 5 the
+/// cancel cue. Those slots are the `cursor`/`decide`/`cancel` samples the
+/// character tables share, so the port's UI cues resolve to the same wavs.
+fn menu_cue(input: MenuInput) -> Option<ui::UiCue> {
+    match input {
+        MenuInput::Up | MenuInput::Down | MenuInput::Left | MenuInput::Right => {
+            Some(ui::UiCue::Cursor)
+        }
+        MenuInput::Confirm => Some(ui::UiCue::Decide),
+        MenuInput::Cancel => Some(ui::UiCue::Cancel),
+        MenuInput::PageLeft | MenuInput::PageRight => None,
+    }
+}
+
 /// The player's character model plus its no-weapon locomotion clips.
 struct PlayerAssets {
     emd: Emd,
@@ -11327,6 +11371,21 @@ mod tests {
         assert!(input.tick().ui.start);
         assert!(!input.tick().ui.start);
         assert_eq!(menu_input(input.tick().ui), None);
+    }
+
+    #[test]
+    fn menu_cues_match_the_original_play_sfx_slots() {
+        // The original's inventory handlers play `play_sfx(3, 4)` on a D-pad
+        // move, `(3, 6)` on confirm and `(3, 5)` on cancel; those character
+        // slots are the shared cursor/decide/cancel samples.
+        assert_eq!(menu_cue(MenuInput::Up), Some(ui::UiCue::Cursor));
+        assert_eq!(menu_cue(MenuInput::Down), Some(ui::UiCue::Cursor));
+        assert_eq!(menu_cue(MenuInput::Left), Some(ui::UiCue::Cursor));
+        assert_eq!(menu_cue(MenuInput::Right), Some(ui::UiCue::Cursor));
+        assert_eq!(menu_cue(MenuInput::Confirm), Some(ui::UiCue::Decide));
+        assert_eq!(menu_cue(MenuInput::Cancel), Some(ui::UiCue::Cancel));
+        assert_eq!(menu_cue(MenuInput::PageLeft), None);
+        assert_eq!(menu_cue(MenuInput::PageRight), None);
     }
 
     #[test]
