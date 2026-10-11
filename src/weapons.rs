@@ -757,8 +757,10 @@ fn steer_step(character: u8, right: bool) -> u16 {
     }
 }
 
-/// The direction term the guns add into the motion id:
-/// `(up_bit >> 4) + down_bit`.
+/// The direction term the guns add into the motion id. The authoritative
+/// remap binds held up to 0x80 and held down to 0x20 (the reference's comments
+/// label these the other way round), so up adds 1 and down adds 2:
+/// `(0x20 bit >> 4) + 0x80 bit`.
 fn aim_dir_term(flags: u8) -> u8 {
     ((flags & 0x20) >> 4) + (flags >> 7)
 }
@@ -856,17 +858,9 @@ fn gun_aim(
     let character = game.id.player_flag & 1;
     let frame = player.anim.frame as u8;
     let ready = (character == 0 && frame > 4 && matches!(weapon, 2 | 4 | 5)) || frame > 9;
+    // The remap table binds held bit 0x1 to up and 0x4 to down, so held up
+    // sets 0x80 (motion 8 / special 6) and held down sets 0x20 (0xb / 7).
     if ready && input.up {
-        player.weapon.aim_flags &= 0x1F;
-        game.player_flags &= 0x1F;
-        player.weapon.aim_flags |= 0x20;
-        game.player_flags |= 0x20;
-        player.weapon.behavior = 0x15;
-        player.weapon.state = 0;
-        set_motion(player, if weapon < SPECIAL_WEAPON_MIN { 0x0B } else { 7 });
-        return;
-    }
-    if ready && input.down {
         player.weapon.aim_flags &= 0x1F;
         game.player_flags &= 0x1F;
         player.weapon.aim_flags |= 0x80;
@@ -874,6 +868,16 @@ fn gun_aim(
         player.weapon.behavior = 0x15;
         player.weapon.state = 0;
         set_motion(player, if weapon < SPECIAL_WEAPON_MIN { 8 } else { 6 });
+        return;
+    }
+    if ready && input.down {
+        player.weapon.aim_flags &= 0x1F;
+        game.player_flags &= 0x1F;
+        player.weapon.aim_flags |= 0x20;
+        game.player_flags |= 0x20;
+        player.weapon.behavior = 0x15;
+        player.weapon.state = 0;
+        set_motion(player, if weapon < SPECIAL_WEAPON_MIN { 0x0B } else { 7 });
         return;
     }
     if weapon > 0x6E && special_frame_update(game, player, 0, 0) {
@@ -972,10 +976,11 @@ fn gun_hold_input(
 ) {
     let old = player.weapon.aim_flags;
     player.weapon.aim_flags = (old & 0x1F) | 0x40;
-    if input.down {
+    // Held up (the remap's bit 0x10) sets 0x80; held down (0x20) sets 0x20.
+    if input.up {
         player.weapon.aim_flags = (player.weapon.aim_flags & 0x1F) | 0x80;
     }
-    if input.up {
+    if input.down {
         player.weapon.aim_flags = (player.weapon.aim_flags & 0x1F) | 0x20;
     }
     let weapon = equipped_weapon(game).unwrap_or(0);
@@ -1270,8 +1275,8 @@ fn autoaim_fire(
     if FIRE_END_FRAME[index] < frame && index == 1 {
         let aim = player.weapon.aim_flags;
         if (aim & 0xA0 != 0 && !(input.up || input.down))
-            || (aim & 0x80 != 0 && !input.down)
-            || (aim & 0x20 != 0 && !input.up)
+            || (aim & 0x80 != 0 && !input.up)
+            || (aim & 0x20 != 0 && !input.down)
         {
             player.weapon.aim_flags = (aim & 0x1F) | 0x40;
             player.weapon.behavior = 0x13;
@@ -1317,10 +1322,11 @@ fn autoaim_holdfire(
 ) {
     let old = player.weapon.aim_flags;
     player.weapon.aim_flags = (old & 0x1F) | 0x40;
-    if input.down {
+    // Held up (the remap's bit 0x10) sets 0x80; held down (0x20) sets 0x20.
+    if input.up {
         player.weapon.aim_flags = (player.weapon.aim_flags & 0x1F) | 0x80;
     }
-    if input.up {
+    if input.down {
         player.weapon.aim_flags = (player.weapon.aim_flags & 0x1F) | 0x20;
     }
     let weapon = equipped_weapon(game).unwrap_or(0);
@@ -1792,10 +1798,12 @@ fn knife_hold(
 ) {
     let old = game.player_flags;
     game.player_flags = (old & 0x1F) | 0x40;
-    if input.down {
+    // The knife writes the flags byte directly: held up (remap bit 0x10) sets
+    // 0x80, held down (0x20) sets 0x20, exactly like the guns' aim flags.
+    if input.up {
         game.player_flags = (game.player_flags & 0x1F) | 0x80;
     }
-    if input.up {
+    if input.down {
         game.player_flags = (game.player_flags & 0x1F) | 0x20;
     }
     player.weapon.aim_flags &= 0xFD;
@@ -2611,6 +2619,92 @@ mod tests {
         assert!(reached_reload, "fire on an empty clip entered the reload");
         assert_eq!(game.inventory[0].quantity, 15, "the clip was refilled");
         assert_eq!(game.item_count(0x0B), 0, "the reserve was consumed");
+    }
+
+    /// Advance the aim-only raise until `behavior` is active with the pose
+    /// past `frame_above`, mirroring the ready gate the aim branch reads.
+    fn raise_until(
+        game: &mut GameState,
+        player: &mut PlayerState,
+        behavior: u8,
+        frame_above: u8,
+    ) -> bool {
+        for _ in 0..16 {
+            if player.weapon.behavior == behavior && player.anim.frame as u8 > frame_above {
+                return true;
+            }
+            drive(game, player, aiming(false), 1);
+        }
+        false
+    }
+
+    #[test]
+    fn the_gun_aim_quick_fire_uses_the_remap_direction_bits() {
+        // The pad remap binds held bit 0x1 to up and 0x4 to down, so held up
+        // sets weaponAimFlags 0x80 / motion 8 and held down sets 0x20 /
+        // motion 0xb. This is the inversion the player reported.
+        for (up, flag, motion) in [(true, 0x80u8, 8usize), (false, 0x20, 0x0B)] {
+            let (mut game, mut player) = armed(2, 15);
+            assert!(
+                raise_until(&mut game, &mut player, 0x12, 4),
+                "the aim raise window opened (up={up})"
+            );
+            let input = Input {
+                aim: true,
+                up,
+                down: !up,
+                ..Input::default()
+            };
+            drive(&mut game, &mut player, input, 1);
+            assert_eq!(player.weapon.behavior, 0x15, "quick fire (up={up})");
+            assert_eq!(
+                player.weapon.aim_flags & 0xE0,
+                flag,
+                "weaponAimFlags direction (up={up})"
+            );
+            assert_eq!(game.player_flags & 0xE0, flag, "flags byte (up={up})");
+            assert_eq!(player.anim.clip, motion, "quick-fire motion (up={up})");
+        }
+    }
+
+    #[test]
+    fn the_gun_hold_direction_change_uses_the_remap_direction_bits() {
+        for (up, flag, motion) in [(true, 0x80u8, 8usize), (false, 0x20, 0x0B)] {
+            let (mut game, mut player) = armed(2, 15);
+            drive(&mut game, &mut player, aiming(false), 40);
+            assert_eq!(player.weapon.behavior, 0x13, "the hold behavior");
+            let input = Input {
+                aim: true,
+                up,
+                down: !up,
+                ..Input::default()
+            };
+            drive(&mut game, &mut player, input, 1);
+            assert_eq!(player.weapon.behavior, 0x15, "quick fire (up={up})");
+            assert_eq!(
+                player.weapon.aim_flags & 0xE0,
+                flag,
+                "weaponAimFlags direction (up={up})"
+            );
+            assert_eq!(player.anim.clip, motion, "quick-fire motion (up={up})");
+        }
+    }
+
+    #[test]
+    fn the_knife_hold_uses_the_remap_direction_bits() {
+        for (up, flag) in [(true, 0x80u8), (false, 0x20)] {
+            let (mut game, mut player) = armed(1, 0);
+            drive(&mut game, &mut player, aiming(false), 40);
+            assert_eq!(player.weapon.behavior, 0x13, "the knife hold");
+            let input = Input {
+                aim: true,
+                up,
+                down: !up,
+                ..Input::default()
+            };
+            drive(&mut game, &mut player, input, 1);
+            assert_eq!(game.player_flags & 0xE0, flag, "flags byte (up={up})");
+        }
     }
 
     #[test]
