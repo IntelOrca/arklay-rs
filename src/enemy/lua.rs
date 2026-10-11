@@ -11000,6 +11000,92 @@ mod zombie_tests {
         );
     }
 
+    /// The full bite release: once the zombie's timer expires it arms the
+    /// player's action_state 3, and the state-5 recoil window must run the
+    /// break-free clip back to pad control - and the locomotion machine must
+    /// move the player again.
+    #[test]
+    fn zombie_bite_releases_the_player_to_pad_control() {
+        let pack = pack();
+        let mut game = zombie_game(0x00, 0);
+        game.entities[0].health = 50;
+        let mut host = LuaEnemyHost::new();
+        assert!(step(&mut host, &mut game, &pack));
+
+        // Latch the bite the way the attack's case 0 does.
+        game.entities[0].angle = 0x800;
+        game.entities[1].set_state(5);
+        game.entities[1].set_ignore(0);
+        game.entities[1].action_state = 0;
+        assert!(step(&mut host, &mut game, &pack));
+        assert_eq!(game.entities[0].state(), 5);
+
+        // The damage bank the loaded monster model installs.
+        game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+            keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+            clips: std::sync::Arc::new(
+                (0..12)
+                    .map(|_| crate::model::Clip {
+                        frames: (0..3)
+                            .map(|_| crate::model::ClipFrame {
+                                keyframe: 0,
+                                timing: 1,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+        }));
+
+        // Force the bite timer to expire: the zombie arms the player's
+        // break-free state and withdraws.
+        game.entities[1].action_state = 3;
+        game.entities[1].reaction_timer = 0x0100;
+        for _ in 0..4 {
+            step(&mut host, &mut game, &pack);
+            if game.entities[0].action_state == 3 {
+                break;
+            }
+        }
+        assert_eq!(game.entities[0].action_state, 3, "the release armed");
+
+        // The player's state-5 window runs the release clip to control.
+        let mut player = crate::player::spawn(game.id, &RoomState::default());
+        player.pos = game.entities[0].pos;
+        let mut released = false;
+        for _ in 0..64 {
+            crate::player_script::update(
+                &mut game,
+                &mut player,
+                &RoomState::default(),
+                &[],
+                &[],
+                &[],
+            );
+            if game.entities[0].state() == 1 && game.entities[0].is_being_attacked == 0 {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "the player never returned to pad control");
+
+        // The locomotion machine now moves him again.
+        let clips = clips();
+        let start = player.pos;
+        crate::player::update_with_room(
+            &mut player,
+            &RoomState::default(),
+            &clips,
+            &clips,
+            &[],
+            crate::player::Input {
+                up: true,
+                ..crate::player::Input::default()
+            },
+        );
+        assert_ne!(player.pos, start, "the player can move after the bite");
+    }
+
     #[test]
     fn zombie_attack_kills_the_player_into_the_death_pose() {
         let pack = pack();
