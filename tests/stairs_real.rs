@@ -608,6 +608,113 @@ fn west_stairwell_101_to_201_marks_the_climb() {
     assert!(sim.gameplay_frame.rgba.iter().any(|&byte| byte != 0));
 }
 
+/// The return stair from 106 fires with real per-tick input through the full
+/// engine path (the scripts, entities, player physics, the object pass and the
+/// stair hand-off), not just from `simulate_door`'s teleport.
+///
+/// The 1060 first-visit intro is suppressed by seeding the three `FG_COMMON`
+/// bits a later-game save carries, so the player has pad control from the
+/// landing the 2F stair door arrives on.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room106_return_stair_fires_with_real_input() {
+    let Some(path) = pack_path() else {
+        return;
+    };
+    let pack = Pack::open(&path).unwrap();
+    let id = RoomId::parse("1060").unwrap();
+    let run = arklay::engine::simulate_room_prepared(
+        &pack,
+        id,
+        &[(1, 0), (1, 2), (1, 3)],
+        600,
+        |_game, player| {
+            // The landing the 203 stair door arrives on, facing the stairs.
+            player.pos = [17000, 0, 14300];
+            player.angle = 0xC00;
+        },
+        |tick| Input {
+            up: true,
+            action_pressed: tick % 4 == 0,
+            ..Input::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        run.transitions,
+        vec![RoomId::parse("2030").unwrap()],
+        "the 106 return stair never fired: pos={:?} state={}",
+        run.player.pos,
+        run.game.entities[0].state()
+    );
+}
+
+/// The same real-input drive for the Jill RDT variant (`ROOM2031`): the stair
+/// door records are identical and the climb fires from the landing.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room2031_jill_stair_door_fires_with_real_input() {
+    let Some(path) = pack_path() else {
+        return;
+    };
+    let pack = Pack::open(&path).unwrap();
+    let id = RoomId {
+        stage: 2,
+        room: 3,
+        player_flag: 1,
+    };
+    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let room = rdt::parse(bytes, id).unwrap();
+    let scripts = arklay::scd::reader::parse(bytes).unwrap();
+    let mut game = GameState::new(id, &room);
+    let mut vm = CommandVm::new(&scripts);
+    let mut host = ScdGameHost::new(&mut game);
+    vm.run_init(&mut host);
+    // The Barry first-visit scene is gated on three clear flags; setting them
+    // is the later-game state where the landing has pad control.
+    for (bank, bit) in [(1u8, 10u8), (1, 7), (7, 13)] {
+        assert!(game.apply_flag(bank, bit, 0));
+    }
+    let entry =
+        arklay::engine::room_entry_placement(&pack, &room, &game, id).expect("2031 room entry");
+    let run = arklay::engine::simulate_room_prepared(
+        &pack,
+        id,
+        &[],
+        900,
+        |game, player| {
+            // Re-seed after the harness built its own fresh state.
+            for (bank, bit) in [(1u8, 10u8), (1, 7), (7, 13)] {
+                game.apply_flag(bank, bit, 0);
+            }
+            player.pos = entry.0;
+            // The placement arrival faces away from the staircase (the paired
+            // record's angle); turn to face the door and walk up.
+            player.angle = 0x400;
+        },
+        |tick| {
+            let _ = tick;
+            Input {
+                up: true,
+                action_pressed: tick % 4 == 0,
+                ..Input::default()
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        run.transitions,
+        vec![RoomId {
+            stage: 1,
+            room: 6,
+            player_flag: 1,
+        }],
+        "the Jill stair door never fired: pos={:?} state={}",
+        run.player.pos,
+        run.game.entities[0].state()
+    );
+}
+
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn capture_player_partway_up_the_lab_stairway() {

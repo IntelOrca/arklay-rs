@@ -3885,7 +3885,7 @@ mod tests {
             player.vault_bit,
             "the climb up keeps the transition bit latched"
         );
-        assert!(player.vault_return == false);
+        assert!(!player.vault_return);
         assert_eq!(player.clip_source, ClipSource::Emd);
 
         // The verified second press restarts on the return side: the vault

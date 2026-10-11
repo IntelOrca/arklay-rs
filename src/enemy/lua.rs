@@ -11095,6 +11095,102 @@ mod zombie_tests {
         assert_ne!(player.pos, start, "the player can move after the bite");
     }
 
+    /// A bite interrupted before its timer expires must still hand the player
+    /// back. The attack FSM only arms the release (the player's action_state
+    /// 3) from its bite-timer branch, so a zombie that leaves the attack
+    /// through the damage reaction or the death sequence - what the shared
+    /// damage pipeline writes for a hit that lands mid-window - used to strand
+    /// the player in the state-5 hold with `isBeingAttacked` set forever.
+    #[test]
+    fn interrupted_zombie_bite_releases_the_player() {
+        for interrupt_state in [2u8, 3u8] {
+            let pack = pack();
+            let mut game = zombie_game(0x00, 0);
+            game.entities[0].health = 50;
+            let mut host = LuaEnemyHost::new();
+            assert!(step(&mut host, &mut game, &pack));
+
+            // Latch the bite the way the attack's case 0 does. The attack
+            // handler leaves the state byte at 5, so the driver's mirror
+            // carries the attack state into the interrupt frame.
+            game.entities[0].angle = 0x800;
+            game.entities[1].set_state(5);
+            game.entities[1].set_ignore(0);
+            game.entities[1].action_state = 0;
+            assert!(step(&mut host, &mut game, &pack));
+            assert_eq!(game.entities[0].state(), 5);
+            assert_eq!(game.entities[1].state_mirror & 0xFF, 5);
+
+            game.player_damage = Some(std::sync::Arc::new(crate::game::PlayerDamageBank {
+                keyframes: std::sync::Arc::new(vec![crate::model::Keyframe::default()]),
+                clips: std::sync::Arc::new(
+                    (0..12)
+                        .map(|_| crate::model::Clip {
+                            frames: (0..3)
+                                .map(|_| crate::model::ClipFrame {
+                                    keyframe: 0,
+                                    timing: 1,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                ),
+            }));
+
+            // Interrupt the attack the way `apply_weapon_damage` does: the
+            // state byte is overwritten (2 when the zombie survives, 3 on a
+            // kill) and the ignore byte cleared.
+            game.entities[1].set_state(interrupt_state);
+            game.entities[1].set_ignore(0);
+            game.entities[1].action_state = 0;
+            assert!(step(&mut host, &mut game, &pack));
+            assert_eq!(
+                game.entities[0].action_state, 3,
+                "state {interrupt_state}: the interrupted bite must arm the release"
+            );
+
+            // The state-5 window plays the break-free clip back to control.
+            let mut player = crate::player::spawn(game.id, &RoomState::default());
+            player.pos = game.entities[0].pos;
+            let mut released = false;
+            for _ in 0..64 {
+                crate::player_script::update(
+                    &mut game,
+                    &mut player,
+                    &RoomState::default(),
+                    &[],
+                    &[],
+                    &[],
+                );
+                if game.entities[0].state() == 1 && game.entities[0].is_being_attacked == 0 {
+                    released = true;
+                    break;
+                }
+            }
+            assert!(
+                released,
+                "state {interrupt_state}: the player never returned to pad control"
+            );
+            let clips = clips();
+            let start = player.pos;
+            crate::player::update_with_room(
+                &mut player,
+                &RoomState::default(),
+                &clips,
+                &clips,
+                &[],
+                crate::player::Input {
+                    up: true,
+                    ..crate::player::Input::default()
+                },
+            );
+            assert_ne!(
+                player.pos, start,
+                "state {interrupt_state}: the player can move after the interrupted bite"
+            );
+        }
+    }
+
     #[test]
     fn zombie_attack_kills_the_player_into_the_death_pose() {
         let pack = pack();
