@@ -1035,12 +1035,12 @@ fn real_m13_corpus_audit_has_no_implemented_placeholders() {
     }
     println!(
         "M13 corpus: {simulated} rooms simulated, {noops} audited 3D-SE no-ops, \
-         {enemy_drops} enemy position drops, zero implemented placeholders"
+         {enemy_drops} out-of-range enemy position drops, zero implemented placeholders"
     );
     assert!(simulated > 300, "only {simulated} rooms simulated");
-    assert!(
-        enemy_drops <= 80,
-        "more enemy position drops ({enemy_drops}) than shipped sites"
+    assert_eq!(
+        enemy_drops, 0,
+        "every shipped position-type-2 site must index a live entity slot"
     );
 
     // Every implemented opcode must really appear in the shipped scripts; an

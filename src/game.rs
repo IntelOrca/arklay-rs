@@ -3445,8 +3445,8 @@ pub struct GameState {
     /// `se_play_3d` (0x17) requests queued by the scripts, consumed by the
     /// engine's bank dispatch.
     pub snd3d_requests: Vec<Snd3dRequest>,
-    /// Position-type-2 requests dropped because no enemy slot exists
-    /// (documented no-enemy deviation), for the corpus audit.
+    /// Position-type-2 requests whose enemy index is past the entity table
+    /// (the original reads out of bounds), counted for the corpus audit.
     pub snd3d_enemy_drops: u64,
     /// `se_play_3d` requests whose bank/table combination resolved to a typed
     /// no-op, counted by `(bank, id)` for the corpus audit.
@@ -8383,9 +8383,22 @@ impl ScdHost for ScdGameHost<'_> {
                         });
                     }
                     2 => {
-                        // No enemy slot ever allocates, so the request is a
-                        // counted no-op (the milestone's no-enemy deviation).
-                        self.state.snd3d_enemy_drops += 1;
+                        // The reference plays the cue at
+                        // `g_EnemiesList[enemy].scaMatrixData.localMatrix.t`;
+                        // the port's enemy slot 0 is entity 1. Only an index
+                        // past the entity table (which the original would read
+                        // out of bounds) is dropped.
+                        let enemy = usize::from(operand_u8(operands, 4));
+                        if let Some(entity) = self.state.entities.get(1 + enemy) {
+                            self.state.snd3d_requests.push(Snd3dRequest {
+                                bank,
+                                id,
+                                volume,
+                                pos: Snd3dPos::Point(entity.pos),
+                            });
+                        } else {
+                            self.state.snd3d_enemy_drops += 1;
+                        }
                     }
                     3 => {
                         // The original calls `play_sfx(sndType, sndType)`,
@@ -9464,13 +9477,15 @@ mod tests {
     fn se_play_3d_parses_every_position_type() {
         let mut state = game();
         state.entities[0].pos = [100, 20, 300];
+        // Enemy slot 6 is entity 7 (slot 0 -> entity 1).
+        state.entities[7].pos = [70, 80, 90];
         {
             let mut host = ScdGameHost::new(&mut state);
             // Type 0: the scratch point (x, 0, z).
             host.on_sound(op(0x17), &operands(&[2, 23, 0, 0, 0, -5, 7]));
             // Type 1: the player's position.
             host.on_sound(op(0x17), &operands(&[3, 2, 1, 1, 0, 0, 0]));
-            // Type 2: an enemy index; counted and dropped.
+            // Type 2: an enemy index; the cue plays at that entity's position.
             host.on_sound(op(0x17), &operands(&[2, 11, 0, 2, 6, 0, 0]));
             // Type 3: queued without a position, with the original's
             // `play_sfx(sndType, sndType)` id quirk.
@@ -9478,6 +9493,8 @@ mod tests {
             // The 6-byte form (type 4+): no case in the original's switch, so
             // the instruction is consumed silently.
             host.on_sound(op(0x17), &operands(&[4, 23, 0, 4, 0]));
+            // An enemy index past the entity table is dropped.
+            host.on_sound(op(0x17), &operands(&[2, 11, 0, 2, 31, 0, 0]));
         }
         assert_eq!(
             state.snd3d_requests,
@@ -9493,6 +9510,12 @@ mod tests {
                     id: 2,
                     volume: 1,
                     pos: Snd3dPos::Point([100, 20, 300]),
+                },
+                Snd3dRequest {
+                    bank: 2,
+                    id: 11,
+                    volume: 0,
+                    pos: Snd3dPos::Point([70, 80, 90]),
                 },
                 Snd3dRequest {
                     bank: 1,

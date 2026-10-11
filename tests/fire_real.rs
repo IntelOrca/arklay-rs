@@ -219,6 +219,46 @@ fn real_room1051_fire_handler_releases_the_stalled_scene() {
     );
 }
 
+/// The firing block's inline `se_play_3d` cues are position-type 2 (enemy 0,
+/// Barry): the request must play at his entity position, name the room table's
+/// `magnum01` and resolve in the pack. Before the fix the type-2 form was
+/// dropped, so the scripted gunshot was silent even with the bank packed.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_room1051_scripted_gunshot_plays_at_barry_and_is_packed() {
+    let Some((_, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1051").unwrap();
+    let mut scene = FireScene::boot(&pack, id, FIRE_EVENT);
+    let row = arklay::sfx::room_row(id.stage, id.room);
+    let mut shot = None;
+    for _ in 0..300 {
+        scene.tick(&pack);
+        for request in scene.game.snd3d_requests.drain(..) {
+            // The script's gunshots are bank 2, ids 0x18/0x19, at enemy slot 0.
+            if request.bank == 2 && request.id == 0x18 {
+                let expected = scene.game.entities[1].pos;
+                match request.pos {
+                    arklay::game::Snd3dPos::Point(pos) => {
+                        assert_eq!(pos, expected, "the shot plays at enemy slot 0");
+                    }
+                    arklay::game::Snd3dPos::None => panic!("the shot carries no position"),
+                }
+                assert_eq!(
+                    arklay::sfx::room_sound(row, 0x18),
+                    Some("magnum01"),
+                    "the room table names the gunshot"
+                );
+                assert!(pack.contains("se/magnum01.wav"), "the sample is packed");
+                shot = Some(request);
+            }
+        }
+    }
+    assert!(shot.is_some(), "the final cutscene queued Barry's gunshot");
+}
+
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_room6051_fire_handler_releases_the_stalled_scene() {
