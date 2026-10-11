@@ -188,6 +188,42 @@ pub fn parse_assets(data: &[u8], pointer: u32, count: u8) -> (Vec<ObjectAsset>, 
     (assets, warnings)
 }
 
+/// The event VM's tween sub-ISA scratch on a model record.
+///
+/// The original's room object and item records ARE `Entity` heads, so the
+/// state-2 movement handlers (`scd_event_state2_movement`) mutate the same
+/// incremental words on them as on an enemy: the position/rotation step left
+/// by `tw_set_rot`/`tw_set_pos`, the packed state/ignore word `tw_rot_add`
+/// folds into the roll, and the writable state block `tw_set_field`/
+/// `tw_set_sel` address. The port models those bytes here so event scripts can
+/// drive furniture (the room 10E cupboard doors, the rolling boulder, item
+/// models) with the same opcodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TweenScratch {
+    /// The `Add_speedXZ`-style step added to the position by
+    /// `tw_pos_add`/`tw_pos_rot_add`, set by `tw_set_pos`.
+    pub speed: [i16; 3],
+    /// The rotation step added by `tw_rot_add`/`tw_pos_rot_add`, set by
+    /// `tw_set_rot`: X (pitch), Z (roll).
+    pub move_step: [i16; 3],
+    /// The packed `+0x84` word: low byte state, high byte ignore.
+    pub state_field: u16,
+    /// State-block byte `+0x86` (`action_behavior`).
+    pub action_behavior: u8,
+    /// State-block byte `+0x87` (`action_state`).
+    pub action_state: u8,
+    /// State-block word `+0x88` (`health`).
+    pub health: i16,
+    /// State-block byte `+0x8A` (`hit_state`).
+    pub hit_state: u8,
+    /// The `+0xC6` word `tw_set_sel` selector 4 writes.
+    pub unk_c6: u16,
+    /// The `+0xC8` word `tw_set_sel` selector 5 writes.
+    pub unk_c8: u16,
+    /// The last `tw_set_sel` selector.
+    pub selector: u16,
+}
+
 /// One runtime object record. The original reuses a 0xA4-byte `Entity` head
 /// for these; the port keeps a named struct with only the fields the opcodes
 /// and the collision helpers address.
@@ -242,6 +278,8 @@ pub struct ObjectRecord {
     /// (stage 2F and its return) room 0x0A slot 1 arms `0x30` (the water
     /// tank's surface, 81% opaque instead of the authored half blend).
     pub blend_override: Option<u8>,
+    /// The event VM's tween scratch the movement handlers mutate.
+    pub tween: TweenScratch,
 }
 
 impl Default for ObjectRecord {
@@ -267,6 +305,7 @@ impl Default for ObjectRecord {
             tint: [0; 3],
             light_scale: 0,
             blend_override: None,
+            tween: TweenScratch::default(),
         }
     }
 }
@@ -404,6 +443,7 @@ impl ObjectTable {
             tint: [0; 3],
             light_scale: 0,
             blend_override,
+            tween: TweenScratch::default(),
         };
         self.built = self.built.wrapping_add(1);
         true
@@ -540,6 +580,8 @@ pub struct ItemRecord {
     /// The `0x40`-word alternate-rotation seed at record `+0xC`/`+0xF`:
     /// `0x4000_0000`, or `0x4000_0040` when the slot byte's bit `0x80` is set.
     pub alt_rotation: u32,
+    /// The event VM's tween scratch the movement handlers mutate.
+    pub tween: TweenScratch,
 }
 
 impl Default for ItemRecord {
@@ -555,6 +597,7 @@ impl Default for ItemRecord {
             asset: None,
             sparkle: 0,
             alt_rotation: 0,
+            tween: TweenScratch::default(),
         }
     }
 }
@@ -690,6 +733,7 @@ pub fn build_item(operands: &[Operand], visible: bool, built: u8, id: RoomId) ->
         } else {
             0x4000_0000
         },
+        tween: TweenScratch::default(),
     }
 }
 

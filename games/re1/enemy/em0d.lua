@@ -343,7 +343,7 @@ move = function(e)
         spawn_dust(e, r < 0 and -(-r & 1) or (r & 1))
     end
 
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x30)
 end
 
@@ -478,7 +478,7 @@ bite = function(e)
         miss()
     end
 
-    e:move(0, 0)
+    e:move(0, as_s16(e.move_speed_current))
     e:yawn_post_move(0x30)
 end
 
@@ -548,7 +548,7 @@ rear = function(e)
     end
 
     turn_accel(e)
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x30)
 end
 
@@ -641,7 +641,7 @@ swallow = function(e)
                 e.pos_x, e.pos_y, e.pos_z)
         end
 
-        e:move(0, 0)
+        e:move(0, as_s16(e.move_speed_current))
     end
 
     if st == 0 then
@@ -753,14 +753,14 @@ swallow = function(e)
         e.player_health = -1
         -- fall through to case 5
         e.action_state = e.action_state + (e:yawn_anim(true, 0x200) and 1 or 0)
-        e:move(0, 0)
+        e:move(0, as_s16(e.move_speed_current))
         if e.animation_frame_id == 0x0F then
             e:yawn_set_status_range(0, 12, 0xFF, 4)
         end
         tail()
     elseif st == 5 then
         e.action_state = e.action_state + (e:yawn_anim(true, 0x200) and 1 or 0)
-        e:move(0, 0)
+        e:move(0, as_s16(e.move_speed_current))
         if e.animation_frame_id == 0x0F then
             e:yawn_set_status_range(0, 12, 0xFF, 4)
         end
@@ -863,7 +863,7 @@ entry = function(e)
     end
 
     e:yawn_anim(false, 0x200)
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x30)
 end
 
@@ -886,7 +886,7 @@ emerge = function(e)
                 e:spawn_world_effect(EMERGE_TYPE[i], EMERGE_DEPTH[i], x, 0, z, 0)
             end
         end
-        e:move(0, 0)
+        e:move(0, as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     end
 
@@ -1046,7 +1046,7 @@ flee = function(e)
     if e.yawn_path_index < 4 then
         turn_accel(e)
     end
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x38)
 end
 
@@ -1094,7 +1094,7 @@ reposition = function(e)
 
     e:yawn_anim(false, 0x100)
     turn_accel(e)
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x38)
 end
 
@@ -1183,7 +1183,7 @@ damaged_run = function(e)
         recovery_turn()
     end
 
-    e:move(0, as_s16(e.yawn_speed))
+    e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
     e:yawn_post_move(0x30)
 end
 
@@ -1194,12 +1194,12 @@ die_run = function(e)
 
     local function first_phase()
         e.action_state = e.action_state + (e:yawn_anim(false, 0x200) and 1 or 0)
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     end
 
     local function dissolve(phase)
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
         e.has_enter_switch_zone = e.has_enter_switch_zone | 0x80
 
@@ -1272,13 +1272,13 @@ die_run = function(e)
         local px, _, pz = e:player_pos()
         e:rotate_toward_target(px, pz, 0x30)
         e.action_state = e.action_state + (e:yawn_anim(false, 0x200) and 1 or 0)
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     elseif st == 3 then
         local px, _, pz = e:player_pos()
         e:rotate_toward_target(px, pz, 0x30)
         e.action_state = e.action_state + (e:yawn_anim(false, 0x200) and 1 or 0)
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     elseif st == 4 then
         e.action_state = 5
@@ -1292,7 +1292,7 @@ die_run = function(e)
             e:spawn_joint_effect_at(0, 0x0B, 0, 0, 500, 0, 0)
             e:spawn_joint_effect_at(0, 8, 0, 0, 500, 0, 0)
         end
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     elseif st == 5 then
         e.action_state = e.action_state + (e:yawn_anim(false, 0x200) and 1 or 0)
@@ -1300,7 +1300,7 @@ die_run = function(e)
             e:spawn_joint_effect_at(0, 0x0B, 0, 0, 500, 0, 0)
             e:spawn_joint_effect_at(0, 8, 0, 0, 500, 0, 0)
         end
-        e:move(0, as_s16(e.yawn_speed))
+        e:move(as_s16(e.yawn_speed), as_s16(e.move_speed_current))
         e:yawn_post_move(0x30)
     elseif st == 6 then
         e.move_speed_current = 0

@@ -3122,6 +3122,15 @@ mod imp {
                 Ok(())
             });
 
+            // The two spiders' path-result keep: the same reduction into the
+            // +0x16E word (`WS_PATHW`/`BT_PATHW`), which is where the
+            // WebSpinner and Black Tiger store `entity_pathfind_update`'s
+            // line-of-sight bit - not the adder's +0x16C.
+            methods.add_method_mut("spider_path_keep", |_lua, api, path: i64| {
+                crate::enemy::walk::wasp_pathfind_track(api.entity_mut(), path as u8);
+                Ok(())
+            });
+
             // The flat distance to the player with the visual-range status bit
             // write (`entity_check_visual_range`); the alert variant raises bit
             // 7 instead.

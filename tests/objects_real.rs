@@ -1602,3 +1602,51 @@ fn room_105_jill_blood_decals_keep_their_colour_key() {
         "the blood decals painted {black} opaque black background pixels"
     );
 }
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room_10e_cupboard_doors_open_through_the_event_tween() {
+    use arklay::scd::host::EventRequest;
+
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = common::enemy_scripts_pack(&pack_path);
+    let id = RoomId::parse("10e").unwrap();
+
+    // The room's action zone starts event script 0, whose forks tween-drive
+    // the two cupboard-door object models (slots 0 and 1) through their
+    // open-and-settle swing. Queue the same event the zone would and let it
+    // play out.
+    let run = |ticks| {
+        arklay::engine::simulate_room_prepared(
+            &pack,
+            id,
+            &[],
+            ticks,
+            |game, _player| {
+                game.pending_event_requests
+                    .push(EventRequest::Start { slot: 0, event: 0 });
+            },
+            |_| arklay::player::Input::default(),
+        )
+        .unwrap()
+    };
+    let first = run(120);
+    let second = run(120);
+    assert_eq!(
+        first.frame.rgba, second.frame.rgba,
+        "the run differs between boots"
+    );
+
+    let door0 = first.game.objects.records[0].rotation[1];
+    let door1 = first.game.objects.records[1].rotation[1];
+    assert!(
+        door0.unsigned_abs() > 500,
+        "the left cupboard door never swung: yaw {door0}"
+    );
+    assert!(
+        door1.unsigned_abs() > 500,
+        "the right cupboard door never swung: yaw {door1}"
+    );
+}

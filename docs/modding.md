@@ -342,8 +342,10 @@ steering and collision (`e:move(offset, distance)` stores the rotated vector,
 `e:turn_toward_heading(heading, step)`,
 `e:heading_within(heading, half)`, `e:xz_distance_to(x, z)`, `e:angle_to(x, z)`,
 `e:check_visual_range(range)`, `e:check_alert_range(range)`,
-`e:pathfind_keep(result)`, `e:wasp_path_keep(result)` (the same keep into the
-wasp's `+0x16E` byte), `e:zone_path_update(x, z)` (the zombie distance
+`e:pathfind_keep(result)` (into the adder's `+0x16C` byte),
+`e:wasp_path_keep(result)`, `e:spider_path_keep(result)` (the same keep into
+the `+0x16E` word the wasp, WebSpinner and Black Tiger gate on),
+`e:zone_path_update(x, z)` (the zombie distance
 driver's out-parameter form: write the steered waypoint into
 `player_pos_x`/`player_pos_z`), `e:player_facing_entity()` (is the player's yaw within
 half a turn of the entity?), `e:player_mashing()` (any d-pad direction or face
