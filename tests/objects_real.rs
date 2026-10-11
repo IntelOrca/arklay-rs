@@ -1210,6 +1210,10 @@ fn room_30b_objs_hide_changes_the_rendered_tint() {
 
     let player = arklay::player::spawn(id, &room);
     game.sync_entity_from_player(&player);
+    // The renderer's whole-entity gate reads the live zoneFlags low byte; a
+    // gameplay tick sets the camera-zone bit, so seed it for this untickled
+    // render harness.
+    game.entities[0].zone_flags |= 0x01;
 
     // Find a cut that draws the player, then compare the tinted and untinted
     // frames there.
@@ -1294,6 +1298,9 @@ fn room_20a0_water_tank_blend_weight_rebaselines_its_capture() {
 
     let player = arklay::player::spawn(id, &room);
     game.sync_entity_from_player(&player);
+    // The renderer's whole-entity gate reads the live zoneFlags low byte; seed
+    // the camera-zone bit the gameplay tick would set.
+    game.entities[0].zone_flags |= 0x01;
 
     // Re-baseline check: the 0.2 override must repaint the frames that draw
     // the tank with a different mix than the authored 0.5 half blend. The

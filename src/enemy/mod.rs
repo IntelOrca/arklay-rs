@@ -379,17 +379,36 @@ pub fn update_entity(
     // Common tail: refresh the live look-at target, slew the tracking joint
     // toward it at the instruction's yaw/pitch step, and recompute the
     // camera-switch-zone shadow bit. The SCA hit-volume reset the original
-    // shares this tail with stays with the enemy milestone.
+    // shares this tail with stays with the enemy milestone. The pitch slope
+    // reads the tracking joint's world translation, which the previous tick's
+    // composed matrices carry (the original's render pass fills the same
+    // `joint->world`); the freshly composed matrices are stored back for the
+    // next tick.
     if let Some(target) = look_at_target {
         game.entities[slot].target = target;
     }
-    game.entity_anims[slot].slew_look_at(&game.entities[slot]);
+    let origin = look_at_joint_origin(game, slot);
+    game.entity_anims[slot].slew_look_at(&game.entities[slot], origin);
+    if game.entities[slot].look_at_flags != 0 {
+        game.joint_worlds[slot] = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
+    }
     game.entities[slot].has_enter_switch_zone = u8::from(in_camera_zone(
         room,
         room.current_cut,
         game.entities[slot].pos,
     ));
     game.entities[slot].status_flags |= ENTITY_STATUS_ACTIVE;
+}
+
+/// The look-at tracking joint's world translation from the slot's stored
+/// joint matrices, the origin the original's pitch slope reads from
+/// `joint->world.t[]` (composed by the previous frame's render pass). `None`
+/// when the slot has no composed matrices yet; the slew then falls back to
+/// the entity's own origin.
+pub(crate) fn look_at_joint_origin(game: &GameState, slot: usize) -> Option<[i32; 3]> {
+    let index = usize::from(game.entities.get(slot)?.look_at_joint.max(1));
+    let joint = game.joint_worlds.get(slot)?.get(index)?;
+    Some(joint.t)
 }
 
 /// Whether `pos` lies inside the current camera's switch zone.

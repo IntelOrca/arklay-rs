@@ -287,10 +287,16 @@ impl EntityAnim {
     /// when the snap would land outside the +/-0x2C8 cone, decays a zero
     /// target toward zero, and clamps the period branches to the cone.
     ///
-    /// The pitch is a bounded approximation: the port derives its target from
-    /// the entity position rather than the tracking joint's world translation
-    /// and steps it with the same under-two-steps snap rule.
-    pub fn slew_look_at(&mut self, entity: &Entity) {
+    /// The pitch target derives from the tracking joint's world translation
+    /// (`joint_world`), exactly like the original's `joint->world.t[]`: the
+    /// elevation is `GetAngleQuadrantValue((dy << 12) / dist)` with both Y
+    /// values truncated to 16 bits first, and a zero horizontal distance
+    /// folds to the straight-up/straight-down quadrant. A caller without the
+    /// composed joint matrices falls back to the entity's own origin.
+    ///
+    /// The pitch is stepped by the original's own routine, which mirrors the
+    /// yaw slew but with the `+/-0x138` pitch cone and no zero-target decay.
+    pub fn slew_look_at(&mut self, entity: &Entity, joint_world: Option<[i32; 3]>) {
         if entity.look_at_flags & 0x10 == 0 {
             return;
         }
@@ -306,29 +312,36 @@ impl EntityAnim {
         } else {
             0
         };
-        let dx = i64::from(entity.target[0]) - i64::from(entity.pos[0]);
-        let dz = i64::from(entity.target[2]) - i64::from(entity.pos[2]);
-        let horizontal =
-            crate::sfx::integer_sqrt((dx * dx + dz * dz).min(i64::from(i32::MAX)) as i32);
-        let pitch_target = if entity.look_at_flags & 0x02 != 0 && horizontal > 0 {
-            let slope = (i32::from(
-                (entity.target[1] - entity.pos[1]).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
-                    as i16,
-            ) << 12)
-                / horizontal;
-            let radians = (f64::from(slope) / 4096.0).atan();
-            (radians * (2048.0 / std::f64::consts::PI)) as i32
+        let origin = joint_world.unwrap_or(entity.pos);
+        let pitch_enable = i32::from((entity.look_at_flags & 0x02) >> 1);
+        let pitch_target = if entity.look_at_flags & 0x20 == 0 {
+            let dx = i64::from(entity.target[0]) - i64::from(origin[0]);
+            let dz = i64::from(entity.target[2]) - i64::from(origin[2]);
+            let horizontal =
+                crate::sfx::integer_sqrt((dx * dx + dz * dz).min(i64::from(i32::MAX)) as i32);
+            let dy = (entity.target[1] as i16).wrapping_sub(origin[1] as i16);
+            if horizontal != 0 {
+                angle_quadrant_value((i32::from(dy) << 12) / horizontal) * pitch_enable
+            } else {
+                ((if dy > 0 { 0x800 } else { 0 }) + 0x400) * pitch_enable
+            }
         } else {
-            0
+            pitch_enable * i32::from(entity.target[1] as i16)
         };
         self.look_at_yaw = slew_yaw(self.look_at_yaw, yaw_target, entity.look_at_yaw_step);
-        self.look_at_pitch = step_angle(
-            self.look_at_pitch,
-            pitch_target as u16 & 0x0FFF,
-            u16::from(entity.look_at_pitch_step),
-            PITCH_CONE,
-        );
+        self.look_at_pitch =
+            slew_pitch(self.look_at_pitch, pitch_target, entity.look_at_pitch_step);
     }
+}
+
+/// `GetAngleQuadrantValue` (0x0040a930): `atan(slope / 4096)` in the game's
+/// 12-bit angle units, truncated like the original's `(int)` cast.
+fn angle_quadrant_value(slope: i32) -> i32 {
+    if slope == 0 {
+        return 0;
+    }
+    let radians = (f64::from(slope) / 4096.0).atan();
+    (radians * (2048.0 / std::f64::consts::PI)) as i32
 }
 
 /// The tracking joint's yaw cone half-width, `+/-0x2C8`.
@@ -388,26 +401,41 @@ fn signed12(value: i32) -> i16 {
     }
 }
 
-/// Step one 12-bit angle toward `target` by at most `step`, snapping when the
-/// remaining turn is under two steps, then clamp into `+/-cone`.
-fn step_angle(current: i16, target: u16, step: u16, cone: u16) -> i16 {
-    let step = i32::from(step.min(0x0FFF));
-    let current_u = current as u16 & 0x0FFF;
-    let difference = (i32::from(target) - i32::from(current_u)).rem_euclid(0x1000);
-    let next = if difference < step * 2 || difference > 0x1000 - step * 2 {
-        i32::from(target)
-    } else if difference < 0x800 {
-        i32::from(current_u) + step
+/// One pitch step of the original's look-at slew.
+///
+/// The same folded-step snap window as [`slew_yaw`], but with the `+/-0x138`
+/// pitch cone and no zero-target decay: the two period branches step toward
+/// the target and reject a step that would leave the cone by holding the
+/// pre-step value.
+fn slew_pitch(current: i16, target: i32, step: u8) -> i16 {
+    let step = i32::from(step);
+    let current = i32::from(current) & 0x0FFF;
+    let target = target & 0x0FFF;
+    let pitch_diff = (step - current + target) & 0x0FFF;
+    if pitch_diff < step * 2 {
+        // Snap, but keep the previous angle when the target is out of cone.
+        if ((target + i32::from(PITCH_CONE)) & 0x0FFF) > 0x270 {
+            signed12(current)
+        } else {
+            signed12(target)
+        }
+    } else if ((current - target) & 0x0FFF) < 0x801 {
+        let next = (current - step) & 0x0FFF;
+        let signed = signed12(next);
+        if ((i32::from(signed) + i32::from(PITCH_CONE)) & 0x0FFF) > 0x938 {
+            signed12((next + step) & 0x0FFF)
+        } else {
+            signed
+        }
     } else {
-        i32::from(current_u) - step
-    };
-    let wrapped = next.rem_euclid(0x1000);
-    let signed = if wrapped > 0x800 {
-        wrapped - 0x1000
-    } else {
-        wrapped
-    };
-    signed.clamp(-i32::from(cone), i32::from(cone)) as i16
+        let next = (current + step) & 0x0FFF;
+        let signed = signed12(next);
+        if ((i32::from(signed) - i32::from(PITCH_CONE)) & 0x0FFF) < 0x6C8 {
+            signed12((next - step) & 0x0FFF)
+        } else {
+            signed
+        }
+    }
 }
 
 /// The blend step the walk layer derives from the entity's `blend_counter`:
@@ -788,20 +816,20 @@ mod tests {
         entity.look_at_pitch_step = 0x40;
         // 45 degrees to the right of the entity's facing.
         entity.target = [1000, 0, 1000];
-        clock.slew_look_at(&entity);
+        clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_yaw, -0x40);
         for _ in 0..7 {
-            clock.slew_look_at(&entity);
+            clock.slew_look_at(&entity, None);
         }
         assert_eq!(clock.look_at_yaw, -0x200);
-        clock.slew_look_at(&entity);
+        clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_yaw, -0x200, "snapped and held");
 
         // Straight behind the entity the target lies outside the +/-0x2C8
         // cone, so the slew stops on the cone's edge.
         entity.target = [0, 0, 1000];
         for _ in 0..16 {
-            clock.slew_look_at(&entity);
+            clock.slew_look_at(&entity, None);
         }
         assert_eq!(clock.look_at_yaw, -0x2C8);
 
@@ -809,7 +837,7 @@ mod tests {
         let frozen = clock.look_at_yaw;
         entity.look_at_flags = 0;
         entity.target = [1000, 0, 0];
-        clock.slew_look_at(&entity);
+        clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_yaw, frozen);
     }
 
@@ -836,12 +864,26 @@ mod tests {
         // 250 below over 1000 horizontal: atan(0.25) in 12-bit units.
         let target_pitch = -(((0.25f64).atan() * (2048.0 / std::f64::consts::PI)) as i16);
         entity.target = [0, -250, 1000];
-        clock.slew_look_at(&entity);
+        clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_pitch, -0x40);
-        // The remaining turn (95 units) is under two steps, so the second
-        // call snaps to the target.
-        clock.slew_look_at(&entity);
+        clock.slew_look_at(&entity, None);
+        assert_eq!(clock.look_at_pitch, -0x80, "still stepping");
+        // The remaining turn is under one step, so the third call snaps to
+        // the target.
+        clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_pitch, target_pitch, "snapped");
         assert_eq!(clock.look_at_yaw, 0, "the yaw bit is clear");
+
+        // The pitch target is measured from the tracking joint's world
+        // translation, not the entity origin: with a joint 200 units above
+        // the entity the same absolute target reads 200 lower.
+        let mut joint_clock = EntityAnim::default();
+        // slope = ((-250 - 200) << 12) / 1000 = -1843, truncated.
+        let joint_target = angle_quadrant_value((-450 << 12) / 1000);
+        assert_ne!(joint_target, i32::from(target_pitch));
+        for _ in 0..16 {
+            joint_clock.slew_look_at(&entity, Some([0, 200, 0]));
+        }
+        assert_eq!(i32::from(joint_clock.look_at_pitch), joint_target);
     }
 }
