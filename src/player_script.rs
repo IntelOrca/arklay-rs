@@ -68,7 +68,12 @@ const SCRIPTED_BEHAVIOR: u8 = 0xFF;
 /// The original's animation remap for incoming clip ids below 0x10:
 /// `(action state base, clip)` pairs. A higher id plays from the third action
 /// state without remapping, and 0x3E and up rebase by 0x3E.
-const SCD_ANIM_REMAP: [(u8, u8); 10] = [
+///
+/// The original's `g_ScdAnimRemap` table has sixteen pairs (0x004bec80); the
+/// six unused rows are zero. Behavior 1 indexes it for every incoming id below
+/// 0x10, so a ten-entry table panicked on an `act_anim_flags` animation id of
+/// 0x0A..0x0F.
+const SCD_ANIM_REMAP: [(u8, u8); 16] = [
     (0, 0),
     (0, 1),
     (0, 2),
@@ -79,6 +84,12 @@ const SCD_ANIM_REMAP: [(u8, u8); 10] = [
     (1, 2),
     (1, 3),
     (1, 4),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
+    (0, 0),
 ];
 
 /// Clip playback step of behavior 1 (the original's `Joint_move(..., 0x200)`).
@@ -3141,6 +3152,23 @@ mod tests {
         room: &[Clip],
     ) {
         update(game, player, &RoomState::default(), emd, emw, room);
+    }
+
+    /// `act_anim_flags`/`act_anim_set` can pass animation ids in `0x0A..0x0F`.
+    /// The original's remap table has sixteen rows (the unused six fold onto
+    /// the first bank row), so behavior 1 must index all of them rather than
+    /// running off a ten-entry table.
+    #[test]
+    fn behavior_one_remaps_every_incoming_id_below_sixteen() {
+        for incoming in [0x0Au8, 0x0D, 0x0F] {
+            let emd = vec![clip(3, 1); 0x10];
+            let mut game = test_game(8, 1, incoming);
+            let mut player = test_player();
+            run(&mut game, &mut player, &emd, &[], &[]);
+            assert_eq!(game.entities[0].action_state, 1, "id {incoming:#x}");
+            assert_eq!(player.anim.clip, 0, "id {incoming:#x} folds onto row 0");
+            assert_eq!(player.clip_source, ClipSource::Emd);
+        }
     }
 
     #[test]
