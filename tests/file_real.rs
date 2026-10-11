@@ -148,6 +148,27 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
         FileMode::List,
         "confirm exits on the last page"
     );
+
+    // The document pick-up path (`open_pickup`) enters the reader directly on
+    // the picked entry: item 0x5F is document 0, whose shared 0xFE list slot
+    // resolves to it once collected.
+    game.set_file_collected(0, true);
+    let mut pickup = FileScreen::default();
+    pickup.open_pickup(&game, FILE_ITEM_MIN);
+    assert_eq!(pickup.mode, FileMode::Reader);
+    assert_eq!(pickup.book, 0);
+    assert_eq!(pickup.slot, 2, "the 0xFE list slot holds document 0");
+    assert_eq!(pickup.reader_anim, ReaderAnim::InRight);
+    settle_reader(&mut pickup);
+    assert_eq!(pickup.page, 0);
+    let mut frame = Framebuffer::new();
+    pickup.draw(&mut frame, &assets, &menu, &text, &game);
+    let drawn = non_black(&Image {
+        width: frame.width,
+        height: frame.height,
+        rgba: frame.rgba.clone(),
+    });
+    assert!(drawn > 5000, "the pick-up reader drew only {drawn} pixels");
 }
 
 /// Advance the toggle-only reader until its slide animation settles.
