@@ -405,7 +405,26 @@ end
 -- State 2: the damage reaction
 -- ---------------------------------------------------------------------------
 
+-- ---------------------------------------------------------------------------
+-- A bite interrupted by damage or death has to hand the player back. The
+-- attack FSM only arms the release (player action_state 3, which makes the
+-- state-5 recoil window play the break-free clip and return to pad control)
+-- from its bite-timer branch, so a zombie that leaves the attack through the
+-- damage reaction or the death sequence strands the player in the hold
+-- forever. The state mirror still carries the previous frame's state on the
+-- interrupt frame, which is what tells us the attack owned the player.
+-- ---------------------------------------------------------------------------
+local function release_interrupted_bite(e)
+    if (e.state_mirror & 0xFF) == STATE_ATTACK
+        and (e.player_attacked & 0x3F) ~= 0
+        and e.player_state == 5
+        and e.player_anim_frame_id == 0 then
+        e.player_action_state = 3
+    end
+end
+
 damaged = function(e)
+    release_interrupted_bite(e)
     if e.ignore == 0 then
         local beh_type = e.behavior_flags & 0x0F
 
@@ -484,6 +503,7 @@ end
 -- ---------------------------------------------------------------------------
 
 die = function(e)
+    release_interrupted_bite(e)
     if e.ignore == 0 then
         e.ignore = 1
         e.action_behavior = 0
