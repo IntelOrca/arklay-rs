@@ -8356,10 +8356,15 @@ impl ScdHost for ScdGameHost<'_> {
                 }
                 StepResult::Continue
             }
-            // spd_set: entity index (0 player), new posY word.
+            // spd_set: entity index (0 player), new posY word. The original
+            // writes `g_playerEntity.posY` (entity +0x8E), the floor reference
+            // the shadow pass reads - NOT the transform's Y. Selector 0 is the
+            // only form the shipped scripts use.
             0x41 => {
                 let slot = usize::from(operand_u8(operands, 0));
-                if let Some(entity) = self.state.entities.get_mut(slot) {
+                if slot == 0 {
+                    self.state.entities[0].floor_step = operand_i16(operands, 1);
+                } else if let Some(entity) = self.state.entities.get_mut(slot) {
                     entity.pos[1] = i32::from(operand_i16(operands, 1));
                 }
                 StepResult::Continue
@@ -8385,10 +8390,16 @@ impl ScdHost for ScdGameHost<'_> {
                 entity.set_active(true);
                 StepResult::Continue
             }
-            // spd_add: signed byte added to the player posY.
+            // spd_add: signed byte added to the player posY (entity +0x8E), the
+            // shadow's floor reference - NOT the transform's Y. The room-310
+            // elevator events pair it with a tween that moves the transform, so
+            // applying it to the position doubled the ride and overshot the
+            // destination floor.
             0x45 => {
                 let entity = &mut self.state.entities[0];
-                entity.pos[1] = entity.pos[1].wrapping_add(i32::from(operand_i8(operands, 0)));
+                entity.floor_step = entity
+                    .floor_step
+                    .wrapping_add(i16::from(operand_i8(operands, 0)));
                 StepResult::Continue
             }
             // `plw_anim` (0x2B): the scripted attack animation. The behavior
@@ -9066,6 +9077,32 @@ mod tests {
             host.on_flags(op(0x04), &operands(&[0, 3, 1])),
             StepResult::Continue
         );
+    }
+
+    #[test]
+    fn spd_add_writes_the_posy_floor_reference_not_the_position() {
+        // `cmd_player_posy_add` (0x45) adjusts `g_playerEntity.posY` (entity
+        // +0x8E), the floor reference the shadow pass reads. Applying it to
+        // the transform doubled ROOM310's elevator ride and overshot the
+        // destination floor.
+        let mut state = game();
+        state.entities[0].pos = [100, 200, 300];
+        state.entities[0].floor_step = 7;
+        let mut host = ScdGameHost::new(&mut state);
+        assert_eq!(
+            host.on_player(op(0x45), &operands(&[0xF8])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().entities[0].pos, [100, 200, 300]);
+        assert_eq!(host.state().entities[0].floor_step, -1);
+
+        // `spd_set` (0x41) writes the same word for the player selector.
+        assert_eq!(
+            host.on_enemy(op(0x41), &operands(&[0, 2500])),
+            StepResult::Continue
+        );
+        assert_eq!(host.state().entities[0].pos, [100, 200, 300]);
+        assert_eq!(host.state().entities[0].floor_step, 2500);
     }
 
     #[test]
