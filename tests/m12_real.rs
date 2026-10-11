@@ -379,6 +379,12 @@ fn corpus_desks_run_the_full_flow_and_items_stay_in_bounds() {
                 hidden_items += 1;
                 continue;
             }
+            // An event tween can move a record off-map with `tw_abs_pos`
+            // (the original sign-extends each operand), exactly like the
+            // ROOM113 object move; those script-driven placements leave the
+            // built coordinate space and are exempt from the bounds probe.
+            let built_space =
+                (0..=0xFFFF).contains(&record.pos[0]) && (0..=0xFFFF).contains(&record.pos[2]);
             let world = arklay::objects::item_world_transform(
                 &sim.game.items,
                 &sim.game.objects,
@@ -387,6 +393,9 @@ fn corpus_desks_run_the_full_flow_and_items_stay_in_bounds() {
                 sim.player.angle,
             );
             let (x, z) = (world.t[0], world.t[2]);
+            if !built_space {
+                continue;
+            }
             if let Some(([min_x, min_z], [max_x, max_z])) = bounds {
                 assert!(
                     x >= min_x - margin
