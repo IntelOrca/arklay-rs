@@ -6757,6 +6757,19 @@ fn tick_room_timed(
         );
         context.game.entities[0].pos = context.player.pos;
     }
+    // `update_player_anim` refreshes zoneFlags bit 0 from the camera switch
+    // zone after the collision pass. The renderer reads the whole low byte as
+    // its whole-entity gate, so a player the current camera's zone does not
+    // cover (and who carries no other interaction bit) is not drawn - the
+    // original's own mechanism for hiding the character during a scripted
+    // inspect.
+    let in_zone = u8::from(enemy::in_camera_zone(
+        context.room,
+        context.room.current_cut,
+        context.game.entities[0].pos,
+    ));
+    context.game.entities[0].zone_flags =
+        (context.game.entities[0].zone_flags & !0x01) | in_zone;
     // The gated reach finished this tick: raise the viewer flag the action
     // entry selects, return the message ready bit and clear the health lock.
     // The end-of-tick item-viewer hook then opens the viewer.
@@ -7672,11 +7685,11 @@ fn render_frame(
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
-        // The port does not model the player's own switch-zone bit (the
-        // original recomputes it for the player every frame); keep the player
-        // mesh on the inside-the-zone path so only member joints are gated.
+        // The player's whole-entity gate reads the live `zoneFlags` low byte
+        // (the camera-zone bit plus the interaction bits the scripts raise),
+        // exactly like the entity pass.
         let hidden = joint_hidden_mask(
-            true,
+            game.entities[0].zone_flags & 0x7F != 0,
             member_joint_class(game.entities[0].id),
             room,
             room.current_cut,
@@ -12485,6 +12498,53 @@ off_0010:
             player::Input::default(),
         );
         assert!(!game.message.active, "the pulse does not latch");
+    }
+
+    /// `update_player_anim` refreshes `zoneFlags` bit 0 from the current
+    /// camera's switch zone every frame. The renderer's whole-entity gate
+    /// reads the low byte, so the bit is what keeps a scripted inspect (which
+    /// parks the player outside the camera zone) from drawing the model.
+    #[test]
+    fn the_player_switch_zone_bit_tracks_the_camera_zone() {
+        let (pack, _id, mut room, mut game, mut player_state, assets) = scripted_room_fixture();
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+
+        // Inside the cut-0 switch zone [0,0]-[2000,2000].
+        player_state.pos = [1000, 0, 1000];
+        game.sync_entity_from_player(&player_state);
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert_eq!(game.entities[0].zone_flags & 0x01, 0x01);
+
+        // Outside it: the bit clears and the whole render gate reads zero.
+        player_state.pos = [5000, 0, 1000];
+        game.sync_entity_from_player(&player_state);
+        tick_scripted_room(
+            &pack,
+            &mut room,
+            &mut game,
+            &mut player_state,
+            &assets,
+            &mut command_vm,
+            &mut event_vm,
+            player::Input::default(),
+        );
+        assert_eq!(game.entities[0].zone_flags & 0x01, 0);
+        assert_eq!(
+            game.entities[0].zone_flags & 0x7F,
+            0,
+            "the whole-entity gate reads clear"
+        );
     }
 
     /// The player runs `EntityUpdateLookAtAngles` every tick after the state
