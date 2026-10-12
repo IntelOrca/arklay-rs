@@ -333,7 +333,10 @@ pub fn update(game: &mut GameState, room: &RoomState, parent: usize, count: u8) 
             }
         }
 
-        walk::check_room_collision(room, &mut entity);
+        let (_, bkp) = walk::check_room_collision_bkp(room, &mut entity);
+        if let Some(bkp) = bkp {
+            game.entity_bkp = bkp;
+        }
 
         if let Some(clone) = game.web_clones[slot].as_mut() {
             clone.entity = entity;

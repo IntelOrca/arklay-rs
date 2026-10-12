@@ -1654,7 +1654,11 @@ fn knockdown_recover(
             // The collision test is probe-only: the resolve runs on a copy and
             // only its hit result is kept.
             let mut probe = game.entities[0];
-            if crate::enemy::walk::check_room_collision(room, &mut probe) != 0 {
+            let (code, bkp) = crate::enemy::walk::check_room_collision_bkp(room, &mut probe);
+            if let Some(bkp) = bkp {
+                game.entity_bkp = bkp;
+            }
+            if code != 0 {
                 game.entities[0].action_state = 5;
             }
         }
@@ -2122,7 +2126,10 @@ fn tyrant_knockback_slide(
     player.pos = game.entities[0].pos;
 
     let before = game.entities[0].pos;
-    let code = walk::check_room_collision(room, &mut game.entities[0]);
+    let (code, bkp) = walk::check_room_collision_bkp(room, &mut game.entities[0]);
+    if let Some(bkp) = bkp {
+        game.entity_bkp = bkp;
+    }
     game.entities[0].pos = before;
     if code != 0 {
         game.entities[0].action_state = 5;

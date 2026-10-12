@@ -1150,11 +1150,13 @@ end
 zombie_walk1 = function(e)
     local px, _, pz = e:player_pos()
     local entry_behavior = e.action_behavior
-    -- The raw pathfinder result, or the kept bit when no call ran this frame.
-    local path_result = e.path_bit
+    -- The raw pathfinder result, or the shared `g_entity_bkp` scratch when no
+    -- call ran this frame (the original keeps it in a room global).
+    local path_result = e.entity_bkp
 
     if e.zombie_move_word == 0 then
         path_result = e:pathfind_update(px, pz)
+        e.entity_bkp = path_result
         if (path_result & 0xFE) == 0 then
             e.is_moving = e.is_moving & 0xFE
             e.zombie_move_word = e.zombie_move_word | (path_result & 1)
@@ -1193,7 +1195,11 @@ zombie_walk1 = function(e)
     end
 
     if (e.player_attacked & 0x80) ~= 0 then
-        if (path_result & 1) ~= 0 then
+        -- The original reads the shared `g_entity_bkp` scratch here. walk1 has
+        -- just stored the fresh pathfinder result into it; walk2 keeps its
+        -- result in a local, so the scratch still holds the last collision
+        -- resolve's -z exit depth.
+        if (e.entity_bkp & 1) ~= 0 then
             if entry_behavior ~= 2 then
                 e.action_state = 0
                 e.blend_counter = 3
@@ -1276,8 +1282,10 @@ end
 zombie_walk2 = function(e)
     local px, _, pz = e:player_pos()
     local entry_behavior = e.action_behavior
-    -- The raw pathfinder result, or the kept bit when no call ran this frame.
-    local path_result = e.path_bit
+    -- The raw pathfinder result, or the shared `g_entity_bkp` scratch when no
+    -- call ran this frame. Unlike walk1, walk2 does not store the fresh result
+    -- (the original writes it to a local only).
+    local path_result = e.entity_bkp
 
     if e.zombie_move_word == 0 then
         path_result = e:pathfind_update(px, pz)
@@ -1332,7 +1340,11 @@ zombie_walk2 = function(e)
     end
 
     if (e.player_attacked & 0x80) ~= 0 then
-        if (path_result & 1) ~= 0 then
+        -- The original reads the shared `g_entity_bkp` scratch here. walk1 has
+        -- just stored the fresh pathfinder result into it; walk2 keeps its
+        -- result in a local, so the scratch still holds the last collision
+        -- resolve's -z exit depth.
+        if (e.entity_bkp & 1) ~= 0 then
             if entry_behavior ~= 2 then
                 e.action_state = 0
                 e.blend_counter = 3

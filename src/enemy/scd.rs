@@ -157,14 +157,18 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     // out of any obstruction the step crossed and rolls back to the
     // pre-dispatch position when still stuck, the same shape the player's
     // scripted animation tail uses.
-    let entity = &mut game.entities[slot];
-    entity.pos = crate::player::resolve_collision(
+    let entity = &game.entities[slot];
+    let resolution = crate::player::resolve_collision_full(
         &room.collision,
         prev_pos,
         entity.pos,
         i32::from(entity.sca_radius),
         entity.collision_flags,
     );
+    if let Some(bkp) = resolution.entity_bkp {
+        game.entity_bkp = bkp;
+    }
+    game.entities[slot].pos = resolution.pos;
     // The render-pass equivalent: compose and store the pose's joint worlds
     // after the collision tail, so the next tick's `EntityUpdateWeaponJoint`
     // (and the effect pass) reads the previous frame's pose, exactly like the

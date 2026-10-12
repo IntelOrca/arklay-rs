@@ -735,6 +735,16 @@ mod imp {
             fields.add_field_method_get("path_bit", |_lua, api| {
                 Ok(api.entity().attacking_direction & 1)
             });
+            // `g_entity_bkp` (0x00be0df4): the shared pathfinder-result scratch.
+            // The zombie's walk behaviours store `pathfind_update`'s result and
+            // read it back on frames that skip the call.
+            fields.add_field_method_get("entity_bkp", |_lua, api| {
+                Ok(i64::from(api.game_ref().entity_bkp))
+            });
+            fields.add_field_method_set("entity_bkp", |_lua, api, value: i64| {
+                api.game().entity_bkp = value as u32;
+                Ok(())
+            });
 
             // The wasp's views over the shared scratch block. The names are
             // the original's aliases; each typed accessor owns the
@@ -3106,7 +3116,11 @@ mod imp {
                 let before = game.entities[slot]
                     .saved_pos
                     .unwrap_or(game.entities[slot].pos);
-                let code = crate::enemy::walk::check_room_collision(room, &mut game.entities[slot]);
+                let (code, bkp) =
+                    crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot]);
+                if let Some(bkp) = bkp {
+                    game.entity_bkp = bkp;
+                }
                 // The original's `g_tempVar`: the distance actually travelled,
                 // measured between the resolved position and the previous
                 // accepted one, both through their 16-bit `position` words.

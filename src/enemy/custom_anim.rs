@@ -820,7 +820,11 @@ pub fn yawn_post_move(
         );
     }
 
-    let result = crate::enemy::walk::check_room_collision(room, &mut game.entities[slot]);
+    let (result, bkp) =
+        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot]);
+    if let Some(bkp) = bkp {
+        game.entity_bkp = bkp;
+    }
     if game.entities[slot].behavior_flags & 1 == 0 {
         if result == 0 {
             if game.entities[slot].yawn_stuck_cool() != 0 {

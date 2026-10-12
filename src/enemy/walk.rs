@@ -169,6 +169,14 @@ pub fn wasp_pathfind_track(entity: &mut Entity, path: u8) {
 /// zone was crossed); the caller's consecutive-blocked counter counts
 /// everything but `0`.
 pub fn check_room_collision(room: &RoomState, entity: &mut Entity) -> u8 {
+    check_room_collision_bkp(room, entity).0
+}
+
+/// [`check_room_collision`] with the resolve's `g_entity_bkp` write: a shape-1/5
+/// rect whose -z face is the nearer exit stores that exit depth in the shared
+/// scratch, which callers with the game state forward to
+/// [`GameState::entity_bkp`].
+pub fn check_room_collision_bkp(room: &RoomState, entity: &mut Entity) -> (u8, Option<u32>) {
     let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
     let radius = i32::from(entity.sca_radius);
     let resolution = player::resolve_collision_full(
@@ -182,7 +190,7 @@ pub fn check_room_collision(room: &RoomState, entity: &mut Entity) -> u8 {
     entity.saved_pos = Some(resolution.pos);
     entity.floor_step = resolution.floor_step;
     apply_push_axis(entity, resolution.push_z);
-    resolution.code
+    (resolution.code, resolution.entity_bkp)
 }
 
 /// The room resolve's push-axis status bit (entity +0x00 bit 4): a correction
@@ -231,6 +239,9 @@ fn probe_room_collision(room: &RoomState, game: &mut GameState, slot: usize, rad
         entity.collision_flags,
     );
     game.scratch_vec = resolution.scratch;
+    if let Some(bkp) = resolution.entity_bkp {
+        game.entity_bkp = bkp;
+    }
     let entity = &mut game.entities[slot];
     entity.pos = resolution.pos;
     entity.saved_pos = Some(resolution.pos);

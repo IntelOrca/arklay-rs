@@ -379,11 +379,13 @@ pub const MSF2_SCREEN_SHAKE: u8 = 0x3E;
 /// `0x20 + (31 - 22) = 0x29` in flag bank 5.
 pub const MSF2_DOOR_TURN_PENDING: u8 = 0x29;
 /// `main_state_flags2` bit 0x10000000 (`MSF2_ATTRACT_DEMO`): attract-mode
-/// demo playback. Selector 3 in flag bank 5.
-pub const MSF2_ATTRACT_DEMO: u8 = 3;
+/// demo playback. The second dword of flag bank 5, i.e. selector
+/// `0x20 + 3 = 0x23` in the MSB-first flag bank.
+pub const MSF2_ATTRACT_DEMO: u8 = 0x23;
 /// `main_state_flags2` bit 0x80000000 (`MSF2_DEATH_VARIANT`): the scripted
-/// death variant that skips the DIED screen. Selector 0 in flag bank 5.
-pub const MSF2_DEATH_VARIANT: u8 = 0;
+/// death variant that skips the DIED screen. The second dword of flag bank 5,
+/// i.e. selector `0x20 + 0 = 0x20`.
+pub const MSF2_DEATH_VARIANT: u8 = 0x20;
 /// The four D-pad direction bits of the held/pressed pad word the scripts read
 /// with `ck_bits` (0x38) and that a message dismissal blanks. `up` is bit 0
 /// because the original's walk behaviour tests `dpadHeld & 1` for forward.
@@ -3377,6 +3379,11 @@ pub struct GameState {
     /// transition stores (0x1F after a fresh room/stage init), read by the
     /// hunter's scripted-intro camera selector.
     pub attract_room_camera_id: u8,
+    /// `g_entity_bkp` (0x00be0df4): the shared pathfinder-result scratch. The
+    /// zombie's walk behaviours store `entity_pathfind_update`'s result here
+    /// and read it back on frames that skip the call, so the value is a room
+    /// global, not per-entity state.
+    pub entity_bkp: u32,
     /// The alternate-outfit selector (`g_bCostumeVariant`): `costume_set`
     /// (0x4F) stores the operand's low bit and `costume_ck` (0x50) tests it.
     /// The original's `LoadEntityEMD` reads it to pick the alternate player
@@ -3583,6 +3590,7 @@ impl Default for GameState {
             hunter_grab_one_shot: true,
             monster_plant_sides: 0,
             attract_room_camera_id: 0x1F,
+            entity_bkp: 0,
             costume_variant: 0,
             selected_item: None,
             max_health: 0,

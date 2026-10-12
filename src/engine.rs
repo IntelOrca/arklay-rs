@@ -2848,7 +2848,7 @@ impl GameSession {
     /// Blend the death fade (the white-out or the screen's final fade) over
     /// the frame just rendered.
     fn draw_death_fade(&mut self) {
-        if let Some(overlay) = self.death.overlay() {
+        if let Some(overlay) = self.death.drawn_overlay() {
             self.framebuffer.fade_to_color(overlay.color, overlay.alpha);
         }
     }
@@ -2990,13 +2990,23 @@ impl GameSession {
 
     /// The per-tick oracle-trace snapshot (`oracle/trace-v1.md`): the live
     /// room, game and room-entry fade state plus the rendered frame's hash.
+    ///
+    /// The reference's `g_fading_counter`/`g_fading_state` is one global; once
+    /// the game-over machine has taken over it is the death fade that owns it,
+    /// so the trace reports that fade instead of the (already inactive) room
+    /// entry fade.
     fn trace_tick<'a>(&'a self, frame: &Framebuffer) -> trace::TraceTick<'a> {
+        let (fade_counter, fade_state) = if self.death.is_idle() {
+            (self.room_fade.counter(), self.room_fade.state())
+        } else {
+            (self.death.fade_counter(), self.death.fade_state())
+        };
         trace::TraceTick {
             room: self.loaded.id,
             rng: self.game.rand_state,
             rseed: self.game.rand_seed,
-            fade_counter: self.room_fade.counter() as i16,
-            fade_state: self.room_fade.state(),
+            fade_counter: fade_counter as i16,
+            fade_state,
             cam: self.loaded.room.current_cut as u8,
             entities: &self.game.entities,
             frame_hash: trace::frame_hash(frame),
@@ -4676,12 +4686,18 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         }
         let in_transition =
             matches!(&app.mode, Mode::Play(session) if session.transition.is_some());
+        // The reference emits no trace lines while the DIED screen runs: its
+        // display loop is outside `game_loop`, so the tick that opens the
+        // screen is the last traced one until the title cycles back into
+        // gameplay.
+        let screen_before = matches!(&app.mode, Mode::Play(session) if session.death.screen_open());
         if let AppFlow::Quit = app.update(UiInput::default(), player::Input::default(), false)? {
             break;
         }
         app.draw();
         if let Mode::Play(session) = &app.mode
             && !in_transition
+            && !screen_before
         {
             let index = writer.tick_index();
             writer.write_tick(&session.trace_tick(&app.framebuffer))?;
@@ -16979,8 +16995,10 @@ end
         // 3; the game-over machine still runs to the title.
         assert_eq!(session.game.entities[0].state(), 3, "the fall state");
         let screen_open_at = screen_open_at.expect("the DIED screen opened");
-        // 90 delay frames + 128 fade frames, plus the trigger tick.
-        assert_eq!(screen_open_at, 219);
+        // The trigger tick starts the machine (the original's case 0 falls
+        // through into case 1 and decrements once), 89 more delay ticks, then
+        // 128 fade steps with the first already applied on the arm tick.
+        assert_eq!(screen_open_at, 217);
         let title_at = title_at.expect("the title returned");
         assert!(title_at > screen_open_at, "the screen ran before the title");
         assert!(!session.death.screen_open());

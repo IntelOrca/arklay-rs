@@ -188,6 +188,22 @@ impl Fade {
         })
     }
 
+    /// The overlay the original DRAWS this frame: the accumulator value before
+    /// this tick's step. The original's main loop draws the fade and only then
+    /// adds the counter, so a fade whose `state` is traced post-step draws one
+    /// step behind it - and the tick that wraps the accumulator negative still
+    /// draws the pre-wrap alpha.
+    pub fn drawn_overlay(&self) -> Option<Overlay> {
+        let previous = self.state.wrapping_sub(self.counter as i16);
+        if previous < 0 {
+            return None;
+        }
+        Some(Overlay {
+            alpha: (i32::from(previous) >> 7).clamp(0, 255) as u8,
+            color: FadeColor::from_id(self.fade_type),
+        })
+    }
+
     /// The scripted fade type id.
     pub fn fade_type(&self) -> u8 {
         self.fade_type

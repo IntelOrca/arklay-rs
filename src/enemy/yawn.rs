@@ -148,7 +148,11 @@ pub fn segment_tick(game: &mut GameState, room: &RoomState, slot: usize) {
     }
 
     // Room collision at the mirrored point; a hit drags the chain.
-    let result = crate::enemy::walk::check_room_collision(room, &mut game.entities[slot]);
+    let (result, bkp) =
+        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot]);
+    if let Some(bkp) = bkp {
+        game.entity_bkp = bkp;
+    }
     if result != 0 {
         let pushed = game.entities[slot].pos;
         let Some(pose) = game.entity_anims[head_slot].yawn.as_deref_mut() else {

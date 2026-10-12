@@ -1720,6 +1720,11 @@ pub(crate) struct CollisionResolution {
     /// along X (the bit is cleared), `None` when nothing pushed or only a
     /// rollback ran (the bit is left alone).
     pub push_z: Option<bool>,
+    /// The original's `g_entity_bkp` write: a shape-1/5 rect whose -z face is
+    /// the nearer exit stores that exit depth in the shared scratch, which the
+    /// zombie walk behaviours read back on frames that skip the pathfinder.
+    /// The last write of the resolve wins.
+    pub entity_bkp: Option<u32>,
 }
 
 /// The two-pass resolve with the scratch snapshot [`CollisionResolution`]
@@ -1736,6 +1741,7 @@ pub(crate) fn resolve_collision_full(
     let mut hit = 0u16;
     let mut floor_step = 0i16;
     let mut push_z = None;
+    let mut entity_bkp = None;
 
     for rect in records {
         if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
@@ -1746,13 +1752,16 @@ pub(crate) fn resolve_collision_full(
             continue;
         }
         if let Some(shape) = classify(proposed[0], proposed[2], rect, radius) {
-            let axis = match shape {
+            let (axis, bkp) = match shape {
                 1 | 5 => push_rect(rect, prev, &mut pos, radius),
-                3 => push_circle(rect, &mut pos, radius),
-                _ => None,
+                3 => (push_circle(rect, &mut pos, radius), None),
+                _ => (None, None),
             };
             if axis.is_some() {
                 push_z = axis;
+            }
+            if bkp.is_some() {
+                entity_bkp = bkp.map(|value| value as u32);
             }
             hit |= (rect.flags & 0x300) >> 8;
         }
@@ -1765,6 +1774,7 @@ pub(crate) fn resolve_collision_full(
             floor_step,
             scratch: proposed,
             push_z,
+            entity_bkp,
         };
     }
 
@@ -1795,6 +1805,7 @@ pub(crate) fn resolve_collision_full(
             floor_step,
             scratch,
             push_z,
+            entity_bkp,
         };
     }
     if still_hit == 0 {
@@ -1804,6 +1815,7 @@ pub(crate) fn resolve_collision_full(
             floor_step,
             scratch,
             push_z,
+            entity_bkp,
         };
     }
     CollisionResolution {
@@ -1812,6 +1824,7 @@ pub(crate) fn resolve_collision_full(
         floor_step,
         scratch,
         push_z,
+        entity_bkp,
     }
 }
 
@@ -2057,7 +2070,12 @@ pub(crate) fn point_outside(x: i32, z: i32, x_hi: i32, z_hi: i32, x_lo: i32, z_l
 /// the entity entered through; when both or neither do, or when a single-axis
 /// push exceeds 400 units, the shallower correction wins. The selector is bit
 /// 0: movement and push disagree in sign on X; bit 1: on Z.
-fn rect_push(rect: &CollisionRect, prev: [i32; 3], pos: &[i32; 3], radius: i32) -> (i16, i16, u8) {
+fn rect_push(
+    rect: &CollisionRect,
+    prev: [i32; 3],
+    pos: &[i32; 3],
+    radius: i32,
+) -> (i16, i16, u8, Option<i32>) {
     let r = radius as i16;
     let pos_x = pos[0] as i16;
     let pos_z = pos[2] as i16;
@@ -2084,6 +2102,14 @@ fn rect_push(rect: &CollisionRect, prev: [i32; 3], pos: &[i32; 3], radius: i32) 
         .wrapping_sub(r)
         .wrapping_sub(pos_z)
         .wrapping_sub(COLLISION_SKIN);
+    // The original stores the -z exit depth in the shared `g_entity_bkp`
+    // scratch whenever the -z face is the nearer exit, before it even decides
+    // how to resolve the push.
+    let entity_bkp = if -(i32::from(push_z_lo)) < i32::from(push_z_hi) {
+        Some(i32::from(push_z_lo))
+    } else {
+        None
+    };
     let push_z = if -(i32::from(push_z_lo)) < i32::from(push_z_hi) {
         push_z_lo
     } else {
@@ -2095,7 +2121,7 @@ fn rect_push(rect: &CollisionRect, prev: [i32; 3], pos: &[i32; 3], radius: i32) 
     let selector = ((((movement_z >> 14) ^ (i32::from(push_z) >> 14)) & 2)
         | (((movement_x >> 15) ^ (i32::from(push_x) >> 15)) & 1)) as u8;
 
-    (push_x, push_z, selector)
+    (push_x, push_z, selector, entity_bkp)
 }
 
 /// Shapes 1 and 5: push the entity out of a rectangular obstacle.
@@ -2104,10 +2130,10 @@ fn push_rect(
     prev: [i32; 3],
     pos: &mut [i32; 3],
     radius: i32,
-) -> Option<bool> {
-    let (push_x, push_z, selector) = rect_push(rect, prev, pos, radius);
+) -> (Option<bool>, Option<i32>) {
+    let (push_x, push_z, selector, entity_bkp) = rect_push(rect, prev, pos, radius);
 
-    match selector {
+    let axis = match selector {
         0 => {
             // The original rolls the whole move back without touching the
             // status bit.
@@ -2124,7 +2150,8 @@ fn push_rect(
             Some(true)
         }
         _ => Some(push_shallow(push_x, push_z, pos)),
-    }
+    };
+    (axis, entity_bkp)
 }
 
 /// Shapes 1 and 5 for [`object_two_point_probe`].
@@ -2139,7 +2166,7 @@ fn push_rect_probe(
     point: &mut [i32; 3],
     radius: i32,
 ) -> Option<(i32, i32)> {
-    let (push_x, push_z, selector) = rect_push(rect, prev, point, radius);
+    let (push_x, push_z, selector, _entity_bkp) = rect_push(rect, prev, point, radius);
 
     match selector {
         0 => {
