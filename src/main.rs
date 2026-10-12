@@ -32,10 +32,11 @@ struct Cli {
     demo: u8,
 
     /// UI screen to boot straight into instead of a room:
-    /// `title`, `select`, `game`, `menu`, `box`, `file`, `map`, `view`, `save`,
-    /// `load`, `death` or `font`. `--ui game` also accepts `--room` to boot the
-    /// new game straight into that room through the session flow (the oracle
-    /// anchor for room-specific differentials)
+    /// `title`, `select`, `game`, `demo`, `menu`, `box`, `file`, `map`,
+    /// `view`, `save`, `load`, `death` or `font`. `--ui game` also accepts
+    /// `--room` to boot the new game straight into that room through the
+    /// session flow (the oracle anchor for room-specific differentials);
+    /// `--ui demo` plays the `--demo` attract reel.
     #[arg(long, value_name = "SCREEN", requires = "pack")]
     ui: Option<String>,
 
