@@ -348,15 +348,8 @@ pub fn run_with_options(
                     session.transition.set_sound_busy(false);
                     if frame.finished {
                         let from = loaded.id;
-                        finish_transition(
-                            &pack,
-                            &mut session,
-                            &mut game,
-                            &mut player_state,
-                            &mut loaded,
-                            &mut no_mixer,
-                            &mut sfx_cache,
-                        );
+                        finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
+                        play_room_close_sfx(&mut no_mixer, &mut sfx_cache, &pack, &session);
                         let scripts = Rc::new(loaded.scripts.clone());
                         command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
                         event_vm = scd::vm::EventVm::from_scripts(scripts);
@@ -2695,6 +2688,10 @@ impl GameSession {
         };
         self.transition_finished = false;
         if session.entered {
+            // The destination was already swapped in when the animation began
+            // (the original loads the room before it waits the door task out);
+            // the close SE still fires at the end, like `room_transition_load`.
+            play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
             return;
         }
         // The BGM state machine needs the source room to resolve the outgoing
@@ -2704,14 +2701,12 @@ impl GameSession {
         // keeps the room and must not arm the entry fade.
         let arms_fade = session.destination.is_some();
         finish_transition(
-            pack,
             &mut session,
             &mut self.game,
             &mut self.player,
             &mut self.loaded,
-            &mut self.music,
-            &mut self.sfx_cache,
         );
+        play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
         if arms_fade {
             let scripts = Rc::new(self.loaded.scripts.clone());
             self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -2750,13 +2745,10 @@ impl GameSession {
         }
         let from = self.loaded.id;
         finish_transition(
-            pack,
             &mut session,
             &mut self.game,
             &mut self.player,
             &mut self.loaded,
-            &mut self.music,
-            &mut self.sfx_cache,
         );
         session.entered = true;
         self.transition = Some(session);
@@ -5244,28 +5236,27 @@ fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
     render::draw_door_scene(framebuffer, dor, &frame);
 }
 
-/// Tear the transition down: play the door's close SE (unless suppressed),
-/// swap in the destination room and place the player.
+/// Tear the transition down: swap in the destination room and place the player.
+///
+/// The door's close SE (`play_sfx(0, 1, 0)`) belongs to the *end* of the
+/// original's `room_transition_load`, after the animation task has been waited
+/// out; the callers that tear down at the animation's end play it via
+/// [`play_room_close_sfx`], while the interactive destination entry (which
+/// mirrors the load half that runs before the wait) does not.
 ///
 /// The BGM handoff runs later, in [`GameSession::enter_room`], after the
 /// destination's init script has had its say (the original's ordering).
 fn finish_transition(
-    pack: &Pack,
     session: &mut TransitionMode,
     game: &mut game::GameState,
     player_state: &mut player::PlayerState,
     loaded: &mut LoadedRoom,
-    music: &mut Option<Mixer>,
-    sfx_cache: &mut SfxCache,
 ) {
     // The original's `room_transition_load` latches the record's sfx byte and
     // reloads `g_RoomSfxBanks` before the destination's init runs; camera-only
     // records reload the pair too, even though the room stays.
     if session.camera_only {
         loaded.room.room_sfx = session.door.sfx;
-        if !session.silent {
-            play_room_sfx(music, sfx_cache, pack, session.door.sfx, 1);
-        }
         // The original re-tests the current camera's switch zones in place
         // (room_transition_load's camera-only branch calls
         // check_camera_switch(1)); the record's entry camera only feeds the
@@ -5311,7 +5302,16 @@ fn finish_transition(
     // feeds the .dor animation, so it must not seed the room camera.
     loaded.room.current_cut = 0;
     game.camera.current_cut = 0;
+}
 
+/// Play the door transition's close SE (the original's `play_sfx(0, 1, 0)`
+/// at the end of `room_transition_load`), unless the record suppressed it.
+fn play_room_close_sfx(
+    music: &mut Option<Mixer>,
+    sfx_cache: &mut SfxCache,
+    pack: &Pack,
+    session: &TransitionMode,
+) {
     if !session.silent {
         play_room_sfx(music, sfx_cache, pack, session.door.sfx, 1);
     }
@@ -5422,15 +5422,8 @@ pub fn simulate_door(
         }
     }
     let frame_count = session.transition.frame();
-    finish_transition(
-        pack,
-        &mut session,
-        &mut game,
-        &mut player_state,
-        &mut loaded,
-        &mut mixer,
-        &mut sfx_cache,
-    );
+    finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
+    play_room_close_sfx(&mut mixer, &mut sfx_cache, pack, &session);
 
     // The engine runs the destination's init when gameplay resumes; run it
     // here too so the captured frame matches the first rendered frame (mask
@@ -5815,15 +5808,8 @@ fn simulate_loaded_with(
             session.transition.set_sound_busy(false);
             if frame.finished {
                 let from = loaded.id;
-                finish_transition(
-                    pack,
-                    &mut session,
-                    &mut game,
-                    &mut player_state,
-                    &mut loaded,
-                    &mut no_mixer,
-                    &mut sfx_cache,
-                );
+                finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
+                play_room_close_sfx(&mut no_mixer, &mut sfx_cache, pack, &session);
                 let scripts = Rc::new(loaded.scripts.clone());
                 command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
                 event_vm = scd::vm::EventVm::from_scripts(scripts);
@@ -11303,7 +11289,7 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.0.join("pair.akpak");
         PackWriter::new().write(&path).unwrap();
-        let pack = Pack::open(&path).unwrap();
+        let _pack = Pack::open(&path).unwrap();
 
         let id = RoomId::parse("1000").unwrap();
         let mut loaded = LoadedRoom {
@@ -11335,17 +11321,7 @@ mod tests {
             entered: false,
             frame: transition::TransitionFrame::default(),
         };
-        let mut music: Option<Mixer> = None;
-        let mut cache = SfxCache::default();
-        finish_transition(
-            &pack,
-            &mut session,
-            &mut game,
-            &mut player_state,
-            &mut loaded,
-            &mut music,
-            &mut cache,
-        );
+        finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
         assert_eq!(loaded.room.room_sfx, 1, "the record's sfx byte is live");
         assert_eq!(
             sfx::play_sfx_3d(&loaded.room, 0, 0, 0, [0; 3], [1000, 0, 0], [1000, 0, 0]).name,
@@ -11381,15 +11357,7 @@ mod tests {
             entered: false,
             frame: transition::TransitionFrame::default(),
         };
-        finish_transition(
-            &pack,
-            &mut session,
-            &mut game,
-            &mut player_state,
-            &mut loaded,
-            &mut music,
-            &mut cache,
-        );
+        finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
         assert_eq!(loaded.id, target);
         assert_eq!(loaded.room.room_sfx, 2, "the destination latches its pair");
         assert_eq!(
