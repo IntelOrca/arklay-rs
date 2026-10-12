@@ -343,9 +343,12 @@ fn death_fall(game: &mut GameState, player: &mut PlayerState, room: &RoomState, 
             .wrapping_add(u8::from(completed));
         // The slide: the speed is the character's crawl, the table's second
         // value is the facing offset (0 for Chris, a quarter turn for Jill).
+        // `Add_speedXZ` moves the entity matrix; mirror it onto the visible
+        // player so the engine's entity sync does not clobber the slide.
         let offset = DEATH_FALL[character * 2 + 1];
         let speed = game.entities[0].move_speed_current as i16;
         walk::advance_xz(&mut game.entities[0], offset, speed);
+        player.pos = game.entities[0].pos;
         return;
     }
     match state {
@@ -787,7 +790,10 @@ fn attack_recoil(
                 }
                 player.pos = game.entities[0].pos;
                 play_player_sound(game, room, 3, 0);
-                game.entities[0].flags |= 2;
+                // The original's `g_playerEntity.flags |= 2` is the +0x00
+                // status byte (`status_flags` here), not the +0xE0
+                // `scd_entity_flags`.
+                game.entities[0].status_flags |= 2;
             }
             if advance_reaction_clip(game, player, bank, emd_clips) {
                 enter_recoil_hold(game);
@@ -822,13 +828,14 @@ fn enter_recoil_hold(game: &mut GameState) {
     entity.attack_anim = entity.attack_anim.wrapping_add(1);
 }
 
-/// Case 4's completion: return to the pad-driven state, clear `flags` bit 1
-/// and the attacked flag, spin a two/eight clip and re-arm the attack timer.
+/// Case 4's completion: return to the pad-driven state, clear the +0x00
+/// status byte's bit 1 and the attacked flag, spin a two/eight clip and
+/// re-arm the attack timer.
 fn finish_recoil(game: &mut GameState) {
     let entity = &mut game.entities[0];
     return_to_control(entity);
     entity.set_ignore(0);
-    entity.flags &= !2;
+    entity.status_flags &= !2;
     if entity.attack_anim == 2 || entity.attack_anim == 8 {
         entity.angle = entity.angle.wrapping_add(0x800);
     }
@@ -3322,7 +3329,6 @@ mod tests {
     #[test]
     fn behavior_one_flag_two_anchors_the_held_weapon_hand() {
         use crate::model::Skeleton;
-        use std::sync::Arc;
 
         let emd = vec![clip(1, 1); 4];
         let skeleton = Skeleton {
@@ -3330,6 +3336,7 @@ mod tests {
             children: (1..15).map(|index| vec![index as u8]).collect(),
         };
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [100, -200, 300],
             rotations: vec![[0, 0, 0]; 15],
         }];
@@ -3358,7 +3365,8 @@ mod tests {
 
         // Store the pose's worlds like the engine's render-pass pass does.
         let entity_matrix = crate::anim::entity_matrix(player.pos, player.angle);
-        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity_matrix);
+        game.joint_worlds[0] =
+            crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity_matrix);
 
         // Second tick: the stored hand world matches the current pose, so the
         // anchor is a no-op and the position holds.
@@ -3403,7 +3411,7 @@ mod tests {
         );
         assert_eq!(game.entities[0].action_state, 1);
         assert_eq!(game.entities[0].ignore(), 0);
-        assert_eq!(game.entities[0].flags & 2, 2, "the combat flag");
+        assert_eq!(game.entities[0].status_flags & 2, 2, "the combat flag");
         assert_eq!(player.clip_source, ClipSource::Damage);
         assert_eq!(player.anim.clip, 3);
 
@@ -3436,7 +3444,11 @@ mod tests {
         run(&mut game, &mut player, &[], &[], &[]);
         run(&mut game, &mut player, &[], &[], &[]);
         assert_eq!(game.entities[0].state(), 1, "control returns");
-        assert_eq!(game.entities[0].flags & 2, 0, "the combat flag clears");
+        assert_eq!(
+            game.entities[0].status_flags & 2,
+            0,
+            "the combat flag clears"
+        );
         assert_eq!(game.entities[0].is_being_attacked, 0);
         assert_eq!(game.entities[0].next_turn_timer, 0x96);
     }

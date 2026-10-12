@@ -102,10 +102,20 @@ pub struct Skeleton {
     pub children: Vec<Vec<u8>>,
 }
 
-/// One animation keyframe: a root translation plus a rotation per joint.
+/// One animation keyframe: a root translation, the root-motion vertex and a
+/// rotation per joint.
+///
+/// The on-disk frame header is six `i16`s before the rotations: the first three
+/// are the root joint's translation (the original's `Joint_move` writes them
+/// into `joint->transform.t[0..2]`), the next three are the root-motion vertex
+/// (`entity_extract_anim_vertex` reads bytes +6/+8/+10). They are separate
+/// values: an attack whose joint translation is `(0, -1031, 0)` can carry a
+/// vertex of `(-1031, 0, 0)`, and using one for the other puts the entity a
+/// thousand units off.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Keyframe {
     pub offset: [i16; 3],
+    pub vertex: [i16; 3],
     pub rotations: Vec<[i16; 3]>,
 }
 
@@ -133,6 +143,12 @@ pub struct Emd {
     /// enemy models it carries the player's hit/bite/grab reaction clips; the
     /// player models ship no second bank and parse an empty list.
     pub damage_clips: Vec<Clip>,
+    /// The keyframes the [`Emd::damage_clips`] frames index: the original's
+    /// `emdScratchPtr1` points at the EMD file base, whose own EMR-style header
+    /// describes a keyframe table that ends where the damage clip table
+    /// begins. This is NOT the model's main [`Emd::keyframes`] table: the
+    /// damage clips' frame indices only resolve against this one.
+    pub damage_keyframes: Vec<Keyframe>,
     pub mesh: Tmd,
     pub texture: Texture8,
 }

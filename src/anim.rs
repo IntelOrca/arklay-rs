@@ -633,6 +633,9 @@ pub fn blend_keyframes(
     };
     model::Keyframe {
         offset: [target.offset[0], root_y as i16, target.offset[2]],
+        // The original never blends the root-motion vertex: the extract reads
+        // the raw frame. Carry the target's so a blended pose round-trips.
+        vertex: target.vertex,
         rotations,
     }
 }
@@ -801,6 +804,7 @@ mod tests {
             children: vec![vec![1], vec![]],
         };
         let keyframe = Keyframe {
+            vertex: [0, 0, 0],
             offset: [10, 0, 0],
             rotations: vec![[0, 0, 0]; 2],
         };
@@ -826,6 +830,7 @@ mod tests {
             children: vec![vec![9, 1], vec![255], vec![]],
         };
         let keyframe = Keyframe {
+            vertex: [0, 0, 0],
             offset: [100, 0, 0],
             rotations: Vec::new(),
         };
@@ -937,10 +942,12 @@ mod tests {
     #[test]
     fn blend_keyframes_interpolates_each_step_and_the_root_y() {
         let current = Keyframe {
+            vertex: [0, 0, 0],
             offset: [10, 100, 20],
             rotations: vec![[0, 0, 0]],
         };
         let target = Keyframe {
+            vertex: [0, 0, 0],
             offset: [50, 200, 60],
             rotations: vec![[0x400, 0, 0]],
         };
@@ -967,10 +974,12 @@ mod tests {
         // the current angle shifts by a full turn and the weighted sum lands
         // on 0xF80 instead of 0x480.
         let current = Keyframe {
+            vertex: [0, 0, 0],
             offset: [0; 3],
             rotations: vec![[0x0F00, 0, 0]],
         };
         let target = Keyframe {
+            vertex: [0, 0, 0],
             offset: [0; 3],
             rotations: vec![[0x0100, 0, 0]],
         };
@@ -989,6 +998,7 @@ mod tests {
         let clips = vec![timing_clip(&[1, 1, 1, 1, 1])];
         let keyframes: Vec<Keyframe> = (0..5)
             .map(|index| Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 0, 0],
                 rotations: vec![[(index as i16) * 0x100, 0, 0]],
             })
@@ -1041,10 +1051,12 @@ mod tests {
             ],
         }];
         let keyframes_a = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 200, 0],
             rotations: vec![[0x300, 0, 0]],
         }];
         let keyframes_b = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0], [0x100, 0, 0]],
         }];
@@ -1093,6 +1105,7 @@ mod tests {
         let keyframes = vec![
             Keyframe::default(),
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 100, 0],
                 rotations: vec![[0x200, 0, 0]],
             },

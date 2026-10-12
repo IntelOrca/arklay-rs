@@ -48,10 +48,17 @@ pub fn parse(data: &[u8]) -> Result<Emd> {
     // points `emdScratchPtr2` at (`(dir[0] & ~3) + file base`, bounded by the
     // EMR chunk). A zero offset leaves the player's pointers untouched.
     let damage_offset = directory[0] & !3;
-    let damage_clips = if damage_offset != 0 && damage_offset < emr_offset {
-        parse_clips(data, damage_offset, emr_offset)?
+    let (damage_clips, damage_keyframes) = if damage_offset != 0 && damage_offset < emr_offset {
+        // `emdScratchPtr1` is the file base, and `Joint_move` reads its
+        // EMR-style header from there: the damage keyframe table starts at the
+        // base's own keyframe offset and ends where the damage clip table
+        // begins. The main EMR table is unrelated and must not be used.
+        (
+            parse_clips(data, damage_offset, emr_offset)?,
+            parse_keyframes(data, 0, damage_offset)?,
+        )
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     let mesh = tmd::parse(
         data.get(tmd_offset..)
@@ -67,6 +74,7 @@ pub fn parse(data: &[u8]) -> Result<Emd> {
         keyframes,
         clips,
         damage_clips,
+        damage_keyframes,
         mesh,
         texture,
     })
@@ -234,6 +242,13 @@ fn parse_keyframes(data: &[u8], emr_offset: usize, emr_end: usize) -> Result<Vec
     for index in 0..count {
         let base = start + index * frame_stride;
         let offset = chunk_slice(data, base, ANGLE_LEN, emr_end, "EMR keyframe offset")?;
+        let vertex = chunk_slice(
+            data,
+            base + ANGLE_LEN,
+            ANGLE_LEN,
+            emr_end,
+            "EMR keyframe vertex",
+        )?;
         let angles = chunk_slice(
             data,
             base + KEYFRAME_HEADER_LEN,
@@ -243,6 +258,7 @@ fn parse_keyframes(data: &[u8], emr_offset: usize, emr_end: usize) -> Result<Vec
         )?;
         keyframes.push(Keyframe {
             offset: vec3(offset),
+            vertex: vec3(vertex),
             rotations: angles
                 .as_chunks::<ANGLE_LEN>()
                 .0
@@ -456,7 +472,9 @@ mod tests {
         data[0x30..0x32].copy_from_slice(&1i16.to_le_bytes());
         data[0x32..0x34].copy_from_slice(&8i16.to_le_bytes());
         data[0x38] = 1;
-        for (slot, value) in [7i16, 8, 9, 0, 0, 0, 10, 11, 12, 13, 14, 15]
+        // Keyframe 0: root translation 7/8/9, root-motion vertex 4/5/6, then
+        // two joints' rotations.
+        for (slot, value) in [7i16, 8, 9, 4, 5, 6, 10, 11, 12, 13, 14, 15]
             .iter()
             .enumerate()
         {
@@ -527,6 +545,7 @@ mod tests {
         assert_eq!(emd.skeleton.children, [vec![1], vec![]]);
         assert_eq!(emd.keyframes.len(), 1);
         assert_eq!(emd.keyframes[0].offset, [7, 8, 9]);
+        assert_eq!(emd.keyframes[0].vertex, [4, 5, 6]);
         assert_eq!(emd.keyframes[0].rotations, [[10, 11, 12], [13, 14, 15]]);
         assert_eq!(emd.clips.len(), 1);
         assert_eq!(
@@ -547,13 +566,18 @@ mod tests {
             emd.damage_clips.is_empty(),
             "a zero directory[0] has no damage bank"
         );
+        assert!(
+            emd.damage_keyframes.is_empty(),
+            "a zero directory[0] has no reaction keyframes"
+        );
     }
 
     #[test]
     fn parses_the_emd_damage_bank() {
-        // The directory's first chunk sits before the EMR header and carries
-        // the player's reaction clips; a non-zero offset selects it.
-        let mut data = vec![0u8; 0x10];
+        // The file base carries the reaction keyframe table under its own
+        // EMR-style header; the directory's first chunk is the clip table that
+        // follows it. A non-zero offset selects both.
+        let mut data = minimal_emr();
         let damage_offset = data.len();
         data.extend_from_slice(&minimal_edd());
         let emr_offset = data.len();
@@ -584,6 +608,17 @@ mod tests {
                 timing: 7
             }]
         );
+        assert_eq!(
+            emd.damage_keyframes.len(),
+            1,
+            "the file-base header describes the reaction keyframes"
+        );
+        assert_eq!(emd.damage_keyframes[0].offset, [7, 8, 9]);
+        assert_eq!(emd.damage_keyframes[0].vertex, [4, 5, 6]);
+        assert_eq!(
+            emd.damage_keyframes[0].rotations,
+            [[10, 11, 12], [13, 14, 15]]
+        );
         assert_eq!(emd.clips.len(), 1, "the main bank is still parsed");
     }
 
@@ -596,6 +631,7 @@ mod tests {
         assert_eq!(emw.skeleton.relative, [[1, 2, 3], [4, 5, 6]]);
         assert_eq!(emw.keyframes.len(), 1);
         assert_eq!(emw.keyframes[0].offset, [7, 8, 9]);
+        assert_eq!(emw.keyframes[0].vertex, [4, 5, 6]);
         assert_eq!(emw.clips.len(), 1);
         assert_eq!(
             emw.clips[0].frames,
@@ -787,6 +823,22 @@ mod tests {
             let data = std::fs::read(&path).unwrap();
             let emd = parse(&data).unwrap();
             assert_eq!(emd.damage_clips.len(), clips, "{name}: damage clip count");
+            assert!(
+                !emd.damage_keyframes.is_empty(),
+                "{name}: the file-base reaction keyframes are parsed"
+            );
+            // The damage clips index the file-base table, not the model's main
+            // keyframes; an out-of-range index was the wrong-table bug.
+            for (index, clip) in emd.damage_clips.iter().enumerate() {
+                for frame in &clip.frames {
+                    assert!(
+                        usize::from(frame.keyframe) < emd.damage_keyframes.len(),
+                        "{name}: damage clip {index} keyframe {} is outside the {} entry reaction table",
+                        frame.keyframe,
+                        emd.damage_keyframes.len()
+                    );
+                }
+            }
             assert!(
                 !emd.clips.is_empty(),
                 "{name}: the main bank is still parsed"

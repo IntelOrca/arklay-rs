@@ -5486,6 +5486,7 @@ end
             children: (1..15).map(|index| vec![index as u8]).collect(),
         }));
         game.entity_anims[1].keyframes = Some(Arc::new(vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [100, -200, 300],
             rotations: vec![[0, 0, 0]; 15],
         }]));
@@ -6373,6 +6374,7 @@ end
             })
             .collect();
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0], [0, 0, 0]],
         }];
@@ -6454,6 +6456,7 @@ end
             })
             .collect();
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 10],
         }];
@@ -7657,6 +7660,7 @@ end
         let mut game = wasp_game(0);
         game.id.player_flag = 1;
         game.entity_anims[1].keyframes = Some(std::sync::Arc::new(vec![crate::model::Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 10],
         }]));
@@ -8044,6 +8048,7 @@ end
             })
             .collect();
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 13],
         }];
@@ -9989,6 +9994,7 @@ mod spider_tests {
             })
             .collect();
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 20],
         }];
@@ -13202,6 +13208,7 @@ mod hunter_tests {
     fn identity_pose(game: &mut GameState, slot: usize) {
         use std::sync::Arc;
         let keyframes = vec![crate::model::Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 32],
         }];
@@ -15988,6 +15995,7 @@ mod computer_arms_tests {
             let skeleton = Skeleton { relative, children };
             let keyframes: Vec<Keyframe> = (0..4)
                 .map(|index| Keyframe {
+                    vertex: [0, 0, 0],
                     offset: [0, -1700, 0],
                     rotations: vec![[0, (index as i16) * 0x40, 0]; 15],
                 })
@@ -16442,6 +16450,7 @@ mod computer_arms_tests {
             let skeleton = Skeleton { relative, children };
             let keyframes: Vec<Keyframe> = (0..4)
                 .map(|_| Keyframe {
+                    vertex: [0, 0, 0],
                     offset: [0, -1000, 0],
                     rotations: vec![[0, 0, 0]; 15],
                 })

@@ -269,10 +269,12 @@ impl EntityAnim {
         };
         let frame = clip.frames.get(index)?;
         let keyframe = keyframes.get(usize::from(frame.keyframe))?;
+        // Bytes +6/+8/+10 of the frame header, not the root joint translation
+        // at +0/+2/+4 (`entity_extract_anim_vertex`).
         Some(crate::player::rotate_xz(
             entity.angle,
-            i32::from(keyframe.offset[0]),
-            i32::from(keyframe.offset[2]),
+            i32::from(keyframe.vertex[0]),
+            i32::from(keyframe.vertex[2]),
         ))
     }
 
@@ -607,6 +609,7 @@ mod tests {
 
         let clips = vec![clip(&[(0, 1)])];
         let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [10, 0, 0],
             rotations: vec![[0, 0, 0], [0, 0, 0]],
         }];
@@ -651,18 +654,22 @@ mod tests {
         let clips = vec![clip(&[(0, 1), (1, 1), (2, 1), (3, 1)])];
         let keyframes = vec![
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 100, 0],
                 rotations: vec![[0, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 300, 0],
                 rotations: vec![[0x400, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 500, 0],
                 rotations: vec![[0x800, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 700, 0],
                 rotations: vec![[0xC00, 0, 0]],
             },
@@ -693,10 +700,12 @@ mod tests {
         let clips = vec![clip(&[(0, 1)]), clip(&[(1, 1), (1, 1)])];
         let keyframes = vec![
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 0, 0],
                 rotations: vec![[0, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 800, 0],
                 rotations: vec![[0x400, 0, 0]],
             },
@@ -731,18 +740,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_anim_vertex_reads_the_frame_and_offsets() {
+    fn apply_anim_vertex_reads_the_frame_vertex_not_the_joint_offset() {
         use crate::model::{Keyframe, Skeleton};
         use std::sync::Arc;
 
+        // The pose translation and the root-motion vertex are distinct fields;
+        // the extract reads the vertex at bytes +6/+8/+10, so the offsets here
+        // must be ignored.
         let clips = vec![clip(&[(0, 1), (1, 3)])];
         let keyframes = vec![
             Keyframe {
                 offset: [10, 0, 20],
+                vertex: [1, 0, 2],
                 rotations: vec![[0, 0, 0]],
             },
             Keyframe {
                 offset: [30, 0, 40],
+                vertex: [3, 0, 4],
                 rotations: vec![[0, 0, 0]],
             },
         ];
@@ -760,14 +774,14 @@ mod tests {
         // A spent hold reads the pending frame, the one the same tick's
         // advance is about to apply.
         clock.apply_anim_vertex(&mut wasp, &clips);
-        let (x, z) = crate::player::rotate_xz(0x400, 10, 20);
+        let (x, z) = crate::player::rotate_xz(0x400, 1, 2);
         assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z], "X/Z only");
 
         // A running hold reads the frame just shown.
         wasp.timing_control = 2;
         wasp.pos = [0, 7, 0];
         clock.apply_anim_vertex(&mut wasp, &clips);
-        let (x, z) = crate::player::rotate_xz(0x400, 30, 40);
+        let (x, z) = crate::player::rotate_xz(0x400, 3, 4);
         assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z]);
 
         // The step-back wraps from pending frame 0 to the clip's last frame.
@@ -781,7 +795,7 @@ mod tests {
         wasp.timing_control = 0;
         wasp.pos = [0, 7, 0];
         clock.apply_anim_vertex(&mut wasp, &clips);
-        let (x, z) = crate::player::rotate_xz(0x400, 30, 40);
+        let (x, z) = crate::player::rotate_xz(0x400, 3, 4);
         assert_eq!(wasp.pos, [100 + x, 7, 0x32 + z]);
 
         // The base offsets zero-extend through their 16-bit fields, like the
@@ -791,7 +805,7 @@ mod tests {
         wrapped.unk_c8 = 0;
         wrapped.angle = 0;
         clock.apply_anim_vertex(&mut wrapped, &clips);
-        let (x, _) = crate::player::rotate_xz(0, 10, 20);
+        let (x, _) = crate::player::rotate_xz(0, 1, 2);
         assert_eq!(wrapped.pos[0], 0xFFCE + x, "the u16 base zero-extends");
 
         // No keyframe table or an out-of-range frame changes nothing.

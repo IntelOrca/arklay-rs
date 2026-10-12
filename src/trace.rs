@@ -135,6 +135,15 @@ impl TraceWriter {
             if slot > 0 && !entity.active() {
                 continue;
             }
+            // The reference reads one byte at 0x8A: `isBeingAttackedFlag` for
+            // the player and `hit_state` for every other entity. The port
+            // keeps the player's flag in its own field, so slot 0 emits that
+            // one.
+            let hit = if slot == 0 {
+                entity.is_being_attacked
+            } else {
+                entity.hit_state
+            };
             write!(
                 self.out,
                 " e={},{},{},{},{},{},{},{},{},{},{},{},{}",
@@ -148,7 +157,7 @@ impl TraceWriter {
                 entity.action_behavior,
                 entity.action_state,
                 entity.health,
-                entity.hit_state,
+                hit,
                 entity.status_flags,
                 entity.action_ticks_counter
             )?;

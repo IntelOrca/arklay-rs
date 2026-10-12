@@ -52,21 +52,22 @@ Fields, in this exact order, separated by single spaces:
   where `slot` (u8), `id` (u8), x/y/z i32, angle is the 12-bit yaw
   (`& 0x0FFF`), `state` u8 (the reference's `state` byte / the port's state low
   byte), `beh` `action_behavior`, `as` `action_state`, `hp` i16, `hit`
-  `hit_state` u8, `status` `status_flags` u8, `ticks`
-  `action_ticks_counter` u16.
+  `hit_state` u8 — except slot 0, which emits the player's
+  `is_being_attacked` flag: the reference reads one byte at 0x8A named
+  `isBeingAttackedFlag` on the player struct and `hit_state` on every other
+  entity, and the port keeps the player's flag in its own field — `status`
+  `status_flags` u8, `ticks` `action_ticks_counter` u16.
 - `f` — u32 FNV-1a hash of the rendered frame (see below).
 
 ### Entity position and tick sources
 
-- Slot 0 (the player) emits `g_playerEntity.position` in the reference. Every
-  tick of `update_player_anim` syncs it from the player's matrix translation,
-  so it is the live position and equals arklay's `game.entities[0].pos`.
-- Slots `i >= 1` emit the entity's live matrix translation
-  (`scaMatrixData.localMatrix.t`) in the reference. The `position` field of a
-  character NPC is never synced by `character_npc_update` (the intro's Wesker
-  and Jill walk in the matrix while `position` stays at the spawn point), so
-  the matrix is the field comparable to arklay's `Entity::pos`. Monsters that
-  do sync `position` have identical values in both fields.
+- Every slot emits the entity's live matrix translation
+  (`scaMatrixData.localMatrix.t`) in the reference, the field comparable to
+  arklay's `Entity::pos`. The `position` field is not a per-tick mirror: it is
+  only synced by the player init and some walk handlers, so a grabbed/bitten
+  player and a scripted character NPC (the intro's Wesker and Jill walk in the
+  matrix) keep a stale value there. Both `p=` and `e=0` emit the matrix for
+  slot 0.
 - `ticks` is the reference's `g_playerEntity` / `Entity` +0xC4
   (`attackDirection` / `action_ticks_counter`). arklay emits its
   `entities[0].action_ticks_counter`, which the engine keeps in step with the
@@ -117,3 +118,21 @@ Tick 0 is the first gameplay tick after the new-game room (106) is live and
 the room transition has completed. Both engines normalise the platform PRNG
 to `re1_srand(1)` before the room runs. Any constant tick offset between the
 two traces is a hook bug, not a comparator feature.
+
+### Room anchor
+
+A room-specific scenario boots the same new-game flow directly into another
+room instead of 106:
+
+- arklay: `--ui game --room <3hex> --player <n> --ticks N --trace ark.trace`
+  (the session flow: boot narration, room-entry fade, camera and idle
+  mirroring).
+- reference: `--test-newgame <0|1> --test-room <3hex> --test-trace
+  ref.trace --test-exit-after N --test-nolimit` (test-only hooks that apply
+  the room override before `init_room` and spawn the player at the room's
+  first walk zone centre).
+
+Both place the player at that centre with the new game's health and run the
+room-entry fade; tick 0 is the first gameplay tick of the requested room.
+The reference window must be 320x240 (`config.ini [Display] Width/Height`) so
+the capture frames and hashes match arklay's logical size.

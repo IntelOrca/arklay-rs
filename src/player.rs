@@ -1715,6 +1715,11 @@ pub(crate) struct CollisionResolution {
     pub floor_step: i16,
     /// The original's `g_playerPosScratch` after the resolve.
     pub scratch: [i32; 3],
+    /// The last push's axis: `Some(true)` when the correction moved the
+    /// entity along Z (the original sets `status_flags` bit 4), `Some(false)`
+    /// along X (the bit is cleared), `None` when nothing pushed or only a
+    /// rollback ran (the bit is left alone).
+    pub push_z: Option<bool>,
 }
 
 /// The two-pass resolve with the scratch snapshot [`CollisionResolution`]
@@ -1730,6 +1735,7 @@ pub(crate) fn resolve_collision_full(
     let mut pos = proposed;
     let mut hit = 0u16;
     let mut floor_step = 0i16;
+    let mut push_z = None;
 
     for rect in records {
         if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
@@ -1740,10 +1746,13 @@ pub(crate) fn resolve_collision_full(
             continue;
         }
         if let Some(shape) = classify(proposed[0], proposed[2], rect, radius) {
-            match shape {
+            let axis = match shape {
                 1 | 5 => push_rect(rect, prev, &mut pos, radius),
                 3 => push_circle(rect, &mut pos, radius),
-                _ => {}
+                _ => None,
+            };
+            if axis.is_some() {
+                push_z = axis;
             }
             hit |= (rect.flags & 0x300) >> 8;
         }
@@ -1755,6 +1764,7 @@ pub(crate) fn resolve_collision_full(
             code: accept_code(floor_step, 0),
             floor_step,
             scratch: proposed,
+            push_z,
         };
     }
 
@@ -1784,6 +1794,7 @@ pub(crate) fn resolve_collision_full(
             code: accept_code(floor_step, 0),
             floor_step,
             scratch,
+            push_z,
         };
     }
     if still_hit == 0 {
@@ -1792,6 +1803,7 @@ pub(crate) fn resolve_collision_full(
             code: accept_code(floor_step, 1),
             floor_step,
             scratch,
+            push_z,
         };
     }
     CollisionResolution {
@@ -1799,6 +1811,7 @@ pub(crate) fn resolve_collision_full(
         code: accept_code(floor_step, 2),
         floor_step,
         scratch,
+        push_z,
     }
 }
 
@@ -2086,17 +2099,31 @@ fn rect_push(rect: &CollisionRect, prev: [i32; 3], pos: &[i32; 3], radius: i32) 
 }
 
 /// Shapes 1 and 5: push the entity out of a rectangular obstacle.
-fn push_rect(rect: &CollisionRect, prev: [i32; 3], pos: &mut [i32; 3], radius: i32) {
+fn push_rect(
+    rect: &CollisionRect,
+    prev: [i32; 3],
+    pos: &mut [i32; 3],
+    radius: i32,
+) -> Option<bool> {
     let (push_x, push_z, selector) = rect_push(rect, prev, pos, radius);
 
     match selector {
         0 => {
+            // The original rolls the whole move back without touching the
+            // status bit.
             pos[0] = prev[0];
             pos[2] = prev[2];
+            None
         }
-        1 if push_within_limit(push_x) => pos[0] += i32::from(push_x),
-        2 if push_within_limit(push_z) => pos[2] += i32::from(push_z),
-        _ => push_shallow(push_x, push_z, pos),
+        1 if push_within_limit(push_x) => {
+            pos[0] += i32::from(push_x);
+            Some(false)
+        }
+        2 if push_within_limit(push_z) => {
+            pos[2] += i32::from(push_z);
+            Some(true)
+        }
+        _ => Some(push_shallow(push_x, push_z, pos)),
     }
 }
 
@@ -2177,10 +2204,20 @@ fn circle_push_delta(rect: &CollisionRect, x: i32, z: i32, radius: i32) -> (i32,
 
 /// Shapes 3: push the entity out of a circular obstacle whose radius is the
 /// record's X half-width plus the entity radius, centred on the box centre.
-fn push_circle(rect: &CollisionRect, pos: &mut [i32; 3], radius: i32) {
-    let (dx, dz) = circle_push_delta(rect, pos[0], pos[2], radius);
-    pos[2] += dz;
-    pos[0] += dx;
+fn push_circle(rect: &CollisionRect, pos: &mut [i32; 3], radius: i32) -> Option<bool> {
+    let (penetration, dx, dz, dist) = circle_overlap(rect, pos[0], pos[2], radius)?;
+    if dist == 0 {
+        // Dead centre: the original pushes along +x and clears the bit.
+        pos[0] += penetration;
+        return Some(false);
+    }
+    let push_x = penetration.wrapping_mul(dx) / dist;
+    let push_z = penetration.wrapping_mul(dz) / dist;
+    pos[2] += push_z;
+    pos[0] += push_x;
+    // The original's axis choice uses the integer-divided corrections, so a
+    // sub-unit overlap that truncates both to zero still clears the bit.
+    Some(push_x.abs() < push_z.abs())
 }
 
 /// The original's `SquareRoot0`: integer square root, zero for non-positive.
@@ -2198,11 +2235,15 @@ fn push_within_limit(push: i16) -> bool {
 }
 
 /// Ambiguous push: move out along whichever axis needs the smaller correction.
-fn push_shallow(push_x: i16, push_z: i16, pos: &mut [i32; 3]) {
+/// The returned axis is `true` for a Z correction (the original sets the status
+/// bit) and `false` for X.
+fn push_shallow(push_x: i16, push_z: i16, pos: &mut [i32; 3]) -> bool {
     if i32::from(push_z).abs() > i32::from(push_x).abs() {
         pos[0] += i32::from(push_x);
+        false
     } else {
         pos[2] += i32::from(push_z);
+        true
     }
 }
 
@@ -2312,14 +2353,17 @@ mod tests {
         }
         let keyframes = vec![
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 0, 0],
                 rotations: vec![[0, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 200, 0],
                 rotations: vec![[0x200, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 400, 0],
                 rotations: vec![[0x400, 0, 0]],
             },

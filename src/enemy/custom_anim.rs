@@ -938,6 +938,7 @@ mod tests {
         rotations
             .iter()
             .map(|&rotation| Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, rotation, 0],
                 rotations: vec![[rotation, 0, 0]],
             })
@@ -1068,10 +1069,12 @@ mod tests {
         // last step's fixup leaves the source alone.
         let keyframes = vec![
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 0, 0],
                 rotations: vec![[0x700, 0, 0]],
             },
             Keyframe {
+                vertex: [0, 0, 0],
                 offset: [0, 0, 0],
                 rotations: vec![[0x900, 0, 0]],
             },
@@ -1153,6 +1156,7 @@ mod tests {
 
     fn yawn_keyframe(yaw: i16, roll: i16) -> Keyframe {
         Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, -1000, 0],
             rotations: vec![[0, yaw, roll]; YAWN_JOINTS],
         }
@@ -1371,6 +1375,7 @@ mod tests {
         }
         let skeleton = Skeleton { relative, children };
         let keyframe = Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 15],
         };

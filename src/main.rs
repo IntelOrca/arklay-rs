@@ -29,13 +29,10 @@ struct Cli {
 
     /// UI screen to boot straight into instead of a room:
     /// `title`, `select`, `game`, `menu`, `box`, `file`, `map`, `view`, `save`,
-    /// `load`, `death` or `font`
-    #[arg(
-        long,
-        value_name = "SCREEN",
-        requires = "pack",
-        conflicts_with = "room"
-    )]
+    /// `load`, `death` or `font`. `--ui game` also accepts `--room` to boot the
+    /// new game straight into that room through the session flow (the oracle
+    /// anchor for room-specific differentials)
+    #[arg(long, value_name = "SCREEN", requires = "pack")]
     ui: Option<String>,
 
     /// Directory holding `savedat*.dat` (default: `saves/` beside the pack)
@@ -573,12 +570,24 @@ fn main() -> Result<()> {
                 );
             }
             if let Some(screen) = cli.ui {
+                // `--ui game --room <id>` boots the new game straight into the
+                // room through the session flow, the anchor the reference's
+                // test-only room boot mirrors.
+                let room = cli
+                    .room
+                    .as_deref()
+                    .map(|room| arklay::state::RoomId::from_room_and_player(room, cli.player))
+                    .transpose()?;
+                if room.is_some() && screen != "game" {
+                    bail!("--room with --ui is only supported for `--ui game`");
+                }
                 return arklay::engine::run_ui_with_mods(
                     &pack,
                     &screen,
                     cli.capture.as_deref(),
                     &save_dir,
                     cli.character,
+                    room,
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,

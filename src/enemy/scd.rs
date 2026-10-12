@@ -1430,6 +1430,7 @@ mod tests {
             children: (1..15).map(|index| vec![index as u8]).collect(),
         }));
         game.entity_anims[1].keyframes = Some(Arc::new(vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [100, -200, 300],
             rotations: vec![[0, 0, 0]; 15],
         }]));

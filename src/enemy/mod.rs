@@ -239,22 +239,18 @@ impl EntityModelCache {
 /// the original's `LoadEntityEMD` store at `EntityModelLoader.cpp:555-558`.
 /// The last model with a second bank wins; a model without one leaves the
 /// pair untouched, exactly like the original's `if (*puVar2 != 0)` guard.
-pub(crate) fn note_player_damage_bank(
-    game: &mut GameState,
-    model: Option<&Emd>,
-    keyframes: Option<Arc<Vec<Keyframe>>>,
-) {
+///
+/// The reaction clips index the file-base keyframe table the EMD's own header
+/// describes ([`Emd::damage_keyframes`]), never the model's main keyframes.
+pub(crate) fn note_player_damage_bank(game: &mut GameState, model: Option<&Emd>) {
     let Some(model) = model else {
-        return;
-    };
-    let Some(keyframes) = keyframes else {
         return;
     };
     if model.damage_clips.is_empty() {
         return;
     }
     game.player_damage = Some(Arc::new(crate::game::PlayerDamageBank {
-        keyframes,
+        keyframes: Arc::new(model.damage_keyframes.clone()),
         clips: Arc::new(model.damage_clips.clone()),
     }));
 }
@@ -287,8 +283,8 @@ pub fn update_all(
             let model = models.get(pack, id, player);
             if let Some(keyframes) = models.keyframes(pack, id, player) {
                 game.entity_anims[slot].keyframes = Some(Arc::clone(&keyframes));
-                note_player_damage_bank(game, model.as_deref(), Some(keyframes));
             }
+            note_player_damage_bank(game, model.as_deref());
             if let Some(skeleton) = models.skeleton(pack, id, player) {
                 game.entity_anims[slot].skeleton = Some(skeleton);
             }
@@ -455,6 +451,11 @@ mod tests {
             keyframes: vec![Keyframe::default()],
             clips: Vec::new(),
             damage_clips: vec![Clip::default(); clips],
+            damage_keyframes: vec![Keyframe {
+                vertex: [0, 0, 0],
+                offset: [1, 2, 3],
+                rotations: Vec::new(),
+            }],
             mesh: crate::model::Tmd::default(),
             texture: crate::model::Texture8 {
                 width: 0,
@@ -471,18 +472,23 @@ mod tests {
     #[test]
     fn a_model_with_a_damage_bank_repoints_the_player_pair() {
         let mut game = GameState::default();
-        let keyframes = Arc::new(vec![Keyframe::default()]);
-        note_player_damage_bank(
-            &mut game,
-            Some(&model_with_damage(2)),
-            Some(Arc::clone(&keyframes)),
-        );
+        let model = model_with_damage(2);
+        note_player_damage_bank(&mut game, Some(&model));
         let bank = game.player_damage.as_ref().expect("the bank is set");
         assert_eq!(bank.clips.len(), 2);
-        assert!(Arc::ptr_eq(&bank.keyframes, &keyframes));
+        assert_eq!(
+            bank.keyframes.as_slice(),
+            model.damage_keyframes.as_slice(),
+            "the reaction clips index the file-base keyframe table, not the main one"
+        );
+        assert_ne!(
+            bank.keyframes.as_slice(),
+            model.keyframes.as_slice(),
+            "a model whose tables coincide cannot prove the selection"
+        );
 
         let plain = model_with_damage(0);
-        note_player_damage_bank(&mut game, Some(&plain), Some(keyframes));
+        note_player_damage_bank(&mut game, Some(&plain));
         assert_eq!(
             game.player_damage.as_ref().unwrap().clips.len(),
             2,

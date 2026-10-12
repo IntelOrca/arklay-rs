@@ -2346,6 +2346,7 @@ mod tests {
             children: (1..15).map(|index| vec![index as u8]).collect(),
         };
         let keyframe = Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, root_y, 0],
             rotations: vec![[0, 0, 0]; 15],
         };

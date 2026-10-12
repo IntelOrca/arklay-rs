@@ -292,6 +292,10 @@ pub fn run_with_options(
         let mut loaded = load_room(&pack, id)?;
         let mut game = new_game_state(&pack, id, &loaded.room);
         seed_room_items(&mut game);
+        // The arbitrary-room boot seeds the selected character's start block
+        // like the interactive `from_room` path, so a headless run starts with
+        // a live character rather than a zeroed one.
+        seed_start_health(&mut game, id.player_flag);
         let mut player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         run_room_init(&mut loaded, &mut game);
@@ -1076,6 +1080,22 @@ impl GameSession {
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
+    /// A new game as `id.player_flag` that boots straight into `id` instead
+    /// of the card's start room: the new-game items, flags and start health,
+    /// with the player at the room's first walk zone centre (the reference's
+    /// test-only room boot and the port's arbitrary-room spawn). The oracle
+    /// trace path uses this so the boot narration, room-entry fade and idle
+    /// mirroring all run exactly like the session's `--ui game` flow.
+    fn new_in_room(pack: &Pack, id: RoomId, character: u8, save_dir: &Path) -> Result<Self> {
+        let character = character & 1;
+        let loaded = load_room(pack, id)?;
+        let mut game = new_game_state(pack, id, &loaded.room);
+        seed_new_game(pack, &mut game, character);
+        let player_state = player::spawn(id, &loaded.room);
+        game.sync_entity_from_player(&player_state);
+        Self::from_loaded(pack, loaded, game, player_state, save_dir)
+    }
+
     /// Boot `id` directly, the `--room` path. A direct boot is a fresh game
     /// state, so the shipped room-items bank and the selected character's
     /// start health are seeded like a new game's, and the player is placed at
@@ -1303,19 +1323,22 @@ impl GameSession {
                 self.room_boot_grace = false;
                 // The inner-loop state machine restores the saved word the
                 // tick the entry fade's accumulator drops below 1. The port
-                // only mirrors the player-state bit here (its other message
-                // bits have their own consumers); the reference's word is
-                // `g_short_message_flags | 0x200` = 0xFFFF.
-                self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
+                // mirrors the player-state and monster bits here (its other
+                // message bits have their own consumers); the reference's word
+                // is `g_short_message_flags | 0x200` = 0xFF3F.
+                self.game.message_flags |=
+                    game::MESSAGE_FLAG_PLAYER_STATE | game::MESSAGE_FLAG_MONSTERS;
             }
         } else {
             // While the entry fade runs the reference's `g_message_flags` is
-            // cleared, which freezes the whole player animation state machine:
-            // the post-door idle countdown must not start until the gate opens.
-            // The clearing starts the tick AFTER the entry, so the spawn init
-            // (player state 0 to 1) still runs under the closed gate.
+            // cleared, which freezes the whole player animation state machine
+            // and the monsters: the post-door idle countdown must not start
+            // and no zombie may think until the gate opens. The clearing
+            // starts the tick AFTER the entry, so the spawn init (player state
+            // 0 to 1) still runs under the closed gate.
             if !self.room_boot_grace {
-                self.game.message_flags &= !game::MESSAGE_FLAG_PLAYER_STATE;
+                self.game.message_flags &=
+                    !(game::MESSAGE_FLAG_PLAYER_STATE | game::MESSAGE_FLAG_MONSTERS);
             }
             self.room_boot_grace = false;
         }
@@ -3609,8 +3632,10 @@ pub enum AppBoot {
     SaveLoad,
     /// The typewriter save screen over the deterministic capture room.
     Save,
-    /// A new game as the character (`0` Chris, `1` Jill).
-    NewGame(u8),
+    /// A new game as the character (`0` Chris, `1` Jill), optionally booting
+    /// straight into `room` instead of the card's start room (the new-game
+    /// semantics, the room's first walk zone centre as the spawn).
+    NewGame { character: u8, room: Option<RoomId> },
     /// The pause menu over the deterministic capture room.
     Menu,
     /// The item box over the deterministic capture room.
@@ -3939,8 +3964,13 @@ impl App {
             AppBoot::CharSelect => self.open_select(),
             AppBoot::SaveLoad => self.open_load(),
             AppBoot::Save => self.open_save_capture(),
-            AppBoot::NewGame(character) => {
-                let session = GameSession::new(&self.pack, character, &self.save_dir)?;
+            AppBoot::NewGame { character, room } => {
+                let session = match room {
+                    Some(id) => {
+                        GameSession::new_in_room(&self.pack, id, character, &self.save_dir)?
+                    }
+                    None => GameSession::new(&self.pack, character, &self.save_dir)?,
+                };
                 self.start_session(session);
                 Ok(())
             }
@@ -4437,6 +4467,7 @@ pub fn run_ui_with_options(
         capture,
         save_dir,
         character,
+        None,
         &[],
         false,
         false,
@@ -4456,6 +4487,7 @@ pub fn run_ui_with_mods(
     capture: Option<&Path>,
     save_dir: &Path,
     character: u8,
+    room: Option<RoomId>,
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
@@ -4467,7 +4499,10 @@ pub fn run_ui_with_mods(
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
         "save" => AppBoot::Save,
-        "game" => AppBoot::NewGame(character & 1),
+        "game" => AppBoot::NewGame {
+            character: room.map_or(character & 1, |id| id.player_flag & 1),
+            room,
+        },
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
         "file" => AppBoot::File,
@@ -4558,8 +4593,11 @@ fn run_ui_impl(
                 app.open_save_capture()?;
                 app.settle(SAVE_CAPTURE_TICKS)?;
             }
-            AppBoot::NewGame(character) => {
-                let session = GameSession::new(&app.pack, character, &app.save_dir)?;
+            AppBoot::NewGame { character, room } => {
+                let session = match room {
+                    Some(id) => GameSession::new_in_room(&app.pack, id, character, &app.save_dir)?,
+                    None => GameSession::new(&app.pack, character, &app.save_dir)?,
+                };
                 app.start_session(session);
                 run_game_trace(&mut app, &trace)?;
             }
@@ -7214,6 +7252,19 @@ fn tick_room_timed(
     // become visible here, before the player's physics and before the
     // renderer reads the lighting.
     context.game.apply_room_edits(context.room);
+    // The original's `check_camera_switch(0)` runs after the scripts and
+    // BEFORE `update_entities`/`update_player_anim`, so it tests the position
+    // the scripts left rather than this tick's movement. That is what makes a
+    // cut change land one tick after the crossing frame, not on it.
+    context.game.sync_player(context.player);
+    let previous_cut = context.room.current_cut;
+    apply_camera(context.room, context.game, Some(context.player.pos));
+    if context.room.current_cut != previous_cut {
+        // The effects projected above under the pre-switch camera; recompute
+        // their stored screen/depth so the frame renders billboards against
+        // the camera it draws.
+        context.game.reproject_effects(context.room);
+    }
     // The entities think after the event scripts and before the player's
     // physics, exactly like the original's `update_entities`.
     context.game.tick_entities(
@@ -7309,11 +7360,7 @@ fn tick_room_timed(
                     .as_ref()
                     .map_or(empty_keyframes, |anim| anim.keyframes.as_slice()),
                 emd_skeleton: context.player_assets.map(|assets| &assets.emd.skeleton),
-                room_skeleton: context
-                    .room
-                    .room_anim
-                    .as_ref()
-                    .map(|anim| &anim.skeleton),
+                room_skeleton: context.room.room_anim.as_ref().map(|anim| &anim.skeleton),
             };
             player_script::update_banks(context.game, context.player, context.room, &banks);
         }
@@ -7449,21 +7496,23 @@ fn tick_room_timed(
     // all read the frame's final player state.
     context.game.tick_objects(context.room, context.player);
     context.game.apply_stair_state(context.player);
+    // A script that changed the camera id this frame (the desk's close-up, a
+    // cutscene cut) owns the render cut from this frame on: the original
+    // writes `g_roomCameraId` directly and the render reads it. The zone scan
+    // itself already ran before the player's movement; this only propagates a
+    // mid-tick script write.
+    if context.game.camera.current_cut < context.room.cuts.len()
+        && context.room.current_cut != context.game.camera.current_cut
+    {
+        context.room.current_cut = context.game.camera.current_cut;
+        context.game.reproject_effects(context.room);
+    }
     // The stair probe wrote `player.pos[1]`; mirror it onto entity 0 so the
     // renderer and the next script tick see the resolved height.
     context.game.sync_entity_from_player(context.player);
     // The climb's camera-scroll consumer is not ported; drop the queued
     // screen-effect rectangles each tick so the list cannot grow unbounded.
     context.player.take_screen_effects();
-    // The effects projected above under the pre-switch camera. If the zone
-    // scan moved the cut, recompute their stored screen/depth so the frame
-    // renders billboards against the camera it draws; without this the first
-    // frame after a switch shows the old projection.
-    let previous_cut = context.room.current_cut;
-    apply_camera(context.room, context.game, Some(context.player.pos));
-    if context.room.current_cut != previous_cut {
-        context.game.reproject_effects(context.room);
-    }
     context.game.transition.take()
 }
 
@@ -7814,9 +7863,7 @@ fn store_player_joint_worlds(
             &assets.emw.clips,
         ),
         player::ClipSource::Room => match &room.room_anim {
-            Some(anim) if !anim.clips.is_empty() => {
-                (&anim.skeleton, &anim.keyframes, &anim.clips)
-            }
+            Some(anim) if !anim.clips.is_empty() => (&anim.skeleton, &anim.keyframes, &anim.clips),
             _ => (
                 &assets.emd.skeleton,
                 &assets.emd.keyframes,
@@ -12246,7 +12293,11 @@ mod tests {
         let pack_path = new_game_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
         let mut app = App::new(pack, dir.0.join("saves"), false);
-        app.boot(AppBoot::NewGame(0)).unwrap();
+        app.boot(AppBoot::NewGame {
+            character: 0,
+            room: None,
+        })
+        .unwrap();
 
         let updates = std::rc::Rc::new(std::cell::Cell::new(0));
         let before = match &app.mode {
@@ -12961,6 +13012,7 @@ end
                 keyframes: keyframes.clone(),
                 clips: clip_bank(0x24),
                 damage_clips: Vec::new(),
+                damage_keyframes: Vec::new(),
                 mesh: Tmd::default(),
                 texture: Texture8 {
                     width: 0,
@@ -16778,6 +16830,7 @@ end
                 }],
             }],
             damage_clips: Vec::new(),
+            damage_keyframes: Vec::new(),
             mesh: Tmd {
                 objects: vec![crate::model::TmdObject {
                     vertices: vec![[0, 0, 0], [1000, 0, 0], [0, 1000, 0]],

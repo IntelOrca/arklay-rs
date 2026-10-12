@@ -48,6 +48,12 @@ cargo run -- re1.akpak --room 100 --player 0
 # Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font)
 cargo run -- re1.akpak
 
+# `--ui game` with `--room` boots the new game straight into that room through
+# the session flow (boot narration, entry fade, camera and idle mirroring), the
+# anchor the reference oracle's test-only room boot mirrors
+cargo run -- re1.akpak --ui game --room 101 --player 0 --ticks 600 \
+  --trace room101.trace
+
 # Headless capture (no display)
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
 # Run N fixed 30 Hz ticks before a room capture (deterministic, audio-free),

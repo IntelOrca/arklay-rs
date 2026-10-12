@@ -3148,7 +3148,9 @@ impl RoomLightsEdit {
 /// enemy model the model loader most recently loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlayerDamageBank {
-    /// The enemy model's EMR keyframe table, which the damage clips index.
+    /// The enemy model's file-base keyframe table (the EMD header at offset 0
+    /// describes it), which the damage clips index. The original's
+    /// `emdScratchPtr1` is the file base, not the model's main EMR.
     pub keyframes: std::sync::Arc<Vec<crate::model::Keyframe>>,
     /// The enemy model's second EDD chunk: the player's reaction clips.
     pub clips: std::sync::Arc<Vec<crate::model::Clip>>,

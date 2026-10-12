@@ -171,17 +171,31 @@ pub fn wasp_pathfind_track(entity: &mut Entity, path: u8) {
 pub fn check_room_collision(room: &RoomState, entity: &mut Entity) -> u8 {
     let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
     let radius = i32::from(entity.sca_radius);
-    let (pos, code, floor_step) = player::resolve_collision_code(
+    let resolution = player::resolve_collision_full(
         &room.collision,
         prev_pos,
         entity.pos,
         radius,
         entity.collision_flags,
     );
-    entity.pos = pos;
-    entity.saved_pos = Some(pos);
-    entity.floor_step = floor_step;
-    code
+    entity.pos = resolution.pos;
+    entity.saved_pos = Some(resolution.pos);
+    entity.floor_step = resolution.floor_step;
+    apply_push_axis(entity, resolution.push_z);
+    resolution.code
+}
+
+/// The room resolve's push-axis status bit (entity +0x00 bit 4): a correction
+/// along Z sets it, one along X clears it, and no push or a rollback leaves it
+/// alone - exactly the original's `status_flags |= 0x10` / `&= 0xef` in the
+/// collision push handlers. The state-9 walker reads it to pick its swerve
+/// direction.
+pub fn apply_push_axis(entity: &mut Entity, push_z: Option<bool>) {
+    match push_z {
+        Some(true) => entity.status_flags |= 0x10,
+        Some(false) => entity.status_flags &= !0x10,
+        None => {}
+    }
 }
 
 /// The hound's forward probe distance (the collision record's local X).
@@ -221,6 +235,7 @@ fn probe_room_collision(room: &RoomState, game: &mut GameState, slot: usize, rad
     entity.pos = resolution.pos;
     entity.saved_pos = Some(resolution.pos);
     entity.floor_step = resolution.floor_step;
+    apply_push_axis(entity, resolution.push_z);
     resolution.code
 }
 
@@ -4576,6 +4591,7 @@ mod tests {
         use crate::model::Keyframe;
         use std::sync::Arc;
         let keyframes = Arc::new(vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 20],
         }]);
@@ -5001,6 +5017,7 @@ mod tests {
         game.entities[1].pos = [100, 0, 200];
         game.entities[1].saved_pos = Some(game.entities[1].pos);
         game.entity_anims[1].keyframes = Some(Arc::new(vec![Keyframe {
+            vertex: [0, 0, 0],
             offset: [0, 0, 0],
             rotations: vec![[0, 0, 0]; 32],
         }]));
