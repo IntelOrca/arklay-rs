@@ -1,4 +1,4 @@
-//! The attract-demo reels (`data/pdemoN.dat`).
+//! The attract-demo reels (`demo/<hex>.dat`).
 //!
 //! Each reel is 0x994 bytes: a 0x30-byte header (recorded room, character,
 //! position, items, length and camera), 1202 recorded pad words from +0x30,
@@ -6,16 +6,41 @@
 //! health, overlapping the last two pad words exactly like the original's
 //! single 0x994-byte block).
 //!
-//! The title's idle timeout hands off to `game_start` with
-//! `MSF2_ATTRACT_DEMO`; the engine replays the recorded words through the pad
-//! every gameplay frame and ends the reel with the attract death fade when the
-//! playback timer runs out or the live pad is touched.
+//! Conversion packs the shipped `PDEMON.DAT` reels as `demo/<hex>.dat` where
+//! the name is the reel's hex number; the title enumerates the pack's `demo/`
+//! entries and cycles them, so no reel index is hard coded. The title's idle
+//! timeout hands off to `game_start` with `MSF2_ATTRACT_DEMO`; the engine
+//! replays the recorded words through the pad every gameplay frame and ends
+//! the reel with the attract death fade when the playback timer runs out or
+//! the live pad is touched.
 
 use anyhow::{Result, bail};
 
+use crate::pack::Pack;
 use crate::player;
 use crate::state::RoomId;
 use crate::ui::UiInput;
+
+/// The pack directory the attract-demo reels live under.
+pub const DIR: &str = "demo/";
+/// The reel entry extension.
+pub const EXT: &str = ".dat";
+
+/// The pack's demo reels, in play order: every `demo/<hex>.dat` entry, sorted.
+/// The title cycles this list instead of a hard-coded count, so a pack may
+/// ship any number of reels (including none).
+pub fn entries(pack: &Pack) -> Vec<String> {
+    let mut entries: Vec<String> = pack
+        .paths()
+        .filter(|path| {
+            path.strip_prefix(DIR)
+                .is_some_and(|name| !name.is_empty() && name.ends_with(EXT))
+        })
+        .map(str::to_owned)
+        .collect();
+    entries.sort();
+    entries
+}
 
 /// Recorded pad words the file holds (the original's `g_demoPadData` size).
 pub const PAD_WORDS: usize = 1202;
@@ -29,8 +54,8 @@ pub const TAIL_HEALTH: usize = 0x992;
 /// One attract-demo reel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DemoReel {
-    /// Reel index (`0..=3`), for logging.
-    pub index: u8,
+    /// The pack entry the reel was loaded from (`demo/<hex>.dat`).
+    pub entry: String,
     /// The recorded room identity; `player_flag` carries the recorded
     /// character.
     pub room: RoomId,
@@ -61,11 +86,12 @@ pub struct DemoReel {
 }
 
 impl DemoReel {
-    /// Parse a `pdemoN.dat` image.
-    pub fn parse(index: u8, data: &[u8]) -> Result<Self> {
+    /// Parse a demo reel image.
+    pub fn parse(entry: impl Into<String>, data: &[u8]) -> Result<Self> {
+        let entry = entry.into();
         if data.len() < HEADER_LEN + 4 {
             bail!(
-                "demo reel {index} is {} bytes; at least {} are required",
+                "demo reel {entry} is {} bytes; at least {} are required",
                 data.len(),
                 HEADER_LEN + 4
             );
@@ -97,10 +123,10 @@ impl DemoReel {
             0
         };
         if room > RoomId::MAX_ROOM || stage > RoomId::MAX_STAGE {
-            bail!("demo reel {index} names an invalid room {stage}:{room:#04X}");
+            bail!("demo reel {entry} names an invalid room {stage}:{room:#04X}");
         }
         Ok(Self {
-            index,
+            entry,
             room: RoomId {
                 stage,
                 room,
@@ -119,11 +145,6 @@ impl DemoReel {
             controller_config,
             health,
         })
-    }
-
-    /// The reel's pack entry.
-    pub fn entry(&self) -> String {
-        format!("data/pdemo{}.dat", self.index)
     }
 }
 
@@ -309,8 +330,8 @@ mod tests {
         // The tail overlaps the last two pad words, exactly like the file.
         data[0x990..0x992].copy_from_slice(&5u16.to_le_bytes());
         data[0x992..0x994].copy_from_slice(&96i16.to_le_bytes());
-        let reel = DemoReel::parse(2, &data).unwrap();
-        assert_eq!(reel.index, 2);
+        let reel = DemoReel::parse("demo/02.dat", &data).unwrap();
+        assert_eq!(reel.entry, "demo/02.dat");
         assert_eq!(reel.room.stage, 1);
         assert_eq!(reel.room.room, 0x07);
         assert_eq!(reel.room.player_flag, 1);
@@ -351,7 +372,7 @@ mod tests {
 
     #[test]
     fn the_counter_and_gate_follow_the_original() {
-        let reel = DemoReel::parse(0, &reel_bytes()).unwrap();
+        let reel = DemoReel::parse("demo/00.dat", &reel_bytes()).unwrap();
         let max = reel.timer_max;
         let mut state = AttractState::new(reel);
         assert_eq!(state.timer_cur, 1);
@@ -375,7 +396,7 @@ mod tests {
 
     #[test]
     fn the_watchdog_ends_near_the_recorded_end_or_on_live_input() {
-        let reel = DemoReel::parse(0, &reel_bytes()).unwrap();
+        let reel = DemoReel::parse("demo/00.dat", &reel_bytes()).unwrap();
         let mut state = AttractState::new(reel);
         state.gate = true;
         state.timer_cur = 5;
@@ -385,5 +406,18 @@ mod tests {
         assert!(!state.should_end(false), "cur + 10 == max still plays");
         state.timer_cur = state.timer_max - 9;
         assert!(state.should_end(false));
+    }
+
+    #[test]
+    fn enumeration_sorts_only_the_demo_dat_entries() {
+        let mut writer = crate::pack::PackWriter::new();
+        writer.add("demo/0a.dat", vec![0]).unwrap();
+        writer.add("demo/00.dat", vec![0]).unwrap();
+        writer.add("demo/01.DAT", vec![0]).unwrap();
+        writer.add("demo/notes.txt", vec![0]).unwrap();
+        writer.add("demo/", vec![0]).unwrap();
+        writer.add("data/pdemo0.dat", vec![0]).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(entries(&pack), ["demo/00.dat", "demo/0a.dat"]);
     }
 }

@@ -14,8 +14,8 @@
 //! never leaves NEW GAME and confirming it is a no-op. An idle title that
 //! reaches the `g_titleDemoTime` timeout (0x708 ticks after the PRESS ramp)
 //! fades to black and reports [`ScreenAction::Attract`]; the app then plays
-//! the next `pdemoN.dat` reel. Any button during the fade cancels back to the
-//! PRESS wait, exactly like the original's state 3.
+//! the next reel of the pack's `demo/` enumeration. Any button during the fade
+//! cancels back to the PRESS wait, exactly like the original's state 3.
 
 use anyhow::Result;
 
@@ -252,13 +252,13 @@ impl Screen for TitleScreen {
 
     fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
         self.ticks = self.ticks.saturating_add(1);
-        // TODO(parity): (UI) the original title runs an attract/demo timer
-        // (`g_titleDemoTime`): idling on PRESS or on the option menu eventually
-        // fades into the attract demo and back, the selection id cycles
-        // NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED submenu). The port
-        // waits on PRESS forever with only the two entries. The PRESS phase
-        // and the option-menu moves are silent in the original; confirming
-        // NEW GAME or LOAD GAME plays EVIL01 and runs the white flash chain.
+        // TODO(parity): (UI) the original's title state 2 also cycles the
+        // selection id NEW/LOAD (and the DC STANDARD/TRAINING/ADVANCED
+        // submenu) while idle before handing off to the attract demo. The port
+        // keeps the two entries and hands the idle timeout straight to the
+        // reel. The PRESS phase and the option-menu moves are silent in the
+        // original; confirming NEW GAME or LOAD GAME plays EVIL01 and runs the
+        // white flash chain.
         match self.stage {
             Stage::Press => {
                 self.fade.tick();

@@ -27,8 +27,9 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
     player: u8,
 
-    /// Attract-demo reel index for `--ui demo` (0-3)
-    #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=3))]
+    /// Attract-demo reel ordinal for `--ui demo`: the index into the pack's
+    /// sorted `demo/<hex>.dat` entries (0 = first reel)
+    #[arg(long, default_value_t = 0, value_name = "N", requires = "pack")]
     demo: u8,
 
     /// UI screen to boot straight into instead of a room:

@@ -934,7 +934,9 @@ fn copy_bio_card(
     Ok((1, bytes))
 }
 
-/// Add the raw attract-demo reels as `data/pdemo{N}.dat`.
+/// Add the raw attract-demo reels as `demo/<hex>.dat`, where the name is the
+/// reel's hex number, so the title can enumerate them without a hard-coded
+/// count.
 fn copy_demos(
     data: &DataPlan,
     writer: &mut PackWriter,
@@ -953,7 +955,7 @@ fn copy_demos(
         };
         let raw =
             fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
-        let entry = format!("data/pdemo{index}.dat");
+        let entry = format!("demo/{index:02x}.dat");
         bytes += raw.len();
         count += 1;
         writer
@@ -1099,7 +1101,7 @@ fn bake_item_atlas(pix: &[u8], rows: usize, palette: &Texture8) -> Result<Vec<u8
 
 /// Pack entry of the save prefix.
 const BIO_CARD_ENTRY: &str = "data/bio_card.dat";
-/// The attract-demo reels (raw), packed under `data/pdemo{N}.dat`.
+/// The attract-demo reels (raw), packed under `demo/<hex>.dat`.
 const DEMO_FILES: [&str; 4] = ["PDEMO0.DAT", "PDEMO1.DAT", "PDEMO2.DAT", "PDEMO3.DAT"];
 /// Shipped name of the save prefix.
 const BIO_CARD_FILE: &str = "BIO_CARD.DAT";

@@ -991,7 +991,7 @@ struct GameSession {
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
     /// The active attract-demo playback, when the session was booted (or
-    /// handed off) into a `pdemoN.dat` reel. While it is set the session
+    /// handed off) into a `demo/<hex>.dat` reel. While it is set the session
     /// injects the recorded pad words and runs the reel-end watchdog.
     attract: Option<demo::AttractState>,
     /// The player's death sequence: the delay, the fades and the DIED screen.
@@ -1094,7 +1094,7 @@ impl GameSession {
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
 
-    /// Boot one attract-demo reel (`data/pdemo{index}.dat`).
+    /// Boot one attract-demo reel (`demo/<hex>.dat`).
     ///
     /// This is the reference's title-timeout hand-off: `InitializeGame`'s
     /// new-game branch with `MSF2_ATTRACT_DEMO` set, which copies the bio card
@@ -1102,12 +1102,11 @@ impl GameSession {
     /// character, room, position, facing, items, equipped item, camera and
     /// health. `game_loop` seeds the platform stream with `srand(0)` for
     /// attract playback, so the reel replays its recorded draws exactly.
-    fn from_demo(pack: &Pack, index: u8, save_dir: &Path) -> Result<Self> {
-        let entry = format!("data/pdemo{index}.dat");
+    fn from_demo(pack: &Pack, entry: &str, save_dir: &Path) -> Result<Self> {
         let bytes = pack
-            .read(&entry)
+            .read(entry)
             .with_context(|| format!("missing attract demo reel {entry}"))?;
-        let reel = demo::DemoReel::parse(index, bytes)?;
+        let reel = demo::DemoReel::parse(entry, bytes)?;
         let id = reel.room;
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
@@ -1153,6 +1152,19 @@ impl GameSession {
         }
         session.attract = Some(demo::AttractState::new(reel));
         Ok(session)
+    }
+
+    /// Boot the `index`-th entry of the pack's `demo/` enumeration (the
+    /// reference's `--test-demo` anchor and the port's `--ui demo`).
+    fn from_demo_index(pack: &Pack, index: u8, save_dir: &Path) -> Result<Self> {
+        let entries = demo::entries(pack);
+        let entry = entries.get(usize::from(index)).with_context(|| {
+            format!(
+                "pack has {} demo entries; demo {index} is out of range",
+                entries.len()
+            )
+        })?;
+        Self::from_demo(pack, entry, save_dir)
     }
 
     /// Boot `id` directly, the `--room` path. A direct boot is a fresh game
@@ -3751,8 +3763,8 @@ pub enum AppBoot {
     /// straight into `room` instead of the card's start room (the new-game
     /// semantics, the room's first walk zone centre as the spawn).
     NewGame { character: u8, room: Option<RoomId> },
-    /// An attract-demo reel boot: `data/pdemo{index}.dat` replayed with its
-    /// recorded input, the reference's `--test-demo` anchor.
+    /// An attract-demo reel boot: the pack's `demo/` entry `N` replayed with
+    /// its recorded input, the reference's `--test-demo` anchor.
     Demo(u8),
     /// The pause menu over the deterministic capture room.
     Menu,
@@ -3846,9 +3858,12 @@ struct App {
     films: bool,
     /// Whether the title's opening film (id 0) has been queued once.
     opening_played: bool,
-    /// The next attract reel index (`g_CurrentAttractModeId`): the title's
-    /// idle timeout plays this reel, then advances it.
-    next_demo: u8,
+    /// The pack's attract-demo entries (`demo/<hex>.dat`), sorted; the title
+    /// cycles them instead of a hard-coded list.
+    demos: Vec<String>,
+    /// The next attract reel (`g_CurrentAttractModeId`): the title's idle
+    /// timeout plays `demos[next_demo]`, then advances the cycle.
+    next_demo: usize,
     /// Whether the prologue film (id 1) is playing for a pending new game:
     /// the follow-up `NewGame` action then builds the session instead of
     /// queueing the film again. A later confirm queues the prologue anew,
@@ -3884,6 +3899,7 @@ impl App {
             Err(_) => None,
         };
         let text = Text::load(&pack);
+        let demos = demo::entries(&pack);
         Self {
             pack,
             save_dir,
@@ -3902,6 +3918,7 @@ impl App {
             chain_active: false,
             films: false,
             opening_played: false,
+            demos,
             next_demo: 0,
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
@@ -4097,7 +4114,7 @@ impl App {
                 Ok(())
             }
             AppBoot::Demo(index) => {
-                let session = GameSession::from_demo(&self.pack, index, &self.save_dir)?;
+                let session = GameSession::from_demo_index(&self.pack, index, &self.save_dir)?;
                 self.start_session(session);
                 Ok(())
             }
@@ -4316,20 +4333,23 @@ impl App {
             }
             ScreenAction::Title => self.open_title()?,
             ScreenAction::Attract => {
-                // The title's idle timeout: play the reel `g_CurrentAttractModeId`
-                // names and advance the cycle (the original's
-                // `LoadAttractModePlayerData` advances after the load).
-                let index = self.next_demo & 3;
-                match GameSession::from_demo(&self.pack, index, &self.save_dir) {
-                    Ok(mut session) => {
-                        self.next_demo = self.next_demo.wrapping_add(1);
-                        session.arm_new_game_boot();
-                        self.start_session(session);
-                    }
-                    Err(err) => {
-                        eprintln!("warning: attract demo unavailable: {err:#}");
-                        self.open_title()?;
-                    }
+                // The title's idle timeout: play the next entry of the pack's
+                // `demo/` enumeration and advance the cycle (the original's
+                // `LoadAttractModePlayerData` advances after the load). A pack
+                // without reels simply stays on the title.
+                match self.next_attract_entry() {
+                    Some(entry) => match GameSession::from_demo(&self.pack, &entry, &self.save_dir)
+                    {
+                        Ok(mut session) => {
+                            session.arm_new_game_boot();
+                            self.start_session(session);
+                        }
+                        Err(err) => {
+                            eprintln!("warning: attract demo unavailable: {err:#}");
+                            self.open_title()?;
+                        }
+                    },
+                    None => self.open_title()?,
                 }
             }
             ScreenAction::Resume => {
@@ -4340,6 +4360,19 @@ impl App {
             ScreenAction::Quit => return Ok(AppFlow::Quit),
         }
         Ok(AppFlow::Continue)
+    }
+
+    /// The next attract reel to play and the advanced cycle: the original's
+    /// `LoadAttractModePlayerData` wraps after the last shipped `pdemoN.dat`;
+    /// here the pack's `demo/` enumeration is the list. `None` when the pack
+    /// ships no reels.
+    fn next_attract_entry(&mut self) -> Option<String> {
+        if self.demos.is_empty() {
+            return None;
+        }
+        let entry = self.demos[self.next_demo % self.demos.len()].clone();
+        self.next_demo = (self.next_demo + 1) % self.demos.len();
+        Some(entry)
     }
 
     /// One app tick: start a queued film, advance the active film, or advance
@@ -4649,7 +4682,7 @@ pub fn run_ui_with_mods(
             character: room.map_or(character & 1, |id| id.player_flag & 1),
             room,
         },
-        "demo" => AppBoot::Demo(demo.min(3)),
+        "demo" => AppBoot::Demo(demo),
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
         "file" => AppBoot::File,
@@ -4749,7 +4782,7 @@ fn run_ui_impl(
                 run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Demo(index) => {
-                let session = GameSession::from_demo(&app.pack, index, &app.save_dir)?;
+                let session = GameSession::from_demo_index(&app.pack, index, &app.save_dir)?;
                 app.start_session(session);
                 run_game_trace(&mut app, &trace)?;
             }

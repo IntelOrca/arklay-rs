@@ -48,8 +48,9 @@ cargo run -- re1.akpak --room 100 --player 0
 # Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font)
 cargo run -- re1.akpak
 
-# Play one attract reel directly (the reference's --test-demo oracle anchor);
-# with --ticks/--trace it emits the per-tick differential trace
+# Play one attract reel directly (the reference's --test-demo oracle anchor):
+# --demo N is the Nth entry of the pack's sorted demo/<hex>.dat list; with
+# --ticks/--trace it emits the per-tick differential trace
 cargo run -- re1.akpak --ui demo --demo 0 --ticks 600 --trace demo0.trace
 
 # `--ui game` with `--room` boots the new game straight into that room through
