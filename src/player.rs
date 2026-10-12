@@ -617,6 +617,9 @@ pub fn update_with_room(
         player.locomotion_tick(room, BEHAVIOR_WALK, i32::from(player.move_speed_current));
         player.enter_behavior(BEHAVIOR_IDLE);
         player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+        // The reference's release tick clears the behaviour and its
+        // sub-state without running the idle entry yet.
+        player.trace_state = Some((0, 0, 0));
         return;
     }
     // Turn release: the original's turn handler also releases through
@@ -625,6 +628,7 @@ pub fn update_with_room(
     {
         player.enter_behavior(BEHAVIOR_IDLE);
         player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+        player.trace_state = Some((0, 0, 0));
         return;
     }
     // Run release: the original's run handler starts its four-tick
@@ -1583,6 +1587,7 @@ fn turned_angle(angle: u16, behavior: u8, input: Input) -> u16 {
     };
 
     let mut angle = angle & 0x0FFF;
+
     if input.right {
         angle = angle.wrapping_add(step) & 0x0FFF;
     }
