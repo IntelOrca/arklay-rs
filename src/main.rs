@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=9))]
     player: u8,
 
+    /// Attract-demo reel index for `--ui demo` (0-3)
+    #[arg(long, default_value_t = 0, value_name = "N", requires = "pack", value_parser = clap::value_parser!(u8).range(0..=3))]
+    demo: u8,
+
     /// UI screen to boot straight into instead of a room:
     /// `title`, `select`, `game`, `menu`, `box`, `file`, `map`, `view`, `save`,
     /// `load`, `death` or `font`. `--ui game` also accepts `--room` to boot the
@@ -513,7 +517,7 @@ fn main() -> Result<()> {
             let tracing = cli.trace.is_some();
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
-                && (screen != "game" || !tracing)
+                && ((screen != "game" && screen != "demo") || !tracing)
             {
                 bail!("--ticks with --ui is only supported for `--ui game` with --trace");
             }
@@ -535,8 +539,9 @@ fn main() -> Result<()> {
             if cli.capture_dir.is_some() && cli.capture_every.is_none() {
                 bail!("--capture-dir requires --capture-every");
             }
-            if tracing && cli.room.is_none() && !matches!(cli.ui.as_deref(), Some("game")) {
-                bail!("--trace is only supported for --room or --ui game");
+            if tracing && cli.room.is_none() && !matches!(cli.ui.as_deref(), Some("game" | "demo"))
+            {
+                bail!("--trace is only supported for --room or --ui game/demo");
             }
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),
@@ -588,6 +593,7 @@ fn main() -> Result<()> {
                     &save_dir,
                     cli.character,
                     room,
+                    cli.demo,
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,

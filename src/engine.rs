@@ -83,6 +83,7 @@ use crate::anim;
 use crate::audio::{self, Mixer};
 use crate::bgm;
 use crate::bmp;
+use crate::demo;
 use crate::door;
 use crate::effects;
 use crate::emd;
@@ -989,6 +990,10 @@ struct GameSession {
     return_title: Option<ReturnTitlePrompt>,
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
+    /// The active attract-demo playback, when the session was booted (or
+    /// handed off) into a `pdemoN.dat` reel. While it is set the session
+    /// injects the recorded pad words and runs the reel-end watchdog.
+    attract: Option<demo::AttractState>,
     /// The player's death sequence: the delay, the fades and the DIED screen.
     death: ui::death::DeathSequence,
     /// The decoded `ui/died.tim` page, loaded when the DIED screen first opens.
@@ -1087,6 +1092,67 @@ impl GameSession {
         let player_state = player::spawn(id, &loaded.room);
         game.sync_entity_from_player(&player_state);
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
+    }
+
+    /// Boot one attract-demo reel (`data/pdemo{index}.dat`).
+    ///
+    /// This is the reference's title-timeout hand-off: `InitializeGame`'s
+    /// new-game branch with `MSF2_ATTRACT_DEMO` set, which copies the bio card
+    /// but loads the reel's header instead of `InitPlayerData` — the recorded
+    /// character, room, position, facing, items, equipped item, camera and
+    /// health. `game_loop` seeds the platform stream with `srand(0)` for
+    /// attract playback, so the reel replays its recorded draws exactly.
+    fn from_demo(pack: &Pack, index: u8, save_dir: &Path) -> Result<Self> {
+        let entry = format!("data/pdemo{index}.dat");
+        let bytes = pack
+            .read(&entry)
+            .with_context(|| format!("missing attract demo reel {entry}"))?;
+        let reel = demo::DemoReel::parse(index, bytes)?;
+        let id = reel.room;
+        let loaded = load_room(pack, id)?;
+        let mut game = new_game_state(pack, id, &loaded.room);
+        if std::env::var_os("ARKLAY_DDBG").is_some() {
+            eprintln!("ddbg new_game_state rng={}", game.rand_state);
+        }
+        seed_new_game(pack, &mut game, reel.character);
+        if std::env::var_os("ARKLAY_DDBG").is_some() {
+            eprintln!("ddbg seed_new_game rng={}", game.rand_state);
+        }
+        // The attract branch sets the mode bit before the room loads, so every
+        // script and entity driver sees it, and seeds the PRNG as game_loop
+        // does for attract playback.
+        game.apply_flag(5, game::MSF2_ATTRACT_DEMO, 0);
+        game.srand(0);
+        // The header's recorded inventory, equipped item and health replace
+        // the new-game seeding (the attract branch never runs InitPlayerData).
+        game.inventory.clear();
+        for pair in reel.items.as_chunks::<2>().0 {
+            if pair[0] != 0 {
+                game.inventory.push(game::InventoryItem {
+                    id: pair[0],
+                    quantity: pair[1],
+                });
+            }
+        }
+        game.state_bytes[usize::from(game::STATE_BYTE_TOTAL_HELD)] = reel.total_held_items;
+        game.equipped = (reel.equipped_item != 0).then_some(reel.equipped_item);
+        game.selected_item = game.equipped;
+        game.entities[0].health = reel.health;
+        game.set_health_copy(reel.health);
+        game.attract_room_camera_id = reel.camera_id;
+        let mut player_state = player::spawn(id, &loaded.room);
+        player_state.pos = reel.pos;
+        player_state.angle = reel.angle;
+        game.sync_entity_from_player(&player_state);
+        if std::env::var_os("ARKLAY_DDBG").is_some() {
+            eprintln!("ddbg pre_from_loaded rng={}", game.rand_state);
+        }
+        let mut session = Self::from_loaded(pack, loaded, game, player_state, save_dir)?;
+        if std::env::var_os("ARKLAY_DDBG").is_some() {
+            eprintln!("ddbg post_from_loaded rng={}", session.game.rand_state);
+        }
+        session.attract = Some(demo::AttractState::new(reel));
+        Ok(session)
     }
 
     /// Boot `id` directly, the `--room` path. A direct boot is a fresh game
@@ -1207,6 +1273,7 @@ impl GameSession {
             debug_menu: None,
             return_title: None,
             return_title_requested: false,
+            attract: None,
             death: ui::death::DeathSequence::idle(),
             died_texture: None,
             died_texture_tried: false,
@@ -1279,7 +1346,38 @@ impl GameSession {
     /// word. START opens the pause menu while no message owns the tick; while
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
-    fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+    fn tick(
+        &mut self,
+        pack: &Pack,
+        mut ui: UiInput,
+        mut input: player::Input,
+        mut action: bool,
+    ) -> Result<()> {
+        // The attract reel owns the pad while it plays: the recorded word
+        // replaces the live input exactly like the original's InputSystem
+        // overwrite, and any live button ends the playback (the watchdog
+        // below reads it).
+        let live_input = ui.any
+            || input.up
+            || input.down
+            || input.left
+            || input.right
+            || input.run
+            || input.action_held
+            || input.aim
+            || input.fire;
+        if let Some(attract) = self.attract.as_mut() {
+            // The playback gate opens when the room-entry fade's accumulator
+            // drops below one (the reference's `g_message_flags` bit 0x200),
+            // which is also the tick the player state machine unfreezes.
+            if !attract.gate && self.room_fade.state() < 1 {
+                attract.gate = true;
+            }
+            let translated = attract.tick_input();
+            ui = translated.ui;
+            input = translated.player;
+            action = translated.action;
+        }
         // The loading narration owns the tick while it is up: the room stays
         // frozen on a black screen and only the message window advances. The
         // tick the message clears arms the room-entry fade, so the first room
@@ -1453,8 +1551,9 @@ impl GameSession {
         if !self.room_boot_gate
             && self.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE != 0
             && self.game.entities[0].state() == 1
-            && let Some((action_state, ticks)) = self.player.idle_trace
+            && let Some((behavior, action_state, ticks)) = self.player.trace_state
         {
+            self.game.entities[0].action_behavior = behavior;
             self.game.entities[0].action_state = action_state;
             self.game.entities[0].action_ticks_counter = ticks;
         }
@@ -1595,6 +1694,20 @@ impl GameSession {
         // The death machine runs at the end of the gameplay frame, after the
         // room tick noticed the health drop, exactly like the original.
         self.tick_death();
+        // The attract watchdog runs after the gameplay tick: it advances the
+        // playback counter and, once the reel is within ten frames of its
+        // recorded end or a live button is held, raises the dead flag. The
+        // game-over machine picks it up on the next tick, like the original's
+        // per-frame `StartAttractDemo`.
+        if let Some(attract) = self.attract.as_mut() {
+            if attract.gate {
+                attract.advance();
+            }
+            if !attract.ended && attract.should_end(live_input) {
+                attract.ended = true;
+                self.game.apply_flag(5, game::MSF_PLAYER_DEAD, 0);
+            }
+        }
         Ok(())
     }
 
@@ -1612,10 +1725,10 @@ impl GameSession {
             return;
         }
         if self.death.is_idle() {
-            let variant = self.game.flags[5].bit(game::MSF2_DEATH_VARIANT)
-                || self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO);
+            let attract = self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO);
+            let variant = self.game.flags[5].bit(game::MSF2_DEATH_VARIANT) || attract;
             self.death
-                .start(ui::death::immediate_fade(self.loaded.id), variant);
+                .start(ui::death::immediate_fade(self.loaded.id), variant, attract);
             return;
         }
         // A scripted death (the hunter pounce) arms the fade itself at its own
@@ -3638,6 +3751,9 @@ pub enum AppBoot {
     /// straight into `room` instead of the card's start room (the new-game
     /// semantics, the room's first walk zone centre as the spawn).
     NewGame { character: u8, room: Option<RoomId> },
+    /// An attract-demo reel boot: `data/pdemo{index}.dat` replayed with its
+    /// recorded input, the reference's `--test-demo` anchor.
+    Demo(u8),
     /// The pause menu over the deterministic capture room.
     Menu,
     /// The item box over the deterministic capture room.
@@ -3730,6 +3846,9 @@ struct App {
     films: bool,
     /// Whether the title's opening film (id 0) has been queued once.
     opening_played: bool,
+    /// The next attract reel index (`g_CurrentAttractModeId`): the title's
+    /// idle timeout plays this reel, then advances it.
+    next_demo: u8,
     /// Whether the prologue film (id 1) is playing for a pending new game:
     /// the follow-up `NewGame` action then builds the session instead of
     /// queueing the film again. A later confirm queues the prologue anew,
@@ -3783,6 +3902,7 @@ impl App {
             chain_active: false,
             films: false,
             opening_played: false,
+            next_demo: 0,
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
             debug_menu: true,
@@ -3973,6 +4093,11 @@ impl App {
                     }
                     None => GameSession::new(&self.pack, character, &self.save_dir)?,
                 };
+                self.start_session(session);
+                Ok(())
+            }
+            AppBoot::Demo(index) => {
+                let session = GameSession::from_demo(&self.pack, index, &self.save_dir)?;
                 self.start_session(session);
                 Ok(())
             }
@@ -4190,6 +4315,23 @@ impl App {
                 self.continue_from_slot(slot)?;
             }
             ScreenAction::Title => self.open_title()?,
+            ScreenAction::Attract => {
+                // The title's idle timeout: play the reel `g_CurrentAttractModeId`
+                // names and advance the cycle (the original's
+                // `LoadAttractModePlayerData` advances after the load).
+                let index = self.next_demo & 3;
+                match GameSession::from_demo(&self.pack, index, &self.save_dir) {
+                    Ok(mut session) => {
+                        self.next_demo = self.next_demo.wrapping_add(1);
+                        session.arm_new_game_boot();
+                        self.start_session(session);
+                    }
+                    Err(err) => {
+                        eprintln!("warning: attract demo unavailable: {err:#}");
+                        self.open_title()?;
+                    }
+                }
+            }
             ScreenAction::Resume => {
                 if let Mode::Play(session) = &mut self.mode {
                     session.close_modal();
@@ -4470,6 +4612,7 @@ pub fn run_ui_with_options(
         save_dir,
         character,
         None,
+        0,
         &[],
         false,
         false,
@@ -4490,6 +4633,7 @@ pub fn run_ui_with_mods(
     save_dir: &Path,
     character: u8,
     room: Option<RoomId>,
+    demo: u8,
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
@@ -4505,6 +4649,7 @@ pub fn run_ui_with_mods(
             character: room.map_or(character & 1, |id| id.player_flag & 1),
             room,
         },
+        "demo" => AppBoot::Demo(demo.min(3)),
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
         "file" => AppBoot::File,
@@ -4514,7 +4659,7 @@ pub fn run_ui_with_mods(
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `menu`, `box`, `file`, `map`, `view`, `save`, `load` or `death`"
+                 `demo`, `menu`, `box`, `file`, `map`, `view`, `save`, `load` or `death`"
             )
         }
     };
@@ -4600,6 +4745,11 @@ fn run_ui_impl(
                     Some(id) => GameSession::new_in_room(&app.pack, id, character, &app.save_dir)?,
                     None => GameSession::new(&app.pack, character, &app.save_dir)?,
                 };
+                app.start_session(session);
+                run_game_trace(&mut app, &trace)?;
+            }
+            AppBoot::Demo(index) => {
+                let session = GameSession::from_demo(&app.pack, index, &app.save_dir)?;
                 app.start_session(session);
                 run_game_trace(&mut app, &trace)?;
             }
@@ -7331,6 +7481,7 @@ fn tick_room_timed(
         // The pad-driven idle did not run this tick, so its reference scratch
         // is stale: the trace mirror must not reapply it.
         context.player.idle_trace = None;
+        context.player.trace_state = None;
         pad.action_pressed = false;
         pad.action_held = false;
         context.player.input = pad;

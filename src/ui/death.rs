@@ -50,6 +50,9 @@ use crate::transition::{Fade, Overlay};
 
 /// Frames the game-over machine waits before the fade in an ordinary room.
 pub const DEATH_DELAY: u8 = 0x5A;
+/// The attract reel-end fade's counter (type 2 black, `TimeoutDeathFadeOut`'s
+/// attract branch).
+const ATTRACT_FADE_OUT_COUNTER: i32 = 0x800;
 
 /// The pre-screen fade counter (a 2-alpha-per-frame white-out).
 const DEATH_FADE_OUT_COUNTER: i32 = 0x100;
@@ -168,15 +171,21 @@ impl DeathSequence {
 
     /// Trigger the sequence: an immediate-fade room arms the white fade at
     /// once, every other room starts the 90-frame delay. `variant` is the
-    /// attract-demo/scripted-death flag, which skips the screen.
+    /// scripted-death flag, which skips the screen; `attract` is the
+    /// attract-reel end, whose `TimeoutDeathFadeOut` branch arms a black fade
+    /// with the `0x800` counter.
     ///
     /// The original's case 0 falls straight through into case 1 in the same
     /// tick, so the freshly-armed delay is decremented once here; the arm tick
     /// also applies the fade's first accumulator step (`main_loop`'s
     /// draw-then-add runs in the same frame the machine arms it).
-    pub fn start(&mut self, immediate: bool, variant: bool) {
-        self.variant = variant;
-        if immediate || variant {
+    pub fn start(&mut self, immediate: bool, variant: bool, attract: bool) {
+        self.variant = variant || attract;
+        if attract {
+            self.arm_fade(2, ATTRACT_FADE_OUT_COUNTER);
+            self.fade.tick();
+            self.state = 3;
+        } else if immediate || variant {
             self.arm_fade(1, DEATH_FADE_OUT_COUNTER);
             self.fade.tick();
             self.state = 3;
@@ -549,7 +558,7 @@ mod tests {
     #[test]
     fn an_ordinary_death_waits_ninety_frames_then_fades() {
         let mut sequence = DeathSequence::idle();
-        sequence.start(false, false);
+        sequence.start(false, false, false);
         // The original's case 0 falls through into case 1 and decrements the
         // freshly-armed delay once in the same tick.
         assert_eq!(sequence.delay, DEATH_DELAY - 1);
@@ -581,7 +590,7 @@ mod tests {
     #[test]
     fn an_immediate_room_arms_the_fade_without_the_delay() {
         let mut sequence = DeathSequence::idle();
-        sequence.start(true, false);
+        sequence.start(true, false, false);
         let overlay = sequence.overlay().unwrap();
         assert_eq!(overlay.color, FadeColor::White);
         assert_eq!(overlay.alpha, 2, "the arm tick applies the first step");
@@ -591,7 +600,7 @@ mod tests {
     fn a_scripted_death_arms_the_fade_ahead_of_the_delay() {
         // A normal room starts the 90-frame delay; the request skips it.
         let mut sequence = DeathSequence::idle();
-        sequence.start(false, false);
+        sequence.start(false, false, false);
         assert_eq!(sequence.delay, DEATH_DELAY - 1);
         assert!(sequence.overlay().is_none());
         sequence.arm_fade_now();
@@ -610,7 +619,7 @@ mod tests {
     #[test]
     fn the_variant_path_skips_the_screen() {
         let mut sequence = DeathSequence::idle();
-        sequence.start(false, true);
+        sequence.start(false, true, false);
         for _ in 0..300 {
             if sequence.tick() == DeathTick::Finished {
                 break;

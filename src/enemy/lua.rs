@@ -1549,6 +1549,12 @@ mod imp {
             fields.add_field_method_get("room", |_lua, api| Ok(api.game_ref().id.room));
             // The per-frame platform random snapshot (`g_RandSeed`).
             fields.add_field_method_get("rand_seed", |_lua, api| Ok(api.game_ref().rand_seed));
+            // `MSF2_ATTRACT_DEMO` (main_state_flags2 bit 0x10000000): attract
+            // playback, which changes several init-time draws to reuse the
+            // frame seed instead of consuming the platform stream.
+            fields.add_field_method_get("attract_demo", |_lua, api| {
+                Ok(api.game_ref().flags[5].bit(crate::game::MSF2_ATTRACT_DEMO))
+            });
             // A write reseeds the frame snapshot (`g_RandSeed`) so the same
             // frame's later readers see it; the stream itself is `e:srand`.
             fields.add_field_method_set("rand_seed", |_lua, api, value: i64| {

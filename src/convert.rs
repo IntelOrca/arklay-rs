@@ -390,6 +390,7 @@ pub fn convert_game_with_options(
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress, jobs)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress, jobs)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
+    let (demo_count, demo_bytes) = copy_demos(&data, &mut writer, &mut progress)?;
     let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress, jobs)?;
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
     let (text_count, text_bytes) = copy_text(exe.as_deref(), &mut writer, &mut progress)?;
@@ -436,6 +437,7 @@ pub fn convert_game_with_options(
     println!("ui: {ui_count} entries, {ui_bytes} bytes");
     println!("item: {item_count} entries, {item_bytes} bytes");
     println!("data: {data_count} entries, {data_bytes} bytes");
+    println!("demo: {demo_count} entries, {demo_bytes} bytes");
     println!("core00: {core_count} entries, {core_bytes} bytes");
     println!("shadow: {shadow_count} entries, {shadow_bytes} bytes");
     println!("text: {text_count} entries, {text_bytes} bytes");
@@ -932,6 +934,37 @@ fn copy_bio_card(
     Ok((1, bytes))
 }
 
+/// Add the raw attract-demo reels as `data/pdemo{N}.dat`.
+fn copy_demos(
+    data: &DataPlan,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    let count_present = data.demos.iter().filter(|entry| entry.is_some()).count();
+    if count_present == 0 {
+        return Ok((0, 0));
+    }
+    progress.begin("demo", count_present as u64, "files");
+    let mut bytes = 0;
+    let mut count = 0;
+    for (index, source) in data.demos.iter().enumerate() {
+        let Some(source) = source else {
+            continue;
+        };
+        let raw =
+            fs::read(source).with_context(|| format!("failed to read {}", source.display()))?;
+        let entry = format!("data/pdemo{index}.dat");
+        bytes += raw.len();
+        count += 1;
+        writer
+            .add(&entry, raw)
+            .with_context(|| format!("failed to add {entry}"))?;
+        progress.advance(&entry);
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
 /// Add the raw `CORE00.ESP`/`CORE00.ETM` weapon-effect metadata.
 ///
 /// The runtime decodes both files itself; they are copied raw.
@@ -1066,6 +1099,8 @@ fn bake_item_atlas(pix: &[u8], rows: usize, palette: &Texture8) -> Result<Vec<u8
 
 /// Pack entry of the save prefix.
 const BIO_CARD_ENTRY: &str = "data/bio_card.dat";
+/// The attract-demo reels (raw), packed under `data/pdemo{N}.dat`.
+const DEMO_FILES: [&str; 4] = ["PDEMO0.DAT", "PDEMO1.DAT", "PDEMO2.DAT", "PDEMO3.DAT"];
 /// Shipped name of the save prefix.
 const BIO_CARD_FILE: &str = "BIO_CARD.DAT";
 /// Shipped name of the item-icon palette TIM.
@@ -1117,6 +1152,9 @@ struct DataPlan {
     palette: Option<PathBuf>,
     /// `BIO_CARD.DAT`.
     bio_card: Option<PathBuf>,
+    /// `PDEMO0..3.DAT`, the attract-demo reels, in index order. Missing
+    /// entries are skipped (a pack may ship fewer reels).
+    demos: Vec<Option<PathBuf>>,
     /// `KAGE.TIM`, the player shadow's coverage page.
     shadow: Option<PathBuf>,
     /// `CORE00.ESP`, the global weapon-effect sprite metadata.
@@ -1229,6 +1267,10 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     }
 
     plan.bio_card = index.get(&BIO_CARD_FILE.to_ascii_lowercase()).cloned();
+    plan.demos = DEMO_FILES
+        .iter()
+        .map(|file| index.get(&file.to_ascii_lowercase()).cloned())
+        .collect();
     plan.shadow = index.get(&KAGE_FILE.to_ascii_lowercase()).cloned();
     plan.core_esp = index.get(&CORE_ESP_FILE.to_ascii_lowercase()).cloned();
     plan.core_etm = index.get(&CORE_ETM_FILE.to_ascii_lowercase()).cloned();

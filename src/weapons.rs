@@ -549,6 +549,7 @@ pub fn update(
     // The weapon machine owns the tick: the pad-driven idle did not run, so
     // its reference scratch must not be mirrored after this tick.
     player.idle_trace = None;
+    player.trace_state = None;
     tick(game, player, room, clips, input);
 }
 

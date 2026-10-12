@@ -429,6 +429,12 @@ pub struct PlayerState {
     /// engine mirrors it into `entities[0]` so scripts and the oracle trace
     /// see the same bytes the reference writes at +0x87/+0xC4.
     pub idle_trace: Option<(u8, u16)>,
+    /// The reference's `(action_behavior, action_state, attackDirection)` for
+    /// the pad-driven locomotion this tick, translated to the original's
+    /// behavior ids: idle `0`, walk `1`, turn-left `2`, back `4`, turn-right
+    /// `8` and run `0x0D`. The engine mirrors it onto entity 0 so the oracle
+    /// trace reports the same bytes the reference writes.
+    pub trace_state: Option<(u8, u8, u16)>,
     /// Stair/ladder state set by the room's action probes.
     pub stairs: StairState,
     /// The locked action behaviour owning the tick, if any.
@@ -521,6 +527,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         idle_phase: 0,
         idle_ticks: 0,
         idle_trace: None,
+        trace_state: None,
         stairs: StairState::default(),
         locked: LockedAction::None,
         action_state: 0,
@@ -577,6 +584,7 @@ pub fn update_with_room(
 ) {
     player.input = input;
     player.idle_trace = None;
+    player.trace_state = None;
     // The push bit raised by `tick_objects` last tick forces the push
     // behaviour this tick, the original's one-frame hand-off.
     if player.object_push && player.locked == LockedAction::None {
@@ -675,6 +683,17 @@ pub fn update_with_room(
 
     player.locomotion_tick(room, behavior, speed);
 
+    // The reference's action_behavior for the locomotion behaviors, mirrored
+    // for the oracle trace: idle is handled below with its phase/countdown,
+    // the rest carry `action_state` 1 and a zeroed attackDirection.
+    player.trace_state = match behavior {
+        BEHAVIOR_WALK => Some((1, 1, 0)),
+        BEHAVIOR_TURN => Some((if input.left { 2 } else { 8 }, 1, 0)),
+        BEHAVIOR_BACK => Some((4, 1, 0)),
+        BEHAVIOR_RUN => Some((0x0D, 1, 0)),
+        _ => None,
+    };
+
     if behavior == BEHAVIOR_IDLE {
         player.slow_counter = 0;
         player.idle_ticks = player.idle_ticks.saturating_add(1);
@@ -707,6 +726,11 @@ pub fn update_with_room(
         // captured after the phase advance so the transition tick reports the
         // new phase, exactly like the reference writes it in the same tick.
         player.idle_trace = Some((
+            player.idle_phase.saturating_add(1),
+            if player.idle_phase == 0 { counter } else { 0 },
+        ));
+        player.trace_state = Some((
+            0,
             player.idle_phase.saturating_add(1),
             if player.idle_phase == 0 { counter } else { 0 },
         ));
@@ -2330,6 +2354,7 @@ mod tests {
             idle_phase: 0,
             idle_ticks: 0,
             idle_trace: None,
+            trace_state: None,
             stairs: StairState::default(),
             locked: LockedAction::None,
             action_state: 0,

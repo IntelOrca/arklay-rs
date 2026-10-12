@@ -297,10 +297,18 @@ init = function(e, config)
     e:reset_joints()
 
     -- Health: two draws, the first indexes the table, the second rolls the
-    -- 0..21 subtraction (17..99 HP). The attract demo's seed-based variant is
-    -- not modelled (the port has no attract demo).
-    local health_base = HEALTH[(e:random() & 0xF) + 1]
-    local health_variance = e:random() % 22
+    -- 0..21 subtraction (17..99 HP). During attract playback the original
+    -- reuses the frame seed for both instead, so the recorded reels replay
+    -- their health without consuming the platform stream.
+    local health_base
+    local health_variance
+    if e.attract_demo then
+        health_base = HEALTH[(e.rand_seed & 0xF) + 1]
+        health_variance = e.rand_seed % 22
+    else
+        health_base = HEALTH[(e:random() & 0xF) + 1]
+        health_variance = e:random() % 22
+    end
     e.health = health_base - health_variance
 
     if (e.behavior_flags & 0x0F) == 5 then

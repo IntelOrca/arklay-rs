@@ -96,6 +96,9 @@ pub enum ScreenAction {
     NewGame { character: u8 },
     /// Continue from save slot `index` (zero-based, `savedat{index+1}.dat`).
     LoadGame { slot: usize },
+    /// Play the next attract-demo reel (`pdemoN.dat`), then return to the
+    /// title.
+    Attract,
     /// Return to the title screen.
     Title,
     /// Open the character-selection screen.

@@ -11,8 +11,11 @@
 //! The screen fades in from black while the PRESS text ramps up, then pulses
 //! bright/dim. Any key opens the option menu, where left/right picks NEW GAME
 //! or LOAD GAME. LOAD is refused when no `savedat*.dat` exists: the cursor
-//! never leaves NEW GAME and confirming it is a no-op. An attract-mode timeout
-//! is not implemented; the screen waits on PRESS forever.
+//! never leaves NEW GAME and confirming it is a no-op. An idle title that
+//! reaches the `g_titleDemoTime` timeout (0x708 ticks after the PRESS ramp)
+//! fades to black and reports [`ScreenAction::Attract`]; the app then plays
+//! the next `pdemoN.dat` reel. Any button during the fade cancels back to the
+//! PRESS wait, exactly like the original's state 3.
 
 use anyhow::Result;
 
@@ -39,6 +42,12 @@ const PRESS_RAMP_STEP: u8 = 4;
 const PRESS_FULL: u8 = 0x80;
 /// Ticks per PRESS blink phase.
 const BLINK_TICKS: u32 = 32;
+/// Frames the idle title waits before it fades into an attract demo (the
+/// original's `g_titleDemoTime = 0x708`), counted from the end of the PRESS
+/// ramp.
+const ATTRACT_TIMEOUT: i32 = 0x708;
+/// The attract fade-out counter (type 2 black, the original's `0x400`).
+const ATTRACT_FADE_COUNTER: i16 = 0x400 >> 7;
 
 /// One prompt row's UV: sheet row, sprite height and descriptor screen-y.
 struct PromptRow {
@@ -75,6 +84,8 @@ enum Stage {
     Menu,
     /// Fade to black, then report the stored action.
     FadeOut,
+    /// The attract timeout's fade to black, then the demo hand-off.
+    AttractFade,
 }
 
 /// The title screen state.
@@ -94,6 +105,9 @@ pub struct TitleScreen {
     /// Which leg of the confirm flash chain is running (the original's
     /// `g_titleOptionsFading` 6..9 then 4).
     fade_phase: u8,
+    /// The idle countdown to the attract demo (`g_titleDemoTime`); negative
+    /// while the PRESS ramp is still running.
+    attract_countdown: i32,
     ticks: u32,
     /// Action reported once the fade-out finishes.
     exit: Option<ScreenAction>,
@@ -111,10 +125,11 @@ impl TitleScreen {
             press_brightness: 0,
             // The title has no entry fade: the reference only arms the
             // `0xFC00` black fade-in when the attract demo returns to the
-            // title, which this port does not run. The PRESS brightness ramp
-            // below is the whole entry animation.
+            // title. The PRESS brightness ramp below is the whole entry
+            // animation.
             fade: Fade::inactive(),
             fade_phase: 0,
+            attract_countdown: -1,
             ticks: 0,
             exit: None,
         }
@@ -228,6 +243,7 @@ impl Screen for TitleScreen {
         self.press_brightness = 0;
         self.fade = Fade::inactive();
         self.fade_phase = 0;
+        self.attract_countdown = -1;
         self.ticks = 0;
         self.stage = Stage::Press;
         self.exit = None;
@@ -250,8 +266,23 @@ impl Screen for TitleScreen {
                     .press_brightness
                     .saturating_add(PRESS_RAMP_STEP)
                     .min(PRESS_FULL);
+                // The idle countdown starts once the PRESS text has ramped to
+                // full; the original arms it when state 1 hands over to 2.
+                if self.press_brightness >= PRESS_FULL {
+                    if self.attract_countdown < 0 {
+                        self.attract_countdown = ATTRACT_TIMEOUT;
+                    }
+                    self.attract_countdown -= 1;
+                    if self.attract_countdown <= 0 {
+                        // The original's case 2: fade type 2 with counter 0x400.
+                        self.fade = Fade::fade_out(ATTRACT_FADE_COUNTER, 0, 2);
+                        self.stage = Stage::AttractFade;
+                        return ScreenResult::Continue;
+                    }
+                }
                 if input.any || input.confirm || input.cancel {
                     self.stage = Stage::Menu;
+                    self.attract_countdown = -1;
                     self.ticks = 0;
                 }
             }
@@ -292,6 +323,20 @@ impl Screen for TitleScreen {
                     return ScreenResult::Done(self.exit.take().unwrap_or(ScreenAction::Title));
                 }
             }
+            Stage::AttractFade => {
+                self.fade.tick();
+                if !self.fade.is_active() {
+                    // The fade reached black: hand off to the attract reel.
+                    return ScreenResult::Done(ScreenAction::Attract);
+                }
+                // Any button cancels back to the PRESS wait with the overlay
+                // cleared (the original's case 3 cancellation).
+                if input.any || input.confirm || input.cancel {
+                    self.fade = Fade::inactive();
+                    self.attract_countdown = ATTRACT_TIMEOUT;
+                    self.stage = Stage::Press;
+                }
+            }
         }
         ScreenResult::Continue
     }
@@ -311,7 +356,7 @@ impl Screen for TitleScreen {
             return;
         };
         let (row, scale) = match self.stage {
-            Stage::Press => (&ROW_PRESS, self.press_scale()),
+            Stage::Press | Stage::AttractFade => (&ROW_PRESS, self.press_scale()),
             Stage::Menu | Stage::FadeOut => {
                 let row = if self.selection == 2 {
                     &ROW_LOAD_GAME
@@ -618,6 +663,48 @@ mod tests {
             }
         }
         panic!("the screen never finished");
+    }
+
+    #[test]
+    fn the_idle_title_times_out_into_the_attract_demo() {
+        let mut screen = TitleScreen::new();
+        let cx = test_context();
+        // The PRESS ramp runs first; the countdown then runs 0x708 ticks and
+        // the black fade completes.
+        let mut action = None;
+        let mut ticks = 0u32;
+        for _ in 0..4000 {
+            ticks += 1;
+            if let ScreenResult::Done(result) = screen.update(&cx, neutral()) {
+                action = Some(result);
+                break;
+            }
+        }
+        assert_eq!(action, Some(ScreenAction::Attract));
+        // 32 ramp ticks + the 0x708 countdown + the 0x400 fade (counter 8
+        // alpha a tick; the wrap tick ends it).
+        assert_eq!(ticks, 1863);
+        assert_eq!(screen.stage, Stage::AttractFade);
+    }
+
+    #[test]
+    fn a_button_cancels_the_attract_fade_back_to_press() {
+        let mut screen = TitleScreen::new();
+        let cx = test_context();
+        screen.attract_countdown = 1;
+        screen.press_brightness = PRESS_FULL;
+        screen.update(&cx, neutral());
+        assert_eq!(screen.stage, Stage::AttractFade);
+        screen.update(
+            &cx,
+            UiInput {
+                any: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::Press);
+        assert_eq!(screen.fade(), 0, "the fade clears instantly");
+        assert_eq!(screen.attract_countdown, ATTRACT_TIMEOUT);
     }
 
     /// A context over an empty pack and save directory.

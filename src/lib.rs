@@ -10,6 +10,7 @@ pub mod budget;
 pub mod cinepak;
 pub mod combat;
 pub mod convert;
+pub mod demo;
 pub mod door;
 pub mod effects;
 pub mod emd;
