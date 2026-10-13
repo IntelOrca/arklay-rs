@@ -1382,6 +1382,7 @@ mod tests {
             load_order,
             rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
             scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
+            language: None,
             engine: None,
             lua: Vec::new(),
         }

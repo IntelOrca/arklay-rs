@@ -299,6 +299,10 @@ fn load_table(pack: &Pack, path: &str, kind: Kind) -> Table {
 
 /// Encode entries in the `text/*.bin` format: a `u32` count, one file-relative
 /// `u32` offset per entry (zero for a missing entry) and the raw streams.
+///
+/// Test-only: the format is no longer packed, but the older reader tests still
+/// build fixtures with it.
+#[cfg(test)]
 pub(crate) fn encode_table(entries: &[Option<Vec<u8>>]) -> Vec<u8> {
     let mut data = Vec::new();
     data.extend_from_slice(&(entries.len() as u32).to_le_bytes());

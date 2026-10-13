@@ -141,8 +141,8 @@ enum Command {
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
 
-        /// Game executable holding the text tables (default: a `Bio.exe`
-        /// discovered under the root)
+        /// Game executable holding the map and combat tables (default: a
+        /// `Bio.exe` discovered under the root)
         #[arg(long, value_name = "EXE")]
         exe: Option<PathBuf>,
 
