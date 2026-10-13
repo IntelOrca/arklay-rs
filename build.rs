@@ -26,6 +26,20 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
         }
+    } else if let Some(out_dir) = std::env::var_os("DEP_SDL3_OUT_DIR") {
+        // sdl3-sys built SDL3 from source (`build-from-source`) into its
+        // OUT_DIR and copies the shared library to the profile directory for
+        // runtime lookup. That copy is a loose file, so tooling such as
+        // rust-cache prunes it while keeping the build output, leaving a
+        // cached binary unable to load libSDL3.so.0. Point the binary straight
+        // at the build output so the libraries the engine links against are
+        // always found.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+            let lib = PathBuf::from(out_dir).join("lib");
+            if lib.join("libSDL3.so.0").is_file() {
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+            }
+        }
     }
 
     emit_enemy_scripts();
