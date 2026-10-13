@@ -45,6 +45,9 @@ cargo run -- extract re1.akpak --out extracted/
 # Launch room 100 as player 0 (RDT 1000)
 cargo run -- re1.akpak --room 100 --player 0
 
+# Pick the displayed language; the default is the OS locale, then en-US
+cargo run -- re1.akpak --room 100 --language ja-JP
+
 # Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font)
 cargo run -- re1.akpak
 
@@ -115,7 +118,9 @@ cargo run -- scd build 1000.s --out scd/1000.scd
 ```
 
 `docs/modding.md` documents the manifest grammar, the `.s` grammar, the mod
-source convention and the sandboxed Lua hook API; `docs/m15-deviations.md`
+source convention, the language-file overrides and the sandboxed Lua hook API;
+`docs/language.md` documents the `language/<tag>.txt` format, the key
+registry, the fallback chain and the missing-glyph box; `docs/m15-deviations.md`
 records the deliberate limits (whole-room script replacement, sandbox,
 error/budget policy). A run without any layer stays byte-identical to a
 pre-M15 run, Lua or not.

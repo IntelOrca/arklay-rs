@@ -96,7 +96,11 @@ fn the_japanese_seed_matches_the_executable_tables() {
         };
         file.get(key).map(|entry| entry.encode())
     });
-    assert!(checked > 100, "{checked} table entries checked");
+    // A pack converted by this tree carries no text tables; a legacy pack
+    // does, and then the check must be substantial.
+    if pack.contains("text/messages.bin") {
+        assert!(checked > 100, "{checked} table entries checked");
+    }
 }
 
 #[test]

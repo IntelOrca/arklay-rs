@@ -7,11 +7,13 @@ before. What follows is what the milestone's tools deliberately do not prove.
 
 ## `verify`
 
-- **Classification is by path.** `room/*.rdt`, `roommask/*.bmp`, `text/*.bin`,
-  `map/tables.bin`, `data/bio_card.dat` and `manifest.toml` are matched by
-  prefix/name, everything else by extension. A known format under an unknown
-  name is counted opaque; `--strict` turns that into a failure. This is
-  deliberate: future pack entries must not be able to break the command.
+- **Classification is by path.** `room/*.rdt`, `roommask/*.bmp`,
+  `language/*.txt`, `map/tables.bin`, `data/bio_card.dat` and `manifest.toml`
+  are matched by prefix/name, everything else by extension. A known format
+  under an unknown name is counted opaque; `--strict` turns that into a
+  failure. This is deliberate: future pack entries must not be able to break
+  the command. (The executable `text/*.bin` tables this milestone classified
+  were retired; a leftover one is opaque.)
 - **An RDT must load the way the engine loads it.** It needs at least one
   camera cut, a `roomcut/{room}_{camera:03}.bmp` for every cut, and the
   init/main/event SCD table the reader would use (a standalone `scd/{id}.scd`
