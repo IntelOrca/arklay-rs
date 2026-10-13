@@ -167,7 +167,7 @@ fn real_corpus_zone_paths_never_panic() {
         let Ok(data) = pack.read(path) else {
             continue;
         };
-        let Ok(room) = rdt::parse(data, id) else {
+        let Ok(room) = rdt::parse(&data, id) else {
             continue;
         };
         if room.walk_zones.is_empty() {
@@ -235,7 +235,7 @@ fn assert_real_footstep(pack: &Pack, name: &str) {
     let bytes = pack
         .read(&path)
         .unwrap_or_else(|err| panic!("pack has no {path}: {err}"));
-    audio::parse_wav(bytes).unwrap_or_else(|err| panic!("{path} does not parse: {err:#}"));
+    audio::parse_wav(&bytes).unwrap_or_else(|err| panic!("{path} does not parse: {err:#}"));
 }
 
 #[test]

@@ -18,7 +18,7 @@ use arklay::state::{RoomId, RoomState};
 
 /// Parse the SCD streams of the room's pack entry.
 fn room_scripts(pack: &Pack, id: RoomId) -> Scripts {
-    let data = pack.read(&id.rdt_entry()).expect("room entry");
+    let data = &*pack.read(&id.rdt_entry()).expect("room entry");
     arklay::scd::reader::parse(data).expect("parse SCD")
 }
 
@@ -99,7 +99,7 @@ fn real_room20d0_state8_walk_reaches_the_scripted_waypoint() {
         .position(|entity| entity.id == 0x27 && entity.active())
         .expect("ROOM20D0 spawns Richard");
 
-    let model = emd::parse(pack.read("enemy/em27.emd").unwrap()).unwrap();
+    let model = emd::parse(&pack.read("enemy/em27.emd").unwrap()).unwrap();
     let mut game = arklay::game::GameState::default();
     let mut richard = sim.game.entities[slot];
     // ROOM20D0's own walk script: behaviour 3, target (7380, 2440), turn step

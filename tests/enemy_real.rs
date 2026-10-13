@@ -32,7 +32,7 @@ fn real_room4080_wasp_nests_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em07{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert!(
         model.skeleton.relative.len() >= 10,
         "the wasp model's ten joints are the effect anchors the death paths use"
@@ -99,7 +99,7 @@ fn real_room30c0_spider_web_initialises_through_the_script() {
     let model = pack
         .read(&format!("enemy/em13{}.emd", id.player_flag & 1))
         .unwrap();
-    assert!(arklay::emd::parse(model).is_ok(), "the web model parses");
+    assert!(arklay::emd::parse(&model).is_ok(), "the web model parses");
 
     assert_eq!(web.state(), 1, "the script's init moved the web to idle");
     assert_eq!(web.health, 0x37, "the script set the web health");
@@ -125,7 +125,7 @@ fn real_room3010_adders_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em0a{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         11,
@@ -185,7 +185,7 @@ fn real_room40f0_plant42_roots_initialises_through_the_script() {
     let model = pack
         .read(&format!("enemy/em0e{}.emd", id.player_flag & 1))
         .unwrap();
-    assert!(arklay::emd::parse(model).is_ok(), "the roots model parses");
+    assert!(arklay::emd::parse(&model).is_ok(), "the roots model parses");
 
     // A fresh boot takes the scenario script's nested dormant branch: the
     // mass initialises, pins to its spawn point and never moves.
@@ -259,7 +259,7 @@ fn real_room30c0_black_tiger_initialises_through_the_script() {
     let model = pack
         .read(&format!("enemy/em04{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         20,
@@ -302,7 +302,7 @@ fn real_room4040_webspinners_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em03{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         20,
@@ -417,7 +417,7 @@ fn real_room1140_hounds_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em02{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert!(
         model.skeleton.relative.len() >= 5,
         "the hound model carries the reach/blood joint anchors"
@@ -467,7 +467,7 @@ fn real_room50f0_chimeras_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em09{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert!(
         model.skeleton.relative.len() >= 11,
         "the chimera model carries the claw and torso anchors"
@@ -518,7 +518,7 @@ fn real_room30a0_hunters_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em06{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert!(
         model.skeleton.relative.len() >= 16,
         "the hunter model carries the mouth and death chains"
@@ -590,7 +590,7 @@ fn real_room10c0_monster_plants_initialise_through_the_script() {
     let model = pack
         .read(&format!("enemy/em0f{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         15,
@@ -649,7 +649,7 @@ fn real_room5060_computer_arms_initialise_through_the_script() {
         let model = pack
             .read(&format!("enemy/em{arm_id:02x}{}.emd", id.player_flag & 1))
             .unwrap();
-        assert!(arklay::emd::parse(model).is_ok(), "the arm model parses");
+        assert!(arklay::emd::parse(&model).is_ok(), "the arm model parses");
     }
 
     let first = arklay::engine::simulate_room(&pack, id, 4, player::Input::default()).unwrap();
@@ -701,7 +701,7 @@ fn boot_and_tick(pack: &Pack, id: RoomId, ticks: usize) -> arklay::game::GameSta
     use arklay::scd;
     use arklay::scd::vm::CommandVm;
 
-    let data = pack.read(&id.rdt_entry()).unwrap();
+    let data = &*pack.read(&id.rdt_entry()).unwrap();
     let room = arklay::rdt::parse(data, id).unwrap();
     let scripts = scd::reader::parse(data).unwrap();
     let mut game = GameState::new(id, &room);
@@ -749,7 +749,7 @@ fn real_room210_yawn_initialises_with_its_twelve_segments() {
     let model = pack
         .read(&format!("enemy/em0d{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         15,
@@ -911,7 +911,7 @@ fn real_room70c_rematch_yawn_initialises() {
     let model = pack
         .read(&format!("enemy/em12{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(model.skeleton.relative.len(), 15);
 
     let first = boot_and_tick(&pack, id, 4);
@@ -954,7 +954,7 @@ fn real_room40c0_plant42_initialises_with_its_companions() {
     let model = pack
         .read(&format!("enemy/em08{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert!(
         model.skeleton.relative.len() >= 16,
         "the plant model carries its sixteen joints plus the companion objects"
@@ -1025,7 +1025,7 @@ fn real_room5130_lab_tyrant_floats_in_the_pod() {
     let model = pack
         .read(&format!("enemy/em0c{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(
         model.skeleton.relative.len(),
         15,
@@ -1097,7 +1097,7 @@ fn real_room3030_heliport_tyrant_waits_suspended() {
     let model = pack
         .read(&format!("enemy/em10{}.emd", id.player_flag & 1))
         .unwrap();
-    let model = arklay::emd::parse(model).unwrap();
+    let model = arklay::emd::parse(&model).unwrap();
     assert_eq!(model.skeleton.relative.len(), 15);
     assert_eq!(model.mesh.objects.len(), 16);
 

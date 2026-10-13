@@ -10,18 +10,19 @@
 //! no parser panics, aborts or grows without bound on malformed data.
 //!
 //! The caps are policy, chosen per format from the shipped corpus with
-//! generous headroom (the converter's pack holds 2,541 entries and 408 MiB):
+//! generous headroom (the converter's pack holds 3,242 entries and 458 MiB):
 //!
 //! | cap | limit | corpus peak | formats |
 //! |---|---|---|---|
-//! | [`MAX_PACK_BYTES`] | 2 GiB | 408 MiB | `.akpak` image |
-//! | [`MAX_PACK_ENTRIES`] | 1,048,576 | 2,541 | pack table of contents |
+//! | [`MAX_PACK_BYTES`] | 2 GiB | 458 MiB | `.akpak` image |
+//! | [`MAX_PACK_ENTRIES`] | 1,048,576 | 3,242 | pack table of contents |
 //! | [`MAX_ENTRY_BYTES`] | 1 GiB | ~40 MiB | one pack entry |
 //! | [`MAX_DECODE_ALLOC`] | 512 MiB | ~64 MiB | one transient decode buffer |
+//! | [`MAX_ZSTD_OUTPUT`] | 512 MiB | ~40 MiB | one decompressed zstd entry |
 //! | [`MAX_PIXELS`] | 16,777,216 | 320x240 | TIM/BMP/IVM/cinepak canvas |
 //! | [`MAX_LZW_OUTPUT`] | 64 MiB | ~1 MiB | one LZW stream |
 //! | [`MAX_RECORDS`] | 1,048,576 | 348 RDTs total | per-format record lists |
-//! | [`MAX_TEXT_BYTES`] | 16 MiB | a few KiB | manifest, `.s` source |
+//! | [`MAX_TEXT_BYTES`] | 16 MiB | a few KiB | manifest, `.s` source, language file |
 //! | [`MAX_CLUT_ENTRIES`] | 65,536 | 1,536 | TIM CLUT |
 //! | [`MAX_CLUT_ROWS`] | 256 | 3 | TIM 4bpp CLUT rows |
 //! | [`MAX_TMD_OBJECTS`] | 65,536 | 16 (player EMD) | TMD/IVM objects |
@@ -43,6 +44,7 @@
 //! | [`MAX_MANIFEST_ITEMS`] | 4,096 | 11 | manifest statements |
 //! | [`MAX_MANIFEST_LINE`] | 65,536 | < 100 | one manifest line |
 //! | [`MAX_MANIFEST_LUA`] | 1,024 | a handful | manifest Lua list |
+//! | [`MAX_LANGUAGE_ENTRIES`] | 65,536 | 1,791 | language `<tag>.txt` entries |
 //! | [`MAX_LUA_CHUNKS`] | 256 | a handful | loaded Lua chunks |
 //! | [`MAX_LUA_CHUNK`] | 1 MiB | a few KiB | one Lua chunk |
 //! | [`MAX_SAVE_BYTES`] | 1 MiB | 2 KiB | save slot file |
@@ -64,6 +66,11 @@ pub const MAX_PACK_ENTRIES: usize = 1 << 20;
 pub const MAX_ENTRY_BYTES: u64 = 1 << 30;
 /// Largest single transient decode allocation, in bytes.
 pub const MAX_DECODE_ALLOC: usize = 512 << 20;
+/// Largest decompressed pack entry accepted, in bytes.
+///
+/// The writer never stores a zstd entry whose plain size exceeds this, so a
+/// converted pack always reads back.
+pub const MAX_ZSTD_OUTPUT: usize = 512 << 20;
 /// Largest decoded image, in pixels.
 pub const MAX_PIXELS: usize = 4096 * 4096;
 /// Largest decoded LZW stream, in bytes.
@@ -122,6 +129,8 @@ pub const MAX_LUA_CHUNK: usize = 1 << 20;
 pub const MAX_SAVE_BYTES: usize = 1 << 20;
 /// Largest combat table blob accepted (`data/combat.bin`).
 pub const MAX_COMBAT_TABLE_BYTES: usize = 1 << 16;
+/// Largest language-file entry count.
+pub const MAX_LANGUAGE_ENTRIES: usize = 1 << 16;
 /// Largest cinepak canvas, in pixels.
 pub const MAX_CINEPAK_PIXELS: usize = MAX_PIXELS;
 
@@ -129,6 +138,7 @@ pub const MAX_CINEPAK_PIXELS: usize = MAX_PIXELS;
 const _: () = {
     assert!(MAX_ENTRY_BYTES <= MAX_PACK_BYTES);
     assert!(MAX_LZW_OUTPUT <= MAX_DECODE_ALLOC);
+    assert!(MAX_ZSTD_OUTPUT <= MAX_DECODE_ALLOC);
     assert!(MAX_PIXELS * 4 <= MAX_DECODE_ALLOC);
     assert!(MAX_CLUT_ENTRIES >= 256);
     assert!(MAX_MASK_SPRITES >= 53);

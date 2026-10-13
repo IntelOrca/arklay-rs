@@ -310,17 +310,13 @@ impl SaveLoadScreen {
                     .text
                     .map(|text| {
                         text.save()
-                            .char_name(usize::from(file.character & 1))
+                            .character_name(usize::from(file.character & 1))
                             .to_vec()
                     })
                     .unwrap_or_default();
                 let location = cx
                     .text
-                    .map(|text| {
-                        text.save()
-                            .location(location_index(file.stage, file.room))
-                            .to_vec()
-                    })
+                    .map(|text| text.save().location(file.stage, file.room).to_vec())
                     .unwrap_or_default();
                 self.reveal = Some(Reveal::new(build_reveal(&name, file.saves, &location)));
                 self.stage = Stage::SaveAnim;
@@ -342,7 +338,7 @@ impl Default for SaveLoadScreen {
 impl Screen for SaveLoadScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         self.background = match cx.pack.read("ui/type00.bmp") {
-            Ok(bytes) => match bmp::decode(bytes) {
+            Ok(bytes) => match bmp::decode(&bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid save/load background: {err:#}");
@@ -501,7 +497,7 @@ impl Screen for SaveLoadScreen {
             HEADER_Y,
             Tint::White,
             2,
-            &save_strings.header_suffix,
+            save_strings.header_suffix(),
         );
 
         for (index, slot) in self.slots.iter().enumerate() {
@@ -517,7 +513,7 @@ impl Screen for SaveLoadScreen {
                         y,
                         Tint::White,
                         2,
-                        &save_strings.filled_slot,
+                        save_strings.slot_filled(),
                     );
                     font.draw_text(
                         framebuffer,
@@ -525,7 +521,7 @@ impl Screen for SaveLoadScreen {
                         y,
                         Tint::White,
                         2,
-                        save_strings.char_name(usize::from(info.character & 1)),
+                        save_strings.character_name(usize::from(info.character & 1)),
                     );
                     let count = count_bytes(info.saves);
                     font.draw_text(framebuffer, COUNT_X, y, Tint::White, 2, &count);
@@ -535,7 +531,7 @@ impl Screen for SaveLoadScreen {
                         y,
                         Tint::White,
                         2,
-                        save_strings.location(location_index(info.stage, info.room)),
+                        save_strings.location(info.stage, info.room),
                     );
                 }
                 None => font.draw_text(
@@ -544,7 +540,7 @@ impl Screen for SaveLoadScreen {
                     y,
                     Tint::White,
                     2,
-                    &save_strings.empty_slot,
+                    save_strings.slot_empty(),
                 ),
             }
         }
@@ -563,7 +559,7 @@ impl Screen for SaveLoadScreen {
             EXIT_Y,
             Tint::White,
             2,
-            &save_strings.exit_suffix,
+            save_strings.exit_suffix(),
         );
 
         if let Some(reveal) = &self.reveal {
@@ -585,7 +581,7 @@ impl Screen for SaveLoadScreen {
                 PROMPT_Y,
                 Tint::White,
                 2,
-                &save_strings.overwrite_prompt,
+                save_strings.overwrite_prompt(),
             );
             font.draw_text(
                 framebuffer,
@@ -593,7 +589,7 @@ impl Screen for SaveLoadScreen {
                 CONFIRM_Y,
                 Tint::White,
                 2,
-                &save_strings.yes_no,
+                save_strings.yes_no(),
             );
         }
         if self.stage == Stage::Error {
@@ -646,26 +642,6 @@ impl SaveLoadScreen {
         };
         font.draw_text(framebuffer, x, y, Tint::White, 2, &[CURSOR_GLYPH]);
     }
-}
-
-/// The original's `GetSaveLocationIndex`: the stage digit picks a location
-/// name, with the main hall, the mansion storeroom and the courtyard path
-/// overriding it. The save block stores the engine's 1-based stage.
-pub fn location_index(stage: u8, room: u8) -> usize {
-    let zero = stage.saturating_sub(1) % 5;
-    let mut index = usize::from(zero);
-    if zero == 0 {
-        if room == 0x06 {
-            index = 1;
-        }
-        if index == 0 && room == 0x18 {
-            index = 5;
-        }
-    }
-    if zero == 2 && room == 0x07 {
-        index = 6;
-    }
-    index
 }
 
 /// The save-count digits as the original's `%02d` line: tens, units, each in
@@ -1058,22 +1034,11 @@ mod tests {
     }
 
     #[test]
-    fn count_digits_and_location_names_follow_the_original_tables() {
+    fn count_digits_follow_the_original_table() {
         assert_eq!(count_bytes(0), [0x0C, 0xFB, 0x0C, 0xFB]);
         assert_eq!(count_bytes(7), [0x0C, 0xFB, 0x13, 0xFB]);
         assert_eq!(count_bytes(42), [0x10, 0xFB, 0x0E, 0xFB]);
         assert_eq!(count_bytes(107), [0x0C, 0xFB, 0x13, 0xFB]);
-
-        // Mansion 1F, main hall, storeroom, courtyard path, guardhouse and lab.
-        assert_eq!(location_index(1, 0), 0);
-        assert_eq!(location_index(1, 0x06), 1);
-        assert_eq!(location_index(1, 0x18), 5);
-        assert_eq!(location_index(2, 0), 1);
-        assert_eq!(location_index(3, 0x07), 6);
-        assert_eq!(location_index(3, 0), 2);
-        assert_eq!(location_index(4, 0), 3);
-        assert_eq!(location_index(5, 0), 4);
-        assert_eq!(location_index(6, 0), 0);
     }
 
     #[test]

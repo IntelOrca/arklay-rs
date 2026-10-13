@@ -55,8 +55,8 @@ pub enum Format {
     Dor,
     /// `*.wav`, a RIFF/WAVE sample.
     Wav,
-    /// `text/*.bin`, an executable text table.
-    Text,
+    /// `language/*.txt`, a language string file.
+    Language,
     /// `map/tables.bin`, the map tables blob.
     MapTables,
     /// `data/combat.bin`, the shared combat table blob.
@@ -88,7 +88,7 @@ impl Format {
             Self::Tmd => "tmd",
             Self::Dor => "dor",
             Self::Wav => "wav",
-            Self::Text => "text",
+            Self::Language => "language",
             Self::MapTables => "maptables",
             Self::Combat => "combat",
             Self::BioCard => "biocard",
@@ -133,15 +133,8 @@ pub fn classify(path: &str) -> Format {
     if lower.starts_with("scd/") && lower.ends_with(".scd") {
         return Format::Scd;
     }
-    if lower.starts_with("text/") && lower.ends_with(".bin") {
-        let name = lower.rsplit('/').next().unwrap_or(&lower);
-        return if known_text_table(name) {
-            Format::Text
-        } else {
-            // A future or third-party `text/*.bin` table has no parser; count
-            // it opaque so it cannot break the command.
-            Format::Opaque
-        };
+    if lower.starts_with("language/") && lower.ends_with(".txt") {
+        return Format::Language;
     }
     if lower.starts_with("roomcut/") && lower.ends_with(".bmp") {
         return Format::Cut;
@@ -165,17 +158,6 @@ pub fn classify(path: &str) -> Format {
         Some((_, "lua")) => Format::Lua,
         _ => Format::Opaque,
     }
-}
-
-/// Whether a `text/*.bin` file name has a table parser.
-///
-/// The classifier uses this list, so an unrecognized table name never reaches
-/// the `Text` arm.
-fn known_text_table(name: &str) -> bool {
-    matches!(
-        name,
-        "messages.bin" | "idesc.bin" | "names.bin" | "unknown.bin" | "save.bin"
-    )
 }
 
 /// Per-format counters in the report.
@@ -310,7 +292,7 @@ pub fn verify_pack(pack: &Pack, strict: bool) -> VerifyReport {
 
 /// Parse one entry with the parser for `format`.
 fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
-    let data = pack.read(path)?;
+    let data = &*pack.read(path)?;
     match format {
         Format::Manifest => {
             let text = std::str::from_utf8(data).context("manifest.toml is not valid UTF-8")?;
@@ -336,7 +318,7 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
             // the reader accepts.
             match pack.read(&id.scd_entry()) {
                 Ok(bytes) => {
-                    crate::scd::reader::parse(bytes).context("invalid SCD override")?;
+                    crate::scd::reader::parse(&bytes).context("invalid SCD override")?;
                 }
                 Err(_) => {
                     crate::scd::reader::parse(data).context("invalid room SCD scripts")?;
@@ -391,20 +373,10 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
         Format::Wav => {
             crate::audio::parse_wav(data)?;
         }
-        Format::Text => {
-            let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-            match name.as_str() {
-                "messages.bin" | "idesc.bin" => {
-                    crate::text::Table::parse_message(data)?;
-                }
-                "names.bin" | "unknown.bin" => {
-                    crate::text::Table::parse_name(data)?;
-                }
-                "save.bin" => {
-                    crate::text::Table::parse_plain(data)?;
-                }
-                other => bail!("no text-table parser for {other}"),
-            }
+        Format::Language => {
+            let source = std::str::from_utf8(data)
+                .map_err(|error| anyhow::anyhow!("language file is not UTF-8: {error}"))?;
+            crate::language::Language::parse(source)?;
         }
         Format::MapTables => {
             crate::ui::map::MapTables::parse(data)?;
@@ -496,8 +468,8 @@ mod tests {
         assert_eq!(classify("player/ws202.tmd"), Format::Tmd);
         assert_eq!(classify("door/door00.dor"), Format::Dor);
         assert_eq!(classify("se/a_mcn03.wav"), Format::Wav);
-        assert_eq!(classify("text/messages.bin"), Format::Text);
-        assert_eq!(classify("text/save.bin"), Format::Text);
+        assert_eq!(classify("language/en-US.txt"), Format::Language);
+        assert_eq!(classify("Language/JA-JP.TXT"), Format::Language);
         assert_eq!(classify("map/tables.bin"), Format::MapTables);
         assert_eq!(classify("data/combat.bin"), Format::Combat);
         assert_eq!(classify("data/bio_card.dat"), Format::BioCard);
@@ -505,9 +477,9 @@ mod tests {
         assert_eq!(classify("enemy/em13.lua"), Format::Lua);
         assert_eq!(classify("lua/demo.lua"), Format::Lua);
         assert_eq!(classify("data/core00.esp"), Format::Opaque);
-        // A future text table or a room the loader can never request stays
-        // opaque instead of breaking the command.
+        // A retired text table stays opaque instead of breaking the command.
         assert_eq!(classify("text/credits.bin"), Format::Opaque);
+        assert_eq!(classify("language/notes.md"), Format::Opaque);
         assert_eq!(classify("room/bonus.rdt"), Format::Opaque);
         assert_eq!(classify("room/100.rdt"), Format::Opaque);
         assert_eq!(classify("room/zzzz.rdt"), Format::Opaque);
@@ -524,7 +496,7 @@ mod tests {
         assert!(lenient.valid());
         assert_eq!(lenient.opaque, 2);
         assert_eq!(lenient.failed, 0);
-        assert!(!lenient.formats.contains_key(&Format::Text));
+        assert!(!lenient.formats.contains_key(&Format::Language));
         assert!(!lenient.formats.contains_key(&Format::Rdt));
 
         let strict = verify_pack(&pack, true);

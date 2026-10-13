@@ -116,7 +116,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
     };
     let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1000").unwrap();
-    let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let entry = id.roommask_entry(0);
     let page_bytes = pack.read(&entry).unwrap_or_else(|err| {
@@ -125,7 +125,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
             path.display()
         )
     });
-    let page = bmp::decode_mask(page_bytes).unwrap();
+    let page = bmp::decode_mask(&page_bytes).unwrap();
 
     // The first group-1 sprite is the pillar top at screen (9, 73): 8x40,
     // page UV (0, 0), so pixel (12, 80) samples page texel (3, 7).
@@ -237,7 +237,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
     };
     let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1000").unwrap();
-    let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let cut = &room.cuts[0];
     let mask_entry = id.roommask_entry(0);
     let page_bytes = pack.read(&mask_entry).unwrap_or_else(|err| {
@@ -246,9 +246,9 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
             path.display()
         )
     });
-    let background = bmp::decode(pack.read(&id.cut_entry(0)).unwrap()).unwrap();
-    let page = bmp::decode_mask(page_bytes).unwrap();
-    let emd = arklay::emd::parse(pack.read("player/00.emd").unwrap()).unwrap();
+    let background = bmp::decode(&pack.read(&id.cut_entry(0)).unwrap()).unwrap();
+    let page = bmp::decode_mask(&page_bytes).unwrap();
+    let emd = arklay::emd::parse(&pack.read("player/00.emd").unwrap()).unwrap();
 
     // The same pose the engine's gameplay render would use at spawn.
     let player_state = arklay::player::spawn(id, &room);

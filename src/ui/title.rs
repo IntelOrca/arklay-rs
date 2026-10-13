@@ -210,7 +210,7 @@ impl Default for TitleScreen {
 impl Screen for TitleScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         self.background = match cx.pack.read("ui/title.bmp") {
-            Ok(bytes) => match bmp::decode(bytes) {
+            Ok(bytes) => match bmp::decode(&bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid title background: {err:#}");
@@ -226,7 +226,7 @@ impl Screen for TitleScreen {
             .into_iter()
             .find_map(|entry| cx.pack.read(entry).ok());
         self.prompt = match prompt {
-            Some(bytes) => match tim::decode_4bpp(bytes) {
+            Some(bytes) => match tim::decode_4bpp(&bytes) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
                     eprintln!("warning: invalid title prompt sheet: {err:#}");

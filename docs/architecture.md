@@ -20,7 +20,7 @@ responsibility.
 
 | Module | Owner | Responsibility |
 |---|---|---|
-| `pack` | Container | `.akpak` v1 reader/writer, layered mod packs, entry lookup, atomic `PackWriter::write` |
+| `pack` | Container | `.akpak` v1 reader/writer with raw and zstd-compressed entries, layered mod packs, entry lookup, atomic `PackWriter::write` |
 | `budget` | Container | Fixed per-format decode caps and checked allocation shared by every parser |
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
@@ -74,10 +74,22 @@ responsibility.
 | `bmp` | Format | BMP encode/decode, including the black-key room-mask decode |
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
-| `font` | Presentation | Glyph decoding, metrics and tinted drawing |
-| `text` | Presentation | Executable text tables: messages, names, descriptions, save strings |
+| `font` | Presentation | Glyph decoding, metrics and tinted drawing; paints the missing-glyph box |
+| `charset` | Presentation | The font's byte <-> character map: greedy cell encoding, substitutes and the box cell |
+| `language` | Presentation | `language/<tag>.txt` grammar, the layered catalog, the fallback chain and OS locale detection |
+| `text` | Presentation | The runtime string facade: messages, item names/descriptions, save strings, room labels and `UI_*` |
 | `mask` | Presentation | Room mask (foreground overlay) sprites and depth ordering |
 | `ui` | UI | `Screen` contract, title, character select, pause menu, item box, FILE, map, item viewer, save/load; the port-only F1 room-select overlay (`ui/debug_menu.rs`) and the F9 return-to-title prompt (`ui/return_title.rs`) |
+
+### Strings and languages
+
+The engine has no text tables: every string resolves through
+`language/<tag>.txt` files packed by `convert-game` and merged per key across
+mod layers. `language::Catalog` resolves the selected tag (the `--language`
+flag, then the OS locale, then `en-US`), `charset` encodes the value into the
+font's byte stream, and `text::Text` is the facade the message machine, the
+menus and the overlays call. The format, the key registry, the fallback chain
+and the mod story live in [`language.md`](language.md).
 
 ## The fixed 30 Hz tick and the frame data flow
 
@@ -278,7 +290,7 @@ claims about the original.
 
 | Format | Entry point | Cap | Tests |
 |---|---|---|---|
-| `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
+| `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB, also the zstd decompression cap) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
 | `manifest.toml` | `manifest::Manifest::parse` | line/key/value length caps | `manifest` unit tests, `tests/torture`, `fuzz/manifest` |
 | RDT room | `rdt::parse` | section counts bounded by remaining bytes; `MAX_RECORDS` | `rdt` unit tests, `tests/m16_game_real.rs`, `tests/soak_real.rs`, `tests/torture`, `fuzz/rdt` |
 | SCD scripts | `scd::reader::parse` | instructions per block, `MAX_SCD_EVENTS` event-table cap | `scd` unit tests, `fuzz/scd` |

@@ -32,7 +32,7 @@ fn pack() -> Option<Pack> {
 
 fn jill_game(pack: &Pack) -> (RoomId, GameState) {
     let id = RoomId::parse("1001").unwrap();
-    let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let mut game = GameState::new(id, &room);
     game.max_health = 96;
     game.entities[0].health = 96;
@@ -46,9 +46,9 @@ fn menu_over_room1001_is_deterministic_and_draws_the_ship_art() {
         return;
     };
     let (id, mut game) = jill_game(&pack);
-    let background = bmp::decode(pack.read(&id.cut_entry(0)).unwrap()).unwrap();
+    let background = bmp::decode(&pack.read(&id.cut_entry(0)).unwrap()).unwrap();
     let assets = MenuAssets::load(&pack).expect("the pack has the slice-5 UI assets");
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
 
     game.entities[0].health = 20;
     game.set_health_status(0x20);

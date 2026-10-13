@@ -194,7 +194,7 @@ impl EntityModelCache {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
             };
-            match emd::parse(bytes) {
+            match emd::parse(&bytes) {
                 Ok(model) => {
                     let model = Arc::new(model);
                     self.models.insert(key, Arc::clone(&model));
@@ -220,7 +220,7 @@ impl EntityModelCache {
             return None;
         }
         let path = format!("player/ws{id:03x}.tmd");
-        match pack.read(&path).and_then(crate::tmd::parse) {
+        match pack.read(&path).and_then(|bytes| crate::tmd::parse(&bytes)) {
             Ok(tmd) => {
                 let tmd = Arc::new(tmd);
                 self.weapon_tmds.insert(id, Arc::clone(&tmd));

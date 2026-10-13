@@ -31,7 +31,7 @@ fn pack_path() -> Option<PathBuf> {
 
 /// Load `id`, run its init script and return the room and game state.
 fn load(pack: &Pack, id: RoomId) -> (RoomState, GameState) {
-    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let bytes = &*pack.read(&id.rdt_entry()).unwrap();
     let room = rdt::parse(bytes, id).unwrap();
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
@@ -230,7 +230,7 @@ fn lab_ladder_zone_latches_flags_and_base() {
     let id = RoomId::parse("3010").unwrap();
     // The lab ladders only exist while scenario flag 47 (the powered lab) is
     // set; with it clear the init rewrites both slots into messages.
-    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let bytes = &*pack.read(&id.rdt_entry()).unwrap();
     let room = rdt::parse(bytes, id).unwrap();
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
@@ -349,7 +349,7 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
     };
     let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("3010").unwrap();
-    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let bytes = &*pack.read(&id.rdt_entry()).unwrap();
     let room = rdt::parse(bytes, id).unwrap();
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
@@ -360,8 +360,8 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
         vm.run_init(&mut host);
     }
     assert!(room.room_anim.is_some(), "ROOM301 room animation pair");
-    let emd = emd::parse(pack.read("player/00.emd").unwrap()).unwrap();
-    let emw = emd::parse_emw(pack.read("player/00.emw").unwrap()).unwrap();
+    let emd = emd::parse(&pack.read("player/00.emd").unwrap()).unwrap();
+    let emw = emd::parse_emw(&pack.read("player/00.emw").unwrap()).unwrap();
     let mut player = player::spawn(id, &room);
 
     // Bottom leg: slot 2's variant zone starts the 0x35 clip, which shifts the
@@ -663,7 +663,7 @@ fn room2031_jill_stair_door_fires_with_real_input() {
         room: 3,
         player_flag: 1,
     };
-    let bytes = pack.read(&id.rdt_entry()).unwrap();
+    let bytes = &*pack.read(&id.rdt_entry()).unwrap();
     let room = rdt::parse(bytes, id).unwrap();
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
@@ -726,11 +726,11 @@ fn capture_player_partway_up_the_lab_stairway() {
     let (mut room, mut game) = load(&pack, id);
     for cut in &mut room.cuts {
         let entry = id.cut_entry(cut.index);
-        cut.background = Some(bmp::decode(pack.read(&entry).unwrap()).unwrap());
+        cut.background = Some(bmp::decode(&pack.read(&entry).unwrap()).unwrap());
     }
 
-    let emd = emd::parse(pack.read("player/00.emd").unwrap()).unwrap();
-    let emw = emd::parse_emw(pack.read("player/00.emw").unwrap()).unwrap();
+    let emd = emd::parse(&pack.read("player/00.emd").unwrap()).unwrap();
+    let emw = emd::parse_emw(&pack.read("player/00.emw").unwrap()).unwrap();
     let mut player = player::spawn(id, &room);
     // Inside the camera-switch zone that selects the stairway cut (7) and on
     // the ramp's lane.

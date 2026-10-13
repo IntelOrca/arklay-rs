@@ -111,7 +111,8 @@ fn real_map_tables_match_sampled_rooms() {
     };
     let pack = Pack::open(&pack_path).unwrap();
     let tables = MapTables::parse(
-        pack.read(arklay::ui::map::TABLES_ENTRY)
+        &pack
+            .read(arklay::ui::map::TABLES_ENTRY)
             .expect("the pack carries map/tables.bin"),
     )
     .unwrap();
@@ -150,7 +151,7 @@ fn real_item_examine_combos_gate_the_description() {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
     let cx = UiContext {
         pack: &pack,
         save_dir: Path::new("."),

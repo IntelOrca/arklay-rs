@@ -77,6 +77,11 @@ struct Cli {
     )]
     character: u8,
 
+    /// Language tag for the displayed strings, e.g. `en-GB`; the default is
+    /// the OS locale, then `en-US`
+    #[arg(long, value_name = "TAG", requires = "pack")]
+    language: Option<String>,
+
     /// Mod pack layers to apply, repeatable (ignored with `--no-mods`)
     #[arg(long = "mod", value_name = "PATH", requires = "pack")]
     mods: Vec<PathBuf>,
@@ -141,8 +146,8 @@ enum Command {
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
 
-        /// Game executable holding the text tables (default: a `Bio.exe`
-        /// discovered under the root)
+        /// Game executable holding the map and combat tables (default: a
+        /// `Bio.exe` discovered under the root)
         #[arg(long, value_name = "EXE")]
         exe: Option<PathBuf>,
 
@@ -166,7 +171,7 @@ enum Command {
         mods: Vec<PathBuf>,
     },
 
-    /// List every entry of a game pack with its size
+    /// List every entry of a game pack with its stored size
     List {
         /// Game pack to read
         #[arg(value_name = "PACK")]
@@ -368,7 +373,7 @@ fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        arklay::atomic::write(&destination, data)
+        arklay::atomic::write(&destination, &data)
             .with_context(|| format!("failed to write {}", destination.display()))?;
         bytes += data.len() as u64;
         progress.advance(entry.path());
@@ -599,6 +604,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,
+                    cli.language.as_deref(),
                     trace_options,
                 );
             }
@@ -613,6 +619,7 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.stats,
                     cli.debug_menu,
+                    cli.language.as_deref(),
                     trace_options,
                 );
             }
@@ -626,6 +633,7 @@ fn main() -> Result<()> {
                 &cli.mods,
                 cli.no_mods,
                 cli.debug_menu,
+                cli.language.as_deref(),
             )
         }
     }
@@ -678,11 +686,11 @@ mod tests {
 
         for entry in pack.entries() {
             let extracted = fs::read(out.join(entry.path())).unwrap();
-            assert_eq!(extracted, pack.read(entry.path()).unwrap());
+            assert_eq!(extracted, pack.read(entry.path()).unwrap().as_ref());
         }
         assert_eq!(
             fs::read(out.join("room/1001.rdt")).unwrap(),
-            pack.read("room/1001.rdt").unwrap()
+            pack.read("room/1001.rdt").unwrap().as_ref()
         );
     }
 
@@ -701,7 +709,7 @@ mod tests {
 
         for sample in ["room/1001.rdt", "roomcut/100_000.bmp", "bgm/013.wav"] {
             let extracted = fs::read(out.join(sample)).unwrap();
-            assert_eq!(extracted, pack.read(sample).unwrap(), "{sample}");
+            assert_eq!(extracted, pack.read(sample).unwrap().as_ref(), "{sample}");
         }
     }
 
@@ -957,16 +965,16 @@ entries:
         layer.write(&mod_path).unwrap();
 
         // The sibling directory is discovered.
-        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false).unwrap();
+        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false, None).unwrap();
         assert!(discovered.is_layered());
-        assert_eq!(discovered.read("room/1000.rdt").unwrap(), b"layer");
+        assert_eq!(discovered.read("room/1000.rdt").unwrap().as_ref(), b"layer");
 
         // `--no-mods` ignores both the discovery and an explicit `--mod`.
         let vanilla =
-            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true)
+            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true, None)
                 .unwrap();
         assert!(!vanilla.is_layered());
-        assert_eq!(vanilla.read("room/1000.rdt").unwrap(), b"base");
+        assert_eq!(vanilla.read("room/1000.rdt").unwrap().as_ref(), b"base");
         assert_eq!(
             vanilla.paths().collect::<Vec<_>>(),
             Pack::open(&pack_path).unwrap().paths().collect::<Vec<_>>()

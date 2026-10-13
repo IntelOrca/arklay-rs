@@ -266,7 +266,7 @@ fn decode(pack: &Pack, entry: &str) -> Result<Texture8> {
     let bytes = pack
         .read(entry)
         .with_context(|| format!("missing {entry}"))?;
-    tim::decode_8bpp(bytes).with_context(|| format!("invalid {entry}"))
+    tim::decode_8bpp(&bytes).with_context(|| format!("invalid {entry}"))
 }
 
 /// Which view owns the FILE tab.

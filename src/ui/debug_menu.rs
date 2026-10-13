@@ -15,8 +15,8 @@ use crate::font::Font;
 use crate::pack::Pack;
 use crate::render::{Framebuffer, Tint};
 use crate::state::RoomId;
-
-use super::UiInput;
+use crate::text::Text;
+use crate::{charset, ui::UiInput};
 
 /// Rows the panel shows before it scrolls.
 pub const VISIBLE_ROWS: usize = 9;
@@ -109,20 +109,19 @@ impl DebugMenu {
 
     /// Draw the dark panel, the room list and the key hints. Without a font
     /// the panel still dims the frozen frame.
-    pub fn draw(&mut self, framebuffer: &mut Framebuffer, font: Option<&Font>) {
+    pub fn draw(&mut self, framebuffer: &mut Framebuffer, font: Option<&Font>, text: &Text) {
         framebuffer.blend_black_rect(PANEL, 200);
         let Some(font) = font else {
             return;
         };
         let [panel_x, panel_y, _, _] = PANEL;
-        let title = encode_ascii("DEBUG MENU");
         font.draw_text_plain(
             framebuffer,
             panel_x + 12,
             panel_y + 8,
             Tint::White,
             2,
-            &title,
+            text.ui("UI_DEBUG_TITLE"),
         );
         for (index, id) in self
             .rooms
@@ -135,24 +134,35 @@ impl DebugMenu {
             if index == self.cursor {
                 font.draw_text_plain(framebuffer, CURSOR_X, y, Tint::White, 2, &[CURSOR_GLYPH]);
             }
-            let text = encode_ascii(&id.room3());
+            let room3 = id.room3();
+            let mut label = Vec::new();
+            charset::encode(&room3, &mut label);
             let tint = if Some(index) == self.current {
                 Tint::Green
             } else {
                 Tint::White
             };
-            font.draw_text_plain(framebuffer, TEXT_X, y, tint, 2, &text);
+            font.draw_text_plain(framebuffer, TEXT_X, y, tint, 2, &label);
+            // The room's name, in the room-label column and clipped to the
+            // panel.
+            if let Some(name) = text.room_name(&room3) {
+                let x = TEXT_X + 5 * font.metrics.glyph_w;
+                let panel_right = panel_x + PANEL[2];
+                let max_cells = ((panel_right - x) / font.metrics.glyph_w).max(0) as usize;
+                font.draw_text_plain(framebuffer, x, y, Tint::Grey, 2, fit_cells(name, max_cells));
+            }
         }
-        let hints = ["UP/DOWN: MOVE", "ENTER: JUMP", "F1/ESC: CLOSE"];
-        for (line, hint) in hints.iter().enumerate() {
-            let bytes = encode_ascii(hint);
+        for (line, key) in ["UI_DEBUG_HINT_1", "UI_DEBUG_HINT_2", "UI_DEBUG_HINT_3"]
+            .iter()
+            .enumerate()
+        {
             font.draw_text_plain(
                 framebuffer,
                 panel_x + 12,
                 panel_y + 164 + line as i32 * ROW_HEIGHT,
                 Tint::Grey,
                 2,
-                &bytes,
+                text.ui(key),
             );
         }
     }
@@ -199,25 +209,30 @@ pub fn room_entries(pack: &Pack, preferred_player: u8) -> Vec<RoomId> {
         .collect()
 }
 
-/// Encode one line of plain ASCII into the shared font's glyph bytes: letters
-/// and digits use the font's ASCII grid, with the punctuation the overlays
-/// need. The period uses the shipped sheet's own period cell (0x17); the USA
-/// sheet's period index (0x9D) lands on a kana cell on the Japanese-width
-/// sheet, so it would not stay legible.
-pub fn encode_ascii(text: &str) -> Vec<u8> {
-    text.chars()
-        .map(|c| match c {
-            'A'..='Z' => 0x1D + (c as u8 - b'A'),
-            'a'..='z' => 0x3D + (c as u8 - b'a'),
-            '0'..='9' => 0x0C + (c as u8 - b'0'),
-            ' ' => 0x00,
-            ':' => 0x16,
-            '.' => 0x17,
-            '-' => 0x3B,
-            '/' => 0x38,
-            _ => 0x1B,
-        })
-        .collect()
+/// The longest prefix of `bytes` that draws in at most `max_cells` cells.
+///
+/// Terminators end the stream; an extended glyph pair counts as one cell and
+/// `0xFB` as none, matching [`crate::font::wrap_cells`].
+fn fit_cells(bytes: &[u8], max_cells: usize) -> &[u8] {
+    let mut index = 0;
+    let mut cells = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x01 || byte == 0x07 {
+            break;
+        }
+        let step = match byte {
+            0xF8..=0xFA => 2,
+            _ => 1,
+        };
+        let width = usize::from(byte != 0xFB);
+        if cells + width > max_cells {
+            break;
+        }
+        cells += width;
+        index = (index + step).min(bytes.len());
+    }
+    &bytes[..index]
 }
 
 #[cfg(test)]
@@ -314,13 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn encode_ascii_uses_the_font_grid() {
-        assert_eq!(encode_ascii("106"), [0x0D, 0x0C, 0x12]);
-        assert_eq!(encode_ascii("A B"), [0x1D, 0x00, 0x1E]);
-        assert_eq!(
-            encode_ascii("F1/ESC: X"),
-            [0x22, 0x0D, 0x38, 0x21, 0x2F, 0x1F, 0x16, 0x00, 0x34]
-        );
-        assert_eq!(encode_ascii("a z."), [0x3D, 0x00, 0x56, 0x17]);
+    fn fit_cells_stops_at_the_cell_budget() {
+        // `106` is three glyphs; the extended pair counts once.
+        assert_eq!(fit_cells(&[0x0D, 0x0C, 0x12], 2), [0x0D, 0x0C]);
+        assert_eq!(fit_cells(&[0xF9, 0x09, 0x1D], 1), [0xF9, 0x09]);
+        assert_eq!(fit_cells(&[0x1D, 0xFB, 0x1E], 2), [0x1D, 0xFB, 0x1E]);
+        assert_eq!(fit_cells(&[0x1D, 0x01], 4), [0x1D]);
     }
 }

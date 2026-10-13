@@ -193,12 +193,12 @@ pub struct Font {
 }
 
 impl Font {
-    /// Pair `texture` with the metrics its width selects.
-    pub fn new(texture: Texture8) -> Self {
-        Self {
-            metrics: FontMetrics::from_sheet_width(texture.width),
-            texture,
-        }
+    /// Pair `texture` with the metrics its width selects and paint the
+    /// missing-glyph box into the cell [`crate::charset::MISSING`] selects.
+    pub fn new(mut texture: Texture8) -> Self {
+        let metrics = FontMetrics::from_sheet_width(texture.width);
+        paint_missing_box(&mut texture, metrics);
+        Self { texture, metrics }
     }
 
     /// Draw an encoded stream left to right from `(x, y)`.
@@ -286,10 +286,89 @@ impl Font {
     }
 }
 
+/// Paint a hollow box into the cell [`crate::charset::MISSING`] selects.
+///
+/// Plain byte `MISSING` addresses row `MISSING / 18`, column `MISSING % 18`
+/// of the glyph grid; the strokes use the palette index the shipped glyph
+/// pixels do, so the box takes the same tint and brightness as the text
+/// around it.
+fn paint_missing_box(texture: &mut Texture8, metrics: FontMetrics) {
+    /// The palette index the shipped glyph strokes use (a dark grey that the
+    /// tint pass maps to the text colour).
+    const INK: u8 = 8;
+    let glyph_w = metrics.glyph_w.max(1) as u32;
+    let height = GLYPH_HEIGHT as u32;
+    let byte = usize::from(crate::charset::MISSING);
+    let left = (byte % 18) as u32 * glyph_w;
+    let top = 28 + (byte / 18) as u32 * height;
+    for y in 0..height {
+        for x in 0..glyph_w {
+            let index = (top + y) as usize * texture.width as usize + left as usize + x as usize;
+            let Some(pixel) = texture.indices.get_mut(index) else {
+                return;
+            };
+            let edge = y == 0 || y == height - 1 || x == 0 || x == glyph_w - 1;
+            *pixel = if edge { INK } else { 0 };
+        }
+    }
+}
+
 /// The text shadow's blend alpha: `brightness * 255 / 30`, capped at 255.
 /// Unlike the text pass, the shadow pass has no 0/2 collapse.
 pub fn shadow_alpha(brightness: u8) -> u8 {
     (u32::from(brightness) * 255 / 30).min(255) as u8
+}
+
+/// Split an encoded stream into rows of at most `max_cells` glyph cells,
+/// breaking at the last space of a row when there is one.
+///
+/// The terminators end the stream; a `0xF8`/`0xF9`/`0xFA` pair counts as one
+/// cell, `0xFB` as none.
+pub fn wrap_cells(bytes: &[u8], max_cells: usize) -> Vec<&[u8]> {
+    let max_cells = max_cells.max(1);
+    let mut rows = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let mut index = 0;
+        let mut cells = 0;
+        let mut last_space = None;
+        while index < rest.len() {
+            let byte = rest[index];
+            if byte == 0x01 || byte == 0x07 {
+                // The terminator closes the stream; the rest is the last row.
+                index = rest.len();
+                break;
+            }
+            let step = match byte {
+                0xF8..=0xFA => 2,
+                _ => 1,
+            };
+            let width = usize::from(byte != 0xFB);
+            if cells + width > max_cells {
+                break;
+            }
+            if byte == 0x00 {
+                last_space = Some(index);
+            }
+            cells += width;
+            index = (index + step).min(rest.len());
+        }
+        if index >= rest.len() {
+            rows.push(rest);
+            break;
+        }
+        let cut = match last_space {
+            Some(space) if space > 0 => space,
+            _ => index.max(1),
+        };
+        rows.push(&rest[..cut]);
+        rest = &rest[cut..];
+        // The space the row broke at does not start the next one.
+        if rest.first() == Some(&0x00) {
+            rest = &rest[1..];
+        }
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -393,6 +472,62 @@ mod tests {
         let decoded = steps(&[0x0C], metrics_jpn());
         assert_eq!(decoded[0].u, 168);
         assert_eq!(decoded[0].v, 28);
+    }
+
+    #[test]
+    fn wrap_cells_breaks_at_spaces_and_cell_limits() {
+        // `A B`: `A` = 0x1D, space = 0x00, `B` = 0x1E, terminator 0x01.
+        let bytes = [0x1D, 0x00, 0x1E, 0x01];
+        assert_eq!(
+            wrap_cells(&bytes, 10),
+            vec![[0x1D, 0x00, 0x1E, 0x01].as_slice()]
+        );
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0x1D].as_slice(), [0x1E, 0x01].as_slice()]
+        );
+
+        // An extended glyph pair counts as one cell.
+        let bytes = [0xF9, 0x09, 0x1D, 0x00, 0x1E];
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0xF9, 0x09, 0x1D].as_slice(), [0x1E].as_slice()]
+        );
+
+        // `0xFB` takes no cell.
+        let bytes = [0x1D, 0xFB, 0x1E, 0x1D];
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0x1D, 0xFB, 0x1E].as_slice(), [0x1D].as_slice()]
+        );
+    }
+
+    #[test]
+    fn the_missing_glyph_cell_is_a_hollow_box() {
+        let font = Font::new(sheet_with_cell(168, 28));
+        let glyph = Glyphs::new(&[crate::charset::MISSING], font.metrics)
+            .next()
+            .expect("the missing byte decodes to a cell");
+        assert!(glyph.visible());
+        let pixel = |x: i32, y: i32| {
+            font.texture.indices[(y as u32 * font.texture.width + x as u32) as usize]
+        };
+        assert_ne!(pixel(glyph.u, glyph.v), 0, "top-left corner");
+        assert_ne!(
+            pixel(glyph.u + glyph.width - 1, glyph.v),
+            0,
+            "top-right corner"
+        );
+        assert_ne!(
+            pixel(glyph.u, glyph.v + glyph.height - 1),
+            0,
+            "bottom-left corner"
+        );
+        assert_eq!(
+            pixel(glyph.u + glyph.width / 2, glyph.v + glyph.height / 2),
+            0,
+            "the middle stays hollow"
+        );
     }
 
     #[test]

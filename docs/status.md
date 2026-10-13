@@ -584,40 +584,43 @@ converted base pack on the reference install reports:
 
 ```
 pack: re1.akpak
-3206 entries, 769251500 bytes
+3245 entries, 479906472 bytes
 format       entries        ok    failed          bytes
-manifest           1         1         0            101
-rdt              348       320        28      107997096
-roomcut          842       842         0      175695340
-roommask         601       601         0       29133338
-bmp               12        12         0        1784964
-tim              122       122         0        6401234
-ivm               77        77         0        6525012
-emd               63        63         0        8624580
-emw               32        32         0         784348
-tmd                7         7         0          18824
-dor               34        34         0        2279820
-wav              992       992         0      177670174
-text               5         5         0           6581
+manifest           1         1         0            106
+rdt              348       320        28       51364907
+roomcut          842       842         0       42258554
+roommask         601       601         0        4194392
+bmp               12        12         0         269296
+tim              122       122         0         776669
+ivm               77        77         0        1581983
+emd               63        63         0        4062003
+emw               32        32         0         446942
+tmd                7         7         0           8822
+dor               34        34         0         888924
+wav             1023      1023         0      122047547
+language           8         8         0         205617
 maptables          1         1         0             72
-combat             1         1         0           6924
-biocard            1         1         0           1052
+combat             1         1         0           1017
+biocard            1         1         0            335
 avi               27        27         0      251624740
-lua               38        38         0         639312
-opaque             2         2         0          57988
-verify: 3206 entries, 3178 ok, 28 failed, 2 opaque
+lua               39        39         0         151044
+opaque             6         6         0          23502
+verify: 3245 entries, 3217 ok, 28 failed, 6 opaque
 ```
 
 The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
 whose header declares no camera cuts: the engine refuses them on load and the
 soak skips them, so `verify` reports them instead of green-lighting rooms the
-engine cannot load. Every other entry parses. The two opaque entries are
-`data/core00.esp` and `data/core00.etm`, the effect tables whose pair parser is
-not in the path classifier; `--strict` turns them into failures by design.
+engine cannot load. Every other entry parses. The six opaque entries are the
+four attract reels (`demo/*.dat`), whose bespoke format the classifier does
+not cover yet, and `data/core00.esp`/`data/core00.etm`, the effect tables
+whose pair parser is not in the path classifier; `--strict` turns them into
+failures by design.
 
-The one pack carries everything: the 517 referenced voice `wav` entries
-(101,697,368 bytes) and the 27 shipped `avi` films (251,624,740 bytes) sit
-beside the room, audio and UI entries, and all three formats verify clean.
+The one pack carries everything: the 517 referenced voice `wav` entries and
+the 27 shipped `avi` films (251,624,740 bytes) sit beside the room, audio, UI
+and `language/` entries, and all three formats verify clean. `language/`
+replaces the retired executable `text/*.bin` tables.
 
 ## Verification spine
 

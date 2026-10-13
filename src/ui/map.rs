@@ -395,7 +395,7 @@ impl MapScreen {
     /// Load the tables and art, and pick the initial view from `game`'s room.
     pub fn open(pack: &Pack, game: &GameState) -> Self {
         let tables = match pack.read(TABLES_ENTRY) {
-            Ok(data) => match MapTables::parse(data) {
+            Ok(data) => match MapTables::parse(&data) {
                 Ok(tables) => tables,
                 Err(err) => {
                     eprintln!("warning: invalid {TABLES_ENTRY}: {err:#}; the map tab stays blank");
@@ -431,7 +431,7 @@ impl MapScreen {
 
     fn load_backdrop(&self, pack: &Pack) -> Option<Texture8> {
         match pack.read(BLUE_ENTRY) {
-            Ok(bytes) => match tim::decode_8bpp(bytes) {
+            Ok(bytes) => match tim::decode_8bpp(&bytes) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
                     eprintln!("warning: invalid {BLUE_ENTRY}: {err:#}");
@@ -450,7 +450,7 @@ impl MapScreen {
         if self.plans[layout].is_none() {
             let entry = TAB_ENTRIES[layout];
             self.plans[layout] = match pack.read(entry) {
-                Ok(bytes) => match tim::decode_8bpp(bytes) {
+                Ok(bytes) => match tim::decode_8bpp(&bytes) {
                     Ok(texture) => Some(texture),
                     Err(err) => {
                         eprintln!("warning: invalid {entry}: {err:#}");

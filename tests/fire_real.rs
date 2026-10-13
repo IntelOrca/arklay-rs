@@ -50,7 +50,7 @@ impl FireScene {
         let data = pack
             .read(&format!("room/{:04x}.rdt", id.rdt_number()))
             .unwrap();
-        let scripts = reader::parse(data).unwrap();
+        let scripts = reader::parse(&data).unwrap();
         let command_vm = CommandVm::new(&scripts);
         let mut event_vm = EventVm::new(&scripts);
         event_vm.start(0, event);

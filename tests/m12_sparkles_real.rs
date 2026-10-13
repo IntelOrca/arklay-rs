@@ -296,13 +296,13 @@ fn corpus_walk_spawns_all_43_shipped_sparkles_and_frees_them() {
         let Ok(data) = pack.read(&id.rdt_entry()) else {
             continue;
         };
-        let Ok(room) = rdt::parse(data, id) else {
+        let Ok(room) = rdt::parse(&data, id) else {
             continue;
         };
         if room.item_models.is_empty() {
             continue;
         }
-        let Ok(scripts) = scd::reader::parse(data) else {
+        let Ok(scripts) = scd::reader::parse(&data) else {
             continue;
         };
         // Every `item_aot_set` site whose flags word carries the sparkle bit,

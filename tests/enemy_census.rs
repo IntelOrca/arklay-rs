@@ -45,10 +45,10 @@ fn corpus_monster_records_run_or_park_without_script_errors() {
             continue;
         };
         // The stub rooms without camera cuts are skipped, like the soak.
-        let Ok(room) = arklay::rdt::parse(data, id) else {
+        let Ok(room) = arklay::rdt::parse(&data, id) else {
             continue;
         };
-        let Ok(scripts) = scd::reader::parse(data) else {
+        let Ok(scripts) = scd::reader::parse(&data) else {
             continue;
         };
         // Every `eml_state` (0x28) sub-command every corpus stream uses. The

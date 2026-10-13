@@ -31,7 +31,7 @@ fn every_packed_weapon_asset_parses_and_resolves() {
             let bytes = pack
                 .read(&entry)
                 .unwrap_or_else(|_| panic!("missing {entry}"));
-            let emw = arklay::emd::parse_emw(bytes).unwrap_or_else(|err| {
+            let emw = arklay::emd::parse_emw(&bytes).unwrap_or_else(|err| {
                 panic!("{entry} does not parse: {err:#}");
             });
             assert!(!emw.clips.is_empty(), "{entry} carries no clips");
@@ -54,7 +54,7 @@ fn every_packed_weapon_asset_parses_and_resolves() {
             let bytes = pack
                 .read(&entry)
                 .unwrap_or_else(|_| panic!("missing {entry}"));
-            let tmd = arklay::tmd::parse(bytes).unwrap_or_else(|err| {
+            let tmd = arklay::tmd::parse(&bytes).unwrap_or_else(|err| {
                 panic!("{entry} does not parse: {err:#}");
             });
             assert_eq!(tmd.objects.len(), 1, "{entry} is the held mesh");
@@ -94,9 +94,9 @@ fn real_room_web_dies_through_the_weapon_input_path() {
     run.game.entities[0].pos = run.player.pos;
 
     let emd_bytes = pack.read("player/00.emd").unwrap();
-    let emd = arklay::emd::parse(emd_bytes).unwrap();
-    let emw = arklay::emd::parse_emw(pack.read("player/00.emw").unwrap()).unwrap();
-    let weapon = arklay::emd::parse_emw(pack.read("player/w01.emw").unwrap()).unwrap();
+    let emd = arklay::emd::parse(&emd_bytes).unwrap();
+    let emw = arklay::emd::parse_emw(&pack.read("player/00.emw").unwrap()).unwrap();
+    let weapon = arklay::emd::parse_emw(&pack.read("player/w01.emw").unwrap()).unwrap();
     let clips = WeaponClips {
         emd: &emd.clips,
         emw: &emw.clips,
@@ -199,11 +199,11 @@ fn handgun_fire_queues_weapon_bank_sounds_that_are_packed() {
 
     let character = run.game.id.player_flag & 3;
     let emd =
-        arklay::emd::parse(pack.read(&format!("player/{character:02}.emd")).unwrap()).unwrap();
+        arklay::emd::parse(&pack.read(&format!("player/{character:02}.emd")).unwrap()).unwrap();
     let emw =
-        arklay::emd::parse_emw(pack.read(&format!("player/{character:02}.emw")).unwrap()).unwrap();
+        arklay::emd::parse_emw(&pack.read(&format!("player/{character:02}.emw")).unwrap()).unwrap();
     let weapon_entry = weapons::weapon_emw_entry(character, 2).unwrap();
-    let weapon = arklay::emd::parse_emw(pack.read(&weapon_entry).unwrap()).unwrap();
+    let weapon = arklay::emd::parse_emw(&pack.read(&weapon_entry).unwrap()).unwrap();
     let clips = WeaponClips {
         emd: &emd.clips,
         emw: &emw.clips,

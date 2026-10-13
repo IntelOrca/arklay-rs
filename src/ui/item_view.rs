@@ -455,7 +455,7 @@ fn load_model(pack: &Pack, item: u8) -> Option<Ivm> {
     let name = items::model_name(item)?;
     let entry = format!("{ITEM_MODEL_PREFIX}{}.ivm", name.to_ascii_lowercase());
     match pack.read(&entry) {
-        Ok(data) => match ivm::parse(data) {
+        Ok(data) => match ivm::parse(&data) {
             Ok(model) => Some(model),
             Err(err) => {
                 eprintln!("warning: invalid {entry}: {err:#}");
@@ -1025,24 +1025,20 @@ mod tests {
 
     #[test]
     fn ingram_and_minimi_descriptions_use_their_own_entries() {
-        // A table where entries 0x4D and 0x4E (zero-based; the 1-based
-        // lookups 0x4E/0x4F) are present but the direct item-id entries are
-        // not.
+        // A language file where the 1-based item ids 0x4E/0x4F have
+        // descriptions but the direct item-id entries do not.
         let dir = TempDir::new();
         let path = dir.0.join("game.akpak");
-        let mut descriptions: Vec<Option<Vec<u8>>> = (0..79).map(|_| None).collect();
-        descriptions[0x4D] = Some(vec![0x0C, 0x01, 0x00]);
-        descriptions[0x4E] = Some(vec![0x0D, 0x01, 0x00]);
         let mut writer = PackWriter::new();
         writer
             .add(
-                crate::text::DESCRIPTIONS_ENTRY,
-                crate::text::encode_table(&descriptions),
+                "language/en-US.txt",
+                b"ITEM_4E_DESCRIPTION = \"0\"\nITEM_4F_DESCRIPTION = \"1\"\n".to_vec(),
             )
             .unwrap();
         writer.write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
-        let text = Text::load(&pack);
+        let text = Text::load(&pack, Some("en-US"));
 
         assert_eq!(
             description_bytes(&text, items::ITEM_INGRAM),

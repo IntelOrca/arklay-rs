@@ -3,8 +3,8 @@
 //! The manifest is an ordinary pack entry that describes its pack: the format
 //! version, a stable id, a human name and version, whether the pack is a base
 //! or a mod, the base id a mod shadows, the layer order mods sort by, the RDT
-//! and SCD dialects it carries, a free-form engine note and the explicit Lua
-//! hook list.
+//! and SCD dialects it carries, the language of its own room text, a free-form
+//! engine note and the explicit Lua hook list.
 //!
 //! The parser is a deliberately small, dependency-free TOML subset: comments,
 //! blank lines, `key = value` with strings, integers, booleans and string
@@ -77,6 +77,11 @@ pub struct Manifest {
     pub rdt_version: String,
     /// SCD dialect, e.g. `re1`.
     pub scd_version: String,
+    /// Language of the pack's own room text, e.g. `ja-JP`.
+    ///
+    /// The converted install's RDT messages are in this language; the
+    /// `language/<tag>.txt` files a pack carries are separate.
+    pub language: Option<String>,
     /// Optional note about the engine build this pack targets.
     pub engine: Option<String>,
     /// Explicit Lua hook paths, in load order.
@@ -96,6 +101,7 @@ impl Manifest {
             load_order: 0,
             rdt_version: DEFAULT_RDT_VERSION.to_string(),
             scd_version: DEFAULT_SCD_VERSION.to_string(),
+            language: None,
             engine: None,
             lua: Vec::new(),
         }
@@ -122,6 +128,7 @@ impl Manifest {
         let mut load_order = None;
         let mut rdt_version = None;
         let mut scd_version = None;
+        let mut language = None;
         let mut engine = None;
         let mut lua = None;
         let mut seen: HashSet<String> = HashSet::new();
@@ -180,6 +187,7 @@ impl Manifest {
                 }
                 "rdt" => rdt_version = Some(non_empty_string(item, "rdt")?),
                 "scd" => scd_version = Some(non_empty_string(item, "scd")?),
+                "language" => language = Some(non_empty_string(item, "language")?),
                 "engine" => engine = Some(string_value(item, "engine")?),
                 "lua" => {
                     let Value::Array(values) = item.value else {
@@ -216,6 +224,7 @@ impl Manifest {
             load_order: load_order.unwrap_or(0),
             rdt_version: rdt_version.unwrap_or_else(|| DEFAULT_RDT_VERSION.to_string()),
             scd_version: scd_version.unwrap_or_else(|| DEFAULT_SCD_VERSION.to_string()),
+            language,
             engine,
             lua: lua.unwrap_or_default(),
         })
@@ -246,6 +255,9 @@ impl Manifest {
         }
         write_pair(&mut out, "rdt", &quote(&self.rdt_version));
         write_pair(&mut out, "scd", &quote(&self.scd_version));
+        if let Some(language) = &self.language {
+            write_pair(&mut out, "language", &quote(language));
+        }
         if let Some(engine) = &self.engine {
             write_pair(&mut out, "engine", &quote(engine));
         }
@@ -555,6 +567,7 @@ mod tests {
             load_order: 0,
             rdt_version: DEFAULT_RDT_VERSION.to_string(),
             scd_version: DEFAULT_SCD_VERSION.to_string(),
+            language: None,
             engine: Some("arklay 0.1.0".to_string()),
             lua: Vec::new(),
         }
@@ -571,6 +584,7 @@ mod tests {
             load_order: 40,
             rdt_version: DEFAULT_RDT_VERSION.to_string(),
             scd_version: DEFAULT_SCD_VERSION.to_string(),
+            language: None,
             engine: None,
             lua: vec!["lua/demo.lua".to_string(), "lua/extra.lua".to_string()],
         }
@@ -652,6 +666,7 @@ base = \"re1\"
 load_order = -7
 rdt = \"re1-jpn\"
 scd = \"re1\"
+language = \"ja-JP\"
 engine = \"arklay 0.1.0\"
 lua = [\"lua/a.lua\", \"lua/b.lua\"]
 ";
@@ -669,6 +684,7 @@ lua = [\"lua/a.lua\", \"lua/b.lua\"]
             load_order: -7,
             rdt_version: "re1-jpn".to_string(),
             scd_version: "re1".to_string(),
+            language: Some("ja-JP".to_string()),
             engine: Some("arklay 0.1.0".to_string()),
             lua: vec!["lua/a.lua".to_string(), "lua/b.lua".to_string()],
         }
@@ -679,6 +695,7 @@ lua = [\"lua/a.lua\", \"lua/b.lua\"]
         let manifest = Manifest::parse("format = 1\nid = \"re1\"\nkind = \"base\"\n").unwrap();
         assert_eq!(manifest.rdt_version, "re1");
         assert_eq!(manifest.scd_version, "re1");
+        assert_eq!(manifest.language, None);
         assert_eq!(manifest.load_order, 0);
         assert_eq!(manifest.lua, Vec::<String>::new());
         assert_eq!(manifest.name, None);

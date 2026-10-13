@@ -148,12 +148,14 @@ impl MenuAssets {
         let statface = decode_texture(pack, STATFACE_ENTRY)?;
         let staitem = decode_texture(pack, STAITEM_ENTRY)?;
         let item_all = bmp::decode_mask(
-            pack.read(ITEM_ALL_ENTRY)
+            &pack
+                .read(ITEM_ALL_ENTRY)
                 .with_context(|| format!("missing {ITEM_ALL_ENTRY}"))?,
         )
         .with_context(|| format!("invalid {ITEM_ALL_ENTRY}"))?;
         let font = Font::new(tim::decode_4bpp(
-            pack.read(FONT_ENTRY)
+            &pack
+                .read(FONT_ENTRY)
                 .with_context(|| format!("missing {FONT_ENTRY}"))?,
         )?);
         Ok(Self {
@@ -171,7 +173,7 @@ fn decode_texture(pack: &Pack, entry: &str) -> Result<Texture8> {
     let bytes = pack
         .read(entry)
         .with_context(|| format!("missing {entry}"))?;
-    tim::decode_8bpp(bytes).with_context(|| format!("invalid {entry}"))
+    tim::decode_8bpp(&bytes).with_context(|| format!("invalid {entry}"))
 }
 
 /// The pause menu's screen state.
@@ -772,7 +774,8 @@ pub fn item_name_bytes<'a>(text: &'a Text, item: u8, examined: &[u8; 4]) -> Opti
             if !record.name_valid()
                 && !crate::message::examined_bit(examined, record.name_class) =>
         {
-            text.unknown_name(usize::from(record.name_class))
+            text.item_name_unchecked(u16::from(item))
+                .or_else(|| text.item_name(u16::from(item)))
         }
         _ => text.item_name(u16::from(item)),
     }
@@ -1412,20 +1415,18 @@ mod tests {
     fn the_item_name_line_can_be_suppressed_for_a_message() {
         use crate::pack::{Pack, PackWriter};
 
-        // A names table with one real name for the green herb, so the name
+        // A language file with one real name for the green herb, so the name
         // draw has something to paint.
         let dir = std::env::temp_dir().join(format!("arklay-menu-name-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("game.akpak");
-        let mut names: Vec<Option<Vec<u8>>> = (0..0x45).map(|_| None).collect();
-        names[0x43] = Some(vec![0xAA, 0x07]);
         let mut writer = PackWriter::new();
         writer
-            .add(crate::text::NAMES_ENTRY, crate::text::encode_table(&names))
+            .add("language/en-US.txt", b"ITEM_44_NAME = \"\\xAA\"\n".to_vec())
             .unwrap();
         writer.write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
-        let text = Text::load(&pack);
+        let text = Text::load(&pack, Some("en-US"));
 
         let mut game = new_game();
         game.add_item(0x44, 1);

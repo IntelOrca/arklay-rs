@@ -435,7 +435,7 @@ impl Default for CharSelectScreen {
 impl Screen for CharSelectScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         self.background = match cx.pack.read("ui/sel_back.bmp") {
-            Ok(bytes) => match bmp::decode(bytes) {
+            Ok(bytes) => match bmp::decode(&bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid character-select background: {err:#}");
@@ -452,7 +452,7 @@ impl Screen for CharSelectScreen {
         // the arrows); the converted 24-bit BMP cannot carry alpha, so key
         // black out here. The background sheet above keeps its black art.
         self.cards = match cx.pack.read("ui/select_b.bmp") {
-            Ok(bytes) => match bmp::decode_mask(bytes) {
+            Ok(bytes) => match bmp::decode_mask(&bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid character-select cards: {err:#}");
@@ -465,7 +465,7 @@ impl Screen for CharSelectScreen {
             }
         };
         self.extras = match cx.pack.read("ui/select_k.tim") {
-            Ok(bytes) => match tim::decode_8bpp(bytes) {
+            Ok(bytes) => match tim::decode_8bpp(&bytes) {
                 Ok(texture) => Some(texture),
                 Err(err) => {
                     eprintln!("warning: invalid character-select sheet: {err:#}");

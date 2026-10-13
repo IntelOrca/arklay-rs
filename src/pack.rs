@@ -3,18 +3,30 @@
 //! The container is little-endian. A 10-byte header holds the magic `APAK`, a
 //! `u16` version, and a `u32` entry count. It is followed by one fixed 32-byte
 //! table-of-contents entry per file: `path_offset: u64`, `data_offset: u64`,
-//! `length: u64`, `kind: u8`, and seven reserved zero bytes, with offsets
-//! measured from the start of the file. The payload area then holds the
-//! NUL-terminated UTF-8 paths in entry order, followed by the entry data in
-//! entry order with no padding. Writers sort entries by ASCII-lowercased path
-//! so output is byte-deterministic; readers key entries by ASCII-lowercased
-//! path while preserving the original path strings. Both the writer and the
-//! reader reject unsafe paths (absolute, `..` components, backslashes, NUL
-//! bytes or empty), so a pack can never name a file outside its pack root.
+//! `length: u64`, `compression: u8`, and seven reserved zero bytes, with
+//! offsets measured from the start of the file. `length` is the stored length,
+//! so for a compressed entry it is the size of the zstd frame, not of the
+//! decompressed bytes (the frame embeds that size). The compression byte is 0
+//! for a raw entry and 1 for a zstd frame; it was reserved zero in the
+//! original v1 layout, so a raw pack is byte-for-byte unchanged and only a
+//! pack that actually uses mode 1 needs a reader that knows it.
+//! [`PackWriter::compress_entries`] zstd-compresses the entries a caller does
+//! not exempt, on a worker pool; an entry never grows, so a frame smaller than
+//! the raw bytes is required. The payload area then holds the NUL-terminated
+//! UTF-8 paths in entry order, followed by the entry data in entry order with
+//! no padding. Writers sort entries by ASCII-lowercased path so output is
+//! byte-deterministic for a given libzstd build; readers key entries by
+//! ASCII-lowercased path while preserving the original path strings. Both the
+//! writer and the reader reject unsafe paths (absolute, `..` components,
+//! backslashes, NUL bytes or empty), so a pack can never name a file outside
+//! its pack root.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -27,16 +39,59 @@ pub const MAGIC: [u8; 4] = *b"APAK";
 /// Pack format version written and accepted by this module.
 pub const VERSION: u16 = 1;
 
+/// The zstd compression level `compress_entries` uses.
+///
+/// Fixed from an experiment over the RE1 pack's 518 MB of compressible
+/// entries on the 4-core reference machine. Full-conversion wall clock: 2.0 s
+/// raw (770.2 MB), 2.5 s at level 3 (487.7 MB), 3.8 s at level 6 (479.9 MB)
+/// and 5.0 s at level 9 (478.5 MB). Higher levels buy almost nothing until
+/// level 19, whose larger window saves 16 MB more for over a minute extra, so
+/// six sits at the knee of the size/time curve. The container exposes no
+/// strength knob.
+pub const ZSTD_LEVEL: i32 = 6;
+
 /// Size of the fixed pack header.
 const HEADER_LEN: usize = 10;
 
 /// Size of one table-of-contents entry.
 const ENTRY_LEN: usize = 32;
 
+/// How one entry's bytes are stored in the pack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compression {
+    /// The entry is stored as-is (table-of-contents mode 0).
+    None,
+    /// The entry is a zstd frame (table-of-contents mode 1).
+    Zstd,
+}
+
+impl Compression {
+    /// The mode byte written to the table of contents.
+    fn mode(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Zstd => 1,
+        }
+    }
+
+    /// Parse a table-of-contents mode byte.
+    fn from_mode(mode: u8) -> Result<Self> {
+        match mode {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Zstd),
+            other => bail!("unsupported compression mode {other}"),
+        }
+    }
+}
+
+/// One entry's compression result: its index and, when the frame paid for
+/// itself, the compressed bytes. An `Err` aborts the compression pass.
+type CompressResult = (usize, Result<Option<Vec<u8>>>);
+
 /// Builds an `.akpak` pack from named byte blobs.
 #[derive(Debug, Default)]
 pub struct PackWriter {
-    entries: Vec<(String, Vec<u8>)>,
+    entries: Vec<(String, Vec<u8>, Compression)>,
     /// ASCII-lowercased entry paths, for O(1) duplicate detection.
     seen: HashSet<String>,
 }
@@ -66,8 +121,111 @@ impl PackWriter {
         if !self.seen.insert(path.to_ascii_lowercase()) {
             bail!("duplicate pack entry: {path}");
         }
-        self.entries.push((path.to_owned(), data));
+        self.entries
+            .push((path.to_owned(), data, Compression::None));
         Ok(())
+    }
+
+    /// Compress every raw entry `keep_raw` does not exempt with zstd at
+    /// [`ZSTD_LEVEL`], on up to `jobs` scoped workers (clamped to 1..=entries;
+    /// entries already stored zstd are skipped).
+    ///
+    /// `keep_raw` names the paths whose data is already compressed (films,
+    /// PNG and WebP images, `ogg` audio) and would only waste conversion time;
+    /// it runs on the worker threads and is consulted only for raw entries. An
+    /// entry is stored compressed only when the frame is smaller than the raw
+    /// bytes and the plain data fits [`budget::MAX_ZSTD_OUTPUT`], the reader's
+    /// decompression cap, so an entry can never grow and every written pack
+    /// reads back. Returns how many entries ended up compressed.
+    ///
+    /// Workers run to completion before any entry is replaced, and the results
+    /// are applied in entry order, so a failed pass leaves every entry raw and
+    /// a successful one is byte-deterministic for a given libzstd build
+    /// whatever the worker count or scheduling. The pass holds the raw entries
+    /// and every compressed frame at once, so its peak memory is the plain
+    /// pack size plus the compressed pack size.
+    pub fn compress_entries(
+        &mut self,
+        jobs: usize,
+        keep_raw: impl Fn(&str) -> bool + Sync,
+    ) -> Result<usize> {
+        self.compress_entries_capped(jobs, keep_raw, budget::MAX_ZSTD_OUTPUT)
+    }
+
+    /// [`PackWriter::compress_entries`] with an explicit plain-size cap, for
+    /// the unit tests.
+    fn compress_entries_capped(
+        &mut self,
+        jobs: usize,
+        keep_raw: impl Fn(&str) -> bool + Sync,
+        cap: usize,
+    ) -> Result<usize> {
+        if self.entries.is_empty() {
+            return Ok(0);
+        }
+        let jobs = jobs.clamp(1, self.entries.len());
+        let next = AtomicUsize::new(0);
+        let results: Mutex<Vec<CompressResult>> = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..jobs {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((path, data, compression)) = self.entries.get(index) else {
+                            return;
+                        };
+                        if *compression != Compression::None || keep_raw(path) {
+                            continue;
+                        }
+                        // The reader refuses to decompress beyond its cap, so
+                        // an over-cap entry stays raw and keeps reading back.
+                        if data.len() > cap {
+                            continue;
+                        }
+                        let compressed = zstd::bulk::compress(data, ZSTD_LEVEL)
+                            .with_context(|| format!("failed to zstd-compress {path}"));
+                        // Keep an entry raw when the frame does not pay for
+                        // itself, whatever the policy says.
+                        let compressed = compressed.map(|frame| {
+                            if frame.len() < data.len() {
+                                Some(frame)
+                            } else {
+                                None
+                            }
+                        });
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((index, compressed));
+                    }
+                });
+            }
+        });
+
+        let mut count = 0;
+        let mut results = results
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        results.sort_by_key(|(index, _)| *index);
+        // Move the frames out first: a failed pass leaves every entry exactly
+        // as it was, because nothing is replaced until every result succeeded.
+        let mut frames = Vec::with_capacity(results.len());
+        for (index, result) in results {
+            frames.push((index, result?));
+        }
+        for (index, frame) in frames {
+            if let Some(frame) = frame {
+                self.entries[index].1 = frame;
+                self.entries[index].2 = Compression::Zstd;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// The number of entries added so far.
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     /// Whether no entries have been added.
@@ -85,7 +243,7 @@ impl PackWriter {
         let mut total = HEADER_LEN
             .checked_add(toc_len)
             .context("pack table of contents is too large")?;
-        for (path, data) in &self.entries {
+        for (path, data, _) in &self.entries {
             total = total
                 .checked_add(path.len() + 1)
                 .and_then(|size| size.checked_add(data.len()))
@@ -109,7 +267,7 @@ impl PackWriter {
             .entries
             .iter()
             .enumerate()
-            .map(|(index, (path, _))| (path.to_ascii_lowercase(), index))
+            .map(|(index, (path, _, _))| (path.to_ascii_lowercase(), index))
             .collect();
         order.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -124,11 +282,11 @@ impl PackWriter {
         let mut path_offset = paths_start;
         let mut data_offset = data_start;
         for (_, index) in &order {
-            let (path, data) = &self.entries[*index];
+            let (path, data, compression) = &self.entries[*index];
             toc.extend_from_slice(&to_u64(path_offset)?.to_le_bytes());
             toc.extend_from_slice(&to_u64(data_offset)?.to_le_bytes());
             toc.extend_from_slice(&to_u64(data.len())?.to_le_bytes());
-            toc.push(0);
+            toc.push(compression.mode());
             toc.extend_from_slice(&[0; 7]);
             path_offset += path.len() + 1;
             data_offset += data.len();
@@ -219,7 +377,8 @@ impl<'a> PackEntry<'a> {
         self.path
     }
 
-    /// The entry size in bytes.
+    /// The entry size in bytes as stored in the pack: the zstd frame size for
+    /// a compressed entry, not the decompressed size.
     pub fn size(self) -> usize {
         self.size
     }
@@ -231,6 +390,7 @@ struct Entry {
     path: String,
     offset: usize,
     length: usize,
+    compression: Compression,
 }
 
 /// A parsed `.akpak` pack, optionally layered over by mod packs.
@@ -252,6 +412,9 @@ pub struct Pack {
     overlays: Vec<Pack>,
     /// Non-fatal problems found while layering.
     warnings: Vec<String>,
+    /// Requested display language (`--language`); the string catalog resolves
+    /// it, falling back to the OS locale and then `en-US`.
+    language: Option<String>,
 }
 
 impl Pack {
@@ -389,10 +552,8 @@ impl Pack {
                 budget::MAX_ENTRY_BYTES,
                 &format!("entry {index} length"),
             )?;
-            let kind = toc[24];
-            if kind != 0 {
-                bail!("entry {index} has unsupported kind {kind}");
-            }
+            let compression = Compression::from_mode(toc[24])
+                .map_err(|err| anyhow!("entry {index} has {err}"))?;
             let path_offset =
                 usize::try_from(path_offset).context("pack path offset does not fit in memory")?;
             let data_offset =
@@ -428,14 +589,16 @@ impl Pack {
                 path: path.to_owned(),
                 offset: data_offset,
                 length,
+                compression,
             });
         }
 
         let manifest = match lookup.get(&manifest::ENTRY.to_ascii_lowercase()) {
             Some(&index) => {
                 let entry = &entries[index];
-                let text = std::str::from_utf8(&data[entry.offset..entry.offset + entry.length])
-                    .context("manifest.toml is not valid UTF-8")?;
+                let bytes = entry_bytes(&data, entry)?;
+                let text =
+                    std::str::from_utf8(&bytes).context("manifest.toml is not valid UTF-8")?;
                 Some(manifest::Manifest::parse(text).context("invalid manifest.toml")?)
             }
             None => None,
@@ -449,6 +612,7 @@ impl Pack {
             source: None,
             overlays: Vec::new(),
             warnings: Vec::new(),
+            language: None,
         })
     }
 
@@ -485,6 +649,18 @@ impl Pack {
         self.source.as_deref()
     }
 
+    /// Select the display language tag the string catalog resolves first.
+    ///
+    /// `None` leaves the catalog to the OS locale and then `en-US`.
+    pub fn set_language(&mut self, language: Option<&str>) {
+        self.language = language.map(str::to_string);
+    }
+
+    /// The requested display language, if any.
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
     /// The layer whose entry wins `path`: the last overlay that has it, or the
     /// base, or nothing.
     fn winner(&self, path: &str) -> Option<&Pack> {
@@ -503,7 +679,12 @@ impl Pack {
     }
 
     /// Read an entry's data, looking the path up ignoring ASCII case.
-    pub fn read(&self, path: &str) -> Result<&[u8]> {
+    ///
+    /// A raw entry borrows directly from the pack image; a zstd entry is
+    /// decompressed into an owned buffer, so it costs CPU and an allocation
+    /// per call. The decompressed size is capped by
+    /// [`budget::MAX_ZSTD_OUTPUT`] whatever the frame claims.
+    pub fn read(&self, path: &str) -> Result<Cow<'_, [u8]>> {
         let Some(layer) = self.winner(path) else {
             bail!("no pack entry named {path}");
         };
@@ -511,8 +692,27 @@ impl Pack {
             .lookup
             .get(&path.to_ascii_lowercase())
             .expect("the winning layer holds the entry");
-        let entry = &layer.entries[index];
-        Ok(&layer.data[entry.offset..entry.offset + entry.length])
+        entry_bytes(&layer.data, &layer.entries[index])
+    }
+
+    /// Every layer's copy of `path`, base first and overlays in applied order.
+    ///
+    /// [`Pack::read`] resolves the winning copy only; a text file that merges
+    /// per key (a language file) needs the whole stack, so this exposes it.
+    pub fn read_stack(&self, path: &str) -> Vec<Cow<'_, [u8]>> {
+        let key = path.to_ascii_lowercase();
+        let mut stack = Vec::new();
+        let mut layers: Vec<&Pack> = Vec::with_capacity(1 + self.overlays.len());
+        layers.push(self);
+        layers.extend(self.overlays.iter());
+        for layer in layers {
+            if let Some(index) = layer.lookup.get(&key)
+                && let Ok(bytes) = entry_bytes(&layer.data, &layer.entries[*index])
+            {
+                stack.push(bytes);
+            }
+        }
+        stack
     }
 
     /// The merged entries: shadowed base entries hidden, later layers winning,
@@ -632,6 +832,53 @@ fn read_u64(bytes: &[u8], at: usize) -> Result<u64> {
     Ok(u64::from_le_bytes(raw))
 }
 
+/// The readable bytes of one entry: borrowed when raw, decompressed when zstd.
+fn entry_bytes<'a>(data: &'a [u8], entry: &Entry) -> Result<Cow<'a, [u8]>> {
+    let stored = &data[entry.offset..entry.offset + entry.length];
+    match entry.compression {
+        Compression::None => Ok(Cow::Borrowed(stored)),
+        Compression::Zstd => Ok(Cow::Owned(decompress_zstd(stored, &entry.path)?)),
+    }
+}
+
+/// Decompress one stored zstd entry, bounded by [`budget::MAX_ZSTD_OUTPUT`].
+///
+/// A frame that declares a larger decompressed size is refused before any
+/// buffer grows, and one that produces more is cut off at the cap and
+/// rejected, so a malicious pack cannot expand a small entry without bound.
+/// The output is reserved with `try_reserve` in 64 KiB steps, so the transient
+/// allocation never exceeds the cap.
+fn decompress_zstd(stored: &[u8], path: &str) -> Result<Vec<u8>> {
+    decompress_zstd_with_cap(stored, path, budget::MAX_ZSTD_OUTPUT)
+}
+
+/// [`decompress_zstd`] with an explicit output cap, for the unit tests.
+fn decompress_zstd_with_cap(stored: &[u8], path: &str, cap: usize) -> Result<Vec<u8>> {
+    if let Ok(Some(size)) = zstd::zstd_safe::get_frame_content_size(stored)
+        && size > cap as u64
+    {
+        bail!("entry {path} declares {size} decompressed bytes, over the {cap} byte limit");
+    }
+    let mut decoder = zstd::stream::read::Decoder::new(stored)
+        .with_context(|| format!("entry {path} is not a valid zstd frame"))?;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 64 << 10];
+    loop {
+        let read = decoder
+            .read(&mut chunk)
+            .with_context(|| format!("failed to decompress entry {path}"))?;
+        if read == 0 {
+            return Ok(out);
+        }
+        if out.len() + read > cap {
+            bail!("entry {path} decompresses beyond the {cap} byte limit");
+        }
+        out.try_reserve(read)
+            .map_err(|_| anyhow!("entry {path}: failed to reserve decompression space"))?;
+        out.extend_from_slice(&chunk[..read]);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -714,9 +961,9 @@ mod tests {
         let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert_eq!(pack.len(), 3);
         assert!(!pack.is_empty());
-        assert_eq!(pack.read("room/1000.rdt").unwrap(), &[1, 2, 3]);
-        assert_eq!(pack.read("roomcut/100_000.bmp").unwrap(), &[9; 64]);
-        assert_eq!(pack.read("MixEd.TxT").unwrap(), b"hello");
+        assert_eq!(&*pack.read("room/1000.rdt").unwrap(), &[1, 2, 3]);
+        assert_eq!(&*pack.read("roomcut/100_000.bmp").unwrap(), &[9; 64]);
+        assert_eq!(&*pack.read("MixEd.TxT").unwrap(), b"hello");
         let paths: Vec<&str> = pack.paths().collect();
         assert_eq!(paths, ["MixEd.TxT", "room/1000.rdt", "roomcut/100_000.bmp"]);
     }
@@ -810,7 +1057,7 @@ mod tests {
         assert!(pack.contains("data/room.rdt"));
         assert!(pack.contains("DATA/ROOM.RDT"));
         assert!(!pack.contains("data/other.rdt"));
-        assert_eq!(pack.read("dAtA/rOoM.rdT").unwrap(), b"room");
+        assert_eq!(&*pack.read("dAtA/rOoM.rdT").unwrap(), b"room");
         assert!(pack.read("missing").is_err());
     }
 
@@ -897,10 +1144,145 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_kind() {
+    fn rejects_unsupported_compression_mode() {
         let mut bytes = single_entry_pack("a.txt", b"x");
+        bytes[HEADER_LEN + 24] = 2;
+        let err = Pack::from_bytes(bytes).unwrap_err().to_string();
+        assert!(err.contains("compression mode"), "{err}");
+    }
+
+    #[test]
+    fn compress_entries_round_trips() {
+        let rdt = vec![7u8; 64 * 1024];
+        let film = vec![1u8, 2, 3, 4];
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", rdt.clone()).unwrap();
+        writer.add("movie/oj.avi", film.clone()).unwrap();
+
+        let compressed = writer
+            .compress_entries(2, |path| path.ends_with(".avi"))
+            .unwrap();
+        assert_eq!(compressed, 1);
+
+        let bytes = writer.to_bytes().unwrap();
+        // Sorted order is movie/oj.avi then room/1000.rdt: the film is mode 0
+        // (exempt), the RDT is mode 1.
+        assert_eq!(bytes[HEADER_LEN + 24], 0);
+        assert_eq!(bytes[HEADER_LEN + ENTRY_LEN + 24], 1);
+
+        let pack = Pack::from_bytes(bytes).unwrap();
+        assert_eq!(&*pack.read("room/1000.rdt").unwrap(), rdt.as_slice());
+        assert_eq!(&*pack.read("movie/oj.avi").unwrap(), film.as_slice());
+    }
+
+    #[test]
+    fn compress_entries_keeps_small_entries_raw() {
+        let mut writer = PackWriter::new();
+        writer.add("a.txt", b"x".to_vec()).unwrap();
+        assert_eq!(writer.compress_entries(1, |_| false).unwrap(), 0);
+        let bytes = writer.to_bytes().unwrap();
+        assert_eq!(bytes[HEADER_LEN + 24], 0);
+        let pack = Pack::from_bytes(bytes).unwrap();
+        assert_eq!(&*pack.read("a.txt").unwrap(), b"x");
+    }
+
+    #[test]
+    fn compress_entries_is_deterministic() {
+        let entries = [
+            ("room/1000.rdt", vec![3u8; 9_000]),
+            (
+                "roomcut/100_000.bmp",
+                (0..=255u8).cycle().take(4_096).collect(),
+            ),
+            ("bgm/013.wav", vec![0u8; 1_000]),
+        ];
+        let mut one = PackWriter::new();
+        let mut many = PackWriter::new();
+        for (path, data) in &entries {
+            one.add(path, data.clone()).unwrap();
+            many.add(path, data.clone()).unwrap();
+        }
+        assert_eq!(one.compress_entries(1, |_| false).unwrap(), 3);
+        assert_eq!(many.compress_entries(4, |_| false).unwrap(), 3);
+        assert_eq!(one.to_bytes().unwrap(), many.to_bytes().unwrap());
+    }
+
+    #[test]
+    fn reader_rejects_a_corrupt_zstd_entry() {
+        let mut bytes = single_entry_pack("a.txt", b"not a zstd frame");
         bytes[HEADER_LEN + 24] = 1;
-        assert!(Pack::from_bytes(bytes).is_err());
+        let pack = Pack::from_bytes(bytes).unwrap();
+        let err = pack.read("a.txt").unwrap_err().to_string();
+        assert!(err.contains("a.txt"), "{err}");
+    }
+
+    #[test]
+    fn a_compressed_manifest_is_still_parsed() {
+        let manifest = manifest::Manifest::base("demo");
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        writer.add("room/1000.rdt", vec![5u8; 32 * 1024]).unwrap();
+        // The manifest is tiny, so it may or may not shrink; either way the
+        // reader must parse it.
+        writer.compress_entries(2, |_| false).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.manifest(), Some(&manifest));
+    }
+
+    #[test]
+    fn decompression_refuses_a_declared_size_over_the_cap() {
+        // A hand-built frame header that declares 4096 bytes with no blocks.
+        let frame = [0x28, 0xB5, 0x2F, 0xFD, 0xA0, 0x00, 0x10, 0x00, 0x00];
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            Some(4096)
+        );
+        let err = decompress_zstd_with_cap(&frame, "a.bin", 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn decompression_refuses_output_over_the_cap() {
+        // A streaming encoder writes no content size, so the cap is enforced
+        // by the read loop rather than the declared-size check.
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.write_all(&[7u8; 4096]).unwrap();
+        let frame = encoder.finish().unwrap();
+        assert_eq!(
+            zstd::zstd_safe::get_frame_content_size(&frame).unwrap(),
+            None
+        );
+        assert_eq!(
+            decompress_zstd_with_cap(&frame, "a.bin", 4096)
+                .unwrap()
+                .len(),
+            4096
+        );
+        let err = decompress_zstd_with_cap(&frame, "a.bin", 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("limit"), "{err}");
+    }
+
+    #[test]
+    fn over_cap_entries_are_kept_raw() {
+        let mut writer = PackWriter::new();
+        writer.add("a.bin", vec![3u8; 4096]).unwrap();
+        assert_eq!(
+            writer.compress_entries_capped(1, |_| false, 1024).unwrap(),
+            0
+        );
+        let bytes = writer.to_bytes().unwrap();
+        assert_eq!(bytes[HEADER_LEN + 24], 0);
+        // Raised to the entry's own size, the same entry compresses.
+        assert_eq!(
+            writer.compress_entries_capped(1, |_| false, 4096).unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -986,7 +1368,7 @@ mod tests {
         writer.add("a.bin", vec![7, 8, 9]).unwrap();
         writer.write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
-        assert_eq!(pack.read("A.BIN").unwrap(), &[7, 8, 9]);
+        assert_eq!(&*pack.read("A.BIN").unwrap(), &[7, 8, 9]);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1036,11 +1418,42 @@ mod tests {
             load_order,
             rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
             scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
+            language: None,
             engine: None,
             lua: Vec::new(),
         }
         .render()
         .into_bytes()
+    }
+
+    #[test]
+    fn read_stack_keeps_every_layer_in_order() {
+        let dir = TempDir::new("read-stack");
+        let base = dir.join("base.akpak");
+        let mod_a = dir.join("mod-a.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[
+                (manifest::ENTRY, &base_manifest),
+                ("language/en-US.txt", b"base copy"),
+                ("language/ja-JP.txt", b"base only"),
+            ],
+        );
+        write_pack(
+            &mod_a,
+            &[
+                (manifest::ENTRY, &mod_manifest("a", "base", 0)),
+                ("language/en-US.txt", b"mod copy"),
+            ],
+        );
+
+        let layered = Pack::open_layered(&base, &[mod_a]).unwrap();
+        let copies = layered.read_stack("LANGUAGE/en-us.TXT");
+        let stack: Vec<&[u8]> = copies.iter().map(|copy| &**copy).collect();
+        assert_eq!(stack, [b"base copy".as_slice(), b"mod copy".as_slice()]);
+        assert_eq!(layered.read_stack("language/ja-JP.txt").len(), 1);
+        assert!(layered.read_stack("language/missing.txt").is_empty());
     }
 
     #[test]
@@ -1078,9 +1491,9 @@ mod tests {
         assert!(layered.is_layered());
         assert!(layered.warnings().is_empty());
         assert_eq!(layered.manifest().unwrap().id, "base");
-        assert_eq!(layered.read("room/1000.rdt").unwrap(), b"mod-b");
-        assert_eq!(layered.read("ROOM/1000.RDT").unwrap(), b"mod-b");
-        assert_eq!(layered.read("BgM/013.WaV").unwrap(), b"music");
+        assert_eq!(&*layered.read("room/1000.rdt").unwrap(), b"mod-b");
+        assert_eq!(&*layered.read("ROOM/1000.RDT").unwrap(), b"mod-b");
+        assert_eq!(&*layered.read("BgM/013.WaV").unwrap(), b"music");
         assert!(layered.contains("new/file.bin"));
         assert!(!layered.contains("missing.bin"));
         assert!(layered.read("missing.bin").is_err());
@@ -1105,6 +1518,37 @@ mod tests {
         assert_eq!(layered.layer_of("bgm/013.wav"), Some(base.as_path()));
         assert_eq!(layered.layer_of("missing.bin"), None);
         assert_eq!(layered.overrides().count(), 2);
+    }
+
+    #[test]
+    fn a_mod_layer_shadows_a_compressed_entry() {
+        let dir = TempDir::new("compressed-layer");
+        let base = dir.join("base.akpak");
+        let mod_a = dir.join("mod.akpak");
+
+        let mut writer = PackWriter::new();
+        writer.add("bgm/013.wav", vec![2u8; 16 * 1024]).unwrap();
+        writer.add("room/1000.rdt", vec![1u8; 32 * 1024]).unwrap();
+        writer.compress_entries(2, |_| false).unwrap();
+        writer.write(&base).unwrap();
+
+        let layer_bytes = vec![9u8; 8 * 1024];
+        let mut writer = PackWriter::new();
+        writer
+            .add(manifest::ENTRY, mod_manifest("mod", "base", 0))
+            .unwrap();
+        writer.add("room/1000.rdt", layer_bytes.clone()).unwrap();
+        writer
+            .compress_entries(1, |path| path == manifest::ENTRY)
+            .unwrap();
+        writer.write(&mod_a).unwrap();
+
+        let layered = Pack::open_layered(&base, &[mod_a]).unwrap();
+        assert_eq!(
+            &*layered.read("room/1000.rdt").unwrap(),
+            layer_bytes.as_slice()
+        );
+        assert_eq!(&*layered.read("bgm/013.wav").unwrap(), &[2u8; 16 * 1024]);
     }
 
     #[test]
@@ -1144,8 +1588,8 @@ mod tests {
             .map(|layer| layer.manifest().unwrap().id.as_str())
             .collect();
         assert_eq!(order, ["third", "first", "second"]);
-        assert_eq!(layered.read("x.txt").unwrap(), b"second");
-        assert_eq!(layered.read("X.TXT").unwrap(), b"second");
+        assert_eq!(&*layered.read("x.txt").unwrap(), b"second");
+        assert_eq!(&*layered.read("X.TXT").unwrap(), b"second");
     }
 
     #[test]

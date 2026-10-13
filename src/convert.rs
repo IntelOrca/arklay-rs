@@ -31,7 +31,6 @@ use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
 use crate::sfx;
 use crate::state::{Image, RoomId};
-use crate::text;
 use crate::ui::map::MapTables;
 use crate::voice;
 use crate::{bmp, door, lzw, rdt, tim};
@@ -50,6 +49,27 @@ const BMP_BPP_OFFSET: usize = 28;
 
 /// Bytes buffered while streaming the finished pack to disk.
 const WRITE_CHUNK: usize = 1 << 20;
+
+/// Entry extensions stored raw in the pack: these formats are already
+/// compressed with their own codec, so zstd cannot shrink them and would only
+/// cost conversion time. The list grows as more formats are supported.
+///
+/// `.wav` is deliberately not exempt: the shipped PCM is not otherwise
+/// compressed, and zstd takes the RE1 pack's 178.4 MB of WAVs to 122.1 MB
+/// (68.5%). Expanding the 8-bit files to 16-bit PCM first was strictly worse
+/// (18.2 MB vs 15.5 MB for those 60 files) and recovers no quality, so the
+/// pack stores the shipped samples as they are.
+const PRECOMPRESSED_EXTENSIONS: &[&str] = &["avi", "ogg", "png", "webp"];
+
+/// Whether an entry's format already carries its own compression, in which
+/// case `convert-game` stores it raw instead of zstd-compressing it.
+fn is_precompressed(entry: &str) -> bool {
+    Path::new(entry).extension().is_some_and(|extension| {
+        PRECOMPRESSED_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
+}
 
 /// Resolve the requested worker count: `0` selects one worker per CPU.
 fn worker_count(jobs: usize) -> usize {
@@ -393,7 +413,7 @@ pub fn convert_game_with_options(
     let (demo_count, demo_bytes) = copy_demos(&data, &mut writer, &mut progress)?;
     let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress, jobs)?;
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
-    let (text_count, text_bytes) = copy_text(exe.as_deref(), &mut writer, &mut progress)?;
+    let (language_count, language_bytes) = copy_language_files(&mut writer, &mut progress)?;
     let (ivm_count, ivm_bytes) =
         copy_item_models(item_m2.as_deref(), &mut writer, &mut progress, jobs)?;
     let (file_count, file_bytes) =
@@ -440,7 +460,7 @@ pub fn convert_game_with_options(
     println!("demo: {demo_count} entries, {demo_bytes} bytes");
     println!("core00: {core_count} entries, {core_bytes} bytes");
     println!("shadow: {shadow_count} entries, {shadow_bytes} bytes");
-    println!("text: {text_count} entries, {text_bytes} bytes");
+    println!("language: {language_count} entries, {language_bytes} bytes");
     println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
     println!("file: {file_count} entries, {file_bytes} bytes");
     println!("map: {map_count} entries, {map_bytes} bytes");
@@ -459,6 +479,16 @@ pub fn convert_game_with_options(
         );
     }
     println!("movie: {movie_count} entries, {movie_bytes} bytes");
+
+    // Zstd-compress every entry except the formats that already carry their
+    // own compression, spread over the worker pool. Entries that would not
+    // shrink stay raw, so this can only help.
+    let compressed = writer.compress_entries(jobs, is_precompressed)?;
+    let entries = writer.len();
+    println!(
+        "compress: {compressed} of {entries} entries stored with zstd (level {})",
+        crate::pack::ZSTD_LEVEL
+    );
 
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
@@ -492,33 +522,6 @@ pub fn convert_game_with_options(
     })?;
     progress.end_phase();
 
-    let entries = rdt_count
-        + cut_count
-        + mask_count
-        + bgm_count
-        + se_count
-        + door_count
-        + player_count
-        + weapon_count
-        + npc_count
-        + enemy_count
-        + enemylua_count
-        + effect_count
-        + ui_count
-        + item_count
-        + data_count
-        + core_count
-        + shadow_count
-        + font_count
-        + text_count
-        + ivm_count
-        + file_count
-        + map_count
-        + maptbl_count
-        + combat_count
-        + manifest_count
-        + voice_count
-        + movie_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -1313,46 +1316,10 @@ fn resolve_data_assets(data: Option<&Path>) -> Result<DataPlan> {
     Ok(plan)
 }
 
-/// JPN virtual addresses and entry counts of the executable text tables.
-const TEXT_MESSAGES_VA: u32 = 0x4CDE58;
-const TEXT_MESSAGES_COUNT: usize = 64;
-const TEXT_NAMES_VA: u32 = 0x4CD388;
-const TEXT_NAMES_COUNT: usize = 128;
-const TEXT_UNKNOWN_VA: u32 = 0x4CD548;
-const TEXT_UNKNOWN_COUNT: usize = 16;
-const TEXT_DESCRIPTIONS_VA: u32 = 0x4C9370;
-const TEXT_DESCRIPTIONS_COUNT: usize = 79;
-
-/// JPN virtual addresses of the save-screen string block.
-const SAVE_HEADER_TABLE_VA: u32 = 0x4B0FF0;
-const SAVE_HEADER_SUFFIX_VA: u32 = 0x4B0FD0;
-const SAVE_EXIT_TABLE_VA: u32 = 0x4B1008;
-const SAVE_EXIT_SUFFIX_VA: u32 = 0x4B0FF8;
-const SAVE_CHAR_TABLE_VA: u32 = 0x4B1020;
-const SAVE_FILLED_SLOT_VA: u32 = 0x4B0FA0;
-const SAVE_EMPTY_SLOT_VA: u32 = 0x4B0FC0;
-const SAVE_OVERWRITE_VA: u32 = 0x4B1130;
-const SAVE_YES_NO_VA: u32 = 0x4B1148;
-const SAVE_ERROR_1_VA: u32 = 0x4B1028;
-const SAVE_ERROR_2_VA: u32 = 0x4B1040;
-const SAVE_LOCATION_TABLE_VA: u32 = 0x4B1110;
-const SAVE_LOCATION_COUNT: usize = 7;
-
 /// Shipped item-view model and document-art counts.
 const IVM_COUNT: usize = 77;
 const FILEI_COUNT: usize = 17;
 const TEXTM_COUNT: usize = 43;
-
-/// How one extracted text stream is terminated.
-#[derive(Debug, Clone, Copy)]
-enum StreamKind {
-    /// Message grammar: `0x01` terminator plus the trailing action byte.
-    Message,
-    /// Item name: `0x07` terminator.
-    Name,
-    /// Plain `0x01` terminator with no action byte (save strings).
-    Plain,
-}
 
 /// One PE section: the virtual range and the file bytes backing it.
 #[derive(Debug, Clone, Copy)]
@@ -1449,14 +1416,6 @@ impl<'a> PeImage<'a> {
             return (offset < self.data.len()).then_some(offset);
         }
         None
-    }
-
-    /// Read a little-endian `u32` at a virtual address.
-    fn u32_at_va(&self, va: u32) -> Result<u32> {
-        let offset = self
-            .va_to_offset(va)
-            .with_context(|| format!("virtual address 0x{va:08X} is not in the image"))?;
-        read_u32_at(self.data, offset)
     }
 }
 
@@ -1779,167 +1738,31 @@ pub fn extract_combat_tables(data: &[u8]) -> Result<crate::combat::CombatTables>
     })
 }
 
-/// Extract the five executable text tables, in pack-entry order.
-fn extract_text_tables(data: &[u8]) -> Result<Vec<(&'static str, Vec<u8>)>> {
-    let image = PeImage::parse(data)?;
-    let messages = extract_pointer_table(
-        &image,
-        TEXT_MESSAGES_VA,
-        TEXT_MESSAGES_COUNT,
-        StreamKind::Message,
-    )
-    .context("failed to extract the global message table")?;
-    let names = extract_pointer_table(&image, TEXT_NAMES_VA, TEXT_NAMES_COUNT, StreamKind::Name)
-        .context("failed to extract the item-name table")?;
-    let unknown = extract_pointer_table(
-        &image,
-        TEXT_UNKNOWN_VA,
-        TEXT_UNKNOWN_COUNT,
-        StreamKind::Name,
-    )
-    .context("failed to extract the generic-name table")?;
-    let descriptions = extract_pointer_table(
-        &image,
-        TEXT_DESCRIPTIONS_VA,
-        TEXT_DESCRIPTIONS_COUNT,
-        StreamKind::Message,
-    )
-    .context("failed to extract the item-description table")?;
-    let save = extract_save_strings(&image).context("failed to extract the save-screen strings")?;
-
-    Ok(vec![
-        (text::MESSAGES_ENTRY, text::encode_table(&messages)),
-        (text::NAMES_ENTRY, text::encode_table(&names)),
-        (text::UNKNOWN_ENTRY, text::encode_table(&unknown)),
-        (text::DESCRIPTIONS_ENTRY, text::encode_table(&descriptions)),
-        (text::SAVE_ENTRY, text::encode_table(&save)),
-    ])
-}
-
-/// Follow a pointer table at `va` and extract every pointed-at stream.
+/// Add the checked-in `language/<tag>.txt` sources to the pack.
 ///
-/// A null or unmapped pointer, like the trailing slot of the global message
-/// table, becomes a missing entry.
-fn extract_pointer_table(
-    image: &PeImage,
-    va: u32,
-    count: usize,
-    kind: StreamKind,
-) -> Result<Vec<Option<Vec<u8>>>> {
-    let mut entries = Vec::with_capacity(count);
-    for index in 0..count {
-        let pointer_va = va
-            .checked_add(index as u32 * 4)
-            .context("text pointer table address overflows")?;
-        let pointer = image.u32_at_va(pointer_va).with_context(|| {
-            format!("text pointer table slot {index} at 0x{pointer_va:08X} is unreadable")
-        })?;
-        entries.push(read_stream(image, pointer, kind)?);
+/// Every source is parsed before it is packed, so a malformed checked-in file
+/// fails the conversion instead of shipping.
+fn copy_language_files(writer: &mut PackWriter, progress: &mut Progress) -> Result<(usize, usize)> {
+    if !crate::language::LANGUAGE_FILES
+        .iter()
+        .any(|(entry, _)| entry.eq_ignore_ascii_case("language/en-US.txt"))
+    {
+        bail!("the checked-in language files must include en-US.txt, the fallback language");
     }
-    Ok(entries)
-}
-
-/// Extract one `0x01`/`0x07`-terminated stream at `pointer`, if it is mapped.
-fn read_stream(image: &PeImage, pointer: u32, kind: StreamKind) -> Result<Option<Vec<u8>>> {
-    if pointer == 0 {
-        return Ok(None);
-    }
-    let Some(offset) = image.va_to_offset(pointer) else {
-        return Ok(None);
-    };
-    let stream = &image.data[offset..];
-    let end = match kind {
-        StreamKind::Name => text::scan_terminator(stream, 0x07),
-        StreamKind::Plain => text::scan_terminator(stream, 0x01),
-        StreamKind::Message => text::scan_message(stream),
-    }
-    .with_context(|| format!("unterminated text stream at VA 0x{pointer:08X}"))?;
-    let end = if matches!(kind, StreamKind::Message) {
-        end.checked_add(1)
-            .filter(|&end| end <= stream.len())
-            .with_context(|| format!("text stream at VA 0x{pointer:08X} has no action byte"))?
-    } else {
-        end
-    };
-    Ok(Some(stream[..end].to_vec()))
-}
-
-/// Extract the save-screen strings in their documented order: both headers,
-/// the header suffix, both character names, both exit verbs, the exit suffix,
-/// the filled and empty slot rows, the confirmation lines and the seven
-/// location names.
-fn extract_save_strings(image: &PeImage) -> Result<Vec<Option<Vec<u8>>>> {
-    let headers = extract_pointer_table(image, SAVE_HEADER_TABLE_VA, 2, StreamKind::Plain)?;
-    let chars = extract_pointer_table(image, SAVE_CHAR_TABLE_VA, 2, StreamKind::Plain)?;
-    let exits = extract_pointer_table(image, SAVE_EXIT_TABLE_VA, 2, StreamKind::Plain)?;
-    let locations = extract_pointer_table(
-        image,
-        SAVE_LOCATION_TABLE_VA,
-        SAVE_LOCATION_COUNT,
-        StreamKind::Plain,
-    )?;
-
-    let mut entries = vec![
-        headers[0].clone(),
-        headers[1].clone(),
-        read_stream(image, SAVE_HEADER_SUFFIX_VA, StreamKind::Plain)?,
-        chars[0].clone(),
-        chars[1].clone(),
-        exits[0].clone(),
-        exits[1].clone(),
-        read_stream(image, SAVE_EXIT_SUFFIX_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_FILLED_SLOT_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_EMPTY_SLOT_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_OVERWRITE_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_YES_NO_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_ERROR_1_VA, StreamKind::Plain)?,
-        read_stream(image, SAVE_ERROR_2_VA, StreamKind::Plain)?,
-    ];
-    entries.extend(locations);
-    Ok(entries)
-}
-
-/// Extract the executable's text tables into the pack.
-///
-/// A missing or unreadable executable is a warning: room messages still work
-/// and menu strings read empty.
-fn copy_text(
-    exe: Option<&Path>,
-    writer: &mut PackWriter,
-    progress: &mut Progress,
-) -> Result<(usize, usize)> {
-    let Some(path) = exe else {
-        return Ok((0, 0));
-    };
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) => {
-            println!(
-                "warning: failed to read executable {}: {error}; text tables will be missing",
-                path.display()
-            );
-            return Ok((0, 0));
-        }
-    };
-    let tables = match extract_text_tables(&data) {
-        Ok(tables) => tables,
-        Err(error) => {
-            println!(
-                "warning: failed to extract text from {}: {error:#}; text tables will be missing",
-                path.display()
-            );
-            return Ok((0, 0));
-        }
-    };
-
-    progress.begin("text", tables.len() as u64, "files");
+    progress.begin(
+        "language",
+        crate::language::LANGUAGE_FILES.len() as u64,
+        "files",
+    );
     let mut count = 0usize;
     let mut bytes = 0usize;
-    for (entry, data) in tables {
-        bytes += data.len();
+    for (entry, source) in crate::language::LANGUAGE_FILES {
+        crate::language::Language::parse(source)
+            .with_context(|| format!("invalid language file {entry}"))?;
+        bytes += source.len();
         count += 1;
         writer
-            .add(entry, data)
+            .add(entry, source.as_bytes().to_vec())
             .with_context(|| format!("failed to add {entry}"))?;
         progress.advance(entry);
     }
@@ -2183,6 +2006,9 @@ fn base_manifest() -> manifest::Manifest {
         load_order: 0,
         rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
         scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
+        // Converted from the Japanese install, so the pack's own RDT room
+        // text is Japanese.
+        language: Some("ja-JP".to_string()),
         engine: None,
         lua: Vec::new(),
     }
@@ -3040,6 +2866,27 @@ mod tests {
     const RDT_HEADER_LEN: usize = 0x94;
     const RDT_CAMERA_LEN: usize = 44;
 
+    #[test]
+    fn precompressed_extensions_are_recognised_case_insensitively() {
+        for entry in [
+            "movie/oj.avi",
+            "assets/logo.PNG",
+            "bgm/track.ogg",
+            "ui/photo.webp",
+        ] {
+            assert!(is_precompressed(entry), "{entry}");
+        }
+        for entry in [
+            "room/1000.rdt",
+            "bgm/013.wav",
+            "ui/title.bmp",
+            "manifest.toml",
+            "no-extension",
+        ] {
+            assert!(!is_precompressed(entry), "{entry}");
+        }
+    }
+
     /// Self-deleting temporary directory unique to this process and label.
     struct TempDir {
         path: PathBuf,
@@ -3333,7 +3180,7 @@ mod tests {
             1,
             "the checked-in script is packed"
         );
-        assert_eq!(pack.read("enemy/em23.emd").unwrap(), b"npc-23");
+        assert_eq!(pack.read("enemy/em23.emd").unwrap().as_ref(), b"npc-23");
     }
 
     /// Write all 33 effect-sheet files under `EFFSPR` with mixed-case names.
@@ -3383,7 +3230,7 @@ mod tests {
                 "missing {name}"
             );
         }
-        assert_eq!(pack.read("effspr/esp224.tim").unwrap(), b"esp224");
+        assert_eq!(pack.read("effspr/esp224.tim").unwrap().as_ref(), b"esp224");
     }
 
     #[test]
@@ -3447,11 +3294,15 @@ mod tests {
         assert_eq!(bytes, "esp-bytes".len() + "etm-bytes".len());
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert_eq!(
-            pack.read(crate::effects::room::CORE_ESP_ENTRY).unwrap(),
+            pack.read(crate::effects::room::CORE_ESP_ENTRY)
+                .unwrap()
+                .as_ref(),
             b"esp-bytes"
         );
         assert_eq!(
-            pack.read(crate::effects::room::CORE_ETM_ENTRY).unwrap(),
+            pack.read(crate::effects::room::CORE_ETM_ENTRY)
+                .unwrap()
+                .as_ref(),
             b"etm-bytes"
         );
     }
@@ -3695,20 +3546,23 @@ mod tests {
         assert!(pack.contains("bgm/002.wav"));
         assert!(!pack.contains("bgm/000.wav"));
         assert!(pack.contains("se/ft_wda.wav"));
-        assert_eq!(pack.read("se/ft_wda.wav").unwrap(), b"ft_wdA");
+        assert_eq!(pack.read("se/ft_wda.wav").unwrap().as_ref(), b"ft_wdA");
 
-        assert_eq!(pack.read("door/door00.dor").unwrap(), b"dor-door00");
-        assert_eq!(pack.read("door/kai03.dor").unwrap(), b"dor-kai03");
-        assert_eq!(pack.read("door/lad01.dor").unwrap(), b"dor-lad01");
+        assert_eq!(
+            pack.read("door/door00.dor").unwrap().as_ref(),
+            b"dor-door00"
+        );
+        assert_eq!(pack.read("door/kai03.dor").unwrap().as_ref(), b"dor-kai03");
+        assert_eq!(pack.read("door/lad01.dor").unwrap().as_ref(), b"dor-lad01");
 
-        assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
-        assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
+        assert_eq!(pack.read("player/01.emd").unwrap().as_ref(), b"emd1");
+        assert_eq!(pack.read("player/01.emw").unwrap().as_ref(), b"emw1");
         // The NPC phase copies the fifteen character models raw, lower-cased.
-        assert_eq!(pack.read("enemy/em20.emd").unwrap(), b"npc-20");
-        assert_eq!(pack.read("enemy/em2e.emd").unwrap(), b"npc-2e");
+        assert_eq!(pack.read("enemy/em20.emd").unwrap().as_ref(), b"npc-20");
+        assert_eq!(pack.read("enemy/em2e.emd").unwrap().as_ref(), b"npc-2e");
 
         let manifest = manifest::Manifest::parse(
-            std::str::from_utf8(pack.read(manifest::ENTRY).unwrap()).unwrap(),
+            std::str::from_utf8(pack.read(manifest::ENTRY).unwrap().as_ref()).unwrap(),
         )
         .unwrap();
         assert_eq!(manifest.id, BASE_PACK_ID);
@@ -3752,7 +3606,7 @@ mod tests {
             2
         );
 
-        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
     }
 
@@ -3857,8 +3711,21 @@ mod tests {
         let out = root.path.join("out.akpak");
         convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(main.read("movie/oj.avi").unwrap(), b"movie-oj");
-        assert_eq!(main.read("movie/capcom.avi").unwrap(), b"movie-capcom");
+        assert_eq!(main.read("movie/oj.avi").unwrap().as_ref(), b"movie-oj");
+        assert_eq!(
+            main.read("movie/capcom.avi").unwrap().as_ref(),
+            b"movie-capcom"
+        );
+        // The issue's policy end to end: an already-compressed film stays
+        // borrowed (raw), a compressible RDT is owned (zstd).
+        assert!(matches!(
+            main.read("movie/oj.avi").unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            main.read("room/1000.rdt").unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
         // No companion pack is written beside the main one.
         assert!(!root.path.join("out.movie.akpak").exists());
     }
@@ -3883,8 +3750,11 @@ mod tests {
         let out = root.path.join("out.akpak");
         convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(main.read("voice/v001_00.wav").unwrap(), b"voice-a");
-        assert_eq!(main.read("voice/v104_00.wav").unwrap(), b"voice-bb");
+        assert_eq!(main.read("voice/v001_00.wav").unwrap().as_ref(), b"voice-a");
+        assert_eq!(
+            main.read("voice/v104_00.wav").unwrap().as_ref(),
+            b"voice-bb"
+        );
         // The unreferenced file stays out and no companion pack is written.
         assert!(!main.contains("voice/announce.wav"));
         assert!(!root.path.join("out.voice.akpak").exists());
@@ -3979,8 +3849,8 @@ mod tests {
 
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("door/"), 34);
-        assert_eq!(pack.read("door/ele01.dor").unwrap(), b"dor-ele01");
-        assert_eq!(pack.read("door/mon.dor").unwrap(), b"dor-mon");
+        assert_eq!(pack.read("door/ele01.dor").unwrap().as_ref(), b"dor-ele01");
+        assert_eq!(pack.read("door/mon.dor").unwrap().as_ref(), b"dor-mon");
         // Every door type byte maps to a distinct pack entry.
         let mut entries: Vec<&str> = pack
             .paths()
@@ -4083,7 +3953,7 @@ mod tests {
         convert_game(&root.path, &out).unwrap();
 
         let pack = crate::pack::Pack::open(&out).unwrap();
-        let image = bmp::decode(pack.read("roomcut/300_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/300_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (316, 236));
     }
 
@@ -4291,7 +4161,7 @@ mod tests {
             pack.read("ui/statface.tim").unwrap(),
             b"STATFACE.TIM".as_slice()
         );
-        let image = bmp::decode(pack.read("item/item_all.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("item/item_all.bmp").unwrap()).unwrap();
         assert_eq!(
             (image.width, image.height),
             (
@@ -4441,108 +4311,10 @@ mod tests {
         pe[offset..offset + bytes.len()].copy_from_slice(bytes);
     }
 
-    /// Write a pointer table at `table_va`.
-    fn pe_pointer_table(pe: &mut [u8], table_va: u32, count: usize, entries: &[(usize, u32)]) {
-        let mut table = vec![0u8; count * 4];
-        for &(index, va) in entries {
-            table[index * 4..index * 4 + 4].copy_from_slice(&va.to_le_bytes());
-        }
-        pe_place(pe, table_va, &table);
-    }
-
-    /// A synthetic executable holding all five text tables at the JPN virtual
-    /// addresses.
-    fn synthetic_text_exe() -> Vec<u8> {
-        let mut pe = synthetic_pe();
-
-        pe_place(&mut pe, 0x4CDA00, &[0x0C, 0x0D, 0x01, 0x00]);
-        pe_place(
-            &mut pe,
-            0x4CDA10,
-            &[0x05, 0x01, 0x06, 0x00, 0x05, 0x00, 0x0C, 0x01, 0x2A],
-        );
-        pe_pointer_table(
-            &mut pe,
-            TEXT_MESSAGES_VA,
-            TEXT_MESSAGES_COUNT,
-            &[(0, 0x4CDA00), (1, 0x4CDA10)],
-        );
-
-        pe_place(&mut pe, 0x4CDA20, &[0xB0, 0x07]);
-        pe_pointer_table(&mut pe, TEXT_NAMES_VA, TEXT_NAMES_COUNT, &[(0, 0x4CDA20)]);
-        pe_place(&mut pe, 0x4CDA30, &[0xC0, 0x07]);
-        pe_pointer_table(
-            &mut pe,
-            TEXT_UNKNOWN_VA,
-            TEXT_UNKNOWN_COUNT,
-            &[(0, 0x4CDA30)],
-        );
-
-        pe_place(&mut pe, 0x4CDA40, &[0xDD, 0x01, 0x00]);
-        pe_pointer_table(
-            &mut pe,
-            TEXT_DESCRIPTIONS_VA,
-            TEXT_DESCRIPTIONS_COUNT,
-            &[(0, 0x4CDA40)],
-        );
-
-        pe_place(&mut pe, 0x4B0FA0, &[0x00, 0xFB, 0x01]);
-        pe_place(&mut pe, 0x4B0FC0, &[0x3B, 0x01]);
-        pe_place(
-            &mut pe,
-            0x4B0FD0,
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x23, 0x1D, 0x29, 0x21, 0x01],
-        );
-        pe_place(&mut pe, 0x4B0FE0, &[0x28, 0x2B, 0x1D, 0x20, 0x01]);
-        pe_place(&mut pe, 0x4B0FE8, &[0x2F, 0x1D, 0x32, 0x21, 0x01]);
-        pe_pointer_table(
-            &mut pe,
-            SAVE_HEADER_TABLE_VA,
-            2,
-            &[(0, 0x4B0FE8), (1, 0x4B0FE0)],
-        );
-        pe_place(&mut pe, 0x4B0FF8, &[0x00, 0x00, 0x00, 0x01]);
-        pe_place(&mut pe, 0x4B1000, &[0x01]);
-        pe_place(&mut pe, 0x4B1004, &[0x01]);
-        pe_pointer_table(
-            &mut pe,
-            SAVE_EXIT_TABLE_VA,
-            2,
-            &[(0, 0x4B1004), (1, 0x4B1000)],
-        );
-
-        pe_place(&mut pe, 0x4B1010, &[0x41, 0x01]);
-        pe_place(&mut pe, 0x4B1018, &[0x42, 0x01]);
-        pe_pointer_table(
-            &mut pe,
-            SAVE_CHAR_TABLE_VA,
-            2,
-            &[(0, 0x4B1010), (1, 0x4B1018)],
-        );
-        pe_place(&mut pe, 0x4B1028, &[0x01]);
-        pe_place(&mut pe, 0x4B1040, &[0x01]);
-        for index in 0..SAVE_LOCATION_COUNT {
-            let va = 0x4B1068 + index as u32 * 0x18;
-            pe_place(&mut pe, va, &[0x50 + index as u8, 0x01]);
-        }
-        let locations: Vec<(usize, u32)> = (0..SAVE_LOCATION_COUNT)
-            .map(|index| (index, 0x4B1068 + index as u32 * 0x18))
-            .collect();
-        pe_pointer_table(
-            &mut pe,
-            SAVE_LOCATION_TABLE_VA,
-            SAVE_LOCATION_COUNT,
-            &locations,
-        );
-        pe_place(&mut pe, SAVE_OVERWRITE_VA, &[0x01]);
-        pe_place(&mut pe, SAVE_YES_NO_VA, &[0x01]);
-        pe
-    }
-
-    /// [`synthetic_text_exe`] with the map bookkeeping tables at their JPN
+    /// A synthetic executable holding the map bookkeeping tables at their JPN
     /// virtual addresses, overlaps and all.
-    fn synthetic_text_and_map_exe() -> Vec<u8> {
-        let mut pe = synthetic_text_exe();
+    fn synthetic_map_exe() -> Vec<u8> {
+        let mut pe = synthetic_pe();
         let tables = MapTables::default();
         pe_place(
             &mut pe,
@@ -4560,7 +4332,7 @@ mod tests {
 
     #[test]
     fn extracts_map_tables_from_a_synthetic_executable() {
-        let data = synthetic_text_and_map_exe();
+        let data = synthetic_map_exe();
         let tables = extract_map_tables(&data).unwrap();
         assert_eq!(tables, MapTables::default());
         assert_eq!(tables.encode().len(), crate::ui::map::TABLES_BYTES);
@@ -4584,52 +4356,6 @@ mod tests {
         assert!(PeImage::parse(&data[..0x20]).is_err());
         assert!(PeImage::parse(&[0u8; 0x100]).is_err());
     }
-
-    #[test]
-    fn extracts_the_five_text_tables_from_a_synthetic_executable() {
-        let data = synthetic_text_exe();
-        let tables = extract_text_tables(&data).unwrap();
-        assert_eq!(tables.len(), 5);
-        let table = |name: &str| {
-            tables
-                .iter()
-                .find(|(path, _)| *path == name)
-                .map(|(_, data)| data.as_slice())
-                .unwrap()
-        };
-
-        let messages = crate::text::Table::parse_message(table(text::MESSAGES_ENTRY)).unwrap();
-        assert_eq!(messages.len(), 64);
-        assert_eq!(messages.get(0), Some(&[0x0C, 0x0D, 0x01, 0x00][..]));
-        assert_eq!(
-            messages.get(1),
-            Some(&[0x05, 0x01, 0x06, 0x00, 0x05, 0x00, 0x0C, 0x01, 0x2A][..])
-        );
-        // A null pointer is a missing entry, like the shipped table's slot 63.
-        assert_eq!(messages.get(63), None);
-
-        let names = crate::text::Table::parse_name(table(text::NAMES_ENTRY)).unwrap();
-        assert_eq!(names.len(), 128);
-        assert_eq!(names.get(0), Some(&[0xB0, 0x07][..]));
-
-        let unknown = crate::text::Table::parse_name(table(text::UNKNOWN_ENTRY)).unwrap();
-        assert_eq!(unknown.len(), 16);
-        // The unknown table is the tail of the name table.
-        assert_eq!(unknown.get(0), Some(&[0xC0, 0x07][..]));
-
-        let descriptions =
-            crate::text::Table::parse_message(table(text::DESCRIPTIONS_ENTRY)).unwrap();
-        assert_eq!(descriptions.len(), 79);
-        assert_eq!(descriptions.get(0), Some(&[0xDD, 0x01, 0x00][..]));
-
-        let save = crate::text::Table::parse_plain(table(text::SAVE_ENTRY)).unwrap();
-        assert_eq!(save.len(), 21);
-        assert_eq!(save.get(0), Some(&[0x2F, 0x1D, 0x32, 0x21, 0x01][..]));
-        assert_eq!(save.get(8), Some(&[0x00, 0xFB, 0x01][..]));
-        assert_eq!(save.get(14), Some(&[0x50, 0x01][..]));
-        assert_eq!(save.get(20), Some(&[0x56, 0x01][..]));
-    }
-
     #[test]
     fn discovers_item_m2_and_the_executable() {
         let root = TempDir::new("item-m2-discover");
@@ -4680,11 +4406,11 @@ mod tests {
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
         assert!(item_bytes > 0 && file_bytes > 0);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
-        assert_eq!(pack.read("item/i00v.ivm").unwrap(), b"ivm0");
-        assert_eq!(pack.read("item/ing.ivm").unwrap(), b"ivm1");
-        assert_eq!(pack.read("file/file000.tim").unwrap(), b"cover0");
-        assert_eq!(pack.read("file/filei17.tim").unwrap(), b"i17");
-        assert_eq!(pack.read("file/textm_42.tim").unwrap(), b"page42");
+        assert_eq!(pack.read("item/i00v.ivm").unwrap().as_ref(), b"ivm0");
+        assert_eq!(pack.read("item/ing.ivm").unwrap().as_ref(), b"ivm1");
+        assert_eq!(pack.read("file/file000.tim").unwrap().as_ref(), b"cover0");
+        assert_eq!(pack.read("file/filei17.tim").unwrap().as_ref(), b"i17");
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
@@ -4695,7 +4421,7 @@ mod tests {
         let root = TempDir::new("text-item-file");
         make_stage_dirs(&root.path);
         fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
-        fs::write(root.path.join("Bio.exe"), synthetic_text_and_map_exe()).unwrap();
+        fs::write(root.path.join("Bio.exe"), synthetic_map_exe()).unwrap();
         let dir = root.path.join("ITEM_M2");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("I00V.IVM"), b"ivm0").unwrap();
@@ -4730,86 +4456,21 @@ mod tests {
         let pack = crate::pack::Pack::open(&out).unwrap();
 
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
-        assert_eq!(count("text/"), 5);
+        assert_eq!(count("text/"), 0, "the text tables are gone for good");
+        assert_eq!(count("language/"), crate::language::LANGUAGE_FILES.len());
+        for (entry, source) in crate::language::LANGUAGE_FILES {
+            assert_eq!(pack.read(entry).unwrap().as_ref(), source.as_bytes());
+        }
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
         assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
-        let messages =
-            crate::text::Table::parse_message(pack.read("text/messages.bin").unwrap()).unwrap();
-        assert_eq!(messages.len(), 64);
-        assert_eq!(messages.get(0), Some(&[0x0C, 0x0D, 0x01, 0x00][..]));
-        assert_eq!(pack.read("item/mini.ivm").unwrap(), b"ivm1");
-        assert_eq!(pack.read("file/textm_42.tim").unwrap(), b"page42");
-        assert_eq!(pack.read("map/map0e.tim").unwrap(), b"plan14");
-        assert_eq!(pack.read("map/blue.tim").unwrap(), b"blue");
-        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        assert_eq!(pack.read("item/mini.ivm").unwrap().as_ref(), b"ivm1");
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
+        assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
+        assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
+        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
         assert_eq!(tables, MapTables::default());
     }
-
-    #[test]
-    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-    fn extracts_real_text_tables() {
-        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
-            return;
-        };
-        let path = PathBuf::from(root).join("Bio.exe");
-        let data = fs::read(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-
-        let tables = extract_text_tables(&data).unwrap();
-        assert_eq!(tables.len(), 5);
-        let table = |name: &str| {
-            tables
-                .iter()
-                .find(|(path, _)| *path == name)
-                .map(|(_, data)| data.as_slice())
-                .unwrap()
-        };
-
-        let messages = crate::text::Table::parse_message(table(text::MESSAGES_ENTRY)).unwrap();
-        assert_eq!(messages.len(), 64);
-        assert_eq!(
-            messages.get(0).unwrap(),
-            &[
-                0x05, 0x01, 0x06, 0x00, 0x05, 0x00, 0x83, 0xF9, 0x52, 0x7E, 0x75, 0x63, 0x5C, 0x1B,
-                0x08, 0x02, 0x0A, 0x00, 0x01, 0x00,
-            ][..]
-        );
-        assert_eq!(messages.get(63), None);
-
-        let names = crate::text::Table::parse_name(table(text::NAMES_ENTRY)).unwrap();
-        assert_eq!(names.len(), 128);
-        assert_eq!(
-            names.get(0).unwrap(),
-            &[0xB0, 0xD4, 0xE4, 0xF6, 0xBA, 0xBB, 0xA8, 0xC2, 0x07][..]
-        );
-
-        let unknown = crate::text::Table::parse_name(table(text::UNKNOWN_ENTRY)).unwrap();
-        assert_eq!(unknown.len(), 16);
-        assert_eq!(unknown.get(0).unwrap(), names.get(112).unwrap());
-
-        let descriptions =
-            crate::text::Table::parse_message(table(text::DESCRIPTIONS_ENTRY)).unwrap();
-        assert_eq!(descriptions.len(), 79);
-        assert_eq!(&descriptions.get(0).unwrap()[..2], &[0x60, 0x6F]);
-
-        let save = crate::text::Table::parse_plain(table(text::SAVE_ENTRY)).unwrap();
-        assert_eq!(save.len(), 21);
-        assert_eq!(
-            save.get(0).unwrap(),
-            &[0x2F, 0x1D, 0x32, 0x21, 0x01][..],
-            "header 0 must be SAVE"
-        );
-        assert_eq!(
-            save.get(1).unwrap(),
-            &[0x28, 0x2B, 0x1D, 0x20, 0x01][..],
-            "header 1 must be LOAD"
-        );
-        assert!(save.get(8).unwrap().ends_with(&[0x01]));
-        // Location names are eight two-byte cells plus the terminator.
-        assert_eq!(save.get(14).unwrap().len(), 17);
-    }
-
     #[test]
     #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
     fn extracts_real_map_tables() {
@@ -4950,7 +4611,7 @@ mod tests {
         );
         assert_eq!(count("effspr/"), 33);
         assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
-        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
         assert_eq!(tables, MapTables::default(), "the installed tables match");
         assert!(pack.contains("enemy/em20.emd"));
         assert!(pack.contains("enemy/em2e.emd"));
@@ -5046,7 +4707,7 @@ mod tests {
         assert!(pack.contains("player/01.emd"));
         assert!(pack.contains("player/01.emw"));
 
-        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
     }
 
@@ -5156,7 +4817,7 @@ mod tests {
         for asset in &assets {
             let data = pack.read(&asset.entry).unwrap();
             let emd =
-                crate::emd::parse(data).unwrap_or_else(|err| panic!("{}: {err:#}", asset.entry));
+                crate::emd::parse(&data).unwrap_or_else(|err| panic!("{}: {err:#}", asset.entry));
             let prims: usize = emd
                 .mesh
                 .objects
@@ -5250,6 +4911,9 @@ mod tests {
 
         assert_eq!((count, bytes), (1, 14));
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
-        assert_eq!(pack.read("font/font.tim").unwrap(), b"raw-font-sheet");
+        assert_eq!(
+            pack.read("font/font.tim").unwrap().as_ref(),
+            b"raw-font-sheet"
+        );
     }
 }

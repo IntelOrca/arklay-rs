@@ -24,6 +24,7 @@ base = "re1"
 load_order = 10
 rdt = "re1"
 scd = "re1"
+language = "ja-JP"
 lua = ["lua/demo.lua"]
 ```
 
@@ -36,6 +37,7 @@ lua = ["lua/demo.lua"]
 | `base` | A mod's base pack id. Required for mods. |
 | `load_order` | Layer order; lower applies first. Default 0. |
 | `rdt`, `scd` | Dialect tags; default `"re1"`. |
+| `language` | The language of the pack's own room text (`ja-JP` for the Japanese install). Optional. |
 | `engine` | Optional note about the target engine build. |
 | `lua` | Ordered hook paths; empty means discover `lua/**.lua`. |
 
@@ -64,6 +66,33 @@ layers at all the engine takes exactly the single-pack path, so a run without
 `arklay list`, `arklay extract` and `arklay pack info` accept `--mod`
 too; `pack info` prints the manifest, the applied layers and the merged entry
 table.
+
+## Language files
+
+A mod may ship `language/<tag>.txt` with any subset of strings. Every layer's
+copy of a tag merges per key, later layers winning, so a translation mod can
+replace a handful of strings without restating the file; a whole new tag works
+too. The runtime picks the file through `--language`, the OS locale and the
+`en-US` fallback; the format, the tag vocabulary and the key registry live in
+[`language.md`](language.md).
+
+```sh
+# A French-language mod overriding one item name and one message
+mkdir -p mods/fr/language
+cat > mods/fr/manifest.toml <<'EOF'
+[pack]
+format = 1
+id = "fr"
+kind = "mod"
+base = "re1"
+EOF
+cat > mods/fr/language/fr-FR.txt <<'EOF'
+ITEM_33_NAME = "Clé du manoir"
+MESSAGE_1B = "{scroll 2}Ils se sont échappés…{timed 48}"
+EOF
+arklay mod build mods/fr --out fr.akpak
+arklay re1.akpak --mod fr.akpak --language fr-FR --room 100
+```
 
 ## Mod source directories
 

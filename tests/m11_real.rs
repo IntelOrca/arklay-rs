@@ -107,7 +107,7 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
             animation_rooms += 1;
         }
         if let Ok(bytes) = pack.read(&id.rdt_entry()) {
-            corpus_ops.extend(script_opcodes(bytes));
+            corpus_ops.extend(script_opcodes(&bytes));
         }
         let hits: Vec<(u8, u64)> = IMPLEMENTED_OPCODES
             .iter()
