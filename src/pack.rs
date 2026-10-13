@@ -91,9 +91,21 @@ type CompressResult = (usize, Result<Option<Vec<u8>>>);
 /// Builds an `.akpak` pack from named byte blobs.
 #[derive(Debug, Default)]
 pub struct PackWriter {
-    entries: Vec<(String, Vec<u8>, Compression)>,
+    entries: Vec<WriterEntry>,
     /// ASCII-lowercased entry paths, for O(1) duplicate detection.
     seen: HashSet<String>,
+}
+
+/// One entry being assembled.
+#[derive(Debug)]
+struct WriterEntry {
+    path: String,
+    /// The bytes as added; replaced by the zstd frame once compressed.
+    data: Vec<u8>,
+    /// Plain (uncompressed) byte count, kept after compression replaces
+    /// `data` so the conversion report can still name both sizes.
+    plain_len: usize,
+    compression: Compression,
 }
 
 /// Entry order and offsets of a serialized pack.
@@ -104,6 +116,39 @@ struct SerializeLayout {
     order: Vec<(String, usize)>,
     /// The fixed-size table of contents.
     toc: Vec<u8>,
+}
+
+/// One writer entry with both its plain and stored sizes, as reported by
+/// [`PackWriter::entries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrittenEntry<'a> {
+    path: &'a str,
+    plain_len: usize,
+    stored_len: usize,
+    compressed: bool,
+}
+
+impl<'a> WrittenEntry<'a> {
+    /// The entry path as added.
+    pub fn path(self) -> &'a str {
+        self.path
+    }
+
+    /// Plain (uncompressed) size in bytes.
+    pub fn plain_len(self) -> usize {
+        self.plain_len
+    }
+
+    /// Size in bytes as it will be stored: the zstd frame size for a
+    /// compressed entry, the plain size for a raw one.
+    pub fn stored_len(self) -> usize {
+        self.stored_len
+    }
+
+    /// Whether the entry is stored as a zstd frame.
+    pub fn compressed(self) -> bool {
+        self.compressed
+    }
 }
 
 impl PackWriter {
@@ -121,8 +166,12 @@ impl PackWriter {
         if !self.seen.insert(path.to_ascii_lowercase()) {
             bail!("duplicate pack entry: {path}");
         }
-        self.entries
-            .push((path.to_owned(), data, Compression::None));
+        self.entries.push(WriterEntry {
+            path: path.to_owned(),
+            plain_len: data.len(),
+            data,
+            compression: Compression::None,
+        });
         Ok(())
     }
 
@@ -149,16 +198,31 @@ impl PackWriter {
         jobs: usize,
         keep_raw: impl Fn(&str) -> bool + Sync,
     ) -> Result<usize> {
-        self.compress_entries_capped(jobs, keep_raw, budget::MAX_ZSTD_OUTPUT)
+        self.compress_entries_reporting(jobs, keep_raw, |_| {})
+    }
+
+    /// [`PackWriter::compress_entries`] reporting the pass through `on_entry`:
+    /// it is called on the worker threads, in completion order, once for every
+    /// entry a worker claims — whether the entry was compressed or skipped
+    /// (already zstd, exempt or over the cap), so a caller that begins a phase
+    /// over [`PackWriter::len`] always reaches its total.
+    pub fn compress_entries_reporting(
+        &mut self,
+        jobs: usize,
+        keep_raw: impl Fn(&str) -> bool + Sync,
+        on_entry: impl Fn(&str) + Sync,
+    ) -> Result<usize> {
+        self.compress_entries_capped(jobs, keep_raw, budget::MAX_ZSTD_OUTPUT, on_entry)
     }
 
     /// [`PackWriter::compress_entries`] with an explicit plain-size cap, for
-    /// the unit tests.
+    /// the unit tests, and a per-entry reporter.
     fn compress_entries_capped(
         &mut self,
         jobs: usize,
         keep_raw: impl Fn(&str) -> bool + Sync,
         cap: usize,
+        on_entry: impl Fn(&str) + Sync,
     ) -> Result<usize> {
         if self.entries.is_empty() {
             return Ok(0);
@@ -171,32 +235,33 @@ impl PackWriter {
                 scope.spawn(|| {
                     loop {
                         let index = next.fetch_add(1, Ordering::Relaxed);
-                        let Some((path, data, compression)) = self.entries.get(index) else {
+                        let Some(entry) = self.entries.get(index) else {
                             return;
                         };
-                        if *compression != Compression::None || keep_raw(path) {
-                            continue;
-                        }
                         // The reader refuses to decompress beyond its cap, so
-                        // an over-cap entry stays raw and keeps reading back.
-                        if data.len() > cap {
-                            continue;
+                        // an over-cap entry stays raw and keeps reading back;
+                        // an exempt or already-compressed entry is left as-is.
+                        if entry.compression == Compression::None
+                            && !keep_raw(&entry.path)
+                            && entry.data.len() <= cap
+                        {
+                            let compressed = zstd::bulk::compress(&entry.data, ZSTD_LEVEL)
+                                .with_context(|| format!("failed to zstd-compress {}", entry.path));
+                            // Keep an entry raw when the frame does not pay for
+                            // itself, whatever the policy says.
+                            let compressed = compressed.map(|frame| {
+                                if frame.len() < entry.data.len() {
+                                    Some(frame)
+                                } else {
+                                    None
+                                }
+                            });
+                            results
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push((index, compressed));
                         }
-                        let compressed = zstd::bulk::compress(data, ZSTD_LEVEL)
-                            .with_context(|| format!("failed to zstd-compress {path}"));
-                        // Keep an entry raw when the frame does not pay for
-                        // itself, whatever the policy says.
-                        let compressed = compressed.map(|frame| {
-                            if frame.len() < data.len() {
-                                Some(frame)
-                            } else {
-                                None
-                            }
-                        });
-                        results
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((index, compressed));
+                        on_entry(&entry.path);
                     }
                 });
             }
@@ -215,8 +280,8 @@ impl PackWriter {
         }
         for (index, frame) in frames {
             if let Some(frame) = frame {
-                self.entries[index].1 = frame;
-                self.entries[index].2 = Compression::Zstd;
+                self.entries[index].data = frame;
+                self.entries[index].compression = Compression::Zstd;
                 count += 1;
             }
         }
@@ -233,6 +298,19 @@ impl PackWriter {
         self.entries.is_empty()
     }
 
+    /// Every entry in insertion order — the deterministic order the caller
+    /// added them (`add` requires `&mut self`, so the order cannot race) and
+    /// independent of worker scheduling — with its plain and stored sizes for
+    /// reporting after compression.
+    pub fn entries(&self) -> impl Iterator<Item = WrittenEntry<'_>> {
+        self.entries.iter().map(|entry| WrittenEntry {
+            path: &entry.path,
+            plain_len: entry.plain_len,
+            stored_len: entry.data.len(),
+            compressed: entry.compression != Compression::None,
+        })
+    }
+
     /// Total size in bytes of the serialized pack.
     pub fn pack_size(&self) -> Result<usize> {
         let count = self.entries.len();
@@ -243,10 +321,10 @@ impl PackWriter {
         let mut total = HEADER_LEN
             .checked_add(toc_len)
             .context("pack table of contents is too large")?;
-        for (path, data, _) in &self.entries {
+        for entry in &self.entries {
             total = total
-                .checked_add(path.len() + 1)
-                .and_then(|size| size.checked_add(data.len()))
+                .checked_add(entry.path.len() + 1)
+                .and_then(|size| size.checked_add(entry.data.len()))
                 .context("pack data exceeds addressable size")?;
         }
         Ok(total)
@@ -267,14 +345,14 @@ impl PackWriter {
             .entries
             .iter()
             .enumerate()
-            .map(|(index, (path, _, _))| (path.to_ascii_lowercase(), index))
+            .map(|(index, entry)| (entry.path.to_ascii_lowercase(), index))
             .collect();
         order.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut data_start = paths_start;
         for (_, index) in &order {
             data_start = data_start
-                .checked_add(self.entries[*index].0.len() + 1)
+                .checked_add(self.entries[*index].path.len() + 1)
                 .context("pack paths exceed addressable size")?;
         }
 
@@ -282,14 +360,14 @@ impl PackWriter {
         let mut path_offset = paths_start;
         let mut data_offset = data_start;
         for (_, index) in &order {
-            let (path, data, compression) = &self.entries[*index];
+            let entry = &self.entries[*index];
             toc.extend_from_slice(&to_u64(path_offset)?.to_le_bytes());
             toc.extend_from_slice(&to_u64(data_offset)?.to_le_bytes());
-            toc.extend_from_slice(&to_u64(data.len())?.to_le_bytes());
-            toc.push(compression.mode());
+            toc.extend_from_slice(&to_u64(entry.data.len())?.to_le_bytes());
+            toc.push(entry.compression.mode());
             toc.extend_from_slice(&[0; 7]);
-            path_offset += path.len() + 1;
-            data_offset += data.len();
+            path_offset += entry.path.len() + 1;
+            data_offset += entry.data.len();
         }
 
         Ok(SerializeLayout {
@@ -306,11 +384,11 @@ impl PackWriter {
         out.write_all(&layout.entry_count.to_le_bytes())?;
         out.write_all(&layout.toc)?;
         for (_, index) in &layout.order {
-            out.write_all(self.entries[*index].0.as_bytes())?;
+            out.write_all(self.entries[*index].path.as_bytes())?;
             out.write_all(&[0])?;
         }
         for (_, index) in &layout.order {
-            out.write_all(&self.entries[*index].1)?;
+            out.write_all(&self.entries[*index].data)?;
         }
         Ok(())
     }
@@ -1273,15 +1351,54 @@ mod tests {
         let mut writer = PackWriter::new();
         writer.add("a.bin", vec![3u8; 4096]).unwrap();
         assert_eq!(
-            writer.compress_entries_capped(1, |_| false, 1024).unwrap(),
+            writer
+                .compress_entries_capped(1, |_| false, 1024, |_| {})
+                .unwrap(),
             0
         );
         let bytes = writer.to_bytes().unwrap();
         assert_eq!(bytes[HEADER_LEN + 24], 0);
         // Raised to the entry's own size, the same entry compresses.
         assert_eq!(
-            writer.compress_entries_capped(1, |_| false, 4096).unwrap(),
+            writer
+                .compress_entries_capped(1, |_| false, 4096, |_| {})
+                .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn compress_reports_every_claimed_entry() {
+        let mut writer = PackWriter::new();
+        writer.add("room/1000.rdt", vec![3u8; 4096]).unwrap();
+        writer.add("movie/oj.avi", vec![1u8, 2, 3, 4]).unwrap();
+        writer.add("tiny.bin", b"x".to_vec()).unwrap();
+        writer.add("over-cap.bin", vec![5u8; 8192]).unwrap();
+
+        let reported = Mutex::new(Vec::new());
+        let compressed = writer
+            .compress_entries_capped(
+                2,
+                |path| path.ends_with(".avi"),
+                4096,
+                |path| {
+                    reported
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(path.to_string());
+                },
+            )
+            .unwrap();
+        assert_eq!(compressed, 1, "only the RDT fits the cap and shrinks");
+
+        let mut reported = reported
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reported.sort();
+        assert_eq!(
+            reported,
+            ["movie/oj.avi", "over-cap.bin", "room/1000.rdt", "tiny.bin"],
+            "exempt, over-cap and unprofitable entries are reported too"
         );
     }
 
