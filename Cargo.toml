@@ -20,6 +20,7 @@ mlua = { version = "0.10", default-features = false, features = [
     "vendored",
 ], optional = true }
 sdl3-sys = { version = "0.7", default-features = false }
+zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }

@@ -244,7 +244,7 @@ impl WeaponEffects {
         let esp = pack.read(CORE_ESP_ENTRY).ok();
         let etm = pack.read(CORE_ETM_ENTRY).ok();
         match (esp, etm) {
-            (Some(esp), Some(etm)) => Self::parse(esp, etm),
+            (Some(esp), Some(etm)) => Self::parse(&esp, &etm),
             (None, _) => Self {
                 warnings: vec![format!(
                     "missing {CORE_ESP_ENTRY}; no weapon effects will draw"

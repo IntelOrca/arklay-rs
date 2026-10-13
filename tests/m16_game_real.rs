@@ -111,7 +111,7 @@ fn real_m16_game_corpus_has_no_slice_placeholders_and_lists_transitions() {
             transitions.push((*id, *destination));
         }
         if let Ok(bytes) = pack.read(&id.rdt_entry()) {
-            corpus_ops.extend(script_opcodes(bytes));
+            corpus_ops.extend(script_opcodes(&bytes));
         }
         for (&op, &count) in &sim.game.placeholders {
             *corpus_placeholders.entry(op).or_default() += count;

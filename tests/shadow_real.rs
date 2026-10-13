@@ -35,7 +35,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// The baked shadow page: the pack entry when present, else the install file.
 fn shadow_page(pack: &Pack, root: &Path) -> Image {
     if let Ok(bytes) = pack.read(shadow::KAGE_ENTRY) {
-        return shadow::decode(bytes).unwrap_or_else(|err| {
+        return shadow::decode(&bytes).unwrap_or_else(|err| {
             panic!("pack {} is invalid: {err:#}", shadow::KAGE_ENTRY);
         });
     }
@@ -67,7 +67,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     };
     let pack = Pack::open(&path).unwrap();
     let id = RoomId::parse("1001").unwrap();
-    let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let player_state = player::spawn(id, &room);
     let camera_index = player::camera_for_position(&room, 0, player_state.pos);
     let cut = &room.cuts[camera_index];
@@ -89,7 +89,8 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     };
 
     let emd = emd::parse(
-        pack.read(&format!("player/{:02}.emd", id.player_flag & 3))
+        &pack
+            .read(&format!("player/{:02}.emd", id.player_flag & 3))
             .unwrap(),
     )
     .unwrap();
@@ -105,13 +106,13 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         hidden_joints: 0,
     }];
 
-    let background = bmp::decode(pack.read(&id.cut_entry(camera_index)).unwrap()).unwrap();
+    let background = bmp::decode(&pack.read(&id.cut_entry(camera_index)).unwrap()).unwrap();
     let page = if cut.masks.is_empty() || cut.mask_active == 0 {
         None
     } else {
         pack.read(&id.roommask_entry(camera_index))
             .ok()
-            .and_then(|bytes| bmp::decode_mask(bytes).ok())
+            .and_then(|bytes| bmp::decode_mask(&bytes).ok())
     };
     let layer = page.as_ref().map(|page| MaskLayer {
         room: id,
@@ -240,7 +241,7 @@ fn shadow_page_matches_the_pack_entry_when_converted() {
         );
         return;
     };
-    let image = shadow::decode(bytes).unwrap();
+    let image = shadow::decode(&bytes).unwrap();
     assert_eq!((image.width, image.height), (26, 29));
     let direct = shadow_page(&pack, &root);
     assert_eq!(image.rgba, direct.rgba);

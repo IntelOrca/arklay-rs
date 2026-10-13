@@ -68,7 +68,7 @@ fn every_shipped_item_model_parses_from_the_pack() {
     assert_eq!(entries.len(), 77, "the pack holds 77 item models");
 
     for entry in entries {
-        let model = ivm::parse(pack.read(entry).unwrap())
+        let model = ivm::parse(&pack.read(entry).unwrap())
             .unwrap_or_else(|error| panic!("{entry}: {error:#}"));
         assert_eq!((model.texture.width, model.texture.height), (256, 256));
         assert!(
@@ -130,7 +130,7 @@ fn the_description_window_draws_over_the_model() {
     };
     let text = Text::load(&pack);
     let font = Font::new(
-        tim::decode_4bpp(pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
+        tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
     );
     let cx = context(&pack, &text, Some(&font));
 

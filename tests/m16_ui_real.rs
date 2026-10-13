@@ -111,7 +111,8 @@ fn real_map_tables_match_sampled_rooms() {
     };
     let pack = Pack::open(&pack_path).unwrap();
     let tables = MapTables::parse(
-        pack.read(arklay::ui::map::TABLES_ENTRY)
+        &pack
+            .read(arklay::ui::map::TABLES_ENTRY)
             .expect("the pack carries map/tables.bin"),
     )
     .unwrap();

@@ -1107,7 +1107,7 @@ impl GameSession {
         let bytes = pack
             .read(entry)
             .with_context(|| format!("missing attract demo reel {entry}"))?;
-        let reel = demo::DemoReel::parse(entry, bytes)?;
+        let reel = demo::DemoReel::parse(entry, &bytes)?;
         let id = reel.room;
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
@@ -1231,7 +1231,7 @@ impl GameSession {
         // The message window's glyph sheet is optional: a pack without one
         // still runs the state machine and simply draws nothing.
         let font = match pack.read("font/font.tim") {
-            Ok(bytes) => match tim::decode_4bpp(bytes) {
+            Ok(bytes) => match tim::decode_4bpp(&bytes) {
                 Ok(texture) => Some(font::Font::new(texture)),
                 Err(err) => {
                     eprintln!("warning: invalid font/font.tim: {err:#}");
@@ -2487,7 +2487,7 @@ impl GameSession {
         let Ok(prefix) = pack.read(save::SAVE_PREFIX_ENTRY) else {
             return save::SaveFile::from_state(&self.game);
         };
-        match save::SaveFile::from_state_with_prefix(&self.game, prefix) {
+        match save::SaveFile::from_state_with_prefix(&self.game, &prefix) {
             Ok(file) => file,
             Err(err) => {
                 eprintln!("warning: invalid {0}: {err:#}", save::SAVE_PREFIX_ENTRY);
@@ -3013,7 +3013,7 @@ impl GameSession {
         }
         self.died_texture_tried = true;
         match pack.read("ui/died.tim") {
-            Ok(bytes) => match tim::decode_8bpp(bytes) {
+            Ok(bytes) => match tim::decode_8bpp(&bytes) {
                 Ok(texture) => self.died_texture = Some(texture),
                 Err(err) => eprintln!("warning: invalid ui/died.tim: {err:#}"),
             },
@@ -3605,10 +3605,10 @@ fn entry_door(doors: &[Option<game::Door>; game::ROOM_ACTION_SLOTS]) -> Option<g
 /// the init script, without loading backgrounds or player assets, and return
 /// the state the `door_aot_set` records landed in.
 fn room_door_state(pack: &Pack, id: RoomId) -> Result<game::GameState> {
-    let rdt_bytes = pack.read(&id.rdt_entry())?;
+    let rdt_bytes = &*pack.read(&id.rdt_entry())?;
     let room = rdt::parse(rdt_bytes, id)?;
     let scripts = match pack.read(&id.scd_entry()) {
-        Ok(bytes) => scd::reader::parse(bytes)?,
+        Ok(bytes) => scd::reader::parse(&bytes)?,
         Err(_) => scd::reader::parse(rdt_bytes)?,
     };
     let mut game = game::GameState::new(id, &room);
@@ -3678,7 +3678,7 @@ fn entry_spot_free(room: &RoomState, pos: [i32; 3]) -> bool {
 /// BioCard block on every new game; the port reads it for the same purpose.
 fn bio_card(pack: &Pack) -> Option<save::SaveFile> {
     let bytes = pack.read(save::SAVE_PREFIX_ENTRY).ok()?;
-    match save::SaveFile::from_bytes(bytes) {
+    match save::SaveFile::from_bytes(&bytes) {
         Ok(card) => Some(card),
         Err(err) => {
             eprintln!("warning: invalid {}: {err:#}", save::SAVE_PREFIX_ENTRY);
@@ -3921,7 +3921,7 @@ impl App {
     /// `audio` opens the mixer when a game session or film starts.
     fn new(pack: Pack, save_dir: PathBuf, audio: bool) -> Self {
         let font = match pack.read("font/font.tim") {
-            Ok(bytes) => match tim::decode_4bpp(bytes) {
+            Ok(bytes) => match tim::decode_4bpp(&bytes) {
                 Ok(texture) => Some(font::Font::new(texture)),
                 Err(err) => {
                     eprintln!("warning: invalid font/font.tim: {err:#}");
@@ -5092,7 +5092,7 @@ fn run_font_ui(
     let bytes = pack
         .read("font/font.tim")
         .context("the pack has no font/font.tim (re-run convert-game)")?;
-    let texture = tim::decode_4bpp(bytes).context("failed to decode font/font.tim")?;
+    let texture = tim::decode_4bpp(&bytes).context("failed to decode font/font.tim")?;
     let font = font::Font::new(texture);
 
     if capture.is_some() {
@@ -5440,7 +5440,7 @@ fn load_door_animation(pack: &Pack, record: &game::Door, entry_camera: u8) -> Do
             return DoorAnimation::missing();
         }
     };
-    let dor = match door::parse(bytes) {
+    let dor = match door::parse(&bytes) {
         Ok(dor) => dor,
         Err(err) => {
             eprintln!("warning: invalid door animation {path}: {err:#}");
@@ -6708,7 +6708,7 @@ impl SfxCache {
                 return None;
             }
         };
-        match audio::parse_wav(bytes) {
+        match audio::parse_wav(&bytes) {
             Ok(wav) => {
                 self.wavs.insert(path, wav.clone());
                 Some(wav)
@@ -6826,7 +6826,7 @@ impl VoiceCache {
             self.missing.insert(path);
             return None;
         };
-        match audio::parse_wav(bytes) {
+        match audio::parse_wav(&bytes) {
             Ok(wav) => {
                 self.wavs.insert(path, wav.clone());
                 Some(wav)
@@ -6923,7 +6923,7 @@ impl MaskCache {
         if !self.pages.contains_key(&camera) && !self.missing.contains(&camera) {
             let entry = id.roommask_entry(camera);
             match pack.read(&entry) {
-                Ok(bytes) => match bmp::decode_mask(bytes) {
+                Ok(bytes) => match bmp::decode_mask(&bytes) {
                     Ok(image) => {
                         self.pages.insert(camera, image);
                     }
@@ -6957,7 +6957,7 @@ impl ShadowCache {
         if !self.attempted {
             self.attempted = true;
             if let Ok(bytes) = pack.read(shadow::KAGE_ENTRY) {
-                match shadow::decode(bytes) {
+                match shadow::decode(&bytes) {
                     Ok(image) => self.page = Some(image),
                     Err(err) => {
                         eprintln!("warning: invalid {}: {err:#}", shadow::KAGE_ENTRY);
@@ -7076,7 +7076,7 @@ fn build_effect_pages(pack: &Pack, id: RoomId, room: &effects::RoomEffects) -> E
         let Ok(bytes) = pack.read(&path) else {
             continue;
         };
-        match tim::decode_8bpp(bytes) {
+        match tim::decode_8bpp(&bytes) {
             Ok(texture) => pages.base[page] = Some(effect_page_image(&texture)),
             Err(err) => eprintln!("warning: invalid effect page {path}: {err:#}"),
         }
@@ -7327,7 +7327,7 @@ struct LoadedRoom {
 /// A layered pack's `scd/{id}.scd` standalone container overrides the RDT's
 /// embedded scripts; without one the RDT bytes are parsed exactly as before.
 fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
-    let rdt_bytes = pack.read(&id.rdt_entry())?;
+    let rdt_bytes = &*pack.read(&id.rdt_entry())?;
     let mut room = rdt::parse(rdt_bytes, id)?;
     for warning in &room.model_warnings {
         eprintln!("warning: {}: {warning}", id.rdt_entry());
@@ -7340,11 +7340,11 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
         let bytes = pack
             .read(&path)
             .with_context(|| format!("missing background for cut {}", cut.index))?;
-        cut.background = Some(bmp::decode(bytes).with_context(|| format!("invalid {path}"))?);
+        cut.background = Some(bmp::decode(&bytes).with_context(|| format!("invalid {path}"))?);
     }
     let (scripts, script_source) = match pack.read(&id.scd_entry()) {
         Ok(bytes) => (
-            scd::reader::parse(bytes)
+            scd::reader::parse(&bytes)
                 .with_context(|| format!("invalid SCD override {}", id.scd_entry()))?,
             ScriptSource::Override,
         ),
@@ -9136,14 +9136,14 @@ fn load_player_assets(pack: &Pack, id: RoomId) -> Option<PlayerAssets> {
     });
     let emd_bytes = emd_bytes.ok()?;
     let emw_bytes = emw_bytes.ok()?;
-    let emd = match emd::parse(emd_bytes) {
+    let emd = match emd::parse(&emd_bytes) {
         Ok(model) => model,
         Err(err) => {
             eprintln!("warning: invalid player model {emd_path}: {err:#}");
             return None;
         }
     };
-    let emw = match emd::parse_emw(emw_bytes) {
+    let emw = match emd::parse_emw(&emw_bytes) {
         Ok(model) => model,
         Err(err) => {
             eprintln!("warning: invalid player clips {emw_path}: {err:#}");
@@ -9165,7 +9165,7 @@ fn load_player_assets(pack: &Pack, id: RoomId) -> Option<PlayerAssets> {
             continue;
         };
         match pack.read(&entry) {
-            Ok(bytes) => match emd::parse_emw(bytes) {
+            Ok(bytes) => match emd::parse_emw(&bytes) {
                 Ok(model) => {
                     weapons.insert(file, model);
                 }
@@ -9185,7 +9185,7 @@ fn load_room_music(pack: &Pack, id: RoomId) -> Option<audio::Wav> {
     let (name, _looping) = crate::music::primary_track(id)?;
     let path = crate::music::pack_path(name)?;
     match pack.read(&path) {
-        Ok(bytes) => match audio::parse_wav(bytes) {
+        Ok(bytes) => match audio::parse_wav(&bytes) {
             Ok(wav) => Some(wav),
             Err(err) => {
                 eprintln!("warning: invalid music track {path}: {err:#}");
@@ -9714,7 +9714,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         let id = RoomId::parse("1001").unwrap();
-        let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+        let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
         let assets = load_player_assets(&pack, id).expect("player assets");
         let mut player_state = player::spawn(id, &room);
         let mut masks = MaskCache::default();
@@ -9801,7 +9801,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         let id = RoomId::parse("1001").unwrap();
-        let rdt_bytes = pack.read(&id.rdt_entry()).unwrap();
+        let rdt_bytes = &*pack.read(&id.rdt_entry()).unwrap();
         let room = rdt::parse(rdt_bytes, id).unwrap();
         let scripts = scd::reader::parse(rdt_bytes).unwrap();
 
@@ -10974,7 +10974,8 @@ mod tests {
 
         let pack = Pack::open(Path::new(&path)).unwrap();
         let background = bmp::decode(
-            pack.read(&RoomId::parse("1001").unwrap().cut_entry(0))
+            &pack
+                .read(&RoomId::parse("1001").unwrap().cut_entry(0))
                 .unwrap(),
         )
         .unwrap();
@@ -11402,7 +11403,7 @@ mod tests {
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
-        let page = bmp::decode_mask(pack.read(&id.roommask_entry(0)).unwrap()).unwrap();
+        let page = bmp::decode_mask(&pack.read(&id.roommask_entry(0)).unwrap()).unwrap();
         let layer = MaskLayer {
             room: id,
             camera: 0,
@@ -11817,7 +11818,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         let id = RoomId::parse("1001").unwrap();
-        let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+        let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
         let assets = load_player_assets(&pack, id).expect("player assets");
         let mut player_state = player::spawn(id, &room);
         let input = player::Input {
@@ -11860,7 +11861,7 @@ mod tests {
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
         let id = RoomId::parse("1001").unwrap();
-        let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+        let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
         let assets = load_player_assets(&pack, id).expect("player assets");
 
         type Footfall = (usize, u8, u8, [i32; 3], Option<&'static str>);
@@ -11975,7 +11976,7 @@ mod tests {
             return;
         };
         let pack = Pack::open(&font_pack).unwrap();
-        let font = font::Font::new(tim::decode_4bpp(pack.read("font/font.tim").unwrap()).unwrap());
+        let font = font::Font::new(tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
         assert_eq!((font.texture.width, font.texture.height), (768, 256));
         assert_eq!(font.metrics, font::FontMetrics::from_sheet_width(768));
 
@@ -16442,7 +16443,7 @@ off_0010:
         let dir = TempDir::new();
         let saves = dir.0.join("saves");
         let card = pack.read(save::SAVE_PREFIX_ENTRY).unwrap();
-        let file = save::SaveFile::from_state_with_prefix(&session.game, card).unwrap();
+        let file = save::SaveFile::from_state_with_prefix(&session.game, &card).unwrap();
         save::save(&saves, 3, &file).unwrap();
 
         let parsed = save::load(&saves, 3).unwrap();

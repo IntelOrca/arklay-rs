@@ -342,7 +342,7 @@ impl Default for SaveLoadScreen {
 impl Screen for SaveLoadScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
         self.background = match cx.pack.read("ui/type00.bmp") {
-            Ok(bytes) => match bmp::decode(bytes) {
+            Ok(bytes) => match bmp::decode(&bytes) {
                 Ok(image) => Some(image),
                 Err(err) => {
                     eprintln!("warning: invalid save/load background: {err:#}");

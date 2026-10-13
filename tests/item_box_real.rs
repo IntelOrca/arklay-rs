@@ -33,7 +33,7 @@ fn pack() -> Option<Pack> {
 }
 
 fn room_game(pack: &Pack, id: RoomId) -> GameState {
-    let room = rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     GameState::new(id, &room)
 }
 
@@ -81,7 +81,7 @@ fn real_item_box_deposit_survives_room_changes_and_a_save_round_trip() {
         player_flag: id.player_flag,
         ..destination
     };
-    let other_room = rdt::parse(pack.read(&other.rdt_entry()).unwrap(), other).unwrap();
+    let other_room = rdt::parse(&pack.read(&other.rdt_entry()).unwrap(), other).unwrap();
     game.enter_room(other, &other_room);
     assert_eq!(game.item_box[10].id, SPRAY);
 
@@ -96,7 +96,7 @@ fn real_item_box_deposit_survives_room_changes_and_a_save_round_trip() {
     let prefix = pack
         .read(SAVE_PREFIX_ENTRY)
         .expect("bio_card.dat in the pack");
-    let file = SaveFile::from_state_with_prefix(&game, prefix).unwrap();
+    let file = SaveFile::from_state_with_prefix(&game, &prefix).unwrap();
     let parsed = SaveFile::from_bytes(&file.to_bytes()).unwrap();
     let mut restored = GameState::default();
     parsed.apply_to(&mut restored);
@@ -107,7 +107,7 @@ fn real_item_box_deposit_survives_room_changes_and_a_save_round_trip() {
     // The room-flag save block carries the file bits too: 0x82 + 3 = 0x85 is
     // the room-flags word at byte 16, MSB-first bit 5, i.e. byte 19 bit 2.
     game.set_file_collected(3, true);
-    let file = SaveFile::from_state_with_prefix(&game, prefix).unwrap();
+    let file = SaveFile::from_state_with_prefix(&game, &prefix).unwrap();
     assert!(file.room_flags[19] & 0x04 != 0, "0x85 lands in byte 19");
     let restored = SaveFile::from_bytes(&file.to_bytes()).unwrap();
     let mut state = GameState::default();

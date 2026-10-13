@@ -20,7 +20,7 @@ responsibility.
 
 | Module | Owner | Responsibility |
 |---|---|---|
-| `pack` | Container | `.akpak` v1 reader/writer, layered mod packs, entry lookup, atomic `PackWriter::write` |
+| `pack` | Container | `.akpak` v1 reader/writer with raw and zstd-compressed entries, layered mod packs, entry lookup, atomic `PackWriter::write` |
 | `budget` | Container | Fixed per-format decode caps and checked allocation shared by every parser |
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
@@ -278,7 +278,7 @@ claims about the original.
 
 | Format | Entry point | Cap | Tests |
 |---|---|---|---|
-| `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
+| `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB, also the zstd decompression cap) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
 | `manifest.toml` | `manifest::Manifest::parse` | line/key/value length caps | `manifest` unit tests, `tests/torture`, `fuzz/manifest` |
 | RDT room | `rdt::parse` | section counts bounded by remaining bytes; `MAX_RECORDS` | `rdt` unit tests, `tests/m16_game_real.rs`, `tests/soak_real.rs`, `tests/torture`, `fuzz/rdt` |
 | SCD scripts | `scd::reader::parse` | instructions per block, `MAX_SCD_EVENTS` event-table cap | `scd` unit tests, `fuzz/scd` |

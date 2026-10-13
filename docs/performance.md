@@ -13,7 +13,7 @@ the report's shape and ordering, never wall-clock values.
 | OS | Linux 7.0.0 (x86_64) |
 | Toolchain | rustc 1.98.0 stable |
 | Profile | `release` (`lto = "thin"`) |
-| Pack | `re1.akpak` (3085 entries, 761,873,608 bytes) |
+| Pack | `re1.akpak` (3,242 entries, 479,865,985 bytes, zstd level 6) |
 
 ## Budgets and measurements
 
@@ -34,8 +34,8 @@ these numbers exclude the interactive mixer and presentation costs.
 | Full-game soak, all three passes | 1183.0 s | - | - |
 | Soak peak above baseline | 11.0 MiB | 512 MiB | ~45x |
 | Soak live-byte drift between passes 2 and 3 | 0 MiB | 32 MiB | - |
-| Conversion, single pack (761,873,608 bytes) | 1.5-1.9 s (~400-500 MB/s) | - | - |
-| Conversion peak RSS | 660 MB | - | - |
+| Conversion, single pack (770,227,997 bytes in, zstd level 6) | 3.8 s, 479,865,985 bytes out (2026-10-13) | - | - |
+| Conversion peak RSS | 1256 MB | - | - |
 
 The soak's 2026-10-06 coverage: 3003 room simulations over the three passes
 (348 starts per pass, 28 stub rooms without camera cuts skipped, 681 followed
@@ -43,8 +43,9 @@ destinations per pass), 2919 `.dor` door transitions, 89 unique destinations,
 5922 save round-trips, 42 rooms declaring the typewriter action (6 sampled
 flows), 17,649 camera cuts and 3003 rendered frames. The only placeholder
 opcode dispatched is the documented `0x05` flag-bank fallback. The soak's live
-bytes are exactly the pack's own allocation after every pass (727.1 MiB), so
-the three-pass check sees no drift at all on the reference machine.
+bytes are exactly the pack's own allocation after every pass (727.1 MiB,
+measured with the pre-zstd pack image), so the three-pass check sees no drift
+at all on the reference machine.
 
 The p95 is the upper edge of a power-of-two microsecond histogram bucket
 (`src/stats.rs`), clamped between the mean and the maximum. A tick p95 below

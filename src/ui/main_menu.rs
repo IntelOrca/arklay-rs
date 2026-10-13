@@ -148,12 +148,14 @@ impl MenuAssets {
         let statface = decode_texture(pack, STATFACE_ENTRY)?;
         let staitem = decode_texture(pack, STAITEM_ENTRY)?;
         let item_all = bmp::decode_mask(
-            pack.read(ITEM_ALL_ENTRY)
+            &pack
+                .read(ITEM_ALL_ENTRY)
                 .with_context(|| format!("missing {ITEM_ALL_ENTRY}"))?,
         )
         .with_context(|| format!("invalid {ITEM_ALL_ENTRY}"))?;
         let font = Font::new(tim::decode_4bpp(
-            pack.read(FONT_ENTRY)
+            &pack
+                .read(FONT_ENTRY)
                 .with_context(|| format!("missing {FONT_ENTRY}"))?,
         )?);
         Ok(Self {
@@ -171,7 +173,7 @@ fn decode_texture(pack: &Pack, entry: &str) -> Result<Texture8> {
     let bytes = pack
         .read(entry)
         .with_context(|| format!("missing {entry}"))?;
-    tim::decode_8bpp(bytes).with_context(|| format!("invalid {entry}"))
+    tim::decode_8bpp(&bytes).with_context(|| format!("invalid {entry}"))
 }
 
 /// The pause menu's screen state.

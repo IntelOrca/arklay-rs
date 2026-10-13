@@ -80,7 +80,7 @@ fn the_shipped_died_page_decodes() {
         .read("ui/died.tim")
         .expect("the pack carries ui/died.tim; re-convert the install");
     assert_eq!(bytes.len(), 66_080, "the shipped page is 66,080 bytes");
-    let texture = arklay::tim::decode_8bpp(bytes).expect("ui/died.tim is an 8bpp TIM");
+    let texture = arklay::tim::decode_8bpp(&bytes).expect("ui/died.tim is an 8bpp TIM");
     assert_eq!((texture.width, texture.height), (256, 256));
 }
 

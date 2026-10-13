@@ -310,7 +310,7 @@ pub fn verify_pack(pack: &Pack, strict: bool) -> VerifyReport {
 
 /// Parse one entry with the parser for `format`.
 fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
-    let data = pack.read(path)?;
+    let data = &*pack.read(path)?;
     match format {
         Format::Manifest => {
             let text = std::str::from_utf8(data).context("manifest.toml is not valid UTF-8")?;
@@ -336,7 +336,7 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
             // the reader accepts.
             match pack.read(&id.scd_entry()) {
                 Ok(bytes) => {
-                    crate::scd::reader::parse(bytes).context("invalid SCD override")?;
+                    crate::scd::reader::parse(&bytes).context("invalid SCD override")?;
                 }
                 Err(_) => {
                     crate::scd::reader::parse(data).context("invalid room SCD scripts")?;

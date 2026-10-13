@@ -125,7 +125,11 @@ camera cuts, BGM, player files, bytes written): one in-place line with
 `done/total`, percentage, elapsed time and ETA when stderr is a terminal, or
 periodic plain lines without control characters when it is redirected.
 Conversions end with per-category totals, the output size and the total
-elapsed time. `extract` rejects packs whose entry paths are absolute, contain
+elapsed time. Every entry of a converted pack is zstd-compressed at a fixed
+level except formats that already carry their own compression (`avi`, `ogg`,
+`png`, `webp`), which are stored raw; an entry that would not shrink also
+stays raw.
+`extract` rejects packs whose entry paths are absolute, contain
 `..` or backslashes, or are empty, so it never writes outside `--out`.
 
 ### Controls

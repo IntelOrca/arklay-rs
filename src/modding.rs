@@ -381,9 +381,9 @@ mod tests {
         );
 
         let pack = Pack::open(&out).unwrap();
-        assert_eq!(pack.read("scd/1000.scd").unwrap(), b"scd-bytes");
-        assert_eq!(pack.read("notes.toml").unwrap(), b"other = true");
-        assert_eq!(pack.read("sub/data.bin").unwrap(), b"data");
+        assert_eq!(pack.read("scd/1000.scd").unwrap().as_ref(), b"scd-bytes");
+        assert_eq!(pack.read("notes.toml").unwrap().as_ref(), b"other = true");
+        assert_eq!(pack.read("sub/data.bin").unwrap().as_ref(), b"data");
         let manifest = pack.manifest().unwrap();
         assert_eq!(manifest.id, "demo");
         assert_eq!(manifest.kind, manifest::PackKind::Mod);
@@ -417,7 +417,7 @@ mod tests {
 
         let pack = Pack::open(&out).unwrap();
         assert!(!pack.contains("scd/1000.s"));
-        let scripts = crate::scd::reader::parse(pack.read("scd/1000.scd").unwrap()).unwrap();
+        let scripts = crate::scd::reader::parse(&pack.read("scd/1000.scd").unwrap()).unwrap();
         assert_eq!(scripts.main.len(), 1);
         assert_eq!(scripts.main[0].insns[0].bytes, [0x0E, 0x00]);
     }
@@ -726,12 +726,12 @@ mod tests {
         assert_eq!(manifest.load_order, 10);
         assert_eq!(manifest.lua, ["lua/demo.lua"]);
 
-        let scripts = crate::scd::reader::parse(pack.read("scd/1000.scd").unwrap()).unwrap();
+        let scripts = crate::scd::reader::parse(&pack.read("scd/1000.scd").unwrap()).unwrap();
         assert_eq!(scripts.main.len(), 1);
         assert_eq!(scripts.events.len(), 1);
         assert_eq!(scripts.events[0].kind, crate::scd::ir::StreamKind::Event(0));
 
-        let image = crate::bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        let image = crate::bmp::decode(&pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (320, 240));
         assert!(image.rgba.iter().any(|&byte| byte != 0));
 

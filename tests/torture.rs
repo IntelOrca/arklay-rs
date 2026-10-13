@@ -45,7 +45,13 @@ const LCG_CASES: usize = 64;
 // --- runners: the same entry points the engine uses -----------------------
 
 fn run_pack(data: &[u8]) {
-    let _ = Pack::from_bytes(data.to_vec());
+    // `from_bytes` alone only decompresses the manifest, so read a prefix of
+    // the entries to reach the zstd decompression path too.
+    if let Ok(pack) = Pack::from_bytes(data.to_vec()) {
+        for entry in pack.entries().take(64) {
+            let _ = pack.read(entry.path());
+        }
+    }
 }
 
 fn run_manifest(data: &[u8]) {
@@ -417,6 +423,12 @@ fn seed_pack() -> Vec<u8> {
     writer.add("room/1000.rdt", seed_rdt()).unwrap();
     writer
         .add("text/readme.txt", b"hello pack".to_vec())
+        .unwrap();
+    // One zstd entry, so the fuzzer also mutates around the decompression
+    // path; the rest of the seed stays raw.
+    writer.add("bgm/013.wav", vec![7u8; 4 * 1024]).unwrap();
+    writer
+        .compress_entries(1, |path| path != "bgm/013.wav")
         .unwrap();
     writer.to_bytes().unwrap()
 }

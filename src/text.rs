@@ -283,7 +283,7 @@ impl Text {
 
 fn load_table(pack: &Pack, path: &str, kind: Kind) -> Table {
     match pack.read(path) {
-        Ok(data) => match Table::parse(data, kind) {
+        Ok(data) => match Table::parse(&data, kind) {
             Ok(table) => table,
             Err(error) => {
                 eprintln!("warning: invalid text table {path}: {error:#}");

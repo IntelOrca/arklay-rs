@@ -51,6 +51,27 @@ const BMP_BPP_OFFSET: usize = 28;
 /// Bytes buffered while streaming the finished pack to disk.
 const WRITE_CHUNK: usize = 1 << 20;
 
+/// Entry extensions stored raw in the pack: these formats are already
+/// compressed with their own codec, so zstd cannot shrink them and would only
+/// cost conversion time. The list grows as more formats are supported.
+///
+/// `.wav` is deliberately not exempt: the shipped PCM is not otherwise
+/// compressed, and zstd takes the RE1 pack's 178.4 MB of WAVs to 122.1 MB
+/// (68.5%). Expanding the 8-bit files to 16-bit PCM first was strictly worse
+/// (18.2 MB vs 15.5 MB for those 60 files) and recovers no quality, so the
+/// pack stores the shipped samples as they are.
+const PRECOMPRESSED_EXTENSIONS: &[&str] = &["avi", "ogg", "png", "webp"];
+
+/// Whether an entry's format already carries its own compression, in which
+/// case `convert-game` stores it raw instead of zstd-compressing it.
+fn is_precompressed(entry: &str) -> bool {
+    Path::new(entry).extension().is_some_and(|extension| {
+        PRECOMPRESSED_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+    })
+}
+
 /// Resolve the requested worker count: `0` selects one worker per CPU.
 fn worker_count(jobs: usize) -> usize {
     if jobs != 0 {
@@ -460,6 +481,16 @@ pub fn convert_game_with_options(
     }
     println!("movie: {movie_count} entries, {movie_bytes} bytes");
 
+    // Zstd-compress every entry except the formats that already carry their
+    // own compression, spread over the worker pool. Entries that would not
+    // shrink stay raw, so this can only help.
+    let compressed = writer.compress_entries(jobs, is_precompressed)?;
+    let entries = writer.len();
+    println!(
+        "compress: {compressed} of {entries} entries stored with zstd (level {})",
+        crate::pack::ZSTD_LEVEL
+    );
+
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
     // full memcpy. The bytes land in a sibling temporary file that is renamed
@@ -492,33 +523,6 @@ pub fn convert_game_with_options(
     })?;
     progress.end_phase();
 
-    let entries = rdt_count
-        + cut_count
-        + mask_count
-        + bgm_count
-        + se_count
-        + door_count
-        + player_count
-        + weapon_count
-        + npc_count
-        + enemy_count
-        + enemylua_count
-        + effect_count
-        + ui_count
-        + item_count
-        + data_count
-        + core_count
-        + shadow_count
-        + font_count
-        + text_count
-        + ivm_count
-        + file_count
-        + map_count
-        + maptbl_count
-        + combat_count
-        + manifest_count
-        + voice_count
-        + movie_count;
     println!(
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
@@ -3040,6 +3044,27 @@ mod tests {
     const RDT_HEADER_LEN: usize = 0x94;
     const RDT_CAMERA_LEN: usize = 44;
 
+    #[test]
+    fn precompressed_extensions_are_recognised_case_insensitively() {
+        for entry in [
+            "movie/oj.avi",
+            "assets/logo.PNG",
+            "bgm/track.ogg",
+            "ui/photo.webp",
+        ] {
+            assert!(is_precompressed(entry), "{entry}");
+        }
+        for entry in [
+            "room/1000.rdt",
+            "bgm/013.wav",
+            "ui/title.bmp",
+            "manifest.toml",
+            "no-extension",
+        ] {
+            assert!(!is_precompressed(entry), "{entry}");
+        }
+    }
+
     /// Self-deleting temporary directory unique to this process and label.
     struct TempDir {
         path: PathBuf,
@@ -3333,7 +3358,7 @@ mod tests {
             1,
             "the checked-in script is packed"
         );
-        assert_eq!(pack.read("enemy/em23.emd").unwrap(), b"npc-23");
+        assert_eq!(pack.read("enemy/em23.emd").unwrap().as_ref(), b"npc-23");
     }
 
     /// Write all 33 effect-sheet files under `EFFSPR` with mixed-case names.
@@ -3383,7 +3408,7 @@ mod tests {
                 "missing {name}"
             );
         }
-        assert_eq!(pack.read("effspr/esp224.tim").unwrap(), b"esp224");
+        assert_eq!(pack.read("effspr/esp224.tim").unwrap().as_ref(), b"esp224");
     }
 
     #[test]
@@ -3447,11 +3472,15 @@ mod tests {
         assert_eq!(bytes, "esp-bytes".len() + "etm-bytes".len());
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
         assert_eq!(
-            pack.read(crate::effects::room::CORE_ESP_ENTRY).unwrap(),
+            pack.read(crate::effects::room::CORE_ESP_ENTRY)
+                .unwrap()
+                .as_ref(),
             b"esp-bytes"
         );
         assert_eq!(
-            pack.read(crate::effects::room::CORE_ETM_ENTRY).unwrap(),
+            pack.read(crate::effects::room::CORE_ETM_ENTRY)
+                .unwrap()
+                .as_ref(),
             b"etm-bytes"
         );
     }
@@ -3695,20 +3724,23 @@ mod tests {
         assert!(pack.contains("bgm/002.wav"));
         assert!(!pack.contains("bgm/000.wav"));
         assert!(pack.contains("se/ft_wda.wav"));
-        assert_eq!(pack.read("se/ft_wda.wav").unwrap(), b"ft_wdA");
+        assert_eq!(pack.read("se/ft_wda.wav").unwrap().as_ref(), b"ft_wdA");
 
-        assert_eq!(pack.read("door/door00.dor").unwrap(), b"dor-door00");
-        assert_eq!(pack.read("door/kai03.dor").unwrap(), b"dor-kai03");
-        assert_eq!(pack.read("door/lad01.dor").unwrap(), b"dor-lad01");
+        assert_eq!(
+            pack.read("door/door00.dor").unwrap().as_ref(),
+            b"dor-door00"
+        );
+        assert_eq!(pack.read("door/kai03.dor").unwrap().as_ref(), b"dor-kai03");
+        assert_eq!(pack.read("door/lad01.dor").unwrap().as_ref(), b"dor-lad01");
 
-        assert_eq!(pack.read("player/01.emd").unwrap(), b"emd1");
-        assert_eq!(pack.read("player/01.emw").unwrap(), b"emw1");
+        assert_eq!(pack.read("player/01.emd").unwrap().as_ref(), b"emd1");
+        assert_eq!(pack.read("player/01.emw").unwrap().as_ref(), b"emw1");
         // The NPC phase copies the fifteen character models raw, lower-cased.
-        assert_eq!(pack.read("enemy/em20.emd").unwrap(), b"npc-20");
-        assert_eq!(pack.read("enemy/em2e.emd").unwrap(), b"npc-2e");
+        assert_eq!(pack.read("enemy/em20.emd").unwrap().as_ref(), b"npc-20");
+        assert_eq!(pack.read("enemy/em2e.emd").unwrap().as_ref(), b"npc-2e");
 
         let manifest = manifest::Manifest::parse(
-            std::str::from_utf8(pack.read(manifest::ENTRY).unwrap()).unwrap(),
+            std::str::from_utf8(pack.read(manifest::ENTRY).unwrap().as_ref()).unwrap(),
         )
         .unwrap();
         assert_eq!(manifest.id, BASE_PACK_ID);
@@ -3752,7 +3784,7 @@ mod tests {
             2
         );
 
-        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
     }
 
@@ -3857,8 +3889,21 @@ mod tests {
         let out = root.path.join("out.akpak");
         convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(main.read("movie/oj.avi").unwrap(), b"movie-oj");
-        assert_eq!(main.read("movie/capcom.avi").unwrap(), b"movie-capcom");
+        assert_eq!(main.read("movie/oj.avi").unwrap().as_ref(), b"movie-oj");
+        assert_eq!(
+            main.read("movie/capcom.avi").unwrap().as_ref(),
+            b"movie-capcom"
+        );
+        // The issue's policy end to end: an already-compressed film stays
+        // borrowed (raw), a compressible RDT is owned (zstd).
+        assert!(matches!(
+            main.read("movie/oj.avi").unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            main.read("room/1000.rdt").unwrap(),
+            std::borrow::Cow::Owned(_)
+        ));
         // No companion pack is written beside the main one.
         assert!(!root.path.join("out.movie.akpak").exists());
     }
@@ -3883,8 +3928,11 @@ mod tests {
         let out = root.path.join("out.akpak");
         convert_game_with_options(&root.path, &out, None, 1).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(main.read("voice/v001_00.wav").unwrap(), b"voice-a");
-        assert_eq!(main.read("voice/v104_00.wav").unwrap(), b"voice-bb");
+        assert_eq!(main.read("voice/v001_00.wav").unwrap().as_ref(), b"voice-a");
+        assert_eq!(
+            main.read("voice/v104_00.wav").unwrap().as_ref(),
+            b"voice-bb"
+        );
         // The unreferenced file stays out and no companion pack is written.
         assert!(!main.contains("voice/announce.wav"));
         assert!(!root.path.join("out.voice.akpak").exists());
@@ -3979,8 +4027,8 @@ mod tests {
 
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("door/"), 34);
-        assert_eq!(pack.read("door/ele01.dor").unwrap(), b"dor-ele01");
-        assert_eq!(pack.read("door/mon.dor").unwrap(), b"dor-mon");
+        assert_eq!(pack.read("door/ele01.dor").unwrap().as_ref(), b"dor-ele01");
+        assert_eq!(pack.read("door/mon.dor").unwrap().as_ref(), b"dor-mon");
         // Every door type byte maps to a distinct pack entry.
         let mut entries: Vec<&str> = pack
             .paths()
@@ -4083,7 +4131,7 @@ mod tests {
         convert_game(&root.path, &out).unwrap();
 
         let pack = crate::pack::Pack::open(&out).unwrap();
-        let image = bmp::decode(pack.read("roomcut/300_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/300_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (316, 236));
     }
 
@@ -4291,7 +4339,7 @@ mod tests {
             pack.read("ui/statface.tim").unwrap(),
             b"STATFACE.TIM".as_slice()
         );
-        let image = bmp::decode(pack.read("item/item_all.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("item/item_all.bmp").unwrap()).unwrap();
         assert_eq!(
             (image.width, image.height),
             (
@@ -4680,11 +4728,11 @@ mod tests {
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
         assert!(item_bytes > 0 && file_bytes > 0);
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
-        assert_eq!(pack.read("item/i00v.ivm").unwrap(), b"ivm0");
-        assert_eq!(pack.read("item/ing.ivm").unwrap(), b"ivm1");
-        assert_eq!(pack.read("file/file000.tim").unwrap(), b"cover0");
-        assert_eq!(pack.read("file/filei17.tim").unwrap(), b"i17");
-        assert_eq!(pack.read("file/textm_42.tim").unwrap(), b"page42");
+        assert_eq!(pack.read("item/i00v.ivm").unwrap().as_ref(), b"ivm0");
+        assert_eq!(pack.read("item/ing.ivm").unwrap().as_ref(), b"ivm1");
+        assert_eq!(pack.read("file/file000.tim").unwrap().as_ref(), b"cover0");
+        assert_eq!(pack.read("file/filei17.tim").unwrap().as_ref(), b"i17");
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
@@ -4735,14 +4783,14 @@ mod tests {
         assert_eq!(count("file/"), 62);
         assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
         let messages =
-            crate::text::Table::parse_message(pack.read("text/messages.bin").unwrap()).unwrap();
+            crate::text::Table::parse_message(&pack.read("text/messages.bin").unwrap()).unwrap();
         assert_eq!(messages.len(), 64);
         assert_eq!(messages.get(0), Some(&[0x0C, 0x0D, 0x01, 0x00][..]));
-        assert_eq!(pack.read("item/mini.ivm").unwrap(), b"ivm1");
-        assert_eq!(pack.read("file/textm_42.tim").unwrap(), b"page42");
-        assert_eq!(pack.read("map/map0e.tim").unwrap(), b"plan14");
-        assert_eq!(pack.read("map/blue.tim").unwrap(), b"blue");
-        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        assert_eq!(pack.read("item/mini.ivm").unwrap().as_ref(), b"ivm1");
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
+        assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
+        assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
+        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
         assert_eq!(tables, MapTables::default());
     }
 
@@ -4950,7 +4998,7 @@ mod tests {
         );
         assert_eq!(count("effspr/"), 33);
         assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
-        let tables = MapTables::parse(pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
+        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
         assert_eq!(tables, MapTables::default(), "the installed tables match");
         assert!(pack.contains("enemy/em20.emd"));
         assert!(pack.contains("enemy/em2e.emd"));
@@ -5046,7 +5094,7 @@ mod tests {
         assert!(pack.contains("player/01.emd"));
         assert!(pack.contains("player/01.emw"));
 
-        let image = bmp::decode(pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
+        let image = bmp::decode(&pack.read("roomcut/100_000.bmp").unwrap()).unwrap();
         assert_eq!((image.width, image.height), (CUT_WIDTH, CUT_HEIGHT));
     }
 
@@ -5156,7 +5204,7 @@ mod tests {
         for asset in &assets {
             let data = pack.read(&asset.entry).unwrap();
             let emd =
-                crate::emd::parse(data).unwrap_or_else(|err| panic!("{}: {err:#}", asset.entry));
+                crate::emd::parse(&data).unwrap_or_else(|err| panic!("{}: {err:#}", asset.entry));
             let prims: usize = emd
                 .mesh
                 .objects
@@ -5250,6 +5298,9 @@ mod tests {
 
         assert_eq!((count, bytes), (1, 14));
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
-        assert_eq!(pack.read("font/font.tim").unwrap(), b"raw-font-sheet");
+        assert_eq!(
+            pack.read("font/font.tim").unwrap().as_ref(),
+            b"raw-font-sheet"
+        );
     }
 }

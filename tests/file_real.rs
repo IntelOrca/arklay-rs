@@ -64,7 +64,7 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     // Room 1001 is Jill's; list slot 0 is file index 0x0F in both lists, and
     // the page tables give it five half-pages.
     let id = RoomId::parse("1001").unwrap();
-    let room = arklay::rdt::parse(pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let room = arklay::rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
     let mut game = GameState::new(id, &room);
     game.set_file_collected(0x0F, true);
     assert!(game.document_collected(FILE_ITEM_MIN + 0x0F));

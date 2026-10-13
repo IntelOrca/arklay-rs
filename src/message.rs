@@ -1322,7 +1322,8 @@ mod tests {
             return;
         };
         let pack = Pack::open(std::path::Path::new(&path)).unwrap();
-        let font = Font::new(crate::tim::decode_4bpp(pack.read("font/font.tim").unwrap()).unwrap());
+        let font =
+            Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
         let text = Text::load(&pack);
 
         let data = std::fs::read(std::path::Path::new(&root).join("JPN/STAGE1/ROOM1001.RDT"))
@@ -1388,7 +1389,8 @@ mod tests {
             return;
         };
         let pack = Pack::open(std::path::Path::new(&path)).unwrap();
-        let font = Font::new(crate::tim::decode_4bpp(pack.read("font/font.tim").unwrap()).unwrap());
+        let font =
+            Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
         let text = Text::load(&pack);
 
         // ROOM1010 slot 1 is the sword-key locked door; probe it without the

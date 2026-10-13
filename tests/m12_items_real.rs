@@ -270,7 +270,7 @@ fn room_300_courtyard_map_raises_the_room_flag_without_inventory() {
         return;
     };
     let id = RoomId::parse("3000").unwrap();
-    let data = pack.read(&id.rdt_entry()).unwrap();
+    let data = &*pack.read(&id.rdt_entry()).unwrap();
     let room = arklay::rdt::parse(data, id).unwrap();
     let scripts = Rc::new(arklay::scd::reader::parse(data).unwrap());
     let mut game = GameState::new(id, &room);
@@ -476,7 +476,7 @@ fn room_406_map_palette_is_darkened_in_the_render() {
     assert!(item_record(&sim.game, map).unwrap().active());
 
     // Decode the shipped, undarkened pair straight from the RDT.
-    let data = pack.read(&id.rdt_entry()).unwrap();
+    let data = &*pack.read(&id.rdt_entry()).unwrap();
     let stock = rdt::parse(data, id).unwrap();
     let stock_texture = stock
         .item_models
@@ -548,7 +548,7 @@ fn room_11a_crest_wall_probes_arm_the_item_use_flags() {
         return;
     };
     let id = RoomId::parse("11a1").unwrap();
-    let data = pack.read(&id.rdt_entry()).expect("room/11a1.rdt");
+    let data = &*pack.read(&id.rdt_entry()).expect("room/11a1.rdt");
     let room = rdt::parse(data, id).unwrap();
     let scripts = arklay::scd::reader::parse(data).unwrap();
     let mut state = GameState::new(id, &room);

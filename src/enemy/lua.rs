@@ -263,7 +263,7 @@ mod imp {
             self.budget.begin();
             self.pack.set(pack as *const Pack);
             if let Err(err) = lua
-                .load(bytes)
+                .load(&*bytes)
                 .set_name(path.clone())
                 .set_environment(env.clone())
                 .exec()
@@ -417,7 +417,7 @@ mod imp {
             entry,
         )?;
         let value: Value = lua
-            .load(bytes)
+            .load(&*bytes)
             .set_name(entry.to_string())
             .set_environment(env)
             .eval()?;

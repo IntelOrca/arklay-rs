@@ -142,7 +142,7 @@ impl ItemBoxAssets {
             .read(ITEMBOX_ENTRY)
             .with_context(|| format!("missing {ITEMBOX_ENTRY}"))?;
         let itemboxn =
-            tim::decode_8bpp(bytes).with_context(|| format!("invalid {ITEMBOX_ENTRY}"))?;
+            tim::decode_8bpp(&bytes).with_context(|| format!("invalid {ITEMBOX_ENTRY}"))?;
         Ok(Self { itemboxn })
     }
 }

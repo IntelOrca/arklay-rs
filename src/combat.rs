@@ -475,7 +475,7 @@ impl CombatTables {
     /// the entry is absent or unreadable (a mod or a foreign install).
     pub fn load(pack: &crate::pack::Pack) -> Self {
         match pack.read(COMBAT_ENTRY) {
-            Ok(data) => match Self::parse(data) {
+            Ok(data) => match Self::parse(&data) {
                 Ok(tables) => tables,
                 Err(err) => {
                     eprintln!(

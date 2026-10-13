@@ -67,7 +67,7 @@ fn character(pack: &Pack, game: &arklay::game::GameState, id: u8) -> Option<(usi
         .enumerate()
         .find(|(_, entity)| entity.id == id && entity.active())?;
     let path = arklay::enemy::model_path(id)?;
-    let model = arklay::emd::parse(pack.read(path).ok()?).ok()?;
+    let model = arklay::emd::parse(&pack.read(path).ok()?).ok()?;
     Some((slot, *entity, model))
 }
 
@@ -370,7 +370,7 @@ fn real_room109_cut4_barry_is_culled_by_the_switch_zone() {
 /// The baked shadow page: the pack entry when present, else the install file.
 fn shadow_page(pack: &Pack, root: &Path) -> Image {
     if let Ok(bytes) = pack.read(arklay::shadow::KAGE_ENTRY) {
-        return arklay::shadow::decode(bytes).unwrap_or_else(|err| {
+        return arklay::shadow::decode(&bytes).unwrap_or_else(|err| {
             panic!("pack {} is invalid: {err:#}", arklay::shadow::KAGE_ENTRY);
         });
     }

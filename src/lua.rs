@@ -202,7 +202,7 @@ mod imp {
                     &format!("lua chunk {path} size"),
                 )?;
                 budget.begin();
-                if let Err(err) = lua.load(bytes).set_name(path.clone()).exec() {
+                if let Err(err) = lua.load(&*bytes).set_name(path.clone()).exec() {
                     eprintln!("[lua] failed to run {path}: {err}");
                 }
             }

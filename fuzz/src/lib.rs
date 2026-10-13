@@ -16,7 +16,13 @@ use arklay::state::RoomId;
 use arklay::{audio, bmp, door, emd, ivm, lzw, mask, rdt, scd, tim, tmd};
 
 pub fn pack(data: &[u8]) {
-    let _ = Pack::from_bytes(data.to_vec());
+    // `from_bytes` alone only decompresses the manifest, so read a prefix of
+    // the entries to reach the zstd decompression path too.
+    if let Ok(pack) = Pack::from_bytes(data.to_vec()) {
+        for entry in pack.entries().take(64) {
+            let _ = pack.read(entry.path());
+        }
+    }
 }
 
 pub fn manifest(data: &[u8]) {

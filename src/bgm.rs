@@ -221,7 +221,7 @@ impl BgmCache {
             let Ok(bytes) = pack.read(path) else {
                 continue;
             };
-            match audio::parse_wav(bytes) {
+            match audio::parse_wav(&bytes) {
                 Ok(wav) => {
                     self.wavs.insert(path.clone(), wav.clone());
                     return Some(wav);

@@ -1013,7 +1013,7 @@ fn real_m13_corpus_audit_has_no_implemented_placeholders() {
         };
         simulated += 1;
         if let Ok(bytes) = pack.read(&id.rdt_entry()) {
-            corpus_ops.extend(script_opcodes(bytes));
+            corpus_ops.extend(script_opcodes(&bytes));
         }
         noops += sim.game.snd3d_noops.values().sum::<u64>();
         enemy_drops += sim.game.snd3d_enemy_drops;

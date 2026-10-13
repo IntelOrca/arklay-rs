@@ -115,7 +115,7 @@ fn real_save_room_door_walk_runs_the_destination_message_path() {
     // A global message requested in the destination room resolves and draws
     // over the frozen gameplay frame the transition left behind.
     let font = Font::new(
-        tim::decode_4bpp(pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
+        tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
     );
     game.cancel_message();
     game.show_message(0x40, 0x145);
@@ -154,7 +154,7 @@ fn real_locked_door_message_renders_over_a_frozen_frame() {
 
     // Probe the sword-key door with no key: the door handler requests its
     // locked message through the same window path the engine drives.
-    let data = pack.read(&id.rdt_entry()).unwrap();
+    let data = &*pack.read(&id.rdt_entry()).unwrap();
     let room = arklay::rdt::parse(data, id).unwrap();
     let scripts = arklay::scd::reader::parse(data).unwrap();
     let mut state = GameState::new(id, &room);
@@ -188,7 +188,7 @@ fn real_locked_door_message_renders_over_a_frozen_frame() {
     let frozen = bmp::decode(&std::fs::read(&capture).unwrap()).unwrap();
 
     let font = Font::new(
-        tim::decode_4bpp(pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
+        tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
     );
     let mut framebuffer = Framebuffer::new();
     framebuffer.blit(&frozen);

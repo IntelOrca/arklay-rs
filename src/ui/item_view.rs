@@ -455,7 +455,7 @@ fn load_model(pack: &Pack, item: u8) -> Option<Ivm> {
     let name = items::model_name(item)?;
     let entry = format!("{ITEM_MODEL_PREFIX}{}.ivm", name.to_ascii_lowercase());
     match pack.read(&entry) {
-        Ok(data) => match ivm::parse(data) {
+        Ok(data) => match ivm::parse(&data) {
             Ok(model) => Some(model),
             Err(err) => {
                 eprintln!("warning: invalid {entry}: {err:#}");

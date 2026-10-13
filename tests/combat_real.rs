@@ -28,7 +28,8 @@ fn packed_combat_tables_match_a_fresh_executable_decode() {
     };
     let pack = Pack::open(&pack_path).unwrap();
     let packed = CombatTables::parse(
-        pack.read(arklay::combat::COMBAT_ENTRY)
+        &pack
+            .read(arklay::combat::COMBAT_ENTRY)
             .expect("the converted pack carries data/combat.bin"),
     )
     .unwrap();

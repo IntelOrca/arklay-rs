@@ -627,7 +627,7 @@ fn conversion_adds_exactly_the_manifest_entry() {
 
     assert!(converted.contains(manifest::ENTRY));
     let manifest = manifest::Manifest::parse(
-        std::str::from_utf8(converted.read(manifest::ENTRY).unwrap()).unwrap(),
+        std::str::from_utf8(&converted.read(manifest::ENTRY).unwrap()).unwrap(),
     )
     .unwrap();
     assert_eq!(manifest.id, convert::BASE_PACK_ID);
