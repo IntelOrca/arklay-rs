@@ -1,552 +1,288 @@
-//! Executable text tables: global messages, item names, generic names, item
-//! descriptions and the save-screen strings.
+//! The engine's runtime strings: the pack's language files behind the lookups
+//! the message machine, the menus and the overlays use.
 //!
-//! `convert-game` extracts the tables from the Japanese executable into five
-//! `text/*.bin` pack entries. Each file is a little-endian `u32` count,
-//! `count` `u32` byte offsets from the start of the file, then the raw encoded
-//! streams; an offset of zero marks a missing entry. Global messages and item
-//! descriptions end at their `0x01` terminator and keep the action byte that
-//! follows it; item names end at `0x07`; the save-screen strings are plain
-//! `0x01`-terminated streams.
-//!
-//! Missing files are a warning rather than a failure: room messages still
-//! work and menu strings simply read empty.
+//! Every lookup walks the catalog's fallback chain
+//! ([`crate::language::Catalog`]): the selected language file, then the same
+//! language in any region, then English. A room message no language carries
+//! falls back to the RDT's own text and then to its registry id; item names
+//! and UI labels a chain does not carry read as empty, exactly like a missing
+//! entry in the tables this module replaces.
 
-use anyhow::{Context, Result, bail};
-
+use crate::language::Catalog;
 use crate::pack::Pack;
 use crate::state::RoomState;
 
-/// Pack entry of the global message table (64 entries).
-pub const MESSAGES_ENTRY: &str = "text/messages.bin";
-/// Pack entry of the item-name table (128 entries, item id - 1).
-pub const NAMES_ENTRY: &str = "text/names.bin";
-/// Pack entry of the generic item-name table (16 entries, by class).
-pub const UNKNOWN_ENTRY: &str = "text/unknown.bin";
-/// Pack entry of the item-description table (79 entries, item id - 1).
-pub const DESCRIPTIONS_ENTRY: &str = "text/idesc.bin";
-/// Pack entry of the save-screen strings.
-pub const SAVE_ENTRY: &str = "text/save.bin";
-
-/// How one encoded stream is terminated.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    /// Message grammar: stops at the `0x01` terminator and keeps the action
-    /// byte (`0` = wait for input, otherwise an auto-dismiss frame count).
-    Message,
-    /// Item name: stops at the `0x07` return marker.
-    Name,
-    /// Plain `0x01`-terminated stream with no action byte (save strings).
-    Plain,
-}
-
-/// One text table: the encoded stream of every entry, or `None` for a missing
-/// entry (the file's zero offset).
-#[derive(Debug, Clone, Default)]
-pub struct Table {
-    entries: Vec<Option<Vec<u8>>>,
-}
-
-impl Table {
-    /// Parse a message-grammar table (`text/messages.bin`, `text/idesc.bin`).
-    pub fn parse_message(data: &[u8]) -> Result<Self> {
-        Self::parse(data, Kind::Message)
-    }
-
-    /// Parse an item-name table (`text/names.bin`, `text/unknown.bin`).
-    pub fn parse_name(data: &[u8]) -> Result<Self> {
-        Self::parse(data, Kind::Name)
-    }
-
-    /// Parse a plain `0x01`-terminated table (`text/save.bin`).
-    pub fn parse_plain(data: &[u8]) -> Result<Self> {
-        Self::parse(data, Kind::Plain)
-    }
-
-    fn parse(data: &[u8], kind: Kind) -> Result<Self> {
-        let count = read_u32(data, 0).context("text table is missing its count")? as usize;
-        let table_len = count
-            .checked_mul(4)
-            .and_then(|bytes| bytes.checked_add(4))
-            .context("text table entry count overflows")?;
-        if data.len() < table_len {
-            bail!(
-                "text table declares {count} entries but is only {} bytes",
-                data.len()
-            );
-        }
-
-        let mut entries = Vec::with_capacity(count);
-        for index in 0..count {
-            let offset = read_u32(data, 4 + index * 4)? as usize;
-            if offset == 0 {
-                entries.push(None);
-                continue;
-            }
-            let stream = data.get(offset..).with_context(|| {
-                format!(
-                    "text entry {index} points at offset 0x{offset:X}, past the {}-byte table",
-                    data.len()
-                )
-            })?;
-            let end = match kind {
-                Kind::Name => scan_terminator(stream, 0x07),
-                Kind::Plain => scan_terminator(stream, 0x01),
-                Kind::Message => scan_message(stream),
-            }
-            .with_context(|| {
-                format!("text entry {index} at offset 0x{offset:X} is unterminated")
-            })?;
-            let end = if kind == Kind::Message {
-                end.checked_add(1)
-                    .filter(|&end| end <= stream.len())
-                    .with_context(|| {
-                        format!("text entry {index} at offset 0x{offset:X} has no action byte")
-                    })?
-            } else {
-                end
-            };
-            entries.push(Some(stream[..end].to_vec()));
-        }
-        Ok(Self { entries })
-    }
-
-    /// Number of entries, missing ones included.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the table has no entries at all.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// The encoded bytes of entry `id`, or `None` when the entry is missing or
-    /// out of range.
-    pub fn get(&self, id: usize) -> Option<&[u8]> {
-        self.entries.get(id)?.as_deref()
-    }
-}
-
-/// The save-screen strings, in their documented table order.
-///
-/// Read the fields, or use the indexing accessors, which return an empty slice
-/// for a missing entry.
-#[derive(Debug, Clone, Default)]
-pub struct SaveStrings {
-    /// `SAVE`, `LOAD` (indexed by screen mode).
-    pub headers: Vec<Vec<u8>>,
-    /// The shared `     GAME` suffix of both headers.
-    pub header_suffix: Vec<u8>,
-    /// Chris, Jill (indexed by character id).
-    pub char_names: Vec<Vec<u8>>,
-    /// The exit-row verbs: `セーブ`, `ロード` (indexed by screen mode).
-    pub exits: Vec<Vec<u8>>,
-    /// The `   しない` suffix drawn over the exit verb.
-    pub exit_suffix: Vec<u8>,
-    /// The filled-slot row template (`   /  /     /  `).
-    pub filled_slot: Vec<u8>,
-    /// The empty-slot row template (`ーーー/ーー/ーーーーー/ーー`).
-    pub empty_slot: Vec<u8>,
-    /// The overwrite confirmation line.
-    pub overwrite_prompt: Vec<u8>,
-    /// The `はい  いいえ` line the confirm cursor sits on.
-    pub yes_no: Vec<u8>,
-    /// The two error lines (`no free space` and its blank second line).
-    pub errors: Vec<Vec<u8>>,
-    /// The seven stage/room location names.
-    pub locations: Vec<Vec<u8>>,
-}
-
-impl SaveStrings {
-    fn from_table(table: &Table) -> Self {
-        let entry = |id: usize| table.get(id).unwrap_or(&[]).to_vec();
-        Self {
-            headers: vec![entry(0), entry(1)],
-            header_suffix: entry(2),
-            char_names: vec![entry(3), entry(4)],
-            exits: vec![entry(5), entry(6)],
-            exit_suffix: entry(7),
-            filled_slot: entry(8),
-            empty_slot: entry(9),
-            overwrite_prompt: entry(10),
-            yes_no: entry(11),
-            errors: vec![entry(12), entry(13)],
-            locations: (14..21).map(entry).collect(),
-        }
-    }
-
-    /// The header of screen mode `0` (save) or `1` (load).
-    pub fn header(&self, mode: usize) -> &[u8] {
-        self.headers.get(mode).map_or(&[], Vec::as_slice)
-    }
-
-    /// The name of character `0` (Chris) or `1` (Jill).
-    pub fn char_name(&self, character: usize) -> &[u8] {
-        self.char_names.get(character).map_or(&[], Vec::as_slice)
-    }
-
-    /// The exit verb of screen mode `0` (save) or `1` (load).
-    pub fn exit(&self, mode: usize) -> &[u8] {
-        self.exits.get(mode).map_or(&[], Vec::as_slice)
-    }
-
-    /// Error line `0` or `1`.
-    pub fn error(&self, line: usize) -> &[u8] {
-        self.errors.get(line).map_or(&[], Vec::as_slice)
-    }
-
-    /// Location name `index` (`0..7`).
-    pub fn location(&self, index: usize) -> &[u8] {
-        self.locations.get(index).map_or(&[], Vec::as_slice)
-    }
-}
-
-/// Every text table the engine reads, loaded from a game pack.
+/// Every string source a session reads.
 #[derive(Debug, Clone, Default)]
 pub struct Text {
-    messages: Table,
-    names: Table,
-    unknown: Table,
-    descriptions: Table,
-    save: SaveStrings,
+    catalog: Catalog,
 }
 
 impl Text {
-    /// Load the five `text/*.bin` entries. A missing or malformed file is
-    /// reported as a warning and reads as an empty table.
-    pub fn load(pack: &Pack) -> Self {
+    /// Load the pack's language files (every mod layer merged per key) and
+    /// resolve the selected language: `language`, else the OS locale, else
+    /// `en-US`.
+    pub fn load(pack: &Pack, language: Option<&str>) -> Self {
         Self {
-            messages: load_table(pack, MESSAGES_ENTRY, Kind::Message),
-            names: load_table(pack, NAMES_ENTRY, Kind::Name),
-            unknown: load_table(pack, UNKNOWN_ENTRY, Kind::Name),
-            descriptions: load_table(pack, DESCRIPTIONS_ENTRY, Kind::Message),
-            save: SaveStrings::from_table(&load_table(pack, SAVE_ENTRY, Kind::Plain)),
+            catalog: Catalog::load(pack, language),
         }
+    }
+
+    /// The tag the fallback chain starts from.
+    pub fn selected_language(&self) -> &str {
+        self.catalog.selected()
+    }
+
+    /// `KEY` along the chain, with the registry-id fallback; `None` when no
+    /// language knows the key at all.
+    pub fn get(&self, key: &str) -> Option<&[u8]> {
+        self.catalog.get(key)
     }
 
     /// Global message `id` (`0..64`), encoded for the message state machine.
     pub fn global(&self, id: usize) -> Option<&[u8]> {
-        self.messages.get(id)
+        self.catalog.get(&format!("MESSAGE_{id:02X}"))
     }
 
-    /// Item-name entry for the 1-based `item_id`; `0` has no name.
+    /// Item-name entry for the `item_id`; `None` when the item has no name.
     pub fn item_name(&self, item_id: u16) -> Option<&[u8]> {
-        self.names.get(usize::from(item_id).checked_sub(1)?)
+        self.catalog.lookup(&format!("ITEM_{item_id:02X}_NAME"))
     }
 
-    /// Generic name for item class `class` (`0..16`).
-    pub fn unknown_name(&self, class: usize) -> Option<&[u8]> {
-        self.unknown.get(class)
+    /// The generic name shown before the item is examined. Only items whose
+    /// generic name differs from the real one have an entry; the caller falls
+    /// back to [`Text::item_name`].
+    pub fn item_name_unchecked(&self, item_id: u16) -> Option<&[u8]> {
+        self.catalog
+            .lookup(&format!("ITEM_{item_id:02X}_NAME_UNCHECKED"))
     }
 
-    /// Item-description entry for the 1-based `item_id`; `0` has none.
+    /// Item-description entry for the `item_id`.
     pub fn description(&self, item_id: u16) -> Option<&[u8]> {
-        self.descriptions.get(usize::from(item_id).checked_sub(1)?)
+        self.catalog
+            .lookup(&format!("ITEM_{item_id:02X}_DESCRIPTION"))
+    }
+
+    /// The message selected by `id`: bit `0x40` picks the global table, and
+    /// the low six bits are the index within either table.
+    ///
+    /// Room messages resolve the RDT variant's key, then the shared room key,
+    /// then the RDT's own text, then the registry id.
+    pub fn message<'a>(&'a self, room: &'a RoomState, id: u16) -> Option<&'a [u8]> {
+        if id & 0x40 != 0 {
+            return self.global(usize::from(id & 0x3F));
+        }
+        let room3 = format!("{:X}{:02X}", room.stage, room.room);
+        let variant = format!("ROOM_{room3}{}_TEXT_{id:02X}", room.player_flag);
+        if let Some(bytes) = self.catalog.lookup(&variant) {
+            return Some(bytes);
+        }
+        let shared = format!("ROOM_{room3}_TEXT_{id:02X}");
+        if let Some(bytes) = self.catalog.lookup(&shared) {
+            return Some(bytes);
+        }
+        if let Some(bytes) = room.message(id) {
+            return Some(bytes);
+        }
+        self.catalog
+            .key_display(&variant)
+            .or_else(|| self.catalog.key_display(&shared))
+    }
+
+    /// The room's display name (`ROOM_<room3>_NAME`), shown by the port-only
+    /// F1 overlay.
+    pub fn room_name(&self, room3: &str) -> Option<&[u8]> {
+        self.catalog.lookup(&format!("ROOM_{room3}_NAME"))
+    }
+
+    /// The save screen's shorthand label for a room: `ROOM_<room3>_NAME_SAVE`,
+    /// falling back to its display name.
+    pub fn room_label(&self, stage: u8, room: u8) -> Option<&[u8]> {
+        let room3 = format!("{stage:X}{room:02X}");
+        self.catalog
+            .lookup(&format!("ROOM_{room3}_NAME_SAVE"))
+            .or_else(|| self.room_name(&room3))
     }
 
     /// The save-screen strings.
-    pub fn save(&self) -> &SaveStrings {
-        &self.save
+    pub fn save(&self) -> SaveStrings<'_> {
+        SaveStrings { text: self }
     }
 
-    /// The message selected by `id`: bit `0x40` picks the global table, and the
-    /// low six bits are the index within either table.
-    pub fn message<'a>(&'a self, room: &'a RoomState, id: u16) -> Option<&'a [u8]> {
-        if id & 0x40 != 0 {
-            self.global(usize::from(id & 0x3F))
-        } else {
-            room.message(id)
-        }
+    /// A port-only UI string (`UI_*`); an unknown key reads as empty.
+    pub fn ui(&self, key: &str) -> &[u8] {
+        self.catalog.lookup(key).unwrap_or(&[])
     }
 
-    /// Number of global message entries (missing ones included).
-    pub fn message_count(&self) -> usize {
-        self.messages.len()
+    /// Test helper: the sources embedded in the binary, selected as `en-US`.
+    #[cfg(test)]
+    pub(crate) fn embedded() -> Self {
+        let pack = crate::pack::Pack::from_bytes(
+            crate::pack::PackWriter::new()
+                .to_bytes()
+                .expect("an empty pack writes"),
+        )
+        .expect("an empty pack parses");
+        Self::load(&pack, Some("en-US"))
     }
-
-    /// Number of item-name entries (missing ones included).
-    pub fn item_name_count(&self) -> usize {
-        self.names.len()
-    }
-
-    /// Number of generic-name entries (missing ones included).
-    pub fn unknown_count(&self) -> usize {
-        self.unknown.len()
-    }
-
-    /// Number of item-description entries (missing ones included).
-    pub fn description_count(&self) -> usize {
-        self.descriptions.len()
-    }
-}
-
-fn load_table(pack: &Pack, path: &str, kind: Kind) -> Table {
-    match pack.read(path) {
-        Ok(data) => match Table::parse(&data, kind) {
-            Ok(table) => table,
-            Err(error) => {
-                eprintln!("warning: invalid text table {path}: {error:#}");
-                Table::default()
-            }
-        },
-        Err(error) => {
-            eprintln!("warning: missing text table {path}: {error:#}");
-            Table::default()
-        }
-    }
-}
-
-/// Encode entries in the `text/*.bin` format: a `u32` count, one file-relative
-/// `u32` offset per entry (zero for a missing entry) and the raw streams.
-///
-/// Test-only: the format is no longer packed, but the older reader tests still
-/// build fixtures with it.
-#[cfg(test)]
-pub(crate) fn encode_table(entries: &[Option<Vec<u8>>]) -> Vec<u8> {
-    let mut data = Vec::new();
-    data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    let mut offset = 4 + entries.len() as u32 * 4;
-    for entry in entries {
-        match entry {
-            Some(bytes) => {
-                data.extend_from_slice(&offset.to_le_bytes());
-                offset += bytes.len() as u32;
-            }
-            None => data.extend_from_slice(&0u32.to_le_bytes()),
-        }
-    }
-    for entry in entries.iter().flatten() {
-        data.extend_from_slice(entry);
-    }
-    data
-}
-
-/// Scan one message stream up to and including its `0x01` terminator,
-/// consuming the operand bytes of the tags the message state machine consumes.
-pub(crate) fn scan_message(data: &[u8]) -> Option<usize> {
-    let mut position = 0usize;
-    loop {
-        let byte = *data.get(position)?;
-        match byte {
-            0x01 => return Some(position + 1),
-            0x03 | 0x05 | 0x06 | 0xF8 | 0xF9 | 0xFA => position += 2,
-            0x04 => {
-                position += 1;
-                if *data.get(position)? == 0 {
-                    position += 1;
-                    loop {
-                        match *data.get(position)? {
-                            0x04 => break,
-                            0x05 | 0x06 | 0xF8 | 0xF9 | 0xFA => position += 1,
-                            _ => {}
-                        }
-                        position += 1;
-                    }
-                    position += 1;
-                }
-                position += 1;
-            }
-            _ => position += 1,
-        }
-    }
-}
-
-/// Scan a plain stream up to and including the first `terminator` byte.
-pub(crate) fn scan_terminator(data: &[u8], terminator: u8) -> Option<usize> {
-    data.iter()
-        .position(|&byte| byte == terminator)
-        .map(|position| position + 1)
-}
-
-/// Read a little-endian `u32` from `data`.
-fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
-    let raw = data
-        .get(offset..offset + 4)
-        .context("text table is truncated")?;
-    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pack::PackWriter;
 
-    /// Encode entries in the `text/*.bin` format.
-    fn encode(entries: &[Option<&[u8]>]) -> Vec<u8> {
-        let mut data = Vec::new();
-        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-        let mut offset = 4 + entries.len() as u32 * 4;
-        for entry in entries {
-            match entry {
-                Some(bytes) => {
-                    data.extend_from_slice(&offset.to_le_bytes());
-                    offset += bytes.len() as u32;
-                }
-                None => data.extend_from_slice(&0u32.to_le_bytes()),
-            }
+    fn pack_with(files: &[(&str, &str)]) -> Pack {
+        let mut writer = PackWriter::new();
+        for (path, source) in files {
+            writer.add(path, source.as_bytes().to_vec()).unwrap();
         }
-        for entry in entries.iter().flatten() {
-            data.extend_from_slice(entry);
-        }
-        data
+        Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
     }
 
     #[test]
-    fn parses_messages_and_keeps_the_action_byte() {
-        // Item-name placeholder, a glyph, an extended glyph, a skip block,
-        // then the terminator and its auto-dismiss action byte.
-        let message: &[u8] = &[
-            0x05, 0x01, 0x06, 0x00, 0x05, 0x00, 0x83, 0xF9, 0x52, 0x04, 0x00, 0x0C, 0x04, 0x02,
-            0x08, 0x02, 0x01, 0x2A,
-        ];
-        let data = encode(&[Some(message)]);
-
-        let table = Table::parse_message(&data).unwrap();
-
-        assert_eq!(table.len(), 1);
-        assert_eq!(table.get(0), Some(message));
-    }
-
-    #[test]
-    fn parses_names_up_to_the_return_marker() {
-        let name: &[u8] = &[0xB0, 0xD4, 0xE4, 0x07];
-        let data = encode(&[Some(name)]);
-
-        let table = Table::parse_name(&data).unwrap();
-
-        assert_eq!(table.get(0), Some(name));
-    }
-
-    #[test]
-    fn zero_offsets_read_as_missing_entries() {
-        let data = encode(&[Some(&[0x0C, 0x01, 0x00][..]), None]);
-
-        let table = Table::parse_message(&data).unwrap();
-
-        assert_eq!(table.len(), 2);
-        assert_eq!(table.get(0), Some(&[0x0C, 0x01, 0x00][..]));
-        assert_eq!(table.get(1), None);
-        assert_eq!(table.get(2), None);
-    }
-
-    #[test]
-    fn plain_streams_stop_at_the_terminator() {
-        let data = encode(&[Some(&[0x00, 0xFB, 0x38, 0x01][..])]);
-
-        let table = Table::parse_plain(&data).unwrap();
-
-        assert_eq!(table.get(0), Some(&[0x00, 0xFB, 0x38, 0x01][..]));
-    }
-
-    #[test]
-    fn unterminated_streams_are_rejected() {
-        let data = encode(&[Some(&[0x0C, 0x0D][..])]);
-        assert!(Table::parse_message(&data).is_err());
-        assert!(Table::parse_name(&data).is_err());
-        assert!(Table::parse_plain(&data).is_err());
-
-        assert!(Table::parse_message(&[0x01]).is_err());
-    }
-
-    fn sample_text() -> Text {
-        let messages = Table::parse_message(&encode(&[
-            Some(&[0x0C, 0x01, 0x00][..]),
-            Some(&[0x0D, 0x01, 0x05][..]),
-        ]))
-        .unwrap();
-        let names = Table::parse_name(&encode(&[Some(&[0xAA, 0x07][..]), Some(&[0xBB, 0x07][..])]))
-            .unwrap();
-        let unknown = Table::parse_name(&encode(&[Some(&[0xCC, 0x07][..])])).unwrap();
-        let descriptions = Table::parse_message(&encode(&[
-            Some(&[0xDD, 0x01, 0x00][..]),
-            Some(&[0xEE, 0x01, 0x00][..]),
-        ]))
-        .unwrap();
-        let save_entries: Vec<Vec<u8>> = (0..21)
-            .map(|index| vec![0x41 + index as u8, 0x01])
-            .collect();
-        let save_refs: Vec<Option<&[u8]>> = save_entries
-            .iter()
-            .map(|entry| Some(entry.as_slice()))
-            .collect();
-        let save = SaveStrings::from_table(&Table::parse_plain(&encode(&save_refs)).unwrap());
-        Text {
-            messages,
-            names,
-            unknown,
-            descriptions,
-            save,
-        }
-    }
-
-    #[test]
-    fn item_lookups_are_one_based() {
-        let text = sample_text();
-
-        assert_eq!(text.item_name(1), Some(&[0xAA, 0x07][..]));
-        assert_eq!(text.item_name(2), Some(&[0xBB, 0x07][..]));
-        assert_eq!(text.item_name(0), None);
-        assert_eq!(text.item_name(3), None);
-        assert_eq!(text.unknown_name(0), Some(&[0xCC, 0x07][..]));
-        assert_eq!(text.unknown_name(1), None);
-        assert_eq!(text.description(1), Some(&[0xDD, 0x01, 0x00][..]));
-        assert_eq!(text.description(2), Some(&[0xEE, 0x01, 0x00][..]));
-        assert_eq!(text.description(0), None);
-        assert_eq!(text.description(3), None);
-        assert_eq!(text.global(0), Some(&[0x0C, 0x01, 0x00][..]));
-        assert_eq!(text.global(2), None);
-        assert_eq!(text.message_count(), 2);
-        assert_eq!(text.item_name_count(), 2);
-        assert_eq!(text.unknown_count(), 1);
-        assert_eq!(text.description_count(), 2);
-    }
-
-    #[test]
-    fn save_strings_follow_the_documented_order() {
-        let save = sample_text().save;
-        assert_eq!(save.header(0), &[0x41, 0x01]);
-        assert_eq!(save.header(1), &[0x42, 0x01]);
-        assert_eq!(save.header_suffix, &[0x43, 0x01]);
-        assert_eq!(save.char_name(0), &[0x44, 0x01]);
-        assert_eq!(save.char_name(1), &[0x45, 0x01]);
-        assert_eq!(save.exit(0), &[0x46, 0x01]);
-        assert_eq!(save.exit(1), &[0x47, 0x01]);
-        assert_eq!(save.exit_suffix, &[0x48, 0x01]);
-        assert_eq!(save.filled_slot, &[0x49, 0x01]);
-        assert_eq!(save.empty_slot, &[0x4A, 0x01]);
-        assert_eq!(save.overwrite_prompt, &[0x4B, 0x01]);
-        assert_eq!(save.yes_no, &[0x4C, 0x01]);
-        assert_eq!(save.error(0), &[0x4D, 0x01]);
-        assert_eq!(save.error(1), &[0x4E, 0x01]);
-        for index in 0..7 {
-            assert_eq!(save.location(index), &[0x4F + index as u8, 0x01]);
-        }
-        assert_eq!(save.header(2), &[0u8; 0]);
-        assert_eq!(save.location(7), &[0u8; 0]);
-    }
-
-    #[test]
-    fn message_id_bit_6_selects_the_global_table() {
-        let text = sample_text();
-        let mut block = Vec::new();
-        block.extend_from_slice(&4u16.to_le_bytes());
-        block.extend_from_slice(&9u16.to_le_bytes());
-        block.extend_from_slice(&[0x0C, 0x01, 0x00]);
-        block.extend_from_slice(&[0x0D, 0x01, 0x00]);
+    fn room_messages_prefer_the_variant_then_the_shared_key_then_the_rdt() {
+        // A room no shipped language knows, so only the pack's keys and the
+        // RDT can answer.
+        let pack = pack_with(&[(
+            "language/en-US.txt",
+            "ROOM_FFF_TEXT_00 = \"A\"\nROOM_FFF1_TEXT_00 = \"B\"\n",
+        )]);
+        let text = Text::load(&pack, Some("en-US"));
         let room = RoomState {
-            messages: Some(block),
+            stage: 0xF,
+            room: 0xFF,
+            player_flag: 1,
+            // Offset table with no id 0 and `0xCC` at id 1 (offset 4).
+            messages: Some(vec![0x00, 0x00, 0x04, 0x00, 0xCC, 0x01, 0x00]),
             ..RoomState::default()
         };
+        // The RDT variant's key wins.
+        assert_eq!(text.message(&room, 0), Some([0x1E, 0x01, 0x00].as_slice()));
+        // No language key: the RDT stream is used.
+        assert_eq!(text.message(&room, 1), Some([0xCC, 0x01, 0x00].as_slice()));
+    }
 
-        // Room message 0 runs to the end of the block; the global table slice
-        // is exact.
-        assert!(
-            text.message(&room, 0)
-                .unwrap()
-                .starts_with(&[0x0C, 0x01, 0x00])
+    #[test]
+    fn item_names_and_descriptions_are_keyed_by_item_id() {
+        // Item ids no shipped language defines.
+        let pack = pack_with(&[(
+            "language/en-US.txt",
+            "ITEM_FE_NAME = \"A\"\nITEM_FE_NAME_UNCHECKED = \"B\"\nITEM_FE_DESCRIPTION = \"C\"\n",
+        )]);
+        let text = Text::load(&pack, Some("en-US"));
+        assert_eq!(text.item_name(0xFE), Some([0x1D, 0x07].as_slice()));
+        assert_eq!(
+            text.item_name_unchecked(0xFE),
+            Some([0x1E, 0x07].as_slice())
         );
-        assert_eq!(text.message(&room, 0x40), Some(&[0x0C, 0x01, 0x00][..]));
-        assert_eq!(text.message(&room, 0x41), Some(&[0x0D, 0x01, 0x05][..]));
-        assert_eq!(text.message(&room, 0x42), None);
+        assert_eq!(text.description(0xFE), Some([0x1F, 0x01, 0x00].as_slice()));
+        assert_eq!(text.item_name(0xFF), None);
+    }
+
+    #[test]
+    fn room_labels_fall_back_to_the_display_name() {
+        // Stage `F` rooms exist in no language file.
+        let pack = pack_with(&[(
+            "language/en-US.txt",
+            "ROOM_F00_NAME = \"A\"\nROOM_F01_NAME_SAVE = \"B\"\n",
+        )]);
+        let text = Text::load(&pack, Some("en-US"));
+        assert_eq!(text.room_name("F00"), Some([0x1D, 0x01].as_slice()));
+        assert_eq!(text.room_label(0xF, 0x00), Some([0x1D, 0x01].as_slice()));
+        assert_eq!(text.room_label(0xF, 0x01), Some([0x1E, 0x01].as_slice()));
+        assert_eq!(text.room_label(0xF, 0x02), None);
+    }
+
+    #[test]
+    fn the_save_strings_read_their_keys() {
+        let pack = pack_with(&[(
+            "language/en-US.txt",
+            "UI_SAVE_HEADER_0 = \"A\"\nUI_SAVE_SLOT_EMPTY = \"B\"\n",
+        )]);
+        let text = Text::load(&pack, Some("en-US"));
+        let save = text.save();
+        assert_eq!(save.header(0), [0x1D, 0x01]);
+        assert!(!save.header(1).is_empty(), "the embedded file fills it");
+        assert_eq!(save.slot_empty(), [0x1E, 0x01]);
+    }
+}
+
+/// The save-screen strings, in their documented table order.
+#[derive(Debug, Clone, Copy)]
+pub struct SaveStrings<'a> {
+    text: &'a Text,
+}
+
+impl SaveStrings<'_> {
+    /// The header of screen mode `0` (save) or `1` (load).
+    pub fn header(&self, mode: usize) -> &[u8] {
+        self.text.ui(if mode == 0 {
+            "UI_SAVE_HEADER_0"
+        } else {
+            "UI_SAVE_HEADER_1"
+        })
+    }
+
+    /// The shared `     GAME` suffix of both headers.
+    pub fn header_suffix(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_HEADER_SUFFIX")
+    }
+
+    /// The name of character `0` (Chris) or `1` (Jill).
+    pub fn character_name(&self, character: usize) -> &[u8] {
+        self.text.ui(if character == 0 {
+            "UI_SAVE_CHARACTER_0_NAME"
+        } else {
+            "UI_SAVE_CHARACTER_1_NAME"
+        })
+    }
+
+    /// The exit verb of screen mode `0` (save) or `1` (load).
+    pub fn exit(&self, mode: usize) -> &[u8] {
+        self.text.ui(if mode == 0 {
+            "UI_SAVE_EXIT_0"
+        } else {
+            "UI_SAVE_EXIT_1"
+        })
+    }
+
+    /// The `   しない` suffix drawn over the exit verb.
+    pub fn exit_suffix(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_EXIT_SUFFIX")
+    }
+
+    /// The filled-slot row template (`   /  /     /  `).
+    pub fn slot_filled(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_SLOT_FILLED")
+    }
+
+    /// The empty-slot row template (`ーーー/ーー/ーーーーー/ーー`).
+    pub fn slot_empty(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_SLOT_EMPTY")
+    }
+
+    /// The overwrite confirmation line.
+    pub fn overwrite_prompt(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_OVERWRITE_PROMPT")
+    }
+
+    /// The `はい  いいえ` line the confirm cursor sits on.
+    pub fn yes_no(&self) -> &[u8] {
+        self.text.ui("UI_SAVE_YES_NO")
+    }
+
+    /// Error line `0` or `1`.
+    pub fn error(&self, line: usize) -> &[u8] {
+        self.text.ui(if line == 0 {
+            "UI_SAVE_ERROR_0"
+        } else {
+            "UI_SAVE_ERROR_1"
+        })
+    }
+
+    /// The shorthand location label of the room a save was made in.
+    pub fn location(&self, stage: u8, room: u8) -> &[u8] {
+        self.text.room_label(stage, room).unwrap_or(&[])
     }
 }

@@ -412,6 +412,9 @@ pub struct Pack {
     overlays: Vec<Pack>,
     /// Non-fatal problems found while layering.
     warnings: Vec<String>,
+    /// Requested display language (`--language`); the string catalog resolves
+    /// it, falling back to the OS locale and then `en-US`.
+    language: Option<String>,
 }
 
 impl Pack {
@@ -609,6 +612,7 @@ impl Pack {
             source: None,
             overlays: Vec::new(),
             warnings: Vec::new(),
+            language: None,
         })
     }
 
@@ -645,6 +649,18 @@ impl Pack {
         self.source.as_deref()
     }
 
+    /// Select the display language tag the string catalog resolves first.
+    ///
+    /// `None` leaves the catalog to the OS locale and then `en-US`.
+    pub fn set_language(&mut self, language: Option<&str>) {
+        self.language = language.map(str::to_string);
+    }
+
+    /// The requested display language, if any.
+    pub fn language(&self) -> Option<&str> {
+        self.language.as_deref()
+    }
+
     /// The layer whose entry wins `path`: the last overlay that has it, or the
     /// base, or nothing.
     fn winner(&self, path: &str) -> Option<&Pack> {
@@ -677,6 +693,26 @@ impl Pack {
             .get(&path.to_ascii_lowercase())
             .expect("the winning layer holds the entry");
         entry_bytes(&layer.data, &layer.entries[index])
+    }
+
+    /// Every layer's copy of `path`, base first and overlays in applied order.
+    ///
+    /// [`Pack::read`] resolves the winning copy only; a text file that merges
+    /// per key (a language file) needs the whole stack, so this exposes it.
+    pub fn read_stack(&self, path: &str) -> Vec<Cow<'_, [u8]>> {
+        let key = path.to_ascii_lowercase();
+        let mut stack = Vec::new();
+        let mut layers: Vec<&Pack> = Vec::with_capacity(1 + self.overlays.len());
+        layers.push(self);
+        layers.extend(self.overlays.iter());
+        for layer in layers {
+            if let Some(index) = layer.lookup.get(&key)
+                && let Ok(bytes) = entry_bytes(&layer.data, &layer.entries[*index])
+            {
+                stack.push(bytes);
+            }
+        }
+        stack
     }
 
     /// The merged entries: shadowed base entries hidden, later layers winning,
@@ -1388,6 +1424,36 @@ mod tests {
         }
         .render()
         .into_bytes()
+    }
+
+    #[test]
+    fn read_stack_keeps_every_layer_in_order() {
+        let dir = TempDir::new("read-stack");
+        let base = dir.join("base.akpak");
+        let mod_a = dir.join("mod-a.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[
+                (manifest::ENTRY, &base_manifest),
+                ("language/en-US.txt", b"base copy"),
+                ("language/ja-JP.txt", b"base only"),
+            ],
+        );
+        write_pack(
+            &mod_a,
+            &[
+                (manifest::ENTRY, &mod_manifest("a", "base", 0)),
+                ("language/en-US.txt", b"mod copy"),
+            ],
+        );
+
+        let layered = Pack::open_layered(&base, &[mod_a]).unwrap();
+        let copies = layered.read_stack("LANGUAGE/en-us.TXT");
+        let stack: Vec<&[u8]> = copies.iter().map(|copy| &**copy).collect();
+        assert_eq!(stack, [b"base copy".as_slice(), b"mod copy".as_slice()]);
+        assert_eq!(layered.read_stack("language/ja-JP.txt").len(), 1);
+        assert!(layered.read_stack("language/missing.txt").is_empty());
     }
 
     #[test]

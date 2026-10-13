@@ -39,6 +39,7 @@ pub const MISSING: u8 = 0x0B;
 static SUBSTITUTIONS: &[(char, &str)] = &[
     ('"', "”"),
     ('-', "ー"),
+    ('_', "ー"),
     ('«', "“"),
     ('·', "・"),
     ('»', "”"),

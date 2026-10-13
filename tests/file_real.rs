@@ -70,7 +70,7 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     assert!(game.document_collected(FILE_ITEM_MIN + 0x0F));
 
     let menu = MenuAssets::load(&pack).expect("the pack has the menu art");
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
     let mut screen = FileScreen::default();
     screen.open(&game);
     assert_eq!(screen.mode, FileMode::List);

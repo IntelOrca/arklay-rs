@@ -77,6 +77,11 @@ struct Cli {
     )]
     character: u8,
 
+    /// Language tag for the displayed strings, e.g. `en-GB`; the default is
+    /// the OS locale, then `en-US`
+    #[arg(long, value_name = "TAG", requires = "pack")]
+    language: Option<String>,
+
     /// Mod pack layers to apply, repeatable (ignored with `--no-mods`)
     #[arg(long = "mod", value_name = "PATH", requires = "pack")]
     mods: Vec<PathBuf>,
@@ -599,6 +604,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,
+                    cli.language.as_deref(),
                     trace_options,
                 );
             }
@@ -613,6 +619,7 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.stats,
                     cli.debug_menu,
+                    cli.language.as_deref(),
                     trace_options,
                 );
             }
@@ -626,6 +633,7 @@ fn main() -> Result<()> {
                 &cli.mods,
                 cli.no_mods,
                 cli.debug_menu,
+                cli.language.as_deref(),
             )
         }
     }
@@ -957,13 +965,13 @@ entries:
         layer.write(&mod_path).unwrap();
 
         // The sibling directory is discovered.
-        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false).unwrap();
+        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false, None).unwrap();
         assert!(discovered.is_layered());
         assert_eq!(discovered.read("room/1000.rdt").unwrap().as_ref(), b"layer");
 
         // `--no-mods` ignores both the discovery and an explicit `--mod`.
         let vanilla =
-            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true)
+            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true, None)
                 .unwrap();
         assert!(!vanilla.is_layered());
         assert_eq!(vanilla.read("room/1000.rdt").unwrap().as_ref(), b"base");

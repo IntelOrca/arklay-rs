@@ -157,9 +157,10 @@ fn skip(cursor: Cursor) -> Cursor {
 
 /// Resolve the stream drawn for an item-name substitution.
 ///
-/// Item ids with a real name draw from the name table; the generic-name table
-/// stands in for an item the player has not examined yet (ids below `0x4E`
-/// whose lookup record has bit `0x80` clear in its name class).
+/// Item ids with a real name draw from the name table; an item the player has
+/// not examined yet (ids below `0x4E` whose lookup record has bit `0x80`
+/// clear) prefers the generic `ITEM_<id>_NAME_UNCHECKED` entry and falls back
+/// to the real name.
 pub fn item_name_bytes(text: &Text, item: u8, examined: &[u8; 4]) -> Vec<u8> {
     if item < 0x4E
         && let Some(record) = items::record(item)
@@ -167,7 +168,8 @@ pub fn item_name_bytes(text: &Text, item: u8, examined: &[u8; 4]) -> Vec<u8> {
         && !examined_bit(examined, record.name_class)
     {
         return text
-            .unknown_name(usize::from(record.name_class))
+            .item_name_unchecked(u16::from(item))
+            .or_else(|| text.item_name(u16::from(item)))
             .unwrap_or(&[])
             .to_vec();
     }
@@ -809,30 +811,40 @@ mod tests {
         Font::new(sheet(&cells))
     }
 
-    fn text_tables(names: &[&[u8]], unknown: &[&[u8]]) -> Text {
-        let table = |entries: &[&[u8]]| {
-            let entries: Vec<Option<Vec<u8>>> = entries
-                .iter()
-                .map(|entry| (!entry.is_empty()).then(|| entry.to_vec()))
-                .collect();
-            crate::text::encode_table(&entries)
-        };
+    /// A language file with the given `ITEM_<id>_NAME` entries (`names[i]` is
+    /// item `i + 1`) and `(item id, stream)` unchecked-name entries.
+    fn text_tables(names: &[&[u8]], unchecked: &[(u8, &[u8])]) -> Text {
+        let mut source = String::from("MESSAGE_00 = \"0\"\n");
+        for (index, name) in names.iter().enumerate() {
+            if !name.is_empty() {
+                source.push_str(&format!(
+                    "ITEM_{:02X}_NAME = \"{}\"\n",
+                    index + 1,
+                    language_value(name)
+                ));
+            }
+        }
+        for (item, name) in unchecked {
+            source.push_str(&format!(
+                "ITEM_{item:02X}_NAME_UNCHECKED = \"{}\"\n",
+                language_value(name)
+            ));
+        }
         let mut writer = PackWriter::new();
-        writer.add("text/names.bin", table(names)).unwrap();
-        writer.add("text/unknown.bin", table(unknown)).unwrap();
         writer
-            .add(
-                "text/messages.bin",
-                crate::text::encode_table(&[Some(vec![0x0C, 0x01, 0x00])]),
-            )
+            .add("language/en-US.txt", source.into_bytes())
             .unwrap();
-        writer
-            .add("text/idesc.bin", crate::text::encode_table(&[]))
-            .unwrap();
-        writer
-            .add("text/save.bin", crate::text::encode_table(&[]))
-            .unwrap();
-        Text::load(&Pack::from_bytes(writer.to_bytes().unwrap()).unwrap())
+        Text::load(&Pack::from_bytes(writer.to_bytes().unwrap()).unwrap(), None)
+    }
+
+    /// A language-file value for an encoded stream: every byte as `\xNN`,
+    /// without the stream's terminator (the encoder appends it again).
+    fn language_value(bytes: &[u8]) -> String {
+        let bytes = match bytes.last() {
+            Some(0x01 | 0x07) => &bytes[..bytes.len() - 1],
+            _ => bytes,
+        };
+        bytes.iter().map(|byte| format!("\\x{byte:02X}")).collect()
     }
 
     fn text() -> Text {
@@ -1085,13 +1097,10 @@ mod tests {
             .find(|&item| items::record(item).is_some_and(|record| !record.name_valid()))
             .expect("an item with a generic name class");
         let class = usize::from(items::record(item).unwrap().name_class);
-        let mut unknown: Vec<Vec<u8>> = (0..16).map(|_| Vec::new()).collect();
-        unknown[class] = vec![0xCC, 0x07];
-        let unknown_refs: Vec<&[u8]> = unknown.iter().map(Vec::as_slice).collect();
         let mut names: Vec<Vec<u8>> = vec![Vec::new(); usize::from(item)];
         names[usize::from(item) - 1] = vec![0xAA, 0x07];
         let name_refs: Vec<&[u8]> = names.iter().map(Vec::as_slice).collect();
-        let text = text_tables(&name_refs, &unknown_refs);
+        let text = text_tables(&name_refs, &[(item, &[0xCC, 0x07])]);
 
         let mut window = MessageWindow::default();
         assert!(window.start(1, 0, &[0x06, item, 0x07, 0x01, 0x00], false));
@@ -1324,7 +1333,7 @@ mod tests {
         let pack = Pack::open(std::path::Path::new(&path)).unwrap();
         let font =
             Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
-        let text = Text::load(&pack);
+        let text = Text::load(&pack, Some("en-US"));
 
         let data = std::fs::read(std::path::Path::new(&root).join("JPN/STAGE1/ROOM1001.RDT"))
             .expect("ROOM1001.RDT");
@@ -1391,7 +1400,7 @@ mod tests {
         let pack = Pack::open(std::path::Path::new(&path)).unwrap();
         let font =
             Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
-        let text = Text::load(&pack);
+        let text = Text::load(&pack, Some("en-US"));
 
         // ROOM1010 slot 1 is the sword-key locked door; probe it without the
         // key so the door handler requests its locked message through the game

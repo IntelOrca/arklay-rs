@@ -84,7 +84,7 @@ fn the_combat_knife_renders_a_non_empty_model() {
     let Some(pack) = pack() else {
         return;
     };
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
     let cx = context(&pack, &text, None);
 
     let mut screen = ItemViewScreen::new(1);
@@ -128,7 +128,7 @@ fn the_description_window_draws_over_the_model() {
     let Some(pack) = pack() else {
         return;
     };
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
     let font = Font::new(
         tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
     );

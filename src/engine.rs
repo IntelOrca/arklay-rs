@@ -257,6 +257,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         false,
         false,
         false,
+        None,
         trace::TraceOptions::default(),
     )
 }
@@ -282,10 +283,11 @@ pub fn run_with_options(
     no_mods: bool,
     stats: bool,
     _debug_menu: bool,
+    language: Option<&str>,
     trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
-    let pack = open_game_pack(pack, mods, no_mods)?;
+    let pack = open_game_pack(pack, mods, no_mods, language)?;
 
     if capture.is_some() || stats || trace.path.is_some() {
         let mut timings = stats::Stats::new();
@@ -519,9 +521,16 @@ fn active_entities(game: &game::GameState) -> usize {
 /// ignores both the discovered and the explicit layers, giving the plain
 /// single-pack path a vanilla run needs. Layer warnings are printed once here,
 /// and a non-fatal base without a manifest still boots.
-pub fn open_game_pack(path: &Path, mods: &[PathBuf], no_mods: bool) -> Result<Pack> {
+pub fn open_game_pack(
+    path: &Path,
+    mods: &[PathBuf],
+    no_mods: bool,
+    language: Option<&str>,
+) -> Result<Pack> {
     if no_mods {
-        return Pack::open(path);
+        let mut pack = Pack::open(path)?;
+        pack.set_language(language);
+        return Ok(pack);
     }
     let mut layers: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -538,9 +547,12 @@ pub fn open_game_pack(path: &Path, mods: &[PathBuf], no_mods: bool) -> Result<Pa
         }
     }
     if layers.is_empty() {
-        return Pack::open(path);
+        let mut pack = Pack::open(path)?;
+        pack.set_language(language);
+        return Ok(pack);
     }
-    let pack = Pack::open_layered(path, &layers)?;
+    let mut pack = Pack::open_layered(path, &layers)?;
+    pack.set_language(language);
     for warning in pack.warnings() {
         eprintln!("warning: {warning}");
     }
@@ -1256,7 +1268,7 @@ impl GameSession {
             npc_models: enemy::EntityModelCache::default(),
             enemy_lua: enemy::LuaEnemyHost::new(),
             music: None,
-            text: Text::load(pack),
+            text: Text::load(pack, pack.language()),
             font,
             menu_assets: None,
             menu_assets_loaded: false,
@@ -3236,7 +3248,7 @@ impl GameSession {
         // The computer terminal draws over the frozen monitor-camera scene.
         if self.computer.is_some() {
             if let Some(screen) = &self.computer {
-                screen.draw(&mut self.framebuffer, self.font.as_ref());
+                screen.draw(&mut self.framebuffer, self.font.as_ref(), &self.text);
             }
             return;
         }
@@ -3360,12 +3372,12 @@ impl GameSession {
         // The debug overlay is drawn last so it stays legible over the frozen
         // frame and any message the room raised before it opened.
         if let Some(debug_menu) = self.debug_menu.as_mut() {
-            debug_menu.draw(&mut self.framebuffer, self.font.as_ref());
+            debug_menu.draw(&mut self.framebuffer, self.font.as_ref(), &self.text);
         }
         // The return-to-title prompt draws over everything, including the
         // debug overlay, with its own full-screen dim.
         if let Some(return_title) = self.return_title.as_ref() {
-            return_title.draw(&mut self.framebuffer, self.font.as_ref());
+            return_title.draw(&mut self.framebuffer, self.font.as_ref(), &self.text);
         }
     }
 
@@ -3436,7 +3448,7 @@ impl GameSession {
         let Some(screen) = self.computer.as_mut() else {
             return;
         };
-        if screen.update(ui) {
+        if screen.update(ui, &self.text) {
             self.close_computer();
         }
     }
@@ -3930,7 +3942,7 @@ impl App {
             },
             Err(_) => None,
         };
-        let text = Text::load(&pack);
+        let text = Text::load(&pack, pack.language());
         let demos = demo::entries(&pack);
         Self {
             pack,
@@ -4697,6 +4709,7 @@ pub fn run_ui_with_options(
         &[],
         false,
         false,
+        None,
         trace::TraceOptions::default(),
     )
 }
@@ -4718,6 +4731,7 @@ pub fn run_ui_with_mods(
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
+    language: Option<&str>,
     trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
     let boot = match screen {
@@ -4752,6 +4766,7 @@ pub fn run_ui_with_mods(
         mods,
         no_mods,
         _debug_menu,
+        language,
         trace,
     )
 }
@@ -4766,6 +4781,7 @@ pub fn run_root(
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
+    language: Option<&str>,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -4775,6 +4791,7 @@ pub fn run_root(
         mods,
         no_mods,
         _debug_menu,
+        language,
         trace::TraceOptions::default(),
     )
 }
@@ -4789,10 +4806,11 @@ fn run_ui_impl(
     mods: &[PathBuf],
     no_mods: bool,
     _debug_menu: bool,
+    language: Option<&str>,
     trace: trace::TraceOptions<'_>,
 ) -> Result<()> {
     if capture.is_some() || trace.path.is_some() {
-        let pack = open_game_pack(pack, mods, no_mods)?;
+        let pack = open_game_pack(pack, mods, no_mods, language)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
             // A root-boot capture is the title capture: no automatic films.
@@ -4869,7 +4887,7 @@ fn run_ui_impl(
         return Ok(());
     }
 
-    let pack = open_game_pack(pack, mods, no_mods)?;
+    let pack = open_game_pack(pack, mods, no_mods, language)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
     app.boot(boot)?;
     let display = Display::new("Arklay", false)?;
@@ -5022,7 +5040,7 @@ pub fn run_fmv(
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     if let Some(capture_path) = capture {
-        let pack = open_game_pack(pack, mods, no_mods)?;
+        let pack = open_game_pack(pack, mods, no_mods, None)?;
         let mut session = MovieSession::open(&pack, id, character)?;
         for _ in 0..ticks {
             // Audio-free: the fixed 30 Hz tick is the clock.
@@ -5035,7 +5053,7 @@ pub fn run_fmv(
         return display.capture(capture_path);
     }
 
-    let pack = open_game_pack(pack, mods, no_mods)?;
+    let pack = open_game_pack(pack, mods, no_mods, None)?;
     let session = MovieSession::open(&pack, id, character)?;
     let mut app = App::new(pack, save_dir, true);
     app.queue_movie(session, None);
@@ -5066,7 +5084,7 @@ pub fn run_ending(
         bail!("ending id {id} is outside 1-7");
     }
     let save_dir = save::default_save_dir_for_pack(pack);
-    let pack = open_game_pack(pack, mods, no_mods)?;
+    let pack = open_game_pack(pack, mods, no_mods, None)?;
     let mut app = App::new(pack, save_dir, capture.is_none());
     let chain: Vec<(u8, u8)> = films.iter().map(|&film| (film, character)).collect();
     if app.play_film_chain(chain, None)? == AppFlow::Quit {
@@ -5088,7 +5106,7 @@ fn run_font_ui(
     mods: &[PathBuf],
     no_mods: bool,
 ) -> Result<()> {
-    let pack = open_game_pack(pack_path, mods, no_mods)?;
+    let pack = open_game_pack(pack_path, mods, no_mods, None)?;
     let bytes = pack
         .read("font/font.tim")
         .context("the pack has no font/font.tim (re-run convert-game)")?;
@@ -13222,32 +13240,29 @@ end
             room: 0,
             player_flag: 0,
         };
-        let mut messages: Vec<Option<Vec<u8>>> =
-            (0..64).map(|_| Some(vec![0x0C, 0x01, 0x00])).collect();
         // Index 0 is global 0xC0, the ground pick-up yes/no prompt: "A" then
         // confirm. The branch record is `[no-offset 2][tag 10][arg 0]`: Yes
         // runs the take action, No lands on the `0x01` terminator and does
         // nothing.
-        messages[0] = Some(vec![0x0C, 0x08, 0x02, 0x0A, 0x00, 0x01, 0x00]);
         // Index 63 is the same yes/no stream used by the direct post-action
         // test.
-        messages[63] = Some(vec![0x0C, 0x08, 0x02, 0x0A, 0x00, 0x01, 0x00]);
+        let mut language = String::new();
+        for index in 0..64 {
+            let value = if index == 0x00 || index == 0x3F {
+                "0{branch 2 10 0}"
+            } else {
+                "0"
+            };
+            language.push_str(&format!("MESSAGE_{index:02X} = \"{value}\"\n"));
+        }
         let mut writer = PackWriter::new();
         writer
             .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
             .unwrap();
         writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
         writer
-            .add("text/messages.bin", crate::text::encode_table(&messages))
+            .add("language/en-US.txt", language.as_bytes().to_vec())
             .unwrap();
-        for table in [
-            "text/names.bin",
-            "text/unknown.bin",
-            "text/idesc.bin",
-            "text/save.bin",
-        ] {
-            writer.add(table, crate::text::encode_table(&[])).unwrap();
-        }
         writer.write(&pack_path).unwrap();
         pack_path
     }
@@ -13946,8 +13961,10 @@ off_0010:
         .unwrap()
         .to_container()
         .unwrap();
-        let messages: Vec<Option<Vec<u8>>> =
-            (0..64).map(|_| Some(vec![0x0C, 0x01, 0x00])).collect();
+        let mut language = String::new();
+        for index in 0..64 {
+            language.push_str(&format!("MESSAGE_{index:02X} = \"0\"\n"));
+        }
         let mut writer = PackWriter::new();
         writer
             .add(&id.rdt_entry(), synthetic_rdt(&[0x0E, 0x00]))
@@ -13955,16 +13972,8 @@ off_0010:
         writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
         writer.add(&id.scd_entry(), container).unwrap();
         writer
-            .add("text/messages.bin", crate::text::encode_table(&messages))
+            .add("language/en-US.txt", language.as_bytes().to_vec())
             .unwrap();
-        for table in [
-            "text/names.bin",
-            "text/unknown.bin",
-            "text/idesc.bin",
-            "text/save.bin",
-        ] {
-            writer.add(table, crate::text::encode_table(&[])).unwrap();
-        }
         writer.write(&path).unwrap();
 
         let pack = Pack::open(&path).unwrap();

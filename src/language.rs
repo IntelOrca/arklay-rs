@@ -36,7 +36,14 @@ use std::collections::HashMap;
 
 use anyhow::{Result, bail};
 
+use crate::pack::Pack;
 use crate::{budget, charset};
+
+/// Pack entry prefix of a language file.
+pub const ENTRY_PREFIX: &str = "language/";
+
+/// The ultimate fallback language every lookup resolves to.
+pub const FALLBACK_TAG: &str = "en-US";
 
 mod sources {
     include!(concat!(env!("OUT_DIR"), "/language_files.rs"));
@@ -215,6 +222,242 @@ impl Language {
             .iter()
             .map(|(key, entry)| (key.as_str(), entry))
     }
+}
+
+/// One language file's encoded entries.
+#[derive(Debug, Clone, Default)]
+struct TagEntries {
+    /// The tag as written in the file name, lower-cased.
+    tag: String,
+    /// `KEY` -> the encoded stream.
+    entries: HashMap<String, Vec<u8>>,
+}
+
+/// Every language a pack carries over the sources embedded in the binary,
+/// each layer merged per key, resolved through the fallback chain.
+///
+/// The chain for a requested `<language>-<REGION>` is: that exact file, then
+/// every file of the same language, then [`FALLBACK_TAG`]. A key the chain
+/// does not carry resolves to its own name, so a missing string is visible as
+/// its registry id instead of blank.
+#[derive(Debug, Clone, Default)]
+pub struct Catalog {
+    /// Known tags, sorted.
+    files: Vec<TagEntries>,
+    /// Indices into `files` in resolution order.
+    chain: Vec<usize>,
+    /// Encoded key names, for the registry-id fallback.
+    fallbacks: HashMap<String, Vec<u8>>,
+    /// The tag the chain starts from.
+    selected: String,
+}
+
+impl Catalog {
+    /// Read every `language/<tag>.txt` from the pack (mod layers merged per
+    /// key, later layers winning) over the embedded sources and resolve
+    /// `requested`: the `--language` tag, else the OS locale, else `en-US`.
+    pub fn load(pack: &Pack, requested: Option<&str>) -> Self {
+        let mut sources: Vec<(String, String)> = Vec::new();
+        for (entry, source) in LANGUAGE_FILES {
+            sources.push((entry.to_string(), source.to_string()));
+        }
+        for path in pack.paths() {
+            let lower = path.to_ascii_lowercase();
+            if !lower.starts_with(ENTRY_PREFIX) || !lower.ends_with(".txt") {
+                continue;
+            }
+            for copy in pack.read_stack(path) {
+                match std::str::from_utf8(&copy) {
+                    Ok(source) => sources.push((path.to_string(), source.to_string())),
+                    Err(_) => eprintln!("warning: language file {path} is not UTF-8"),
+                }
+            }
+        }
+        assemble(
+            sources
+                .iter()
+                .map(|(entry, source)| (entry.as_str(), source.as_str())),
+            requested,
+        )
+    }
+
+    /// The tag the fallback chain starts from.
+    pub fn selected(&self) -> &str {
+        &self.selected
+    }
+
+    /// Every tag the catalog carries, sorted.
+    pub fn tags(&self) -> impl Iterator<Item = &str> {
+        self.files.iter().map(|file| file.tag.as_str())
+    }
+
+    /// Look `key` up along the chain, without the registry-id fallback.
+    pub fn lookup(&self, key: &str) -> Option<&[u8]> {
+        self.chain
+            .iter()
+            .find_map(|&index| self.files[index].entries.get(key).map(Vec::as_slice))
+    }
+
+    /// [`Catalog::lookup`], then the key's own name for a key the chain does
+    /// not carry.
+    pub fn get(&self, key: &str) -> Option<&[u8]> {
+        self.lookup(key)
+            .or_else(|| self.fallbacks.get(key).map(Vec::as_slice))
+    }
+
+    /// The encoded key name, when any language knows the key.
+    pub fn key_display(&self, key: &str) -> Option<&[u8]> {
+        self.fallbacks.get(key).map(Vec::as_slice)
+    }
+}
+
+/// Assemble a catalog from `(pack entry, source)` pairs, in merge order.
+fn assemble<'a>(
+    sources: impl Iterator<Item = (&'a str, &'a str)>,
+    requested: Option<&str>,
+) -> Catalog {
+    let mut files: Vec<TagEntries> = Vec::new();
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    for (entry, source) in sources {
+        let Some(tag) = entry_tag(entry) else {
+            continue;
+        };
+        if !valid_tag(&tag) {
+            eprintln!("warning: ignoring language entry {entry}: `{tag}` is not a language tag");
+            continue;
+        }
+        let language = match Language::parse(source) {
+            Ok(language) => language,
+            Err(error) => {
+                eprintln!("warning: invalid language file {entry}: {error:#}");
+                continue;
+            }
+        };
+        let index = *index_of.entry(tag.clone()).or_insert_with(|| {
+            files.push(TagEntries {
+                tag: tag.clone(),
+                entries: HashMap::new(),
+            });
+            files.len() - 1
+        });
+        let entries = &mut files[index].entries;
+        for (key, value) in language.iter() {
+            entries.insert(key.to_string(), value.encode());
+        }
+    }
+    files.sort_by(|a, b| a.tag.cmp(&b.tag));
+    let selected = requested
+        .map(normalize_tag)
+        .filter(|tag| !tag.is_empty())
+        .or_else(detect_os_locale)
+        .unwrap_or_else(|| FALLBACK_TAG.to_string());
+    let chain = resolve(&files, &selected);
+    let fallbacks = key_fallbacks(&files);
+    Catalog {
+        files,
+        chain,
+        fallbacks,
+        selected,
+    }
+}
+
+/// The tag of a `language/<tag>.txt` entry, lower-cased.
+fn entry_tag(entry: &str) -> Option<String> {
+    let lower = entry.to_ascii_lowercase();
+    let rest = lower.strip_prefix(ENTRY_PREFIX)?;
+    let stem = rest.strip_suffix(".txt")?;
+    (!stem.is_empty()).then(|| stem.to_string())
+}
+
+/// Whether a file name stem is a language tag (`en`, `en-us`).
+fn valid_tag(tag: &str) -> bool {
+    !tag.is_empty()
+        && tag
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+}
+
+/// Normalize a language tag: `fr_FR.UTF-8` -> `fr-FR`, `JA-jp@euro` -> `ja-JP`.
+pub fn normalize_tag(tag: &str) -> String {
+    let core = tag.trim().replace('_', "-");
+    let core = core.split(['.', '@']).next().unwrap_or("");
+    let mut parts = core.split('-');
+    let mut out = parts.next().unwrap_or("").to_ascii_lowercase();
+    if let Some(region) = parts.next()
+        && !region.is_empty()
+    {
+        out.push('-');
+        out.push_str(&region.to_ascii_uppercase());
+    }
+    out
+}
+
+/// The language half of a tag.
+fn language_part(tag: &str) -> &str {
+    tag.split('-').next().unwrap_or(tag)
+}
+
+/// The user's preferred language from the environment, normalized: the first
+/// non-empty of `LC_ALL`, `LC_MESSAGES`, `LANGUAGE`, `LANG`.
+pub fn detect_os_locale() -> Option<String> {
+    for name in ["LC_ALL", "LC_MESSAGES", "LANGUAGE", "LANG"] {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        // `LANGUAGE` is a colon-separated preference list.
+        let value = value.split(':').next().unwrap_or("").trim();
+        if value.is_empty() || value == "C" || value == "POSIX" {
+            continue;
+        }
+        let tag = normalize_tag(value);
+        if !tag.is_empty() {
+            return Some(tag);
+        }
+    }
+    None
+}
+
+/// The resolution order for `selected`: the exact file, its language in any
+/// region, then [`FALLBACK_TAG`].
+fn resolve(files: &[TagEntries], selected: &str) -> Vec<usize> {
+    let wanted = selected.to_ascii_lowercase();
+    let language = language_part(&wanted);
+    let mut chain = Vec::new();
+    let mut push = |index: usize| {
+        if !chain.contains(&index) {
+            chain.push(index);
+        }
+    };
+    if let Some(index) = files.iter().position(|file| file.tag == wanted) {
+        push(index);
+    }
+    for (index, file) in files.iter().enumerate() {
+        if language_part(&file.tag) == language {
+            push(index);
+        }
+    }
+    if let Some(index) = files
+        .iter()
+        .position(|file| file.tag.eq_ignore_ascii_case(FALLBACK_TAG))
+    {
+        push(index);
+    }
+    chain
+}
+
+/// Encode every known key's own name for the registry-id fallback.
+fn key_fallbacks(files: &[TagEntries]) -> HashMap<String, Vec<u8>> {
+    let mut fallbacks: HashMap<String, Vec<u8>> = HashMap::new();
+    for file in files {
+        for key in file.entries.keys() {
+            fallbacks.entry(key.clone()).or_insert_with(|| {
+                let mut bytes = Vec::new();
+                charset::encode(key, &mut bytes);
+                bytes
+            });
+        }
+    }
+    fallbacks
 }
 
 /// Validate one key's spelling and prefix.
@@ -634,5 +877,110 @@ ITEM_05_DESCRIPTION = \"A\"
                 "{name}: parsed {parsed}, unparsable {bad}, entries with boxes {boxed_entries}, box cells {boxed_cells}"
             );
         }
+    }
+
+    fn catalog(sources: &[(&str, &str)], requested: Option<&str>) -> Catalog {
+        assemble(sources.iter().copied(), requested)
+    }
+
+    /// Encode `text` the way the catalog stores an entry.
+    fn encoded_text(text: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        charset::encode(text, &mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn tags_normalize_posix_locales() {
+        assert_eq!(normalize_tag("fr_FR.UTF-8"), "fr-FR");
+        assert_eq!(normalize_tag("ja-jp@euro"), "ja-JP");
+        assert_eq!(normalize_tag(" en "), "en");
+        assert_eq!(normalize_tag("pt_BR"), "pt-BR");
+        assert_eq!(normalize_tag(""), "");
+    }
+
+    #[test]
+    fn the_chain_is_the_exact_file_then_its_language_then_english() {
+        let sources = [
+            ("language/en-US.txt", "UI_EN = \"A\"\n"),
+            ("language/en-GB.txt", "UI_GB = \"B\"\n"),
+            ("language/fr-FR.txt", "UI_FR = \"C\"\n"),
+        ];
+
+        // Selected en-GB: the exact file, then its language (en-US).
+        let british = catalog(&sources, Some("en-GB"));
+        assert_eq!(british.selected(), "en-GB");
+        assert_eq!(british.lookup("UI_GB").unwrap(), [0x1E, 0x01]);
+        assert_eq!(british.lookup("UI_EN").unwrap(), [0x1D, 0x01]);
+        assert!(british.lookup("UI_FR").is_none());
+
+        // Selected fr-FR: only French then English.
+        let french = catalog(&sources, Some("fr-FR"));
+        assert_eq!(french.lookup("UI_FR").unwrap(), [0x1F, 0x01]);
+        assert_eq!(french.lookup("UI_EN").unwrap(), [0x1D, 0x01]);
+        assert!(french.lookup("UI_GB").is_none());
+
+        // An unshipped locale still resolves English.
+        let unknown = catalog(&sources, Some("pt-BR"));
+        assert_eq!(unknown.lookup("UI_EN").unwrap(), [0x1D, 0x01]);
+        assert!(unknown.lookup("UI_FR").is_none());
+    }
+
+    #[test]
+    fn the_exact_file_wins_a_shared_key() {
+        let sources = [
+            ("language/en-US.txt", "UI_X = \"A\"\n"),
+            ("language/en-GB.txt", "UI_X = \"B\"\n"),
+        ];
+        assert_eq!(
+            catalog(&sources, Some("en-GB")).lookup("UI_X").unwrap(),
+            [0x1E, 0x01]
+        );
+        assert_eq!(
+            catalog(&sources, Some("en-US")).lookup("UI_X").unwrap(),
+            [0x1D, 0x01]
+        );
+    }
+
+    #[test]
+    fn sources_merge_per_key_in_order() {
+        // A mod's partial file extends the base's and overrides shared keys.
+        let sources = [
+            ("language/en-US.txt", "UI_A = \"A\"\nUI_B = \"B\"\n"),
+            ("language/en-US.txt", "UI_B = \"C\"\nUI_D = \"D\"\n"),
+        ];
+        let catalog = catalog(&sources, Some("en-US"));
+        assert_eq!(catalog.lookup("UI_A").unwrap(), [0x1D, 0x01]);
+        assert_eq!(catalog.lookup("UI_B").unwrap(), [0x1F, 0x01]);
+        assert_eq!(catalog.lookup("UI_D").unwrap(), [0x20, 0x01]);
+        assert_eq!(catalog.tags().collect::<Vec<_>>(), ["en-us"]);
+    }
+
+    #[test]
+    fn a_key_outside_the_chain_reads_as_its_name() {
+        // No English file, so the chain holds the selected language only.
+        let sources = [
+            ("language/ja-JP.txt", "UI_JA = \"A\"\n"),
+            ("language/fr-FR.txt", "UI_FR = \"B\"\n"),
+        ];
+        let catalog = catalog(&sources, Some("ja-JP"));
+        assert_eq!(catalog.lookup("UI_FR"), None);
+        assert_eq!(catalog.get("UI_FR").unwrap(), encoded_text("UI_FR"));
+        // A key no language carries at all has no display text.
+        assert_eq!(catalog.get("UI_MISSING"), None);
+        assert_eq!(catalog.key_display("UI_FR").unwrap(), encoded_text("UI_FR"));
+    }
+
+    #[test]
+    fn invalid_language_entries_are_skipped() {
+        let sources = [
+            ("language/en-US.txt", "UI_OK = \"A\"\n"),
+            ("language/notes.md", "not a language file"),
+            ("language/bad name.txt", "UI_X = \"A\"\n"),
+            ("language/de-DE.txt", "this is not = \"valid\""),
+        ];
+        let catalog = catalog(&sources, Some("en-US"));
+        assert_eq!(catalog.tags().collect::<Vec<_>>(), ["en-us"]);
+        assert_eq!(catalog.lookup("UI_OK").unwrap(), [0x1D, 0x01]);
     }
 }

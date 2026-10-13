@@ -23,6 +23,7 @@
 
 use crate::font::{Font, Tint};
 use crate::render::Framebuffer;
+use crate::text::Text;
 use crate::ui::UiInput;
 
 /// Keyboard grid columns.
@@ -38,10 +39,21 @@ const CELL_EXIT: u8 = 0x00;
 /// Longest accepted field, the original's 8-byte text buffers.
 const FIELD_LEN: usize = 8;
 
-/// Virtual-keyboard char codes (`1` = `A`), the original's `s_expect*` space.
-const EXPECT_USER: &[u8] = &[10, 15, 8, 14]; // JOHN
-const EXPECT_PASS: &[u8] = &[1, 4, 1]; // ADA
-const EXPECT_CMD: &[u8] = &[13, 15, 12, 5]; // MOLE
+/// The expected credential char codes (`1` = `A`) for a language-file key.
+///
+/// The key's value encodes through the game font; letters map back to the
+/// original's virtual-keyboard code space, so the check is case-insensitive
+/// and independent of the sheet's letter layout.
+fn expected_codes(text: &Text, key: &str) -> Vec<u8> {
+    text.ui(key)
+        .iter()
+        .filter_map(|&byte| match byte {
+            0x1D..=0x36 => Some(byte - 0x1C), // 'A'..='Z'
+            0x3D..=0x56 => Some(byte - 0x3C), // 'a'..='z'
+            _ => None,
+        })
+        .collect()
+}
 
 /// The two cell doors' `g_LocksFlags` bits, indexed by the menu row.
 const DOOR_LOCK_BITS: [u8; 2] = [0x25, 0x26];
@@ -205,7 +217,7 @@ impl ComputerLab {
     }
 
     /// Advance the login stage (`cl_login_*`).
-    fn tick_login(&mut self, input: UiInput) {
+    fn tick_login(&mut self, input: UiInput, text: &Text) {
         match self.sub {
             Sub::User => {
                 if self.type_field(input) {
@@ -222,7 +234,9 @@ impl ComputerLab {
                     if self.done {
                         return;
                     }
-                    if self.user == EXPECT_USER && self.field == EXPECT_PASS {
+                    if self.user == expected_codes(text, "UI_LAB_PASSWORD_USER")
+                        && self.field == expected_codes(text, "UI_LAB_PASSWORD_ENTRY")
+                    {
                         self.sub = Sub::Accepted;
                     } else {
                         self.sub = Sub::Rejected;
@@ -278,14 +292,14 @@ impl ComputerLab {
     }
 
     /// Advance the command stage (`cl_cmd_*`).
-    fn tick_command(&mut self, input: UiInput) {
+    fn tick_command(&mut self, input: UiInput, text: &Text) {
         match self.sub {
             Sub::User => {
                 if self.type_field(input) {
                     if self.done {
                         return;
                     }
-                    if self.field == EXPECT_CMD {
+                    if self.field == expected_codes(text, "UI_LAB_PASSWORD_COMMAND") {
                         self.sub = Sub::Accepted;
                         self.timer = 90;
                     } else {
@@ -322,14 +336,14 @@ impl ComputerLab {
     }
 
     /// Advance one fixed tick. Returns `true` once the terminal has finished.
-    pub fn update(&mut self, input: UiInput) -> bool {
+    pub fn update(&mut self, input: UiInput, text: &Text) -> bool {
         if self.done {
             return true;
         }
         match self.stage {
-            Stage::Login => self.tick_login(input),
+            Stage::Login => self.tick_login(input, text),
             Stage::Menu => self.tick_menu(input),
-            Stage::Command => self.tick_command(input),
+            Stage::Command => self.tick_command(input, text),
             Stage::Unlocked => {
                 self.timer -= 1;
                 if self.timer <= 0 || input.confirm || input.cancel {
@@ -362,89 +376,83 @@ impl ComputerLab {
 
     /// Draw the screen. `font` is the pack font; a missing font draws only the
     /// panels.
-    pub fn draw(&self, framebuffer: &mut Framebuffer, font: Option<&Font>) {
+    pub fn draw(&self, framebuffer: &mut Framebuffer, font: Option<&Font>, text: &Text) {
         framebuffer.fill_rect([0, 0, 320, 240], [8, 10, 20, 255]);
         let Some(font) = font else {
             return;
         };
-        let line = |framebuffer: &mut Framebuffer, y: i32, text: &str| {
-            let bytes: Vec<u8> = text
-                .bytes()
-                .map(|byte| match byte {
-                    b'A'..=b'Z' => 0x1D + (byte - b'A'),
-                    b'a'..=b'z' => 0x1D + (byte - b'a'),
-                    b'0'..=b'9' => 0x0C + (byte - b'0'),
-                    b' ' => 0x00,
-                    b':' => 0x16,
-                    b'.' => 0x79,
-                    b'-' => 0x3B,
-                    _ => 0x1B,
-                })
-                .collect();
-            font.draw_text(framebuffer, 16, y, Tint::Green, 2, &bytes);
+        let line = |framebuffer: &mut Framebuffer, y: i32, key: &str| {
+            let bytes = text.ui(key);
+            if !bytes.is_empty() {
+                font.draw_text(framebuffer, 16, y, Tint::Green, 2, bytes);
+            }
         };
         match self.stage {
             Stage::Login => {
-                line(framebuffer, 8, "UMBRELLA LAB TERMINAL");
-                line(framebuffer, 32, "USER");
+                line(framebuffer, 8, "UI_LAB_TITLE");
+                line(framebuffer, 32, "UI_LAB_USER");
                 Self::draw_field(framebuffer, font, 72, 32, &self.field);
-                line(framebuffer, 48, "PASSWORD");
+                line(framebuffer, 48, "UI_LAB_PASSWORD");
                 if self.sub != Sub::User {
                     for index in 0..self.field.len() {
                         framebuffer
                             .fill_rect([104 + index as i32 * 8, 48, 6, 10], [200, 255, 200, 255]);
                     }
                 }
-                self.draw_keyboard(framebuffer, font);
+                self.draw_keyboard(framebuffer, font, text);
                 match self.sub {
-                    Sub::Rejected => line(framebuffer, 208, "ACCESS DENIED"),
-                    Sub::Accepted => line(framebuffer, 208, "ACCESS GRANTED"),
-                    _ => line(framebuffer, 208, "ENTER USER AND PASSWORD"),
+                    Sub::Rejected => line(framebuffer, 208, "UI_LAB_ACCESS_DENIED"),
+                    Sub::Accepted => line(framebuffer, 208, "UI_LAB_ACCESS_GRANTED"),
+                    _ => line(framebuffer, 208, "UI_LAB_ENTER_CREDENTIALS"),
                 }
             }
             Stage::Menu => {
-                line(framebuffer, 8, "SELECT A DOOR TO RELEASE");
-                for (row, text) in ["RELEASE DOOR 1", "RELEASE DOOR 2", "EXIT"]
-                    .iter()
-                    .enumerate()
+                line(framebuffer, 8, "UI_LAB_SELECT_DOOR");
+                for (row, key) in [
+                    "UI_LAB_RELEASE_DOOR_1",
+                    "UI_LAB_RELEASE_DOOR_2",
+                    "UI_LAB_EXIT",
+                ]
+                .iter()
+                .enumerate()
                 {
                     let y = 48 + row as i32 * 20;
-                    line(framebuffer, y, text);
+                    line(framebuffer, y, key);
                     if self.menu_row == row as u8 {
                         framebuffer.fill_rect([10, y + 2, 4, 10], [80, 255, 80, 255]);
                     }
                 }
             }
             Stage::Command => {
-                line(framebuffer, 8, "COMMAND");
+                line(framebuffer, 8, "UI_LAB_COMMAND");
                 for index in 0..self.field.len() {
                     framebuffer.fill_rect([80 + index as i32 * 8, 32, 6, 10], [200, 255, 200, 255]);
                 }
-                self.draw_keyboard(framebuffer, font);
+                self.draw_keyboard(framebuffer, font, text);
                 match self.sub {
-                    Sub::Rejected => line(framebuffer, 208, "INVALID COMMAND"),
-                    Sub::Accepted => line(framebuffer, 208, "COMMAND ACCEPTED"),
-                    _ => line(framebuffer, 208, "TYPE THE RELEASE COMMAND"),
+                    Sub::Rejected => line(framebuffer, 208, "UI_LAB_INVALID_COMMAND"),
+                    Sub::Accepted => line(framebuffer, 208, "UI_LAB_COMMAND_ACCEPTED"),
+                    _ => line(framebuffer, 208, "UI_LAB_TYPE_COMMAND"),
                 }
             }
             Stage::Unlocked => {
-                line(framebuffer, 96, "DOOR RELEASED");
+                line(framebuffer, 96, "UI_LAB_DOOR_RELEASED");
             }
         }
     }
 
     /// The virtual keyboard: 4 rows x 8 cells, `A`..`Z` around ENTER, with the
     /// cursor cell highlighted.
-    fn draw_keyboard(&self, framebuffer: &mut Framebuffer, font: &Font) {
+    fn draw_keyboard(&self, framebuffer: &mut Framebuffer, font: &Font, text: &Text) {
         for row in 0..ROWS {
             for col in 0..COLS {
                 let cell = row * COLS + col;
                 let x = 40 + i32::from(col) * 24;
                 let y = 96 + i32::from(row) * 20;
-                let (label, byte): (&str, u8) = match cell {
-                    CELL_EXIT => ("EXIT", 0),
-                    CELL_ENTER => ("ENT", 0),
-                    CELL_BACKSPACE => ("DEL", 0),
+                let (key, byte): (&str, u8) = match cell {
+                    CELL_EXIT => ("UI_LAB_EXIT", 0),
+                    CELL_ENTER => ("UI_LAB_KEY_ENT", 0),
+                    CELL_BACKSPACE => ("UI_LAB_KEY_DEL", 0),
                     0x1e | 0x1f => ("", 0),
                     1..=0x16 => ("", Self::letter(b'A' + cell - 1)),
                     0x18..=0x1b => ("", Self::letter(b'W' + cell - 0x18)),
@@ -455,9 +463,8 @@ impl ComputerLab {
                 }
                 if byte != 0 {
                     font.draw_text(framebuffer, x, y, Tint::White, 2, &[byte, 0x01]);
-                } else if !label.is_empty() {
-                    let bytes: Vec<u8> = label.bytes().map(|b| 0x1D + (b - b'A')).collect();
-                    font.draw_text(framebuffer, x, y, Tint::Yellow, 2, &bytes);
+                } else if !key.is_empty() {
+                    font.draw_text(framebuffer, x, y, Tint::Yellow, 2, text.ui(key));
                 }
             }
         }
@@ -533,14 +540,14 @@ mod tests {
         // The user field is typed through the keyboard; ENTER submits it.
         type_codes(&mut screen, &[10, 15, 8, 14]);
         screen.cell = CELL_ENTER;
-        screen.tick_login(submit());
+        screen.tick_login(submit(), &Text::embedded());
         assert_eq!(screen.sub, Sub::Secret);
         type_codes(&mut screen, &[1, 4, 1]);
         screen.cell = CELL_ENTER;
-        screen.tick_login(submit());
+        screen.tick_login(submit(), &Text::embedded());
         assert_eq!(screen.sub, Sub::Accepted);
         for _ in 0..90 {
-            screen.tick_login(UiInput::default());
+            screen.tick_login(UiInput::default(), &Text::embedded());
         }
         assert_eq!(screen.stage, Stage::Menu);
     }
@@ -550,10 +557,10 @@ mod tests {
         let mut screen = ComputerLab::new();
         type_codes(&mut screen, &[10, 15, 8, 14]);
         screen.cell = CELL_ENTER;
-        screen.tick_login(submit());
+        screen.tick_login(submit(), &Text::embedded());
         type_codes(&mut screen, &[1, 4, 2]);
         screen.cell = CELL_ENTER;
-        screen.tick_login(submit());
+        screen.tick_login(submit(), &Text::embedded());
         assert_eq!(screen.sub, Sub::Rejected);
     }
 
@@ -566,17 +573,17 @@ mod tests {
         assert_eq!(screen.stage, Stage::Command);
         type_codes(&mut screen, &[13, 15, 12, 5]);
         screen.cell = CELL_ENTER;
-        screen.tick_command(submit());
+        screen.tick_command(submit(), &Text::embedded());
         assert_eq!(screen.sub, Sub::Accepted);
         for _ in 0..90 {
-            screen.tick_command(UiInput::default());
+            screen.tick_command(UiInput::default(), &Text::embedded());
         }
         assert_eq!(screen.stage, Stage::Unlocked);
         assert_eq!(screen.unlock(), Some(DOOR_LOCK_BITS[1]));
         assert!(screen.map_flag());
         // The unlock hold then closes the terminal.
         for _ in 0..90 {
-            screen.update(UiInput::default());
+            screen.update(UiInput::default(), &Text::embedded());
         }
         assert!(screen.is_done());
     }
@@ -585,10 +592,13 @@ mod tests {
     fn cancel_leaves_the_terminal_from_the_menu() {
         let mut screen = ComputerLab::new();
         screen.stage = Stage::Menu;
-        screen.update(UiInput {
-            cancel: true,
-            ..UiInput::default()
-        });
+        screen.update(
+            UiInput {
+                cancel: true,
+                ..UiInput::default()
+            },
+            &Text::embedded(),
+        );
         assert!(screen.is_done());
     }
 }

@@ -151,7 +151,7 @@ fn real_item_examine_combos_gate_the_description() {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let text = Text::load(&pack);
+    let text = Text::load(&pack, Some("en-US"));
     let cx = UiContext {
         pack: &pack,
         save_dir: Path::new("."),

@@ -319,6 +319,58 @@ pub fn shadow_alpha(brightness: u8) -> u8 {
     (u32::from(brightness) * 255 / 30).min(255) as u8
 }
 
+/// Split an encoded stream into rows of at most `max_cells` glyph cells,
+/// breaking at the last space of a row when there is one.
+///
+/// The terminators end the stream; a `0xF8`/`0xF9`/`0xFA` pair counts as one
+/// cell, `0xFB` as none.
+pub fn wrap_cells(bytes: &[u8], max_cells: usize) -> Vec<&[u8]> {
+    let max_cells = max_cells.max(1);
+    let mut rows = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let mut index = 0;
+        let mut cells = 0;
+        let mut last_space = None;
+        while index < rest.len() {
+            let byte = rest[index];
+            if byte == 0x01 || byte == 0x07 {
+                // The terminator closes the stream; the rest is the last row.
+                index = rest.len();
+                break;
+            }
+            let step = match byte {
+                0xF8..=0xFA => 2,
+                _ => 1,
+            };
+            let width = usize::from(byte != 0xFB);
+            if cells + width > max_cells {
+                break;
+            }
+            if byte == 0x00 {
+                last_space = Some(index);
+            }
+            cells += width;
+            index = (index + step).min(rest.len());
+        }
+        if index >= rest.len() {
+            rows.push(rest);
+            break;
+        }
+        let cut = match last_space {
+            Some(space) if space > 0 => space,
+            _ => index.max(1),
+        };
+        rows.push(&rest[..cut]);
+        rest = &rest[cut..];
+        // The space the row broke at does not start the next one.
+        if rest.first() == Some(&0x00) {
+            rest = &rest[1..];
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +472,34 @@ mod tests {
         let decoded = steps(&[0x0C], metrics_jpn());
         assert_eq!(decoded[0].u, 168);
         assert_eq!(decoded[0].v, 28);
+    }
+
+    #[test]
+    fn wrap_cells_breaks_at_spaces_and_cell_limits() {
+        // `A B`: `A` = 0x1D, space = 0x00, `B` = 0x1E, terminator 0x01.
+        let bytes = [0x1D, 0x00, 0x1E, 0x01];
+        assert_eq!(
+            wrap_cells(&bytes, 10),
+            vec![[0x1D, 0x00, 0x1E, 0x01].as_slice()]
+        );
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0x1D].as_slice(), [0x1E, 0x01].as_slice()]
+        );
+
+        // An extended glyph pair counts as one cell.
+        let bytes = [0xF9, 0x09, 0x1D, 0x00, 0x1E];
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0xF9, 0x09, 0x1D].as_slice(), [0x1E].as_slice()]
+        );
+
+        // `0xFB` takes no cell.
+        let bytes = [0x1D, 0xFB, 0x1E, 0x1D];
+        assert_eq!(
+            wrap_cells(&bytes, 2),
+            vec![[0x1D, 0xFB, 0x1E].as_slice(), [0x1D].as_slice()]
+        );
     }
 
     #[test]
