@@ -1084,15 +1084,23 @@ pub enum ZonePath {
     Unreachable,
 }
 
-/// The original's zone-walk scratch block, per call. `idx` is the zones on
-/// the current walk, `dir` the per-step scan bound, `best` the best-path
-/// zones, `step`/`prev` the per-step walk and previous-position X/Z pairs.
+/// The original's zone-walk scratch block. `idx` is the zones on the current
+/// walk, `dir` the per-step scan bound, `best` the best-path zones,
+/// `step`/`prev` the per-step walk and previous-position X/Z pairs.
 ///
 /// `best` holds `step + 1` entries when the goal step is recorded, and `step`
 /// can reach 15 (the walk refuses to extend past index 15), so the array must
 /// hold the entry at index 16.
-#[derive(Clone, Copy)]
-struct ZoneWalk {
+///
+/// This is the original's shared scratch (`g_zonePathIdx`, `g_zonePathDir`,
+/// `g_zonePathBest`, `g_zonePathStep`, `g_zonePathPrev`): one block reused by
+/// every call in the process. A walk that finds the target adjacent writes
+/// only the head entries, so the *candidate cursors* left behind by the
+/// previous call are what the next call's scan starts from - a CW walk
+/// entered with a stale cursor can fail where a fresh one would have found a
+/// route. Keep the block on the game state and pass it to every walk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ZoneWalk {
     idx: [u8; 0x10],
     dir: [u8; 0x10],
     best: [u8; 0x11],
@@ -1101,22 +1109,13 @@ struct ZoneWalk {
 }
 
 impl ZoneWalk {
-    /// A walk with the entity's zone and position seeded. The original never
-    /// clears the rest of the block, so stale scratch leaks between calls; the
-    /// port starts every walk from zeroes so the same inputs always take the
-    /// same route.
-    fn new(start: u8, pos: [i32; 3]) -> Self {
-        let mut walk = ZoneWalk {
-            idx: [0; 0x10],
-            dir: [0; 0x10],
-            best: [0; 0x11],
-            step: [[0; 2]; 0x10],
-            prev: [[0; 2]; 0x10],
-        };
-        walk.prev[0] = [pos[0] as i16, pos[2] as i16];
-        walk.idx[0] = start;
-        walk.best[0] = start;
-        walk
+    /// A walk with the entity's zone and position seeded. The rest of the
+    /// block keeps whatever the previous walk left there, exactly like the
+    /// original's globals.
+    fn seed(&mut self, start: u8, pos: [i32; 3]) {
+        self.prev[0] = [pos[0] as i16, pos[2] as i16];
+        self.idx[0] = start;
+        self.best[0] = start;
     }
 }
 
@@ -1461,7 +1460,12 @@ fn finish(best: u32, walk: &ZoneWalk) -> u8 {
 /// A `to.z == 0` target is the original's alternate entry: `to.x` names a zone
 /// index and the waypoint becomes that zone's midpoint. A start zone of 0
 /// flips the chosen ring direction, exactly like the original.
-pub fn zone_path_find(room: &RoomState, from: [i32; 3], to: [i32; 3]) -> ZonePath {
+pub fn zone_path_find(
+    room: &RoomState,
+    walk: &mut ZoneWalk,
+    from: [i32; 3],
+    to: [i32; 3],
+) -> ZonePath {
     let count = room.walk_zones.len().min(0xFF) as u8;
     let Some(start) = walk_zone_find(room, from[0], from[2]) else {
         return ZonePath::Unreachable;
@@ -1501,13 +1505,13 @@ pub fn zone_path_find(room: &RoomState, from: [i32; 3], to: [i32; 3]) -> ZonePat
         dir = -dir;
     }
 
-    let mut walk = ZoneWalk::new(start, from);
+    walk.seed(start, from);
     let first = if dir < 1 {
         walk.dir[0] = count;
-        zone_walk_ccw(room, count, target, target_x, target_z, &mut walk)
+        zone_walk_ccw(room, count, target, target_x, target_z, walk)
     } else {
         walk.dir[0] = 0xFF;
-        zone_walk_cw(room, count, target, target_x, target_z, &mut walk)
+        zone_walk_cw(room, count, target, target_x, target_z, walk)
     };
     if first == 0xFF {
         return ZonePath::Unreachable;
@@ -1843,10 +1847,15 @@ pub fn entity_pathfind_update(room: &RoomState, entity: &mut Entity, player_pos:
 /// [`crossing_heading`] clamps the character's own position into the corridor.
 /// The waypoint lands in `player_pos_x`/`player_pos_z`, the path result in
 /// `bob_speed` and the heading in `reaction_timer`; the heading is returned.
-fn choose_heading(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3]) -> i16 {
+fn choose_heading(
+    entity: &mut Entity,
+    room: &RoomState,
+    walk: &mut ZoneWalk,
+    player_pos: [i32; 3],
+) -> i16 {
     let entity_pos = entity.pos;
     let radius = i32::from(entity.sca_radius);
-    let heading = match zone_path_find(room, entity_pos, player_pos) {
+    let heading = match zone_path_find(room, walk, entity_pos, player_pos) {
         ZonePath::Direct { zone } => {
             entity.bob_speed = zone | 0x10;
             entity.player_pos_x = player_pos[0] as i16;
@@ -2103,8 +2112,14 @@ fn behavior_00_walk(entity: &mut Entity, seed: u16) {
 /// Behaviour 1: walk to the player on animation 7 at speed 0x5D. While the
 /// heading is within ±0x180 of the yaw the character walks; otherwise it only
 /// turns, at half the step.
-fn behavior_01(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed: u16) {
-    let heading = choose_heading(entity, room, player_pos);
+fn behavior_01(
+    entity: &mut Entity,
+    room: &RoomState,
+    walk: &mut ZoneWalk,
+    player_pos: [i32; 3],
+    seed: u16,
+) {
+    let heading = choose_heading(entity, room, walk, player_pos);
     if entity.action_state == 0 {
         entity.action_state = 1;
         if entity.animation_id != 7 {
@@ -2129,8 +2144,14 @@ fn behavior_01(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed
 /// Behaviour 2: fast walk to the player. On animation 8 at speed 0xD2 while
 /// the heading is within ±0x180; when it is far off the character falls back
 /// to animation 7, and a second ±0x200 test skips the movement entirely.
-fn behavior_02(entity: &mut Entity, room: &RoomState, player_pos: [i32; 3], seed: u16) {
-    let heading = choose_heading(entity, room, player_pos);
+fn behavior_02(
+    entity: &mut Entity,
+    room: &RoomState,
+    walk: &mut ZoneWalk,
+    player_pos: [i32; 3],
+    seed: u16,
+) {
+    let heading = choose_heading(entity, room, walk, player_pos);
     let move_speed = if heading_within(entity.angle, heading as u16, 0x180) {
         if entity.animation_id != 8 {
             entity.animation_id = 8;
@@ -2662,6 +2683,7 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
         entities,
         entity_anims,
         entity_sounds,
+        zone_path_walk,
         ..
     } = game;
     // The original's `HandleEnemyPlayerCollisions` scans the enemy list after
@@ -2698,8 +2720,8 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     entity.splatter_flag = walk_zone_find(room, entity.pos[0], entity.pos[2]).unwrap_or(0xFF);
     match entity.action_behavior {
         0 => behavior_00(entity, seed),
-        1 => behavior_01(entity, room, player_pos, seed),
-        2 => behavior_02(entity, room, player_pos, seed),
+        1 => behavior_01(entity, room, zone_path_walk, player_pos, seed),
+        2 => behavior_02(entity, room, zone_path_walk, player_pos, seed),
         3 => behavior_03(entity, room, player_pos, seed),
         _ => {}
     }
@@ -3065,8 +3087,14 @@ pub fn two_point_probe(
 /// of `player_pos_x`/`player_pos_z`. A direct path stores the target, a
 /// crossing stores the shared-edge crossing, and an unreachable target writes
 /// nothing.
-pub fn zone_path_update(room: &RoomState, entity: &mut Entity, px: i32, pz: i32) {
-    match zone_path_find(room, entity.pos, [px, 0, pz]) {
+pub fn zone_path_update(
+    room: &RoomState,
+    walk: &mut ZoneWalk,
+    entity: &mut Entity,
+    px: i32,
+    pz: i32,
+) {
+    match zone_path_find(room, walk, entity.pos, [px, 0, pz]) {
         ZonePath::Direct { .. } => {
             entity.player_pos_x = px as i16;
             entity.player_pos_z = pz as i16;
@@ -3958,11 +3986,11 @@ mod tests {
     fn zone_path_find_returns_direct_adjacent_and_corner_steps() {
         let room = corridor();
         assert_eq!(
-            zone_path_find(&room, [50, 0, 50], [60, 0, 60]),
+            zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [60, 0, 60]),
             ZonePath::Direct { zone: 0 }
         );
 
-        let path = zone_path_find(&room, [50, 0, 50], [250, 0, 50]);
+        let path = zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [250, 0, 50]);
         assert_eq!(
             path,
             ZonePath::Cross {
@@ -3972,7 +4000,12 @@ mod tests {
             }
         );
 
-        let path = zone_path_find(&corner(), [50, 0, 50], [150, 0, 150]);
+        let path = zone_path_find(
+            &corner(),
+            &mut ZoneWalk::default(),
+            [50, 0, 50],
+            [150, 0, 150],
+        );
         assert_eq!(
             path,
             ZonePath::Cross {
@@ -3992,7 +4025,7 @@ mod tests {
         // unwritten previous-position scratch is what selects zone 3, the same
         // deterministic fresh-scratch result as the original's split arrays.)
         assert_eq!(
-            zone_path_find(&room, [50, 0, 50], [150, 0, 150]),
+            zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [150, 0, 150]),
             ZonePath::Cross {
                 from: 0,
                 next: 3,
@@ -4002,7 +4035,7 @@ mod tests {
         // Zone 2 to zone 0 takes the same side of the ring back through
         // zone 3, whose shared edge with zone 0 the crossing names.
         assert_eq!(
-            zone_path_find(&room, [150, 0, 150], [50, 0, 50]),
+            zone_path_find(&room, &mut ZoneWalk::default(), [150, 0, 150], [50, 0, 50]),
             ZonePath::Cross {
                 from: 2,
                 next: 3,
@@ -4020,7 +4053,12 @@ mod tests {
         for count in [13usize, 16] {
             let room = chain(count);
             assert_eq!(
-                zone_path_find(&room, [50, 0, 50], [(count - 1) as i32, 0, 0]),
+                zone_path_find(
+                    &room,
+                    &mut ZoneWalk::default(),
+                    [50, 0, 50],
+                    [(count - 1) as i32, 0, 0]
+                ),
                 ZonePath::Cross {
                     from: 0,
                     next: 1,
@@ -4041,16 +4079,22 @@ mod tests {
             next: 3,
             crossing: [50, 100],
         };
-        assert_eq!(zone_path_find(&room, [50, 0, 50], [2, 0, 0]), expected);
-        assert_eq!(zone_path_find(&room, [50, 0, 50], [150, 0, 150]), expected);
+        assert_eq!(
+            zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [2, 0, 0]),
+            expected
+        );
+        assert_eq!(
+            zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [150, 0, 150]),
+            expected
+        );
         // Standing in the named zone is a direct path.
         assert_eq!(
-            zone_path_find(&room, [150, 0, 150], [2, 0, 0]),
+            zone_path_find(&room, &mut ZoneWalk::default(), [150, 0, 150], [2, 0, 0]),
             ZonePath::Direct { zone: 2 }
         );
         // An index outside the table has no zone record to name.
         assert_eq!(
-            zone_path_find(&room, [50, 0, 50], [9, 0, 0]),
+            zone_path_find(&room, &mut ZoneWalk::default(), [50, 0, 50], [9, 0, 0]),
             ZonePath::Unreachable
         );
     }
@@ -4062,11 +4106,21 @@ mod tests {
             ..RoomState::default()
         };
         assert_eq!(
-            zone_path_find(&room, [50, 0, 50], [1050, 0, 1050]),
+            zone_path_find(
+                &room,
+                &mut ZoneWalk::default(),
+                [50, 0, 50],
+                [1050, 0, 1050]
+            ),
             ZonePath::Unreachable
         );
         assert_eq!(
-            zone_path_find(&room, [5000, 0, 5000], [1050, 0, 1050]),
+            zone_path_find(
+                &room,
+                &mut ZoneWalk::default(),
+                [5000, 0, 5000],
+                [1050, 0, 1050]
+            ),
             ZonePath::Unreachable,
             "a point outside every zone has no path"
         );
@@ -4174,7 +4228,7 @@ mod tests {
     fn choose_heading_walks_straight_within_one_zone() {
         let room = corridor();
         let mut e = entity([50, 0, 50], 0, 0);
-        let heading = choose_heading(&mut e, &room, [80, 0, 50]);
+        let heading = choose_heading(&mut e, &room, &mut ZoneWalk::default(), [80, 0, 50]);
         assert_eq!(heading, 0, "the player is due +X");
         assert_eq!(e.bob_speed, 0x10, "the direct result carries bit 4");
         assert_eq!((e.player_pos_x, e.player_pos_z), (80, 50));
@@ -5218,14 +5272,14 @@ mod tests {
             flags: 0,
         });
         let mut e = entity([100, 0, 100], 0, 0);
-        zone_path_update(&room, &mut e, 500, 600);
+        zone_path_update(&room, &mut ZoneWalk::default(), &mut e, 500, 600);
         assert_eq!(e.player_pos_x, 500);
         assert_eq!(e.player_pos_z, 600);
 
         // An unreachable target (outside every zone) writes nothing.
         let mut e = entity([100, 0, 100], 0, 0);
         e.player_pos_x = 77;
-        zone_path_update(&room, &mut e, 9000, 9000);
+        zone_path_update(&room, &mut ZoneWalk::default(), &mut e, 9000, 9000);
         assert_eq!(e.player_pos_x, 77);
     }
     /// A room with one blocking rectangle ahead of the origin, for the

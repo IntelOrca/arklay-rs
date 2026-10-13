@@ -249,9 +249,12 @@ pub fn control_gate(game: &mut GameState, player: &mut PlayerState) -> bool {
     // 0x00495180: dead - fall into the death animation and stop.
     if game.entities[0].health < 0 {
         // A back-shot death plays turned around: attackDirection 0x7FFF
-        // flips the facing 180 degrees.
+        // flips the facing 180 degrees. The spin has to go through
+        // `player.angle`: the engine mirrors it onto entity 0 every tick, so
+        // an entity-only write is clobbered before the next frame sees it.
         if game.entities[0].action_ticks_counter == 0x7FFF {
-            game.entities[0].angle = game.entities[0].angle.wrapping_add(0x800);
+            player.angle = player.angle.wrapping_add(0x800) & 0x0FFF;
+            game.entities[0].angle = player.angle;
         }
         let entity = &mut game.entities[0];
         entity.set_state(3);
@@ -263,7 +266,6 @@ pub fn control_gate(game: &mut GameState, player: &mut PlayerState) -> bool {
         if game.flags[5].bit(MSF2_EFFECT_ZONE) {
             entity.health = 1;
         }
-        let _ = player;
         return true;
     }
 
@@ -808,7 +810,7 @@ fn attack_recoil(
                 entity.action_state = 4;
             }
             if advance_reaction_clip(game, player, bank, emd_clips) {
-                finish_recoil(game);
+                finish_recoil(game, player);
             }
         }
         // Case 2 holds the clip: it advances and ignores completion, so the
@@ -831,13 +833,18 @@ fn enter_recoil_hold(game: &mut GameState) {
 /// Case 4's completion: return to the pad-driven state, clear the +0x00
 /// status byte's bit 1 and the attacked flag, spin a two/eight clip and
 /// re-arm the attack timer.
-fn finish_recoil(game: &mut GameState) {
+///
+/// The spin writes the *player's* facing as well as the entity's: the engine
+/// mirrors `player.angle` onto entity 0 every tick, so an entity-only write
+/// would be clobbered before the next frame sees it.
+fn finish_recoil(game: &mut GameState, player: &mut PlayerState) {
     let entity = &mut game.entities[0];
     return_to_control(entity);
     entity.set_ignore(0);
     entity.status_flags &= !2;
     if entity.attack_anim == 2 || entity.attack_anim == 8 {
-        entity.angle = entity.angle.wrapping_add(0x800);
+        player.angle = player.angle.wrapping_add(0x800) & 0x0FFF;
+        entity.angle = player.angle;
     }
     entity.is_being_attacked = 0;
     if entity.next_turn_timer == 0 {
@@ -5057,7 +5064,7 @@ mod tests {
 
         // The mash bleeds three a tick; with the countdown negative the clip
         // advances twice (the mash branch's advance and the tail's).
-        game.dpad_held = crate::game::PAD_ACTION_HELD;
+        game.dpad_pressed = crate::game::PAD_ACTION_HELD;
         game.entities[0].action_ticks_counter = 2;
         let frame = game.entities[0].animation_frame_id;
         run(&mut game, &mut player, &[], &emw, &[]);
@@ -5194,13 +5201,18 @@ mod tests {
         let mut player = test_player();
         game.entities[0].health = -1;
         game.entities[0].action_ticks_counter = 0x7FFF;
+        player.angle = 0x100;
         game.entities[0].angle = 0x100;
         assert!(control_gate(&mut game, &mut player));
         assert_eq!(game.entities[0].state(), 3);
         assert_eq!(game.entities[0].action_behavior, 200);
         assert_eq!(game.entities[0].action_state, 0);
         assert_eq!(game.entities[0].is_being_attacked, 1);
-        assert_eq!(game.entities[0].angle, 0x900, "the facing flipped");
+        assert_eq!(player.angle, 0x900, "the facing flipped");
+        assert_eq!(
+            game.entities[0].angle, 0x900,
+            "the entity mirror carries the flip"
+        );
 
         // The effect-zone flag is the cannot-die guard.
         let mut game = test_game(1, 0, 0);

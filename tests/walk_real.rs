@@ -6,7 +6,7 @@
 mod common;
 
 use arklay::audio;
-use arklay::enemy::walk::{xz_distance_to, zone_path_find};
+use arklay::enemy::walk::{ZoneWalk, xz_distance_to, zone_path_find};
 use arklay::engine::{SimulatedRoom, simulate_room_prepared, simulate_room_seeded};
 use arklay::game::GameState;
 use arklay::pack::Pack;
@@ -153,6 +153,9 @@ fn real_corpus_zone_paths_never_panic() {
     let pack = Pack::open(&pack_path).unwrap();
     let mut rooms = 0usize;
     let mut paths = 0usize;
+    // The original's zone-path scratch is one shared block; reuse it across
+    // the whole sweep so the stale-cursor paths are exercised too.
+    let mut walk = ZoneWalk::default();
     for entry in pack.entries() {
         let path = entry.path();
         if !path.starts_with("room/") || !path.ends_with(".rdt") {
@@ -179,7 +182,7 @@ fn real_corpus_zone_paths_never_panic() {
                 (i32::from(zone.z1) + i32::from(zone.z2)) / 2,
             ];
             for to_index in 0..room.walk_zones.len().min(0x100) {
-                let _ = zone_path_find(&room, from, [to_index as i32, 0, 0]);
+                let _ = zone_path_find(&room, &mut walk, from, [to_index as i32, 0, 0]);
                 paths += 1;
             }
         }

@@ -721,6 +721,7 @@ impl Framebuffer {
                 0,
                 [255; 3],
                 None,
+                false,
                 &mut triangles,
             );
         }
@@ -755,6 +756,7 @@ impl Framebuffer {
                 0,
                 [255; 3],
                 None,
+                false,
                 &mut triangles,
             );
         }
@@ -801,6 +803,7 @@ impl Framebuffer {
                 0,
                 [255; 3],
                 None,
+                false,
                 &mut triangles,
             );
         }
@@ -1477,6 +1480,10 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
         let light = lighting.latched(root_position(mesh.joints));
+        // The room's own object and item models come first in the list (the
+        // original's room pass, which uses its own D3D light setup); every
+        // later mesh is an entity and uses the world-space dot.
+        let room_object = texture < mirror_from;
         for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
             if !mesh.joint_visible(index) {
                 continue;
@@ -1491,6 +1498,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                 texture,
                 mesh.tint,
                 mesh.blend_weight,
+                room_object,
                 &mut triangles,
             );
         }
@@ -1520,6 +1528,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                     texture,
                     mesh.tint,
                     mesh.blend_weight,
+                    false,
                     &mut triangles,
                 );
             }
@@ -2221,6 +2230,7 @@ fn collect_triangles(
     texture: usize,
     tint: [u8; 3],
     blend_weight: Option<u8>,
+    room_object: bool,
     triangles: &mut Vec<Triangle>,
 ) {
     let vertices: Vec<[i32; 3]> = object
@@ -2346,10 +2356,14 @@ fn collect_triangles(
                     let mut shade = light.ambient;
                     if let Some(normal) = normal {
                         for source in &light.sources {
-                            let diffuse = (normal[0] * source.direction[0]
-                                + normal[1] * source.direction[1]
-                                + normal[2] * source.direction[2])
-                                .max(0.0);
+                            let diffuse = if room_object {
+                                room_object_diffuse(camera, normal, source.direction).max(0.0)
+                            } else {
+                                (normal[0] * source.direction[0]
+                                    + normal[1] * source.direction[1]
+                                    + normal[2] * source.direction[2])
+                                    .max(0.0)
+                            };
                             for (channel, &value) in shade.iter_mut().zip(&source.color) {
                                 *channel += diffuse * value;
                             }
@@ -2394,6 +2408,34 @@ fn collect_triangles(
             blend_weight,
         });
     }
+}
+
+/// The original PC port's room-object lighting, from `RoomObjectRender`'s D3D
+/// setup.
+///
+/// The room pass hands D3D a light matrix built from the room lights and the
+/// object's own rotation, then transforms it by the camera; the TMD's normals
+/// are transformed by the draw's world matrix (`camera * object`). Working the
+/// matrix chain back into the port's world frame leaves a camera-dependent
+/// pairing: the normal is the camera transform of the PS1-frame normal (the
+/// world normal with its Y negated), the light direction is the camera
+/// transform of the world direction with the view-space Y negated, and D3D's
+/// fixed-function lighting uses the negated dot (its stored direction is the
+/// light's travel direction, not the direction towards the light). The entity
+/// pass skips the object rotation and lands on the plain world-space dot
+/// instead, which is why only the room's own models use this.
+fn room_object_diffuse(camera: &Camera, normal: [f64; 3], direction: [f64; 3]) -> f64 {
+    let view = |vector: [f64; 3]| -> [f64; 3] {
+        std::array::from_fn(|row| {
+            (0..3)
+                .map(|axis| f64::from(camera.view[row][axis]) / 4096.0 * vector[axis])
+                .sum()
+        })
+    };
+    let n_view = view([normal[0], -normal[1], normal[2]]);
+    let l = view(direction);
+    let l_view = [l[0], -l[1], l[2]];
+    -(n_view[0] * l_view[0] + n_view[1] * l_view[1] + n_view[2] * l_view[2])
 }
 
 /// Project and full-bright-shade one `.ivm` object into `triangles`.
@@ -4389,6 +4431,7 @@ mod tests {
             0,
             [255; 3],
             None,
+            false,
             &mut triangles,
         );
         assert_eq!(triangles.len(), 1);
@@ -4410,6 +4453,7 @@ mod tests {
             0,
             [255; 3],
             None,
+            false,
             &mut triangles,
         );
         assert!(!triangles[0].blend);

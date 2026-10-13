@@ -234,6 +234,10 @@ const MSF_MENU_KEY_DEPLETED: u8 = 18;
 /// the direction word its position pass reads. It is NOT the message freeze:
 /// that is [`MESSAGE_FLAG_PLAYER_STATE`].
 pub const MESSAGE_FLAG_CONTROLS: u16 = 0x100;
+/// `g_message_flags` bit 9: the attract-demo playback gate. While the bit is
+/// set the recorded counter advances and the recorded pad is injected; a room
+/// script clearing it pauses the reel.
+pub const MESSAGE_FLAG_DEMO_PLAYBACK: u16 = 0x200;
 /// `g_message_flags` bit 0: the player state-machine gate. The original only
 /// dispatches the player's animation state while this bit is set, and a
 /// message's pause word masks it out, so the whole player state machine (pad
@@ -393,6 +397,15 @@ pub const DPAD_DIRECTIONS: u16 = 0x000F;
 /// The action button's bit in the remapped held-pad word ([`dpad_word`]): the
 /// port's closest analogue of the original's masked face-button half.
 pub const PAD_ACTION_HELD: u16 = 0x0080;
+/// The cancel/run button's bit in the remapped held-pad word ([`dpad_word`]).
+/// The original's raw pad carries it at `0x0040`, inside the same face-button
+/// quartet the mash masks read.
+pub const PAD_RUN_HELD: u16 = 0x0010;
+/// The remapped word's bits that stand for the original's raw face-button
+/// quartet (`0x00F0`): the confirm/action and cancel/run buttons. The other
+/// two raw bits (`0x0010`/`0x0020`) are shoulder buttons the port does not
+/// model.
+pub const PAD_BUTTONS_HELD: u16 = PAD_ACTION_HELD | PAD_RUN_HELD;
 /// State word index of `g_PlayerDpadHeld` (BioCard 0x220).
 pub const STATE_WORD_DPAD_HELD: u8 = 6;
 /// State word index of `g_PlayerDpadPressed` (BioCard 0x222).
@@ -3324,6 +3337,11 @@ pub struct GameState {
     /// The held D-pad word (`g_PlayerDpadHeld`), mirrored into
     /// [`STATE_WORD_DPAD_HELD`] every tick and blanked on a message dismissal.
     pub dpad_held: u16,
+    /// The edge-detected pad word (`~prevRaw & raw`, the reference's
+    /// `g_PlayerPadHeld`, which its input system overwrites with the pressed
+    /// word every tick). The mash consumers read this one: a held button only
+    /// counts on the tick it rises.
+    pub dpad_pressed: u16,
     /// Direction bits a state-5/6 message dismissal blanked: while a bit stays
     /// held the engine suppresses that direction, and releasing it restores
     /// control, exactly like the original's cleared-and-held pad word.
@@ -3396,6 +3414,11 @@ pub struct GameState {
     /// and read it back on frames that skip the call, so the value is a room
     /// global, not per-entity state.
     pub entity_bkp: u32,
+    /// The shared zone-path scratch (`g_zonePathIdx`/`g_zonePathDir`/
+    /// `g_zonePathBest`/`g_zonePathStep`/`g_zonePathPrev`): one block every
+    /// `zone_path_find` call reads and writes, so a walk's candidate cursors
+    /// carry over between entities and ticks exactly like the original's.
+    pub zone_path_walk: crate::enemy::walk::ZoneWalk,
     /// The alternate-outfit selector (`g_bCostumeVariant`): `costume_set`
     /// (0x4F) stores the operand's low bit and `costume_ck` (0x50) tests it.
     /// The original's `LoadEntityEMD` reads it to pick the alternate player
@@ -3607,6 +3630,7 @@ impl Default for GameState {
             monster_plant_sides: 0,
             attract_room_camera_id: 0x1F,
             entity_bkp: 0,
+            zone_path_walk: crate::enemy::walk::ZoneWalk::default(),
             costume_variant: 0,
             selected_item: None,
             max_health: 0,
@@ -3627,6 +3651,7 @@ impl Default for GameState {
             event_item_used: false,
             special_light_masks: [0; 3],
             dpad_held: 0,
+            dpad_pressed: 0,
             dpad_blanked: 0,
             zone_edits: Vec::new(),
             room_light_edits: Vec::new(),
@@ -7466,25 +7491,31 @@ impl GameState {
         self.message_flags & MESSAGE_FLAG_MONSTERS == 0
     }
 
-    /// `GetPlayerInputMasked`: any d-pad direction or face button held. The
-    /// port's remapped held-pad word carries the directions in the low nibble
-    /// and the action button at `0x80`, so the mask is exactly those bits.
+    /// `GetPlayerInputMasked`: any d-pad direction or face button that *rose*
+    /// this frame. The original masks `g_PlayerPadHeld` (its edge-detected
+    /// word) with `0xF0F0`; the port's remapped word carries the directions in
+    /// the low nibble and the two modelled face buttons at
+    /// [`PAD_BUTTONS_HELD`], so the mask is exactly those bits.
     pub fn player_mashing(&self) -> bool {
-        self.dpad_held & (DPAD_DIRECTIONS | PAD_ACTION_HELD) != 0
+        self.dpad_pressed & (DPAD_DIRECTIONS | PAD_BUTTONS_HELD) != 0
     }
 
-    /// `reduce_attack_time_by_btn_press`: how many frames the held controls
-    /// shorten the zombie bite. The original reads the two button quartets of
-    /// its pad word (3 for the face buttons, +2 for the directions); the
-    /// port's remapped word carries the directions in the low nibble and the
-    /// action button at `0x80`, so those two sources stand in for the
-    /// quartets.
+    /// `reduce_attack_time_by_btn_press`: how many frames the mashed controls
+    /// shorten the zombie bite.
+    ///
+    /// The original masks the two quartets of `g_PlayerPadHeld` - which its
+    /// input system overwrites with the edge-detected word every tick, so only
+    /// the buttons that *rose* this frame count. The d-pad half (bits 12..15)
+    /// shortens the bite by 3, the face-button half (bits 4..7, carrying the
+    /// confirm/action and cancel/run buttons) by 2 more. The port's remapped
+    /// word keeps the directions in its low nibble and those two buttons at
+    /// [`PAD_BUTTONS_HELD`].
     pub fn mash_reduce(&self) -> u8 {
         let mut reduce = 0;
-        if self.dpad_held & PAD_ACTION_HELD != 0 {
+        if self.dpad_pressed & DPAD_DIRECTIONS != 0 {
             reduce = 3;
         }
-        if self.dpad_held & DPAD_DIRECTIONS != 0 {
+        if self.dpad_pressed & PAD_BUTTONS_HELD != 0 {
             reduce += 2;
         }
         reduce
@@ -11282,13 +11313,13 @@ mod tests {
     fn player_mashing_masks_the_directions_and_the_action_bit() {
         let mut state = GameState::default();
         assert!(!state.player_mashing(), "a quiet pad is no mash");
-        state.dpad_held = 0x0010;
-        assert!(!state.player_mashing(), "the run bit alone is not a mash");
-        state.dpad_held = 0x0004;
+        state.dpad_pressed = 0x0010;
+        assert!(state.player_mashing(), "the run button counts");
+        state.dpad_pressed = 0x0004;
         assert!(state.player_mashing(), "a d-pad direction counts");
-        state.dpad_held = PAD_ACTION_HELD;
+        state.dpad_pressed = PAD_ACTION_HELD;
         assert!(state.player_mashing(), "the action button counts");
-        state.dpad_held = 0x0040 | 0x0100;
+        state.dpad_pressed = 0x0040 | 0x0100;
         assert!(!state.player_mashing(), "unmapped bits do not");
     }
 
@@ -11296,11 +11327,11 @@ mod tests {
     fn mash_reduce_counts_buttons_and_directions() {
         let mut state = GameState::default();
         assert_eq!(state.mash_reduce(), 0);
-        state.dpad_held = PAD_ACTION_HELD;
-        assert_eq!(state.mash_reduce(), 3, "the face button");
-        state.dpad_held = 0x0004;
-        assert_eq!(state.mash_reduce(), 2, "a direction");
-        state.dpad_held = PAD_ACTION_HELD | 0x0004;
+        state.dpad_pressed = PAD_ACTION_HELD;
+        assert_eq!(state.mash_reduce(), 2, "the face button");
+        state.dpad_pressed = 0x0004;
+        assert_eq!(state.mash_reduce(), 3, "a direction");
+        state.dpad_pressed = PAD_ACTION_HELD | 0x0004;
         assert_eq!(state.mash_reduce(), 5, "both");
     }
 

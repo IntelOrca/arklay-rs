@@ -269,6 +269,10 @@ pub struct WeaponState {
     pub weapon_file: Option<u8>,
     /// The equipped item is the knife.
     pub knife: bool,
+    /// The handler ended the machine this tick (the holster's final loop). The
+    /// shared frame-3 tail still runs the weapon-joint adjust on this tick,
+    /// from the weapon bank's pose; the locomotion hand-off waits for it.
+    pub finished: bool,
 }
 
 impl WeaponState {
@@ -583,6 +587,14 @@ fn try_enter(game: &mut GameState, player: &mut PlayerState, clips: &WeaponClips
     if !player.input.aim || player.locked != LockedAction::None {
         return false;
     }
+    // The aim entry is the input step's job, and that only runs under the
+    // reference's animFrameId 0 (the walk/idle/turn/back family). While the
+    // run - or its stop segment - owns the tick the pad is read by the run
+    // handler instead, so the press only starts the stop; the weapon machine
+    // waits for the stop to hand control back.
+    if !player.input_step_active() {
+        return false;
+    }
     let Some(weapon) = equipped_weapon(game) else {
         return false;
     };
@@ -605,9 +617,14 @@ fn try_enter(game: &mut GameState, player: &mut PlayerState, clips: &WeaponClips
 }
 
 /// End the machine and hand control back to the locomotion behavior.
+///
+/// The return itself is deferred to the end of the tick ([`tick`]): the shared
+/// frame-3 tail still composes the weapon hand from the pose this handler's
+/// last `Joint_move` wrote, and the locomotion hand-off would reset the clip
+/// source (and drop the pending blend pose) before that composition ran.
 fn holster_done(player: &mut PlayerState) {
     player.weapon = WeaponState::default();
-    player.return_from_weapon();
+    player.weapon.finished = true;
 }
 
 /// One tick of the active machine.
@@ -645,12 +662,32 @@ fn tick(
     // The shared frame-3 tail: the weapon-joint translation adjustment (which
     // reads the previous frame's joint-5 world), then the refreshed hand
     // matrix for the effects pass and the flamethrower's per-frame pitch.
-    if player.weapon.active() {
-        adjust_weapon_joint_translation(game, player, clips);
-        refresh_weapon_joint(game, player, clips);
+    //
+    // The reference's tail is outside the behavior dispatch, so it also runs on
+    // the tick a handler finishes the machine: the holster's last `Joint_move`
+    // sets behavior 0, then `player_ctrl_frame3` still calls
+    // `EntityUpdateWeaponJoint(0)` - composing the pose the *weapon* bank just
+    // wrote, not the locomotion pose the pending return will select next tick.
+    // The hand-off is therefore deferred until after the tail.
+    let finished = player.weapon.finished;
+    if player.weapon.active() || finished {
+        let bank = if finished {
+            Bank::Weapon
+        } else {
+            match player.clip_source {
+                ClipSource::Weapon => Bank::Weapon,
+                _ => Bank::Body,
+            }
+        };
+        adjust_weapon_joint_translation(game, player, clips, bank);
+        refresh_weapon_joint(game, player, clips, bank);
         if !knife && equipped_weapon(game) == Some(ITEM_FLAMETHROWER) {
             auto_aim_pitch(game, player, clips);
         }
+    }
+    if finished {
+        player.weapon.finished = false;
+        player.return_from_weapon();
     }
 }
 
@@ -674,10 +711,11 @@ fn adjust_weapon_joint_translation(
     game: &mut GameState,
     player: &mut PlayerState,
     clips: &WeaponClips<'_>,
+    bank: Bank,
 ) {
-    let (bank, keyframes, skeleton) = match player.clip_source {
-        ClipSource::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
-        _ => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
+    let (bank, keyframes, skeleton) = match bank {
+        Bank::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
+        Bank::Body => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
     };
     let Some(keyframe) = player.anim.pose_keyframe(bank, keyframes) else {
         return;
@@ -703,10 +741,15 @@ fn adjust_weapon_joint_translation(
 
 /// Compose the player's pose into `joint_worlds[0]` so `Attach::Joint(0, 14)`
 /// resolves the weapon hand for this tick's and the effects pass's FX.
-fn refresh_weapon_joint(game: &mut GameState, player: &PlayerState, clips: &WeaponClips<'_>) {
-    let (bank, keyframes, skeleton) = match player.clip_source {
-        ClipSource::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
-        _ => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
+fn refresh_weapon_joint(
+    game: &mut GameState,
+    player: &PlayerState,
+    clips: &WeaponClips<'_>,
+    bank: Bank,
+) {
+    let (bank, keyframes, skeleton) = match bank {
+        Bank::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
+        Bank::Body => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
     };
     let Some(keyframe) = player.anim.pose_keyframe(bank, keyframes) else {
         return;
@@ -903,9 +946,9 @@ fn gun_aim(
         _ => return,
     }
 
-    // Reticle follow: a fresh fire press drops the lock; a locked target
-    // turns the player toward it.
-    if input.fire_pressed {
+    // Reticle follow: the raw pad's bit 4 drops the lock; a locked target
+    // (state 3) turns the player toward it.
+    if input.lock_drop {
         player.weapon.aim_state = 0;
     }
     if player.weapon.aim_state == 3
@@ -1759,6 +1802,11 @@ fn gun_lockon_fire(
             set_blend(player, 0x200);
             return;
         }
+        // The recover blend plays the *body* bank at the motion id the state-1
+        // arm left in `attackAnim` (weapon*3+2, the held pose), then steers.
+        // Without it the tail's weapon-joint adjust composes the stale weapon
+        // pose and the hand anchor creeps the player the wrong way.
+        let _ = joint_move(player, clips, Bank::Body, 0x200, false);
         turn_tail(game, player);
         return;
     }
@@ -1841,7 +1889,7 @@ fn knife_aim(
     }
 
     player.weapon.aim_state |= 2;
-    if input.fire_pressed {
+    if input.lock_drop {
         player.weapon.aim_state = 0;
     }
     if player.weapon.aim_state == 3
@@ -2894,6 +2942,11 @@ mod tests {
             }
         }
         assert!(!player.weapon.active(), "the machine released");
+        // The reference's exit tick clears the behaviour but leaves the joints
+        // on the clip the holster last played; the body clip is armed on the
+        // idle handler's own first tick.
+        assert_eq!(player.clip_source, player::ClipSource::Weapon);
+        update(&mut game, &mut player, &room, &clips, Input::default());
         assert_eq!(player.clip_source, player::ClipSource::Emd);
         assert_eq!(player.behavior, 0, "idle behavior code");
     }

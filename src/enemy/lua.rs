@@ -2820,14 +2820,20 @@ mod imp {
             // The zone path from the entity's position to a point. Returns
             // (kind, from, next, crossing_x, crossing_z) with kind 0 direct,
             // 1 cross, 2 unreachable.
-            methods.add_method("zone_path_find", |_lua, api, (x, z): (i64, i64)| {
+            methods.add_method_mut("zone_path_find", |_lua, api, (x, z): (i64, i64)| {
                 let room = api.room;
                 // SAFETY: the room pointer borrows the caller's room for the
                 // whole call (see the type-level comment).
                 let room = unsafe { &*room };
-                let entity = api.entity();
-                match crate::enemy::walk::zone_path_find(room, entity.pos, [x as i32, 0, z as i32])
-                {
+                let slot = api.slot;
+                let game = api.game();
+                let entity_pos = game.entities[slot].pos;
+                match crate::enemy::walk::zone_path_find(
+                    room,
+                    &mut game.zone_path_walk,
+                    entity_pos,
+                    [x as i32, 0, z as i32],
+                ) {
                     crate::enemy::walk::ZonePath::Direct { zone } => Ok((0, zone, 0, 0, 0)),
                     crate::enemy::walk::ZonePath::Cross {
                         from,
@@ -2850,6 +2856,7 @@ mod imp {
                 let game = api.game();
                 crate::enemy::walk::zone_path_update(
                     room,
+                    &mut game.zone_path_walk,
                     &mut game.entities[slot],
                     x as i32,
                     z as i32,
@@ -3332,13 +3339,14 @@ mod imp {
                     // the whole call (see the type-level comment).
                     let room = unsafe { &*room };
                     let slot = api.slot;
-                    Ok(crate::enemy::walk::probe_ahead_code(
+                    let out = crate::enemy::walk::probe_ahead_code(
                         room,
                         api.game(),
                         slot,
                         distance as i16,
                         radius as i16,
-                    ))
+                    );
+                    Ok(out)
                 },
             );
 
@@ -8927,7 +8935,7 @@ end
             // back.
             game.entities[1].action_state = 1;
             game.entities[1].struggle = 1;
-            game.dpad_held = 1;
+            game.dpad_pressed = 1;
             assert!(crow_step(&mut host, &mut game, &pack, &clips));
             assert_eq!(game.entities[0].action_state, 4, "the crow's release write");
             for _ in 0..8 {
@@ -9002,7 +9010,7 @@ end
                 e.angle = 0xC00;
                 e.struggle = struggle;
             }
-            game.dpad_held = if mash { 1 } else { 0 };
+            game.dpad_pressed = if mash { 1 } else { 0 };
             (game, host)
         };
 
@@ -11211,7 +11219,7 @@ mod zombie_tests {
         assert_eq!(timer, 105 - 1, "no mash reduces by one");
 
         // Mash the pad: the action button and a direction shorten the bite.
-        game.dpad_held = crate::game::PAD_ACTION_HELD | 0x0004;
+        game.dpad_pressed = crate::game::PAD_ACTION_HELD | 0x0004;
         assert!(step(&mut host, &mut game, &pack));
         let timer2 = (game.entities[1].reaction_timer as u16 >> 8) as u8;
         assert_eq!(timer2, timer.wrapping_sub(6));
@@ -12962,7 +12970,7 @@ mod chimera_tests {
 
         // Mashing bleeds three frames of the meter per tick; the player's
         // attack direction mirrors it.
-        game.dpad_held = 1;
+        game.dpad_pressed = 1;
         assert!(step(&mut host, &mut game, &pack));
         assert_eq!(game.entities[1].groan_timer(), 0x57);
         assert_eq!(game.entities[0].action_ticks_counter, 0x57);
@@ -13761,10 +13769,10 @@ mod hunter_tests {
 
         // The clawed pose leaves the player's escape surface live: a held pad
         // reads through the mash helpers while the hunter keeps its grip.
-        game.dpad_held = crate::game::PAD_ACTION_HELD | 0x0004;
+        game.dpad_pressed = crate::game::PAD_ACTION_HELD | 0x0004;
         assert!(game.player_mashing(), "the pad registers during the hold");
         assert_eq!(game.mash_reduce(), 5, "the face button plus a direction");
-        game.dpad_held = 0;
+        game.dpad_pressed = 0;
 
         // Row 1 (frames 18/19) reaches joint 15 with a 600 box.
         game.entities[0].health = 100;
@@ -14697,7 +14705,7 @@ mod monster_plant_tests {
         }
         assert_eq!(game.entities[1].action_behavior, 3);
         let before = game.entities[1].action_ticks_counter;
-        game.dpad_held = crate::game::PAD_ACTION_HELD;
+        game.dpad_pressed = crate::game::PAD_ACTION_HELD;
         assert!(step_clipped(&mut host, &mut game, &pack, &clips));
         assert_eq!(
             game.entities[1].action_ticks_counter,

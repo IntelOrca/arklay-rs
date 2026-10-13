@@ -1129,8 +1129,24 @@ impl GameSession {
             }
         }
         game.state_bytes[usize::from(game::STATE_BYTE_TOTAL_HELD)] = reel.total_held_items;
-        game.equipped = (reel.equipped_item != 0).then_some(reel.equipped_item);
+        // The recorded `equippedItemId` is a 1-based index into the character's
+        // item slots, not an item id: `SetupCharacterData` (which runs after
+        // `LoadAttractModePlayerData`) resolves it through the bio card's slot
+        // array (`g_itemboxSlots[equippedItemId + 47]`, whose tail is the
+        // character's own slots) and derives the equipped weapon from the item
+        // found there. The attract boot runs that derivation with the reel's
+        // recorded inventory already in place, so a reel whose equipped slot
+        // holds the M92FS aims the M92FS, not whatever weapon the default state
+        // carried - demo 3's Jill carries the Ingram (item 0x6F ->
+        // `player/w18.emw`), not the shipped card's Beretta.
+        let equipped_item = usize::from(reel.equipped_item)
+            .checked_sub(1)
+            .and_then(|slot| reel.items.get(slot * 2))
+            .copied()
+            .unwrap_or(0);
+        game.equipped = (equipped_item != 0).then_some(equipped_item);
         game.selected_item = game.equipped;
+        game.equipped_weapon_id = equipped_item;
         game.entities[0].health = reel.health;
         game.set_health_copy(reel.health);
         game.attract_room_camera_id = reel.camera_id;
@@ -1370,10 +1386,16 @@ impl GameSession {
         if let Some(attract) = self.attract.as_mut() {
             // The playback gate opens when the room-entry fade's accumulator
             // drops below one (the reference's `g_message_flags` bit 0x200),
-            // which is also the tick the player state machine unfreezes.
+            // which is also the tick the player state machine unfreezes. The
+            // bit is published into the message flags so the live re-read
+            // below sees it, and whatever clears it later (a room script, or
+            // the death sequence's block-input state, which zeroes the whole
+            // word) pauses the counter and zeroes the injected pad.
             if !attract.gate && self.room_fade.state() < 1 {
                 attract.gate = true;
+                self.game.message_flags |= game::MESSAGE_FLAG_DEMO_PLAYBACK;
             }
+            attract.live_gate = self.game.message_flags & game::MESSAGE_FLAG_DEMO_PLAYBACK != 0;
             let translated = attract.tick_input();
             ui = translated.ui;
             input = translated.player;
@@ -1713,6 +1735,7 @@ impl GameSession {
         // game-over machine picks it up on the next tick, like the original's
         // per-frame `StartAttractDemo`.
         if let Some(attract) = self.attract.as_mut() {
+            attract.live_gate = self.game.message_flags & game::MESSAGE_FLAG_DEMO_PLAYBACK != 0;
             if attract.gate {
                 attract.advance();
             }
@@ -7435,6 +7458,7 @@ fn tick_room_timed(
     let held = game::dpad_word(&input);
     let pressed = held & !context.game.dpad_held;
     context.game.dpad_held = held;
+    context.game.dpad_pressed = pressed;
     context.game.state_words[usize::from(game::STATE_WORD_DPAD_HELD)] = held;
     context.game.state_words[usize::from(game::STATE_WORD_DPAD_PRESSED)] = pressed;
     // The special-room-light state advances once per gameplay frame, after the
@@ -7541,6 +7565,9 @@ fn tick_room_timed(
     // The frame-start position the entity/room collision passes anchor their
     // rollbacks at.
     let pre_move = context.player.pos;
+    // A movement's free step is consumed by this tick's collision tail; drop
+    // any value a skipped tail left behind so it can never leak into this one.
+    context.player.collision_pre = None;
     if state != 1 || frozen {
         // The pad-driven idle did not run this tick, so its reference scratch
         // is stale: the trace mirror must not reapply it.
@@ -7550,6 +7577,16 @@ fn tick_room_timed(
         pad.action_held = false;
         context.player.input = pad;
         if !frozen {
+            // A scripted state owns the player's bytes now. The reference's
+            // `action_behavior` is one field, so a grab (or a cutscene pose)
+            // that takes the player over writes it and an interrupted weapon
+            // machine cannot resume when the state returns to 1 - the demo 2
+            // bite left the port's reload latched and it restarted after the
+            // recoil. Clear the machine with the state change.
+            if state != 1 {
+                context.player.weapon = crate::weapons::WeaponState::default();
+                context.player.scripted_hold = true;
+            }
             let (emd_clips, emw_clips): (&[Clip], &[Clip]) = context
                 .player_assets
                 .map(|assets| (assets.emd.clips.as_slice(), assets.emw.clips.as_slice()))
@@ -7584,6 +7621,17 @@ fn tick_room_timed(
     } else if !player_script::control_gate(context.game, context.player)
         && let Some(assets) = context.player_assets
     {
+        // A scripted state can hand the player back mid-settle: `action_state`
+        // already 1, the settle's pose words written on the entity. The
+        // reference's idle then skips its case-0 entry and the settle's first
+        // `Joint_move` snaps the body clip straight to the written frame with
+        // the written blend counter. Adopt the words before the pad-driven
+        // machine's entry check runs.
+        if std::mem::take(&mut context.player.scripted_hold) {
+            context
+                .player
+                .adopt_scripted_handback(&context.game.entities[0]);
+        }
         let room_clips = context
             .room
             .room_anim
@@ -7644,12 +7692,28 @@ fn tick_room_timed(
     // scripted door sequence's other arm never runs the room tick in the port.
     context.game.sync_entity_from_player(context.player);
     if context.game.entities[0].state() != 5 {
+        // The reference runs this pass on the *free* step the behaviour's
+        // `Add_speedXZ` left - before any room resolve. The locomotion tick
+        // resolves its move too (the paths that never reach this tail need
+        // that), so rewind to the step it recorded and anchor at the
+        // pre-resolve mirror: SCA push first, room resolve last.
+        let recorded = context.player.collision_pre.take();
+        if let Some(pre) = recorded {
+            context.game.entities[0].pos = pre.step;
+        }
         enemy::walk::separate_player_from_entities(context.game, pre_move);
-        let prev = [
-            context.player.collision_mirror[0],
-            context.game.entities[0].pos[1],
-            context.player.collision_mirror[1],
-        ];
+        let prev = match recorded {
+            Some(pre) => [
+                pre.anchor[0],
+                context.game.entities[0].pos[1],
+                pre.anchor[1],
+            ],
+            None => [
+                context.player.collision_mirror[0],
+                context.game.entities[0].pos[1],
+                context.player.collision_mirror[1],
+            ],
+        };
         let resolution = player::resolve_collision_full(
             &context.room.collision,
             prev,
@@ -8000,6 +8064,9 @@ impl InputState {
                 aim_pressed: pressed & KEY_AIM != 0,
                 fire: active & KEY_FIRE != 0,
                 fire_pressed: pressed & KEY_FIRE != 0,
+                // The PC key map leaves the joystick button that feeds the raw
+                // pad's bit 4 unbound, so the keyboard never raises it.
+                lock_drop: false,
                 slow_motion: false,
                 message_blocked: false,
             },

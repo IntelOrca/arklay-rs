@@ -117,6 +117,11 @@ const BEHAVIOR_RUN: u8 = 4;
 /// Transient value that forces the next tick through the entry path, so a
 /// released stop re-arms its blend instead of continuing the old animation.
 const BEHAVIOR_ENTRY: u8 = 0xFF;
+/// Transient value marking the tick after a walk->run handover: the original's
+/// walk handler set `animFrameId` 1 and `action_behavior` 0x0D at its tail, so
+/// the next tick dispatches the run handler (entry, or its stop when the pad
+/// has gone) without another handover.
+const BEHAVIOR_RUN_ENTRY: u8 = 0xFE;
 
 /// Ticks of the run's decelerating stop segment.
 const RUN_STOP_TICKS: u8 = 4;
@@ -167,6 +172,12 @@ pub struct Input {
     pub fire: bool,
     /// The fire button's press edge.
     pub fire_pressed: bool,
+    /// The raw pad's held bit `0x0004` - the original's `(g_button_pressed_id
+    /// & 4) != 0` in the gun and knife aim handlers, where it drops a reticle
+    /// lock. The PC key map leaves the joystick button that feeds the bit
+    /// unbound and no default pad button reaches it, so in practice it only
+    /// arrives through an attract reel's recorded pad word.
+    pub lock_drop: bool,
     /// `MSF2_EFFECT_ZONE` this tick: walk/run speeds halve and the locomotion
     /// animation advances only every other tick (the original's slow-motion
     /// variant).
@@ -257,6 +268,24 @@ pub struct StairState {
     pub climbing: bool,
     /// Facing held while `climbing`.
     pub locked_angle: u16,
+}
+
+/// The free step a locomotion tick applied before its own room collision
+/// resolve, and the rollback anchor that preceded it.
+///
+/// The reference's player tick resolves the room collision exactly once, in
+/// `update_player_anim`'s tail (`HandleEnemyPlayerCollisions` then
+/// `check_room_collision`), on the position the behaviour's `Add_speedXZ`
+/// left. The engine's collision tail rewinds entity 0 to [`CollisionPre::step`]
+/// and anchors its resolve at [`CollisionPre::anchor`], so the SCA push and the
+/// room resolve both see what the reference sees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollisionPre {
+    /// The position after this tick's movement, before any collision push.
+    pub step: [i32; 3],
+    /// `collision_mirror` as it stood before that resolve: the reference's
+    /// `position` word, its rollback anchor for the tick's single pass.
+    pub anchor: [i32; 2],
 }
 
 /// Which model file's keyframes drive the current clip.
@@ -435,6 +464,17 @@ pub struct PlayerState {
     pub idle_phase: u8,
     /// Ticks spent in the idle behavior.
     pub idle_ticks: u32,
+    /// A scripted state (a grab, a cutscene pose) owned the previous tick.
+    /// The reference's `action_state` is a shared byte: a script can hand
+    /// control back mid-settle (already 1) with the settle's pose words
+    /// written itself, and the idle's case-0 entry is then skipped. The port
+    /// keeps the pose on the live clock, so such a hand-back is adopted on
+    /// the first pad-driven tick.
+    pub scripted_hold: bool,
+    /// The settle's case-0 entry already ran for this idle spell: a scripted
+    /// hand-back that left the settle words on the entity marks it so the
+    /// idle handler skips the entry's clip arming and blend.
+    pub settle_entered: bool,
     /// The reference's idle scratch while the pad-driven idle behavior owns
     /// the tick: `(action_state, attackDirection)` of
     /// `player_behavior_00_idle`. `None` when another behavior ran. The
@@ -471,6 +511,18 @@ pub struct PlayerState {
     ///   direct writes - move the matrix without touching it, so the next tick's
     ///   selector still sees the pre-push movement.
     pub collision_mirror: [i32; 2],
+    /// The movement the pad-driven locomotion applied this tick, captured
+    /// before its own room collision resolve, with the rollback anchor that
+    /// preceded that resolve.
+    ///
+    /// The reference resolves the player's room collision exactly once per
+    /// tick - in `update_player_anim`'s tail, after the SCA separation - and
+    /// it runs on the position the behaviour's `Add_speedXZ` left, the *free*
+    /// step. The engine's collision tail therefore rewinds entity 0 here
+    /// before it starts, so the SCA push and the resolve both see the free
+    /// step the reference sees. Consumed by that tail; `None` when this tick
+    /// moved nothing (or the movement suspended the collision pass).
+    pub collision_pre: Option<CollisionPre>,
     /// The last collision pass's push axis: `Some(true)` when it corrected
     /// along Z (the original raises `status_flags` bit 4), `Some(false)` along
     /// X (the bit is cleared), `None` when nothing pushed. The engine applies
@@ -567,11 +619,14 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         behavior: BEHAVIOR_IDLE,
         idle_phase: 0,
         idle_ticks: 0,
+        scripted_hold: false,
+        settle_entered: false,
         idle_trace: None,
         trace_state: None,
         last_behavior_id: 0,
         clear_attacked_flag: false,
         collision_mirror: [pos[0], pos[2]],
+        collision_pre: None,
         last_push_z: None,
         stairs: StairState::default(),
         locked: LockedAction::None,
@@ -662,7 +717,15 @@ pub fn update_with_room(
     // speed 0xD2, the stride-continuing frame) plays on the next tick. The
     // port mirrors that by finishing this tick as the walk and only publishing
     // the handover bytes; the next tick's behaviour change enters the run.
-    let run_handover = behavior == BEHAVIOR_RUN && player.behavior == BEHAVIOR_WALK;
+    //
+    // The handover is the original's *only* way into the run: its frame-0
+    // input mapping selects the walk for any held forward direction (the run
+    // modifier is not part of that decision), so a run picked up out of the
+    // idle, a turn or the weapon machine also plays one walk tick first. Only
+    // the run's own locked tick (`BEHAVIOR_RUN`, animFrameId 1) and the
+    // handover tick itself skip it.
+    let run_handover =
+        behavior == BEHAVIOR_RUN && !matches!(player.behavior, BEHAVIOR_RUN | BEHAVIOR_RUN_ENTRY);
     let behavior = if run_handover {
         BEHAVIOR_WALK
     } else {
@@ -716,8 +779,13 @@ pub fn update_with_room(
         }
     }
     // Run release: the original's run handler starts its four-tick
-    // decelerating stop towards the body idle clip.
-    if player.behavior == BEHAVIOR_RUN && behavior != BEHAVIOR_RUN && !input.up {
+    // decelerating stop towards the body idle clip. The tick after a handover
+    // dispatches the same handler, so a pad released during the handover
+    // tick's walk still opens the stop.
+    if matches!(player.behavior, BEHAVIOR_RUN | BEHAVIOR_RUN_ENTRY)
+        && behavior != BEHAVIOR_RUN
+        && !input.up
+    {
         player.run_stop_ticks = RUN_STOP_TICKS;
         run_stop_tick(player, room, emd_clips, emw_clips, room_clips);
         return;
@@ -814,12 +882,26 @@ pub fn update_with_room(
         // entry state (the sentinel forces that entry even though the walk
         // handler finished this tick's movement).
         player.trace_state = Some((0x0D, 0, Some(u16::from(player.slow_counter != 0))));
-        player.behavior = BEHAVIOR_ENTRY;
+        player.behavior = BEHAVIOR_RUN_ENTRY;
     }
 
     if behavior == BEHAVIOR_IDLE {
         player.slow_counter = 0;
         player.idle_ticks = player.idle_ticks.saturating_add(1);
+        // The original's `player_behavior_00_idle` case 0 selects `attackAnim`
+        // 0 on the body bank (with `unk_8c = 3`) and falls into the countdown,
+        // so the idle entry always re-selects the settle clip - whatever the
+        // interrupted behaviour left playing (the vault's landed room clip, a
+        // weapon's raise, a scripted pose). The release paths arm the same clip
+        // one tick earlier; re-selecting here is what makes that entry
+        // self-contained. The case only runs while `action_state` is zero, so
+        // a scripted hand-back that already left the settle words on the
+        // entity skips it.
+        let entry = player.idle_ticks == 1 && !player.settle_entered;
+        player.settle_entered = false;
+        if entry {
+            player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+        }
         // The original's `attackDirection` countdown: set to 100 on the settle
         // entry and decremented every tick; a 16-bit field, so it wraps past
         // zero when a displayed message keeps the transition gate closed.
@@ -880,9 +962,12 @@ pub fn update_with_room(
 ///
 /// The original's run handler switches to the body idle clip on the first
 /// stop tick and sheds [`RUN_STOP_DECEL`] from `move_speed_current` on each of
-/// the four ticks (`0xD2` eases out as 180/150/120/90), steering with the run
-/// step. The fourth tick hands control back to idle through [`BEHAVIOR_ENTRY`],
-/// so the next tick re-arms a fresh three-step blend into the settle pose.
+/// the four ticks (`0xD2` eases out as 180/150/120, then the exit tick). The
+/// subtraction happens *after* the `unk_bc > 3` exit test, which zeroes the
+/// speed on the last tick - so that tick ends at `0 - 0x1e = 0xFFE2` and
+/// `Add_speedXZ` moves the player *backwards* by 30 units. The fourth tick
+/// hands control back to idle through [`BEHAVIOR_ENTRY`], so the next tick
+/// re-arms a fresh three-step blend into the settle pose.
 fn run_stop_tick(
     player: &mut PlayerState,
     room: &RoomState,
@@ -898,7 +983,11 @@ fn run_stop_tick(
     // run's `attackDirection` left untouched - until case 3's `unk_bc > 3`
     // exit clears the behaviour byte in the same tick.
     let ticks = player.trace_state.and_then(|(_, _, ticks)| ticks);
-    player.trace_state = if player.run_stop_ticks == 1 {
+    let exit = player.run_stop_ticks == 1;
+    player.trace_state = if exit {
+        // The exit branch zeroes the speed before the tick's deceleration:
+        // `move_speed_current = 0`, then `-= 0x1e` -> 0xFFE2.
+        player.move_speed_current = 0;
         Some((0, 0, ticks))
     } else {
         Some((0x0D, 3, ticks))
@@ -906,8 +995,14 @@ fn run_stop_tick(
     if !player.stairs.climbing {
         player.angle = turned_angle(player.angle, BEHAVIOR_RUN, player.input);
     }
-    player.move_speed_current = player.move_speed_current.saturating_sub(RUN_STOP_DECEL);
-    player.locomotion_tick(room, BEHAVIOR_RUN, i32::from(player.move_speed_current));
+    // 16-bit wrap, then the movement reads the *signed* speed: the exit tick
+    // is the original's backwards -30 step, not a stopped one.
+    player.move_speed_current = player.move_speed_current.wrapping_sub(RUN_STOP_DECEL);
+    player.locomotion_tick(
+        room,
+        BEHAVIOR_RUN,
+        i32::from(player.move_speed_current as i16),
+    );
     player.advance(emd_clips, emw_clips, room_clips);
     player.run_stop_ticks -= 1;
     if player.run_stop_ticks == 0 {
@@ -922,7 +1017,24 @@ impl PlayerState {
         self.anim.set_clip(clip);
     }
 
+    /// Switch clips with the blend counter cleared: the reference's
+    /// `unk_8c = 0` followed by `Joint_move`, which snaps the pose straight to
+    /// the new clip's frame instead of easing from the one on screen.
+    fn set_clip_direct(&mut self, source: ClipSource, clip: usize) {
+        self.set_clip(source, clip);
+        self.anim.blend_counter = 0;
+    }
+
+    /// Advance the current clip one tick, forward.
+    ///
+    /// Every locomotion and scripted handler's `Joint_move` passes reverse 0;
+    /// only the weapon machine's holster/quick-fire steps play backwards. The
+    /// port models the original's per-call `reverse` argument as clock state,
+    /// so a finished weapon machine would otherwise leave the flag set and the
+    /// idle/walk would play their clips backwards (same logical frame, mirrored
+    /// pose). Reset it here, where the forward callers land.
     fn advance(&mut self, emd_clips: &[Clip], emw_clips: &[Clip], room_clips: &[Clip]) -> bool {
+        self.anim.reverse = false;
         match self.clip_source {
             ClipSource::Emd => self.anim.update(emd_clips),
             ClipSource::Emw => self.anim.update(emw_clips),
@@ -934,6 +1046,18 @@ impl PlayerState {
         }
     }
 
+    /// Whether the reference's input step (`player_input_to_behavior`, the
+    /// animFrameId-0 dispatch) runs this tick.
+    ///
+    /// Only the idle/walk/turn/back family lives under frame 0. The run and its
+    /// decelerating stop run under frame 1 and re-read the pad themselves, and
+    /// the handover sentinel stands for the frame-1 run entry, so an aim press
+    /// cannot start the weapon machine while one of those owns the tick - it
+    /// only makes the run handler start its stop.
+    pub fn input_step_active(&self) -> bool {
+        !matches!(self.behavior, BEHAVIOR_RUN | BEHAVIOR_ENTRY)
+    }
+
     /// Select a locomotion behavior with its entry state: the idle sequence
     /// and the slow-motion cadence restart, exactly like the original's
     /// action state 0.
@@ -942,6 +1066,7 @@ impl PlayerState {
         self.idle_ticks = 0;
         self.idle_phase = 0;
         self.slow_counter = 0;
+        self.settle_entered = false;
     }
 
     /// The run or walk entry frame that continues the current stride, when the
@@ -1002,6 +1127,12 @@ impl PlayerState {
         self.pos = if self.stairs.climbing {
             proposed
         } else {
+            // Record the free step and the pre-resolve anchor: the engine's
+            // collision tail re-runs the reference's single pass from here.
+            self.collision_pre = Some(CollisionPre {
+                step: proposed,
+                anchor: self.collision_mirror,
+            });
             let r = resolve_collision_full(
                 &room.collision,
                 prev,
@@ -1316,8 +1447,10 @@ fn update_vault(
             // The turn runs over the walk pose: the original selects
             // `attackAnim` 2 (the unarmed walk clip) and resets the frame each
             // tick, so the pose is the walk's first frame while the player
-            // squares up.
+            // squares up. Case 0 also calls `Joint_move` on every turn tick,
+            // so the clip consumes a frame here like any other state.
             player.set_clip(ClipSource::Emw, WALK_CLIP);
+            player.advance(emd_clips, emw_clips, room_clips);
             player.move_speed_current = 0;
             let angle = player.angle & 0x0FFF;
             let step = (angle & 0x3FC) >> 2;
@@ -1383,6 +1516,28 @@ fn update_vault(
 
     if warping {
         player.warp_through_object();
+        // The reference's case 3 re-selects the room bank one clip on
+        // (`attackAnim++`), resets the frame and clears the blend counter
+        // before its `Joint_move`: the pose snaps straight to the landed
+        // frame. That `Joint_move` runs before the warp in the original, but
+        // the warp only clears the control words - the animation words and
+        // the joint structs keep the landed pose - so applying it after the
+        // warp's idle hand-off lands the same pose on the same tick. The
+        // warp's `enter_idle` also re-selects the body clip; this overrides
+        // it, matching the reference's `attackAnim` still reading 52 (or 54
+        // on the return side) at the end of the tick.
+        let landed = if player.vault_return {
+            VAULT_CLIP_RETURN + 1
+        } else {
+            VAULT_CLIP_PLAIN + 1
+        };
+        if room_clips
+            .get(landed)
+            .is_some_and(|clip| !clip.frames.is_empty())
+        {
+            player.set_clip_direct(ClipSource::Room, landed);
+            player.advance(emd_clips, emw_clips, room_clips);
+        }
     }
 }
 
@@ -1649,6 +1804,7 @@ impl PlayerState {
         self.behavior = BEHAVIOR_IDLE;
         self.idle_phase = 0;
         self.idle_ticks = 0;
+        self.settle_entered = false;
         // A locked behaviour interrupts a stop (or a stop hand-off) and owns
         // the next selection: neither survives the return to idle.
         self.run_stop_ticks = 0;
@@ -1658,8 +1814,48 @@ impl PlayerState {
 
     /// Hand control back to the locomotion machine after the weapon machine
     /// finishes its holster/reload exit.
+    ///
+    /// The reference's exit tick clears `action_behavior`/`animFrameId` but
+    /// leaves the joint structs on the clip the handler last played - the body
+    /// idle's first `Joint_move` is the *next* tick's. The clip switch is
+    /// therefore deferred to the idle handler's own first tick: switching here
+    /// would move this tick's shared weapon-joint tail onto the body pose.
     pub(crate) fn return_from_weapon(&mut self) {
-        self.enter_idle();
+        self.behavior = BEHAVIOR_IDLE;
+        self.idle_phase = 0;
+        self.idle_ticks = 0;
+        self.settle_entered = false;
+        self.run_stop_ticks = 0;
+        self.fresh_entry = false;
+    }
+
+    /// Adopt the pose words a scripted state left on the player entity when
+    /// it handed control back mid-settle.
+    ///
+    /// The reference's idle case 0 runs only while `action_state` is zero: a
+    /// monster that lets the player go writes `attackAnim`, the frame id and
+    /// `unk_8c` (the shared blend counter) itself and leaves `action_state`
+    /// at 1. The settle's first `Joint_move` then plays the body clip at
+    /// that frame with that blend counter - the shark's release writes a
+    /// zero counter, so the pose snaps in without an entry blend. The port
+    /// carries the same pose state on the live clock, so the entity's words
+    /// are copied onto it and the entry is marked as already run.
+    pub(crate) fn adopt_scripted_handback(&mut self, entity: &crate::game::Entity) {
+        if entity.action_state == 0 || self.idle_ticks != 0 {
+            return;
+        }
+        self.idle_phase = 0;
+        self.settle_entered = true;
+        // The scripted path parks the machine on its sentinel; the reference's
+        // behaviour byte is the release's 0, so the locomotion entry (which
+        // re-arms the clip and blend) must not run for the settle.
+        self.behavior = BEHAVIOR_IDLE;
+        self.fresh_entry = false;
+        self.set_clip(ClipSource::Emd, usize::from(entity.attack_anim));
+        self.anim.frame = usize::from(entity.animation_frame_id);
+        self.anim.display_frame = usize::from(entity.animation_frame_id);
+        self.anim.timing = u16::from(entity.timing_control);
+        self.anim.blend_counter = u16::from(entity.blend_counter);
     }
 
     /// The pause-menu / item-viewer exit restore (`MainMenu` mode 7,
@@ -1879,7 +2075,14 @@ pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
 
 /// Rotate an arbitrary local XZ point by a 12-bit yaw, the transform the SCA
 /// collision records run their part offsets through (the original's
-/// `SetEntityScaHitData` applies the entity's `RotMatrixY` to each part).
+/// `SetEntityScaHitData` applies the entity's `RotMatrixY` to each part) and
+/// the one the animation root-motion vertex goes through
+/// (`entity_apply_anim_vertex`).
+///
+/// The original's `ApplyMatrix`/`ApplyMatrixSV` sum the matrix-vector products
+/// in 32 bits and truncate the *sum* toward zero once; truncating each product
+/// separately would round a unit away whenever the two fractions add up past
+/// one.
 pub(crate) fn rotate_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
     let angle = angle & 0x0FFF;
     let m00 = scale14_to_4_12(cos14(angle));
@@ -1887,9 +2090,15 @@ pub(crate) fn rotate_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
     let m20 = scale14_to_4_12(-sin14(angle));
     let m22 = scale14_to_4_12(cos14(angle));
     (
-        fixed_mul_12(m00, x) + fixed_mul_12(m02, z),
-        fixed_mul_12(m20, x) + fixed_mul_12(m22, z),
+        fixed_mul_12_sum(m00 * x + m02 * z),
+        fixed_mul_12_sum(m20 * x + m22 * z),
     )
+}
+
+/// The original's matrix-vector row: sum the products, then truncate the sum
+/// back out of 4.12 toward zero.
+fn fixed_mul_12_sum(product: i32) -> i32 {
+    (product + ((product >> 31) & 0xFFF)) >> 12
 }
 
 /// The original's `GteFixedMul14(value, 0x1000)`: a 14-bit table value scaled
@@ -2589,11 +2798,14 @@ mod tests {
             behavior: BEHAVIOR_IDLE,
             idle_phase: 0,
             idle_ticks: 0,
+            scripted_hold: false,
+            settle_entered: false,
             idle_trace: None,
             trace_state: None,
             last_behavior_id: 0,
             clear_attacked_flag: false,
             collision_mirror: [x, z],
+            collision_pre: None,
             last_push_z: None,
             stairs: StairState::default(),
             locked: LockedAction::None,
@@ -2750,7 +2962,10 @@ mod tests {
             ..Input::default()
         };
 
-        // Enter the run and read its pose.
+        // Enter the run: the walk handler's handover tick plays the walk and
+        // only publishes the run's bytes, and the next tick runs the entry.
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.behavior, BEHAVIOR_RUN_ENTRY);
         blend_step(&mut player, &room, &emd, &emw, run);
         assert_eq!(player.behavior, BEHAVIOR_RUN);
         assert_eq!(player.move_speed_current, RUN_SPEED as u16);
@@ -2758,11 +2973,12 @@ mod tests {
         assert_eq!(run_pose, keyframes[2]);
         blend_step(&mut player, &room, &emd, &emw, run);
 
-        // Release: four decelerating ticks on body clip 0, moving at
-        // 180/150/120/90.
+        // Release: four decelerating ticks on body clip 0. The first three
+        // move at 180/150/120; the exit tick zeroes the speed and *then* sheds
+        // 0x1e, so it steps backwards by 30 (0xFFE2 as a signed 16-bit).
         let settle = keyframes[0].clone();
         let mut expected = run_pose;
-        for (tick, (speed, counter)) in [(180u16, 3u16), (150, 2), (120, 1), (90, 0)]
+        for (tick, (speed, counter)) in [(180u16, 3u16), (150, 2), (120, 1), (0xFFE2, 0)]
             .into_iter()
             .enumerate()
         {
@@ -2772,7 +2988,7 @@ mod tests {
             assert_eq!(player.anim.blend_used, counter, "stop tick {tick}");
             assert_eq!(player.clip_source, ClipSource::Emd);
             assert_eq!(player.anim.clip, SETTLE_CLIP);
-            let (dx, dz) = rotate_speed(player.angle, 0, i32::from(speed));
+            let (dx, dz) = rotate_speed(player.angle, 0, i32::from(speed as i16));
             assert_eq!(
                 player.pos,
                 [before[0] + dx, before[1], before[2] + dz],
@@ -2841,8 +3057,11 @@ mod tests {
         assert_eq!(player.anim.display_frame, RUN_ENTRY_FRAME);
         assert_eq!(player.anim.blend_used, 3);
 
-        // A run early in its stride re-enters the walk at 0x19.
+        // A run early in its stride re-enters the walk at 0x19. The run's
+        // entry goes through the walk handover, so the run's own stride
+        // starts on the second run-input tick.
         let mut player = player_at(1000, 0);
+        blend_step(&mut player, &room, &emd, &emw, run);
         blend_step(&mut player, &room, &emd, &emw, run);
         assert_eq!(player.anim.frame, 2);
         let run_pose = shown_pose(&player, &emd, &emw, &keyframes);
@@ -2855,9 +3074,11 @@ mod tests {
             blend_keyframes(&run_pose, &keyframes[1], 3, 0x400)
         );
 
-        // A run late in its stride re-enters the walk at frame 10.
+        // A run late in its stride re-enters the walk at frame 10. The run's
+        // handover tick comes first, so the run's own stride needs one more
+        // tick to reach frame 11.
         let mut player = player_at(1000, 0);
-        for _ in 0..10 {
+        for _ in 0..11 {
             blend_step(&mut player, &room, &emd, &emw, run);
         }
         assert_eq!(player.anim.frame, 11);
@@ -3757,6 +3978,23 @@ mod tests {
         );
         assert_eq!(player.angle, 0x0FD8);
 
+        // A diagonal run is still entered through the walk's handover tick, so
+        // the first tick steers with the walk's step (-0x28) and the run's own
+        // steering (-0x30) lands on the next tick.
+        player.angle = 0;
+        step(
+            &mut player,
+            &room,
+            &clips,
+            Input {
+                up: true,
+                run: true,
+                left: true,
+                ..Input::default()
+            },
+        );
+        assert_eq!(player.angle, 0x0FD8);
+
         player.angle = 0;
         step(
             &mut player,
@@ -4471,8 +4709,10 @@ mod tests {
         );
 
         // The 20-frame run cycle contacts on frames 0 and 0x0A: a footfall
-        // every 10 ticks (3/s).
-        assert_eq!(run_ticks.len(), 30, "{run_ticks:?}");
+        // every 10 ticks (3/s). The run's first tick is the walk handler's
+        // handover, which footfalls by the walk's own rules, so the log holds
+        // one fewer run contact than a full run would.
+        assert_eq!(run_ticks.len(), 29, "{run_ticks:?}");
         assert!(run_ticks.windows(2).all(|pair| pair[1] - pair[0] == 10));
         assert!(
             run.iter()

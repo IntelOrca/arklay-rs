@@ -160,6 +160,12 @@ pub struct AttractState {
     /// The playback gate (`g_message_flags` bit `0x200`): the first gameplay
     /// tick runs with it clear, like the original's resumed outer setup.
     pub gate: bool,
+    /// The live `g_message_flags` bit `0x200` this tick. The boot [`gate`] is
+    /// only the opening condition: a room script can clear the bit (and the
+    /// original's `UpdateDemoTimer` and pad injection both re-read it every
+    /// frame), which pauses the playback counter and forces a zero pad until
+    /// the script restores it.
+    pub live_gate: bool,
     /// The previous frame's pad word, for edge detection.
     prev_pad: u16,
     /// The reel's playback ended and the attract death fade was armed.
@@ -191,9 +197,17 @@ impl AttractState {
             reel,
             timer_cur,
             gate: false,
+            live_gate: true,
             prev_pad: 0,
             ended: false,
         }
+    }
+
+    /// Whether the playback counter and the pad injection are live this tick:
+    /// the opening gate has been raised and the room has not cleared
+    /// `g_message_flags` bit `0x200`.
+    fn playing(&self) -> bool {
+        self.gate && self.live_gate
     }
 
     /// The raw pad word this gameplay tick plays: the word the original read
@@ -201,7 +215,7 @@ impl AttractState {
     /// player's behaviour update, so the recorded word lands one tick later
     /// than the frame that reads it.
     pub fn pad_word(&self) -> u16 {
-        if !self.gate || self.timer_cur == 0 {
+        if !self.playing() || self.timer_cur == 0 {
             return 0;
         }
         let index = i32::from(self.timer_cur) - 1;
@@ -251,6 +265,7 @@ impl AttractState {
                 // it once the aim state owns the tick.
                 fire: action,
                 fire_pressed: false,
+                lock_drop: word & 0x0004 != 0,
                 aim,
                 aim_pressed: false,
                 slow_motion: false,
@@ -283,10 +298,10 @@ impl AttractState {
     }
 
     /// Advance the playback counter one gameplay frame. The original's
-    /// `UpdateDemoTimer` only counts while the gate is set and wraps to zero
-    /// one frame before the recorded length.
+    /// `UpdateDemoTimer` only counts while `g_message_flags` bit 0x200 is set
+    /// and wraps to zero one frame before the recorded length.
     pub fn advance(&mut self) {
-        if !self.gate || self.timer_cur == 0 {
+        if !self.playing() || self.timer_cur == 0 {
             return;
         }
         self.timer_cur = self.timer_cur.wrapping_add(1);
