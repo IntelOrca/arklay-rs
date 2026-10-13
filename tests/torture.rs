@@ -24,6 +24,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use arklay::avi::Avi;
 use arklay::budget;
 use arklay::cinepak::Decoder;
+use arklay::language::Language;
 use arklay::manifest::{self, Manifest};
 use arklay::pack::{Pack, PackWriter};
 use arklay::save::SaveFile;
@@ -56,6 +57,14 @@ fn run_pack(data: &[u8]) {
 
 fn run_manifest(data: &[u8]) {
     let _ = Manifest::parse(&String::from_utf8_lossy(data));
+}
+
+fn run_language(data: &[u8]) {
+    if let Ok(file) = Language::parse(&String::from_utf8_lossy(data)) {
+        for (_, entry) in file.iter() {
+            let _ = entry.encode();
+        }
+    }
 }
 
 fn run_rdt(data: &[u8]) {
@@ -433,6 +442,22 @@ fn seed_pack() -> Vec<u8> {
     writer.to_bytes().unwrap()
 }
 
+fn seed_language() -> Vec<u8> {
+    let mut out = String::new();
+    for index in 0..8 {
+        out.push_str(&format!(
+            "MESSAGE_{index:02X} = \"Line one\\nLine two{{branch 2 10 0}}{{timed 40}}\"\n"
+        ));
+    }
+    out.push_str("ITEM_01_NAME = \"Test item\"\n");
+    out.push_str("ITEM_01_NAME_UNCHECKED = \"Test thing\"\n");
+    out.push_str("ITEM_01_DESCRIPTION = \"A description{{\\x41}}\"\n");
+    out.push_str("ROOM_100_TEXT_00 = \"Room text\"\n");
+    out.push_str("ROOM_100_NAME = \"A room\"\n");
+    out.push_str("UI_SAVE_HEADER_0 = \"Save\"\n");
+    out.into_bytes()
+}
+
 fn seed_manifest() -> Vec<u8> {
     b"format = 1\nid = \"re1\"\nname = \"Arklay\"\nkind = \"base\"\nlua = [\"lua/a.lua\"]\n"
         .to_vec()
@@ -660,6 +685,11 @@ fn targets() -> Vec<Target> {
             run: run_manifest,
         },
         Target {
+            name: "language",
+            seed: seed_language,
+            run: run_language,
+        },
+        Target {
             name: "rdt",
             seed: seed_rdt,
             run: run_rdt,
@@ -865,7 +895,7 @@ fn cases(name: &str, seed: &[u8]) -> Vec<Vec<u8>> {
     }
 
     // Text-boundary cases for the text parsers.
-    if matches!(name, "manifest" | "scd_asm" | "pack") {
+    if matches!(name, "manifest" | "language" | "scd_asm" | "pack") {
         out.push(vec![0xFF; 64]);
         out.push(vec![b'a'; budget::MAX_MANIFEST_LINE + 1]);
         out.push(b"key = \"unterminated".to_vec());
@@ -932,7 +962,7 @@ fn torture_matrix_never_panics() {
         total >= 10_000,
         "torture matrix ran {total} cases, below the 10,000 floor"
     );
-    assert_eq!(per_format.len(), 18, "every target must run");
+    assert_eq!(per_format.len(), 19, "every target must run");
 }
 
 /// Regenerate the committed cargo-fuzz seed corpus from these builders.

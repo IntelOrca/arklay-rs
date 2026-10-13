@@ -27,6 +27,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "language"
+path = "fuzz_targets/language.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "rdt"
 path = "fuzz_targets/rdt.rs"
 test = false

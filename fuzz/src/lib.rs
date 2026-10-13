@@ -29,6 +29,14 @@ pub fn manifest(data: &[u8]) {
     let _ = Manifest::parse(&String::from_utf8_lossy(data));
 }
 
+pub fn language(data: &[u8]) {
+    if let Ok(file) = arklay::language::Language::parse(&String::from_utf8_lossy(data)) {
+        for (_, entry) in file.iter() {
+            let _ = entry.encode();
+        }
+    }
+}
+
 pub fn rdt(data: &[u8]) {
     let _ = rdt::parse(data, RoomId::parse("1000").unwrap());
     let _ = scd::reader::parse(data);
