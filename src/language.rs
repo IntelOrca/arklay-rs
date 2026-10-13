@@ -1,0 +1,630 @@
+//! Language files (`language/<tag>.txt`): the string packs the game displays.
+//!
+//! One file holds `KEY = "value"` lines. Blank lines, whole-line `#` comments
+//! and trailing `#` comments after a value are ignored, keys are upper-case
+//! ASCII with one of the `MESSAGE_`/`ROOM_`/`ITEM_`/`UI_` prefixes, and every
+//! key may appear once. A missing key falls through the caller's language
+//! chain, so a mod file may carry any subset of keys.
+//!
+//! A value is literal text plus escapes and tags:
+//!
+//! | syntax | bytes | meaning |
+//! |---|---|---|
+//! | `\n` | `0x02` | line break |
+//! | `\"`, `\\` | - | a literal quote or backslash |
+//! | `\xNN` | `NN` | one raw glyph/operand byte |
+//! | `{clear N}` | `0x03 N` | page break with settle N |
+//! | `{scroll N}` | `0x04 N` | skip/tag block N |
+//! | `{color N}` | `0x05 N` | CLUT tint N |
+//! | `{string N}` | `0x06 N` | item-name substitution N |
+//! | `{branch A B C}` | `0x08 A B C` | yes/no post-action |
+//! | `{s}` | `0xFB` | glyph spacing |
+//! | `{timed N}` | action byte | auto-dismiss after N frames (messages only) |
+//!
+//! [`Entry::encode`] appends the stream's terminator the way `text::Table`
+//! used to carry it: `0x07` for item names, `0x01` for plain UI strings, and
+//! `0x01` plus the `{timed N}` action byte for messages and descriptions.
+//!
+//! Literal characters encode through [`crate::charset`]; a character the font
+//! cannot spell becomes that module's box cell, so an entry the selected
+//! language declares always renders. The language chain above only fills in
+//! keys a file does not declare. The raw `0x01`/`0x07` terminators are
+//! rejected as `\xNN` because a value must not carry a second stream end; tags
+//! spell operands that happen to be those bytes.
+
+use std::collections::HashMap;
+
+use anyhow::{Result, bail};
+
+use crate::{budget, charset};
+
+/// How one encoded stream ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// Message grammar: `0x01` terminator plus an action byte.
+    Message,
+    /// Item name: `0x07` return marker.
+    Name,
+    /// Plain UI string: `0x01` terminator, no action byte.
+    Plain,
+}
+
+/// One parsed value: text runs, escapes and tags in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Piece {
+    /// A literal character run, encoded through the charset.
+    Text(String),
+    /// `\n`: the `0x02` line break.
+    Newline,
+    /// A `{...}` tag.
+    Tag(Tag),
+    /// `\xNN`: one raw byte.
+    Raw(u8),
+    /// `{timed N}`: the action byte after the terminator.
+    Dismiss(u8),
+}
+
+/// A `{...}` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tag {
+    /// `{clear N}`: `0x03 N`.
+    Clear(u8),
+    /// `{scroll N}`: `0x04 N`.
+    Scroll(u8),
+    /// `{color N}`: `0x05 N`.
+    Color(u8),
+    /// `{string N}`: `0x06 N`.
+    String(u8),
+    /// `{branch A B C}`: `0x08 A B C`.
+    Branch(u8, u8, u8),
+    /// `{s}`: `0xFB`.
+    S,
+    /// `{timed N}`: the action byte after the terminator.
+    Timed(u8),
+}
+
+/// One entry of a language file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    kind: Kind,
+    pieces: Vec<Piece>,
+}
+
+impl Entry {
+    /// How this entry's stream ends.
+    pub fn kind(&self) -> Kind {
+        self.kind
+    }
+
+    /// Number of literal characters in this entry the font cannot spell
+    /// (each encodes as [`charset::MISSING`]).
+    pub fn missing_glyphs(&self) -> usize {
+        self.pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Text(text) => text.chars().filter(|ch| !charset::spellable(*ch)).count(),
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// Encode the entry into the font byte stream the engine renders.
+    ///
+    /// Characters the font cannot spell become [`charset::MISSING`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut dismiss = None;
+        for piece in &self.pieces {
+            match piece {
+                Piece::Text(text) => charset::encode(text, &mut out),
+                Piece::Newline => out.push(0x02),
+                Piece::Tag(Tag::Clear(value)) => out.extend([0x03, *value]),
+                Piece::Tag(Tag::Scroll(value)) => out.extend([0x04, *value]),
+                Piece::Tag(Tag::Color(value)) => out.extend([0x05, *value]),
+                Piece::Tag(Tag::String(value)) => out.extend([0x06, *value]),
+                Piece::Tag(Tag::Branch(a, b, c)) => out.extend([0x08, *a, *b, *c]),
+                Piece::Tag(Tag::S) => out.push(0xFB),
+                Piece::Raw(byte) => out.push(*byte),
+                Piece::Tag(Tag::Timed(value)) | Piece::Dismiss(value) => {
+                    dismiss = Some(*value);
+                }
+            }
+        }
+        match self.kind {
+            Kind::Message => {
+                out.push(0x01);
+                out.push(dismiss.unwrap_or(0));
+            }
+            Kind::Name => out.push(0x07),
+            Kind::Plain => out.push(0x01),
+        }
+        out
+    }
+}
+
+/// One parsed `language/<tag>.txt` file.
+#[derive(Debug, Clone, Default)]
+pub struct Language {
+    entries: HashMap<String, Entry>,
+}
+
+impl Language {
+    /// Parse a language file, naming the line of every malformed key or value.
+    ///
+    /// The source is capped by [`budget::MAX_TEXT_BYTES`] and the entry count
+    /// by [`budget::MAX_LANGUAGE_ENTRIES`].
+    pub fn parse(source: &str) -> Result<Self> {
+        let source = source.strip_prefix('\u{FEFF}').unwrap_or(source);
+        budget::check_len(source.len(), budget::MAX_TEXT_BYTES, "language file size")?;
+        let mut entries = HashMap::new();
+        for (index, raw) in source.lines().enumerate() {
+            let line = index + 1;
+            let content = raw.trim();
+            if content.is_empty() || content.starts_with('#') {
+                continue;
+            }
+            let Some(equals) = content.find('=') else {
+                bail!("language file line {line}: expected `KEY = \"value\"`");
+            };
+            let key = content[..equals].trim();
+            validate_key(key, line)?;
+            let kind = kind_of(key, line)?;
+            let value = quoted(content[equals + 1..].trim_start(), line)?;
+            let pieces = parse_value(value, kind, line)?;
+            budget::check_len(
+                entries.len() + 1,
+                budget::MAX_LANGUAGE_ENTRIES,
+                "language entry count",
+            )?;
+            if entries
+                .insert(key.to_string(), Entry { kind, pieces })
+                .is_some()
+            {
+                bail!("language file line {line}: duplicate key `{key}`");
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// The entry for `key`, if this file declares it.
+    pub fn get(&self, key: &str) -> Option<&Entry> {
+        self.entries.get(key)
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the file declares no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Every entry, in no particular order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Entry)> {
+        self.entries
+            .iter()
+            .map(|(key, entry)| (key.as_str(), entry))
+    }
+}
+
+/// Validate one key's spelling and prefix.
+fn validate_key(key: &str, line: usize) -> Result<()> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        bail!("language file line {line}: invalid key `{key}`");
+    }
+    let known = ["MESSAGE_", "ROOM_", "ITEM_", "UI_"];
+    if !known.iter().any(|prefix| key.starts_with(prefix)) {
+        bail!(
+            "language file line {line}: key `{key}` must start with MESSAGE_, ROOM_, ITEM_ or UI_"
+        );
+    }
+    Ok(())
+}
+
+/// The stream kind a key selects.
+fn kind_of(key: &str, line: usize) -> Result<Kind> {
+    if key.starts_with("MESSAGE_") {
+        return Ok(Kind::Message);
+    }
+    if let Some(rest) = key.strip_prefix("ROOM_") {
+        if rest.contains("_TEXT_") {
+            return Ok(Kind::Message);
+        }
+        if rest.ends_with("_NAME") || rest.ends_with("_NAME_SAVE") {
+            return Ok(Kind::Plain);
+        }
+        bail!(
+            "language file line {line}: room key `{key}` must be a `_TEXT_` message or a `_NAME`/`_NAME_SAVE` label"
+        );
+    }
+    if let Some(rest) = key.strip_prefix("ITEM_") {
+        if rest.ends_with("_NAME") || rest.ends_with("_NAME_UNCHECKED") {
+            return Ok(Kind::Name);
+        }
+        if rest.ends_with("_DESCRIPTION") {
+            return Ok(Kind::Message);
+        }
+        bail!(
+            "language file line {line}: item key `{key}` must be a `_NAME`/`_NAME_UNCHECKED`/`_DESCRIPTION` entry"
+        );
+    }
+    // `UI_`: plain labels and save-screen strings.
+    Ok(Kind::Plain)
+}
+
+/// The content of the double-quoted value `text` starts with.
+fn quoted(text: &str, line: usize) -> Result<&str> {
+    let Some(rest) = text.strip_prefix('"') else {
+        bail!("language file line {line}: the value must be a double-quoted string");
+    };
+    let mut escaped = false;
+    for (index, ch) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '"' => {
+                let trailing = rest[index + 1..].trim();
+                if !trailing.is_empty() && !trailing.starts_with('#') {
+                    bail!(
+                        "language file line {line}: unexpected `{trailing}` after the closing quote"
+                    );
+                }
+                return Ok(&rest[..index]);
+            }
+            _ => {}
+        }
+    }
+    bail!("language file line {line}: unterminated string")
+}
+
+/// Parse a value's escapes and tags into pieces.
+fn parse_value(content: &str, kind: Kind, line: usize) -> Result<Vec<Piece>> {
+    let mut pieces = Vec::new();
+    let mut text = String::new();
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => {
+                let Some(escape) = chars.next() else {
+                    bail!("language file line {line}: dangling `\\`");
+                };
+                match escape {
+                    'n' => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Newline);
+                    }
+                    '"' => text.push('"'),
+                    '\\' => text.push('\\'),
+                    'x' => {
+                        let byte = hex(chars.next(), chars.next(), line)?;
+                        if byte == 0x01 || byte == 0x07 {
+                            bail!(
+                                "language file line {line}: a value must not spell its own `\\x{byte:02X}` stream end"
+                            );
+                        }
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Raw(byte));
+                    }
+                    other => bail!("language file line {line}: unknown escape `\\{other}`"),
+                }
+            }
+            '{' => {
+                let mut inner = String::new();
+                let mut closed = false;
+                for inner_ch in chars.by_ref() {
+                    if inner_ch == '}' {
+                        closed = true;
+                        break;
+                    }
+                    inner.push(inner_ch);
+                }
+                if !closed {
+                    bail!("language file line {line}: unterminated tag `{{{inner}`");
+                }
+                match parse_tag(&inner, kind, line)? {
+                    Tag::S => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::S));
+                    }
+                    Tag::Clear(value) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::Clear(value)));
+                    }
+                    Tag::Scroll(value) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::Scroll(value)));
+                    }
+                    Tag::Color(value) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::Color(value)));
+                    }
+                    Tag::String(value) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::String(value)));
+                    }
+                    Tag::Branch(a, b, c) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Tag(Tag::Branch(a, b, c)));
+                    }
+                    Tag::Timed(value) => {
+                        flush(&mut text, &mut pieces);
+                        pieces.push(Piece::Dismiss(value));
+                        if chars.peek().is_some() {
+                            bail!(
+                                "language file line {line}: nothing may follow `{{timed {value}}}`"
+                            );
+                        }
+                    }
+                }
+            }
+            '}' => bail!("language file line {line}: unexpected `}}`"),
+            text_ch => text.push(text_ch),
+        }
+    }
+    flush(&mut text, &mut pieces);
+    Ok(pieces)
+}
+
+/// Parse one tag body (the text between `{` and `}`).
+fn parse_tag(inner: &str, kind: Kind, line: usize) -> Result<Tag> {
+    let mut parts = inner.split_ascii_whitespace();
+    let name = parts.next().unwrap_or("");
+    let mut arguments = Vec::new();
+    for part in parts {
+        let value: u16 = part.parse().map_err(|_| {
+            anyhow::anyhow!("language file line {line}: `{name}` argument `{part}` is not a number")
+        })?;
+        if value > u16::from(u8::MAX) {
+            bail!("language file line {line}: `{name}` argument `{part}` does not fit a byte");
+        }
+        arguments.push(value as u8);
+        if arguments.len() > 3 {
+            bail!("language file line {line}: too many arguments for `{name}`");
+        }
+    }
+    let one = |tag: &str| -> Result<u8> {
+        match arguments.as_slice() {
+            [value] => Ok(*value),
+            _ => bail!("language file line {line}: `{tag}` takes exactly one argument"),
+        }
+    };
+    match name {
+        "clear" => Ok(Tag::Clear(one("clear")?)),
+        "scroll" => Ok(Tag::Scroll(one("scroll")?)),
+        "color" => Ok(Tag::Color(one("color")?)),
+        "string" => Ok(Tag::String(one("string")?)),
+        "branch" => match arguments.as_slice() {
+            [a, b, c] => Ok(Tag::Branch(*a, *b, *c)),
+            _ => bail!("language file line {line}: `branch` takes exactly three arguments"),
+        },
+        "s" => {
+            if arguments.is_empty() {
+                Ok(Tag::S)
+            } else {
+                bail!("language file line {line}: `s` takes no arguments");
+            }
+        }
+        "timed" => {
+            if kind != Kind::Message {
+                bail!("language file line {line}: `timed` is only for messages and descriptions");
+            }
+            Ok(Tag::Timed(one("timed")?))
+        }
+        other => bail!("language file line {line}: unknown tag `{{{other}}}`"),
+    }
+}
+
+/// Flush a literal text run into the piece list.
+fn flush(text: &mut String, pieces: &mut Vec<Piece>) {
+    if !text.is_empty() {
+        pieces.push(Piece::Text(std::mem::take(text)));
+    }
+}
+
+/// Parse the two hex digits of a `\xNN` escape.
+fn hex(high: Option<char>, low: Option<char>, line: usize) -> Result<u8> {
+    let value = |ch: Option<char>| -> Result<u8> {
+        ch.and_then(|ch| ch.to_digit(16))
+            .map(|digit| digit as u8)
+            .ok_or_else(|| anyhow::anyhow!("language file line {line}: `\\x` needs two hex digits"))
+    };
+    Ok((value(high)? << 4) | value(low)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse one entry and encode it.
+    fn encoded(source: &str, key: &str) -> Vec<u8> {
+        Language::parse(source)
+            .unwrap()
+            .get(key)
+            .unwrap_or_else(|| panic!("missing {key}"))
+            .encode()
+    }
+
+    #[test]
+    fn parses_a_message_with_tags_and_a_dismiss() {
+        let bytes = encoded(r#"MESSAGE_00 = "\nA{s}{timed 60}""#, "MESSAGE_00");
+        assert_eq!(bytes, [0x02, 0x1D, 0xFB, 0x01, 60]);
+    }
+
+    #[test]
+    fn parses_every_tag_into_its_bytes() {
+        let bytes = encoded(
+            r#"MESSAGE_01 = "{clear 100}{scroll 2}{color 1}{string 0}{branch 0 1 0}""#,
+            "MESSAGE_01",
+        );
+        assert_eq!(
+            bytes,
+            [0x03, 100, 0x04, 2, 0x05, 1, 0x06, 0, 0x08, 0, 1, 0, 0x01, 0]
+        );
+    }
+
+    #[test]
+    fn raw_bytes_pass_through() {
+        let bytes = encoded(r#"MESSAGE_02 = "\x0E\x0F\x7F""#, "MESSAGE_02");
+        assert_eq!(bytes, [0x0E, 0x0F, 0x7F, 0x01, 0]);
+    }
+
+    #[test]
+    fn terminates_each_entry_kind() {
+        let source = "\
+UI_SAVE_HEADER_0 = \"A\"
+ROOM_100_NAME = \"A\"
+ROOM_100_NAME_SAVE = \"A\"
+ROOM_100_TEXT_00 = \"A\"
+ITEM_05_NAME = \"A\"
+ITEM_05_NAME_UNCHECKED = \"B\"
+ITEM_05_DESCRIPTION = \"A\"
+";
+        assert_eq!(encoded(source, "UI_SAVE_HEADER_0"), [0x1D, 0x01]);
+        assert_eq!(encoded(source, "ROOM_100_NAME"), [0x1D, 0x01]);
+        assert_eq!(encoded(source, "ROOM_100_NAME_SAVE"), [0x1D, 0x01]);
+        assert_eq!(encoded(source, "ROOM_100_TEXT_00"), [0x1D, 0x01, 0]);
+        assert_eq!(encoded(source, "ITEM_05_NAME"), [0x1D, 0x07]);
+        assert_eq!(encoded(source, "ITEM_05_NAME_UNCHECKED"), [0x1E, 0x07]);
+        assert_eq!(encoded(source, "ITEM_05_DESCRIPTION"), [0x1D, 0x01, 0]);
+    }
+
+    #[test]
+    fn accepts_comments_blank_lines_bom_and_crlf() {
+        let source = "\u{FEFF}# a note\r\n\r\nUI_X = \"A\" # trailing is part of the value\r\n";
+        let language = Language::parse(source).unwrap();
+        assert_eq!(language.len(), 1);
+        assert_eq!(language.get("UI_X").unwrap().encode(), [0x1D, 0x01]);
+    }
+
+    #[test]
+    fn characters_without_cells_become_boxes() {
+        let language = Language::parse("UI_X = \"é\"\nUI_Y = \"A\"\n").unwrap();
+        assert_eq!(language.len(), 2);
+        assert_eq!(
+            language.get("UI_X").unwrap().encode(),
+            [charset::MISSING, 0x01]
+        );
+        assert_eq!(language.get("UI_Y").unwrap().encode(), [0x1D, 0x01]);
+    }
+
+    #[test]
+    fn malformed_files_name_the_line() {
+        let cases = [
+            ("UI_X = A", "double-quoted"),
+            ("UI_X \"A\"", "expected `KEY"),
+            ("UI_X = \"A\" tail", "unexpected"),
+            ("UI_X = \"A", "unterminated"),
+            (r#"UI_X = "\q""#, "unknown escape"),
+            (r#"UI_X = "\x4""#, "two hex digits"),
+            (r#"UI_X = "\x01""#, "stream end"),
+            (r#"UI_X = "\x07""#, "stream end"),
+            ("UI_X = \"{wat 1}\"", "unknown tag"),
+            ("UI_X = \"{clear}\"", "exactly one argument"),
+            ("UI_X = \"{clear 256}\"", "does not fit a byte"),
+            ("UI_X = \"{branch 1 2}\"", "three arguments"),
+            ("UI_X = \"{s 1}\"", "no arguments"),
+            ("UI_X = \"{timed 5}\"", "only for messages"),
+            ("MESSAGE_03 = \"{timed 5}A\"", "nothing may follow"),
+            ("MESSAGE_04 = \"{timed 5}{timed 6}\"", "nothing may follow"),
+            ("UI_X = \"}\"", "unexpected `}`"),
+            ("UI_X = \"{scroll 1\"", "unterminated tag"),
+            ("UI_X = \"{{scroll 1}\"", "unknown tag"),
+            ("ITEM_05 = \"A\"", "item key"),
+            ("ROOM_100 = \"A\"", "room key"),
+            ("OTHER_1 = \"A\"", "must start with"),
+            ("ui_x = \"A\"", "invalid key"),
+            ("UI_X = \"A\"\nUI_X = \"B\"", "duplicate key"),
+        ];
+        for (source, want) in cases {
+            let error = Language::parse(source).unwrap_err().to_string();
+            assert!(error.contains(want), "{source:?}: {error}");
+            assert!(error.contains("line"), "{source:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn rejects_text_over_the_caps() {
+        let mut many = String::new();
+        for index in 0..=budget::MAX_LANGUAGE_ENTRIES {
+            many.push_str(&format!("UI_{index} = \"A\"\n"));
+        }
+        let message = budget::assert_cap_error(Language::parse(&many));
+        assert!(message.contains("entry count"), "{message}");
+
+        let huge = "x".repeat(budget::MAX_TEXT_BYTES + 1);
+        let message = budget::assert_cap_error(Language::parse(&huge));
+        assert!(message.contains("file size"), "{message}");
+    }
+
+    #[test]
+    fn parses_and_encodes_the_japanese_seed() {
+        let source = include_str!("../games/re1/language/ja-JP.txt");
+        let language = Language::parse(source).unwrap();
+        assert!(language.len() > 1_600, "{} entries", language.len());
+        for (key, entry) in language.iter() {
+            assert_eq!(
+                entry.missing_glyphs(),
+                0,
+                "{key} wants a glyph the Japanese font lacks"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic over every checked-in seed"]
+    fn seed_diagnostics() {
+        let files: [(&str, &str); 8] = [
+            ("ja-JP", include_str!("../games/re1/language/ja-JP.txt")),
+            ("en-US", include_str!("../games/re1/language/en-US.txt")),
+            ("ru-RU", include_str!("../games/re1/language/ru-RU.txt")),
+            ("fi-FI", include_str!("../games/re1/language/fi-FI.txt")),
+            ("fr-FR", include_str!("../games/re1/language/fr-FR.txt")),
+            ("it-IT", include_str!("../games/re1/language/it-IT.txt")),
+            ("de-DE", include_str!("../games/re1/language/de-DE.txt")),
+            ("es-ES", include_str!("../games/re1/language/es-ES.txt")),
+        ];
+        for (name, source) in files {
+            let mut parsed = 0;
+            let mut bad = 0;
+            let mut boxed_entries = 0;
+            let mut boxed_cells = 0;
+            for (index, line) in source.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match Language::parse(line) {
+                    Ok(language) => {
+                        parsed += 1;
+                        let (key, entry) = language.iter().next().unwrap();
+                        let cells = entry.missing_glyphs();
+                        if cells > 0 {
+                            boxed_entries += 1;
+                            boxed_cells += cells;
+                            if boxed_entries <= 8 {
+                                println!("{name} line {}: {key}: {cells} box cell(s)", index + 1);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        bad += 1;
+                        if bad <= 8 {
+                            println!("{name} line {} parse: {error:#}", index + 1);
+                        }
+                    }
+                }
+            }
+            println!(
+                "{name}: parsed {parsed}, unparsable {bad}, entries with boxes {boxed_entries}, box cells {boxed_cells}"
+            );
+        }
+    }
+}

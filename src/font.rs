@@ -193,12 +193,12 @@ pub struct Font {
 }
 
 impl Font {
-    /// Pair `texture` with the metrics its width selects.
-    pub fn new(texture: Texture8) -> Self {
-        Self {
-            metrics: FontMetrics::from_sheet_width(texture.width),
-            texture,
-        }
+    /// Pair `texture` with the metrics its width selects and paint the
+    /// missing-glyph box into the cell [`crate::charset::MISSING`] selects.
+    pub fn new(mut texture: Texture8) -> Self {
+        let metrics = FontMetrics::from_sheet_width(texture.width);
+        paint_missing_box(&mut texture, metrics);
+        Self { texture, metrics }
     }
 
     /// Draw an encoded stream left to right from `(x, y)`.
@@ -283,6 +283,33 @@ impl Font {
             cursor += glyph.advance;
         }
         framebuffer.draw_sprites(&mut sprites);
+    }
+}
+
+/// Paint a hollow box into the cell [`crate::charset::MISSING`] selects.
+///
+/// Plain byte `MISSING` addresses row `MISSING / 18`, column `MISSING % 18`
+/// of the glyph grid; the strokes use the palette index the shipped glyph
+/// pixels do, so the box takes the same tint and brightness as the text
+/// around it.
+fn paint_missing_box(texture: &mut Texture8, metrics: FontMetrics) {
+    /// The palette index the shipped glyph strokes use (a dark grey that the
+    /// tint pass maps to the text colour).
+    const INK: u8 = 8;
+    let glyph_w = metrics.glyph_w.max(1) as u32;
+    let height = GLYPH_HEIGHT as u32;
+    let byte = usize::from(crate::charset::MISSING);
+    let left = (byte % 18) as u32 * glyph_w;
+    let top = 28 + (byte / 18) as u32 * height;
+    for y in 0..height {
+        for x in 0..glyph_w {
+            let index = (top + y) as usize * texture.width as usize + left as usize + x as usize;
+            let Some(pixel) = texture.indices.get_mut(index) else {
+                return;
+            };
+            let edge = y == 0 || y == height - 1 || x == 0 || x == glyph_w - 1;
+            *pixel = if edge { INK } else { 0 };
+        }
     }
 }
 
@@ -393,6 +420,34 @@ mod tests {
         let decoded = steps(&[0x0C], metrics_jpn());
         assert_eq!(decoded[0].u, 168);
         assert_eq!(decoded[0].v, 28);
+    }
+
+    #[test]
+    fn the_missing_glyph_cell_is_a_hollow_box() {
+        let font = Font::new(sheet_with_cell(168, 28));
+        let glyph = Glyphs::new(&[crate::charset::MISSING], font.metrics)
+            .next()
+            .expect("the missing byte decodes to a cell");
+        assert!(glyph.visible());
+        let pixel = |x: i32, y: i32| {
+            font.texture.indices[(y as u32 * font.texture.width + x as u32) as usize]
+        };
+        assert_ne!(pixel(glyph.u, glyph.v), 0, "top-left corner");
+        assert_ne!(
+            pixel(glyph.u + glyph.width - 1, glyph.v),
+            0,
+            "top-right corner"
+        );
+        assert_ne!(
+            pixel(glyph.u, glyph.v + glyph.height - 1),
+            0,
+            "bottom-left corner"
+        );
+        assert_eq!(
+            pixel(glyph.u + glyph.width / 2, glyph.v + glyph.height / 2),
+            0,
+            "the middle stays hollow"
+        );
     }
 
     #[test]

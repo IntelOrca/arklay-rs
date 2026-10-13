@@ -22,7 +22,7 @@
 //! | [`MAX_PIXELS`] | 16,777,216 | 320x240 | TIM/BMP/IVM/cinepak canvas |
 //! | [`MAX_LZW_OUTPUT`] | 64 MiB | ~1 MiB | one LZW stream |
 //! | [`MAX_RECORDS`] | 1,048,576 | 348 RDTs total | per-format record lists |
-//! | [`MAX_TEXT_BYTES`] | 16 MiB | a few KiB | manifest, `.s` source |
+//! | [`MAX_TEXT_BYTES`] | 16 MiB | a few KiB | manifest, `.s` source, language file |
 //! | [`MAX_CLUT_ENTRIES`] | 65,536 | 1,536 | TIM CLUT |
 //! | [`MAX_CLUT_ROWS`] | 256 | 3 | TIM 4bpp CLUT rows |
 //! | [`MAX_TMD_OBJECTS`] | 65,536 | 16 (player EMD) | TMD/IVM objects |
@@ -44,6 +44,7 @@
 //! | [`MAX_MANIFEST_ITEMS`] | 4,096 | 11 | manifest statements |
 //! | [`MAX_MANIFEST_LINE`] | 65,536 | < 100 | one manifest line |
 //! | [`MAX_MANIFEST_LUA`] | 1,024 | a handful | manifest Lua list |
+//! | [`MAX_LANGUAGE_ENTRIES`] | 65,536 | 1,791 | language `<tag>.txt` entries |
 //! | [`MAX_LUA_CHUNKS`] | 256 | a handful | loaded Lua chunks |
 //! | [`MAX_LUA_CHUNK`] | 1 MiB | a few KiB | one Lua chunk |
 //! | [`MAX_SAVE_BYTES`] | 1 MiB | 2 KiB | save slot file |
@@ -128,6 +129,8 @@ pub const MAX_LUA_CHUNK: usize = 1 << 20;
 pub const MAX_SAVE_BYTES: usize = 1 << 20;
 /// Largest combat table blob accepted (`data/combat.bin`).
 pub const MAX_COMBAT_TABLE_BYTES: usize = 1 << 16;
+/// Largest language-file entry count.
+pub const MAX_LANGUAGE_ENTRIES: usize = 1 << 16;
 /// Largest cinepak canvas, in pixels.
 pub const MAX_CINEPAK_PIXELS: usize = MAX_PIXELS;
 
