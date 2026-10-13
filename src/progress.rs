@@ -2,7 +2,7 @@
 //!
 //! [`Progress`] tracks one phase at a time: a label, a completed/total count,
 //! the item currently being processed, and the phase's elapsed time. On a
-//! terminal it redraws a single line in place with carriage returns;
+//! terminal it redraws a single bar line in place with carriage returns;
 //! everywhere else it falls back to periodic plain lines, so logs and pipes
 //! never see control characters.
 //!
@@ -15,6 +15,14 @@ use std::time::{Duration, Instant};
 
 /// How often a non-terminal reporter emits a plain progress line.
 const PLAIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Width of the bar the terminal reporter draws, brackets included.
+const BAR_WIDTH: usize = 24;
+
+/// Longest line the terminal reporter draws, leaving the last column of an
+/// 80-column terminal free so the line never wraps (a wrapped line cannot be
+/// redrawn in place with a carriage return).
+const TTY_MAX_CHARS: usize = 79;
 
 /// Longest item name rendered before its start is elided.
 const ITEM_MAX_CHARS: usize = 44;
@@ -142,20 +150,49 @@ impl Progress {
         self.item.push_str(&short_item(item));
     }
 
-    /// The full text of the current progress line.
-    fn render(&self) -> String {
+    /// The full text of the terminal progress line: label, bar, percentage,
+    /// counts, ETA when known, then the item name if it fits.
+    fn render_tty(&self) -> String {
         let elapsed = self.phase_started.elapsed();
-        let percent = format_percent(self.done, self.total);
-        let eta = estimate_remaining(elapsed, self.done, self.total)
-            .map_or_else(|| "--".to_owned(), format_duration);
         let mut line = format!(
-            "{}: {}/{} {} ({percent}%) {} ETA {eta}",
+            "{}: {} {:>3}% {}/{} {}",
+            self.label,
+            format_bar(self.done, self.total),
+            format_percent(self.done, self.total),
+            self.done,
+            self.total,
+            self.unit,
+        );
+        if let Some(eta) = estimate_remaining(elapsed, self.done, self.total) {
+            line.push_str(" ETA ");
+            line.push_str(&format_duration(eta));
+        }
+        if !self.item.is_empty() {
+            let budget = TTY_MAX_CHARS.saturating_sub(line.chars().count() + 2);
+            if budget >= 4 {
+                line.push_str("  ");
+                line.push_str(&elide_start(&self.item, budget));
+            }
+        }
+        line
+    }
+
+    /// The full text of one plain progress line, for non-terminal outputs.
+    fn render_plain(&self) -> String {
+        let elapsed = self.phase_started.elapsed();
+        let mut line = format!(
+            "{}: {}/{} {} ({}%) {}",
             self.label,
             self.done,
             self.total,
             self.unit,
+            format_percent(self.done, self.total),
             format_duration(elapsed),
         );
+        if let Some(eta) = estimate_remaining(elapsed, self.done, self.total) {
+            line.push_str(" ETA ");
+            line.push_str(&format_duration(eta));
+        }
         if !self.item.is_empty() {
             line.push(' ');
             line.push_str(&self.item);
@@ -165,7 +202,7 @@ impl Progress {
 
     /// Redraw the progress line in place; only called when stderr is a TTY.
     fn draw_tty(&mut self) {
-        let line = self.render();
+        let line = self.render_tty();
         let width = line.chars().count();
         let padding = self.line_len.saturating_sub(width);
         let mut stderr = std::io::stderr().lock();
@@ -179,7 +216,7 @@ impl Progress {
 
     /// Write one plain progress line; only called when stderr is not a TTY.
     fn draw_plain(&mut self) {
-        let line = self.render();
+        let line = self.render_plain();
         let mut stderr = std::io::stderr().lock();
         let _ = writeln!(stderr, "{line}");
         let _ = stderr.flush();
@@ -201,6 +238,25 @@ fn format_percent(done: u64, total: u64) -> u64 {
         return 100;
     }
     (u128::from(done) * 100 / u128::from(total)) as u64
+}
+
+/// The bar the terminal reporter draws, e.g. `[##########--------------]`,
+/// `BAR_WIDTH` characters wide including both brackets.
+///
+/// A zero total counts as complete.
+fn format_bar(done: u64, total: u64) -> String {
+    let cells = BAR_WIDTH - 2;
+    let filled = if total == 0 {
+        cells
+    } else {
+        (u128::from(done.min(total)) * cells as u128 / u128::from(total)) as usize
+    };
+    let mut bar = String::with_capacity(BAR_WIDTH);
+    bar.push('[');
+    bar.extend(std::iter::repeat_n('#', filled));
+    bar.extend(std::iter::repeat_n('-', cells - filled));
+    bar.push(']');
+    bar
 }
 
 /// Format a duration as `45s`, `1m05s` or `1h01m01s`.
@@ -227,12 +283,20 @@ fn estimate_remaining(elapsed: Duration, done: u64, total: u64) -> Option<Durati
 
 /// Shorten a long item name to [`ITEM_MAX_CHARS`], keeping its end.
 fn short_item(item: &str) -> String {
+    elide_start(item, ITEM_MAX_CHARS)
+}
+
+/// Shorten `item` to `max_chars` characters (never below the three of the
+/// elision itself), keeping its end so the file name survives; shorter names
+/// are returned unchanged.
+fn elide_start(item: &str, max_chars: usize) -> String {
     let count = item.chars().count();
-    if count <= ITEM_MAX_CHARS {
+    if count <= max_chars {
         return item.to_owned();
     }
+    let keep = max_chars.saturating_sub(3);
     let mut out = String::from("...");
-    out.extend(item.chars().skip(count - (ITEM_MAX_CHARS - 3)));
+    out.extend(item.chars().skip(count - keep));
     out
 }
 
@@ -259,6 +323,84 @@ mod tests {
         assert_eq!(format_percent(3, 3), 100);
         assert_eq!(format_percent(4, 3), 100);
         assert_eq!(format_percent(u64::MAX - 1, u64::MAX), 99);
+    }
+
+    #[test]
+    fn bars_fill_proportionally_and_clamp_at_both_ends() {
+        let empty: String = std::iter::repeat_n('-', BAR_WIDTH - 2).collect();
+        let full: String = std::iter::repeat_n('#', BAR_WIDTH - 2).collect();
+        assert_eq!(format_bar(0, 10), format!("[{empty}]"));
+        assert_eq!(
+            format_bar(1, 2),
+            format!("[{}{}]", "#".repeat(11), "-".repeat(11))
+        );
+        assert_eq!(format_bar(10, 10), format!("[{full}]"));
+        assert_eq!(format_bar(20, 10), format!("[{full}]"));
+        assert_eq!(
+            format_bar(0, 0),
+            format!("[{full}]"),
+            "a zero total is done"
+        );
+    }
+
+    #[test]
+    fn terminal_lines_show_a_bar_and_a_known_eta() {
+        let mut progress = Progress::new();
+        progress.label = "room".to_string();
+        progress.unit = "files";
+        progress.total = 10;
+        progress.done = 3;
+        progress.set_item("room/1000.rdt");
+
+        let line = progress.render_tty();
+        assert_eq!(
+            line,
+            format!(
+                "room: {}  30% 3/10 files ETA 0s  room/1000.rdt",
+                format_bar(3, 10)
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn terminal_lines_stay_on_one_line() {
+        let mut progress = Progress::new();
+        progress.label = "roomcut".to_string();
+        progress.unit = "cuts";
+        progress.total = 100;
+        progress.done = 1;
+        progress.item = "roomcut/".to_string() + &"nested/".repeat(20) + "100_000.bmp";
+
+        let line = progress.render_tty();
+        assert_eq!(line.chars().count(), TTY_MAX_CHARS, "{line}");
+        assert!(line.ends_with("100_000.bmp"), "{line}");
+        assert!(!line.chars().any(char::is_control), "{line}");
+    }
+
+    #[test]
+    fn plain_lines_drop_an_unknown_eta() {
+        let mut progress = Progress::new();
+        progress.label = "room".to_string();
+        progress.unit = "files";
+        progress.total = 10;
+        progress.item = "room/1000.rdt".to_string();
+
+        let line = progress.render_plain();
+        assert!(line.starts_with("room: 0/10 files (0%) "), "{line}");
+        assert!(line.ends_with(" room/1000.rdt"), "{line}");
+        assert!(!line.contains("ETA"), "{line}");
+
+        progress.done = 3;
+        let line = progress.render_plain();
+        assert!(line.contains("(30%)"), "{line}");
+        assert!(line.contains(" ETA "), "{line}");
+
+        progress.done = 10;
+        let line = progress.render_plain();
+        assert!(line.starts_with("room: 10/10 files (100%) "), "{line}");
+        assert!(line.ends_with(" room/1000.rdt"), "{line}");
+        assert!(!line.contains("ETA"), "{line}");
     }
 
     #[test]

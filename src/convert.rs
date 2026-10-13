@@ -201,6 +201,54 @@ fn copy_raw_files(
     Ok((count, bytes))
 }
 
+/// One `--verbose` report line:
+/// `path: plain -> stored bytes (75.0% smaller, zstd)`.
+///
+/// Entries stored as-is are marked `stored raw`: that is every format that
+/// carries its own compression plus the entries whose zstd frame did not pay
+/// for itself.
+fn entry_report_line(path: &str, plain_len: usize, stored_len: usize, compressed: bool) -> String {
+    if compressed {
+        let saved = 100.0 - stored_len as f64 * 100.0 / plain_len.max(1) as f64;
+        format!("{path}: {plain_len} -> {stored_len} bytes ({saved:.1}% smaller, zstd)")
+    } else {
+        format!("{path}: {plain_len} -> {stored_len} bytes (stored raw)")
+    }
+}
+
+/// Write the `--verbose` per-file report: one line per packed entry, in
+/// processing order, with its plain and stored size.
+fn write_entry_report(writer: &PackWriter, out: &mut impl Write) -> std::io::Result<()> {
+    for entry in writer.entries() {
+        writeln!(
+            out,
+            "{}",
+            entry_report_line(
+                entry.path(),
+                entry.plain_len(),
+                entry.stored_len(),
+                entry.compressed(),
+            )
+        )?;
+    }
+    Ok(())
+}
+
+/// Flush the buffered stdout report.
+///
+/// The pack is already written and renamed, so a closed stdout (a `| head`
+/// downstream exiting early) is not an error: the report is simply dropped.
+/// Any other write failure is reported.
+fn flush_report(out: &mut impl Write, report: &[u8]) -> Result<()> {
+    let written = out.write_all(report).and_then(|()| out.flush());
+    if let Err(error) = written
+        && error.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        return Err(error).context("failed to write the conversion report");
+    }
+    Ok(())
+}
+
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 ///
 /// The text tables are extracted from a `Bio.exe` discovered under `root`; use
@@ -212,19 +260,24 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
 /// Convert the game installation under `root` into the `.akpak` pack `out`,
 /// taking the text tables from `exe` instead of the discovered `Bio.exe`.
 pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Result<()> {
-    convert_game_with_options(root, out, exe, 0)
+    convert_game_with_options(root, out, exe, 0, false)
 }
 
-/// Like [`convert_game_with_exe`], but with an explicit worker count.
+/// Like [`convert_game_with_exe`], but with an explicit worker count and
+/// whether the verbose per-file report is printed.
 ///
-/// A `jobs` of `0` selects one worker per available CPU, and the output is
-/// byte-identical whatever the worker count. Every asset category — rooms,
-/// audio, voice and films — lands in the one output pack.
+/// A `jobs` of `0` selects one worker per available CPU, and the output pack
+/// is byte-identical whatever the worker count. Every asset category — rooms,
+/// audio, voice and films — lands in the one output pack. Progress is
+/// reported on stderr; with `verbose` the run also prints the stage and
+/// category totals and one line per packed file with its plain and stored
+/// size on stdout.
 pub fn convert_game_with_options(
     root: &Path,
     out: &Path,
     exe: Option<&Path>,
     jobs: usize,
+    verbose: bool,
 ) -> Result<()> {
     let jobs = worker_count(jobs);
     let mut progress = Progress::new();
@@ -266,16 +319,16 @@ pub fn convert_game_with_options(
         },
     };
     for warning in &warnings {
-        println!("warning: {warning}");
+        eprintln!("warning: {warning}");
     }
     if !voice_dir_found {
-        println!(
+        eprintln!(
             "warning: no voice directory found; {} voice line(s) will be missing",
             voice::referenced_names().len()
         );
     }
     if !movie_dir_found {
-        println!(
+        eprintln!(
             "warning: no movie directory found; {} film(s) will be missing",
             movie::name_count()
         );
@@ -438,57 +491,23 @@ pub fn convert_game_with_options(
         copy_movies(&movie, &mut writer, &mut progress, jobs)?
     };
 
-    for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
-        println!("STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1);
-    }
-    println!("room: {rdt_count} entries, {rdt_bytes} bytes");
-    println!("roomcut: {cut_count} entries, {cut_bytes} bytes");
-    println!("roommask: {mask_count} entries, {mask_bytes} bytes");
-    println!("bgm: {bgm_count} entries, {bgm_bytes} bytes");
-    println!("se: {se_count} entries, {se_bytes} bytes");
-    println!("door: {door_count} entries, {door_bytes} bytes");
-    println!("player: {player_count} entries, {player_bytes} bytes");
-    println!("weapon: {weapon_count} entries, {weapon_bytes} bytes");
-    println!("enemy: {npc_count} entries, {npc_bytes} bytes");
-    println!("monster: {enemy_count} entries, {enemy_bytes} bytes");
-    println!("enemylua: {enemylua_count} entries, {enemylua_bytes} bytes");
-    println!("effspr: {effect_count} entries, {effect_bytes} bytes");
-    println!("font: {font_count} entries, {font_bytes} bytes");
-    println!("ui: {ui_count} entries, {ui_bytes} bytes");
-    println!("item: {item_count} entries, {item_bytes} bytes");
-    println!("data: {data_count} entries, {data_bytes} bytes");
-    println!("demo: {demo_count} entries, {demo_bytes} bytes");
-    println!("core00: {core_count} entries, {core_bytes} bytes");
-    println!("shadow: {shadow_count} entries, {shadow_bytes} bytes");
-    println!("language: {language_count} entries, {language_bytes} bytes");
-    println!("ivm: {ivm_count} entries, {ivm_bytes} bytes");
-    println!("file: {file_count} entries, {file_bytes} bytes");
-    println!("map: {map_count} entries, {map_bytes} bytes");
-    println!("maptbl: {maptbl_count} entry, {maptbl_bytes} bytes");
-    println!("combat: {combat_count} entry, {combat_bytes} bytes");
-    println!(
-        "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
-        base_manifest().id
-    );
-    println!("voice: {voice_count} entries, {voice_bytes} bytes");
-    if !voice_unreferenced.is_empty() {
-        println!(
-            "voice: {} unreferenced file(s) not packed: {}",
-            voice_unreferenced.len(),
-            voice_unreferenced.join(", ")
-        );
-    }
-    println!("movie: {movie_count} entries, {movie_bytes} bytes");
-
     // Zstd-compress every entry except the formats that already carry their
     // own compression, spread over the worker pool. Entries that would not
     // shrink stay raw, so this can only help.
-    let compressed = writer.compress_entries(jobs, is_precompressed)?;
     let entries = writer.len();
-    println!(
-        "compress: {compressed} of {entries} entries stored with zstd (level {})",
-        crate::pack::ZSTD_LEVEL
-    );
+    progress.begin("compress", entries as u64, "entries");
+    let compressed = {
+        // The pass runs on its own worker pool, so the reporter is shared;
+        // only the bar sees the completion order, which does not matter.
+        let progress = Mutex::new(&mut progress);
+        writer.compress_entries_reporting(jobs, is_precompressed, |entry| {
+            progress
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .advance(entry);
+        })?
+    };
+    progress.end_phase();
 
     // Stream the pack straight to disk: the entry data is already in memory,
     // so materializing a second serialized copy would only cost memory and a
@@ -522,11 +541,92 @@ pub fn convert_game_with_options(
     })?;
     progress.end_phase();
 
-    println!(
+    // The report is buffered and written once the pack has landed, so a
+    // stdout failure (a `... | head` closing the pipe, for example) can never
+    // abort the conversion with the pack unwritten. The verbose per-file
+    // lines name the stored size next to the plain one and stay in processing
+    // order, which is deterministic whatever the worker count.
+    let mut report = Vec::new();
+    if verbose {
+        for (index, (rdts, cuts)) in stage_counts.iter().enumerate() {
+            writeln!(report, "STAGE{}: {rdts} RDT(s), {cuts} cut(s)", index + 1)?;
+        }
+        writeln!(report, "room: {rdt_count} entries, {rdt_bytes} bytes")?;
+        writeln!(report, "roomcut: {cut_count} entries, {cut_bytes} bytes")?;
+        writeln!(report, "roommask: {mask_count} entries, {mask_bytes} bytes")?;
+        writeln!(report, "bgm: {bgm_count} entries, {bgm_bytes} bytes")?;
+        writeln!(report, "se: {se_count} entries, {se_bytes} bytes")?;
+        writeln!(report, "door: {door_count} entries, {door_bytes} bytes")?;
+        writeln!(
+            report,
+            "player: {player_count} entries, {player_bytes} bytes"
+        )?;
+        writeln!(
+            report,
+            "weapon: {weapon_count} entries, {weapon_bytes} bytes"
+        )?;
+        writeln!(report, "enemy: {npc_count} entries, {npc_bytes} bytes")?;
+        writeln!(
+            report,
+            "monster: {enemy_count} entries, {enemy_bytes} bytes"
+        )?;
+        writeln!(
+            report,
+            "enemylua: {enemylua_count} entries, {enemylua_bytes} bytes"
+        )?;
+        writeln!(
+            report,
+            "effspr: {effect_count} entries, {effect_bytes} bytes"
+        )?;
+        writeln!(report, "font: {font_count} entries, {font_bytes} bytes")?;
+        writeln!(report, "ui: {ui_count} entries, {ui_bytes} bytes")?;
+        writeln!(report, "item: {item_count} entries, {item_bytes} bytes")?;
+        writeln!(report, "data: {data_count} entries, {data_bytes} bytes")?;
+        writeln!(report, "demo: {demo_count} entries, {demo_bytes} bytes")?;
+        writeln!(report, "core00: {core_count} entries, {core_bytes} bytes")?;
+        writeln!(
+            report,
+            "shadow: {shadow_count} entries, {shadow_bytes} bytes"
+        )?;
+        writeln!(
+            report,
+            "language: {language_count} entries, {language_bytes} bytes"
+        )?;
+        writeln!(report, "ivm: {ivm_count} entries, {ivm_bytes} bytes")?;
+        writeln!(report, "file: {file_count} entries, {file_bytes} bytes")?;
+        writeln!(report, "map: {map_count} entries, {map_bytes} bytes")?;
+        writeln!(report, "maptbl: {maptbl_count} entry, {maptbl_bytes} bytes")?;
+        writeln!(report, "combat: {combat_count} entry, {combat_bytes} bytes")?;
+        writeln!(
+            report,
+            "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
+            base_manifest().id
+        )?;
+        writeln!(report, "voice: {voice_count} entries, {voice_bytes} bytes")?;
+        if !voice_unreferenced.is_empty() {
+            writeln!(
+                report,
+                "voice: {} unreferenced file(s) not packed: {}",
+                voice_unreferenced.len(),
+                voice_unreferenced.join(", ")
+            )?;
+        }
+        writeln!(report, "movie: {movie_count} entries, {movie_bytes} bytes")?;
+        writeln!(
+            report,
+            "compress: {compressed} of {entries} entries stored with zstd (level {})",
+            crate::pack::ZSTD_LEVEL
+        )?;
+        write_entry_report(&writer, &mut report)?;
+    }
+    writeln!(
+        report,
         "wrote {} ({entries} entries, {size} bytes) in {}",
         out.display(),
         format_duration(progress.elapsed())
-    );
+    )?;
+    let mut stdout = std::io::stdout().lock();
+    flush_report(&mut stdout, &report)?;
     Ok(())
 }
 
@@ -840,6 +940,7 @@ fn copy_enemy_scripts(writer: &mut PackWriter, progress: &mut Progress) -> Resul
         writer
             .add(entry, source.as_bytes().to_vec())
             .with_context(|| format!("failed to add {entry}"))?;
+        progress.advance(entry);
     }
     progress.end_phase();
     Ok((count, bytes))
@@ -1781,7 +1882,7 @@ fn copy_item_models(
     jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m2 else {
-        println!("warning: no ITEM_M2 directory found; item models will be missing");
+        eprintln!("warning: no ITEM_M2 directory found; item models will be missing");
         return Ok((0, 0));
     };
 
@@ -1797,7 +1898,7 @@ fn copy_item_models(
         files.push((format!("item/{}", name.to_ascii_lowercase()), entry.path()));
     }
     if files.len() != IVM_COUNT {
-        println!(
+        eprintln!(
             "warning: found {} item model(s) in {}, expected {IVM_COUNT}",
             files.len(),
             dir.display()
@@ -1817,7 +1918,7 @@ fn copy_file_art(
     jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m2 else {
-        println!("warning: no ITEM_M2 directory found; file art will be missing");
+        eprintln!("warning: no ITEM_M2 directory found; file art will be missing");
         return Ok((0, 0));
     };
 
@@ -1838,7 +1939,7 @@ fn copy_file_art(
         }
     }
     if !missing.is_empty() {
-        println!(
+        eprintln!(
             "warning: missing {} document art file(s) in {}: {}",
             missing.len(),
             dir.display(),
@@ -1852,7 +1953,7 @@ fn copy_file_art(
         .collect();
     pages.sort();
     if pages.len() != TEXTM_COUNT {
-        println!(
+        eprintln!(
             "warning: found {} TEXTM page(s) in {}, expected {TEXTM_COUNT}",
             pages.len(),
             dir.display()
@@ -1875,7 +1976,7 @@ fn copy_map_art(
     jobs: usize,
 ) -> Result<(usize, usize)> {
     let Some(dir) = item_m2 else {
-        println!("warning: no ITEM_M2 directory found; the map art will be missing");
+        eprintln!("warning: no ITEM_M2 directory found; the map art will be missing");
         return Ok((0, 0));
     };
 
@@ -1894,7 +1995,7 @@ fn copy_map_art(
         None => missing.push("map_blue.tim".to_string()),
     }
     if !missing.is_empty() {
-        println!(
+        eprintln!(
             "warning: missing {} map art file(s) in {}: {}; the map tab degrades to blank",
             missing.len(),
             dir.display(),
@@ -1920,7 +2021,7 @@ fn copy_map_tables(
     let data = match fs::read(path) {
         Ok(data) => data,
         Err(error) => {
-            println!(
+            eprintln!(
                 "warning: failed to read executable {}: {error}; the map tables will be missing",
                 path.display()
             );
@@ -1930,7 +2031,7 @@ fn copy_map_tables(
     let tables = match extract_map_tables(&data) {
         Ok(tables) => tables,
         Err(error) => {
-            println!(
+            eprintln!(
                 "warning: failed to extract the map tables from {}: {error:#}; the map tab uses its defaults",
                 path.display()
             );
@@ -1964,7 +2065,7 @@ fn copy_combat_tables(
     let data = match fs::read(path) {
         Ok(data) => data,
         Err(error) => {
-            println!(
+            eprintln!(
                 "warning: failed to read executable {}: {error}; the combat tables will use the built-in data",
                 path.display()
             );
@@ -1974,7 +2075,7 @@ fn copy_combat_tables(
     let tables = match extract_combat_tables(&data) {
         Ok(tables) => tables,
         Err(error) => {
-            println!(
+            eprintln!(
                 "warning: failed to decode the combat tables from {}: {error:#}; the built-in tables are used",
                 path.display()
             );
@@ -3709,7 +3810,7 @@ mod tests {
         fs::write(movie.join("capcom.AVI"), b"movie-capcom").unwrap();
 
         let out = root.path.join("out.akpak");
-        convert_game_with_options(&root.path, &out, None, 1).unwrap();
+        convert_game_with_options(&root.path, &out, None, 1, false).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("movie/oj.avi").unwrap().as_ref(), b"movie-oj");
         assert_eq!(
@@ -3748,7 +3849,7 @@ mod tests {
         fs::write(voice.join("ANNOUNCE.WAV"), b"unused").unwrap();
 
         let out = root.path.join("out.akpak");
-        convert_game_with_options(&root.path, &out, None, 1).unwrap();
+        convert_game_with_options(&root.path, &out, None, 1, false).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("voice/v001_00.wav").unwrap().as_ref(), b"voice-a");
         assert_eq!(
@@ -3792,9 +3893,79 @@ mod tests {
 
         let serial = root.path.join("serial.akpak");
         let parallel = root.path.join("parallel.akpak");
-        convert_game_with_options(&root.path, &serial, None, 1).unwrap();
-        convert_game_with_options(&root.path, &parallel, None, 4).unwrap();
+        convert_game_with_options(&root.path, &serial, None, 1, false).unwrap();
+        convert_game_with_options(&root.path, &parallel, None, 4, false).unwrap();
         assert_eq!(fs::read(&serial).unwrap(), fs::read(&parallel).unwrap());
+    }
+
+    #[test]
+    fn entry_report_lines_name_both_sizes() {
+        assert_eq!(
+            entry_report_line("room/1000.rdt", 1000, 250, true),
+            "room/1000.rdt: 1000 -> 250 bytes (75.0% smaller, zstd)"
+        );
+        assert_eq!(
+            entry_report_line("movie/oj.avi", 1000, 1000, false),
+            "movie/oj.avi: 1000 -> 1000 bytes (stored raw)"
+        );
+    }
+
+    /// A writer that fails every write with a fixed [`std::io::ErrorKind`].
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_pipe_drops_the_report_but_other_stdout_errors_fail() {
+        let mut broken_pipe = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        assert!(flush_report(&mut broken_pipe, b"report").is_ok());
+
+        let mut failed = FailingWriter(std::io::ErrorKind::StorageFull);
+        let error = flush_report(&mut failed, b"report").unwrap_err();
+        assert!(error.to_string().contains("conversion report"), "{error}");
+    }
+
+    #[test]
+    fn the_verbose_report_lists_every_entry_in_processing_order() {
+        let entries = [
+            ("room/1000.rdt", vec![3u8; 9_000]),
+            ("movie/oj.avi", vec![1u8, 2, 3, 4]),
+            ("manifest.toml", b"format = 1\n".to_vec()),
+        ];
+        let mut one = PackWriter::new();
+        let mut many = PackWriter::new();
+        for (path, data) in &entries {
+            one.add(path, data.clone()).unwrap();
+            many.add(path, data.clone()).unwrap();
+        }
+        let raw = |path: &str| path.ends_with(".avi");
+        assert_eq!(one.compress_entries(1, raw).unwrap(), 1);
+        assert_eq!(many.compress_entries(4, raw).unwrap(), 1);
+
+        let mut serial = Vec::new();
+        write_entry_report(&one, &mut serial).unwrap();
+        let mut parallel = Vec::new();
+        write_entry_report(&many, &mut parallel).unwrap();
+        assert_eq!(
+            serial, parallel,
+            "the report must not depend on the worker count or scheduling"
+        );
+
+        let text = String::from_utf8(serial).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), entries.len());
+        assert!(lines[0].starts_with("room/1000.rdt: 9000 -> "), "{text}");
+        assert!(lines[0].ends_with("% smaller, zstd)"), "{text}");
+        assert_eq!(lines[1], "movie/oj.avi: 4 -> 4 bytes (stored raw)");
+        assert_eq!(lines[2], "manifest.toml: 11 -> 11 bytes (stored raw)");
     }
 
     #[test]

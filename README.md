@@ -28,6 +28,9 @@ Lua 5.4 is vendored and compiled from source by the default-on `lua` feature.
 # Convert an RE1 installation into a game pack (parallel across CPUs)
 cargo run -- convert-game /path/to/re1 --out re1.akpak
 
+# The same, with one line per packed file: its plain and stored size
+cargo run -- convert-game /path/to/re1 --out re1.akpak --verbose
+
 # Limit the conversion to N workers (default: one per available CPU)
 cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 
@@ -126,14 +129,18 @@ error/budget policy). A run without any layer stays byte-identical to a
 pre-M15 run, Lua or not.
 
 `convert-game` and `extract` report progress on stderr per phase (RDTs,
-camera cuts, BGM, player files, bytes written): one in-place line with
-`done/total`, percentage, elapsed time and ETA when stderr is a terminal, or
-periodic plain lines without control characters when it is redirected.
-Conversions end with per-category totals, the output size and the total
-elapsed time. Every entry of a converted pack is zstd-compressed at a fixed
-level except formats that already carry their own compression (`avi`, `ogg`,
-`png`, `webp`), which are stored raw; an entry that would not shrink also
-stays raw.
+camera cuts, BGM, player files, bytes written): an interactive bar with
+`done/total`, percentage and ETA when stderr is a terminal, or periodic plain
+lines without control characters when it is redirected. `convert-game`
+warnings also go to stderr, and a conversion ends with a single
+`wrote <pack> (<n> entries, <bytes> bytes) in <time>` line. With `--verbose`
+the conversion additionally prints the stage and category totals, the
+compression summary and one line per packed file with its plain
+(pre-compression) and stored size on stdout, in processing order; the report
+is identical whatever the worker count. Every entry of a converted pack is
+zstd-compressed at a fixed level except formats that already carry their own
+compression (`avi`, `ogg`, `png`, `webp`), which are stored raw; an entry that
+would not shrink also stays raw.
 `extract` rejects packs whose entry paths are absolute, contain
 `..` or backslashes, or are empty, so it never writes outside `--out`.
 

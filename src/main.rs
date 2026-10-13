@@ -154,6 +154,10 @@ enum Command {
         /// Number of worker threads (default: one per available CPU)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
         jobs: Option<u16>,
+
+        /// Print one line per packed file with its plain and stored size
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Extract every entry of a game pack into a directory
@@ -498,11 +502,13 @@ fn main() -> Result<()> {
             out,
             exe,
             jobs,
+            verbose,
         }) => arklay::convert::convert_game_with_options(
             &root,
             &out,
             exe.as_deref(),
             jobs.map_or(0, usize::from),
+            verbose,
         ),
         Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
@@ -929,6 +935,36 @@ entries:
 
         let cli = Cli::try_parse_from(["arklay", "game.akpak", "--room", "100"]).unwrap();
         assert!(!cli.debug_menu);
+    }
+
+    #[test]
+    fn the_cli_accepts_verbose_conversions() {
+        let cli = Cli::try_parse_from([
+            "arklay",
+            "convert-game",
+            "re1-install",
+            "--out",
+            "re1.akpak",
+            "--verbose",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::ConvertGame { verbose: true, .. })
+        ));
+
+        let cli = Cli::try_parse_from([
+            "arklay",
+            "convert-game",
+            "re1-install",
+            "--out",
+            "re1.akpak",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::ConvertGame { verbose: false, .. })
+        ));
     }
 
     #[test]

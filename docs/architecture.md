@@ -24,8 +24,8 @@ responsibility.
 | `budget` | Container | Fixed per-format decode caps and checked allocation shared by every parser |
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
-| `convert` | Tooling | `convert-game`: discover an install and migrate every asset category — rooms, audio, voice and films — into one pack |
-| `progress` | Tooling | Terminal-aware progress lines and phase totals for the long-running commands |
+| `convert` | Tooling | `convert-game`: discover an install and migrate every asset category — rooms, audio, voice and films — into one pack; progress on stderr, per-file sizes with `--verbose` |
+| `progress` | Tooling | Terminal-aware progress bars (and periodic plain lines when redirected) for the long-running commands |
 | `atomic` | Tooling | Sibling-temp-then-rename single-file output used by every artifact writer |
 | `verify` | Tooling | `arklay verify`: path-classified parse of every pack entry with a per-format report |
 | `stats` | Tooling | Fixed-bucket frame-time histogram and the `--stats` report |
