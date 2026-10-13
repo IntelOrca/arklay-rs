@@ -1154,6 +1154,16 @@ pub struct ClimbCandidate {
     pub attack_direction: i8,
 }
 
+/// The side `attackDirection` the player's facing picks for a climb
+/// (`check_climb_object`'s shared tail): `-1` or `1` from the half-turn bit.
+pub fn climb_side(player_angle: u16) -> i8 {
+    if (player_angle.wrapping_add(0x200) & 0x800) == 0 {
+        -1
+    } else {
+        1
+    }
+}
+
 /// `check_climb_object` (0x00474930) when msf bit 7 is clear: walk the built
 /// records from the last down to the first, keeping the first with flag `0x40`
 /// that the reach box accepts and whose yaw is within 299/4096 of the player's
@@ -1180,11 +1190,7 @@ pub fn check_climb_object(
         }
         return Some(ClimbCandidate {
             slot,
-            attack_direction: if (player_angle.wrapping_add(0x200) & 0x800) == 0 {
-                -1
-            } else {
-                1
-            },
+            attack_direction: climb_side(player_angle),
         });
     }
     None

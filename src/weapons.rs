@@ -367,7 +367,9 @@ pub fn is_weapon(item: u8) -> bool {
 
 /// The equipped weapon id, or `None` when nothing/a non-weapon is equipped.
 fn equipped_weapon(game: &GameState) -> Option<u8> {
-    game.equipped.filter(|&item| is_weapon(item))
+    (game.equipped_weapon_id != 0)
+        .then_some(game.equipped_weapon_id)
+        .filter(|&id| is_weapon(id))
 }
 
 /// The inventory index of the equipped weapon's stack.
@@ -539,18 +541,41 @@ pub fn update(
     input: Input,
 ) {
     player.input = input;
-    if player.weapon.behavior == 0 && !try_enter(game, player, clips) {
-        crate::player::update_with_room(player, room, clips.emd, clips.emw, clips.room, input);
-        return;
-    }
     if player.weapon.behavior == 0 {
+        if !try_enter(game, player, clips) {
+            crate::player::update_with_room(player, room, clips.emd, clips.emw, clips.room, input);
+            return;
+        }
+        // The reference's input path raises behavior 0x12 with action_state 0
+        // and its frame-2 dispatch has no entry for it: the entry tick runs no
+        // handler, only the next tick's frame-3 dispatch reaches the aim.
+        player.idle_trace = None;
+        player.last_behavior_id = 0;
+        player.trace_state = Some((
+            player.weapon.behavior,
+            player.weapon.state,
+            Some(player.weapon.cooldown),
+        ));
         return;
     }
     // The weapon machine owns the tick: the pad-driven idle did not run, so
     // its reference scratch must not be mirrored after this tick.
     player.idle_trace = None;
-    player.trace_state = None;
+    player.last_behavior_id = 0;
     tick(game, player, room, clips, input);
+    // Mirror the machine's live bytes for the oracle trace: the reference
+    // reads `action_behavior`/`action_state`/`attackDirection` straight off
+    // the entity, and the release tick clears the behaviour without running
+    // the idle entry.
+    player.trace_state = if player.weapon.active() {
+        Some((
+            player.weapon.behavior,
+            player.weapon.state,
+            Some(player.weapon.cooldown),
+        ))
+    } else {
+        Some((0, 0, None))
+    };
 }
 
 /// Start the weapon machine when the aim input is held with a weapon ready.
@@ -569,6 +594,10 @@ fn try_enter(game: &mut GameState, player: &mut PlayerState, clips: &WeaponClips
         behavior: 0x12,
         knife: weapon == ITEM_KNIFE,
         weapon_file: weapon_emw_id(character, weapon),
+        // The reference reuses `attackDirection` for the aim/fire timers; the
+        // live byte is the entity mirror, so the machine starts from whatever
+        // the previous behaviour left there.
+        cooldown: game.entities[0].action_ticks_counter,
         ..WeaponState::default()
     };
     player.clip_source = ClipSource::Weapon;
@@ -613,12 +642,14 @@ fn tick(
         // A stale behavior after an item swap: release control.
         _ => holster_done(player),
     }
-    // The shared frame-3 tail: refresh the weapon hand's world matrix for the
-    // effects pass, then the flamethrower's per-frame pitch update.
+    // The shared frame-3 tail: the weapon-joint translation adjustment (which
+    // reads the previous frame's joint-5 world), then the refreshed hand
+    // matrix for the effects pass and the flamethrower's per-frame pitch.
     if player.weapon.active() {
+        adjust_weapon_joint_translation(game, player, clips);
         refresh_weapon_joint(game, player, clips);
         if !knife && equipped_weapon(game) == Some(ITEM_FLAMETHROWER) {
-            auto_aim_pitch(game, player);
+            auto_aim_pitch(game, player, clips);
         }
     }
 }
@@ -628,6 +659,46 @@ fn tick(
 enum Bank {
     Weapon,
     Body,
+}
+
+/// `EntityUpdateWeaponJoint(0)`: compose the weapon-hand chain and adjust the
+/// entity's translation so the hand keeps its composed position.
+///
+/// The reference rebuilds the entity matrix from the facing, composes joints
+/// 0, 2, 3, 4 and 5 with the *current* pose, then moves the entity by the
+/// difference between that chain's translation and the *previous* frame's
+/// joint-5 world translation (which the render pass composed through the
+/// skeleton hierarchy). The hand stays put while the body animates, which is
+/// what creeps the player forward while aiming.
+fn adjust_weapon_joint_translation(
+    game: &mut GameState,
+    player: &mut PlayerState,
+    clips: &WeaponClips<'_>,
+) {
+    let (bank, keyframes, skeleton) = match player.clip_source {
+        ClipSource::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
+        _ => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
+    };
+    let Some(keyframe) = player.anim.pose_keyframe(bank, keyframes) else {
+        return;
+    };
+    let locals = crate::anim::joint_local_transforms(skeleton, &keyframe);
+    let mut scratch = crate::anim::entity_matrix(player.pos, player.angle);
+    for index in [0usize, 2, 3, 4, 5] {
+        let Some(local) = locals.get(index) else {
+            return;
+        };
+        scratch = crate::anim::compose(&scratch, local);
+    }
+    let previous = game.joint_worlds[0]
+        .get(5)
+        .map_or([0, 0, 0], |world| world.t);
+    let dx = scratch.t[0] - previous[0];
+    let dz = scratch.t[2] - previous[2];
+    player.pos[0] -= dx;
+    player.pos[2] -= dz;
+    game.entities[0].pos[0] = player.pos[0];
+    game.entities[0].pos[2] = player.pos[2];
 }
 
 /// Compose the player's pose into `joint_worlds[0]` so `Attach::Joint(0, 14)`
@@ -647,17 +718,32 @@ fn refresh_weapon_joint(game: &mut GameState, player: &PlayerState, clips: &Weap
     }
 }
 
-/// The world Y of the composed pose's joint 11, the auto-aim pitch origin
-/// (the original composes joints 0/9/10/11).
-fn aim_pitch_y(game: &GameState, player: &PlayerState) -> i32 {
-    game.joint_worlds[0]
-        .get(11)
-        .map_or(player.pos[1], |world| world.t[1])
+/// The world Y of the freshly composed joints 0/9/10/11 chain, the auto-aim
+/// pitch origin (`auto_aim_pitch_update` rebuilds the entity matrix from the
+/// position words and composes those four live joint transforms, it never
+/// reads a stored world).
+fn aim_pitch_y(player: &PlayerState, clips: &WeaponClips<'_>) -> i32 {
+    let (bank, keyframes, skeleton) = match player.clip_source {
+        ClipSource::Weapon => (clips.weapon, clips.weapon_keyframes, clips.weapon_skeleton),
+        _ => (clips.emd, clips.emd_keyframes, clips.emd_skeleton),
+    };
+    let Some(keyframe) = player.anim.pose_keyframe(bank, keyframes) else {
+        return player.pos[1];
+    };
+    let locals = crate::anim::joint_local_transforms(skeleton, &keyframe);
+    let mut scratch = crate::anim::entity_matrix(player.pos, player.angle);
+    for index in [0usize, 9, 10, 11] {
+        let Some(local) = locals.get(index) else {
+            return player.pos[1];
+        };
+        scratch = crate::anim::compose(&scratch, local);
+    }
+    scratch.t[1]
 }
 
 /// `auto_aim_pitch_update`: write the aim direction (0x20 up, 0x40 neutral,
 /// 0x80 down) from the hand height against the per-character height table.
-fn auto_aim_pitch(game: &mut GameState, player: &PlayerState) {
+fn auto_aim_pitch(game: &mut GameState, player: &PlayerState, clips: &WeaponClips<'_>) {
     let Some(weapon) = equipped_weapon(game) else {
         return;
     };
@@ -669,7 +755,7 @@ fn auto_aim_pitch(game: &mut GameState, player: &PlayerState) {
     let character = usize::from(game.id.player_flag & 1);
     let t = character * 6;
     let entity_y = player.pos[1] as i16;
-    let aim_y = aim_pitch_y(game, player);
+    let aim_y = aim_pitch_y(player, clips);
     let mut low = i32::from(AIM_HEIGHT_TABLE[t]) + i32::from(entity_y);
     let mut high = i32::from(AIM_HEIGHT_TABLE[t + 1]) + i32::from(entity_y);
     if weapon < 6 && weapon != 3 {
@@ -1046,7 +1132,7 @@ fn gun_hold_input(
             }
         }
     }
-    if input.fire && player_find_aim_target(game, player, room) {
+    if input.run_pressed && player_find_aim_target(game, player, room) {
         player.weapon.behavior = 0x1A;
         player.weapon.state = 0;
         return;
@@ -1185,10 +1271,9 @@ fn autoaim_fire(
     player.weapon.state = player.weapon.state.wrapping_add(u8::from(done));
     let frame = player.anim.frame as u8;
     if frame == 2 {
-        // The pitch reads the hand chain's height; compose the pose the tick
-        // just applied before sampling it.
-        refresh_weapon_joint(game, player, clips);
-        auto_aim_pitch(game, player);
+        // The pitch composes the live pose itself; the stored world stays the
+        // previous frame's hand for the shared frame-3 adjustment.
+        auto_aim_pitch(game, player, clips);
     }
 
     if FIRE_BILLBOARD[index].frame == frame {
@@ -1357,7 +1442,7 @@ fn autoaim_holdfire(
     } else {
         let index = usize::from(weapon) - 99;
         if u32::from(frame) % FIRE_INTERVALS[0] == 0 {
-            auto_aim_pitch(game, player);
+            auto_aim_pitch(game, player, clips);
             let row = FIRE_BILLBOARD[index];
             spawn_hand_fx(game, row.effect_type, row.depth, row.offset(), 0);
             let weapon_id = FIRE_DATA[index].weapon_id;
@@ -1741,7 +1826,8 @@ fn knife_aim(
         reset_frame(player);
         player.move_speed_current = 1;
         player.weapon.state = 1;
-        player.weapon.cooldown = 0;
+        // `attackDirection` is NOT reset here: the reference's state 0 leaves
+        // the shared byte alone.
         player.weapon.action_tick = 0;
         set_motion(player, 5);
         set_blend(player, 0x400);

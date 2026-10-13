@@ -1436,10 +1436,10 @@ fn plant_eat_physics(game: &mut GameState, player: &mut PlayerState) {
 /// recomposes the player matrix from the shark's capture transform every
 /// frame.
 ///
-/// The Neptune is not scripted in this port and has no capture matrix, so
-/// case 2's recomposition (the original composes the shark's local matrix and
-/// its joint 0 through the shared `neptune_capture_matrix` the devour script
-/// fills in) is the documented deferral; the grabbed zone flag is kept.
+/// The enemy script now fills `neptune_capture`, but case 2's recomposition
+/// (the original composes the first enemy's local matrix and its joint 0 with
+/// the capture transform) still needs the shark's posed joint, so it remains
+/// the documented deferral; the grabbed zone flag is kept.
 fn neptune_devour(game: &mut GameState, player: &mut PlayerState, clips: &[Clip]) {
     match game.entities[0].action_state {
         0 => {

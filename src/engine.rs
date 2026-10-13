@@ -434,6 +434,7 @@ pub fn run_with_options(
                         fade_counter: inactive.counter() as i16,
                         fade_state: inactive.state(),
                         cam: loaded.room.current_cut as u8,
+                        player_flags: game.player_flags,
                         entities: &game.entities,
                         frame_hash: trace::frame_hash(&framebuffer),
                     })?;
@@ -1110,13 +1111,7 @@ impl GameSession {
         let id = reel.room;
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
-        if std::env::var_os("ARKLAY_DDBG").is_some() {
-            eprintln!("ddbg new_game_state rng={}", game.rand_state);
-        }
         seed_new_game(pack, &mut game, reel.character);
-        if std::env::var_os("ARKLAY_DDBG").is_some() {
-            eprintln!("ddbg seed_new_game rng={}", game.rand_state);
-        }
         // The attract branch sets the mode bit before the room loads, so every
         // script and entity driver sees it, and seeds the PRNG as game_loop
         // does for attract playback.
@@ -1143,13 +1138,7 @@ impl GameSession {
         player_state.pos = reel.pos;
         player_state.angle = reel.angle;
         game.sync_entity_from_player(&player_state);
-        if std::env::var_os("ARKLAY_DDBG").is_some() {
-            eprintln!("ddbg pre_from_loaded rng={}", game.rand_state);
-        }
         let mut session = Self::from_loaded(pack, loaded, game, player_state, save_dir)?;
-        if std::env::var_os("ARKLAY_DDBG").is_some() {
-            eprintln!("ddbg post_from_loaded rng={}", session.game.rand_state);
-        }
         session.attract = Some(demo::AttractState::new(reel));
         Ok(session)
     }
@@ -1553,21 +1542,33 @@ impl GameSession {
             },
             input,
         );
-        // While the pad-driven idle behavior owns the player, mirror its
+        // The vault's warp tick clears the entity's `isBeingAttackedFlag` the
+        // original's door sequence zeroes in its warp case.
+        if std::mem::take(&mut self.player.clear_attacked_flag) {
+            self.game.entities[0].is_being_attacked = 0;
+        }
+        // While the pad-driven locomotion owns the player, mirror its
         // reference scratch into entity 0: `player_behavior_00_idle` keeps
         // `action_state` as the idle phase and `attackDirection` as the
-        // 100-tick settle countdown, and scripts plus the oracle trace read
-        // those bytes. The room-entry gate (the original's `g_message_flags`
-        // freeze) keeps the player machine from running until the fade has
-        // stepped, exactly like the reference's post-load window.
+        // 100-tick settle countdown, and the locomotion behaviours keep their
+        // own action_behavior/action_state, and scripts plus the oracle trace
+        // read those bytes. The room-entry gate (the original's
+        // `g_message_flags` freeze) keeps the player machine from running
+        // until the fade has stepped, exactly like the reference's post-load
+        // window. `trace_state` is `Some` exactly when the machine ran this
+        // tick - the frozen and scripted paths clear it - so it, not the live
+        // message flags, is the gate: a message requested after the machine
+        // ran still reports this tick's bytes, which is what the reference's
+        // live globals hold.
         if !self.room_boot_gate
-            && self.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE != 0
             && self.game.entities[0].state() == 1
             && let Some((behavior, action_state, ticks)) = self.player.trace_state
         {
             self.game.entities[0].action_behavior = behavior;
             self.game.entities[0].action_state = action_state;
-            self.game.entities[0].action_ticks_counter = ticks;
+            if let Some(ticks) = ticks {
+                self.game.entities[0].action_ticks_counter = ticks;
+            }
         }
         // The Lua hooks run after the room tick: `on_tick` sees the whole
         // tick's state and `on_message` may rewrite a message the tick raised
@@ -1718,6 +1719,10 @@ impl GameSession {
             if !attract.ended && attract.should_end(live_input) {
                 attract.ended = true;
                 self.game.apply_flag(5, game::MSF_PLAYER_DEAD, 0);
+                // The original's `StartAttractDemo` tail clears the player,
+                // entity and monster gates (`g_message_flags &= 0xFE70`), so
+                // the ending fade plays over a frozen world.
+                self.game.message_flags &= 0xFE70;
             }
         }
         Ok(())
@@ -2948,7 +2953,10 @@ impl GameSession {
     /// only clears the pending flag: the frame it was armed on has not been
     /// drawn, and the fade is draw-then-add, so its first drawn frame is the
     /// full `0x7FFF` alpha. Once the accumulator goes negative the fade is
-    /// cleared until the next room entry.
+    /// over but keeps its last counter and state: the original's gameplay
+    /// branch only adds while the accumulator is non-negative and never
+    /// zeroes the pair outside the `MSF_FADE_ACTIVE` machine (the death and
+    /// character-select fades), so the trace keeps reporting them.
     fn tick_room_fade(&mut self) {
         if self.room_fade.overlay().is_none() {
             return;
@@ -2958,9 +2966,6 @@ impl GameSession {
             return;
         }
         self.room_fade.tick();
-        if self.room_fade.overlay().is_none() {
-            self.room_fade = transition::Fade::inactive();
-        }
     }
 
     /// Blend the room-entry fade over the frame just rendered.
@@ -3133,6 +3138,7 @@ impl GameSession {
             fade_counter: fade_counter as i16,
             fade_state,
             cam: self.loaded.room.current_cut as u8,
+            player_flags: self.game.player_flags,
             entities: &self.game.entities,
             frame_hash: trace::frame_hash(frame),
         }
@@ -3864,10 +3870,13 @@ struct App {
     /// The next attract reel (`g_CurrentAttractModeId`): the title's idle
     /// timeout plays `demos[next_demo]`, then advances the cycle.
     next_demo: usize,
+    /// The death-finished tick queued its title hand-off: the next update
+    /// opens the title instead of running another gameplay tick, so the tick
+    /// that finished the death is still traced with the session's final state.
+    pending_return_title: bool,
     /// Whether the prologue film (id 1) is playing for a pending new game:
     /// the follow-up `NewGame` action then builds the session instead of
-    /// queueing the film again. A later confirm queues the prologue anew,
-    /// exactly like the original.
+    /// queueing the film again. A later confirm queues the prologue anew,    /// exactly like the original.
     prologue_pending: bool,
     /// One-shot cache for the UI cue sounds (`se/cursor.wav`, ...).
     ui_sfx_cache: SfxCache,
@@ -3920,6 +3929,7 @@ impl App {
             opening_played: false,
             demos,
             next_demo: 0,
+            pending_return_title: false,
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
             debug_menu: true,
@@ -4379,6 +4389,11 @@ impl App {
     /// the active screen/room.
     fn update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         self.ticks = self.ticks.saturating_add(1);
+        // The death-finished tick has been traced; the title hand-off it
+        // queued owns this update instead of a gameplay tick.
+        if std::mem::take(&mut self.pending_return_title) {
+            return self.apply(ScreenAction::Title);
+        }
         // A queued film takes over on the next tick; the tick that starts it
         // shows frame 0 without advancing it.
         if let Some(pending) = self.pending_movie.take() {
@@ -4431,6 +4446,7 @@ impl App {
     fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         let mut cues: Vec<ui::UiCue> = Vec::new();
         let mut return_title = false;
+        let mut death_finished = false;
         {
             let App {
                 pack,
@@ -4471,11 +4487,20 @@ impl App {
                     session.tick(pack, ui, input, action)?;
                 }
                 return_title = session.take_return_title_request();
+                death_finished = session.death.finished;
             }
         }
         self.play_ui_cues(cues);
         if return_title {
-            return self.apply(ScreenAction::Title);
+            if death_finished {
+                // The tick the death finished is still a traced gameplay tick
+                // (the reference's `game_loop` returns after its last inner
+                // iteration and that frame is emitted); the title hand-off
+                // happens on the next update.
+                self.pending_return_title = true;
+            } else {
+                return self.apply(ScreenAction::Title);
+            }
         }
         Ok(AppFlow::Continue)
     }
@@ -4867,6 +4892,7 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         if iterations > bound {
             break;
         }
+        let was_play = matches!(app.mode, Mode::Play(_));
         let in_transition =
             matches!(&app.mode, Mode::Play(session) if session.transition.is_some());
         // The reference emits no trace lines while the DIED screen runs: its
@@ -4878,7 +4904,11 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
             break;
         }
         app.draw();
+        // A session created by this update (the title's attract hand-off) has
+        // not run a gameplay tick yet; its first trace line is that tick, not
+        // the creation frame.
         if let Mode::Play(session) = &app.mode
+            && was_play
             && !in_transition
             && !screen_before
         {
@@ -5485,6 +5515,7 @@ fn finish_transition(
     game.enter_room(session.target, &loaded.room);
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
+    player_state.collision_mirror = [session.door.next_pos[0], session.door.next_pos[2]];
     player_state.angle = session.door.next_angle as u16 & 0x0FFF;
     // `enter_room` clears the source room's stair state and `spawn` starts the
     // fresh player with a clean climb, so the destination cannot inherit a
@@ -7585,6 +7616,14 @@ fn tick_room_timed(
             weapon_keyframes: &weapon.keyframes,
             weapon_skeleton: &weapon.skeleton,
         };
+        // `player_input_to_behavior`'s action-key scan runs at the top of the
+        // player's frame-0 dispatch, before the behaviour it selects executes
+        // on the same tick (`update_player_anim`, 0x00480ebd). `pad` is
+        // already blanked for a closed controls latch, and the message gate is
+        // open in this branch.
+        if pad.action_pressed {
+            context.game.player_action_press(context.player);
+        }
         crate::weapons::update(context.game, context.player, context.room, &clips, pad);
     }
     // `update_player_anim` runs `EntityUpdateLookAtAngles` after the state
@@ -7606,14 +7645,34 @@ fn tick_room_timed(
     context.game.sync_entity_from_player(context.player);
     if context.game.entities[0].state() != 5 {
         enemy::walk::separate_player_from_entities(context.game, pre_move);
-        context.player.pos = player::resolve_collision(
+        let prev = [
+            context.player.collision_mirror[0],
+            context.game.entities[0].pos[1],
+            context.player.collision_mirror[1],
+        ];
+        let resolution = player::resolve_collision_full(
             &context.room.collision,
-            pre_move,
+            prev,
             context.game.entities[0].pos,
             context.player.radius,
             context.player.collision_flags,
         );
+        if resolution.code != 2 {
+            context.player.collision_mirror = [resolution.pos[0], resolution.pos[2]];
+        }
+        context.player.pos = resolution.pos;
         context.game.entities[0].pos = context.player.pos;
+        // The push handlers raise `status_flags` bit 4 for a Z correction and
+        // clear it for an X one; the last push of the tick wins. The player
+        // module's own resolve (the locomotion and push steps) records its
+        // axis first, then this pass reports its own if it pushed.
+        if let Some(push_z) = context.player.last_push_z.take().or(resolution.push_z) {
+            if push_z {
+                context.game.entities[0].status_flags |= 0x10;
+            } else {
+                context.game.entities[0].status_flags &= !0x10;
+            }
+        }
     }
     // `update_player_anim` refreshes zoneFlags bit 0 from the camera switch
     // zone after the collision pass. The renderer reads the whole low byte as
@@ -7934,6 +7993,7 @@ impl InputState {
                 left: active & KEY_LEFT != 0,
                 right: active & KEY_RIGHT != 0,
                 run: active & KEY_RUN != 0,
+                run_pressed: pressed & KEY_RUN != 0,
                 action_held: active & KEY_CONFIRM != 0,
                 action_pressed: pressed & KEY_CONFIRM != 0,
                 aim: active & KEY_AIM != 0,
@@ -8080,7 +8140,17 @@ fn store_player_joint_worlds(
     // Materialize the pose on the live clock, not the published snapshot: the
     // clock's `applied` pose is the port's `joints[].transform`, which persists
     // until the next consuming tick exactly like the original's joint structs.
-    let Some(keyframe) = game.entity_anims[0].player.pose_keyframe(clips, keyframes) else {
+    //
+    // While the weapon machine drives the pose the handler's own clock is that
+    // source: the entity mirror's frame words are only synced at behavior
+    // entries, so they read one pose ahead of the transforms the handler just
+    // wrote (the original's render pass composes exactly those transforms).
+    let keyframe = if player.weapon.active() {
+        player.anim.pose_keyframe(clips, keyframes)
+    } else {
+        game.entity_anims[0].player.pose_keyframe(clips, keyframes)
+    };
+    let Some(keyframe) = keyframe else {
         return;
     };
     let entity = crate::anim::entity_matrix(player.pos, player.angle);
@@ -12207,6 +12277,7 @@ mod tests {
                 SDL_SCANCODE_LSHIFT,
                 player::Input {
                     run: true,
+                    run_pressed: true,
                     ..player::Input::default()
                 },
             ),
@@ -12214,6 +12285,7 @@ mod tests {
                 SDL_SCANCODE_RSHIFT,
                 player::Input {
                     run: true,
+                    run_pressed: true,
                     ..player::Input::default()
                 },
             ),

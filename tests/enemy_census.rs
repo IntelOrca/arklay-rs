@@ -110,16 +110,17 @@ fn corpus_monster_records_run_or_park_without_script_errors() {
     assert_eq!(
         scripted.keys().copied().collect::<Vec<_>>(),
         vec![
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0c, 0x0d, 0x0e,
-            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15
         ],
         "the zombies, the hound, the WebSpinner, the Black Tiger, the crow, \
-         the hunter, the wasp, Plant 42, the chimera, the adder, both Tyrants, \
-         Yawn, the roots, the monster plant, the rematch Yawn, the computer \
-         arms and the spider web are the scripted monster ids so far"
+         the hunter, the wasp, Plant 42, the chimera, the adder, Neptune, both \
+         Tyrants, Yawn, the roots, the monster plant, the rematch Yawn, the \
+         computer arms and the spider web are the scripted monster ids so far"
     );
     assert!(scripted[&0x00] > 0, "no room spawns a standard zombie");
     assert!(scripted[&0x01] > 0, "no room spawns a naked zombie");
+    assert!(scripted[&0x0b] > 0, "no room spawns a Neptune");
     assert!(scripted[&0x11] > 0, "no room spawns a green zombie");
     assert!(scripted[&0x13] > 0, "no room spawns a spider web");
     assert!(scripted[&0x0e] > 0, "no room spawns Plant 42's roots");

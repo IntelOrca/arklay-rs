@@ -220,34 +220,338 @@ fn probe_step(entity: &Entity, distance: i16) -> [i32; 3] {
     apply_matrix_lv(&matrix, [i32::from(distance), 0, 0])
 }
 
+/// The original's rect/circle shape handlers read the entity's own SCA record
+/// radius (`ENTITY->Sca_info + 10`), NOT the radius `check_room_collision` was
+/// called with. The Neptune's nose probe is the visible case: it classifies
+/// obstacles at 600 but pushes the small variant out with its 300-unit front
+/// box, which flips the rect push's selector and rolls the probe step back. The
+/// devour drag classifies at 500 with the same record radius. The shared
+/// [`player::resolve_collision_full`] takes one radius for both, so this is the
+/// two-radius variant for callers whose radius differs from the entity's
+/// record.
+///
+/// The pass structure and the handlers are copies of the shared resolve; keep
+/// the two in step.
+pub(crate) fn resolve_collision_two_radius(
+    collision: &crate::state::Collision,
+    prev: [i32; 3],
+    proposed: [i32; 3],
+    classify_radius: i32,
+    push_radius: i32,
+    collision_flags: u8,
+) -> player::CollisionResolution {
+    let records = collision.records(proposed[0], proposed[2]);
+    let mut pos = proposed;
+    let mut hit = 0u16;
+    let mut floor_step = 0i16;
+    let mut push_z = None;
+    let mut entity_bkp = None;
+
+    for rect in records {
+        if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
+            floor_step = two_radius_floor_step(rect);
+            continue;
+        }
+        if rect.kind & 0xFF == 5 && collision_flags & 0x10 != 0 {
+            continue;
+        }
+        if let Some(shape) = two_radius_classify(proposed[0], proposed[2], rect, classify_radius) {
+            let (axis, bkp) = match shape {
+                1 | 5 => two_radius_push_rect(rect, prev, &mut pos, push_radius),
+                3 => (two_radius_push_circle(rect, &mut pos, push_radius), None),
+                _ => (None, None),
+            };
+            if axis.is_some() {
+                push_z = axis;
+            }
+            if bkp.is_some() {
+                entity_bkp = bkp.map(|value| value as u32);
+            }
+            hit |= (rect.flags & 0x300) >> 8;
+        }
+    }
+
+    if hit == 0 {
+        return player::CollisionResolution {
+            pos,
+            code: two_radius_accept_code(floor_step, 0),
+            floor_step,
+            scratch: proposed,
+            push_z,
+            entity_bkp,
+        };
+    }
+
+    let scratch = pos;
+    let mut still_hit = 0u16;
+    let mut wedged = false;
+    for rect in records {
+        let shape = rect.kind & 0xFF;
+        if shape == 4 || (shape == 5 && collision_flags & 0x10 != 0) {
+            continue;
+        }
+        if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
+            continue;
+        }
+        if let Some(inside) = two_radius_classify(pos[0], pos[2], rect, classify_radius) {
+            let bits = rect.flags & 0x300;
+            still_hit |= bits >> 8;
+            if inside == 3 && bits != 0 {
+                wedged = true;
+            }
+        }
+    }
+
+    if wedged {
+        return player::CollisionResolution {
+            pos,
+            code: two_radius_accept_code(floor_step, 0),
+            floor_step,
+            scratch,
+            push_z,
+            entity_bkp,
+        };
+    }
+    if still_hit == 0 {
+        return player::CollisionResolution {
+            pos,
+            code: two_radius_accept_code(floor_step, 1),
+            floor_step,
+            scratch,
+            push_z,
+            entity_bkp,
+        };
+    }
+    player::CollisionResolution {
+        pos: [prev[0], proposed[1], prev[2]],
+        code: two_radius_accept_code(floor_step, 2),
+        floor_step,
+        scratch,
+        push_z,
+        entity_bkp,
+    }
+}
+
+/// [`player::classify`] copy (private there): the record's grown-box test at
+/// an explicit radius.
+fn two_radius_classify(
+    x: i32,
+    z: i32,
+    rect: &crate::state::CollisionRect,
+    radius: i32,
+) -> Option<u16> {
+    let r = radius & 0xFFFF;
+    let x_hi = i32::from(rect.x_max) + r;
+    let z_hi = i32::from(rect.z_max) + r;
+    let x_lo = i32::from(rect.x_min) - r;
+    let z_lo = i32::from(rect.z_min) - r;
+    if player::point_outside(x, z, x_hi, z_hi, x_lo, z_lo) {
+        None
+    } else {
+        Some(rect.kind & 0xFF)
+    }
+}
+
+/// [`player::floor_record_step`] copy (private there).
+fn two_radius_floor_step(rect: &crate::state::CollisionRect) -> i16 {
+    let step = ((((rect.kind & 0x7F00) >> 8) as i32) * 10 + i32::from(rect.flags & 0xFF)) * 100;
+    let step = step as i16;
+    ((if rect.kind & 0x8000 != 0 {
+        -i32::from(step)
+    } else {
+        0
+    }) | 1) as i16
+}
+
+/// [`player::accept_code`] copy (private there).
+fn two_radius_accept_code(floor_step: i16, clear_result: u8) -> u8 {
+    if floor_step != 0 { 3 } else { clear_result }
+}
+
+/// [`player::rect_push`] copy (private there): the four exit depths and the
+/// movement-vs-push selector, at an explicit push radius.
+fn two_radius_rect_push(
+    rect: &crate::state::CollisionRect,
+    prev: [i32; 3],
+    pos: &[i32; 3],
+    radius: i32,
+) -> (i16, i16, u8, Option<i32>) {
+    const COLLISION_SKIN: i16 = 0x12;
+    let r = radius as i16;
+    let pos_x = pos[0] as i16;
+    let pos_z = pos[2] as i16;
+
+    let push_x_hi = r
+        .wrapping_sub(pos_x)
+        .wrapping_add(rect.x_max as i16)
+        .wrapping_add(COLLISION_SKIN);
+    let push_x_lo = (rect.x_min as i16)
+        .wrapping_sub(r)
+        .wrapping_sub(pos_x)
+        .wrapping_sub(COLLISION_SKIN);
+    let push_x = if -(i32::from(push_x_lo)) < i32::from(push_x_hi) {
+        push_x_lo
+    } else {
+        push_x_hi
+    };
+
+    let push_z_hi = r
+        .wrapping_add(rect.z_max as i16)
+        .wrapping_sub(pos_z)
+        .wrapping_add(COLLISION_SKIN);
+    let push_z_lo = (rect.z_min as i16)
+        .wrapping_sub(r)
+        .wrapping_sub(pos_z)
+        .wrapping_sub(COLLISION_SKIN);
+    let entity_bkp = if -(i32::from(push_z_lo)) < i32::from(push_z_hi) {
+        Some(i32::from(push_z_lo))
+    } else {
+        None
+    };
+    let push_z = if -(i32::from(push_z_lo)) < i32::from(push_z_hi) {
+        push_z_lo
+    } else {
+        push_z_hi
+    };
+
+    let movement_x = pos[0] - prev[0];
+    let movement_z = pos[2] - prev[2];
+    let selector = ((((movement_z >> 14) ^ (i32::from(push_z) >> 14)) & 2)
+        | (((movement_x >> 15) ^ (i32::from(push_x) >> 15)) & 1)) as u8;
+
+    (push_x, push_z, selector, entity_bkp)
+}
+
+/// [`player::push_within_limit`] copy (private there).
+fn two_radius_push_within_limit(push: i16) -> bool {
+    (push.wrapping_add(0x190) as u16) <= 0x320
+}
+
+/// [`player::push_shallow`] copy (private there).
+fn two_radius_push_shallow(push_x: i16, push_z: i16, pos: &mut [i32; 3]) -> bool {
+    if i32::from(push_z).abs() > i32::from(push_x).abs() {
+        pos[0] += i32::from(push_x);
+        false
+    } else {
+        pos[2] += i32::from(push_z);
+        true
+    }
+}
+
+/// [`player::push_rect`] copy (private there).
+fn two_radius_push_rect(
+    rect: &crate::state::CollisionRect,
+    prev: [i32; 3],
+    pos: &mut [i32; 3],
+    radius: i32,
+) -> (Option<bool>, Option<i32>) {
+    let (push_x, push_z, selector, entity_bkp) = two_radius_rect_push(rect, prev, pos, radius);
+
+    let axis = match selector {
+        0 => {
+            pos[0] = prev[0];
+            pos[2] = prev[2];
+            None
+        }
+        1 if two_radius_push_within_limit(push_x) => {
+            pos[0] += i32::from(push_x);
+            Some(false)
+        }
+        2 if two_radius_push_within_limit(push_z) => {
+            pos[2] += i32::from(push_z);
+            Some(true)
+        }
+        _ => Some(two_radius_push_shallow(push_x, push_z, pos)),
+    };
+    (axis, entity_bkp)
+}
+
+/// [`player::circle_overlap`] copy (private there).
+fn two_radius_circle_overlap(
+    rect: &crate::state::CollisionRect,
+    x: i32,
+    z: i32,
+    radius: i32,
+) -> Option<(i32, i32, i32, i32)> {
+    let extent = (u32::from(rect.x_max))
+        .wrapping_sub(u32::from(rect.x_min))
+        .wrapping_add((radius as u32).wrapping_mul(2));
+    let reach = (extent as i32) / 2;
+
+    let dz = (z - i32::from(rect.z_min) - reach) + radius;
+    let dx = (x - i32::from(rect.x_min) - reach) + radius;
+    let dist = integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
+
+    let penetration = reach - dist;
+    (penetration >= 1).then_some((penetration, dx, dz, dist))
+}
+
+/// [`player::push_circle`] copy (private there).
+fn two_radius_push_circle(
+    rect: &crate::state::CollisionRect,
+    pos: &mut [i32; 3],
+    radius: i32,
+) -> Option<bool> {
+    let (penetration, dx, dz, dist) = two_radius_circle_overlap(rect, pos[0], pos[2], radius)?;
+    if dist == 0 {
+        pos[0] += penetration;
+        return Some(false);
+    }
+    let push_x = penetration.wrapping_mul(dx) / dist;
+    let push_z = penetration.wrapping_mul(dz) / dist;
+    pos[2] += push_z;
+    pos[0] += push_x;
+    Some(push_x.abs() < push_z.abs())
+}
+
 /// The original's room resolve entered from the hound's probe: the same
 /// two-pass walk as [`check_room_collision`] but at an explicit radius, with
 /// the collision-flags bit-3 clear and the status bit-4 early-out, and leaving
 /// the shared scratch vector set to the incoming point or the pass-1 push.
-fn probe_room_collision(room: &RoomState, game: &mut GameState, slot: usize, radius: i16) -> u8 {
+///
+/// Returns the result code together with the travelled distance
+/// `check_room_collision`'s `collision_accept` records in `g_tempVar`: the
+/// distance between the accepted position and the pre-resolve `position` word
+/// (+0x6C), both through their 16-bit views, and zero on the rollback branch
+/// (which sets `g_tempVar = 0` without running the accept).
+fn probe_room_collision(
+    room: &RoomState,
+    game: &mut GameState,
+    slot: usize,
+    radius: i16,
+) -> (u8, u16) {
     game.entities[slot].collision_flags &= !0x08;
     if game.entities[slot].status_flags & 0x04 != 0 {
-        return 0;
+        return (0, 0);
     }
     let entity = &game.entities[slot];
     let prev = entity.saved_pos.unwrap_or(entity.pos);
-    let resolution = player::resolve_collision_full(
+    let resolution = resolve_collision_two_radius(
         &room.collision,
         prev,
         entity.pos,
         i32::from(radius),
+        i32::from(entity.sca_radius),
         entity.collision_flags,
     );
     game.scratch_vec = resolution.scratch;
     if let Some(bkp) = resolution.entity_bkp {
         game.entity_bkp = bkp;
     }
+    let dx = resolution.pos[0].wrapping_sub(i32::from(prev[0] as i16));
+    let dz = resolution.pos[2].wrapping_sub(i32::from(prev[2] as i16));
+    let sum = dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz));
+    let travelled = if sum <= 0 {
+        0
+    } else {
+        (f64::from(sum)).sqrt() as u32 as u16
+    };
     let entity = &mut game.entities[slot];
     entity.pos = resolution.pos;
     entity.saved_pos = Some(resolution.pos);
     entity.floor_step = resolution.floor_step;
     apply_push_axis(entity, resolution.push_z);
-    resolution.code
+    (resolution.code, travelled)
 }
 
 /// The hound's `probe ahead`: step `distance` units along the entity's own
@@ -266,17 +570,31 @@ pub fn probe_ahead(
     distance: i16,
     radius: i16,
 ) -> bool {
+    probe_ahead_code(room, game, slot, distance, radius).0 as i8 > 0
+}
+
+/// [`probe_ahead`] with the original's raw result code and the distance its
+/// `collision_accept` recorded in `g_tempVar` (`NE_ROOM_HIT`): the shark's
+/// nose probe ORs the code into `splatter_flag` and latches the distance.
+/// Returns `(code, travelled)`.
+pub fn probe_ahead_code(
+    room: &RoomState,
+    game: &mut GameState,
+    slot: usize,
+    distance: i16,
+    radius: i16,
+) -> (u8, u16) {
     let step = probe_step(&game.entities[slot], distance);
     {
         let entity = &mut game.entities[slot];
         entity.pos[0] = entity.pos[0].wrapping_add(step[0]);
         entity.pos[2] = entity.pos[2].wrapping_add(step[2]);
     }
-    let code = probe_room_collision(room, game, slot, radius);
+    let (code, travelled) = probe_room_collision(room, game, slot, radius);
     let entity = &mut game.entities[slot];
     entity.pos[0] = entity.pos[0].wrapping_sub(step[0]);
     entity.pos[2] = entity.pos[2].wrapping_sub(step[2]);
-    code as i8 > 0
+    (code, travelled)
 }
 
 /// The hound's `probe turn`: "would I hit a wall if I turned by `angle_delta`
@@ -1978,12 +2296,35 @@ impl ScaHit {
 
     /// `SetEntityScaHitData`: the world-space volume centre, the local offset
     /// rotated by the entity's yaw, then the script's per-frame world bias.
+    ///
+    /// The rotation is the original's exact pipeline, not a Y-only shortcut:
+    /// `RotMatrix((0, angle, 0))` builds the 4.12 matrix through
+    /// `GteRotationMatrixCalc` (two-stage 14-bit multiplies, the saturated
+    /// cosine at angle 0, then `>> 2`) and `ApplyMatrix` applies it with the
+    /// PS1 Y-sign conjugation and the truncating `>> 12`. The world words are
+    /// stored as shorts, exactly like the original's `dstVol` write.
     pub(crate) fn world_offset(&self, angle: u16) -> [i32; 3] {
-        let (x, z) = player::rotate_xz(angle, i32::from(self.offset[0]), i32::from(self.offset[2]));
+        let matrix = crate::anim::rotation_matrix(0, i32::from(angle), 0);
+        let vx = i32::from(self.offset[0]);
+        let vy = -i32::from(self.offset[1]);
+        let vz = i32::from(self.offset[2]);
+        let shift = |value: i32| (value + ((value >> 31) & 0xFFF)) >> 12;
+        let rx = shift(
+            matrix[0][0]
+                .wrapping_mul(vx)
+                .wrapping_add(matrix[0][1].wrapping_mul(vy))
+                .wrapping_add(matrix[0][2].wrapping_mul(vz)),
+        ) as i16 as i32;
+        let rz = shift(
+            matrix[2][0]
+                .wrapping_mul(vx)
+                .wrapping_add(matrix[2][1].wrapping_mul(vy))
+                .wrapping_add(matrix[2][2].wrapping_mul(vz)),
+        ) as i16 as i32;
         [
-            x + i32::from(self.world_bias[0]),
+            rx + i32::from(self.world_bias[0]),
             i32::from(self.offset[1]) + i32::from(self.world_bias[1]),
-            z + i32::from(self.world_bias[2]),
+            rz + i32::from(self.world_bias[2]),
         ]
     }
 }
@@ -2631,6 +2972,39 @@ pub fn tyrant_wander_turn(
         &mut turn_counter,
     );
     entity.behavior_step = turn_counter;
+    result
+}
+
+/// The Neptune's call of `entity_update_wander_turn`: the same core, with the
+/// movement distance read from the room-hit word (`NE_ROOM_HIT` at +0x16E,
+/// the `sca_touch` word the nose probe latched last frame), the control byte
+/// at +0x174 (`splatter_flag`, the byte the probe also ORs into) and the turn
+/// counter at +0x170 (`angle_turn_delta`). Both the swim steering and the two
+/// circle legs pass those fields.
+pub fn neptune_wander_turn(
+    entity: &mut Entity,
+    angle_step: u16,
+    turn_limit: u8,
+    rand_seed: u16,
+) -> u8 {
+    let speed_div = i32::from(entity.move_speed_current as i16);
+    let movement_dist = u32::from(entity.sca_touch() as u16);
+    let mut turn_counter = entity.angle_turn_delta;
+    let pos = [entity.pos[0], entity.pos[2]];
+    let waypoint = [entity.player_pos_x, entity.player_pos_z];
+    let result = wander_turn_core(
+        movement_dist,
+        angle_step,
+        turn_limit,
+        rand_seed,
+        speed_div,
+        &mut entity.angle,
+        pos,
+        waypoint,
+        &mut entity.splatter_flag,
+        &mut turn_counter,
+    );
+    entity.angle_turn_delta = turn_counter;
     result
 }
 
@@ -5094,5 +5468,43 @@ mod tests {
         e.attacking_direction = 0x80;
         assert_eq!(tyrant_wander_turn(&mut e, 0, 0x28, 0x28, 0), 1);
         assert_eq!(e.angle, 0x28, "without 0x40 the step turns");
+    }
+
+    /// The original's rect/circle handlers push with the entity's own SCA
+    /// record radius, not the radius the resolve was called with. The Neptune's
+    /// nose probe is the live case: it classifies at 600 but the small
+    /// variant's first box is 300, which flips the rect selector to the
+    /// whole-move undo.
+    #[test]
+    fn two_radius_resolve_pushes_with_the_record_radius() {
+        // The room-40E1 wall the small shark's t264 probe meets, in every
+        // quadrant so the cell choice cannot hide it.
+        let record = CollisionRect {
+            x_max: 21690,
+            z_max: 24714,
+            x_min: 6228,
+            z_min: 8172,
+            kind: 1,
+            flags: 0x300,
+        };
+        let collision = Collision {
+            cell_x: 5188,
+            cell_z: 0,
+            quadrants: std::array::from_fn(|_| vec![record]),
+        };
+        let prev = [5535, 0, 8512];
+        let proposed = [5635, 0, 8423];
+
+        // Classify at 600: the grown box contains the probe point. Pushing
+        // with the small variant's 300-unit record flips the selector to the
+        // whole-move undo, so the accepted point is the rollback word.
+        let small = resolve_collision_two_radius(&collision, prev, proposed, 600, 300, 0);
+        assert_eq!(small.code, 1);
+        assert_eq!(small.pos, [5535, 0, 8512], "the move is undone to prev");
+
+        // Pushing with 600 (the big variant's record) keeps the -x exit.
+        let big = resolve_collision_two_radius(&collision, prev, proposed, 600, 600, 0);
+        assert_eq!(big.code, 1);
+        assert_eq!(big.pos, [5610, 0, 8423]);
     }
 }

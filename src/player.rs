@@ -103,9 +103,14 @@ const PUSH_TEST_BIAS: i16 = 0x190;
 const BEHAVIOR_IDLE: u8 = 0;
 /// `Input.up` selects the walk.
 const BEHAVIOR_WALK: u8 = 1;
-/// A direction without `up`/`down` selects the in-place turn.
-const BEHAVIOR_TURN: u8 = 2;
-/// `Input.down` selects the backward walk.
+/// `Input.right` without `up`/`down` selects the in-place right turn
+/// (the reference's `action_behavior` 4: `directionAngle += 0x60`).
+const BEHAVIOR_TURN_RIGHT: u8 = 2;
+/// `Input.left` without `up`/`down` selects the in-place left turn
+/// (the reference's `action_behavior` 5: `directionAngle -= 0x60`).
+const BEHAVIOR_TURN_LEFT: u8 = 5;
+/// `Input.down` selects the backward walk (the reference's
+/// `action_behavior` 6/7/8).
 const BEHAVIOR_BACK: u8 = 3;
 /// `Input.up + Input.run` selects the run.
 const BEHAVIOR_RUN: u8 = 4;
@@ -147,6 +152,10 @@ pub struct Input {
     pub left: bool,
     pub right: bool,
     pub run: bool,
+    /// The run/cancel button's press edge (the original's raw pad bit `0x40`,
+    /// which its edge-detected `g_PlayerPadHeld` exposes): starts the special
+    /// lock-on fire while a target is in range.
+    pub run_pressed: bool,
     pub action_held: bool,
     pub action_pressed: bool,
     /// The aim button (the original's D-pad bit `0x100`): raises the weapon.
@@ -204,7 +213,7 @@ struct FootstepRule {
 /// model's run cycle with the walk contact frames.
 fn footstep_rule(behavior: u8) -> Option<FootstepRule> {
     match behavior {
-        BEHAVIOR_WALK | BEHAVIOR_TURN => Some(FootstepRule {
+        BEHAVIOR_WALK | BEHAVIOR_TURN_RIGHT | BEHAVIOR_TURN_LEFT => Some(FootstepRule {
             source: ClipSource::Emw,
             clip: WALK_CLIP,
             frames: &[0x08, 0x16],
@@ -273,6 +282,9 @@ pub const PUSH_CLIP: usize = 0x30;
 /// Room-animation clip of the push loop (`attackAnim 0x31`, one past the
 /// wind-up: the behaviour increments the id when the wind-up completes).
 pub const PUSH_LOOP_CLIP: usize = 0x31;
+/// Room-animation clip of the push release (`attackAnim 0x32`, one past the
+/// loop: the behaviour increments the id again when the push bit drops).
+pub const PUSH_RELEASE_CLIP: usize = 0x32;
 /// Room-animation clip of the vault's plain approach (`attackAnim 0x33`).
 pub const VAULT_CLIP_PLAIN: usize = 0x33;
 /// Room-animation clip of the vault's return side (`attackAnim 0x35`).
@@ -431,10 +443,39 @@ pub struct PlayerState {
     pub idle_trace: Option<(u8, u16)>,
     /// The reference's `(action_behavior, action_state, attackDirection)` for
     /// the pad-driven locomotion this tick, translated to the original's
-    /// behavior ids: idle `0`, walk `1`, turn-left `2`, back `4`, turn-right
-    /// `8` and run `0x0D`. The engine mirrors it onto entity 0 so the oracle
-    /// trace reports the same bytes the reference writes.
-    pub trace_state: Option<(u8, u8, u16)>,
+    /// behavior ids: idle `0`, walk `1`, walk-steer `2`/`3`, turn right `4`,
+    /// turn left `5`, backpedal-steer `6`/`7`, backpedal `8` and run `0x0D`.
+    /// The engine mirrors it onto entity 0 so the oracle trace reports the
+    /// same bytes the reference writes. The third field is `None` on a
+    /// behaviour that leaves `attackDirection` alone (the in-place turns and
+    /// every release tick), so the mirror keeps the entity's previous value,
+    /// exactly like the reference's live field.
+    pub trace_state: Option<(u8, u8, Option<u16>)>,
+    /// The reference `action_behavior` id the last pad-driven locomotion tick
+    /// selected (0 idle, 1/2/3 walk and steering, 4/5 in-place turn, 6/7/8
+    /// backpedal and steering, 0x0D run). The release tick dispatches through
+    /// that behaviour before clearing it, so its frame-2 steering rotation
+    /// (`player_ctrl_frame2`) applies one more time even with the pad already
+    /// clear. Survives frozen ticks, exactly like the reference's live
+    /// `action_behavior` byte.
+    pub last_behavior_id: u8,
+    /// The vault's warp ran this tick: the original's door sequence clears
+    /// `isBeingAttackedFlag` (the 0x80 the action scan raised) in the same
+    /// case, so the engine zeroes the entity byte.
+    pub clear_attacked_flag: bool,
+    /// The reference's `position` (x, z) mirror: the last position a room
+    /// collision pass *accepted*. The original's `check_room_collision` uses it
+    /// as `prevPos` for the push selector and as the rollback anchor, and only
+    /// `collision_accept` updates it. Movements that bypass the collision pass
+    /// - the room-object pass pushing the player out of an omodel, the ladder's
+    ///   direct writes - move the matrix without touching it, so the next tick's
+    ///   selector still sees the pre-push movement.
+    pub collision_mirror: [i32; 2],
+    /// The last collision pass's push axis: `Some(true)` when it corrected
+    /// along Z (the original raises `status_flags` bit 4), `Some(false)` along
+    /// X (the bit is cleared), `None` when nothing pushed. The engine applies
+    /// it to entity 0.
+    pub last_push_z: Option<bool>,
     /// Stair/ladder state set by the room's action probes.
     pub stairs: StairState,
     /// The locked action behaviour owning the tick, if any.
@@ -528,6 +569,10 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         idle_ticks: 0,
         idle_trace: None,
         trace_state: None,
+        last_behavior_id: 0,
+        clear_attacked_flag: false,
+        collision_mirror: [pos[0], pos[2]],
+        last_push_z: None,
         stairs: StairState::default(),
         locked: LockedAction::None,
         action_state: 0,
@@ -611,25 +656,64 @@ pub fn update_with_room(
 
     let behavior = behavior_for(input);
 
-    // Walk release: the original's walk handler keeps the walk speed and the
-    // walk pose for one tick (no frame is consumed), then idle takes over.
-    if player.behavior == BEHAVIOR_WALK && behavior != BEHAVIOR_WALK && !input.up {
-        player.locomotion_tick(room, BEHAVIOR_WALK, i32::from(player.move_speed_current));
-        player.enter_behavior(BEHAVIOR_IDLE);
-        player.set_clip(ClipSource::Emd, SETTLE_CLIP);
-        // The reference's release tick clears the behaviour and its
-        // sub-state without running the idle entry yet.
-        player.trace_state = Some((0, 0, 0));
-        return;
-    }
-    // Turn release: the original's turn handler also releases through
-    // behavior 0 without consuming a frame, so the turn pose stays one tick.
-    if player.behavior == BEHAVIOR_TURN && behavior != BEHAVIOR_TURN && !input.left && !input.right
-    {
-        player.enter_behavior(BEHAVIOR_IDLE);
-        player.set_clip(ClipSource::Emd, SETTLE_CLIP);
-        player.trace_state = Some((0, 0, 0));
-        return;
+    // The original's walk handler hands the run over at its own tail: it sets
+    // `action_behavior` 0x0D and state 0 and then finishes the walk tick (walk
+    // speed, walk clip, its own movement). The run's entry state (run clip,
+    // speed 0xD2, the stride-continuing frame) plays on the next tick. The
+    // port mirrors that by finishing this tick as the walk and only publishing
+    // the handover bytes; the next tick's behaviour change enters the run.
+    let run_handover = behavior == BEHAVIOR_RUN && player.behavior == BEHAVIOR_WALK;
+    let behavior = if run_handover {
+        BEHAVIOR_WALK
+    } else {
+        behavior
+    };
+
+    // Release ticks: the original's input mapping leaves `action_behavior`
+    // untouched only when no direction survives its remap, so the previous
+    // behaviour's handler sees the cleared pad and runs its stop step - one
+    // more movement tick for the walk and the backpedal, one more rotation
+    // for the turn - then clears the behaviour and its sub-state without
+    // running the idle entry. That entry happens on the following tick.
+    if behavior == BEHAVIOR_IDLE {
+        match player.behavior {
+            BEHAVIOR_WALK => {
+                // The frame-2 dispatch steers by the previous walk's step
+                // before the walk handler releases, so a released diagonal
+                // still turns once with the pad already clear.
+                player.angle = frame2_turn(player.angle, player.last_behavior_id);
+                player.locomotion_tick(room, BEHAVIOR_WALK, i32::from(player.move_speed_current));
+                player.enter_behavior(BEHAVIOR_IDLE);
+                player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+                player.last_behavior_id = 0;
+                player.trace_state = Some((0, 0, None));
+                return;
+            }
+            BEHAVIOR_TURN_RIGHT | BEHAVIOR_TURN_LEFT => {
+                // The frame-2 dispatch rotates by the behaviour's own step
+                // before the shared turn handler clears it, so the release
+                // tick still turns once even with the pad already clear.
+                player.angle = frame2_turn(player.angle, player.last_behavior_id);
+                player.enter_behavior(BEHAVIOR_IDLE);
+                player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+                player.last_behavior_id = 0;
+                player.trace_state = Some((0, 0, None));
+                return;
+            }
+            BEHAVIOR_BACK => {
+                // The backpedal's stop step steers by the previous step and
+                // moves once more at the recorded speed before the body idle
+                // clip takes over.
+                player.angle = frame2_turn(player.angle, player.last_behavior_id);
+                player.locomotion_tick(room, BEHAVIOR_BACK, BACK_SPEED);
+                player.enter_behavior(BEHAVIOR_IDLE);
+                player.set_clip(ClipSource::Emd, SETTLE_CLIP);
+                player.last_behavior_id = 0;
+                player.trace_state = Some((0, 0, None));
+                return;
+            }
+            _ => {}
+        }
     }
     // Run release: the original's run handler starts its four-tick
     // decelerating stop towards the body idle clip.
@@ -662,7 +746,7 @@ pub fn update_with_room(
 
     let mut speed = match behavior {
         BEHAVIOR_WALK => walk_speed(player.radius, player.anim.frame),
-        BEHAVIOR_TURN => 0,
+        BEHAVIOR_TURN_RIGHT | BEHAVIOR_TURN_LEFT => 0,
         BEHAVIOR_BACK => BACK_SPEED,
         BEHAVIOR_RUN => RUN_SPEED,
         _ => 0,
@@ -689,14 +773,49 @@ pub fn update_with_room(
 
     // The reference's action_behavior for the locomotion behaviors, mirrored
     // for the oracle trace: idle is handled below with its phase/countdown,
-    // the rest carry `action_state` 1 and a zeroed attackDirection.
+    // the rest carry `action_state` 1. The walk and backpedal steering ids
+    // come from the pad, and the in-place turns leave `attackDirection`
+    // alone, so they carry `None` to keep the entity's previous value.
     player.trace_state = match behavior {
-        BEHAVIOR_WALK => Some((1, 1, 0)),
-        BEHAVIOR_TURN => Some((if input.left { 2 } else { 8 }, 1, 0)),
-        BEHAVIOR_BACK => Some((4, 1, 0)),
-        BEHAVIOR_RUN => Some((0x0D, 1, 0)),
+        BEHAVIOR_WALK => Some((
+            if input.right {
+                2
+            } else if input.left {
+                3
+            } else {
+                1
+            },
+            1,
+            Some(0),
+        )),
+        BEHAVIOR_TURN_RIGHT => Some((4, 1, None)),
+        BEHAVIOR_TURN_LEFT => Some((5, 1, None)),
+        BEHAVIOR_BACK => Some((
+            if input.right {
+                6
+            } else if input.left {
+                7
+            } else {
+                8
+            },
+            1,
+            Some(0),
+        )),
+        BEHAVIOR_RUN => Some((0x0D, 1, Some(0))),
         _ => None,
     };
+    // Remember the reference id this tick's locomotion selected: the release
+    // tick dispatches through it before clearing it.
+    player.last_behavior_id = player.trace_state.map_or(0, |(id, _, _)| id);
+    if run_handover {
+        // The handover tick's bytes: behaviour 0x0D with the walk's sub-state
+        // cleared and its slow-motion counter, exactly like the tail write.
+        // The behaviour byte moves on so the next tick dispatches the run's
+        // entry state (the sentinel forces that entry even though the walk
+        // handler finished this tick's movement).
+        player.trace_state = Some((0x0D, 0, Some(u16::from(player.slow_counter != 0))));
+        player.behavior = BEHAVIOR_ENTRY;
+    }
 
     if behavior == BEHAVIOR_IDLE {
         player.slow_counter = 0;
@@ -736,7 +855,7 @@ pub fn update_with_room(
         player.trace_state = Some((
             0,
             player.idle_phase.saturating_add(1),
-            if player.idle_phase == 0 { counter } else { 0 },
+            Some(if player.idle_phase == 0 { counter } else { 0 }),
         ));
     } else if slow_locomotion {
         // The original keeps a counter in `attackDirection`: a frame applies
@@ -746,6 +865,10 @@ pub fn update_with_room(
         if previous == 0 {
             player.advance(emd_clips, emw_clips, room_clips);
             player.slow_counter = 1;
+        }
+        // The walk and run publish that post-tick counter as their `ticks`.
+        if let Some((id, state, Some(_))) = player.trace_state {
+            player.trace_state = Some((id, state, Some(u16::from(player.slow_counter != 0))));
         }
     } else {
         player.slow_counter = 0;
@@ -770,6 +893,16 @@ fn run_stop_tick(
     if player.run_stop_ticks == RUN_STOP_TICKS {
         player.set_clip(ClipSource::Emd, SETTLE_CLIP);
     }
+    // The reference's stop sub-state: the run handler's case 2 sets state 3
+    // and falls into case 3, so every stop tick reports 0x0D / 3 with the
+    // run's `attackDirection` left untouched - until case 3's `unk_bc > 3`
+    // exit clears the behaviour byte in the same tick.
+    let ticks = player.trace_state.and_then(|(_, _, ticks)| ticks);
+    player.trace_state = if player.run_stop_ticks == 1 {
+        Some((0, 0, ticks))
+    } else {
+        Some((0x0D, 3, ticks))
+    };
     if !player.stairs.climbing {
         player.angle = turned_angle(player.angle, BEHAVIOR_RUN, player.input);
     }
@@ -857,21 +990,34 @@ impl PlayerState {
         } else {
             0
         };
-        let prev = self.pos;
+        let prev = [
+            self.collision_mirror[0],
+            self.pos[1],
+            self.collision_mirror[1],
+        ];
         let (dx, dz) = rotate_speed(self.angle, offset, speed);
-        let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
+        let proposed = [self.pos[0] + dx, self.pos[1], self.pos[2] + dz];
         // The climb behaviour suspends the collision boundary pass, exactly
         // like the original's `update_player_anim` does for 0x11.
         self.pos = if self.stairs.climbing {
             proposed
         } else {
-            resolve_collision(
+            let r = resolve_collision_full(
                 &room.collision,
                 prev,
                 proposed,
                 self.radius,
                 self.collision_flags,
-            )
+            );
+            // `collision_accept` advances the `position` mirror only when the
+            // pass accepted; a rollback leaves it alone.
+            if r.code != 2 {
+                self.collision_mirror = [r.pos[0], r.pos[2]];
+            }
+            if r.push_z.is_some() {
+                self.last_push_z = r.push_z;
+            }
+            r.pos
         };
         // `stairs_height_update` owns the player's height on the ramp.
         if let Some(height) = self.stairs.height {
@@ -956,15 +1102,26 @@ impl PlayerState {
     /// Move the locked behaviour's forward step with the room collision pass.
     fn locked_step(&mut self, room: &RoomState, speed: i32) {
         let (dx, dz) = rotate_speed(self.angle, 0, speed);
-        let prev = self.pos;
-        let proposed = [prev[0] + dx, prev[1], prev[2] + dz];
-        self.pos = resolve_collision(
+        let prev = [
+            self.collision_mirror[0],
+            self.pos[1],
+            self.collision_mirror[1],
+        ];
+        let proposed = [self.pos[0] + dx, self.pos[1], self.pos[2] + dz];
+        let r = resolve_collision_full(
             &room.collision,
             prev,
             proposed,
             self.radius,
             self.collision_flags,
         );
+        if r.code != 2 {
+            self.collision_mirror = [r.pos[0], r.pos[2]];
+        }
+        if r.push_z.is_some() {
+            self.last_push_z = r.push_z;
+        }
+        self.pos = r.pos;
     }
 }
 
@@ -980,6 +1137,13 @@ fn update_locked(
     emw_clips: &[Clip],
     room_clips: &[Clip],
 ) {
+    let behavior = match player.locked {
+        LockedAction::Push => 0x10,
+        LockedAction::Vault => 0x0A,
+        LockedAction::Ladder => 0x0B,
+        LockedAction::Interact => 0x0C,
+        LockedAction::None => return,
+    };
     match player.locked {
         LockedAction::Push => update_push(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::Vault => update_vault(player, emd_clips, emw_clips, room_clips),
@@ -987,6 +1151,24 @@ fn update_locked(
         LockedAction::Interact => update_interact(player, emd_clips, emw_clips, room_clips),
         LockedAction::None => {}
     }
+    // Mirror the locked behaviour's live bytes for the oracle trace: the
+    // reference's action_behavior/action_state are read straight off the
+    // entity, and the release tick clears both without running the idle
+    // entry. The vault carries the side `check_climb_object` picked in
+    // `attackDirection`; the other locked behaviours never touch it, so they
+    // keep the entity's previous value.
+    player.last_behavior_id = 0;
+    player.trace_state = if player.locked == LockedAction::None {
+        Some((0, 0, None))
+    } else if player.locked == LockedAction::Vault {
+        Some((
+            behavior,
+            player.action_state,
+            Some(player.attack_direction as u16),
+        ))
+    } else {
+        Some((behavior, player.action_state, None))
+    };
 }
 
 /// `player_behavior_0c_interact` (0x00495e00): the object reach a gated
@@ -1059,6 +1241,13 @@ fn update_push(
             player.set_clip(ClipSource::Room, PUSH_CLIP);
             player.move_speed_current = 0;
             player.action_state = 1;
+            // The reference's state 0 falls through into state 1, so the
+            // windup clip consumes its first frame on the entry tick too.
+            if !windup || player.advance(emd_clips, emw_clips, room_clips) {
+                player.set_clip(ClipSource::Room, PUSH_LOOP_CLIP);
+                player.action_state = 2;
+                player.move_speed_current = 0;
+            }
         }
         1 => {
             if !windup || player.advance(emd_clips, emw_clips, room_clips) {
@@ -1073,17 +1262,18 @@ fn update_push(
             }
             // The locomotion runs on every frame below 0x10, even the frame
             // the push bit drops: the original tests the bit only afterwards.
-            if player.anim.display_frame < 0x10 {
+            // `anim.frame` is the original's post-increment
+            // `animation_frame_id`, so a held frame tests the next index and
+            // stops the creep during the hold, exactly like the reference.
+            if player.anim.frame < 0x10 {
                 player.move_speed_current = PUSH_SPEED as u16;
                 player.locked_step(room, PUSH_SPEED);
             }
             if !player.object_push {
-                player.anim.frame = 0;
-                player.anim.display_frame = 0;
-                player.anim.timing = 0;
+                player.set_clip(ClipSource::Room, PUSH_RELEASE_CLIP);
                 player.move_speed_current = 0;
                 player.action_state = 3;
-            } else if player.anim.display_frame == 1 {
+            } else if player.anim.frame == 1 {
                 let id = if player.push_heavy {
                     SE_PUSH_GRUNT_HEAVY
                 } else {
@@ -1093,7 +1283,10 @@ fn update_push(
             }
         }
         3 => {
-            if !looping || player.advance(emd_clips, emw_clips, room_clips) {
+            let releasing = room_clips
+                .get(PUSH_RELEASE_CLIP)
+                .is_some_and(|clip| !clip.frames.is_empty());
+            if !releasing || player.advance(emd_clips, emw_clips, room_clips) {
                 // Back to normal control; the message flag the original
                 // returns is represented by the port's own message state.
                 player.locked = LockedAction::None;
@@ -1151,6 +1344,11 @@ fn update_vault(
         _ => {}
     }
 
+    // The reference's case 2 is the only place the machine advances to case 3
+    // (the clip's completion return adds 1), and the switch has already
+    // dispatched case 2 for that tick, so the warp runs on the following tick.
+    let warping = player.action_state == 3;
+
     if player.action_state == 2 {
         if !player.vault_clip_present(room_clips) {
             // A room without the climb clips cannot play the animation; the
@@ -1183,7 +1381,7 @@ fn update_vault(
         }
     }
 
-    if player.action_state == 3 {
+    if warping {
         player.warp_through_object();
     }
 }
@@ -1356,6 +1554,8 @@ fn ladder_descend(player: &mut PlayerState) {
     } else {
         0
     };
+    // The original's case 5 writes the `position` mirror from the matrix.
+    player.collision_mirror = [player.pos[0], player.pos[2]];
     player.screen_effects.push(ScreenEffect {
         right: 500,
         left: 500,
@@ -1427,10 +1627,17 @@ impl PlayerState {
             -VAULT_ACROSS
         };
         self.pos = [self.pos[0] + x, self.pos[1] + y, self.pos[2] + z];
+        // The original's case 3 writes the `position` mirror from the matrix
+        // in the same tick, so the next collision pass measures from here.
+        self.collision_mirror = [self.pos[0], self.pos[2]];
         if self.vault_return {
             self.vault_bit = false;
             self.vault_return = false;
         }
+        // The reference's case 3 clears `isBeingAttackedFlag` (the 0x80 the
+        // input path raised) in the same tick as the warp; the engine reads
+        // this and zeroes the entity byte.
+        self.clear_attacked_flag = true;
         self.locked = LockedAction::None;
         self.action_state = 0;
         self.move_speed_current = 0;
@@ -1552,8 +1759,10 @@ fn behavior_for(input: Input) -> u8 {
         BEHAVIOR_WALK
     } else if input.down {
         BEHAVIOR_BACK
-    } else if input.left || input.right {
-        BEHAVIOR_TURN
+    } else if input.right {
+        BEHAVIOR_TURN_RIGHT
+    } else if input.left {
+        BEHAVIOR_TURN_LEFT
     } else {
         BEHAVIOR_IDLE
     }
@@ -1562,7 +1771,7 @@ fn behavior_for(input: Input) -> u8 {
 /// The clip a behavior starts on when it is selected.
 fn entry_clip(behavior: u8) -> usize {
     match behavior {
-        BEHAVIOR_WALK | BEHAVIOR_TURN => WALK_CLIP,
+        BEHAVIOR_WALK | BEHAVIOR_TURN_RIGHT | BEHAVIOR_TURN_LEFT => WALK_CLIP,
         BEHAVIOR_BACK => BACK_CLIP,
         BEHAVIOR_RUN => RUN_CLIP,
         _ => SETTLE_CLIP,
@@ -1572,26 +1781,48 @@ fn entry_clip(behavior: u8) -> usize {
 /// Which file the entry clip of a behavior lives in.
 fn entry_clip_source(behavior: u8) -> ClipSource {
     match behavior {
-        BEHAVIOR_WALK | BEHAVIOR_TURN | BEHAVIOR_RUN => ClipSource::Emw,
+        BEHAVIOR_WALK | BEHAVIOR_TURN_RIGHT | BEHAVIOR_TURN_LEFT | BEHAVIOR_RUN => ClipSource::Emw,
         _ => ClipSource::Emd,
     }
 }
 
+/// The reference `player_ctrl_frame2` steering rotation for a behaviour id.
+///
+/// The frame-2 dispatch rotates the facing before running the behaviour's
+/// handler: `+0x28` for the walk/backpedal right steers (2/6), `-0x28` for
+/// their left steers (3/7), `+0x60` for the in-place right turn (4) and
+/// `-0x60` for the left turn (5). Every other behaviour leaves the facing
+/// alone. The release ticks use this with the previous tick's id.
+fn frame2_turn(angle: u16, behavior: u8) -> u16 {
+    let angle = angle & 0x0FFF;
+    match behavior {
+        2 | 6 => angle.wrapping_add(DIAGONAL_TURN) & 0x0FFF,
+        3 | 7 => angle.wrapping_sub(DIAGONAL_TURN) & 0x0FFF,
+        4 => angle.wrapping_add(TURN_STEP) & 0x0FFF,
+        5 => angle.wrapping_sub(TURN_STEP) & 0x0FFF,
+        _ => angle,
+    }
+}
+
 /// Apply the behavior's per-tick yaw step; right is positive, left negative.
+///
+/// The in-place turns carry their direction in the behavior itself (the
+/// reference's 4/5 rotate before dispatching to the shared turn handler), so
+/// the release tick - when the pad is already clear - still rotates.
 fn turned_angle(angle: u16, behavior: u8, input: Input) -> u16 {
-    let step = match behavior {
-        BEHAVIOR_WALK | BEHAVIOR_BACK => DIAGONAL_TURN,
-        BEHAVIOR_TURN => TURN_STEP,
-        BEHAVIOR_RUN => RUN_TURN,
-        _ => return angle & 0x0FFF,
+    let mut angle = angle & 0x0FFF;
+    let (step, right, left) = match behavior {
+        BEHAVIOR_WALK | BEHAVIOR_BACK => (DIAGONAL_TURN, input.right, input.left),
+        BEHAVIOR_TURN_RIGHT => (TURN_STEP, true, false),
+        BEHAVIOR_TURN_LEFT => (TURN_STEP, false, true),
+        BEHAVIOR_RUN => (RUN_TURN, input.right, input.left),
+        _ => return angle,
     };
 
-    let mut angle = angle & 0x0FFF;
-
-    if input.right {
+    if right {
         angle = angle.wrapping_add(step) & 0x0FFF;
     }
-    if input.left {
+    if left {
         angle = angle.wrapping_sub(step) & 0x0FFF;
     }
     angle
@@ -2360,6 +2591,10 @@ mod tests {
             idle_ticks: 0,
             idle_trace: None,
             trace_state: None,
+            last_behavior_id: 0,
+            clear_attacked_flag: false,
+            collision_mirror: [x, z],
+            last_push_z: None,
             stairs: StairState::default(),
             locked: LockedAction::None,
             action_state: 0,
@@ -2576,12 +2811,16 @@ mod tests {
             ..Input::default()
         };
 
-        // Walk headed into the stride's middle enters the run at 0x0C.
+        // Walk headed into the stride's middle enters the run at 0x0C. The
+        // handover tick finishes as the walk (the original's walk handler sets
+        // behaviour 0x0D at its tail); the run's entry state plays next tick.
         let mut player = player_at(1000, 0);
         for _ in 0..10 {
             blend_step(&mut player, &room, &emd, &emw, walk);
         }
         assert_eq!(player.anim.frame, 10);
+        blend_step(&mut player, &room, &emd, &emw, run);
+        assert_eq!(player.trace_state, Some((0x0D, 0, Some(0))));
         let walk_pose = shown_pose(&player, &emd, &emw, &keyframes);
         blend_step(&mut player, &room, &emd, &emw, run);
         assert_eq!(player.behavior, BEHAVIOR_RUN);
@@ -2597,6 +2836,7 @@ mod tests {
         for _ in 0..2 {
             blend_step(&mut player, &room, &emd, &emw, walk);
         }
+        blend_step(&mut player, &room, &emd, &emw, run);
         blend_step(&mut player, &room, &emd, &emw, run);
         assert_eq!(player.anim.display_frame, RUN_ENTRY_FRAME);
         assert_eq!(player.anim.blend_used, 3);
@@ -2642,7 +2882,7 @@ mod tests {
             },
         );
         let turn_pose = shown_pose(&player, &emd, &emw, &keyframes);
-        assert_eq!(player.behavior, BEHAVIOR_TURN);
+        assert_eq!(player.behavior, BEHAVIOR_TURN_LEFT);
 
         // Release holds the turn pose for one tick, then the idle entry eases
         // it into the settle pose with a fresh three-step blend.
@@ -3350,6 +3590,18 @@ mod tests {
                 ..Input::default()
             },
         );
+        // The handover tick finishes as the walk; the run's entry is next.
+        assert_eq!(player.trace_state, Some((0x0D, 0, Some(0))));
+        step(
+            &mut player,
+            &room,
+            &clips,
+            Input {
+                up: true,
+                run: true,
+                ..Input::default()
+            },
+        );
         assert_eq!(player.behavior, BEHAVIOR_RUN);
         assert_eq!(player.anim.clip, RUN_CLIP);
         assert_eq!(player.clip_source, ClipSource::Emw);
@@ -3382,7 +3634,7 @@ mod tests {
                 ..Input::default()
             },
         );
-        assert_eq!(player.behavior, BEHAVIOR_TURN);
+        assert_eq!(player.behavior, BEHAVIOR_TURN_LEFT);
         assert_eq!(player.anim.clip, WALK_CLIP);
 
         step(&mut player, &room, &clips, Input::default());
@@ -3918,9 +4170,10 @@ mod tests {
         player.locked = LockedAction::Push;
         player.object_push = true;
         update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
-        assert_eq!(player.action_state, 1);
-        update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
-        assert_eq!(player.action_state, 2, "the missing clip skips the wind-up");
+        assert_eq!(
+            player.action_state, 2,
+            "the missing clip skips the wind-up on the entry tick"
+        );
         player.object_push = false;
         update_with_room(&mut player, &room, &emd, &emd, &[], Input::default());
         assert_eq!(player.action_state, 3);

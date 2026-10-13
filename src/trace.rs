@@ -56,6 +56,11 @@ pub struct TraceTick<'a> {
     pub fade_state: i16,
     /// Current camera cut index.
     pub cam: u8,
+    /// The player's `PlayerEntity.flags` byte (`GameState::player_flags`): the
+    /// aim direction bits. The reference reads the player's status byte at
+    /// entity +0x00, which the player entity shares with this flags byte, so
+    /// slot 0's `status` field is this ORed with the entity's active bit.
+    pub player_flags: u8,
     /// Every entity slot; slot 0 is the player and is always emitted.
     pub entities: &'a [Entity],
     /// [`frame_hash`] of the rendered frame.
@@ -158,7 +163,11 @@ impl TraceWriter {
                 entity.action_state,
                 entity.health,
                 hit,
-                entity.status_flags,
+                if slot == 0 {
+                    entity.status_flags | tick.player_flags
+                } else {
+                    entity.status_flags
+                },
                 entity.action_ticks_counter
             )?;
         }
@@ -247,6 +256,7 @@ mod tests {
             fade_counter: 0,
             fade_state: -1,
             cam: 3,
+            player_flags: 0,
             entities: &game.entities,
             frame_hash: 0xDEAD_BEEF,
         };
@@ -281,6 +291,7 @@ mod tests {
             fade_counter: 0,
             fade_state: -1,
             cam: 0,
+            player_flags: 0,
             entities: &game.entities,
             frame_hash: 0,
         };

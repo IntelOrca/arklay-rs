@@ -1673,6 +1673,27 @@ mod imp {
             fields.add_field_method_get("player_move_speed", |_lua, api| {
                 Ok(api.game_ref().entities[0].move_speed_current)
             });
+            fields.add_field_method_set("player_move_speed", |_lua, api, value: i64| {
+                api.game().entities[0].move_speed_current = value as u16;
+                Ok(())
+            });
+            // The player's `unk_8c` and `unk_bf` animation scratch bytes (the
+            // monster-side `blend_counter` and `unk_bf` re-viewed through the
+            // player layout); the grab-attack handlers clear them.
+            fields.add_field_method_get("player_unk_8c", |_lua, api| {
+                Ok(api.game_ref().entities[0].unk_8c)
+            });
+            fields.add_field_method_set("player_unk_8c", |_lua, api, value: i64| {
+                api.game().entities[0].unk_8c = value as u8;
+                Ok(())
+            });
+            fields.add_field_method_get("player_unk_bf", |_lua, api| {
+                Ok(api.game_ref().entities[0].unk_bf)
+            });
+            fields.add_field_method_set("player_unk_bf", |_lua, api, value: i64| {
+                api.game().entities[0].unk_bf = value as u8;
+                Ok(())
+            });
             // The player's height, the plant's drop tests read it directly.
             fields.add_field_method_get("player_pos_y", |_lua, api| {
                 Ok(api.game_ref().entities[0].pos[1])
@@ -3142,6 +3163,50 @@ mod imp {
                 Ok((code, game.entities[slot].floor_step, distance))
             });
 
+            // `check_room_collision` at an explicit radius (the Neptune
+            // devour's drag uses 500): clears the collision-flags bit 3,
+            // early-outs on the status hidden bit, then pushes or rolls the
+            // entity back and accepts. Returns the result code with the X/Z
+            // delta the resolve applied, which the devour adds to the pair's
+            // animation offsets and `position` words.
+            methods.add_method_mut("resolve_collision_radius", |_lua, api, radius: i64| {
+                let room = api.room;
+                // SAFETY: the room pointer borrows the caller's room for the
+                // whole call (see the type-level comment).
+                let room = unsafe { &*room };
+                let slot = api.slot;
+                let game = api.game();
+                game.entities[slot].collision_flags &= !0x08;
+                if game.entities[slot].status_flags & 0x04 != 0 {
+                    return Ok((0, 0, 0));
+                }
+                let entity = &game.entities[slot];
+                let prev = entity.saved_pos.unwrap_or(entity.pos);
+                let before = entity.pos;
+                let resolution = crate::enemy::walk::resolve_collision_two_radius(
+                    &room.collision,
+                    prev,
+                    before,
+                    radius as i32,
+                    i32::from(entity.sca_radius),
+                    entity.collision_flags,
+                );
+                game.scratch_vec = resolution.scratch;
+                if let Some(bkp) = resolution.entity_bkp {
+                    game.entity_bkp = bkp;
+                }
+                let entity = &mut game.entities[slot];
+                entity.pos = resolution.pos;
+                entity.saved_pos = Some(resolution.pos);
+                entity.floor_step = resolution.floor_step;
+                crate::enemy::walk::apply_push_axis(entity, resolution.push_z);
+                Ok((
+                    resolution.code,
+                    resolution.pos[0].wrapping_sub(before[0]),
+                    resolution.pos[2].wrapping_sub(before[2]),
+                ))
+            });
+
             // The path-result keep: reduce `entity_pathfind_update`'s returned
             // bitfield to bit 0 of the scratch byte at +0x16C, only when no
             // higher bit was set.
@@ -3246,6 +3311,28 @@ mod imp {
                     let room = unsafe { &*room };
                     let slot = api.slot;
                     Ok(crate::enemy::walk::probe_ahead(
+                        room,
+                        api.game(),
+                        slot,
+                        distance as i16,
+                        radius as i16,
+                    ))
+                },
+            );
+
+            // [`probe_ahead`] with the original's raw result code and the
+            // distance its `collision_accept` recorded in `g_tempVar`: the
+            // shark's nose probe ORs the code into `splatter_flag` and latches
+            // the distance in its room-hit word. Returns `(code, travelled)`.
+            methods.add_method_mut(
+                "probe_ahead_code",
+                |_lua, api, (distance, radius): (i64, i64)| {
+                    let room = api.room;
+                    // SAFETY: the room pointer borrows the caller's room for
+                    // the whole call (see the type-level comment).
+                    let room = unsafe { &*room };
+                    let slot = api.slot;
+                    Ok(crate::enemy::walk::probe_ahead_code(
                         room,
                         api.game(),
                         slot,
@@ -4405,6 +4492,37 @@ mod imp {
                 },
             );
 
+            // `neptune_capture_setup` (the shared `capture_setup` the Yawn and
+            // Plant 42 also use): build the devour matrix from the mouth
+            // joint's world transform and the player's matrix.
+            methods.add_method_mut("neptune_capture_setup", |_lua, api, joint: i64| {
+                let slot = api.slot;
+                let game = api.game();
+                let Some(joint_matrix) = game.joint_worlds[slot].get(joint as usize).copied()
+                else {
+                    return Ok(());
+                };
+                let player = game.entities[0];
+                let player_matrix = crate::anim::entity_matrix_rotated(
+                    player.pos,
+                    player.pitch,
+                    player.angle,
+                    player.roll,
+                );
+                game.neptune_capture =
+                    crate::enemy::custom_anim::capture_setup(&joint_matrix, &player_matrix);
+                Ok(())
+            });
+
+            // The devour swallow's per-frame drag on the capture translation:
+            // `t[0] -= 0x41` and `t[1] += 0x0D` as dword steps.
+            methods.add_method_mut("neptune_capture_drag", |_lua, api, ()| {
+                let capture = &mut api.game().neptune_capture;
+                capture.t[0] = capture.t[0].wrapping_sub(0x41);
+                capture.t[1] = capture.t[1].wrapping_add(0x0D);
+                Ok(())
+            });
+
             // Scale a joint world's rotation columns (`ScaleMatrixCols`), the
             // swallow and death ramps.
             methods.add_method_mut(
@@ -4603,6 +4721,23 @@ mod imp {
                     Ok(crate::enemy::walk::tyrant_wander_turn(
                         api.entity_mut(),
                         movement_dist as u32,
+                        angle_step as u16,
+                        turn_limit as u8,
+                        seed,
+                    ))
+                },
+            );
+
+            // The Neptune's call of the same steering: the movement distance
+            // is the entity's own room-hit word (`NE_ROOM_HIT`), the control
+            // byte +0x174 (`splatter_flag`) and the counter +0x170
+            // (`angle_turn_delta`), so the helper reads the word itself.
+            methods.add_method_mut(
+                "neptune_wander_turn",
+                |_lua, api, (angle_step, turn_limit): (i64, i64)| {
+                    let seed = api.game_ref().rand_seed;
+                    Ok(crate::enemy::walk::neptune_wander_turn(
+                        api.entity_mut(),
                         angle_step as u16,
                         turn_limit as u8,
                         seed,
@@ -16981,6 +17116,492 @@ mod computer_arms_tests {
                 )
             };
             assert_eq!(scene(false), scene(true), "the VM reset changes nothing");
+        }
+    }
+
+    mod neptune_tests {
+        use crate::enemy::LuaEnemyHost;
+        use crate::game::GameState;
+        use crate::pack::{Pack, PackWriter};
+        use crate::state::RoomState;
+
+        fn source() -> &'static str {
+            crate::enemy::ENEMY_SCRIPTS
+                .iter()
+                .find(|(path, _)| *path == "enemy/em0b.lua")
+                .expect("the checked-in Neptune script")
+                .1
+        }
+
+        fn pack() -> Pack {
+            let mut writer = PackWriter::new();
+            writer
+                .add("enemy/em0b.lua", source().as_bytes().to_vec())
+                .unwrap();
+            Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+        }
+
+        /// Room 40E1's three script spawns: behaviour byte, X and Z. The
+        /// second and third carry the small-variant bit.
+        const SPAWNS: [(u8, i32, i32); 3] = [
+            (0x80, 4060, 15600),
+            (0x82, 4060, 14600),
+            (0x82, 4060, 13600),
+        ];
+
+        /// The three sharks exactly as `cmd_enemy_set` leaves them, with the
+        /// player at the demo's t0 position and the platform stream where the
+        /// attract boot's frame draw left it (`srand(0)` then one draw).
+        fn sharks() -> GameState {
+            let mut game = GameState::default();
+            game.entities[0].pos = [2900, 0, 23400];
+            for (index, (behavior, x, z)) in SPAWNS.iter().enumerate() {
+                let entity = &mut game.entities[1 + index];
+                entity.id = 0x0B;
+                entity.set_active(true);
+                entity.status_flags = 1;
+                entity.behavior_flags = *behavior;
+                entity.angle = 848;
+                entity.pos = [*x, -32000, *z];
+                entity.saved_pos = Some(entity.pos);
+                entity.sca_radius = crate::game::DEFAULT_ENEMY_RADIUS;
+                entity.sca_half_height = crate::game::DEFAULT_ENEMY_HALF_HEIGHT;
+                entity.sca_offset = crate::game::DEFAULT_ENEMY_SCA_OFFSET;
+            }
+            game.enemy_count = 3;
+            game.rand_state = 2_531_011;
+            game
+        }
+
+        fn step(host: &mut LuaEnemyHost, game: &mut GameState, pack: &Pack, slot: usize) -> bool {
+            host.update(game, &RoomState::default(), pack, slot, &[])
+        }
+
+        fn run_all(host: &mut LuaEnemyHost, game: &mut GameState, pack: &Pack) {
+            for slot in 1..=3 {
+                assert!(step(host, game, pack, slot), "slot {slot} ran");
+            }
+        }
+
+        #[test]
+        fn neptune_spawns_roll_health_and_arm_the_two_box_record() {
+            let pack = pack();
+            let mut game = sharks();
+            let mut host = LuaEnemyHost::new();
+            run_all(&mut host, &mut game, &pack);
+
+            let healths: Vec<i16> = game.entities[1..=3].iter().map(|e| e.health).collect();
+            assert_eq!(
+                healths,
+                vec![58, 52, 55],
+                "four draws each, first discarded"
+            );
+            assert_eq!(game.rand_state, 2_222_380_191, "twelve draws, slot order");
+            assert_eq!(host.failed_scripts(), 0);
+
+            for (index, entity) in game.entities[1..=3].iter().enumerate() {
+                assert_eq!(entity.state(), 1);
+                assert_eq!(entity.action_ticks_counter, 15);
+                assert_eq!(entity.action_behavior, 0);
+                assert_eq!(entity.action_state, 0);
+                assert_eq!(entity.hit_state, 0);
+                assert_eq!(entity.shadow_tint, 0x0040_4040);
+                assert_eq!((entity.move_timer, entity.move_max_steps), (7, 5));
+                assert_eq!(entity.splatter_flag, 0);
+                assert_eq!(entity.angle_turn_delta, 0);
+                // The nose probe accepted its 800-unit step (213, -770) and
+                // stepped the live matrix back, leaving the accepted position
+                // words at the probed point.
+                let pos = entity.pos;
+                let saved = entity.saved_pos.expect("the probe stored the position");
+                assert_eq!(
+                    saved,
+                    [pos[0] + 213, pos[1], pos[2] - 770],
+                    "slot {} probe accept",
+                    index + 1
+                );
+            }
+
+            let big = &game.entities[1];
+            assert_eq!(big.sca_radius, 600);
+            assert_eq!(big.sca_half_height, 800);
+            assert_eq!(big.sca_offset, [500, -800, 0]);
+            let rear = big.sca2.expect("the second box");
+            assert_eq!(
+                (rear.radius, rear.half_height, rear.offset),
+                (600, 800, [-500, -800, 0])
+            );
+            assert_eq!((big.shadow_half_x, big.shadow_half_z), (2000, 300));
+            assert_eq!(big.joint_scale, 0, "the big variant keeps the default");
+
+            for small in &game.entities[2..=3] {
+                assert_eq!(small.sca_radius, 300);
+                assert_eq!(small.sca_half_height, 400);
+                assert_eq!(small.sca_offset, [250, -400, 0]);
+                let rear = small.sca2.expect("the second box");
+                assert_eq!(
+                    (rear.radius, rear.half_height, rear.offset),
+                    (600, 400, [-250, -400, 0])
+                );
+                assert_eq!((small.shadow_half_x, small.shadow_half_z), (1000, 150));
+                assert_eq!(small.joint_scale, 0x800);
+            }
+        }
+
+        #[test]
+        fn neptune_spawned_sharks_gate_out_after_the_init_tick() {
+            let pack = pack();
+            let mut game = sharks();
+            let mut host = LuaEnemyHost::new();
+            run_all(&mut host, &mut game, &pack);
+            let after_init: Vec<_> = game.entities[1..=3].to_vec();
+            let rand_after = game.rand_state;
+            for tick in 0..30 {
+                run_all(&mut host, &mut game, &pack);
+                assert_eq!(game.rand_state, rand_after, "no draws after init");
+                for (index, before) in after_init.iter().enumerate() {
+                    let entity = &game.entities[1 + index];
+                    assert_eq!(entity.pos, before.pos, "tick {tick}");
+                    assert_eq!(entity.action_ticks_counter, before.action_ticks_counter);
+                    assert_eq!(entity.health, before.health);
+                }
+            }
+        }
+
+        #[test]
+        fn neptune_init_nudges_the_accepted_position_1000_units() {
+            let pack = pack();
+            let mut game = sharks();
+            // The deactivation (0x02) and hidden (0x04) bits park both the SCA
+            // separation and the nose probe, so the nudge stays observable on
+            // the accepted words.
+            for entity in &mut game.entities[1..=3] {
+                entity.status_flags = 0x07;
+            }
+            let mut host = LuaEnemyHost::new();
+            run_all(&mut host, &mut game, &pack);
+            for (index, entity) in game.entities[1..=3].iter().enumerate() {
+                let spawn = SPAWNS[index];
+                assert_eq!(
+                    entity.pos,
+                    [spawn.1, -32000, spawn.2],
+                    "the live matrix stays put"
+                );
+                assert_eq!(
+                    entity.saved_pos,
+                    Some([4326, -32000, spawn.2 - 963]),
+                    "the 1000-unit facing nudge"
+                );
+            }
+        }
+
+        #[test]
+        fn neptune_init_tick_runs_the_collision_tail_in_slot_order() {
+            let pack = pack();
+            let mut game = sharks();
+            let mut host = LuaEnemyHost::new();
+            // The first shark's separation runs against the two sharks that
+            // still carry the default record; its own live boxes are what the
+            // later slots see when they separate. The resulting positions are
+            // the reference demo's t0 values exactly.
+            assert!(step(&mut host, &mut game, &pack, 1));
+            let first_pos = game.entities[1].pos;
+            assert_ne!(first_pos, [4060, -32000, 15600], "the first tail moved it");
+            run_all(&mut host, &mut game, &pack);
+            assert_eq!(game.entities[1].pos, [4180, -32000, 16070], "slot 1");
+            assert_eq!(game.entities[2].pos, [3849, -32000, 14546], "slot 2");
+            assert_eq!(game.entities[3].pos, [4131, -32000, 13180], "slot 3");
+            // The nose probe latched the accepted distance in the room-hit
+            // word (`NE_ROOM_HIT`).
+            assert_ne!(game.entities[1].sca_touch(), 0, "the probe latched");
+        }
+
+        // -------------------------------------------------------------------
+        // State 1 - the swim/wander AI
+        // -------------------------------------------------------------------
+
+        /// One-frame clips for every animation id, so `advance_anim` completes
+        /// on every tick.
+        fn clips() -> Vec<crate::model::Clip> {
+            (0..32)
+                .map(|_| crate::model::Clip {
+                    frames: vec![crate::model::ClipFrame {
+                        keyframe: 0,
+                        timing: 1,
+                    }],
+                })
+                .collect()
+        }
+
+        /// Thirty-two-frame clips, so an animation takes a known number of
+        /// ticks and specific frame ids are reachable.
+        fn long_clips() -> Vec<crate::model::Clip> {
+            (0..32)
+                .map(|_| crate::model::Clip {
+                    frames: (0..32)
+                        .map(|_| crate::model::ClipFrame {
+                            keyframe: 0,
+                            timing: 1,
+                        })
+                        .collect(),
+                })
+                .collect()
+        }
+
+        /// One awake big-variant shark in slot 1, facing +X at the origin,
+        /// with the live two-box record and a 7-frame wake timer.
+        fn awake_shark() -> GameState {
+            let mut game = GameState::default();
+            let entity = &mut game.entities[1];
+            entity.id = 0x0B;
+            entity.set_active(true);
+            entity.status_flags = 1;
+            entity.behavior_flags = 0;
+            entity.set_state(1);
+            entity.set_ignore(0);
+            entity.angle = 0;
+            entity.pos = [0, 0, 0];
+            entity.saved_pos = Some(entity.pos);
+            entity.sca_radius = 600;
+            entity.sca_half_height = 800;
+            entity.sca_offset = [500, -800, 0];
+            entity.sca2 = Some(crate::game::ScaVolume {
+                radius: 600,
+                half_height: 800,
+                offset: [-500, -800, 0],
+            });
+            entity.move_timer = 7;
+            game.enemy_count = 1;
+            game
+        }
+
+        #[test]
+        fn neptune_swim_substates_follow_the_player_run() {
+            let pack = pack();
+            let clips = clips();
+            let mut game = awake_shark();
+            game.entities[0].pos = [20000, 0, 0];
+            game.entities[0].action_behavior = 0xD;
+            let mut host = LuaEnemyHost::new();
+
+            // State 0 of the swim actions picks the animation and the 0x78
+            // cruise speed.
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_state, 1);
+            assert_eq!(game.entities[1].move_speed_current, 0x78);
+
+            // Far and running: speed up to 0x82 in sub-state 2.
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_state, 2);
+            assert_eq!(game.entities[1].move_speed_current, 0x82);
+
+            // Close in: drop back to sub-state 1 at speed 100.
+            game.entities[0].pos = [5000, 0, 0];
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_state, 1);
+            assert_eq!(game.entities[1].move_speed_current, 100);
+
+            // A stopped player keeps the shark in the far sub-state.
+            game.entities[0].pos = [20000, 0, 0];
+            game.entities[0].action_behavior = 0;
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_state, 1);
+            assert_eq!(game.entities[1].move_speed_current, 100);
+        }
+
+        #[test]
+        fn neptune_choose_attack_selects_devour_and_bite() {
+            let pack = pack();
+            let clips = clips();
+
+            // Nearly dead player inside 3500: the swallow.
+            let mut game = awake_shark();
+            game.entities[0].pos = [1000, 0, 0];
+            game.entities[0].health = 10;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].ignore(), 1);
+            assert_eq!(game.entities[1].action_behavior, 4);
+            assert_eq!(game.entities[1].action_state, 1, "the seize ran");
+
+            // A healthy player inside 3000: the bite.
+            let mut game = awake_shark();
+            game.entities[0].pos = [2000, 0, 0];
+            game.entities[0].health = 50;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 5);
+            assert_eq!(game.entities[1].action_state, 1, "the close began");
+
+            // A healthy player out of range keeps swimming.
+            let mut game = awake_shark();
+            game.entities[0].pos = [4000, 0, 0];
+            game.entities[0].health = 50;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 0);
+
+            // The small variant never attacks.
+            let mut game = awake_shark();
+            game.entities[1].behavior_flags = 2;
+            game.entities[0].pos = [1000, 0, 0];
+            game.entities[0].health = 10;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 0);
+
+            // Off-axis: the 768 half-window test refuses the attack.
+            let mut game = awake_shark();
+            game.entities[0].pos = [0, 0, 1000];
+            game.entities[0].health = 10;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 0);
+
+            // A player already being attacked is never interrupted.
+            let mut game = awake_shark();
+            game.entities[0].pos = [1000, 0, 0];
+            game.entities[0].health = 10;
+            game.entities[0].is_being_attacked = 1;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 0);
+        }
+
+        #[test]
+        fn neptune_devour_miss_spits_and_recovers() {
+            let pack = pack();
+            let clips = long_clips();
+            let mut game = awake_shark();
+            game.entities[0].pos = [1000, 0, 0];
+            game.entities[0].health = 10;
+            let mut host = LuaEnemyHost::new();
+
+            // The attack decision selects the devour; the seize takes the
+            // player's animation and facing.
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_behavior, 4);
+            assert_eq!(game.entities[1].action_state, 1);
+            assert_eq!(game.entities[1].status_flags & 2, 2);
+            assert_eq!(game.entities[0].action_behavior, 0);
+
+            // The carry's frame-15 reach test misses (no posed mouth joint),
+            // so the shark spits the player back.
+            let mut saw_spit = false;
+            let mut saw_recover = false;
+            for _ in 0..200 {
+                assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+                match game.entities[1].action_state {
+                    5 => saw_spit = true,
+                    6 => saw_recover = true,
+                    _ => {}
+                }
+                if saw_recover
+                    && game.entities[1].action_behavior == 0
+                    && game.entities[1].action_state == 1
+                {
+                    break;
+                }
+            }
+            assert!(saw_spit, "the missed grab reached the spit");
+            assert!(saw_recover, "the spit settled");
+            assert_eq!(game.entities[1].action_behavior, 0, "back to the swim");
+            assert_eq!(game.entities[1].action_state, 1, "resumes at swim_far");
+            assert_eq!(game.entities[1].move_speed_current, 0x78);
+            assert_eq!(game.entities[1].status_flags & 2, 0);
+            // The miss handed the player back untouched.
+            assert_eq!(game.entities[0].health, 10);
+            assert_eq!(game.entities[0].action_state, 1);
+            assert_eq!(game.entities[0].is_being_attacked, 0);
+            assert_eq!(game.player_flags & 6, 0, "the grab bits cleared");
+        }
+
+        #[test]
+        fn neptune_lunge_picks_a_swim_animation_from_the_frame_seed() {
+            let pack = pack();
+            let clips = long_clips();
+            let mut game = awake_shark();
+            game.entities[0].pos = [20000, 0, 0];
+            // prev = 3: the shifted seed is 1 and the taps disagree, so the
+            // returned low byte is 1 and the pick is animation 3.
+            game.rand_seed = 3;
+            let entity = &mut game.entities[1];
+            entity.action_behavior = 1;
+            entity.action_state = 0;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            assert_eq!(game.entities[1].action_state, 1);
+            assert_eq!(game.entities[1].animation_id, 3);
+            assert_eq!(game.entities[1].move_speed_current, 0x32);
+            assert_eq!(game.rand_seed, 1, "the LFSR stepped the frame seed");
+            assert_eq!(game.rand_state, 2_745_024, "one platform draw moved");
+        }
+
+        #[test]
+        fn neptune_wander_turn_steers_on_the_room_hit_word() {
+            let pack = pack();
+            let clips = clips();
+            let mut game = awake_shark();
+            game.rand_seed = 0;
+            game.entities[0].pos = [20000, 0, 0];
+            let entity = &mut game.entities[1];
+            entity.move_speed_current = 0x78;
+            // The room-hit word is the movement distance: zero is under the
+            // 80-unit stuck threshold, and a counter already at the 60 limit
+            // arms the random turn on this call.
+            entity.set_sca_touch(0);
+            entity.angle_turn_delta = 60;
+            entity.player_pos_x = 1000;
+            entity.player_pos_z = 0;
+            let mut host = LuaEnemyHost::new();
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            let entity = game.entities[1];
+            assert_eq!(entity.splatter_flag & 0x80, 0x80, "the stuck flag");
+            assert_eq!(entity.angle_turn_delta, 10, "turn_limit / 6");
+        }
+
+        // -------------------------------------------------------------------
+        // State 2 - the death/respawn machine
+        // -------------------------------------------------------------------
+
+        #[test]
+        fn neptune_damaged_state_turns_thrashes_sinks_and_respawns() {
+            let pack = pack();
+            let clips = clips();
+            let mut game = awake_shark();
+            game.entities[0].pos = [1000, 0, 0];
+            let entity = &mut game.entities[1];
+            // The weapon-damage entry: state 2 with a survived-hit latch.
+            entity.set_state(2);
+            entity.set_ignore(0);
+            entity.action_behavior = 0;
+            entity.action_state = 0;
+            entity.hit_state = 27;
+            let mut host = LuaEnemyHost::new();
+
+            // The first tick claims the shark and runs the turn.
+            assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+            let entity = game.entities[1];
+            assert_eq!(entity.ignore(), 1);
+            assert_eq!(entity.action_ticks_counter, 0x1E);
+            // The aligned shark falls straight into the thrash, which the
+            // one-frame clip completes, stepping the stage to the sink.
+            assert_eq!(entity.action_behavior, 2);
+            assert_eq!(entity.angle, 0x800, "the half-turn");
+
+            // The sink counts the 30-frame timer down and resets the block.
+            for _ in 0..40 {
+                assert!(host.update(&mut game, &RoomState::default(), &pack, 1, &clips));
+                if game.entities[1].state() == 1 {
+                    break;
+                }
+            }
+            let entity = game.entities[1];
+            assert_eq!(entity.state(), 1, "the respawn path");
+            assert_eq!(entity.action_behavior, 0);
+            assert_eq!(entity.action_state, 0);
+            assert_eq!(entity.hit_state, 0, "the latch cleared");
+            assert_eq!(entity.blend_counter, 0x3F);
         }
     }
 }

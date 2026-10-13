@@ -213,27 +213,28 @@ impl AttractState {
 
     /// Translate a raw recorded pad word into the engine's input shapes.
     ///
-    /// The raw word is the PC build's pad word (the one `JoyToPSX` produces):
-    /// `0x1000/0x2000/0x4000/0x8000` are up/down/left/right, `0x0080` the
-    /// action/confirm button, `0x0040` cancel/run and `0x0008` aim. The
-    /// original's `PlayerPad_Update` remaps raw to its internal dpad word and
-    /// clears the left/right bits when up/down are held; the player machine
-    /// then reads that word, so the same clearing is applied here.
+    /// The raw word is the PC build's pad word (the one `JoyToPSX` produces),
+    /// with the standard PlayStation D-pad layout: `0x1000` up, `0x2000`
+    /// right, `0x4000` down, `0x8000` left, `0x0080` the action/confirm
+    /// button, `0x0040` cancel/run and `0x0008` aim. The original's
+    /// `PlayerPad_Update` remaps raw to its internal dpad word and clears the
+    /// bit of a direction whose opposite is held; the player machine then
+    /// reads that word, so the same clearing is applied here.
     pub fn input(word: u16) -> DemoInput {
         let action = word & 0x0080 != 0;
         let aim = word & 0x0008 != 0;
         let run = word & 0x0040 != 0;
         let up = word & 0x1000 != 0;
-        let down = word & 0x2000 != 0;
-        let mut left = word & 0x4000 != 0;
-        let mut right = word & 0x8000 != 0;
-        // `if (prevDpadState & 1) clear bit2` (left); `if (& 2) clear bit3`
-        // (right): up masks left, down masks right.
+        let right = word & 0x2000 != 0;
+        let mut down = word & 0x4000 != 0;
+        let mut left = word & 0x8000 != 0;
+        // `if (dpadHeld & 1) clear bit2` (down); `if (& 2) clear bit3`
+        // (left): an opposite pair cancels with the up/right bit winning.
         if up {
-            left = false;
+            down = false;
         }
-        if down {
-            right = false;
+        if right {
+            left = false;
         }
         DemoInput {
             player: player::Input {
@@ -242,6 +243,7 @@ impl AttractState {
                 left,
                 right,
                 run,
+                run_pressed: false,
                 action_held: action,
                 action_pressed: false,
                 // The original has no separate fire button: the action button
@@ -265,12 +267,13 @@ impl AttractState {
         let pressed = !self.prev_pad & word;
         let mut input = Self::input(word);
         input.player.action_pressed = pressed & 0x0080 != 0;
+        input.player.run_pressed = pressed & 0x0040 != 0;
         input.player.aim_pressed = pressed & 0x0008 != 0;
         input.player.fire_pressed = input.player.action_pressed;
         input.ui.up = pressed & 0x1000 != 0;
-        input.ui.down = pressed & 0x2000 != 0;
-        input.ui.left = pressed & 0x4000 != 0;
-        input.ui.right = pressed & 0x8000 != 0;
+        input.ui.right = pressed & 0x2000 != 0;
+        input.ui.down = pressed & 0x4000 != 0;
+        input.ui.left = pressed & 0x8000 != 0;
         input.ui.confirm = pressed & 0x0080 != 0;
         input.ui.cancel = pressed & 0x0040 != 0;
         input.ui.start = pressed & 0x0800 != 0;
@@ -357,17 +360,17 @@ mod tests {
 
         let input = AttractState::input(0x4000 | 0x8000 | 0x2000);
         assert!(input.player.down);
-        assert!(input.player.left);
-        assert!(!input.player.right, "down masks right");
+        assert!(input.player.right);
+        assert!(!input.player.left, "right masks left");
         assert!(!input.action);
 
         let input = AttractState::input(0x8000);
-        assert!(input.player.right);
+        assert!(input.player.left);
 
-        // Up masks left; down masks right, exactly like the remap.
+        // Up masks down; right masks left, exactly like the remap.
         let input = AttractState::input(0x1000 | 0x4000);
         assert!(input.player.up);
-        assert!(!input.player.left);
+        assert!(!input.player.down);
     }
 
     #[test]

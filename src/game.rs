@@ -3263,6 +3263,10 @@ pub struct GameState {
     /// the head joint, recomposed by the swallowed player's own state machine
     /// every frame.
     pub yawn_capture: crate::anim::Mat4x3,
+    /// The Neptune capture matrix (`neptune_capture_matrix`, 0x004bc988): the
+    /// devour transform built from the shark's mouth joint, dragged by the
+    /// swallow's own step.
+    pub neptune_capture: crate::anim::Mat4x3,
     /// The Tyrant's render-only scratch: the slash ribbon, the two claw
     /// ghosts and the five rocket-death limbs. One Tyrant is alive at a time,
     /// and the block resets with the room.
@@ -3334,6 +3338,14 @@ pub struct GameState {
     pub last_used_item: Option<u8>,
     /// The item currently equipped.
     pub equipped: Option<u8>,
+    /// The reference's `g_playerEntity.equippedWeaponId`: the *weapon* the aim
+    /// and fire machine uses. `SetupCharacterData` derives it from the
+    /// equipped item (`g_itemboxSlots[item + 47].Id`), so it normally tracks
+    /// `equipped`; the attract boot is the exception - the original loads the
+    /// reel's item into `g_EquippedItemId` AFTER `SetupCharacterData` ran, so
+    /// a demo keeps whatever weapon the boot left (the shipped card's
+    /// Beretta) even though its inventory shows the knife.
+    pub equipped_weapon_id: u8,
     /// The player's `PlayerEntity` flags byte (offset 0x00): the aim
     /// direction (`0x20` up, `0x40` neutral, `0x80` down) and the animation
     /// state bits. Combat does not raise the aim bits yet, so this stays `0`;
@@ -3564,6 +3576,7 @@ impl Default for GameState {
             plant42_shared_body: None,
             plant42_capture: crate::anim::Mat4x3::default(),
             yawn_capture: crate::anim::Mat4x3::default(),
+            neptune_capture: crate::anim::Mat4x3::default(),
             tyrant: crate::enemy::tyrant::TyrantState::default(),
             player_attacker: None,
             player_damage: None,
@@ -3579,6 +3592,9 @@ impl Default for GameState {
             last_picked_item: None,
             last_used_item: None,
             equipped: None,
+            // The shipped bio card equips the Beretta (`g_EquippedItemId` 2),
+            // so `SetupCharacterData` leaves weapon id 2 in place.
+            equipped_weapon_id: 2,
             player_flags: 0,
             cerberus_barked: false,
             scratch_vec: [0; 3],
@@ -4282,6 +4298,10 @@ impl GameState {
         let entity = &self.entities[0];
         if entity.pos != player.pos {
             player.pos = entity.pos;
+            // A script wrote the entity's position (`cmd_player_pos_set`
+            // writes the `position` mirror in the same instruction), so the
+            // collision rollback anchor follows it.
+            player.collision_mirror = [entity.pos[0], entity.pos[2]];
         }
         let angle = entity.angle & 0x0FFF;
         if player.angle != angle {
@@ -4979,6 +4999,9 @@ impl GameState {
     /// Equip (or clear) an item.
     pub fn set_equipped(&mut self, item: Option<u8>) {
         self.equipped = item;
+        // `SetupCharacterData`'s derivation: the weapon id is the equipped
+        // item's own id (the item-slot table maps every weapon to itself).
+        self.equipped_weapon_id = item.unwrap_or(0);
         self.state_bytes[usize::from(STATE_BYTE_EQUIPPED)] = item.unwrap_or(0);
     }
 
@@ -6677,6 +6700,88 @@ impl GameState {
         }
     }
 
+    /// `player_input_to_behavior`'s action-key branches (0x004956a0): the
+    /// press edge scans for a climbable object (a door's vault) and for a
+    /// marked stairs/ladder zone, latching the locked behaviour the player's
+    /// state machine then runs on the same tick.
+    ///
+    /// The engine calls this at the top of the player's frame-0 dispatch -
+    /// before the tick's movement, the original's point - so the scan reads
+    /// the frame-start position. The caller guarantees the press edge
+    /// survived the pad blanking, the message gate is open and the player is
+    /// in the pad-driven state.
+    pub fn player_action_press(&mut self, player: &mut PlayerState) {
+        use crate::objects;
+
+        // The scan is part of the frame-0 dispatch: a locked behaviour (the
+        // vault sequence, the ladder climb, the push) has already switched
+        // the player to the frame-1 dispatch, so the press cannot re-enter
+        // it.
+        if player.locked != crate::player::LockedAction::None {
+            return;
+        }
+
+        // A second press mid-climb verifies the facing: settling flips the
+        // vault to the return side. The transition bit stays latched after a
+        // climb up (the original's `check_climb_object` only clears it on the
+        // verify pass), so the next press restarts the sequence on the return
+        // side instead of climbing up again.
+        if player.vault_bit {
+            let facing = player
+                .climb_object
+                .and_then(|slot| self.objects.record(usize::from(slot)))
+                .is_some_and(|record| objects::verify_climb_object(record, player.angle));
+            if facing {
+                // The verification branch clears the transition bit and the
+                // input handler immediately re-raises it: behavior 10
+                // restarts from state 0 with zone flag 0x10 set, so the warp
+                // takes the return side and consumes the bit.
+                player.vault_return = true;
+                player.locked = crate::player::LockedAction::Vault;
+                player.action_state = 0;
+                player.move_speed_current = 0;
+                // `check_climb_object`'s shared tail recomputes the side from
+                // the facing on both branches.
+                player.attack_direction = objects::climb_side(player.angle);
+                self.entities[0].zone_flags |= 0x10;
+                self.entities[0].is_being_attacked = 0x80;
+                self.entities[0].animation_frame_id = 1;
+                self.message_flags &= 0xFFBF;
+                self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
+            }
+        } else if player.locked == crate::player::LockedAction::None {
+            if let Some(candidate) =
+                objects::check_climb_object(&self.objects, player.pos, player.angle)
+            {
+                player.vault_bit = true;
+                player.vault_return = false;
+                player.climb_object = Some(candidate.slot as u8);
+                player.attack_direction = candidate.attack_direction;
+                player.locked = crate::player::LockedAction::Vault;
+                player.action_state = 0;
+                player.move_speed_current = 0;
+                // `check_climb_object` clears the approach-side flag on the
+                // scan pass; it is re-raised by the verify pass.
+                self.entities[0].zone_flags &= !0x10;
+                self.entities[0].is_being_attacked = 0x80;
+                self.entities[0].animation_frame_id = 1;
+                self.message_flags &= 0xFFBF;
+                self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
+            } else if self.entities[0].zone_flags & 0x20 != 0 && self.ladder_down() {
+                // `player_input_to_behavior`'s zone branch: the action-key
+                // probe above ran `set_stairs_zone`, so the marked zone and
+                // ladder mode are live. Without the mode the stair-door
+                // behaviour (M5's transition) owns the tick.
+                player.locked = crate::player::LockedAction::Ladder;
+                player.action_state = 0;
+                player.move_speed_current = 0;
+                self.entities[0].is_being_attacked = 0x80;
+                self.entities[0].animation_frame_id = 1;
+                self.message_flags &= 0xFFBF;
+            }
+        }
+    }
+
     /// `update_room_objects` (0x00474090): one pass over the built omodel
     /// records, run each tick after the player's physics and the player-side
     /// probe.
@@ -6699,59 +6804,11 @@ impl GameState {
             self.message_flags |= 0x0040;
         }
 
-        // The action press drives `check_climb_object` exactly where the
-        // original's input path calls it. A second press mid-climb verifies
-        // the facing: settling flips the vault to the return side. The
-        // transition bit stays latched after a climb up (the original's
-        // `check_climb_object` only clears it on the verify pass), so the next
-        // press restarts the sequence on the return side instead of climbing
-        // up again.
-        if player.input.action_pressed {
-            if player.vault_bit {
-                let facing = player
-                    .climb_object
-                    .and_then(|slot| self.objects.record(usize::from(slot)))
-                    .is_some_and(|record| objects::verify_climb_object(record, player.angle));
-                if facing {
-                    // The verification branch clears the transition bit and
-                    // the input handler immediately re-raises it: behavior 10
-                    // restarts from state 0 with zone flag 0x10 set, so the
-                    // warp takes the return side and consumes the bit.
-                    player.vault_return = true;
-                    player.locked = crate::player::LockedAction::Vault;
-                    player.action_state = 0;
-                    player.move_speed_current = 0;
-                    self.entities[0].zone_flags |= 0x10;
-                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
-                }
-            } else if player.locked == crate::player::LockedAction::None {
-                if let Some(candidate) =
-                    objects::check_climb_object(&self.objects, player.pos, player.angle)
-                {
-                    player.vault_bit = true;
-                    player.vault_return = false;
-                    player.climb_object = Some(candidate.slot as u8);
-                    player.attack_direction = candidate.attack_direction;
-                    player.locked = crate::player::LockedAction::Vault;
-                    player.action_state = 0;
-                    player.move_speed_current = 0;
-                    // `check_climb_object` clears the approach-side flag on the
-                    // scan pass; it is re-raised by the verify pass.
-                    self.entities[0].zone_flags &= !0x10;
-                    self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
-                } else if self.entities[0].zone_flags & 0x20 != 0 && self.ladder_down() {
-                    // `player_input_to_behavior`'s zone branch: the action-key
-                    // probe above ran `set_stairs_zone`, so the marked zone and
-                    // ladder mode are live. Without the mode the stair-door
-                    // behaviour (M5's transition) owns the tick.
-                    player.locked = crate::player::LockedAction::Ladder;
-                    player.action_state = 0;
-                    player.move_speed_current = 0;
-                }
-            }
-        }
-        // The transition bit tracks the vault latch: the warp clears both
-        // together on the return side, so a completed vault releases it.
+        // The action-press scan for a climbable object or a ladder zone runs
+        // at the top of the player's frame-0 dispatch, before this pass:
+        // [`GameState::player_action_press`]. The transition bit tracks the
+        // vault latch: the warp clears both together on the return side, so a
+        // completed vault releases it.
         self.flags[5].apply(MSF_DOOR_TRANSITION, if player.vault_bit { 0 } else { 1 });
 
         let was_pushing = self.object_push;
@@ -12184,12 +12241,14 @@ mod tests {
         state.interact(player.pos, 0, true);
         assert_eq!(state.entities[0].zone_flags & 0x30, 0x30);
         assert!(state.ladder_down());
+        state.player_action_press(&mut player);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert_eq!(player.action_state, 0);
 
         // A second press mid-climb neither flips the vault nor restarts.
         player.input.action_pressed = true;
+        state.player_action_press(&mut player);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert!(!player.vault_bit);
@@ -15723,17 +15782,23 @@ mod tests {
         let mut player = push_player();
         player.input.action_pressed = true;
 
+        state.player_action_press(&mut player);
         state.tick_objects(&room, &mut player);
         assert!(player.vault_bit);
         assert_eq!(player.locked, crate::player::LockedAction::Vault);
         assert_eq!(player.attack_direction, -1);
         assert!(state.flags[5].bit(MSF_DOOR_TRANSITION));
 
-        // A second press with the player turned onto the object's facing
-        // settles onto the return side and restarts the sequence, keeping the
-        // transition bit latched until the return warp consumes it.
+        // A second press after the climb finished (the warp cleared `locked`
+        // but the transition bit stays latched on the approach side) verifies
+        // the facing: settling onto the object's yaw flips the vault to the
+        // return side and restarts the sequence. The original's frame-0
+        // dispatch only runs while the sequence is not (animFrameId back to
+        // 0), so the press is ignored mid-climb.
+        player.locked = crate::player::LockedAction::None;
         player.angle = 0x800;
         player.input.action_pressed = true;
+        state.player_action_press(&mut player);
         state.tick_objects(&room, &mut player);
         assert!(player.vault_bit);
         assert!(player.vault_return);
