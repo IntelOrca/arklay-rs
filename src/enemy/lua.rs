@@ -3062,24 +3062,19 @@ mod imp {
                 Ok(())
             });
 
-            // The lab terminal's voice line: resolve the id in the stage's
-            // voice table and queue the request for the engine, counting a
-            // miss for an empty record so a package without the line degrades
-            // instead of deadlocking. The caller owns the playing bit.
+            // The lab terminal's voice line: resolve the id to the stage
+            // row's pack entry and queue the request for the engine. The
+            // caller owns the playing bit; an id with no line in the package
+            // simply misses at load.
             methods.add_method_mut("play_voice", |_lua, api, id: i64| {
                 let stage = api.game_ref().id.stage.saturating_sub(1);
-                match crate::voice::name(stage, id as u16) {
-                    Some(name) => {
-                        let volume = if stage == 0 && id == 0x33 { -300 } else { 0 };
-                        let game = api.game();
-                        game.voice.request = Some(crate::game::VoiceRequest {
-                            name,
-                            volume,
-                            pan: 0,
-                        });
-                    }
-                    None => api.game().voice.misses += 1,
-                }
+                let volume = if stage == 0 && id == 0x33 { -300 } else { 0 };
+                let game = api.game();
+                game.voice.request = Some(crate::game::VoiceRequest {
+                    path: crate::voice::pack_path(stage, id as u16),
+                    volume,
+                    pan: 0,
+                });
                 Ok(())
             });
 
@@ -15414,7 +15409,10 @@ mod computer_arms_tests {
                 game.entities[1],
                 game.entities[2],
                 game.rand_state,
-                game.voice.request.map(|request| request.name),
+                game.voice
+                    .request
+                    .as_ref()
+                    .map(|request| request.path.clone()),
             )
         };
         assert_eq!(scene(false), scene(true), "the VM reset changes nothing");

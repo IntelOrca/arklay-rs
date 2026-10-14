@@ -789,10 +789,10 @@ pub struct Snd3dRequest {
 pub const ROOM_BGM_LEN: usize = 224;
 
 /// A voice line queued by `voice_play` (0x1E) for the engine's voice cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceRequest {
-    /// Voice basename resolved from the stage row, e.g. `V004_00`.
-    pub name: &'static str,
+    /// Pack entry resolved from the stage's table row, e.g. `voice/01_09.wav`.
+    pub path: String,
     /// DirectSound millibel volume (0 full, -300 for the stage-1 id `0x33`
     /// quirk).
     pub volume: i32,
@@ -801,7 +801,7 @@ pub struct VoiceRequest {
 }
 
 /// Voice-line state: the pending request and the miss audit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct VoiceState {
     /// The most recent line the script asked for; the engine takes it on the
     /// next tick and holds it until the voice channel frees up.
@@ -809,8 +809,9 @@ pub struct VoiceState {
     /// The script (`voice_play` type 2) or `bgm_stop_all` asked the engine to stop
     /// the active line.
     pub stop_requested: bool,
-    /// Names that resolved to nothing (empty record or out-of-range id), kept
-    /// so the corpus audit can report the hardening path.
+    /// Lines the engine could not load (an empty record, an out-of-range id
+    /// or a file absent from the package), kept so the corpus audit can
+    /// report the hardening path.
     pub misses: u64,
 }
 
@@ -8113,26 +8114,18 @@ impl ScdHost for ScdGameHost<'_> {
                 let id = operand_u16(operands, 1);
                 match kind {
                     1 => {
-                        // The stage tables are 0-based; `id` indexes the row.
+                        // The stage tables are 0-based; the request formats
+                        // the row's pack entry directly.
                         let stage = self.state.id.stage.saturating_sub(1);
-                        match voice::name(stage, id) {
-                            Some(name) => {
-                                // The one mixed-well-down line: stage 1 (the
-                                // 1F/2F mansion tables' stage 0) id 0x33.
-                                let volume = if stage == 0 && id == 0x33 { -300 } else { 0 };
-                                self.state.voice.request = Some(VoiceRequest {
-                                    name,
-                                    volume,
-                                    pan: 0,
-                                });
-                                self.state.set_voice_playing();
-                            }
-                            // Hardening: an empty record or an out-of-range id
-                            // records the miss and never raises the wait bit, so
-                            // a package without the line cannot deadlock a
-                            // script on F7.
-                            None => self.state.voice.misses += 1,
-                        }
+                        // The one mixed-well-down line: stage 1 (the
+                        // 1F/2F mansion tables' stage 0) id 0x33.
+                        let volume = if stage == 0 && id == 0x33 { -300 } else { 0 };
+                        self.state.voice.request = Some(VoiceRequest {
+                            path: voice::pack_path(stage, id),
+                            volume,
+                            pan: 0,
+                        });
+                        self.state.set_voice_playing();
                     }
                     2 => {
                         self.state.voice.request = None;
@@ -9885,7 +9878,7 @@ mod tests {
             assert_eq!(
                 host.state().voice.request,
                 Some(VoiceRequest {
-                    name: "V004_00",
+                    path: "voice/01_09.wav".to_string(),
                     volume: 0,
                     pan: 0,
                 })
@@ -9897,12 +9890,14 @@ mod tests {
 
     #[test]
     fn voice_play_resolves_each_stage_to_its_row() {
-        let cases: [(&str, u16, &str); 5] = [
-            ("1000", 0, "V001_00"),
-            ("2000", 0, "V104_00"),
-            ("3000", 0, "V00D_00"),
-            ("4000", 0, "V109_00"),
-            ("5000", 0, "VA09_00"),
+        let cases: [(&str, u16, &str); 7] = [
+            ("1000", 0, "voice/01_00.wav"),
+            ("2000", 0, "voice/02_00.wav"),
+            ("3000", 0, "voice/03_00.wav"),
+            ("4000", 0, "voice/04_00.wav"),
+            ("5000", 0, "voice/05_00.wav"),
+            ("6000", 0, "voice/01_00.wav"),
+            ("7000", 0, "voice/02_00.wav"),
         ];
         for (room, id, expected) in cases {
             let id_room = RoomId::parse(room).unwrap();
@@ -9910,7 +9905,11 @@ mod tests {
             let mut host = ScdGameHost::new(&mut state);
             host.on_message(op(0x1E), &operands(&[1, i64::from(id)]));
             assert_eq!(
-                host.state().voice.request.map(|request| request.name),
+                host.state()
+                    .voice
+                    .request
+                    .as_ref()
+                    .map(|request| request.path.as_str()),
                 Some(expected),
                 "room {room} id {id}"
             );
@@ -9923,18 +9922,20 @@ mod tests {
         {
             let mut host = ScdGameHost::new(&mut state);
             host.on_message(op(0x1E), &operands(&[1, 0x33]));
-            assert_eq!(host.state().voice.request.unwrap().volume, -300);
+            assert_eq!(host.state().voice.request.as_ref().unwrap().volume, -300);
         }
         // The quirk only covers the mansion 1F/2F row (0-based stage 0).
         let mut state = GameState::new(RoomId::parse("2000").unwrap(), &RoomState::default());
         let mut host = ScdGameHost::new(&mut state);
         host.on_message(op(0x1E), &operands(&[1, 0x33]));
-        assert_eq!(host.state().voice.request.unwrap().volume, 0);
+        assert_eq!(host.state().voice.request.as_ref().unwrap().volume, 0);
     }
 
     #[test]
-    fn voice_play_empty_records_and_out_of_range_ids_never_raise_the_bit() {
-        // 0-based stage 4 (the guardhouse table) id 181 is an empty record.
+    fn voice_play_empty_records_and_out_of_range_ids_still_queue_a_path() {
+        // 0-based stage 4 (the guardhouse table) id 181 is an empty record:
+        // the request still formats its row entry, and the engine's failed
+        // load counts the miss without ever stalling the F7 wait.
         let id = RoomId {
             stage: 5,
             room: 0,
@@ -9944,10 +9945,26 @@ mod tests {
         {
             let mut host = ScdGameHost::new(&mut state);
             host.on_message(op(0x1E), &operands(&[1, 181]));
+            assert_eq!(
+                host.state()
+                    .voice
+                    .request
+                    .as_ref()
+                    .map(|request| request.path.as_str()),
+                Some("voice/05_b5.wav")
+            );
+            assert!(host.state().voice_playing(), "the wait bit is raised");
+            assert_eq!(host.state().voice.misses, 0, "the engine counts the miss");
             host.on_message(op(0x1E), &operands(&[1, 9999]));
-            assert!(host.state().voice.request.is_none());
-            assert!(!host.state().voice_playing(), "the wait bit stays clear");
-            assert_eq!(host.state().voice.misses, 2);
+            assert_eq!(
+                host.state()
+                    .voice
+                    .request
+                    .as_ref()
+                    .map(|request| request.path.as_str()),
+                Some("voice/05_270f.wav")
+            );
+            assert_eq!(host.state().voice.misses, 0);
         }
     }
 
@@ -9971,7 +9988,7 @@ mod tests {
     #[test]
     fn voice_play_unknown_types_are_inert() {
         let mut state = game();
-        let before = state.voice;
+        let before = state.voice.clone();
         let mut host = ScdGameHost::new(&mut state);
         assert_eq!(
             host.on_message(op(0x1E), &operands(&[3, 9])),

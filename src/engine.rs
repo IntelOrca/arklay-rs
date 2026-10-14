@@ -121,7 +121,6 @@ use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
-use crate::voice;
 
 const WIDTH: i32 = 320;
 const HEIGHT: i32 = 240;
@@ -6830,28 +6829,27 @@ struct VoiceCache {
 }
 
 impl VoiceCache {
-    /// Load and parse `voice/{name}.wav` from the pack.
-    fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
-        let path = voice::pack_path(name);
-        if let Some(wav) = self.wavs.get(&path) {
+    /// Load and parse the pack entry `path`, caching hits and misses.
+    fn load(&mut self, pack: &Pack, path: &str) -> Option<audio::Wav> {
+        if let Some(wav) = self.wavs.get(path) {
             return Some(wav.clone());
         }
-        if self.missing.contains(&path) {
+        if self.missing.contains(path) {
             return None;
         }
-        let Ok(bytes) = pack.read(&path) else {
+        let Ok(bytes) = pack.read(path) else {
             eprintln!("warning: missing voice line {path}");
-            self.missing.insert(path);
+            self.missing.insert(path.to_owned());
             return None;
         };
         match audio::parse_wav(&bytes) {
             Ok(wav) => {
-                self.wavs.insert(path, wav.clone());
+                self.wavs.insert(path.to_owned(), wav.clone());
                 Some(wav)
             }
             Err(err) => {
                 eprintln!("warning: invalid voice line {path}: {err:#}");
-                self.missing.insert(path);
+                self.missing.insert(path.to_owned());
                 None
             }
         }
@@ -6864,8 +6862,8 @@ impl VoiceCache {
 ///
 /// With no audio device the flag is cleared every tick, so a headless run
 /// (`--capture`, the corpus audit) advances its scripts immediately instead of
-/// hanging on F7. A name that resolves but cannot be read clears the flag the
-/// same way (the documented hardening).
+/// hanging on F7. A line whose entry is absent from the pack clears the flag
+/// the same way (the documented hardening).
 fn tick_voice(
     music: &mut Option<Mixer>,
     cache: &mut VoiceCache,
@@ -6903,7 +6901,7 @@ fn tick_voice(
         && !mixer.voice_playing()
         && let Some(request) = cache.pending.take()
     {
-        match cache.load(pack, request.name) {
+        match cache.load(pack, &request.path) {
             Some(wav) => {
                 let gain = sfx::volume_gain(request.volume);
                 let pan = sfx::pan_from_raw(request.pan);
@@ -6912,8 +6910,8 @@ fn tick_voice(
                 game.set_voice_playing();
             }
             None => {
-                // The line resolved by name but its file is absent: count the
-                // miss and release the wait so the script cannot deadlock.
+                // The requested entry is absent from the pack: count the miss
+                // and release the wait so the script cannot deadlock.
                 game.voice.misses += 1;
                 game.clear_voice_playing();
             }
@@ -11753,10 +11751,10 @@ mod tests {
         let path = dir.0.join("voice.akpak");
         let mut writer = PackWriter::new();
         writer
-            .add("voice/v004_00.wav", voice_wav_bytes(&[100, 200]))
+            .add("voice/01_09.wav", voice_wav_bytes(&[100, 200]))
             .unwrap();
         writer
-            .add("voice/v004_01.wav", voice_wav_bytes(&[300, 400]))
+            .add("voice/01_0a.wav", voice_wav_bytes(&[300, 400]))
             .unwrap();
         writer.write(&path).unwrap();
         let pack = Pack::open(&path).unwrap();
@@ -11774,14 +11772,14 @@ mod tests {
         let mut cache = VoiceCache::default();
         let id = RoomId::parse("1000").unwrap();
         let mut game = game::GameState::new(id, &RoomState::default());
-        let request = |name| game::VoiceRequest {
-            name,
+        let request = |path: &str| game::VoiceRequest {
+            path: path.to_string(),
             volume: 0,
             pan: 0,
         };
 
         // A queued request starts on the next tick and raises the F7 wait bit.
-        game.voice.request = Some(request("V004_00"));
+        game.voice.request = Some(request("voice/01_09.wav"));
         game.set_voice_playing();
         tick_voice(&mut music, &mut cache, &mut game, &pack);
         assert!(cache.active, "the line started");
@@ -11802,15 +11800,15 @@ mod tests {
 
         // A request queued while a line is active waits, then starts when the
         // channel frees.
-        game.voice.request = Some(request("V004_00"));
+        game.voice.request = Some(request("voice/01_09.wav"));
         game.set_voice_playing();
         tick_voice(&mut music, &mut cache, &mut game, &pack);
-        game.voice.request = Some(request("V004_01"));
+        game.voice.request = Some(request("voice/01_0a.wav"));
         game.set_voice_playing();
         tick_voice(&mut music, &mut cache, &mut game, &pack);
         assert_eq!(
-            cache.pending.map(|pending| pending.name),
-            Some("V004_01"),
+            cache.pending.as_ref().map(|pending| pending.path.as_str()),
+            Some("voice/01_0a.wav"),
             "a second line stays pending while the first plays"
         );
         assert!(music.as_ref().unwrap().voice_playing());
@@ -11826,6 +11824,18 @@ mod tests {
         );
         assert!(music.as_ref().unwrap().voice_playing());
         assert_eq!(game.voice.misses, 0);
+
+        // A request whose entry is absent from the pack counts the miss and
+        // releases the wait so the script cannot deadlock on F7.
+        music.as_mut().unwrap().render_for_test(4);
+        tick_voice(&mut music, &mut cache, &mut game, &pack);
+        assert!(!cache.active, "the previous line finished");
+        game.voice.request = Some(request("voice/00_ff.wav"));
+        game.set_voice_playing();
+        tick_voice(&mut music, &mut cache, &mut game, &pack);
+        assert_eq!(game.voice.misses, 1, "the absent entry was counted");
+        assert!(!game.voice_playing(), "the wait released on the miss");
+        assert!(!cache.active);
     }
 
     #[test]
