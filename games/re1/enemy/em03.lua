@@ -7,7 +7,7 @@
 --                    behaviour owns the spider, anything else freezes
 --   behavior_flags   the SPAWN KIND, clamped to 2 at init:
 --                      0/1 sit on the floor, 2 hangs from the ceiling at
---                      -6136 (-7200 in the guardhouse) and drops on a thread
+--                      -6120 (-7200 in the guardhouse) and drops on a thread
 --                    bit 7 skips the whole update
 --   action_behavior  the twelve-entry behaviour word (idle, three walks, the
 --                    strafe, two approaches, lunge, spit, webdrop, ret, circle)
@@ -849,7 +849,7 @@ local function init(e)
     if e.behavior_flags > 1 then
         e.pitch = 0x0800
         e.roll = 0
-        e.pos_y = -6136
+        e.pos_y = -6120
         if e.stage == 4 then
             e.pos_y = -7200
         end

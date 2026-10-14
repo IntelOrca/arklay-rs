@@ -3501,6 +3501,10 @@ pub struct GameState {
     /// effect consumers; the same value lands in the BioCard word `cmpw 3`
     /// reads (`state_words[3]`).
     pub rand_seed: u16,
+    /// This frame's screen-shake offset (the original's `g_ScreenShakeOffsetX/Y`),
+    /// rolled at the top of the gameplay tick while `MSF2_SCREEN_SHAKE` is set
+    /// and read by the renderer. See [`GameState::roll_screen_shake`].
+    pub screen_shake: [i32; 2],
     /// The effect pool (64 slots).
     pub effects: effects::EffectPool,
     /// The room's runtime object-model records, one per declared omodel slot;
@@ -3677,6 +3681,7 @@ impl Default for GameState {
             sfx_requests: Vec::new(),
             rand_state: 1,
             rand_seed: 0,
+            screen_shake: [0, 0],
             effects: effects::EffectPool::new(),
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
@@ -4287,7 +4292,9 @@ impl GameState {
         crate::enemy::update_all(self, room, models, pack, lua)
     }
 
-    /// The frame's screen-shake offset: the original's `ApplyScreenShake`.
+    /// Roll this frame's screen-shake offset into [`GameState::screen_shake`]:
+    /// the original's `ApplyScreenShake`, which `main_loop` runs at the top of
+    /// every rendered frame, before the game task and its per-frame random draw.
     ///
     /// While `MSF2_SCREEN_SHAKE` is set this draws three values from the
     /// platform stream: the X and Y magnitudes (the draw's low bit, so 0 or
@@ -4297,19 +4304,28 @@ impl GameState {
     /// direction is `draw & 3`. The offset is cleared to `[0, 0]` without
     /// drawing when the bit is off, and the renderer applies it to the camera
     /// projection and the background's display origin.
-    pub fn shake_offset(&mut self) -> [i32; 2] {
-        if !self.flags[5].bit(MSF2_SCREEN_SHAKE) {
-            return [0, 0];
-        }
-        let x = i32::from(platform_rand(&mut self.rand_state) & 1);
-        let y = i32::from(platform_rand(&mut self.rand_state) & 1);
-        let direction = platform_rand(&mut self.rand_state) & 3;
-        match direction {
-            1 => [x, -y],
-            2 => [-x, y],
-            3 => [-x, -y],
-            _ => [x, y],
-        }
+    pub fn roll_screen_shake(&mut self) {
+        self.screen_shake = if !self.flags[5].bit(MSF2_SCREEN_SHAKE) {
+            [0, 0]
+        } else {
+            let x = i32::from(platform_rand(&mut self.rand_state) & 1);
+            let y = i32::from(platform_rand(&mut self.rand_state) & 1);
+            let direction = platform_rand(&mut self.rand_state) & 3;
+            match direction {
+                1 => [x, -y],
+                2 => [-x, y],
+                3 => [-x, -y],
+                _ => [x, y],
+            }
+        };
+    }
+
+    /// The screen-shake offset rolled for this frame by
+    /// [`GameState::roll_screen_shake`]. The renderer reads this instead of
+    /// drawing the stream so that the roll happens once per tick, at the top,
+    /// like the original.
+    pub fn screen_shake(&self) -> [i32; 2] {
+        self.screen_shake
     }
 
     /// One tick of the effect pool: behaviours, velocity integration, sprite
@@ -11534,14 +11550,17 @@ mod tests {
         let mut state = game();
         // The bit is clear: the offset is cleared without touching the stream.
         let frozen = state.rand_state;
-        assert_eq!(state.shake_offset(), [0, 0]);
+        state.roll_screen_shake();
+        assert_eq!(state.screen_shake(), [0, 0]);
         assert_eq!(state.rand_state, frozen);
 
         state.flags[5].apply(MSF2_SCREEN_SHAKE, 0);
         // X = 41 & 1 = 1, Y = 18467 & 1 = 1, direction 6334 & 3 = 2 negates X.
-        assert_eq!(state.shake_offset(), [-1, 1]);
+        state.roll_screen_shake();
+        assert_eq!(state.screen_shake(), [-1, 1]);
         // X = 26500 & 1 = 0, Y = 19169 & 1 = 1, direction 15724 & 3 = 0.
-        assert_eq!(state.shake_offset(), [0, 1]);
+        state.roll_screen_shake();
+        assert_eq!(state.screen_shake(), [0, 1]);
         assert_eq!(state.rand_state, 1_030_492_215, "six draws consumed");
     }
 
