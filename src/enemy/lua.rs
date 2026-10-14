@@ -195,6 +195,10 @@ mod imp {
                     function.call::<()>(e)
                 })
             };
+            // The original's shared `SetEntityScaHitData` tail runs inside the
+            // entity's own update, after its state handler; the port mirrors it
+            // here so the scripted and native drivers leave the same buffer.
+            crate::enemy::walk::refresh_entity_sca_world(&mut game.entities[slot]);
             // The entity's joint world matrices, computed from the pose this
             // update leaves behind: the original's render pass does the same
             // between two entity updates, so the next tick's script (the

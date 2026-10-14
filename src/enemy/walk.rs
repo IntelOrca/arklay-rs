@@ -2358,22 +2358,51 @@ type SeparationTarget = ([i32; 3], u16, ([ScaHit; 2], usize), u8);
 /// record first, then the optional second profile volume
 /// ([`crate::game::Entity::sca2`]). Returns the volumes and the live count.
 pub fn entity_sca_volumes(entity: &Entity) -> ([ScaHit; 2], usize) {
-    let first = ScaHit::of(entity);
+    // The volume's world centre is the entity's stored `pSca_hit_data`, not a
+    // fresh rotation of the local record: the original only refreshes it inside
+    // the owning entity's update, so a character that has not run yet this
+    // frame (spawned later in the same pass, or frozen) still carries the old
+    // buffer. Encoding it in `world_bias` with a zero local offset makes
+    // `world_offset` return the stored centre verbatim.
+    let mut first = ScaHit::of(entity);
+    first.offset = [0; 3];
+    first.world_bias = entity.sca_world;
     match entity.sca2 {
         Some(volume) => (
             [
                 first,
                 ScaHit {
-                    offset: volume.offset,
+                    offset: [0; 3],
                     half_height: volume.half_height,
                     radius: volume.radius,
-                    world_bias: [0; 3],
+                    world_bias: entity.sca_world2,
                 },
             ],
             2,
         ),
         None => ([first, first], 1),
     }
+}
+
+/// `SetEntityScaHitData`: write the entity's `pSca_hit_data` world centres from
+/// its live local SCA record, rotated by its yaw (with any `e:set_sca_hit_point`
+/// bias folded in). The original calls this once inside the entity's own update,
+/// immediately before its collision resolve; the stored words are then what
+/// every *other* entity's resolve reads for this frame.
+pub fn refresh_entity_sca_world(entity: &mut Entity) {
+    let primary = ScaHit::of(entity);
+    entity.sca_world = primary.world_offset(entity.angle).map(|word| word as i16);
+    entity.sca_world2 = match entity.sca2 {
+        Some(volume) => ScaHit {
+            offset: volume.offset,
+            half_height: volume.half_height,
+            radius: volume.radius,
+            world_bias: [0; 3],
+        }
+        .world_offset(entity.angle)
+        .map(|word| word as i16),
+        None => [0; 3],
+    };
 }
 
 /// `ResolveEntityScaCollision` against the player: push the character out of
@@ -2450,6 +2479,7 @@ pub fn separate_all(game: &mut GameState, slot: usize) -> bool {
         .collect();
     let entity = &mut game.entities[slot];
     let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
+    refresh_entity_sca_world(entity);
     let touched = separate_from_player(
         entity,
         prev_pos,
@@ -4740,6 +4770,7 @@ mod tests {
         let prev = e.pos;
         e.sca_offset = [0, 0, 0];
         e.sca_hit_delta = [0, 0, 0];
+        refresh_entity_sca_world(&mut e);
         let other = ScaHit {
             offset: [0, 0, 0],
             half_height: 100,
@@ -4755,6 +4786,7 @@ mod tests {
             0
         ));
         e.sca_hit_delta = [600, 0, 0];
+        refresh_entity_sca_world(&mut e);
         assert!(separate_from_character(
             &mut e,
             prev,
@@ -4763,6 +4795,29 @@ mod tests {
             &[other],
             0
         ));
+    }
+
+    #[test]
+    fn an_unrefreshed_entity_lends_a_zero_world_centre() {
+        // A slot spawned later in the same pass has not run its own
+        // `SetEntityScaHitData` yet, so its `pSca_hit_data` is still the zeroed
+        // pool words: the local record is live, but the world centre is zero.
+        let mut e = entity([0, 0, 0], 0, 0);
+        e.sca_radius = 422;
+        e.sca_half_height = 0x05FA;
+        e.sca_offset = [0, -0x05FA, 0];
+        let volumes = entity_sca_volumes(&e).0;
+        assert_eq!(volumes[0].radius, 422, "the local record is live");
+        assert_eq!(
+            volumes[0].world_offset(0),
+            [0, 0, 0],
+            "but the buffer is not"
+        );
+
+        // After the entity's own update the buffer carries the rotated record.
+        refresh_entity_sca_world(&mut e);
+        let volumes = entity_sca_volumes(&e).0;
+        assert_eq!(volumes[0].world_offset(0), [0, -0x05FA, 0]);
     }
 
     #[test]
@@ -5113,12 +5168,12 @@ mod tests {
                 half_height: 180,
                 offset: [0, -180, -1000],
             });
+            refresh_entity_sca_world(&mut e);
             e
         };
-        let (volumes, count) = entity_sca_volumes(&make());
-        assert_eq!(count, 2);
-        assert_eq!(volumes[0].offset, [0, -180, 1000]);
-        assert_eq!(volumes[1].offset, [0, -180, -1000]);
+        let volumes = entity_sca_volumes(&make()).0;
+        assert_eq!(volumes[0].world_offset(0), [0, -180, 999]);
+        assert_eq!(volumes[1].world_offset(0), [0, -180, -999]);
 
         // The other sits past the front box: the entity is pushed back.
         let mut e = make();

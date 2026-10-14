@@ -294,6 +294,7 @@ pub fn update_all(
             {
                 updated += 1;
             }
+            walk::refresh_entity_sca_world(&mut game.entities[slot]);
             continue;
         }
         if characters_frozen {
@@ -318,6 +319,7 @@ pub fn update_all(
             let target = live_look_at_target(game, slot);
             update_entity(game, slot, room, clips, target);
         }
+        walk::refresh_entity_sca_world(&mut game.entities[slot]);
         updated += 1;
     }
     updated
@@ -391,6 +393,9 @@ pub fn update_entity(
     if game.entities[slot].look_at_flags != 0 {
         game.joint_worlds[slot] = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
     }
+    // The original's shared `SetEntityScaHitData` tail writes the character's
+    // `pSca_hit_data` every tick, before the next entity's SCA resolve reads it.
+    walk::refresh_entity_sca_world(&mut game.entities[slot]);
     game.entities[slot].has_enter_switch_zone = u8::from(in_camera_zone(
         room,
         room.current_cut,
