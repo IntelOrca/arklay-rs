@@ -593,9 +593,7 @@ impl Framebuffer {
                         // The reference blends through the GL pipeline in
                         // normalized floats, so the result rounds to nearest
                         // rather than truncating.
-                        *channel = ((u32::from(value) * source
-                            + u32::from(*channel) * keep
-                            + 127)
+                        *channel = ((u32::from(value) * source + u32::from(*channel) * keep + 127)
                             / 255) as u8;
                     }
                 }
@@ -2505,11 +2503,7 @@ fn reference_vertex_shade(
 ) -> [f64; 3] {
     // The reference accumulates in 32-bit floats (`TmdComputeLight`), so the
     // port matches its rounding exactly rather than using doubles.
-    let normal = [
-        normal[0] as f32,
-        -(normal[1] as f32),
-        normal[2] as f32,
-    ];
+    let normal = [normal[0] as f32, -(normal[1] as f32), normal[2] as f32];
     let mut n_view = [0.0f32; 3];
     for row in 0..3 {
         let mut sum = 0.0f32;
@@ -2530,8 +2524,8 @@ fn reference_vertex_shade(
             source.dir
         };
         let l = apply_matrix_sv(camera, vec);
-        let d = -(n_view[0] * l[0] as f32 + n_view[1] * l[1] as f32 + n_view[2] * l[2] as f32)
-            / 4096.0;
+        let d =
+            -(n_view[0] * l[0] as f32 + n_view[1] * l[1] as f32 + n_view[2] * l[2] as f32) / 4096.0;
         if d > 0.0 {
             for (channel, &value) in shade.iter_mut().zip(&source.color) {
                 *channel += d * value as f32 * 255.0 / 128.0;
