@@ -797,8 +797,13 @@ fn detect_projectile(
 }
 
 /// `check_weapon_line_of_sight`: walk the room's four sight-blocking layers
-/// from the player to the hit point.
-fn check_weapon_line_of_sight(game: &GameState, room: &RoomState, target: [i32; 3]) -> u8 {
+/// from the player to the hit point. Returns non-zero when the sight line is
+/// blocked; the effect splash test (and the weapon aim) treat `0` as clear.
+pub(crate) fn check_weapon_line_of_sight(
+    game: &GameState,
+    room: &RoomState,
+    target: [i32; 3],
+) -> u8 {
     let player = &game.entities[0];
     let dir = [
         target[0] - player.pos[0],

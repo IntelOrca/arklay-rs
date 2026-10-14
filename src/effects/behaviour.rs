@@ -245,6 +245,82 @@ fn ground_splat(game: &mut GameState, index: usize) {
     }
 }
 
+/// `effect_projectile_hit_check` (0x0043bd90): the splash test shared by the
+/// drop-splat (range 600) and splash-timer (range 900) behaviours. When the
+/// splash lands within `range` of the player with a clear weapon sight line it
+/// hurts them: a Black Tiger's (id 4) acid takes 12 health and can poison, a
+/// Web Spinner's (id 3) 10; a second playthrough takes 15 (30 for the tiger).
+/// The hit sets the bitten pose (animation 2, behaviour 100). Returns true even
+/// when the player was already being attacked, in which case no damage lands.
+///
+/// The original's trailing branch also probes the secondary enemy list for a
+/// stage-2 room-0xC "shark" (an entity id 0x13 in slot 2). No shipped room
+/// reaches it: that shut web sits far outside the 500-unit grace, so the port
+/// leaves the branch out.
+fn projectile_hit_check(
+    game: &mut GameState,
+    room: &RoomState,
+    range: i32,
+    x: i16,
+    z: i16,
+) -> bool {
+    let (player_pos, attacked, base) = {
+        let player = &game.entities[0];
+        (player.pos, player.is_being_attacked, player.health)
+    };
+    let dx = player_pos[0] - i32::from(x);
+    let dz = player_pos[2] - i32::from(z);
+    let distance =
+        crate::sfx::integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
+    if distance >= range {
+        return false;
+    }
+    if crate::combat::check_weapon_line_of_sight(game, room, player_pos) != 0 {
+        return false;
+    }
+    if attacked == 0 {
+        let enemy_id = game.entities[1].id;
+        if enemy_id == 3 || enemy_id == 4 {
+            if game.rand_seed & 1 != 0 {
+                game.poison_player();
+            }
+        }
+        let second = game.flags[usize::from(crate::game::BANK_SCENARIO)]
+            .bit(crate::game::SCENARIO_FLAG_SECOND_PLAYTHROUGH);
+        let mut health = if !second {
+            base.wrapping_sub(5)
+        } else {
+            base.wrapping_sub(0x0f)
+        };
+        if enemy_id == 3 && !second {
+            health = base.wrapping_sub(10);
+        }
+        if enemy_id == 4 {
+            health = if !second {
+                health.wrapping_sub(7)
+            } else {
+                base.wrapping_sub(0x1e)
+            };
+        }
+        let player = &mut game.entities[0];
+        player.health = health;
+        player.is_being_attacked = 1;
+        // The original writes 0x84 animationId = 2 and 0x85 animFrameId = 0,
+        // which are the entity's packed state/ignore bytes.
+        player.set_state(2);
+        player.set_ignore(0);
+        player.action_behavior = 100;
+        player.action_state = 0;
+        if health < 0 {
+            player.set_state(3);
+            player.set_ignore(0);
+            player.action_behavior = 0;
+            player.action_state = 0;
+        }
+    }
+    true
+}
+
 /// Spawn a billboard and remember the returned slot for later behaviours.
 fn spawn_from_header(game: &mut GameState, index: usize) {
     let Some(effect) = game.effects.slot(index).copied() else {
@@ -353,7 +429,16 @@ fn attach_matrix(game: &GameState, attach: Attach) -> [i16; 9] {
             None => return IDENTITY_MATRIX,
         },
     };
-    let matrix = anim::entity_matrix(entity.pos, entity.angle);
+    // The original stores the parent entity's render-time `localMatrix` (the
+    // full pitch/yaw/roll rotation with the entity's joint scale folded in),
+    // not a yaw-only matrix.
+    let matrix = anim::entity_matrix_rotated_scaled(
+        entity.pos,
+        entity.pitch,
+        entity.angle,
+        entity.roll,
+        entity.joint_scale,
+    );
     std::array::from_fn(|index| matrix.r[index / 3][index % 3] as i16)
 }
 
@@ -1495,14 +1580,23 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
                 return;
             };
             let y = i32::from(h16(&effect, 0x0e)) + i32::from(effect.pos[1]);
-            // The original also runs the player-damage splash probe inside the
-            // `-0x961..-1` band, which needs combat; only the floor crossing
-            // (`-1 < y`, the tighter of the two) remains.
-            if -1 < y {
-                ground_splat(game, index);
-                if let Some(slot) = game.effects.slot_mut(index) {
-                    let flags = slot.flags() | 0x4007;
-                    slot.set_flags(flags);
+            // Inside the `-0x961..` band: past the floor the sprite lands, and
+            // while the player is in their idle animation the splash also
+            // probes for a hit (the Black Tiger's acid globs land through this
+            // path).
+            if -0x961 < y {
+                if -1 < y {
+                    ground_splat(game, index);
+                    if let Some(slot) = game.effects.slot_mut(index) {
+                        let flags = slot.flags() | 0x4007;
+                        slot.set_flags(flags);
+                    }
+                }
+                if game.entities[0].animation_id == 1
+                    && projectile_hit_check(game, room, 900, effect.pos[0], effect.pos[2])
+                {
+                    ground_splat(game, index);
+                    return;
                 }
             }
         }
@@ -1590,6 +1684,9 @@ fn drop_splat(game: &mut GameState, room: &RoomState, index: usize) {
         i32::from(effect.pos[2]),
     ];
     if probe_ground(room, pos, [0, 0, 0], 4) != 0 {
+        ground_splat(game, index);
+    }
+    if projectile_hit_check(game, room, 600, effect.pos[0], effect.pos[2]) {
         ground_splat(game, index);
     }
 }

@@ -3344,16 +3344,18 @@ pub fn weapon_joint_anchor(
 /// difference so the falling body pivots around the joint that reached the
 /// ground instead of sliding through it.
 ///
-/// `which` 0 composes joints 0, 9, 10 and 11 and compares against joint 12's
-/// world translation; `which` 1 composes joints 0, 12, 13 and 14 against
-/// joint 15's.
+/// `which` 0 composes joints 0, 10, 11 and 12 and compares against joint 12's
+/// world translation; `which` 1 composes joints 0, 13, 14 and 15 against
+/// joint 15's. The tip joint is part of the composed chain: the original's
+/// `base + b * -0x7C + 0xA0` walks `joints[tip-2..=tip]`, then subtracts the
+/// tip's stored world.
 pub fn hunter_recenter_on_joint(game: &mut GameState, clips: &[Clip], slot: usize, which: u8) {
     let entity = game.entities[slot];
     let locals = game.entity_anims[slot].local_transforms(&entity, clips);
     let tip = if which == 0 { 12usize } else { 15usize };
     let mut scratch =
         crate::anim::entity_matrix_rotated(entity.pos, entity.pitch, entity.angle, entity.roll);
-    for index in [0usize, tip - 3, tip - 2, tip - 1] {
+    for index in [0usize, tip - 2, tip - 1, tip] {
         if let Some(transform) = locals.get(index) {
             scratch = compose(&scratch, transform);
         }
@@ -3380,8 +3382,9 @@ pub fn hunter_recenter_on_joint(game: &mut GameState, clips: &[Clip], slot: usiz
 /// joint-1 slot ([`crate::game::Entity::joint_track`]).
 ///
 /// `sel` is the hunter's mouth-joint selector. The held-player chain walks
-/// joints 0 and 1 then the three below the mouth joint; the scripted-bite
-/// chain walks the fixed joints 0, 1, 3, 4 and 5. Chain indices outside the
+/// joints 0 and 1 then the mouth joint and the two below it (`sel-2..=sel`);
+/// the scripted-bite chain walks the fixed joints 0, 1, 4, 5 and 6 (the
+/// original's `sel`-less `0x388`-based walk). Chain indices outside the
 /// skeleton are skipped (the original walks past the joint array; nothing in
 /// the port reads the bytes there).
 pub fn hunter_track_joint(
@@ -3397,14 +3400,14 @@ pub fn hunter_track_joint(
     let mut scratch =
         crate::anim::entity_matrix_rotated(entity.pos, entity.pitch, entity.angle, entity.roll);
     if scripted {
-        for index in [0usize, 1, 3, 4, 5] {
+        for index in [0usize, 1, 4, 5, 6] {
             if let Some(transform) = locals.get(index) {
                 scratch = compose(&scratch, transform);
             }
         }
     } else {
         let sel = i32::from(sel);
-        for index in [0i32, 1, sel - 3, sel - 2, sel - 1] {
+        for index in [0i32, 1, sel - 2, sel - 1, sel] {
             if index >= 0
                 && let Some(transform) = locals.get(index as usize)
             {

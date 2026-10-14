@@ -103,6 +103,14 @@ impl EntityAnim {
         self.player.reverse = reverse;
         self.player.blend_step = blend_step;
         self.player.blend_counter = u16::from(entity.blend_counter);
+        // The first consuming tick after a reset. `ResetJointTransforms` left
+        // every joint at identity, so the original's `Joint_move` blends the
+        // first frame's rotations out of zero instead of snapping straight to
+        // the clip's frame. Seed the on-screen pose with that identity rotation
+        // (the frame's own root offsets) so the first blend eases.
+        if self.player.applied_pose().is_none() {
+            self.seed_identity_pose(entity, clips);
+        }
         let completed = self.player.update(clips);
         entity.animation_frame_id = self.player.frame as u8;
         entity.timing_control = self.player.timing.min(u16::from(u8::MAX)) as u8;
@@ -114,6 +122,29 @@ impl EntityAnim {
             let _ = self.player.pose_keyframe(clips, keyframes);
         }
         completed
+    }
+
+    /// Seed the on-screen pose with the reset identity (zero rotations, the
+    /// pending frame's root offsets) so the first blend after a reset eases
+    /// out of `ResetJointTransforms` instead of jumping to the frame.
+    fn seed_identity_pose(&self, entity: &Entity, clips: &[Clip]) {
+        let Some(keyframes) = self.keyframes.as_deref() else {
+            return;
+        };
+        let Some(clip) = clips.get(usize::from(entity.animation_id)) else {
+            return;
+        };
+        let Some(frame) = clip.frames.get(usize::from(entity.animation_frame_id)) else {
+            return;
+        };
+        let Some(target) = keyframes.get(usize::from(frame.keyframe)) else {
+            return;
+        };
+        self.player.set_applied_pose(Some(Keyframe {
+            offset: target.offset,
+            vertex: target.vertex,
+            rotations: vec![[0, 0, 0]; target.rotations.len()],
+        }));
     }
 
     /// The keyframe to pose `entity`'s mesh at.
@@ -160,6 +191,16 @@ impl EntityAnim {
         keyframes: &[Keyframe],
     ) -> Option<Keyframe> {
         if self.player.clip != usize::from(entity.animation_id) {
+            // The original's joint structs hold the pose on screen: the last
+            // consuming tick's materialized pose. A behaviour (or script) that
+            // switched the animation without advancing the clock must keep
+            // reading that pose for the rest of the tick, exactly like the
+            // un-recomposed joints; only before the first consuming tick is
+            // there nothing on screen to fall back on, and the entity's own
+            // frame word stands in.
+            if let Some(pose) = self.player.applied_pose() {
+                return Some(pose);
+            }
             return keyframes.get(self.keyframe_index(entity, clips)).cloned();
         }
         self.player.pose_keyframe(clips, keyframes)
