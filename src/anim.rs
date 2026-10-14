@@ -121,16 +121,31 @@ pub fn joint_local_transforms(
                 *relative
             };
             Mat4x3 {
-                r: rotation_matrix(
-                    i32::from(rotation[0]),
-                    i32::from(rotation[1]),
-                    i32::from(rotation[2]),
-                ),
+                r: if rotation == IDENTITY_ROTATION {
+                    IDENTITY_MATRIX
+                } else {
+                    rotation_matrix(
+                        i32::from(rotation[0]),
+                        i32::from(rotation[1]),
+                        i32::from(rotation[2]),
+                    )
+                },
                 t: translation.map(i32::from),
             }
         })
         .collect()
 }
+
+/// Sentinel rotation placed in a seeded joint's `Keyframe::rotations` to mean
+/// the exact 4.12 identity. The original's `ResetJointTransforms` copies the
+/// literal `g_identityMatrixData` (a 4096 diagonal) rather than running
+/// `RotMatrix`, which saturates a zero-angle matrix to a 4095 diagonal. A real
+/// keyframe rotation is always a 12-bit angle, so `i16::MAX` never occurs
+/// naturally.
+pub const IDENTITY_ROTATION: [i16; 3] = [i16::MAX, i16::MAX, i16::MAX];
+
+/// The exact 4.12 identity matrix `g_identityMatrixData` holds.
+pub const IDENTITY_MATRIX: [[i32; 3]; 3] = [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]];
 
 /// Compose world matrices for every joint:
 /// `world[0] = entity * transform[0]`; `world[i] = world[parent] * transform[i]`.
@@ -604,12 +619,14 @@ pub fn blend_keyframes(
     let rotations: Vec<[i16; 3]> = (0..count)
         .map(|joint| {
             let rotation: [i16; 3] = std::array::from_fn(|axis| {
-                let cur = i32::from(
-                    current
-                        .rotations
-                        .get(joint)
-                        .map_or(0, |rotation| rotation[axis]),
-                );
+                // A seeded joint carries [`IDENTITY_ROTATION`] so the world
+                // composition emits the exact 4096 matrix; as a blend source it
+                // stands for the zero-angle rotation the original's joints hold.
+                let cur = match current.rotations.get(joint) {
+                    Some(r) if *r == IDENTITY_ROTATION => 0,
+                    Some(r) => i32::from(r[axis]),
+                    None => 0,
+                };
                 let tgt = i32::from(
                     target
                         .rotations
@@ -1032,6 +1049,35 @@ mod tests {
             player.pose_keyframe(&clips, &keyframes).unwrap().rotations[0],
             [0x300, 0, 0]
         );
+    }
+
+    #[test]
+    fn the_seeded_identity_rotation_is_the_exact_identity_matrix() {
+        // `ResetJointTransforms` copies the literal 4096 identity, while
+        // `RotMatrix` on a zero angle saturates to 4095. The sentinel keeps the
+        // two apart without disturbing the blend, which reads it as zero.
+        let skeleton = Skeleton {
+            relative: vec![[0, 100, 0], [0, 50, 0]],
+            children: vec![vec![1], vec![]],
+        };
+        let keyframe = Keyframe {
+            offset: [0, 0, 0],
+            vertex: [0, 0, 0],
+            rotations: vec![IDENTITY_ROTATION, IDENTITY_ROTATION],
+        };
+        let locals = joint_local_transforms(&skeleton, &keyframe);
+        assert_eq!(locals[0].r, IDENTITY_MATRIX);
+        assert_eq!(locals[1].r, IDENTITY_MATRIX);
+
+        // The same pose blended as a source is treated as a zero rotation, not
+        // the 0x7FFF sentinel (blend = 0x1000/step pins the current pose).
+        let target = Keyframe {
+            offset: [0, 0, 0],
+            vertex: [0, 0, 0],
+            rotations: vec![[0x100, 0, 0], [0, 0, 0]],
+        };
+        let blended = blend_keyframes(&keyframe, &target, 8, 0x200);
+        assert_eq!(blended.rotations[0], [0, 0, 0]);
     }
 
     #[test]

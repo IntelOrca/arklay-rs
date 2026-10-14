@@ -2288,13 +2288,23 @@ mod imp {
             // mask and restart the clip clock, keeping the shared keyframe
             // table and skeleton the driver installed for this frame.
             methods.add_method_mut("reset_joints", |_lua, api, ()| {
+                let clips = api.clips;
                 let slot = api.slot;
                 let game = api.game();
+                // SAFETY: the clips pointer borrows the caller's model for
+                // the whole call (see the type-level comment).
+                let clips = unsafe { &*clips };
                 let keyframes = game.entity_anims[slot].keyframes.take();
                 let skeleton = game.entity_anims[slot].skeleton.take();
                 game.entity_anims[slot] = EntityAnim::default();
                 game.entity_anims[slot].keyframes = keyframes;
                 game.entity_anims[slot].skeleton = skeleton;
+                // `ResetJointTransforms`: the original leaves every joint at the
+                // bind pose (identity rotations, the joint's own offset). Seed
+                // the on-screen pose so a scripted clip/frame setter that never
+                // consumes a tick keeps reading that pose instead of the freshly
+                // named frame.
+                game.entity_anims[slot].seed_identity_pose(&game.entities[slot], clips);
                 game.entities[slot].joint_flags = 0;
                 game.entities[slot].joint_armed = 0;
                 game.entities[slot].joint_flags_hi = [0; 32];
