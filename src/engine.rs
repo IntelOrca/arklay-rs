@@ -3319,6 +3319,13 @@ impl GameSession {
             self.draw_screen_intensity_bars();
             self.draw_room_fade();
             self.draw_death_fade();
+        } else if self.menu_fade_phase == MenuFadePhase::Out && !self.menu_fade_pending {
+            // The original suspends game_loop while the menu opens, so the room
+            // is not redrawn: the screen is the menu's black background with the
+            // opening fade over it, not the frozen room darkening. Clear to
+            // black for the fade-out so the frames match the reference. The
+            // pending flag skips the press frame, which still shows the room.
+            self.framebuffer.clear();
         }
         // The computer terminal draws over the frozen monitor-camera scene.
         if self.computer.is_some() {

@@ -31,12 +31,12 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
 
 ## Open (found, not yet fixed)
 
-- **Menu-open fade timing.** The reference shows `game_loop` suspended, so its
-  menu-open screen is the menu's black background with the fade over it: the
-  screen is black ~2 frames after START. arklay keeps the frozen room and
-  darkens it over the whole `0xC00` fade (`render` skips the menu while
-  `MenuFadePhase::Out`), so the two agree again only once the menu has faded in
-  (~14 frames). The trace's `fade` field also differs (arklay's menu fade is a
+- **Menu-open fade timing.** Partly fixed: during `MenuFadePhase::Out` arklay
+  now clears the frame to black instead of keeping the frozen room darkening,
+  matching the reference's suspended-`game_loop` screen. The fade-out frames
+  (t=62-70) are now byte-identical. What remains is the fade-in ramp: the menu
+  becomes visible ~2 frames earlier in arklay, so t=74/76 still differ
+  (~30-38%). The trace's `fade` field also differs (arklay's menu fade is a
   separate accumulator from the room-entry fade the trace reads).
 - **Menu-close timing.** `inventory_open_close` (cancel at tick 120) diverges:
   ~44% differing pixels for the close fade (t=120-130), ~84% while the room
