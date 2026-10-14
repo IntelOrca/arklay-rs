@@ -343,6 +343,12 @@ pub const MSF_SCREEN_INTENSITY: u8 = 0x0F;
 /// raises the redraw bit instead of redisplaying immediately. Mask bit 2 of
 /// the first dword, i.e. selector 29 in the MSB-first flag bank.
 pub const MSF_CAMERA_DEFER: u8 = 29;
+/// `main_state_flags` bit 0x00800000 (`MSF_CHAR_VARIANT`): the room loads the
+/// Jill RDT variant and the scripts' `ck FG_STATUS, 8` tests select the
+/// character's spawns. Set by the character-select hand-off (and the test
+/// hook) when Jill is chosen. Mask bit 23 of the first dword, i.e. selector
+/// 8 in the MSB-first flag bank.
+pub const MSF_CHAR_VARIANT: u8 = 8;
 /// `main_state_flags` bit 0x20 (`MSF_CAMERA_REDRAW`): a deferred camera
 /// redisplay is pending and `game_loop` consumes it once, drawing the cut
 /// chosen by the previous frame's zone walk. Mask bit 5 of the first dword,
@@ -378,6 +384,11 @@ pub const MSF2_EFFECT_ZONE: u8 = 0x3F;
 /// scripts enable the per-frame +/-1 screen shake. The second dword of flag
 /// bank 5 selects it at selector `0x3E`.
 pub const MSF2_SCREEN_SHAKE: u8 = 0x3E;
+/// `main_state_flags2` bit 2 (`MSF2_SCREEN_BORDER`): the room's backgrounds
+/// are stored 316x236 instead of 320x240 and displayed inset by two pixels.
+/// The caves' room scripts set it; the second dword of flag bank 5 selects it
+/// at selector `0x20 + (31 - 2) = 0x3D`.
+pub const MSF2_SCREEN_BORDER: u8 = 0x3D;
 /// `main_state_flags2` bit `0x400000` (`MSF2_DOOR_TURN_PENDING`): a
 /// `check_door` handler latched the approach side this frame. Selector
 /// `0x20 + (31 - 22) = 0x29` in flag bank 5.
@@ -3406,10 +3417,6 @@ pub struct GameState {
     /// previously chosen, so two consecutive poison-plant lunges do not pick
     /// the same side three times running. Reset by the plant's init.
     pub monster_plant_sides: u32,
-    /// `g_AttractMode_RoomCameraId`: the outgoing room id a same-stage door
-    /// transition stores (0x1F after a fresh room/stage init), read by the
-    /// hunter's scripted-intro camera selector.
-    pub attract_room_camera_id: u8,
     /// `g_entity_bkp` (0x00be0df4): the shared pathfinder-result scratch. The
     /// zombie's walk behaviours store `entity_pathfind_update`'s result here
     /// and read it back on frames that skip the call, so the value is a room
@@ -3557,10 +3564,14 @@ fn initial_entities() -> [Entity; ENTITY_COUNT] {
 
 impl Default for GameState {
     fn default() -> Self {
+        let mut state_bytes = [0u8; STATE_BYTES];
+        // `g_AttractMode_RoomCameraId` starts at 0x1F (a fresh room/stage
+        // init's value); the room scripts' `cmpb 3` tests depend on it.
+        state_bytes[3] = 0x1F;
         Self {
             id: RoomId::default(),
             flags: [FlagBank::default(); FLAG_BANK_COUNT],
-            state_bytes: [0; STATE_BYTES],
+            state_bytes,
             state_words: [0; STATE_WORDS],
             camera: CameraState::default(),
             message_item_slot: None,
@@ -3629,7 +3640,7 @@ impl Default for GameState {
             hunter_intro_jump_kind: 0,
             hunter_grab_one_shot: true,
             monster_plant_sides: 0,
-            attract_room_camera_id: 0x1F,
+
             entity_bkp: 0,
             zone_path_walk: crate::enemy::walk::ZoneWalk::default(),
             costume_variant: 0,
@@ -4320,6 +4331,20 @@ impl GameState {
     /// Mirror entity 0 into the engine's player state when the scripts moved
     /// it, leaving the player alone otherwise. Called after the scripts run
     /// each tick so `dir_set` and actor motions move the visible player.
+    /// `g_AttractMode_RoomCameraId` (BioCard +0x203): the outgoing room id a
+    /// same-stage door transition stores (0x1F after a fresh room/stage
+    /// init), read by the hunter's scripted-intro camera selector and by the
+    /// room scripts' `cmpb 3` tests. Stored in the state image so the two
+    /// readers cannot drift apart.
+    pub fn attract_room_camera_id(&self) -> u8 {
+        self.state_bytes[3]
+    }
+
+    /// Set [`Self::attract_room_camera_id`].
+    pub fn set_attract_room_camera_id(&mut self, value: u8) {
+        self.state_bytes[3] = value;
+    }
+
     pub fn sync_player(&self, player: &mut PlayerState) {
         let entity = &self.entities[0];
         if entity.pos != player.pos {
@@ -9051,7 +9076,7 @@ mod tests {
         assert_eq!(state.state_bytes[0], 1);
         assert_eq!(state.state_bytes[1], 0);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)], 0);
-        assert_eq!(state.state_bytes[3], 0);
+        assert_eq!(state.state_bytes[3], 0x1F);
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_CHARACTER)], 1);
         assert_eq!(state.camera, CameraState::default());
         assert_eq!(state.frame, 0);
@@ -16743,7 +16768,7 @@ mod tests {
         // starts set: the original's image value is non-zero, so the first
         // death screen hides the head even before any hunter grab.
         let state = GameState::default();
-        assert_eq!(state.attract_room_camera_id, 0x1F);
+        assert_eq!(state.attract_room_camera_id(), 0x1F);
         assert!(state.hunter_grab_one_shot);
         assert_eq!(state.player_distance_z, 0);
         assert_eq!(state.player_displacement, 0);

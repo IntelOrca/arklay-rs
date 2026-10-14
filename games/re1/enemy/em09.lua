@@ -20,7 +20,7 @@
 -- latches the hard word). Bit 0x80 freezes the whole update, bit 2 forces the
 -- drop death.
 --
--- The ceiling pose is `pos_y = -6008` with `roll = 0x800` (upside down), the
+-- The ceiling pose is `pos_y = -6120` with `roll = 0x800` (upside down), the
 -- ceiling brain runs its whole decision body with the yaw flipped 180
 -- degrees, and the drop/swoop/knockdown/death drivers read the dive arc table
 -- as negated Y heights.
@@ -60,6 +60,9 @@ local DROP_SPEED = {
     0, 0, 0, 0, 0, 0,
     150, 150, 150, 150, 150, 150, 150, 150, 150, 150,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    -- The original reads one word past the table on the final descent frame
+    -- (frame 32); the decomp's adjacent global there is 0.
+    0,
 }
 
 -- ---------------------------------------------------------------------------
@@ -169,7 +172,7 @@ local function state_init(e)
     if e.behavior_flags > 1 then
         e.pitch = 0
         e.roll = 0x800
-        e.pos_y = -6008
+        e.pos_y = -6120
         e.behavior_flags = 2
     end
 
@@ -894,7 +897,7 @@ local function behavior_swoop(e)
         e.timing_control = 0
         e.animation_id = 1
         e:advance_anim(0x40)
-        e.pos_y = -6008
+        e.pos_y = -6120
         e.ignore = 0
         set_beh(e, 0)
         return

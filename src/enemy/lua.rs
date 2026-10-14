@@ -1315,7 +1315,7 @@ mod imp {
                 Ok(())
             });
             fields.add_field_method_get("attract_room_camera_id", |_lua, api| {
-                Ok(api.game_ref().attract_room_camera_id)
+                Ok(api.game_ref().attract_room_camera_id())
             });
             // `get_stage_id()`: the original's 0-based stage digit (the room
             // id's stage is 1-based).
@@ -12787,7 +12787,7 @@ mod chimera_tests {
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack));
         let entity = &game.entities[1];
-        assert_eq!(entity.pos[1], -6008);
+        assert_eq!(entity.pos[1], -6120);
         assert_eq!(entity.roll, 0x800);
         assert_eq!(entity.animation_id, 2);
 
@@ -13919,7 +13919,7 @@ mod hunter_tests {
         let clips = clips_long();
         let mut game = hunter(0x0A);
         game.id = RoomId::parse("6090").unwrap();
-        game.attract_room_camera_id = 21;
+        game.set_attract_room_camera_id(21);
         game.entities[2].status_flags = 1;
         let mut host = LuaEnemyHost::new();
         game.entities[1].set_state(1);

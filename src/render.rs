@@ -268,10 +268,24 @@ impl Framebuffer {
             return;
         }
         let width = self.width as usize;
+        // The reference uploads the background as a texture and stretches it
+        // over the full logical 320x240 quad (see the display-image pass in
+        // `OT_InsertPrimitive`), so a 316x236 screen-border background covers
+        // the frame. The origin is the display-image origin in logical pixels,
+        // applied before the texture-space sampling, and the fragment centre
+        // (`(2x + 1) / 2`) is the reference's GL rasterisation.
+        let scale_x = i64::from(image.width);
+        let scale_y = i64::from(image.height);
+        let frame_w = i64::from(self.width);
+        let frame_h = i64::from(self.height);
         for y in 0..self.height {
-            let source_y = (y as i32 - origin[1]).clamp(0, image.height as i32 - 1) as u32;
+            let source_y = (((i64::from(y) - i64::from(origin[1])) * 2 + 1) * scale_y
+                / (2 * frame_h))
+                .clamp(0, scale_y - 1) as u32;
             for x in 0..self.width {
-                let source_x = (x as i32 - origin[0]).clamp(0, image.width as i32 - 1) as u32;
+                let source_x = (((i64::from(x) - i64::from(origin[0])) * 2 + 1) * scale_x
+                    / (2 * frame_w))
+                    .clamp(0, scale_x - 1) as u32;
                 let source = ((source_y * image.width + source_x) * 4) as usize;
                 let Some(texel) = image.rgba.get(source..source + 4) else {
                     continue;
@@ -576,8 +590,13 @@ impl Framebuffer {
                 let offset = (row as usize * self.width as usize + column as usize) * 4;
                 if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
                     for (channel, &value) in pixel[..3].iter_mut().zip(&color) {
-                        *channel =
-                            ((u32::from(value) * source + u32::from(*channel) * keep) / 255) as u8;
+                        // The reference blends through the GL pipeline in
+                        // normalized floats, so the result rounds to nearest
+                        // rather than truncating.
+                        *channel = ((u32::from(value) * source
+                            + u32::from(*channel) * keep
+                            + 127)
+                            / 255) as u8;
                     }
                 }
             }
@@ -2011,19 +2030,21 @@ impl Lighting {
             } else {
                 (light.pos, light.color)
             };
-            // The original's normalize clamps a near-zero length to 1.0.
+            // The original's normalize clamps a near-zero length to 1.0, then
+            // stores the 4.12 fixed-point vector with its Y negated
+            // (`FUN_0040ac80`). The colour caps at `0x80` in the same record.
             let length = (f64::from(offset[0]).powi(2)
                 + f64::from(offset[1]).powi(2)
                 + f64::from(offset[2]).powi(2))
             .sqrt()
             .max(1.0);
             EntityLightSource {
-                direction: [
-                    -f64::from(offset[0]) / length,
-                    -f64::from(offset[1]) / length,
-                    -f64::from(offset[2]) / length,
+                dir: [
+                    (f64::from(offset[0]) / length * 4096.0) as i32,
+                    (-f64::from(offset[1]) / length * 4096.0) as i32,
+                    (f64::from(offset[2]) / length * 4096.0) as i32,
                 ],
-                color: color.map(|channel| f64::from(channel.min(0x80)) * 255.0 / 128.0),
+                color: color.map(|channel| channel.min(0x80)),
             }
         });
         EntityLight { ambient, sources }
@@ -2040,12 +2061,13 @@ pub struct EntityLight {
     pub sources: [EntityLightSource; 3],
 }
 
-/// One latched light: the unit direction from the entity towards the light and
-/// its attenuated, `0x80`-capped colour.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One latched light in the reference's stored form: the 4.12 direction
+/// `F * normalize(entity - light)` (`FUN_0040ac80`) and its attenuated,
+/// `0x80`-capped colour byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntityLightSource {
-    pub direction: [f64; 3],
-    pub color: [f64; 3],
+    pub dir: [i32; 3],
+    pub color: [u8; 3],
 }
 
 /// The ABE (semi-transparency) bit of a primitive's CLUT word.
@@ -2241,12 +2263,9 @@ fn collect_triangles(
     // The raw-Y form's vertices skip the standard input Y negation; the pool
     // is built lazily so the common path pays nothing.
     let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
-    // World-space unit normals: the packet's normal rotated by the joint.
-    let normals: Vec<Option<[f64; 3]>> = object
-        .normals
-        .iter()
-        .map(|normal| normalize(rotate(joint, *normal)))
-        .collect();
+    // The reference lights the raw TMD normal through `camera * joint`, so the
+    // stored camera matrix and the joint's 4.12 rotation are all it needs.
+    let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
@@ -2319,16 +2338,21 @@ fn collect_triangles(
         // one (the original substitutes and still draws the packet), and a
         // packet with no usable normal at all is dropped on the lit path.
         let mut corner_normals = [
-            normals.get(usize::from(prim.normals[0])).copied().flatten(),
-            normals.get(usize::from(prim.normals[1])).copied().flatten(),
-            normals.get(usize::from(prim.normals[2])).copied().flatten(),
+            object.normals.get(usize::from(prim.normals[0])).copied(),
+            object.normals.get(usize::from(prim.normals[1])).copied(),
+            object.normals.get(usize::from(prim.normals[2])).copied(),
         ];
         if lighting.is_some() {
-            let Some(substitute) = corner_normals.iter().flatten().next().copied() else {
+            let Some(substitute) = corner_normals
+                .iter()
+                .flatten()
+                .copied()
+                .find(|normal| normal != &[0; 3])
+            else {
                 continue;
             };
             for normal in &mut corner_normals {
-                if normal.is_none() {
+                if normal.is_none() || normal == &Some([0; 3]) {
                     *normal = Some(substitute);
                 }
             }
@@ -2353,22 +2377,16 @@ fn collect_triangles(
                 // latched light directions, clamps the accumulated light, then
                 // folds in the vertex colour and the mesh tint.
                 (Some(_), Some(light)) if !blend => {
-                    let mut shade = light.ambient;
-                    if let Some(normal) = normal {
-                        for source in &light.sources {
-                            let diffuse = if room_object {
-                                room_object_diffuse(camera, normal, source.direction).max(0.0)
-                            } else {
-                                (normal[0] * source.direction[0]
-                                    + normal[1] * source.direction[1]
-                                    + normal[2] * source.direction[2])
-                                    .max(0.0)
-                            };
-                            for (channel, &value) in shade.iter_mut().zip(&source.color) {
-                                *channel += diffuse * value;
-                            }
-                        }
-                    }
+                    let mut shade = match normal {
+                        Some(normal) => reference_vertex_shade(
+                            &stored_camera,
+                            &joint.r,
+                            normal,
+                            &light,
+                            room_object,
+                        ),
+                        None => light.ambient,
+                    };
                     for (channel, &scale) in shade.iter_mut().zip(&tint) {
                         *channel = channel.min(CHANNEL_MAX) * f64::from(scale) / CHANNEL_MAX;
                     }
@@ -2410,32 +2428,117 @@ fn collect_triangles(
     }
 }
 
-/// The original PC port's room-object lighting, from `RoomObjectRender`'s D3D
-/// setup.
-///
-/// The room pass hands D3D a light matrix built from the room lights and the
-/// object's own rotation, then transforms it by the camera; the TMD's normals
-/// are transformed by the draw's world matrix (`camera * object`). Working the
-/// matrix chain back into the port's world frame leaves a camera-dependent
-/// pairing: the normal is the camera transform of the PS1-frame normal (the
-/// world normal with its Y negated), the light direction is the camera
-/// transform of the world direction with the view-space Y negated, and D3D's
-/// fixed-function lighting uses the negated dot (its stored direction is the
-/// light's travel direction, not the direction towards the light). The entity
-/// pass skips the object rotation and lands on the plain world-space dot
-/// instead, which is why only the room's own models use this.
-fn room_object_diffuse(camera: &Camera, normal: [f64; 3], direction: [f64; 3]) -> f64 {
-    let view = |vector: [f64; 3]| -> [f64; 3] {
-        std::array::from_fn(|row| {
-            (0..3)
-                .map(|axis| f64::from(camera.view[row][axis]) / 4096.0 * vector[axis])
-                .sum()
+/// The reference's `g_RoomCameraData` view matrix (4.12) from the camera's
+/// from/look-at points, `MatrixToCamera` (0x0040a680). Every lighting stage
+/// uses this matrix, and it differs slightly from
+/// [`Camera::from_points_rolled`]'s angle-built view, so the port rebuilds it
+/// here rather than reusing the projection matrix. Roll is omitted exactly
+/// like the reference (every shipped RDT camera stores zero).
+fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3] {
+    let dx = f64::from(to[0] - from[0]);
+    let dy = f64::from(to[1] - from[1]);
+    let dz = f64::from(to[2] - from[2]);
+    let len = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
+    let h = (dx * dx + dz * dz).sqrt().max(1.0);
+    [
+        [(dz / h * 4096.0) as i32, 0, (-dx / h * 4096.0) as i32],
+        [
+            (dx * dy / (h * len) * 4096.0) as i32,
+            (h / len * 4096.0) as i32,
+            (dy * dz / (h * len) * 4096.0) as i32,
+        ],
+        [
+            (dx / len * 4096.0) as i32,
+            (-dy / len * 4096.0) as i32,
+            (dz / len * 4096.0) as i32,
+        ],
+    ]
+}
+
+/// `MulMatrix0`: `m2 = m0 * m1` over 4.12 matrices with the reference's
+/// per-product rounding.
+fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
+    std::array::from_fn(|i| {
+        std::array::from_fn(|j| {
+            let mut sum = 0i64;
+            for k in 0..3 {
+                let value = i64::from(a[i][k]) * i64::from(b[k][j]);
+                sum += (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS;
+            }
+            sum as i32
         })
-    };
-    let n_view = view([normal[0], -normal[1], normal[2]]);
-    let l = view(direction);
-    let l_view = [l[0], -l[1], l[2]];
-    -(n_view[0] * l_view[0] + n_view[1] * l_view[1] + n_view[2] * l_view[2])
+    })
+}
+
+/// `ApplyMatrixSV`: the PS1 GTE convention, Y negated on input and output,
+/// 4.12 in and out with the reference's rounding.
+fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
+    let source = [v[0], -v[1], v[2]];
+    let mut out = [0i32; 3];
+    for row in 0..3 {
+        let mut sum = 0i64;
+        for k in 0..3 {
+            let value = i64::from(m[row][k]) * i64::from(source[k]);
+            sum += (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS;
+        }
+        out[row] = sum as i32;
+    }
+    [out[0], -out[1], out[2]]
+}
+
+/// The reference's `TmdComputeLight` (TmdRenderer.cpp) for one vertex.
+///
+/// `camera` is `g_RoomCameraData`; `rot` is the object's or joint's 4.12 world
+/// matrix; `normal` is the raw TMD normal. Room objects multiply the stored
+/// light row by the object's rotation before the camera transform
+/// (`RoomObjectRender`); entities use the stored row as-is. Both paths then
+/// rotate the normal (Y-negated and scaled like the vertex buffer's
+/// `PSXObjVtx`) by `camera * rot`, negate the transformed light direction, and
+/// accumulate `max(0, -(n_view . l)) * colour` over the ambient. The scale of
+/// the dot is 4.12 (the light vectors) against unit (the normal).
+fn reference_vertex_shade(
+    camera: &[[i32; 3]; 3],
+    rot: &[[i32; 3]; 3],
+    normal: [i16; 3],
+    light: &EntityLight,
+    room_object: bool,
+) -> [f64; 3] {
+    // The reference accumulates in 32-bit floats (`TmdComputeLight`), so the
+    // port matches its rounding exactly rather than using doubles.
+    let normal = [
+        normal[0] as f32,
+        -(normal[1] as f32),
+        normal[2] as f32,
+    ];
+    let mut n_view = [0.0f32; 3];
+    for row in 0..3 {
+        let mut sum = 0.0f32;
+        for k in 0..3 {
+            let mut inner = 0.0f32;
+            for j in 0..3 {
+                inner += camera[row][j] as f32 * rot[j][k] as f32;
+            }
+            sum += inner * normal[k];
+        }
+        n_view[row] = sum / (4096.0 * 4096.0 * 4096.0);
+    }
+    let mut shade = light.ambient.map(|value| value as f32);
+    for source in &light.sources {
+        let vec = if room_object {
+            mul_matrix0(&[source.dir, [0; 3], [0; 3]], rot)[0]
+        } else {
+            source.dir
+        };
+        let l = apply_matrix_sv(camera, vec);
+        let d = -(n_view[0] * l[0] as f32 + n_view[1] * l[1] as f32 + n_view[2] * l[2] as f32)
+            / 4096.0;
+        if d > 0.0 {
+            for (channel, &value) in shade.iter_mut().zip(&source.color) {
+                *channel += d * value as f32 * 255.0 / 128.0;
+            }
+        }
+    }
+    shade.map(f64::from)
 }
 
 /// Project and full-bright-shade one `.ivm` object into `triangles`.
@@ -2663,8 +2766,13 @@ fn wrap_texel(coordinate: f64, size: u32) -> Option<u32> {
 }
 
 /// Multiply a texture channel by a 0..255 shade.
+///
+/// The reference multiplies through the GL pipeline in normalized floats, so
+/// the result rounds to nearest rather than truncating.
 fn channel(texel: u8, shade: f64) -> u8 {
-    (f64::from(texel) * shade / CHANNEL_MAX).clamp(0.0, CHANNEL_MAX) as u8
+    (f32::from(texel) * shade as f32 / 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 #[cfg(test)]
@@ -2685,8 +2793,8 @@ mod tests {
         EntityLight {
             ambient: [0.0; 3],
             sources: std::array::from_fn(|_| EntityLightSource {
-                direction: [0.0; 3],
-                color: [0.0; 3],
+                dir: [0; 3],
+                color: [0; 3],
             }),
         }
     }
@@ -2774,7 +2882,7 @@ mod tests {
         let framebuffer = render_triangle(false);
         let center = (53 * 320 + 226) * 4;
         // The default ambient 4095 maps to 254, so each channel truncates.
-        assert_eq!(&framebuffer.rgba[center..center + 4], &[9, 19, 29, 255]);
+        assert_eq!(&framebuffer.rgba[center..center + 4], &[10, 20, 30, 255]);
         assert_eq!(&framebuffer.rgba[0..4], &[0, 0, 0, 0]);
         let corner = (239 * 320 + 319) * 4;
         assert_eq!(&framebuffer.rgba[corner..corner + 4], &[0, 0, 0, 0]);
@@ -2789,7 +2897,7 @@ mod tests {
     #[test]
     fn synthetic_triangle_render_matches_golden_hash() {
         let framebuffer = render_triangle(false);
-        assert_eq!(fnv1a(&framebuffer.rgba), 16_946_568_591_050_320_677);
+        assert_eq!(fnv1a(&framebuffer.rgba), 12_035_862_220_174_893_125);
     }
 
     #[test]
@@ -3447,7 +3555,7 @@ mod tests {
     fn near_player_paints_over_a_far_mask() {
         // Mask key 6080 is behind the triangle's key of 1000.
         let framebuffer = interleaved_frame(380);
-        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 19, 29, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [10, 20, 30, 255]);
         // Neither item covers this background pixel.
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
     }
@@ -3469,7 +3577,7 @@ mod tests {
         let framebuffer = interleaved_frame(4);
         assert_eq!(framebuffer_pixel(&framebuffer, 180, 100), [9, 8, 7, 255]);
         // A triangle pixel outside the 20x20 mask keeps the player colour.
-        assert_eq!(framebuffer_pixel(&framebuffer, 220, 110), [9, 19, 29, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 220, 110), [10, 20, 30, 255]);
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [7, 8, 9, 255]);
     }
 
@@ -4872,7 +4980,7 @@ mod tests {
         let light = ambient_only.latched([0, 0, 0]);
         assert_eq!(light.ambient, [254.0, 110.0, 0.0]);
         for source in light.sources {
-            assert_eq!(source.color, [0.0; 3]);
+            assert_eq!(source.color, [0; 3]);
         }
 
         // A point light at the entity's own X/Z (a huge Y offset does not
@@ -4892,9 +5000,11 @@ mod tests {
             ],
         };
         let light = point.latched([0, 0, 0]);
-        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
-        // The stored direction points from the entity towards the light.
-        assert_eq!(light.sources[0].direction, [0.0, 1.0, 0.0]);
+        assert_eq!(light.sources[0].color, [128, 128, 128]);
+        // The stored direction is `F * normalize(entity - light)` in 4.12: the
+        // entity sits at the light's X/Z, so only the Y term survives and the
+        // negation flips it.
+        assert_eq!(light.sources[0].dir, [0, 4096, 0]);
 
         // Half the radius out on X/Z truncates each channel, and the direction
         // is normalized over all three axes.
@@ -4914,15 +5024,16 @@ mod tests {
         let light = point.latched([300, 0, 400]);
         assert_eq!(
             light.sources[0].color,
-            [199.21875, 99.609375, 1.9921875],
-            "100/50/1 attenuated bytes at the 1/128 scale"
+            [100, 50, 1],
+            "attenuated bytes before the 0x80 cap"
         );
-        assert!((light.sources[0].direction[0] + 0.6).abs() < 1e-9);
-        assert!((light.sources[0].direction[2] + 0.8).abs() < 1e-9);
+        // normalize(entity - light) = (0.6, 0, 0.8), Y negated (zero here),
+        // truncated to 4.12.
+        assert_eq!(light.sources[0].dir, [2457, 0, 3276]);
 
         // A light at or beyond the radius contributes nothing, and a zero
         // radius is black.
-        assert_eq!(point.latched([0, 0, 1000]).sources[0].color, [0.0; 3]);
+        assert_eq!(point.latched([0, 0, 1000]).sources[0].color, [0; 3]);
         let zero = Lighting {
             ambient: [0; 3],
             lights: [
@@ -4937,8 +5048,8 @@ mod tests {
             ],
         };
         let light = zero.latched([0, 0, 0]);
-        assert_eq!(light.sources[0].color, [0.0; 3]);
-        assert_eq!(light.sources[0].direction, [0.0, 0.0, 0.0]);
+        assert_eq!(light.sources[0].color, [0; 3]);
+        assert_eq!(light.sources[0].dir, [0, 0, 0]);
 
         // The radius is unsigned: 0xFFFF is the widest falloff, not -1, so a
         // room whose lights store it stays lit at any in-room distance.
@@ -4956,7 +5067,7 @@ mod tests {
             ],
         };
         let light = wide.latched([0, 0, 1000]);
-        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
+        assert_eq!(light.sources[0].color, [128, 128, 128]);
 
         // A directional light's position is its direction vector: it is
         // normalized, capped at 0x80 and reversed (the stored direction points
@@ -4975,8 +5086,9 @@ mod tests {
             ],
         };
         let light = directional.latched([0, 0, 0]);
-        assert_eq!(light.sources[0].color, [255.0, 255.0, 255.0]);
-        assert_eq!(light.sources[0].direction, [-1.0, 0.0, 0.0]);
+        assert_eq!(light.sources[0].color, [128, 128, 128]);
+        // `F * normalize((1,0,0))` in 4.12.
+        assert_eq!(light.sources[0].dir, [4096, 0, 0]);
         assert!((light.ambient[0] - 0.0).abs() < 1e-9);
     }
 
@@ -4996,7 +5108,7 @@ mod tests {
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
-        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [63, 63, 63, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 200, 100), [64, 64, 64, 255]);
     }
 
     #[test]

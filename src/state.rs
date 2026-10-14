@@ -124,6 +124,23 @@ pub struct Image {
     pub rgba: Vec<u8>,
 }
 
+impl Image {
+    /// Re-interpret the linear pixel stream at a new width and height.
+    ///
+    /// The decoded background is a linear run of pixels; the TIM header's
+    /// dimensions are not always the artwork's (the screen-border paks claim
+    /// 320x240 for 316-wide rows), so a caller that knows the true geometry
+    /// re-wraps the same stream.
+    pub fn reslice(&mut self, width: u32, height: u32) {
+        let pixels = (width as usize)
+            .saturating_mul(height as usize)
+            .min(self.rgba.len() / 4);
+        self.rgba.truncate(pixels * 4);
+        self.width = width;
+        self.height = height;
+    }
+}
+
 /// One room light. The RDT stores three of them.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Light {

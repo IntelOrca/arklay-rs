@@ -986,6 +986,12 @@ struct GameSession {
     /// 0 to 1) runs while the gate is still nominally closed. The freeze
     /// starts one tick later.
     room_boot_grace: bool,
+    /// An arbitrary-room boot (`--ui game --room`) re-places the player at the
+    /// room's first walk zone centre after the room-set event pass, exactly
+    /// like the reference's `TestHooks_PlaceRoomSpawn` runs after `init_room`.
+    /// Without it a queued intro event's own `dir_set` survives the boot and
+    /// the anchor position differs from the reference.
+    room_boot_respawn: bool,
     /// The cutscene screen-intensity value the letterbox bars blend with.
     /// The bank-5 `MSF_SCREEN_INTENSITY` flag ramps it 16 a frame: up to `0xF0`
     /// while the flag is set, back down to zero while it is clear.
@@ -1091,19 +1097,43 @@ impl GameSession {
     }
 
     /// A new game as `id.player_flag` that boots straight into `id` instead
-    /// of the card's start room: the new-game items, flags and start health,
-    /// with the player at the room's first walk zone centre (the reference's
-    /// test-only room boot and the port's arbitrary-room spawn). The oracle
-    /// trace path uses this so the boot narration, room-entry fade and idle
-    /// mirroring all run exactly like the session's `--ui game` flow.
+    /// of the card's start room: the new-game items, flags and start health.
+    ///
+    /// The player starts at the new-game position, exactly like the reference
+    /// before its test-only room hook runs: `InitializeGame` seeds the position
+    /// and `init_room`'s camera switch-zone scan tests it, so the boot camera
+    /// is the one the new-game position selects. The room hook (and the port's
+    /// arbitrary-room boot) re-places the player at the walk zone centre after
+    /// the room-set event pass, in [`GameSession::place_room_boot_spawn`] and
+    /// [`GameSession::arm_new_game_boot`].
     fn new_in_room(pack: &Pack, id: RoomId, character: u8, save_dir: &Path) -> Result<Self> {
         let character = character & 1;
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
         seed_new_game(pack, &mut game, character);
-        let player_state = player::spawn(id, &loaded.room);
+        let mut player_state = player::spawn(id, &loaded.room);
+        player_state.pos = [NEW_GAME_POS_X, 0, NEW_GAME_POS_Z];
+        player_state.angle = NEW_GAME_ANGLE;
+        player_state.collision_mirror = [NEW_GAME_POS_X, NEW_GAME_POS_Z];
         game.sync_entity_from_player(&player_state);
-        Self::from_loaded(pack, loaded, game, player_state, save_dir)
+        let mut session = Self::from_loaded(pack, loaded, game, player_state, save_dir)?;
+        session.room_boot_respawn = true;
+        Ok(session)
+    }
+
+    /// Re-place the player at the room's first walk zone centre, the
+    /// reference's `TestHooks_PlaceRoomSpawn` position. The room's camera
+    /// switch-zone scan is not re-run: the reference's hook only moves the
+    /// player, so the camera stays as the new-game position selected it.
+    fn place_room_boot_spawn(&mut self) {
+        if !self.room_boot_respawn {
+            return;
+        }
+        let spawn = player::spawn(self.loaded.id, &self.loaded.room);
+        self.player.pos = spawn.pos;
+        self.player.angle = spawn.angle;
+        self.player.collision_mirror = spawn.collision_mirror;
+        self.game.sync_entity_from_player(&self.player);
     }
 
     /// Boot one attract-demo reel (`demo/<hex>.dat`).
@@ -1160,7 +1190,7 @@ impl GameSession {
         game.equipped_weapon_id = equipped_item;
         game.entities[0].health = reel.health;
         game.set_health_copy(reel.health);
-        game.attract_room_camera_id = reel.camera_id;
+        game.set_attract_room_camera_id(reel.camera_id);
         let mut player_state = player::spawn(id, &loaded.room);
         player_state.pos = reel.pos;
         player_state.angle = reel.angle;
@@ -1293,6 +1323,7 @@ impl GameSession {
             room_fade_pending: false,
             room_boot_gate: false,
             room_boot_grace: false,
+            room_boot_respawn: false,
             menu_fade: transition::Fade::inactive(),
             menu_fade_phase: MenuFadePhase::None,
             menu_fade_pending: false,
@@ -1323,14 +1354,16 @@ impl GameSession {
         // `g_AttractMode_RoomCameraId` on a same-stage door; a fresh or
         // stage-change load resets it to 0x1F. The hunter's scripted intro
         // reads it as a camera selector.
-        self.game.attract_room_camera_id = match from {
+        let attract_room_camera_id = match from {
             Some(source) if source.stage == self.game.id.stage => source.room,
             _ => 0x1F,
         };
+        self.game.set_attract_room_camera_id(attract_room_camera_id);
         {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.command_vm.run_init(&mut host);
         }
+        self.apply_screen_border();
         // The init script's starts and kills apply in program order before the
         // Lua room hook or the first tick can observe the slots.
         apply_event_requests(&mut self.game, &mut self.event_vm);
@@ -1346,6 +1379,22 @@ impl GameSession {
         // room's data is loaded.
         bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
         bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
+    }
+
+    /// Re-slice the loaded backgrounds to 316x236 when the room's
+    /// screen-border flag is set (msf2 bit 2, the caves): those paks store
+    /// their artwork 316 pixels wide while the TIM header claims 320, so the
+    /// same linear pixels are re-wrapped. The reference reads the flag when it
+    /// loads the background, after the init script and the room_set event
+    /// pass, so this runs at both points; a second call is a no-op.
+    fn apply_screen_border(&mut self) {
+        if self.game.flag_test(5, game::MSF2_SCREEN_BORDER, false) {
+            for cut in &mut self.loaded.room.cuts {
+                if let Some(background) = cut.background.as_mut() {
+                    background.reslice(316, 236);
+                }
+            }
+        }
     }
 
     /// Place the player for an arbitrary room start: the room's paired-door
@@ -2884,6 +2933,7 @@ impl GameSession {
                 let mut host = game::ScdGameHost::new(&mut self.game);
                 self.event_vm.step(&mut host);
             }
+            self.apply_screen_border();
             self.arm_room_entry_fade();
         }
     }
@@ -2977,6 +3027,15 @@ impl GameSession {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.event_vm.step(&mut host);
         }
+        // An event the room's init script queued can select the screen-border
+        // background geometry, and the reference reads the flag after this
+        // pass (room_set runs room_events_check, then loads the background).
+        self.apply_screen_border();
+        // The reference's room hook re-places the player after `init_room` and
+        // that event pass (`TestHooks_PlaceRoomSpawn` runs after `init_room`),
+        // so a queued intro event's own `dir_set` does not survive the boot.
+        // Mirror that order for arbitrary-room boots.
+        self.place_room_boot_spawn();
         // `game_loop`'s outer loop arms the entry fade and `main_loop` steps
         // it once before the first inner-loop tick, so tick 0's in-tick
         // accumulator is `0x7FFF - 0x1800` (26623).
@@ -3725,6 +3784,12 @@ fn new_game_id(pack: &Pack, character: u8) -> RoomId {
 /// explicit overrides that follow it.
 fn seed_new_game(pack: &Pack, game: &mut game::GameState, character: u8) {
     let character = character & 1;
+    // `TestHooks_StartNewGame` (and the character-select hand-off it mirrors)
+    // raise `MSF_CHAR_VARIANT` for Jill, so the room loads the Jill RDT
+    // variant and the scripts' `ck FG_STATUS, 8` tests select her spawns.
+    if character == 1 {
+        game.apply_flag(5, game::MSF_CHAR_VARIANT, 0);
+    }
     let card = bio_card(pack);
     if let Some(card) = &card {
         card.apply_new_game_card(game);
@@ -4148,12 +4213,16 @@ impl App {
             AppBoot::SaveLoad => self.open_load(),
             AppBoot::Save => self.open_save_capture(),
             AppBoot::NewGame { character, room } => {
-                let session = match room {
+                let mut session = match room {
                     Some(id) => {
                         GameSession::new_in_room(&self.pack, id, character, &self.save_dir)?
                     }
                     None => GameSession::new(&self.pack, character, &self.save_dir)?,
                 };
+                // The interactive arbitrary-room boot lands on the walk zone
+                // centre right away; the trace path re-places after the
+                // room-set event pass instead (see `arm_new_game_boot`).
+                session.place_room_boot_spawn();
                 self.start_session(session);
                 Ok(())
             }
@@ -9074,8 +9143,15 @@ fn render_frame(
         camera: camera.mirrored(game.mirror_axis_x(), i32::from(game.mirror.plane)),
     });
     // The display origin pans the background; in gameplay it is the frame's
-    // screen-shake offset and the global colour stays white.
-    let display_origin = shake;
+    // screen-shake offset and the global colour stays white. A screen-border
+    // room (`msf2` bit 2, the caves) runs `ApplyShakeAndRebuildSprites`
+    // instead, which parks the origin at (2, 2) so the inset 316x236
+    // background has the two-pixel shake margin.
+    let display_origin = if game.flag_test(5, game::MSF2_SCREEN_BORDER, false) {
+        [shake[0] + 2, shake[1] + 2]
+    } else {
+        shake
+    };
     let global_colour = [255; 3];
     render::draw_gameplay_scene_with_effects(
         framebuffer,
@@ -12928,7 +13004,7 @@ mod tests {
         // The saturated white veil at alpha 0x80 over the [200, 0, 0] backdrop.
         assert_eq!(
             image.rgba[0..4],
-            [227, 128, 128, 255],
+            [228, 128, 128, 255],
             "the scripted overlay covers the background"
         );
     }
