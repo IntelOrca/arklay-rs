@@ -469,8 +469,10 @@ floor/step zone crossed) together with the crossed floor step the flying crow
 keeps as its ground reference (`e.floor_step`). `e:play_sfx(bank, id)` queues
 the raw one-shot cue the computer arms use (identical to `e:play_3d_sound` for
 the banks it names), and `e:play_voice(id)` resolves the lab terminal's voice
-id in the stage's voice table and queues it for the engine, while
-`e.voice_playing` reads and writes the `MSF_VOICE_PLAYING` handshake bit the
+id to the stage row's positional `voice/<row>_<id>.wav` pack entry (1-based
+row, lowercase hex id; a mod override must use this name, not the shipped
+`V004_00`-style basename) and queues it for the engine, while
+`e:voice_playing` reads and writes the `MSF_VOICE_PLAYING` handshake bit the
 arms poll. All
 mutable state lives on the Rust entity: **scripts must keep no state of their
 own**, so the engine may drop and recreate the whole script VM between any two

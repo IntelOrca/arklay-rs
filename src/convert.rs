@@ -33,6 +33,7 @@ use crate::sfx;
 use crate::state::{Image, RoomId};
 use crate::ui::map::MapTables;
 use crate::voice;
+use crate::voice_table;
 use crate::{bmp, door, lzw, rdt, tim};
 
 /// How many directory levels below the root are searched for the stage and
@@ -324,7 +325,7 @@ pub fn convert_game_with_options(
     if !voice_dir_found {
         eprintln!(
             "warning: no voice directory found; {} voice line(s) will be missing",
-            voice::referenced_names().len()
+            voice_table::entry_count()
         );
     }
     if !movie_dir_found {
@@ -737,9 +738,10 @@ fn copy_se(
 
 /// Add every resolved voice WAV to the pack.
 ///
-/// The entries are the referenced union of the per-stage name rows; the
-/// shipped-but-unreferenced files (`ANNOUNCE`, the `V111_*` group and the
-/// variants) are deliberately left out and listed in the summary.
+/// The entries are the non-empty records of the per-stage name rows, named by
+/// their `voice/{row}_{id}.wav` position; the shipped-but-unreferenced files
+/// (`ANNOUNCE`, the `V111_*` group and the variants) are deliberately left out
+/// and listed in the summary.
 fn copy_voice(
     assets: &[VoiceAsset],
     writer: &mut PackWriter,
@@ -2327,7 +2329,7 @@ struct EnemyAsset {
 /// One voice WAV resolved to its pack entry.
 #[derive(Debug)]
 struct VoiceAsset {
-    /// Pack entry, e.g. `voice/v004_00.wav`.
+    /// Pack entry, e.g. `voice/01_09.wav` for the first table-row record.
     entry: String,
     /// Source file in the installation.
     source: PathBuf,
@@ -2598,28 +2600,34 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         }
     }
 
-    // Voice is a second optional pack: every referenced name is resolved
-    // case-insensitively, missing files are aggregated into one warning, and
-    // the shipped-but-unreferenced files are listed in the summary. A missing
+    // Voice is a second optional pack: every table record is resolved to its
+    // `voice/{row}_{id}.wav` entry (empty records are silent slots and get no
+    // entry), missing source files are aggregated into one warning, and the
+    // shipped-but-unreferenced files are listed in the summary. A missing
     // `voice` directory is only reported by the conversion summary, so a
     // partial tree stays warning-free like the other optional categories.
     let voice_index = voice_dir.as_deref().map(index_dir).transpose()?;
     let mut voice_assets = Vec::new();
     let mut voice_unreferenced = Vec::new();
     if let (Some(dir), Some(index)) = (voice_dir.as_deref(), voice_index.as_ref()) {
-        let referenced: HashSet<String> = voice::referenced_names()
+        let referenced: HashSet<String> = voice_table::referenced_names()
             .into_iter()
             .map(|name| format!("{}.wav", name.to_ascii_lowercase()))
             .collect();
         let mut missing_voice = Vec::new();
-        for name in voice::referenced_names() {
+        for name in voice_table::referenced_names() {
             let file = format!("{}.wav", name.to_ascii_lowercase());
-            match index.get(&file) {
-                Some(source) => voice_assets.push(VoiceAsset {
-                    entry: format!("voice/{file}"),
+            if !index.contains_key(&file) {
+                missing_voice.push(format!("{}.WAV", name.to_ascii_uppercase()));
+            }
+        }
+        for (row, id, name) in voice_table::entries() {
+            let file = format!("{}.wav", name.to_ascii_lowercase());
+            if let Some(source) = index.get(&file) {
+                voice_assets.push(VoiceAsset {
+                    entry: voice::entry_path(row, id),
                     source: source.clone(),
-                }),
-                None => missing_voice.push(format!("{}.WAV", name.to_ascii_uppercase())),
+                });
             }
         }
         if !missing_voice.is_empty() {
@@ -3728,21 +3736,23 @@ mod tests {
 
         let plan = build_plan(&root.path).unwrap();
         assert_eq!(plan.voice.len(), 3);
+        // Row 0 id 0 (`V001_00`).
         assert!(
             plan.voice
                 .iter()
-                .any(|asset| asset.entry == "voice/v001_00.wav")
+                .any(|asset| asset.entry == "voice/01_00.wav")
         );
+        // Row 1 id 0 (`V104_00`), lowercased source file.
         assert!(
             plan.voice
                 .iter()
-                .any(|asset| asset.entry == "voice/v104_00.wav")
+                .any(|asset| asset.entry == "voice/02_00.wav")
         );
-        // The 8-character `VB00_31a` record resolves to its lowercased file.
+        // The 8-character `VB00_31a` record is row 2 id 45.
         assert!(
             plan.voice
                 .iter()
-                .any(|asset| asset.entry == "voice/vb00_31a.wav")
+                .any(|asset| asset.entry == "voice/03_2d.wav")
         );
         assert_eq!(plan.voice_unreferenced, vec!["ANNOUNCE.WAV".to_string()]);
         assert!(plan.voice_dir_found);
@@ -3846,16 +3856,18 @@ mod tests {
         fs::create_dir_all(&voice).unwrap();
         fs::write(voice.join("v001_00.wav"), b"voice-a").unwrap();
         fs::write(voice.join("V104_00.WAV"), b"voice-bb").unwrap();
+        fs::write(voice.join("V106_00.WAV"), b"voice-dup").unwrap();
         fs::write(voice.join("ANNOUNCE.WAV"), b"unused").unwrap();
 
         let out = root.path.join("out.akpak");
         convert_game_with_options(&root.path, &out, None, 1, false).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
-        assert_eq!(main.read("voice/v001_00.wav").unwrap().as_ref(), b"voice-a");
-        assert_eq!(
-            main.read("voice/v104_00.wav").unwrap().as_ref(),
-            b"voice-bb"
-        );
+        assert_eq!(main.read("voice/01_00.wav").unwrap().as_ref(), b"voice-a");
+        assert_eq!(main.read("voice/02_00.wav").unwrap().as_ref(), b"voice-bb");
+        // `V106_00` is one source file referenced by two records: row 0 id
+        // 130 and row 1 id 34 each get their own entry with the same bytes.
+        assert_eq!(main.read("voice/01_82.wav").unwrap().as_ref(), b"voice-dup");
+        assert_eq!(main.read("voice/02_22.wav").unwrap().as_ref(), b"voice-dup");
         // The unreferenced file stays out and no companion pack is written.
         assert!(!main.contains("voice/announce.wav"));
         assert!(!root.path.join("out.voice.akpak").exists());

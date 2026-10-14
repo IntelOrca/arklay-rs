@@ -30,6 +30,7 @@ use arklay::scd::vm::{CommandVm, EventVm};
 use arklay::sfx;
 use arklay::state::{RoomId, RoomState};
 use arklay::voice;
+use arklay::voice_table;
 
 /// The shipped RDT path for a four-digit room identity.
 fn room_path(root: &Path, room: &str) -> PathBuf {
@@ -101,8 +102,10 @@ fn room_1000s_opening_lines_resolve_to_v004() {
         by_id.insert(id, ());
     }
     for id in 9..=17u16 {
-        let name = voice::name(0, id).unwrap_or_else(|| panic!("id {id} has no name"));
+        let name = voice_table::name(0, id).unwrap_or_else(|| panic!("id {id} has no name"));
         assert_eq!(name, format!("V004_{:02x}", id - 9), "id {id}");
+        // Row 0 is stage 1's row, so the pack entry is `voice/01_{id}.wav`.
+        assert_eq!(voice::pack_path(0, id), format!("voice/01_{id:02x}.wav"));
         assert!(by_id.contains_key(&id), "ROOM1000 never uses id {id}");
     }
 }
@@ -157,7 +160,7 @@ fn every_shipped_voice_play_resolves_to_a_present_file() {
                     .get(1)
                     .map_or(0, |operand| operand.value as u16);
                 let stage0 = id.stage - 1;
-                match voice::name(stage0, id_voice) {
+                match voice_table::name(stage0, id_voice) {
                     Some(name) if files.contains(&name.to_ascii_lowercase()) => sites += 1,
                     Some(name) => missing.push(format!("{name} (room {digits} id {id_voice})")),
                     None => missing.push(format!(
@@ -202,12 +205,16 @@ fn room_1000_stalls_on_f7_while_a_line_plays() {
             let mut host = ScdGameHost::new(&mut game);
             event_vm.step(&mut host);
         }
-        if let Some(request) = game.voice.request {
-            first = Some(request.name);
+        if let Some(request) = game.voice.request.as_ref() {
+            first = Some(request.path.clone());
             break;
         }
     }
-    assert_eq!(first, Some("V004_00"), "the first line must be V004_00");
+    assert_eq!(
+        first.as_deref(),
+        Some("voice/01_09.wav"),
+        "the first line must be ROOM1000 id 9"
+    );
     assert!(game.voice_playing(), "voice_play raised the wait bit");
 
     // Held: the next voice_play must not replace the active line.
@@ -216,8 +223,11 @@ fn room_1000_stalls_on_f7_while_a_line_plays() {
         event_vm.step(&mut host);
     }
     assert_eq!(
-        game.voice.request.map(|request| request.name),
-        Some("V004_00"),
+        game.voice
+            .request
+            .as_ref()
+            .map(|request| request.path.as_str()),
+        Some("voice/01_09.wav"),
         "F7 held the script while the line played"
     );
 
@@ -231,14 +241,27 @@ fn room_1000_stalls_on_f7_while_a_line_plays() {
             let mut host = ScdGameHost::new(&mut game);
             event_vm.step(&mut host);
         }
-        if game.voice.request.map(|request| request.name) != Some("V004_00")
+        if game
+            .voice
+            .request
+            .as_ref()
+            .map(|request| request.path.as_str())
+            != Some("voice/01_09.wav")
             && game.voice.request.is_some()
         {
-            second = game.voice.request.map(|request| request.name);
+            second = game
+                .voice
+                .request
+                .as_ref()
+                .map(|request| request.path.clone());
             break;
         }
     }
-    assert_eq!(second, Some("V004_01"), "the wait released the next line");
+    assert_eq!(
+        second.as_deref(),
+        Some("voice/01_0a.wav"),
+        "the wait released the next line"
+    );
 }
 
 #[test]
@@ -265,10 +288,10 @@ fn a_voice_less_run_advances_past_the_first_wait() {
             let mut host = ScdGameHost::new(&mut game);
             event_vm.step(&mut host);
         }
-        if let Some(request) = game.voice.request
-            && names.last() != Some(&request.name)
+        if let Some(request) = game.voice.request.as_ref()
+            && names.last() != Some(&request.path)
         {
-            names.push(request.name);
+            names.push(request.path.clone());
         }
         game.clear_voice_playing();
         // A message can hold the same F7 through the menu-choice bit; dismiss
@@ -280,7 +303,7 @@ fn a_voice_less_run_advances_past_the_first_wait() {
     }
     assert_eq!(
         names,
-        vec!["V004_00", "V004_01"],
+        vec!["voice/01_09.wav", "voice/01_0a.wav"],
         "a voice-less run reaches the second line"
     );
 }
@@ -885,15 +908,17 @@ fn conversion_packs_the_referenced_voice_lines_in_the_single_pack() {
     convert_game_with_options(&root, &out, None, 0, false).unwrap();
 
     let pack = Pack::open(&out).unwrap();
-    let referenced = voice::referenced_names();
+    let entries: Vec<String> = voice_table::entries()
+        .map(|(row, id, _)| voice::entry_path(row, id))
+        .collect();
     let voice_entries: Vec<&str> = pack
         .paths()
         .filter(|path| path.starts_with("voice/"))
         .collect();
     assert_eq!(
         voice_entries.len(),
-        referenced.len(),
-        "one voice entry per referenced name"
+        voice_table::entry_count(),
+        "one voice entry per non-empty table record"
     );
     let bytes: usize = voice_entries
         .iter()
@@ -905,10 +930,9 @@ fn conversion_packs_the_referenced_voice_lines_in_the_single_pack() {
         out.display()
     );
     let mut missing = Vec::new();
-    for name in &referenced {
-        let path = voice::pack_path(name);
-        if !pack.contains(&path) {
-            missing.push(path);
+    for path in &entries {
+        if !pack.contains(path) {
+            missing.push(path.clone());
         }
     }
     assert!(missing.is_empty(), "unpacked voice entries: {missing:?}");

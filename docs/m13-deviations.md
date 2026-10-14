@@ -28,8 +28,11 @@ is a bounded no-op or a documented approximation rather than a silent failure.
 
 5. **Unreferenced voice files.** 47 shipped `voice/*.WAV` files (6.0 MiB) are
    not named by any stage table row and stay out of the pack. The conversion
-   summary lists them; a script that somehow named one records a miss and never
-   raises the F7 wait, so it cannot deadlock.
+   summary lists them. A request for a record whose file is absent (an empty
+   slot, an out-of-range id or an unpacked file) still queues its positional
+   `voice/<row>_<id>.wav` path (1-based row, lowercase hex id); the engine's
+   failed load counts the miss and releases the F7 wait, so it cannot
+   deadlock.
 
 6. **FMV (`movie_on`, 0x29).** Films are out of scope: the opcode keeps its
    graceful no-op, so a scene that requests one advances instead of waiting.

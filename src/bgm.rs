@@ -20,7 +20,6 @@ use crate::music;
 use crate::pack::Pack;
 use crate::sfx;
 use crate::state::RoomId;
-use crate::voice;
 
 /// The original's per-step volume scale (`g_SndDistSteps` and the ramp
 /// direction both use it).
@@ -192,9 +191,8 @@ impl BgmCache {
     ///
     /// `Bgm_*` names resolve through [`music::pack_path`]; every other group
     /// track (the `Se_*` tracks and the mixed dialogue `V110_00`) lives in the
-    /// install's `sound/` directory and is read from `se/`. A track whose
-    /// `voice/` entry is the only one packed (the mixed dialogue) resolves
-    /// through the same pack as every other entry.
+    /// install's `sound/` directory and is read from `se/`, which conversion
+    /// always packs for every group-track name.
     pub fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
         let mut candidates: Vec<String> = Vec::new();
         if let Some(path) = music::pack_path(name) {
@@ -203,10 +201,6 @@ impl BgmCache {
         let se = format!("se/{}.wav", name.to_ascii_lowercase());
         if !candidates.iter().any(|path| path == &se) {
             candidates.push(se);
-        }
-        let voice = voice::pack_path(name);
-        if !candidates.iter().any(|path| path == &voice) {
-            candidates.push(voice);
         }
 
         for path in &candidates {
@@ -936,7 +930,7 @@ mod tests {
         set_row(&mut game, id, 0x08);
         update_room_bgm(&mut game, id, None);
         game.voice.request = Some(crate::game::VoiceRequest {
-            name: "V004_00",
+            path: "voice/01_09.wav".to_string(),
             volume: 0,
             pan: 0,
         });

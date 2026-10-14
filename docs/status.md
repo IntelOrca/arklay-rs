@@ -584,7 +584,7 @@ converted base pack on the reference install reports:
 
 ```
 pack: re1.akpak
-3245 entries, 479906472 bytes
+3261 entries, 484033461 bytes
 format       entries        ok    failed          bytes
 manifest           1         1         0            106
 rdt              348       320        28       51364907
@@ -597,7 +597,7 @@ emd               63        63         0        4062003
 emw               32        32         0         446942
 tmd                7         7         0           8822
 dor               34        34         0         888924
-wav             1023      1023         0      122047547
+wav             1039      1039         0      126174536
 language           8         8         0         205617
 maptables          1         1         0             72
 combat             1         1         0           1017
@@ -605,7 +605,7 @@ biocard            1         1         0            335
 avi               27        27         0      251624740
 lua               39        39         0         151044
 opaque             6         6         0          23502
-verify: 3245 entries, 3217 ok, 28 failed, 6 opaque
+verify: 3261 entries, 3233 ok, 28 failed, 6 opaque
 ```
 
 The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
@@ -617,7 +617,7 @@ not cover yet, and `data/core00.esp`/`data/core00.etm`, the effect tables
 whose pair parser is not in the path classifier; `--strict` turns them into
 failures by design.
 
-The one pack carries everything: the 517 referenced voice `wav` entries and
+The one pack carries everything: the 533 positional voice `wav` entries and
 the 27 shipped `avi` films (251,624,740 bytes) sit beside the room, audio, UI
 and `language/` entries, and all three formats verify clean. `language/`
 replaces the retired executable `text/*.bin` tables.

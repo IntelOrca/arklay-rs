@@ -52,7 +52,8 @@ responsibility.
 | `audio` | Runtime | WAV parsing and the single SDL3 software mixer used for SE, voice, BGM and film audio |
 | `bgm` | Runtime | The three-channel music state machine, ramps and channel hand-off |
 | `sfx` | Runtime | Per-room sound-name tables and footstep resolution |
-| `voice` | Runtime | Per-stage voice-line tables and pack path naming |
+| `voice` | Runtime | Voice pack-entry naming (`voice/<row>_<id>.wav`) and the stage-to-row selector |
+| `voice_table` | Tooling | The shipped per-stage voice-line name tables `convert-game` renames into pack entries |
 | `music` | Runtime | Room BGM tables and track path naming |
 | `movie` | Runtime | The film table, `movie_on` hand-off and the playback session |
 | `ending` | Runtime | Ending-row selection and its film chain |
