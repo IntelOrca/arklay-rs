@@ -16104,7 +16104,10 @@ off_0010:
 
         // A fresh monitor has not run yet: the original's item-box state 3
         // calls `menu_draw_health_bar` every frame, so the first box tick
-        // initialises the EKG and the following ticks sweep its head.
+        // initialises the EKG. Its case 0 falls through into case 1, so the
+        // head steps to 0x85 and immediately wraps to 0x35 (off the window's
+        // left edge); the sweep then fills the window over the next ~0x50
+        // ticks.
         assert_eq!(session.menu.as_ref().unwrap().health_bar.state, 0);
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
@@ -16114,6 +16117,11 @@ off_0010:
             1,
             "the item box starts the EKG sweep"
         );
+        for _ in 0..70 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
         let first = session.menu.as_ref().unwrap().health_bar.primary_span();
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)

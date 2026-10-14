@@ -359,6 +359,7 @@ impl Framebuffer {
 
     /// Draw one indexed sprite with explicit U/V mirror flags and the font's
     /// `0..=30` brightness scale.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_indexed_sprite_mirrored(
         &mut self,
         texture: &Texture8,
