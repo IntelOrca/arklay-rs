@@ -90,8 +90,9 @@ echo "== reference: room $ROOM player $PLAYER, $TICKS ticks"
 # links it with --dynamic-linker), so it runs directly. Do not invoke the
 # loader explicitly: /proc/self/exe would then name the loader and the game
 # would resolve config.ini and assets from the loader's directory. Run it from
-# its own directory so the lock file and a crash log stay beside the binary.
-( cd "$(dirname "$REF_BIN")" && \
+# OUT so its single-instance lock file and a crash log stay per-run, which
+# also lets several oracle runs execute concurrently.
+( cd "$OUT" && \
 SDL_VIDEODRIVER=offscreen \
 LD_LIBRARY_PATH="$SYSROOT/usr/lib32:$SYSROOT/usr" \
 __EGL_VENDOR_LIBRARY_FILENAMES="$SYSROOT/usr/share/glvnd/egl_vendor.d/50_mesa.json" \
