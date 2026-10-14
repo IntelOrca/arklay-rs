@@ -16,7 +16,7 @@
 #   OUTDIR  output directory (default target/oracle/room<ROOM>_p<PLAYER>)
 #
 # Environment overrides:
-#   RE1_REF_REPO    reference checkout (default ../resident-evil-pc-decomp)
+#   RE1_REF_REPO    reference checkout (default ../ref)
 #   RE1_REF_BIN     reference binary (default <ref>/build/linux/residentevil)
 #   RE1_REF_SYSROOT 32-bit sysroot (default <ref>/build/sysroot32)
 #   RE1_ASSETS      game install root (default /usr/share/games/re1)
@@ -25,7 +25,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-REF_REPO="${RE1_REF_REPO:-$REPO_ROOT/../resident-evil-pc-decomp}"
+REF_REPO="${RE1_REF_REPO:-$REPO_ROOT/../ref}"
 REF_BIN="${RE1_REF_BIN:-$REF_REPO/build/linux/residentevil}"
 SYSROOT="${RE1_REF_SYSROOT:-$REF_REPO/build/sysroot32}"
 ASSETS="${RE1_ASSETS:-/usr/share/games/re1}"
