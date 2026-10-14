@@ -40,3 +40,4 @@ below press `start` at tick 60 and begin navigating once the panel has settled
 - `inventory_nav.txt` — open, then walk the item grid cursor.
 - `inventory_examine.txt` — open, then confirm the selected item (examine/use
   submenu).
+- `inventory_open_close.txt` — open the pause menu, then cancel it.

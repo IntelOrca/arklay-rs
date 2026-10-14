@@ -38,14 +38,23 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   `MenuFadePhase::Out`), so the two agree again only once the menu has faded in
   (~14 frames). The trace's `fade` field also differs (arklay's menu fade is a
   separate accumulator from the room-entry fade the trace reads).
+- **Menu-close timing.** `inventory_open_close` (cancel at tick 120) diverges:
+  ~44% differing pixels for the close fade (t=120-130), ~84% while the room
+  comes back (t=134-138), and the shared `rng`/`rseed` and the player's
+  `action_state`/`ticks` fall out of step afterwards. Same root cause as the
+  open fade: the reference's menu exit fades the menu out and unfreezes the
+  room on its own schedule, while arklay's `MenuFadePhase::Closing` + room fade
+  runs at a different cadence.
 - **Item-action submenu open animation.** The original grows the submenu box
   from zero to full (`DAT_00ae9f27` `0x80..=0x88`, width `*6`, height `*3`)
   over ~8 frames after confirm. arklay draws the full box immediately, so the
   examine/use/equip submenu differs by ~3-5% of pixels for those 8 frames.
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
-  is the health monitor's EKG line: arklay rasterizes a Bresenham polyline, the
-  original fills per-column vertical spans, so steep segments cover a different
-  pixel set.
+  is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
+  reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`
+  renders as two alpha-blended triangles through the (llvmpipe) GPU, so the
+  covered pixels differ on steep segments. Not exactly matchable without
+  replicating the GPU quad coverage.
 - **Portrait face edges.** ~55 pixels in the character portrait differ at a
   fine threshold (edge/rounding level, like the room frame backlog).
 
