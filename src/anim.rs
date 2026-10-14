@@ -660,7 +660,7 @@ pub fn blend_keyframes(
 /// The original's last-blend-step angle adjustment: shift `current` by one
 /// full turn when the target lies more than half a turn away in the lerp's
 /// direction.
-fn fix_wrap(current: i32, target: i32) -> i32 {
+pub(crate) fn fix_wrap(current: i32, target: i32) -> i32 {
     let diff = (target - current + 0x800) as u16;
     if diff > 0x1000 {
         if diff & 0x8000 == 0 {
