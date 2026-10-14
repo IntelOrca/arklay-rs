@@ -1497,22 +1497,26 @@ impl GameSession {
                 self.room_boot_grace = false;
                 // The inner-loop state machine restores the saved word the
                 // tick the entry fade's accumulator drops below 1. The port
-                // mirrors the player-state and monster bits here (its other
-                // message bits have their own consumers); the reference's word
-                // is `g_short_message_flags | 0x200` = 0xFF3F.
-                self.game.message_flags |=
-                    game::MESSAGE_FLAG_PLAYER_STATE | game::MESSAGE_FLAG_MONSTERS;
+                // mirrors the player-state, character and monster bits here
+                // (its other message bits have their own consumers); the
+                // reference's word is `g_short_message_flags | 0x200` = 0xFF3F.
+                self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE
+                    | game::MESSAGE_FLAG_ENTITIES
+                    | game::MESSAGE_FLAG_MONSTERS
+                    | game::MESSAGE_FLAG_EFFECTS;
             }
         } else {
             // While the entry fade runs the reference's `g_message_flags` is
-            // cleared, which freezes the whole player animation state machine
-            // and the monsters: the post-door idle countdown must not start
-            // and no zombie may think until the gate opens. The clearing
-            // starts the tick AFTER the entry, so the spawn init (player state
-            // 0 to 1) still runs under the closed gate.
+            // cleared, which freezes the whole player animation state machine,
+            // the scripted characters and the monsters: the post-door idle
+            // countdown must not start and no zombie may think until the gate
+            // opens. The clearing starts the tick AFTER the entry, so the spawn
+            // init (player state 0 to 1) still runs under the closed gate.
             if !self.room_boot_grace {
-                self.game.message_flags &=
-                    !(game::MESSAGE_FLAG_PLAYER_STATE | game::MESSAGE_FLAG_MONSTERS);
+                self.game.message_flags &= !(game::MESSAGE_FLAG_PLAYER_STATE
+                    | game::MESSAGE_FLAG_ENTITIES
+                    | game::MESSAGE_FLAG_MONSTERS
+                    | game::MESSAGE_FLAG_EFFECTS);
             }
             self.room_boot_grace = false;
         }
