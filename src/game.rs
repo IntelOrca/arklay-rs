@@ -4293,9 +4293,7 @@ impl GameState {
         pack: &crate::pack::Pack,
         lua: Option<&mut crate::enemy::LuaEnemyHost>,
     ) -> usize {
-        let frame_rand = platform_rand(&mut self.rand_state);
-        self.rand_seed = frame_rand;
-        self.state_words[3] = frame_rand;
+        self.draw_frame_rand();
         // The clone chains only draw on the frames their parent script ticks
         // them; clear the live marks before the scripts run and let
         // `enemy::web::update` re-raise them.
@@ -4306,6 +4304,18 @@ impl GameState {
             companion.live = false;
         }
         crate::enemy::update_all(self, room, models, pack, lua)
+    }
+
+    /// Draw this gameplay frame's platform random seed (`g_RandSeed = rand()`),
+    /// the original's first statement of every game_loop iteration. The menu
+    /// request is detected later in the same tick, so the frame START opens the
+    /// menu still consumes exactly one draw - arklay opens the menu before the
+    /// room tick, so it must draw the seed here to keep the shared stream in
+    /// step with the reference.
+    pub fn draw_frame_rand(&mut self) {
+        let frame_rand = platform_rand(&mut self.rand_state);
+        self.rand_seed = frame_rand;
+        self.state_words[3] = frame_rand;
     }
 
     /// Roll this frame's screen-shake offset into [`GameState::screen_shake`]:

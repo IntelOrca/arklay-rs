@@ -227,8 +227,11 @@ impl MainMenu {
 
     /// Advance the health monitor one frame and re-read the cursor selection.
     pub fn tick(&mut self, game: &mut GameState) {
+        let health = game.entities[0].health;
+        let max_health = game.max_health;
+        let status = game.health_status;
         self.health_bar
-            .update(game.entities[0].health, game.max_health, game.health_status);
+            .update(health, max_health, status, &mut game.rand_state);
         if self.mode == MenuMode::Navigation {
             self.refresh_selection(game);
         }

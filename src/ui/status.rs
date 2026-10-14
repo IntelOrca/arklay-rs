@@ -13,6 +13,7 @@
 //! framebuffer's RGBA buffer; the EKG uses a Bresenham line so no renderer
 //! primitive beyond the existing sprite path is needed.
 
+use crate::game::platform_rand;
 use crate::model::Texture8;
 use crate::render::{Framebuffer, Tint};
 
@@ -213,7 +214,10 @@ pub struct HealthBar {
     head: i16,
     secondary_head: i16,
     secondary_color: [u8; 3],
-    rng: u32,
+    /// The original's `DAT_00ae9f48`: the low two bits are the active wave
+    /// variant and bits 2-3 the wave group (health state, or 4 poisoned). The
+    /// variant pick folds away an immediate repeat.
+    wave_variant: u8,
 }
 
 impl Default for HealthBar {
@@ -236,34 +240,28 @@ impl HealthBar {
             head: 0x84,
             secondary_head: 0x84,
             secondary_color: health_color(3),
-            rng: 0x1234_5678,
+            wave_variant: 0,
         }
     }
 
     /// Advance the sweep one frame for the current health and status.
-    pub fn update(&mut self, health: i16, max_health: i16, status: u8) {
-        self.health_state = health_state(health, max_health);
+    ///
+    /// `rand_state` is the game's platform PRNG stream: the original's health
+    /// monitor draws its wave variant (and, when poisoned, the poison-pick
+    /// bit) from the shared `rand()` the scripts use, so the stream stays in
+    /// step with the reference.
+    pub fn update(&mut self, health: i16, max_health: i16, status: u8, rand_state: &mut u32) {
         self.poisoned = is_poisoned(status);
         match self.state {
             0 => {
                 self.state = 1;
                 self.head = 0x84;
                 self.secondary_head = 0x84;
-                self.refresh_wave();
+                // The original's case 0 falls through into case 1, so the first
+                // frame already steps the head to 0x85 and wraps it to 0x35.
+                self.sweep_step(health, max_health, rand_state);
             }
-            1 => {
-                self.head += 1;
-                if self.head > layout::EKG_MAX_X as i16 {
-                    self.head = 0x35;
-                    self.refresh_wave();
-                }
-                self.secondary_head += 1;
-                if self.secondary_head > layout::EKG_MAX_X as i16 {
-                    self.secondary_head = self.head - 0x1F;
-                    self.secondary_wave = self.wave;
-                    self.secondary_color = self.color;
-                }
-            }
+            1 => self.sweep_step(health, max_health, rand_state),
             2 => {
                 self.state = 3;
                 self.head = 0xAF;
@@ -276,6 +274,38 @@ impl HealthBar {
                 }
             }
             _ => self.state = 0,
+        }
+    }
+
+    /// One step of the primary/secondary EKG sweep (the original's case 1).
+    fn sweep_step(&mut self, health: i16, max_health: i16, rand_state: &mut u32) {
+        self.head += 1;
+        if self.head > layout::EKG_MAX_X as i16 {
+            self.head = 0x35;
+            // The health state and colour are recomputed only at the wrap.
+            self.health_state = health_state(health, max_health);
+            self.color = health_color(self.health_state);
+            // Poisoned health picks the poisoned wave group (4) on a random
+            // bit; the variant draw follows with the original's no-repeat fold.
+            let mut group = self.health_state;
+            if self.poisoned && platform_rand(rand_state) & 1 != 0 {
+                group = 4;
+            }
+            let mut variant = (platform_rand(rand_state) & 3) as u8;
+            if self.wave_variant & 3 == variant {
+                variant = (variant + 1) & 3;
+            }
+            self.wave_variant = variant | (group << 2);
+            self.wave = usize::from(group) * 4 + usize::from(variant);
+            if self.wave >= EKG_WAVES.len() {
+                self.wave = 0;
+            }
+        }
+        self.secondary_head += 1;
+        if self.secondary_head > layout::EKG_MAX_X as i16 {
+            self.secondary_head = self.head - 0x1F;
+            self.secondary_wave = self.wave;
+            self.secondary_color = self.color;
         }
     }
 
@@ -301,35 +331,6 @@ impl HealthBar {
             (i32::from(self.secondary_head) + 0x1F).clamp(layout::EKG_MIN_X, layout::EKG_MAX_X);
         let right = i32::from(self.secondary_head).clamp(layout::EKG_MIN_X, layout::EKG_MAX_X);
         (left, right)
-    }
-
-    /// Pick the next wave table: four variants per health state, with the
-    /// poisoned group (`16..=19`) chosen by a random bit like the original.
-    fn refresh_wave(&mut self) {
-        let variant = self.next_random() & 3;
-        let group = if self.poisoned && self.next_random() & 1 != 0 {
-            4
-        } else {
-            self.health_state
-        };
-        self.wave = usize::from(group) * 4 + variant as usize;
-        if self.wave >= EKG_WAVES.len() {
-            self.wave = 0;
-        }
-        self.color = health_color(self.health_state);
-        if self.state != 3 {
-            self.secondary_wave = self.wave;
-            self.secondary_color = self.color;
-        }
-    }
-
-    fn next_random(&mut self) -> u32 {
-        let mut value = self.rng;
-        value ^= value << 13;
-        value ^= value >> 17;
-        value ^= value << 5;
-        self.rng = value;
-        value
     }
 
     /// Draw the health face and EKG into `framebuffer` from `texture`.
@@ -619,15 +620,16 @@ mod tests {
     #[test]
     fn the_sweep_walks_and_wraps() {
         let mut bar = HealthBar::new();
-        bar.update(140, 140, 0);
+        let mut rand = 0x1234_5678u32;
+        bar.update(140, 140, 0, &mut rand);
         assert_eq!(bar.state, 1);
         // The head starts just past the right edge and wraps on the next tick.
         bar.head = layout::EKG_MAX_X as i16;
-        bar.update(140, 140, 0);
+        bar.update(140, 140, 0, &mut rand);
         assert_eq!(bar.head, 0x35);
         assert_eq!(bar.color, health_color(3));
         for _ in 0..40 {
-            bar.update(140, 140, 0);
+            bar.update(140, 140, 0, &mut rand);
         }
         assert_eq!(bar.state, 1);
         assert!(bar.head > 0x50 && bar.head <= layout::EKG_MAX_X as i16);
@@ -636,17 +638,18 @@ mod tests {
     #[test]
     fn a_heal_flush_and_its_end() {
         let mut bar = HealthBar::new();
-        bar.update(20, 96, 0x22);
+        let mut rand = 0x1234_5678u32;
+        bar.update(20, 96, 0x22, &mut rand);
         assert_eq!(bar.health_state, 0);
         assert!(bar.poisoned);
         bar.start_flush(true, true);
         assert_eq!(bar.state, 2);
         assert_eq!(bar.flush, Some(Flush::White));
-        bar.update(96, 96, 0);
+        bar.update(96, 96, 0, &mut rand);
         assert_eq!(bar.state, 3);
         assert_eq!(bar.head, 0xAF);
         while bar.state == 3 {
-            bar.update(96, 96, 0);
+            bar.update(96, 96, 0, &mut rand);
         }
         assert_eq!(bar.flush, None);
     }
@@ -690,16 +693,17 @@ mod tests {
     #[test]
     fn the_face_row_depends_on_health_and_poison() {
         let mut bar = HealthBar::new();
-        bar.update(140, 140, 0);
+        let mut rand = 0x1234_5678u32;
+        bar.update(140, 140, 0, &mut rand);
         assert!(!bar.poisoned);
         assert_eq!(bar.health_state, 3);
-        bar.update(140, 140, 0x20);
+        bar.update(140, 140, 0x20, &mut rand);
         assert!(bar.poisoned);
         assert_eq!(bar.health_state, 3);
         // Poisoned waves live in the 16..=19 group when the random bit fires.
         let mut poisoned_group = false;
         for _ in 0..200 {
-            bar.update(140, 140, 0x20);
+            bar.update(140, 140, 0x20, &mut rand);
             if bar.wave >= 16 {
                 poisoned_group = true;
                 break;

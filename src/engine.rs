@@ -1574,6 +1574,12 @@ impl GameSession {
         // window advances after the script pass, so the frame's start state
         // decides; the press that dismissed a window is spent on it.
         if ui.start && !was_active {
+            // The reference draws this frame's random seed before its menu
+            // request is even detected (game_loop's first statement), then
+            // opens the menu at the end of the same tick. arklay opens the menu
+            // here, ahead of the room tick, so it must draw the seed itself or
+            // the shared stream falls one draw behind for the rest of the run.
+            self.game.draw_frame_rand();
             self.begin_menu_open(pack);
             return Ok(());
         }
