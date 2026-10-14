@@ -1647,13 +1647,20 @@ impl GameSession {
         // ran still reports this tick's bytes, which is what the reference's
         // live globals hold.
         if !self.room_boot_gate
-            && self.game.entities[0].state() == 1
             && let Some((behavior, action_state, ticks)) = self.player.trace_state
         {
-            self.game.entities[0].action_behavior = behavior;
-            self.game.entities[0].action_state = action_state;
+            // The settle countdown publishes whenever the pad machine ran this
+            // tick, even if a later effect flipped the state byte: the original
+            // wrote it during the player update, before the effects ran.
             if let Some(ticks) = ticks {
                 self.game.entities[0].action_ticks_counter = ticks;
+            }
+            // The behaviour/action-state bytes are the machine's only while it
+            // still owns the player; a post-update grab or splash overwrote
+            // them and must win.
+            if self.game.entities[0].state() == 1 {
+                self.game.entities[0].action_behavior = behavior;
+                self.game.entities[0].action_state = action_state;
             }
         }
         // The Lua hooks run after the room tick: `on_tick` sees the whole
