@@ -809,13 +809,18 @@ fn draw_part(framebuffer: &mut Framebuffer, texture: &Texture8, part: layout::Fr
 fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::FrameTile) {
     let [x, y] = tile.part.pos;
     let [w, h] = tile.part.size;
+    // The tiled record's flag byte maps straight onto the sprite mirror bits
+    // the original sets from `(flags & 0xc0) << 16` (SpriteRenderer.h:
+    // TEXDESC_MIRROR_U 0x80, TEXDESC_MIRROR_V 0x40). The bottom decoration
+    // record (0x40) is the top one flipped with V.
+    let mirror = [tile.flags & 0x80 != 0, tile.flags & 0x40 != 0];
     for index in 0..tile.tiles() {
         let (dx, dy) = if tile.vertical() {
             (0, i32::from(index) * i32::from(h))
         } else {
             (i32::from(index) * i32::from(w), 0)
         };
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_indexed_sprite_mirrored(
             texture,
             [
                 i32::from(tile.part.uv[0]),
@@ -832,6 +837,7 @@ fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::Fr
             0,
             0,
             Tint::White,
+            mirror,
         );
     }
 }

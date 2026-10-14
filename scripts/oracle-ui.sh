@@ -52,6 +52,12 @@ case "$OUT" in
     /*) ;;
     *) OUT="$PWD/$OUT" ;;
 esac
+# The reference runs from OUT, so the input script and pack paths must be
+# absolute before it cd's.
+case "$INPUT" in
+    /*) ;;
+    *) INPUT="$PWD/$INPUT" ;;
+esac
 mkdir -p "$OUT/refcaps" "$OUT/arkcaps"
 
 REF_CONFIG="$(dirname "$REF_BIN")/config.ini"

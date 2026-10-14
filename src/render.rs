@@ -357,6 +357,30 @@ impl Framebuffer {
         );
     }
 
+    /// Draw one indexed sprite with explicit U/V mirror flags and the font's
+    /// `0..=30` brightness scale.
+    pub fn draw_indexed_sprite_mirrored(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+        mirror: [bool; 2],
+    ) {
+        self.draw_indexed_sprite_full(
+            texture,
+            src,
+            dst,
+            clut_row,
+            brightness_scale(brightness),
+            tint,
+            SpriteBlend::Opaque,
+            mirror,
+        );
+    }
+
     /// [`Framebuffer::draw_indexed_sprite_scaled`] with a blend mode and U/V
     /// mirror flags.
     #[allow(clippy::too_many_arguments)]
