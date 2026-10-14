@@ -4,14 +4,14 @@
 //! (`0x0C..=0xF7`), through the `0xF8`/`0xF9`/`0xFA` extended pages and a few
 //! cursor controls. This module is the inverse direction: it turns the
 //! characters of a language-file value into those bytes, and names the cell a
-//! byte selects. The grids in [`table`] are generated from the same reference
+//! byte selects. The grids in `table` are generated from the same reference
 //! map (`FONT.TIM`) that `font.rs` was verified against, so encoding and
 //! rendering always agree.
 //!
 //! [`encode`] is greedy: a two-codepoint cell (`S.`) matches before its single
 //! characters would, so text written with the ligature cells re-encodes to the
 //! bytes the game uses. Characters the font has no cell for either map to a
-//! documented substitute ([`SUBSTITUTIONS`]: curly quotes, dashes, middle
+//! documented substitute (`SUBSTITUTIONS`: curly quotes, dashes, middle
 //! dots, fullwidth ASCII) or encode as [`MISSING`], the cell
 //! [`crate::font::Font::new`] paints as an empty box so an unspellable
 //! character is visible instead of silently dropped.

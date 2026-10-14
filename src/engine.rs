@@ -5,7 +5,7 @@
 //! The world-item milestone leaves these deliberate gaps:
 //! - the ground pick-up (menu mode 3) and scripted `give_item` (mode 4) item
 //!   viewers run the model intro, the model spin and the 0xC0/0xC1/0xC2
-//!   message round trip through [`PickupView`]. A gated `item_aot_set` entry
+//!   message round trip through `PickupView`. A gated `item_aot_set` entry
 //!   (flags word bit 0) plays the 0x0c reach animation first through
 //!   [`crate::player::LockedAction::Interact`] and the viewer opens when it
 //!   completes; an ungated entry opens instantly, exactly like the original.

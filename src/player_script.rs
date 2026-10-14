@@ -32,7 +32,7 @@
 //! `health_status & 0x80` lock, not the NPC `collision_flags` bit.
 //!
 //! The handlers move the player with the original's un-collided `Add_speedXZ`
-//! step; [`scripted_animation`] then runs the room collision pass over the
+//! step; `scripted_animation` then runs the room collision pass over the
 //! tick's movement, pushing the player out of any obstruction the step
 //! crossed. The NPC state-8 drivers in [`crate::enemy::scd`] use the same
 //! un-collided step and tail.

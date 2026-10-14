@@ -371,7 +371,7 @@ pub struct AnimPlayer {
     /// clips). `0x1000 / blend_step - 1` is the counter a switch arms.
     pub blend_step: u16,
     /// The keyframe displayed before the latest consuming tick. The blend
-    /// source is [`AnimPlayer::applied`]; this is kept for diagnostics and the
+    /// source is `AnimPlayer::applied`; this is kept for diagnostics and the
     /// within-clip tests that inspect the pending frame transition.
     pub previous_keyframe: usize,
     /// The blend counter the latest consuming tick applied (before the

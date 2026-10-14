@@ -571,7 +571,7 @@ pub struct PlayerState {
     pub slow_counter: i16,
     /// Remaining ticks of the run's four-tick decelerating stop; 0 outside a
     /// stop. The first stop tick switches the animation to the body idle clip
-    /// with a fresh blend and sheds [`RUN_STOP_DECEL`] from the run speed.
+    /// with a fresh blend and sheds `RUN_STOP_DECEL` from the run speed.
     pub run_stop_ticks: u8,
     /// The next tick selects its behavior through the normal entry path even
     /// when the requested behavior matches the current one; a finished run

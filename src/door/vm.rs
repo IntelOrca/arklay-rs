@@ -126,7 +126,7 @@ pub enum VertexWrite {
     ///
     /// The original writes these three shorts over the order entry's model
     /// pointer instead of the mesh; this port deliberately redirects the write
-    /// to the order's mesh copy. See [`Vm::write_vertex`].
+    /// to the order's mesh copy. See `Vm::write_vertex`.
     Set {
         /// Order slot.
         order: u8,

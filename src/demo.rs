@@ -160,7 +160,7 @@ pub struct AttractState {
     /// The playback gate (`g_message_flags` bit `0x200`): the first gameplay
     /// tick runs with it clear, like the original's resumed outer setup.
     pub gate: bool,
-    /// The live `g_message_flags` bit `0x200` this tick. The boot [`gate`] is
+    /// The live `g_message_flags` bit `0x200` this tick. The boot [`gate`](Self::gate) is
     /// only the opening condition: a room script can clear the bit (and the
     /// original's `UpdateDemoTimer` and pad injection both re-read it every
     /// frame), which pauses the playback counter and forces a zero pad until

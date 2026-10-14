@@ -6,7 +6,7 @@
 //! reports a completed interaction through [`ScreenResult`]. The app reacts to
 //! [`ScreenAction`] values by switching modes.
 //!
-//! The same contract also serves gameplay modals: [`crate::engine::GameSession`]
+//! The same contract also serves gameplay modals: `crate::engine::GameSession`
 //! owns an optional boxed screen and freezes the room tick while one is
 //! installed, so screens that own all of their state (the item viewer) plug in
 //! without changing the mode machine. The message window and pause menu are

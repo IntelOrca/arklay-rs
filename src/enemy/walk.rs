@@ -1021,7 +1021,7 @@ pub fn footstep(
 /// `walk_zone_find`: the walk zone containing `(x, z)`, searched from the last
 /// record down like the original, so an overlap resolves to the later zone.
 /// Containment is half-open with the original's wrapping unsigned-short
-/// arithmetic ([`WalkZone::contains`]); a point outside every zone yields
+/// arithmetic ([`WalkZone::contains`](crate::state::WalkZone::contains)); a point outside every zone yields
 /// `None` (the original's `0xFF`).
 pub fn walk_zone_find(room: &RoomState, x: i32, z: i32) -> Option<u8> {
     room.walk_zones

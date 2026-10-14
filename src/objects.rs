@@ -384,7 +384,7 @@ impl ObjectTable {
     /// `0x80` texture-queue request have no analogue in the per-model texture
     /// design and are not ported (the model byte keeps both flag bits so the
     /// push grunt still reads `0x40`). The room/slot positional overrides are
-    /// transcribed by [`apply_position_overrides`].
+    /// transcribed by `apply_position_overrides`.
     ///
     /// Returns whether a record was written; a slot past the declared table
     /// is ignored (the original would run off the loaded record block).

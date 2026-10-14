@@ -1307,7 +1307,7 @@ pub struct EntityMesh<'a> {
     /// white); the shared plumbing for `model_op` and `objs_hide`.
     pub tint: [u8; 3],
     /// The record's background blend weight (the original's `+0x68` field),
-    /// from [`record_blend_weight`] and the record's `DAT_004d2be0` override.
+    /// from `record_blend_weight` and the record's `DAT_004d2be0` override.
     /// `None` keeps the M16 per-packet half blend; `Some(weight)` mixes a
     /// blended texel as `source * (256 - weight) + background * weight`, so
     /// `Some(0)` draws opaque and `Some(0x30)` keeps 18.75% background.
@@ -1711,7 +1711,7 @@ fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camer
 /// focal length in pixels.
 ///
 /// `view` maps a world point to the screen's Y-down camera frame with a
-/// truncating 4.12 multiply (see [`Camera::view_position`]); `trans` holds the
+/// truncating 4.12 multiply (see `Camera::view_position`); `trans` holds the
 /// rotated eye. `roll` is the cut's 12-bit head roll and `screen` the frame's
 /// screen-shake offset, both applied at projection time so the view matrix
 /// stays the room's own. `from` and `look_at` are the source points the matrix

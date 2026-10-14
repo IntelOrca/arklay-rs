@@ -3314,7 +3314,7 @@ pub struct GameState {
     pub death_fade_request: bool,
     /// The grab speed vector the plant's hold behaviours write onto the player
     /// (`g_playerEntity.speed.y/z/pad`), added to the player position by
-    /// [`GameState::add_player_speed`].
+    /// `add_player_speed`.
     pub player_speed: [i16; 3],
     /// Whether a spawn over the clone arena cap has been logged this session.
     pub web_cap_logged: bool,
@@ -3776,7 +3776,7 @@ impl GameState {
     /// Bank 6 is not a standalone bank in the original: its SCD handlers cast
     /// `&g_message_flags` to a dword, so selectors 16..=31 address
     /// `message_flags` and 0..=15 the adjacent short-word backup. See
-    /// [`message_bank_selector`].
+    /// `message_bank_selector`.
     pub fn flag_test(&self, bank: u8, sel: u8, expected: bool) -> bool {
         if bank == 6
             && let Some((main_word, mask)) = message_bank_selector(sel)

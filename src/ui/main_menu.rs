@@ -10,7 +10,7 @@
 //!
 //! # Engine hook
 //!
-//! [`crate::engine::GameSession`] handles this screen explicitly (it is not a
+//! `crate::engine::GameSession` handles this screen explicitly (it is not a
 //! [`crate::ui::Screen`] modal, because it mutates the session's
 //! [`GameState`] and shares its message window):
 //!

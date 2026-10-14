@@ -182,7 +182,7 @@ pub fn orient_from_matrix(m: [i16; 9]) -> Mat4x3 {
     Mat4x3 { r: rm, t: [0; 3] }
 }
 
-/// The inverse of [`crate::anim::compose`]: `compose(a, compose_inverse(a))`
+/// The inverse of `crate::anim::compose`: `compose(a, compose_inverse(a))`
 /// is the identity in the game's composition algebra (rotation transpose plus
 /// the Y-sign conjugation the compose applies to translations).
 pub fn compose_inverse(a: &Mat4x3) -> Mat4x3 {
@@ -896,7 +896,7 @@ fn apply_matrix_lv(matrix: &Mat4x3, v: [i32; 3]) -> [i32; 3] {
 
 /// `ApplyMatrixSV`: rotate an SVECTOR by a 4.12 matrix, truncating each
 /// component to a signed short with the game's Y-sign negation. Unlike
-/// [`apply_matrix_lv`] the products are full integer multiplies, not per-term
+/// `apply_matrix_lv` the products are full integer multiplies, not per-term
 /// 4.12 truncations.
 pub fn apply_matrix_sv(matrix: &Mat4x3, v: [i16; 3]) -> [i16; 3] {
     let vx = i32::from(v[0]);

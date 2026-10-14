@@ -44,7 +44,7 @@
 //!
 //! # Engine hook
 //!
-//! The engine owns the pack's [`Text`] tables and the active [`RoomState`], so
+//! The engine owns the pack's [`Text`] tables and the active [`RoomState`](crate::state::RoomState), so
 //! it drives the window through [`crate::game::GameState::update_message`]
 //! once per fixed tick, feeding the held keys the same way the room tick does:
 //!

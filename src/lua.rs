@@ -11,7 +11,7 @@
 //! - `on_message` runs when a message was raised during the tick and may return
 //!   a replacement message id (nothing/nil keeps the original).
 //!
-//! The `api` argument is the live [`GameState`] exposed as a scoped userdata
+//! The `api` argument is the live [`GameState`](crate::game::GameState) exposed as a scoped userdata
 //! through [`mlua::Lua::scope`], with only the author-facing accessors:
 //! `api:room()` (read-only), `api:flag_get`/`api:flag_set`,
 //! `api:item_count`/`api:give_item`/`api:item_remove`, `api:kill_event`,
