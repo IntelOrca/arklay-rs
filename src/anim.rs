@@ -1059,7 +1059,6 @@ mod tests {
         let skeleton = Skeleton {
             relative: vec![[0, 100, 0], [0, 50, 0]],
             children: vec![vec![1], vec![]],
-            ..Skeleton::default()
         };
         let keyframe = Keyframe {
             offset: [0, 0, 0],
