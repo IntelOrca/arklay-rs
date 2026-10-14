@@ -1,14 +1,21 @@
 //! Lightweight progress reporting for long-running command-line operations.
 //!
-//! [`Progress`] tracks one phase at a time: a label, a completed/total count,
-//! the item currently being processed, and the phase's elapsed time. On a
-//! terminal it redraws a single bar line in place with carriage returns;
-//! everywhere else it falls back to periodic plain lines, so logs and pipes
-//! never see control characters.
+//! One [`Progress`] reports a single bar for the whole operation, however many
+//! internal phases it runs: [`Progress::begin`] starts a named phase and
+//! [`Progress::end_phase`] finishes it, and the bar measures the completed
+//! phases plus the fraction of the active one. A conversion that touches two
+//! dozen asset categories therefore still draws one bar that fills from start to
+//! finish, with the current phase named alongside it.
 //!
-//! The ETA and formatting helpers at the bottom of the module are pure and
-//! unit tested; the reporter itself only keeps a handful of counters and one
-//! short item string, so it stays cheap enough for per-entry updates.
+//! On a terminal it redraws one line in place with carriage returns; when the
+//! run ends [`Progress::finish`] (or the reporter's drop, on an early return)
+//! erases it so the command's own output stands alone. Everywhere else it falls
+//! back to periodic plain lines, so logs and pipes never see control
+//! characters.
+//!
+//! The formatting helpers at the bottom of the module are pure and unit tested;
+//! the reporter itself only keeps a handful of counters and one short item
+//! string, so it stays cheap enough for per-entry updates.
 
 use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
@@ -27,22 +34,29 @@ const TTY_MAX_CHARS: usize = 79;
 /// Longest item name rendered before its start is elided.
 const ITEM_MAX_CHARS: usize = 44;
 
-/// Tracks and renders the progress of one phase at a time.
+/// Fixed-point scale of the overall progress fraction: the bar is full at
+/// [`SCALE`]. Integer fixed point keeps the reporter allocation- and
+/// float-free.
+const SCALE: u64 = 10_000;
+
+/// Tracks one overall bar across the phases of a run.
 pub struct Progress {
     /// When this reporter was created; basis for [`Progress::elapsed`].
     started: Instant,
+    /// Fixed prefix of the rendered line, e.g. `convert-game`.
+    title: String,
+    /// Total phases the run will report; set once they are known.
+    phases_total: u64,
+    /// Phases finished so far.
+    phases_done: u64,
     /// Label of the active phase, e.g. `roomcut`.
     label: String,
-    /// Unit of the active phase, e.g. `cuts`.
-    unit: &'static str,
     /// Total units in the active phase.
     total: u64,
-    /// Units completed so far.
+    /// Units completed in the active phase.
     done: u64,
     /// Shortened name of the item currently being processed.
     item: String,
-    /// When the active phase began.
-    phase_started: Instant,
     /// When the last plain line was written (non-terminal mode).
     last_plain: Instant,
     /// Width of the last terminal line, used to pad over stale text.
@@ -51,51 +65,55 @@ pub struct Progress {
     active: bool,
     /// Whether stderr is a terminal.
     tty: bool,
+    /// Whether the terminal cursor is currently hidden by the bar.
+    cursor_hidden: bool,
 }
 
 impl Progress {
-    /// Create a reporter; the overall clock starts now.
-    pub fn new() -> Self {
+    /// Create a reporter for `title` that will run `phases` phases; pass `0`
+    /// when the count is not known yet and call [`Progress::set_phases`] before
+    /// the first [`Progress::begin`].
+    pub fn new(title: &str, phases: u64) -> Self {
         let now = Instant::now();
         Self {
             started: now,
+            title: title.to_owned(),
+            phases_total: phases,
+            phases_done: 0,
             label: String::new(),
-            unit: "items",
             total: 0,
             done: 0,
             item: String::new(),
-            phase_started: now,
             last_plain: now,
             line_len: 0,
             active: false,
             tty: std::io::stderr().is_terminal(),
+            cursor_hidden: false,
         }
     }
 
-    /// Begin a phase of `total` `unit`s, ending any previous phase.
-    pub fn begin(&mut self, label: &str, total: u64, unit: &'static str) {
+    /// Set the total number of phases the run will report, once known.
+    pub fn set_phases(&mut self, phases: u64) {
+        self.phases_total = phases;
+    }
+
+    /// Begin a phase of `total` units, ending any previous phase.
+    ///
+    /// A zero-total phase is counted in the overall bar but draws nothing, so a
+    /// category that resolved no files never flashes on screen.
+    pub fn begin(&mut self, label: &str, total: u64) {
         if self.active {
             self.end_phase();
         }
         self.label.clear();
         self.label.push_str(label);
-        self.unit = unit;
         self.total = total;
         self.done = 0;
         self.item.clear();
-        self.phase_started = Instant::now();
-        self.last_plain = self.phase_started;
-        self.line_len = 0;
+        self.last_plain = Instant::now();
         self.active = true;
-        // Draw the zero line immediately so a long first item does not leave
-        // the phase invisible until the first update or the plain interval.
-        // Empty phases only render their final line from `end_phase`.
-        if self.total > 0 {
-            if self.tty {
-                self.draw_tty();
-            } else {
-                self.draw_plain();
-            }
+        if total > 0 && self.tty {
+            self.draw_tty();
         }
     }
 
@@ -119,29 +137,84 @@ impl Progress {
         self.done = self.done.saturating_add(count);
         if self.tty {
             self.draw_tty();
-        } else if self.done < self.total && self.last_plain.elapsed() >= PLAIN_INTERVAL {
-            // The final line is always emitted by `end_phase`.
+        } else if self.total > 0
+            && self.done < self.total
+            && self.last_plain.elapsed() >= PLAIN_INTERVAL
+        {
             self.draw_plain();
         }
     }
 
-    /// Finish the active phase, leaving its final line on screen.
+    /// Finish the active phase.
+    ///
+    /// The bar stays on its line; the caller's [`Progress::finish`] (or the
+    /// reporter's drop) erases it once the run ends.
     pub fn end_phase(&mut self) {
         if !self.active {
             return;
         }
         self.active = false;
-        if self.tty {
-            self.draw_tty();
-            let _ = writeln!(std::io::stderr());
-        } else {
-            self.draw_plain();
+        self.done = self.total;
+        if self.phases_total > 0 && self.phases_done < self.phases_total {
+            self.phases_done += 1;
         }
+        if self.tty && self.total > 0 {
+            self.draw_tty();
+        }
+    }
+
+    /// End the active phase, settle the final line and erase it.
+    ///
+    /// A run whose declared phase count matched its phases has already finished
+    /// by the last [`Progress::end_phase`]; this only settles the line when the
+    /// count drifted. Either way the bar is removed so the command's own output
+    /// (warnings, the final status line) stands alone.
+    pub fn finish(&mut self) {
+        if self.active {
+            self.end_phase();
+        }
+        debug_assert_eq!(
+            self.phases_done, self.phases_total,
+            "the declared phase count drifted from the run"
+        );
+        if self.phases_total > 0 && self.phases_done < self.phases_total {
+            self.phases_done = self.phases_total;
+            self.done = self.total;
+        }
+        self.clear();
+    }
+
+    /// Erase the bar's line and restore the cursor, leaving the cursor where
+    /// the run's own output can carry on. A no-op when nothing was drawn
+    /// (redirected) or already cleared.
+    fn clear(&mut self) {
+        if !self.tty {
+            return;
+        }
+        if self.line_len == 0 && !self.cursor_hidden {
+            return;
+        }
+        let mut stderr = std::io::stderr().lock();
+        if self.line_len > 0 {
+            let _ = write!(stderr, "\r{:width$}\r", "", width = self.line_len);
+            self.line_len = 0;
+        }
+        if self.cursor_hidden {
+            let _ = write!(stderr, "\x1b[?25h");
+            self.cursor_hidden = false;
+        }
+        let _ = stderr.flush();
     }
 
     /// Time since this reporter was created.
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    /// Number of phases finished so far.
+    #[cfg(test)]
+    fn phases_done(&self) -> u64 {
+        self.phases_done
     }
 
     /// Name the current item for upcoming redraws.
@@ -150,23 +223,35 @@ impl Progress {
         self.item.push_str(&short_item(item));
     }
 
-    /// The full text of the terminal progress line: label, bar, percentage,
-    /// counts, ETA when known, then the item name if it fits.
-    fn render_tty(&self) -> String {
-        let elapsed = self.phase_started.elapsed();
-        let mut line = format!(
-            "{}: {} {:>3}% {}/{} {}",
-            self.label,
-            format_bar(self.done, self.total),
-            format_percent(self.done, self.total),
-            self.done,
-            self.total,
-            self.unit,
-        );
-        if let Some(eta) = estimate_remaining(elapsed, self.done, self.total) {
-            line.push_str(" ETA ");
-            line.push_str(&format_duration(eta));
+    /// Overall progress in `0..=SCALE`: completed phases plus the active
+    /// phase's fraction, spread over the phase count.
+    fn overall_scaled(&self) -> u64 {
+        if self.phases_total == 0 {
+            return 0;
         }
+        let base = u128::from(self.phases_done.min(self.phases_total)) * u128::from(SCALE)
+            / u128::from(self.phases_total);
+        let within = if self.total == 0 {
+            0
+        } else {
+            u128::from(self.done.min(self.total)) * u128::from(SCALE)
+                / u128::from(self.total)
+                / u128::from(self.phases_total)
+        };
+        (base + within).min(u128::from(SCALE)) as u64
+    }
+
+    /// The full text of the terminal progress line: title, overall bar and
+    /// percentage, the active phase, then the item name if it fits.
+    fn render_tty(&self) -> String {
+        let scaled = self.overall_scaled();
+        let mut line = format!(
+            "{}: {} {:>3}%",
+            self.title,
+            format_bar(scaled),
+            scaled / 100,
+        );
+        self.push_context(&mut line);
         if !self.item.is_empty() {
             let budget = TTY_MAX_CHARS.saturating_sub(line.chars().count() + 2);
             if budget >= 4 {
@@ -179,20 +264,15 @@ impl Progress {
 
     /// The full text of one plain progress line, for non-terminal outputs.
     fn render_plain(&self) -> String {
-        let elapsed = self.phase_started.elapsed();
+        let scaled = self.overall_scaled();
+        let elapsed = self.started.elapsed();
         let mut line = format!(
-            "{}: {}/{} {} ({}%) {}",
-            self.label,
-            self.done,
-            self.total,
-            self.unit,
-            format_percent(self.done, self.total),
+            "{}: {}% {}",
+            self.title,
+            scaled / 100,
             format_duration(elapsed),
         );
-        if let Some(eta) = estimate_remaining(elapsed, self.done, self.total) {
-            line.push_str(" ETA ");
-            line.push_str(&format_duration(eta));
-        }
+        self.push_context(&mut line);
         if !self.item.is_empty() {
             line.push(' ');
             line.push_str(&self.item);
@@ -200,18 +280,36 @@ impl Progress {
         line
     }
 
+    /// Append the active phase to `line`, unless it just repeats the title (a
+    /// single-phase run names the title as its own phase).
+    fn push_context(&self, line: &mut String) {
+        if !self.label.is_empty() && self.label != self.title {
+            line.push(' ');
+            line.push_str(&self.label);
+        }
+    }
+
     /// Redraw the progress line in place; only called when stderr is a TTY.
     fn draw_tty(&mut self) {
         let line = self.render_tty();
         let width = line.chars().count();
-        let padding = self.line_len.saturating_sub(width);
+        // The cursor now sits past the padding, so the stale-text bound is the
+        // padded width, not just this line's width; the next (possibly shorter)
+        // line must clear all of it.
+        let (padding, line_len) = erase_widths(self.line_len, width);
         let mut stderr = std::io::stderr().lock();
+        if !self.cursor_hidden {
+            // Hide the cursor while the bar owns the line, so it does not dance
+            // over each redraw. Restored by `clear`.
+            let _ = write!(stderr, "\x1b[?25l");
+            self.cursor_hidden = true;
+        }
         let _ = write!(stderr, "\r{line}");
         if padding > 0 {
             let _ = write!(stderr, "{:width$}", "", width = padding);
         }
         let _ = stderr.flush();
-        self.line_len = width;
+        self.line_len = line_len;
     }
 
     /// Write one plain progress line; only called when stderr is not a TTY.
@@ -224,33 +322,31 @@ impl Progress {
     }
 }
 
-impl Default for Progress {
-    fn default() -> Self {
-        Self::new()
+impl Drop for Progress {
+    fn drop(&mut self) {
+        // A run that returns early (an error) never reaches `finish`, so the
+        // bar is erased here to keep the error message readable.
+        self.clear();
     }
 }
 
-/// Percentage of `total` completed, clamped to `0..=100`.
+/// The padding and new stale-text bound for drawing a `width`-wide line over a
+/// previous line of `previous` columns.
 ///
-/// A zero total counts as complete.
-fn format_percent(done: u64, total: u64) -> u64 {
-    if done >= total {
-        return 100;
-    }
-    (u128::from(done) * 100 / u128::from(total)) as u64
+/// A line shorter than the previous one is padded out to `previous`; because
+/// the cursor then sits at the padded width, that width (not the line's own) is
+/// what the next frame must clear.
+fn erase_widths(previous: usize, width: usize) -> (usize, usize) {
+    let padding = previous.saturating_sub(width);
+    (padding, width + padding)
 }
 
-/// The bar the terminal reporter draws, e.g. `[##########--------------]`,
-/// `BAR_WIDTH` characters wide including both brackets.
-///
-/// A zero total counts as complete.
-fn format_bar(done: u64, total: u64) -> String {
+/// The bar the terminal reporter draws for an overall fraction in
+/// `0..=SCALE`, e.g. `[##########--------------]`, `BAR_WIDTH` characters wide
+/// including both brackets.
+fn format_bar(scaled: u64) -> String {
     let cells = BAR_WIDTH - 2;
-    let filled = if total == 0 {
-        cells
-    } else {
-        (u128::from(done.min(total)) * cells as u128 / u128::from(total)) as usize
-    };
+    let filled = (u128::from(scaled.min(SCALE)) * cells as u128 / u128::from(SCALE)) as usize;
     let mut bar = String::with_capacity(BAR_WIDTH);
     bar.push('[');
     bar.extend(std::iter::repeat_n('#', filled));
@@ -269,16 +365,6 @@ pub fn format_duration(duration: Duration) -> String {
         return format!("{}m{:02}s", secs / 60, secs % 60);
     }
     format!("{}h{:02}m{:02}s", secs / 3600, (secs / 60) % 60, secs % 60)
-}
-
-/// Estimate the time left at the current rate, or `None` when it cannot be
-/// estimated (nothing done yet, already finished, or absurdly large).
-fn estimate_remaining(elapsed: Duration, done: u64, total: u64) -> Option<Duration> {
-    if done == 0 || done >= total {
-        return None;
-    }
-    let per_unit = elapsed.as_secs_f64() / done as f64;
-    Duration::try_from_secs_f64(per_unit * (total - done) as f64).ok()
 }
 
 /// Shorten a long item name to [`ITEM_MAX_CHARS`], keeping its end.
@@ -315,59 +401,65 @@ mod tests {
     }
 
     #[test]
-    fn percentages_clamp_and_round_down() {
-        assert_eq!(format_percent(0, 0), 100);
-        assert_eq!(format_percent(0, 10), 0);
-        assert_eq!(format_percent(1, 2), 50);
-        assert_eq!(format_percent(2, 3), 66);
-        assert_eq!(format_percent(3, 3), 100);
-        assert_eq!(format_percent(4, 3), 100);
-        assert_eq!(format_percent(u64::MAX - 1, u64::MAX), 99);
-    }
-
-    #[test]
     fn bars_fill_proportionally_and_clamp_at_both_ends() {
         let empty: String = std::iter::repeat_n('-', BAR_WIDTH - 2).collect();
         let full: String = std::iter::repeat_n('#', BAR_WIDTH - 2).collect();
-        assert_eq!(format_bar(0, 10), format!("[{empty}]"));
+        assert_eq!(format_bar(0), format!("[{empty}]"));
         assert_eq!(
-            format_bar(1, 2),
+            format_bar(SCALE / 2),
             format!("[{}{}]", "#".repeat(11), "-".repeat(11))
         );
-        assert_eq!(format_bar(10, 10), format!("[{full}]"));
-        assert_eq!(format_bar(20, 10), format!("[{full}]"));
-        assert_eq!(
-            format_bar(0, 0),
-            format!("[{full}]"),
-            "a zero total is done"
-        );
+        assert_eq!(format_bar(SCALE), format!("[{full}]"));
+        assert_eq!(format_bar(SCALE + 1), format!("[{full}]"));
     }
 
     #[test]
-    fn terminal_lines_show_a_bar_and_a_known_eta() {
-        let mut progress = Progress::new();
-        progress.label = "room".to_string();
-        progress.unit = "files";
+    fn redraws_keep_the_stale_text_bound() {
+        // A shorter line pads out to the previous width, and the bound stays at
+        // that padded width so the next frame still clears the whole tail.
+        assert_eq!(erase_widths(74, 40), (34, 74));
+        assert_eq!(erase_widths(74, 60), (14, 74));
+        // A longer line needs no padding and raises the bound.
+        assert_eq!(erase_widths(50, 60), (0, 60));
+        assert_eq!(erase_widths(0, 40), (0, 40));
+    }
+
+    #[test]
+    fn terminal_lines_spread_phases_over_one_bar() {
+        let mut progress = Progress::new("convert-game", 4);
+        progress.phases_done = 1;
+        progress.label = "roomcut".to_string();
+        progress.total = 10;
+        progress.done = 5;
+        progress.item = "roomcut/100_000.bmp".to_string();
+
+        // (1 + 5/10) / 4 = 37.5%, rounded down to 37%.
+        let line = progress.render_tty();
+        assert!(line.starts_with("convert-game: "), "{line}");
+        assert!(line.contains(" 37% roomcut "), "{line}");
+        assert!(line.ends_with("roomcut/100_000.bmp"), "{line}");
+    }
+
+    #[test]
+    fn a_single_phase_run_is_its_own_bar() {
+        let mut progress = Progress::new("extract", 1);
+        progress.label = "extract".to_string();
         progress.total = 10;
         progress.done = 3;
-        progress.set_item("room/1000.rdt");
 
         let line = progress.render_tty();
-        assert_eq!(
-            line,
-            format!(
-                "room: {}  30% 3/10 files ETA 0s  room/1000.rdt",
-                format_bar(3, 10)
-            ),
-            "{line}"
+        assert!(line.starts_with("extract: "), "{line}");
+        assert!(line.contains(" 30%"), "{line}");
+        assert!(
+            !line.contains(" extract"),
+            "the phase repeats the title: {line}"
         );
     }
 
     #[test]
     fn terminal_lines_stay_on_one_line() {
-        let mut progress = Progress::new();
+        let mut progress = Progress::new("convert-game", 30);
         progress.label = "roomcut".to_string();
-        progress.unit = "cuts";
         progress.total = 100;
         progress.done = 1;
         progress.item = "roomcut/".to_string() + &"nested/".repeat(20) + "100_000.bmp";
@@ -379,39 +471,47 @@ mod tests {
     }
 
     #[test]
-    fn plain_lines_drop_an_unknown_eta() {
-        let mut progress = Progress::new();
+    fn plain_lines_carry_the_phase_and_item() {
+        let mut progress = Progress::new("convert-game", 10);
         progress.label = "room".to_string();
-        progress.unit = "files";
         progress.total = 10;
         progress.item = "room/1000.rdt".to_string();
 
         let line = progress.render_plain();
-        assert!(line.starts_with("room: 0/10 files (0%) "), "{line}");
-        assert!(line.ends_with(" room/1000.rdt"), "{line}");
-        assert!(!line.contains("ETA"), "{line}");
+        assert!(line.starts_with("convert-game: 0% "), "{line}");
+        assert!(line.ends_with("room room/1000.rdt"), "{line}");
 
         progress.done = 3;
         let line = progress.render_plain();
-        assert!(line.contains("(30%)"), "{line}");
-        assert!(line.contains(" ETA "), "{line}");
+        assert!(line.contains(" 3% "), "{line}");
+        assert!(line.contains(" room "), "{line}");
 
-        progress.done = 10;
+        progress.phases_done = 10;
         let line = progress.render_plain();
-        assert!(line.starts_with("room: 10/10 files (100%) "), "{line}");
-        assert!(line.ends_with(" room/1000.rdt"), "{line}");
-        assert!(!line.contains("ETA"), "{line}");
+        assert!(line.starts_with("convert-game: 100% "), "{line}");
     }
 
     #[test]
-    fn remaining_interpolates_the_current_rate() {
-        assert_eq!(estimate_remaining(Duration::from_secs(10), 0, 100), None);
-        assert_eq!(estimate_remaining(Duration::from_secs(10), 100, 100), None);
-        assert_eq!(estimate_remaining(Duration::from_secs(10), 150, 100), None);
-        let eta = estimate_remaining(Duration::from_secs(10), 50, 100).unwrap();
-        assert!((eta.as_secs_f64() - 10.0).abs() < 0.001);
-        let eta = estimate_remaining(Duration::from_secs(5), 1, 4).unwrap();
-        assert!((eta.as_secs_f64() - 15.0).abs() < 0.001);
+    fn end_phase_counts_phases_and_clamps_at_the_total() {
+        let mut progress = Progress::new("convert-game", 2);
+        progress.begin("a", 4);
+        progress.end_phase();
+        assert_eq!(progress.phases_done(), 1);
+        progress.begin("b", 4);
+        progress.end_phase();
+        assert_eq!(progress.phases_done(), 2);
+        progress.begin("c", 4);
+        progress.end_phase();
+        assert_eq!(progress.phases_done(), 2, "never past the declared total");
+    }
+
+    #[test]
+    fn empty_phases_still_advance_the_overall_bar() {
+        let mut progress = Progress::new("convert-game", 2);
+        progress.begin("empty", 0);
+        progress.end_phase();
+        assert_eq!(progress.phases_done(), 1);
+        assert_eq!(progress.overall_scaled(), SCALE / 2);
     }
 
     #[test]

@@ -25,7 +25,7 @@ responsibility.
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
 | `convert` | Tooling | `convert-game`: discover an install and migrate every asset category — rooms, audio, voice and films — into one pack; progress on stderr, per-file sizes with `--verbose` |
-| `progress` | Tooling | Terminal-aware progress bars (and periodic plain lines when redirected) for the long-running commands |
+| `progress` | Tooling | One terminal-aware overall progress bar per command, spanning its internal phases (and periodic plain lines when redirected) |
 | `atomic` | Tooling | Sibling-temp-then-rename single-file output used by every artifact writer |
 | `verify` | Tooling | `arklay verify`: path-classified parse of every pack entry with a per-format report |
 | `stats` | Tooling | Fixed-bucket frame-time histogram and the `--stats` report |

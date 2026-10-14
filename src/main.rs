@@ -366,8 +366,8 @@ fn open_game_pack(pack_path: &Path, mods: &[PathBuf]) -> Result<Pack> {
 /// outside `out_dir`.
 fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()> {
     let pack = open_game_pack(pack_path, mods)?;
-    let mut progress = Progress::new();
-    progress.begin("extract", pack.len() as u64, "files");
+    let mut progress = Progress::new("extract", 1);
+    progress.begin("extract", pack.len() as u64);
 
     let mut bytes = 0u64;
     for entry in pack.entries() {
@@ -382,7 +382,7 @@ fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()
         bytes += data.len() as u64;
         progress.advance(entry.path());
     }
-    progress.end_phase();
+    progress.finish();
 
     println!(
         "extracted {} entries, {bytes} bytes to {} in {}",

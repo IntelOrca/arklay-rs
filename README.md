@@ -128,12 +128,17 @@ records the deliberate limits (whole-room script replacement, sandbox,
 error/budget policy). A run without any layer stays byte-identical to a
 pre-M15 run, Lua or not.
 
-`convert-game` and `extract` report progress on stderr per phase (RDTs,
-camera cuts, BGM, player files, bytes written): an interactive bar with
-`done/total`, percentage and ETA when stderr is a terminal, or periodic plain
-lines without control characters when it is redirected. `convert-game`
-warnings also go to stderr, and a conversion ends with a single
-`wrote <pack> (<n> entries, <bytes> bytes) in <time>` line. With `--verbose`
+`convert-game` and `extract` report progress on stderr as a single bar for the
+whole command. `convert-game` runs its asset categories (RDTs, camera cuts,
+BGM, player files, compression, bytes written) as internal phases under that
+one bar, which names the phase in progress, so a conversion never scrolls a bar
+per category. On a terminal it hides the cursor and redraws the bar in place
+with a percentage, then erases it when the run finishes (restoring the cursor);
+when redirected it emits periodic plain lines without control characters
+instead. The warnings are buffered and
+printed to stderr after the bar is gone, so they never corrupt it, and a
+conversion ends with a single
+`Created <pack> (<n> entries, <size> MiB) in <time>` line. With `--verbose`
 the conversion additionally prints the stage and category totals, the
 compression summary and one line per packed file with its plain
 (pre-compression) and stored size on stdout, in processing order; the report
