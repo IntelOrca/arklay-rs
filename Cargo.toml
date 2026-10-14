@@ -25,6 +25,9 @@ zstd = "0.13"
 [target.'cfg(windows)'.dependencies]
 sdl3-sys = { version = "0.7", default-features = false, features = ["build-from-source-static"] }
 
+[lints.rust]
+warnings = "deny"
+
 [profile.dev]
 debug = "line-tables-only"
 

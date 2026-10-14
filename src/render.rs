@@ -2697,37 +2697,6 @@ fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
-/// Rotate a normal by a joint's 4.12 rotation, ignoring the translation.
-fn rotate(joint: &anim::Mat4x3, normal: [i16; 3]) -> [i32; 3] {
-    let v = [
-        i128::from(normal[0]),
-        -i128::from(normal[1]),
-        i128::from(normal[2]),
-    ];
-    std::array::from_fn(|row| {
-        let r = joint.r[row];
-        let mut sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
-        if row == 1 {
-            sum = -sum;
-        }
-        clamp_i32(sum >> FIXED_BITS)
-    })
-}
-
-/// Normalize a fixed-point vector; zero-length vectors have no direction.
-fn normalize(vector: [i32; 3]) -> Option<[f64; 3]> {
-    let real = [
-        f64::from(vector[0]),
-        f64::from(vector[1]),
-        f64::from(vector[2]),
-    ];
-    let length = (real[0] * real[0] + real[1] * real[1] + real[2] * real[2]).sqrt();
-    if length <= f64::MIN_POSITIVE {
-        return None;
-    }
-    Some([real[0] / length, real[1] / length, real[2] / length])
-}
-
 /// Clamp an intermediate to the `i32` range.
 fn clamp_i32(value: i128) -> i32 {
     value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
