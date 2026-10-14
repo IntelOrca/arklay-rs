@@ -1384,6 +1384,16 @@ pub struct Entity {
     /// plant's head and the other bosses' segmented hitboxes). Zero for every
     /// entity whose collision record is not overridden.
     pub sca_hit_delta: [i16; 3],
+    /// `pSca_hit_data` for the primary SCA volume: the local record centre
+    /// rotated into world space (with [`Entity::sca_hit_delta`] folded in), as
+    /// last written by the entity's own update. The original keeps this in a
+    /// shared pool that starts zeroed and is only refreshed inside the owning
+    /// entity's update, so an entity that has not run yet this frame lends a
+    /// zero world centre to every other entity's SCA resolve.
+    pub sca_world: [i16; 3],
+    /// The second SCA volume's world centre ([`Entity::sca2`]), zero when the
+    /// entity carries a single-volume record.
+    pub sca_world2: [i16; 3],
     /// Whether the entity has entered a camera switch zone (behaviour
     /// scratch).
     pub has_enter_switch_zone: u8,
@@ -4175,6 +4185,12 @@ impl GameState {
             entity.sca_radius = DEFAULT_ENEMY_RADIUS;
             entity.sca_half_height = DEFAULT_ENEMY_HALF_HEIGHT;
             entity.sca_offset = DEFAULT_ENEMY_SCA_OFFSET;
+            // `pSca_hit_data` is only written by the entity's own update, so a
+            // freshly spawned slot starts with the zeroed pool words until its
+            // first SetEntityScaHitData.
+            entity.sca_world = [0; 3];
+            entity.sca_world2 = [0; 3];
+            entity.sca_hit_delta = [0; 3];
             if !occupied {
                 self.enemy_count = self.enemy_count.saturating_add(1);
             }
