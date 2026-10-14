@@ -111,13 +111,15 @@ end
 
 -- The original's Manhattan distance to the player with its sign quirk:
 -- absDz - (dx >> 31) + absDx, so a player to the left adds one extra unit.
+-- The reference's `dx >> 31` is an arithmetic shift on a signed int (-1 when
+-- dx < 0); Lua's `>>` is logical, so spell the sign out.
 local function player_distance(e)
     local px, _, pz = e:player_pos()
     local dz = pz - e.pos_z
     local dx = px - e.pos_x
     local abs_dz = (dz < 0) and -dz or dz
     local abs_dx = (dx < 0) and -dx or dx
-    return abs_dz - (dx >> 31) + abs_dx
+    return abs_dz + ((dx < 0) and 1 or 0) + abs_dx
 end
 
 -- `sVar = *ticks; *ticks = sVar - 1; return sVar == 0` - the
@@ -1255,8 +1257,9 @@ zombie_slow_walk_alt = function(e)
     local abs_dx = (dx < 0) and -dx or dx
     local abs_dz = (dz < 0) and -dz or dz
     -- The original publishes the waypoint's Manhattan distance into the
-    -- shared collision scratch; nothing reads it back here.
-    local waypoint_distance = abs_dz - (dx >> 31) + abs_dx
+    -- shared collision scratch; nothing reads it back here. As above, the
+    -- reference's `dx >> 31` is arithmetic, so spell the sign out.
+    local waypoint_distance = abs_dz + ((dx < 0) and 1 or 0) + abs_dx
     local entry_behavior = e.action_behavior
 
     if e.zombie_move_word == 0 then
