@@ -127,7 +127,7 @@ impl EntityAnim {
     /// Seed the on-screen pose with the reset identity (zero rotations, the
     /// pending frame's root offsets) so the first blend after a reset eases
     /// out of `ResetJointTransforms` instead of jumping to the frame.
-    fn seed_identity_pose(&self, entity: &Entity, clips: &[Clip]) {
+    pub(crate) fn seed_identity_pose(&self, entity: &Entity, clips: &[Clip]) {
         let Some(keyframes) = self.keyframes.as_deref() else {
             return;
         };
@@ -140,10 +140,17 @@ impl EntityAnim {
         let Some(target) = keyframes.get(usize::from(frame.keyframe)) else {
             return;
         };
+        // `ResetJointTransforms` writes every joint's own bind offset, joint 0
+        // included, not the pending frame's root vertex.
+        let offset = self
+            .skeleton
+            .as_deref()
+            .and_then(|skeleton| skeleton.relative.first().copied())
+            .unwrap_or(target.offset);
         self.player.set_applied_pose(Some(Keyframe {
-            offset: target.offset,
+            offset,
             vertex: target.vertex,
-            rotations: vec![[0, 0, 0]; target.rotations.len()],
+            rotations: vec![crate::anim::IDENTITY_ROTATION; target.rotations.len()],
         }));
     }
 
