@@ -287,7 +287,16 @@ impl EventVm {
                     break;
                 }
                 steps += 1;
-                if !self.step_slot(index, host) {
+                let cont = self.step_slot(index, host);
+                // Apply an event script's inline `evt_exec`/`task_kill` the
+                // moment it is issued, exactly like the original's synchronous
+                // `ScdEventEntry_Create` (RoomEvents.cpp 0x0041d650). Deferring
+                // the drain to the next slot let the issuing slot hit its
+                // `0xFF` and go inactive first, so a `slot > 7` create resolved
+                // to the just-freed slot (0) and the follow-up event never ran
+                // that pass - the room intro cutscene started one frame late.
+                self.apply_requests(host);
+                if !cont {
                     break;
                 }
             }

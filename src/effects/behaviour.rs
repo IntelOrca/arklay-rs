@@ -270,8 +270,7 @@ fn projectile_hit_check(
     };
     let dx = player_pos[0] - i32::from(x);
     let dz = player_pos[2] - i32::from(z);
-    let distance =
-        crate::sfx::integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
+    let distance = crate::sfx::integer_sqrt(dx.wrapping_mul(dx).wrapping_add(dz.wrapping_mul(dz)));
     if distance >= range {
         return false;
     }
@@ -280,10 +279,8 @@ fn projectile_hit_check(
     }
     if attacked == 0 {
         let enemy_id = game.entities[1].id;
-        if enemy_id == 3 || enemy_id == 4 {
-            if game.rand_seed & 1 != 0 {
-                game.poison_player();
-            }
+        if (enemy_id == 3 || enemy_id == 4) && game.rand_seed & 1 != 0 {
+            game.poison_player();
         }
         let second = game.flags[usize::from(crate::game::BANK_SCENARIO)]
             .bit(crate::game::SCENARIO_FLAG_SECOND_PLAYTHROUGH);
@@ -1596,7 +1593,6 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
                     && projectile_hit_check(game, room, 900, effect.pos[0], effect.pos[2])
                 {
                     ground_splat(game, index);
-                    return;
                 }
             }
         }

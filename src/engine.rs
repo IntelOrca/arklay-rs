@@ -5023,6 +5023,16 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         if let AppFlow::Quit = app.update(UiInput::default(), player::Input::default(), false)? {
             break;
         }
+        // A script's `movie_on` (MSF_FMV_REQUEST) starts a film at the end of
+        // the tick. The capture path never plays films - the boot drain above
+        // drops the queued ones for deterministic, audio-free frames - so drop
+        // an in-game one here too. The reference's oracle hook skips an absent
+        // FMV (`UpdateVideoPlayback` clears `g_bMCINotifyEnabled`), and playing
+        // it froze the room mid-cutscene: room 60A's intro event set the player
+        // and camera, then the film owned every tick after it.
+        if let Mode::Play(session) = &mut app.mode {
+            session.movie = None;
+        }
         app.draw();
         // A session created by this update (the title's attract hand-off) has
         // not run a gameplay tick yet; its first trace line is that tick, not
