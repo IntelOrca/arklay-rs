@@ -820,8 +820,14 @@ pub fn yawn_post_move(
         );
     }
 
-    let (result, bkp) =
-        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot]);
+    // The reference's `check_room_collision` skips an entity whose hidden bit
+    // (status & 4) is set; the head carries it through the entry fade and must
+    // not be pushed while the body is still a straight chain.
+    let (result, bkp) = if game.entities[slot].status_flags & 0x04 != 0 {
+        (0, None)
+    } else {
+        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot])
+    };
     if let Some(bkp) = bkp {
         game.entity_bkp = bkp;
     }
@@ -862,17 +868,27 @@ pub fn yawn_post_move(
     }
 }
 
+/// `GteFixedMul12`: the reference's 4.12 product, full-width so the Yawn body
+/// chain's `<<9` offsets cannot overflow, rounded toward zero and truncated to
+/// `i32`. `ApplyMatrixLV` sums three of these; the rounding is per product, not
+/// over the sum, and that one-unit-per-joint difference is what the chain
+/// anchors on.
+fn gte_fixed_mul12(a: i32, b: i32) -> i32 {
+    let product = i64::from(a) * i64::from(b);
+    ((product + ((product >> 63) & 0xFFF)) >> 12) as i32
+}
+
 /// `ApplyMatrixLV`: rotate a vector by the matrix's 4.12 rotation with the
 /// game's Y-sign conjugation. The translation is not read.
 fn apply_matrix_lv(matrix: &Mat4x3, v: [i32; 3]) -> [i32; 3] {
     let source = [v[0], v[1].wrapping_neg(), v[2]];
     let mut out = [0i32; 3];
     for (row, value) in matrix.r.iter().zip(out.iter_mut()) {
-        let mut sum = 0i64;
+        let mut sum = 0i32;
         for (element, input) in row.iter().zip(&source) {
-            sum += i64::from(*element) * i64::from(*input);
+            sum = sum.wrapping_add(gte_fixed_mul12(*element, *input));
         }
-        *value = ((sum + ((sum >> 63) & 0xFFF)) >> 12) as i32;
+        *value = sum;
     }
     out[1] = out[1].wrapping_neg();
     out

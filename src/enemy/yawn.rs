@@ -147,9 +147,16 @@ pub fn segment_tick(game: &mut GameState, room: &RoomState, slot: usize) {
         game.entities[slot].hit_state &= 0x87;
     }
 
-    // Room collision at the mirrored point; a hit drags the chain.
-    let (result, bkp) =
-        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot]);
+    // Room collision at the mirrored point; a hit drags the chain. The
+    // reference's `check_room_collision` returns 0 while the entity's hidden
+    // bit (status & 4) is set, and `status_flags &= 0x1f` above keeps that bit:
+    // a Yawn parked in the walls during the room-entry fade must not be pushed
+    // onto them, or the whole joint chain is dragged off its pose.
+    let (result, bkp) = if game.entities[slot].status_flags & 0x04 != 0 {
+        (0, None)
+    } else {
+        crate::enemy::walk::check_room_collision_bkp(room, &mut game.entities[slot])
+    };
     if let Some(bkp) = bkp {
         game.entity_bkp = bkp;
     }
