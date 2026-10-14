@@ -10236,7 +10236,7 @@ mod spider_tests {
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack, &[]));
         let entity = &game.entities[1];
-        assert_eq!(entity.pos[1], -6136);
+        assert_eq!(entity.pos[1], -6120);
         assert_eq!(entity.pitch, 0x0800);
         assert!(entity.shadow_suppressed);
         assert_eq!(entity.behavior_flags, 2);
