@@ -8332,6 +8332,14 @@ fn store_player_joint_worlds(
     let Some(keyframe) = keyframe else {
         return;
     };
+    // Pin the pose on screen. A scripted frame setter (`plw_anim`) can point
+    // the clock at a clip and frame without consuming a tick; the original's
+    // joint structs keep the last `Joint_move` output, so the next scripted
+    // read must still see this pose rather than the freshly named frame.
+    game.entity_anims[0]
+        .player
+        .set_applied_pose(Some(keyframe.clone()));
+    player.anim.set_applied_pose(Some(keyframe.clone()));
     let entity = crate::anim::entity_matrix(player.pos, player.angle);
     let worlds = crate::anim::joint_matrices(skeleton, &keyframe, &entity);
     if !worlds.is_empty() {
