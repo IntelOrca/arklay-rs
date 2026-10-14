@@ -7535,6 +7535,12 @@ fn tick_room_timed(
     mut phases: Option<&mut stats::PhaseTotals>,
 ) -> Option<game::RoomTransition> {
     let update_start = Instant::now();
+    // The original's `main_loop` rolls the screen-shake offset at the very top
+    // of the rendered frame, before the game task runs its scripts and its
+    // per-frame random draw. Doing it here (rather than at render time) keeps
+    // the three shake draws ahead of this tick's `g_RandSeed` draw and on the
+    // frame the shake bit takes effect, matching the reference stream.
+    context.game.roll_screen_shake();
     // The original publishes the remapped D-pad held/pressed words before the
     // scripts run, so a `ck_bits` (0x38) condition sees this frame's pad. The
     // press edge is the current word minus the previous frame's *raw* word
@@ -8543,11 +8549,10 @@ fn render_frame(
         framebuffer.clear();
         return;
     };
-    // The frame's screen shake: three draws from the platform stream while
-    // `MSF2_SCREEN_SHAKE` is set, cleared to zero otherwise. It shifts the
-    // camera projection and the background's display origin; the room's view
-    // matrix stays untouched.
-    let shake = game.shake_offset();
+    // The frame's screen shake, rolled by `roll_screen_shake` at the top of the
+    // gameplay tick. It shifts the camera projection and the background's
+    // display origin; the room's view matrix stays untouched.
+    let shake = game.screen_shake();
     let mut camera = Camera::from_cut(cut);
     camera.screen = shake;
     let lighting = Lighting::from_room(room);
