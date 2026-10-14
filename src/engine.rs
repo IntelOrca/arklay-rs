@@ -5003,6 +5003,7 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
     // safety bound) until that many lines have been written.
     let mut emitted = 0u32;
     let mut iterations = 0u32;
+    let mut script_input = InputState::default();
     let bound = options
         .ticks
         .saturating_mul(2)
@@ -5020,7 +5021,19 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         // screen is the last traced one until the title cycles back into
         // gameplay.
         let screen_before = matches!(&app.mode, Mode::Play(session) if session.death.screen_open());
-        if let AppFlow::Quit = app.update(UiInput::default(), player::Input::default(), false)? {
+        // The scripted `--input` word is keyed by the trace tick, exactly like
+        // the reference's `--test-input` (which reads it from its own `t`). An
+        // iteration that emits no line (a door transition, the death screen)
+        // keeps the previous tick's word, matching the reference's per-frame
+        // injection while its trace counter is stalled.
+        let (tick_ui, tick_player, tick_action) = match options.input {
+            Some(script) => {
+                let tick = script_input.tick_scripted(script.word_at(writer.tick_index()));
+                (tick.ui, tick.player, tick.action)
+            }
+            None => (UiInput::default(), player::Input::default(), false),
+        };
+        if let AppFlow::Quit = app.update(tick_ui, tick_player, tick_action)? {
             break;
         }
         // A script's `movie_on` (MSF_FMV_REQUEST) starts a film at the end of
@@ -8088,6 +8101,103 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
     })
 }
 
+/// A scripted per-tick input playback for the oracle (`--input`).
+///
+/// The file lists `<tick> <button>...` entries, one per line; a later entry
+/// replaces the held button set from its tick on, and a tick with no buttons
+/// releases everything. The trace tick is the reference's (a frame past the
+/// room-entry arm), so `word_at(t)` is the set of keys held during the tick
+/// that emits trace line `t`. The button names mirror the reference's
+/// `--test-input` button map:
+///
+/// `up down left right confirm cancel run aim fire start page_left page_right`
+/// (with the aliases `action/cross`, `circle`, `square`, `inventory`, `l1`,
+/// `r1`).
+#[derive(Debug, Default, Clone)]
+pub struct InputScript {
+    /// `(tick, key bit word)` entries, sorted by tick; the last entry at or
+    /// before a tick is the held set.
+    entries: Vec<(u32, u32)>,
+}
+
+/// The key bit a `--input` button name maps to, or `None` for an unknown name.
+fn script_button_bit(name: &str) -> Option<u32> {
+    Some(match name {
+        "up" => KEY_UP,
+        "down" => KEY_DOWN,
+        "left" => KEY_LEFT,
+        "right" => KEY_RIGHT,
+        "confirm" | "cross" | "action" => KEY_CONFIRM,
+        "cancel" | "circle" => KEY_CANCEL,
+        "run" => KEY_RUN,
+        "aim" | "square" => KEY_AIM,
+        "fire" => KEY_FIRE,
+        "start" | "inventory" => KEY_TAB,
+        "page_left" | "l1" => KEY_LEFTBRACKET,
+        "page_right" | "r1" => KEY_RIGHTBRACKET,
+        _ => return None,
+    })
+}
+
+impl InputScript {
+    /// Parse an `--input` script body.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut entries: Vec<(u32, u32)> = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut tokens = line.split_whitespace();
+            let Some(tick) = tokens.next() else { continue };
+            let tick: u32 = tick.parse().with_context(|| {
+                format!("input line {}: `{tick}` is not a tick number", number + 1)
+            })?;
+            let mut word = 0u32;
+            for token in tokens {
+                let bit = script_button_bit(token).ok_or_else(|| {
+                    anyhow::anyhow!("input line {}: unknown button `{token}`", number + 1)
+                })?;
+                word |= bit;
+            }
+            // Last entry at a tick wins.
+            if let Some(last) = entries.last_mut()
+                && last.0 == tick
+            {
+                last.1 = word;
+                continue;
+            }
+            entries.push((tick, word));
+        }
+        entries.sort_by_key(|entry| entry.0);
+        Ok(Self { entries })
+    }
+
+    /// Read and parse an `--input` script file.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read input script {}", path.display()))?;
+        Self::parse(&text)
+    }
+
+    /// Whether any entry is armed (so a plain run stays byte-identical).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The key word held during traced tick `t`.
+    pub fn word_at(&self, tick: u32) -> u32 {
+        let mut word = 0;
+        for &(at, value) in &self.entries {
+            if at > tick {
+                break;
+            }
+            word = value;
+        }
+        word
+    }
+}
+
 /// The keyboard, latched from the SDL event queue.
 ///
 /// The render loop runs at the display's refresh rate, which is not the 30 Hz
@@ -8202,6 +8312,20 @@ impl InputState {
                 any: std::mem::take(&mut self.any_pressed),
             },
         }
+    }
+
+    /// Latch the scripted held word for one tick and consume its edges.
+    ///
+    /// The word is the full set of keys down during the tick, exactly what the
+    /// reference's `--test-input` injects into the pad. The rising edge (keys
+    /// down now that were not down last tick) becomes this tick's press, so a
+    /// one-tick scripted tap reaches the UI exactly once.
+    fn tick_scripted(&mut self, down: u32) -> TickInput {
+        let edge = down & !self.held;
+        self.held = down;
+        self.pressed = edge;
+        self.any_pressed = edge != 0;
+        self.tick()
     }
 }
 

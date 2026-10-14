@@ -489,7 +489,7 @@ impl MainMenu {
         self.draw_inventory(framebuffer, assets, game);
         self.draw_portrait(framebuffer, assets, game);
         self.health_bar.draw(framebuffer, &assets.status);
-        self.draw_tabs(framebuffer, assets);
+        self.draw_tabs(framebuffer, assets, game.has_radio());
         if self.mode != MenuMode::Navigation {
             self.draw_submenu(framebuffer, assets);
         }
@@ -582,9 +582,16 @@ impl MainMenu {
         );
     }
 
-    fn draw_tabs(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
+    fn draw_tabs(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets, has_radio: bool) {
         for tab in 0..layout::TOP_TABS_LEN {
-            let part = layout::tab_part(tab);
+            let mut part = layout::tab_part(tab);
+            // The original swaps the RADIO tab art for a blank dash (source V
+            // 0x40) while `DAT_00ae9f1f` is clear: `MainMenu.cpp:925`,
+            // `if (bVar6 == 4 && DAT_00ae9f1f == 0) g_TextureDesc.texV = 0x40`.
+            // Tab index 2 is the radio tab (cursor value 4, bottom-left).
+            if tab == 2 && !has_radio {
+                part.uv[1] = 0x40;
+            }
             draw_part(framebuffer, &assets.status, part);
         }
     }
