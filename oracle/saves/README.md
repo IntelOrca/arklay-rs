@@ -37,8 +37,8 @@ All saves were generated from the Japanese MediaKite assets at
 | `combine_chris_101.dat` | room 101, Chris | green herb (`0x44`), red herb (`0x43`) and a second green herb, for the mix and the refusal. |
 | `use_chris_101.dat` | room 101, Chris | health 30/140 + green herb + first-aid spray. |
 | `equip_chris_101.dat` | room 101, Chris | Beretta (`0x02`) + handgun ammo (`0x0B`). |
-| `itembox_chris_101.dat` | room 101, Chris | player inside the dining room's item-box action rect + mixed inventory/box. |
-| `typewriter_chris_101.dat` | room 101, Chris | player inside the dining-room typewriter action rect + an ink ribbon. |
+| `itembox_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's item-box action rect + mixed inventory/box. |
+| `typewriter_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's typewriter action rect + an ink ribbon. |
 
 ## Format notes
 

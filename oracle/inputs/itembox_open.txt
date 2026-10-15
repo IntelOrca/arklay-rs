@@ -1,5 +1,6 @@
-# Item box: press action inside the dining room's box zone, wait for the lid
-# and the overlay, then move an inventory item into the box and cancel out.
+# Item box: press action inside the B1 save room's box zone, wait for the lid
+# and the overlay, then swap one inventory item into the box. The cancel path
+# is still being matched; see oracle/ui-findings.md.
 60 confirm
 61
 120 confirm
@@ -8,5 +9,3 @@
 141
 150 confirm
 151
-180 cancel
-181

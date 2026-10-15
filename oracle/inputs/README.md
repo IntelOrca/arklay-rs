@@ -72,7 +72,8 @@ Save mode (each header names its save):
   flush.
 - `equip_weapon.txt` — `equip_chris_101.dat`: equip and unequip the Beretta
   through the action submenu.
-- `itembox_open.txt`, `itembox_page.txt` — `itembox_chris_101.dat`: the item
+- `itembox_open.txt`, `itembox_page.txt` — `itembox_chris_118.dat`: the item
   box world action, its overlay, the L1/R1 pages and a swap.
-- `save_screen.txt` — `typewriter_chris_101.dat`: the typewriter prompt and
-  the save screen (cancelled before any write).
+- `save_screen.txt` — `typewriter_chris_118.dat`: the typewriter prompt,
+  the Yes answer, the fade hand-off and the SAVE GAME screen (stopped before
+  a slot is written).

@@ -1,8 +1,9 @@
-# Typewriter: press action inside the dining room's typewriter zone, accept
-# the save prompt, then cancel out of the save screen without writing.
+# Typewriter: press action inside the B1 save room's typewriter zone, dismiss
+# the typewriter description, accept the save prompt (the save screen opens),
+# then back out before a slot is written.
 60 confirm
 61
-120 confirm
-121
-150 cancel
-151
+170 confirm
+171
+340 confirm
+341

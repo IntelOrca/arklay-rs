@@ -94,11 +94,24 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   frames are byte-identical); the page-turn mid-slide frames and the exit's
   final phase are still open below.
 
+- **Item box world action and handshake.** `open_itembox` arms the lid; the
+  reference then runs three frames of menu handshake between the lid settling
+  and the panel fade (the room keeps ticking with the player frozen), and the
+  panel fade steps straight after its arm (no draw-then-add frame). The box
+  cancel restores the lid and drops back to the inventory with no fade; a
+  further cancel closes the menu.
+- **Typewriter save flow.** The save prompt's Yes arms the fade on the *next*
+  frame (`check_typewriter_state` 2->3, counter 0x1000) while the room keeps
+  ticking and the player stays frozen; the fade's last frame still runs the
+  room tick, the save screen opens after it, and the screen owns the frame
+  after that. arklay opened the screen immediately with no fade.
+
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
-`use_herb` and `equip_weapon` all match tick-for-tick in save mode
-(`MATCH: 180-220 ticks identical`), with the menu/flush frames pixel-verified
-at capture every tick; the residual frames are the room/player-mesh baseline.
+`use_herb`, `equip_weapon`, `file_open`, `file_pages`, `map_open`,
+`itembox_open`, `itembox_page` and `save_screen` all match tick-for-tick in
+save mode (`MATCH: 180-480 ticks identical`); the menu, flush and
+save-screen frames are pixel-verified at capture every tick.
 
 ## Save-mode oracle
 
@@ -139,12 +152,16 @@ match), which is what the save interchange exists for.
   the area-name caption drawn at the plan's foot, and the frame-by-frame
   zoom/light animation (the documented M16 simplification,
   `docs/m16-deviations.md` item 4).
-- **Item box / typewriter world action not reached.** The authored saves place
-  the player inside the dining room's `aot_set` rects (item box slot 2,
-  typewriter slot 7) and press action, but the overlay does not open on either
-  engine, so the current `itembox_*`/`save_screen` runs are vacuous (matched
-  but exercised nothing). The scenarios need the real interaction spot
-  (facing/reach or a short scripted walk) before they count.
+- **Item box contents/model.** The box overlay opens and the trace matches,
+  but the frames differ ~15%: the item swapped by the scenario's confirms and
+  the model drawn in the viewport differ (the reference keeps the box object
+  and swaps a different slot after the D-pad press), so the box cursor/state
+  and the item viewer model need another pass.
+- **Save screen fade.** The save screen's fade-in dims the reference's screen
+  for its run (the 0xf000 counter's overlay while negative), which arklay does
+  not draw (~60% during the fade, 1.5% mean settled). The screen's exit fade
+  is also one LSB off (state 0x6FFF vs 0x7000), so the scenario stops before
+  the cancel.
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`

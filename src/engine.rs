@@ -1011,6 +1011,20 @@ struct GameSession {
     /// Frames the player/entities stay frozen for the room-entry fade after the
     /// menu closes (the original suspends game_loop while it runs). The first
     /// post-arm frame still runs.
+    /// The typewriter's save-screen hand-off: `Some(ink_ribbon)` while the
+    /// fade-out runs (the original's `g_typewriter_state` 2->3, counter
+    /// 0x1000); the save screen opens once the fade completes. The confirm
+    /// only records the request; the fade arms on the next frame, exactly
+    /// like the original's next-frame `check_typewriter_state`.
+    typewriter_fade: Option<bool>,
+    /// The confirmed typewriter answer awaiting its fade arm.
+    typewriter_arm: Option<bool>,
+    /// The faded-out typewriter hand-off awaiting its save screen.
+    typewriter_open: Option<bool>,
+    /// Frames the item box waits between the lid settling and the panel fade
+    /// (the original's menu handshake: game_loop keeps ticking while
+    /// `g_openMenuFlag` walks its states).
+    itembox_open_delay: u8,
     menu_close_freeze: u8,
     /// Whether the first post-arm frame has already been allowed through.
     menu_close_freeze_first: bool,
@@ -1452,6 +1466,10 @@ impl GameSession {
             menu_fade_draw: None,
             menu_fade_started: false,
             menu_exit_restored: false,
+            typewriter_fade: None,
+            typewriter_arm: None,
+            typewriter_open: None,
+            itembox_open_delay: 0,
             menu_close_freeze: 0,
             menu_close_freeze_first: false,
             menu_close_restore: false,
@@ -1598,6 +1616,46 @@ impl GameSession {
         if self.boot_message.is_some() {
             self.tick_boot_message(input, action);
             return Ok(());
+        }
+        // The item box's menu handshake: three frames after the lid settles
+        // the panel fade arms and the frame is owned by the menu (the
+        // original's `g_openMenuFlag` walk keeps game_loop running for two
+        // frames, then main_loop hands the frame to main_menu). Opening here,
+        // before the room tick, keeps the settle handshake's rand draws in
+        // step with the reference.
+        if self.itembox_open_delay > 0 {
+            self.itembox_open_delay -= 1;
+            if self.itembox_open_delay == 0 {
+                let _ = self.game.take_itembox_open();
+                self.begin_item_box_open(pack);
+                return Ok(());
+            }
+        }
+        // The typewriter's save hand-off: the fade-out runs while the room
+        // keeps ticking (exactly the reference's next-frame
+        // `check_typewriter_state`); the frame after the fade completes still
+        // runs the room tick (`LoadSaveGameState`'s transition), and the save
+        // screen owns the frame after that.
+        if let Some(ink_ribbon) = self.typewriter_open {
+            self.typewriter_open = None;
+            self.open_typewriter_save(pack, ink_ribbon);
+            return Ok(());
+        }
+        if let Some(ink_ribbon) = self.typewriter_arm {
+            self.typewriter_arm = None;
+            self.typewriter_fade = Some(ink_ribbon);
+            self.room_fade.set(2, 0x1000, 0);
+            self.room_fade_pending = false;
+            // The reference keeps the player machine frozen through the
+            // hand-off: the typewriter flow restores the message word only
+            // when the save screen closes.
+            self.game.message_flags &= !game::MESSAGE_FLAG_PLAYER_STATE;
+        }
+        if let Some(ink_ribbon) = self.typewriter_fade
+            && self.room_fade.state() < 0
+        {
+            self.typewriter_fade = None;
+            self.typewriter_open = Some(ink_ribbon);
         }
         // The DIED screen owns the whole tick while it is up: the room stays
         // frozen and the screen's state machine, fade and spinning corpse
@@ -1864,10 +1922,12 @@ impl GameSession {
         if dismissed && action {
             self.swallow_action = true;
         }
-        // The typewriter prompt was answered: a confirmed save opens the save
-        // screen instead of running the rest of the room's tick.
+        // The typewriter prompt was answered: a confirmed save fades the room
+        // out (counter 0x1000, armed and stepped on this frame) and the save
+        // screen opens when it completes; the rest of the room's tick is
+        // skipped.
         if let Some(ink_ribbon) = self.game.take_typewriter_confirm() {
-            self.open_typewriter_save(pack, ink_ribbon);
+            self.typewriter_arm = Some(ink_ribbon);
             return Ok(());
         }
         // A typewriter runs its save prompt; the item-box overlay opens when
@@ -1958,8 +2018,11 @@ impl GameSession {
             if let Err(err) = self.start_movie(pack, id, self.game.id.player_flag) {
                 eprintln!("warning: film id {id} unavailable: {err:#}");
             }
-        } else if self.game.take_itembox_open() {
-            self.begin_item_box_open(pack);
+        } else if self.game.itembox.menu_open && self.itembox_open_delay == 0 {
+            // The lid settled: arm the menu handshake; the opening frame is
+            // owned by the head check (no room tick), like the reference. The
+            // flag stays up until then so the player machine stays frozen.
+            self.itembox_open_delay = 3;
         } else if let Some(request) = self.game.item_view_request() {
             // A room action armed the item viewer: the original's main loop
             // opens its menu over the frozen room. It waits for an active
@@ -2267,7 +2330,10 @@ impl GameSession {
         }
         self.open_item_box(pack);
         self.menu_fade.set(2, 24 << 7, self.room_fade.state());
-        self.menu_fade_pending = true;
+        // Unlike the START menu, the reference's box request steps the fade
+        // on the frame after the arm (game_loop's menu-request path), so the
+        // draw-then-add pending tick is not applied here.
+        self.menu_fade_pending = false;
         self.menu_fade_started = false;
         self.menu_fade_phase = MenuFadePhase::Out;
     }
@@ -2895,6 +2961,9 @@ impl GameSession {
             self.game.increment_saves();
         }
         self.save_screen = None;
+        // The typewriter hand-off completes: restore the player machine gate
+        // the reference restores with `message_flags |= 0x45`.
+        self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
     }
 
     /// One frozen tick of the pause menu. A message owns the input while it is
@@ -2957,12 +3026,12 @@ impl GameSession {
                     self.play_ui_cue_names(pack, vec![cue]);
                 }
                 if event == Some(ItemBoxEvent::Close) {
-                    // The original restores the lid angle (state 4) once the
-                    // box menu is closed, then runs the menu's closing fade
-                    // (`menu_exit_cleanup`'s `set_fading(2, 0xC00)`): the panel
-                    // and box darken before the room unfreezes.
+                    // The box is a sub-screen of the inventory panel: its
+                    // cancel restores the lid angle (state 4) and returns to
+                    // the inventory with no fade and the room still frozen.
+                    // A further cancel closes the whole menu.
                     self.game.reset_itembox();
-                    self.begin_menu_close_silent();
+                    self.item_box = None;
                 }
             }
             if let Some(cursor) = self
@@ -8103,7 +8172,12 @@ fn tick_room_timed(
     // that ignores the pad. The frozen and scripted paths still publish the
     // direction pad so the object probe sees it; only the action edge, which
     // belongs to the skipped input state, is withheld.
-    let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
+    let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0
+        // The itembox settle frame: `check_itembox_state` restores the whole
+        // message word and raises the box-menu flag, and the menu takes the
+        // next frame. The original's player machine still stays frozen on the
+        // settle frame (its menu mode owns the frame), so gate on the flag.
+        || context.game.itembox.menu_open;
     let state = context.game.entities[0].state();
     let mut pad = input;
     // The original's `game_loop` blanking (0x00480e89): outside an action
@@ -16668,7 +16742,24 @@ off_0010:
         assert!(session.game.inventory.is_empty());
         assert_eq!(session.game.frame, before, "the room stayed frozen");
 
-        // Cancel darkens the panel and box, then closes both and resumes the
+        // Cancel drops the box overlay back to the inventory: no fade, the
+        // room stays frozen (the box is a sub-screen of the panel).
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.item_box.is_none());
+        assert!(session.menu.is_some(), "the inventory stays up");
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::None);
+
+        // A further cancel closes the menu through its fade and resumes the
         // room through the room-entry fade.
         session
             .tick(
@@ -16682,12 +16773,7 @@ off_0010:
             )
             .unwrap();
         assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
-        assert!(
-            session.item_box.is_some(),
-            "the box stays up while it darkens"
-        );
         settle_menu_fade(&mut session, &pack);
-        assert!(session.item_box.is_none());
         assert!(session.menu.is_none());
         let frozen = session.game.frame;
         session

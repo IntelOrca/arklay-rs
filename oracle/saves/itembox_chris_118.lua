@@ -1,8 +1,8 @@
--- Item box: the player inside the dining room's item-box action zone
--- (aot_set slot 2, centre 6200,2100 size 2000x1400) with a mixed inventory,
+-- Item box: the player inside the quiet B1 save room's item-box action rect
+-- (aot_set slot 3, x 4750..7550, z 1900..3950) with a mixed inventory,
 -- and a few box slots occupied so the box pages have entries.
 local api = ...
-api:set_player_pos(6200, 0, 2100)
+api:set_player_pos(5200, 0, 2500)
 api:set_player_angle(0)
 api:clear_inventory()
 api:set_item_slot(0, 0x01, 0)
