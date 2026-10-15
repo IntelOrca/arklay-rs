@@ -1,0 +1,12 @@
+# RADIO tab: open the pause menu and use the carried radio (confirm on the
+# RADIO tab closes the menu through the item-use path).
+60 start
+61
+90 up
+91
+100 confirm
+101
+130 confirm
+131
+150 cancel
+151

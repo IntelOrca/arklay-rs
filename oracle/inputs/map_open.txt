@@ -1,0 +1,22 @@
+# MAP tab: open the pause menu, walk to the MAP tab, open the floor plan,
+# step between rooms and close.
+60 start
+61
+90 up
+91
+100 up
+101
+110 confirm
+111
+130 right
+131
+140 down
+141
+150 left
+151
+160 up
+161
+180 cancel
+181
+200 cancel
+201

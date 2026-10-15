@@ -1,0 +1,30 @@
+# FILE tab: turn through the document's pages with both the dpad and the
+# paging buttons, then cancel back out of the reader and the tab.
+60 start
+61
+90 up
+91
+100 up
+101
+110 right
+111
+120 confirm
+121
+140 confirm
+141
+150 right
+151
+160 right
+161
+170 page_right
+171
+180 page_left
+181
+190 page_left
+191
+200 cancel
+201
+220 cancel
+221
+240 cancel
+241

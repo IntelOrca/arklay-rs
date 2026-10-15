@@ -65,6 +65,21 @@ cargo run -- re1.akpak --ui demo --demo 0 --ticks 600 --trace demo0.trace
 cargo run -- re1.akpak --ui game --room 101 --player 0 --ticks 600 \
   --trace room101.trace
 
+# Load a save block (savedatN.dat) and boot its saved game immediately: the
+# file's stage, room, character, position, health, inventory and flags drive
+# the session. `--ui game --load` is the oracle anchor; without `--ui` it is
+# the interactive continue
+cargo run -- re1.akpak --ui game --load savedat1.dat --ticks 600 \
+  --trace loaded.trace
+cargo run -- re1.akpak --load savedat1.dat
+
+# Authoring/oracle seams: run a Lua chunk once on the freshly booted session
+# (before its first tick; it receives the game state as `local api = ...`) and
+# serialise the resulting state to a save block, or both
+cargo run -- re1.akpak --ui game --room 101 \
+  --setup-script oracle/saves/pause_chris_101.lua \
+  --save-out out/savedat1.dat
+
 # Headless capture (no display)
 cargo run -- re1.akpak --room 100 --player 0 --capture cut0.bmp
 # Run N fixed 30 Hz ticks before a room capture (deterministic, audio-free),

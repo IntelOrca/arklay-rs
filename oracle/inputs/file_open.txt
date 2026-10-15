@@ -1,0 +1,22 @@
+# FILE tab: open the pause menu, walk to the FILE tab, open the first
+# document's reader, turn one page, cancel the reader, then close the menu.
+60 start
+61
+90 up
+91
+100 up
+101
+110 right
+111
+120 confirm
+121
+140 confirm
+141
+160 right
+161
+180 cancel
+181
+200 cancel
+201
+220 cancel
+221

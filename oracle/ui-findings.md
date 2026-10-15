@@ -49,13 +49,70 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   from zero to full (`DAT_00ae9f27` `0x80..=0x88`, width `*6`, height `*3`)
   over eight frames after confirm. `MainMenu::submenu_frames` scales
   `draw_submenu` and gates the action input until it is open.
+- **Menu-close entity freeze.** The room-entry fade after a menu close suspends
+  the reference's `game_loop` for its whole run. On its first frame the
+  restored word has the player bit but not the entity/monster/effect bits, so
+  the player machine resumes one tick before the NPCs: arklay used to run the
+  entity pass on that frame too, leaving every NPC one tick ahead from then on
+  (`inventory_open_close` diverged at t=134, `e1/e2/e3.ticks`).
+- **Save block stage byte.** The original's BioCard 0x200 is the 0-based
+  `g_stageId`; the port stored the 1-based RDT stage digit. arklay's own
+  round-trip hid it, but a save written by arklay booted stage+1 in the
+  reference (and vice versa). `SaveFile::from_state`/`apply_to` convert.
+- **Continue position rollback.** `GameSession::from_save` restored the saved
+  position but left the player's collision mirror at `player::spawn`'s
+  walk-zone centre. The first room tick anchored the collision resolve at that
+  mirror and teleported the player back to the spawn whenever the saved spot
+  differed, so any save not already standing on the spawn diverged on tick 1.
 
-With these, `inventory_open`, `inventory_examine` and `inventory_open_close` all
-match tick-for-tick (`MATCH: 200 ticks identical`); the open/close fade frames
-are byte-identical or at the residual level below.
+With these, `inventory_open`, `inventory_examine`, `inventory_nav` and
+`inventory_open_close` all match tick-for-tick in **both** room mode and
+save mode (`MATCH: 200 ticks identical`); the open/close fade frames are
+byte-identical or at the residual level below.
+
+## Save-mode oracle
+
+`scripts/oracle-ui.sh --save oracle/saves/<file>.dat` boots both engines from
+the same checked-in 0x800-byte BioCard block: arklay with
+`--ui game --load <file>`, the reference with `--test-load <file>` (port-only
+hook in `TestHooks.cpp`; `DebugQuick_LoadFile` shares the F1 debug load's
+restore/arming path). The blocks are generated deterministically with
+`--setup-script` + `--save-out` from the chunks in `oracle/saves/`
+(`scripts/oracle-saves.sh`); the reference's `--test-load` arms its trace on
+the room the save records.
+
+The pause-menu suite is identical from the save path; the room-mode table
+above was re-verified after the save-path fixes. The save path also booted the
+first FILE/MAP/radio/combine/use/equip/item-box/typewriter scenario attempts
+into the same tick-0 state on both engines (rng, fade, entities and pixels to
+match), which is what the save interchange exists for.
 
 ## Open
 
+- **FILE/MAP screens hold the room one tick differently.** From the save path
+  (and room mode), opening the FILE or MAP tab freezes the room on both
+  engines, but the reference runs exactly one gameplay tick (one `rand()` draw)
+  at t=158 that arklay skips, so `rng` diverges for the rest of the run while
+  every other field stays identical. Same shape as the fixed menu-open seed:
+  the reference's `game_loop` first statement runs on the frame the screen
+  closes its entry animation, arklay's screen owns the tick instead. Scenario
+  inputs `file_open`/`file_pages`/`map_open`.
+- **RADIO use menu-close pacing.** Confirm on the RADIO tab records used item
+  0x4D and closes the menu. The reference resumes gameplay one tick later than
+  arklay's `close_menu()` path (divergence at t=100, `e0.as` then `rng`), the
+  same class as the paused menu cancel path that `begin_menu_close` models.
+  Scenario input `radio_use`.
+- **USE/MOVE action timing.** The green herb's heal lands at t=105 on arklay
+  and ~t=110+ on the reference (the submenu close/flush frames), and the
+  combine MOVE action leaves the same one-tick `rand()` seed gap as FILE/MAP
+  at t=158. Scenarios `use_herb`, `combine_ok`, `combine_refuse`,
+  `equip_weapon`.
+- **Item box / typewriter world action not reached.** The authored saves place
+  the player inside the dining room's `aot_set` rects (item box slot 2,
+  typewriter slot 7) and press action, but the overlay does not open on either
+  engine, so the current `itembox_*`/`save_screen` runs are vacuous (matched
+  but exercised nothing). The scenarios need the real interaction spot
+  (facing/reach or a short scripted walk) before they count.
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`
@@ -68,7 +125,12 @@ are byte-identical or at the residual level below.
 
 ## Reaching more screens
 
-The new-game inventory is only the Combat Knife and one other item, and the
-map/file/radio tabs need scenario items a fresh game does not carry, so the
-pause menu is the only screen reachable with `--test-room`. The item box needs
-a physical box object `--test-room` does not place the player at.
+Every screen is reachable through the save-mode oracle: the setup chunk in
+`oracle/saves/*.lua` authors the inventory, item box, health, flags, files,
+keys and position the interaction needs, and both engines boot the same block
+(`--load` / `--test-load`). The room-mode capture seams (`--ui box`/`file`/
+`map`/`view`) remain arklay-only and cannot replace the differential oracle,
+because the reference has no equivalent.
+
+The checklist runs above used `oracle/inputs/*.txt`; the saves they boot are
+listed in `oracle/inputs/README.md`.

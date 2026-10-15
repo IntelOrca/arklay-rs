@@ -45,6 +45,43 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "pack")]
     save_dir: Option<PathBuf>,
 
+    /// Load the save block (`savedatN.dat`) at FILE and boot its saved game
+    /// immediately instead of starting a new one: the saved stage, room,
+    /// character, position, health, inventory and flags drive the session.
+    /// Use it with `--ui game --load FILE` for the oracle trace, or alone for
+    /// the interactive continue
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "pack",
+        conflicts_with_all = ["room", "fmv", "ending"]
+    )]
+    load: Option<PathBuf>,
+
+    /// Run this Lua chunk once on the freshly booted session, before its first
+    /// tick, to author a test state. The chunk receives the game state as its
+    /// first argument (`local api = ...`); this is the oracle/authoring seam,
+    /// not a mod hook
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "pack",
+        conflicts_with_all = ["fmv", "ending"]
+    )]
+    setup_script: Option<PathBuf>,
+
+    /// Write the booted session's save block to FILE and exit before the first
+    /// tick. The deterministic save generator for the oracle: pair it with
+    /// `--setup-script` for an authored state or use it bare for the new-game
+    /// state. This is the oracle/authoring seam, not a mod hook
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "pack",
+        conflicts_with_all = ["fmv", "ending"]
+    )]
+    save_out: Option<PathBuf>,
+
     /// Play one film id (0-28) standalone and exit; with `--capture` the
     /// frame after `--ticks` fixed ticks is written headlessly
     #[arg(
@@ -559,12 +596,24 @@ fn main() -> Result<()> {
             if cli.capture_dir.is_some() && cli.capture_every.is_none() {
                 bail!("--capture-dir requires --capture-every");
             }
-            if tracing && cli.room.is_none() && !matches!(cli.ui.as_deref(), Some("game" | "demo"))
+            // `--load` without `--ui` defaults to the game boot, so it is a
+            // valid trace target like `--ui game`/`--ui demo`.
+            if tracing
+                && cli.room.is_none()
+                && !matches!(cli.ui.as_deref(), Some("game" | "demo"))
+                && (cli.load.is_none() || cli.ui.is_some())
             {
                 bail!("--trace is only supported for --room or --ui game/demo");
             }
             if cli.input.is_some() && !tracing {
                 bail!("--input requires --trace");
+            }
+            if (cli.setup_script.is_some() || cli.save_out.is_some())
+                && cli.ui.is_none()
+                && cli.room.is_none()
+                && cli.load.is_none()
+            {
+                bail!("--setup-script/--save-out require --room, --load or a --ui boot");
             }
             let input_script = match cli.input.as_deref() {
                 Some(path) => Some(arklay::engine::InputScript::from_file(path)?),
@@ -576,6 +625,11 @@ fn main() -> Result<()> {
                 capture_dir: cli.capture_dir.as_deref(),
                 ticks: cli.ticks,
                 input: input_script.as_ref(),
+            };
+            let authoring = arklay::engine::Authoring {
+                load: cli.load.as_deref(),
+                setup_script: cli.setup_script.as_deref(),
+                save_out: cli.save_out.as_deref(),
             };
             let save_dir = cli
                 .save_dir
@@ -627,6 +681,26 @@ fn main() -> Result<()> {
                     cli.debug_menu,
                     cli.language.as_deref(),
                     trace_options,
+                    authoring,
+                );
+            }
+            // `--load` without `--ui` is the interactive continue: the same
+            // game boot `--ui game --load` drives headlessly.
+            if cli.load.is_some() {
+                return arklay::engine::run_ui_with_mods(
+                    &pack,
+                    "game",
+                    cli.capture.as_deref(),
+                    &save_dir,
+                    cli.character,
+                    None,
+                    cli.demo,
+                    &cli.mods,
+                    cli.no_mods,
+                    cli.debug_menu,
+                    cli.language.as_deref(),
+                    trace_options,
+                    authoring,
                 );
             }
             if let Some(room) = cli.room {
@@ -642,6 +716,7 @@ fn main() -> Result<()> {
                     cli.debug_menu,
                     cli.language.as_deref(),
                     trace_options,
+                    authoring,
                 );
             }
             // No room and no `--ui`: boot the app root, whose interactive run
@@ -940,6 +1015,33 @@ entries:
             list.command,
             Some(Command::List { mods, .. }) if mods == [PathBuf::from("x.akpak")]
         ));
+    }
+
+    #[test]
+    fn the_cli_accepts_the_oracle_authoring_flags() {
+        let cli = Cli::try_parse_from([
+            "arklay",
+            "game.akpak",
+            "--ui",
+            "game",
+            "--load",
+            "savedat1.dat",
+            "--setup-script",
+            "setup.lua",
+            "--save-out",
+            "out.dat",
+        ])
+        .unwrap();
+        assert_eq!(cli.load.as_deref(), Some(Path::new("savedat1.dat")));
+        assert_eq!(cli.setup_script.as_deref(), Some(Path::new("setup.lua")));
+        assert_eq!(cli.save_out.as_deref(), Some(Path::new("out.dat")));
+
+        // `--load` is the continue boot: it cannot combine with a new-game
+        // room or the film/ending boots.
+        assert!(
+            Cli::try_parse_from(["arklay", "game.akpak", "--load", "s.dat", "--room", "101"])
+                .is_err()
+        );
     }
 
     #[test]
