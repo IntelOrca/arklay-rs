@@ -874,6 +874,12 @@ enum MenuFadePhase {
     Closing,
 }
 
+/// Frames the player and entities stay frozen for the room-entry fade after the
+/// menu closes: the original suspends game_loop for the whole fade, but the
+/// first frame after the menu task exits still runs one gameplay tick before
+/// the suspension takes hold.
+const MENU_CLOSE_FREEZE_FRAMES: u8 = 4;
+
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -927,6 +933,15 @@ struct GameSession {
     /// Whether the closing fade has already restored the player to idle (the
     /// original's exit state 7 runs one frame after the cancel).
     menu_exit_restored: bool,
+    /// Frames the player/entities stay frozen for the room-entry fade after the
+    /// menu closes (the original suspends game_loop while it runs). The first
+    /// post-arm frame still runs.
+    menu_close_freeze: u8,
+    /// Whether the first post-arm frame has already been allowed through.
+    menu_close_freeze_first: bool,
+    /// Set when the menu-close freeze ends, to restore the message bits on the
+    /// following frame.
+    menu_close_restore: bool,
     /// One frame of delay between the opening fade finishing and the menu
     /// accepting input: the original's main_menu spends its state 0 -> 1
     /// transition frame without drawing the health bar (menu_draw_health_bar
@@ -1356,6 +1371,9 @@ impl GameSession {
             menu_fade_draw: None,
             menu_fade_started: false,
             menu_exit_restored: false,
+            menu_close_freeze: 0,
+            menu_close_freeze_first: false,
+            menu_close_restore: false,
             menu_open_delay: false,
             menu_close_wait: 0,
             sprite_anim_intensity: 0,
@@ -1550,6 +1568,30 @@ impl GameSession {
                     | game::MESSAGE_FLAG_EFFECTS);
             }
             self.room_boot_grace = false;
+        }
+        // The room-entry fade after a menu close suspends the reference's
+        // game_loop for its whole run, freezing the player machine (its idle
+        // countdown included) and the entities. The first frame after the menu
+        // task exits still runs one gameplay tick before the freeze takes hold.
+        if self.menu_close_freeze > 0 {
+            if self.menu_close_freeze_first {
+                self.menu_close_freeze_first = false;
+            } else {
+                self.menu_close_freeze -= 1;
+                self.game.message_flags &= !(game::MESSAGE_FLAG_PLAYER_STATE
+                    | game::MESSAGE_FLAG_ENTITIES
+                    | game::MESSAGE_FLAG_MONSTERS
+                    | game::MESSAGE_FLAG_EFFECTS);
+                if self.menu_close_freeze == 0 {
+                    self.menu_close_restore = true;
+                }
+            }
+        } else if self.menu_close_restore {
+            self.menu_close_restore = false;
+            self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE
+                | game::MESSAGE_FLAG_ENTITIES
+                | game::MESSAGE_FLAG_MONSTERS
+                | game::MESSAGE_FLAG_EFFECTS;
         }
         self.event_vm.set_enabled(events_enabled);
         self.tick_room_fade();
@@ -2215,6 +2257,14 @@ impl GameSession {
                 self.room_fade_pending = false;
                 self.room_fade_draw = self.room_fade.overlay();
                 self.room_fade.tick();
+                // The original suspends game_loop for the room-entry fade, so
+                // the player and entities stay frozen until it clears. The
+                // first frame after the arm still runs (the reference's
+                // `g_short_message_flags | 0x200` still has the player bit),
+                // then the fade holds them for the rest of its run.
+                self.menu_close_freeze = MENU_CLOSE_FREEZE_FRAMES;
+                self.menu_close_freeze_first = true;
+                self.menu_close_restore = false;
             }
             return;
         }
