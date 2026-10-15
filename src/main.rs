@@ -111,6 +111,13 @@ struct Cli {
     #[arg(long, value_name = "FILE", requires = "pack")]
     trace: Option<PathBuf>,
 
+    /// Scripted per-tick input playback for a `--ui game` oracle run: one
+    /// `<tick> <button>...` entry per line (`up`, `down`, `left`, `right`,
+    /// `confirm`, `cancel`, `run`, `aim`, `fire`, `start`, `page_left`,
+    /// `page_right`). Requires `--trace`.
+    #[arg(long, value_name = "FILE", requires = "pack")]
+    input: Option<PathBuf>,
+
     /// Write a frame BMP every N traced ticks; requires `--capture-dir` and
     /// `--trace`
     #[arg(
@@ -556,11 +563,19 @@ fn main() -> Result<()> {
             {
                 bail!("--trace is only supported for --room or --ui game/demo");
             }
+            if cli.input.is_some() && !tracing {
+                bail!("--input requires --trace");
+            }
+            let input_script = match cli.input.as_deref() {
+                Some(path) => Some(arklay::engine::InputScript::from_file(path)?),
+                None => None,
+            };
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),
                 capture_every: cli.capture_every.unwrap_or(0),
                 capture_dir: cli.capture_dir.as_deref(),
                 ticks: cli.ticks,
+                input: input_script.as_ref(),
             };
             let save_dir = cli
                 .save_dir

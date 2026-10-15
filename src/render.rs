@@ -357,6 +357,31 @@ impl Framebuffer {
         );
     }
 
+    /// Draw one indexed sprite with explicit U/V mirror flags and the font's
+    /// `0..=30` brightness scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_sprite_mirrored(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+        mirror: [bool; 2],
+    ) {
+        self.draw_indexed_sprite_full(
+            texture,
+            src,
+            dst,
+            clut_row,
+            brightness_scale(brightness),
+            tint,
+            SpriteBlend::Opaque,
+            mirror,
+        );
+    }
+
     /// [`Framebuffer::draw_indexed_sprite_scaled`] with a blend mode and U/V
     /// mirror flags.
     #[allow(clippy::too_many_arguments)]
@@ -485,13 +510,14 @@ impl Framebuffer {
     /// This is the screens' fade overlay: `0` leaves the frame untouched and
     /// `255` paints it the overlay colour. Alpha is preserved.
     pub fn fade_to_color(&mut self, color: crate::transition::FadeColor, alpha: u8) {
+        if color == crate::transition::FadeColor::Black {
+            self.fade_to_black_weighted(alpha);
+            return;
+        }
         if alpha == 0 {
             return;
         }
-        let target: u8 = match color {
-            crate::transition::FadeColor::White => 255,
-            crate::transition::FadeColor::Black => 0,
-        };
+        let target: u8 = 255;
         if alpha == 255 {
             for pixel in self.rgba.as_chunks_mut::<4>().0 {
                 pixel[..3].fill(target);
@@ -507,12 +533,37 @@ impl Framebuffer {
         }
     }
 
+    /// Blend the whole frame towards black by `alpha`/255 with the reference's
+    /// per-texel weight.
+    ///
+    /// The reference draws the fade through the GPU as an alpha blend, so each
+    /// texel is `round(channel * (255 - alpha) / 255)` (verified exact against
+    /// the oracle's fade frames). Rounding, not truncating, is what matches;
+    /// truncation diverges ~60% of a fading screen by one LSB.
+    pub fn fade_to_black_weighted(&mut self, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            for pixel in self.rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(0);
+            }
+            return;
+        }
+        let keep = u32::from(255 - alpha);
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * keep + 127) / 255) as u8;
+            }
+        }
+    }
+
     /// Blend the whole frame towards black by `alpha`/255.
     ///
-    /// This is the screens' fade overlay: `0` leaves the frame untouched and
-    /// `255` paints it black. Alpha is preserved.
+    /// This is the screens' black fade overlay: `0` leaves the frame untouched
+    /// and `255` paints it black. Alpha is preserved.
     pub fn fade_to_black(&mut self, alpha: u8) {
-        self.fade_to_color(crate::transition::FadeColor::Black, alpha);
+        self.fade_to_black_weighted(alpha);
     }
 
     /// Blend a screen's full-frame overlay over the frame.

@@ -337,6 +337,10 @@ pub const SUBMENU_POS: [i16; 2] = [0x90, 0x39];
 pub const SUBMENU_OPTION_SIZE: [i16; 2] = [0x30, 0x18];
 /// Number of item action options (use/check/move).
 pub const SUBMENU_OPTION_COUNT: usize = 3;
+/// Frames the action submenu's box takes to grow from nothing to its full
+/// 48x24 (the original's `DAT_00ae9f27` `0x80..=0x88`): each frame widens the
+/// sampled box region by 6px and heightens it by 3px.
+pub const SUBMENU_OPEN_FRAMES: u8 = 8;
 /// Top-tab icon size.
 pub const TAB_SIZE: [i16; 2] = [0x30, 0x10];
 /// Top-tab cursor icon size.

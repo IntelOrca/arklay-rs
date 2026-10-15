@@ -78,6 +78,8 @@ pub struct TraceOptions<'a> {
     pub capture_dir: Option<&'a Path>,
     /// Fixed ticks to run.
     pub ticks: u32,
+    /// Scripted per-tick input playback (`--input`), or `None` for an idle run.
+    pub input: Option<&'a crate::engine::InputScript>,
 }
 
 /// The streaming oracle trace file.

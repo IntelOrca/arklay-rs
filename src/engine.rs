@@ -874,6 +874,12 @@ enum MenuFadePhase {
     Closing,
 }
 
+/// Frames the player and entities stay frozen for the room-entry fade after the
+/// menu closes: the original suspends game_loop for the whole fade, but the
+/// first frame after the menu task exits still runs one gameplay tick before
+/// the suspension takes hold.
+const MENU_CLOSE_FREEZE_FRAMES: u8 = 4;
+
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -917,6 +923,35 @@ struct GameSession {
     /// The first fixed tick after arming a fade must not advance it: the frame
     /// it was armed on has not been drawn yet.
     menu_fade_pending: bool,
+    /// The overlay the menu fade draws this frame: the accumulator before the
+    /// tick's step (the original draws and only then adds). Consumed by
+    /// [`Self::draw_menu_fade`].
+    menu_fade_draw: Option<transition::Overlay>,
+    /// Whether the current Out/Closing fade has taken its first step. The
+    /// negative accumulator reset only applies to that first step.
+    menu_fade_started: bool,
+    /// Whether the closing fade has already restored the player to idle (the
+    /// original's exit state 7 runs one frame after the cancel).
+    menu_exit_restored: bool,
+    /// Frames the player/entities stay frozen for the room-entry fade after the
+    /// menu closes (the original suspends game_loop while it runs). The first
+    /// post-arm frame still runs.
+    menu_close_freeze: u8,
+    /// Whether the first post-arm frame has already been allowed through.
+    menu_close_freeze_first: bool,
+    /// Set when the menu-close freeze ends, to restore the message bits on the
+    /// following frame.
+    menu_close_restore: bool,
+    /// One frame of delay between the opening fade finishing and the menu
+    /// accepting input: the original's main_menu spends its state 0 -> 1
+    /// transition frame without drawing the health bar (menu_draw_health_bar
+    /// runs from state 1), so the first health-monitor tick is one frame after
+    /// the fade goes inactive.
+    menu_open_delay: bool,
+    /// Frames to hold the black screen after the closing fade reaches black
+    /// before game_loop resumes and the room-entry fade arms (the original's
+    /// menu task teardown takes two frames).
+    menu_close_wait: u8,
     /// The item-box overlay opened by a room `item_box` action. It shares the
     /// session's state and draws over the inventory panel the menu underneath
     /// provides; the room stays frozen while it is up.
@@ -974,6 +1009,11 @@ struct GameSession {
     /// The first fixed tick after arming must not advance the fade: the frame
     /// it was armed on has not been drawn yet, so that tick only clears this.
     room_fade_pending: bool,
+    /// The alpha the room fade draws this frame: the accumulator *before* the
+    /// tick's step, since the original draws and only then adds the counter
+    /// (`main_loop`). Captured in [`Self::tick_room_fade`] so the draw matches
+    /// the reference while the traced state stays the post-step value.
+    room_fade_draw: Option<transition::Overlay>,
     /// The original's room-events gate (`g_message_flags & 0x80`) for a
     /// new-game boot: the boot's entry fade keeps the bit clear, so
     /// `room_events_check` does not step an event the room's init script
@@ -1321,12 +1361,21 @@ impl GameSession {
             boot_message: None,
             room_fade: transition::Fade::inactive(),
             room_fade_pending: false,
+            room_fade_draw: None,
             room_boot_gate: false,
             room_boot_grace: false,
             room_boot_respawn: false,
             menu_fade: transition::Fade::inactive(),
             menu_fade_phase: MenuFadePhase::None,
             menu_fade_pending: false,
+            menu_fade_draw: None,
+            menu_fade_started: false,
+            menu_exit_restored: false,
+            menu_close_freeze: 0,
+            menu_close_freeze_first: false,
+            menu_close_restore: false,
+            menu_open_delay: false,
+            menu_close_wait: 0,
             sprite_anim_intensity: 0,
             debug_menu_enabled: true,
             debug_menu: None,
@@ -1520,6 +1569,30 @@ impl GameSession {
             }
             self.room_boot_grace = false;
         }
+        // The room-entry fade after a menu close suspends the reference's
+        // game_loop for its whole run, freezing the player machine (its idle
+        // countdown included) and the entities. The first frame after the menu
+        // task exits still runs one gameplay tick before the freeze takes hold.
+        if self.menu_close_freeze > 0 {
+            if self.menu_close_freeze_first {
+                self.menu_close_freeze_first = false;
+            } else {
+                self.menu_close_freeze -= 1;
+                self.game.message_flags &= !(game::MESSAGE_FLAG_PLAYER_STATE
+                    | game::MESSAGE_FLAG_ENTITIES
+                    | game::MESSAGE_FLAG_MONSTERS
+                    | game::MESSAGE_FLAG_EFFECTS);
+                if self.menu_close_freeze == 0 {
+                    self.menu_close_restore = true;
+                }
+            }
+        } else if self.menu_close_restore {
+            self.menu_close_restore = false;
+            self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE
+                | game::MESSAGE_FLAG_ENTITIES
+                | game::MESSAGE_FLAG_MONSTERS
+                | game::MESSAGE_FLAG_EFFECTS;
+        }
         self.event_vm.set_enabled(events_enabled);
         self.tick_room_fade();
         // A film owns the tick while it plays: the room's scripts, entities,
@@ -1558,6 +1631,12 @@ impl GameSession {
             return Ok(());
         }
         if self.menu.is_some() {
+            // The frame after the open fade finishes is the original's state-0
+            // -> state-1 transition: no health-bar tick and no input yet.
+            if self.menu_open_delay {
+                self.menu_open_delay = false;
+                return Ok(());
+            }
             self.tick_menu(pack, ui, input, action);
             return Ok(());
         }
@@ -1574,6 +1653,12 @@ impl GameSession {
         // window advances after the script pass, so the frame's start state
         // decides; the press that dismissed a window is spent on it.
         if ui.start && !was_active {
+            // The reference draws this frame's random seed before its menu
+            // request is even detected (game_loop's first statement), then
+            // opens the menu at the end of the same tick. arklay opens the menu
+            // here, ahead of the room tick, so it must draw the seed itself or
+            // the shared stream falls one draw behind for the rest of the run.
+            self.game.draw_frame_rand();
             self.begin_menu_open(pack);
             return Ok(());
         }
@@ -2075,8 +2160,13 @@ impl GameSession {
             return;
         }
         self.open_menu(pack);
-        self.menu_fade.set(2, 24 << 7, 0);
+        // The original's `set_fading` only sets the counter: the accumulator is
+        // left at the room-entry fade's negative leftover, and the first step
+        // resets it to 0 before adding. Seed it from the room fade so the
+        // traced state matches the reference's `-4097` leftovers.
+        self.menu_fade.set(2, 24 << 7, self.room_fade.state());
         self.menu_fade_pending = true;
+        self.menu_fade_started = false;
         self.menu_fade_phase = MenuFadePhase::Out;
     }
 
@@ -2089,8 +2179,9 @@ impl GameSession {
             return;
         }
         self.open_item_box(pack);
-        self.menu_fade.set(2, 24 << 7, 0);
+        self.menu_fade.set(2, 24 << 7, self.room_fade.state());
         self.menu_fade_pending = true;
+        self.menu_fade_started = false;
         self.menu_fade_phase = MenuFadePhase::Out;
     }
 
@@ -2119,8 +2210,16 @@ impl GameSession {
         if self.menu.is_none() || self.menu_fade_phase != MenuFadePhase::None {
             return;
         }
-        self.menu_fade.set(2, 24 << 7, 0);
-        self.menu_fade_pending = true;
+        // Unlike the open, the close arms and steps in consecutive frames: the
+        // original runs `menu_exit_cleanup`'s fade and main_loop's addition on
+        // the cancel frame and the next, with no pending tick in between. The
+        // accumulator is seeded from the room fade's negative leftover, like
+        // `set_fading` leaves it.
+        self.menu_fade.set(2, 24 << 7, self.room_fade.state());
+        self.menu_fade_pending = false;
+        self.menu_close_wait = 0;
+        self.menu_fade_started = false;
+        self.menu_exit_restored = false;
         self.menu_fade_phase = MenuFadePhase::Closing;
     }
 
@@ -2140,9 +2239,65 @@ impl GameSession {
     /// negative the phase either starts the fade-in, finishes opening, or
     /// closes the menu and arms the room-entry fade.
     fn tick_menu_fade(&mut self) {
+        // The closing fade holds the black screen for two frames before the
+        // room resumes: the original's menu task still has to tear down after
+        // state 7's wait. This runs before the draw capture so those frames
+        // trace as the original's cleared `0:0`.
+        if self.menu_fade_phase == MenuFadePhase::Closing && self.menu_close_wait > 0 {
+            self.menu_close_wait -= 1;
+            if self.menu_close_wait == 0 {
+                self.menu_fade = transition::Fade::inactive();
+                self.menu_fade_phase = MenuFadePhase::None;
+                self.close_menu();
+                // Arm the room-entry fade for its first drawn frame: the
+                // original's `arm_room_fade` runs on this frame and main_loop
+                // draws (then adds) on it, so this frame draws the full 0x7FFF
+                // alpha and the following frames step it down.
+                self.arm_room_fade();
+                self.room_fade_pending = false;
+                self.room_fade_draw = self.room_fade.overlay();
+                self.room_fade.tick();
+                // The original suspends game_loop for the room-entry fade, so
+                // the player and entities stay frozen until it clears. The
+                // first frame after the arm still runs (the reference's
+                // `g_short_message_flags | 0x200` still has the player bit),
+                // then the fade holds them for the rest of its run.
+                self.menu_close_freeze = MENU_CLOSE_FREEZE_FRAMES;
+                self.menu_close_freeze_first = true;
+                self.menu_close_restore = false;
+            }
+            return;
+        }
+        // The original's exit state 7 restores the player to pad control and the
+        // idle pose on the first frame after the cancel, so the frozen player is
+        // already idle while the panel darkens.
+        if self.menu_fade_phase == MenuFadePhase::Closing && !self.menu_exit_restored {
+            self.menu_exit_restored = true;
+            if let Some(assets) = self.loaded.player_assets.as_ref() {
+                self.player
+                    .menu_exit_restore(&mut self.game, &assets.emd.clips);
+            }
+        }
+        // Capture the accumulator before this frame's step: the original draws
+        // the fade and only then adds the counter.
+        self.menu_fade_draw = self.menu_fade.overlay();
         if self.menu_fade_pending {
             self.menu_fade_pending = false;
             return;
+        }
+        // The opening/closing fades start from the room-entry fade's negative
+        // leftover; the original's fade machine resets a negative accumulator
+        // to 0 before the first add when the counter is positive.
+        if matches!(
+            self.menu_fade_phase,
+            MenuFadePhase::Out | MenuFadePhase::Closing
+        ) && !self.menu_fade_started
+        {
+            self.menu_fade_started = true;
+            if self.menu_fade.state() < 0 && self.menu_fade.counter() >= 1 {
+                self.menu_fade
+                    .set(self.menu_fade.fade_type(), self.menu_fade.counter(), 0);
+            }
         }
         self.menu_fade.tick();
         if self.menu_fade.overlay().is_some() {
@@ -2150,29 +2305,37 @@ impl GameSession {
         }
         match self.menu_fade_phase {
             MenuFadePhase::Out => {
-                // Armed inside this tick: the frame drawn after it is the
-                // first fade-in frame, so the next tick advances straight
-                // away (no pending frame).
+                // The fade-out has reached black: arm the menu's fade-in and
+                // advance it once, since the original's main_menu and the same
+                // frame's counter addition share the tick. This frame still
+                // draws the captured fade-out alpha.
                 self.menu_fade.set(2, -6144, 0x7FFF);
+                self.menu_fade.tick();
                 self.menu_fade_phase = MenuFadePhase::In;
             }
             MenuFadePhase::In => {
                 self.menu_fade = transition::Fade::inactive();
                 self.menu_fade_phase = MenuFadePhase::None;
+                // The original's state-0 -> state-1 frame draws no health bar,
+                // so hold one frame before the menu starts ticking.
+                self.menu_open_delay = true;
             }
             MenuFadePhase::Closing => {
-                self.menu_fade = transition::Fade::inactive();
-                self.menu_fade_phase = MenuFadePhase::None;
-                self.close_menu();
-                self.arm_room_fade();
+                // The fade-out has reached black. The original clears the fade
+                // pair to `0:0` and the menu task tears down over the next two
+                // frames before game_loop resumes and arms the room-entry fade.
+                self.menu_close_wait = 2;
+                self.menu_fade.set(self.menu_fade.fade_type(), 0, 0);
             }
             MenuFadePhase::None => {}
         }
     }
 
-    /// Blend the pause-menu fade over the frame just rendered.
+    /// Blend the pause-menu fade over the frame just rendered, at the alpha the
+    /// original draws (the pre-step accumulator captured by
+    /// [`Self::tick_menu_fade`]).
     fn draw_menu_fade(&mut self) {
-        if let Some(overlay) = self.menu_fade.overlay() {
+        if let Some(overlay) = self.menu_fade_draw.take() {
             self.framebuffer.fade_to_color(overlay.color, overlay.alpha);
         }
     }
@@ -2740,6 +2903,11 @@ impl GameSession {
             return;
         };
         menu.tick(&mut self.game);
+        // The action submenu ignores all input while its 8-frame open
+        // animation runs (main_menu's state 1, before it becomes state 2).
+        if menu.mode == MenuMode::Actions && !menu.submenu_ready() {
+            return;
+        }
         // START (Tab) cycles the top tabs while the menu is open; the file
         // tab opens the document selector.
         if ui.start {
@@ -3062,7 +3230,12 @@ impl GameSession {
     /// zeroes the pair outside the `MSF_FADE_ACTIVE` machine (the death and
     /// character-select fades), so the trace keeps reporting them.
     fn tick_room_fade(&mut self) {
-        if self.room_fade.overlay().is_none() {
+        // The original draws the fade with the accumulator at the start of the
+        // frame and only then adds the counter, so capture the pre-step overlay
+        // for this frame's draw before advancing.
+        let pre = self.room_fade.overlay();
+        self.room_fade_draw = pre;
+        if pre.is_none() {
             return;
         }
         if self.room_fade_pending {
@@ -3072,9 +3245,10 @@ impl GameSession {
         self.room_fade.tick();
     }
 
-    /// Blend the room-entry fade over the frame just rendered.
+    /// Blend the room-entry fade over the frame just rendered, at the alpha the
+    /// original draws (the pre-step accumulator value).
     fn draw_room_fade(&mut self) {
-        if let Some(overlay) = self.room_fade.overlay() {
+        if let Some(overlay) = self.room_fade_draw {
             self.framebuffer.fade_to_black(overlay.alpha);
         }
     }
@@ -3216,6 +3390,17 @@ impl GameSession {
         self.room_fade.overlay().map(|overlay| overlay.alpha)
     }
 
+    /// Whether the pause-menu fade is currently hiding the menu panel (the
+    /// opening fade-out and the whole closing fade). The original does not draw
+    /// the inventory in these phases: the room is suspended (open) or the
+    /// menu's exit state 7 skipped the draw (close).
+    fn menu_fade_hides(&self) -> bool {
+        matches!(
+            self.menu_fade_phase,
+            MenuFadePhase::Out | MenuFadePhase::Closing
+        )
+    }
+
     /// The pause-menu fade's current alpha, for the deterministic tests.
     #[cfg(test)]
     fn menu_fade_alpha(&self) -> Option<u8> {
@@ -3225,15 +3410,17 @@ impl GameSession {
     /// The per-tick oracle-trace snapshot (`oracle/trace-v1.md`): the live
     /// room, game and room-entry fade state plus the rendered frame's hash.
     ///
-    /// The reference's `g_fading_counter`/`g_fading_state` is one global; once
-    /// the game-over machine has taken over it is the death fade that owns it,
-    /// so the trace reports that fade instead of the (already inactive) room
-    /// entry fade.
+    /// The reference's `g_fading_counter`/`g_fading_state` is one global. The
+    /// death machine takes it over first; while a pause-menu fade is running
+    /// (open, fade-in or close) that menu fade owns it; otherwise it is the
+    /// room-entry fade.
     fn trace_tick<'a>(&'a self, frame: &Framebuffer) -> trace::TraceTick<'a> {
-        let (fade_counter, fade_state) = if self.death.is_idle() {
-            (self.room_fade.counter(), self.room_fade.state())
-        } else {
+        let (fade_counter, fade_state) = if !self.death.is_idle() {
             (self.death.fade_counter(), self.death.fade_state())
+        } else if self.menu_fade_phase != MenuFadePhase::None {
+            (self.menu_fade.counter(), self.menu_fade.state())
+        } else {
+            (self.room_fade.counter(), self.room_fade.state())
         };
         trace::TraceTick {
             room: self.loaded.id,
@@ -3313,6 +3500,18 @@ impl GameSession {
             self.draw_screen_intensity_bars();
             self.draw_room_fade();
             self.draw_death_fade();
+        } else if self.menu_fade_hides()
+            && !(self.menu_fade_phase == MenuFadePhase::Out && self.menu_fade_pending)
+        {
+            // The original suspends game_loop while the menu opens or closes,
+            // so the room is not redrawn: the screen is the menu's black
+            // background with the fade over it, not the frozen room darkening
+            // (open) or the menu panel darkening (close; the original's exit
+            // state 7 does not draw the inventory). Clear to black so the
+            // frames match the reference. The opening request frame still shows
+            // the frozen room, so only the Out-pending frame skips the clear;
+            // the closing request frame is already black in the reference.
+            self.framebuffer.clear();
         }
         // The computer terminal draws over the frozen monitor-camera scene.
         if self.computer.is_some() {
@@ -3322,25 +3521,33 @@ impl GameSession {
             return;
         }
         // The menu is hidden while the opening fade-out darkens the frozen
-        // frame; it is revealed for the fade-in.
-        if self.menu.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
+        // frame and while the closing fade runs; it is revealed for the
+        // fade-in.
+        if self.menu.is_some() && !self.menu_fade_hides() {
             self.ensure_menu_assets(pack);
-            // The 0xBA item-name line belongs to whatever owns the screen: a
+            // The cursor and the 0xBA item-name line are drawn from
+            // menu_handle_input (state 1), which only runs once the opening
+            // fade has finished; while the fade is still up neither is drawn.
+            // The name line also belongs to whatever owns the screen - a
             // message window, the examine viewer or a pick-up prompt draws
-            // there, so the menu must not paint its own name under it.
-            let show_item_name =
-                !self.game.message.active && self.pickup_view.is_none() && self.modal.is_none();
+            // there - so the menu must not paint its own name under it.
+            let menu_ready = self.menu_fade_phase == MenuFadePhase::None;
+            let show_item_name = menu_ready
+                && !self.game.message.active
+                && self.pickup_view.is_none()
+                && self.modal.is_none();
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw_with_name(
                     &mut self.framebuffer,
                     assets,
                     &self.text,
                     &self.game,
+                    menu_ready,
                     show_item_name,
                 );
             }
         }
-        if self.item_box.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
+        if self.item_box.is_some() && !self.menu_fade_hides() {
             self.ensure_item_box_assets(pack);
             if let (Some(item_box), Some(item_box_assets), Some(menu_assets)) =
                 (&self.item_box, &self.item_box_assets, &self.menu_assets)
@@ -5003,6 +5210,7 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
     // safety bound) until that many lines have been written.
     let mut emitted = 0u32;
     let mut iterations = 0u32;
+    let mut script_input = InputState::default();
     let bound = options
         .ticks
         .saturating_mul(2)
@@ -5020,7 +5228,19 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         // screen is the last traced one until the title cycles back into
         // gameplay.
         let screen_before = matches!(&app.mode, Mode::Play(session) if session.death.screen_open());
-        if let AppFlow::Quit = app.update(UiInput::default(), player::Input::default(), false)? {
+        // The scripted `--input` word is keyed by the trace tick, exactly like
+        // the reference's `--test-input` (which reads it from its own `t`). An
+        // iteration that emits no line (a door transition, the death screen)
+        // keeps the previous tick's word, matching the reference's per-frame
+        // injection while its trace counter is stalled.
+        let (tick_ui, tick_player, tick_action) = match options.input {
+            Some(script) => {
+                let tick = script_input.tick_scripted(script.word_at(writer.tick_index()));
+                (tick.ui, tick.player, tick.action)
+            }
+            None => (UiInput::default(), player::Input::default(), false),
+        };
+        if let AppFlow::Quit = app.update(tick_ui, tick_player, tick_action)? {
             break;
         }
         // A script's `movie_on` (MSF_FMV_REQUEST) starts a film at the end of
@@ -8088,6 +8308,103 @@ fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
     })
 }
 
+/// A scripted per-tick input playback for the oracle (`--input`).
+///
+/// The file lists `<tick> <button>...` entries, one per line; a later entry
+/// replaces the held button set from its tick on, and a tick with no buttons
+/// releases everything. The trace tick is the reference's (a frame past the
+/// room-entry arm), so `word_at(t)` is the set of keys held during the tick
+/// that emits trace line `t`. The button names mirror the reference's
+/// `--test-input` button map:
+///
+/// `up down left right confirm cancel run aim fire start page_left page_right`
+/// (with the aliases `action/cross`, `circle`, `square`, `inventory`, `l1`,
+/// `r1`).
+#[derive(Debug, Default, Clone)]
+pub struct InputScript {
+    /// `(tick, key bit word)` entries, sorted by tick; the last entry at or
+    /// before a tick is the held set.
+    entries: Vec<(u32, u32)>,
+}
+
+/// The key bit a `--input` button name maps to, or `None` for an unknown name.
+fn script_button_bit(name: &str) -> Option<u32> {
+    Some(match name {
+        "up" => KEY_UP,
+        "down" => KEY_DOWN,
+        "left" => KEY_LEFT,
+        "right" => KEY_RIGHT,
+        "confirm" | "cross" | "action" => KEY_CONFIRM,
+        "cancel" | "circle" => KEY_CANCEL,
+        "run" => KEY_RUN,
+        "aim" | "square" => KEY_AIM,
+        "fire" => KEY_FIRE,
+        "start" | "inventory" => KEY_TAB,
+        "page_left" | "l1" => KEY_LEFTBRACKET,
+        "page_right" | "r1" => KEY_RIGHTBRACKET,
+        _ => return None,
+    })
+}
+
+impl InputScript {
+    /// Parse an `--input` script body.
+    pub fn parse(text: &str) -> Result<Self> {
+        let mut entries: Vec<(u32, u32)> = Vec::new();
+        for (number, line) in text.lines().enumerate() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let mut tokens = line.split_whitespace();
+            let Some(tick) = tokens.next() else { continue };
+            let tick: u32 = tick.parse().with_context(|| {
+                format!("input line {}: `{tick}` is not a tick number", number + 1)
+            })?;
+            let mut word = 0u32;
+            for token in tokens {
+                let bit = script_button_bit(token).ok_or_else(|| {
+                    anyhow::anyhow!("input line {}: unknown button `{token}`", number + 1)
+                })?;
+                word |= bit;
+            }
+            // Last entry at a tick wins.
+            if let Some(last) = entries.last_mut()
+                && last.0 == tick
+            {
+                last.1 = word;
+                continue;
+            }
+            entries.push((tick, word));
+        }
+        entries.sort_by_key(|entry| entry.0);
+        Ok(Self { entries })
+    }
+
+    /// Read and parse an `--input` script file.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read input script {}", path.display()))?;
+        Self::parse(&text)
+    }
+
+    /// Whether any entry is armed (so a plain run stays byte-identical).
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The key word held during traced tick `t`.
+    pub fn word_at(&self, tick: u32) -> u32 {
+        let mut word = 0;
+        for &(at, value) in &self.entries {
+            if at > tick {
+                break;
+            }
+            word = value;
+        }
+        word
+    }
+}
+
 /// The keyboard, latched from the SDL event queue.
 ///
 /// The render loop runs at the display's refresh rate, which is not the 30 Hz
@@ -8202,6 +8519,20 @@ impl InputState {
                 any: std::mem::take(&mut self.any_pressed),
             },
         }
+    }
+
+    /// Latch the scripted held word for one tick and consume its edges.
+    ///
+    /// The word is the full set of keys down during the tick, exactly what the
+    /// reference's `--test-input` injects into the pad. The rising edge (keys
+    /// down now that were not down last tick) becomes this tick's press, so a
+    /// one-tick scripted tap reaches the UI exactly once.
+    fn tick_scripted(&mut self, down: u32) -> TickInput {
+        let edge = down & !self.held;
+        self.held = down;
+        self.pressed = edge;
+        self.any_pressed = edge != 0;
+        self.tick()
     }
 }
 
@@ -14565,9 +14896,10 @@ off_0010:
                 false,
             )
             .unwrap();
-        // Draw-then-add: the arming frame is still transparent, then the
-        // frozen frame darkens by 24 alpha a tick.
-        assert_eq!(session.menu_fade_alpha(), Some(0));
+        // The fade starts from the room-entry fade's negative leftover, so the
+        // arming frame is inactive; the first step resets it to 0 and darkens
+        // the frozen frame by 24 alpha a tick.
+        assert_eq!(session.menu_fade_alpha(), None);
         let mut out = Vec::new();
         while session.menu_fade_phase == MenuFadePhase::Out {
             session
@@ -14579,9 +14911,11 @@ off_0010:
                 out.push(alpha);
             }
         }
-        assert_eq!(out, vec![0, 24, 48, 72, 96, 120, 144, 168, 192, 216, 240]);
+        assert_eq!(out, vec![24, 48, 72, 96, 120, 144, 168, 192, 216, 240]);
 
-        // The menu fades in from full black over 0xE800 (48 a tick).
+        // The menu fades in from full black over 0xE800 (48 a tick); the step
+        // is applied on the frame it is armed, so the first traced value is
+        // already one step in.
         let mut fade_in = Vec::new();
         while session.menu_fade_phase == MenuFadePhase::In {
             if let Some(alpha) = session.menu_fade_alpha() {
@@ -14591,9 +14925,13 @@ off_0010:
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
         }
-        assert_eq!(fade_in, vec![255, 207, 159, 111, 63, 15]);
+        assert_eq!(fade_in, vec![207, 159, 111, 63, 15]);
         assert_eq!(session.menu_fade_phase, MenuFadePhase::None);
         assert!(session.menu.is_some(), "the menu accepts input afterwards");
+        // The original's state-0 -> state-1 transition frame takes no input.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
 
         // Cancel darkens the menu, then unfreezes the room through the
         // room-entry fade.
@@ -14613,7 +14951,7 @@ off_0010:
         assert!(session.menu.is_none());
         assert_eq!(
             session.room_fade_alpha(),
-            Some(255),
+            Some(207),
             "the room fades back in after the menu closes"
         );
     }
@@ -14676,7 +15014,7 @@ off_0010:
     /// Advance the pause-menu open/close fade to completion.
     fn settle_menu_fade(session: &mut GameSession, pack: &Pack) {
         for _ in 0..64 {
-            if session.menu_fade_phase == MenuFadePhase::None {
+            if session.menu_fade_phase == MenuFadePhase::None && !session.menu_open_delay {
                 return;
             }
             session
@@ -14684,6 +15022,24 @@ off_0010:
                 .unwrap();
         }
         panic!("the pause-menu fade did not settle");
+    }
+
+    /// Advance the pause menu until its action submenu's 8-frame open
+    /// animation has finished and it accepts input again.
+    fn settle_submenu_open(session: &mut GameSession, pack: &Pack) {
+        for _ in 0..32 {
+            if session
+                .menu
+                .as_ref()
+                .is_none_or(|menu| menu.submenu_ready())
+            {
+                return;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("the action submenu did not finish opening");
     }
 
     #[test]
@@ -15116,11 +15472,19 @@ off_0010:
 
         // Slot 0 holds the knife: confirm opens the action submenu, down
         // selects CHECK, confirm installs the viewer.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_submenu_open(&mut session, &pack);
         for ui in [
-            UiInput {
-                confirm: true,
-                ..UiInput::default()
-            },
             UiInput {
                 down: true,
                 ..UiInput::default()
@@ -15497,7 +15861,10 @@ off_0010:
             session.menu.is_some(),
             "the panel stays up while it darkens"
         );
-        assert_eq!(session.menu_fade_alpha(), Some(0));
+        // The fade pair starts at the room-entry fade's negative leftover
+        // (`set_fading` only sets the counter), so it is inactive here and the
+        // first step resets it to 0 before darkening.
+        assert_eq!(session.menu_fade_alpha(), None);
 
         // The panel darkens by 24 alpha a tick before the menu drops and the
         // room-entry fade is re-armed at full black.
@@ -15514,7 +15881,7 @@ off_0010:
         }
         assert_eq!(
             alphas,
-            vec![0, 24, 48, 72, 96, 120, 144, 168, 192, 216, 240]
+            vec![24, 48, 72, 96, 120, 144, 168, 192, 216, 240, 0, 0]
         );
         assert!(
             session.menu.is_none(),
@@ -15523,7 +15890,7 @@ off_0010:
         assert!(!session.game.menu_pending());
         assert_eq!(
             session.room_fade_alpha(),
-            Some(255),
+            Some(207),
             "the room fades back in"
         );
     }
@@ -15974,7 +16341,10 @@ off_0010:
 
         // A fresh monitor has not run yet: the original's item-box state 3
         // calls `menu_draw_health_bar` every frame, so the first box tick
-        // initialises the EKG and the following ticks sweep its head.
+        // initialises the EKG. Its case 0 falls through into case 1, so the
+        // head steps to 0x85 and immediately wraps to 0x35 (off the window's
+        // left edge); the sweep then fills the window over the next ~0x50
+        // ticks.
         assert_eq!(session.menu.as_ref().unwrap().health_bar.state, 0);
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
@@ -15984,6 +16354,11 @@ off_0010:
             1,
             "the item box starts the EKG sweep"
         );
+        for _ in 0..70 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
         let first = session.menu.as_ref().unwrap().health_bar.primary_span();
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
@@ -16017,19 +16392,29 @@ off_0010:
         settle_menu_fade(&mut session, &pack);
         // Confirm opens the submenu, confirm again uses the key: the original
         // sets the close bit and the menu exits through its fade.
-        for _ in 0..2 {
-            session
-                .tick(
-                    &pack,
-                    UiInput {
-                        confirm: true,
-                        ..UiInput::default()
-                    },
-                    player::Input::default(),
-                    false,
-                )
-                .unwrap();
-        }
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_submenu_open(&mut session, &pack);
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
         assert_eq!(
             session.game.last_picked_item, None,
             "the key is used, not picked"
@@ -16043,7 +16428,7 @@ off_0010:
         assert!(session.menu.is_none(), "the inventory closed after the use");
         assert_eq!(
             session.room_fade_alpha(),
-            Some(255),
+            Some(207),
             "the room fades back in"
         );
     }
@@ -16253,6 +16638,7 @@ off_0010:
                 false,
             )
             .unwrap();
+        settle_submenu_open(&mut session, &pack);
         session
             .tick(
                 &pack,

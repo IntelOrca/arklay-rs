@@ -196,6 +196,11 @@ pub struct MainMenu {
     pub slots: usize,
     /// The animated health monitor.
     pub health_bar: HealthBar,
+    /// The action submenu's open animation frame (`DAT_00ae9f27` low 7 bits):
+    /// `0` on the confirm frame, then `1..=8` as the box grows from nothing to
+    /// its full 48x24 over eight frames. Once it reaches `SUBMENU_OPEN_FRAMES`
+    /// the box is fully open and accepts input.
+    pub submenu_frames: u8,
 }
 
 impl MainMenu {
@@ -210,6 +215,7 @@ impl MainMenu {
             equippable: false,
             slots,
             health_bar: HealthBar::new(),
+            submenu_frames: layout::SUBMENU_OPEN_FRAMES,
         }
     }
 
@@ -222,15 +228,27 @@ impl MainMenu {
         self.action = 0;
         self.move_cursor = self.cursor;
         self.health_bar = HealthBar::new();
+        self.submenu_frames = layout::SUBMENU_OPEN_FRAMES;
         self.refresh_selection(game);
+    }
+
+    /// Whether the action submenu has finished its open animation and accepts
+    /// input. The engine consumes no menu input while it is still opening.
+    pub fn submenu_ready(&self) -> bool {
+        self.submenu_frames >= layout::SUBMENU_OPEN_FRAMES
     }
 
     /// Advance the health monitor one frame and re-read the cursor selection.
     pub fn tick(&mut self, game: &mut GameState) {
+        let health = game.entities[0].health;
+        let max_health = game.max_health;
+        let status = game.health_status;
         self.health_bar
-            .update(game.entities[0].health, game.max_health, game.health_status);
+            .update(health, max_health, status, &mut game.rand_state);
         if self.mode == MenuMode::Navigation {
             self.refresh_selection(game);
+        } else if self.submenu_frames < layout::SUBMENU_OPEN_FRAMES {
+            self.submenu_frames += 1;
         }
     }
 
@@ -308,6 +326,8 @@ impl MainMenu {
                 self.action = 0;
                 self.move_cursor = self.cursor;
                 self.equippable = is_equippable(self.selected_item);
+                // Start the submenu box's open animation from nothing.
+                self.submenu_frames = 0;
                 MenuEvent::None
             }
         }
@@ -390,7 +410,10 @@ impl MainMenu {
     fn move_input(&mut self, game: &mut GameState, input: MenuInput) -> MenuEvent {
         match input {
             MenuInput::Cancel => {
+                // Walking back from MOVE returns to the already-open submenu:
+                // the original does not replay the open animation.
                 self.mode = MenuMode::Actions;
+                self.submenu_frames = layout::SUBMENU_OPEN_FRAMES;
                 MenuEvent::None
             }
             MenuInput::Left | MenuInput::Right => {
@@ -466,34 +489,42 @@ impl MainMenu {
         text: &Text,
         game: &GameState,
     ) {
-        self.draw_with_name(framebuffer, assets, text, game, true);
+        self.draw_with_name(framebuffer, assets, text, game, true, true);
     }
 
-    /// [`MainMenu::draw`] with the item-name line optional.
+    /// [`MainMenu::draw`] with the item cursor and the item-name line optional.
     ///
-    /// The original draws the 0xBA line from `menu_handle_input` and the
-    /// submenu states that still own the screen; while a message, the examine
-    /// viewer or a pick-up owns the line, the menu must not paint its name over
-    /// them (`menu_item_submenu` case 4's jump past the name draw).
+    /// The original draws the cursor and the 0xBA name line from
+    /// `menu_handle_input` (state 1) and the submenu states that still own the
+    /// screen. While the menu fade is still running (state 0) neither is drawn;
+    /// while a message, the examine viewer or a pick-up owns the line the name
+    /// must not paint over them (`menu_item_submenu` case 4's jump past the
+    /// name draw).
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_with_name(
         &self,
         framebuffer: &mut Framebuffer,
         assets: &MenuAssets,
         text: &Text,
         game: &GameState,
+        show_cursor: bool,
         show_item_name: bool,
     ) {
         self.draw_background(framebuffer);
-        self.draw_tab_cursor(framebuffer, assets);
+        if show_cursor {
+            self.draw_tab_cursor(framebuffer, assets);
+        }
         self.draw_frames(framebuffer, assets);
         self.draw_inventory(framebuffer, assets, game);
         self.draw_portrait(framebuffer, assets, game);
         self.health_bar.draw(framebuffer, &assets.status);
-        self.draw_tabs(framebuffer, assets);
+        self.draw_tabs(framebuffer, assets, game.has_radio());
         if self.mode != MenuMode::Navigation {
             self.draw_submenu(framebuffer, assets);
         }
-        self.draw_slot_cursor(framebuffer, assets);
+        if show_cursor {
+            self.draw_slot_cursor(framebuffer, assets);
+        }
         if show_item_name {
             self.draw_item_name(framebuffer, assets, text, game);
         }
@@ -582,9 +613,16 @@ impl MainMenu {
         );
     }
 
-    fn draw_tabs(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
+    fn draw_tabs(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets, has_radio: bool) {
         for tab in 0..layout::TOP_TABS_LEN {
-            let part = layout::tab_part(tab);
+            let mut part = layout::tab_part(tab);
+            // The original swaps the RADIO tab art for a blank dash (source V
+            // 0x40) while `DAT_00ae9f1f` is clear: `MainMenu.cpp:925`,
+            // `if (bVar6 == 4 && DAT_00ae9f1f == 0) g_TextureDesc.texV = 0x40`.
+            // Tab index 2 is the radio tab (cursor value 4, bottom-left).
+            if tab == 2 && !has_radio {
+                part.uv[1] = 0x40;
+            }
             draw_part(framebuffer, &assets.status, part);
         }
     }
@@ -596,30 +634,42 @@ impl MainMenu {
             [0x18, 0x30, 0x48]
         };
         let [x, y] = layout::SUBMENU_POS;
-        let [w, h] = layout::SUBMENU_OPTION_SIZE;
-        // Selected action highlight behind the option list.
-        framebuffer.draw_indexed_sprite(
-            &assets.status,
-            [0x30, 0x60, i32::from(w), i32::from(h)],
-            [
-                i32::from(x),
-                i32::from(y) + i32::from(self.action) * i32::from(h),
-                i32::from(w),
-                i32::from(h),
-            ],
-            0,
-            0,
-            Tint::White,
-        );
+        let [fw, fh] = layout::SUBMENU_OPTION_SIZE;
+        // The original grows the box from nothing at (0x90, 0x39): each open
+        // frame samples a 6px-wider, 3px-taller region of the option art, so
+        // the full 48x24 is revealed over eight frames. The options' screen
+        // rows are at the full 0x18 pitch throughout.
+        let frame = self.submenu_frames.min(layout::SUBMENU_OPEN_FRAMES);
+        let w = i32::from(fw).min(i32::from(frame) * 6);
+        let h = i32::from(fh).min(i32::from(frame) * 3);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if self.submenu_ready() {
+            // Selected action highlight behind the option list.
+            framebuffer.draw_indexed_sprite(
+                &assets.status,
+                [0x30, 0x60, i32::from(fw), i32::from(fh)],
+                [
+                    i32::from(x),
+                    i32::from(y) + i32::from(self.action) * i32::from(fh),
+                    i32::from(fw),
+                    i32::from(fh),
+                ],
+                0,
+                0,
+                Tint::White,
+            );
+        }
         for (option, v) in labels.into_iter().enumerate() {
             framebuffer.draw_indexed_sprite(
                 &assets.status,
-                [0x30, i32::from(v), i32::from(w), i32::from(h)],
+                [0x30, i32::from(v), w, h],
                 [
                     i32::from(x),
-                    i32::from(y) + option as i32 * i32::from(h),
-                    i32::from(w),
-                    i32::from(h),
+                    i32::from(y) + option as i32 * i32::from(fh),
+                    w,
+                    h,
                 ],
                 0,
                 0,
@@ -802,13 +852,18 @@ fn draw_part(framebuffer: &mut Framebuffer, texture: &Texture8, part: layout::Fr
 fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::FrameTile) {
     let [x, y] = tile.part.pos;
     let [w, h] = tile.part.size;
+    // The tiled record's flag byte maps straight onto the sprite mirror bits
+    // the original sets from `(flags & 0xc0) << 16` (SpriteRenderer.h:
+    // TEXDESC_MIRROR_U 0x80, TEXDESC_MIRROR_V 0x40). The bottom decoration
+    // record (0x40) is the top one flipped with V.
+    let mirror = [tile.flags & 0x80 != 0, tile.flags & 0x40 != 0];
     for index in 0..tile.tiles() {
         let (dx, dy) = if tile.vertical() {
             (0, i32::from(index) * i32::from(h))
         } else {
             (i32::from(index) * i32::from(w), 0)
         };
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_indexed_sprite_mirrored(
             texture,
             [
                 i32::from(tile.part.uv[0]),
@@ -825,6 +880,7 @@ fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::Fr
             0,
             0,
             Tint::White,
+            mirror,
         );
     }
 }
@@ -1440,7 +1496,7 @@ mod tests {
         ));
         let name_pixels = |show_name: bool| {
             let mut framebuffer = Framebuffer::new();
-            menu.draw_with_name(&mut framebuffer, &assets, &text, &game, show_name);
+            menu.draw_with_name(&mut framebuffer, &assets, &text, &game, true, show_name);
             let mut count = 0;
             for y in 0..framebuffer.height {
                 for x in 0..framebuffer.width {
