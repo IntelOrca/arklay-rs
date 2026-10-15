@@ -1,0 +1,18 @@
+# Equip: open the menu on the Beretta, equip it through the action submenu,
+# then open the submenu again and unequip.
+60 start
+61
+90 confirm
+91
+105 confirm
+106
+130 cancel
+131
+150 confirm
+151
+165 confirm
+166
+190 cancel
+191
+210 cancel
+211

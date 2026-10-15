@@ -59,7 +59,8 @@ pub struct SaveFile {
     /// explicit fields below mirror the parts the port owns; the remaining
     /// bytes (0x208..0x20F, 0x214..0x223) survive only here.
     pub state_bytes: [u8; STATE_BYTES],
-    /// Stage id (0x200).
+    /// Stage id (0x200), the original's 0-based `g_stageId`: the port's
+    /// 1-based RDT stage digit minus one.
     pub stage: u8,
     /// Room id (0x201).
     pub room: u8,
@@ -169,7 +170,9 @@ impl SaveFile {
     /// a reload followed by a re-capture is identical. The bytes with no
     /// explicit field (0x208..0x20F, 0x214..0x223) are left untouched.
     fn sync_state_image(&mut self) {
-        self.state_bytes[0] = self.stage;
+        // The state image keeps the port's 1-based stage digit; the block's
+        // own 0x200 byte (`self.stage`) is the original's 0-based g_stageId.
+        self.state_bytes[0] = self.stage.saturating_add(1);
         self.state_bytes[1] = self.room;
         self.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)] = self.camera;
         self.state_bytes[usize::from(STATE_BYTE_CUT)] = self.cut;
@@ -214,7 +217,9 @@ impl SaveFile {
         );
         let mut file = Self {
             state_bytes: state.state_bytes,
-            stage: state.id.stage,
+            // The block stores the original's 0-based `g_stageId`; the port's
+            // `RoomId.stage` is the 1-based RDT digit.
+            stage: state.id.stage.saturating_sub(1),
             room: state.id.room,
             camera: state.camera.current_cut.min(0xFF) as u8,
             cut: state.state_bytes[usize::from(STATE_BYTE_CUT)],
@@ -309,8 +314,10 @@ impl SaveFile {
     /// cleared), the inventory and item box are rebuilt, and the BioCard state
     /// bytes are reseeded from the block.
     pub fn apply_to(&self, state: &mut GameState) {
+        // The block's stage byte is the original's 0-based `g_stageId`; the
+        // port's `RoomId.stage` is the 1-based RDT digit.
         state.id = RoomId {
-            stage: self.stage,
+            stage: self.stage.saturating_add(1),
             room: self.room,
             player_flag: self.character & 1,
         };
@@ -364,9 +371,9 @@ impl SaveFile {
 
         // The saved image comes first; the explicit fields below restate the
         // bytes the port owns, exactly like the original's prefix-then-fields
-        // memcpy.
+        // memcpy. The state image's stage byte is the port's own 1-based digit.
         state.state_bytes = self.state_bytes;
-        state.state_bytes[0] = self.stage;
+        state.state_bytes[0] = self.stage.saturating_add(1);
         state.state_bytes[1] = self.room;
         state.state_bytes[usize::from(STATE_BYTE_ROOM_CAMERA)] = self.camera;
         state.state_bytes[usize::from(STATE_BYTE_CUT)] = self.cut;
@@ -493,6 +500,9 @@ impl SaveFile {
         }
         file.room_bgm
             .copy_from_slice(&bytes[0x33C..SAVE_LAYOUT_SIZE]);
+        // The state image keeps the port's 1-based stage digit; the block's
+        // own 0x200 byte read above is the original's 0-based `g_stageId`.
+        file.state_bytes[0] = file.stage.saturating_add(1);
         Ok(file)
     }
 }
@@ -585,6 +595,17 @@ pub fn load(dir: &Path, index: usize) -> Result<SaveFile> {
     let path =
         slot_path(dir, index).with_context(|| format!("save slot {index} is out of range"))?;
     let bytes = read_slot_bytes(&path)?;
+    SaveFile::from_bytes(&bytes).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+/// Read a save block from an explicit file path.
+///
+/// Unlike [`load`], the file need not be a `savedatN.dat` under a save
+/// directory: the CLI `--load`/`--test-load` oracle seam takes any path, so a
+/// scenario save checked into the repository loads without copying it into a
+/// save slot.
+pub fn load_file(path: &Path) -> Result<SaveFile> {
+    let bytes = read_slot_bytes(path)?;
     SaveFile::from_bytes(&bytes).with_context(|| format!("failed to parse {}", path.display()))
 }
 
@@ -917,7 +938,9 @@ mod tests {
         }
 
         let file = SaveFile::from_state(&state);
-        assert_eq!(file.stage, 1);
+        // The block stores the 0-based `g_stageId` of the 1-based room digit.
+        assert_eq!(file.stage, 0);
+        assert_eq!(file.to_bytes()[0x200], 0);
         assert_eq!(file.room, 0x1C);
         assert_eq!(file.character, 1);
         assert_eq!(file.health, 96);
@@ -1046,6 +1069,17 @@ mod tests {
         assert!(text.contains("blocked"), "{text}");
         assert_eq!(fs::read(&blocked).unwrap(), b"not a directory");
         assert!(load(&blocked, 0).is_err());
+    }
+
+    #[test]
+    fn an_explicit_path_loads_a_written_block() {
+        let dir = TempDir::new("file");
+        let file = filled();
+        let path = dir.path.join("scenario.dat");
+        fs::write(&path, file.to_bytes()).unwrap();
+
+        assert_eq!(load_file(&path).unwrap(), file);
+        assert!(load_file(&dir.path.join("missing.dat")).is_err());
     }
 
     #[test]

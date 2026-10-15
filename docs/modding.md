@@ -173,11 +173,34 @@ exist (Lua colon syntax):
 | `api:flag_get(bank, bit)` | Whether a flag bit is set. |
 | `api:flag_set(bank, bit[, value])` | Set (default) or clear a flag bit. |
 | `api:item_count(item)` | Total held quantity. |
-| `api:give_item(item)` | Add one item through the normal merge rules. |
+| `api:give_item(item[, quantity])` | Add items through the normal merge rules (default one). |
 | `api:item_remove(item)` | Clear the whole inventory slot holding the item. |
+| `api:set_item_slot(slot, id[, quantity])` | Replace a player slot's stack; past the held run it appends, id `0` drops it. |
+| `api:clear_inventory()` | Empty the inventory and clear the equipped/selected item. |
+| `api:set_equipped(id)` | Equip an item (or `nil`/`0` to unequip); derives the weapon id. |
+| `api:set_equipped_weapon(id)` | Set the weapon id the firing model uses, without touching the equipped item. |
+| `api:item_box_set(slot, id[, quantity])` | Replace one of the 48 item-box slots. |
+| `api:item_box_clear()` | Empty the whole item box. |
+| `api:set_health(hp)` | Set the player's health and its BioCard copy. |
+| `api:set_max_health(hp)` | Set the player's maximum health. |
+| `api:set_health_status(byte)` | Set the health-status flags (poison bits included). |
+| `api:set_player_pos(x, y, z)` | Set the player entity's position. |
+| `api:set_player_angle(degrees)` | Set the player's 12-bit yaw. |
+| `api:set_character(id)` | Select Chris (`0`) or Jill (`1`): identity, model and entity id. |
+| `api:set_room(stage, room)` | Rewrite the room identity the save block records (authoring only). |
+| `api:set_room_camera(cut)` | Select the room camera cut. |
+| `api:set_file_collected(item[, value])` | Set/clear a FILE-tab document's collected bit by item id (`0x5F..=0x6E`). |
+| `api:set_item_use_flag(item[, value])` | Set/clear a key/special/chemical item-use flag. |
+| `api:set_flag_bank(bank, bytes)` | Overwrite a bank's raw bytes, from a string or a sequence table. |
+| `api:set_state_byte(index, value)` | Write one BioCard state-image byte. |
 | `api:kill_event(slot)` | Deactivate a running event slot. |
 | `api:message(id)` | Request a room/global message. |
 | `api:log(text)` | Write one `[lua]` line to stderr. |
+
+The state-authoring methods (`set_*`, `clear_inventory`, `item_box_*`) exist
+for the CLI's `--setup-script`/`--save-out` oracle seam: a mod may use them
+too, but they are deliberately coarse. `set_room` only rewrites the identity
+the save block serialises; it does not load another room.
 
 ### Sandbox and errors
 

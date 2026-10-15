@@ -1,0 +1,23 @@
+# Combine: open the menu, confirm the green herb, walk the action submenu to
+# MOVE, walk the move cursor onto the red herb and confirm (green+red mixes
+# into the mixed herb with the herbal-mix message), then dismiss and close.
+60 start
+61
+90 confirm
+91
+105 down
+106
+110 down
+111
+120 confirm
+121
+140 right
+141
+150 confirm
+151
+180 confirm
+181
+200 cancel
+201
+220 cancel
+221

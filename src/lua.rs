@@ -12,11 +12,14 @@
 //!   a replacement message id (nothing/nil keeps the original).
 //!
 //! The `api` argument is the live [`GameState`](crate::game::GameState) exposed as a scoped userdata
-//! through [`mlua::Lua::scope`], with only the author-facing accessors:
-//! `api:room()` (read-only), `api:flag_get`/`api:flag_set`,
+//! through [`mlua::Lua::scope`]: the author-facing hook methods
+//! (`api:room()`, `api:flag_get`/`api:flag_set`,
 //! `api:item_count`/`api:give_item`/`api:item_remove`, `api:kill_event`,
-//! `api:message` and `api:log` (stderr with a `[lua]` prefix). Methods use
-//! Lua's colon syntax (`api:flag_set(0, 1, true)`).
+//! `api:message`, `api:log`) plus the coarser state-authoring methods the
+//! CLI's `--setup-script`/`--save-out` oracle seam uses (inventory slots, the
+//! item box, player health/position/character, room identity/camera, FILE and
+//! item-use flags, raw flag banks and state bytes). Methods use Lua's colon
+//! syntax (`api:flag_set(0, 1, true)`); `docs/modding.md` is the full table.
 //!
 //! The sandbox loads only the base, `string` and `table` libraries, so `os`,
 //! `io`, `package`, `debug`, `coroutine` and `math` do not exist; the base
@@ -47,6 +50,18 @@ mod imp {
         /// Always `None`: the lean build has no Lua runtime.
         pub fn load(_pack: &Pack) -> Result<Option<LuaVm>> {
             Ok(None)
+        }
+
+        /// An empty VM. The lean build has none, so `--setup-script` fails.
+        pub fn empty() -> Result<LuaVm> {
+            Ok(LuaVm)
+        }
+
+        /// The lean build cannot run `--setup-script` chunks.
+        pub fn run_setup(&self, _game: &mut GameState, _bytes: &[u8], _name: &str) -> Result<()> {
+            anyhow::bail!(
+                "this build has no Lua runtime; `--setup-script` requires the `lua` feature"
+            )
         }
 
         /// No-op room-entry hook.
@@ -224,6 +239,44 @@ mod imp {
             }))
         }
 
+        /// An empty VM with no pack hooks, for the CLI `--setup-script` seam
+        /// on a pack that carries no `lua/` entries: the chunk still runs in
+        /// the same sandbox and the same authoring API.
+        pub fn empty() -> Result<LuaVm> {
+            let (lua, budget) = new_sandboxed_state()?;
+            Ok(Self {
+                lua,
+                budget,
+                hooks: RefCell::new(Hooks::default()),
+            })
+        }
+
+        /// Run a CLI `--setup-script` chunk against `game`.
+        ///
+        /// The chunk is called with the `api` userdata as its first argument
+        /// (`local api = ...`). Unlike the hook calls, a failure is returned
+        /// to the caller: the authoring seam must not silently produce a save.
+        pub fn run_setup(&self, game: &mut GameState, bytes: &[u8], name: &str) -> Result<()> {
+            budget::check_len(
+                bytes.len(),
+                budget::MAX_LUA_CHUNK,
+                &format!("setup script {name} size"),
+            )?;
+            let function = self
+                .lua
+                .load(bytes)
+                .set_name(name.to_string())
+                .into_function()
+                .map_err(|err| anyhow::anyhow!("{name}: {err}"))?;
+            self.budget.begin();
+            self.lua
+                .scope(|scope| {
+                    let api = scope.create_userdata_ref_mut(game)?;
+                    function.call::<()>(api)
+                })
+                .map_err(|err| anyhow::anyhow!("{name}: {err}"))
+        }
+
         /// Run `on_room_load(api)` after the room state exists.
         pub fn call_room_load(&self, game: &mut GameState, id: RoomId) {
             debug_assert_eq!(game.id, id, "the hook runs for the state's own room");
@@ -327,14 +380,207 @@ mod imp {
                 Ok(game.item_count(item))
             });
 
-            methods.add_method_mut("give_item", |_lua, game, item: u8| {
-                game.add_item(item, 1);
-                Ok(())
-            });
+            // `give_item(item[, quantity])`: the quantity defaults to one, so
+            // the original one-argument form is unchanged.
+            methods.add_method_mut(
+                "give_item",
+                |_lua, game, (item, quantity): (u8, Option<u8>)| {
+                    game.add_item(item, quantity.unwrap_or(1));
+                    Ok(())
+                },
+            );
 
             methods.add_method_mut("item_remove", |_lua, game, item: u8| {
                 Ok(game.item_remove(item))
             });
+
+            // `set_item_slot(slot, id[, quantity])`: replace the stack in a
+            // player slot (or drop it with id 0). An index past the held run
+            // appends; the inventory compacts so no empty slot survives.
+            methods.add_method_mut(
+                "set_item_slot",
+                |_lua, game, (slot, id, quantity): (usize, u8, Option<u8>)| {
+                    let capacity = game.inventory_capacity();
+                    if slot >= capacity {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "inventory slot {slot} is out of range (0..{capacity})"
+                        )));
+                    }
+                    let stack = crate::game::InventoryItem {
+                        id,
+                        quantity: quantity.unwrap_or(1),
+                    };
+                    if slot < game.inventory.len() {
+                        game.inventory[slot] = stack;
+                    } else {
+                        game.inventory.push(stack);
+                    }
+                    game.rebuild_slots();
+                    Ok(())
+                },
+            );
+
+            methods.add_method_mut("clear_inventory", |_lua, game, ()| {
+                game.inventory.clear();
+                game.set_equipped(None);
+                game.select_item(None);
+                game.rebuild_slots();
+                Ok(())
+            });
+
+            methods.add_method_mut("set_equipped", |_lua, game, item: Option<u8>| {
+                game.set_equipped(item.filter(|item| *item != 0));
+                Ok(())
+            });
+
+            methods.add_method_mut("set_equipped_weapon", |_lua, game, id: u8| {
+                game.equipped_weapon_id = id;
+                Ok(())
+            });
+
+            methods.add_method_mut(
+                "item_box_set",
+                |_lua, game, (slot, id, quantity): (usize, u8, Option<u8>)| {
+                    if slot >= crate::game::ITEM_BOX_SLOTS {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "item box slot {slot} is out of range (0..{})",
+                            crate::game::ITEM_BOX_SLOTS
+                        )));
+                    }
+                    game.item_box[slot] = crate::game::InventoryItem {
+                        id,
+                        quantity: quantity.unwrap_or(1),
+                    };
+                    Ok(())
+                },
+            );
+
+            methods.add_method_mut("item_box_clear", |_lua, game, ()| {
+                game.item_box =
+                    [crate::game::InventoryItem::default(); crate::game::ITEM_BOX_SLOTS];
+                Ok(())
+            });
+
+            methods.add_method_mut("set_health", |_lua, game, health: i16| {
+                game.entities[0].health = health;
+                game.set_health_copy(health);
+                Ok(())
+            });
+
+            methods.add_method_mut("set_max_health", |_lua, game, health: i16| {
+                game.max_health = health;
+                Ok(())
+            });
+
+            methods.add_method_mut("set_health_status", |_lua, game, status: u8| {
+                game.set_health_status(status);
+                Ok(())
+            });
+
+            methods.add_method_mut(
+                "set_player_pos",
+                |_lua, game, (x, y, z): (i32, i32, i32)| {
+                    game.entities[0].pos = [x, y, z];
+                    Ok(())
+                },
+            );
+
+            methods.add_method_mut("set_player_angle", |_lua, game, degrees: i32| {
+                game.entities[0].angle = degrees as u16 & 0x0FFF;
+                Ok(())
+            });
+
+            // `set_character(id)`: 0 Chris, 1 Jill. The variant selects the
+            // room RDT, so a script that changes it usually also picks a room
+            // booted for that character.
+            methods.add_method_mut("set_character", |_lua, game, id: u8| {
+                let id = id & 1;
+                game.id.player_flag = id;
+                game.state_bytes[usize::from(crate::game::STATE_BYTE_CHARACTER)] = id;
+                game.state_bytes[usize::from(crate::game::STATE_BYTE_CHARACTER_MODEL)] = id;
+                game.entities[0].id = id;
+                Ok(())
+            });
+
+            // `set_room(stage, room)`: authoring-only. It retargets the room
+            // identity the save block records; the session keeps running the
+            // room it booted, like a save written while the block is edited.
+            methods.add_method_mut("set_room", |_lua, game, (stage, room): (u8, u8)| {
+                game.id.stage = stage;
+                game.id.room = room;
+                game.state_bytes[0] = stage;
+                game.state_bytes[1] = room;
+                Ok(())
+            });
+
+            methods.add_method_mut("set_room_camera", |_lua, game, cut: usize| {
+                game.set_camera_cut(cut);
+                Ok(())
+            });
+
+            // `set_file_collected(item[, value])`: the FILE-tab document item
+            // ids (0x5F..=0x6E) map to the saved file bits.
+            methods.add_method_mut(
+                "set_file_collected",
+                |_lua, game, (item, value): (u8, Option<bool>)| {
+                    let Some(index) = crate::game::file_index(item) else {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "item 0x{item:02X} is not a file document (0x5F..=0x6E)"
+                        )));
+                    };
+                    game.set_file_collected(index, value.unwrap_or(true));
+                    Ok(())
+                },
+            );
+
+            methods.add_method_mut(
+                "set_item_use_flag",
+                |_lua, game, (item, value): (u8, Option<bool>)| {
+                    game.set_item_use_flag(item, value.unwrap_or(true));
+                    Ok(())
+                },
+            );
+
+            // `set_flag_bank(bank, bytes)`: the raw bytes of one bank, from a
+            // Lua string or a sequence table of byte values, for state the
+            // named methods do not reach.
+            methods.add_method_mut("set_flag_bank", |_lua, game, (bank, value): (u8, Value)| {
+                let Some(flags) = game.flags.get_mut(usize::from(bank)) else {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "flag bank {bank} is out of range (0..{})",
+                        crate::game::FLAG_BANK_COUNT
+                    )));
+                };
+                let raw: Vec<u8> = match value {
+                    Value::String(text) => text.as_bytes().to_vec(),
+                    Value::Table(table) => table
+                        .sequence_values::<u8>()
+                        .collect::<mlua::Result<Vec<u8>>>()?,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "set_flag_bank expects a string or table of bytes, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let count = raw.len().min(crate::game::FLAG_BANK_BYTES);
+                flags.bytes_mut()[..count].copy_from_slice(&raw[..count]);
+                Ok(())
+            });
+
+            methods.add_method_mut(
+                "set_state_byte",
+                |_lua, game, (index, value): (usize, u8)| {
+                    let Some(byte) = game.state_bytes.get_mut(index) else {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "state byte {index} is out of range (0..{})",
+                            crate::game::STATE_BYTES
+                        )));
+                    };
+                    *byte = value;
+                    Ok(())
+                },
+            );
 
             methods.add_method_mut("kill_event", |_lua, game, slot: u8| {
                 game.pending_event_requests

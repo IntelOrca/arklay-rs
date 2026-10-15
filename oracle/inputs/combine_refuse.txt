@@ -1,0 +1,22 @@
+# Combine refusal: green herb onto the second green herb - two herbs with no
+# recipe, the original's 0xF6 "cannot combine" message.
+60 start
+61
+90 confirm
+91
+105 down
+106
+110 down
+111
+120 confirm
+121
+140 down
+141
+150 confirm
+151
+180 confirm
+181
+200 cancel
+201
+220 cancel
+221

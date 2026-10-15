@@ -1,0 +1,20 @@
+# Use health: open the menu on the green herb and use it (one-third heal and
+# the EKG flush), then use the first-aid spray.
+60 start
+61
+90 confirm
+91
+105 confirm
+106
+140 confirm
+141
+150 down
+151
+160 confirm
+161
+170 confirm
+171
+200 cancel
+201
+220 cancel
+221

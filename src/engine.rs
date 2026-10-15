@@ -235,6 +235,28 @@ impl Drop for SurfaceHandle {
     }
 }
 
+/// The oracle/authoring seams the CLI adds on top of a session boot.
+///
+/// These are test-only: they let a scenario author a game state once (a Lua
+/// chunk through [`Authoring::setup_script`]) and serialise it to a
+/// `savedatN.dat` block ([`Authoring::save_out`]) so both engines can boot the
+/// exact same state from the same file ([`Authoring::load`]). None of them
+/// widen the mod-facing sandbox: `--setup-script` reads a CLI-fixed path and
+/// `--save-out` writes a CLI-fixed path, both from Rust.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Authoring<'a> {
+    /// `--load`: continue from the save block at this path instead of building
+    /// a new game.
+    pub load: Option<&'a Path>,
+    /// `--setup-script`: a Lua chunk run once on the freshly booted session,
+    /// before the first tick. It receives the game state as its first argument
+    /// (`local api = ...`) and may use any authoring method of the `api`.
+    pub setup_script: Option<&'a Path>,
+    /// `--save-out`: write the session's current save block to this path and
+    /// exit before ticking. The oracle's deterministic save generator.
+    pub save_out: Option<&'a Path>,
+}
+
 /// Load `id` from `pack`, simulate it and optionally capture one frame.
 ///
 /// Gameplay runs until the game quits. A door transition is played in full:
@@ -258,6 +280,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         false,
         None,
         trace::TraceOptions::default(),
+        Authoring::default(),
     )
 }
 
@@ -284,11 +307,12 @@ pub fn run_with_options(
     _debug_menu: bool,
     language: Option<&str>,
     trace: trace::TraceOptions<'_>,
+    authoring: Authoring<'_>,
 ) -> Result<()> {
     let save_dir = save::default_save_dir_for_pack(pack);
     let pack = open_game_pack(pack, mods, no_mods, language)?;
 
-    if capture.is_some() || stats || trace.path.is_some() {
+    if capture.is_some() || stats || trace.path.is_some() || authoring.save_out.is_some() {
         let mut timings = stats::Stats::new();
         let load_start = Instant::now();
         let mut loaded = load_room(&pack, id)?;
@@ -303,6 +327,12 @@ pub fn run_with_options(
         run_room_init(&mut loaded, &mut game);
         let lua = load_lua(&pack);
         call_lua_room_load(lua.as_ref(), &mut game, id);
+        run_setup_chunk(lua.as_ref(), &mut game, authoring.setup_script)?;
+        game.sync_player(&mut player_state);
+        if let Some(path) = authoring.save_out {
+            write_save_file(&pack, &game, path)?;
+            return Ok(());
+        }
         drain_mask_toggles(&mut loaded.room, &mut game);
         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
         bgm::update_room_bgm(&mut game, id, None);
@@ -494,6 +524,7 @@ pub fn run_with_options(
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
+    session.run_setup_script(authoring.setup_script)?;
     let title = window_title(
         &session.loaded.id.room3(),
         session.loaded.room.current_cut,
@@ -574,6 +605,50 @@ fn call_lua_room_load(lua: Option<&lua::LuaVm>, game: &mut game::GameState, id: 
     if let Some(lua) = lua {
         lua.call_room_load(game, id);
     }
+}
+
+/// Run the CLI `--setup-script` chunk once against the room state.
+///
+/// The chunk runs whatever the pack's own Lua entries are: a pack with hooks
+/// reuses its VM, a pack without one gets a throwaway sandboxed state, so
+/// `--setup-script` works with every pack. Errors are fatal: this is an
+/// authoring seam, so a broken setup must not silently produce a save.
+fn run_setup_chunk(
+    lua: Option<&lua::LuaVm>,
+    game: &mut game::GameState,
+    script: Option<&Path>,
+) -> Result<()> {
+    let Some(path) = script else {
+        return Ok(());
+    };
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let name = path.display().to_string();
+    match lua {
+        Some(lua) => lua.run_setup(game, &bytes, &name)?,
+        None => lua::LuaVm::empty()?.run_setup(game, &bytes, &name)?,
+    }
+    Ok(())
+}
+
+/// Write `game` as a save block to `path`, with the pack's bio-card prefix.
+///
+/// The `--save-out` half of [`run_setup_chunk`]: the same
+/// [`save::SaveFile::from_state`] capture the typewriter screen writes, so the
+/// file loads through `--load` here and `--test-load` in the reference.
+fn write_save_file(pack: &Pack, game: &game::GameState, path: &Path) -> Result<()> {
+    let file = match pack.read(save::SAVE_PREFIX_ENTRY) {
+        Ok(prefix) => save::SaveFile::from_state_with_prefix(game, &prefix)?,
+        Err(_) => save::SaveFile::from_state(game),
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    crate::atomic::write(path, &file.to_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))
 }
 
 /// Run the per-tick Lua hooks: `on_tick` after the room tick and `on_message`
@@ -1274,7 +1349,8 @@ impl GameSession {
     /// position and angle place the player and the saved room loads.
     fn from_save(pack: &Pack, file: &save::SaveFile, save_dir: &Path) -> Result<Self> {
         let id = RoomId {
-            stage: file.stage,
+            // The block's stage byte is the original's 0-based `g_stageId`.
+            stage: file.stage + 1,
             room: file.room,
             player_flag: file.character & 1,
         };
@@ -1294,6 +1370,11 @@ impl GameSession {
             i32::from(file.pos_z),
         ];
         player_state.angle = file.angle as u16 & 0x0FFF;
+        // The room collision resolve anchors its rollback at the mirror, so a
+        // continue must move it with the restored position; otherwise the
+        // first tick resolves the segment back to the spawn's walk-zone centre
+        // and teleports the player there.
+        player_state.collision_mirror = [i32::from(file.pos_x), i32::from(file.pos_z)];
         game.sync_entity_from_player(&player_state);
         Self::from_loaded(pack, loaded, game, player_state, save_dir)
     }
@@ -1572,10 +1653,16 @@ impl GameSession {
         // The room-entry fade after a menu close suspends the reference's
         // game_loop for its whole run, freezing the player machine (its idle
         // countdown included) and the entities. The first frame after the menu
-        // task exits still runs one gameplay tick before the freeze takes hold.
+        // task exits still runs one gameplay tick before the freeze takes hold;
+        // on that frame the reference's restored word has the player bit but
+        // not the entity/monster/effect bits, so the player machine resumes one
+        // frame before the NPCs.
         if self.menu_close_freeze > 0 {
             if self.menu_close_freeze_first {
                 self.menu_close_freeze_first = false;
+                self.game.message_flags &= !(game::MESSAGE_FLAG_ENTITIES
+                    | game::MESSAGE_FLAG_MONSTERS
+                    | game::MESSAGE_FLAG_EFFECTS);
             } else {
                 self.menu_close_freeze -= 1;
                 self.game.message_flags &= !(game::MESSAGE_FLAG_PLAYER_STATE
@@ -2728,6 +2815,30 @@ impl GameSession {
                 save::SaveFile::from_state(&self.game)
             }
         }
+    }
+
+    /// Run the `--setup-script` authoring chunk over the freshly booted
+    /// session, then mirror the authored player state into the live player.
+    ///
+    /// The chunk runs after the room boot (init script, room edits and the
+    /// pack's `on_room_load`) and before the first tick, so tick 0 sees the
+    /// authored state. This is the CLI's oracle seam, not a mod-facing hook:
+    /// the path comes from `--setup-script`, never from the sandbox.
+    fn run_setup_script(&mut self, script: Option<&Path>) -> Result<()> {
+        run_setup_chunk(self.lua.as_ref(), &mut self.game, script)?;
+        if script.is_some() {
+            self.game.sync_player(&mut self.player);
+        }
+        Ok(())
+    }
+
+    /// Write the session's current state to `path` as a save block.
+    ///
+    /// The `--save-out` authoring seam: the same capture the typewriter save
+    /// screen writes, so the file loads through `--load` and the reference's
+    /// `--test-load`.
+    fn write_save(&self, pack: &Pack, path: &Path) -> Result<()> {
+        write_save_file(pack, &self.game, path)
     }
 
     /// The session's UI context for a screen that runs over the frozen room.
@@ -4068,7 +4179,7 @@ fn seed_new_game(pack: &Pack, game: &mut game::GameState, character: u8) {
 }
 
 /// Which screen `--ui` boots or the app opens first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppBoot {
     /// The interactive root boot: the Virgin logo (28, absent from this
     /// install), the Capcom logo (23), then the title with its once-per-process
@@ -4086,6 +4197,10 @@ pub enum AppBoot {
     /// straight into `room` instead of the card's start room (the new-game
     /// semantics, the room's first walk zone centre as the spawn).
     NewGame { character: u8, room: Option<RoomId> },
+    /// A continue from the save block at `path` (`--load`): the file's own
+    /// stage, room, character and state boot the session, exactly like the
+    /// title screen's load picker minus the menu.
+    Continue { path: PathBuf },
     /// An attract-demo reel boot: the pack's `demo/` entry `N` replayed with
     /// its recorded input, the reference's `--test-demo` anchor.
     Demo(u8),
@@ -4442,6 +4557,12 @@ impl App {
                 // room-set event pass instead (see `arm_new_game_boot`).
                 session.place_room_boot_spawn();
                 self.start_session(session);
+                Ok(())
+            }
+            AppBoot::Continue { path } => {
+                let file = save::load_file(&path)?;
+                let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
+                self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
                 Ok(())
             }
             AppBoot::Demo(index) => {
@@ -4997,6 +5118,7 @@ pub fn run_ui_with_options(
         false,
         None,
         trace::TraceOptions::default(),
+        Authoring::default(),
     )
 }
 
@@ -5004,7 +5126,9 @@ pub fn run_ui_with_options(
 /// exactly like [`open_game_pack`]. `_debug_menu` is retained for CLI
 /// compatibility: the port-only F1 room-select overlay is always enabled.
 /// `trace` enables the `--ui game` oracle run: `ticks` fixed updates with a
-/// trace line per tick and the `capture_every` BMP cadence.
+/// trace line per tick and the `capture_every` BMP cadence. `authoring` adds
+/// the CLI's oracle seams: a `--load` continue boot, the `--setup-script`
+/// chunk and the `--save-out` dump.
 #[allow(clippy::too_many_arguments)] // the CLI boot options are all needed
 pub fn run_ui_with_mods(
     pack: &Path,
@@ -5019,16 +5143,25 @@ pub fn run_ui_with_mods(
     _debug_menu: bool,
     language: Option<&str>,
     trace: trace::TraceOptions<'_>,
+    authoring: Authoring<'_>,
 ) -> Result<()> {
+    if authoring.load.is_some() && screen != "game" {
+        bail!("--load is only supported with `--ui game`");
+    }
     let boot = match screen {
         "font" => return run_font_ui(pack, capture, mods, no_mods),
         "title" => AppBoot::Title,
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
         "save" => AppBoot::Save,
-        "game" => AppBoot::NewGame {
-            character: room.map_or(character & 1, |id| id.player_flag & 1),
-            room,
+        "game" => match authoring.load {
+            Some(path) => AppBoot::Continue {
+                path: path.to_path_buf(),
+            },
+            None => AppBoot::NewGame {
+                character: room.map_or(character & 1, |id| id.player_flag & 1),
+                room,
+            },
         },
         "demo" => AppBoot::Demo(demo),
         "menu" => AppBoot::Menu,
@@ -5054,6 +5187,7 @@ pub fn run_ui_with_mods(
         _debug_menu,
         language,
         trace,
+        authoring,
     )
 }
 
@@ -5079,6 +5213,7 @@ pub fn run_root(
         _debug_menu,
         language,
         trace::TraceOptions::default(),
+        Authoring::default(),
     )
 }
 
@@ -5094,8 +5229,9 @@ fn run_ui_impl(
     _debug_menu: bool,
     language: Option<&str>,
     trace: trace::TraceOptions<'_>,
+    authoring: Authoring<'_>,
 ) -> Result<()> {
-    if capture.is_some() || trace.path.is_some() {
+    if capture.is_some() || trace.path.is_some() || authoring.save_out.is_some() {
         let pack = open_game_pack(pack, mods, no_mods, language)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
@@ -5131,35 +5267,68 @@ fn run_ui_impl(
                     None => GameSession::new(&app.pack, character, &app.save_dir)?,
                 };
                 app.start_session(session);
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                run_game_trace(&mut app, &trace)?;
+            }
+            AppBoot::Continue { path } => {
+                let file = save::load_file(&path)?;
+                let session = GameSession::from_save(&app.pack, &file, &app.save_dir)?;
+                app.start_session(session);
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Demo(index) => {
                 let session = GameSession::from_demo_index(&app.pack, index, &app.save_dir)?;
                 app.start_session(session);
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Menu => {
                 app.open_menu()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::ItemBox => {
                 app.open_item_box_capture()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(ITEM_BOX_CAPTURE_TICKS)?;
             }
             AppBoot::File => {
                 app.open_file_capture()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(FILE_CAPTURE_TICKS)?;
             }
             AppBoot::Map => {
                 app.open_map_capture()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::View => {
                 app.open_view()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::Death(character) => {
                 app.open_death_capture(character)?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
                 app.settle(DEATH_CAPTURE_TICKS)?;
             }
         }
@@ -5176,8 +5345,33 @@ fn run_ui_impl(
     let pack = open_game_pack(pack, mods, no_mods, language)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
     app.boot(boot)?;
+    if let Mode::Play(session) = &mut app.mode {
+        session.run_setup_script(authoring.setup_script)?;
+    } else if authoring.setup_script.is_some() {
+        bail!("--setup-script requires a boot that opens a game session");
+    }
     let display = Display::new("Arklay", false)?;
     run_app_loop(&mut app, &display)
+}
+
+/// Apply the CLI authoring seams to the session an app boot just opened:
+/// `--setup-script` runs once over it and `--save-out` serialises it and asks
+/// the caller to exit before the first tick.
+///
+/// Returns `true` when the run should stop now (the save was written).
+fn apply_authoring(app: &mut App, authoring: Authoring<'_>) -> Result<bool> {
+    if authoring.setup_script.is_none() && authoring.save_out.is_none() {
+        return Ok(false);
+    }
+    let Mode::Play(session) = &mut app.mode else {
+        bail!("--setup-script/--save-out require a boot that opens a game session");
+    };
+    session.run_setup_script(authoring.setup_script)?;
+    let Some(path) = authoring.save_out else {
+        return Ok(false);
+    };
+    session.write_save(&app.pack, path)?;
+    Ok(true)
 }
 
 /// The `--ui game` oracle run (`oracle/trace-v1.md`): `options.ticks` fixed
@@ -12985,6 +13179,80 @@ mod tests {
         );
     }
 
+    /// The `--setup-script`/`--save-out` authoring seam and the `--load`
+    /// continue seam: a chunk authored with the Lua API serialises to a block
+    /// that boots back through the CLI flag with the authored state.
+    #[test]
+    fn the_setup_script_authors_a_save_the_load_boot_reads() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let saves = dir.0.join("saves");
+        let script = dir.0.join("setup.lua");
+        let saved = dir.0.join("authored.dat");
+        std::fs::write(
+            &script,
+            "local api = ...\napi:set_health(77)\napi:set_item_slot(0, 0x44, 1)\n",
+        )
+        .unwrap();
+
+        run_ui_with_mods(
+            &pack_path,
+            "game",
+            None,
+            &saves,
+            0,
+            None,
+            0,
+            &[],
+            false,
+            false,
+            None,
+            trace::TraceOptions::default(),
+            Authoring {
+                setup_script: Some(&script),
+                save_out: Some(&saved),
+                ..Authoring::default()
+            },
+        )
+        .unwrap();
+
+        let file = save::load_file(&saved).unwrap();
+        assert_eq!(file.health, 77);
+        assert_eq!(file.player_slots[0].id, 0x44);
+
+        // Boot the written block back through the load seam and trace it.
+        let trace_path = dir.0.join("load.trace");
+        run_ui_with_mods(
+            &pack_path,
+            "game",
+            None,
+            &saves,
+            0,
+            None,
+            0,
+            &[],
+            false,
+            false,
+            None,
+            trace::TraceOptions {
+                path: Some(&trace_path),
+                capture_every: 0,
+                capture_dir: None,
+                ticks: 3,
+                input: None,
+            },
+            Authoring {
+                load: Some(&saved),
+                ..Authoring::default()
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&trace_path).unwrap();
+        assert_eq!(text.lines().count(), 4, "header plus three ticks");
+        assert!(text.contains("t=0 "), "{text}");
+    }
+
     #[test]
     fn app_title_load_opens_the_picker_and_loads_a_save() {
         let dir = TempDir::new();
@@ -12992,7 +13260,8 @@ mod tests {
         let saves = dir.0.join("saves");
         std::fs::create_dir_all(&saves).unwrap();
         let mut file = save::SaveFile {
-            stage: 1,
+            // The block is 0-based like the original's g_stageId.
+            stage: 0,
             room: NEW_GAME_ROOM,
             character: 0,
             health: 77,

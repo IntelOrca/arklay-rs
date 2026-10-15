@@ -1,0 +1,8 @@
+# Typewriter: press action inside the dining room's typewriter zone, accept
+# the save prompt, then cancel out of the save screen without writing.
+60 confirm
+61
+120 confirm
+121
+150 cancel
+151

@@ -1,0 +1,18 @@
+# Item box: open the box, page the box list (L1/R1), swap items both ways and
+# close.
+60 confirm
+61
+120 confirm
+121
+140 page_right
+141
+160 page_left
+161
+180 down
+181
+190 confirm
+191
+210 confirm
+211
+240 cancel
+241
