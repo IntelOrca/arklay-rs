@@ -13,7 +13,7 @@
 //! root-motion extractor) land with their own groups; this module is where
 //! they will live.
 
-use crate::anim::{AnimPlayer, Mat4x3, blend_keyframes};
+use crate::anim::{AnimPlayer, Mat4x3, fix_wrap};
 use crate::enemy::EntityAnim;
 use crate::game::Entity;
 use crate::model::{Clip, Keyframe, Skeleton};
@@ -51,6 +51,58 @@ pub fn plant42_advance(
     entity.timing_control = player.timing.min(u16::from(u8::MAX)) as u8;
     entity.blend_counter = player.blend_counter.min(u16::from(u8::MAX)) as u8;
     completed
+}
+
+/// Plant 42's own sub-frame rotation blend (`plant42_lerp3`): the joint angles
+/// are prescaled by 16 before the fixed-point multiply and the summed result is
+/// shifted back down by 4 at the end. That two-stage truncation rounds
+/// differently from the shared [`blend_keyframes`], which the original's own
+/// `plant42_joint_move` never uses for the rotations. The root translation is
+/// blended separately with the shared single-stage truncation.
+fn plant42_blend_keyframes(
+    current: &Keyframe,
+    target: &Keyframe,
+    blend: u16,
+    step: u16,
+) -> Keyframe {
+    let step = i32::from(step);
+    let blend = i32::from(blend);
+    let inverse = (0x1000 / step.max(1)) - blend;
+    let count = current.rotations.len().max(target.rotations.len());
+    let rotations: Vec<[i16; 3]> = (0..count)
+        .map(|joint| {
+            std::array::from_fn(|axis| {
+                let cur = match current.rotations.get(joint) {
+                    Some(r) if *r == crate::anim::IDENTITY_ROTATION => 0,
+                    Some(r) => i32::from(r[axis]),
+                    None => 0,
+                };
+                let tgt = target
+                    .rotations
+                    .get(joint)
+                    .map_or(0, |rotation| i32::from(rotation[axis]));
+                let cur = if inverse == 1 {
+                    fix_wrap(cur, tgt)
+                } else {
+                    cur
+                };
+                let ta = (cur << 4) * blend * step;
+                let tb = (tgt << 4) * inverse * step;
+                ((((ta + ((ta >> 31) & 0xFFF)) >> 12) + ((tb + ((tb >> 31) & 0xFFF)) >> 12)) >> 4)
+                    as i16
+            })
+        })
+        .collect();
+    let root_y = {
+        let ty = i32::from(target.offset[1]) * inverse * step;
+        let cy = i32::from(current.offset[1]) * blend * step;
+        ((ty + ((ty >> 31) & 0xFFF)) >> 12) + ((cy + ((cy >> 31) & 0xFFF)) >> 12)
+    };
+    Keyframe {
+        offset: [target.offset[0], root_y as i16, target.offset[2]],
+        vertex: target.vertex,
+        rotations,
+    }
 }
 
 /// One tick of [`plant42_advance`] against a bare clock (the entity words are
@@ -108,7 +160,7 @@ fn plant42_step(
         let pose = if blend == 0 {
             target.clone()
         } else if let Some(source) = player.applied_pose() {
-            blend_keyframes(&source, target, blend, blend_step)
+            plant42_blend_keyframes(&source, target, blend, blend_step)
         } else {
             target.clone()
         };
@@ -944,6 +996,31 @@ fn fp_lerp(current: [i16; 3], target: [i16; 3], w_cur: i32, w_tgt: i32) -> [i16;
 mod tests {
     use super::*;
     use crate::model::{ClipFrame, Keyframe};
+
+    #[test]
+    fn the_plant_blend_prescale_rounds_like_the_original() {
+        // `plant42_lerp3` prescales each angle by 16, truncates the two
+        // products and shifts the summed result back down by 4. The shared
+        // `blend_keyframes` truncates once. For this input they differ by one.
+        let cur = Keyframe {
+            offset: [0, 0, 0],
+            vertex: [0, 0, 0],
+            rotations: vec![[-20, 0, 0]],
+        };
+        let tgt = Keyframe {
+            offset: [0, 0, 0],
+            vertex: [0, 0, 0],
+            rotations: vec![[-20, 0, 0]],
+        };
+        assert_eq!(
+            crate::anim::blend_keyframes(&cur, &tgt, 1, 0x40).rotations[0][0],
+            -19
+        );
+        assert_eq!(
+            plant42_blend_keyframes(&cur, &tgt, 1, 0x40).rotations[0][0],
+            -20
+        );
+    }
 
     fn clip(frames: &[(u16, u16)]) -> Clip {
         Clip {
