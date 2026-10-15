@@ -510,13 +510,14 @@ impl Framebuffer {
     /// This is the screens' fade overlay: `0` leaves the frame untouched and
     /// `255` paints it the overlay colour. Alpha is preserved.
     pub fn fade_to_color(&mut self, color: crate::transition::FadeColor, alpha: u8) {
+        if color == crate::transition::FadeColor::Black {
+            self.fade_to_black_weighted(alpha);
+            return;
+        }
         if alpha == 0 {
             return;
         }
-        let target: u8 = match color {
-            crate::transition::FadeColor::White => 255,
-            crate::transition::FadeColor::Black => 0,
-        };
+        let target: u8 = 255;
         if alpha == 255 {
             for pixel in self.rgba.as_chunks_mut::<4>().0 {
                 pixel[..3].fill(target);
@@ -532,12 +533,39 @@ impl Framebuffer {
         }
     }
 
+    /// Blend the whole frame towards black by `alpha`/255 with the PSX fade's
+    /// per-tick weight.
+    ///
+    /// The original's `draw_rect` stores `(0x100 - level) / 256` as the
+    /// destination weight (Rendering.cpp:244), so a black veil is
+    /// `channel * (256 - alpha) / 256`, not `/ 255`: the one-LSB difference
+    /// would otherwise diverge every non-black pixel of a fading screen.
+    pub fn fade_to_black_weighted(&mut self, alpha: u8) {
+        if alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            for pixel in self.rgba.as_chunks_mut::<4>().0 {
+                pixel[..3].fill(0);
+            }
+            return;
+        }
+        let inv = 256u32 - u32::from(alpha);
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * inv + 128) / 256) as u8;
+            }
+        }
+    }
+
     /// Blend the whole frame towards black by `alpha`/255.
     ///
-    /// This is the screens' fade overlay: `0` leaves the frame untouched and
-    /// `255` paints it black. Alpha is preserved.
+    /// This is the screens' black fade overlay: `0` leaves the frame untouched
+    /// and `255` paints it black. Alpha is preserved. Uses the original's
+    /// `(256 - alpha) / 256` destination weight (see
+    /// [`Framebuffer::fade_to_black_weighted`]).
     pub fn fade_to_black(&mut self, alpha: u8) {
-        self.fade_to_color(crate::transition::FadeColor::Black, alpha);
+        self.fade_to_black_weighted(alpha);
     }
 
     /// Blend a screen's full-frame overlay over the frame.
@@ -5313,7 +5341,7 @@ mod tests {
         assert_eq!(&frame.rgba[..4], &[255, 255, 255, 255]);
 
         frame.fade_to_color(FadeColor::Black, 128);
-        assert_eq!(&frame.rgba[..4], &[127, 127, 127, 255]);
+        assert_eq!(&frame.rgba[..4], &[128, 128, 128, 255]);
         frame.fade_to_color(FadeColor::Black, 255);
         assert_eq!(&frame.rgba[..4], &[0, 0, 0, 255]);
 
