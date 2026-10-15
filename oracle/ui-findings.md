@@ -64,11 +64,31 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   walk-zone centre. The first room tick anchored the collision resolve at that
   mirror and teleported the player back to the spawn whenever the saved spot
   differed, so any save not already standing on the spawn diverged on tick 1.
+- **Item-action hand-off.** The original's submenu confirm only switches to
+  state 4 (`DAT_00ae9f21 = 4; DAT_00ae9f22 = 0`) - the use/view action runs on
+  the *next* frame, and the equip toggle and every successful use then run the
+  submenu's eight-frame close animation (state 3) back to the inventory.
+  arklay ran the action on the confirm frame and left the submenu open, so a
+  use healed one tick early (t=105) and a following cancel closed the wrong
+  level.
+- **Health monitor under menus/modals.** The original's `menu_draw_health_bar`
+  keeps running while a message window owns the input, while the FILE/MAP tabs
+  and the item box are up, and under the item model viewer; its shared
+  `rand()` draws must keep pace. arklay stopped the monitor in those states, so
+  the first wrap after a screen opened diverged (`rng` at t=158 for
+  FILE/MAP/combine).
+- **RADIO tab action.** Confirm on the RADIO tab checks the room's per-frame
+  item-use latch (bank 9 selector `0x3F`): with the latch up it records used
+  item 0x4D and exits through the normal close fade; without it, it opens the
+  radio's model viewer (the STATUS-screen item view), which keeps the room
+  frozen. arklay always closed the menu instantly, resuming gameplay one tick
+  early.
 
-With these, `inventory_open`, `inventory_examine`, `inventory_nav` and
-`inventory_open_close` all match tick-for-tick in **both** room mode and
-save mode (`MATCH: 200 ticks identical`); the open/close fade frames are
-byte-identical or at the residual level below.
+With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
+`inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
+`use_herb` and `equip_weapon` all match tick-for-tick in save mode
+(`MATCH: 180-220 ticks identical`), with the menu/flush frames pixel-verified
+at capture every tick; the residual frames are the room/player-mesh baseline.
 
 ## Save-mode oracle
 
@@ -89,24 +109,22 @@ match), which is what the save interchange exists for.
 
 ## Open
 
-- **FILE/MAP screens hold the room one tick differently.** From the save path
-  (and room mode), opening the FILE or MAP tab freezes the room on both
-  engines, but the reference runs exactly one gameplay tick (one `rand()` draw)
-  at t=158 that arklay skips, so `rng` diverges for the rest of the run while
-  every other field stays identical. Same shape as the fixed menu-open seed:
-  the reference's `game_loop` first statement runs on the frame the screen
-  closes its entry animation, arklay's screen owns the tick instead. Scenario
-  inputs `file_open`/`file_pages`/`map_open`.
-- **RADIO use menu-close pacing.** Confirm on the RADIO tab records used item
-  0x4D and closes the menu. The reference resumes gameplay one tick later than
-  arklay's `close_menu()` path (divergence at t=100, `e0.as` then `rng`), the
-  same class as the paused menu cancel path that `begin_menu_close` models.
-  Scenario input `radio_use`.
-- **USE/MOVE action timing.** The green herb's heal lands at t=105 on arklay
-  and ~t=110+ on the reference (the submenu close/flush frames), and the
-  combine MOVE action leaves the same one-tick `rand()` seed gap as FILE/MAP
-  at t=158. Scenarios `use_herb`, `combine_ok`, `combine_refuse`,
-  `equip_weapon`.
+- **FILE reader hand-off.** The original's book-selector to reading-mode
+  hand-off is a white fade (`pickup_fade_update`, +/-0x20 per frame over the
+  full-screen rect, with a busy lock on the selector), and the reader's own
+  black backdrop replaces it when it completes. arklay slides the reader in
+  instead, so `file_pages` matches the state trace but the pixels differ ~60%
+  on the transition frames. The selector's post-reader busy lock is also
+  missing, which is why a cancel pressed during the slide-in is taken by
+  arklay and ignored by the reference (`file_open` diverges at t=221 when the
+  script cancels twice).
+- **MAP tab auto-zoom.** The original zooms the floor plan from the inventory
+  panel to the full-display map as soon as the tab opens (with the "Mansion
+  1F" caption); arklay keeps the panel browser until a confirm and then swaps.
+  The state trace matches but the pixels differ ~30% until arklay is told to
+  zoom. The frame-by-frame zoom/light animation is the documented M16
+  simplification (`docs/m16-deviations.md` item 4); the scenario should at
+  least enter the zoomed view to compare the settled plan.
 - **Item box / typewriter world action not reached.** The authored saves place
   the player inside the dining room's `aot_set` rects (item box slot 2,
   typewriter slot 7) and press action, but the overlay does not open on either

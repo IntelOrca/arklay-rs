@@ -2918,6 +2918,17 @@ impl GameSession {
             &self.text,
         );
         if message_was_up || self.game.message.active {
+            // The message owns the input, but the original's menu task still
+            // runs `menu_draw_health_bar` under it (the status-screen message
+            // wait and the submenu's message states), so the health monitor
+            // and its shared `rand()` draws keep advancing.
+            let deferred = match &mut self.menu {
+                Some(menu) => menu.tick(&mut self.game),
+                None => None,
+            };
+            if let Some(event) = deferred {
+                self.apply_menu_event(pack, event);
+            }
             return;
         }
 
@@ -2967,6 +2978,12 @@ impl GameSession {
 
         // The map tab returns to the inventory on cancel.
         if self.map.is_some() {
+            // The original's menu task keeps running `menu_update_status_screen`
+            // (the health monitor and its shared `rand()` draws) while the map
+            // browser is up, exactly like the item box below.
+            if let Some(menu) = self.menu.as_mut() {
+                menu.tick(&mut self.game);
+            }
             if let Some(map) = self.map.as_mut() {
                 map.tick();
             }
@@ -2989,6 +3006,12 @@ impl GameSession {
 
         // The FILE tab returns to the inventory on close.
         if self.file.is_some() {
+            // The original's menu task keeps running `menu_update_status_screen`
+            // (the health monitor and its shared `rand()` draws) while the
+            // document selector/reader is up.
+            if let Some(menu) = self.menu.as_mut() {
+                menu.tick(&mut self.game);
+            }
             if let Some(file) = self.file.as_mut() {
                 file.tick();
             }
@@ -3010,13 +3033,21 @@ impl GameSession {
         }
 
         let has_radio = self.game.has_radio();
+        // A use/view confirmed on the previous frame runs now, before this
+        // frame's health-bar draw, exactly like the original's submenu state 4.
+        let deferred = match &mut self.menu {
+            Some(menu) => menu.tick(&mut self.game),
+            None => return,
+        };
+        if let Some(event) = deferred {
+            self.apply_menu_event(pack, event);
+        }
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
-        menu.tick(&mut self.game);
-        // The action submenu ignores all input while its 8-frame open
-        // animation runs (main_menu's state 1, before it becomes state 2).
-        if menu.mode == MenuMode::Actions && !menu.submenu_ready() {
+        // The action submenu ignores all input while its 8-frame open or
+        // close animation runs (main_menu's states 1 and 3).
+        if menu.mode == MenuMode::Actions && (!menu.submenu_ready() || menu.submenu_closing) {
             return;
         }
         // START (Tab) cycles the top tabs while the menu is open; the file
@@ -3045,6 +3076,11 @@ impl GameSession {
         if let Some(cue) = cue {
             self.play_ui_cue_names(pack, vec![cue]);
         }
+        self.apply_menu_event(pack, event);
+    }
+
+    /// Apply one completed menu event.
+    fn apply_menu_event(&mut self, pack: &Pack, event: MenuEvent) {
         match event {
             MenuEvent::None => {}
             MenuEvent::Close => self.begin_menu_close(pack),
@@ -3062,17 +3098,25 @@ impl GameSession {
     /// original's `menu_tab_map` runs its state machine without any scenario
     /// check (`DAT_00ae9f1f` gates only the radio tab). The file tab (cursor 2)
     /// opens the document selector/reader. The radio tab (cursor 4) uses the
-    /// carried radio when its scenario flag is up: the used-item byte 0x4D
-    /// reaches the room scripts and the menu closes, as the original's radio
-    /// tab does; without the radio the tab is inert.
+    /// carried radio when the room's per-frame item-use latch (bank 9 selector
+    /// `0x3F`, the original's `g_itemUseFlags` radio-transmission bit) is up:
+    /// the used-item byte 0x4D reaches the room scripts and the menu closes
+    /// through the normal exit fade. Without the latch it opens the radio's
+    /// model viewer (the original's `FUN_0044e1b0` item view) like a CHECK.
     fn handle_tab(&mut self, pack: &Pack, cursor: u8) {
         match cursor {
             0 => self.open_map(pack),
             2 => self.open_file(pack),
             4 => {
-                if self.game.has_radio() {
+                if !self.game.has_radio() {
+                    return;
+                }
+                let transmitting = self.game.flags[usize::from(game::BANK_ITEM_USE)].bit(0x3F);
+                if transmitting {
                     self.game.record_used_item(ITEM_COMM_RADIO);
-                    self.close_menu();
+                    self.begin_menu_close(pack);
+                } else {
+                    self.open_item_view(pack, ITEM_COMM_RADIO);
                 }
             }
             _ => self.close_menu(),
@@ -4903,6 +4947,14 @@ impl App {
                 return Ok(AppFlow::Continue);
             };
             if let Some(modal) = session.modal.as_mut() {
+                // The original's menu task keeps running
+                // `menu_update_status_screen` under the model viewer (the
+                // status-screen cases 4 and 6 both call `menu_draw_health_bar`
+                // with the viewer up), so its health-monitor `rand()` draws
+                // stay in step.
+                if let Some(menu) = session.menu.as_mut() {
+                    menu.tick(&mut session.game);
+                }
                 let cx = UiContext {
                     pack,
                     save_dir,
@@ -15311,6 +15363,24 @@ off_0010:
         panic!("the action submenu did not finish opening");
     }
 
+    /// Run a confirmed action's deferred frame and the submenu's close
+    /// animation until the box is gone (or the whole menu starts closing).
+    fn settle_submenu_close(session: &mut GameSession, pack: &Pack) {
+        for _ in 0..64 {
+            let closing = session
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.submenu_closing);
+            if !closing {
+                return;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("the action submenu did not finish closing");
+    }
+
     #[test]
     fn a_movie_on_request_starts_the_film_and_resumes_the_sounds() {
         let _sdl = crate::audio::test_lock::sdl();
@@ -15767,6 +15837,10 @@ off_0010:
                 .tick(&pack, ui, player::Input::default(), false)
                 .unwrap();
         }
+        // The viewer action runs on the frame after the confirm.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
         assert!(session.modal.is_some(), "CHECK installs the item viewer");
         assert!(session.menu.is_some(), "the menu stays underneath");
         let frozen = session.game.frame;
@@ -16684,6 +16758,12 @@ off_0010:
                 false,
             )
             .unwrap();
+        // The use runs on the frame after the confirm, then the submenu's
+        // close animation and the menu's exit fade.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        settle_submenu_close(&mut session, &pack);
         assert_eq!(
             session.game.last_picked_item, None,
             "the key is used, not picked"
@@ -16918,6 +16998,10 @@ off_0010:
                 player::Input::default(),
                 false,
             )
+            .unwrap();
+        // The refusal action runs on the frame after the confirm.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert!(session.game.message.active, "the refusal message opened");
         assert_eq!(session.game.message.id, Some(0xFE));

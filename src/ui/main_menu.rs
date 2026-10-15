@@ -201,6 +201,28 @@ pub struct MainMenu {
     /// its full 48x24 over eight frames. Once it reaches `SUBMENU_OPEN_FRAMES`
     /// the box is fully open and accepts input.
     pub submenu_frames: u8,
+    /// An action confirmed on the previous frame, run at the top of the next
+    /// `tick`. The original's submenu confirm with the use/view actions
+    /// switches to state 4 with `DAT_00ae9f22 = 0` and the action function
+    /// runs on the following frame (equip toggles immediately).
+    pending_action: Option<PendingAction>,
+    /// The submenu's close animation is running (the open sequence in
+    /// reverse, `DAT_00ae9f27` `0x88..=0x80`): input is gated until it
+    /// finishes and the cursor returns to the inventory. The original always
+    /// runs it after a successful use; an equip toggle keeps the submenu up.
+    pub submenu_closing: bool,
+    /// Whether the whole menu exits when the close animation finishes (the
+    /// original's `DAT_00ae9f13 & 0x80` key/special/book close bit).
+    close_after_submenu: bool,
+}
+
+/// A submenu action deferred to the next frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    /// Use the selected item (action 0, non-equippable).
+    Use,
+    /// Open the item viewer for the selected item (action 1).
+    View(u8),
 }
 
 impl MainMenu {
@@ -216,6 +238,9 @@ impl MainMenu {
             slots,
             health_bar: HealthBar::new(),
             submenu_frames: layout::SUBMENU_OPEN_FRAMES,
+            pending_action: None,
+            submenu_closing: false,
+            close_after_submenu: false,
         }
     }
 
@@ -229,6 +254,9 @@ impl MainMenu {
         self.move_cursor = self.cursor;
         self.health_bar = HealthBar::new();
         self.submenu_frames = layout::SUBMENU_OPEN_FRAMES;
+        self.pending_action = None;
+        self.submenu_closing = false;
+        self.close_after_submenu = false;
         self.refresh_selection(game);
     }
 
@@ -238,18 +266,42 @@ impl MainMenu {
         self.submenu_frames >= layout::SUBMENU_OPEN_FRAMES
     }
 
-    /// Advance the health monitor one frame and re-read the cursor selection.
-    pub fn tick(&mut self, game: &mut GameState) {
+    /// Advance one frame: run a deferred action first (the original's input
+    /// runs before `menu_draw_health_bar`), then the health monitor, then the
+    /// cursor mirror. Returns the event a deferred action produced.
+    pub fn tick(&mut self, game: &mut GameState) -> Option<MenuEvent> {
+        let mut event = match self.pending_action.take() {
+            Some(PendingAction::Use) => Some(self.use_selected(game)),
+            Some(PendingAction::View(item)) => {
+                self.mode = MenuMode::Navigation;
+                Some(MenuEvent::ViewItem(item))
+            }
+            None => None,
+        };
+        if self.submenu_closing {
+            // The close walks the open sequence backwards; the cursor only
+            // returns to the inventory when the box is gone.
+            self.submenu_frames = self.submenu_frames.saturating_sub(1);
+            if self.submenu_frames == 0 {
+                self.submenu_closing = false;
+                self.mode = MenuMode::Navigation;
+                self.refresh_selection(game);
+                if self.close_after_submenu {
+                    self.close_after_submenu = false;
+                    event = Some(MenuEvent::Close);
+                }
+            }
+        } else if self.mode == MenuMode::Navigation {
+            self.refresh_selection(game);
+        } else if self.submenu_frames < layout::SUBMENU_OPEN_FRAMES {
+            self.submenu_frames += 1;
+        }
         let health = game.entities[0].health;
         let max_health = game.max_health;
         let status = game.health_status;
         self.health_bar
             .update(health, max_health, status, &mut game.rand_state);
-        if self.mode == MenuMode::Navigation {
-            self.refresh_selection(game);
-        } else if self.submenu_frames < layout::SUBMENU_OPEN_FRAMES {
-            self.submenu_frames += 1;
-        }
+        event
     }
 
     /// Move the cursor to `cursor` and re-read the item under it.
@@ -285,6 +337,9 @@ impl MainMenu {
 
     /// Handle one input, mutating `game` where the action takes effect.
     pub fn handle_input(&mut self, game: &mut GameState, input: MenuInput) -> MenuEvent {
+        if self.submenu_closing {
+            return MenuEvent::None;
+        }
         match self.mode {
             MenuMode::Navigation => self.navigation_input(game, input),
             MenuMode::Actions => self.action_input(game, input),
@@ -360,10 +415,19 @@ impl MainMenu {
             0 if self.equippable => {
                 let equipped = game.equipped == Some(item);
                 game.set_equipped(if equipped { None } else { Some(item) });
+                // The original's equip toggle also closes the submenu through
+                // its state-3 animation (`DAT_00ae9f21 = 3`).
+                self.submenu_closing = true;
                 MenuEvent::Changed
             }
-            0 => self.use_selected(game),
-            1 => MenuEvent::ViewItem(item),
+            0 => {
+                self.pending_action = Some(PendingAction::Use);
+                MenuEvent::None
+            }
+            1 => {
+                self.pending_action = Some(PendingAction::View(item));
+                MenuEvent::None
+            }
             2 => {
                 self.mode = MenuMode::Move;
                 self.move_cursor = self.cursor;
@@ -394,13 +458,12 @@ impl MainMenu {
                 consume_slot(game, slot);
                 self.health_bar.start_flush(healed, cured);
                 self.refresh_selection(game);
-                if closes_inventory(item) {
-                    self.mode = MenuMode::Navigation;
-                    return MenuEvent::Close;
-                }
-                if self.selected_item == 0 {
-                    self.mode = MenuMode::Navigation;
-                }
+                // A successful use always runs the submenu's close animation
+                // (state 3) before the cursor returns to the inventory; a
+                // key/special/book item also arms the menu's close bit, so the
+                // whole menu exits when the animation finishes.
+                self.submenu_closing = true;
+                self.close_after_submenu = closes_inventory(item);
                 MenuEvent::Changed
             }
             UseResult::Unusable => MenuEvent::Message(MESSAGE_USE_REFUSED + category_index(item)),
@@ -519,7 +582,7 @@ impl MainMenu {
         self.draw_portrait(framebuffer, assets, game);
         self.health_bar.draw(framebuffer, &assets.status);
         self.draw_tabs(framebuffer, assets, game.has_radio());
-        if self.mode != MenuMode::Navigation {
+        if self.mode != MenuMode::Navigation || self.submenu_closing {
             self.draw_submenu(framebuffer, assets);
         }
         if show_cursor {
@@ -1007,6 +1070,20 @@ mod tests {
         framebuffer.rgba[offset..offset + 4].try_into().unwrap()
     }
 
+    /// Confirm the selected action and run its one-frame hand-off plus the
+    /// submenu's close animation, returning the last event the animation
+    /// produced (a key/book use closes the inventory when it finishes).
+    fn confirm_action(menu: &mut MainMenu, game: &mut GameState) -> Option<MenuEvent> {
+        menu.handle_input(game, MenuInput::Confirm);
+        let mut event = menu.tick(game);
+        while menu.submenu_closing {
+            if let Some(next) = menu.tick(game) {
+                event = Some(next);
+            }
+        }
+        event
+    }
+
     fn solid_texture(width: u32, height: u32, patches: &[([u32; 4], u8, [u8; 4])]) -> Texture8 {
         let mut indices = vec![0u8; (width * height) as usize];
         for &([x, y, w, h], index, _) in patches {
@@ -1140,8 +1217,8 @@ mod tests {
         menu.handle_input(&mut game, MenuInput::Down);
         assert_eq!(menu.action, 1);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::ViewItem(0x44)
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::ViewItem(0x44))
         );
 
         // An empty slot refuses to open the submenu.
@@ -1185,19 +1262,24 @@ mod tests {
         menu.open(&mut game);
 
         menu.handle_input(&mut game, MenuInput::Confirm);
-        assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Changed
-        );
+        // The action runs one frame after the confirm; assert the flush's
+        // first frame before the submenu's close animation advances it.
+        menu.handle_input(&mut game, MenuInput::Confirm);
+        assert_eq!(menu.tick(&mut game), Some(MenuEvent::Changed));
         // A green herb restores exactly one third of the maximum.
         assert_eq!(game.entities[0].health, 20 + 96 / 3);
         assert!(game.inventory.is_empty(), "the herb was consumed");
         assert_eq!(game.last_used_item, Some(0x44));
         assert_eq!(game.state_bytes[usize::from(STATE_BYTE_USED_ITEM)], 0x44);
         assert_eq!(game.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)], 0);
-        assert_eq!(menu.mode, MenuMode::Navigation);
         assert_eq!(menu.health_bar.flush, Some(crate::ui::status::Flush::Green));
-        assert_eq!(menu.health_bar.state, 2);
+        // The heal's draw is the same frame's health-bar update, so the flush
+        // has already advanced its first step.
+        assert_eq!(menu.health_bar.state, 3);
+        while menu.submenu_closing {
+            menu.tick(&mut game);
+        }
+        assert_eq!(menu.mode, MenuMode::Navigation);
     }
 
     #[test]
@@ -1207,8 +1289,8 @@ mod tests {
         let mut menu = MainMenu::new(8);
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
-        let event = menu.handle_input(&mut game, MenuInput::Confirm);
-        assert_eq!(event, MenuEvent::Message(MESSAGE_USE_REFUSED + 7));
+        let event = confirm_action(&mut menu, &mut game);
+        assert_eq!(event, Some(MenuEvent::Message(MESSAGE_USE_REFUSED + 7)));
         assert_eq!(game.inventory.len(), 1, "the herb was not consumed");
         assert_eq!(game.last_used_item, None);
     }
@@ -1223,8 +1305,8 @@ mod tests {
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Changed
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Changed)
         );
         assert_eq!(game.health_status, 0x20);
         assert_eq!(
@@ -1238,7 +1320,10 @@ mod tests {
         game.add_item(0x42, 1);
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
-        menu.handle_input(&mut game, MenuInput::Confirm);
+        assert_eq!(
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Changed)
+        );
         assert_eq!(game.health_status, 0x02);
         assert!(!game.flag_test(1, crate::game::SCENARIO2_FLAG_YAWN_POISONED, false));
     }
@@ -1251,8 +1336,8 @@ mod tests {
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Message(MESSAGE_USE_REFUSED + 5)
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Message(MESSAGE_USE_REFUSED + 5))
         );
         assert_eq!(game.inventory.len(), 1);
 
@@ -1260,8 +1345,8 @@ mod tests {
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Close,
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Close),
             "a key use closes the inventory"
         );
         assert!(game.inventory.is_empty());
@@ -1276,15 +1361,15 @@ mod tests {
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Message(MESSAGE_USE_REFUSED + 6)
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Message(MESSAGE_USE_REFUSED + 6))
         );
         game.set_item_use_flag(0x3E, true);
         menu.open(&mut game);
         menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
-            menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Close,
+            confirm_action(&mut menu, &mut game),
+            Some(MenuEvent::Close),
             "a book use closes the inventory"
         );
         assert!(game.inventory.is_empty());
@@ -1317,8 +1402,14 @@ mod tests {
         );
         assert_eq!(game.equipped, Some(0x02));
         assert_eq!(game.state_bytes[usize::from(STATE_BYTE_EQUIPPED)], 0x02);
-        // A second confirm under the menu removes it again; the ammo is not
+        // The equip runs the submenu's close animation; a second confirm once
+        // it is back on the inventory removes it again. The ammo is not
         // consumed by an equip.
+        while menu.submenu_closing {
+            menu.tick(&mut game);
+        }
+        assert_eq!(menu.mode, MenuMode::Navigation);
+        menu.handle_input(&mut game, MenuInput::Confirm);
         assert_eq!(
             menu.handle_input(&mut game, MenuInput::Confirm),
             MenuEvent::Changed
@@ -1531,7 +1622,7 @@ mod tests {
         assert!(game.compare_byte(18, 0, 0));
 
         menu.handle_input(&mut game, MenuInput::Confirm);
-        menu.handle_input(&mut game, MenuInput::Confirm);
+        confirm_action(&mut menu, &mut game);
         assert!(game.compare_byte(18, 0, 0x44), "used item byte");
         assert!(game.compare_byte(7, 0, 1), "the green herb was consumed");
         assert!(game.compare_byte(6, 0, 0x0B), "cursor follows the pack");
