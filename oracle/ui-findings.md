@@ -22,33 +22,43 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   first frame steps the head to `0x85` and wraps it to `0x35`), the health
   state/colour are recomputed only at the wrap, the poison bit is drawn before
   the variant, and the variant folds away an immediate repeat (`DAT_00ae9f48`).
-  With this, `inventory_open`/`inventory_nav`/`inventory_examine` match tick-for-tick
-  except the menu `fade` field, and the shared PRNG stays in step.
 - **Missing menu-open frame seed.** On the frame START opens the menu the
   reference still draws `g_RandSeed = rand()` (game_loop's first statement)
   before it detects the request; arklay opened the menu ahead of the room tick
   and skipped the draw. `GameState::draw_frame_rand` on the open path.
-
-## Open (found, not yet fixed)
-
-- **Menu-open fade timing.** Partly fixed: during `MenuFadePhase::Out` arklay
-  now clears the frame to black instead of keeping the frozen room darkening,
-  matching the reference's suspended-`game_loop` screen. The fade-out frames
-  (t=62-70) are now byte-identical. What remains is the fade-in ramp: the menu
-  becomes visible ~2 frames earlier in arklay, so t=74/76 still differ
-  (~30-38%). The trace's `fade` field also differs (arklay's menu fade is a
-  separate accumulator from the room-entry fade the trace reads).
-- **Menu-close timing.** `inventory_open_close` (cancel at tick 120) diverges:
-  ~44% differing pixels for the close fade (t=120-130), ~84% while the room
-  comes back (t=134-138), and the shared `rng`/`rseed` and the player's
-  `action_state`/`ticks` fall out of step afterwards. Same root cause as the
-  open fade: the reference's menu exit fades the menu out and unfreezes the
-  room on its own schedule, while arklay's `MenuFadePhase::Closing` + room fade
-  runs at a different cadence.
+- **Menu fade blend.** The black veil uses the original's
+  `(256 - alpha) / 256` destination weight with round-to-nearest
+  (`Rendering.cpp:244`), not `/255`. The one-LSB mismatch previously diverged
+  every non-black pixel of a fading screen; it fixed the room-entry fade, the
+  menu fade-in and the room fade after the close.
+- **Draw-then-add ordering.** The menu and room fades capture the pre-step
+  accumulator for the frame's draw (`menu_fade_draw` / `room_fade_draw`) while
+  the traced state stays the post-step value, so both the pixels and the trace
+  match the reference.
+- **Menu fade accumulator setup.** The opening and closing fades seed the
+  accumulator from the room-entry fade's negative leftover (`set_fading` leaves
+  it), reset it on their first step, and the closing fade clears it to the
+  original's `0:0` before a two-frame menu-task teardown.
+- **Menu exit and open pacing.** The closing fade restores the player to idle on
+  the first frame after the cancel (the original's exit state 7), and the menu
+  holds one frame after the fade before its first health-bar tick (the original's
+  state-0 -> state-1 frame).
 - **Item-action submenu open animation.** The original grows the submenu box
   from zero to full (`DAT_00ae9f27` `0x80..=0x88`, width `*6`, height `*3`)
-  over ~8 frames after confirm. arklay draws the full box immediately, so the
-  examine/use/equip submenu differs by ~3-5% of pixels for those 8 frames.
+  over eight frames after confirm. `MainMenu::submenu_frames` scales
+  `draw_submenu` and gates the action input until it is open.
+
+With these, `inventory_open` and `inventory_examine` match tick-for-tick
+(`MATCH: N ticks identical`) and their frames are at the residual level below.
+
+## Open
+
+- **Menu close, player idle counter.** `inventory_open_close` (cancel at tick
+  120) now matches through t=134; from t=135 the player's idle settle
+  `action_ticks_counter` (`e0.ticks`) diverges: the reference holds 99 for five
+  frames before counting down, arklay decrements immediately. Frames: t=120-130
+  byte-identical, t=134/136 ~22%/15% (the room fade-in's one-step alpha), then
+  the room baseline (~4.9%).
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`
