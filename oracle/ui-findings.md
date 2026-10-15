@@ -126,13 +126,16 @@ match), which is what the save interchange exists for.
   idle window than arklay's (the state trace cannot see either). The reader's
   exit path is likewise phase-shifted (~20 frames), so the scenario inputs
   stop before the exit for now.
-- **MAP tab auto-zoom.** The original zooms the floor plan from the inventory
-  panel to the full-display map as soon as the tab opens (with the "Mansion
-  1F" caption); arklay keeps the panel browser until a confirm and then swaps.
-  The state trace matches but the pixels differ ~30% until arklay is told to
-  zoom. The frame-by-frame zoom/light animation is the documented M16
-  simplification (`docs/m16-deviations.md` item 4); the scenario should at
-  least enter the zoomed view to compare the settled plan.
+- **MAP full-display rendering.** The original zooms the floor plan from the
+  inventory panel to the full-display map as soon as the tab opens (with the
+  "Mansion 1F" caption); arklay keeps the panel browser until a confirm and
+  then swaps. With both engines in the zoomed view the settled frames still
+  differ ~33%: arklay's full-display plan is missing the corridor walls and
+  door markers and is positioned differently, so the zoom is not just an
+  animation gap. This is the documented M16 map-tab simplification
+  (`docs/m16-deviations.md` item 4); the full-display compositor needs the
+  same pass the reference's `menu_update_map_animation`/`map_display_update`
+  performs. The scenario runs at the state level until then.
 - **Item box / typewriter world action not reached.** The authored saves place
   the player inside the dining room's `aot_set` rects (item box slot 2,
   typewriter slot 7) and press action, but the overlay does not open on either
