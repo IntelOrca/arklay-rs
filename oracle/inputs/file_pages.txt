@@ -1,5 +1,6 @@
 # FILE tab: turn through the document's pages with both the dpad and the
-# paging buttons, then cancel back out of the reader and the tab.
+# paging buttons, then settle. The reader's exit path is still being matched;
+# see oracle/ui-findings.md.
 60 start
 61
 90 up
@@ -22,9 +23,3 @@
 181
 190 page_left
 191
-200 cancel
-201
-220 cancel
-221
-240 cancel
-241

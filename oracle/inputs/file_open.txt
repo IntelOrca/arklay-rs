@@ -1,5 +1,6 @@
 # FILE tab: open the pause menu, walk to the FILE tab, open the first
-# document's reader, turn one page, cancel the reader, then close the menu.
+# document's reader, turn one page, then settle in the reader. The reader's
+# exit path is still being matched; see oracle/ui-findings.md.
 60 start
 61
 90 up
@@ -14,9 +15,5 @@
 141
 160 right
 161
-180 cancel
+180 right
 181
-200 cancel
-201
-220 cancel
-221

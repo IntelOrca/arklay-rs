@@ -83,6 +83,16 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   radio's model viewer (the STATUS-screen item view), which keeps the room
   frozen. arklay always closed the menu instantly, resuming gameplay one tick
   early.
+- **FILE selector/reader hand-off.** The original darkens the selector with
+  the `pickup_fade_update` rect (`+0x20` per frame, input locked), then the
+  reader takes over on its opaque black backdrop after two load frames, turns
+  pages with the same slides arklay uses (whose start falls through the input
+  frame), and returns to the selector through an exit slide, a black hold and
+  the reverse fade. arklay switched modes instantly, kept the whole screen
+  black behind the selector, and had no busy lock. The hand-off, the panel
+  behind the selector and the input lock now match (the 140-147 transition
+  frames are byte-identical); the page-turn mid-slide frames and the exit's
+  final phase are still open below.
 
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
@@ -109,15 +119,13 @@ match), which is what the save interchange exists for.
 
 ## Open
 
-- **FILE reader hand-off.** The original's book-selector to reading-mode
-  hand-off is a white fade (`pickup_fade_update`, +/-0x20 per frame over the
-  full-screen rect, with a busy lock on the selector), and the reader's own
-  black backdrop replaces it when it completes. arklay slides the reader in
-  instead, so `file_pages` matches the state trace but the pixels differ ~60%
-  on the transition frames. The selector's post-reader busy lock is also
-  missing, which is why a cancel pressed during the slide-in is taken by
-  arklay and ignored by the reference (`file_open` diverges at t=221 when the
-  script cancels twice).
+- **FILE page turns and reader exit.** The selector/reader hand-off now
+  matches, but the page-turn frames still differ ~22%: the reader's slide
+  phase drifts because the reference's page-turn inputs are only accepted
+  when its busy lock is clear, and its turns have a slightly different
+  idle window than arklay's (the state trace cannot see either). The reader's
+  exit path is likewise phase-shifted (~20 frames), so the scenario inputs
+  stop before the exit for now.
 - **MAP tab auto-zoom.** The original zooms the floor plan from the inventory
   panel to the full-display map as soon as the tab opens (with the "Mansion
   1F" caption); arklay keeps the panel browser until a confirm and then swaps.

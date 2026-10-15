@@ -16867,10 +16867,14 @@ off_0010:
                 false,
             )
             .unwrap();
-        assert_eq!(
-            session.file.as_ref().unwrap().mode,
-            crate::ui::file::FileMode::Reader
-        );
+        // The confirm fades the selector out first; the reader appears when
+        // the hand-off completes, then its entry slide settles.
+        tick_until(&mut session, &pack, 32, "the reader hand-off", |session| {
+            session
+                .file
+                .as_ref()
+                .is_some_and(|file| file.mode == crate::ui::file::FileMode::Reader)
+        });
         tick_until(
             &mut session,
             &pack,
@@ -16903,6 +16907,7 @@ off_0010:
                 session.file.as_ref().is_some_and(|file| {
                     file.mode == crate::ui::file::FileMode::List
                         && file.reader_anim == crate::ui::file::ReaderAnim::Idle
+                        && !file.input_locked()
                 })
             },
         );
