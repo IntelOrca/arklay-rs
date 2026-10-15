@@ -26,11 +26,11 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   reference still draws `g_RandSeed = rand()` (game_loop's first statement)
   before it detects the request; arklay opened the menu ahead of the room tick
   and skipped the draw. `GameState::draw_frame_rand` on the open path.
-- **Menu fade blend.** The black veil uses the original's
-  `(256 - alpha) / 256` destination weight with round-to-nearest
-  (`Rendering.cpp:244`), not `/255`. The one-LSB mismatch previously diverged
-  every non-black pixel of a fading screen; it fixed the room-entry fade, the
-  menu fade-in and the room fade after the close.
+- **Menu fade blend.** The black veil is `round(channel * (255 - alpha) / 255)`
+  (verified exact against the oracle's fade frames), not `(256 - alpha) / 256`
+  and not the truncated `/255`. The one-LSB mismatch diverged ~19% (round) or
+  ~60% (truncate) of a fading screen; fixed the room-entry fade, the menu
+  fade-in and the room fade after the close.
 - **Draw-then-add ordering.** The menu and room fades capture the pre-step
   accumulator for the frame's draw (`menu_fade_draw` / `room_fade_draw`) while
   the traced state stays the post-step value, so both the pixels and the trace
@@ -40,33 +40,31 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   it), reset it on their first step, and the closing fade clears it to the
   original's `0:0` before a two-frame menu-task teardown.
 - **Menu exit and open pacing.** The closing fade restores the player to idle on
-  the first frame after the cancel (the original's exit state 7), and the menu
-  holds one frame after the fade before its first health-bar tick (the original's
-  state-0 -> state-1 frame).
+  the first frame after the cancel (the original's exit state 7), the menu holds
+  one frame after the fade before its first health-bar tick (the original's
+  state-0 -> state-1 frame), and the room-entry fade after the close freezes the
+  player machine and entities for its run (the reference suspends game_loop),
+  with the first frame after the menu task exiting still running one tick.
 - **Item-action submenu open animation.** The original grows the submenu box
   from zero to full (`DAT_00ae9f27` `0x80..=0x88`, width `*6`, height `*3`)
   over eight frames after confirm. `MainMenu::submenu_frames` scales
   `draw_submenu` and gates the action input until it is open.
 
-With these, `inventory_open` and `inventory_examine` match tick-for-tick
-(`MATCH: N ticks identical`) and their frames are at the residual level below.
+With these, `inventory_open`, `inventory_examine` and `inventory_open_close` all
+match tick-for-tick (`MATCH: 200 ticks identical`); the open/close fade frames
+are byte-identical or at the residual level below.
 
 ## Open
 
-- **Menu close, player idle counter.** `inventory_open_close` (cancel at tick
-  120) now matches through t=134; from t=135 the player's idle settle
-  `action_ticks_counter` (`e0.ticks`) diverges: the reference holds 99 for five
-  frames before counting down, arklay decrements immediately. Frames: t=120-130
-  byte-identical, t=134/136 ~22%/15% (the room fade-in's one-step alpha), then
-  the room baseline (~4.9%).
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`
   renders as two alpha-blended triangles through the (llvmpipe) GPU, so the
   covered pixels differ on steep segments. Not exactly matchable without
   replicating the GPU quad coverage.
-- **Portrait face edges.** ~55 pixels in the character portrait differ at a
-  fine threshold (edge/rounding level, like the room frame backlog).
+- **Room/player frame backlog.** The room-close frames sit at the same ~4.9%
+  baseline as the plain room captures (player-mesh edges), unrelated to the
+  menu.
 
 ## Reaching more screens
 
