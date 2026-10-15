@@ -129,13 +129,16 @@ match), which is what the save interchange exists for.
 - **MAP full-display rendering.** The original zooms the floor plan from the
   inventory panel to the full-display map as soon as the tab opens (with the
   "Mansion 1F" caption); arklay keeps the panel browser until a confirm and
-  then swaps. With both engines in the zoomed view the settled frames still
-  differ ~33%: arklay's full-display plan is missing the corridor walls and
-  door markers and is positioned differently, so the zoom is not just an
-  animation gap. This is the documented M16 map-tab simplification
-  (`docs/m16-deviations.md` item 4); the full-display compositor needs the
-  same pass the reference's `menu_update_map_animation`/`map_display_update`
-  performs. The scenario runs at the state level until then.
+  then swaps. The display now composites the area's own 128x100 plan
+  (`map/map01..0b.tim` by area) over the blue grid backdrop with the
+  original's index-0 key on the plan only, unvisited markers transparent,
+  the current room in the original's red highlight and both layers at the
+  `colorMul` half brightness (`MapScreen::display_image`), which drops the
+  settled-frame error from 13.3 to 4.4 mean/255. Still open: the exact
+  per-layer blend (some grid pixels read full brightness in the reference),
+  the area-name caption drawn at the plan's foot, and the frame-by-frame
+  zoom/light animation (the documented M16 simplification,
+  `docs/m16-deviations.md` item 4).
 - **Item box / typewriter world action not reached.** The authored saves place
   the player inside the dining room's `aot_set` rects (item box slot 2,
   typewriter slot 7) and press action, but the overlay does not open on either

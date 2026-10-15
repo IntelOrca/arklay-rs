@@ -385,6 +385,8 @@ pub struct MapScreen {
     zoomed: bool,
     /// The browser floor plans, lazily loaded and keyed by layout.
     plans: [Option<Texture8>; 4],
+    /// The full-display floor plans, lazily loaded and keyed by area.
+    display: [Option<Texture8>; 11],
     /// The map backdrop.
     backdrop: Option<Texture8>,
     /// Blink phase for the cursor arrows.
@@ -414,6 +416,7 @@ impl MapScreen {
             area: 0,
             zoomed: false,
             plans: Default::default(),
+            display: Default::default(),
             backdrop: None,
             ticks: 0,
         };
@@ -459,6 +462,26 @@ impl MapScreen {
                 },
                 Err(err) => {
                     eprintln!("warning: missing {entry}: {err:#}; the map tab stays blank");
+                    None
+                }
+            };
+        }
+    }
+
+    /// Load the full-display plan of `area` on first use.
+    fn load_display(&mut self, pack: &Pack, area: usize) {
+        if self.display[area].is_none() {
+            let entry = AREA_ENTRIES[area];
+            self.display[area] = match pack.read(entry) {
+                Ok(bytes) => match tim::decode_8bpp(&bytes) {
+                    Ok(texture) => Some(texture),
+                    Err(err) => {
+                        eprintln!("warning: invalid {entry}: {err:#}");
+                        None
+                    }
+                },
+                Err(err) => {
+                    eprintln!("warning: missing {entry}: {err:#}; the map display stays blank");
                     None
                 }
             };
@@ -585,6 +608,62 @@ impl MapScreen {
         }
     }
 
+    /// The full-display plan image: the blue grid backdrop (`backdrop`, drawn
+    /// with its index-0 transparent key) with `plan` over it. The plan's
+    /// unvisited room markers stay transparent (the grid shows), the current
+    /// room's marker is the original's red highlight (`0x001f` BGR555), and
+    /// everything else keeps its palette colour. Both layers draw at the
+    /// original's half brightness (`colorMul` 0x80).
+    pub fn display_image(
+        &self,
+        plan: &Texture8,
+        backdrop: Option<&Texture8>,
+        flags: &[game::FlagBank],
+    ) -> Image {
+        let width = plan.width;
+        let height = plan.height;
+        let mut rgba = vec![0u8; width as usize * height as usize * 4];
+        let dim = |channel: u8| (u16::from(channel) * 0x80 / 0xFF) as u8;
+        if let Some(backdrop) = backdrop {
+            // The blue grid draws as a solid layer (its index 0 is the dark
+            // blue square colour, not the transparent key); the plan over it
+            // is the layer that carries the key.
+            for (pixel, &index) in rgba.chunks_mut(4).zip(backdrop.indices.iter()) {
+                let [r, g, b, _] = backdrop.palette(0, index);
+                pixel.copy_from_slice(&[dim(r), dim(g), dim(b), 255]);
+            }
+        }
+        let group = self.group();
+        let room_count = usize::from(self.tables.room_counts[group]);
+        let layout = usize::from(self.layout);
+        let highlight = (self.tables.area_at(layout, usize::from(self.room_index())) == self.area)
+            .then(|| self.room_index());
+        for (pixel, &index) in rgba.chunks_mut(4).zip(plan.indices.iter()) {
+            if index == 0 {
+                continue;
+            }
+            let index = usize::from(index);
+            let colour = match index.checked_sub(13).map(|offset| offset / 6) {
+                Some(room) if room < room_count => {
+                    if highlight == Some(room as u8) {
+                        [0xF8, 0, 0, 255]
+                    } else if self.tables.room_visited(flags, group, room) {
+                        plan.palette(0, index as u8)
+                    } else {
+                        continue;
+                    }
+                }
+                _ => plan.palette(0, index as u8),
+            };
+            pixel.copy_from_slice(&[dim(colour[0]), dim(colour[1]), dim(colour[2]), 255]);
+        }
+        Image {
+            width,
+            height,
+            rgba,
+        }
+    }
+
     /// Build the tinted RGBA image of `texture`'s markers: unvisited rooms are
     /// transparent, the current room is highlighted, everything else keeps its
     /// palette colour.
@@ -633,6 +712,27 @@ impl MapScreen {
     /// The menu underneath already draws the tab row; this paints the blue
     /// backdrop and the tinted floor plan into the middle band.
     pub fn draw(&mut self, framebuffer: &mut Framebuffer, pack: &Pack, game: &GameState) {
+        if self.zoomed {
+            // The full display: the blue grid backdrop with the area's own
+            // 128x100 floor plan over it, both at the original's half
+            // brightness (`colorMul` 0x80). The zoom sprites park at
+            // screenX 0x80/screenY 0x4e with pivot (0x50, 0x32) and scale
+            // 0x1000 (1.0), i.e. the plan lands at (48, 28).
+            let area = usize::from(self.area).min(AREA_ENTRIES.len() - 1);
+            self.load_display(pack, area);
+            if let Some(plan) = self.display[area].as_ref() {
+                let image = self.display_image(plan, self.backdrop.as_ref(), &game.flags);
+                let width = image.width.min(128) as i32;
+                let height = image.height.min(100) as i32;
+                framebuffer.draw_rgba_sprite(
+                    &image,
+                    [0, 0, width, height],
+                    [48, 28, width, height],
+                    255,
+                );
+            }
+            return;
+        }
         // The blue backdrop frames the plan; both are drawn into the middle
         // band the original's browser uses.
         if let Some(backdrop) = &self.backdrop {
@@ -792,6 +892,63 @@ mod tests {
     }
 
     #[test]
+    fn display_image_dims_the_grid_and_reddens_the_current_room() {
+        // A synthetic plan: indices 0 (transparent key), 13 (room 0's marker)
+        // and 200 (an ordinary palette index). The grid backdrop's index 0 is
+        // a solid colour (it is not the plan's key).
+        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
+        palettes[0] = [255, 255, 255, 255];
+        palettes[13] = [80, 80, 80, 255];
+        palettes[200] = [200, 100, 50, 255];
+        let plan = Texture8 {
+            width: 4,
+            height: 1,
+            indices: vec![0, 13, 200, 13],
+            palettes: palettes.clone(),
+            stp: Vec::new(),
+        };
+        let mut grid_palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
+        grid_palettes[0] = [16, 0, 96, 255];
+        grid_palettes[1] = [0, 72, 0, 255];
+        let grid = Texture8 {
+            width: 4,
+            height: 1,
+            indices: vec![0, 1, 0, 1],
+            palettes: grid_palettes,
+            stp: Vec::new(),
+        };
+        let mut flags = vec![FlagBank::default(); 16];
+        let screen = MapScreen {
+            tables: tables(),
+            layout: 0,
+            room: [0, 1, 1, 3],
+            area: 2,
+            zoomed: true,
+            plans: Default::default(),
+            display: Default::default(),
+            backdrop: None,
+            ticks: 0,
+        };
+        let image = screen.display_image(&plan, Some(&grid), &flags);
+        let dim = |c: u8| (u16::from(c) * 0x80 / 0xFF) as u8;
+        // The keyed plan pixel shows the grid square (dimmed), not black.
+        assert_eq!(image.rgba[0..4], [dim(16), 0, dim(96), 255]);
+        // The current room's marker (layout 0 room 0 is area 2) is red.
+        assert_eq!(image.rgba[4..8], [dim(0xF8), 0, 0, 255]);
+        // Ordinary indices keep their palette colour, dimmed.
+        assert_eq!(image.rgba[8..12], [dim(200), dim(100), dim(50), 255]);
+        // The grid line shows through the unvisited marker of room 0 when the
+        // current area is not this layout's room area.
+        let screen = MapScreen { area: 0, ..screen };
+        let image = screen.display_image(&plan, Some(&grid), &flags);
+        assert_eq!(image.rgba[4..8], [dim(0), dim(72), 0, 255]);
+        // A visited marker keeps its palette colour.
+        flags[usize::from(game::BANK_ROOM_FLAGS)].apply(0, 0);
+        let image = screen.display_image(&plan, Some(&grid), &flags);
+        assert_eq!(image.rgba[4..8], [dim(80), dim(80), dim(80), 255]);
+    }
+
+    #[test]
     fn plan_tint_hides_unvisited_and_highlights_the_current_room() {
         // A synthetic plan: palette entries 13..18 are room 0's six marker
         // colours, indices 13 and 14 occur in the pixel data.
@@ -815,6 +972,7 @@ mod tests {
                 area,
                 zoomed: false,
                 plans: Default::default(),
+                display: Default::default(),
                 backdrop: None,
                 ticks: 0,
             };
@@ -863,6 +1021,7 @@ mod tests {
             area: 0,
             zoomed: false,
             plans: Default::default(),
+            display: Default::default(),
             backdrop: None,
             ticks: 0,
         };
