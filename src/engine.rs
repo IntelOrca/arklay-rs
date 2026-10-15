@@ -8893,26 +8893,26 @@ fn store_player_joint_worlds(
             ),
         },
     };
-    // Materialize the pose on the live clock, not the published snapshot: the
-    // clock's `applied` pose is the port's `joints[].transform`, which persists
-    // until the next consuming tick exactly like the original's joint structs.
+    // Materialize the pose on the live clock, the one the render pass poses
+    // from: the clock's `applied` pose is the port's `joints[].transform`,
+    // which persists until the next consuming tick exactly like the original's
+    // joint structs. Reading it here folds the pending blend steps so `applied`
+    // always holds the frame the pass will draw; the pass's own read is then
+    // idempotent.
     //
-    // While the weapon machine drives the pose the handler's own clock is that
-    // source: the entity mirror's frame words are only synced at behavior
-    // entries, so they read one pose ahead of the transforms the handler just
-    // wrote (the original's render pass composes exactly those transforms).
-    let keyframe = if player.weapon.active() {
-        player.anim.pose_keyframe(clips, keyframes)
-    } else {
-        game.entity_anims[0].player.pose_keyframe(clips, keyframes)
-    };
+    // The entity mirror's clock is not the source: its frame words are only
+    // synced at behavior entries and scripted publishes, so a pad-driven walk
+    // or run would read the stale pose it last scripted (regression: the
+    // locomotion animation froze on screen while the player kept moving).
+    let keyframe = player.anim.pose_keyframe(clips, keyframes);
     let Some(keyframe) = keyframe else {
         return;
     };
-    // Pin the pose on screen. A scripted frame setter (`plw_anim`) can point
-    // the clock at a clip and frame without consuming a tick; the original's
-    // joint structs keep the last `Joint_move` output, so the next scripted
-    // read must still see this pose rather than the freshly named frame.
+    // Pin the pose on screen on both clocks. A scripted frame setter
+    // (`plw_anim`) can point the clock at a clip and frame without consuming a
+    // tick; the original's joint structs keep the last `Joint_move` output, so
+    // the next scripted read must still see this pose rather than the freshly
+    // named frame.
     game.entity_anims[0]
         .player
         .set_applied_pose(Some(keyframe.clone()));
@@ -14125,6 +14125,90 @@ end
             },
             weapons: std::collections::HashMap::new(),
         }
+    }
+
+    /// The end-of-tick joint store poses from the live clock: a pad-driven
+    /// walk must advance its skeleton frame by frame. Regression: the store
+    /// read the script mirror's clock (whose words only change on scripted
+    /// publishes) and pinned the live clock to it every tick, so the walk
+    /// clock's pending blends were dropped and the model rendered a single
+    /// frozen pose while the trace kept moving.
+    #[test]
+    fn a_walking_player_advances_through_the_joint_store() {
+        let (pack, _id, mut room, mut game, mut player_state, mut assets) = scripted_room_fixture();
+        // Two poses the walk clip alternates between, on the fixture's body
+        // skeleton so the composed joint world carries the rotation.
+        assets.emd.skeleton = Skeleton {
+            relative: vec![[0, 0, 0]],
+            children: vec![vec![]],
+        };
+        assets.emw.keyframes = vec![
+            Keyframe {
+                vertex: [0, 0, 0],
+                offset: [0, 0, 0],
+                rotations: vec![[0, 0, 0]],
+            },
+            Keyframe {
+                vertex: [0, 0, 0],
+                offset: [0, 0, 0],
+                rotations: vec![[0x200, 0, 0]],
+            },
+        ];
+        let still = Clip {
+            frames: vec![ClipFrame {
+                keyframe: 0,
+                timing: 1,
+            }],
+        };
+        assets.emw.clips = vec![
+            still.clone(),
+            still.clone(),
+            // EMW clip 2 is the walk cycle.
+            Clip {
+                frames: vec![
+                    ClipFrame {
+                        keyframe: 1,
+                        timing: 1,
+                    },
+                    ClipFrame {
+                        keyframe: 0,
+                        timing: 1,
+                    },
+                ],
+            },
+            still,
+        ];
+        let scripts = scd::ir::Scripts::default();
+        let mut command_vm = scd::vm::CommandVm::new(&scripts);
+        let mut event_vm = scd::vm::EventVm::new(&scripts);
+        let walking = player::Input {
+            up: true,
+            ..player::Input::default()
+        };
+        let mut poses = Vec::new();
+        for _ in 0..6 {
+            tick_scripted_room(
+                &pack,
+                &mut room,
+                &mut game,
+                &mut player_state,
+                &assets,
+                &mut command_vm,
+                &mut event_vm,
+                walking,
+            );
+            let first = game
+                .joint_worlds
+                .first()
+                .and_then(|worlds| worlds.first())
+                .expect("the store composed the player's joint worlds");
+            poses.push(first.r);
+        }
+        assert_eq!(player_state.behavior, 1, "the pad selected the walk");
+        assert!(
+            poses.windows(2).any(|pair| pair[0] != pair[1]),
+            "the stored walk pose stayed frozen across six ticks: {poses:?}"
+        );
     }
 
     #[allow(clippy::too_many_arguments)] // the seam already takes this many

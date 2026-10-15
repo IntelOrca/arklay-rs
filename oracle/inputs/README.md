@@ -54,6 +54,12 @@ Room mode / `pause_chris_101.dat`:
   submenu).
 - `inventory_open_close.txt` — open the pause menu, then cancel it.
 
+Room mode (from the new-game spawn):
+
+- `walk_forward.txt` — ROOM 101: hold `up` out of the idle, hand over to the
+  run with `run` held and release; the pad-driven locomotion's rendered pose
+  must step with the same clip frames as the reference.
+
 Save mode (each header names its save):
 
 - `file_open.txt`, `file_pages.txt` — `file_chris_101.dat`: FILE tab selector

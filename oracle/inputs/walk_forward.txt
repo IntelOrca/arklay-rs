@@ -1,0 +1,7 @@
+# Walk forward, pick up the run, then release: the locomotion
+# animation oracle. `up` selects the walk; `run` (Circle) held with `up`
+# hands over to the run at the walk handler's tail.
+5 up
+80 up run
+160 up
+220
