@@ -2746,6 +2746,11 @@ impl GameSession {
             return;
         };
         menu.tick(&mut self.game);
+        // The action submenu ignores all input while its 8-frame open
+        // animation runs (main_menu's state 1, before it becomes state 2).
+        if menu.mode == MenuMode::Actions && !menu.submenu_ready() {
+            return;
+        }
         // START (Tab) cycles the top tabs while the menu is open; the file
         // tab opens the document selector.
         if ui.start {
@@ -14830,6 +14835,24 @@ off_0010:
         panic!("the pause-menu fade did not settle");
     }
 
+    /// Advance the pause menu until its action submenu's 8-frame open
+    /// animation has finished and it accepts input again.
+    fn settle_submenu_open(session: &mut GameSession, pack: &Pack) {
+        for _ in 0..32 {
+            if session
+                .menu
+                .as_ref()
+                .is_none_or(|menu| menu.submenu_ready())
+            {
+                return;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("the action submenu did not finish opening");
+    }
+
     #[test]
     fn a_movie_on_request_starts_the_film_and_resumes_the_sounds() {
         let _sdl = crate::audio::test_lock::sdl();
@@ -15260,11 +15283,19 @@ off_0010:
 
         // Slot 0 holds the knife: confirm opens the action submenu, down
         // selects CHECK, confirm installs the viewer.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_submenu_open(&mut session, &pack);
         for ui in [
-            UiInput {
-                confirm: true,
-                ..UiInput::default()
-            },
             UiInput {
                 down: true,
                 ..UiInput::default()
@@ -16169,19 +16200,29 @@ off_0010:
         settle_menu_fade(&mut session, &pack);
         // Confirm opens the submenu, confirm again uses the key: the original
         // sets the close bit and the menu exits through its fade.
-        for _ in 0..2 {
-            session
-                .tick(
-                    &pack,
-                    UiInput {
-                        confirm: true,
-                        ..UiInput::default()
-                    },
-                    player::Input::default(),
-                    false,
-                )
-                .unwrap();
-        }
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_submenu_open(&mut session, &pack);
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
         assert_eq!(
             session.game.last_picked_item, None,
             "the key is used, not picked"
@@ -16405,6 +16446,7 @@ off_0010:
                 false,
             )
             .unwrap();
+        settle_submenu_open(&mut session, &pack);
         session
             .tick(
                 &pack,

@@ -196,6 +196,11 @@ pub struct MainMenu {
     pub slots: usize,
     /// The animated health monitor.
     pub health_bar: HealthBar,
+    /// The action submenu's open animation frame (`DAT_00ae9f27` low 7 bits):
+    /// `0` on the confirm frame, then `1..=8` as the box grows from nothing to
+    /// its full 48x24 over eight frames. Once it reaches `SUBMENU_OPEN_FRAMES`
+    /// the box is fully open and accepts input.
+    pub submenu_frames: u8,
 }
 
 impl MainMenu {
@@ -210,6 +215,7 @@ impl MainMenu {
             equippable: false,
             slots,
             health_bar: HealthBar::new(),
+            submenu_frames: layout::SUBMENU_OPEN_FRAMES,
         }
     }
 
@@ -222,7 +228,14 @@ impl MainMenu {
         self.action = 0;
         self.move_cursor = self.cursor;
         self.health_bar = HealthBar::new();
+        self.submenu_frames = layout::SUBMENU_OPEN_FRAMES;
         self.refresh_selection(game);
+    }
+
+    /// Whether the action submenu has finished its open animation and accepts
+    /// input. The engine consumes no menu input while it is still opening.
+    pub fn submenu_ready(&self) -> bool {
+        self.submenu_frames >= layout::SUBMENU_OPEN_FRAMES
     }
 
     /// Advance the health monitor one frame and re-read the cursor selection.
@@ -234,6 +247,8 @@ impl MainMenu {
             .update(health, max_health, status, &mut game.rand_state);
         if self.mode == MenuMode::Navigation {
             self.refresh_selection(game);
+        } else if self.submenu_frames < layout::SUBMENU_OPEN_FRAMES {
+            self.submenu_frames += 1;
         }
     }
 
@@ -311,6 +326,8 @@ impl MainMenu {
                 self.action = 0;
                 self.move_cursor = self.cursor;
                 self.equippable = is_equippable(self.selected_item);
+                // Start the submenu box's open animation from nothing.
+                self.submenu_frames = 0;
                 MenuEvent::None
             }
         }
@@ -393,7 +410,10 @@ impl MainMenu {
     fn move_input(&mut self, game: &mut GameState, input: MenuInput) -> MenuEvent {
         match input {
             MenuInput::Cancel => {
+                // Walking back from MOVE returns to the already-open submenu:
+                // the original does not replay the open animation.
                 self.mode = MenuMode::Actions;
+                self.submenu_frames = layout::SUBMENU_OPEN_FRAMES;
                 MenuEvent::None
             }
             MenuInput::Left | MenuInput::Right => {
@@ -614,30 +634,42 @@ impl MainMenu {
             [0x18, 0x30, 0x48]
         };
         let [x, y] = layout::SUBMENU_POS;
-        let [w, h] = layout::SUBMENU_OPTION_SIZE;
-        // Selected action highlight behind the option list.
-        framebuffer.draw_indexed_sprite(
-            &assets.status,
-            [0x30, 0x60, i32::from(w), i32::from(h)],
-            [
-                i32::from(x),
-                i32::from(y) + i32::from(self.action) * i32::from(h),
-                i32::from(w),
-                i32::from(h),
-            ],
-            0,
-            0,
-            Tint::White,
-        );
+        let [fw, fh] = layout::SUBMENU_OPTION_SIZE;
+        // The original grows the box from nothing at (0x90, 0x39): each open
+        // frame samples a 6px-wider, 3px-taller region of the option art, so
+        // the full 48x24 is revealed over eight frames. The options' screen
+        // rows are at the full 0x18 pitch throughout.
+        let frame = self.submenu_frames.min(layout::SUBMENU_OPEN_FRAMES);
+        let w = i32::from(fw).min(i32::from(frame) * 6);
+        let h = i32::from(fh).min(i32::from(frame) * 3);
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        if self.submenu_ready() {
+            // Selected action highlight behind the option list.
+            framebuffer.draw_indexed_sprite(
+                &assets.status,
+                [0x30, 0x60, i32::from(fw), i32::from(fh)],
+                [
+                    i32::from(x),
+                    i32::from(y) + i32::from(self.action) * i32::from(fh),
+                    i32::from(fw),
+                    i32::from(fh),
+                ],
+                0,
+                0,
+                Tint::White,
+            );
+        }
         for (option, v) in labels.into_iter().enumerate() {
             framebuffer.draw_indexed_sprite(
                 &assets.status,
-                [0x30, i32::from(v), i32::from(w), i32::from(h)],
+                [0x30, i32::from(v), w, h],
                 [
                     i32::from(x),
-                    i32::from(y) + option as i32 * i32::from(h),
-                    i32::from(w),
-                    i32::from(h),
+                    i32::from(y) + option as i32 * i32::from(fh),
+                    w,
+                    h,
                 ],
                 0,
                 0,
