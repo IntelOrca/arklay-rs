@@ -3338,17 +3338,24 @@ impl GameSession {
         // frame; it is revealed for the fade-in.
         if self.menu.is_some() && self.menu_fade_phase != MenuFadePhase::Out {
             self.ensure_menu_assets(pack);
-            // The 0xBA item-name line belongs to whatever owns the screen: a
+            // The cursor and the 0xBA item-name line are drawn from
+            // menu_handle_input (state 1), which only runs once the opening
+            // fade has finished; while the fade is still up neither is drawn.
+            // The name line also belongs to whatever owns the screen - a
             // message window, the examine viewer or a pick-up prompt draws
-            // there, so the menu must not paint its own name under it.
-            let show_item_name =
-                !self.game.message.active && self.pickup_view.is_none() && self.modal.is_none();
+            // there - so the menu must not paint its own name under it.
+            let menu_ready = self.menu_fade_phase == MenuFadePhase::None;
+            let show_item_name = menu_ready
+                && !self.game.message.active
+                && self.pickup_view.is_none()
+                && self.modal.is_none();
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw_with_name(
                     &mut self.framebuffer,
                     assets,
                     &self.text,
                     &self.game,
+                    menu_ready,
                     show_item_name,
                 );
             }

@@ -469,25 +469,31 @@ impl MainMenu {
         text: &Text,
         game: &GameState,
     ) {
-        self.draw_with_name(framebuffer, assets, text, game, true);
+        self.draw_with_name(framebuffer, assets, text, game, true, true);
     }
 
-    /// [`MainMenu::draw`] with the item-name line optional.
+    /// [`MainMenu::draw`] with the item cursor and the item-name line optional.
     ///
-    /// The original draws the 0xBA line from `menu_handle_input` and the
-    /// submenu states that still own the screen; while a message, the examine
-    /// viewer or a pick-up owns the line, the menu must not paint its name over
-    /// them (`menu_item_submenu` case 4's jump past the name draw).
+    /// The original draws the cursor and the 0xBA name line from
+    /// `menu_handle_input` (state 1) and the submenu states that still own the
+    /// screen. While the menu fade is still running (state 0) neither is drawn;
+    /// while a message, the examine viewer or a pick-up owns the line the name
+    /// must not paint over them (`menu_item_submenu` case 4's jump past the
+    /// name draw).
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_with_name(
         &self,
         framebuffer: &mut Framebuffer,
         assets: &MenuAssets,
         text: &Text,
         game: &GameState,
+        show_cursor: bool,
         show_item_name: bool,
     ) {
         self.draw_background(framebuffer);
-        self.draw_tab_cursor(framebuffer, assets);
+        if show_cursor {
+            self.draw_tab_cursor(framebuffer, assets);
+        }
         self.draw_frames(framebuffer, assets);
         self.draw_inventory(framebuffer, assets, game);
         self.draw_portrait(framebuffer, assets, game);
@@ -496,7 +502,9 @@ impl MainMenu {
         if self.mode != MenuMode::Navigation {
             self.draw_submenu(framebuffer, assets);
         }
-        self.draw_slot_cursor(framebuffer, assets);
+        if show_cursor {
+            self.draw_slot_cursor(framebuffer, assets);
+        }
         if show_item_name {
             self.draw_item_name(framebuffer, assets, text, game);
         }
@@ -1456,7 +1464,7 @@ mod tests {
         ));
         let name_pixels = |show_name: bool| {
             let mut framebuffer = Framebuffer::new();
-            menu.draw_with_name(&mut framebuffer, &assets, &text, &game, show_name);
+            menu.draw_with_name(&mut framebuffer, &assets, &text, &game, true, show_name);
             let mut count = 0;
             for y in 0..framebuffer.height {
                 for x in 0..framebuffer.width {
