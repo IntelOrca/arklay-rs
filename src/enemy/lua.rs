@@ -12899,7 +12899,7 @@ mod chimera_tests {
         game.entities[1].set_ignore(1);
         game.entities[1].action_behavior = 6;
         game.entities[1].action_state = 0;
-        game.entities[1].pos[1] = -6008;
+        game.entities[1].pos[1] = -6120;
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack));
         let entity = &game.entities[1];
@@ -12933,7 +12933,7 @@ mod chimera_tests {
         game.entities[1].set_ignore(1);
         game.entities[1].action_behavior = 7;
         game.entities[1].action_state = 0;
-        game.entities[1].pos[1] = -6008;
+        game.entities[1].pos[1] = -6120;
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack));
         let entity = &game.entities[1];

@@ -492,7 +492,10 @@ fn real_room50f0_chimeras_initialise_through_the_script() {
     for chimera in &chimeras {
         assert_eq!(chimera.state(), 1, "init moved the chimera to the driver");
         assert_eq!(chimera.behavior_flags, 2, "the ceiling variant");
-        assert_eq!(chimera.pos[1], -6008, "parked on the ceiling");
+        // The reference stores the ceiling pose as the immediate
+        // `0xffffe818`, which sign-extends to -6120; its own `// -6008`
+        // comment is a typo (the same trap as the webspinner spawn).
+        assert_eq!(chimera.pos[1], -6120, "parked on the ceiling");
         assert_eq!(chimera.roll, 0x800, "the upside-down pose");
         assert!(
             (80..=122).contains(&chimera.health),

@@ -540,7 +540,7 @@ toggles, the drop and swoop dive arcs read in opposite directions, the acid
 spit, the flee and turn-back (yaw-flipped steering), the claw with its wall-bit
 grab cancel and hard-mode touch, the hit-fall and the stagger/knockdown
 drivers, and both death dissolves with the shadow recolour/growth and the
-death-event flag. The ceiling attachment parks the model at `-6008` with the
+death-event flag. The ceiling attachment parks the model at `-6120` with the
 180-degree roll, and the per-frame shadow resize reads joint 3's world height
 with the 600-clamp band and the freeze gate. The helpers the chimera needed
 landed with it: the four chimera scratch views, the player's attack-direction
