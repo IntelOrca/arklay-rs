@@ -17,6 +17,7 @@ pub mod char_select;
 pub mod computer_lab;
 pub mod death;
 pub mod debug_menu;
+pub mod ending;
 pub mod file;
 pub mod item_box;
 pub mod item_view;
@@ -105,6 +106,14 @@ pub enum ScreenAction {
     CharSelect,
     /// Open the load screen.
     SaveLoad,
+    /// The ending films finished: open the RESULT screen.
+    EndingResult,
+    /// The RESULT screen finished: run the rocket-launcher epilogue (endings
+    /// 6/7 without the special key) or go straight to the next-cycle save.
+    EndingEpilogue,
+    /// The epilogue finished (or was skipped): build the next-cycle card and
+    /// open the save screen.
+    EndingSave,
     /// Close a gameplay modal and resume the frozen room.
     Resume,
     /// Quit the app.

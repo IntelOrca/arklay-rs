@@ -29,10 +29,9 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
 
 3. **No subtitle or credits overlays.** The PS1 releases draw FMV subtitles and
    an ending-credits overlay over the films; neither ships in this PC install
-   and neither is ported. The films play bare, and the ending path stops after
-   the film chain: no RESULT screen, no rocket-launcher epilogue, no
-   next-cycle save carryover. `--ending` exists precisely because those
-   screens are out of scope.
+   and neither is ported. The films play bare; the post-film sequence that
+   follows them (the RESULT screen, the rocket-launcher epilogue and the
+   next-cycle save) is implemented - see item 9.
 
 4. **Wall-clock-mastered film pacing.** The film time comes from the elapsed
    wall clock; with a real device the mixer's device-playback cursor (frames
@@ -53,10 +52,13 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
 5. **Endings unreachable through normal play.** Reaching an ending requires the
    excluded combat and bosses, so `ending::select_id` and `ending::chain` are
    pure functions and the only way to see the sequence is the `--ending <id>`
-   debug entry (with `--character`). The seven-row table, the congratulations
-   film rules (plate/character/infinite launcher/second playthrough) and the
-   staff-roll flag are transcribed and unit-tested, but no gameplay path sets
-   the survivor flags or reaches `ending_state`.
+   debug entry (with `--character`), which now runs the films, the RESULT
+   screen, the epilogue and the next-cycle save end to end. The seven-row
+   table, the congratulations film rules (plate/character/infinite
+   launcher/second playthrough) and the staff-roll flag are transcribed and
+   unit-tested, but no gameplay path sets the survivor flags or reaches
+   `ending_state`: the post-film screen sequence and the flow's carried bits
+   are wired, but only the debug entries drive them.
 
 6. **Automatic films only on the interactive root boot.** The boot logos (28
    then 23), the title opening (0, once per process) and the character intro
@@ -82,3 +84,33 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    independent verification. The test fails when the variable is set but the
    golden directory, hash file or a sampled BMP is missing; it prints an
    explicit notice and skips only when the variable is unset.
+
+9. **Post-ending sequence approximations.** The RESULT screen and the
+   rocket-launcher epilogue follow `ending_result_*`/`ending_epilogue_*`
+   (`EndingScreen.cpp:327-836`): the five baked plates from `en05.tim`/`en07.tim`,
+   the per-slot `0x800` fade ramps, the step-4 input gate (any button or the
+   `0x708` timeout), the ending-6 fifth plate, the two epilogue captions, the
+   `rc1121.pix` backdrop, the root->spin->leaf composition of `i73v.ivm` and
+   the next-cycle card's grants and flags. Five details are bounded
+   approximations:
+
+   - The no-save confetti (`Effect_CreateBillboard(0x0B, 0x0A)`) is a
+     deterministic particle burst drawn by the screen, not the original's
+     effect-pool billboard; its `play_sfx` pair is not played because the
+     app-level screens have no bank-slot sound API (only named UI cues).
+   - The ending-6 fifth plate's additive blend (`tex.flags & 0x40000000`) is
+     drawn opaque.
+   - The play timer advances only while the room is live; the reference also
+     ticks it in the pause menu (`MainMenu.cpp:428`), so a menu-heavy run's
+     clear time and the four-hour Ingram/Minimi cutoff can differ.
+   - The next-cycle save is written by the port's normal save screen; the
+     `s_grantRocket` "already infinite" input is carried by the ending flow
+     (a real clear, which is unreachable, would read it from the live run).
+   - The clear-time and save-count strings use the reference's own grid
+     addressing over the shipped font sheet, including the raw `0x5E`
+     separator (`ending_draw_text`), rather than the port's encoded-text path,
+     so the digits land cell for cell on the original's.
+
+   No clear count is persisted (the port has no config/settings store), and the
+   Director's Cut epilogue guards (advanced difficulty, the infinite Colt
+   Python) are absent with the rest of the DC branches.
