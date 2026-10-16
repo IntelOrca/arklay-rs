@@ -25,8 +25,14 @@ entry, exactly the reference's `t`. Scripts should not place input on tick 0
 | `aim` (`square`) | Square `0x0008` | C |
 | `fire` | R1 | Z |
 | `start` (`inventory`) | START `0x0800` | Tab |
-| `page_left` (`l1`) | L1 | `[` |
-| `page_right` (`r1`) | R1 | `]` |
+| `page_left` (`l1`) | not a raw pad bit | `[` |
+| `page_right` (`r1`) | not a raw pad bit | `]` |
+
+The port's raw pad layout has no L1/R1 bits (`--test-press`/`--test-input` can
+only inject the bindings in the table above), so `page_left`/`page_right` are
+unknown to the reference and act as plain releases there; a scenario that wants
+the same paging on both engines must use the screen's own keys (the D-pad
+up/down page the item box).
 
 Run a scenario against both engines with `scripts/oracle-ui.sh`:
 
@@ -73,7 +79,7 @@ Save mode (each header names its save):
 - `equip_weapon.txt` — `equip_chris_101.dat`: equip and unequip the Beretta
   through the action submenu.
 - `itembox_open.txt`, `itembox_page.txt` — `itembox_chris_118.dat`: the item
-  box world action, its overlay, the L1/R1 pages and a swap.
+  box world action, its overlay, the D-pad pages and a swap.
 - `save_screen.txt` — `typewriter_chris_118.dat`: the typewriter prompt,
   the Yes answer, the fade hand-off and the SAVE GAME screen (stopped before
   a slot is written).

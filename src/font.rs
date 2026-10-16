@@ -87,6 +87,21 @@ impl Glyph {
     }
 }
 
+/// Which glyph grid a byte stream addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphGrid {
+    /// The game's encoded grid: a plain byte lands on row `byte / 18`, whose
+    /// texture rows start at `v = 28` on both sheets. The original's
+    /// `PrintFormattedText` (0x00455190) adds those two rows.
+    Encoded,
+    /// The original's `PrintText8x14` (0x00455520) grid: a plain byte
+    /// addresses the grid directly with **no** two-row bias, `' '` advances
+    /// without a glyph and `0x00` ends the string. The item box's empty-slot
+    /// label and the countdown timer come through this renderer, which is why
+    /// `_Nothing_` lands on the Latin cells of the Japanese sheet.
+    Text8x14,
+}
+
 /// Iterator over the glyphs of one encoded byte stream.
 ///
 /// `0x00` advances one cell, `0xFF` half a cell, `0xFB` is a no-op, and
@@ -97,6 +112,7 @@ pub struct Glyphs<'a> {
     position: usize,
     metrics: FontMetrics,
     remap_parentheses: bool,
+    grid: GlyphGrid,
 }
 
 impl<'a> Glyphs<'a> {
@@ -108,6 +124,7 @@ impl<'a> Glyphs<'a> {
             position: 0,
             metrics,
             remap_parentheses: true,
+            grid: GlyphGrid::Encoded,
         }
     }
 
@@ -120,6 +137,18 @@ impl<'a> Glyphs<'a> {
             position: 0,
             metrics,
             remap_parentheses: false,
+            grid: GlyphGrid::Encoded,
+        }
+    }
+
+    /// Decode `bytes` with the original's `PrintText8x14` (0x00455520) grid.
+    pub fn text_8x14(bytes: &'a [u8], metrics: FontMetrics) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            metrics,
+            remap_parentheses: true,
+            grid: GlyphGrid::Text8x14,
         }
     }
 
@@ -138,6 +167,19 @@ impl Iterator for Glyphs<'_> {
     type Item = Glyph;
 
     fn next(&mut self) -> Option<Glyph> {
+        // `PrintText8x14` has no escapes: every byte below `0x0C` is an ASCII
+        // control or a space and never reaches the grid.
+        if self.grid == GlyphGrid::Text8x14 {
+            let byte = *self.bytes.get(self.position)?;
+            self.position += 1;
+            if byte == 0 {
+                return None;
+            }
+            if byte == b' ' {
+                return Some(Glyph::cursor(self.metrics.glyph_w));
+            }
+            return Some(self.plain_glyph(byte));
+        }
         loop {
             let byte = *self.bytes.get(self.position)?;
             match byte {
@@ -165,23 +207,36 @@ impl Iterator for Glyphs<'_> {
                 }
                 _ => {
                     self.position += 1;
-                    // ASCII '(' and ')' are the controller-symbol cells in
-                    // both sheet widths.
-                    if self.remap_parentheses {
-                        if byte == 0x28 {
-                            return Some(self.glyph(56, 224));
-                        }
-                        if byte == 0x29 {
-                            return Some(self.glyph(70, 224));
-                        }
-                    }
-                    let byte = i32::from(byte);
-                    let col = byte % 18;
-                    let row = byte / 18;
-                    return Some(self.glyph(col * self.metrics.glyph_w, 28 + row * GLYPH_HEIGHT));
+                    return Some(self.plain_glyph(byte));
                 }
             }
         }
+    }
+}
+
+impl Glyphs<'_> {
+    /// One plain byte of the sheet's glyph grid, with the controller-symbol
+    /// remap and the grid's row bias applied.
+    fn plain_glyph(&self, byte: u8) -> Glyph {
+        // ASCII '(' and ')' are the controller-symbol cells in both sheet
+        // widths and both renderers.
+        if self.remap_parentheses {
+            if byte == 0x28 {
+                return self.glyph(56, 224);
+            }
+            if byte == 0x29 {
+                return self.glyph(70, 224);
+            }
+        }
+        let byte = i32::from(byte);
+        let col = byte % 18;
+        let row = byte / 18;
+        let bias = if self.grid == GlyphGrid::Encoded {
+            28
+        } else {
+            0
+        };
+        self.glyph(col * self.metrics.glyph_w, bias + row * GLYPH_HEIGHT)
     }
 }
 
@@ -230,6 +285,38 @@ impl Font {
         bytes: &[u8],
     ) {
         self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, false);
+    }
+
+    /// Draw a plain byte string with the original's `PrintText8x14`
+    /// (0x00455520) glyph grid; see [`Glyphs::text_8x14`].
+    ///
+    /// The renderer is the same as [`Font::draw_text`]'s, minus the encoded
+    /// grid's two-row bias and with no shadow pass (the original's
+    /// `PrintText8x14(.., flags = 0)`).
+    pub fn draw_text_8x14(
+        &self,
+        framebuffer: &mut Framebuffer,
+        x: i32,
+        y: i32,
+        tint: Tint,
+        bytes: &[u8],
+    ) {
+        let mut sprites: Vec<SpriteDraw<'_>> = Vec::new();
+        let mut cursor = x;
+        for glyph in Glyphs::text_8x14(bytes, self.metrics) {
+            if glyph.visible() {
+                sprites.push(SpriteDraw::indexed(
+                    &self.texture,
+                    [glyph.u, glyph.v, glyph.width, glyph.height],
+                    [cursor, y, glyph.width, glyph.height],
+                    0,
+                    0,
+                    tint,
+                ));
+            }
+            cursor += glyph.advance;
+        }
+        framebuffer.draw_sprites(&mut sprites);
     }
 
     #[allow(clippy::too_many_arguments)]

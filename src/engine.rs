@@ -1042,6 +1042,10 @@ struct GameSession {
     /// runs from state 1), so the first health-monitor tick is one frame after
     /// the fade goes inactive.
     menu_open_delay: bool,
+    /// Frames the menu's cursor and item-name line stay withheld after the
+    /// opening fade completes (see the decrement in `tick`). The reference's
+    /// fade-complete frame and its state-0 frame both still draw *neither*.
+    menu_reveal_delay: u8,
     /// Frames to hold the black screen after the closing fade reaches black
     /// before game_loop resumes and the room-entry fade arms (the original's
     /// menu task teardown takes two frames).
@@ -1480,6 +1484,7 @@ impl GameSession {
             menu_close_freeze_first: false,
             menu_close_restore: false,
             menu_open_delay: false,
+            menu_reveal_delay: 0,
             menu_close_wait: 0,
             sprite_anim_intensity: 0,
             debug_menu_enabled: true,
@@ -1614,6 +1619,15 @@ impl GameSession {
             ui = translated.ui;
             input = translated.player;
             action = translated.action;
+        }
+        // Frames the menu's cursor and 0xBA item-name line (and the item box's
+        // own `itembox_draw_cursor`) are still withheld: the reference starts
+        // drawing them from the menu's first *input* frame, which is the frame
+        // after both the fade-complete frame and the state-0 frame that arms
+        // the submenu. The reference's box interaction and `menu_handle_input`
+        // own that draw, and neither runs before the state machine's switch.
+        if self.menu_reveal_delay > 0 {
+            self.menu_reveal_delay -= 1;
         }
         // The loading narration owns the tick while it is up: the room stays
         // frozen on a black screen and only the message window advances. The
@@ -2498,8 +2512,10 @@ impl GameSession {
                 self.menu_fade = transition::Fade::inactive();
                 self.menu_fade_phase = MenuFadePhase::None;
                 // The original's state-0 -> state-1 frame draws no health bar,
-                // so hold one frame before the menu starts ticking.
+                // so hold one frame before the menu starts ticking; its cursor
+                // and item-name line wait for the state-1 frame after that.
                 self.menu_open_delay = true;
+                self.menu_reveal_delay = 2;
             }
             MenuFadePhase::Closing => {
                 // The fade-out has reached black. The original clears the fade
@@ -3786,28 +3802,43 @@ impl GameSession {
             self.ensure_menu_assets(pack);
             // The cursor and the 0xBA item-name line are drawn from
             // menu_handle_input (state 1), which only runs once the opening
-            // fade has finished; while the fade is still up neither is drawn.
-            // The name line also belongs to whatever owns the screen - a
-            // message window, the examine viewer or a pick-up prompt draws
-            // there - so the menu must not paint its own name under it.
-            let menu_ready = self.menu_fade_phase == MenuFadePhase::None;
+            // fade has finished *and* the state-0 transition frame has passed;
+            // while either is still up neither is drawn. The name line also
+            // belongs to whatever owns the screen - a message window, the
+            // examine viewer or a pick-up prompt draws there - so the menu must
+            // not paint its own name under it.
+            let menu_ready =
+                self.menu_fade_phase == MenuFadePhase::None && self.menu_reveal_delay == 0;
             let show_item_name = menu_ready
                 && !self.game.message.active
                 && self.pickup_view.is_none()
                 && self.modal.is_none();
+            // While the item box is open its interaction draws the shared slot
+            // cursor itself (`itembox_draw_cursor`), with the box's own blink
+            // counter; the menu only keeps a cursor on the tab row, which the
+            // box's cursor movement cannot reach but a menu-opened box can
+            // inherit.
+            let box_owns_cursor = self
+                .item_box
+                .as_ref()
+                .is_some_and(|item_box| !item_box.cursor_on_tab());
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw_with_name(
                     &mut self.framebuffer,
                     assets,
                     &self.text,
                     &self.game,
-                    menu_ready,
+                    menu_ready && !box_owns_cursor,
                     show_item_name,
                 );
             }
         }
         if self.item_box.is_some() && !self.menu_fade_hides() {
             self.ensure_item_box_assets(pack);
+            // The box's cursor comes from the interaction itself, so it is
+            // withheld until the menu's first input frame like the menu's own.
+            let reveal_cursor =
+                self.menu_fade_phase == MenuFadePhase::None && self.menu_reveal_delay == 0;
             if let (Some(item_box), Some(item_box_assets), Some(menu_assets)) =
                 (&self.item_box, &self.item_box_assets, &self.menu_assets)
             {
@@ -3818,6 +3849,12 @@ impl GameSession {
                     &self.text,
                     &self.game,
                 );
+                // The box interaction draws the cursor after its own overlay
+                // (`itembox_draw_cursor`, pending depth 5 -> nearer than the
+                // frame pieces but behind the masks).
+                if reveal_cursor {
+                    item_box.draw_cursor(&mut self.framebuffer, menu_assets);
+                }
             }
         }
         if self.file.is_some() {

@@ -23,15 +23,21 @@ use crate::text::Text;
 use crate::tim;
 
 use super::main_menu::{
-    MenuAssets, MenuInput, draw_item_icon, draw_item_quantity, item_name_bytes,
+    MenuAssets, MenuInput, draw_item_icon_slice, draw_item_quantity_clipped, item_name_bytes,
 };
 
 /// Pack entry of the item-box frame sheet.
 pub const ITEMBOX_ENTRY: &str = "ui/itemboxn.tim";
 /// Number of box slots (8bpp sheet and save block agree on 48).
 pub const ITEMBOX_SLOTS_TOTAL: usize = 48;
-/// Ticks one page-slide lasts.
-pub const SLIDE_TICKS: u8 = 16;
+/// The page-slide counter's wrap value (`SUBMENU_STATE_ID`, `0x0F`): the
+/// counter steps by the slide direction and wraps to 0 there, which ends the
+/// slide. The slide therefore lasts 15 frames, moving the list one row (15px).
+pub const SLIDE_WRAP: u8 = 0x0F;
+/// The cursor blink counter's dim phase: while bit `0x20` of `DAT_00ae9f18`
+/// is clear the original draws the slot cursor's dim cell (`texU 0xA8`)
+/// instead of the bright one.
+pub const CURSOR_DIM_BIT: u8 = 0x20;
 
 /// One 12-byte frame texture entry of the item-box sheet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +134,11 @@ pub const SLOT_SIZE: [i16; 2] = [40, 30];
 pub const TICK_X: i16 = 0xB0;
 /// Page-position ticks first y offset.
 pub const TICK_Y: i16 = 0x21;
+/// The preview column's bottom drawable row (exclusive): the panel's lower
+/// mask (`0x77 + 9`) ends there, and the reference never paints a sliding
+/// slot below it - the incoming icon rises out of the mask strip, not out of
+/// the panel under it.
+pub const SLOT_CLIP_BOTTOM: i32 = 0x80;
 
 /// The item-box screen's drawable art.
 pub struct ItemBoxAssets {
@@ -170,7 +181,7 @@ pub enum ItemBoxEvent {
 /// The item-box screen state.
 #[derive(Debug, Clone)]
 pub struct ItemBox {
-    /// Which cursor owns the input.
+    /// Which cursor owns the input (`DAT_00ae9f20` 0/1 browse, 2/3 armed).
     pub mode: ItemBoxMode,
     /// The box cursor (`0..48`), matching the original's slot byte.
     pub box_cursor: u8,
@@ -178,12 +189,15 @@ pub struct ItemBox {
     pub player_cursor: u8,
     /// Inventory slots of the current character.
     pub slots: usize,
-    /// Page-slide direction: `0` idle, `+1` next, `-1` previous.
+    /// The page-slide counter (`SUBMENU_STATE_ID`): `0` idle, `1..=14` while
+    /// the slide is drawn; the step that would reach `SLIDE_WRAP` wraps to 0
+    /// and ends the slide.
+    pub slide: u8,
+    /// Page-slide direction (`DAT_00ae9f1c`): `0` idle, `+1` next, `-1`
+    /// previous.
     pub slide_dir: i8,
-    /// Page-slide progress in `0..=SLIDE_TICKS`.
-    pub slide_step: u8,
-    /// Blink counter driving the cursor and page ticks.
-    pub blink: u8,
+    /// The cursor blink counter (`DAT_00ae9f18`).
+    pub cursor_blink: u8,
 }
 
 impl Default for ItemBox {
@@ -193,9 +207,9 @@ impl Default for ItemBox {
             box_cursor: 0,
             player_cursor: 8,
             slots: 6,
+            slide: 0,
             slide_dir: 0,
-            slide_step: 0,
-            blink: 0,
+            cursor_blink: 0,
         }
     }
 }
@@ -208,9 +222,9 @@ impl ItemBox {
         self.box_cursor = 0;
         self.player_cursor = player_cursor;
         self.slots = game.inventory_capacity();
+        self.slide = 0;
         self.slide_dir = 0;
-        self.slide_step = 0;
-        self.blink = 0;
+        self.cursor_blink = 0;
     }
 
     /// The inventory slot under the player cursor.
@@ -227,27 +241,42 @@ impl ItemBox {
             .unwrap_or(0)
     }
 
-    /// Advance one fixed tick: the slide and blink animations.
+    /// Advance one fixed tick: the slide step and the cursor blink.
+    ///
+    /// The original steps the slide from its input state 3, which every frame
+    /// it owns; the tick sits before this frame's input here, so the frame the
+    /// page key was pressed on already draws the slide's first step.
     pub fn tick(&mut self) {
-        self.blink = self.blink.wrapping_add(1);
+        // `DAT_00ae9f18` counts down only in the browse state (state 1): the
+        // armed and sliding states (2/3) leave it alone, which is why an armed
+        // box keeps drawing the cursor's dim frame.
+        if self.mode == ItemBoxMode::Browse {
+            self.cursor_blink = self.cursor_blink.wrapping_sub(1);
+        }
         if self.slide_dir != 0 {
-            self.slide_step = self.slide_step.saturating_add(1);
-            if self.slide_step >= SLIDE_TICKS {
-                self.slide_step = 0;
-                self.slide_dir = 0;
-            }
+            self.advance_slide();
         }
     }
 
-    /// Whether the inventory cursor is on a top tab (the original closes the
-    /// box when confirm lands there).
+    /// Whether the cursor is on a top tab (the original closes the box when
+    /// confirm lands there).
     pub fn cursor_on_tab(&self) -> bool {
         self.player_cursor < super::layout::FIRST_SLOT_CURSOR
+    }
+
+    /// Whether the box cursor's frame is the dim blink phase.
+    pub fn cursor_dim(&self) -> bool {
+        self.cursor_blink & CURSOR_DIM_BIT == 0
     }
 
     /// Handle one discrete menu input, mutating `game` on a confirmed swap.
     pub fn handle_input(&mut self, game: &mut GameState, input: MenuInput) -> ItemBoxEvent {
         match self.mode {
+            // The original's state 3 (a slide is running) reads no buttons at
+            // all - the confirm that lands mid-slide is dropped, which is why
+            // a page-then-confirm sequence swaps the slot the *slide* landed
+            // on and not the one it started from.
+            ItemBoxMode::Armed if self.slide_dir != 0 => ItemBoxEvent::None,
             ItemBoxMode::Browse => self.browse_input(game, input),
             ItemBoxMode::Armed => self.armed_input(game, input),
         }
@@ -261,18 +290,24 @@ impl ItemBox {
                     return ItemBoxEvent::Close;
                 }
                 self.mode = ItemBoxMode::Armed;
+                // The arm resets the blink, so the armed cursor draws its dim
+                // frame from the confirm frame on.
+                self.cursor_blink = 0;
                 ItemBoxEvent::None
             }
             MenuInput::Left | MenuInput::Right => {
                 self.player_cursor = super::layout::move_sideways(self.player_cursor);
+                self.cursor_blink = 0;
                 ItemBoxEvent::None
             }
             MenuInput::Up => {
                 self.player_cursor = super::layout::move_up(self.player_cursor, self.slots);
+                self.cursor_blink = 0;
                 ItemBoxEvent::None
             }
             MenuInput::Down => {
                 self.player_cursor = super::layout::move_down(self.player_cursor, self.slots);
+                self.cursor_blink = 0;
                 ItemBoxEvent::None
             }
             MenuInput::PageLeft | MenuInput::PageRight => ItemBoxEvent::None,
@@ -285,23 +320,15 @@ impl ItemBox {
                 self.mode = ItemBoxMode::Browse;
                 ItemBoxEvent::None
             }
-            // The original's state 2 pages the box grid with the D-pad: down
-            // slides forward one slot, up slides back one (0x004941f0's
-            // `g_button_pressed_id & 0x5000` walk). L1/R1 stay aliases.
-            MenuInput::Up => {
-                self.page(-1);
+            // The original's state 2 pages the box grid with the raw D-pad
+            // up/down (`g_button_pressed_id & 0x5000`); L1/R1 (the `[`/`]`
+            // keys) alias them here. Down/L1 is `next`, up is `previous`.
+            MenuInput::Up | MenuInput::PageLeft => {
+                self.start_slide(-1);
                 ItemBoxEvent::None
             }
-            MenuInput::Down => {
-                self.page(1);
-                ItemBoxEvent::None
-            }
-            MenuInput::PageLeft => {
-                self.page(-1);
-                ItemBoxEvent::None
-            }
-            MenuInput::PageRight => {
-                self.page(1);
+            MenuInput::Down | MenuInput::PageRight => {
+                self.start_slide(1);
                 ItemBoxEvent::None
             }
             MenuInput::Confirm => {
@@ -324,16 +351,19 @@ impl ItemBox {
         }
     }
 
-    /// Step the box cursor by one slot with the slide animation, wrapping at
-    /// the 48-slot ends exactly like the original's L1/R1 walk.
-    pub fn page(&mut self, direction: i8) {
+    /// Start a page slide in `direction`: the original's state-2 page branch
+    /// plus the first step of the state-3 slide it falls into.
+    ///
+    /// The backward (`previous`) branch moves the box cursor immediately; the
+    /// forward one only advances it when the slide ends (`advance_slide`),
+    /// which is what keeps the drawn list and the swapped slot in step.
+    pub fn start_slide(&mut self, direction: i8) {
         if direction > 0 {
-            self.box_cursor = if self.box_cursor >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
-                0
-            } else {
-                self.box_cursor + 1
-            };
+            self.slide = 0;
+            self.slide_dir = 1;
         } else if direction < 0 {
+            self.slide = SLIDE_WRAP;
+            self.slide_dir = -1;
             self.box_cursor = if self.box_cursor == 0 {
                 ITEMBOX_SLOTS_TOTAL as u8 - 1
             } else {
@@ -342,16 +372,40 @@ impl ItemBox {
         } else {
             return;
         }
-        self.slide_dir = direction.signum();
-        self.slide_step = 0;
+        self.advance_slide();
+    }
+
+    /// One state-3 slide step: step the counter, wrap it at [`SLIDE_WRAP`],
+    /// and on reaching 0 advance the box cursor for a forward slide and
+    /// hand the grid back to the armed state.
+    fn advance_slide(&mut self) {
+        self.slide = self.slide.wrapping_add(self.slide_dir as u8);
+        if self.slide == SLIDE_WRAP {
+            self.slide = 0;
+        }
+        if self.slide == 0 {
+            if self.slide_dir > 0 {
+                self.box_cursor = if self.box_cursor >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
+                    0
+                } else {
+                    self.box_cursor + 1
+                };
+            }
+            self.slide_dir = 0;
+        }
     }
 
     /// Draw the box overlay over the already-drawn inventory panel.
     ///
-    /// The layer order follows the original's depth sort: the list interior
-    /// panel first, the shadows that dim its name rows, the bright green frame
-    /// pieces and the slot icon/quantity, the name rows, the full-box warning
-    /// line, then the near masks that clip the list, and the page ticks.
+    /// The layer order is the original's pending-sprite depth, not its
+    /// submission order: the trailing frame pieces (depth 40/30 -> sorts
+    /// 1140/980), the name rows (brightness 30 -> 930), the full-box line
+    /// (25 -> 900) and the preview icon/quantity (23/22 -> 868/852) all sort
+    /// *behind* the two 50% shadow rects (51 -> 501), which sort behind the
+    /// bright frame lines (0 -> 500) and the near masks and scrollbar tracks
+    /// (0 -> 450). Drawing the names and the icon before the shadows is what
+    /// dims the rows above and below the selected one while the selected row
+    /// stays bright.
     pub fn draw(
         &self,
         framebuffer: &mut Framebuffer,
@@ -363,90 +417,136 @@ impl ItemBox {
         // The list interior piece carries the blue background and the green
         // side columns that close the frame rectangle.
         draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[2]);
+        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[1]);
+        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[0]);
+
+        self.draw_names(framebuffer, menu, text, game);
+        self.draw_slot(framebuffer, menu, game);
+
         // The shadows sit on the panel and dim its first/third name rows; in
-        // browse mode they also dim the whole list and the preview slot.
-        framebuffer.blend_black_rect(rect_dst(SHADOW_TOP), SHADOW_ALPHA);
-        framebuffer.blend_black_rect(rect_dst(SHADOW_BOTTOM), SHADOW_ALPHA);
+        // browse mode they also dim the whole list and the preview slot. The
+        // browse-mode pair sorts *behind* the box-full line, while the two row
+        // shadows dim it - which is what the reference's frames show when the
+        // line is drawn on the first slot (`0x2C < cursor - 1` underflows).
         if self.mode == ItemBoxMode::Browse {
             framebuffer.blend_black_rect(rect_dst(SHADOW_LIST), SHADOW_ALPHA);
             framebuffer.blend_black_rect(rect_dst(SHADOW_SLOT), SHADOW_ALPHA);
         }
-        fill_rect(framebuffer, TRACK_TOP, [0, 0, 0, 255]);
-        fill_rect(framebuffer, TRACK_SIDE, [0, 0, 0, 255]);
+        self.draw_full_line(framebuffer);
+        framebuffer.blend_black_rect(rect_dst(SHADOW_TOP), SHADOW_ALPHA);
+        framebuffer.blend_black_rect(rect_dst(SHADOW_BOTTOM), SHADOW_ALPHA);
         // The bright frame pieces draw over the shadows so they stay green.
         for part in FRAME_PARTS_A {
             draw_part(framebuffer, &assets.itemboxn, part);
         }
-        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[0]);
-        draw_part(framebuffer, &assets.itemboxn, FRAME_PARTS_C[1]);
-
-        self.draw_slot(framebuffer, menu, game);
-        self.draw_names(framebuffer, menu, text, game);
-        self.draw_full_line(framebuffer);
+        self.draw_ticks(framebuffer, assets);
+        // The two scrollbar-track rects keep the original's grey `0x70` level
+        // and its `0x60000000` "fade to black" variant, so they darken the
+        // panel behind them rather than erasing it.
+        framebuffer.blend_black_rect(rect_dst(TRACK_TOP), SHADOW_ALPHA);
+        framebuffer.blend_black_rect(rect_dst(TRACK_SIDE), SHADOW_ALPHA);
         // The masks are the nearest layer: they clip the sliding list content
         // and cover the inventory panel around the box.
         for rect in FRAME_MASKS {
             fill_rect(framebuffer, rect, [0, 0, 0, 255]);
         }
-        self.draw_ticks(framebuffer, assets);
+    }
+
+    /// Draw the box's own cursor frame (`menu_draw_cursor` 0x00420A70, called
+    /// as `itembox_draw_cursor` from the interaction).
+    ///
+    /// The original draws the slot cursor from the box interaction rather than
+    /// the inventory handler, and its 40x30 frame has two cells: `texU 0x80`
+    /// while `DAT_00ae9f18` bit `0x20` is set and the dim `0xA8` cell while it
+    /// is clear. A tab cursor is left to the menu's tab highlight.
+    pub fn draw_cursor(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
+        if self.cursor_on_tab() {
+            return;
+        }
+        let Some(position) = super::layout::cursor_position(self.player_cursor, self.slots) else {
+            return;
+        };
+        let tex_u = if self.cursor_dim() { 0xA8 } else { 0x80 };
+        framebuffer.draw_indexed_sprite(
+            &assets.status,
+            [tex_u, 0xE0, 40, 30],
+            [i32::from(position[0]), i32::from(position[1]), 40, 30],
+            0,
+            0,
+            Tint::White,
+        );
     }
 
     /// The preview slot: the box cursor's 40x30 icon with its quantity, plus
     /// the incoming slot during a page slide.
+    ///
+    /// The original draws up to two slots: the first is the current cursor
+    /// slot, whose icon samples two pixels further down the sheet per slide
+    /// step (`texV = (slot & 6) * 0x10 + state * 2 + 0x50`) inside a window
+    /// that shrinks from the bottom, so it scrolls up and out; the second is
+    /// the slot after it, sliding up from 30px below into place. Both
+    /// quantities ride up with their slots.
     fn draw_slot(&self, framebuffer: &mut Framebuffer, menu: &MenuAssets, game: &GameState) {
-        let slide = i32::from(self.slide_step).min(i32::from(SLIDE_TICKS));
-        let reveal = if self.slide_dir == 0 {
-            30
-        } else {
-            30 - (i32::from(SLIDE_TICKS) - slide) * 2
-        };
-        let second = self.slide_dir != 0;
-        for index in 0..if second { 2 } else { 1 } {
-            let cursor = if index == 0 {
-                self.box_cursor
-            } else if self.slide_dir > 0 {
-                if self.box_cursor >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
-                    0
+        let slide = i32::from(self.slide);
+        let mut source_v = slide * 2;
+        let mut qty_y = (0x2C - slide) * 2;
+        let mut slot = self.box_cursor;
+        let mut y = i32::from(SLOT_POS[1]);
+        let mut height = i32::from(SLOT_SIZE[1]) - source_v;
+        let slots = if self.slide_dir != 0 { 2 } else { 1 };
+        for _ in 0..slots {
+            // Rows below the panel's lower mask are never painted.
+            let visible = height.min(SLOT_CLIP_BOTTOM - y);
+            let stack = game.item_box[usize::from(slot)];
+            if visible > 0 {
+                if stack.id == 0 {
+                    framebuffer.draw_indexed_sprite(
+                        &menu.blue,
+                        [0, 0, i32::from(SLOT_SIZE[0]), visible],
+                        [i32::from(SLOT_POS[0]), y, i32::from(SLOT_SIZE[0]), visible],
+                        0,
+                        0,
+                        Tint::White,
+                    );
                 } else {
-                    self.box_cursor + 1
+                    draw_item_icon_slice(
+                        framebuffer,
+                        menu,
+                        stack.id,
+                        [SLOT_POS[0], y as i16],
+                        source_v,
+                        visible,
+                    );
                 }
-            } else if self.box_cursor == 0 {
-                ITEMBOX_SLOTS_TOTAL as u8 - 1
-            } else {
-                self.box_cursor - 1
-            };
-            let stack = game.item_box[usize::from(cursor)];
-            let y = i32::from(SLOT_POS[1]) + index * 30;
-            let height = if index == 0 { reveal.max(0) } else { 30 };
-            if height == 0 {
-                continue;
             }
-            let dst = [i32::from(SLOT_POS[0]), y, i32::from(SLOT_SIZE[0]), height];
-            if stack.id == 0 {
-                framebuffer.draw_indexed_sprite(
-                    &menu.blue,
-                    [0, 0, SLOT_SIZE[0].into(), SLOT_SIZE[1].into()],
-                    dst,
-                    0,
-                    0,
-                    Tint::White,
-                );
-            } else {
-                draw_item_icon(
+            if stack.id != 0 {
+                // The box's quantity is drawn from `screenX - 2`, two pixels
+                // left of the inventory panel's own quantity.
+                draw_item_quantity_clipped(
                     framebuffer,
                     menu,
-                    stack.id,
-                    [SLOT_POS[0], SLOT_POS[1] + index as i16 * 30],
+                    game,
+                    stack,
+                    [SLOT_POS[0] - 2, qty_y as i16],
+                    SLOT_CLIP_BOTTOM,
                 );
-                if index == 0 {
-                    draw_item_quantity(framebuffer, menu, game, stack, SLOT_POS);
-                }
             }
+            source_v = 0;
+            y = qty_y + i32::from(SLOT_SIZE[1]);
+            qty_y += i32::from(SLOT_SIZE[1]);
+            height = i32::from(SLOT_SIZE[1]);
+            slot = if slot >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
+                0
+            } else {
+                slot + 1
+            };
         }
     }
 
-    /// The three-row item name list ending at the box cursor. Rows whose slot
-    /// holds nothing print the original's `_Nothing_` label.
+    /// The item name list ending at the box cursor: three rows normally, four
+    /// while a page slide runs (the extra row fills the gap the list leaves).
+    /// Rows whose slot holds nothing print the original's `_Nothing_` label
+    /// through the 8x14 renderer and in its grey tint.
     fn draw_names(
         &self,
         framebuffer: &mut Framebuffer,
@@ -459,23 +559,18 @@ impl ItemBox {
         } else {
             ITEMBOX_SLOTS_TOTAL as u8 - 1
         };
-        // A page change slides the whole list upward, exactly like the
-        // original's `nameY = 0x23 - state` walk.
-        let shift = if self.slide_dir == 0 {
-            0
-        } else {
-            -(i32::from(SLIDE_TICKS) - i32::from(self.slide_step))
-        };
-        for row in 0..3 {
+        // The list slides up one pixel per slide step (`nameY = 0x23 - state`).
+        let shift = -i32::from(self.slide);
+        let rows = if self.slide_dir != 0 { 4 } else { 3 };
+        for row in 0..rows {
             let stack = game.item_box[usize::from(slot)];
             let y = i32::from(NAME_Y) + row * i32::from(NAME_STEP) + shift;
             if stack.id == 0 {
-                menu.font.draw_text(
+                menu.font.draw_text_8x14(
                     framebuffer,
                     i32::from(NAME_X),
                     y,
-                    Tint::White,
-                    0,
+                    Tint::Grey,
                     NOTHING_LABEL,
                 );
             } else if let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags()) {
@@ -490,36 +585,45 @@ impl ItemBox {
         }
     }
 
-    /// The "box is full" warning line the original draws under the name list
-    /// while the box cursor sits on the last two slots (`0x2E`/`0x2F`). The
-    /// row follows the cursor so it stays under the list's last row.
+    /// The "box is full" warning line under the name list.
+    ///
+    /// The original's test is `0x2C < (unsigned char)(cursor - 1)`, so the
+    /// byte underflow draws it on the *first* slot as well as the last two,
+    /// one row per `state` higher (`lineY = 0x31 - state`, with no cursor term
+    /// for cursor 0). The original's line primitive spans
+    /// `[FULL_LINE_X, FULL_LINE_END_X)`, one pixel short of the mask width.
     fn draw_full_line(&self, framebuffer: &mut Framebuffer) {
-        if self.box_cursor < 0x2E {
+        if self.box_cursor.wrapping_sub(1) < 0x2D {
             return;
         }
-        let slide = if self.slide_dir == 0 {
-            0
+        let cursor_term = if self.box_cursor != 0 {
+            (0x30 - i32::from(self.box_cursor)) * 0x0F
         } else {
-            i32::from(SLIDE_TICKS) - i32::from(self.slide_step)
+            0
         };
-        let y = i32::from(FULL_LINE_Y) - slide + (0x30 - i32::from(self.box_cursor)) * 0x0F;
+        let y = i32::from(FULL_LINE_Y) - i32::from(self.slide) + cursor_term;
         fill_rect(
             framebuffer,
             Rect {
                 pos: [FULL_LINE_X, y as i16],
-                size: [FULL_LINE_END_X - FULL_LINE_X + 1, 1],
+                size: [FULL_LINE_END_X - FULL_LINE_X, 1],
             },
             FULL_LINE_COLOR,
         );
     }
 
-    /// The three page-position ticks following the box cursor.
+    /// The three page-position ticks following the box cursor. A backward
+    /// slide starts one slot further on (`DAT_00ae9f1c < 0` walks the tick
+    /// list forward while the cursor walks back).
     fn draw_ticks(&self, framebuffer: &mut Framebuffer, assets: &ItemBoxAssets) {
         let mut tick = if self.box_cursor != 0 {
             self.box_cursor - 1
         } else {
             ITEMBOX_SLOTS_TOTAL as u8 - 1
         };
+        if self.slide_dir < 0 {
+            tick = tick.wrapping_add(1);
+        }
         for _ in 0..3 {
             if tick >= ITEMBOX_SLOTS_TOTAL as u8 {
                 tick = 0;
@@ -619,7 +723,7 @@ mod tests {
                 height: 2160,
                 rgba: vec![0; (40 * 2160 * 4) as usize],
             },
-            font: crate::font::Font::new(solid_texture(768, 256, 1, [1, 2, 3, 255])),
+            font: crate::font::Font::new(solid_texture(768, 256, 1, [255, 255, 255, 255])),
         }
     }
 
@@ -654,26 +758,42 @@ mod tests {
         }
     }
 
+    /// Run a started page slide to its end (`SLIDE_WRAP` steps minus the step
+    /// the press frame already took).
+    fn settle_slide(item_box: &mut ItemBox) {
+        while item_box.slide_dir != 0 {
+            item_box.tick();
+        }
+    }
+
     #[test]
-    fn paging_walks_one_slot_and_wraps_at_48() {
+    fn paging_slides_one_slot_and_wraps_at_48() {
         let mut item_box = ItemBox::default();
         assert_eq!(item_box.box_cursor, 0);
-        item_box.page(-1);
+        // A backward page moves the cursor at once and slides into it.
+        item_box.start_slide(-1);
         assert_eq!(item_box.box_cursor, 47);
         assert_eq!(item_box.slide_dir, -1);
-        item_box.page(1);
-        assert_eq!(item_box.box_cursor, 0);
-        assert_eq!(item_box.slide_dir, 1);
-        for _ in 0..SLIDE_TICKS {
+        assert_eq!(item_box.slide, SLIDE_WRAP - 1);
+        for _ in 0..SLIDE_WRAP - 1 {
             item_box.tick();
         }
         assert_eq!(item_box.slide_dir, 0);
-        assert_eq!(item_box.slide_step, 0);
-        for _ in 0..47 {
-            item_box.page(1);
-        }
+        assert_eq!(item_box.slide, 0);
         assert_eq!(item_box.box_cursor, 47);
-        item_box.page(1);
+
+        // A forward page holds the cursor until the slide lands on the next
+        // slot: that is the slot the following confirm swaps.
+        item_box.start_slide(1);
+        assert_eq!(item_box.slide, 1);
+        assert_eq!(
+            item_box.box_cursor, 47,
+            "the cursor moves when the slide ends"
+        );
+        for _ in 0..SLIDE_WRAP - 1 {
+            item_box.tick();
+        }
+        assert_eq!(item_box.slide_dir, 0);
         assert_eq!(item_box.box_cursor, 0, "the last slot wraps to the first");
     }
 
@@ -704,8 +824,10 @@ mod tests {
         // Arm, page to the ammo slot and confirm: deposit the spray and take
         // the ammo.
         item_box.handle_input(&mut state, MenuInput::Confirm);
-        item_box.page(1);
-        item_box.page(1);
+        item_box.start_slide(1);
+        settle_slide(&mut item_box);
+        item_box.start_slide(1);
+        settle_slide(&mut item_box);
         assert_eq!(item_box.box_cursor, 2);
         assert_eq!(
             item_box.handle_input(&mut state, MenuInput::Confirm),
@@ -715,6 +837,43 @@ mod tests {
         assert_eq!(state.item_box[2].id, 0x41);
         assert_eq!(state.inventory[0].id, 0x0B);
         assert_eq!(state.inventory[0].quantity, 12);
+    }
+
+    #[test]
+    fn a_confirm_during_the_slide_is_dropped() {
+        let mut state = game();
+        state.add_item(0x41, 1); // spray in slot 0
+        state.item_box[1] = InventoryItem {
+            id: 0x0B,
+            quantity: 12,
+        };
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 8);
+        item_box.handle_input(&mut state, MenuInput::Confirm);
+        assert_eq!(item_box.mode, ItemBoxMode::Armed);
+
+        // Page forward, then confirm with the slide still running: the
+        // original's state 3 reads no buttons, so the box and the inventory
+        // both stay put.
+        item_box.handle_input(&mut state, MenuInput::Down);
+        item_box.tick();
+        assert_eq!(
+            item_box.handle_input(&mut state, MenuInput::Confirm),
+            ItemBoxEvent::None
+        );
+        assert_eq!(item_box.mode, ItemBoxMode::Armed);
+        assert_eq!(state.item_box[1].id, 0x0B);
+        assert_eq!(state.inventory[0].id, 0x41);
+
+        // The same confirm after the slide swaps the slot it landed on.
+        settle_slide(&mut item_box);
+        assert_eq!(item_box.box_cursor, 1);
+        assert_eq!(
+            item_box.handle_input(&mut state, MenuInput::Confirm),
+            ItemBoxEvent::Changed
+        );
+        assert_eq!(state.item_box[1].id, 0x41);
+        assert_eq!(state.inventory[0].id, 0x0B);
     }
 
     #[test]
@@ -730,28 +889,32 @@ mod tests {
         item_box.handle_input(&mut state, MenuInput::Confirm);
         assert_eq!(item_box.mode, ItemBoxMode::Armed);
 
-        // Down walks the box cursor forward one slot with the slide, and the
-        // inventory cursor stays put.
+        // Down slides forward one slot and the inventory cursor stays put.
         item_box.handle_input(&mut state, MenuInput::Down);
+        settle_slide(&mut item_box);
         assert_eq!(item_box.box_cursor, 1);
-        assert_eq!(item_box.slide_dir, 1);
         item_box.handle_input(&mut state, MenuInput::Down);
+        settle_slide(&mut item_box);
         assert_eq!(item_box.box_cursor, 2);
         assert_eq!(item_box.player_cursor, 8, "the inventory cursor is fixed");
 
-        // Up walks it back, wrapping at the first slot.
+        // Up walks it back, wrapping past the first slot.
         item_box.handle_input(&mut state, MenuInput::Up);
         assert_eq!(item_box.box_cursor, 1);
-        assert_eq!(item_box.slide_dir, -1);
+        settle_slide(&mut item_box);
         item_box.handle_input(&mut state, MenuInput::Up);
+        settle_slide(&mut item_box);
         item_box.handle_input(&mut state, MenuInput::Up);
+        settle_slide(&mut item_box);
         assert_eq!(item_box.box_cursor, 47, "past the first slot wraps");
         assert_eq!(item_box.mode, ItemBoxMode::Armed, "paging keeps the arm");
 
-        // The paged-to slot is what the next confirm swaps with.
-        item_box.page(1);
-        item_box.page(1);
-        item_box.page(1);
+        // The paged-to slot is what the next confirm swaps with: three
+        // forward pages wrap 47 -> 0 -> 1 -> 2.
+        for _ in 0..3 {
+            item_box.handle_input(&mut state, MenuInput::Down);
+            settle_slide(&mut item_box);
+        }
         assert_eq!(item_box.box_cursor, 2);
         assert_eq!(
             item_box.handle_input(&mut state, MenuInput::Confirm),
@@ -759,6 +922,36 @@ mod tests {
         );
         assert_eq!(state.item_box[2].id, 0x41);
         assert_eq!(state.inventory[0].id, 0x0B);
+    }
+
+    #[test]
+    fn the_cursor_blinks_in_step_with_the_box_state() {
+        let mut state = game();
+        state.add_item(0x41, 1);
+        let mut item_box = ItemBox::default();
+        item_box.open(&state, 8);
+
+        // `open` is the original's state-0 init: the counter starts at 0 and
+        // the first browse frame's count-down lands on 0xFF, the bright frame.
+        assert!(item_box.cursor_dim());
+        item_box.tick();
+        assert!(!item_box.cursor_dim());
+
+        // The arm resets the counter and the armed and sliding states leave it
+        // alone, so the cursor keeps its dim frame for the whole sequence.
+        item_box.handle_input(&mut state, MenuInput::Confirm);
+        assert!(item_box.cursor_dim());
+        for _ in 0..2 * SLIDE_WRAP * 2 {
+            item_box.tick();
+        }
+        assert!(item_box.cursor_dim());
+
+        // A D-pad move in the browse state resets it back to the dim frame.
+        item_box.handle_input(&mut state, MenuInput::Cancel);
+        item_box.tick();
+        assert!(!item_box.cursor_dim());
+        item_box.handle_input(&mut state, MenuInput::Down);
+        assert!(item_box.cursor_dim());
     }
 
     #[test]
@@ -900,14 +1093,27 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         item_box.draw(&mut framebuffer, &assets, &menu, &text, &state);
 
-        // Each empty row prints `_Nothing_` from `NAME_X`; the solid test font
-        // paints the first glyph's top-left texel.
+        // Each empty row prints `_Nothing_` from `NAME_X` through the 8x14
+        // renderer and its grey tint: the solid white test font comes out at
+        // the tint's 204, and the browse-mode list shadow dims every row once
+        // (the two outer rows carry a second, name-area shadow).
         let x = usize::from(NAME_X as u16) + 7;
         let y = usize::from(NAME_Y as u16) + 7;
-        assert_eq!(pixel(&framebuffer, x, y), [1, 2, 3, 255]);
         let step = usize::from(NAME_STEP as u16);
-        assert_eq!(pixel(&framebuffer, x, y + step), [1, 2, 3, 255]);
-        assert_eq!(pixel(&framebuffer, x, y + 2 * step), [1, 2, 3, 255]);
+        let dim = |value: u8| (u32::from(value) * 143 / 255) as u8;
+        let tinted = dim(204);
+        assert_eq!(
+            pixel(&framebuffer, x, y),
+            [dim(tinted), dim(tinted), dim(tinted), 255]
+        );
+        assert_eq!(
+            pixel(&framebuffer, x, y + step),
+            [tinted, tinted, tinted, 255]
+        );
+        assert_eq!(
+            pixel(&framebuffer, x, y + 2 * step),
+            [dim(tinted), dim(tinted), dim(tinted), 255]
+        );
     }
 
     #[test]
@@ -919,34 +1125,54 @@ mod tests {
         };
         let menu = test_menu_assets();
         let text = Text::default();
-        let line_pixels = |item_box: &ItemBox| {
+        // The browse-mode pair sorts behind the line and the two row shadows
+        // sort in front of it: the row-0 line sits between both shadows and
+        // keeps its raw colour, the last two slots' lines fall under the row-3
+        // shadow and keep one dimming.
+        let dim = |value: u8| (u32::from(value) * 143 / 255) as u8;
+        let dimmed = [
+            dim(FULL_LINE_COLOR[0]),
+            dim(FULL_LINE_COLOR[1]),
+            dim(FULL_LINE_COLOR[2]),
+            255,
+        ];
+        let line_pixels = |item_box: &ItemBox, color: [u8; 4]| {
             let mut framebuffer = Framebuffer::new();
             item_box.draw(&mut framebuffer, &assets, &menu, &text, &state);
             let mut count = 0;
             for y in 0..framebuffer.height as usize {
                 for x in 0..framebuffer.width as usize {
-                    if pixel(&framebuffer, x, y) == FULL_LINE_COLOR {
+                    if pixel(&framebuffer, x, y) == color {
                         count += 1;
                     }
                 }
             }
             count
         };
+        let line_width = usize::from((FULL_LINE_END_X - FULL_LINE_X) as u16);
 
         item_box.open(&state, 8);
-        assert_eq!(line_pixels(&item_box), 0, "no line on the first slot");
+        assert_eq!(
+            line_pixels(&item_box, FULL_LINE_COLOR),
+            line_width,
+            "the first slot draws the line at 0x31"
+        );
         item_box.box_cursor = 0x2D;
-        assert_eq!(line_pixels(&item_box), 0, "no line before the last slots");
+        assert_eq!(
+            line_pixels(&item_box, FULL_LINE_COLOR) + line_pixels(&item_box, dimmed),
+            0,
+            "no line before the last slots"
+        );
         item_box.box_cursor = 0x2E;
         assert_eq!(
-            line_pixels(&item_box),
-            usize::from((FULL_LINE_END_X - FULL_LINE_X + 1) as u16),
+            line_pixels(&item_box, dimmed),
+            line_width,
             "the whole warning line draws on slot 0x2E"
         );
         item_box.box_cursor = 0x2F;
         assert_eq!(
-            line_pixels(&item_box),
-            usize::from((FULL_LINE_END_X - FULL_LINE_X + 1) as u16),
+            line_pixels(&item_box, dimmed),
+            line_width,
             "the whole warning line draws on slot 0x2F"
         );
     }
