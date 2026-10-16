@@ -717,7 +717,10 @@ Still open, by design:
 
 - The attract demo and the title idle timer (the four recorded reels replay
   inputs over boss rooms; the title timer has no destination without them).
-- The ending path (`--ending`-only until the post-fight sequences land).
+- The ending path's gameplay trigger: the RESULT screen, the rocket-launcher
+  epilogue and the next-cycle save run end to end under `--ending`, but no
+  combat/boss path reaches `ending_state` yet, so the surviving flags stay
+  unset in normal play.
 - The DC-only Forest zombie (`0x16`) and the DC branches the port does not
   model.
 - The documented render contracts: per-joint colour tints and joint-object

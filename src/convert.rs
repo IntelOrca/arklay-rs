@@ -1325,6 +1325,53 @@ const UI_ASSETS: &[(&str, &str, UiKind)] = &[
     ("ui/jopt06.bmp", "JOPT06.TIM", UiKind::Tim16),
     ("ui/side06.bmp", "SIDE06.TIM", UiKind::Tim16),
     ("ui/sidekey3.bmp", "SIDEKEY3.TIM", UiKind::Tim16),
+    // The RESULT screen's baked plates: 4bpp TIMs the ending result and the
+    // rocket-launcher epilogue sample by V cursor. Raw, so the renderer
+    // decodes them itself.
+    ("ui/en05.tim", "EN05.TIM", UiKind::Raw),
+    ("ui/en07.tim", "EN07.TIM", UiKind::Raw),
+    // The RESULT screen's character backdrops (first-run and cleared-once
+    // stills) and the epilogue's rocket-launcher backdrop, all 320x240 PIX16.
+    (
+        "ui/chris02.bmp",
+        "CHRIS02.PIX",
+        UiKind::Pix16 {
+            width: 320,
+            height: 240,
+        },
+    ),
+    (
+        "ui/jill02.bmp",
+        "JILL02.PIX",
+        UiKind::Pix16 {
+            width: 320,
+            height: 240,
+        },
+    ),
+    (
+        "ui/clis01.bmp",
+        "CLIS01.PIX",
+        UiKind::Pix16 {
+            width: 320,
+            height: 240,
+        },
+    ),
+    (
+        "ui/jill01.bmp",
+        "JILL01.PIX",
+        UiKind::Pix16 {
+            width: 320,
+            height: 240,
+        },
+    ),
+    (
+        "ui/rc1121.bmp",
+        "RC1121.PIX",
+        UiKind::Pix16 {
+            width: 320,
+            height: 240,
+        },
+    ),
 ];
 
 /// The global weapon-effect metadata file names.
