@@ -26,8 +26,10 @@ const TICK_P95_BUDGET_MS: f64 = 5.0;
 const LOAD_BUDGET_MS: f64 = 60.0;
 /// One rendered frame's ceiling in milliseconds.
 const RENDER_BUDGET_MS: f64 = 30.0;
-/// Sum of the script/entity/player update phases over 600 ticks.
-const UPDATE_BUDGET_MS: f64 = 5.0;
+/// Sum of the script/entity/player update phases over 600 ticks. Raised by
+/// the enemy milestone: the pack's Lua scripts run on every scripted entity
+/// tick and load on the room's first tick (see `docs/performance.md`).
+const UPDATE_BUDGET_MS: f64 = 25.0;
 /// Wall clock for the whole 600-tick run, process start included.
 const ROOM_600_BUDGET_MS: u64 = 5_000;
 

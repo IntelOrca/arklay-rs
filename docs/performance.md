@@ -27,7 +27,7 @@ these numbers exclude the interactive mixer and presentation costs.
 | Gameplay tick max | <= 0.86 ms (room 106, the heaviest sample) | not asserted | - |
 | Room load (RDT parse, cuts, scripts, player assets) | 3.0-5.8 ms | 60 ms | ~10x |
 | One capture render | 2.9-3.7 ms | 30 ms | ~8x |
-| Script/entity/player update, 600 ticks | 0.54-1.30 ms | 5 ms | ~4x |
+| Script/entity/player update, 600 ticks | 8.7-13.6 ms (2026-10-16) | 25 ms | ~2x |
 | Effect update, 600 ticks | 0.24-0.31 ms | not asserted | - |
 | 600-tick room run, process start and pack open included | 318-524 ms | 5 s | ~10x |
 | Full-game soak, one pass | 394.1 / 395.8 / 393.1 s | 900 s | ~2.3x |
@@ -36,6 +36,15 @@ these numbers exclude the interactive mixer and presentation costs.
 | Soak live-byte drift between passes 2 and 3 | 0 MiB | 32 MiB | - |
 | Conversion, single pack (770,227,997 bytes in, zstd level 6) | 3.8 s, 479,865,985 bytes out (2026-10-13) | - | - |
 | Conversion peak RSS | 1256 MB | - | - |
+
+The update row's 2026-10-06 measurement predates the E1-E12 enemy
+milestone, which put the pack's Lua scripts on every scripted entity tick
+(the room's first tick loads and compiles them, the rest step the VM), so
+it was re-measured on 2026-10-16: 8.7-13.6 ms over 600 ticks across the
+three samples (the worst is room 106). The re-measurement ran on the
+development XPS 15 (i7-4702HQ), where the other phases match the reference
+machine's numbers within noise; the budget carries ~2x headroom over the
+worst sample for either machine.
 
 The soak's 2026-10-06 coverage: 3003 room simulations over the three passes
 (348 starts per pass, 28 stub rooms without camera cuts skipped, 681 followed
