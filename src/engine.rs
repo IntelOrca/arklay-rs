@@ -3837,6 +3837,16 @@ impl GameSession {
         if let Some(map) = self.map.as_mut() {
             map.draw(&mut self.framebuffer, pack, &self.game);
         }
+        if let Some(map) = self.map.as_ref() {
+            // The original's depth puts the status screen's frame decorations
+            // in front of the map tab's sprites, so the panel's dithered
+            // right-hand edge shows over the composite (see
+            // `MainMenu::draw_frames_over`).
+            let rect = map.content_rect();
+            if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
+                menu.draw_frames_over(&mut self.framebuffer, assets, rect);
+            }
+        }
         if self.save_screen.is_some() {
             let Self {
                 save_screen,

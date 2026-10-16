@@ -613,6 +613,46 @@ impl MainMenu {
         }
     }
 
+    /// Re-draw the frame decorations that overlap `rect` over a sub-screen's
+    /// content.
+    ///
+    /// The original queues the status screen's frame decorations and the map
+    /// tab's sprites into one ordering table, and the decorations' depth is
+    /// the nearer one: the panel's right-hand edge (the 8x112 part at
+    /// (192,20)) is drawn over the map's composite, and its dithered left
+    /// column lets the map show through every other row. Everything else the
+    /// status screen draws - the health monitor, the portrait, the tabs - is
+    /// under the map tab's sprites, so only the overlapping decorations are
+    /// re-drawn.
+    pub fn draw_frames_over(
+        &self,
+        framebuffer: &mut Framebuffer,
+        assets: &MenuAssets,
+        rect: layout::Rect,
+    ) {
+        let overlaps = |pos: [i16; 2], size: [i16; 2]| {
+            pos[0] < rect.pos[0] + rect.size[0]
+                && pos[0] + size[0] > rect.pos[0]
+                && pos[1] < rect.pos[1] + rect.size[1]
+                && pos[1] + size[1] > rect.pos[1]
+        };
+        for part in layout::frame_parts() {
+            if overlaps(part.pos, part.size) {
+                draw_part(framebuffer, &assets.status, part);
+            }
+        }
+        for tile in layout::common_tiles() {
+            if overlaps(tile.part.pos, tile.part.size) {
+                draw_tile(framebuffer, &assets.status, tile);
+            }
+        }
+        for tile in layout::border_tiles(self.slots) {
+            if overlaps(tile.part.pos, tile.part.size) {
+                draw_tile(framebuffer, &assets.status, tile);
+            }
+        }
+    }
+
     fn draw_frames(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
         for part in layout::frame_parts() {
             draw_part(framebuffer, &assets.status, part);

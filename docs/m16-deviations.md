@@ -30,13 +30,18 @@ authoring limits are in `docs/m15-deviations.md`.
    fixed-point view build cannot be proven against reference frames without the
    golden set (item 8).
 
-4. **Map tab scope.** The tab browser (floor plan, visited-room tinting, the
-   current-room highlight and the dpad page/room steps) is implemented from the
-   extracted tables. The full-display zoom is a single swap rather than the
-   original's frame-by-frame zoom/light animation, the objective highlight is
-   transcribed from the scenario flags rather than extracted as data, and the
-   arrow/dot blink sprites are not drawn. A pack without `map/` degrades to a
-   blank tab with a warning.
+4. **Map full-display scope.** The tab browser is exact (see
+   `oracle/ui-findings.md`): the layout art page, the base window and marker
+   sprites, the area-name row, the floor number glyph and the room-step
+   arrows all come from the reference's own sprite table, and the
+   areas/layouts/rooms from the extracted tables. What remains approximate is
+   the second confirm's full-display view: `map_display_animate`'s
+   frame-by-frame zoom/light animation (the scaleX/scaleY states, the zoom,
+   dot, floor-arrow and highlight sprites) is a single swap in the port, and
+   the display compositor draws the area plan over the blue backdrop rather
+   than the reference's dimmed browser plus its zoom sprites. The objective
+   highlight is transcribed from the scenario flags rather than extracted as
+   data. A pack without `map/` degrades to a blank tab with a warning.
 
 5. **Item-view examine fallback.** When the model's pose is outside the item's
    examine windows the port refuses the confirm (the rotation puzzle stays
@@ -123,7 +128,9 @@ cadence and the headless transition follow.
 ## Capture re-baselines
 
 - `--ui select` and `--ui view` captures are unchanged at their settled poses.
-- `--ui menu` is unchanged; `--ui map` is new (the pack gains `map/`).
+- `--ui menu` is unchanged; `--ui map` is new (the pack gains `map/`) and
+  changed again when the tab browser became the original's composite
+  (`oracle/ui-findings.md`), so that capture's goldens need regenerating.
 - Room captures change where a message is dismissed over an action zone (item 6)
   or where a scripted door is now followed inside the tick window. The corpus
   audit prints the rooms whose captures transition; none do under its

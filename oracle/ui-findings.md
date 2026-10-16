@@ -117,6 +117,30 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   action tick counter now match through the cancel, the exit fade and the
   settled room.
 
+- **MAP tab browser.** The original's tab browser composites one art page into
+  the panel - `map_tab_load_map` loads the file of the availability mask's
+  *highest* layout bit (`map0e`, `map00`, `map0c` or `map0d`) and samples every
+  browser sprite from that single page: the 160x72 base window at (33,32), the
+  four layout markers (the current layout's at full brightness, the others at
+  `colorMul` 0x40), the area-name row (the 80x16 sprite at (57,104) whose
+  `texV` is `layout * 0x10 + 0x48` - the "Mansion 1F" caption) and the current
+  floor's number glyph (24x16 at (137,104), `texV` `(6 - room - 4) * 0x10`,
+  which wraps past the page for layout 3's room index and is then dropped by
+  the page search), plus the up/down arrows while the neighbouring room exists,
+  blinking between two art frames on the reference's per-frame `MAP_HL_COUNT`
+  cycle. arklay drew a private blue-grid backdrop with a centred plan instead
+  (`plan_image`), so the whole display window differed ~29%. Two further
+  reference details came with it: the tab action runs one frame *after* the
+  confirm (`menu_handle_input` only sets `DAT_00ae9f20 = 2` on the confirm
+  frame, so the browser's first frame is the next one and its blink counter
+  starts at 1), and the panel's right-hand edge frame part is at a depth
+  *nearer* than the map sprites, so its dithered column shows over the
+  composite. The scenario's map frames (t=111-179) drop from 21.6k-23.0k
+  differing pixels (28.9-29.9%, mean 13.7-15.4/255) to 525-605 (~0.7-0.8%,
+  mean 0.16-0.21), which is the panel's own portrait/EKG residual seen on every
+  non-map frame - the map window itself is now byte-identical - and the
+  hand-off frame t=110 goes from 16.5k (21.5%) to 525.
+
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
 `use_herb`, `equip_weapon`, `file_open`, `file_pages`, `map_open`,
@@ -153,19 +177,13 @@ match), which is what the save interchange exists for.
   idle window than arklay's (the state trace cannot see either). The reader's
   exit path is likewise phase-shifted (~20 frames), so the scenario inputs
   stop before the exit for now.
-- **MAP full-display rendering.** The original zooms the floor plan from the
-  inventory panel to the full-display map as soon as the tab opens (with the
-  "Mansion 1F" caption); arklay keeps the panel browser until a confirm and
-  then swaps. The display now composites the area's own 128x100 plan
-  (`map/map01..0b.tim` by area) over the blue grid backdrop with the
-  original's index-0 key on the plan only, unvisited markers transparent,
-  the current room in the original's red highlight and both layers at the
-  `colorMul` half brightness (`MapScreen::display_image`), which drops the
-  settled-frame error from 13.3 to 4.4 mean/255. Still open: the exact
-  per-layer blend (some grid pixels read full brightness in the reference),
-  the area-name caption drawn at the plan's foot, and the frame-by-frame
-  zoom/light animation (the documented M16 simplification,
-  `docs/m16-deviations.md` item 4).
+- **MAP full-display zoom.** The browser's confirm switches to the full map
+  display (`map_display_update`: the area plan's zoom sprites, the blue
+  backdrop page and the browser's own composite dimmed underneath). No
+  scenario reaches it - `map_open` only opens the browser, whose second
+  confirm would be needed - and the port's single-swap `display_image`
+  compositor stays the documented M16 simplification
+  (`docs/m16-deviations.md` item 4).
 - **Item box contents/model.** The box overlay opens and the trace matches,
   but the frames differ ~15%: the item swapped by the scenario's confirms and
   the model drawn in the viewport differ (the reference keeps the box object
