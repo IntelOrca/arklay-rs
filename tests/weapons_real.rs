@@ -91,6 +91,10 @@ fn real_room_web_dies_through_the_weapon_input_path() {
     run.player.pos = [web.pos[0] + 300, web.pos[1], web.pos[2]];
     run.player.angle =
         arklay::sfx::angle_between_xz(run.player.pos[0], run.player.pos[2], web.pos[0], web.pos[2]);
+    // Move the collision mirror with the placed position (the door and
+    // scripted-motion paths do the same); a stale mirror resolves the first
+    // movement back toward the spawn.
+    run.player.collision_mirror = [run.player.pos[0], run.player.pos[2]];
     run.game.entities[0].pos = run.player.pos;
 
     let emd_bytes = pack.read("player/00.emd").unwrap();
@@ -111,6 +115,15 @@ fn real_room_web_dies_through_the_weapon_input_path() {
     // it with the weapon tick the way the engine's entity pass does.
     let mut host = arklay::enemy::LuaEnemyHost::new();
     for tick in 0..300 {
+        // Hold the stance: the weapon-joint translation adjustment creeps the
+        // player while the weapon machine drives the pose (the hand stays put
+        // while the body settles), so a standing player is re-anchored every
+        // tick, collision mirror included. The angle is the machine's own (its
+        // turn-to-target steers it and needs to converge).
+        run.player.pos = [web.pos[0] + 300, web.pos[1], web.pos[2]];
+        run.player.collision_mirror = [run.player.pos[0], run.player.pos[2]];
+        run.game.entities[0].pos = run.player.pos;
+        run.game.entities[0].angle = run.player.angle;
         let input = Input {
             aim: true,
             fire: true,
