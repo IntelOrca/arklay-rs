@@ -81,8 +81,11 @@ limit what it can display.
 
 The engine encodes through the install's own font sheet (the 768-wide
 Japanese sheet, or a sheet the pack ships). A character the sheet has no cell
-for is drawn as a small hollow box instead of vanishing or switching
-language, and `charset::MISSING` names the cell `font::Font::new` paints.
+for is drawn as a small synthetic hollow box instead of vanishing or switching
+language. `charset::MISSING` is the reserved byte pair (`0xFA 0xFF`, an
+operand no page's table entries reach) the box is drawn for; the decoded sheet
+is never modified, so the fonts' own glyphs — including the controller symbols
+and the `0x0B` page-wait ▼ — stay intact.
 
 The Japanese sheet has no accented Latin, Cyrillic or the symbols `>`, `=`,
 `+`. A language that needs glyphs its sheet lacks should ship the font as a

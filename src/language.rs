@@ -760,10 +760,7 @@ ITEM_05_DESCRIPTION = \"A\"
     fn characters_without_cells_become_boxes() {
         let language = Language::parse("UI_X = \"é\"\nUI_Y = \"A\"\n").unwrap();
         assert_eq!(language.len(), 2);
-        assert_eq!(
-            language.get("UI_X").unwrap().encode(),
-            [charset::MISSING, 0x01]
-        );
+        assert_eq!(language.get("UI_X").unwrap().encode(), [0xFA, 0xFF, 0x01]);
         assert_eq!(language.get("UI_Y").unwrap().encode(), [0x1D, 0x01]);
     }
 

@@ -75,8 +75,8 @@ responsibility.
 | `bmp` | Format | BMP encode/decode, including the black-key room-mask decode |
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
-| `font` | Presentation | Glyph decoding, metrics and tinted drawing; paints the missing-glyph box |
-| `charset` | Presentation | The font's byte <-> character map: greedy cell encoding, substitutes and the box cell |
+| `font` | Presentation | Glyph decoding, metrics and tinted drawing; draws the synthetic missing-glyph box |
+| `charset` | Presentation | The font's byte <-> character map: greedy cell encoding, substitutes and the missing marker |
 | `language` | Presentation | `language/<tag>.txt` grammar, the layered catalog, the fallback chain and OS locale detection |
 | `text` | Presentation | The runtime string facade: messages, item names/descriptions, save strings, room labels and `UI_*` |
 | `mask` | Presentation | Room mask (foreground overlay) sprites and depth ordering |
