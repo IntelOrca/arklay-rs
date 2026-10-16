@@ -183,10 +183,10 @@ would not shrink also stays raw.
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm
 runs the item's examine check (the rotation-gated descriptions and the red
-book's zoom). The map tab needs the radio's scenario flag; up/down step the
-rooms of the current floor plan, left/right step between the plans the owned
-maps unlock, and confirm shows the full plan of the current area. A pack
-without `map/` leaves the tab blank.
+book's zoom). The map tab shows the floor-plan browser with its "Mansion 1F"
+caption; up/down step the rooms of the current floor plan, left/right step
+between the plans the owned maps unlock, and confirm shows the full plan of
+the current area. A pack without `map/` leaves the tab blank.
 
 Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
 pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
