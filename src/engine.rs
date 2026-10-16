@@ -7270,22 +7270,28 @@ pub fn simulate_typewriter(
         .with_context(|| format!("room {} has no typewriter action", id.room3()))?;
     let center_x = i32::from(action.zone[0]) + i32::from(action.zone[2]) / 2;
     let center_z = i32::from(action.zone[1]) + i32::from(action.zone[3]) / 2;
-    let (dx, dz) = player::reach_offset(0);
-    let typewriter_pos = [center_x - dx, session.player.pos[1], center_z - dz];
 
     // Probe the typewriter, dismiss any startup message, page the prompt and
     // answer its yes/no choice. Action presses alternate with idle ticks so
     // the window and the probe see a fresh edge; the player is re-placed every
-    // tick in case a script keeps moving them.
+    // tick in case a script keeps moving them. The action rect's centre can sit
+    // inside the room's furniture, so the tick's collision resolve leaves the
+    // placed player on the nearest standable spot; cycle the four facings
+    // until one's reach probe covers the rect, then hold it while the prompt
+    // resolves.
     let mut prompted = false;
     let mut pressed = true;
-    for _ in 0..40_000 {
+    let mut facing = 0u16;
+    for tick in 0..40_000 {
         if session.save_screen.is_some() {
             prompted = true;
             break;
         }
-        session.player.pos = typewriter_pos;
-        session.player.angle = 0;
+        if session.game.typewriter == game::TypewriterFlow::Idle {
+            facing = [0u16, 0x400, 0x800, 0xC00][(tick / 16) % 4];
+        }
+        session.player.pos = [center_x, session.player.pos[1], center_z];
+        session.player.angle = facing;
         session.game.sync_entity_from_player(&session.player);
         let input = player::Input {
             action_held: true,

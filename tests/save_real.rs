@@ -55,7 +55,9 @@ fn real_typewriter_save_consumes_a_ribbon_and_reloads() {
     );
     assert_eq!(sim.saved.used_item, items::ITEM_INK_RIBBONS);
     assert_eq!(sim.saved.character, 0);
-    assert_eq!(sim.saved.stage, 1);
+    // The block's stage byte is the original's 0-based `g_stageId`
+    // (216056f), not the port's 1-based RDT digit.
+    assert_eq!(sim.saved.stage, 0);
     assert_eq!(sim.saved.room, 0);
     assert_eq!(
         sim.saved.total_held, 2,
