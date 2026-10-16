@@ -10855,6 +10855,7 @@ mod tests {
 
     #[test]
     fn capture_writes_bmp() {
+        let _sdl = crate::audio::test_lock::sdl();
         let dir = TempDir::new();
         let pack_path = dir.0.join("game.akpak");
         let capture_path = dir.0.join("capture.bmp");
@@ -12112,6 +12113,7 @@ mod tests {
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_room100_ticks_capture_is_deterministic() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -12129,6 +12131,7 @@ mod tests {
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn capture_draws_the_player_in_room_1001() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -12527,6 +12530,7 @@ mod tests {
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_room_1000_capture_and_mask_layer() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -13184,6 +13188,7 @@ mod tests {
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_font_capture_is_deterministic() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -13707,6 +13712,7 @@ mod tests {
     /// that boots back through the CLI flag with the authored state.
     #[test]
     fn the_setup_script_authors_a_save_the_load_boot_reads() {
+        let _sdl = crate::audio::test_lock::sdl();
         let dir = TempDir::new();
         let pack_path = new_game_pack(&dir);
         let saves = dir.0.join("saves");
@@ -14124,6 +14130,7 @@ mod tests {
 
     #[test]
     fn ticks_capture_follows_a_scripted_door_into_the_destination() {
+        let _sdl = crate::audio::test_lock::sdl();
         let dir = TempDir::new();
         let (pack_path, a, _b, _red, blue) = walk_in_door_pack(&dir);
         let capture_path = dir.0.join("capture.bmp");
@@ -18174,6 +18181,7 @@ off_0010:
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_title_capture_is_deterministic() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -18201,6 +18209,7 @@ off_0010:
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_select_capture_is_deterministic() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
@@ -18223,6 +18232,7 @@ off_0010:
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn real_new_game_capture_is_deterministic() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };

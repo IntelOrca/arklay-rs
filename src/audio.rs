@@ -1671,6 +1671,7 @@ mod tests {
     #[test]
     #[ignore = "requires an audio device or SDL dummy driver"]
     fn dummy_driver_plays_loops_and_stops() {
+        let _sdl = crate::audio::test_lock::sdl();
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
         let mut player = Mixer::open().expect("dummy audio device should open");
         let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
@@ -1713,6 +1714,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
     fn real_footstep_wav_parses_and_plays() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
             return;
         };
