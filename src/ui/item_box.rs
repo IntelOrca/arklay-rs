@@ -477,10 +477,18 @@ impl ItemBox {
                     Tint::White,
                     0,
                     NOTHING_LABEL,
+                    text.uses_tight_metrics(),
                 );
             } else if let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags()) {
-                menu.font
-                    .draw_text(framebuffer, i32::from(NAME_X), y, Tint::White, 0, name);
+                menu.font.draw_text(
+                    framebuffer,
+                    i32::from(NAME_X),
+                    y,
+                    Tint::White,
+                    0,
+                    name,
+                    text.uses_tight_metrics(),
+                );
             }
             slot = if slot >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {
                 0

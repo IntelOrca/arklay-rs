@@ -587,6 +587,7 @@ impl Screen for ItemViewScreen {
                 Tint::White,
                 0,
                 &self.name,
+                cx.text.is_none_or(Text::uses_tight_metrics),
             );
         }
     }

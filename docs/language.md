@@ -92,6 +92,35 @@ The Japanese sheet has no accented Latin, Cyrillic or the symbols `>`, `=`,
 mod asset (`font/font.tim`), which the pack layering already supports.
 Per-font character tables (a pack-provided encoding) are not implemented yet.
 
+## Latin spacing (per-glyph metrics)
+
+The sheet is the Japanese 14x14 grid, whose Latin glyphs were drawn full-width:
+lowercase letters carry only 7-10px of ink inside their cell and every space is
+a full cell, so drawing English through the cells leaves a hole between letters
+and a wide gap between words.
+
+The engine measures the sheet's own ink at load time
+(`font::GlyphTable::measure`). For every cell it records `indent = min_x` and
+`advance = min(14, ink_width + 1)` from the ink's bounding box, and the tight
+drawing path blits the cell at `x - indent`. Two authored rules join the
+measurement:
+
+- the space byte `0x00` advances 8px;
+- the digit bytes `0x0C..=0x15` keep the full 14px, so counters and save
+  timers stay monospaced.
+
+The metrics apply only to non-Japanese languages: `Catalog::uses_tight_metrics`
+is true for every tag except `ja`/`ja-*`, so `ja-JP` renders exactly as the
+original. Raw draws with no language context keep the full cells too: the
+`--ui font` sampler and the fixed-width save-screen slot templates and reveal
+string.
+
+`font::Font::draw_text`/`draw_text_plain` take a tight flag, `font::advance`
+returns a stream's advance, and `font::wrap_pixels`/`font::fit_pixels` wrap and
+clip by advances instead of cell counts. Encoding is unchanged, and the metrics
+come from the sheet, so a mod that ships a redrawn narrow `font/font.tim` is
+measured automatically.
+
 ## Licensing
 
 The seeds combine the user's own install (the `ja-JP` file decodes the

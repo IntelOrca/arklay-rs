@@ -476,6 +476,7 @@ impl Screen for SaveLoadScreen {
             return;
         };
         let save_strings = text.save();
+        let tight = text.uses_tight_metrics();
         let mode = match self.mode {
             SaveLoadMode::Save => 0,
             SaveLoadMode::Load => 1,
@@ -490,6 +491,7 @@ impl Screen for SaveLoadScreen {
             Tint::White,
             2,
             save_strings.header(mode),
+            tight,
         );
         font.draw_text_plain(
             framebuffer,
@@ -498,6 +500,7 @@ impl Screen for SaveLoadScreen {
             Tint::White,
             2,
             save_strings.header_suffix(),
+            tight,
         );
 
         for (index, slot) in self.slots.iter().enumerate() {
@@ -507,6 +510,9 @@ impl Screen for SaveLoadScreen {
             }
             match slot {
                 Some(info) => {
+                    // The slot template is fixed-width art authored on the
+                    // Japanese 14px grid: keep its separators on the count
+                    // and location columns.
                     font.draw_text(
                         framebuffer,
                         ROW_X,
@@ -514,6 +520,7 @@ impl Screen for SaveLoadScreen {
                         Tint::White,
                         2,
                         save_strings.slot_filled(),
+                        false,
                     );
                     font.draw_text(
                         framebuffer,
@@ -522,9 +529,10 @@ impl Screen for SaveLoadScreen {
                         Tint::White,
                         2,
                         save_strings.character_name(usize::from(info.character & 1)),
+                        tight,
                     );
                     let count = count_bytes(info.saves);
-                    font.draw_text(framebuffer, COUNT_X, y, Tint::White, 2, &count);
+                    font.draw_text(framebuffer, COUNT_X, y, Tint::White, 2, &count, tight);
                     font.draw_text(
                         framebuffer,
                         LOC_X,
@@ -532,8 +540,10 @@ impl Screen for SaveLoadScreen {
                         Tint::White,
                         2,
                         save_strings.location(info.stage, info.room),
+                        tight,
                     );
                 }
+                // The empty-slot row is fixed-width art too.
                 None => font.draw_text(
                     framebuffer,
                     ROW_X,
@@ -541,6 +551,7 @@ impl Screen for SaveLoadScreen {
                     Tint::White,
                     2,
                     save_strings.slot_empty(),
+                    false,
                 ),
             }
         }
@@ -552,6 +563,7 @@ impl Screen for SaveLoadScreen {
             Tint::White,
             2,
             save_strings.exit(mode),
+            tight,
         );
         font.draw_text(
             framebuffer,
@@ -560,10 +572,13 @@ impl Screen for SaveLoadScreen {
             Tint::White,
             2,
             save_strings.exit_suffix(),
+            tight,
         );
 
         if let Some(reveal) = &self.reveal {
             let end = reveal.length.min(reveal.bytes.len());
+            // The reveal is assembled on the fixed 14px grid to line up with
+            // the row's separators.
             font.draw_text(
                 framebuffer,
                 ROW_X,
@@ -571,6 +586,7 @@ impl Screen for SaveLoadScreen {
                 Tint::White,
                 2,
                 &reveal.bytes[..end],
+                false,
             );
         }
 
@@ -582,6 +598,7 @@ impl Screen for SaveLoadScreen {
                 Tint::White,
                 2,
                 save_strings.overwrite_prompt(),
+                tight,
             );
             font.draw_text(
                 framebuffer,
@@ -590,6 +607,7 @@ impl Screen for SaveLoadScreen {
                 Tint::White,
                 2,
                 save_strings.yes_no(),
+                tight,
             );
         }
         if self.stage == Stage::Error {
@@ -600,6 +618,7 @@ impl Screen for SaveLoadScreen {
                 Tint::White,
                 2,
                 save_strings.error(0),
+                tight,
             );
             font.draw_text(
                 framebuffer,
@@ -608,6 +627,7 @@ impl Screen for SaveLoadScreen {
                 Tint::White,
                 2,
                 save_strings.error(1),
+                tight,
             );
         }
 
@@ -640,7 +660,7 @@ impl SaveLoadScreen {
             framebuffer.fill_rect([x, y, 8, 12], [255, 255, 255, 255]);
             return;
         };
-        font.draw_text(framebuffer, x, y, Tint::White, 2, &[CURSOR_GLYPH]);
+        font.draw_text(framebuffer, x, y, Tint::White, 2, &[CURSOR_GLYPH], false);
     }
 }
 

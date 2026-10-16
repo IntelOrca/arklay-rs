@@ -33,6 +33,13 @@ impl Text {
         self.catalog.selected()
     }
 
+    /// Whether the selected language renders with the font sheet's per-glyph
+    /// tight metrics (every language except Japanese). The drawing paths pass
+    /// this to the font so Latin text takes its own advances.
+    pub fn uses_tight_metrics(&self) -> bool {
+        self.catalog.uses_tight_metrics()
+    }
+
     /// `KEY` along the chain, with the registry-id fallback; `None` when no
     /// language knows the key at all.
     pub fn get(&self, key: &str) -> Option<&[u8]> {

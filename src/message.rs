@@ -645,6 +645,7 @@ impl MessageWindow {
         }
         let metrics = font.metrics;
         let glyph_w = metrics.glyph_w;
+        let tight = text.uses_tight_metrics();
         let base_y = if self.menu {
             metrics.menu_y
         } else {
@@ -663,7 +664,7 @@ impl MessageWindow {
             };
             match byte {
                 0x00 => {
-                    x += glyph_w;
+                    x += font.advance(tight, &[0x00]);
                     cursor = next(cursor);
                 }
                 0x01 => cursor = next(cursor),
@@ -699,18 +700,16 @@ impl MessageWindow {
                     };
                 }
                 0xF8..=0xFA => {
-                    self.draw_step(framebuffer, font, x, y, tint, &name, cursor, 2);
-                    x += glyph_w;
+                    x += self.draw_step(framebuffer, font, x, y, tint, &name, cursor, 2, tight);
                     cursor = skip(cursor);
                 }
                 0xFB => cursor = next(cursor),
                 0xFF => {
-                    x += glyph_w / 2;
+                    x += font.advance(tight, &[0xFF]);
                     cursor = next(cursor);
                 }
                 _ => {
-                    self.draw_step(framebuffer, font, x, y, tint, &name, cursor, 1);
-                    x += glyph_w;
+                    x += self.draw_step(framebuffer, font, x, y, tint, &name, cursor, 1, tight);
                     cursor = next(cursor);
                 }
             }
@@ -720,26 +719,41 @@ impl MessageWindow {
         match self.phase {
             MessagePhase::PageWait => {
                 if self.char_timer & blink != 0 {
-                    font.draw_text(framebuffer, 0x99, base_y + 0x1E, Tint::White, 2, &[0x0B]);
+                    font.draw_text(
+                        framebuffer,
+                        0x99,
+                        base_y + 0x1E,
+                        Tint::White,
+                        2,
+                        &[0x0B],
+                        false,
+                    );
                 }
             }
             MessagePhase::YesNo => {
                 let cursor_x = if glyph_w > 8 { 0xA0 } else { 0xD0 };
+                // The label starts one cursor cell right of the first cursor,
+                // and the second cursor sits one glyph left of `No`; both
+                // follow the tight advances so the cursors stay under their
+                // labels.
+                let label_x = cursor_x + glyph_w;
+                let no_x = label_x + font.advance(tight, &YES_NO[..4]);
                 if self.char_timer & blink != 0 {
                     let x = if self.menu_choice & 1 == 0 {
                         cursor_x
                     } else {
-                        cursor_x + 5 * glyph_w
+                        no_x
                     };
-                    font.draw_text(framebuffer, x, base_y + 16, Tint::White, 2, &[0x02]);
+                    font.draw_text(framebuffer, x, base_y + 16, Tint::White, 2, &[0x02], false);
                 }
                 font.draw_text(
                     framebuffer,
-                    cursor_x + glyph_w,
+                    label_x,
                     base_y + 16,
                     Tint::White,
                     2,
                     YES_NO,
+                    tight,
                 );
             }
             _ => {}
@@ -759,14 +773,16 @@ impl MessageWindow {
         name: &[u8],
         cursor: Cursor,
         len: usize,
-    ) {
+        tight: bool,
+    ) -> i32 {
         let index = cursor.index();
         let slice = match cursor {
             Cursor::Message(_) => self.bytes.get(index..index + len),
             Cursor::Name(_) => name.get(index..index + len),
         }
         .unwrap_or(&[]);
-        font.draw_text(framebuffer, x, y, tint, 2, slice);
+        font.draw_text(framebuffer, x, y, tint, 2, slice, tight);
+        font.advance(tight, slice)
     }
 }
 
@@ -1333,6 +1349,50 @@ mod tests {
     }
 
     #[test]
+    fn tight_messages_advance_by_the_space_metric() {
+        let font = font_for(&[0x1D]);
+        let text = text();
+        let mut window = MessageWindow::default();
+        // "A A": the full `A` cells are 14px, the tight space is 8px.
+        assert!(window.start(1, 0, &[0x1D, 0x00, 0x1D, 0x01, 0x00], false));
+        reveal_all(&mut window, &text);
+        let mut framebuffer = Framebuffer::new();
+        window.draw(&mut framebuffer, &font, &text);
+        assert_eq!(pixel(&framebuffer, 0x22, 181), [255, 255, 255, 255]);
+        assert_eq!(pixel(&framebuffer, 0x22 + 14, 181), [0, 0, 0, 0]);
+        assert_eq!(pixel(&framebuffer, 0x22 + 22, 181), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn tight_yes_no_cursor_follows_the_label_advances() {
+        let font = font_for(&[0x02]);
+        let text = text();
+        let bytes = [0x0C, 0x08, 0x00, 0x01, 0x00];
+        let mut window = MessageWindow::default();
+        assert!(window.start(1, 0, &bytes, false));
+        reveal_all(&mut window, &text);
+        // Select No and let the blink timer run so the cursor is drawn.
+        window.update(
+            MessageInput {
+                left: true,
+                ..MessageInput::default()
+            },
+            &text,
+            0,
+        );
+        window.update(MessageInput::default(), &text, 0);
+        let mut framebuffer = Framebuffer::new();
+        window.draw(&mut framebuffer, &font, &text);
+        // The label starts one cursor cell right of the base; the No cursor
+        // sits one 8px space left of the second `No` cell, whose label cells
+        // are full 14px on this sheet.
+        let cursor_x = 0xA0;
+        let no_cursor = cursor_x + 14 + (14 + 14 + 14 + 8);
+        assert_eq!(pixel(&framebuffer, cursor_x, 197), [0, 0, 0, 0]);
+        assert_eq!(pixel(&framebuffer, no_cursor, 197), [255, 255, 255, 255]);
+    }
+
+    #[test]
     fn missing_source_dismisses_cleanly() {
         let mut window = MessageWindow::default();
         assert!(window.start(1, 5, &[], false));
@@ -1355,7 +1415,10 @@ mod tests {
         let pack = Pack::open(std::path::Path::new(&path)).unwrap();
         let font =
             Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
-        let text = Text::load(&pack, Some("en-US"));
+        // This draws the RDT's own Japanese message bytes, the ja-JP flow, so
+        // the golden below also pins that the tight metrics leave Japanese
+        // rendering byte-identical to the original.
+        let text = Text::load(&pack, Some("ja-JP"));
 
         let data = std::fs::read(std::path::Path::new(&root).join("JPN/STAGE1/ROOM1001.RDT"))
             .expect("ROOM1001.RDT");

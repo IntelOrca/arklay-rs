@@ -53,6 +53,169 @@ impl FontMetrics {
     }
 }
 
+/// One glyph cell's tight metrics: its left trim and advance.
+///
+/// A cell drawn under the tight path blits at `x - indent` and advances the
+/// cursor by `advance`, so ink sits flush against the previous glyph instead
+/// of leaving the Japanese cell's right bearing as a gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GlyphMetric {
+    /// Pixels the cell is shifted left when drawn.
+    pub indent: i32,
+    /// Horizontal cursor advance after the cell.
+    pub advance: i32,
+}
+
+impl GlyphMetric {
+    /// The full-cell metric: no trim, one cell of advance.
+    const fn full(glyph_w: i32) -> Self {
+        Self {
+            indent: 0,
+            advance: glyph_w,
+        }
+    }
+}
+
+/// The plain-glyph grid's columns (18 cells per page).
+const PAGE_COLUMNS: usize = 18;
+/// The x offset of the second (right) glyph page.
+const RIGHT_PAGE_X: i32 = 256;
+
+/// The row a plain glyph byte addresses (the grid starts two rows down).
+fn plain_row(byte: u8) -> usize {
+    2 + usize::from(byte) / PAGE_COLUMNS
+}
+
+/// The column a plain glyph byte addresses.
+fn plain_col(byte: u8) -> usize {
+    usize::from(byte) % PAGE_COLUMNS
+}
+
+/// One font sheet's per-cell metrics, measured from its own ink.
+///
+/// The table covers the two glyph pages [`Glyphs`] decodes: the plain/`0xF8`
+/// left page at x 0 and the `0xF9`/`0xFA` right page at x 256. Every cell
+/// defaults to the full-cell [`GlyphMetric`]; [`GlyphTable::measure`] replaces
+/// the entries whose ink is narrower and applies the authored rules (an 8px
+/// space and full-cell digits).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GlyphTable {
+    glyph_w: i32,
+    pages: [Vec<GlyphMetric>; 2],
+}
+
+impl GlyphTable {
+    /// Measure every cell of the decoded `texture`. The sheet is never
+    /// mutated, so this is exactly the ink the pack ships.
+    pub fn measure(texture: &Texture8, glyph_w: i32) -> Self {
+        let glyph_w = glyph_w.max(1);
+        let rows = (texture.height as i32 / GLYPH_HEIGHT).max(0) as usize;
+        let full = GlyphMetric::full(glyph_w);
+        let mut table = Self {
+            glyph_w,
+            pages: [
+                vec![full; rows * PAGE_COLUMNS],
+                vec![full; rows * PAGE_COLUMNS],
+            ],
+        };
+        for page in 0..2 {
+            for row in 0..rows {
+                for col in 0..PAGE_COLUMNS {
+                    let left = page as i32 * RIGHT_PAGE_X + col as i32 * glyph_w;
+                    let top = row as i32 * GLYPH_HEIGHT;
+                    if left + glyph_w > texture.width as i32
+                        || top + GLYPH_HEIGHT > texture.height as i32
+                    {
+                        continue;
+                    }
+                    if let Some(metric) = measure_cell(texture, left, top, glyph_w) {
+                        table.pages[page][row * PAGE_COLUMNS + col] = metric;
+                    }
+                }
+            }
+        }
+        table.apply_authored_rules();
+        table
+    }
+
+    /// The metric of the cell at `(page, row, col)`, falling back to the full
+    /// cell for out-of-range cells.
+    pub fn get(&self, page: usize, row: usize, col: usize) -> GlyphMetric {
+        self.pages
+            .get(page)
+            .and_then(|cells| cells.get(row * PAGE_COLUMNS + col))
+            .copied()
+            .unwrap_or_else(|| GlyphMetric::full(self.glyph_w))
+    }
+
+    /// The metric of the cell at sheet texel `(u, v)`, the coordinate pair
+    /// [`Glyph`] carries.
+    fn at(&self, u: i32, v: i32, glyph_w: i32) -> GlyphMetric {
+        let glyph_w = glyph_w.max(1);
+        let page = usize::from(u >= RIGHT_PAGE_X);
+        let col = ((u - page as i32 * RIGHT_PAGE_X) / glyph_w).max(0) as usize;
+        let row = (v / GLYPH_HEIGHT).max(0) as usize;
+        self.get(page, row, col)
+    }
+
+    fn set(&mut self, page: usize, row: usize, col: usize, metric: GlyphMetric) {
+        if let Some(cells) = self.pages.get_mut(page)
+            && let Some(cell) = cells.get_mut(row * PAGE_COLUMNS + col)
+        {
+            *cell = metric;
+        }
+    }
+
+    /// The authored overrides the derivation cannot express.
+    fn apply_authored_rules(&mut self) {
+        let full = GlyphMetric::full(self.glyph_w);
+        // The space cell is blank in the sheet; give it an 8px advance so
+        // words do not gap at the Japanese cell width.
+        self.set(
+            0,
+            plain_row(0x00),
+            plain_col(0x00),
+            GlyphMetric {
+                indent: 0,
+                advance: 8.min(self.glyph_w),
+            },
+        );
+        // The digits keep the full cell so counters and save timers stay
+        // monospaced.
+        for byte in 0x0C..=0x15u8 {
+            self.set(0, plain_row(byte), plain_col(byte), full);
+        }
+    }
+}
+
+/// Measure one cell's ink bounding box and derive its metric, or `None` when
+/// the cell is blank or already fills the cell (the full metric is the
+/// default).
+fn measure_cell(texture: &Texture8, left: i32, top: i32, glyph_w: i32) -> Option<GlyphMetric> {
+    let mut min_x = i32::MAX;
+    let mut max_x = -1;
+    for y in 0..GLYPH_HEIGHT {
+        for x in 0..glyph_w {
+            let u = (left + x) as u32;
+            let v = (top + y) as u32;
+            let index = (v * texture.width + u) as usize;
+            if texture.indices.get(index).copied().unwrap_or(0) != 0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+            }
+        }
+    }
+    if max_x < 0 {
+        return None;
+    }
+    let ink = max_x - min_x + 1;
+    let advance = (ink + 1).min(glyph_w);
+    (min_x != 0 || advance != glyph_w).then_some(GlyphMetric {
+        indent: min_x,
+        advance,
+    })
+}
+
 /// One decoded step of an encoded text stream.
 ///
 /// Cursor-only steps (spaces, `0xFF` half-advances) and no-ops have a zero
@@ -70,6 +233,8 @@ pub struct Glyph {
     /// Whether this is the reserved missing-glyph cell; the font draws these
     /// from its synthetic box rather than from the sheet.
     pub missing: bool,
+    /// Pixels the cell is shifted left when drawn (the tight path's trim).
+    pub indent: i32,
 }
 
 impl Glyph {
@@ -82,6 +247,7 @@ impl Glyph {
             height: 0,
             advance,
             missing: false,
+            indent: 0,
         }
     }
 
@@ -100,6 +266,7 @@ pub struct Glyphs<'a> {
     bytes: &'a [u8],
     position: usize,
     metrics: FontMetrics,
+    table: Option<&'a GlyphTable>,
     remap_parentheses: bool,
 }
 
@@ -111,6 +278,7 @@ impl<'a> Glyphs<'a> {
             bytes,
             position: 0,
             metrics,
+            table: None,
             remap_parentheses: true,
         }
     }
@@ -123,27 +291,52 @@ impl<'a> Glyphs<'a> {
             bytes,
             position: 0,
             metrics,
+            table: None,
             remap_parentheses: false,
         }
     }
 
+    /// Use `table`'s per-glyph metrics instead of the full-cell default, the
+    /// Latin tight path.
+    pub fn tight(mut self, table: &'a GlyphTable) -> Self {
+        self.table = Some(table);
+        self
+    }
+
+    /// The metric of the glyph cell at `(u, v)`: the tight table's entry when
+    /// one is selected, else the full cell.
+    fn metric(&self, u: i32, v: i32) -> GlyphMetric {
+        match self.table {
+            Some(table) => table.at(u, v, self.metrics.glyph_w),
+            None => GlyphMetric::full(self.metrics.glyph_w),
+        }
+    }
+
     fn glyph(&self, u: i32, v: i32) -> Glyph {
+        let metric = self.metric(u, v);
         Glyph {
             u,
             v,
             width: self.metrics.glyph_w,
             height: GLYPH_HEIGHT,
-            advance: self.metrics.glyph_w,
+            advance: metric.advance,
             missing: false,
+            indent: metric.indent,
         }
     }
 
     /// The reserved missing-glyph cell: the synthetic box carries no sheet
-    /// coordinate, so it samples from `u = v = 0` of the box texture.
+    /// coordinate, so it samples from `u = v = 0` of the box texture and keeps
+    /// the full-cell metric (the box is a full cell wide).
     fn missing_glyph(&self) -> Glyph {
         Glyph {
+            u: 0,
+            v: 0,
+            width: self.metrics.glyph_w,
+            height: GLYPH_HEIGHT,
+            advance: self.metrics.glyph_w,
             missing: true,
-            ..self.glyph(0, 0)
+            indent: 0,
         }
     }
 }
@@ -158,7 +351,8 @@ impl Iterator for Glyphs<'_> {
                 0x01 | 0x07 => return None,
                 0x00 => {
                     self.position += 1;
-                    return Some(Glyph::cursor(self.metrics.glyph_w));
+                    // The space cell is the plain grid's first cell.
+                    return Some(Glyph::cursor(self.metric(0, 28).advance));
                 }
                 0xFB => self.position += 1,
                 0xFF => {
@@ -213,6 +407,8 @@ pub struct Font {
     /// [`crate::charset::MISSING`]. Kept out of `texture` so the decoded sheet
     /// is never mutated.
     missing: Texture8,
+    /// The tight per-glyph metrics measured from the sheet's ink.
+    pub glyph_table: GlyphTable,
 }
 
 impl Font {
@@ -223,10 +419,52 @@ impl Font {
     pub fn new(texture: Texture8) -> Self {
         let metrics = FontMetrics::from_sheet_width(texture.width);
         let missing = missing_box_texture(&texture, metrics.glyph_w);
+        let glyph_table = GlyphTable::measure(&texture, metrics.glyph_w);
         Self {
             texture,
             metrics,
             missing,
+            glyph_table,
+        }
+    }
+
+    /// The decoded glyph stream of `bytes`: the controller-symbol remap when
+    /// `remap`, with the tight table when `tight`.
+    fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8], remap: bool) -> Glyphs<'a> {
+        let glyphs = if remap {
+            Glyphs::new(bytes, self.metrics)
+        } else {
+            Glyphs::plain(bytes, self.metrics)
+        };
+        if tight {
+            glyphs.tight(&self.glyph_table)
+        } else {
+            glyphs
+        }
+    }
+
+    /// The total horizontal advance of `bytes` drawn by [`Font::draw_text`]
+    /// under `tight` metrics.
+    pub fn advance(&self, tight: bool, bytes: &[u8]) -> i32 {
+        self.glyphs(tight, bytes, true)
+            .map(|glyph| glyph.advance)
+            .sum()
+    }
+
+    /// The advance of the single encoded step at `bytes[0]` (with its operand
+    /// for an extended page) under `tight`, on the plain draw path.
+    ///
+    /// Used by the pixel-budget wrapping and clipping, which mirror
+    /// [`Font::draw_text_plain`].
+    pub fn step_advance(&self, tight: bool, bytes: &[u8]) -> i32 {
+        match bytes.first() {
+            None | Some(0x01 | 0x07 | 0xFB) => 0,
+            Some(&byte) => {
+                let len = if (0xF8..=0xFA).contains(&byte) { 2 } else { 1 };
+                self.glyphs(tight, &bytes[..len.min(bytes.len())], false)
+                    .map(|glyph| glyph.advance)
+                    .sum()
+            }
         }
     }
 
@@ -234,7 +472,10 @@ impl Font {
     ///
     /// Every step advances the cursor by its own advance; glyphs sample
     /// palette row 0 (the sheet's grey ramp) mixed by `tint` and scaled by
-    /// `brightness`.
+    /// `brightness`. Under `tight` the sheet's per-glyph metrics trim each
+    /// cell and use its own advance (the Latin path); otherwise every glyph
+    /// fills its cell (the Japanese default).
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text(
         &self,
         framebuffer: &mut Framebuffer,
@@ -243,12 +484,14 @@ impl Font {
         tint: Tint,
         brightness: u8,
         bytes: &[u8],
+        tight: bool,
     ) {
-        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, true);
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, true, tight);
     }
 
     /// Draw an encoded stream without the controller-symbol remap; see
-    /// [`Glyphs::plain`].
+    /// [`Glyphs::plain`]. `tight` selects the per-glyph metrics.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_text_plain(
         &self,
         framebuffer: &mut Framebuffer,
@@ -257,8 +500,9 @@ impl Font {
         tint: Tint,
         brightness: u8,
         bytes: &[u8],
+        tight: bool,
     ) {
-        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, false);
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, false, tight);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -271,12 +515,9 @@ impl Font {
         brightness: u8,
         bytes: &[u8],
         remap_parentheses: bool,
+        tight: bool,
     ) {
-        let glyphs = if remap_parentheses {
-            Glyphs::new(bytes, self.metrics)
-        } else {
-            Glyphs::plain(bytes, self.metrics)
-        };
+        let glyphs = self.glyphs(tight, bytes, remap_parentheses);
         // Every glyph queues its shadow pass first and its text pass second,
         // both at the pending-sprite depth the brightness selects; the stable
         // order keeps the shadow under the glyph. The shadow is one pixel down
@@ -286,6 +527,8 @@ impl Font {
         let mut cursor = x;
         for glyph in glyphs {
             if glyph.visible() {
+                // The tight path trims the cell's left bearing.
+                let left = cursor - glyph.indent;
                 let src = [glyph.u, glyph.v, glyph.width, glyph.height];
                 let texture = if glyph.missing {
                     &self.missing
@@ -297,7 +540,7 @@ impl Font {
                         SpriteDraw::indexed(
                             texture,
                             src,
-                            [cursor + 1, y + 1, glyph.width, glyph.height],
+                            [left + 1, y + 1, glyph.width, glyph.height],
                             0,
                             brightness,
                             Tint::White,
@@ -308,7 +551,7 @@ impl Font {
                 sprites.push(SpriteDraw::indexed(
                     texture,
                     src,
-                    [cursor, y, glyph.width, glyph.height],
+                    [left, y, glyph.width, glyph.height],
                     0,
                     brightness,
                     tint,
@@ -406,6 +649,86 @@ pub fn wrap_cells(bytes: &[u8], max_cells: usize) -> Vec<&[u8]> {
     rows
 }
 
+/// Split an encoded stream into rows of at most `max_width` pixels, breaking
+/// at the last space of a row when there is one.
+///
+/// Mirrors [`wrap_cells`] but budgets by the steps' advances under `tight`
+/// metrics, so a wrapped row never runs past the frame when the glyphs are
+/// narrower than their cells.
+pub fn wrap_pixels<'a>(bytes: &'a [u8], max_width: i32, font: &Font, tight: bool) -> Vec<&'a [u8]> {
+    let budget = max_width.max(1);
+    let mut rows = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let mut index = 0;
+        let mut width = 0;
+        let mut last_space = None;
+        while index < rest.len() {
+            let byte = rest[index];
+            if byte == 0x01 || byte == 0x07 {
+                // The terminator closes the stream; the rest is the last row.
+                index = rest.len();
+                break;
+            }
+            let step = match byte {
+                0xF8..=0xFA => 2,
+                _ => 1,
+            };
+            let advance = font.step_advance(tight, &rest[index..]);
+            if width + advance > budget {
+                break;
+            }
+            if byte == 0x00 {
+                last_space = Some(index);
+            }
+            width += advance;
+            index = (index + step).min(rest.len());
+        }
+        if index >= rest.len() {
+            rows.push(rest);
+            break;
+        }
+        let cut = match last_space {
+            Some(space) if space > 0 => space,
+            _ => index.max(1),
+        };
+        rows.push(&rest[..cut]);
+        rest = &rest[cut..];
+        // The space the row broke at does not start the next one.
+        if rest.first() == Some(&0x00) {
+            rest = &rest[1..];
+        }
+    }
+    rows
+}
+
+/// The longest prefix of `bytes` that draws in at most `max_width` pixels.
+///
+/// The pixel-budget analogue of the cell clip the debug overlay uses; the
+/// terminators end the stream and `0xFB` takes no width.
+pub fn fit_pixels<'a>(bytes: &'a [u8], max_width: i32, font: &Font, tight: bool) -> &'a [u8] {
+    let budget = max_width.max(0);
+    let mut index = 0;
+    let mut width = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == 0x01 || byte == 0x07 {
+            break;
+        }
+        let step = match byte {
+            0xF8..=0xFA => 2,
+            _ => 1,
+        };
+        let advance = font.step_advance(tight, &bytes[index..]);
+        if width + advance > budget {
+            break;
+        }
+        width += advance;
+        index = (index + step).min(bytes.len());
+    }
+    &bytes[..index]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,6 +797,132 @@ mod tests {
         }
     }
 
+    /// A 768x256 sheet with an ink strip spanning columns `x0..=x1` of each
+    /// cell at `(u, v)`.
+    fn sheet_with_ink(cells: &[(i32, i32, i32, i32)]) -> Texture8 {
+        let width = 768u32;
+        let height = 256u32;
+        let mut indices = vec![0u8; (width * height) as usize];
+        for &(u, v, x0, x1) in cells {
+            for y in v..v + GLYPH_HEIGHT {
+                for x in u + x0..=u + x1 {
+                    indices[(y as u32 * width + x as u32) as usize] = 1;
+                }
+            }
+        }
+        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
+        palettes[1] = [255, 255, 255, 255];
+        Texture8 {
+            width,
+            height,
+            indices,
+            palettes,
+            stp: Vec::new(),
+        }
+    }
+
+    /// The metric of the plain `byte` on the left page.
+    fn metric(font: &Font, byte: u8) -> GlyphMetric {
+        let byte = usize::from(byte);
+        font.glyph_table.get(0, 2 + byte / 18, byte % 18)
+    }
+
+    #[test]
+    fn glyph_table_measures_the_ink_bounding_box() {
+        // 'a' 0x3D is row 5, column 7: 9px of ink at columns 2..=10 gives an
+        // indent of 2 and an advance of min(14, 9 + 1) = 10.
+        let font = Font::new(sheet_with_ink(&[(98, 70, 2, 10)]));
+        assert_eq!(
+            metric(&font, 0x3D),
+            GlyphMetric {
+                indent: 2,
+                advance: 10,
+            }
+        );
+        // 'i' 0x45 is row 5, column 15: 5px of ink at columns 4..=8.
+        let font = Font::new(sheet_with_ink(&[(210, 70, 4, 8)]));
+        assert_eq!(
+            metric(&font, 0x45),
+            GlyphMetric {
+                indent: 4,
+                advance: 6,
+            }
+        );
+        // A cell that fills its width starting at 0 keeps the full metric.
+        let font = Font::new(sheet_with_ink(&[(210, 70, 0, 13)]));
+        assert_eq!(metric(&font, 0x45), GlyphMetric::full(14));
+    }
+
+    #[test]
+    fn glyph_table_applies_the_authored_rules() {
+        // Fill a digit cell with narrow ink: the digit rule still forces the
+        // full cell.
+        let font = Font::new(sheet_with_ink(&[(168, 28, 4, 8)]));
+        assert_eq!(metric(&font, 0x0C), GlyphMetric::full(14));
+        // The blank space cell takes the authored 8px advance.
+        assert_eq!(
+            metric(&font, 0x00),
+            GlyphMetric {
+                indent: 0,
+                advance: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn tight_glyphs_use_the_table_advance_and_indent() {
+        let font = Font::new(sheet_with_ink(&[(210, 70, 4, 8)]));
+        let tight = Glyphs::new(&[0x45], font.metrics)
+            .tight(&font.glyph_table)
+            .next()
+            .unwrap();
+        assert_eq!((tight.indent, tight.advance), (4, 6));
+        // Without the table the glyph fills its cell.
+        let full = Glyphs::new(&[0x45], font.metrics).next().unwrap();
+        assert_eq!((full.indent, full.advance), (0, 14));
+        // The space advances 8 under the table, 14 without it.
+        assert_eq!(font.advance(true, &[0x00]), 8);
+        assert_eq!(font.advance(false, &[0x00]), 14);
+        // The half advance stays half the cell.
+        assert_eq!(font.advance(true, &[0xFF]), 7);
+    }
+
+    #[test]
+    fn extended_glyphs_take_the_selected_cells_metric() {
+        // `0xF8 0x16` selects left row 16, column 4; 6px of ink at 5..=10.
+        let font = Font::new(sheet_with_ink(&[(56, 224, 5, 10)]));
+        let glyph = Glyphs::new(&[0xF8, 0x16], font.metrics)
+            .tight(&font.glyph_table)
+            .next()
+            .unwrap();
+        assert_eq!((glyph.indent, glyph.advance), (5, 7));
+        assert_eq!(font.advance(true, &[0xF8, 0x16]), 7);
+    }
+
+    #[test]
+    fn wrap_pixels_budgets_by_the_advances() {
+        // 'i' 0x45 has 6px advance and 14px full width on this sheet.
+        let font = Font::new(sheet_with_ink(&[(210, 70, 4, 8)]));
+        let text = [0x45, 0x45, 0x45, 0x45];
+        // Four 6px glyphs fit in 40px tight; the full cells fit only two.
+        assert_eq!(wrap_pixels(&text, 40, &font, true), [text.as_slice()]);
+        assert_eq!(
+            wrap_pixels(&text, 40, &font, false),
+            [&text[..2], &text[2..]]
+        );
+    }
+
+    #[test]
+    fn fit_pixels_clips_at_the_budget() {
+        let font = Font::new(sheet_with_ink(&[(210, 70, 4, 8)]));
+        let text = [0x45, 0x45, 0x45];
+        // Two 6px glyphs fit in 17px, but only one 14px glyph does.
+        assert_eq!(fit_pixels(&text, 17, &font, true), &text[..2]);
+        assert_eq!(fit_pixels(&text, 17, &font, false), &text[..1]);
+        // The terminators end the stream.
+        assert_eq!(fit_pixels(&[0x45, 0x01, 0x45], 100, &font, false), &[0x45]);
+    }
+
     #[test]
     fn metrics_follow_the_sheet_width() {
         let jpn = metrics_jpn();
@@ -502,6 +951,7 @@ mod tests {
                 height: 14,
                 advance: 14,
                 missing: false,
+                indent: 0,
             }
         );
 
@@ -603,7 +1053,7 @@ mod tests {
 
         // Byte 0x0B draws the sheet's arrow, not the box.
         let mut framebuffer = Framebuffer::new();
-        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0B]);
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0B], false);
         assert_eq!(pixel(&framebuffer, 10, 10), [255, 255, 255, 255]);
 
         // The reserved missing sequence draws the synthetic hollow box.
@@ -615,6 +1065,7 @@ mod tests {
             Tint::White,
             2,
             &crate::charset::MISSING,
+            false,
         );
         assert_eq!(pixel(&framebuffer, 10, 10), [9, 8, 7, 255], "box edge");
         assert_eq!(pixel(&framebuffer, 17, 17), [0, 0, 0, 0], "box hollow");
@@ -701,7 +1152,7 @@ mod tests {
         let font = Font::new(sheet_with_cell(168, 28));
         let mut framebuffer = Framebuffer::new();
 
-        font.draw_text(&mut framebuffer, 10, 10, Tint::Green, 2, &[0x0C]);
+        font.draw_text(&mut framebuffer, 10, 10, Tint::Green, 2, &[0x0C], false);
 
         fn pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
             let offset = (y * 320 + x) * 4;
@@ -720,13 +1171,14 @@ mod tests {
             Tint::White,
             2,
             &[0x0C, 0x00, 0x0C],
+            false,
         );
         assert_eq!(pixel(&framebuffer, 10, 30), [255, 255, 255, 255]);
         assert_eq!(pixel(&framebuffer, 24, 30), [0, 0, 0, 0]);
         assert_eq!(pixel(&framebuffer, 38, 30), [255, 255, 255, 255]);
 
         // Brightness 15 dims the white glyph to 127.
-        font.draw_text(&mut framebuffer, 10, 50, Tint::White, 15, &[0x0C]);
+        font.draw_text(&mut framebuffer, 10, 50, Tint::White, 15, &[0x0C], false);
         assert_eq!(pixel(&framebuffer, 10, 50), [127, 127, 127, 255]);
     }
 
@@ -749,7 +1201,7 @@ mod tests {
         // 15, and the shadow's one-pixel edge darkens the grey by 127/255.
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 15, &[0x0C]);
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 15, &[0x0C], false);
         assert_eq!(pixel(&framebuffer, 10, 10), [127, 127, 127, 255]);
         // The shadow-only column one past the glyph's right edge.
         assert_eq!(pixel(&framebuffer, 24, 11), [100, 100, 100, 255]);
@@ -758,7 +1210,7 @@ mod tests {
         // brightness-derived alpha rather than collapsing.
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0C]);
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0C], false);
         assert_eq!(pixel(&framebuffer, 24, 11), [186, 186, 186, 255]);
     }
 
@@ -791,7 +1243,7 @@ mod tests {
         .enumerate()
         {
             let y = line as i32 * 16;
-            font.draw_text(&mut framebuffer, 10, y, tint, 2, &[0x0C]);
+            font.draw_text(&mut framebuffer, 10, y, tint, 2, &[0x0C], false);
             assert_eq!(
                 pixel(&framebuffer, 10, y),
                 [tint.rgb()[0], tint.rgb()[1], tint.rgb()[2], 255],
@@ -808,6 +1260,7 @@ mod tests {
             Tint::White,
             2,
             &[0x0C, 0xF8, 20, 0xF9, 20, 0xFA, 20, 0x28, 0x01],
+            false,
         );
         for column in 0..5 {
             assert_eq!(

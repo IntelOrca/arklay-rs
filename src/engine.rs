@@ -6142,6 +6142,7 @@ fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
             tint,
             2,
             SAMPLE_TEXT,
+            false,
         );
     }
     font.draw_text(
@@ -6151,6 +6152,7 @@ fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
         font::Tint::White,
         2,
         SAMPLE_SYMBOLS,
+        false,
     );
     font.draw_text(
         framebuffer,
@@ -6159,6 +6161,7 @@ fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
         font::Tint::White,
         2,
         SAMPLE_KANJI_TOP,
+        false,
     );
     font.draw_text(
         framebuffer,
@@ -6167,6 +6170,7 @@ fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
         font::Tint::White,
         2,
         SAMPLE_KANJI_BOTTOM,
+        false,
     );
     font.draw_text(
         framebuffer,
@@ -6175,8 +6179,17 @@ fn draw_font_screen(framebuffer: &mut Framebuffer, font: &font::Font) {
         font::Tint::White,
         2,
         SAMPLE_SPACING,
+        false,
     );
-    font.draw_text(framebuffer, margin, 222, font::Tint::White, 15, SAMPLE_TEXT);
+    font.draw_text(
+        framebuffer,
+        margin,
+        222,
+        font::Tint::White,
+        15,
+        SAMPLE_TEXT,
+        false,
+    );
 }
 
 /// Digits, the page-wait ▼ (`0x0B`, placed early so it is not clipped by the
