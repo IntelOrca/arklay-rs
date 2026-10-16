@@ -1,5 +1,8 @@
-# FILE tab: turn through the document's pages with both the dpad and the
-# paging buttons, then settle. The reader's exit path is still being matched;
+# FILE tab: turn through the document's pages with the dpad in both
+# directions, then cancel out of the reader. The reader's busy lock only
+# clears ~19 ticks after each accepted input (the entry runs to tick ~173),
+# so the page turns are spaced past it and the cancel runs the exit slide,
+# the FILEI backdrop ramp-down, the black hold and the selector's fade-in;
 # see oracle/ui-findings.md.
 60 start
 61
@@ -13,13 +16,9 @@
 121
 140 confirm
 141
-150 right
-151
-160 right
-161
-170 page_right
-171
-180 page_left
+180 right
 181
-190 page_left
-191
+220 left
+221
+250 cancel
+251

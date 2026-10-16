@@ -62,8 +62,11 @@ Room mode (from the new-game spawn):
 
 Save mode (each header names its save):
 
-- `file_open.txt`, `file_pages.txt` — `file_chris_101.dat`: FILE tab selector
-  and the document reader, including the page turns and the cancel path.
+- `file_open.txt`, `file_pages.txt` — `file_chris_101.dat`: the FILE tab
+  selector (its entry slide and settled display), the document reader's sixteen
+  load frames, the page turns and the reader's exit (a cancel that slides the
+  reader out, ramps its backdrop down through the black hold and fades the
+  selector back in).
 - `map_open.txt` — `map_chris_101.dat`: MAP tab, owned areas and room stepping.
 - `radio_use.txt` — `radio_chris_101.dat`: RADIO tab use (item-use byte 0x4D).
 - `combine_ok.txt`, `combine_refuse.txt` — `combine_chris_101.dat`: the MOVE

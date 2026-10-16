@@ -21,7 +21,7 @@ use arklay::render::Framebuffer;
 use arklay::state::{Image, RoomId};
 use arklay::text::Text;
 use arklay::ui::file::{
-    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, ReaderAnim, page_count,
+    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, ReaderState, page_count,
     page_index,
 };
 use arklay::ui::main_menu::MenuAssets;
@@ -76,6 +76,9 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     assert_eq!(screen.mode, FileMode::List);
     assert_eq!(screen.slot, 0);
 
+    // The selector settles its entry slide after the tab opens.
+    settle_list(&mut screen);
+
     // Two list renders are byte-identical and repaint a meaningful area.
     let mut first = Framebuffer::new();
     let mut second = Framebuffer::new();
@@ -96,9 +99,10 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     // consecutive pages differ. Each page change runs the original's slide
     // animation, so settle it before drawing.
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
-    assert_eq!(screen.mode, FileMode::Reader);
-    assert_eq!(screen.reader_anim, ReaderAnim::InRight);
     settle_reader(&mut screen);
+    assert_eq!(screen.mode, FileMode::Reader);
+    assert_eq!(screen.reader_state, ReaderState::Idle);
+    assert!(screen.reader_page_loaded);
     let count = page_count(0x0F);
     let mut previous: Option<Vec<u8>> = None;
     for page in 0..count {
@@ -119,8 +123,8 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
         }
         previous = Some(frame.rgba);
         if page + 1 < count {
-            screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Down);
-            assert_eq!(screen.reader_anim, ReaderAnim::OutLeft);
+            screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Right);
+            assert_eq!(screen.reader_state, ReaderState::SlideOutLeft);
             settle_reader(&mut screen);
         }
     }
@@ -139,9 +143,22 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     .unwrap();
     println!("wrote {}", capture.display());
 
-    // Confirm exits on the last page through the reader's exit slide.
+    // Confirm exits on the last page through the reader's exit slide (the
+    // last half-page has to be acknowledged first, like the original's
+    // FILE_SAVEFLAG).
+    screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Right);
+    assert!(screen.reader_last_page);
     screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
-    assert_eq!(screen.reader_anim, ReaderAnim::Exit);
+    // The request is raised after the reader's own render ran, so the confirm
+    // frame still draws the settled page and the slide starts on the next
+    // tick.
+    assert_eq!(screen.reader_state, ReaderState::Idle);
+    assert!(
+        screen.input_locked(),
+        "the exit request holds the busy lock"
+    );
+    screen.tick();
+    assert_eq!(screen.reader_state, ReaderState::ExitSlide);
     settle_reader(&mut screen);
     assert_eq!(
         screen.mode,
@@ -158,7 +175,7 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     assert_eq!(pickup.mode, FileMode::Reader);
     assert_eq!(pickup.book, 0);
     assert_eq!(pickup.slot, 2, "the 0xFE list slot holds document 0");
-    assert_eq!(pickup.reader_anim, ReaderAnim::InRight);
+    assert_eq!(pickup.reader_state, ReaderState::Backdrop);
     settle_reader(&mut pickup);
     assert_eq!(pickup.page, 0);
     let mut frame = Framebuffer::new();
@@ -171,10 +188,27 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     assert!(drawn > 5000, "the pick-up reader drew only {drawn} pixels");
 }
 
-/// Advance the toggle-only reader until its slide animation settles.
+/// Advance the selector until its entry slide settles.
+fn settle_list(screen: &mut FileScreen) {
+    for _ in 0..16 {
+        if !screen.input_locked() {
+            return;
+        }
+        screen.tick();
+    }
+    panic!("the selector entry slide did not settle");
+}
+
+/// Advance the toggle-only reader until its state machine settles: either the
+/// reader is idle and unlocked, or its exit handed the screen back to the
+/// selector.
 fn settle_reader(screen: &mut FileScreen) {
     for _ in 0..64 {
-        if screen.reader_anim == ReaderAnim::Idle {
+        let settled = match screen.mode {
+            FileMode::Reader => screen.reader_state == ReaderState::Idle && !screen.input_locked(),
+            FileMode::List => !screen.input_locked(),
+        };
+        if settled {
             return;
         }
         screen.tick();
@@ -222,8 +256,11 @@ fn real_file_capture_is_deterministic_and_draws_the_list() {
         .filter(|(a, b)| a != b)
         .count();
     println!("file vs menu: {changed} changed pixels");
+    // The selector draws into the panel's `0x28,0x18 0xf0x0xc0` screen area
+    // (the original masks it with the panel's chrome), so its own layer can
+    // only repaint that much.
     assert!(
-        changed > 60000,
+        changed > 20000,
         "the FILE tab only repainted {changed} pixels over the menu"
     );
     println!("wrote {}", first.display());

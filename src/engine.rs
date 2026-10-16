@@ -16651,7 +16651,8 @@ off_0010:
             |session| {
                 session.pickup_view.as_ref().is_some_and(|pickup| {
                     pickup.reader.as_ref().is_some_and(|reader| {
-                        reader.reader_anim == crate::ui::file::ReaderAnim::Idle
+                        reader.reader_state == crate::ui::file::ReaderState::Idle
+                            && !reader.input_locked()
                     })
                 })
             },
@@ -17060,7 +17061,11 @@ off_0010:
 
         // Confirm opens the reader; let its entry slide settle, then cancel
         // slides it back out to the selector and a second cancel closes only
-        // the tab.
+        // the tab. The FILE tab's first frames still run the selector's own
+        // entry slide, which holds its busy lock.
+        tick_until(&mut session, &pack, 32, "the selector entry slide", |s| {
+            s.file.as_ref().is_some_and(|file| !file.input_locked())
+        });
         session
             .tick(
                 &pack,
@@ -17086,10 +17091,9 @@ off_0010:
             64,
             "the reader entry slide",
             |session| {
-                session
-                    .file
-                    .as_ref()
-                    .is_some_and(|file| file.reader_anim == crate::ui::file::ReaderAnim::Idle)
+                session.file.as_ref().is_some_and(|file| {
+                    file.reader_state == crate::ui::file::ReaderState::Idle && !file.input_locked()
+                })
             },
         );
         session
@@ -17110,9 +17114,7 @@ off_0010:
             "the reader exit slide",
             |session| {
                 session.file.as_ref().is_some_and(|file| {
-                    file.mode == crate::ui::file::FileMode::List
-                        && file.reader_anim == crate::ui::file::ReaderAnim::Idle
-                        && !file.input_locked()
+                    file.mode == crate::ui::file::FileMode::List && !file.input_locked()
                 })
             },
         );

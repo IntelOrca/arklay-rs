@@ -85,14 +85,52 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   early.
 - **FILE selector/reader hand-off.** The original darkens the selector with
   the `pickup_fade_update` rect (`+0x20` per frame, input locked), then the
-  reader takes over on its opaque black backdrop after two load frames, turns
-  pages with the same slides arklay uses (whose start falls through the input
-  frame), and returns to the selector through an exit slide, a black hold and
-  the reverse fade. arklay switched modes instantly, kept the whole screen
-  black behind the selector, and had no busy lock. The hand-off, the panel
-  behind the selector and the input lock now match (the 140-147 transition
-  frames are byte-identical); the page-turn mid-slide frames and the exit's
-  final phase are still open below.
+  reader takes over on its opaque black backdrop, turns pages with the same
+  slides arklay uses (whose start falls through the input frame), and returns
+  to the selector through an exit slide, a black hold and the reverse fade.
+  arklay switched modes instantly, kept the whole screen black behind the
+  selector, and had no busy lock. The hand-off, the panel behind the selector
+  and the input lock now match (the 140-147 transition frames are
+  byte-identical).
+- **FILE reader timing (page turns and exit).** The reader's state byte
+  (`state[2]` in the JPN `jpn_file_screen_render` 0x0042c080) opens with
+  sixteen black backdrop-load frames: `DAT_004af48c` ramps `8..0x80` while the
+  `g_jpnReaderFrame` pieces are skipped (`DAT_004af600` clear), so the whole
+  entry window after a `140 confirm` is black (t=148..164) and the page only
+  pages in on the state-2 frame (t=165: slide `146, 71, 34, 16, 7, 3, 1, 0`).
+  The busy lock (`state[9]`, FILE_BUSY) clears one frame *after* the slide
+  lands and the input is only read the frame after that, so the reader's first
+  accepted tick is 174 — a press inside the load window is dropped by both
+  engines now. arklay also turned pages on L1/R1 and on confirm; the original's
+  reader reads neither: pages turn with the D-pad right (`0x2000`) and left
+  (`0x8000`) only, and confirm leaves the reader just once the last half-page
+  has been acknowledged (FILE_SAVEFLAG, `state[0x10]`). A cancel is noticed
+  *after* the reader's own render (`menu_file_state_machine` sets FILE_REQUEST
+  `0xd` last), so the cancel frame still draws the settled page and the slide
+  (`0xd`/`0xe`) starts on the next frame; the exit is that nine-frame slide out
+  to the left, sixteen frames of `DAT_004af48c` ramping back down to black (the
+  page parked clear at slide `-511`), the `0x10`/`0x11` black frames (the
+  selector's cover pages back into the shared slot) and the `0x12` hand-off.
+  The hand-off only rewrites the block's first four bytes, so the selector
+  inherits the reader's `-511` slide: its cover and slot list stay parked
+  off-screen (only the fixed-position book indicators, scroll arrows and title
+  draw, dimmed) through the mode-2 fade, and `pickup_fade_update(1)` clears the
+  pair when the ramp completes (t=286 after a 250 cancel).
+- **FILE selector art and masks.** The scroll arrows, book indicators, slot
+  icons and cursor are `(texU, 0)` rectangles of the cover page (`DAT_004d27d0`
+  0x004d27d0, `0x004d27f4`/`0x004d2818`, `0x004d283c`/`0x004d2860`; only texU
+  animates); arklay read them as `(0, texU)` off the cover's empty left edge and
+  drew nothing. The slot icons and cursor also follow the cover's slide (the
+  original rewrites their descriptor X/Y every frame), the selector's layer
+  sits *behind* the panel's black masking rects (980) so a sliding cover cannot
+  spill over the frame — arklay clips the selector to the panel's
+  `0x28,0x18 0xf0x0c0` screen area to match — the FILE task's first frame draws
+  the panel alone (`FUN_00481ae0`'s init runs a frame after the tab-row
+  confirm), and the reader's backdrop pieces use the descriptor's variant-2
+  half blend: `round(texel * 2 * ramp / 255)` modulated, then `127/256` over
+  the black fill, rounding at both stages exactly like the reference's GPU chain
+  (the un-clamped `2 * ramp` matters: an art value of 148 reads 74 at the fully
+  ramped backdrop).
 
 - **Item box world action and handshake.** `open_itembox` arms the lid; the
   reference then runs three frames of menu handshake between the lid settling
@@ -126,6 +164,12 @@ save-screen frames are pixel-verified at capture every tick, and
 `save_screen` (which now includes the cancel and the room fade back in)
 matches all 420 ticks with the fade and settled frames at the room/menu
 residual (3.5-4.4% differing, the plain-room player-mesh baseline).
+`file_open` and `file_pages` now run the reader's whole exit as well: every
+frame that draws the reader (the entry's load window, both page-turn
+directions, the cancel frame, the exit slide, the sixteen-frame backdrop
+ramp-down, the black hold and the hand-off) is byte-identical, and the
+selector frames either side sit at the room/menu residual (~600 differing
+pixels, mean 0.2/255, plus the EKG line).
 
 ## Save-mode oracle
 
@@ -146,13 +190,23 @@ match), which is what the save interchange exists for.
 
 ## Open
 
-- **FILE page turns and reader exit.** The selector/reader hand-off now
-  matches, but the page-turn frames still differ ~22%: the reader's slide
-  phase drifts because the reference's page-turn inputs are only accepted
-  when its busy lock is clear, and its turns have a slightly different
-  idle window than arklay's (the state trace cannot see either). The reader's
-  exit path is likewise phase-shifted (~20 frames), so the scenario inputs
-  stop before the exit for now.
+- **FILE reader blink phase.** The reader's arrows and the selector's icons
+  blink off the state block's shared `state[0x12]` counter, which the original
+  advances only in the selector's display state and the reader's settled state
+  4. arklay now advances it in the same two states, but one frame of the
+  reader's entry is counted by one engine and not the other, so a phase
+  boundary (`blink & 0x30 == 0`) that falls on a reader-idle tick draws the
+  other blink frame: exactly one 4x7 arrow (16 pixels, at most 0.02% of the
+  frame, max channel delta 83) on `file_open` t=172 and `file_pages`
+  t=172/248-250. Not yet traced to the source frame; every other reader frame
+  is byte-identical.
+- **FILE reader ramp-frame rounding.** The exit's first backdrop ramp frame
+  (`file_open` t=241, `file_pages` t=261) leaves five FILEI-scrap pixels one
+  step bright: the reference's GPU chain is reproduced as
+  `round(round(texel * 2 * ramp / 255) * 127 / 256)` modulated over the black
+  fill, which matches every other ramp frame (and the fully ramped backdrop)
+  byte-for-byte, so those five pixels are a residual GPU rounding difference
+  (max channel delta 1, mean 0.000/255).
 - **MAP full-display rendering.** The original zooms the floor plan from the
   inventory panel to the full-display map as soon as the tab opens (with the
   "Mansion 1F" caption); arklay keeps the panel browser until a confirm and
@@ -179,7 +233,9 @@ match), which is what the save interchange exists for.
   replicating the GPU quad coverage.
 - **Room/player frame backlog.** The room-close frames sit at the same ~4.9%
   baseline as the plain room captures (player-mesh edges), unrelated to the
-  menu.
+  menu. In `file_open`/`file_pages` the room-entry frames before the menu opens
+  (t=5..60, the player mesh and the portrait) are the only frames above 1500
+  differing pixels (mean 0.53-0.58/255, max 164).
 
 ## Reaching more screens
 
