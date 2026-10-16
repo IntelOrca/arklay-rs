@@ -1021,6 +1021,11 @@ struct GameSession {
     typewriter_arm: Option<bool>,
     /// The faded-out typewriter hand-off awaiting its save screen.
     typewriter_open: Option<bool>,
+    /// The typewriter save screen has closed and the room is fading back in
+    /// from the black the hand-off left (the original's `g_typewriter_state`
+    /// 3->4, counter `0xf000`); the player machine gate is restored once the
+    /// accumulator runs negative.
+    typewriter_exit_fade: bool,
     /// Frames the item box waits between the lid settling and the panel fade
     /// (the original's menu handshake: game_loop keeps ticking while
     /// `g_openMenuFlag` walks its states).
@@ -1469,6 +1474,7 @@ impl GameSession {
             typewriter_fade: None,
             typewriter_arm: None,
             typewriter_open: None,
+            typewriter_exit_fade: false,
             itembox_open_delay: 0,
             menu_close_freeze: 0,
             menu_close_freeze_first: false,
@@ -1739,6 +1745,17 @@ impl GameSession {
                 | game::MESSAGE_FLAG_EFFECTS;
         }
         self.event_vm.set_enabled(events_enabled);
+        // The typewriter exit fade has run out: restore the player machine gate
+        // (`message_flags |= 0x45`), the reference's `check_typewriter_state`
+        // case 4. The original tests the accumulator at the top of the frame,
+        // before `main_loop` advances it, so the gate opens the frame AFTER the
+        // one whose step wrapped it negative - that frame still runs its room
+        // tick with the player machine frozen. Read the accumulator before this
+        // tick's fade step for the same reason.
+        if self.typewriter_exit_fade && self.room_fade.state() < 0 {
+            self.typewriter_exit_fade = false;
+            self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
+        }
         self.tick_room_fade();
         // A film owns the tick while it plays: the room's scripts, entities,
         // effects and the player stay frozen, exactly like the original's
@@ -1938,6 +1955,17 @@ impl GameSession {
             .is_some_and(|interaction| interaction.kind == game::RoomActionKind::Typewriter);
         if typewriter_fired {
             self.game.check_typewriter();
+        }
+        // The room fade-out that a confirmed typewriter save armed completes on
+        // this tick (the accumulator crossed negative at the top of the frame,
+        // where `typewriter_fade` published `typewriter_open`). The reference's
+        // `check_typewriter_state` case 3 runs at this point in its room tick
+        // and blocks inside `LoadSaveGameState`, so the save screen takes the
+        // rest of the frame; opening here rather than at the next tick's top
+        // keeps the screen's first drawn frame in step with the reference.
+        if let Some(ink_ribbon) = self.typewriter_open.take() {
+            self.open_typewriter_save(pack, ink_ribbon);
+            return Ok(());
         }
         // The scripts have had their say: resolve the tick's `se_play_3d`
         // requests (a bank-4 request pans and restarts BGM channel 0 before
@@ -2961,9 +2989,16 @@ impl GameSession {
             self.game.increment_saves();
         }
         self.save_screen = None;
-        // The typewriter hand-off completes: restore the player machine gate
-        // the reference restores with `message_flags |= 0x45`.
-        self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
+        // The screen does not fade itself: the reference's `LoadSaveGameState`
+        // returns to `check_typewriter_state` case 3, which fades the room back
+        // in from the black the hand-off left (`counter 0xf000`, the `0x7FFF`
+        // accumulator stepped once so the traced state is `0x6FFF` while the
+        // drawn frame is the full `0x7FFF`). The player machine gate stays
+        // frozen (`message_flags |= 0x45`) until the accumulator runs negative,
+        // the reference's case 4.
+        self.room_fade.set(2, -0x1000, 0x6FFF);
+        self.room_fade_draw = self.room_fade.drawn_overlay();
+        self.typewriter_exit_fade = true;
     }
 
     /// One frozen tick of the pause menu. A message owns the input while it is

@@ -78,8 +78,11 @@ const FADE_STEP: u8 = 8;
 const FADE_OUT_STEP: u8 = 16;
 /// Font glyph byte of the slash separator (cell 2 of row 2).
 const SEPARATOR: u8 = 0x38;
-/// Font glyph byte of the blinking cursor sprite (cell 2 of row 2).
-const CURSOR_GLYPH: u8 = 0x26;
+/// Font glyph byte of the blinking cursor sprite. The reference's
+/// `DrawSaveCursor` blits the arrowhead at sheet `texU 2*glyphW`, `texV 28` -
+/// the second glyph row's third cell - which is the plain byte `0x02`
+/// (`col 2`, `row 0` of the 18-column glyph grid).
+const CURSOR_GLYPH: u8 = 0x02;
 
 /// Which mode the screen runs in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,7 +198,7 @@ impl SaveLoadScreen {
             reveal: None,
             outcome: None,
             exit: None,
-            fade: 255,
+            fade: 0,
             ticks: 0,
         }
     }
@@ -359,7 +362,7 @@ impl Screen for SaveLoadScreen {
         self.reveal = None;
         self.outcome = None;
         self.exit = None;
-        self.fade = 255;
+        self.fade = 0;
         self.ticks = 0;
         Ok(())
     }
@@ -451,6 +454,13 @@ impl Screen for SaveLoadScreen {
                 }
             }
             Stage::FadeOut => {}
+        }
+        // The in-game (typewriter) screen does not fade itself: the reference's
+        // `LoadSaveGameState` returns straight to `check_typewriter_state`,
+        // which fades the *room* back in from the black the save hand-off left.
+        // Only the title's load screen fades its own overlay.
+        if self.stage == Stage::FadeOut && self.mode == SaveLoadMode::Save {
+            return ScreenResult::Done(self.exit.take().unwrap_or(ScreenAction::Resume));
         }
         ScreenResult::Continue
     }

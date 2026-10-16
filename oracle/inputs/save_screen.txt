@@ -1,9 +1,12 @@
 # Typewriter: press action inside the B1 save room's typewriter zone, dismiss
 # the typewriter description, accept the save prompt (the save screen opens),
-# then back out before a slot is written.
+# let it settle, then cancel back out to gameplay (the room fades in from the
+# black the save hand-off left).
 60 confirm
 61
 170 confirm
 171
 340 confirm
 341
+360 cancel
+361

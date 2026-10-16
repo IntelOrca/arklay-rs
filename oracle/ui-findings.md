@@ -105,13 +105,27 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   ticking and the player stays frozen; the fade's last frame still runs the
   room tick, the save screen opens after it, and the screen owns the frame
   after that. arklay opened the screen immediately with no fade.
+- **Typewriter save exit.** The in-game save screen draws no fade of its own -
+  the original's `LoadSaveGameState` returns straight to
+  `check_typewriter_state`, which arms a room fade-in at counter `0xF000`
+  (`g_fading_state` `0x7FFF`, the traced state already stepped to `0x6FFF` on
+  the cancel frame while that frame still draws the full `0x7FFF` black). The
+  player-machine gate is restored the frame AFTER the step that wraps the
+  accumulator negative, exactly like the original's frame-top case 4, so the
+  frozen room's last gated tick comes before the gate opens; the frame
+  hashes, the fade's step table (`0x6FFF` down to `-1`) and the player's
+  action tick counter now match through the cancel, the exit fade and the
+  settled room.
 
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
 `use_herb`, `equip_weapon`, `file_open`, `file_pages`, `map_open`,
 `itembox_open`, `itembox_page` and `save_screen` all match tick-for-tick in
 save mode (`MATCH: 180-480 ticks identical`); the menu, flush and
-save-screen frames are pixel-verified at capture every tick.
+save-screen frames are pixel-verified at capture every tick, and
+`save_screen` (which now includes the cancel and the room fade back in)
+matches all 420 ticks with the fade and settled frames at the room/menu
+residual (3.5-4.4% differing, the plain-room player-mesh baseline).
 
 ## Save-mode oracle
 
@@ -157,11 +171,6 @@ match), which is what the save interchange exists for.
   the model drawn in the viewport differ (the reference keeps the box object
   and swaps a different slot after the D-pad press), so the box cursor/state
   and the item viewer model need another pass.
-- **Save screen fade.** The save screen's fade-in dims the reference's screen
-  for its run (the 0xf000 counter's overlay while negative), which arklay does
-  not draw (~60% during the fade, 1.5% mean settled). The screen's exit fade
-  is also one LSB off (state 0x6FFF vs 0x7000), so the scenario stops before
-  the cancel.
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`
