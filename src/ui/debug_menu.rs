@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::font::Font;
+use crate::font::{self, Font};
 use crate::pack::Pack;
 use crate::render::{Framebuffer, Tint};
 use crate::state::RoomId;
@@ -115,6 +115,7 @@ impl DebugMenu {
             return;
         };
         let [panel_x, panel_y, _, _] = PANEL;
+        let tight = text.uses_tight_metrics();
         font.draw_text_plain(
             framebuffer,
             panel_x + 12,
@@ -122,6 +123,7 @@ impl DebugMenu {
             Tint::White,
             2,
             text.ui("UI_DEBUG_TITLE"),
+            tight,
         );
         for (index, id) in self
             .rooms
@@ -132,7 +134,15 @@ impl DebugMenu {
         {
             let y = ROWS_Y + (index - self.scroll) as i32 * ROW_HEIGHT;
             if index == self.cursor {
-                font.draw_text_plain(framebuffer, CURSOR_X, y, Tint::White, 2, &[CURSOR_GLYPH]);
+                font.draw_text_plain(
+                    framebuffer,
+                    CURSOR_X,
+                    y,
+                    Tint::White,
+                    2,
+                    &[CURSOR_GLYPH],
+                    false,
+                );
             }
             let room3 = id.room3();
             let mut label = Vec::new();
@@ -142,14 +152,22 @@ impl DebugMenu {
             } else {
                 Tint::White
             };
-            font.draw_text_plain(framebuffer, TEXT_X, y, tint, 2, &label);
+            font.draw_text_plain(framebuffer, TEXT_X, y, tint, 2, &label, false);
             // The room's name, in the room-label column and clipped to the
             // panel.
             if let Some(name) = text.room_name(&room3) {
                 let x = TEXT_X + 5 * font.metrics.glyph_w;
                 let panel_right = panel_x + PANEL[2];
-                let max_cells = ((panel_right - x) / font.metrics.glyph_w).max(0) as usize;
-                font.draw_text_plain(framebuffer, x, y, Tint::Grey, 2, fit_cells(name, max_cells));
+                let max_width = (panel_right - x).max(0);
+                font.draw_text_plain(
+                    framebuffer,
+                    x,
+                    y,
+                    Tint::Grey,
+                    2,
+                    font::fit_pixels(name, max_width, font, tight),
+                    tight,
+                );
             }
         }
         for (line, key) in ["UI_DEBUG_HINT_1", "UI_DEBUG_HINT_2", "UI_DEBUG_HINT_3"]
@@ -163,6 +181,7 @@ impl DebugMenu {
                 Tint::Grey,
                 2,
                 text.ui(key),
+                tight,
             );
         }
     }
@@ -207,32 +226,6 @@ pub fn room_entries(pack: &Pack, preferred_player: u8) -> Vec<RoomId> {
             }
         })
         .collect()
-}
-
-/// The longest prefix of `bytes` that draws in at most `max_cells` cells.
-///
-/// Terminators end the stream; an extended glyph pair counts as one cell and
-/// `0xFB` as none, matching [`crate::font::wrap_cells`].
-fn fit_cells(bytes: &[u8], max_cells: usize) -> &[u8] {
-    let mut index = 0;
-    let mut cells = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == 0x01 || byte == 0x07 {
-            break;
-        }
-        let step = match byte {
-            0xF8..=0xFA => 2,
-            _ => 1,
-        };
-        let width = usize::from(byte != 0xFB);
-        if cells + width > max_cells {
-            break;
-        }
-        cells += width;
-        index = (index + step).min(bytes.len());
-    }
-    &bytes[..index]
 }
 
 #[cfg(test)]
@@ -326,14 +319,5 @@ mod tests {
             ..UiInput::default()
         };
         assert_eq!(menu.handle_input(f1), DebugMenuEvent::Close);
-    }
-
-    #[test]
-    fn fit_cells_stops_at_the_cell_budget() {
-        // `106` is three glyphs; the extended pair counts once.
-        assert_eq!(fit_cells(&[0x0D, 0x0C, 0x12], 2), [0x0D, 0x0C]);
-        assert_eq!(fit_cells(&[0xF9, 0x09, 0x1D], 1), [0xF9, 0x09]);
-        assert_eq!(fit_cells(&[0x1D, 0xFB, 0x1E], 2), [0x1D, 0xFB, 0x1E]);
-        assert_eq!(fit_cells(&[0x1D, 0x01], 4), [0x1D]);
     }
 }

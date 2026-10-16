@@ -820,6 +820,7 @@ impl MainMenu {
             Tint::White,
             0,
             name,
+            text.uses_tight_metrics(),
         );
     }
 }

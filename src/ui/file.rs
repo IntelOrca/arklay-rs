@@ -824,6 +824,7 @@ impl FileScreen {
                         Tint::White,
                         0,
                         name,
+                        text.uses_tight_metrics(),
                     );
                 }
                 // Scroll arrows follow the cursor through the seen slots.
