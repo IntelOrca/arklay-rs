@@ -5862,21 +5862,10 @@ impl GameState {
         let (dx, dz) = crate::player::reach_offset(angle);
         let reach = [pos[0] + dx, pos[1], pos[2] + dz];
         let mut action_fired = false;
-        eprintln!(
-            "[dbg] probe pos={:?} ang={} reach={:?} actions={}",
-            pos,
-            angle,
-            reach,
-            self.room_actions.iter().filter(|a| a.is_some()).count()
-        );
         for slot in 0..ROOM_ACTION_SLOTS {
             let Some(room_action) = self.room_actions[slot] else {
                 continue;
             };
-            eprintln!(
-                "[dbg] entry slot={} handler={} kind={:?} flags={:#04x} zone={:?}",
-                slot, room_action.handler, room_action.kind, room_action.flags, room_action.zone
-            );
             if room_action.handler == 0 {
                 continue;
             }
@@ -5889,21 +5878,9 @@ impl GameState {
                 continue;
             }
             let probe = if flags & 0x40 != 0 { entity_pos } else { reach };
-            eprintln!(
-                "[dbg] action slot={} kind={:?} flags={:#04x} zone={:?} probe={:?}",
-                slot,
-                room_action.kind,
-                flags,
-                room_action.zone,
-                (probe[0], probe[2])
-            );
             if !room_action.contains(probe[0], probe[2]) {
                 continue;
             }
-            eprintln!(
-                "[dbg] hit slot={} kind={:?} press={}",
-                slot, room_action.kind, action_press
-            );
             // Record which entry the probe hit: the forward reach point writes
             // `fwdPosActionId`, the entity-position probe `entPosActionId`.
             // Scripts read both with `cmpb` 16/17.
@@ -6567,15 +6544,6 @@ impl GameState {
             return false;
         };
         self.itembox.state = 1;
-        eprintln!(
-            "[dbg] itembox arm at frame {} cover={}",
-            self.frame,
-            action.param_word(1)
-        );
-        let cover = usize::from(action.param_word(1));
-        if let Some(r) = self.objects.records.get(cover) {
-            eprintln!("[dbg] cover rot={:?}", r.rotation);
-        }
         self.itembox.cover = Some(usize::from(action.param_word(1)));
         self.itembox.menu_open = false;
         // The original clears bits 0, 2 and 6 so the same probe cannot re-arm,
@@ -6609,7 +6577,6 @@ impl GameState {
                     // Lid settled: the box menu may open. The original
                     // restores the whole ready word (`g_message_flags =
                     // 0xffff`), not just the three bits the arm cleared.
-                    eprintln!("[dbg] itembox settle at frame {}", self.frame);
                     self.flags[5].apply(MSF_MENU_MODE_ITEMBOX, 0);
                     self.itembox.menu_open = true;
                     self.message_flags = 0xFFFF;
