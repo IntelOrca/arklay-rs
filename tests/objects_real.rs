@@ -339,6 +339,12 @@ fn object_tick(
         .map(|anim| anim.clips.as_slice())
         .unwrap_or(&[]);
     game.sync_player(player);
+    // The engine runs the action-press scan at the top of the player's frame-0
+    // dispatch, before the tick's movement, so the climb/ladder latch reads the
+    // frame-start position (`GameState::player_action_press`).
+    if input.action_pressed {
+        game.player_action_press(player);
+    }
     arklay::player::update_with_room(player, room, &[], &[], room_clips, input);
     game.sync_entity_from_player(player);
     game.tick_objects(room, player);
