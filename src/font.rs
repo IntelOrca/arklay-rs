@@ -67,6 +67,9 @@ pub struct Glyph {
     pub height: i32,
     /// Horizontal cursor advance after the step.
     pub advance: i32,
+    /// Whether this is the reserved missing-glyph cell; the font draws these
+    /// from its synthetic box rather than from the sheet.
+    pub missing: bool,
 }
 
 impl Glyph {
@@ -78,6 +81,7 @@ impl Glyph {
             width: 0,
             height: 0,
             advance,
+            missing: false,
         }
     }
 
@@ -130,6 +134,16 @@ impl<'a> Glyphs<'a> {
             width: self.metrics.glyph_w,
             height: GLYPH_HEIGHT,
             advance: self.metrics.glyph_w,
+            missing: false,
+        }
+    }
+
+    /// The reserved missing-glyph cell: the synthetic box carries no sheet
+    /// coordinate, so it samples from `u = v = 0` of the box texture.
+    fn missing_glyph(&self) -> Glyph {
+        Glyph {
+            missing: true,
+            ..self.glyph(0, 0)
         }
     }
 }
@@ -154,6 +168,11 @@ impl Iterator for Glyphs<'_> {
                 0xF8..=0xFA => {
                     let parameter = i32::from(*self.bytes.get(self.position + 1)?);
                     self.position += 2;
+                    // The reserved missing-glyph pair draws the synthetic
+                    // box, not a sheet cell; see `charset::MISSING`.
+                    if [byte, parameter as u8] == crate::charset::MISSING {
+                        return Some(self.missing_glyph());
+                    }
                     let col = parameter % 18;
                     let row = parameter / 18;
                     let (page, v) = match byte {
@@ -190,15 +209,25 @@ impl Iterator for Glyphs<'_> {
 pub struct Font {
     pub texture: Texture8,
     pub metrics: FontMetrics,
+    /// The synthetic hollow box the reserved missing-glyph cell draws; see
+    /// [`crate::charset::MISSING`]. Kept out of `texture` so the decoded sheet
+    /// is never mutated.
+    missing: Texture8,
 }
 
 impl Font {
-    /// Pair `texture` with the metrics its width selects and paint the
-    /// missing-glyph box into the cell [`crate::charset::MISSING`] selects.
-    pub fn new(mut texture: Texture8) -> Self {
+    /// Pair `texture` with the metrics its width selects.
+    ///
+    /// The decoded sheet is left byte-identical; the missing-glyph placeholder
+    /// is a separate synthetic texture, so no sheet cell is ever clobbered.
+    pub fn new(texture: Texture8) -> Self {
         let metrics = FontMetrics::from_sheet_width(texture.width);
-        paint_missing_box(&mut texture, metrics);
-        Self { texture, metrics }
+        let missing = missing_box_texture(&texture, metrics.glyph_w);
+        Self {
+            texture,
+            metrics,
+            missing,
+        }
     }
 
     /// Draw an encoded stream left to right from `(x, y)`.
@@ -258,10 +287,15 @@ impl Font {
         for glyph in glyphs {
             if glyph.visible() {
                 let src = [glyph.u, glyph.v, glyph.width, glyph.height];
+                let texture = if glyph.missing {
+                    &self.missing
+                } else {
+                    &self.texture
+                };
                 if alpha > 0 {
                     sprites.push(
                         SpriteDraw::indexed(
-                            &self.texture,
+                            texture,
                             src,
                             [cursor + 1, y + 1, glyph.width, glyph.height],
                             0,
@@ -272,7 +306,7 @@ impl Font {
                     );
                 }
                 sprites.push(SpriteDraw::indexed(
-                    &self.texture,
+                    texture,
                     src,
                     [cursor, y, glyph.width, glyph.height],
                     0,
@@ -286,30 +320,31 @@ impl Font {
     }
 }
 
-/// Paint a hollow box into the cell [`crate::charset::MISSING`] selects.
+/// Build the synthetic hollow box the reserved missing-glyph cell draws.
 ///
-/// Plain byte `MISSING` addresses row `MISSING / 18`, column `MISSING % 18`
-/// of the glyph grid; the strokes use the palette index the shipped glyph
-/// pixels do, so the box takes the same tint and brightness as the text
-/// around it.
-fn paint_missing_box(texture: &mut Texture8, metrics: FontMetrics) {
+/// It is one glyph cell wide and [`GLYPH_HEIGHT`] tall; the strokes use the
+/// palette index the shipped glyph pixels do, and the palettes are cloned from
+/// the sheet, so the box takes the same tint and brightness as the text around
+/// it. The sheet itself is untouched.
+fn missing_box_texture(texture: &Texture8, glyph_w: i32) -> Texture8 {
     /// The palette index the shipped glyph strokes use (a dark grey that the
     /// tint pass maps to the text colour).
     const INK: u8 = 8;
-    let glyph_w = metrics.glyph_w.max(1) as u32;
+    let width = glyph_w.max(1) as u32;
     let height = GLYPH_HEIGHT as u32;
-    let byte = usize::from(crate::charset::MISSING);
-    let left = (byte % 18) as u32 * glyph_w;
-    let top = 28 + (byte / 18) as u32 * height;
+    let mut indices = vec![0u8; (width * height) as usize];
     for y in 0..height {
-        for x in 0..glyph_w {
-            let index = (top + y) as usize * texture.width as usize + left as usize + x as usize;
-            let Some(pixel) = texture.indices.get_mut(index) else {
-                return;
-            };
-            let edge = y == 0 || y == height - 1 || x == 0 || x == glyph_w - 1;
-            *pixel = if edge { INK } else { 0 };
+        for x in 0..width {
+            let edge = y == 0 || y == height - 1 || x == 0 || x == width - 1;
+            indices[(y * width + x) as usize] = if edge { INK } else { 0 };
         }
+    }
+    Texture8 {
+        width,
+        height,
+        indices,
+        palettes: texture.palettes.clone(),
+        stp: texture.stp.clone(),
     }
 }
 
@@ -466,6 +501,7 @@ mod tests {
                 width: 14,
                 height: 14,
                 advance: 14,
+                missing: false,
             }
         );
 
@@ -505,12 +541,13 @@ mod tests {
     #[test]
     fn the_missing_glyph_cell_is_a_hollow_box() {
         let font = Font::new(sheet_with_cell(168, 28));
-        let glyph = Glyphs::new(&[crate::charset::MISSING], font.metrics)
+        let glyph = Glyphs::new(&crate::charset::MISSING, font.metrics)
             .next()
-            .expect("the missing byte decodes to a cell");
+            .expect("the missing sequence decodes to a cell");
         assert!(glyph.visible());
+        assert!(glyph.missing);
         let pixel = |x: i32, y: i32| {
-            font.texture.indices[(y as u32 * font.texture.width + x as u32) as usize]
+            font.missing.indices[(y as u32 * font.missing.width + x as u32) as usize]
         };
         assert_ne!(pixel(glyph.u, glyph.v), 0, "top-left corner");
         assert_ne!(
@@ -528,6 +565,59 @@ mod tests {
             0,
             "the middle stays hollow"
         );
+    }
+
+    #[test]
+    fn font_new_leaves_the_sheet_byte_identical() {
+        // The shipped 0x0B cell is the real ▼ the message machine draws; the
+        // constructor must not paint over it (or anywhere else).
+        let sheet = sheet_with_cells(&[(154, 28)]);
+        let before = sheet.clone();
+        let font = Font::new(sheet);
+        assert_eq!(font.texture, before, "Font::new mutated the decoded sheet");
+    }
+
+    #[test]
+    fn item_54s_lead_in_pair_still_decodes_to_the_sheet_cell() {
+        // The ja-JP table spells ITEM_54_NAME with `0xFA 0x3B` — the sheet's
+        // one blank, unnamed cell — so that pair must stay an ordinary sheet
+        // sample at (326, 238), not become the missing box.
+        let decoded = steps(&[0xFA, 0x3B], metrics_jpn());
+        assert_eq!(decoded.len(), 1);
+        assert!(!decoded[0].missing);
+        assert_eq!((decoded[0].u, decoded[0].v), (326, 238));
+    }
+
+    #[test]
+    fn draw_text_samples_the_sheet_for_0x0b_and_the_box_for_missing() {
+        // A sheet with the ▼ at the 0x0B cell (white) and a distinct ink for
+        // the synthetic box's palette index.
+        let mut sheet = sheet_with_cell(154, 28);
+        sheet.palettes[8] = [9, 8, 7, 255];
+        let font = Font::new(sheet);
+
+        fn pixel(framebuffer: &Framebuffer, x: i32, y: i32) -> [u8; 4] {
+            let offset = (y as usize * 320 + x as usize) * 4;
+            framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+        }
+
+        // Byte 0x0B draws the sheet's arrow, not the box.
+        let mut framebuffer = Framebuffer::new();
+        font.draw_text(&mut framebuffer, 10, 10, Tint::White, 2, &[0x0B]);
+        assert_eq!(pixel(&framebuffer, 10, 10), [255, 255, 255, 255]);
+
+        // The reserved missing sequence draws the synthetic hollow box.
+        let mut framebuffer = Framebuffer::new();
+        font.draw_text(
+            &mut framebuffer,
+            10,
+            10,
+            Tint::White,
+            2,
+            &crate::charset::MISSING,
+        );
+        assert_eq!(pixel(&framebuffer, 10, 10), [9, 8, 7, 255], "box edge");
+        assert_eq!(pixel(&framebuffer, 17, 17), [0, 0, 0, 0], "box hollow");
     }
 
     #[test]
@@ -726,5 +816,35 @@ mod tests {
             );
         }
         assert_eq!(pixel(&framebuffer, 10 + 5 * 14, 100), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    #[ignore = "requires ARKLAY_RE1_PACK"]
+    fn real_font_new_leaves_the_shipped_sheet_untouched() {
+        let Some(path) = std::env::var("ARKLAY_RE1_PACK").ok() else {
+            return;
+        };
+        let pack = crate::pack::Pack::open(std::path::Path::new(&path)).unwrap();
+        let sheet = crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap();
+        let before = sheet.clone();
+        let font = Font::new(sheet);
+        assert_eq!(
+            font.texture, before,
+            "Font::new mutated the decoded font/font.tim"
+        );
+
+        // The shipped 0x0B cell (u 154, v 28) is the real ▼ and must stay
+        // non-blank. The `0xFA 0x3B` cell (u 326, v 238), which the ja-JP
+        // table uses as the blank lead-in of item 0x54's name, must stay
+        // blank. (Byte-identity already implies both; assert the premises so a
+        // future sheet change is noticed.)
+        let shaded = |u: u32, v: u32| {
+            (v..v + GLYPH_HEIGHT as u32)
+                .flat_map(|y| (u..u + 14).map(move |x| (x, y)))
+                .filter(|&(x, y)| font.texture.indices[(y * font.texture.width + x) as usize] != 0)
+                .count()
+        };
+        assert!(shaded(154, 28) > 0, "the sheet's 0x0B arrow cell is blank");
+        assert_eq!(shaded(326, 238), 0, "the sheet's 0xFA 0x3B cell is inked");
     }
 }

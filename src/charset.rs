@@ -12,8 +12,8 @@
 //! characters would, so text written with the ligature cells re-encodes to the
 //! bytes the game uses. Characters the font has no cell for either map to a
 //! documented substitute (`SUBSTITUTIONS`: curly quotes, dashes, middle
-//! dots, fullwidth ASCII) or encode as [`MISSING`], the cell
-//! [`crate::font::Font::new`] paints as an empty box so an unspellable
+//! dots, fullwidth ASCII) or encode as [`MISSING`], the reserved marker
+//! [`crate::font::Font`] draws as a synthetic empty box so an unspellable
 //! character is visible instead of silently dropped.
 //!
 //! This is the Japanese font's map. A pack whose font sheet is the 256-wide
@@ -25,12 +25,21 @@ mod table;
 /// Longest cell spelling, in characters.
 pub const MAX_CELL_CHARS: usize = 2;
 
-/// The byte a character without a cell encodes to.
+/// The bytes a character without a cell encodes to.
 ///
-/// It selects LEFT row 0, column 11 — a blank cell in the shipped fonts — and
-/// [`crate::font::Font::new`] paints that cell as a hollow box, so a missing
-/// glyph reads as a box rather than as text in another language.
-pub const MISSING: u8 = 0x0B;
+/// The pair is a marker, not a sheet address: [`crate::font::Font`] draws a
+/// synthetic hollow box for it, so an unspellable character reads as a box
+/// rather than as text in another language or as nothing at all.
+///
+/// `0xFA` addresses RIGHT rows 14..=17, so the operand `0xFF` (row 28) lies
+/// past every page's table entries and past the 256-high sheet: the shipped
+/// charsets cannot produce it, and nothing samples the sheet for it. Cells
+/// that are real must not be reused here: the shipped sheet's `0x02..=0x0B`
+/// cells are the controller-symbol glyphs (incl. the `0x0B` ▼ the message
+/// machine draws for a page wait), and its one blank, unnamed cell,
+/// `0xFA 0x3B`, is the blank lead-in the ja-JP table spells item `0x54`'s
+/// name with.
+pub const MISSING: [u8; 2] = [0xFA, 0xFF];
 
 /// Characters with no cell of their own that localized text still uses.
 ///
@@ -163,7 +172,7 @@ fn fold_fullwidth(ch: char) -> char {
 fn push_glyph(ch: char, out: &mut Vec<u8>) {
     match table::ENCODE_ONE.binary_search_by(|(key, _)| key.cmp(&ch)) {
         Ok(index) => out.extend_from_slice(table::ENCODE_ONE[index].1),
-        Err(_) => out.push(MISSING),
+        Err(_) => out.extend_from_slice(&MISSING),
     }
 }
 
@@ -233,15 +242,31 @@ mod tests {
         assert_eq!(encoded("ＳＴＡＲＳ"), encoded("STARS"));
         assert_eq!(encoded("１"), encoded("1"));
         // Folding does not invent glyphs the font lacks.
-        assert_eq!(encoded("＋"), [MISSING]);
+        assert_eq!(encoded("＋"), MISSING);
     }
 
     #[test]
     fn characters_without_cells_encode_as_the_missing_glyph() {
-        assert_eq!(encoded("é"), [MISSING]);
-        assert_eq!(encoded("З"), [MISSING]);
-        assert_eq!(encoded("+"), [MISSING]);
-        assert_eq!(encoded("aéa"), [0x3D, MISSING, 0x3D]);
+        assert_eq!(MISSING, [0xFA, 0xFF], "the pair is the reserved marker");
+        assert_eq!(encoded("é"), MISSING);
+        assert_eq!(encoded("З"), MISSING);
+        assert_eq!(encoded("+"), MISSING);
+        assert_eq!(encoded("aéa"), [0x3D, 0xFA, 0xFF, 0x3D]);
+    }
+
+    #[test]
+    fn the_missing_marker_is_not_a_table_cell() {
+        // Reserving a real cell would make the charset emit the box for a
+        // spellable character. `0xFA 0x3B` in particular is a real stream
+        // byte: the ja-JP table spells item 0x54's name with it.
+        assert_eq!(extended_cell(MISSING[0], MISSING[1]), None);
+        assert_eq!(plain_cell(MISSING[0]), None);
+        for (ch, bytes) in table::ENCODE_ONE.iter() {
+            assert_ne!(*bytes, MISSING.as_slice(), "{ch:?} encodes as the marker");
+        }
+        for (cell, bytes) in table::ENCODE_TWO.iter() {
+            assert_ne!(*bytes, MISSING.as_slice(), "{cell:?} encodes as the marker");
+        }
     }
 
     #[test]
@@ -266,11 +291,7 @@ mod tests {
     fn every_grid_cell_is_encodable() {
         for cell in table::LEFT.iter().chain(table::RIGHT.iter()) {
             if !cell.is_empty() {
-                assert_ne!(
-                    encoded(cell),
-                    [MISSING],
-                    "grid cell {cell:?} has no encoding"
-                );
+                assert_ne!(encoded(cell), MISSING, "grid cell {cell:?} has no encoding");
             }
         }
     }
@@ -291,7 +312,7 @@ mod tests {
                 );
                 assert_ne!(
                     encoded(&target_ch.to_string()),
-                    [MISSING],
+                    MISSING,
                     "{ch:?} -> {target:?} is not encodable"
                 );
             }

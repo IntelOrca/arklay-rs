@@ -1002,6 +1002,28 @@ mod tests {
     }
 
     #[test]
+    fn page_wait_blink_draws_the_sheet_arrow() {
+        // The sheet carries a white cell at byte 0x0B (the shipped ▼); if the
+        // renderer used the synthetic missing box the pixel would be the
+        // palette-8 ink, which the test sheet leaves transparent.
+        let font = font_for(&[0x0B]);
+        let text = text();
+        let mut window = MessageWindow::default();
+        assert!(window.start(1, 0, &[0x0C, 0x03, 0x00, 0x0D, 0x01, 0x00], false));
+        reveal_all(&mut window, &text);
+        assert_eq!(window.phase(), MessagePhase::PageWait);
+
+        window.char_timer = BLINK_BITS; // force the blink on
+        let mut framebuffer = Framebuffer::new();
+        window.draw(&mut framebuffer, &font, &text);
+        assert_eq!(
+            pixel(&framebuffer, 0x99, 181 + 0x1E),
+            [255, 255, 255, 255],
+            "the page-wait hint must be the sheet's 0x0B arrow"
+        );
+    }
+
+    #[test]
     fn page_break_with_an_operand_delays_then_continues() {
         let text = text();
         let mut window = MessageWindow::default();
