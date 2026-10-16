@@ -369,7 +369,7 @@ impl ComputerLab {
                 continue;
             }
             let byte = Self::letter(b'A' + code - 1);
-            font.draw_text(framebuffer, cursor, y, Tint::White, 2, &[byte, 0x01]);
+            font.draw_text(framebuffer, cursor, y, Tint::White, 2, &[byte, 0x01], false);
             cursor += 8;
         }
     }
@@ -384,7 +384,15 @@ impl ComputerLab {
         let line = |framebuffer: &mut Framebuffer, y: i32, key: &str| {
             let bytes = text.ui(key);
             if !bytes.is_empty() {
-                font.draw_text(framebuffer, 16, y, Tint::Green, 2, bytes);
+                font.draw_text(
+                    framebuffer,
+                    16,
+                    y,
+                    Tint::Green,
+                    2,
+                    bytes,
+                    text.uses_tight_metrics(),
+                );
             }
         };
         match self.stage {
@@ -462,9 +470,17 @@ impl ComputerLab {
                     framebuffer.fill_rect([x - 2, y - 2, 20, 16], [60, 120, 60, 255]);
                 }
                 if byte != 0 {
-                    font.draw_text(framebuffer, x, y, Tint::White, 2, &[byte, 0x01]);
+                    font.draw_text(framebuffer, x, y, Tint::White, 2, &[byte, 0x01], false);
                 } else if !key.is_empty() {
-                    font.draw_text(framebuffer, x, y, Tint::Yellow, 2, text.ui(key));
+                    font.draw_text(
+                        framebuffer,
+                        x,
+                        y,
+                        Tint::Yellow,
+                        2,
+                        text.ui(key),
+                        text.uses_tight_metrics(),
+                    );
                 }
             }
         }

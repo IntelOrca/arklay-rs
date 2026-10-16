@@ -34,10 +34,10 @@ struct Cli {
 
     /// UI screen to boot straight into instead of a room:
     /// `title`, `select`, `game`, `demo`, `menu`, `box`, `file`, `map`,
-    /// `view`, `save`, `load`, `death` or `font`. `--ui game` also accepts
-    /// `--room` to boot the new game straight into that room through the
-    /// session flow (the oracle anchor for room-specific differentials);
-    /// `--ui demo` plays the `--demo` attract reel.
+    /// `view`, `save`, `load`, `death`, `result`, `epilogue` or `font`.
+    /// `--ui game` also accepts `--room` to boot the new game straight into
+    /// that room through the session flow (the oracle anchor for room-specific
+    /// differentials); `--ui demo` plays the `--demo` attract reel.
     #[arg(long, value_name = "SCREEN", requires = "pack")]
     ui: Option<String>,
 
@@ -92,8 +92,10 @@ struct Cli {
     )]
     fmv: Option<u8>,
 
-    /// Play ending row `ID` (1-7) as its film chain and exit; with `--capture`
-    /// the frame after `--ticks` fixed ticks is written headlessly
+    /// Play ending row `ID` (1-7): its film chain, the RESULT screen, the
+    /// rocket-launcher epilogue (endings 6/7) and the next-cycle save, then the
+    /// title. With `--capture` the frame after `--ticks` fixed ticks is
+    /// written headlessly.
     #[arg(
         long,
         value_name = "ID",

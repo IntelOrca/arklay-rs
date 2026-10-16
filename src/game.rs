@@ -67,6 +67,10 @@ pub const STATE_BYTE_ENT_ACTION: u8 = 17;
 pub const STATE_BYTE_USED_ITEM: u8 = 18;
 /// State byte holding the last picked item (BioCard 0x213).
 pub const STATE_BYTE_PICKED_ITEM: u8 = 19;
+/// First byte of the 32-bit play-timer snapshot (BioCard 0x224), the
+/// original's `g_gameTimerSnapshot`. It ticks at 30 Hz and is read by the
+/// RESULT screen and the next-cycle grant.
+pub const STATE_BYTE_PLAY_TIMER: u8 = 0x24;
 /// State byte holding the save counter (BioCard 0x228).
 pub const STATE_BYTE_SAVES: u8 = 40;
 /// State byte holding the equipped item (BioCard 0x229).
@@ -4017,8 +4021,30 @@ impl GameState {
     }
 
     /// Count one fixed tick.
+    ///
+    /// The play timer advances with each gameplay frame, exactly like the
+    /// original's `Game_timer` running under `game_loop`. It lives in the
+    /// BioCard state image (0x224) so a save/load round-trips it; menus, films
+    /// and frozen frames never call this, so they do not count.
     pub fn advance_frame(&mut self) {
         self.frame = self.frame.saturating_add(1);
+        let timer = self.play_timer().saturating_add(1);
+        self.set_play_timer(timer);
+    }
+
+    /// The 30 Hz play timer (BioCard 0x224).
+    pub fn play_timer(&self) -> u32 {
+        u32::from_le_bytes(
+            self.state_bytes[usize::from(STATE_BYTE_PLAY_TIMER)..][..4]
+                .try_into()
+                .expect("the state image holds the timer"),
+        )
+    }
+
+    /// Store the 30 Hz play timer (BioCard 0x224).
+    pub fn set_play_timer(&mut self, ticks: u32) {
+        let offset = usize::from(STATE_BYTE_PLAY_TIMER);
+        self.state_bytes[offset..offset + 4].copy_from_slice(&ticks.to_le_bytes());
     }
 
     /// `evt_work_set`: turn a type/index pair into a selection.
@@ -15623,6 +15649,26 @@ mod tests {
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
         state.increment_saves();
         assert_eq!(state.state_bytes[usize::from(STATE_BYTE_SAVES)], 99);
+    }
+
+    #[test]
+    fn the_play_timer_advances_once_per_gameplay_frame() {
+        let mut state = game();
+        assert_eq!(state.play_timer(), 0, "a fresh state starts at zero");
+        for _ in 0..120 {
+            state.advance_frame();
+        }
+        assert_eq!(state.play_timer(), 120, "one tick per 30 Hz frame");
+        assert_eq!(
+            state.state_bytes[usize::from(STATE_BYTE_PLAY_TIMER)..][..4],
+            [120, 0, 0, 0],
+            "the timer lives in the little-endian state image"
+        );
+
+        // The timer saturates instead of wrapping past its 32-bit maximum.
+        state.set_play_timer(u32::MAX);
+        state.advance_frame();
+        assert_eq!(state.play_timer(), u32::MAX);
     }
 
     // ------------------------------------------------------------------

@@ -94,6 +94,11 @@ cargo run -- re1.akpak --ui map --capture map.bmp
 cargo run -- re1.akpak --ui view --capture view.bmp
 # Kill the player and capture the DIED screen (--character 0|1)
 cargo run -- re1.akpak --ui death --character 1 --capture died.bmp
+# Capture the post-film ending screens
+cargo run -- re1.akpak --ui result --capture result.bmp
+cargo run -- re1.akpak --ui epilogue --capture epilogue.bmp
+# Play an ending end to end: the films, RESULT, epilogue and next-cycle save
+cargo run -- re1.akpak --ending 1
 
 # Frame-time report for a 600-tick room run: per-tick min/avg/p95/max, the
 # load/update/effect/render phase totals and the entity/effect high-water

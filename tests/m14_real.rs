@@ -871,6 +871,56 @@ fn ending_chain_captures_are_deterministic() {
 }
 
 #[test]
+#[ignore = "requires a converted game pack and SDL's offscreen driver"]
+fn ending_result_and_epilogue_captures_are_deterministic() {
+    use std::process::Command;
+
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let binary = env!("CARGO_BIN_EXE_arklay");
+
+    for screen in ["result", "epilogue"] {
+        let dir = TempDir::new(&format!("ending-{screen}"));
+        let first = dir.0.join("first.bmp");
+        let second = dir.0.join("second.bmp");
+        for path in [&first, &second] {
+            let status = Command::new(binary)
+                .args([
+                    pack_path.to_str().unwrap(),
+                    "--ui",
+                    screen,
+                    "--capture",
+                    path.to_str().unwrap(),
+                ])
+                .status()
+                .expect("failed to run the arklay binary");
+            assert!(status.success(), "the --ui {screen} capture failed");
+        }
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            fs::read(&second).unwrap(),
+            "--ui {screen} captures differ between runs"
+        );
+        let image = arklay::bmp::decode(&fs::read(&first).unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (320, 240));
+        assert!(
+            image
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0),
+            "the --ui {screen} capture is blank"
+        );
+        println!(
+            "--ui {screen} capture: {} bytes",
+            fs::metadata(&first).unwrap().len()
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires a real RE1 installation; writes ~760 MiB"]
 fn conversion_packs_the_shipped_films_in_the_single_pack() {
     let Some((root, _pack)) = common::asset_env() else {

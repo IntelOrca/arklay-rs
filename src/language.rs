@@ -286,6 +286,13 @@ impl Catalog {
         &self.selected
     }
 
+    /// Whether the selected language renders with the font sheet's per-glyph
+    /// tight metrics: every tag except Japanese (`ja`/`ja-*`). Japanese keeps
+    /// the full 14px cells, matching the original exactly.
+    pub fn uses_tight_metrics(&self) -> bool {
+        !language_part(&self.selected).eq_ignore_ascii_case("ja")
+    }
+
     /// Every tag the catalog carries, sorted.
     pub fn tags(&self) -> impl Iterator<Item = &str> {
         self.files.iter().map(|file| file.tag.as_str())
@@ -760,10 +767,7 @@ ITEM_05_DESCRIPTION = \"A\"
     fn characters_without_cells_become_boxes() {
         let language = Language::parse("UI_X = \"é\"\nUI_Y = \"A\"\n").unwrap();
         assert_eq!(language.len(), 2);
-        assert_eq!(
-            language.get("UI_X").unwrap().encode(),
-            [charset::MISSING, 0x01]
-        );
+        assert_eq!(language.get("UI_X").unwrap().encode(), [0xFA, 0xFF, 0x01]);
         assert_eq!(language.get("UI_Y").unwrap().encode(), [0x1D, 0x01]);
     }
 
@@ -982,5 +986,18 @@ ITEM_05_DESCRIPTION = \"A\"
         let catalog = catalog(&sources, Some("en-US"));
         assert_eq!(catalog.tags().collect::<Vec<_>>(), ["en-us"]);
         assert_eq!(catalog.lookup("UI_OK").unwrap(), [0x1D, 0x01]);
+    }
+
+    #[test]
+    fn only_japanese_keeps_the_full_cell_metrics() {
+        let japanese = [("language/ja-JP.txt", "UI_X = \"A\"\n")];
+        assert!(!catalog(&japanese, Some("ja-JP")).uses_tight_metrics());
+        assert!(!catalog(&japanese, Some("ja")).uses_tight_metrics());
+
+        let english = [("language/en-US.txt", "UI_X = \"A\"\n")];
+        assert!(catalog(&english, Some("en-US")).uses_tight_metrics());
+        assert!(catalog(&english, Some("fr-FR")).uses_tight_metrics());
+        // The empty selector resolves English, so it is tight too.
+        assert!(catalog(&english, None).uses_tight_metrics());
     }
 }

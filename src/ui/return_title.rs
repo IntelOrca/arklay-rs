@@ -76,15 +76,15 @@ impl ReturnTitlePrompt {
         let Some(font) = font else {
             return;
         };
-        let max_cells =
-            ((framebuffer.width as i32 - 2 * TEXT_X) / font.metrics.glyph_w).max(1) as usize;
+        let tight = text.uses_tight_metrics();
+        let max_width = (framebuffer.width as i32 - 2 * TEXT_X).max(1);
         let mut y = LINE_Y[0];
         for (index, key) in KEYS.iter().enumerate() {
             if index + 1 == LINE_Y.len() {
                 y = y.max(LINE_Y[index]);
             }
-            for row in font::wrap_cells(text.ui(key), max_cells) {
-                font.draw_text_plain(framebuffer, TEXT_X, y, Tint::White, 2, row);
+            for row in font::wrap_pixels(text.ui(key), max_width, font, tight) {
+                font.draw_text_plain(framebuffer, TEXT_X, y, Tint::White, 2, row, tight);
                 y += LINE_SPACING;
             }
         }
