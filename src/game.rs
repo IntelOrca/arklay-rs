@@ -6853,9 +6853,10 @@ impl GameState {
     }
 
     /// `player_input_to_behavior`'s action-key branches (0x004956a0): the
-    /// press edge scans for a climbable object (a door's vault) and for a
-    /// marked stairs/ladder zone, latching the locked behaviour the player's
-    /// state machine then runs on the same tick.
+    /// press edge scans for a climbable object (a door's vault). The stairs/
+    /// ladder zone branch is split out into [`Self::player_zone_press`]
+    /// because the original runs the action-key room probe
+    /// (`check_action_object`) between this scan and that test.
     ///
     /// The engine calls this at the top of the player's frame-0 dispatch -
     /// before the tick's movement, the original's point - so the scan reads
@@ -6901,7 +6902,7 @@ impl GameState {
                 self.message_flags &= 0xFFBF;
                 self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
             }
-        } else if player.locked == crate::player::LockedAction::None {
+        } else {
             if let Some(candidate) =
                 objects::check_climb_object(&self.objects, player.pos, player.angle)
             {
@@ -6919,19 +6920,32 @@ impl GameState {
                 self.entities[0].animation_frame_id = 1;
                 self.message_flags &= 0xFFBF;
                 self.flags[5].apply(MSF_DOOR_TRANSITION, 1);
-            } else if self.entities[0].zone_flags & 0x20 != 0 && self.ladder_down() {
-                // `player_input_to_behavior`'s zone branch: the action-key
-                // probe above ran `set_stairs_zone`, so the marked zone and
-                // ladder mode are live. Without the mode the stair-door
-                // behaviour (M5's transition) owns the tick.
-                player.locked = crate::player::LockedAction::Ladder;
-                player.action_state = 0;
-                player.move_speed_current = 0;
-                self.entities[0].is_being_attacked = 0x80;
-                self.entities[0].animation_frame_id = 1;
-                self.message_flags &= 0xFFBF;
             }
         }
+    }
+
+    /// `player_input_to_behavior`'s stairs/ladder zone branch: with the
+    /// action-key probe's `set_stairs_zone` already run this frame, the marked
+    /// zone and the ladder mode bit start the climb. Called right after the
+    /// room probe, the reference's point between `check_action_object` and
+    /// this test; a probe that consumed the press (a pickup's reach) leaves
+    /// the player locked and wins.
+    pub fn player_zone_press(&mut self, player: &mut PlayerState) {
+        if player.locked != crate::player::LockedAction::None {
+            return;
+        }
+        if player.vault_bit {
+            return;
+        }
+        if self.entities[0].zone_flags & 0x20 == 0 || !self.ladder_down() {
+            return;
+        }
+        player.locked = crate::player::LockedAction::Ladder;
+        player.action_state = 0;
+        player.move_speed_current = 0;
+        self.entities[0].is_being_attacked = 0x80;
+        self.entities[0].animation_frame_id = 1;
+        self.message_flags &= 0xFFBF;
     }
 
     /// `update_room_objects` (0x00474090): one pass over the built omodel
@@ -12412,20 +12426,20 @@ mod tests {
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::None);
 
-        // The action press runs `set_stairs_zone`; the object pass then starts
-        // the climb because the ladder mode bit is raised.
+        // The action press runs `set_stairs_zone`; the zone test then starts
+        // the climb in the same frame, the reference's order.
         player.input.action_pressed = true;
         state.interact(player.pos, 0, true);
         assert_eq!(state.entities[0].zone_flags & 0x30, 0x30);
         assert!(state.ladder_down());
-        state.player_action_press(&mut player);
+        state.player_zone_press(&mut player);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert_eq!(player.action_state, 0);
 
         // A second press mid-climb neither flips the vault nor restarts.
         player.input.action_pressed = true;
-        state.player_action_press(&mut player);
+        state.player_zone_press(&mut player);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert!(!player.vault_bit);

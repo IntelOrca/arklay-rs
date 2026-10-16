@@ -8855,6 +8855,13 @@ fn tick_room_timed(
     if let Some(request) = context.game.take_pending_reach() {
         context.player.begin_interact(request);
     }
+    // `player_input_to_behavior` tests the stairs/ladder zone right after
+    // `check_action_object`, so the same press can mark the zone and start the
+    // climb. A probe that took the press (a pickup's reach) has locked the
+    // player and this is a no-op.
+    if probe_action {
+        context.game.player_zone_press(context.player);
+    }
     // The room objects run after the player's physics and the player-side
     // probe: the push probe, the object-side action probe and the climb scan
     // all read the frame's final player state.

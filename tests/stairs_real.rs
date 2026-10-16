@@ -50,9 +50,19 @@ fn tick(
     input: Input,
     action: bool,
 ) {
+    // The action-press scan runs at the top of the player's frame-0 dispatch,
+    // before the tick's movement (`GameState::player_action_press`).
+    if input.action_pressed && player.locked == player::LockedAction::None {
+        game.player_action_press(player);
+    }
     player::update(player, room, &[], &[], input);
     game.sync_entity_from_player(player);
     game.interact(player.pos, player.angle, action);
+    // The zone test follows the probe, the reference's `check_action_object`
+    // hand-off.
+    if action {
+        game.player_zone_press(player);
+    }
     game.apply_stair_state(player);
 }
 
@@ -74,10 +84,16 @@ fn ladder_tick(
         .as_ref()
         .map(|anim| anim.clips.as_slice())
         .unwrap_or(&[]);
+    if input.action_pressed && player.locked == player::LockedAction::None {
+        game.player_action_press(player);
+    }
     player::update_with_room(player, room, emd_clips, emw_clips, room_clips, input);
     game.sync_entity_from_player(player);
     let probe_action = action && player.locked == player::LockedAction::None;
     game.interact(player.pos, player.angle, probe_action);
+    if probe_action {
+        game.player_zone_press(player);
+    }
     game.tick_objects(room, player);
     game.apply_stair_state(player);
 }
@@ -235,6 +251,11 @@ fn lab_ladder_zone_latches_flags_and_base() {
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
     assert!(game.apply_flag(0, 47, 0), "scenario flag 47");
+    // Enter as the room 300 door does: a same-stage transition carries the
+    // outgoing room's id (room 300 is id 0) into `attractMode_RoomCameraId`,
+    // and the init's `cmpb 3, 0, 0` selects the branch where slot 2 is the
+    // ladder variant.
+    game.set_attract_room_camera_id(0);
     let mut vm = CommandVm::new(&scripts);
     let mut host = ScdGameHost::new(&mut game);
     vm.run_init(&mut host);
@@ -354,6 +375,11 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
     let scripts = arklay::scd::reader::parse(bytes).unwrap();
     let mut game = GameState::new(id, &room);
     assert!(game.apply_flag(0, 47, 0), "scenario flag 47");
+    // The room 300 door's entry: the same-stage transition carries the
+    // outgoing room's id (0) into `attractMode_RoomCameraId`, selecting the
+    // init branch with the ladder variant on slot 2 and the plain climb on
+    // slot 3.
+    game.set_attract_room_camera_id(0);
     {
         let mut vm = CommandVm::new(&scripts);
         let mut host = ScdGameHost::new(&mut game);
@@ -552,6 +578,10 @@ fn arbitrary_start_lands_on_the_stair_landing_and_the_door_fires() {
         let mut player = player::spawn(id, &room_state);
         player.pos = pos;
         player.angle = facing;
+        // The engine moves the collision mirror with an arrival position
+        // (the door path does the same); a stale mirror resolves the first
+        // walk back toward the spawn centre.
+        player.collision_mirror = [pos[0], pos[2]];
         game.sync_entity_from_player(&player);
         assert!(
             drive_to_door(&mut player, &room_state, &mut game, slot),
@@ -592,6 +622,9 @@ fn west_stairwell_101_to_201_marks_the_climb() {
     let (dx, dz) = player::reach_offset(0);
     player.pos = [center_x - dx, 0, center_z - dz];
     player.angle = 0;
+    // Move the collision mirror with the placed position, exactly like a door
+    // arrival: the first resolve anchors its rollback at the mirror.
+    player.collision_mirror = [player.pos[0], player.pos[2]];
     game.sync_entity_from_player(&player);
     tick(&mut player, &room, &mut game, Input::default(), true);
     assert!(game.transition.is_some());
