@@ -117,6 +117,55 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   action tick counter now match through the cancel, the exit fade and the
   settled room.
 
+- **Item box contents and model.** The box's page/confirm state machine and
+  overlay were a pass behind the reference's `menu_itembox_interaction`
+  (0x004941F0):
+  - The original's state 3 (a slide is running) reads *no* buttons, so the
+    confirm that lands mid-slide is dropped and the swap uses the slot the
+    slide landed on; a forward page only advances the box cursor when its
+    15-frame slide ends, a backward page moves it at once. arklay swapped on
+    the confirm frame of the slide and advanced the cursor on the press
+    frame, so `itembox_open` deposited the knife into slot 1 instead of
+    leaving the box alone, and `itembox_page`'s swap landed 20 frames early.
+  - The box interaction draws the shared slot cursor itself
+    (`itembox_draw_cursor`): while `DAT_00ae9f18` bit 0x20 is clear it is the
+    dim `texU 0xA8` cell, and the arm/init reset the counter (an armed box
+    never counts down, so it keeps the dim frame). arklay left the menu's
+    bright cursor in place.
+  - The overlay's layer order is the original's pending-sprite depth, not its
+    submission order: the name rows and the preview icon/quantity sort
+    *behind* the two 50% shadow rects (which is what dims the rows above and
+    below the selected one), the browse-mode pair sorts behind the box-full
+    line and the two row shadows in front of it, and the two scrollbar-track
+    rects are the same 44%-black `0x60000000` variant as the shadows rather
+    than opaque black (they darken the MAP/FILE panel to 0.56, not to 0).
+  - The page slide draws the incoming slot's icon from `texV + state*2` in a
+    window that shrinks from the bottom, both quantities ride up with their
+    slots (the box's quantity at `screenX - 2`), a 4th name row fills the
+    list's gap, and nothing is painted below the panel's lower mask
+    (`0x77 + 9`). arklay animated the wrong window, drew the quantity at the
+    slot x and let the incoming icon spill over the panel below the mask.
+  - The empty-slot label comes from the original's `PrintText8x14`
+    (0x00455520), whose plain-byte grid has **no** `+2` row bias (unlike
+    `PrintFormattedText`), in the grey CLUT row: `_Nothing_` therefore lands
+    on the Latin cells of the Japanese sheet. arklay drew its ASCII bytes
+    through the encoded grid and in white.
+  - The box-full line's condition is the byte-underflowed
+    `0x2C < (unsigned char)(cursor - 1)`, so the first slot draws it too,
+    at `0x31 - state` with no cursor term; the original's line spans
+    `[42, 0xA8)` (126px), not `[42, 0xA8]`.
+  `oracle/inputs/itembox_page.txt` now pages with the D-pad up/down: the
+  reference's `--test-input` has no L1/R1 raw bits at all (the port's pad
+  layout binds neither), so the box's own page keys are the only pager both
+  engines can receive.
+- **Menu cursor/name reveal.** The reference starts drawing the cursor and the
+  0xBA item-name line on the menu's first *input* frame: neither the
+  fade-complete frame nor the state-0 transition frame draws them, and the
+  item box's own cursor waits with them. arklay revealed both on the
+  fade-complete frame, two frames early (`itembox_open` 118-119,
+  `inventory_open` 77-78, ~800 extra differing pixels on each). Fixed with
+  `menu_reveal_delay`.
+
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
 `use_herb`, `equip_weapon`, `file_open`, `file_pages`, `map_open`,
@@ -126,6 +175,13 @@ save-screen frames are pixel-verified at capture every tick, and
 `save_screen` (which now includes the cancel and the room fade back in)
 matches all 420 ticks with the fade and settled frames at the room/menu
 residual (3.5-4.4% differing, the plain-room player-mesh baseline).
+
+`itembox_open` and `itembox_page` sit at that same residual: their steady
+frames differ by 430-511 pixels beyond 8 (0.56-0.67%, mean error 0.19-0.26 /
+255) and the fade hand-off frames by ~595, down from ~10700 (14.4-15%) before.
+Every one of those pixels is in the portrait or the EKG strip below - the box
+overlay, its list, its preview column, the cursor and the swap are pixel-equal
+on every compared frame.
 
 ## Save-mode oracle
 
@@ -166,11 +222,22 @@ match), which is what the save interchange exists for.
   the area-name caption drawn at the plan's foot, and the frame-by-frame
   zoom/light animation (the documented M16 simplification,
   `docs/m16-deviations.md` item 4).
-- **Item box contents/model.** The box overlay opens and the trace matches,
-  but the frames differ ~15%: the item swapped by the scenario's confirms and
-  the model drawn in the viewport differ (the reference keeps the box object
-  and swaps a different slot after the D-pad press), so the box cursor/state
-  and the item viewer model need another pass.
+
+- **Menu cursor blink.** The reference's slot cursor alternates between the
+  bright `texU 0x80` and dim `texU 0xA8` cells every 32 frames of
+  `DAT_00ae9f18` (dim for the first 32 frames after any move/arm); arklay's
+  *menu* cursor is always bright, which shows up on the inventory/other menu
+  screens (not the item box, which draws its own blinking cursor now) as 158
+  differing pixels per frame during the dim phases - e.g. `inventory_open`
+  at frames 120-142/175-206/239-270 versus 0 outside them. The item box's own
+  counter and frame selection are already exact (`cursor_dim`).
+- **Portrait and health strip residual.** Every settled menu frame of every
+  scenario keeps ~330 differing pixels on the character portrait
+  (`ui/statface.tim`, the 30x30 window at x 22-51, y 146-175: the blue plate's
+  edge sits one step over in arklay) plus 20-200 on the health strip (the EKG
+  line below, and its small face icon), i.e. 0.46-0.67% of the screen with a
+  local max of 246-255. Both are present identically in `inventory_open`
+  before and after this change, so they are menu-wide, not item-box, gaps.
 - **EKG line rasterization.** The residual settled-screen difference (~0.3-1%)
   is the health monitor's EKG line: arklay rasterizes a Bresenham polyline. The
   reference's `FUN_00470c60` queues a 1px-wide quad that `MarniDX_GL::DrawLine`

@@ -1,12 +1,15 @@
-# Item box: open the box, page the box list (L1/R1), swap items both ways and
-# close.
+# Item box: open the box, page the box list both ways, swap items and close.
+# The box's own page keys are the D-pad up/down (`g_button_pressed_id &
+# 0x5000` in the original's 0x004941F0): the reference's --test-input has no
+# L1/R1 raw bits at all (the port's pad layout binds none), so the dpad is the
+# only button that reaches the pager in both engines.
 60 confirm
 61
 120 confirm
 121
-140 page_right
+140 down
 141
-160 page_left
+160 up
 161
 180 down
 181

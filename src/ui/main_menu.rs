@@ -968,7 +968,27 @@ pub fn draw_item_icon(
     item: u8,
     position: [i16; 2],
 ) {
-    let dst = [i32::from(position[0]), i32::from(position[1]), 40, 30];
+    draw_item_icon_slice(framebuffer, assets, item, position, 0, 30);
+}
+
+/// [`draw_item_icon`] with a vertical slice of the icon: `source_v` skips the
+/// first rows of the 40x30 cell and `height` draws only that many.
+///
+/// The item box's page slide samples its VRAM icon two pixels further down per
+/// step inside a window that shrinks from the bottom (`texV = base + state * 2`
+/// with `height = 0x1E - state * 2`), which this reproduces.
+pub fn draw_item_icon_slice(
+    framebuffer: &mut Framebuffer,
+    assets: &MenuAssets,
+    item: u8,
+    position: [i16; 2],
+    source_v: i32,
+    height: i32,
+) {
+    if height <= 0 {
+        return;
+    }
+    let dst = [i32::from(position[0]), i32::from(position[1]), 40, height];
     if item < 0x6F {
         let row = usize::from(items::image_class(item).wrapping_sub(1));
         if items::image_class(item) == 0 || row >= items::ITEM_ALL_ROWS {
@@ -976,7 +996,12 @@ pub fn draw_item_icon(
         }
         framebuffer.draw_rgba_sprite(
             &assets.item_all,
-            [0, (row * items::ICON_HEIGHT as usize) as i32, 40, 30],
+            [
+                0,
+                (row * items::ICON_HEIGHT as usize) as i32 + source_v,
+                40,
+                height,
+            ],
             dst,
             0,
         );
@@ -984,7 +1009,7 @@ pub fn draw_item_icon(
         let row = i32::from(item - 0x6F);
         framebuffer.draw_indexed_sprite(
             &assets.staitem,
-            [0, row * 30, 40, 30],
+            [0, row * 30 + source_v, 40, height],
             dst,
             0,
             0,
@@ -1001,6 +1026,20 @@ pub fn draw_item_quantity(
     stack: InventoryItem,
     position: [i16; 2],
 ) {
+    draw_item_quantity_clipped(framebuffer, assets, game, stack, position, i32::MAX);
+}
+
+/// [`draw_item_quantity`] with every glyph clipped to rows above `clip_bottom`
+/// (exclusive). The item box's preview column uses it to stop a sliding slot's
+/// quantity where the panel's lower mask ends.
+pub fn draw_item_quantity_clipped(
+    framebuffer: &mut Framebuffer,
+    assets: &MenuAssets,
+    game: &GameState,
+    stack: InventoryItem,
+    position: [i16; 2],
+    clip_bottom: i32,
+) {
     let item = stack.id;
     let quantifiable = (item < 0x13 && item != 0x01) || item == 0x2F || item > items::MAX_ITEM;
     if !quantifiable {
@@ -1009,11 +1048,15 @@ pub fn draw_item_quantity(
     let infinite = item > items::MAX_ITEM || (item == 0x0A && game.flag_test(0, 0x7E, false));
     let x = i32::from(position[0]);
     let y = i32::from(position[1]) + 0x14;
+    let height = (clip_bottom - y).clamp(0, 8);
+    if height <= 0 {
+        return;
+    }
     if infinite {
         framebuffer.draw_indexed_sprite(
             &assets.status,
-            [152, 112, 10, 8],
-            [x + 6, y, 10, 8],
+            [152, 112, 10, height],
+            [x + 6, y, 10, height],
             0,
             0,
             Tint::White,
@@ -1037,8 +1080,8 @@ pub fn draw_item_quantity(
         if digit != 0 || drawn || last {
             framebuffer.draw_indexed_sprite(
                 &assets.status,
-                [column, i32::from(digit) * 8, 8, 8],
-                [cursor, y, 8, 8],
+                [column, i32::from(digit) * 8, 8, height],
+                [cursor, y, 8, height],
                 0,
                 0,
                 Tint::White,
