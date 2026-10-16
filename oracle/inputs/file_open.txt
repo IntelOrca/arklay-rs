@@ -1,6 +1,9 @@
 # FILE tab: open the pause menu, walk to the FILE tab, open the first
-# document's reader, turn one page, then settle in the reader. The reader's
-# exit path is still being matched; see oracle/ui-findings.md.
+# document's reader, turn one page, then cancel out of the reader. The reader
+# only reads the pad once its busy lock is clear (the entry's sixteen-frame
+# backdrop ramp plus the entry slide run to tick ~173), so the press inside
+# that window is ignored and the exit's slide/ramp-down/fade-in are exercised;
+# see oracle/ui-findings.md.
 60 start
 61
 90 up
@@ -17,3 +20,5 @@
 161
 180 right
 181
+230 cancel
+231

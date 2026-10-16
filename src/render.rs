@@ -57,6 +57,11 @@ pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+    /// Optional `[x, y, w, h]` clip applied to sprite draws. The pause menu's
+    /// tab screens sit behind the panel's masking rects and frame, so their
+    /// sliding art is clipped to the panel's screen area instead of spilling
+    /// over the chrome.
+    pub clip: Option<[i32; 4]>,
 }
 
 impl Default for Framebuffer {
@@ -125,6 +130,10 @@ pub enum SpriteBlend {
     Opaque,
     /// `(source + destination) / 2`, the PSX half blend.
     Half,
+    /// The original's variant-2 semi-transparency: `127/256` of the (already
+    /// colour-modulated) source over the destination, rounded - the reference's
+    /// GPU chain, which the FILE reader's backdrop pieces use.
+    HalfVariant,
     /// Mix the destination towards black by `alpha`/255 wherever a texel is
     /// opaque; the text shadow's pass. The source colour is ignored.
     BlackAlpha(u8),
@@ -225,12 +234,19 @@ impl Framebuffer {
             width: WIDTH,
             height: HEIGHT,
             rgba: vec![0; (WIDTH * HEIGHT * 4) as usize],
+            clip: None,
         }
     }
 
     /// Fill the whole framebuffer black.
     pub fn clear(&mut self) {
         self.rgba.fill(0);
+    }
+
+    /// Clip subsequent sprite draws to `rect` (`[x, y, w, h]`); `None` clears
+    /// the clip.
+    pub fn set_clip_rect(&mut self, rect: Option<[i32; 4]>) {
+        self.clip = rect;
     }
 
     /// Copy `image` to the top-left corner, clipping to both images' bounds.
@@ -355,6 +371,50 @@ impl Framebuffer {
             SpriteBlend::Opaque,
             [false; 2],
         );
+    }
+
+    /// Draw one indexed sprite the way the FILE reader's backdrop pieces are:
+    /// the texel is modulated by `2 * ramp` (the original's `DAT_004af48c`
+    /// colour field) and then blended over the destination with the
+    /// descriptor's variant-2 half alpha (`127/256`), rounding at both stages
+    /// exactly like the reference's GPU chain.
+    pub fn draw_indexed_sprite_ramp(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        ramp: u8,
+    ) {
+        if texture.width == 0 || texture.height == 0 {
+            return;
+        }
+        // `2 * ramp` is deliberately NOT clamped to 255: the reference keeps
+        // the modulated colour as a float, so `2 * 0x80` rounds an art value of
+        // 148 up to 149 and the drawn pixel lands on 74 - the value the fully
+        // ramped backdrop actually shows.
+        let colour = u32::from(ramp) * 2;
+        self.draw_sprite(src, dst, [false; 2], SpriteBlend::HalfVariant, |u, v| {
+            if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
+                return None;
+            }
+            let index = *texture
+                .indices
+                .get(v as usize * texture.width as usize + u as usize)?;
+            if index == 0 {
+                return None;
+            }
+            let texel = texture.palette(clut_row, index);
+            if texel[3] == 0 {
+                return None;
+            }
+            Some([
+                ((u32::from(texel[0]) * colour + 127) / 255) as u8,
+                ((u32::from(texel[1]) * colour + 127) / 255) as u8,
+                ((u32::from(texel[2]) * colour + 127) / 255) as u8,
+                255,
+            ])
+        });
     }
 
     /// Draw one indexed sprite with explicit U/V mirror flags and the font's
@@ -707,10 +767,16 @@ impl Framebuffer {
         if src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0 {
             return;
         }
-        let start_x = dst_x.max(0);
-        let start_y = dst_y.max(0);
-        let end_x = dst_x.saturating_add(dst_w).min(self.width as i32);
-        let end_y = dst_y.saturating_add(dst_h).min(self.height as i32);
+        let mut start_x = dst_x.max(0);
+        let mut start_y = dst_y.max(0);
+        let mut end_x = dst_x.saturating_add(dst_w).min(self.width as i32);
+        let mut end_y = dst_y.saturating_add(dst_h).min(self.height as i32);
+        if let Some([clip_x, clip_y, clip_w, clip_h]) = self.clip {
+            start_x = start_x.max(clip_x);
+            start_y = start_y.max(clip_y);
+            end_x = end_x.min(clip_x.saturating_add(clip_w));
+            end_y = end_y.min(clip_y.saturating_add(clip_h));
+        }
         if start_x >= end_x || start_y >= end_y {
             return;
         }
@@ -749,6 +815,13 @@ impl Framebuffer {
                     SpriteBlend::Half => {
                         for (channel, &destination) in pixel[..3].iter_mut().zip(slot.iter()) {
                             *channel = ((u16::from(*channel) + u16::from(destination)) / 2) as u8;
+                        }
+                    }
+                    SpriteBlend::HalfVariant => {
+                        for (channel, &destination) in pixel[..3].iter_mut().zip(slot.iter()) {
+                            *channel =
+                                ((u32::from(*channel) * 127 + u32::from(destination) * 129 + 128)
+                                    >> 8) as u8;
                         }
                     }
                     SpriteBlend::BlackAlpha(alpha) => {

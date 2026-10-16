@@ -82,10 +82,12 @@ pub const SLOTS_PER_BOOK: usize = 8;
 pub const COVER_POS: [i16; 2] = [0x20, 0x18];
 /// The book cover source size (the cover page is the whole selector art).
 pub const COVER_SIZE: [i16; 2] = [0xA0, 0x68];
-/// The slot-icon source rectangle inside the cover.
-pub const SLOT_ICON_UV: [i32; 4] = [0, 0xA8, 4, 8];
-/// The cursor-arrow source rectangle inside the cover.
-pub const CURSOR_UV: [i32; 4] = [0, 0xA0, 4, 8];
+/// The slot-icon source rectangle inside the cover (`g_fileSlotDescs`,
+/// 0x004d268c: 4x8 at texU `0xa8`, texV 0).
+pub const SLOT_ICON_UV: [i32; 4] = [0xA8, 0, 4, 8];
+/// The cursor-arrow source rectangle inside the cover (`DAT_004d27d0`: 4x8 at
+/// texU `0xa0`, texV 0).
+pub const CURSOR_UV: [i32; 4] = [0xA0, 0, 4, 8];
 /// The slot-icon list's x base.
 pub const SLOT_X: i16 = 0x8C;
 /// The slot-icon list's y base.
@@ -278,33 +280,85 @@ pub enum FileMode {
     Reader,
 }
 
-/// Which reader slide animation is running.
+/// Which reader state is running (the original's `state[2]` in
+/// `pickup_screen_render` 0x004823a0, shared by the JPN
+/// `jpn_file_screen_render` 0x0042c080).
 ///
-/// The original's reader (`pickup_screen_render` 0x004823a0 /
-/// `jpn_file_screen_render` 0x0042c080) slides the page texture in and out on
-/// every change: entry eases it in from the right, a page-down first slides it
-/// out to the left and then eases the next page in from the right, a page-up
-/// mirrors that, and the close slides it out to the left.
+/// The reader slides the page texture in and out on every change: entry eases
+/// it in from the right, a page-down first slides it out to the left and then
+/// eases the next page in from the right, a page-up mirrors that, and the close
+/// slides it out to the left and runs the backdrop/selector tail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReaderAnim {
-    /// No animation; the reader accepts input.
+pub enum ReaderState {
+    /// The original's 0/1: the FILEI backdrop pages in and its frame pieces
+    /// ramp `8` at a time to `0x80`. Nothing is drawn over the black backdrop
+    /// until the half-page's TIM has also paged in (state 2), so the whole
+    /// sixteen-frame ramp is black.
+    Backdrop,
+    /// 2: the half-page's TEXTM TIM pages in and the entry slide starts.
+    PageLoad,
+    /// 3: the page eases onto the page box from the right (`0x128` -> 0).
+    SlideIn,
+    /// 4: the slide settled; the busy lock releases on this frame.
     Idle,
-    /// The page eases in from the right (entry / page-down second half).
-    InRight,
-    /// The page slides out to the left (page-down first half).
-    OutLeft,
-    /// The page eases in from the left (page-up second half).
-    InLeft,
-    /// The page slides out to the right (page-up first half).
-    OutRight,
-    /// The reader slides out to the left on close.
-    Exit,
+    /// 5/6: the page slides out to the left, then the next half-page.
+    SlideOutLeft,
+    /// 7: the next half-page's TIM load frame.
+    NextLoad,
+    /// 8/9: the page slides out to the right, then the previous half-page.
+    SlideOutRight,
+    /// 0xa: the previous half-page's unpack frame (a no-op; the load follows).
+    UnpackLeft,
+    /// 0xb: the previous half-page pages in and falls into 0xc.
+    PrevPage,
+    /// 0xc: the page eases back in from the left (`-0x128` -> 0).
+    SlideInLeft,
+    /// 0xd/0xe: the reader slides out to the left on close.
+    ExitSlide,
+    /// 0xf: the frame pieces ramp back down to black over sixteen frames.
+    BackdropOut,
+    /// 0x10: the black hold frame before the selector's cover pages back in.
+    Hold,
+    /// 0x11: the selector's cover pages back into the shared page slot.
+    CoverLoad,
+    /// 0x12: the hand-off - the selector takes over with its fade mode set
+    /// (the original's `b0=0, b1=1, b2=1, b3=2`) and fades back in.
+    HandOff,
 }
 
 /// The reader's entry/exit slide start offset (the original's `0x128`).
 pub const READER_SLIDE_START: i16 = 0x128;
 /// The reader's entry/exit slide start speed (the original's `300`).
 const READER_SLIDE_SPEED: i16 = 300;
+/// The backdrop/frame ramp step (the original's `DAT_004af48c` `+/- 8`).
+const READER_BACKDROP_STEP: u8 = 8;
+/// The ramp's full value: `DAT_004af48c` tops out at `0x80`, which the
+/// descriptor's variant-2 half blend turns into 50% brightness.
+pub const READER_BACKDROP_FULL: u8 = 0x80;
+
+/// The six FILEI pieces the reader draws behind the page (`g_jpnReaderFrame`,
+/// 0x004af478): the backdrop itself plus the five scraps stacked down the
+/// texture's right edge, each a `(src, dst)` rectangle.
+const READER_FRAME_PIECES: [([i32; 4], [i32; 4]); 6] = [
+    ([0x00, 0x00, 0xD0, 0x78], [0x30, 0x30, 0xD0, 0x78]),
+    ([0xD0, 0x00, 0x30, 0x18], [0x30, 0xA8, 0x30, 0x18]),
+    ([0xD0, 0x18, 0x30, 0x18], [0x60, 0xA8, 0x30, 0x18]),
+    ([0xD0, 0x30, 0x30, 0x18], [0x90, 0xA8, 0x30, 0x18]),
+    ([0xD0, 0x48, 0x30, 0x18], [0xC0, 0xA8, 0x30, 0x18]),
+    ([0xD0, 0x60, 0x10, 0x18], [0xF0, 0xA8, 0x10, 0x18]),
+];
+/// The previous/next page arrow source y in the FILEI texture
+/// (`DAT_004af550`/`DAT_004af574` 0x004af550: texV `0x60`).
+const READER_ARROW_Y: i32 = 0x60;
+/// The selector's entry slide (`FUN_00481ae0` 0x00481ae0 / `FUN_00481d00`
+/// case 0): the cover starts at `-0x7f` and eases down at speed `0x80`.
+const LIST_SLIDE_START: i16 = -0x7f;
+const LIST_SLIDE_SPEED: i16 = 0x80;
+/// The pause menu's screen area (`0x28,0x18` `0xf0`x`0xc0`). The original's
+/// selector layer sits behind the panel's black masking rects (depth 980) and
+/// frame parts (820-964), so a sliding cover never spills over the panel's
+/// chrome; clipping the selector to this area reproduces that.
+const SCREEN_AREA: [i32; 4] = [0x28, 0x18, 0xF0, 0xC0];
 
 /// What a handled FILE input asks the engine to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,14 +386,45 @@ pub struct FileScreen {
     pub blink: u8,
     /// Horizontal slide of the current view in pixels (book changes).
     pub slide_x: i16,
-    /// Vertical slide of the current view in pixels (opening/closing).
+    /// Vertical slide of the current view in pixels (the entry slide).
     pub slide_y: i16,
-    /// Which reader slide animation is running.
-    pub reader_anim: ReaderAnim,
+    /// The selector's entry slide speed (the original's `state[0xa]`).
+    list_speed: i16,
+    /// Whether the selector's state machine has run its first frame yet. The
+    /// original switches the pause menu's task a frame after the tab row's
+    /// confirm, so the frame the FILE tab is chosen still draws the panel
+    /// alone and the cover's entry slide starts on the next frame.
+    list_pending: bool,
+    /// Whether the selector has settled and draws its title, book indicators
+    /// and scroll arrows (the original's `FUN_00481d00` display state 1).
+    list_ready: bool,
+    /// Which reader load/slide step is running.
+    pub reader_state: ReaderState,
     /// The reader page's x offset (the original's `state[0xc]`).
     pub reader_slide: i16,
     /// The reader slide's speed (the original's `state[0xa]`).
     reader_speed: i16,
+    /// A reader exit requested this frame (the original's FILE_REQUEST `0xd`).
+    /// The request is raised after the reader's own render ran, so the state
+    /// machine applies it on the next frame and the request frame still draws
+    /// the settled reader.
+    reader_exit_request: bool,
+    /// Whether a half-page TIM is paged in (the original's `DAT_004af600`): the
+    /// frame pieces and the page draw only once it is, which is why the
+    /// reader's whole backdrop ramp is black.
+    pub reader_page_loaded: bool,
+    /// The frame pieces' brightness ramp (the original's `DAT_004af48c`):
+    /// `0..=0x80`, halved by the descriptor's variant-2 blend.
+    pub reader_backdrop: u8,
+    /// The reader's input lock (the original's `state[9]`, the FILE_BUSY byte).
+    reader_busy: bool,
+    /// The busy lock as this frame's input sees it: the original reads
+    /// `state[9]` before the render step that clears it, so the lock always
+    /// looks one frame older than the state machine's own value.
+    reader_busy_frame: bool,
+    /// The original's `state[0x10]` (FILE_SAVEFLAG): the last half-page has
+    /// been acknowledged, which lights the EXIT label and lets a confirm out.
+    pub reader_last_page: bool,
     /// Whether the reader was opened for a document pick-up: its exit ends the
     /// whole flow instead of returning to the selector.
     pickup: bool,
@@ -352,13 +437,6 @@ pub struct FileScreen {
     /// Whether the white fade is ramping down over the selector after the
     /// reader's exit (the original's mode byte 2).
     fade_out: bool,
-    /// Loading frames before the pending reader slide starts: the original
-    /// loads the page texture (state 1) and unpacks the list (state 2) first,
-    /// and its page turns re-enter at state 7/0xa with the unpack frame.
-    reader_wait: u8,
-    /// Black frames between the reader's exit slide and the selector (the
-    /// original's states 0x0f..0x11 before the mode-2 fade).
-    post_exit: u8,
     /// Set when a pick-up reader's exit slide has finished.
     reader_exit_done: bool,
 }
@@ -374,16 +452,23 @@ impl Default for FileScreen {
             blink: 0,
             slide_x: 0,
             slide_y: 0,
-            reader_anim: ReaderAnim::Idle,
+            list_speed: 1,
+            list_pending: false,
+            list_ready: true,
+            reader_state: ReaderState::Backdrop,
+            reader_exit_request: false,
             reader_slide: 0,
             reader_speed: 1,
+            reader_page_loaded: false,
+            reader_backdrop: 0,
+            reader_busy: false,
+            reader_busy_frame: false,
+            reader_last_page: false,
             pickup: false,
             reader_exit_done: false,
             fade: 0,
             fade_in: false,
             fade_out: false,
-            reader_wait: 0,
-            post_exit: 0,
         }
     }
 }
@@ -400,16 +485,18 @@ impl FileScreen {
         self.blink = 0;
         self.slide_x = 0;
         self.slide_y = 0;
-        self.reader_anim = ReaderAnim::Idle;
-        self.reader_slide = 0;
-        self.reader_speed = 1;
+        self.list_speed = 1;
+        // The original's file task starts on the frame *after* the tab row's
+        // confirm, and its `FUN_00481ae0` init starts the cover at `-0x7f`
+        // with speed `0x80`, running the renderer's first state-0 step on the
+        // same frame - which is the next tick here.
+        self.list_pending = true;
+        self.list_ready = false;
+        self.reader_reset();
         self.pickup = false;
-        self.reader_exit_done = false;
         self.fade = 0;
         self.fade_in = false;
         self.fade_out = false;
-        self.reader_wait = 0;
-        self.post_exit = 0;
     }
 
     /// Open the reader directly on the document item `item` (`0x5F..=0x6E`),
@@ -420,7 +507,6 @@ impl FileScreen {
         self.mode = FileMode::Reader;
         self.character = game.id.player_flag & 1;
         self.pickup = true;
-        self.reader_exit_done = false;
         let index = item.wrapping_sub(FILE_ITEM_BASE);
         let list = key_item_list(self.character);
         let found = list
@@ -435,13 +521,40 @@ impl FileScreen {
         self.blink = 0;
         self.slide_x = 0;
         self.slide_y = 0;
-        self.start_reader_entry(1);
+        self.list_pending = false;
+        self.list_ready = true;
+        self.reader_reset();
     }
 
-    /// Whether the white fade hand-off (either direction) or the post-exit
-    /// black hold owns the input: the original's busy lock.
+    /// Reset the reader's state block (the original's `jpn_file_list_init`,
+    /// 0x0042bf70: the half-page counter and the last-page flag; the renderer
+    /// then runs its state-0 load, which arms the backdrop ramp and the lock).
+    fn reader_reset(&mut self) {
+        self.reader_state = ReaderState::Backdrop;
+        self.reader_exit_request = false;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
+        self.reader_page_loaded = false;
+        self.reader_backdrop = 0;
+        self.reader_busy = true;
+        self.reader_busy_frame = true;
+        self.reader_last_page = false;
+        self.reader_exit_done = false;
+    }
+
+    /// Whether the original's busy lock (`state[9]`, FILE_BUSY) owns this
+    /// frame's input: the selector's fade hand-off (MODE 1/2), its entry slide,
+    /// or the reader's own lock. The reader's half of the lock is read as the
+    /// *previous* frame left it, because the original tests `state[9]` before
+    /// the render step that releases it.
     pub fn input_locked(&self) -> bool {
-        self.fade_in || self.fade_out || self.post_exit > 0
+        self.fade_in
+            || self.fade_out
+            || self.reader_exit_request
+            || match self.mode {
+                FileMode::List => self.list_pending || !self.list_ready,
+                FileMode::Reader => self.reader_busy_frame,
+            }
     }
 
     /// Whether a pick-up reader has finished its exit slide.
@@ -449,42 +562,101 @@ impl FileScreen {
         std::mem::take(&mut self.reader_exit_done)
     }
 
-    /// Start the reader's entry slide (also used by the page-forward second
-    /// half): the page eases in from the right at 300 speed, halving each tick
-    /// after `wait` load frames.
-    fn start_reader_entry(&mut self, wait: u8) {
-        self.reader_anim = ReaderAnim::InRight;
-        self.reader_slide = READER_SLIDE_START;
-        self.reader_speed = READER_SLIDE_SPEED;
-        self.reader_wait = wait;
+    /// One step of the selector's entry slide (the original's `FUN_00481d00`
+    /// case 0: the speed halves and the cover eases down from `-0x7f`).
+    fn step_list_entry(&mut self) {
+        self.list_speed /= 2;
+        self.slide_y += self.list_speed;
+        if self.slide_y >= 0 {
+            self.slide_y = 0;
+            self.list_speed = 1;
+            self.list_ready = true;
+        }
     }
 
-    fn start_reader_next(&mut self) {
-        self.reader_anim = ReaderAnim::OutLeft;
-        self.reader_slide = 0;
-        self.reader_speed = 1;
-        // The original's input state falls through into the slide, so the
-        // first step lands on the input frame.
+    /// The original's state 3: the page eases onto the page box from the right,
+    /// halving its speed each frame.
+    fn step_reader_slide_in(&mut self) {
+        self.reader_speed /= 2;
+        self.reader_slide -= self.reader_speed;
+        if self.reader_slide < 1 {
+            self.reader_slide = 0;
+            self.reader_speed = 1;
+            self.reader_state = ReaderState::Idle;
+        }
+    }
+
+    /// The original's state 6: the page runs off to the left, doubling its
+    /// speed; the half-page advances once the texture is fully clear.
+    fn step_reader_out_left(&mut self) {
         self.reader_slide -= self.reader_speed;
         self.reader_speed = self.reader_speed.saturating_mul(2);
+        if self.reader_slide < -0x127 {
+            self.page = self.page.saturating_add(1);
+            self.reader_state = ReaderState::NextLoad;
+        }
     }
 
-    fn start_reader_prev(&mut self) {
-        self.reader_anim = ReaderAnim::OutRight;
-        self.reader_slide = 0;
-        self.reader_speed = 1;
-        // The input state falls through into the slide (input frame step).
+    /// The original's state 9: the page runs off to the right, doubling its
+    /// speed; the previous half-page is entered once it is clear.
+    fn step_reader_out_right(&mut self) {
         self.reader_slide += self.reader_speed;
         self.reader_speed = self.reader_speed.saturating_mul(2);
+        if self.reader_slide > 0x127 {
+            self.page = self.page.saturating_sub(1);
+            self.reader_state = ReaderState::UnpackLeft;
+        }
     }
 
-    fn start_reader_exit(&mut self) {
-        self.reader_anim = ReaderAnim::Exit;
+    /// The original's state 0xc: the page eases back in from the left.
+    fn step_reader_slide_in_left(&mut self) {
+        self.reader_speed /= 2;
+        self.reader_slide += self.reader_speed;
+        if self.reader_slide > -1 {
+            self.reader_slide = 0;
+            self.reader_speed = 1;
+            self.reader_state = ReaderState::Idle;
+        }
+    }
+
+    /// Arm the reader's entry (the original's FILE_STATE 0 -> 1 hand-off when
+    /// the selector's fade reaches full: the state block becomes
+    /// `0x00000001`). The reader's own first frame is the renderer's state 0:
+    /// it pages the FILEI backdrop in, sets the slide start and locks input.
+    fn start_reader_entry(&mut self) {
+        self.mode = FileMode::Reader;
+        self.page = 0;
+        self.reader_reset();
+    }
+
+    /// Start a page-down (the original's `jpn_file_list_input` state 5). The
+    /// input state falls through into the slide, so the input frame already
+    /// moves the page one pixel.
+    fn start_reader_next(&mut self) {
+        self.reader_busy = true;
         self.reader_slide = 0;
         self.reader_speed = 1;
-        // The input state falls through into the slide (input frame step).
-        self.reader_slide -= self.reader_speed;
-        self.reader_speed = self.reader_speed.saturating_mul(2);
+        self.reader_state = ReaderState::SlideOutLeft;
+        self.step_reader_out_left();
+    }
+
+    /// Start a page-up (the original's state 8), with the same input-frame
+    /// fall-through as [`FileScreen::start_reader_next`].
+    fn start_reader_prev(&mut self) {
+        self.reader_busy = true;
+        self.reader_slide = 0;
+        self.reader_speed = 1;
+        self.reader_state = ReaderState::SlideOutRight;
+        self.step_reader_out_right();
+    }
+
+    /// Request the reader's exit (the original's `menu_file_state_machine`
+    /// setting FILE_REQUEST to `0xd`). The request is raised after the
+    /// reader's own advance ran, so the cancel frame still draws the settled
+    /// page and the exit slide's first step lands on the next frame.
+    fn start_reader_exit(&mut self) {
+        self.reader_busy = true;
+        self.reader_exit_request = true;
     }
 
     /// Whether the current book has a selectable document.
@@ -492,37 +664,24 @@ impl FileScreen {
         self.slot != 0xFF
     }
 
-    /// Advance one tick: blink, the book-change slide and the reader slide.
+    /// Advance one tick: the selector's slides or the reader's state machine,
+    /// plus the blink counter and the hand-off fades.
     pub fn tick(&mut self) {
-        self.blink = self.blink.wrapping_add(1);
+        // The original checks the reader's busy lock (`state[9]`) before the
+        // render step that maintains it, so this frame's input sees the lock
+        // as the previous frame left it.
+        self.reader_busy_frame = self.reader_busy;
         // The selector-to-reader hand-off fades the whole screen to white over
         // eight frames (`pickup_fade_update(0)`), then the reading mode takes
-        // over on its opaque black backdrop with the page's load frames and
-        // entry slide.
+        // over on its opaque black backdrop. The frame the ramp completes on
+        // still draws black - the original swaps FILE_STATE mid-render and the
+        // selector is drawn under the full-strength overlay.
         if self.fade_in {
             self.fade = self.fade.saturating_add(0x20);
             if self.fade == 0xFF {
                 self.fade = 0;
                 self.fade_in = false;
-                self.mode = FileMode::Reader;
-                self.page = 0;
-                // State 0 (arrow) + state 1 (page file) load before the
-                // unpack state's own first slide step.
-                self.start_reader_entry(1);
-            }
-            return;
-        }
-        // After the reader's exit slide the original holds the black backdrop
-        // for the cover-load states, then fades the white overlay down over
-        // the selector (mode byte 2).
-        if self.post_exit > 0 {
-            self.post_exit -= 1;
-            if self.post_exit == 0 {
-                self.mode = FileMode::List;
-                self.slide_x = 0;
-                self.slide_y = 0;
-                self.fade_out = true;
-                self.fade = 0xFF;
+                self.start_reader_entry();
             }
             return;
         }
@@ -530,82 +689,155 @@ impl FileScreen {
             self.fade = self.fade.saturating_sub(0x20);
             if self.fade == 0 {
                 self.fade_out = false;
+                // `pickup_fade_update(1)` clears the state block's slide pair
+                // as its ramp completes: the selector snaps back onto the
+                // panel's screen.
+                self.slide_x = 0;
+                self.slide_y = 0;
             }
         }
-        if self.slide_x > 0 {
-            self.slide_x = (self.slide_x - 9).max(0);
-        } else if self.slide_x < 0 {
-            self.slide_x = (self.slide_x + 9).min(0);
+        match self.mode {
+            FileMode::List => {
+                if self.list_pending {
+                    // The task's first frame: the cover's entry slide is armed
+                    // and stepped once (`FUN_00481ae0`).
+                    self.list_pending = false;
+                    self.slide_y = LIST_SLIDE_START;
+                    self.list_speed = LIST_SLIDE_SPEED;
+                    self.list_ready = false;
+                    self.step_list_entry();
+                } else if !self.list_ready {
+                    self.step_list_entry();
+                }
+                if self.slide_x > 0 {
+                    self.slide_x = (self.slide_x - 9).max(0);
+                } else if self.slide_x < 0 {
+                    self.slide_x = (self.slide_x + 9).min(0);
+                }
+            }
+            FileMode::Reader => self.tick_reader(),
         }
-        self.tick_reader_slide();
+        // The original's blink counter only runs in the selector's display
+        // state and in the reader's settled state 4 (both are the frames whose
+        // render draws the blinking arrows).
+        let blinking = match self.mode {
+            FileMode::List => self.list_ready,
+            FileMode::Reader => self.reader_state == ReaderState::Idle,
+        };
+        if blinking {
+            self.blink = self.blink.wrapping_add(1);
+        }
     }
 
-    /// Advance the reader's slide animation one frame, transcribed from the
-    /// original's `pickup_screen_render` states 2-14.
-    fn tick_reader_slide(&mut self) {
-        // The original's load/unpack states run before the slide itself.
-        if self.reader_wait > 0 {
-            self.reader_wait -= 1;
-            return;
+    /// Advance the reader one frame, transcribed from the original's
+    /// `jpn_file_screen_render` (0x0042c080). Each state's step runs before
+    /// the frame draws, and the falling-through states (2->3, 5->6, 8->9,
+    /// 0xb->0xc, 0xd->0xe) are kept as single-frame steps here.
+    fn tick_reader(&mut self) {
+        if self.reader_exit_request {
+            // The original's request byte is read by the renderer's state
+            // switch: state 0xd clears the slide and speed and falls into
+            // 0xe, so the exit's first step lands on this frame.
+            self.reader_exit_request = false;
+            self.reader_state = ReaderState::ExitSlide;
+            self.reader_slide = 0;
+            self.reader_speed = 1;
         }
-        match self.reader_anim {
-            ReaderAnim::Idle => {}
-            ReaderAnim::InRight => {
-                self.reader_speed /= 2;
-                self.reader_slide -= self.reader_speed;
-                if self.reader_slide < 1 {
-                    self.reader_slide = 0;
-                    self.reader_speed = 1;
-                    self.reader_anim = ReaderAnim::Idle;
+        match self.reader_state {
+            ReaderState::Backdrop => {
+                // States 0/1: the FILEI backdrop is paged in and the frame
+                // pieces ramp 8 at a time to 0x80. Nothing else draws yet, so
+                // no frame of the ramp is visible.
+                self.reader_backdrop = self
+                    .reader_backdrop
+                    .saturating_add(READER_BACKDROP_STEP)
+                    .min(READER_BACKDROP_FULL);
+                if self.reader_backdrop >= READER_BACKDROP_FULL {
+                    self.reader_state = ReaderState::PageLoad;
                 }
             }
-            ReaderAnim::OutLeft => {
+            ReaderState::PageLoad => {
+                // State 2: the half-page's TEXTM TIM pages in (arklay holds
+                // every page pack decoded) and falls into state 3.
+                self.reader_page_loaded = true;
+                self.reader_slide = READER_SLIDE_START;
+                self.reader_speed = READER_SLIDE_SPEED;
+                self.reader_state = ReaderState::SlideIn;
+                self.step_reader_slide_in();
+            }
+            ReaderState::SlideIn => self.step_reader_slide_in(),
+            // State 4: the slide settled; the busy lock releases.
+            ReaderState::Idle => self.reader_busy = false,
+            ReaderState::SlideOutLeft => self.step_reader_out_left(),
+            // State 7: the next half-page's load frame.
+            ReaderState::NextLoad => self.reader_state = ReaderState::PageLoad,
+            ReaderState::SlideOutRight => self.step_reader_out_right(),
+            // State 0xa: the previous half-page's unpack frame.
+            ReaderState::UnpackLeft => self.reader_state = ReaderState::PrevPage,
+            // State 0xb: the previous half-page pages in and falls into 0xc,
+            // which starts the left-hand entry at `-0x128`.
+            ReaderState::PrevPage => {
+                self.reader_slide = -READER_SLIDE_START;
+                self.reader_speed = READER_SLIDE_SPEED;
+                self.reader_state = ReaderState::SlideInLeft;
+                self.step_reader_slide_in_left();
+            }
+            ReaderState::SlideInLeft => self.step_reader_slide_in_left(),
+            ReaderState::ExitSlide => {
+                // States 0xd/0xe: the reader runs off to the left, leaving the
+                // page texture parked clear of the screen while the backdrop
+                // ramps down.
                 self.reader_slide -= self.reader_speed;
                 self.reader_speed = self.reader_speed.saturating_mul(2);
                 if self.reader_slide < -0x127 {
-                    self.page = self.page.saturating_add(1);
-                    // State 7 -> 2: the next page unpacks before its slide.
-                    self.start_reader_entry(1);
-                }
-            }
-            ReaderAnim::InLeft => {
-                self.reader_speed /= 2;
-                self.reader_slide += self.reader_speed;
-                if self.reader_slide > -1 {
-                    self.reader_slide = 0;
-                    self.reader_speed = 1;
-                    self.reader_anim = ReaderAnim::Idle;
-                }
-            }
-            ReaderAnim::OutRight => {
-                self.reader_slide += self.reader_speed;
-                self.reader_speed = self.reader_speed.saturating_mul(2);
-                if self.reader_slide > 0x127 {
-                    self.page = self.page.saturating_sub(1);
-                    // States 0xa -> 0xb: unpack, then the left entry slide.
-                    self.reader_anim = ReaderAnim::InLeft;
-                    self.reader_slide = -READER_SLIDE_START;
-                    self.reader_speed = READER_SLIDE_SPEED;
-                    self.reader_wait = 1;
-                }
-            }
-            ReaderAnim::Exit => {
-                self.reader_slide -= self.reader_speed;
-                self.reader_speed = self.reader_speed.saturating_mul(2);
-                if self.reader_slide < -0x127 {
-                    self.reader_slide = 0;
-                    self.reader_speed = 1;
-                    self.reader_anim = ReaderAnim::Idle;
                     if self.pickup {
+                        // A pick-up reader's flow ends with the slide: the
+                        // engine raises the filed line and drops the layer,
+                        // and the original then fades its black overlay away
+                        // over the frozen room. The selector tail below belongs
+                        // to the pause-menu reader.
+                        self.reader_slide = 0;
+                        self.reader_speed = 1;
+                        self.reader_state = ReaderState::Idle;
                         self.reader_exit_done = true;
                     } else {
-                        // States 0x0f..0x12 hold the black backdrop while the
-                        // selector's cover loads; mode 2 then fades the black
-                        // overlay down to reveal it.
-                        self.post_exit = 4;
-                        self.page = 0;
+                        self.reader_state = ReaderState::BackdropOut;
                     }
                 }
+            }
+            ReaderState::BackdropOut => {
+                // State 0xf: the frame pieces ramp back down to black.
+                self.reader_backdrop = self.reader_backdrop.saturating_sub(READER_BACKDROP_STEP);
+                if self.reader_backdrop == 0 {
+                    self.reader_state = ReaderState::Hold;
+                }
+            }
+            // State 0x10: the black hold frame.
+            ReaderState::Hold => self.reader_state = ReaderState::CoverLoad,
+            ReaderState::CoverLoad => {
+                // State 0x11: the selector's cover pages back into the shared
+                // page slot, dropping the reader's half-page with it.
+                self.reader_page_loaded = false;
+                self.reader_state = ReaderState::HandOff;
+            }
+            ReaderState::HandOff => {
+                // State 0x12: `b0=0, b1=1, b2=1, b3=2` - the selector returns
+                // in its display state with the mode-2 fade armed. Its overlay
+                // is still at full strength (the reader held it there), so this
+                // frame draws black too.
+                self.mode = FileMode::List;
+                // The state block's slide pair is shared with the reader, so
+                // the selector inherits the exit slide's offset: the cover and
+                // the slot list stay parked clear of the screen for the whole
+                // fade, while the fixed-position indicators, arrows and title
+                // draw (dimmed) underneath it. `pickup_fade_update(1)` clears
+                // the pair when the ramp completes.
+                self.slide_x = self.reader_slide;
+                self.slide_y = 0;
+                self.list_speed = 1;
+                self.list_ready = true;
+                self.fade = 0xFF;
+                self.fade_out = true;
             }
         }
     }
@@ -695,35 +927,47 @@ impl FileScreen {
             self.mode = FileMode::List;
             return FileEvent::None;
         }
-        // A running slide owns the reader: the original locks its input while
-        // `state[9]` is set.
-        if self.reader_anim != ReaderAnim::Idle {
-            return FileEvent::None;
-        }
+        // The original's `jpn_file_list_input` skips all input while its busy
+        // lock (`state[9]`) is up: [`FileScreen::input_locked`] already
+        // returned for that, so the reader only reads the pad once the lock is
+        // released.
         let count = page_count(entry);
         match input {
-            MenuInput::Cancel => {
-                self.start_reader_exit();
-                FileEvent::None
-            }
-            MenuInput::Down | MenuInput::Right | MenuInput::PageRight => {
+            // The reader turns half-pages with the D-pad alone: right
+            // (`0x2000`) pages down, left (`0x8000`) pages up. Up, down and
+            // L1/R1 are not read here. The last half-page has to be
+            // *acknowledged* by a further page-down, which sets
+            // FILE_SAVEFLAG (state[0x10]) and lights the EXIT label.
+            MenuInput::Right => {
                 if self.page + 1 < count {
                     self.start_reader_next();
+                } else {
+                    self.reader_last_page = true;
                 }
                 FileEvent::None
             }
-            MenuInput::Up | MenuInput::Left | MenuInput::PageLeft => {
-                if self.page > 0 {
+            MenuInput::Left => {
+                if self.reader_last_page {
+                    self.reader_last_page = false;
+                } else if self.page > 0 {
                     self.start_reader_prev();
                 }
                 FileEvent::None
             }
+            // A cancel always slides the reader out; a confirm only leaves it
+            // once the last half-page has been acknowledged (`menu_file_state_
+            // machine`'s FILE_SAVEFLAG check).
+            MenuInput::Cancel => {
+                self.start_reader_exit();
+                FileEvent::None
+            }
             MenuInput::Confirm => {
-                if self.page + 1 >= count {
+                if self.reader_last_page {
                     self.start_reader_exit();
-                } else {
-                    self.start_reader_next();
                 }
+                FileEvent::None
+            }
+            MenuInput::Up | MenuInput::Down | MenuInput::PageLeft | MenuInput::PageRight => {
                 FileEvent::None
             }
         }
@@ -739,10 +983,15 @@ impl FileScreen {
         game: &GameState,
     ) {
         // The book selector draws over the inventory panel (the FILE tab is a
-        // sub-screen of it); the reading mode replaces everything with its own
-        // opaque black backdrop.
+        // sub-screen of it) but under the panel's masking rects and frame, so
+        // it is clipped to the panel's screen area. The reader's own layer
+        // (depth 500) draws over the chrome unmasked.
         match self.mode {
-            FileMode::List => self.draw_list(framebuffer, assets, menu, text, game),
+            FileMode::List => {
+                framebuffer.set_clip_rect(Some(SCREEN_AREA));
+                self.draw_list(framebuffer, assets, menu, text, game);
+                framebuffer.set_clip_rect(None);
+            }
             FileMode::Reader => {
                 framebuffer.fill_rect([0, 0, 320, 240], [0, 0, 0, 255]);
                 self.draw_reader(framebuffer, assets, menu, game);
@@ -763,6 +1012,11 @@ impl FileScreen {
         text: &Text,
         game: &GameState,
     ) {
+        if self.list_pending {
+            // The tab's first frame: the original's file task has not run
+            // yet, so only the panel underneath is drawn.
+            return;
+        }
         let cover = assets
             .covers
             .get(usize::from(self.book))
@@ -781,41 +1035,62 @@ impl FileScreen {
             Tint::White,
         );
 
-        // The current book's indicator is hidden; the other blinks.
+        // The original's display state (1) is the only one that draws the book
+        // indicators, the file title and the scroll arrows; the entry slide and
+        // the book changes draw just the cover, slots and cursor.
         let blink = i32::from(self.blink_phase());
-        if self.book != 0 {
-            draw_uv(
-                framebuffer,
-                cover,
-                [0, 0xB0 + blink * 8, 8, 8],
-                [0x3C, 0x48],
-            );
-        }
-        if self.book != 1 {
-            draw_uv(
-                framebuffer,
-                cover,
-                [0, 0xC0 + blink * 8, 8, 8],
-                [0x9C, 0x48],
-            );
+        if self.list_ready {
+            // The current book's indicator is hidden; the other blinks.
+            if self.book != 0 {
+                draw_uv(
+                    framebuffer,
+                    cover,
+                    [0xB0 + blink * 8, 0, 8, 8],
+                    [0x3C, 0x48],
+                );
+            }
+            if self.book != 1 {
+                draw_uv(
+                    framebuffer,
+                    cover,
+                    [0xC0 + blink * 8, 0, 8, 8],
+                    [0x9C, 0x48],
+                );
+            }
         }
 
-        // Seen document icons and the cursor arrow.
+        // Seen document icons and the cursor arrow. Both are baked into the
+        // cover page, so they follow its slide (the original offsets each
+        // descriptor with `state[0xc]`/`state[0xe]`).
         for slot in 0..SLOTS_PER_BOOK {
             if listed_entry(game, self.character, usize::from(self.book), slot).is_none() {
                 continue;
             }
             let pos = slot_position(slot as u8);
-            draw_uv(framebuffer, cover, SLOT_ICON_UV, pos);
+            draw_uv(
+                framebuffer,
+                cover,
+                SLOT_ICON_UV,
+                [pos[0] + self.slide_x, pos[1] + self.slide_y],
+            );
         }
         if self.has_selection() {
-            draw_uv(framebuffer, cover, CURSOR_UV, slot_position(self.slot));
+            let pos = slot_position(self.slot);
+            draw_uv(
+                framebuffer,
+                cover,
+                CURSOR_UV,
+                [pos[0] + self.slide_x, pos[1] + self.slide_y],
+            );
             if let Some(entry) = listed_entry(
                 game,
                 self.character,
                 usize::from(self.book),
                 usize::from(self.slot),
             ) {
+                if !self.list_ready {
+                    return;
+                }
                 if let Some(name) = text.item_name(u16::from(title_item(entry))) {
                     menu.font.draw_text(
                         framebuffer,
@@ -833,7 +1108,7 @@ impl FileScreen {
                     draw_uv(
                         framebuffer,
                         cover,
-                        [0, 0xD0 + blink * 8, 8, 8],
+                        [0xD0 + blink * 8, 0, 8, 8],
                         [0x6F, 0xB7],
                     );
                 }
@@ -843,7 +1118,7 @@ impl FileScreen {
                     draw_uv(
                         framebuffer,
                         cover,
-                        [0, 0xE0 + blink * 8, 8, 8],
+                        [0xE0 + blink * 8, 0, 8, 8],
                         [0x6F, 0xCF],
                     );
                 }
@@ -866,71 +1141,78 @@ impl FileScreen {
         ) else {
             return;
         };
-        if let Some(backdrop) = assets.backdrop(entry) {
-            framebuffer.draw_indexed_sprite(
-                backdrop,
-                [
+        if self.reader_page_loaded {
+            if let Some(backdrop) = assets.backdrop(entry) {
+                // The six FILEI pieces (`g_jpnReaderFrame` 0x004af478) draw
+                // semi-transparent (the descriptor's variant 2) with the ramp
+                // byte as their colour, which over the black backdrop comes out
+                // as `colour * ramp / 255`: the fully ramped pieces sit at 50%.
+                for (src, dst) in READER_FRAME_PIECES {
+                    framebuffer.draw_indexed_sprite_ramp(
+                        backdrop,
+                        src,
+                        dst,
+                        0,
+                        self.reader_backdrop,
+                    );
+                }
+            }
+            if let Some(page) = assets.page(entry, self.page) {
+                let half = page_half(self.page);
+                framebuffer.draw_indexed_sprite(
+                    page,
+                    [0, half, i32::from(PAGE_SIZE[0]), i32::from(PAGE_SIZE[1])],
+                    [
+                        i32::from(PAGE_POS[0]) + i32::from(self.reader_slide),
+                        i32::from(PAGE_POS[1]),
+                        i32::from(PAGE_SIZE[0]),
+                        i32::from(PAGE_SIZE[1]),
+                    ],
                     0,
                     0,
-                    i32::from(BACKDROP_SIZE[0]),
-                    i32::from(BACKDROP_SIZE[1]),
-                ],
-                [
-                    i32::from(BACKDROP_POS[0]),
-                    i32::from(BACKDROP_POS[1]),
-                    i32::from(BACKDROP_SIZE[0]),
-                    i32::from(BACKDROP_SIZE[1]),
-                ],
-                0,
-                0,
-                Tint::White,
-            );
+                    Tint::White,
+                );
+            }
         }
-        if let Some(page) = assets.page(entry, self.page) {
-            let half = page_half(self.page);
-            framebuffer.draw_indexed_sprite(
-                page,
-                [0, half, i32::from(PAGE_SIZE[0]), i32::from(PAGE_SIZE[1])],
-                [
-                    i32::from(PAGE_POS[0]) + i32::from(self.reader_slide),
-                    i32::from(PAGE_POS[1]),
-                    i32::from(PAGE_SIZE[0]),
-                    i32::from(PAGE_SIZE[1]),
-                ],
-                0,
-                0,
-                Tint::White,
-            );
+        // The arrows, the blink and the EXIT label belong to the settled
+        // state 4; the slides draw the page alone.
+        if self.reader_state != ReaderState::Idle {
+            return;
         }
-        let blink = i32::from(self.blink_phase());
-        let cover = assets
-            .covers
-            .get(usize::from(self.book))
-            .unwrap_or(&assets.covers[0]);
+        let mut blink = i32::from(self.blink_phase());
+        if self.reader_last_page {
+            // The arrows freeze lit once the last half-page is acknowledged.
+            blink = 1;
+        }
+        let Some(cover) = assets.backdrop(entry) else {
+            return;
+        };
+        // Both arrows are cut from the FILEI art's bottom-right strip (texV
+        // 0x60): each blink frame is its own eight-pixel column.
         if self.page != 0 {
             draw_uv(
                 framebuffer,
                 cover,
-                [0, 0xE0 + blink * 8, 8, 8],
+                [0xE0 + blink * 8, READER_ARROW_Y, 8, 8],
                 PREV_ARROW_POS,
             );
         }
         draw_uv(
             framebuffer,
             cover,
-            [0, 0xF0 + blink * 8, 8, 8],
+            [0xF0 + blink * 8, READER_ARROW_Y, 8, 8],
             NEXT_ARROW_POS,
         );
 
-        // The "EXIT" label lights up on the last half-page so the player can
-        // confirm out of the reader.
+        // The "EXIT" label lights up once the last half-page has been
+        // acknowledged so the player can confirm out of the reader.
         if self.page + 1 >= page_count(entry) {
             framebuffer.draw_indexed_sprite(
                 &menu.status,
                 [0x80, 0x88, 0x18, 0x10],
                 [i32::from(EXIT_POS[0]), i32::from(EXIT_POS[1]), 0x18, 0x10],
                 0,
-                20,
+                if self.reader_last_page { 0x50 } else { 0x20 },
                 Tint::White,
             );
         }
@@ -1060,6 +1342,16 @@ mod tests {
         assert_eq!(screen.character, 0);
         assert_eq!(screen.book, 0);
         assert_eq!(screen.slot, 0);
+        // The tab's first frame draws only the panel under it; the cover's
+        // entry slide starts on the next tick at `-0x7f` with speed `0x80`,
+        // and only the settled state reads the pad.
+        assert!(screen.list_pending);
+        assert!(!screen.list_ready);
+        assert_eq!(screen.slide_y, 0);
+        screen.tick();
+        assert_eq!(screen.slide_y, -0x7f + 0x40);
+        settle_list(&mut screen);
+        assert_eq!(screen.slide_y, 0);
 
         screen.handle_input(&mut state, MenuInput::Down);
         assert_eq!(screen.slot, 3, "down jumps to the next collected row");
@@ -1093,21 +1385,35 @@ mod tests {
         state.set_file_collected(0x0F, true);
         let mut screen = FileScreen::default();
         screen.open(&state);
+        settle_list(&mut screen);
         screen.handle_input(&mut state, MenuInput::Confirm);
         settle_reader(&mut screen);
         assert_eq!(screen.mode, FileMode::Reader);
 
         // List slot 0's raw entry is file index 0x0F, whose page-count table
-        // entry is 5 half-pages. Walk to the last page and confirm.
+        // entry is 5 half-pages. Walk to the last page and confirm out.
         let count = page_count(0x0F);
         for page in 1..count {
-            screen.handle_input(&mut state, MenuInput::Down);
+            screen.handle_input(&mut state, MenuInput::Right);
             settle_reader(&mut screen);
             assert_eq!(screen.page, page);
         }
-        screen.handle_input(&mut state, MenuInput::Down);
+        // A further page-down only acknowledges the last half-page (the
+        // original's FILE_SAVEFLAG); the page holds.
+        assert!(!screen.reader_last_page);
+        screen.handle_input(&mut state, MenuInput::Right);
         settle_reader(&mut screen);
         assert_eq!(screen.page, count - 1, "the last page holds");
+        assert!(screen.reader_last_page, "the last page is acknowledged");
+
+        // Up/down and the paging buttons are not read by the reader.
+        screen.handle_input(&mut state, MenuInput::Down);
+        settle_reader(&mut screen);
+        assert_eq!(screen.page, count - 1);
+        screen.handle_input(&mut state, MenuInput::PageRight);
+        settle_reader(&mut screen);
+        assert_eq!(screen.page, count - 1);
+
         screen.handle_input(&mut state, MenuInput::Confirm);
         settle_reader(&mut screen);
         assert_eq!(
@@ -1132,16 +1438,27 @@ mod tests {
         );
     }
 
-    /// Advance the toggle-only screen until its reader slide settles,
+    /// Advance the selector until its entry slide settles.
+    fn settle_list(screen: &mut FileScreen) {
+        for _ in 0..16 {
+            if screen.list_ready {
+                return;
+            }
+            screen.tick();
+        }
+        panic!("the selector entry slide did not settle");
+    }
+
+    /// Advance the toggle-only screen until its reader state settles,
     /// running the selector-to-reader fade hand-off first.
     fn settle_reader(screen: &mut FileScreen) {
         for _ in 0..128 {
-            if screen.fade_in || screen.fade_out || screen.post_exit > 0 {
+            if screen.fade_in || screen.fade_out || screen.input_locked() {
                 screen.tick();
                 continue;
             }
             if screen.mode == FileMode::List
-                || (screen.mode == FileMode::Reader && screen.reader_anim == ReaderAnim::Idle)
+                || (screen.mode == FileMode::Reader && screen.reader_state == ReaderState::Idle)
             {
                 return;
             }
@@ -1156,64 +1473,131 @@ mod tests {
         state.set_file_collected(0x0F, true);
         let mut screen = FileScreen::default();
         screen.open(&state);
+        settle_list(&mut screen);
 
-        // Opening the reader fades the selector out first; the page then
-        // starts at the original's 0x128 offset and eases onto the page box
-        // over a decelerating slide after its load frame.
+        // Opening the reader fades the selector out first; the reader then
+        // spends sixteen black frames ramping its backdrop in before the page
+        // even pages in, and only then starts the 0x128 entry slide.
         screen.handle_input(&mut state, MenuInput::Confirm);
         while screen.fade_in {
             screen.tick();
         }
         assert_eq!(screen.mode, FileMode::Reader);
-        assert_eq!(screen.reader_anim, ReaderAnim::InRight);
-        assert_eq!(screen.reader_slide, READER_SLIDE_START);
-        screen.tick(); // the load frame before the slide's first step
-        let mut positions = Vec::new();
-        while screen.reader_anim != ReaderAnim::Idle {
+        assert_eq!(screen.reader_state, ReaderState::Backdrop);
+        assert_eq!(screen.reader_slide, 0);
+        for _ in 0..15 {
+            screen.tick();
+            assert_eq!(screen.reader_slide, 0, "the page is not up yet");
+            assert!(!screen.reader_page_loaded);
+        }
+        // The sixteenth ramp frame completes the backdrop.
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::PageLoad);
+        assert_eq!(screen.reader_backdrop, READER_BACKDROP_FULL);
+        assert!(!screen.reader_page_loaded, "the load frame draws black");
+        // The half-page's TIM pages in and falls into the slide's first step.
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::SlideIn);
+        assert!(screen.reader_page_loaded);
+        assert_eq!(screen.reader_slide, 146, "300 / 2 slides the first step");
+        let mut positions = vec![screen.reader_slide];
+        while screen.reader_state != ReaderState::Idle {
             screen.tick();
             positions.push(screen.reader_slide);
         }
         assert_eq!(screen.reader_slide, 0, "the page settles on the box");
-        assert_eq!(positions[0], 146, "300 / 2 slides the first step");
         assert_eq!(positions.last(), Some(&0));
+        assert_eq!(positions.len(), 8, "state 2 plus the seven state-3 frames");
+
+        // The busy lock releases one frame after the slide lands, and the
+        // input is only read the frame after that.
+        assert!(screen.reader_busy);
+        screen.tick();
+        assert!(!screen.reader_busy);
+        assert!(screen.reader_busy_frame, "the release frame still locks");
+        screen.tick();
+        assert!(!screen.reader_busy_frame);
 
         // A page-down first slides the current page off to the left, then
         // eases the next one in from the right; the page advances only once
         // the old one is clear.
-        screen.handle_input(&mut state, MenuInput::Down);
-        assert_eq!(screen.reader_anim, ReaderAnim::OutLeft);
+        screen.handle_input(&mut state, MenuInput::Right);
+        assert_eq!(screen.reader_state, ReaderState::SlideOutLeft);
+        assert_eq!(screen.reader_slide, -1, "the input frame steps the slide");
         let mut min_slide = 0;
-        while screen.reader_anim == ReaderAnim::OutLeft {
+        while screen.reader_state == ReaderState::SlideOutLeft {
             screen.tick();
             min_slide = min_slide.min(screen.reader_slide);
-            if screen.reader_anim == ReaderAnim::OutLeft {
+            if screen.reader_state == ReaderState::SlideOutLeft {
                 assert_eq!(screen.page, 0, "the old page holds through the slide-out");
             }
         }
         assert!(min_slide < -0x80, "the old page left through the left edge");
         assert_eq!(screen.page, 1);
-        assert_eq!(screen.reader_anim, ReaderAnim::InRight);
-        while screen.reader_anim != ReaderAnim::Idle {
+        // One load frame, then the right-hand entry slide.
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::PageLoad);
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::SlideIn);
+        assert_eq!(screen.reader_slide, 146);
+        while screen.reader_state != ReaderState::Idle {
             screen.tick();
         }
         assert_eq!(screen.reader_slide, 0);
+        settle_reader(&mut screen);
 
         // A page-up mirrors it: out to the right, then in from the left.
-        screen.handle_input(&mut state, MenuInput::Up);
-        assert_eq!(screen.reader_anim, ReaderAnim::OutRight);
-        while screen.reader_anim != ReaderAnim::Idle {
+        screen.handle_input(&mut state, MenuInput::Left);
+        assert_eq!(screen.reader_state, ReaderState::SlideOutRight);
+        assert_eq!(screen.reader_slide, 1);
+        let mut max_slide = 0;
+        while screen.reader_state == ReaderState::SlideOutRight {
+            screen.tick();
+            max_slide = max_slide.max(screen.reader_slide);
+        }
+        assert!(max_slide > 0x80, "the page left through the right edge");
+        assert_eq!(screen.page, 0);
+        // The unpack frame (0xa) holds the +511 slide; the next frame is the
+        // load, which falls into the left entry's first step.
+        assert_eq!(screen.reader_state, ReaderState::UnpackLeft);
+        assert_eq!(screen.reader_slide, 511);
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::PrevPage);
+        assert_eq!(screen.reader_slide, 511, "the load frame holds the slide");
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::SlideInLeft);
+        assert_eq!(screen.reader_slide, -146, "state 0xb halves the speed in");
+        while screen.reader_state != ReaderState::Idle {
             screen.tick();
         }
-        assert_eq!(screen.page, 0);
+        assert_eq!(screen.reader_slide, 0);
+        settle_reader(&mut screen);
 
-        // Cancel starts the exit slide; the mode only returns to the list
-        // after the black hold and the fade back over the selector.
+        // Cancel draws the settled page on its own frame (the original
+        // notices the cancel after the reader's advance), then slides out.
         screen.handle_input(&mut state, MenuInput::Cancel);
-        assert_eq!(screen.reader_anim, ReaderAnim::Exit);
-        assert_eq!(screen.mode, FileMode::Reader);
+        assert_eq!(screen.reader_slide, 0, "the cancel frame still holds");
+        screen.tick();
+        assert_eq!(screen.reader_state, ReaderState::ExitSlide);
+        assert_eq!(screen.reader_slide, -1);
+        let mut exit_frames = 1;
         while screen.mode != FileMode::List {
             screen.tick();
+            exit_frames += 1;
         }
+        // One hold frame, one cover-load frame and the hand-off, then the
+        // eight-frame fade back over the selector. The selector inherits the
+        // exit slide's offset (its cover stays off-screen) until the ramp
+        // completes.
+        assert_eq!(exit_frames, 9 + 16 + 3);
+        assert_eq!(screen.fade, 0xFF);
+        assert_eq!(screen.slide_x, -511, "the cover stays parked clear");
+        assert_eq!(screen.slide_y, 0);
+        while screen.fade_out {
+            screen.tick();
+        }
+        assert_eq!(screen.fade, 0);
+        assert_eq!(screen.slide_x, 0, "the ramp completion resets the slide");
     }
 
     #[test]
@@ -1235,9 +1619,17 @@ mod tests {
         // past its last half-page ends the flow through the exit slide.
         let count = page_count(0);
         for _ in 1..count {
-            screen.handle_input(&mut state, MenuInput::Down);
+            screen.handle_input(&mut state, MenuInput::Right);
             settle_reader(&mut screen);
         }
+        assert_eq!(screen.page, count - 1);
+        assert!(!screen.reader_last_page);
+        screen.handle_input(&mut state, MenuInput::Right);
+        settle_reader(&mut screen);
+        assert!(
+            screen.reader_last_page,
+            "the last half-page is acknowledged"
+        );
         screen.handle_input(&mut state, MenuInput::Confirm);
         settle_reader(&mut screen);
         assert!(

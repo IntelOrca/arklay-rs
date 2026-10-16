@@ -202,6 +202,7 @@ mod tests {
             width: 1,
             height: 1,
             rgba: vec![255, 0, 0, 255],
+            clip: None,
         };
         assert_eq!(frame_hash(&one), 0x6dc1_4b23);
 
@@ -209,6 +210,7 @@ mod tests {
             width: 2,
             height: 1,
             rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+            clip: None,
         };
         assert_eq!(frame_hash(&two), 0xa4af_09a6);
 
@@ -216,6 +218,7 @@ mod tests {
             width: 320,
             height: 240,
             rgba: vec![0; 320 * 240 * 4],
+            clip: None,
         };
         assert_eq!(frame_hash(&blank), 0xfae3_db1a);
     }
