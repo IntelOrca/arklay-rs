@@ -1,6 +1,7 @@
 # Item box: press action inside the B1 save room's box zone, wait for the lid
-# and the overlay, then swap one inventory item into the box. The cancel path
-# is still being matched; see oracle/ui-findings.md.
+# and the overlay, then swap one inventory item into the box and cancel: the
+# whole pause menu fades out and the room resumes (the reference's
+# `menu_itembox_interaction` browse cancel runs `menu_exit_cleanup`).
 60 confirm
 61
 120 confirm
@@ -9,3 +10,5 @@
 141
 150 confirm
 151
+200 cancel
+201

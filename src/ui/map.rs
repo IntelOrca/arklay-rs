@@ -664,11 +664,6 @@ impl MapScreen {
         }
     }
 
-    /// The current layout.
-    pub fn layout(&self) -> u8 {
-        self.layout
-    }
-
     /// The current room index inside the layout.
     pub fn room_index(&self) -> u8 {
         self.room[usize::from(self.layout)]

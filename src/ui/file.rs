@@ -99,10 +99,6 @@ pub const SLOT_STEP: i16 = 9;
 pub const PAGE_POS: [i16; 2] = [0x18, 0x34];
 /// The reader page size (one half of a TEXTM TIM).
 pub const PAGE_SIZE: [i16; 2] = [0x100, 0x80];
-/// The FILEI backdrop position.
-pub const BACKDROP_POS: [i16; 2] = [0x30, 0x30];
-/// The FILEI backdrop size.
-pub const BACKDROP_SIZE: [i16; 2] = [0xD0, 0x78];
 /// Previous-page arrow position.
 pub const PREV_ARROW_POS: [i16; 2] = [0x18, 0x74];
 /// Next-page arrow position.
@@ -354,10 +350,10 @@ const READER_ARROW_Y: i32 = 0x60;
 /// case 0): the cover starts at `-0x7f` and eases down at speed `0x80`.
 const LIST_SLIDE_START: i16 = -0x7f;
 const LIST_SLIDE_SPEED: i16 = 0x80;
-/// The pause menu's screen area (`0x28,0x18` `0xf0`x`0xc0`). The original's
-/// selector layer sits behind the panel's black masking rects (depth 980) and
-/// frame parts (820-964), so a sliding cover never spills over the panel's
-/// chrome; clipping the selector to this area reproduces that.
+/// The pause menu's screen area (`0x28,0x18` `0xf0`x`0xc0`). The selector's
+/// own depth sits behind the panel's frame parts (820-964), so a sliding cover
+/// never spills over the panel's chrome; clipping the selector to this area
+/// reproduces that.
 const SCREEN_AREA: [i32; 4] = [0x28, 0x18, 0xF0, 0xC0];
 
 /// What a handled FILE input asks the engine to do.
@@ -1205,14 +1201,22 @@ impl FileScreen {
         );
 
         // The "EXIT" label lights up once the last half-page has been
-        // acknowledged so the player can confirm out of the reader.
+        // acknowledged so the player can confirm out of the reader. The
+        // reference stores `0x50` / `0x20` in the descriptor's colour
+        // multiplier (`DAT_004d29d0[0x14]`), whose unity is `0x80`, so the
+        // drawn scale is twice the byte (`0xA0` bright, `0x40` dim).
         if self.page + 1 >= page_count(entry) {
-            framebuffer.draw_indexed_sprite(
+            let scale = if self.reader_last_page {
+                0x50_u32
+            } else {
+                0x20
+            } * 2;
+            framebuffer.draw_indexed_sprite_scaled(
                 &menu.status,
                 [0x80, 0x88, 0x18, 0x10],
                 [i32::from(EXIT_POS[0]), i32::from(EXIT_POS[1]), 0x18, 0x10],
                 0,
-                if self.reader_last_page { 0x50 } else { 0x20 },
+                scale.min(255) as u8,
                 Tint::White,
             );
         }

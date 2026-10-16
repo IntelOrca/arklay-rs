@@ -32,7 +32,8 @@ pub const ITEMBOX_ENTRY: &str = "ui/itemboxn.tim";
 pub const ITEMBOX_SLOTS_TOTAL: usize = 48;
 /// The page-slide counter's wrap value (`SUBMENU_STATE_ID`, `0x0F`): the
 /// counter steps by the slide direction and wraps to 0 there, which ends the
-/// slide. The slide therefore lasts 15 frames, moving the list one row (15px).
+/// slide. The drawn states are 1..14 (the wrap step lands on 0 and is not
+/// drawn), moving the list one row (15px).
 pub const SLIDE_WRAP: u8 = 0x0F;
 /// The cursor blink counter's dim phase: while bit `0x20` of `DAT_00ae9f18`
 /// is clear the original draws the slot cursor's dim cell (`texU 0xA8`)
@@ -134,10 +135,12 @@ pub const SLOT_SIZE: [i16; 2] = [40, 30];
 pub const TICK_X: i16 = 0xB0;
 /// Page-position ticks first y offset.
 pub const TICK_Y: i16 = 0x21;
-/// The preview column's bottom drawable row (exclusive): the panel's lower
-/// mask (`0x77 + 9`) ends there, and the reference never paints a sliding
-/// slot below it - the incoming icon rises out of the mask strip, not out of
-/// the panel under it.
+/// The preview column's bottom drawable row (exclusive). The right half of a
+/// sliding slot would otherwise spill past the preview window, so the port
+/// clips it at the panel's lower edge: the reference does paint those rows,
+/// but the panel's own bottom strip (`common_tiles` `(32,128,160,12)`, depth
+/// 836 vs the icon's 868) and the mask strip `0x77..0x7F` cover them, so the
+/// clip is pixel-equivalent.
 pub const SLOT_CLIP_BOTTOM: i32 = 0x80;
 
 /// The item-box screen's drawable art.
@@ -422,17 +425,18 @@ impl ItemBox {
 
         self.draw_names(framebuffer, menu, text, game);
         self.draw_slot(framebuffer, menu, game);
+        self.draw_full_line(framebuffer);
 
         // The shadows sit on the panel and dim its first/third name rows; in
-        // browse mode they also dim the whole list and the preview slot. The
-        // browse-mode pair sorts *behind* the box-full line, while the two row
-        // shadows dim it - which is what the reference's frames show when the
-        // line is drawn on the first slot (`0x2C < cursor - 1` underflows).
+        // browse mode they also dim the whole list and the preview slot. Every
+        // shadow rect composites *over* the box-full line (the line's depth is
+        // 900, the rects' 501), which is what the reference's frames show when
+        // the line is drawn on the first slot (`0x2C < cursor - 1`
+        // underflows).
         if self.mode == ItemBoxMode::Browse {
             framebuffer.blend_black_rect(rect_dst(SHADOW_LIST), SHADOW_ALPHA);
             framebuffer.blend_black_rect(rect_dst(SHADOW_SLOT), SHADOW_ALPHA);
         }
-        self.draw_full_line(framebuffer);
         framebuffer.blend_black_rect(rect_dst(SHADOW_TOP), SHADOW_ALPHA);
         framebuffer.blend_black_rect(rect_dst(SHADOW_BOTTOM), SHADOW_ALPHA);
         // The bright frame pieces draw over the shadows so they stay green.
@@ -1125,10 +1129,11 @@ mod tests {
         };
         let menu = test_menu_assets();
         let text = Text::default();
-        // The browse-mode pair sorts behind the line and the two row shadows
-        // sort in front of it: the row-0 line sits between both shadows and
-        // keeps its raw colour, the last two slots' lines fall under the row-3
-        // shadow and keep one dimming.
+        // Every shadow rect composites over the full-box line (the line's
+        // depth is 900, the rects' 501): the row-0 line falls under the
+        // browse list shadow and keeps one dimming, while the last two slots'
+        // lines sit under both the browse list rect and the row-3 rect and
+        // take two.
         let dim = |value: u8| (u32::from(value) * 143 / 255) as u8;
         let dimmed = [
             dim(FULL_LINE_COLOR[0]),
@@ -1136,6 +1141,9 @@ mod tests {
             dim(FULL_LINE_COLOR[2]),
             255,
         ];
+        // The last slots' lines (y=0x4F) sit under both the browse list rect
+        // and the row-3 rect, so they take two dimmings.
+        let double_dimmed = [dim(dimmed[0]), dim(dimmed[1]), dim(dimmed[2]), 255];
         let line_pixels = |item_box: &ItemBox, color: [u8; 4]| {
             let mut framebuffer = Framebuffer::new();
             item_box.draw(&mut framebuffer, &assets, &menu, &text, &state);
@@ -1154,8 +1162,13 @@ mod tests {
         item_box.open(&state, 8);
         assert_eq!(
             line_pixels(&item_box, FULL_LINE_COLOR),
+            0,
+            "the browse list shadow dims the first slot's line at 0x31"
+        );
+        assert_eq!(
+            line_pixels(&item_box, dimmed),
             line_width,
-            "the first slot draws the line at 0x31"
+            "the first slot's line keeps one dimming"
         );
         item_box.box_cursor = 0x2D;
         assert_eq!(
@@ -1165,15 +1178,15 @@ mod tests {
         );
         item_box.box_cursor = 0x2E;
         assert_eq!(
-            line_pixels(&item_box, dimmed),
+            line_pixels(&item_box, double_dimmed),
             line_width,
-            "the whole warning line draws on slot 0x2E"
+            "the whole warning line draws on slot 0x2E under both list shadows"
         );
         item_box.box_cursor = 0x2F;
         assert_eq!(
-            line_pixels(&item_box, dimmed),
+            line_pixels(&item_box, double_dimmed),
             line_width,
-            "the whole warning line draws on slot 0x2F"
+            "the whole warning line draws on slot 0x2F under both list shadows"
         );
     }
 }

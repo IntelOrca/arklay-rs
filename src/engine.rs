@@ -1760,12 +1760,14 @@ impl GameSession {
         }
         self.event_vm.set_enabled(events_enabled);
         // The typewriter exit fade has run out: restore the player machine gate
-        // (`message_flags |= 0x45`), the reference's `check_typewriter_state`
-        // case 4. The original tests the accumulator at the top of the frame,
-        // before `main_loop` advances it, so the gate opens the frame AFTER the
-        // one whose step wrapped it negative - that frame still runs its room
-        // tick with the player machine frozen. Read the accumulator before this
-        // tick's fade step for the same reason.
+        // (the reference's `check_typewriter_state` case 4 does
+        // `message_flags |= 0x45`; the port never clears the other two bits, so
+        // only the player-state bit is put back). The original tests the
+        // accumulator at the top of the frame, before `main_loop` advances it,
+        // so the gate opens the frame AFTER the one whose step wrapped it
+        // negative - that frame still runs its room tick with the player
+        // machine frozen. Read the accumulator before this tick's fade step for
+        // the same reason.
         if self.typewriter_exit_fade && self.room_fade.state() < 0 {
             self.typewriter_exit_fade = false;
             self.game.message_flags |= game::MESSAGE_FLAG_PLAYER_STATE;
@@ -3010,8 +3012,8 @@ impl GameSession {
         // in from the black the hand-off left (`counter 0xf000`, the `0x7FFF`
         // accumulator stepped once so the traced state is `0x6FFF` while the
         // drawn frame is the full `0x7FFF`). The player machine gate stays
-        // frozen (`message_flags |= 0x45`) until the accumulator runs negative,
-        // the reference's case 4.
+        // frozen (the reference's case 4 restores `0x45`) until the accumulator
+        // runs negative.
         self.room_fade.set(2, -0x1000, 0x6FFF);
         self.room_fade_draw = self.room_fade.drawn_overlay();
         self.typewriter_exit_fade = true;
@@ -3077,12 +3079,16 @@ impl GameSession {
                     self.play_ui_cue_names(pack, vec![cue]);
                 }
                 if event == Some(ItemBoxEvent::Close) {
-                    // The box is a sub-screen of the inventory panel: its
-                    // cancel restores the lid angle (state 4) and returns to
-                    // the inventory with no fade and the room still frozen.
-                    // A further cancel closes the whole menu.
+                    // `menu_itembox_interaction` returns 1 for a browse cancel
+                    // and for a confirm on a cursor without a slot; the menu
+                    // driver turns that into `menu_exit_cleanup`, so the whole
+                    // pause menu fades out and the room resumes - the box never
+                    // drops back to the inventory panel. The overlay stays drawn
+                    // through the closing fade (`close_menu` drops it with the
+                    // panel) and the interaction already played the cancel cue,
+                    // so the close is silent.
                     self.game.reset_itembox();
-                    self.item_box = None;
+                    self.begin_menu_close_silent();
                 }
             }
             if let Some(cursor) = self
@@ -16825,25 +16831,9 @@ off_0010:
         assert!(session.game.inventory.is_empty());
         assert_eq!(session.game.frame, before, "the room stayed frozen");
 
-        // Cancel drops the box overlay back to the inventory: no fade, the
-        // room stays frozen (the box is a sub-screen of the panel).
-        session
-            .tick(
-                &pack,
-                UiInput {
-                    cancel: true,
-                    ..UiInput::default()
-                },
-                player::Input::default(),
-                false,
-            )
-            .unwrap();
-        assert!(session.item_box.is_none());
-        assert!(session.menu.is_some(), "the inventory stays up");
-        assert_eq!(session.menu_fade_phase, MenuFadePhase::None);
-
-        // A further cancel closes the menu through its fade and resumes the
-        // room through the room-entry fade.
+        // Cancel runs `menu_exit_cleanup` (`menu_itembox_interaction` returns
+        // 1): the whole menu - box overlay still drawn - fades out and the
+        // room resumes.
         session
             .tick(
                 &pack,
@@ -16857,7 +16847,8 @@ off_0010:
             .unwrap();
         assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
         settle_menu_fade(&mut session, &pack);
-        assert!(session.menu.is_none());
+        assert!(session.menu.is_none(), "the panel closed");
+        assert!(session.item_box.is_none(), "the box dropped with the panel");
         let frozen = session.game.frame;
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)

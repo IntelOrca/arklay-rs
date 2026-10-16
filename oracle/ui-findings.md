@@ -135,9 +135,10 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
 - **Item box world action and handshake.** `open_itembox` arms the lid; the
   reference then runs three frames of menu handshake between the lid settling
   and the panel fade (the room keeps ticking with the player frozen), and the
-  panel fade steps straight after its arm (no draw-then-add frame). The box
-  cancel restores the lid and drops back to the inventory with no fade; a
-  further cancel closes the menu.
+  panel fade steps straight after its arm (no draw-then-add frame). A browse
+  cancel (and a confirm on a cursor without a slot) restores the lid and runs
+  `menu_exit_cleanup`: the whole pause menu fades out and the room resumes -
+  the box does not drop back to the inventory panel.
 - **Typewriter save flow.** The save prompt's Yes arms the fade on the *next*
   frame (`check_typewriter_state` 2->3, counter 0x1000) while the room keeps
   ticking and the player stays frozen; the fade's last frame still runs the
@@ -213,7 +214,10 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   - The box-full line's condition is the byte-underflowed
     `0x2C < (unsigned char)(cursor - 1)`, so the first slot draws it too,
     at `0x31 - state` with no cursor term; the original's line spans
-    `[42, 0xA8)` (126px), not `[42, 0xA8]`.
+    `[42, 0xA8)` (126px), not `[42, 0xA8]`. All four shadow rects composite
+    *over* it (the line's depth is 900, the rects' 501): the first slot's line
+    takes the browse list rect's dimming, the last two slots' lines take the
+    browse list and row-3 rects'.
   `oracle/inputs/itembox_page.txt` now pages with the D-pad up/down: the
   reference's `--test-input` has no L1/R1 raw bits at all (the port's pad
   layout binds neither), so the box's own page keys are the only pager both
@@ -242,12 +246,15 @@ ramp-down, the black hold and the hand-off) is byte-identical, and the
 selector frames either side sit at the room/menu residual (~600 differing
 pixels, mean 0.2/255, plus the EKG line).
 
-`itembox_open` and `itembox_page` sit at that same residual: their steady
-frames differ by 430-511 pixels beyond 8 (0.56-0.67%, mean error 0.19-0.26 /
-255) and the fade hand-off frames by ~595, down from ~10700 (14.4-15%) before.
-Every one of those pixels is in the portrait or the EKG strip below - the box
-overlay, its list, its preview column, the cursor and the swap are pixel-equal
-on every compared frame.
+`itembox_open` (which now runs the box cancel, exiting the whole menu through
+`menu_exit_cleanup` and resuming the room) and `itembox_page` sit at that same
+residual: their box frames differ by 441-513 pixels beyond the 8-step
+threshold (mean error 0.19-0.26/255, down from ~10700 / 14.4-15% before) and
+the opening fade hand-off frames by 443-469. Every pixel beyond the threshold
+is in the panel's portrait or health strip - the box overlay, its list, its
+preview column, the cursor and the swap are pixel-equal - and the other
+differing pixels are sub-threshold (the `0x70` dim rounding over the panel
+art).
 
 ## Save-mode oracle
 
@@ -285,6 +292,20 @@ match), which is what the save interchange exists for.
   fill, which matches every other ramp frame (and the fully ramped backdrop)
   byte-for-byte, so those five pixels are a residual GPU rounding difference
   (max channel delta 1, mean 0.000/255).
+- **FILE selector animation.** The reader is matched, but the *selector's* own
+  animation states (`FUN_00481d00` cases 2-12) are still the port's simplified
+  slide: the reference slides the current cover out (to `-0x78` at doubling
+  speed), swaps the book byte mid-slide and eases the new cover in from
+  `+0x7f` at a halving speed with `FILE_BUSY` held throughout, and a cancel
+  slides the cover down to `-0x68` before raising `FILE_EXITFLAG`; arklay
+  changes the book immediately and slides the new cover from `+/-0x78` at a
+  constant 9px/frame without a busy lock, and closes the tab instantly. No
+  scenario exercises either (both cancels in the FILE scenarios are in the
+  reader), so this is uncovered rather than measured.
+- **Item box START.** The reference's `menu_itembox_interaction` tests START
+  *held* before its state machine and exits the whole menu; the port's item
+  box consumes the pad before `ui.start` is read, so START is silently lost
+  while the box is up. No scenario presses it; low impact.
 - **MAP full-display zoom.** The browser's confirm switches to the full map
   display (`map_display_update`: the area plan's zoom sprites, the blue
   backdrop page and the browser's own composite dimmed underneath). No
