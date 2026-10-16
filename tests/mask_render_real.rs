@@ -27,8 +27,9 @@ use arklay::state::{Light, RoomId};
 
 /// The player stand-in's flat texture colour.
 const PLAYER: [u8; 4] = [200, 40, 40, 255];
-/// The stand-in shaded by the test's full ambient (4095 -> 254).
-const PLAYER_LIT: [u8; 4] = [199, 39, 39, 255];
+/// The stand-in shaded by the test's full ambient (4095 -> 254), rounded to
+/// nearest like the reference's GL pipeline.
+const PLAYER_LIT: [u8; 4] = [199, 40, 40, 255];
 /// How far behind the pillar's key the stand-in is placed, in view units.
 const BACK_INSET: f64 = 1500.0;
 

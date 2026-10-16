@@ -156,10 +156,13 @@ fn a_herb_heal_and_a_two_herb_combine_through_the_menu() {
 
     // USE the green herb: one third of 96 health, and it must be consumed.
     menu.handle_input(&mut game, MenuInput::Confirm);
+    // The original's action confirm only starts the action: the use runs on
+    // the next frame, when `tick` returns the event.
     assert_eq!(
         menu.handle_input(&mut game, MenuInput::Confirm),
-        MenuEvent::Changed
+        MenuEvent::None
     );
+    assert_eq!(menu.tick(&mut game), Some(MenuEvent::Changed));
     assert_eq!(game.entities[0].health, 20 + 32);
     assert_eq!(game.inventory.len(), 1);
     assert_eq!(game.inventory[0].id, 0x43);
