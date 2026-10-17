@@ -859,6 +859,15 @@ pub fn advance_xz(entity: &mut Entity, offset: u16, distance: i16) {
     entity.pos[2] += i32::from(entity.speed[2]);
 }
 
+/// `npc_walk_advance_xz`: move `distance` units along the yaw through
+/// `MovePlayerXZ` (not `Add_speedXZ`): the full `RotMatrix` rounds its
+/// elements differently, and the stored `speed` is left untouched.
+pub fn walk_advance_xz(entity: &mut Entity, distance: i16) {
+    let (dx, dz) = player::move_player_xz(entity.angle, i32::from(distance), 0);
+    entity.pos[0] += dx;
+    entity.pos[2] += dz;
+}
+
 /// The original's stored-velocity re-add: add `ENTITY->speed` to the entity
 /// position without recomputing the yaw, so a direction fixed at launch keeps
 /// carrying the entity while its facing turns.
@@ -2155,7 +2164,7 @@ fn behavior_01(
     if heading_within(entity.angle, heading as u16, 0x180) {
         turn_toward_heading(entity, heading, 0x30);
         entity_apply_walk_speed(entity, 0x5D);
-        advance_xz(entity, 0, entity.move_speed_current as i16);
+        walk_advance_xz(entity, entity.move_speed_current as i16);
         wander_lookat(entity, 0, seed);
         return;
     }
@@ -2203,7 +2212,7 @@ fn behavior_02(
         entity_apply_walk_speed(entity, 0x5D);
         entity.move_speed_current as i16
     };
-    advance_xz(entity, 0, move_speed);
+    walk_advance_xz(entity, move_speed);
     set_lookat_target(
         entity,
         i32::from(entity.player_pos_x),
@@ -2228,7 +2237,7 @@ fn behavior_03(entity: &mut Entity, _room: &RoomState, player_pos: [i32; 3], see
             entity.blend_counter = 7;
         }
         turn_toward_heading(entity, heading as i16, 0x30);
-        advance_xz(entity, 0, -0x3C);
+        walk_advance_xz(entity, -0x3C);
         set_lookat_target(entity, player_pos[0], player_pos[2], seed);
         return;
     }
@@ -2243,7 +2252,7 @@ fn behavior_03(entity: &mut Entity, _room: &RoomState, player_pos: [i32; 3], see
     entity.reaction_timer = heading as i16;
     turn_toward_heading(entity, heading as i16, 0x30);
     entity_apply_walk_speed(entity, 0x5D);
-    advance_xz(entity, 0, entity.move_speed_current as i16);
+    walk_advance_xz(entity, entity.move_speed_current as i16);
     reset_lookat(entity, seed);
 }
 

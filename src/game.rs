@@ -7578,6 +7578,11 @@ impl GameState {
             angle: door.next_angle as u16 & 0x0FFF,
         });
         self.transition_door = Some(*door);
+        // The original's `door_begin_transition` zeroes `g_message_flags`, so
+        // the rest of the frame runs with the player machine gated off: a
+        // door the scripts open (`cmd_room_action`) stops the player's update
+        // on the frame it fires. The room load restores the word.
+        self.message_flags = 0;
         // A stairwell or ladder door runs the climb behaviour: the original's
         // `check_door` raises the stair zone flag and `player_door_open_sequence`
         // owns the player's Y while the collision pass is suspended. The climb
@@ -7597,6 +7602,19 @@ impl GameState {
             self.stair_climb = true;
         }
         true
+    }
+
+    /// Restore the message word a door zeroed. The original's gameplay loop
+    /// re-enters through its `0xFD3F` reset after every door, camera-only or
+    /// full load. A message the door animation raised keeps its pause mask
+    /// and releases to the reset word.
+    pub fn reset_message_flags_after_door(&mut self) {
+        self.message_flags_backup = MESSAGE_FLAGS_INITIAL;
+        self.message_flags = if self.message.active {
+            MESSAGE_FLAGS_INITIAL & !self.message.pause
+        } else {
+            MESSAGE_FLAGS_INITIAL
+        };
     }
 
     /// Request a message by id, exactly like the original's
@@ -10877,6 +10895,32 @@ mod tests {
         let transition = state.transition.expect("camera-only transition");
         assert_eq!(transition.target, state.id);
         assert_eq!(state.transition_door.unwrap().camera, 0x80 | 2);
+    }
+
+    #[test]
+    fn a_door_zeroes_the_message_word_until_the_post_door_reset() {
+        let mut state = game();
+        let door = door(0x41, 0);
+        state.room_actions[0] = Some(door_action(door));
+        state.doors[0] = Some(door);
+        state.interact([-550, 0, 50], 0, true);
+        assert!(state.transition.is_some());
+        assert_eq!(
+            state.message_flags, 0,
+            "door_begin_transition clears the word"
+        );
+
+        state.reset_message_flags_after_door();
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
+
+        // A door-animation message raised on the zeroed word keeps its pause
+        // mask and releases to the reset word, not to the zero it captured.
+        state.message_flags = 0;
+        state.show_message(0, 0xFF);
+        state.reset_message_flags_after_door();
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL & !0xFF);
+        state.cancel_message();
+        assert_eq!(state.message_flags, MESSAGE_FLAGS_INITIAL);
     }
 
     #[test]

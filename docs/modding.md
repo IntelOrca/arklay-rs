@@ -389,6 +389,8 @@ length into `move_speed_current`),
 root vertex plus the `unk_c6`/`unk_c8` offsets the grab latched),
 steering and collision (`e:move(offset, distance)` stores the rotated vector,
 `e:advance_speed()` re-adds that stored vector without recomputing the yaw,
+`e:walk_xz(distance)` is the characters' `MovePlayerXZ` step, which rounds
+through the full `RotMatrix` and leaves the stored vector alone,
 `e:try_move(...)`, `e:apply_walk_speed(speed)`,
 `e:turn_toward_target(x, z, step)`, `e:rotate_toward_target(x, z, step)`,
 `e:turn_toward_heading(heading, step)`,

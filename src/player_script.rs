@@ -1548,6 +1548,7 @@ fn hit_reaction(game: &mut GameState, player: &mut PlayerState, room: &RoomState
             }
             let speed = game.entities[0].move_speed_current as i16;
             walk::advance_xz(&mut game.entities[0], 0, speed);
+            player.pos = game.entities[0].pos;
             return;
         }
         0x68 => {
@@ -1556,8 +1557,11 @@ fn hit_reaction(game: &mut GameState, player: &mut PlayerState, room: &RoomState
         }
         _ => return,
     }
+    // `Add_speedXZ` moves the entity matrix; mirror the knock-back onto the
+    // visible player so the engine's entity sync does not clobber it.
     let speed = game.entities[0].move_speed_current as i16;
     walk::advance_xz(&mut game.entities[0], 0x800, speed);
+    player.pos = game.entities[0].pos;
 }
 
 /// The shared hit-reaction body: install the clip and hold, then advance the
@@ -1656,16 +1660,32 @@ fn knockdown_recover(
             game.entities[0].action_state = game.entities[0]
                 .action_state
                 .wrapping_add(u8::from(completed));
+            // `Add_speedXZ` moves the entity matrix; mirror the slide onto the
+            // visible player so the engine's entity sync does not clobber it.
             let speed = game.entities[0].move_speed_current as i16;
             walk::advance_xz(&mut game.entities[0], 0x800, speed);
-            // The collision test is probe-only: the resolve runs on a copy and
-            // only its hit result is kept.
-            let mut probe = game.entities[0];
-            let (code, bkp) = crate::enemy::walk::check_room_collision_bkp(room, &mut probe);
-            if let Some(bkp) = bkp {
+            player.pos = game.entities[0].pos;
+            // The collision test is probe-only: the original resolves the
+            // player's own matrix at the player's radius, from the player's
+            // collision anchor, then restores the position and keeps only
+            // the hit result.
+            let pos = game.entities[0].pos;
+            let prev = [
+                player.collision_mirror[0],
+                pos[1],
+                player.collision_mirror[1],
+            ];
+            let probe = crate::player::resolve_collision_full(
+                &room.collision,
+                prev,
+                pos,
+                player.radius,
+                player.collision_flags,
+            );
+            if let Some(bkp) = probe.entity_bkp {
                 game.entity_bkp = bkp;
             }
-            if code != 0 {
+            if probe.code != 0 {
                 game.entities[0].action_state = 5;
             }
         }
@@ -1687,6 +1707,7 @@ fn knockdown_recover(
                 .wrapping_add(u8::from(completed));
             let speed = game.entities[0].move_speed_current as i16;
             walk::advance_xz(&mut game.entities[0], 0x800, speed);
+            player.pos = game.entities[0].pos;
             game.entities[0].move_speed_current =
                 game.entities[0].move_speed_current.wrapping_sub(0xF);
             if (game.entities[0].move_speed_current as i16) < 0 {
@@ -1897,6 +1918,7 @@ fn thrown(game: &mut GameState, player: &mut PlayerState, room: &RoomState, emd_
                 game.entities[0].angle = game.plant42_capture.t[0] as i16 as u16;
                 let speed = game.entities[0].move_speed_current as i16;
                 walk::advance_xz(&mut game.entities[0], 0, speed);
+                player.pos = game.entities[0].pos;
                 let step = game.entities[0].action_ticks_counter as i16;
                 game.entities[0].action_ticks_counter =
                     game.entities[0].action_ticks_counter.wrapping_add(1);

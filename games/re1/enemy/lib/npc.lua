@@ -1037,7 +1037,7 @@ local function behavior_01(e, player_x, player_z)
     if e:heading_within(heading, 0x180) then
         e:turn_toward_heading(heading, 0x30)
         e:apply_walk_speed(0x5D)
-        e:move(0, i16(e.move_speed_current))
+        e:walk_xz(i16(e.move_speed_current))
         e:lookat_wander(0)
         return
     end
@@ -1075,7 +1075,7 @@ local function behavior_02(e, player_x, player_z)
         e:apply_walk_speed(0x5D)
         move_speed = i16(e.move_speed_current)
     end
-    e:move(0, move_speed)
+    e:walk_xz(move_speed)
     e:lookat_target(e.player_pos_x, e.player_pos_z)
 end
 
@@ -1094,7 +1094,7 @@ local function behavior_03(e, player_x, player_z)
             e.blend_counter = 7
         end
         e:turn_toward_heading(heading, 0x30)
-        e:move(0, -0x3C)
+        e:walk_xz(-0x3C)
         e:lookat_target(player_x, player_z)
         return
     end
@@ -1109,7 +1109,7 @@ local function behavior_03(e, player_x, player_z)
     e.reaction_timer = heading
     e:turn_toward_heading(heading, 0x30)
     e:apply_walk_speed(0x5D)
-    e:move(0, i16(e.move_speed_current))
+    e:walk_xz(i16(e.move_speed_current))
     e:lookat_reset()
 end
 
