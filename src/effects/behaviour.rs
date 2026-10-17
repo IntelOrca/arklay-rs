@@ -9,7 +9,7 @@
 //! The table is ported in tiers. The ids the shipped scripts and every shipped
 //! sprite's animation data can reach have real implementations; anything else
 //! is an inert, counted placeholder ([`GameState::effect_placeholder_hits`],
-//! [`implemented`]). The corpus audit in `tests/effects_real.rs` locks the
+//! [`implemented`]). The corpus audit in `tests/real/effects_real.rs` locks the
 //! reachable set: no shipped script or sprite may dispatch a placeholder.
 
 use std::rc::Rc;

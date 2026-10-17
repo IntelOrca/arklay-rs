@@ -9,6 +9,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # CI builds cold and caches no incremental artifacts, so the local loop's
+    # incremental test-release builds are off here.
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,9 +28,9 @@ jobs:
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
-      - run: cargo test --release --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
+      - run: cargo test --profile test-release --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
         env:
-          LD_LIBRARY_PATH: ${{ github.workspace }}/target/release
+          LD_LIBRARY_PATH: ${{ github.workspace }}/target/test-release
       - run: cargo doc --no-deps
       - run: cargo build --release --features sdl3-sys/build-from-source,sdl3-sys/sdl-unix-console-build
       - name: Package the Linux artifact

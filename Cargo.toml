@@ -36,3 +36,14 @@ debug = false
 
 [profile.release]
 lto = "thin"
+
+# The release-profile test build: release-speed code without the thin LTO
+# link pass, which costs minutes and buys a test binary nothing. Incremental
+# compilation keeps the single-test edit loop at a few seconds (CI sets
+# CARGO_INCREMENTAL=0; it builds cold anyway). Used by `scripts/check.sh`, CI
+# and the documented test commands; shipped binaries keep `[profile.release]`.
+[profile.test-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true

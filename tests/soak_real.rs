@@ -1,10 +1,16 @@
 //! Full-game soak: walk every `room/*.rdt`, follow scripted transitions and
 //! round-trip a save per room, three times, under a counting allocator.
 //!
-//! Run with (release profile; the budgets are documented there):
-//! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/home/ted/openre/assets/re1 \
-//!  ARKLAY_RE1_PACK=/home/ted/openre/re1.akpak \
-//!  cargo test --release --test soak_real -- --ignored --nocapture`
+//! Release-only and opt-in: a full pass takes tens of minutes, so the test
+//! skips with a printed note unless `ARKLAY_SOAK=1` is set. Run with:
+//! `ARKLAY_SOAK=1 TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/path/to/re1 \
+//!  ARKLAY_RE1_PACK=/path/to/re1.akpak \
+//!  cargo test --profile test-release --test soak_real -- --ignored --nocapture`
+//!
+//! `scripts/check.sh --soak` sets the opt-in for a release check. The soak
+//! keeps its own binary (it is not a module of `tests/real/main.rs`): the
+//! counting allocator below measures process-wide live bytes and asserts a
+//! leak budget, so no other test may run beside it.
 //!
 //! The synthetic transition test in `src/engine.rs` (the M16 slice-10 test
 //! extended with this file's save round-trip) is the always-run version.
@@ -390,8 +396,15 @@ fn room_ids(pack: &Pack) -> Vec<RoomId> {
 }
 
 #[test]
-#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+#[ignore = "the full-game soak; opt in with ARKLAY_SOAK=1 (release only)"]
 fn real_soak_walks_the_corpus_transitions_and_saves() {
+    if std::env::var("ARKLAY_SOAK").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping the full-game soak: set ARKLAY_SOAK=1 to run it (release only, \
+             tens of minutes)"
+        );
+        return;
+    }
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };

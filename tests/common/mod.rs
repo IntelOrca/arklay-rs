@@ -31,7 +31,7 @@ pub fn asset_env() -> Option<(PathBuf, PathBuf)> {
 /// must exercise the repository's Lua shadows the pack's `enemy/*.lua` copies
 /// with the `ENEMY_SCRIPTS` the build embeds. Rooms, models and combat data
 /// still come from the real pack.
-// Not every integration-test binary that includes this module calls it.
+// The soak binary includes this module without calling it.
 #[allow(dead_code)]
 pub fn enemy_scripts_pack(pack_path: &Path) -> Pack {
     use std::sync::atomic::{AtomicU64, Ordering};
