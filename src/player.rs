@@ -2281,7 +2281,32 @@ fn walk_speed(radius: i32, frame: usize) -> i32 {
 /// the player (`update_player_position`), so a door or item triggers while the
 /// player is still short of its box.
 pub fn reach_offset(angle: u16) -> (i32, i32) {
-    rotate_speed(angle, 0, REACH_DISTANCE)
+    move_player_xz(angle, REACH_DISTANCE, 0)
+}
+
+/// `MovePlayerXZ`: rotate the local point `(x, 0, z)` by the yaw.
+///
+/// Unlike [`rotate_speed`] (`Add_speedXZ`'s `RotMatrixY`), the original builds
+/// this matrix with the full `RotMatrix(0, yaw, 0)`. Its Euler composition
+/// still multiplies by the X and Z cosines, and the table saturates `cos(0)`
+/// at `0x3FFF`, so every product truncates a 14-bit unit before the 4.12
+/// narrowing: the elements can come out one smaller than `RotMatrixY`'s. The
+/// row sums are truncated toward zero (`ApplyMatrix`) and narrowed to the
+/// caller's `short`.
+pub(crate) fn move_player_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
+    let trunc14 = |v: i32| (v + ((v >> 31) & 0x3FFF)) >> 14;
+    let trunc2 = |v: i32| (v + ((v >> 31) & 3)) >> 2;
+    let angle = angle & 0x0FFF;
+    let cos0 = cos14(0);
+    let (sy, cy) = (sin14(angle), cos14(angle));
+    let m00 = trunc2(trunc14(cos0 * cy));
+    let m02 = trunc2(sy);
+    let m20 = trunc2(-trunc14(trunc14(cos0 * sy) * cos0));
+    let m22 = trunc2(trunc14(cos0 * cy));
+    (
+        fixed_mul_12_sum(m00 * x + m02 * z) as i16 as i32,
+        fixed_mul_12_sum(m20 * x + m22 * z) as i16 as i32,
+    )
 }
 
 /// Rotate `(speed, 0, 0)` by `angle + offset` about Y and return `(dx, dz)`.

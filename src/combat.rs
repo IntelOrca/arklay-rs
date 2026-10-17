@@ -635,7 +635,7 @@ fn square_root0(value: u32) -> u32 {
 /// `MovePlayerXZ`: rotate the local offset `(x, 0, z)` by the yaw and narrow
 /// each component to the original's `short`.
 fn move_player_xz(angle: u16, offset: [i16; 3]) -> [i16; 3] {
-    let (x, z) = crate::player::rotate_xz(angle, i32::from(offset[0]), i32::from(offset[2]));
+    let (x, z) = crate::player::move_player_xz(angle, i32::from(offset[0]), i32::from(offset[2]));
     [x as i16, 0, z as i16]
 }
 

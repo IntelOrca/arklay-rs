@@ -2687,6 +2687,12 @@ mod imp {
                 Ok(())
             });
 
+            // The state-9 characters' `npc_walk_advance_xz` (`MovePlayerXZ`).
+            methods.add_method_mut("walk_xz", |_lua, api, distance: i64| {
+                crate::enemy::walk::walk_advance_xz(api.entity_mut(), distance as i16);
+                Ok(())
+            });
+
             // Re-add the stored `Add_speedXZ` vector without recomputing the
             // yaw (the web threads' fixed launch direction).
             methods.add_method_mut("advance_speed", |_lua, api, ()| {

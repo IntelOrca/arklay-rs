@@ -1121,7 +1121,7 @@ pub fn chk_pl_reach_entity(
     angle: u16,
     obj: &ObjectRecord,
 ) -> Option<[i32; 2]> {
-    let (dx, dz) = crate::player::rotate_speed(angle, 0, OBJECT_REACH_DISTANCE);
+    let (dx, dz) = crate::player::move_player_xz(angle, OBJECT_REACH_DISTANCE, 0);
     let mut probe = [
         dx + i32::from(player_pos[0] as i16),
         dz + i32::from(player_pos[2] as i16),
