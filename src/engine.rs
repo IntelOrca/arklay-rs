@@ -1105,13 +1105,11 @@ struct GameSession {
     /// a room load: type 2, accumulator `0x7FFF` and a negative counter that
     /// steps the alpha down once per fixed tick.
     room_fade: transition::Fade,
-    /// The first fixed tick after arming must not advance the fade: the frame
-    /// it was armed on has not been drawn yet, so that tick only clears this.
-    room_fade_pending: bool,
     /// The alpha the room fade draws this frame: the accumulator *before* the
     /// tick's step, since the original draws and only then adds the counter
-    /// (`main_loop`). Captured in [`Self::tick_room_fade`] so the draw matches
-    /// the reference while the traced state stays the post-step value.
+    /// (`main_loop`). Captured by [`Self::arm_room_fade`] for the armed frame
+    /// and by [`Self::tick_room_fade`] for the stepped frames, so the draw
+    /// matches the reference while the traced state stays the post-step value.
     room_fade_draw: Option<transition::Overlay>,
     /// The original's room-events gate (`g_message_flags & 0x80`) for a
     /// new-game boot: the boot's entry fade keeps the bit clear, so
@@ -1465,7 +1463,6 @@ impl GameSession {
             swallow_action: false,
             boot_message: None,
             room_fade: transition::Fade::inactive(),
-            room_fade_pending: false,
             room_fade_draw: None,
             room_boot_gate: false,
             room_boot_grace: false,
@@ -1666,7 +1663,6 @@ impl GameSession {
             self.typewriter_arm = None;
             self.typewriter_fade = Some(ink_ribbon);
             self.room_fade.set(2, 0x1000, 0);
-            self.room_fade_pending = false;
             // The reference keeps the player machine frozen through the
             // hand-off: the typewriter flow restores the message word only
             // when the save screen closes.
@@ -2452,9 +2448,6 @@ impl GameSession {
                 // draws (then adds) on it, so this frame draws the full 0x7FFF
                 // alpha and the following frames step it down.
                 self.arm_room_fade();
-                self.room_fade_pending = false;
-                self.room_fade_draw = self.room_fade.overlay();
-                self.room_fade.tick();
                 // The original suspends game_loop for the room-entry fade, so
                 // the player and entities stay frozen until it clears. The
                 // first frame after the arm still runs (the reference's
@@ -3443,15 +3436,12 @@ impl GameSession {
     }
 
     /// Arm the room-entry fade exactly like `game_loop`'s outer loop plus the
-    /// first `main_loop` step: the accumulator starts at `0x7FFF` and the
-    /// counter's first step is already applied, and the room-events gate stays
-    /// closed until the accumulator drops below 1. The `room_fade_pending`
-    /// flag would otherwise delay the step by a tick, which shifts the gate
-    /// five ticks late.
+    /// first `main_loop` step: the accumulator starts at `0x7FFF`, its first
+    /// draw is the full black veil and the counter's first step is already
+    /// applied, and the room-events gate stays closed until the accumulator
+    /// drops below 1.
     fn arm_room_entry_fade(&mut self) {
         self.arm_room_fade();
-        self.room_fade.tick();
-        self.room_fade_pending = false;
         self.room_boot_gate = true;
         self.room_boot_grace = true;
     }
@@ -3460,6 +3450,14 @@ impl GameSession {
     /// after a room load: type 2 (black), accumulator `0x7FFF` and the normal
     /// counter `0xE800` (i16 -6144, alpha 255 down to 15 in six fixed ticks),
     /// or the slow `0xFF5D` (i16 -163) while scenario flag `0x7D` is set.
+    ///
+    /// The armed `0x7FFF` veil is captured for this frame's draw and the
+    /// accumulator takes its draw-then-add step now, exactly as `main_loop`
+    /// leaves it: the frame paints fully black and the following frames step
+    /// 207, 159, .... The capture is load-bearing because the app loop draws
+    /// frames that advance no gameplay tick; a frame that drew the stale
+    /// capture (`None` right after a room load) showed the new room unfaded
+    /// for a frame before the veil snapped back - the entry flash.
     fn arm_room_fade(&mut self) {
         let slow = self.game.flag_test(
             game::BANK_SCENARIO,
@@ -3468,7 +3466,8 @@ impl GameSession {
         );
         self.room_fade
             .set(2, if slow { -163 } else { -6144 }, 0x7FFF);
-        self.room_fade_pending = true;
+        self.room_fade_draw = self.room_fade.overlay();
+        self.room_fade.tick();
     }
 
     /// The new-game boot sequence the oracle trace compares against: one
@@ -3503,14 +3502,15 @@ impl GameSession {
         self.arm_room_entry_fade();
     }
 
-    /// Step the room-entry fade once per fixed tick. The tick after arming
-    /// only clears the pending flag: the frame it was armed on has not been
-    /// drawn, and the fade is draw-then-add, so its first drawn frame is the
-    /// full `0x7FFF` alpha. Once the accumulator goes negative the fade is
-    /// over but keeps its last counter and state: the original's gameplay
-    /// branch only adds while the accumulator is non-negative and never
-    /// zeroes the pair outside the `MSF_FADE_ACTIVE` machine (the death and
-    /// character-select fades), so the trace keeps reporting them.
+    /// Step the room-entry fade once per fixed tick. Every arming path captures
+    /// the armed veil for its own frame's draw and applies that frame's
+    /// draw-then-add step itself, so this only has to capture the pre-step
+    /// overlay of the frame about to be drawn and advance. Once the accumulator
+    /// goes negative the fade is over but keeps its last counter and state: the
+    /// original's gameplay branch only adds while the accumulator is
+    /// non-negative and never zeroes the pair outside the `MSF_FADE_ACTIVE`
+    /// machine (the death and character-select fades), so the trace keeps
+    /// reporting them.
     fn tick_room_fade(&mut self) {
         // The original draws the fade with the accumulator at the start of the
         // frame and only then adds the counter, so capture the pre-step overlay
@@ -3518,10 +3518,6 @@ impl GameSession {
         let pre = self.room_fade.overlay();
         self.room_fade_draw = pre;
         if pre.is_none() {
-            return;
-        }
-        if self.room_fade_pending {
-            self.room_fade_pending = false;
             return;
         }
         self.room_fade.tick();
@@ -3670,6 +3666,14 @@ impl GameSession {
     #[cfg(test)]
     fn room_fade_alpha(&self) -> Option<u8> {
         self.room_fade.overlay().map(|overlay| overlay.alpha)
+    }
+
+    /// The alpha the room-entry fade blends over this frame, for the
+    /// deterministic tests: the draw-then-add capture `tick_room_fade` takes
+    /// (or the armed veil a frame drawn before the first gameplay tick sees).
+    #[cfg(test)]
+    fn room_fade_draw_alpha(&self) -> Option<u8> {
+        self.room_fade_draw.map(|overlay| overlay.alpha)
     }
 
     /// Whether the pause-menu fade is currently hiding the menu panel (the
@@ -14282,9 +14286,22 @@ mod tests {
 
         // The destination's entry fade is armed like `game_loop`'s outer loop
         // plus the first `main_loop` step: the accumulator starts at `0x7FFF`
-        // and `0xE800` is already subtracted, so the first drawn alpha is
-        // `26623 >> 7` = 159. The counter then steps the alpha down 48 a tick:
-        // 159, 111, 63, 15, before the state goes negative.
+        // and `0xE800` is already subtracted, so tick 0 draws `26623 >> 7` =
+        // 207 and traces 159 (the post-step state). The counter then steps the
+        // alpha down 48 a tick: 111, 63, 15, before the state goes negative.
+        //
+        // The app loop draws frames without a gameplay tick too, and the first
+        // of them lands right after the teardown: it must draw the armed
+        // `0x7FFF` veil, the reference's outer-loop arm frame. The tick frames
+        // then draw the accumulator before their step, so the visible sequence
+        // is 255, 207, 159, 111, 63, 15, clear.
+        session.render(&pack);
+        assert_eq!(
+            session.framebuffer.rgba[0..4],
+            [0, 0, 0, 255],
+            "the first destination frame is fully veiled, not the unfaded room"
+        );
+        let mut drawn = vec![session.room_fade_draw_alpha()];
         let mut alphas = Vec::new();
         for _ in 0..7 {
             session
@@ -14292,10 +14309,25 @@ mod tests {
                 .unwrap();
             session.render(&pack);
             alphas.push(session.room_fade_alpha());
+            drawn.push(session.room_fade_draw_alpha());
         }
         assert_eq!(
             alphas,
             [Some(159), Some(111), Some(63), Some(15), None, None, None]
+        );
+        assert_eq!(
+            drawn,
+            [
+                Some(255),
+                Some(207),
+                Some(159),
+                Some(111),
+                Some(63),
+                Some(15),
+                None,
+                None
+            ],
+            "the first destination frame is the full black veil, then the draw-then-add steps"
         );
         // The fade stays cleared after it has run out.
         session
@@ -14303,6 +14335,7 @@ mod tests {
             .unwrap();
         session.render(&pack);
         assert_eq!(session.room_fade_alpha(), None);
+        assert_eq!(session.room_fade_draw_alpha(), None);
     }
 
     #[test]
@@ -15845,6 +15878,11 @@ off_0010:
         assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
         settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
+        assert_eq!(
+            session.room_fade_draw_alpha(),
+            Some(255),
+            "the room-entry arm frame draws the full black veil"
+        );
         assert_eq!(
             session.room_fade_alpha(),
             Some(207),
@@ -18116,9 +18154,14 @@ off_0010:
         );
         assert!(ticks > 5, "the dismissal came from the message's own delay");
         assert_eq!(
-            session.room_fade_alpha(),
+            session.room_fade_draw_alpha(),
             Some(255),
-            "the room-entry fade arms the tick the narration clears"
+            "the clearing tick draws the armed full black veil over the room"
+        );
+        assert_eq!(
+            session.room_fade_alpha(),
+            Some(207),
+            "the accumulator already took the arm frame's draw-then-add step"
         );
     }
 
