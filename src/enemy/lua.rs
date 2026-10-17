@@ -3216,6 +3216,7 @@ mod imp {
                 entity.saved_pos = Some(resolution.pos);
                 entity.floor_step = resolution.floor_step;
                 crate::enemy::walk::apply_push_axis(entity, resolution.push_z);
+                crate::enemy::walk::apply_soft_zone(entity, resolution.soft_zone);
                 Ok((
                     resolution.code,
                     resolution.pos[0].wrapping_sub(before[0]),

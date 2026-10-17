@@ -177,6 +177,8 @@ pub fn check_room_collision(room: &RoomState, entity: &mut Entity) -> u8 {
 /// scratch, which callers with the game state forward to
 /// [`GameState::entity_bkp`].
 pub fn check_room_collision_bkp(room: &RoomState, entity: &mut Entity) -> (u8, Option<u32>) {
+    // The original clears bit 3 on entry; a shape-4 soft zone raises it again.
+    entity.collision_flags &= !0x08;
     let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
     let radius = i32::from(entity.sca_radius);
     let resolution = player::resolve_collision_full(
@@ -190,6 +192,7 @@ pub fn check_room_collision_bkp(room: &RoomState, entity: &mut Entity) -> (u8, O
     entity.saved_pos = Some(resolution.pos);
     entity.floor_step = resolution.floor_step;
     apply_push_axis(entity, resolution.push_z);
+    apply_soft_zone(entity, resolution.soft_zone);
     (resolution.code, resolution.entity_bkp)
 }
 
@@ -203,6 +206,15 @@ pub fn apply_push_axis(entity: &mut Entity, push_z: Option<bool>) {
         Some(true) => entity.status_flags |= 0x10,
         Some(false) => entity.status_flags &= !0x10,
         None => {}
+    }
+}
+
+/// The shape-4 handler's write (`collision_flag_set`): a soft zone the resolve
+/// classified raises `collisionFlags` bit 3. Callers clear the bit before the
+/// resolve, as the original's `check_room_collision` does on entry.
+pub fn apply_soft_zone(entity: &mut Entity, soft_zone: bool) {
+    if soft_zone {
+        entity.collision_flags |= 0x08;
     }
 }
 
@@ -246,6 +258,7 @@ pub(crate) fn resolve_collision_two_radius(
     let mut floor_step = 0i16;
     let mut push_z = None;
     let mut entity_bkp = None;
+    let mut soft_zone = false;
 
     for rect in records {
         if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
@@ -259,6 +272,10 @@ pub(crate) fn resolve_collision_two_radius(
             let (axis, bkp) = match shape {
                 1 | 5 => two_radius_push_rect(rect, prev, &mut pos, push_radius),
                 3 => (two_radius_push_circle(rect, &mut pos, push_radius), None),
+                4 => {
+                    soft_zone = true;
+                    (None, None)
+                }
                 _ => (None, None),
             };
             if axis.is_some() {
@@ -279,6 +296,7 @@ pub(crate) fn resolve_collision_two_radius(
             scratch: proposed,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
 
@@ -310,6 +328,7 @@ pub(crate) fn resolve_collision_two_radius(
             scratch,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
     if still_hit == 0 {
@@ -320,6 +339,7 @@ pub(crate) fn resolve_collision_two_radius(
             scratch,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
     player::CollisionResolution {
@@ -329,6 +349,7 @@ pub(crate) fn resolve_collision_two_radius(
         scratch,
         push_z,
         entity_bkp,
+        soft_zone,
     }
 }
 
@@ -551,6 +572,7 @@ fn probe_room_collision(
     entity.saved_pos = Some(resolution.pos);
     entity.floor_step = resolution.floor_step;
     apply_push_axis(entity, resolution.push_z);
+    apply_soft_zone(entity, resolution.soft_zone);
     (resolution.code, travelled)
 }
 
@@ -3640,6 +3662,33 @@ mod tests {
         let mut e = entity([500, 0, 500], 0, 0);
         assert_eq!(check_room_collision(&room, &mut e), 0);
         assert_eq!(e.floor_step, 0);
+    }
+
+    #[test]
+    fn check_room_collision_raises_bit_3_inside_a_soft_zone() {
+        let mut room = RoomState::default();
+        room.collision.quadrants[0].push(CollisionRect {
+            x_max: 2000,
+            z_max: 2000,
+            x_min: 0,
+            z_min: 0,
+            kind: 4,
+            flags: 0,
+        });
+        let mut e = entity([500, 0, 500], 0, 0);
+        assert_eq!(check_room_collision(&room, &mut e), 0);
+        assert_eq!(
+            e.collision_flags & 0x08,
+            0x08,
+            "the shape-4 handler sets bit 3"
+        );
+        assert_eq!(e.pos, [500, 0, 500], "a soft zone never pushes");
+
+        // The resolve clears the bit on entry, so leaving the zone drops it.
+        e.pos = [5000, 0, 5000];
+        e.saved_pos = Some(e.pos);
+        check_room_collision(&room, &mut e);
+        assert_eq!(e.collision_flags & 0x08, 0);
     }
 
     #[test]
