@@ -1583,7 +1583,21 @@ impl GameSession {
     /// word. START opens the pause menu while no message owns the tick; while
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
-    fn tick(
+    fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        let result = self.tick_inner(pack, ui, input, action);
+        // `main_loop` ramps the cutscene screen intensity in its draw phase,
+        // after this frame's scripts, entities and message window have run, so
+        // the ramp sees a flag a script raised on the same frame. Stepping it
+        // at the top of the tick made the bars lead the reference by one
+        // 16-step for the whole ramp (the oracle's frame diff showed it in the
+        // top/bottom letterbox bands). The early-return paths (the death
+        // screen's own loop, the computer terminal, the typewriter hand-off)
+        // still step once per platform frame, exactly like the original's.
+        self.tick_screen_intensity();
+        result
+    }
+
+    fn tick_inner(
         &mut self,
         pack: &Pack,
         mut ui: UiInput,
@@ -1692,7 +1706,6 @@ impl GameSession {
             self.tick_computer(ui);
             return Ok(());
         }
-        self.tick_screen_intensity();
         // The original's room-events gate (`g_message_flags` bit 0x80): the
         // entry fade's state machine restores the bit on the tick its
         // accumulator drops below 1, and until then `room_events_check` does
@@ -3651,19 +3664,28 @@ impl GameSession {
         }
     }
 
-    /// Blend the cutscene letterbox bars over the freshly drawn scene. The
-    /// original draws the top span `[-4,-10,328,38]` and the bottom span
-    /// `[-4,212,328,38]` — slightly past the frame edges — whenever the
-    /// intensity is non-zero, with the intensity byte as the blend weight
-    /// except at the `0xF0` ceiling, where the bars are fully opaque.
+    /// Blend the cutscene letterbox bars over the freshly drawn scene.
+    ///
+    /// The original's two bar descriptors carry the `0x60000000` texture id,
+    /// which `GetTextureVariant` reads as variant 3 ("fade to black"), so
+    /// `draw_rect` forces the colour to black and keeps the level as the
+    /// source alpha. At the `0xF0` ceiling `main_loop` first sets the
+    /// descriptor's colour to white, and `draw_rect` derives the source alpha
+    /// from the last non-zero colour component (`0xFF`), so the bars go fully
+    /// opaque while the variant-3 branch still forces them black
+    /// (`MainLoop.cpp` 0x004297e0, `Rendering.cpp` 0x00470350/0x00470580).
+    /// The rects are the descriptors' own spans, `(-164,-130,328,38)` and
+    /// `(-164,92,328,38)` in the 320x240 origin-centred space.
     fn draw_screen_intensity_bars(&mut self) {
         let byte = self.sprite_anim_intensity as u8;
         if byte == 0 {
             return;
         }
         let alpha = if byte == 0xF0 { 255 } else { byte };
-        self.framebuffer.blend_black_rect([-4, -10, 328, 38], alpha);
-        self.framebuffer.blend_black_rect([-4, 212, 328, 38], alpha);
+        self.framebuffer
+            .blend_black_rect_weighted([-4, -10, 328, 38], alpha);
+        self.framebuffer
+            .blend_black_rect_weighted([-4, 212, 328, 38], alpha);
     }
 
     /// The room-entry fade's current alpha, for the deterministic tests.
@@ -3775,12 +3797,14 @@ impl GameSession {
                 &mut self.shadows,
                 &mut self.effect_pages,
             );
-            // The cutscene letterbox bars sit on the scene; the room-entry
-            // fade (draw-then-add) then darkens both, the death fade overlays
-            // the falling room, and the menu/message overlays stay above all
-            // of it.
-            self.draw_screen_intensity_bars();
+            // The cutscene letterbox bars sit on the scene after the
+            // room-entry fade has darkened it: `main_loop` draws the fading
+            // rect first (0x0042... at the fade block) and then the two
+            // letterbox bars, so an overlapping fade and bar ramp composite
+            // bars-over-fade. The death fade overlays the falling room last,
+            // and the menu/message overlays stay above all of it.
             self.draw_room_fade();
+            self.draw_screen_intensity_bars();
             self.draw_death_fade();
         } else if self.menu_fade_hides()
             && !(self.menu_fade_phase == MenuFadePhase::Out && self.menu_fade_pending)

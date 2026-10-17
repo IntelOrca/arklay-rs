@@ -660,6 +660,42 @@ impl Framebuffer {
         }
     }
 
+    /// [`Self::blend_black_rect`] with the executable's `draw_rect` rounding.
+    ///
+    /// The original stores the variant-3 ("fade to black") primitive's
+    /// destination weight as `(0x100 - brightness)` and its sprite blend
+    /// rounds at the store, the same `(... * keep + 127) / 255` the full-frame
+    /// fade uses (`draw_rect`, Rendering.cpp 0x00470350); the letterbox bars
+    /// therefore have to round like [`Self::fade_to_black_weighted`], not
+    /// truncate. The truncating form shifted every affected bar pixel down by
+    /// up to one unit, which the oracle's frame diff showed as a whole
+    /// top/bottom band of one-unit differences.
+    pub fn blend_black_rect_weighted(&mut self, dst: [i32; 4], alpha: u8) {
+        let [x, y, width, height] = dst;
+        if width <= 0 || height <= 0 || alpha == 0 {
+            return;
+        }
+        if alpha == 255 {
+            self.fill_rect(dst, [0, 0, 0, 255]);
+            return;
+        }
+        let start_x = x.max(0) as u32;
+        let start_y = y.max(0) as u32;
+        let end_x = x.saturating_add(width).min(self.width as i32).max(0) as u32;
+        let end_y = y.saturating_add(height).min(self.height as i32).max(0) as u32;
+        let keep = u32::from(255 - alpha);
+        for row in start_y..end_y {
+            for column in start_x..end_x {
+                let offset = (row as usize * self.width as usize + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    for channel in &mut pixel[..3] {
+                        *channel = ((u32::from(*channel) * keep + 127) / 255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
     /// Fill a rectangle with `color`, clipped to the framebuffer.
     pub fn fill_rect(&mut self, dst: [i32; 4], color: [u8; 4]) {
         let [x, y, width, height] = dst;
