@@ -334,6 +334,13 @@ impl SaveFile {
             saved_cut: None,
             locked: false,
         };
+        // `InitializeGame` writes the block's selected character into the
+        // player entity's id on the continue path too (`g_playerEntity.id =
+        // g_SelectedCharactedId`, GameStart.cpp), exactly as the new-game and
+        // arbitrary-room boots seed it in `seed_start_health`. Room scripts
+        // read that byte (`g_playerEntity.id & 3` is Jill), so a load that
+        // left it zero ran the other character's item and spawn branches.
+        state.entities[0].id = self.character & 1;
         state.entities[0].health = self.health;
         state.entities[0].pos = [
             i32::from(self.pos_x),
@@ -968,6 +975,9 @@ mod tests {
         // The maximum is not in the block; apply_to re-derives it from the
         // saved character exactly as InitializeGame does (Jill here).
         assert_eq!(restored.max_health, 96);
+        // InitializeGame restores the selected character into the player
+        // entity's id on the continue path too; room scripts branch on it.
+        assert_eq!(restored.entities[0].id, 1);
         assert_eq!(restored.entities[0].health, 96);
         assert_eq!(restored.entities[0].pos[0], 1234);
         assert_eq!(restored.entities[0].pos[2], -2345);
@@ -988,6 +998,34 @@ mod tests {
             );
         }
         assert_eq!(SaveFile::from_state(&restored), file);
+    }
+
+    #[test]
+    fn apply_to_restores_the_player_entity_character_from_the_block() {
+        // A continue builds a fresh state (its entity id defaults to zero) and
+        // applies the block. InitializeGame writes the block's selected
+        // character into the player entity's id on that path too, so the room
+        // scripts' `g_playerEntity.id & 3` tests see the saved character.
+        let mut jill = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        jill.state_bytes[usize::from(STATE_BYTE_CHARACTER)] = 1;
+        let file = SaveFile::from_state(&jill);
+        assert_eq!(file.character, 1);
+
+        let mut restored = GameState::default();
+        file.apply_to(&mut restored);
+        assert_eq!(restored.entities[0].id, 1);
+
+        // And a Chris block restores zero even when the fresh state carried a
+        // one: the block wins over the boot's own seeding.
+        let mut chris = GameState::new(RoomId::parse("1000").unwrap(), &RoomState::default());
+        chris.entities[0].id = 1;
+        let file = SaveFile::from_state(&chris);
+        assert_eq!(file.character, 0);
+
+        let mut restored = GameState::default();
+        restored.entities[0].id = 1;
+        file.apply_to(&mut restored);
+        assert_eq!(restored.entities[0].id, 0);
     }
 
     #[test]
