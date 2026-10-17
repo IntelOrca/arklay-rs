@@ -11,6 +11,14 @@ cargo-fuzz = true
 [dependencies]
 arklay = { path = "..", features = ["lua"] }
 libfuzzer-sys = "0.4"
+# The fuzzers only exercise arklay's parsers, but linking the library needs
+# SDL3. A machine with a system SDL3 needs nothing here; CI has none, so its
+# fuzz step enables `sdl-from-source` the same way the test job does.
+sdl3-sys = { version = "0.7", default-features = false }
+
+[features]
+# Build SDL3 from the vendored source with the console-only video backend.
+sdl-from-source = ["sdl3-sys/build-from-source", "sdl3-sys/sdl-unix-console-build"]
 
 [[bin]]
 name = "pack"

@@ -9,6 +9,13 @@ on:
 jobs:
   fuzz:
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins stable and rustup gives it precedence over an
+    # installed nightly, so without this override cargo-fuzz's nightly-only
+    # `-Zsanitizer=address` build is rejected ("the option `Z` is only accepted
+    # on the nightly compiler") and every target fails before it fuzzes
+    # anything. `RUSTUP_TOOLCHAIN` outranks the toolchain file.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     strategy:
       fail-fast: false
       matrix:
@@ -34,6 +41,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          # cargo-fuzz builds the instrumented std with `-Zbuild-std`.
+          components: rust-src
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz
@@ -46,7 +56,13 @@ jobs:
         # seeds stay read-only so a run never dirties the checkout.
         run: |
           mkdir -p corpus/${{ matrix.target }}
-          cargo fuzz run ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
+          # The gnu target, not cargo-fuzz's musl default: its AddressSanitizer
+          # refuses a statically linked libc ("sanitizer is incompatible with
+          # statically linked libc"). `sdl-from-source` builds the SDL3 the
+          # arklay library links against, since the runner has none.
+          cargo fuzz run --target x86_64-unknown-linux-gnu --features sdl-from-source \
+            ${{ matrix.target }} corpus/${{ matrix.target }} seeds/${{ matrix.target }} \
+            -- -max_total_time=300 -rss_limit_mb=4096
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

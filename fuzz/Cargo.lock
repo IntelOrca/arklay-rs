@@ -81,6 +81,7 @@ version = "0.0.0"
 dependencies = [
  "arklay",
  "libfuzzer-sys",
+ "sdl3-sys",
 ]
 
 [[package]]
