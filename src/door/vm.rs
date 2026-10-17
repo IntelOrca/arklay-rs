@@ -294,6 +294,8 @@ pub struct Vm {
     phase: i16,
     hold: u8,
     fade: Fade,
+    /// `FADE_IN`/`FADE_OUT` ops executed so far.
+    fade_writes: u32,
     sfx: Vec<Sfx>,
     messages: Vec<Message>,
 }
@@ -330,6 +332,7 @@ impl Vm {
             phase: 0,
             hold: 0,
             fade: Fade::default(),
+            fade_writes: 0,
             sfx: Vec::new(),
             messages: Vec::new(),
         }
@@ -400,6 +403,13 @@ impl Vm {
             Vec::new(),
             Vec::new(),
         )
+    }
+
+    /// How many `FADE_IN`/`FADE_OUT` ops have run. The ops write the shared
+    /// screen fade directly, so a caller tells a fresh write (even one with
+    /// the same values) from a held one by this count.
+    pub fn fade_writes(&self) -> u32 {
+        self.fade_writes
     }
 
     /// Whether the animation has ended.
@@ -686,6 +696,7 @@ impl Vm {
                 self.fade.fade_type = op[1];
                 self.fade.counter = i32::from(i16_at(op, 2)) * -0x80;
                 self.fade.state = i16_at(op, 4);
+                self.fade_writes = self.fade_writes.wrapping_add(1);
                 self.set_pc(index, script, pc + 6);
                 true
             }
@@ -693,6 +704,7 @@ impl Vm {
                 self.fade.fade_type = op[1];
                 self.fade.counter = i32::from(i16_at(op, 2)) << 7;
                 self.fade.state = i16_at(op, 4);
+                self.fade_writes = self.fade_writes.wrapping_add(1);
                 self.set_pc(index, script, pc + 6);
                 true
             }

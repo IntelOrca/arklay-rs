@@ -95,3 +95,11 @@ Save mode (each header names its save):
   branch starts 0x11 on the next tick without a press. Run it for 180 ticks:
   a zombie's walk diverges from the reference later in the room, separately
   from the stairs.
+- `door_207.txt` — `door_chris_10B.dat`: a full `.dor` door transition with a
+  stage change (10B to 207). Both engines trace every frame of the door: the
+  press frame seen at `door_begin_transition`'s mid-pass yield, the menu
+  path's `set_fading(2, 0x600)`, the animation's fade-in with the gameplay
+  task suspended, the placement and `init_room`'s one-frame yield, the door
+  scene, the teardown and the room-entry fade, then 207's gameplay.
+- `door_101.txt` — `door_chris_103.dat`: the same for a same-stage door (103 to
+  101), whose `room_set` runs on the placement's frame.

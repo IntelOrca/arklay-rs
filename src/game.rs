@@ -3197,6 +3197,23 @@ pub struct PlayerDamageBank {
     pub clips: std::sync::Arc<Vec<crate::model::Clip>>,
 }
 
+/// The state the oracle trace sees on the frame a door fires.
+///
+/// The original's `door_begin_transition` draws its black rect and sleeps a
+/// frame in the middle of the gameplay pass, so the rest of that pass (the
+/// player's behaviour, the later RNG draws) runs on the next frame. The port
+/// runs the whole tick at once and keeps this copy for the press frame's
+/// trace line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoorYield {
+    /// Every entity slot at the yield.
+    pub entities: Box<[Entity; ENTITY_COUNT]>,
+    /// [`GameState::rand_state`] at the yield.
+    pub rand_state: u32,
+    /// [`GameState::rand_seed`] at the yield.
+    pub rand_seed: u16,
+}
+
 /// The game state the SCD scripts read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
@@ -3466,6 +3483,9 @@ pub struct GameState {
     /// The record that requested the pending [`GameState::transition`], so the
     /// engine can play its animation without re-probing the action table.
     pub transition_door: Option<Door>,
+    /// The trace-visible state when the pending transition fired; see
+    /// [`DoorYield`].
+    pub door_yield: Option<DoorYield>,
     /// Mask-group toggles requested by `aot_switch`, consumed by the engine.
     pub mask_toggles: Vec<MaskToggle>,
     /// The pending room-sprite hide mask queued by `room_sprite_hide` (0x49):
@@ -3670,6 +3690,7 @@ impl Default for GameState {
             item_box: [InventoryItem::default(); ITEM_BOX_SLOTS],
             transition: None,
             transition_door: None,
+            door_yield: None,
             mask_toggles: Vec::new(),
             sprite_hide: 0,
             item_events: Vec::new(),
@@ -7572,6 +7593,11 @@ impl GameState {
             };
             target
         };
+        self.door_yield = Some(DoorYield {
+            entities: Box::new(self.entities),
+            rand_state: self.rand_state,
+            rand_seed: self.rand_seed,
+        });
         self.transition = Some(RoomTransition {
             target,
             pos: door.next_pos,

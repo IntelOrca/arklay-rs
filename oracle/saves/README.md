@@ -41,6 +41,8 @@ All saves were generated from the Japanese MediaKite assets at
 | `typewriter_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's typewriter action rect + an ink ribbon. |
 | `stairs_chris_203.dat` | room 203, Chris | player on the 2F main hall's middle landing, facing the east flight up to the balcony. |
 | `stairs_chris_207.dat` | room 207, Chris | player on room 207's lower landing, facing the flight up to the 2F floor. |
+| `door_chris_10B.dat` | room 10B, Chris | player at the foot of the stairwell door to 207 (a stage change), facing it. |
+| `door_chris_103.dat` | room 103, Chris | player in front of the dining room's door to 101 (same stage), facing it. |
 
 ## Format notes
 

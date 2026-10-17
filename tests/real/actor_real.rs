@@ -317,8 +317,9 @@ fn real_room_106_jill_cutscene_steers_to_the_scripted_waypoints() {
 
     // With control gone, the reach-triggered door completes and swaps in
     // Jill's room 105. The door load resets the player animation, so no
-    // scripted state survives into the destination.
-    let sim = simulate_room(&pack, id, 1500, player::Input::default()).unwrap();
+    // scripted state survives into the destination. The door fires on tick
+    // 1198 and its long `.dor` returns on tick 1501, so run a little past it.
+    let sim = simulate_room(&pack, id, 1520, player::Input::default()).unwrap();
     assert_eq!(
         sim.transitions,
         vec![RoomId::from_room_and_player("105", 1).unwrap()],
