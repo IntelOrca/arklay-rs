@@ -52,6 +52,14 @@ or after the value) are ignored. Keys are upper-case ASCII with one of the
 Any other character is encoded through the game font. Literal `0x01`/`0x07`
 are rejected as `\xNN`: a value carries its stream's terminator itself.
 
+Encoding is a direct cell lookup with no reserved glyph bytes: the sheet's
+`0x28`/`0x29` cells are the letters L and M, and the round parentheses are the
+`0xF8 0x16`/`0xF8 0x17` cells, exactly as the original's message, item-name and
+formatted-text renderers index the sheet. Only the original's ASCII-buffer
+`PrintText8x14` — the `_Nothing_` row and the passcode panel — remaps its own
+40/41 to the parenthesis cells, and that grid is a separate byte space whose
+`L` is 76, not 40.
+
 ## Keys
 
 | key | meaning |
@@ -115,7 +123,7 @@ original. Raw draws with no language context keep the full cells too: the
 `--ui font` sampler and the fixed-width save-screen slot templates and reveal
 string.
 
-`font::Font::draw_text`/`draw_text_plain` take a tight flag, `font::advance`
+`font::Font::draw_text` takes a tight flag, `font::advance`
 returns a stream's advance, and `font::wrap_pixels`/`font::fit_pixels` wrap and
 clip by advances instead of cell counts. Encoding is unchanged, and the metrics
 come from the sheet, so a mod that ships a redrawn narrow `font/font.tim` is

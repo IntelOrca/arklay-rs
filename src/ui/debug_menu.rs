@@ -116,7 +116,7 @@ impl DebugMenu {
         };
         let [panel_x, panel_y, _, _] = PANEL;
         let tight = text.uses_tight_metrics();
-        font.draw_text_plain(
+        font.draw_text(
             framebuffer,
             panel_x + 12,
             panel_y + 8,
@@ -134,7 +134,7 @@ impl DebugMenu {
         {
             let y = ROWS_Y + (index - self.scroll) as i32 * ROW_HEIGHT;
             if index == self.cursor {
-                font.draw_text_plain(
+                font.draw_text(
                     framebuffer,
                     CURSOR_X,
                     y,
@@ -152,14 +152,14 @@ impl DebugMenu {
             } else {
                 Tint::White
             };
-            font.draw_text_plain(framebuffer, TEXT_X, y, tint, 2, &label, false);
+            font.draw_text(framebuffer, TEXT_X, y, tint, 2, &label, false);
             // The room's name, in the room-label column and clipped to the
             // panel.
             if let Some(name) = text.room_name(&room3) {
                 let x = TEXT_X + 5 * font.metrics.glyph_w;
                 let panel_right = panel_x + PANEL[2];
                 let max_width = (panel_right - x).max(0);
-                font.draw_text_plain(
+                font.draw_text(
                     framebuffer,
                     x,
                     y,
@@ -174,7 +174,7 @@ impl DebugMenu {
             .iter()
             .enumerate()
         {
-            font.draw_text_plain(
+            font.draw_text(
                 framebuffer,
                 panel_x + 12,
                 panel_y + 164 + line as i32 * ROW_HEIGHT,

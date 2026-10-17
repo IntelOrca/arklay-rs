@@ -492,9 +492,9 @@ impl Screen for SaveLoadScreen {
             SaveLoadMode::Load => 1,
         };
 
-        // The header is the original's formatted path: no controller-symbol
-        // remap, so the suffix's M stays the letter M.
-        font.draw_text_plain(
+        // The header is the original's formatted path, so the suffix's M is
+        // the sheet's letter M.
+        font.draw_text(
             framebuffer,
             HEADER_X,
             HEADER_Y,
@@ -503,7 +503,7 @@ impl Screen for SaveLoadScreen {
             save_strings.header(mode),
             tight,
         );
-        font.draw_text_plain(
+        font.draw_text(
             framebuffer,
             HEADER_X,
             HEADER_Y,

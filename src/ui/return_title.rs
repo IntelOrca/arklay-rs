@@ -84,7 +84,7 @@ impl ReturnTitlePrompt {
                 y = y.max(LINE_Y[index]);
             }
             for row in font::wrap_pixels(text.ui(key), max_width, font, tight) {
-                font.draw_text_plain(framebuffer, TEXT_X, y, Tint::White, 2, row, tight);
+                font.draw_text(framebuffer, TEXT_X, y, Tint::White, 2, row, tight);
                 y += LINE_SPACING;
             }
         }

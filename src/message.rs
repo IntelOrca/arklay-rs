@@ -1130,6 +1130,30 @@ mod tests {
     }
 
     #[test]
+    fn the_item_name_in_a_key_turn_message_draws_its_letter() {
+        // Issue #28's screen: the key-turn message names the selected item, and
+        // the shipped charset spells "Lockpick"'s L as the plain byte 0x28.
+        // Only the letter's own cell is inked on this sheet, so a renderer that
+        // still redirected 0x28 to the ASCII path's parenthesis cell would
+        // leave the name blank.
+        let font = Font::new(sheet(&[cell(0x28)]));
+        let text = text_tables(&[&[0x28, 0x07]], &[]);
+        let bytes = [0x05, 0x01, 0x06, 0x00, 0x05, 0x00, 0x01, 0x00];
+        let mut window = MessageWindow::default();
+        assert!(window.start(0x43, 0xFF, &bytes, false));
+        window.selected_item = 1;
+        reveal_all(&mut window, &text);
+
+        let mut framebuffer = Framebuffer::new();
+        window.draw(&mut framebuffer, &font, &text);
+        assert_eq!(
+            pixel(&framebuffer, 0x22, 181),
+            [0, 255, 0, 255],
+            "the substituted name's L draws the letter cell in the item-name green"
+        );
+    }
+
+    #[test]
     fn unexamined_items_substitute_the_generic_name() {
         let item = (1..=items::MAX_ITEM)
             .find(|&item| items::record(item).is_some_and(|record| !record.name_valid()))

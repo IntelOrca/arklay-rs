@@ -5,6 +5,13 @@
 //! extended glyph pages with a second byte, and a few control bytes move or
 //! stop the cursor. [`Font::draw_text`] samples the sheet through the
 //! original's CLUT-driven [`Tint`] table and the pending 2D sprite path.
+//!
+//! Two byte spaces share the grid. The game-text encoding — what
+//! [`crate::charset`] produces, and what the RDT and message data already
+//! hold — is what [`Glyphs::new`] decodes: every plain byte draws its own
+//! cell. [`Glyphs::text_8x14`] is the original's `PrintText8x14`
+//! (0x00455520) ASCII-buffer renderer, whose 40/41 are `(` and `)` and are
+//! remapped to the sheet's round parentheses; see its own note.
 
 use crate::model::Texture8;
 use crate::render::{Framebuffer, SpriteBlend, SpriteDraw};
@@ -277,33 +284,33 @@ pub enum GlyphGrid {
 /// `0x00` advances one cell, `0xFF` half a cell, `0xFB` is a no-op, and
 /// `0x01`/`0x07` end the stream. A truncated `0xF8`/`0xF9`/`0xFA` sequence
 /// also ends it without a glyph.
+///
+/// Every plain byte draws its own grid cell, whatever the sheet holds there.
+/// The original's game-text renderers all index the grid in this same
+/// unredirected way — the message pass (`message_render_chars`, 0x00456020),
+/// `PrintFormattedText` (0x00455190) and the item-name drawer (0x00454fd0) —
+/// so no byte of the game-text encoding is ever spent on a second meaning.
+/// The `0x28`/`0x29` cells are the letters L and M on the shipped sheet; see
+/// [`Glyphs::text_8x14`] for the one renderer that works in ASCII instead.
 pub struct Glyphs<'a> {
     bytes: &'a [u8],
     position: usize,
     metrics: FontMetrics,
     table: Option<&'a GlyphTable>,
+    /// Only the ASCII `PrintText8x14` grid sets this; see
+    /// [`Glyphs::text_8x14`].
     remap_parentheses: bool,
     grid: GlyphGrid,
 }
 
 impl<'a> Glyphs<'a> {
-    /// Decode `bytes` with `metrics`, remapping `0x28`/`0x29` to the
-    /// controller-symbol cells like the original's game-text renderer.
+    /// Decode game-text `bytes` with `metrics`: every plain byte samples its
+    /// own left-page cell, so `0x28`/`0x29` are the letters L and M.
+    ///
+    /// The round parentheses are the `0xF8 0x16`/`0xF8 0x17` cells the charset
+    /// encodes them to, and a stream that spells `(` with `0xF8 0x16` samples
+    /// the same cell as [`Glyphs::text_8x14`]'s parenthesis remap.
     pub fn new(bytes: &'a [u8], metrics: FontMetrics) -> Self {
-        Self {
-            bytes,
-            position: 0,
-            metrics,
-            table: None,
-            remap_parentheses: true,
-            grid: GlyphGrid::Encoded,
-        }
-    }
-
-    /// Decode `bytes` with `metrics` without the controller-symbol remap, so
-    /// `0x28`/`0x29` are the ordinary letters L and M. The save screen's
-    /// header uses the original's plain formatted path, which has no remap.
-    pub fn plain(bytes: &'a [u8], metrics: FontMetrics) -> Self {
         Self {
             bytes,
             position: 0,
@@ -314,7 +321,21 @@ impl<'a> Glyphs<'a> {
         }
     }
 
-    /// Decode `bytes` with the original's `PrintText8x14` (0x00455520) grid.
+    /// Decode one byte stream with the original's `PrintText8x14`
+    /// (0x00455520) grid: the plain bytes are *ASCII*, each addressing the
+    /// sheet at `v = (b/18)*14` with no `+2` row bias, and 40/41 — ASCII `(`
+    /// and `)` — are remapped to the sheet's round parentheses at
+    /// `(56, 224)`/`(70, 224)`.
+    ///
+    /// The missing bias is what makes this a separate byte space: its row
+    /// `b/18` is the game-text grid's row `b/18 - 2` (the grid [`Glyphs::new`]
+    /// decodes starts two rows in at `v = 28`), so its `L` is byte 76 and
+    /// lands on the same cell the game-text encoding spells `0x28`. The remap
+    /// is a consequence of that space, not of the sheet: an ASCII `(` would
+    /// otherwise sample cell 40, a controller symbol, and the letter the byte
+    /// looks like is 76 instead — so it can never hide a letter. The game-text
+    /// encoding spells the same parenthesis `0xF8 0x16`, which [`Glyphs::new`]
+    /// samples directly.
     pub fn text_8x14(bytes: &'a [u8], metrics: FontMetrics) -> Self {
         Self {
             bytes,
@@ -429,11 +450,12 @@ impl Iterator for Glyphs<'_> {
 }
 
 impl Glyphs<'_> {
-    /// One plain byte of the sheet's glyph grid, with the controller-symbol
-    /// remap and the grid's row bias applied.
+    /// One plain byte of the sheet's glyph grid, with the grid's row bias and
+    /// the ASCII path's parenthesis remap applied.
     fn plain_glyph(&self, byte: u8) -> Glyph {
-        // ASCII '(' and ')' are the controller-symbol cells in both sheet
-        // widths and both renderers.
+        // The original's `PrintText8x14` — which reads an ASCII buffer, not
+        // the game-text encoding — draws ASCII '(' and ')' as the sheet's
+        // round parentheses. Only the ASCII grid sets the flag.
         if self.remap_parentheses {
             if byte == 0x28 {
                 return self.glyph(56, 224);
@@ -484,14 +506,10 @@ impl Font {
         }
     }
 
-    /// The decoded glyph stream of `bytes`: the controller-symbol remap when
-    /// `remap`, with the tight table when `tight`.
-    fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8], remap: bool) -> Glyphs<'a> {
-        let glyphs = if remap {
-            Glyphs::new(bytes, self.metrics)
-        } else {
-            Glyphs::plain(bytes, self.metrics)
-        };
+    /// The decoded glyph stream of game-text `bytes`, with the tight table
+    /// when `tight`.
+    fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8]) -> Glyphs<'a> {
+        let glyphs = Glyphs::new(bytes, self.metrics);
         if tight {
             glyphs.tight(&self.glyph_table)
         } else {
@@ -502,35 +520,34 @@ impl Font {
     /// The total horizontal advance of `bytes` drawn by [`Font::draw_text`]
     /// under `tight` metrics.
     pub fn advance(&self, tight: bool, bytes: &[u8]) -> i32 {
-        self.glyphs(tight, bytes, true)
-            .map(|glyph| glyph.advance)
-            .sum()
+        self.glyphs(tight, bytes).map(|glyph| glyph.advance).sum()
     }
 
     /// The advance of the single encoded step at `bytes[0]` (with its operand
-    /// for an extended page) under `tight`, on the plain draw path.
+    /// for an extended page) under `tight`, on [`Font::draw_text`]'s path.
     ///
     /// Used by the pixel-budget wrapping and clipping, which mirror
-    /// [`Font::draw_text_plain`].
+    /// [`Font::draw_text`].
     pub fn step_advance(&self, tight: bool, bytes: &[u8]) -> i32 {
         match bytes.first() {
             None | Some(0x01 | 0x07 | 0xFB) => 0,
             Some(&byte) => {
                 let len = if (0xF8..=0xFA).contains(&byte) { 2 } else { 1 };
-                self.glyphs(tight, &bytes[..len.min(bytes.len())], false)
+                self.glyphs(tight, &bytes[..len.min(bytes.len())])
                     .map(|glyph| glyph.advance)
                     .sum()
             }
         }
     }
 
-    /// Draw an encoded stream left to right from `(x, y)`.
+    /// Draw a game-text stream left to right from `(x, y)`.
     ///
     /// Every step advances the cursor by its own advance; glyphs sample
     /// palette row 0 (the sheet's grey ramp) mixed by `tint` and scaled by
     /// `brightness`. Under `tight` the sheet's per-glyph metrics trim each
     /// cell and use its own advance (the Latin path); otherwise every glyph
-    /// fills its cell (the Japanese default).
+    /// fills its cell (the Japanese default). No byte is redirected: see
+    /// [`Glyphs::new`].
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text(
         &self,
@@ -542,23 +559,7 @@ impl Font {
         bytes: &[u8],
         tight: bool,
     ) {
-        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, true, tight);
-    }
-
-    /// Draw an encoded stream without the controller-symbol remap; see
-    /// [`Glyphs::plain`]. `tight` selects the per-glyph metrics.
-    #[allow(clippy::too_many_arguments)]
-    pub fn draw_text_plain(
-        &self,
-        framebuffer: &mut Framebuffer,
-        x: i32,
-        y: i32,
-        tint: Tint,
-        brightness: u8,
-        bytes: &[u8],
-        tight: bool,
-    ) {
-        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, false, tight);
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, tight);
     }
 
     /// Draw a plain byte string with the original's `PrintText8x14`
@@ -602,10 +603,9 @@ impl Font {
         tint: Tint,
         brightness: u8,
         bytes: &[u8],
-        remap_parentheses: bool,
         tight: bool,
     ) {
-        let glyphs = self.glyphs(tight, bytes, remap_parentheses);
+        let glyphs = self.glyphs(tight, bytes);
         // Every glyph queues its shadow pass first and its text pass second,
         // both at the pending-sprite depth the brightness selects; the stable
         // order keeps the shadow under the glyph. The shadow is one pixel down
@@ -1212,20 +1212,45 @@ mod tests {
     }
 
     #[test]
-    fn parentheses_remap_to_the_controller_cells() {
-        let open = steps(&[0x28], metrics_jpn());
+    fn encoded_letters_draw_their_own_cells() {
+        // The game-text encoding spells L and M as 0x28/0x29 — the sheet's
+        // letters — while the round parentheses are the 0xF8 0x16/0x17 cells.
+        // The message and item-name renderers must sample what the encoding
+        // says, or "Lockpick" draws "(ockpick" (issue #28).
+        let l = steps(&[0x28], metrics_jpn());
+        assert_eq!((l[0].u, l[0].v), (4 * 14, 28 + 2 * 14));
+        let m = steps(&[0x29], metrics_jpn());
+        assert_eq!((m[0].u, m[0].v), (5 * 14, 28 + 2 * 14));
+
+        let open = steps(&[0xF8, 0x16], metrics_jpn());
         assert_eq!((open[0].u, open[0].v), (56, 224));
-        let close = steps(&[0x29], metrics_jpn());
+        let close = steps(&[0xF8, 0x17], metrics_jpn());
         assert_eq!((close[0].u, close[0].v), (70, 224));
+
+        // The measure path follows the same cells: 0x28 spends the letter
+        // cell's 10px advance here, where the parenthesis cell's is 7.
+        let font = Font::new(sheet_with_ink(&[(56, 56, 2, 10), (56, 224, 5, 10)]));
+        assert_eq!(font.advance(true, &[0x28]), 10, "the letter's advance");
+        assert_eq!(
+            font.advance(true, &[0xF8, 0x16]),
+            7,
+            "the parenthesis' advance"
+        );
     }
 
     #[test]
-    fn the_plain_iterator_keeps_parentheses_as_letters() {
+    fn ascii_parentheses_remap_to_the_sheet_paren_cells() {
+        // `PrintText8x14`'s buffer is ASCII: 40/41 are `(` and `)`, which the
+        // remap sends to the sheet's round parentheses. The ASCII letter L —
+        // byte 76, the cell the game-text encoding also spells 0x28 — is
+        // untouched by it.
         let metrics = metrics_jpn();
-        let open: Vec<Glyph> = Glyphs::plain(&[0x28], metrics).collect();
-        assert_eq!((open[0].u, open[0].v), (4 * 14, 28 + 2 * 14));
-        let close: Vec<Glyph> = Glyphs::plain(&[0x29], metrics).collect();
-        assert_eq!((close[0].u, close[0].v), (5 * 14, 28 + 2 * 14));
+        let open: Vec<Glyph> = Glyphs::text_8x14(&[0x28], metrics).collect();
+        assert_eq!((open[0].u, open[0].v), (56, 224));
+        let close: Vec<Glyph> = Glyphs::text_8x14(&[0x29], metrics).collect();
+        assert_eq!((close[0].u, close[0].v), (70, 224));
+        let l: Vec<Glyph> = Glyphs::text_8x14(b"L", metrics).collect();
+        assert_eq!((l[0].u, l[0].v), (4 * 14, 28 + 2 * 14));
     }
 
     #[test]
@@ -1304,14 +1329,17 @@ mod tests {
 
     #[test]
     fn draw_text_draws_every_page_and_tint() {
-        // White cells at the plain 0x0C, 0xF8, 0xF9 and 0xFA coordinates and
-        // at the parenthesis remap target (56, 224).
-        let font = Font::new(sheet_with_cells(&[
-            (168, 28),
-            (28, 224),
-            (256 + 28, 14),
-            (256 + 28, 210),
-            (56, 224),
+        // Ink at the plain 0x0C, 0xF8, 0xF9 and 0xFA coordinates filling the
+        // cell, and split halves at the plain 0x28 letter and the 0xF8 0x16
+        // parenthesis beside it, so the step sequence below also shows which
+        // of the two cells 0x28 sampled.
+        let font = Font::new(sheet_with_ink(&[
+            (168, 28, 0, 13),
+            (28, 224, 0, 13),
+            (256 + 28, 14, 0, 13),
+            (256 + 28, 210, 0, 13),
+            (56, 56, 0, 4),
+            (56, 224, 5, 13),
         ]));
 
         fn pixel(framebuffer: &Framebuffer, x: i32, y: i32) -> [u8; 4] {
@@ -1339,24 +1367,80 @@ mod tests {
             );
         }
 
-        // One glyph per byte step: plain, the two extended pages and the
-        // remapped parenthesis; the end byte draws nothing further.
+        // One glyph per byte step: plain, the two extended pages, the plain
+        // letter and the parenthesis pair; the end byte draws nothing further.
+        // Cells 0..=3 are inked from their left edge.
         font.draw_text(
             &mut framebuffer,
             10,
             100,
             Tint::White,
             2,
-            &[0x0C, 0xF8, 20, 0xF9, 20, 0xFA, 20, 0x28, 0x01],
+            &[0x0C, 0xF8, 20, 0xF9, 20, 0xFA, 20, 0x28, 0xF8, 0x16, 0x01],
             false,
         );
-        for column in 0..5 {
+        for column in 0..4 {
             assert_eq!(
                 pixel(&framebuffer, 10 + column * 14, 100),
                 [255, 255, 255, 255]
             );
         }
-        assert_eq!(pixel(&framebuffer, 10 + 5 * 14, 100), [0, 0, 0, 0]);
+        // The 0x28 step draws the letter's half of its own cell (cell 4) and
+        // leaves the parenthesis' half alone; the 0xF8 0x16 step (cell 5)
+        // swaps the two.
+        assert_eq!(
+            pixel(&framebuffer, 10 + 4 * 14 + 2, 100),
+            [255, 255, 255, 255],
+            "the letter cell's ink"
+        );
+        assert_eq!(
+            pixel(&framebuffer, 10 + 4 * 14 + 8, 100),
+            [0, 0, 0, 0],
+            "the parenthesis cell is not sampled"
+        );
+        assert_eq!(
+            pixel(&framebuffer, 10 + 5 * 14 + 2, 100),
+            [0, 0, 0, 0],
+            "the parenthesis step leaves the letter's half alone"
+        );
+        assert_eq!(
+            pixel(&framebuffer, 10 + 5 * 14 + 8, 100),
+            [255, 255, 255, 255],
+            "the parenthesis cell's ink"
+        );
+        assert_eq!(pixel(&framebuffer, 10 + 6 * 14, 100), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn the_lockpick_message_draws_its_l_as_a_letter() {
+        // Issue #28: "You have used the lockpick." drew "(ockpick". The item
+        // name is encoded through the charset, whose L is the plain 0x28 —
+        // the letter cell, never the parenthesis the ASCII path's remap
+        // selects. Two disjoint ink strips tell the two cells apart at draw
+        // time: the letter covers columns 0..=3, the parenthesis 4..=6.
+        let font = Font::new(sheet_with_ink(&[(56, 56, 0, 3), (56, 224, 4, 6)]));
+        let mut name = Vec::new();
+        crate::charset::encode("Lockpick", &mut name);
+        assert_eq!(name[0], 0x28, "the charset spells L as 0x28");
+
+        fn pixel(framebuffer: &Framebuffer, x: usize) -> [u8; 4] {
+            let offset = x * 4;
+            framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+        }
+        // Brightness 0 is the full-brightness render with no shadow pass, so
+        // the cell's ink is exactly the sheet's.
+        let mut framebuffer = Framebuffer::new();
+        font.draw_text(&mut framebuffer, 0, 0, Tint::White, 0, &name, false);
+        assert_eq!(
+            pixel(&framebuffer, 2),
+            [255, 255, 255, 255],
+            "the letter's first column is inked"
+        );
+        assert_eq!(
+            pixel(&framebuffer, 5),
+            [0, 0, 0, 0],
+            "the parenthesis' ink is not sampled"
+        );
     }
 
     #[test]
