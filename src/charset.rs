@@ -1,4 +1,4 @@
-//! The install's 14x14 game-text font encoding: characters <-> glyph bytes.
+//! The install's game-text font encodings: characters <-> glyph bytes.
 //!
 //! `font.rs` renders an encoded stream by addressing the font grid directly
 //! (`0x0C..=0xF7`), through the `0xF8`/`0xF9`/`0xFA` extended pages and a few
@@ -8,18 +8,22 @@
 //! map (`FONT.TIM`) that `font.rs` was verified against, so encoding and
 //! rendering always agree.
 //!
+//! Two sheets ship with the games and each assigns the bytes its own way: the
+//! 768-wide Japanese `FONT.TIM` (14px cells, kana through the extended pages)
+//! and the 256-wide Western `fontus.tim` (8px cells, accented Latin letters
+//! and the European punctuation). [`Script`] selects the map; a pack's font
+//! sheet selects the script by its width, so the language files, the message
+//! streams and the font always agree (see [`crate::text::Text`]).
+//!
 //! [`encode`] is greedy: a two-codepoint cell (`S.`) matches before its single
 //! characters would, so text written with the ligature cells re-encodes to the
 //! bytes the game uses. Characters the font has no cell for either map to a
-//! documented substitute (`SUBSTITUTIONS`: curly quotes, dashes, middle
-//! dots, fullwidth ASCII) or encode as [`MISSING`], the reserved marker
+//! documented substitute (each script's `SUBSTITUTIONS`: curly quotes, dashes,
+//! middle dots, fullwidth ASCII) or encode as [`MISSING`], the reserved marker
 //! [`crate::font::Font`] draws as a synthetic empty box so an unspellable
 //! character is visible instead of silently dropped.
-//!
-//! This is the Japanese font's map. A pack whose font sheet is the 256-wide
-//! Western one uses a different byte assignment; a per-font charset lands with
-//! the first pack that ships one.
 
+mod latin;
 mod table;
 
 /// Longest cell spelling, in characters.
@@ -41,11 +45,46 @@ pub const MAX_CELL_CHARS: usize = 2;
 /// name with.
 pub const MISSING: [u8; 2] = [0xFA, 0xFF];
 
-/// Characters with no cell of their own that localized text still uses.
+/// The game-text byte space a font sheet uses.
+///
+/// The sheet's width selects it ([`crate::font::FontMetrics`]): 768 or wider
+/// is the Japanese sheet, 256 the Western one. A session's script is fixed by
+/// the language it renders ([`crate::text::Text::script`]), and every stream
+/// the session draws — language files, RDT text, UI labels — is encoded in
+/// that one byte space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Script {
+    /// The 768-wide Japanese sheet (`DATA/FONT.TIM`): 14px cells, kana and
+    /// kanji through the `0xF8`/`0xF9`/`0xFA` pages.
+    #[default]
+    Japanese,
+    /// The 256-wide Western sheet (`Data/fontus.tim`): 8px cells with the
+    /// accented Latin letters and the European punctuation, all plain cells.
+    Latin,
+}
+
+/// One sheet's character map: the encode tables, the authored substitutions
+/// and the cell names the decode direction reports.
+struct Charset {
+    /// Single characters with their own cell, sorted by character.
+    one: &'static [(char, &'static [u8])],
+    /// Two-codepoint cells, sorted by spelling.
+    two: &'static [(&'static str, &'static [u8])],
+    /// Characters with no cell of their own, mapped to a spellable stand-in.
+    substitutions: &'static [(char, &'static str)],
+    /// Plain grid cell names, row-major, 18 columns.
+    left: &'static [&'static str],
+    /// The right page's cell names (`0xF9`/`0xFA`); empty for a single-page
+    /// sheet.
+    right: &'static [&'static str],
+}
+
+/// Characters with no cell of their own that localized text still uses on the
+/// Japanese sheet.
 ///
 /// Each maps to the closest cell the font draws; every target is directly
 /// encodable and is not itself a substitution key. Sorted by character.
-static SUBSTITUTIONS: &[(char, &str)] = &[
+static JAPANESE_SUBSTITUTIONS: &[(char, &str)] = &[
     ('"', "”"),
     ('-', "ー"),
     ('_', "ー"),
@@ -68,12 +107,57 @@ static SUBSTITUTIONS: &[(char, &str)] = &[
     ('\u{3000}', " "),
 ];
 
+static JAPANESE: Charset = Charset {
+    one: &table::ENCODE_ONE,
+    two: &table::ENCODE_TWO,
+    substitutions: JAPANESE_SUBSTITUTIONS,
+    left: &table::LEFT,
+    right: &table::RIGHT,
+};
+
+static LATIN: Charset = Charset {
+    one: &latin::ENCODE_ONE,
+    two: &latin::ENCODE_TWO,
+    substitutions: &latin::SUBSTITUTIONS,
+    left: &latin::LEFT,
+    right: &[],
+};
+
+impl Script {
+    /// The sheet's character map.
+    fn charset(self) -> &'static Charset {
+        match self {
+            Script::Japanese => &JAPANESE,
+            Script::Latin => &LATIN,
+        }
+    }
+}
+
+impl Charset {
+    /// The bytes for one character, or `None` when the sheet has no cell.
+    fn lookup(&self, ch: char) -> Option<&'static [u8]> {
+        self.one
+            .binary_search_by(|(key, _)| key.cmp(&ch))
+            .ok()
+            .map(|index| self.one[index].1)
+    }
+
+    /// The stand-in for a character the sheet cannot spell.
+    fn substitute(&self, ch: char) -> Option<&'static str> {
+        self.substitutions
+            .binary_search_by(|(key, _)| key.cmp(&ch))
+            .ok()
+            .map(|index| self.substitutions[index].1)
+    }
+}
+
 /// Encode `text` into font bytes, appending to `out`.
 ///
 /// `text` is the literal part of a language-file value; tag and escape syntax
 /// is the caller's job ([`crate::language`]). A character the font cannot
 /// spell encodes as [`MISSING`].
-pub fn encode(text: &str, out: &mut Vec<u8>) {
+pub fn encode(text: &str, script: Script, out: &mut Vec<u8>) {
+    let charset = script.charset();
     let mut rest = text;
     while !rest.is_empty() {
         let first = rest.chars().next().expect("the string is not empty");
@@ -86,26 +170,28 @@ pub fn encode(text: &str, out: &mut Vec<u8>) {
                 .expect("a second character")
                 .len_utf8();
             let pair = &rest[..first_len + second_len];
-            if let Ok(index) = table::ENCODE_TWO.binary_search_by(|(key, _)| (*key).cmp(pair)) {
-                out.extend_from_slice(table::ENCODE_TWO[index].1);
+            if let Ok(index) = charset.two.binary_search_by(|(key, _)| (*key).cmp(pair)) {
+                out.extend_from_slice(charset.two[index].1);
                 rest = &rest[first_len + second_len..];
                 continue;
             }
         }
-        encode_char(first, out);
+        encode_char(first, charset, out);
         rest = &rest[first_len..];
     }
 }
 
 /// The cell a plain glyph byte (`0x0C..=0xF7`) selects.
-pub fn plain_cell(byte: u8) -> Option<&'static str> {
+pub fn plain_cell(byte: u8, script: Script) -> Option<&'static str> {
     if byte >= 0xF8 {
         return None;
     }
     let index = usize::from(byte);
     let row = index / 18;
     let col = index % 18;
-    table::LEFT
+    script
+        .charset()
+        .left
         .get(row * 18 + col)
         .copied()
         .filter(|cell| !cell.is_empty())
@@ -114,8 +200,9 @@ pub fn plain_cell(byte: u8) -> Option<&'static str> {
 /// The cell an extended glyph (`0xF8`/`0xF9`/`0xFA` plus its operand) selects.
 ///
 /// The page byte follows `font.rs`: `0xF8` addresses the LEFT rows 13..15,
-/// `0xF9` the RIGHT rows 0..15 and `0xFA` the RIGHT rows 14..17.
-pub fn extended_cell(page: u8, operand: u8) -> Option<&'static str> {
+/// `0xF9` the RIGHT rows 0..15 and `0xFA` the RIGHT rows 14..17. The Western
+/// sheet is a single page, so only its `0xF8` page has names.
+pub fn extended_cell(page: u8, operand: u8, script: Script) -> Option<&'static str> {
     let index = usize::from(operand);
     let row = match page {
         0xF8 => index / 18 + 13,
@@ -123,10 +210,11 @@ pub fn extended_cell(page: u8, operand: u8) -> Option<&'static str> {
         0xFA => index / 18 + 14,
         _ => return None,
     };
+    let charset = script.charset();
     let grid: &[&str] = if page == 0xF8 {
-        &table::LEFT
+        charset.left
     } else {
-        &table::RIGHT
+        charset.right
     };
     grid.get(row * 18 + index % 18)
         .copied()
@@ -134,27 +222,38 @@ pub fn extended_cell(page: u8, operand: u8) -> Option<&'static str> {
 }
 
 /// Whether the font can spell `ch`, directly or through a substitution.
-pub fn spellable(ch: char) -> bool {
-    let ch = fold_fullwidth(ch);
-    SUBSTITUTIONS
-        .binary_search_by(|(key, _)| key.cmp(&ch))
-        .is_ok()
-        || table::ENCODE_ONE
-            .binary_search_by(|(key, _)| key.cmp(&ch))
-            .is_ok()
+pub fn spellable(ch: char, script: Script) -> bool {
+    let charset = script.charset();
+    charset.lookup(ch).is_some()
+        || charset.substitute(fold_fullwidth(ch)).is_some()
+        || charset.lookup(fold_fullwidth(ch)).is_some()
 }
 
-/// Encode one character: fold fullwidth ASCII, apply a substitution, or use
-/// the table directly (falling back to [`MISSING`]).
-fn encode_char(ch: char, out: &mut Vec<u8>) {
-    let ch = fold_fullwidth(ch);
-    if let Ok(index) = SUBSTITUTIONS.binary_search_by(|(key, _)| key.cmp(&ch)) {
-        for target in SUBSTITUTIONS[index].1.chars() {
-            push_glyph(target, out);
+/// Encode one character: the sheet's own cell, a fullwidth fold, or a
+/// substitution (falling back to [`MISSING`]).
+fn encode_char(ch: char, charset: &Charset, out: &mut Vec<u8>) {
+    // A character the sheet spells itself wins over its fullwidth fold: the
+    // Western sheet spells the seeds' fullwidth `ＳＴＡＲＳ` as the ligature
+    // cells the original text uses, where the fold would spell the letters
+    // apart.
+    if let Some(bytes) = charset.lookup(ch) {
+        out.extend_from_slice(bytes);
+        return;
+    }
+    let folded = fold_fullwidth(ch);
+    if let Some(target) = charset.substitute(folded) {
+        for target_ch in target.chars() {
+            match charset.lookup(target_ch) {
+                Some(bytes) => out.extend_from_slice(bytes),
+                None => out.extend_from_slice(&MISSING),
+            }
         }
         return;
     }
-    push_glyph(ch, out);
+    match charset.lookup(folded) {
+        Some(bytes) => out.extend_from_slice(bytes),
+        None => out.extend_from_slice(&MISSING),
+    }
 }
 
 /// Fold a fullwidth ASCII character to its ASCII form; other characters pass
@@ -168,21 +267,19 @@ fn fold_fullwidth(ch: char) -> char {
     }
 }
 
-/// Push the encoding of one character: its cell, or the missing-glyph cell.
-fn push_glyph(ch: char, out: &mut Vec<u8>) {
-    match table::ENCODE_ONE.binary_search_by(|(key, _)| key.cmp(&ch)) {
-        Ok(index) => out.extend_from_slice(table::ENCODE_ONE[index].1),
-        Err(_) => out.extend_from_slice(&MISSING),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn encoded(text: &str) -> Vec<u8> {
         let mut out = Vec::new();
-        encode(text, &mut out);
+        encode(text, Script::Japanese, &mut out);
+        out
+    }
+
+    fn latin(text: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode(text, Script::Latin, &mut out);
         out
     }
 
@@ -259,63 +356,146 @@ mod tests {
         // Reserving a real cell would make the charset emit the box for a
         // spellable character. `0xFA 0x3B` in particular is a real stream
         // byte: the ja-JP table spells item 0x54's name with it.
-        assert_eq!(extended_cell(MISSING[0], MISSING[1]), None);
-        assert_eq!(plain_cell(MISSING[0]), None);
-        for (ch, bytes) in table::ENCODE_ONE.iter() {
-            assert_ne!(*bytes, MISSING.as_slice(), "{ch:?} encodes as the marker");
-        }
-        for (cell, bytes) in table::ENCODE_TWO.iter() {
-            assert_ne!(*bytes, MISSING.as_slice(), "{cell:?} encodes as the marker");
+        assert_eq!(
+            extended_cell(MISSING[0], MISSING[1], Script::Japanese),
+            None
+        );
+        assert_eq!(extended_cell(MISSING[0], MISSING[1], Script::Latin), None);
+        assert_eq!(plain_cell(MISSING[0], Script::Japanese), None);
+        assert_eq!(plain_cell(MISSING[0], Script::Latin), None);
+        for script in [Script::Japanese, Script::Latin] {
+            let charset = script.charset();
+            for (ch, bytes) in charset.one.iter() {
+                assert_ne!(*bytes, MISSING.as_slice(), "{ch:?} encodes as the marker");
+            }
+            for (cell, bytes) in charset.two.iter() {
+                assert_ne!(*bytes, MISSING.as_slice(), "{cell:?} encodes as the marker");
+            }
         }
     }
 
     #[test]
     fn plain_cell_names_the_grid() {
-        assert_eq!(plain_cell(0x00), Some(" "));
-        assert_eq!(plain_cell(0x1D), Some("A"));
-        assert_eq!(plain_cell(0xFF), None); // beyond the grid
-        assert_eq!(plain_cell(0x09), None); // an unnamed cell
+        assert_eq!(plain_cell(0x00, Script::Japanese), Some(" "));
+        assert_eq!(plain_cell(0x1D, Script::Japanese), Some("A"));
+        assert_eq!(plain_cell(0xFF, Script::Japanese), None); // beyond the grid
+        assert_eq!(plain_cell(0x09, Script::Japanese), None); // an unnamed cell
+        assert_eq!(plain_cell(0x18, Script::Latin), Some(","));
+        assert_eq!(plain_cell(0x37, Script::Latin), Some("("));
+        assert_eq!(plain_cell(0x65, Script::Latin), Some("é"));
+        assert_eq!(plain_cell(0x90, Script::Latin), None); // a symbol row
+        assert_eq!(plain_cell(0xFF, Script::Latin), None);
     }
 
     #[test]
     fn extended_cell_names_the_pages() {
-        assert_eq!(extended_cell(0xF8, 0x12), Some("S."));
-        assert_eq!(extended_cell(0xF8, 0x10), Some("「"));
-        assert_eq!(extended_cell(0xF9, 0x00), Some("壊"));
-        assert_eq!(extended_cell(0xFA, 0x33), Some("潟"));
-        assert_eq!(extended_cell(0xFA, 0xFF), None);
-        assert_eq!(extended_cell(0x00, 0x00), None);
+        assert_eq!(extended_cell(0xF8, 0x12, Script::Japanese), Some("S."));
+        assert_eq!(extended_cell(0xF8, 0x10, Script::Japanese), Some("「"));
+        assert_eq!(extended_cell(0xF9, 0x00, Script::Japanese), Some("壊"));
+        assert_eq!(extended_cell(0xFA, 0x33, Script::Japanese), Some("潟"));
+        assert_eq!(extended_cell(0xFA, 0xFF, Script::Japanese), None);
+        assert_eq!(extended_cell(0x00, 0x00, Script::Japanese), None);
+        // The Western sheet is a single page: no right-page cells at all.
+        assert_eq!(extended_cell(0xF9, 0x00, Script::Latin), None);
+        assert_eq!(extended_cell(0xFA, 0x00, Script::Latin), None);
     }
 
     #[test]
     fn every_grid_cell_is_encodable() {
-        for cell in table::LEFT.iter().chain(table::RIGHT.iter()) {
-            if !cell.is_empty() {
-                assert_ne!(encoded(cell), MISSING, "grid cell {cell:?} has no encoding");
+        for script in [Script::Japanese, Script::Latin] {
+            let charset = script.charset();
+            for cell in charset.left.iter().chain(charset.right.iter()) {
+                if !cell.is_empty() {
+                    let mut out = Vec::new();
+                    encode(cell, script, &mut out);
+                    assert_ne!(out, MISSING, "grid cell {cell:?} has no encoding");
+                }
             }
         }
     }
 
     #[test]
     fn substitutions_are_sorted_and_their_targets_encodable() {
-        for (index, (ch, target)) in SUBSTITUTIONS.iter().enumerate() {
-            if index > 0 {
-                assert!(SUBSTITUTIONS[index - 1].0 < *ch, "unsorted at {ch:?}");
-            }
-            assert!(!target.is_empty());
-            for target_ch in target.chars() {
-                assert!(
-                    SUBSTITUTIONS
-                        .binary_search_by(|(key, _)| key.cmp(&target_ch))
-                        .is_err(),
-                    "{ch:?} substitutes to the substitution key {target_ch:?}"
-                );
-                assert_ne!(
-                    encoded(&target_ch.to_string()),
-                    MISSING,
-                    "{ch:?} -> {target:?} is not encodable"
-                );
+        for script in [Script::Japanese, Script::Latin] {
+            let charset = script.charset();
+            for (index, (ch, target)) in charset.substitutions.iter().enumerate() {
+                if index > 0 {
+                    assert!(
+                        charset.substitutions[index - 1].0 < *ch,
+                        "unsorted at {ch:?}"
+                    );
+                }
+                assert!(!target.is_empty());
+                for target_ch in target.chars() {
+                    assert!(
+                        charset
+                            .substitutions
+                            .binary_search_by(|(key, _)| key.cmp(&target_ch))
+                            .is_err(),
+                        "{ch:?} substitutes to the substitution key {target_ch:?}"
+                    );
+                    let mut out = Vec::new();
+                    encode(&target_ch.to_string(), script, &mut out);
+                    assert_ne!(out, MISSING, "{ch:?} -> {target:?} is not encodable");
+                }
             }
         }
+    }
+
+    #[test]
+    fn latin_encodes_the_official_usa_bytes() {
+        // The bytes the USA release's own text tables and RDTs hold.
+        assert_eq!(
+            latin("COMBAT KNIFE"),
+            [
+                0x1F, 0x2B, 0x29, 0x1E, 0x1D, 0x30, 0x00, 0x27, 0x2A, 0x25, 0x22, 0x21
+            ]
+        );
+        assert_eq!(latin("Beretta"), [0x1E, 0x41, 0x4E, 0x41, 0x50, 0x50, 0x3D]);
+        assert_eq!(latin("café"), [0x3F, 0x3D, 0x42, 0x65]);
+        // `S.T.A.R.S.` is the ligature cells, period included.
+        assert_eq!(latin("S.T.A.R.S."), [0x74, 0x75, 0x76, 0x77, 0x74]);
+        // The seeds spell it fullwidth; it maps to the same cells.
+        assert_eq!(latin("ＳＴＡＲＳ"), [0x74, 0x75, 0x76, 0x77, 0x74]);
+        // A plain "STARS" keeps the plain letters.
+        assert_eq!(latin("STARS"), [0x2F, 0x30, 0x1D, 0x2E, 0x2F]);
+    }
+
+    #[test]
+    fn latin_punctuation_cells_differ_from_the_japanese_sheet() {
+        assert_eq!(latin(","), [0x18]);
+        assert_eq!(encoded(","), [0x17]);
+        assert_eq!(latin(";"), [0x17]);
+        // The Japanese sheet spells both comma and semicolon as its
+        // ideographic comma.
+        assert_eq!(encoded(";"), [0x17]);
+        assert_eq!(latin("("), [0x37]);
+        assert_eq!(encoded("("), [0xF8, 0x16]);
+        // The Western sheet spells `+` and `=` where the Japanese one cannot.
+        assert_eq!(latin("+"), [0x7D]);
+        assert_eq!(encoded("+"), MISSING);
+        assert_eq!(latin("="), [0x7E]);
+        assert_eq!(encoded("="), MISSING);
+        // The save screen's empty-slot dashes are the same byte on both.
+        assert_eq!(latin("ー"), [0x3B]);
+        assert_eq!(encoded("ー"), [0x3B]);
+        assert_eq!(latin("-"), [0x3B]);
+        assert_eq!(encoded("-"), [0x3B]);
+    }
+
+    #[test]
+    fn latin_marks_what_the_western_sheet_cannot_spell() {
+        // The original European releases' font has no Nordic, Iberian or
+        // Cyrillic letters: those read as the missing-glyph box.
+        assert_eq!(latin("ñ"), MISSING);
+        assert_eq!(latin("å"), MISSING);
+        assert_eq!(latin("З"), MISSING);
+        assert_eq!(latin("café"), [0x3F, 0x3D, 0x42, 0x65]);
+        assert_eq!(latin("naïve"), [0x4A, 0x3D, 0x69, 0x52, 0x41]);
+        assert_eq!(
+            latin("a\u{301}"),
+            [0x3D, 0xFA, 0xFF],
+            "a combining mark is not folded into its base letter"
+        );
     }
 }

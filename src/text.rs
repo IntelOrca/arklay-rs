@@ -7,15 +7,30 @@
 //! falls back to the RDT's own text and then to its registry id; item names
 //! and UI labels a chain does not carry read as empty, exactly like a missing
 //! entry in the tables this module replaces.
+//!
+//! One session draws one byte space. [`Text::script`] is the script the
+//! selected language renders in — Japanese for `ja`, the Western sheet for
+//! every other tag when the pack carries one, else the Japanese sheet whose
+//! tight metrics stand in for the missing Western one. The catalog encodes
+//! every language-file entry in that script, and the engine loads the sheet
+//! [`crate::font::session_entry`] names for it, so the strings and the font
+//! can never disagree.
 
-use crate::language::Catalog;
+use crate::charset::Script;
+use crate::font;
+use crate::language::{self, Catalog};
 use crate::pack::Pack;
 use crate::state::RoomState;
+use crate::tim;
 
 /// Every string source a session reads.
 #[derive(Debug, Clone, Default)]
 pub struct Text {
     catalog: Catalog,
+    /// The byte space the selected language's strings are encoded in.
+    script: Script,
+    /// The byte space the pack's own room text (its RDT messages) is in.
+    pack_script: Script,
 }
 
 impl Text {
@@ -23,8 +38,11 @@ impl Text {
     /// resolve the selected language: `language`, else the OS locale, else
     /// `en-US`.
     pub fn load(pack: &Pack, language: Option<&str>) -> Self {
+        let script = script_for(pack, language);
         Self {
-            catalog: Catalog::load(pack, language),
+            catalog: Catalog::load(pack, language, script),
+            script,
+            pack_script: sheet_script(pack, font::DEFAULT_ENTRY).unwrap_or_default(),
         }
     }
 
@@ -33,9 +51,16 @@ impl Text {
         self.catalog.selected()
     }
 
+    /// The script the session's text is encoded in, and the one its font
+    /// sheet draws ([`crate::font::load_session`] loads that sheet).
+    pub fn script(&self) -> Script {
+        self.script
+    }
+
     /// Whether the selected language renders with the font sheet's per-glyph
     /// tight metrics (every language except Japanese). The drawing paths pass
-    /// this to the font so Latin text takes its own advances.
+    /// this to the font so Latin text takes its own advances; the font itself
+    /// ignores it for the Western sheet, which the original draws whole.
     pub fn uses_tight_metrics(&self) -> bool {
         self.catalog.uses_tight_metrics()
     }
@@ -88,7 +113,13 @@ impl Text {
         if let Some(bytes) = self.catalog.lookup(&shared) {
             return Some(bytes);
         }
-        if let Some(bytes) = room.message(id) {
+        // The RDT's own text is encoded in the pack's own script; use it only
+        // when the session draws that script, or its bytes would render as
+        // the wrong characters. A language that lacks the string then reads
+        // as its registry id, like a key no language carries at all.
+        if self.script == self.pack_script
+            && let Some(bytes) = room.message(id)
+        {
             return Some(bytes);
         }
         self.catalog
@@ -134,6 +165,33 @@ impl Text {
     }
 }
 
+/// The script a session for `requested` draws in.
+///
+/// The language decides: `ja` (in any region) keeps the Japanese sheet, every
+/// other tag prefers the Western one. When the pack does not carry that
+/// sheet, the default sheet's own script decides — the same sheet
+/// [`crate::font::session_entry`] loads — so the text and the font agree even
+/// for a pack converted from a single tree.
+pub fn script_for(pack: &Pack, requested: Option<&str>) -> Script {
+    let script = if language::is_japanese(&language::resolve_tag(requested)) {
+        Script::Japanese
+    } else {
+        Script::Latin
+    };
+    sheet_script(pack, font::session_entry(pack, script)).unwrap_or_default()
+}
+
+/// The script a sheet entry's width selects, read from the TIM header alone.
+fn sheet_script(pack: &Pack, entry: &str) -> Option<Script> {
+    let bytes = pack.read(entry).ok()?;
+    let width = tim::image_width(&bytes).ok()?;
+    Some(if width >= font::JPN_SHEET_WIDTH {
+        Script::Japanese
+    } else {
+        Script::Latin
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +203,110 @@ mod tests {
             writer.add(path, source.as_bytes().to_vec()).unwrap();
         }
         Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+    }
+
+    /// A minimal, decodable 4bpp TIM whose image block declares `width_units`
+    /// 16-bit units (four pixels each): 192 units is the 768-wide Japanese
+    /// sheet, 64 units the 256-wide Western one.
+    fn font_tim(width_units: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(0x10u32.to_le_bytes()); // magic
+        out.extend(0x08u32.to_le_bytes()); // 4bpp + CLUT
+        let clut_len = 12 + 16 * 2;
+        out.extend((clut_len as u32).to_le_bytes());
+        out.extend([0u8; 4]); // CLUT x, y
+        out.extend(16u16.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend([0u8; 16 * 2]); // palette
+        let width = width_units as usize * 4;
+        out.extend(((12 + width / 2) as u32).to_le_bytes());
+        out.extend([0u8; 4]); // image x, y
+        out.extend(width_units.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(vec![0u8; width / 2]); // pixels
+        out
+    }
+
+    fn pack_with_bytes(files: &[(&str, &[u8])]) -> Pack {
+        let mut writer = PackWriter::new();
+        for (path, bytes) in files {
+            writer.add(path, bytes.to_vec()).unwrap();
+        }
+        Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn the_script_follows_the_language_and_the_packs_sheets() {
+        let jpn = font_tim(192);
+        let latin = font_tim(64);
+
+        // A pack converted from the Japanese tree keeps its sheet for every
+        // language: non-Japanese tags fall back to it (and its tight metrics).
+        let pack = pack_with_bytes(&[("font/font.tim", &jpn)]);
+        assert_eq!(Text::load(&pack, Some("en-US")).script(), Script::Japanese);
+        assert_eq!(Text::load(&pack, Some("ja-JP")).script(), Script::Japanese);
+
+        // With the Western sheet packed as the override, every non-Japanese
+        // tag draws with it while `ja` keeps the Japanese one.
+        let pack = pack_with_bytes(&[("font/font.tim", &jpn), ("font/latin.tim", &latin)]);
+        assert_eq!(Text::load(&pack, Some("en-US")).script(), Script::Latin);
+        assert_eq!(Text::load(&pack, Some("fr-FR")).script(), Script::Latin);
+        assert_eq!(Text::load(&pack, Some("ja-JP")).script(), Script::Japanese);
+        assert_eq!(Text::load(&pack, Some("ja")).script(), Script::Japanese);
+
+        // A pack converted from a Western tree has the Western sheet as its
+        // default; a Japanese tag then falls back to it too.
+        let pack = pack_with_bytes(&[("font/font.tim", &latin)]);
+        assert_eq!(Text::load(&pack, Some("en-US")).script(), Script::Latin);
+        assert_eq!(Text::load(&pack, Some("ja-JP")).script(), Script::Latin);
+
+        // Both sheets as script-specific entries with a Japanese default.
+        let pack = pack_with_bytes(&[
+            ("font/font.tim", &jpn),
+            ("font/jpn.tim", &jpn),
+            ("font/latin.tim", &latin),
+        ]);
+        assert_eq!(Text::load(&pack, Some("en-US")).script(), Script::Latin);
+        assert_eq!(Text::load(&pack, Some("ja-JP")).script(), Script::Japanese);
+    }
+
+    #[test]
+    fn the_rdt_fallback_needs_the_packs_own_script() {
+        // A Japanese pack with the Western sheet packed for English: the RDT
+        // text is Japanese bytes, so an untranslated message must not be
+        // drawn with the Western font. It reads as its registry id instead.
+        let jpn = font_tim(192);
+        let latin = font_tim(64);
+        let pack = pack_with_bytes(&[
+            ("font/font.tim", &jpn),
+            ("font/latin.tim", &latin),
+            ("language/en-US.txt", b"ROOM_FFF_TEXT_00 = \"A\"\n"),
+            // A third language's file carries the key's name, so the
+            // registry-id fallback has something to draw; neither selected
+            // chain carries the entry itself.
+            ("language/fr-FR.txt", b"ROOM_FFF_TEXT_01 = \"A\"\n"),
+        ]);
+        let text = Text::load(&pack, Some("en-US"));
+        assert_eq!(text.script(), Script::Latin);
+        let room = RoomState {
+            stage: 0xF,
+            room: 0xFF,
+            player_flag: 1,
+            // Offset table with no id 0 and `0xCC` at id 1 (offset 4).
+            messages: Some(vec![0x00, 0x00, 0x04, 0x00, 0xCC, 0x01, 0x00]),
+            ..RoomState::default()
+        };
+        // The translated key is encoded in the session's script.
+        assert_eq!(text.message(&room, 0), Some([0x1D, 0x01, 0x00].as_slice()));
+        // The untranslated one falls back to its key name, not to the RDT.
+        let mut key = Vec::new();
+        crate::charset::encode("ROOM_FFF_TEXT_01", Script::Latin, &mut key);
+        assert_eq!(text.message(&room, 1), Some(key.as_slice()));
+
+        // The same pack selected as Japanese draws the RDT's own bytes.
+        let text = Text::load(&pack, Some("ja-JP"));
+        assert_eq!(text.script(), Script::Japanese);
+        assert_eq!(text.message(&room, 1), Some([0xCC, 0x01, 0x00].as_slice()));
     }
 
     #[test]

@@ -47,7 +47,7 @@ fn menu_over_room1001_is_deterministic_and_draws_the_ship_art() {
     };
     let (id, mut game) = jill_game(&pack);
     let background = bmp::decode(&pack.read(&id.cut_entry(0)).unwrap()).unwrap();
-    let assets = MenuAssets::load(&pack).expect("the pack has the slice-5 UI assets");
+    let assets = MenuAssets::load(&pack, None).expect("the pack has the slice-5 UI assets");
     let text = Text::load(&pack, Some("en-US"));
 
     game.entities[0].health = 20;

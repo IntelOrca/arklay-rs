@@ -32,7 +32,8 @@ pub fn manifest(data: &[u8]) {
 pub fn language(data: &[u8]) {
     if let Ok(file) = arklay::language::Language::parse(&String::from_utf8_lossy(data)) {
         for (_, entry) in file.iter() {
-            let _ = entry.encode();
+            let _ = entry.encode(arklay::charset::Script::Japanese);
+            let _ = entry.encode(arklay::charset::Script::Latin);
         }
     }
 }

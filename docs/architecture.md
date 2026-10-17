@@ -76,7 +76,7 @@ responsibility.
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
 | `font` | Presentation | Glyph decoding, per-glyph metrics measured from the sheet's ink, and tinted drawing; draws the synthetic missing-glyph box |
-| `charset` | Presentation | The font's byte <-> character map: greedy cell encoding, substitutes and the missing marker |
+| `charset` | Presentation | The sheets' byte <-> character maps (Japanese and Western): greedy cell encoding, substitutes and the missing marker |
 | `language` | Presentation | `language/<tag>.txt` grammar, the layered catalog, the fallback chain and OS locale detection |
 | `text` | Presentation | The runtime string facade: messages, item names/descriptions, save strings, room labels and `UI_*` |
 | `mask` | Presentation | Room mask (foreground overlay) sprites and depth ordering |

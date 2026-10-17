@@ -113,11 +113,14 @@ impl Entry {
 
     /// Number of literal characters in this entry the font cannot spell
     /// (each encodes as [`charset::MISSING`]).
-    pub fn missing_glyphs(&self) -> usize {
+    pub fn missing_glyphs(&self, script: charset::Script) -> usize {
         self.pieces
             .iter()
             .map(|piece| match piece {
-                Piece::Text(text) => text.chars().filter(|ch| !charset::spellable(*ch)).count(),
+                Piece::Text(text) => text
+                    .chars()
+                    .filter(|ch| !charset::spellable(*ch, script))
+                    .count(),
                 _ => 0,
             })
             .sum()
@@ -126,12 +129,12 @@ impl Entry {
     /// Encode the entry into the font byte stream the engine renders.
     ///
     /// Characters the font cannot spell become [`charset::MISSING`].
-    pub fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self, script: charset::Script) -> Vec<u8> {
         let mut out = Vec::new();
         let mut dismiss = None;
         for piece in &self.pieces {
             match piece {
-                Piece::Text(text) => charset::encode(text, &mut out),
+                Piece::Text(text) => charset::encode(text, script, &mut out),
                 Piece::Newline => out.push(0x02),
                 Piece::Tag(Tag::Clear(value)) => out.extend([0x03, *value]),
                 Piece::Tag(Tag::Scroll(value)) => out.extend([0x04, *value]),
@@ -256,7 +259,11 @@ impl Catalog {
     /// Read every `language/<tag>.txt` from the pack (mod layers merged per
     /// key, later layers winning) over the embedded sources and resolve
     /// `requested`: the `--language` tag, else the OS locale, else `en-US`.
-    pub fn load(pack: &Pack, requested: Option<&str>) -> Self {
+    ///
+    /// Every entry is encoded in `script`, the byte space the session's font
+    /// sheet uses ([`crate::text::Text`] resolves it from the requested
+    /// language and the pack's fonts).
+    pub fn load(pack: &Pack, requested: Option<&str>, script: charset::Script) -> Self {
         let mut sources: Vec<(String, String)> = Vec::new();
         for (entry, source) in LANGUAGE_FILES {
             sources.push((entry.to_string(), source.to_string()));
@@ -278,6 +285,7 @@ impl Catalog {
                 .iter()
                 .map(|(entry, source)| (entry.as_str(), source.as_str())),
             requested,
+            script,
         )
     }
 
@@ -290,7 +298,7 @@ impl Catalog {
     /// tight metrics: every tag except Japanese (`ja`/`ja-*`). Japanese keeps
     /// the full 14px cells, matching the original exactly.
     pub fn uses_tight_metrics(&self) -> bool {
-        !language_part(&self.selected).eq_ignore_ascii_case("ja")
+        !is_japanese(&self.selected)
     }
 
     /// Every tag the catalog carries, sorted.
@@ -322,6 +330,7 @@ impl Catalog {
 fn assemble<'a>(
     sources: impl Iterator<Item = (&'a str, &'a str)>,
     requested: Option<&str>,
+    script: charset::Script,
 ) -> Catalog {
     let mut files: Vec<TagEntries> = Vec::new();
     let mut index_of: HashMap<String, usize> = HashMap::new();
@@ -349,23 +358,37 @@ fn assemble<'a>(
         });
         let entries = &mut files[index].entries;
         for (key, value) in language.iter() {
-            entries.insert(key.to_string(), value.encode());
+            entries.insert(key.to_string(), value.encode(script));
         }
     }
     files.sort_by(|a, b| a.tag.cmp(&b.tag));
-    let selected = requested
-        .map(normalize_tag)
-        .filter(|tag| !tag.is_empty())
-        .or_else(detect_os_locale)
-        .unwrap_or_else(|| FALLBACK_TAG.to_string());
+    let selected = resolve_tag(requested);
     let chain = resolve(&files, &selected);
-    let fallbacks = key_fallbacks(&files);
+    let fallbacks = key_fallbacks(&files, script);
     Catalog {
         files,
         chain,
         fallbacks,
         selected,
     }
+}
+
+/// The tag a request resolves to: the request, else the OS locale, else
+/// [`FALLBACK_TAG`].
+///
+/// The catalog's fallback chain starts here, and a session's font script
+/// follows it ([`crate::text::script_for`]), so both must use this one rule.
+pub fn resolve_tag(requested: Option<&str>) -> String {
+    requested
+        .map(normalize_tag)
+        .filter(|tag| !tag.is_empty())
+        .or_else(detect_os_locale)
+        .unwrap_or_else(|| FALLBACK_TAG.to_string())
+}
+
+/// Whether a resolved tag selects the Japanese language (`ja`, `ja-JP`).
+pub fn is_japanese(tag: &str) -> bool {
+    language_part(tag).eq_ignore_ascii_case("ja")
 }
 
 /// The tag of a `language/<tag>.txt` entry, lower-cased.
@@ -453,13 +476,13 @@ fn resolve(files: &[TagEntries], selected: &str) -> Vec<usize> {
 }
 
 /// Encode every known key's own name for the registry-id fallback.
-fn key_fallbacks(files: &[TagEntries]) -> HashMap<String, Vec<u8>> {
+fn key_fallbacks(files: &[TagEntries], script: charset::Script) -> HashMap<String, Vec<u8>> {
     let mut fallbacks: HashMap<String, Vec<u8>> = HashMap::new();
     for file in files {
         for key in file.entries.keys() {
             fallbacks.entry(key.clone()).or_insert_with(|| {
                 let mut bytes = Vec::new();
-                charset::encode(key, &mut bytes);
+                charset::encode(key, script, &mut bytes);
                 bytes
             });
         }
@@ -702,13 +725,13 @@ fn hex(high: Option<char>, low: Option<char>, line: usize) -> Result<u8> {
 mod tests {
     use super::*;
 
-    /// Parse one entry and encode it.
+    /// Parse one entry and encode it with the Japanese sheet's map.
     fn encoded(source: &str, key: &str) -> Vec<u8> {
         Language::parse(source)
             .unwrap()
             .get(key)
             .unwrap_or_else(|| panic!("missing {key}"))
-            .encode()
+            .encode(charset::Script::Japanese)
     }
 
     #[test]
@@ -760,15 +783,33 @@ ITEM_05_DESCRIPTION = \"A\"
         let source = "\u{FEFF}# a note\r\n\r\nUI_X = \"A\" # trailing is part of the value\r\n";
         let language = Language::parse(source).unwrap();
         assert_eq!(language.len(), 1);
-        assert_eq!(language.get("UI_X").unwrap().encode(), [0x1D, 0x01]);
+        assert_eq!(
+            language
+                .get("UI_X")
+                .unwrap()
+                .encode(charset::Script::Japanese),
+            [0x1D, 0x01]
+        );
     }
 
     #[test]
     fn characters_without_cells_become_boxes() {
         let language = Language::parse("UI_X = \"é\"\nUI_Y = \"A\"\n").unwrap();
         assert_eq!(language.len(), 2);
-        assert_eq!(language.get("UI_X").unwrap().encode(), [0xFA, 0xFF, 0x01]);
-        assert_eq!(language.get("UI_Y").unwrap().encode(), [0x1D, 0x01]);
+        assert_eq!(
+            language
+                .get("UI_X")
+                .unwrap()
+                .encode(charset::Script::Japanese),
+            [0xFA, 0xFF, 0x01]
+        );
+        assert_eq!(
+            language
+                .get("UI_Y")
+                .unwrap()
+                .encode(charset::Script::Japanese),
+            [0x1D, 0x01]
+        );
     }
 
     #[test]
@@ -827,7 +868,7 @@ ITEM_05_DESCRIPTION = \"A\"
         assert!(language.len() > 1_600, "{} entries", language.len());
         for (key, entry) in language.iter() {
             assert_eq!(
-                entry.missing_glyphs(),
+                entry.missing_glyphs(charset::Script::Japanese),
                 0,
                 "{key} wants a glyph the Japanese font lacks"
             );
@@ -860,7 +901,7 @@ ITEM_05_DESCRIPTION = \"A\"
                     Ok(language) => {
                         parsed += 1;
                         let (key, entry) = language.iter().next().unwrap();
-                        let cells = entry.missing_glyphs();
+                        let cells = entry.missing_glyphs(charset::Script::Japanese);
                         if cells > 0 {
                             boxed_entries += 1;
                             boxed_cells += cells;
@@ -884,13 +925,17 @@ ITEM_05_DESCRIPTION = \"A\"
     }
 
     fn catalog(sources: &[(&str, &str)], requested: Option<&str>) -> Catalog {
-        assemble(sources.iter().copied(), requested)
+        assemble(
+            sources.iter().copied(),
+            requested,
+            charset::Script::Japanese,
+        )
     }
 
     /// Encode `text` the way the catalog stores an entry.
     fn encoded_text(text: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
-        charset::encode(text, &mut bytes);
+        charset::encode(text, charset::Script::Japanese, &mut bytes);
         bytes
     }
 

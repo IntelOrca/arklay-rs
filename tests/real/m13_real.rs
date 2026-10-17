@@ -905,7 +905,7 @@ fn conversion_packs_the_referenced_voice_lines_in_the_single_pack() {
     let out = std::env::temp_dir().join(format!("arklay-m13-{}.akpak", std::process::id()));
     let _ = fs::remove_file(&out);
 
-    convert_game_with_options(&root, &out, None, 0, false).unwrap();
+    convert_game_with_options(&root, &out, 0, false).unwrap();
 
     let pack = Pack::open(&out).unwrap();
     let entries: Vec<String> = voice_table::entries()

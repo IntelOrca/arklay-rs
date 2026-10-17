@@ -192,11 +192,6 @@ enum Command {
         #[arg(long, default_value = "re1.akpak")]
         out: PathBuf,
 
-        /// Game executable holding the map and combat tables (default: a
-        /// `Bio.exe` discovered under the root)
-        #[arg(long, value_name = "EXE")]
-        exe: Option<PathBuf>,
-
         /// Number of worker threads (default: one per available CPU)
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..))]
         jobs: Option<u16>,
@@ -546,13 +541,11 @@ fn main() -> Result<()> {
         Some(Command::ConvertGame {
             root,
             out,
-            exe,
             jobs,
             verbose,
         }) => arklay::convert::convert_game_with_options(
             &root,
             &out,
-            exe.as_deref(),
             jobs.map_or(0, usize::from),
             verbose,
         ),

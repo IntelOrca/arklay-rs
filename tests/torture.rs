@@ -62,7 +62,8 @@ fn run_manifest(data: &[u8]) {
 fn run_language(data: &[u8]) {
     if let Ok(file) = Language::parse(&String::from_utf8_lossy(data)) {
         for (_, entry) in file.iter() {
-            let _ = entry.encode();
+            let _ = entry.encode(arklay::charset::Script::Japanese);
+            let _ = entry.encode(arklay::charset::Script::Latin);
         }
     }
 }

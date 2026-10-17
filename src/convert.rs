@@ -38,7 +38,11 @@ use crate::{bmp, door, lzw, rdt, tim};
 
 /// How many directory levels below the root are searched for the stage and
 /// `sound` directories.
-const MAX_DEPTH: usize = 2;
+///
+/// Two levels cover the single-tree layouts (`<root>/DATA`, `<root>/JPN/DATA`);
+/// three cover the Steam release's install root, whose language trees each
+/// hold a complete game (`<root>/english/USA/Data`, `<root>/japanese/JPN/DATA`).
+const MAX_DEPTH: usize = 3;
 
 /// Expected camera background width.
 const CUT_WIDTH: u32 = 320;
@@ -258,20 +262,16 @@ fn format_size(bytes: u64) -> String {
 
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 ///
-/// The text tables are extracted from a `Bio.exe` discovered under `root`; use
-/// [`convert_game_with_exe`] to point at an executable elsewhere.
+/// The map and combat tables are extracted from a `Bio.exe` discovered under
+/// `root`. A root that carries none — the Steam release's trees ship an
+/// Enigma-packed executable under a different name — packs without them and
+/// the engine uses its built-in copies, which are the same values.
 pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
-    convert_game_with_exe(root, out, None)
+    convert_game_with_options(root, out, 0, false)
 }
 
-/// Convert the game installation under `root` into the `.akpak` pack `out`,
-/// taking the text tables from `exe` instead of the discovered `Bio.exe`.
-pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Result<()> {
-    convert_game_with_options(root, out, exe, 0, false)
-}
-
-/// Like [`convert_game_with_exe`], but with an explicit worker count and
-/// whether the verbose per-file report is printed.
+/// Like [`convert_game`], but with an explicit worker count and whether the
+/// verbose per-file report is printed.
 ///
 /// A `jobs` of `0` selects one worker per available CPU, and the output pack
 /// is byte-identical whatever the worker count. Every asset category — rooms,
@@ -279,10 +279,17 @@ pub fn convert_game_with_exe(root: &Path, out: &Path, exe: Option<&Path>) -> Res
 /// reported on stderr; with `verbose` the run also prints the stage and
 /// category totals and one line per packed file with its plain and stored
 /// size on stdout.
+///
+/// The root may be a single game tree (`<root>/DATA`, `<root>/JPN/DATA`), a
+/// tree's own directory, or the Steam release's install root whose language
+/// trees (`english/USA`, `japanese/JPN`, ...) each hold a complete game. Every
+/// game-text sheet the root carries is packed — the tree the data comes from
+/// is the default and the other script's sheets ride along as `font/latin.tim`
+/// / `font/jpn.tim` — so the one pack renders every language with its own
+/// sheet.
 pub fn convert_game_with_options(
     root: &Path,
     out: &Path,
-    exe: Option<&Path>,
     jobs: usize,
     verbose: bool,
 ) -> Result<()> {
@@ -302,7 +309,8 @@ pub fn convert_game_with_options(
         roommask,
         effects,
         data,
-        font,
+        fonts,
+        language,
         voice,
         voice_unreferenced,
         voice_dir_found,
@@ -310,22 +318,15 @@ pub fn convert_game_with_options(
         movie_dir_found,
         mut warnings,
     } = build_plan_with_progress(root, jobs, &mut progress)?;
-    let exe = match exe {
-        Some(path) if path.is_file() => Some(path.to_path_buf()),
-        Some(path) => {
-            warnings.push(format!(
-                "executable {} does not exist; text tables will be missing",
-                path.display()
-            ));
+    let exe = match discover_exe(root)? {
+        Some(path) => Some(path),
+        None => {
+            warnings.push(
+                "no Bio.exe found; the map and combat tables will use the engine's built-ins"
+                    .to_string(),
+            );
             None
         }
-        None => match discover_exe(root)? {
-            Some(path) => Some(path),
-            None => {
-                warnings.push("no Bio.exe found; text tables will be missing".to_string());
-                None
-            }
-        },
     };
     if !voice_dir_found {
         warnings.push(format!(
@@ -465,7 +466,7 @@ pub fn convert_game_with_options(
     let (enemylua_count, enemylua_bytes) = copy_enemy_scripts(&mut writer, &mut progress)?;
     let (effect_count, effect_bytes) =
         copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
-    let (font_count, font_bytes) = copy_font(font.as_deref(), &mut writer, &mut progress)?;
+    let (font_count, font_bytes) = copy_font(&fonts, &mut writer, &mut progress)?;
     let (ui_count, ui_bytes) = copy_ui_art(&data, &mut writer, &mut progress, jobs)?;
     let (item_count, item_bytes) = copy_item_art(&data, &mut writer, &mut progress, jobs)?;
     let (data_count, data_bytes) = copy_bio_card(&data, &mut writer, &mut progress)?;
@@ -498,7 +499,7 @@ pub fn convert_game_with_options(
         copy_map_tables(exe.as_deref(), &mut writer, &mut progress, &mut warnings)?;
     let (combat_count, combat_bytes) =
         copy_combat_tables(exe.as_deref(), &mut writer, &mut progress, &mut warnings)?;
-    let (manifest_count, manifest_bytes) = copy_manifest(&mut writer)?;
+    let (manifest_count, manifest_bytes) = copy_manifest(&mut writer, &language)?;
 
     // Voice and film land in the same pack as every other category, so a
     // converted game is a single self-contained `.akpak`. Both phases are
@@ -622,7 +623,7 @@ pub fn convert_game_with_options(
         writeln!(
             report,
             "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
-            base_manifest().id
+            base_manifest("ja-JP").id
         )?;
         writeln!(report, "voice: {voice_count} entries, {voice_bytes} bytes")?;
         if !voice_unreferenced.is_empty() {
@@ -2174,7 +2175,7 @@ fn copy_combat_tables(
 /// The id of the pack `convert-game` writes.
 pub const BASE_PACK_ID: &str = "re1";
 /// The base pack's self-description.
-fn base_manifest() -> manifest::Manifest {
+fn base_manifest(language: &str) -> manifest::Manifest {
     manifest::Manifest {
         format: manifest::FORMAT,
         id: BASE_PACK_ID.to_string(),
@@ -2185,17 +2186,17 @@ fn base_manifest() -> manifest::Manifest {
         load_order: 0,
         rdt_version: manifest::DEFAULT_RDT_VERSION.to_string(),
         scd_version: manifest::DEFAULT_SCD_VERSION.to_string(),
-        // Converted from the Japanese install, so the pack's own RDT room
-        // text is Japanese.
-        language: Some("ja-JP".to_string()),
+        // The converted tree's own room text language (Japanese for the
+        // Japanese releases, the Steam tree's language for the Western ones).
+        language: Some(language.to_string()),
         engine: None,
         lua: Vec::new(),
     }
 }
 
 /// Add the base pack's rendered `manifest.toml`: its only self-description.
-fn copy_manifest(writer: &mut PackWriter) -> Result<(usize, usize)> {
-    let text = base_manifest().render().into_bytes();
+fn copy_manifest(writer: &mut PackWriter, language: &str) -> Result<(usize, usize)> {
+    let text = base_manifest(language).render().into_bytes();
     let bytes = text.len();
     writer
         .add(manifest::ENTRY, text)
@@ -2203,25 +2204,41 @@ fn copy_manifest(writer: &mut PackWriter) -> Result<(usize, usize)> {
     Ok((1, bytes))
 }
 
-/// Add `DATA/FONT.TIM` raw as `font/font.tim`; the JPN sheet is 4bpp and
-/// decoded by the engine, so no conversion is needed.
+/// Add the game-text sheets raw: the install's own as `font/font.tim` and the
+/// other script's, when the install carries one, as `font/latin.tim` /
+/// `font/jpn.tim`. Both are 4bpp TIMs the engine decodes, so no conversion is
+/// needed.
 fn copy_font(
-    font: Option<&Path>,
+    fonts: &Fonts,
     writer: &mut PackWriter,
     progress: &mut Progress,
 ) -> Result<(usize, usize)> {
-    let Some(font) = font else {
+    let sheets = [
+        ("font/font.tim", fonts.primary.as_deref()),
+        ("font/latin.tim", fonts.latin.as_deref()),
+        ("font/jpn.tim", fonts.japanese.as_deref()),
+    ];
+    let packed = sheets.iter().filter(|(_, path)| path.is_some()).count();
+    if packed == 0 {
         return Ok((0, 0));
-    };
-    let data = fs::read(font).with_context(|| format!("failed to read {}", font.display()))?;
-    let bytes = data.len();
-    writer
-        .add("font/font.tim", data)
-        .context("failed to add font/font.tim")?;
-    progress.begin("font", 1);
-    progress.advance("font/font.tim");
+    }
+    let mut count = 0;
+    let mut bytes = 0;
+    progress.begin("font", packed as u64);
+    for (entry, path) in sheets {
+        let Some(path) = path else {
+            continue;
+        };
+        let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        bytes += data.len();
+        count += 1;
+        writer
+            .add(entry, data)
+            .with_context(|| format!("failed to add {entry}"))?;
+        progress.advance(entry);
+    }
     progress.end_phase();
-    Ok((1, bytes))
+    Ok((count, bytes))
 }
 
 /// Stage, sound, enemy-model, player, room-mask, door-art, data, item-view and
@@ -2239,6 +2256,20 @@ struct Layout {
     effspr: Option<PathBuf>,
     voice: Option<PathBuf>,
     movie: Option<PathBuf>,
+    /// Every game-text sheet found under the root, in walk order: the first
+    /// `font.tim` (the Japanese sheet) and the first `fontus.tim` (the
+    /// Western one) of any install tree, so a Steam install converted from
+    /// one tree can carry the other tree's sheet too.
+    fonts: Vec<FontSheet>,
+}
+
+/// One `font.tim`/`fontus.tim` discovered under the conversion root.
+#[derive(Debug, Clone)]
+struct FontSheet {
+    /// The sheet's file path.
+    path: PathBuf,
+    /// The script its width selects.
+    script: crate::charset::Script,
 }
 
 /// Breadth-first, case-insensitive discovery of `STAGE1`..`STAGE7`, `sound`,
@@ -2257,6 +2288,7 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut effspr = None;
     let mut voice = None;
     let mut movie = None;
+    let mut fonts: Vec<FontSheet> = Vec::new();
 
     while let Some((dir, depth)) = queue.pop_front() {
         if let Some(name) = dir.file_name().and_then(|name| name.to_str()) {
@@ -2282,6 +2314,9 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 voice = Some(dir.clone());
             } else if movie.is_none() && name.eq_ignore_ascii_case("movie") {
                 movie = Some(dir.clone());
+            }
+            if name.eq_ignore_ascii_case("data") {
+                collect_fonts(&dir, &mut fonts);
             }
         }
         if depth >= MAX_DEPTH {
@@ -2319,7 +2354,143 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         effspr,
         voice,
         movie,
+        fonts,
     })
+}
+
+/// The game-text sheets a conversion packs.
+///
+/// The install's own sheet is the pack's default (`font/font.tim`); a sheet
+/// of the other script — found under the conversion root or named on the
+/// command line — is packed as `font/<script>.tim`, so one pack can render
+/// both the Japanese and the Western text.
+#[derive(Debug, Default, Clone)]
+struct Fonts {
+    /// The install's own sheet, packed as `font/font.tim`.
+    primary: Option<PathBuf>,
+    /// The Western sheet (`fontus.tim`), packed as `font/latin.tim`.
+    latin: Option<PathBuf>,
+    /// The Japanese sheet (`FONT.TIM`), packed as `font/jpn.tim`.
+    japanese: Option<PathBuf>,
+}
+
+/// Resolve the sheets to pack: the chosen data directory's own font is the
+/// default, every other sheet the root carries becomes its script's override.
+///
+/// A sheet the root does not carry is a warning, not an error: a Japanese
+/// install alone renders Latin languages with the Japanese sheet's tight
+/// metrics, and a Steam tree alone renders Japanese with the Western sheet.
+fn resolve_fonts(data: Option<&Path>, found: &[FontSheet]) -> (Fonts, Vec<String>) {
+    let primary = data
+        .and_then(|dir| found.iter().find(|sheet| sheet.path.parent() == Some(dir)))
+        .or_else(|| found.first())
+        .map(|sheet| sheet.path.clone());
+    let mut fonts = Fonts {
+        primary: primary.clone(),
+        latin: None,
+        japanese: None,
+    };
+    for sheet in found {
+        if Some(&sheet.path) == primary.as_ref() {
+            continue;
+        }
+        match sheet.script {
+            crate::charset::Script::Latin if fonts.latin.is_none() => {
+                fonts.latin = Some(sheet.path.clone());
+            }
+            crate::charset::Script::Japanese if fonts.japanese.is_none() => {
+                fonts.japanese = Some(sheet.path.clone());
+            }
+            _ => {}
+        }
+    }
+    // Only diagnose a missing sheet when the install actually has a DATA
+    // directory; a missing DATA root is not reported so partial trees stay
+    // warning-free. The default sheet counts as the script it carries, so a
+    // Western default with no overrides is complete for Latin.
+    let mut warnings = Vec::new();
+    match (data, &fonts.primary) {
+        (Some(dir), None) => warnings.push(format!(
+            "missing DATA/FONT.TIM (or fontus.tim) in {}",
+            dir.display()
+        )),
+        (_, Some(primary)) => {
+            let primary = sheet_script_of(primary);
+            if primary != crate::charset::Script::Latin && fonts.latin.is_none() {
+                warnings.push(
+                    "no Western font sheet (Data/fontus.tim) found; Latin languages draw with \
+                     the Japanese sheet's tight metrics"
+                        .to_string(),
+                );
+            }
+            if primary != crate::charset::Script::Japanese && fonts.japanese.is_none() {
+                warnings.push(
+                    "no Japanese font sheet (DATA/FONT.TIM) found; Japanese text draws with \
+                     the Western sheet"
+                        .to_string(),
+                );
+            }
+        }
+        _ => {}
+    }
+    (fonts, warnings)
+}
+
+/// The pack's own room-text language: the tree the default sheet came from,
+/// as the releases name it (`.../english/USA/Data/fontus.tim` is `en-US`).
+fn install_language(fonts: &Fonts) -> String {
+    let Some(primary) = fonts.primary.as_deref() else {
+        return "ja-JP".to_string();
+    };
+    if sheet_script_of(primary) == crate::charset::Script::Japanese {
+        return "ja-JP".to_string();
+    }
+    for part in primary.components().rev().skip(1).take(4) {
+        let name = part.as_os_str().to_string_lossy();
+        let tag = match name.to_ascii_lowercase().as_str() {
+            "english" | "usa" => "en-US",
+            "french" | "fra" => "fr-FR",
+            "german" | "ger" => "de-DE",
+            "italian" | "ita" => "it-IT",
+            "spanish" | "spa" | "esp" => "es-ES",
+            _ => continue,
+        };
+        return tag.to_string();
+    }
+    "en-US".to_string()
+}
+
+/// Collect the first `font.tim` (Japanese) and `fontus.tim` (Western) in
+/// `dir`, naming each sheet's script by its width.
+fn collect_fonts(dir: &Path, fonts: &mut Vec<FontSheet>) {
+    let Ok(index) = index_dir(dir) else {
+        return;
+    };
+    for name in ["font.tim", "fontus.tim"] {
+        let Some(path) = index.get(name) else {
+            continue;
+        };
+        let script = sheet_script_of(path);
+        if fonts.iter().any(|sheet| sheet.script == script) {
+            continue;
+        }
+        fonts.push(FontSheet {
+            path: path.clone(),
+            script,
+        });
+    }
+}
+
+/// The script a sheet file's width selects, or the Japanese sheet's when the
+/// file cannot be read as a 4bpp TIM.
+fn sheet_script_of(path: &Path) -> crate::charset::Script {
+    let width = fs::read(path)
+        .ok()
+        .and_then(|bytes| crate::tim::image_width(&bytes).ok());
+    match width {
+        Some(width) if width < crate::font::JPN_SHEET_WIDTH => crate::charset::Script::Latin,
+        _ => crate::charset::Script::Japanese,
+    }
 }
 
 /// Find the game executable `Bio.exe` (case-insensitive) up to `MAX_DEPTH`
@@ -2473,8 +2644,13 @@ struct Plan {
     effects: Vec<EffectSheet>,
     /// Resolved `DATA` UI, item and save-prefix assets.
     data: DataPlan,
-    /// `DATA/FONT.TIM` to pack raw as `font/font.tim`.
-    font: Option<PathBuf>,
+    /// The game-text sheets to pack: the install's own `font/font.tim` and,
+    /// when the root carries them, the other script's sheet as
+    /// `font/<script>.tim`.
+    fonts: Fonts,
+    /// The pack's own room-text language, from the tree the fonts and data
+    /// came from (the manifest's `language`).
+    language: String,
     /// The referenced voice WAVs (the union of the name rows).
     voice: Vec<VoiceAsset>,
     /// Shipped voice files no row references; listed in the summary.
@@ -2505,7 +2681,7 @@ fn conversion_phase_count(
     sound: &Option<PathBuf>,
     item_m1: &Option<PathBuf>,
     item_m2: &Option<PathBuf>,
-    font: &Option<PathBuf>,
+    fonts: &Fonts,
     data: &DataPlan,
 ) -> u64 {
     // scan, room, roomcut, roommask, six model phases (player, weapon, npc,
@@ -2514,7 +2690,7 @@ fn conversion_phase_count(
     let mut phases: u64 = 19;
     phases += 2 * u64::from(sound.is_some()); // bgm, se
     phases += u64::from(item_m1.is_some()); // door
-    phases += u64::from(font.is_some()); // font
+    phases += u64::from(fonts.primary.is_some()); // font
     phases += u64::from(data.palette.is_some() && !data.items.is_empty()); // item
     phases += u64::from(data.bio_card.is_some()); // data
     phases += u64::from(data.demos.iter().any(Option::is_some)); // demo
@@ -2541,20 +2717,13 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         effspr,
         voice: voice_dir,
         movie: movie_dir,
+        fonts: found_fonts,
     } = layout;
-    // The font is optional and only diagnosable when the install actually has
-    // a DATA directory; a missing DATA root is not reported so partial trees
-    // stay warning-free.
-    let (font, font_warning) = match data.as_deref() {
-        Some(dir) => match index_dir(dir)?.get("font.tim") {
-            Some(path) => (Some(path.clone()), None),
-            None => (
-                None,
-                Some(format!("missing DATA/FONT.TIM in {}", dir.display())),
-            ),
-        },
-        None => (None, None),
-    };
+    // The game-text sheets: the chosen data directory's own font is the
+    // pack's default, and every other sheet the root carries (the Steam
+    // install's other language trees) rides along as its script's override.
+    let (fonts, font_warnings) = resolve_fonts(data.as_deref(), &found_fonts);
+    let language = install_language(&fonts);
     let data = resolve_data_assets(data.as_deref())?;
 
     // Enumerate every RDT first so reading and parsing them can be one
@@ -2583,7 +2752,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
     }
 
     progress.set_phases(conversion_phase_count(
-        &sound, &item_m1, &item_m2, &font, &data,
+        &sound, &item_m1, &item_m2, &fonts, &data,
     ));
     progress.begin("scan", rdt_files.len() as u64);
     let parsed = parallel_map(rdt_files.len(), jobs, progress, |index| {
@@ -2792,9 +2961,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
     warnings.extend(data.warnings.iter().cloned());
     warnings.extend(npc_warnings);
     warnings.extend(enemy_warnings);
-    if let Some(font_warning) = font_warning {
-        warnings.push(font_warning);
-    }
+    warnings.extend(font_warnings);
     Ok(Plan {
         rooms: rooms.into_values().collect(),
         sound,
@@ -2807,7 +2974,8 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         roommask,
         effects,
         data,
-        font,
+        fonts,
+        language,
         voice: voice_assets,
         voice_unreferenced,
         voice_dir_found: voice_dir.is_some(),
@@ -3122,6 +3290,27 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// A minimal, decodable 4bpp TIM whose image block declares `width_units`
+    /// 16-bit units (four pixels each): 192 is the 768-wide Japanese sheet,
+    /// 64 the 256-wide Western one.
+    fn font_tim_bytes(width_units: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend(0x10u32.to_le_bytes());
+        out.extend(0x08u32.to_le_bytes());
+        out.extend((12u32 + 16 * 2).to_le_bytes());
+        out.extend([0u8; 4]);
+        out.extend(16u16.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend([0u8; 16 * 2]);
+        let width = width_units as usize * 4;
+        out.extend(((12 + width / 2) as u32).to_le_bytes());
+        out.extend([0u8; 4]);
+        out.extend(width_units.to_le_bytes());
+        out.extend(1u16.to_le_bytes());
+        out.extend(vec![0u8; width / 2]);
+        out
     }
 
     fn make_stage_dirs(root: &Path) {
@@ -3927,7 +4116,7 @@ mod tests {
         fs::write(movie.join("capcom.AVI"), b"movie-capcom").unwrap();
 
         let out = root.path.join("out.akpak");
-        convert_game_with_options(&root.path, &out, None, 1, false).unwrap();
+        convert_game_with_options(&root.path, &out, 1, false).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("movie/oj.avi").unwrap().as_ref(), b"movie-oj");
         assert_eq!(
@@ -3967,7 +4156,7 @@ mod tests {
         fs::write(voice.join("ANNOUNCE.WAV"), b"unused").unwrap();
 
         let out = root.path.join("out.akpak");
-        convert_game_with_options(&root.path, &out, None, 1, false).unwrap();
+        convert_game_with_options(&root.path, &out, 1, false).unwrap();
         let main = crate::pack::Pack::open(&out).unwrap();
         assert_eq!(main.read("voice/01_00.wav").unwrap().as_ref(), b"voice-a");
         assert_eq!(main.read("voice/02_00.wav").unwrap().as_ref(), b"voice-bb");
@@ -4012,8 +4201,8 @@ mod tests {
 
         let serial = root.path.join("serial.akpak");
         let parallel = root.path.join("parallel.akpak");
-        convert_game_with_options(&root.path, &serial, None, 1, false).unwrap();
-        convert_game_with_options(&root.path, &parallel, None, 4, false).unwrap();
+        convert_game_with_options(&root.path, &serial, 1, false).unwrap();
+        convert_game_with_options(&root.path, &parallel, 4, false).unwrap();
         assert_eq!(fs::read(&serial).unwrap(), fs::read(&parallel).unwrap());
     }
 
@@ -5173,14 +5362,14 @@ mod tests {
 
     #[test]
     fn base_manifest_renders_and_parses_back() {
-        let manifest = base_manifest();
+        let manifest = base_manifest("ja-JP");
         assert_eq!(
             manifest::Manifest::parse(&manifest.render()).unwrap(),
             manifest
         );
 
         let mut writer = PackWriter::new();
-        let (count, bytes) = copy_manifest(&mut writer).unwrap();
+        let (count, bytes) = copy_manifest(&mut writer, "ja-JP").unwrap();
         assert_eq!(count, 1);
         assert_eq!(bytes, manifest.render().len());
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
@@ -5197,11 +5386,23 @@ mod tests {
         fs::write(data.join("FONT.TIM"), b"raw-font-sheet").unwrap();
 
         let plan = build_plan(&root.path).unwrap();
-        assert_eq!(plan.font.as_deref(), Some(data.join("FONT.TIM").as_path()));
+        assert_eq!(
+            plan.fonts.primary.as_deref(),
+            Some(data.join("FONT.TIM").as_path())
+        );
+        assert_eq!(plan.fonts.latin, None);
+        assert_eq!(plan.fonts.japanese, None);
+        assert_eq!(plan.language, "ja-JP");
+        // The install carries no Western sheet: a warning, not an error.
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("fontus.tim")),
+            "warnings: {:?}",
+            plan.warnings
+        );
 
         let mut writer = PackWriter::new();
         let mut progress = Progress::new("test", 1);
-        let (count, bytes) = copy_font(plan.font.as_deref(), &mut writer, &mut progress).unwrap();
+        let (count, bytes) = copy_font(&plan.fonts, &mut writer, &mut progress).unwrap();
 
         assert_eq!((count, bytes), (1, 14));
         let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
@@ -5209,5 +5410,78 @@ mod tests {
             pack.read("font/font.tim").unwrap().as_ref(),
             b"raw-font-sheet"
         );
+    }
+
+    #[test]
+    fn packs_the_other_scripts_sheet_beside_the_installs_own() {
+        // A data directory carrying both sheets: the Japanese one is the
+        // default (the install's own room text is Japanese) and the Western
+        // one rides along as its override.
+        let root = TempDir::new("font-both");
+        make_stage_dirs(&root.path);
+        let data = root.path.join("DATA");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("FONT.TIM"), font_tim_bytes(192)).unwrap();
+        fs::write(data.join("fontus.tim"), font_tim_bytes(64)).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(
+            plan.fonts.primary.as_deref(),
+            Some(data.join("FONT.TIM").as_path())
+        );
+        assert_eq!(
+            plan.fonts.latin.as_deref(),
+            Some(data.join("fontus.tim").as_path())
+        );
+        assert_eq!(
+            plan.fonts.japanese, None,
+            "the primary is the Japanese sheet"
+        );
+        assert_eq!(plan.language, "ja-JP");
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new("test", 1);
+        let (count, _bytes) = copy_font(&plan.fonts, &mut writer, &mut progress).unwrap();
+        assert_eq!(count, 2);
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert!(pack.contains("font/font.tim"));
+        assert!(pack.contains("font/latin.tim"));
+    }
+
+    #[test]
+    fn discovers_the_steam_install_root() {
+        // The Steam layout: language trees one level down, each a complete
+        // game. The walk picks the first tree (English) for the data and
+        // packs every sheet the root carries, so the one pack serves both
+        // scripts.
+        let root = TempDir::new("steam-root");
+        let english = root.path.join("english/USA");
+        make_stage_dirs(&english);
+        fs::create_dir_all(english.join("Data")).unwrap();
+        fs::write(english.join("Data/fontus.tim"), font_tim_bytes(64)).unwrap();
+        let japanese = root.path.join("japanese/JPN");
+        make_stage_dirs(&japanese);
+        fs::create_dir_all(japanese.join("DATA")).unwrap();
+        fs::write(japanese.join("DATA/FONT.TIM"), font_tim_bytes(192)).unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(
+            plan.fonts.primary.as_deref(),
+            Some(english.join("Data/fontus.tim").as_path())
+        );
+        assert_eq!(
+            plan.fonts.japanese.as_deref(),
+            Some(japanese.join("DATA/FONT.TIM").as_path())
+        );
+        assert_eq!(plan.fonts.latin, None, "the primary is the Western sheet");
+        assert_eq!(plan.language, "en-US");
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new("test", 1);
+        let (count, _bytes) = copy_font(&plan.fonts, &mut writer, &mut progress).unwrap();
+        assert_eq!(count, 2);
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert!(pack.contains("font/font.tim"));
+        assert!(pack.contains("font/jpn.tim"));
     }
 }
