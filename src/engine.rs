@@ -6606,6 +6606,9 @@ fn finish_transition(
     game.entities[0].action_behavior = 0;
     game.entities[0].action_state = 0;
     game.enter_room(session.target, &loaded.room);
+    // `enter_room` keeps the word a door-animation message masked; the door
+    // itself zeroed it, so apply the gameplay loop's post-door reset.
+    game.reset_message_flags_after_door();
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
     player_state.collision_mirror = [session.door.next_pos[0], session.door.next_pos[2]];
