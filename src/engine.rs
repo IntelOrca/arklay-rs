@@ -8703,52 +8703,7 @@ fn tick_room_timed(
             };
             player_script::update_banks(context.game, context.player, context.room, &banks);
         }
-    } else if !player_script::control_gate(context.game, context.player)
-        && let Some(assets) = context.player_assets
-    {
-        // A scripted state can hand the player back mid-settle: `action_state`
-        // already 1, the settle's pose words written on the entity. The
-        // reference's idle then skips its case-0 entry and the settle's first
-        // `Joint_move` snaps the body clip straight to the written frame with
-        // the written blend counter. Adopt the words before the pad-driven
-        // machine's entry check runs.
-        if std::mem::take(&mut context.player.scripted_hold) {
-            context
-                .player
-                .adopt_scripted_handback(&context.game.entities[0]);
-        }
-        let room_clips = context
-            .room
-            .room_anim
-            .as_ref()
-            .map(|anim| anim.clips.as_slice())
-            .unwrap_or(&[]);
-        // The active weapon's bank: the machine's loaded file while it runs,
-        // otherwise the equipped item's, so the frame the aim starts reads the
-        // right clips.
-        let weapon_file = context.player.weapon.weapon_file.or_else(|| {
-            context.game.equipped.and_then(|item| {
-                crate::weapons::weapon_emw_id(context.game.id.player_flag & 3, item)
-            })
-        });
-        let weapon = assets.weapon(weapon_file);
-        let no_weapon = crate::model::Emw {
-            skeleton: Default::default(),
-            keyframes: Vec::new(),
-            clips: Vec::new(),
-            mesh: Default::default(),
-        };
-        let weapon = weapon.unwrap_or(&no_weapon);
-        let clips = crate::weapons::WeaponClips {
-            emd: &assets.emd.clips,
-            emw: &assets.emw.clips,
-            room: room_clips,
-            weapon: &weapon.clips,
-            emd_keyframes: &assets.emd.keyframes,
-            emd_skeleton: &assets.emd.skeleton,
-            weapon_keyframes: &weapon.keyframes,
-            weapon_skeleton: &weapon.skeleton,
-        };
+    } else if !player_script::control_gate(context.game, context.player) {
         // `player_input_to_behavior`'s action-key scan runs at the top of the
         // player's frame-0 dispatch, before the behaviour it selects executes
         // on the same tick (`update_player_anim`, 0x00480ebd). `pad` is
@@ -8756,8 +8711,76 @@ fn tick_room_timed(
         // open in this branch.
         if pad.action_pressed {
             context.game.player_action_press(context.player);
+            // `check_action_object` follows the climb scan in the same
+            // dispatch, still from the frame-start position, and only while
+            // no locked or weapon behaviour owns the frame-1 dispatch.
+            if context.player.locked == player::LockedAction::None
+                && context.player.weapon.behavior == 0
+            {
+                context
+                    .game
+                    .check_action_object(context.player.pos, context.player.angle);
+                // A gated press queued its reach: the 0x0c behaviour owns this
+                // tick.
+                if let Some(request) = context.game.take_pending_reach() {
+                    context.player.begin_interact(request);
+                }
+            }
         }
-        crate::weapons::update(context.game, context.player, context.room, &clips, pad);
+        // The zone branch: a zone the press just marked, or one a script or
+        // the previous frame's probe raised, starts the stairway or ladder
+        // before the locomotion would run.
+        if context.player.weapon.behavior == 0 {
+            context
+                .game
+                .player_zone_behavior(context.player, pad.action_pressed);
+        }
+        if let Some(assets) = context.player_assets {
+            // A scripted state can hand the player back mid-settle: `action_state`
+            // already 1, the settle's pose words written on the entity. The
+            // reference's idle then skips its case-0 entry and the settle's first
+            // `Joint_move` snaps the body clip straight to the written frame with
+            // the written blend counter. Adopt the words before the pad-driven
+            // machine's entry check runs.
+            if std::mem::take(&mut context.player.scripted_hold) {
+                context
+                    .player
+                    .adopt_scripted_handback(&context.game.entities[0]);
+            }
+            let room_clips = context
+                .room
+                .room_anim
+                .as_ref()
+                .map(|anim| anim.clips.as_slice())
+                .unwrap_or(&[]);
+            // The active weapon's bank: the machine's loaded file while it runs,
+            // otherwise the equipped item's, so the frame the aim starts reads the
+            // right clips.
+            let weapon_file = context.player.weapon.weapon_file.or_else(|| {
+                context.game.equipped.and_then(|item| {
+                    crate::weapons::weapon_emw_id(context.game.id.player_flag & 3, item)
+                })
+            });
+            let weapon = assets.weapon(weapon_file);
+            let no_weapon = crate::model::Emw {
+                skeleton: Default::default(),
+                keyframes: Vec::new(),
+                clips: Vec::new(),
+                mesh: Default::default(),
+            };
+            let weapon = weapon.unwrap_or(&no_weapon);
+            let clips = crate::weapons::WeaponClips {
+                emd: &assets.emd.clips,
+                emw: &assets.emw.clips,
+                room: room_clips,
+                weapon: &weapon.clips,
+                emd_keyframes: &assets.emd.keyframes,
+                emd_skeleton: &assets.emd.skeleton,
+                weapon_keyframes: &weapon.keyframes,
+                weapon_skeleton: &weapon.skeleton,
+            };
+            crate::weapons::update(context.game, context.player, context.room, &clips, pad);
+        }
     }
     // `update_player_anim` runs `EntityUpdateLookAtAngles` after the state
     // function and before the collision pass, whether or not the message gate
@@ -8776,7 +8799,11 @@ fn tick_room_timed(
     // (the grab hold), matching the original's `animationId != 5` gate; the
     // scripted door sequence's other arm never runs the room tick in the port.
     context.game.sync_entity_from_player(context.player);
-    if context.game.entities[0].state() != 5 {
+    // The stairway (`action_behavior` 0x11) skips both passes as well: its
+    // clip carries the player through the stairs' own collision volume.
+    if context.game.entities[0].state() != 5
+        && context.player.locked != player::LockedAction::Stairs
+    {
         // The reference runs this pass on the *free* step the behaviour's
         // `Add_speedXZ` left - before any room resolve. The locomotion tick
         // resolves its move too (the paths that never reach this tail need
@@ -8835,6 +8862,19 @@ fn tick_room_timed(
         context.game.entities[0].pos,
     ));
     context.game.entities[0].zone_flags = (context.game.entities[0].zone_flags & !0x01) | in_zone;
+    // The stairway's case 2 measured the root joint's world translation
+    // against the player before this tick's pose is composed: the previous
+    // frame's matrices, exactly like the original's `pushVelocity` (both
+    // subtractions are 16-bit).
+    if std::mem::take(&mut context.player.stairs_shadow_sample)
+        && let Some(root) = context.game.joint_worlds[0].first()
+    {
+        let pos = context.player.pos;
+        context.player.shadow_offset = [
+            i32::from((root.t[0] as i16).wrapping_sub(pos[0] as i16)),
+            i32::from((root.t[2] as i16).wrapping_sub(pos[2] as i16)),
+        ];
+    }
     // The render loop's `EntityComputeJointWorldMatrices` for the player:
     // composed after the physics so the next tick's held-weapon anchor reads
     // the previous frame's hand, exactly like the original's frame order.
@@ -8867,30 +8907,12 @@ fn tick_room_timed(
     // walks the whole action table every frame, scripted states included - the
     // mansion intro's scripted walk is what carries the player into the main
     // hall door's reach, so gating the probe on the pad-driven state would fire
-    // the door several ticks late. Only the action-key entries (flags bit 0x80)
-    // belong to the control path and need a live press.
-    let frozen = context.game.message_flags & game::MESSAGE_FLAG_PLAYER_STATE == 0;
-    let probe_action = input.action_pressed
-        && !controls_locked
-        && !frozen
-        && context.game.entities[0].state() == 1
-        && context.player.locked == player::LockedAction::None;
+    // the door several ticks late. The action-key entries (flags bit 0x80)
+    // are not part of this pass: the press edge fired them through
+    // `check_action_object` at the top of the player's dispatch.
     {
         let mut host = game::ScdGameHost::new(context.game);
-        host.interact(context.player.pos, context.player.angle, probe_action);
-    }
-    // A gated action-key press queued its reach: hand it to the player's
-    // locked interact behaviour. The probe refuses while a locked action owns
-    // the tick, so the action edge cannot re-fire during the animation.
-    if let Some(request) = context.game.take_pending_reach() {
-        context.player.begin_interact(request);
-    }
-    // `player_input_to_behavior` tests the stairs/ladder zone right after
-    // `check_action_object`, so the same press can mark the zone and start the
-    // climb. A probe that took the press (a pickup's reach) has locked the
-    // player and this is a no-op.
-    if probe_action {
-        context.game.player_zone_press(context.player);
+        host.interact(context.player.pos, context.player.angle, false);
     }
     // The room objects run after the player's physics and the player-side
     // probe: the push probe, the object-side action probe and the climb scan
@@ -9697,14 +9719,28 @@ fn render_frame(
     let shadow_texture = shadows.page_for(pack);
     let mut shadow_list: Vec<render::Shadow<'_>> = Vec::new();
     if let Some(texture) = shadow_texture
-        && shadow::visible(id, room, room.current_cut, player_state)
+        && shadow::visible(
+            id,
+            room,
+            room.current_cut,
+            player_state,
+            game.entities[0].zone_flags,
+        )
     {
+        // The quad sits at the player's `pushVelocity` offset and `posY`, which
+        // only the stairway moves away from the entity's own point.
+        let pos = player_state.pos;
         shadow_list.push(render::Shadow {
             texture,
-            pos: player_state.pos,
+            pos: [
+                pos[0] + player_state.shadow_offset[0],
+                player_state.stairs_floor.unwrap_or(pos[1]),
+                pos[2] + player_state.shadow_offset[1],
+            ],
             angle: player_state.angle,
             half_x: player_state.shadow_half_x,
             half_z: player_state.shadow_half_z,
+            shift: player_state.shadow_shift,
             lift: shadow::offset_y(id, room.current_cut),
             tint: shadow::billboard_tint(player_state.shadow_tint),
         });
@@ -9810,6 +9846,7 @@ fn render_frame(
                     angle: entity.angle,
                     half_x: i32::from(init.shadow_half_x),
                     half_z: i32::from(init.shadow_half_z),
+                    shift: [0, 0],
                     lift: shadow::offset_y(id, room.current_cut),
                     tint: shadow::billboard_tint(init.tint),
                 })
@@ -9826,6 +9863,7 @@ fn render_frame(
                     angle: entity.angle,
                     half_x: i32::from(entity.shadow_half_x),
                     half_z: i32::from(entity.shadow_half_z),
+                    shift: [0, 0],
                     lift: shadow::offset_y(id, room.current_cut),
                     tint: shadow::billboard_tint(entity.shadow_tint),
                 })
@@ -10054,6 +10092,7 @@ fn render_frame(
                 angle: clone.entity.angle,
                 half_x: i32::from(clone.entity.shadow_half_x),
                 half_z: i32::from(clone.entity.shadow_half_z),
+                shift: [0, 0],
                 lift: shadow::offset_y(id, room.current_cut),
                 tint: shadow::billboard_tint(clone.entity.shadow_tint),
             });
@@ -10131,6 +10170,7 @@ fn render_frame(
                 angle: companion.entity.angle,
                 half_x: i32::from(companion.entity.shadow_half_x),
                 half_z: i32::from(companion.entity.shadow_half_z),
+                shift: [0, 0],
                 lift: shadow::offset_y(id, room.current_cut),
                 tint: shadow::billboard_tint(companion.entity.shadow_tint),
             });
@@ -16811,6 +16851,20 @@ off_0010:
         session.game.sync_entity_from_player(&session.player);
     }
 
+    /// Run the session's first tick without input. That tick is the player's
+    /// state-0 init, which reads no pad (the reference's `player_state_init`),
+    /// so an action press only reaches the probe from the tick after it.
+    fn settle_control(session: &mut GameSession, pack: &Pack) {
+        session
+            .tick(pack, UiInput::default(), player::Input::default(), true)
+            .unwrap();
+        assert_eq!(
+            session.game.entities[0].state(),
+            1,
+            "the player has control"
+        );
+    }
+
     /// The action-key press edge and held level.
     fn pressed() -> player::Input {
         player::Input {
@@ -16848,6 +16902,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
 
         // The action key arms the flag; the engine opens the viewer over the
@@ -16978,6 +17033,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
         session
             .tick(&pack, UiInput::default(), pressed(), true)
@@ -17048,6 +17104,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
 
         // A wait-for-input message that does not mask the control bit: the
@@ -17085,6 +17142,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
         session
             .tick(&pack, UiInput::default(), pressed(), true)
@@ -17132,6 +17190,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         // Fill every slot with a distinct non-stackable item; the sword key
         // then has neither a free slot nor a stack to merge into.
         for item in [0x41, 0x42, 0x43, 0x44, 0x45, 0x46] {
@@ -17230,6 +17289,7 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         place_player(&mut session);
+        settle_control(&mut session, &pack);
         session.game.room_actions[1] = Some(item_room_action(1, 0x60, 1, 0x0D));
 
         session

@@ -72,7 +72,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     let camera_index = player::camera_for_position(&room, 0, player_state.pos);
     let cut = &room.cuts[camera_index];
     assert!(
-        shadow::visible(id, &room, camera_index, &player_state),
+        shadow::visible(id, &room, camera_index, &player_state, 0),
         "spawn {:?} is not in camera {camera_index}'s header zone",
         player_state.pos
     );
@@ -84,6 +84,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         angle: player_state.angle,
         half_x: shadow::PLAYER_HALF_X,
         half_z: shadow::PLAYER_HALF_Z,
+        shift: [0, 0],
         lift: shadow::offset_y(id, camera_index),
         tint: shadow::billboard_tint(shadow::PLAYER_COLOR),
     };
@@ -222,7 +223,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
     let mut away = player_state.clone();
     away.pos = [30000, 0, 30000];
     assert!(
-        !shadow::visible(id, &room, camera_index, &away),
+        !shadow::visible(id, &room, camera_index, &away, 0),
         "a player far outside the header zone must not queue a shadow"
     );
 }

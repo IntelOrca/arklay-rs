@@ -20,11 +20,13 @@
 //! its contacts closer together, so running produces more footfalls per second
 //! than walking.
 //!
-//! Three locked action behaviours sit on top of the locomotion machine:
+//! Four locked action behaviours sit on top of the locomotion machine:
 //! [`LockedAction::Push`] plays the room animation pair's `0x30` wind-up and
 //! `0x31` push loop while the object pass keeps raising the push bit,
 //! [`LockedAction::Vault`] runs the `0x33`/`0x35` climb-over clip and the
-//! `0x73A`/`0x708` warp, and [`LockedAction::Ladder`] runs the eight-state
+//! `0x73A`/`0x708` warp, [`LockedAction::Stairs`] runs the same clips for an
+//! in-room stairway (`check_door`'s zone) and warps `0x10FE`/`0xB45` onto the
+//! other floor, and [`LockedAction::Ladder`] runs the eight-state
 //! `set_stairs_zone` climb (approach, turn, the room's `0x33`/`0x35` climb
 //! clip with its step SEs, descent and walk-away). All are selected outside
 //! this module (the action press and the push bit are read by
@@ -324,6 +326,21 @@ pub const PUSH_SPEED: i32 = 0x32;
 pub const VAULT_SIDE: i32 = 0x73A;
 /// Vault displacement on the Y axis (negated on the approach side).
 pub const VAULT_ACROSS: i32 = 0x708;
+/// Stairway displacement along the approach side.
+pub const STAIRS_SIDE: i32 = 0x10FE;
+/// Stairway displacement on the Y axis (negated on the approach side).
+pub const STAIRS_ACROSS: i32 = 0xB45;
+/// The shallower doorway's displacement along the approach side (rooms 5 and
+/// 0xE).
+pub const STAIRS_SIDE_SHALLOW: i32 = 0x842;
+/// The shallower doorway's displacement on the Y axis.
+pub const STAIRS_ACROSS_SHALLOW: i32 = 0x57A;
+/// Per-frame `posY` creep while the stairway clip plays.
+pub const STAIRS_CREEP: i32 = 0x29;
+/// The shallower doorway's per-frame `posY` creep.
+pub const STAIRS_CREEP_SHALLOW: i32 = 0x24;
+/// SE played at the stairway clip's cue frame.
+pub const SE_STAIRS_STEP: u16 = 0x2D;
 /// Grunt SE of a push against a model without bit `0x40`.
 pub const SE_PUSH_GRUNT: u16 = 0x16;
 /// Grunt SE of a push against a model with bit `0x40` (the heavy grunt).
@@ -431,6 +448,11 @@ pub enum LockedAction {
     /// `action_behavior 0x0b`: the eight-state ladder climb selected by an
     /// action press inside a marked `set_stairs_zone` zone.
     Ladder,
+    /// `action_behavior 0x11`: `player_door_open_sequence` with msf bit 7
+    /// clear, the in-room stairway a `check_door`/`check_door_side` zone
+    /// selects (clips `0x33`/`0x35` and the `0x10FE`/`0xB45` warp onto the
+    /// other floor). The room collision pass is suspended while it runs.
+    Stairs,
     /// `action_behavior 0x0c`: the object reach animation a gated action-key
     /// press selects before its item viewer opens.
     Interact,
@@ -503,6 +525,10 @@ pub struct PlayerState {
     /// `isBeingAttackedFlag` (the 0x80 the action scan raised) in the same
     /// case, so the engine zeroes the entity byte.
     pub clear_attacked_flag: bool,
+    /// The stairway's warp ran this tick: the original's door sequence raises
+    /// `g_message_flags` bit `0x40` and consumes `check_door`'s turn latch in
+    /// the same case, so the game state returns both.
+    pub door_release: bool,
     /// The reference's `position` (x, z) mirror: the last position a room
     /// collision pass *accepted*. The original's `check_room_collision` uses it
     /// as `prevPos` for the push selector and as the rollback anchor, and only
@@ -543,6 +569,17 @@ pub struct PlayerState {
     pub vault_bit: bool,
     /// `zoneFlags` bit `0x10` for the current vault: the return side.
     pub vault_return: bool,
+    /// `zoneFlags` bit `0x10` for the current stairway: `check_door` saw the
+    /// approach side against the entry's direction word, so the clip is
+    /// `0x35` and the Y displacement is mirrored.
+    pub stairs_reverse: bool,
+    /// `zoneFlags` bit `0x40` for the current stairway: the zone came from
+    /// `check_door_side` (split on Z), which mirrors the turn direction.
+    pub stairs_side_z: bool,
+    /// The stairway behaviour's `posY` (the floor reference the shadow is
+    /// drawn at) while its clip creeps it towards the other floor; `None`
+    /// outside the behaviour, where it equals the position's Y.
+    pub stairs_floor: Option<i32>,
     /// Slot of the object the push probe last held, for the grunt SE.
     pub push_object: Option<u8>,
     /// Slot of the climb candidate latched by `check_climb_object`.
@@ -585,6 +622,16 @@ pub struct PlayerState {
     /// The ground quad's tint: the living shadow grey or the pool's
     /// `0x00FFFF50`.
     pub shadow_tint: u32,
+    /// The ground quad's centre in the entity's local X/Z: non-zero while an
+    /// uneven `BillboardSetRect` (the stairway's 800/700) sizes it.
+    pub shadow_shift: [i32; 2],
+    /// The original's `pushVelocity` X/Z: the stairway shifts the ground quad
+    /// in world space to the root joint the clip carries up the stairs.
+    pub shadow_offset: [i32; 2],
+    /// The stairway's case 2 ran this tick: the engine samples the root
+    /// joint's last composed world translation into [`Self::shadow_offset`]
+    /// before this tick's pose is composed.
+    pub stairs_shadow_sample: bool,
     /// One-shot sound requests emitted since the last
     /// [`PlayerState::take_sounds`].
     sounds: Vec<PlayerSound>,
@@ -625,6 +672,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         trace_state: None,
         last_behavior_id: 0,
         clear_attacked_flag: false,
+        door_release: false,
         collision_mirror: [pos[0], pos[2]],
         collision_pre: None,
         last_push_z: None,
@@ -634,6 +682,9 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         object_push: false,
         vault_bit: false,
         vault_return: false,
+        stairs_reverse: false,
+        stairs_side_z: false,
+        stairs_floor: None,
         push_object: None,
         climb_object: None,
         push_heavy: false,
@@ -650,6 +701,9 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         shadow_half_x: crate::shadow::PLAYER_HALF_X,
         shadow_half_z: crate::shadow::PLAYER_HALF_Z,
         shadow_tint: crate::shadow::PLAYER_COLOR,
+        shadow_shift: [0, 0],
+        shadow_offset: [0, 0],
+        stairs_shadow_sample: false,
         sounds: Vec::new(),
         footsteps: Vec::new(),
         screen_effects: Vec::new(),
@@ -1273,6 +1327,7 @@ fn update_locked(
         LockedAction::Vault => 0x0A,
         LockedAction::Ladder => 0x0B,
         LockedAction::Interact => 0x0C,
+        LockedAction::Stairs => 0x11,
         LockedAction::None => return,
     };
     match player.locked {
@@ -1280,18 +1335,19 @@ fn update_locked(
         LockedAction::Vault => update_vault(player, emd_clips, emw_clips, room_clips),
         LockedAction::Ladder => update_ladder(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::Interact => update_interact(player, emd_clips, emw_clips, room_clips),
+        LockedAction::Stairs => update_stairs(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::None => {}
     }
     // Mirror the locked behaviour's live bytes for the oracle trace: the
     // reference's action_behavior/action_state are read straight off the
     // entity, and the release tick clears both without running the idle
-    // entry. The vault carries the side `check_climb_object` picked in
-    // `attackDirection`; the other locked behaviours never touch it, so they
-    // keep the entity's previous value.
+    // entry. The vault and the stairway carry the side `check_climb_object`
+    // or `check_door` picked in `attackDirection`; the other locked behaviours
+    // never touch it, so they keep the entity's previous value.
     player.last_behavior_id = 0;
     player.trace_state = if player.locked == LockedAction::None {
         Some((0, 0, None))
-    } else if player.locked == LockedAction::Vault {
+    } else if matches!(player.locked, LockedAction::Vault | LockedAction::Stairs) {
         Some((
             behavior,
             player.action_state,
@@ -1527,6 +1583,125 @@ fn update_vault(
         // it, matching the reference's `attackAnim` still reading 52 (or 54
         // on the return side) at the end of the tick.
         let landed = if player.vault_return {
+            VAULT_CLIP_RETURN + 1
+        } else {
+            VAULT_CLIP_PLAIN + 1
+        };
+        if room_clips
+            .get(landed)
+            .is_some_and(|clip| !clip.frames.is_empty())
+        {
+            player.set_clip_direct(ClipSource::Room, landed);
+            player.advance(emd_clips, emw_clips, room_clips);
+        }
+    }
+}
+
+/// The raw room ids whose doorway sequence uses the shallower creep and warp.
+/// The original tests `g_roomId` with no stage guard, so the dining room (5)
+/// and the keeper's bedroom (0xE) ids match on every stage.
+fn shallow_doorway(room: &RoomState) -> bool {
+    matches!(room.room, 0x05 | 0x0E)
+}
+
+/// `player_door_open_sequence` (0x00457390) with msf bit 7 clear: the in-room
+/// stairway a `check_door`/`check_door_side` zone selects.
+///
+/// State 0 squares the player up over the walk pose: `check_door` raised the
+/// turn latch, so the angle eases by `(angle & 0x3FC) >> 2` per tick in the
+/// direction its side flag (`zoneFlags` `0x40`) and the angle's `0x400` bit
+/// pick. State 1 picks clip `0x33` (`0x35` when `zoneFlags` `0x10` is set),
+/// widens the shadow quad and falls through into state 2, which plays the clip
+/// with the `0x2D` cue and creeps the floor reference `0x29` a frame. The
+/// clip's completion moves to state 3 and the next tick warps the player
+/// `0x10FE` along the approach side and `0xB45` onto the other floor (the
+/// shallower `0x842`/`0x57A` in rooms 5 and 0xE).
+fn update_stairs(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    let shallow = shallow_doorway(room);
+    match player.action_state {
+        0 => {
+            // The same walk-pose turn as the vault's state 0, but steered by
+            // the door's turn latch rather than the angle's `0x200` bit.
+            player.set_clip(ClipSource::Emw, WALK_CLIP);
+            player.advance(emd_clips, emw_clips, room_clips);
+            player.move_speed_current = 0;
+            let angle = player.angle & 0x0FFF;
+            let step = (angle & 0x3FC) >> 2;
+            let turn_up = if player.stairs_side_z {
+                angle & 0x400 == 0
+            } else {
+                angle & 0x400 != 0
+            };
+            player.angle = if turn_up {
+                angle.wrapping_add(step)
+            } else {
+                angle.wrapping_sub(step)
+            } & 0x0FFF;
+            if player.angle & 0x3E0 != 0 {
+                return;
+            }
+            player.action_state = 1;
+            return;
+        }
+        1 => {
+            let clip = if player.stairs_reverse {
+                VAULT_CLIP_RETURN
+            } else {
+                VAULT_CLIP_PLAIN
+            };
+            player.set_clip(ClipSource::Room, clip);
+            player.move_speed_current = 0;
+            player.action_state = 2;
+            player.set_shadow_rect(800, 700, 700, 700);
+        }
+        _ => {}
+    }
+
+    // As in the vault, case 2's completion return is the only way into case
+    // 3, so the warp runs on the tick after the clip ends.
+    let warping = player.action_state == 3;
+
+    if player.action_state == 2 {
+        if !player.vault_clip_present(room_clips) {
+            // A room without the climb clips cannot play the animation; the
+            // warp still runs so the player reaches the other floor.
+            player.action_state = 3;
+        } else {
+            // The cue test reads `move_speed_current` before its increment.
+            let frame = player.anim.display_frame as i32;
+            let speed = i32::from(player.move_speed_current as i16);
+            if speed * 15 - frame == -0xC {
+                player.queue_sound(SE_STAIRS_STEP);
+                player.move_speed_current = (speed + 1) as u16;
+            }
+            let creep = if shallow {
+                STAIRS_CREEP_SHALLOW
+            } else {
+                STAIRS_CREEP
+            };
+            let creep = if player.stairs_reverse { creep } else { -creep };
+            let floor = player.stairs_floor.unwrap_or(player.pos[1]);
+            player.stairs_floor = Some(i32::from((floor + creep) as i16));
+            // The shared tail samples the root joint's last composed world
+            // translation for the shadow before this tick's `Joint_move`.
+            player.stairs_shadow_sample = true;
+            if player.advance(emd_clips, emw_clips, room_clips) {
+                player.action_state = 3;
+            }
+        }
+    }
+
+    if warping {
+        player.warp_up_stairs(shallow);
+        // Case 3 snaps to the clip after the one that played, exactly like the
+        // vault's landing.
+        let landed = if player.stairs_reverse {
             VAULT_CLIP_RETURN + 1
         } else {
             VAULT_CLIP_PLAIN + 1
@@ -1793,6 +1968,57 @@ impl PlayerState {
         // input path raised) in the same tick as the warp; the engine reads
         // this and zeroes the entity byte.
         self.clear_attacked_flag = true;
+        self.locked = LockedAction::None;
+        self.action_state = 0;
+        self.move_speed_current = 0;
+        self.enter_idle();
+    }
+
+    /// `BillboardSetRect` on the player's ground quad: `right`/`left` along the
+    /// local X axis and `front`/`back` along local Z. An uneven pair is a
+    /// quad whose centre sits off the entity, which the shadow draws as a
+    /// half extent plus a local shift.
+    fn set_shadow_rect(&mut self, right: u16, left: u16, front: u16, back: u16) {
+        let (right, left) = (i32::from(right), i32::from(left));
+        let (front, back) = (i32::from(front), i32::from(back));
+        self.shadow_half_x = (right + left) / 2;
+        self.shadow_half_z = (front + back) / 2;
+        self.shadow_shift = [(right - left) / 2, (front - back) / 2];
+    }
+
+    /// The stairway's case 3: move the player onto the other floor and hand
+    /// control back.
+    ///
+    /// `check_door` stored the approach side in `attackDirection`; an angle
+    /// with bit `0x400` set means the stairway runs along Z, so the
+    /// displacement swaps axes. Unlike the vault, neither axis is negated.
+    fn warp_up_stairs(&mut self, shallow: bool) {
+        let dir = i32::from(self.attack_direction);
+        let (side, across) = if shallow {
+            (STAIRS_SIDE_SHALLOW, STAIRS_ACROSS_SHALLOW)
+        } else {
+            (STAIRS_SIDE, STAIRS_ACROSS)
+        };
+        let (x, z) = if self.angle & 0x400 != 0 {
+            (0, dir * side)
+        } else {
+            (dir * side, 0)
+        };
+        let y = if self.stairs_reverse { across } else { -across };
+        self.pos = [self.pos[0] + x, self.pos[1] + y, self.pos[2] + z];
+        // The original writes the `position` mirror from the matrix in the
+        // same case, so the next collision pass measures from the new floor.
+        self.collision_mirror = [self.pos[0], self.pos[2]];
+        self.stairs_floor = None;
+        self.shadow_offset = [0, 0];
+        self.set_shadow_rect(
+            crate::shadow::PLAYER_HALF_X as u16,
+            crate::shadow::PLAYER_HALF_X as u16,
+            crate::shadow::PLAYER_HALF_Z as u16,
+            crate::shadow::PLAYER_HALF_Z as u16,
+        );
+        self.clear_attacked_flag = true;
+        self.door_release = true;
         self.locked = LockedAction::None;
         self.action_state = 0;
         self.move_speed_current = 0;
@@ -2804,6 +3030,7 @@ mod tests {
             trace_state: None,
             last_behavior_id: 0,
             clear_attacked_flag: false,
+            door_release: false,
             collision_mirror: [x, z],
             collision_pre: None,
             last_push_z: None,
@@ -2813,6 +3040,9 @@ mod tests {
             object_push: false,
             vault_bit: false,
             vault_return: false,
+            stairs_reverse: false,
+            stairs_side_z: false,
+            stairs_floor: None,
             push_object: None,
             climb_object: None,
             push_heavy: false,
@@ -2829,6 +3059,9 @@ mod tests {
             shadow_half_x: crate::shadow::PLAYER_HALF_X,
             shadow_half_z: crate::shadow::PLAYER_HALF_Z,
             shadow_tint: crate::shadow::PLAYER_COLOR,
+            shadow_shift: [0, 0],
+            shadow_offset: [0, 0],
+            stairs_shadow_sample: false,
             sounds: Vec::new(),
             footsteps: Vec::new(),
             screen_effects: Vec::new(),
@@ -4566,6 +4799,108 @@ mod tests {
             "the return warp consumes the transition bit"
         );
         assert!(!player.vault_return);
+    }
+
+    #[test]
+    fn stairs_turn_creep_and_warp_onto_the_upper_floor() {
+        let room = RoomState::default();
+        let emd = clips();
+        let room_clips = room_clips(&[(VAULT_CLIP_PLAIN, 54)]);
+        let mut player = player_at(1000, 1000);
+        // `check_door`'s turn latch eases 0xF00 up through 0x1000, a facing
+        // along X.
+        player.angle = 0xF00;
+        player.locked = LockedAction::Stairs;
+        player.attack_direction = 1;
+
+        let mut sounds = Vec::new();
+        let mut lowest_floor = 0;
+        let mut quad = None;
+        for _ in 0..200 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            sounds.extend(player.take_sounds().into_iter().map(|sound| sound.id));
+            if let Some(floor) = player.stairs_floor {
+                lowest_floor = lowest_floor.min(floor);
+                quad = Some((player.shadow_half_x, player.shadow_shift));
+            }
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+
+        assert_eq!(player.locked, LockedAction::None, "the climb never ended");
+        assert_eq!(player.angle & 0x3E0, 0);
+        // dir +1 along X, Y up by 0xB45.
+        assert_eq!(player.pos, [1000 + STAIRS_SIDE, -STAIRS_ACROSS, 1000]);
+        assert_eq!(player.collision_mirror, [1000 + STAIRS_SIDE, 1000]);
+        // The cue fires where `15 * counter - frame == -12`: frames 12, 27
+        // and 42 of the 54-frame clip.
+        assert_eq!(
+            sounds.iter().filter(|id| **id == SE_STAIRS_STEP).count(),
+            3,
+            "0x2D cues: {sounds:?}"
+        );
+        // The floor reference crept up 0x29 a frame, and the 800/700 quad sat
+        // 50 units off centre while it did.
+        assert!(lowest_floor < 0 && lowest_floor % STAIRS_CREEP == 0);
+        assert_eq!(quad, Some((750, [50, 0])));
+        // The warp hands everything back.
+        assert_eq!(player.stairs_floor, None);
+        assert_eq!(player.shadow_half_x, crate::shadow::PLAYER_HALF_X);
+        assert_eq!(player.shadow_shift, [0, 0]);
+        assert!(player.door_release && player.clear_attacked_flag);
+        assert_eq!(player.clip_source, ClipSource::Emd);
+    }
+
+    #[test]
+    fn reversed_stairs_along_z_descend_the_shallow_doorway() {
+        // Room id 0xE (the keeper's bedroom on the mansion stages) takes the
+        // shallower displacement on every stage.
+        let room = RoomState {
+            room: 0x0E,
+            ..RoomState::default()
+        };
+        let emd = clips();
+        let room_clips = room_clips(&[(VAULT_CLIP_RETURN, 54)]);
+        let mut player = player_at(1000, 1000);
+        // A facing with bit 0x400 runs the warp along Z.
+        player.angle = 0x400;
+        player.locked = LockedAction::Stairs;
+        player.attack_direction = -1;
+        player.stairs_reverse = true;
+        player.stairs_side_z = true;
+
+        let mut highest_floor = 0;
+        for _ in 0..200 {
+            update_with_room(
+                &mut player,
+                &room,
+                &emd,
+                &emd,
+                &room_clips,
+                Input::default(),
+            );
+            if let Some(floor) = player.stairs_floor {
+                highest_floor = highest_floor.max(floor);
+            }
+            if player.locked == LockedAction::None {
+                break;
+            }
+        }
+
+        assert_eq!(player.locked, LockedAction::None, "the climb never ended");
+        assert_eq!(
+            player.pos,
+            [1000, STAIRS_ACROSS_SHALLOW, 1000 - STAIRS_SIDE_SHALLOW]
+        );
+        assert!(highest_floor > 0 && highest_floor % STAIRS_CREEP_SHALLOW == 0);
     }
 
     #[test]

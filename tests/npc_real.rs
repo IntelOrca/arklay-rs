@@ -398,13 +398,14 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
     let texture = shadow_page(&pack, &root);
 
     let mut shadows: Vec<arklay::render::Shadow<'_>> = Vec::new();
-    if arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player) {
+    if arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player, 0) {
         shadows.push(arklay::render::Shadow {
             texture: &texture,
             pos: sim.player.pos,
             angle: sim.player.angle,
             half_x: arklay::shadow::PLAYER_HALF_X,
             half_z: arklay::shadow::PLAYER_HALF_Z,
+            shift: [0, 0],
             lift: arklay::shadow::offset_y(id, sim.room.current_cut),
             tint: arklay::shadow::billboard_tint(arklay::shadow::PLAYER_COLOR),
         });
@@ -426,6 +427,7 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
             angle: entity.angle,
             half_x: i32::from(init.shadow_half_x),
             half_z: i32::from(init.shadow_half_z),
+            shift: [0, 0],
             lift: arklay::shadow::offset_y(id, sim.room.current_cut),
             tint: arklay::shadow::billboard_tint(init.tint),
         });
@@ -433,13 +435,14 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
     println!(
         "queued {} shadow(s): player={} npc={}",
         shadows.len(),
-        arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player),
+        arklay::shadow::visible(id, &sim.room, sim.room.current_cut, &sim.player, 0),
         shadows.len()
             - usize::from(arklay::shadow::visible(
                 id,
                 &sim.room,
                 sim.room.current_cut,
-                &sim.player
+                &sim.player,
+                0,
             ))
     );
     assert!(
