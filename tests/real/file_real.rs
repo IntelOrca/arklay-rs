@@ -1,0 +1,267 @@
+//! Real-asset FILE tab tests.
+//!
+//! Run with:
+//! `ARKLAY_RE1_ROOT=assets/re1 ARKLAY_RE1_PACK=re1.akpak cargo test --profile test-release --test real file_real:: -- --ignored --nocapture`
+//!
+//! Both `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` must be set together; with
+//! neither the tests skip, and with only one they fail. The pack must carry
+//! the 62 `file/*.tim` entries (two covers, 17 backdrops, 43 page packs) plus
+//! the menu sheets and font. The first test loads every TIM, checks the sizes
+//! the JPN reader indexes, and pages a collected document through to its last
+//! half-page. The second renders the `--ui file` capture twice and requires it
+//! to be deterministic and to draw its own layer over the menu.
+
+use crate::common;
+
+use arklay::bmp;
+use arklay::engine;
+use arklay::game::{FILE_ITEM_MIN, GameState};
+use arklay::pack::Pack;
+use arklay::render::Framebuffer;
+use arklay::state::{Image, RoomId};
+use arklay::text::Text;
+use arklay::ui::file::{
+    FileAssets, FileMode, FileScreen, JPN_FILEI_NAMES, JPN_TEXTM_NAMES, ReaderState, page_count,
+    page_index,
+};
+use arklay::ui::main_menu::MenuAssets;
+
+fn pack() -> Option<Pack> {
+    let (_, path) = common::asset_env()?;
+    Some(Pack::open(&path).unwrap())
+}
+
+fn non_black(image: &Image) -> usize {
+    image
+        .rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0)
+        .count()
+}
+
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_file_art_loads_and_a_collected_document_pages_through() {
+    let Some(pack) = pack() else {
+        return;
+    };
+    let assets = FileAssets::load(&pack).expect("the pack has the slice-8 file art");
+    assert_eq!(assets.covers.len(), 2);
+    assert_eq!(assets.covers[0].width, 256);
+    assert_eq!(assets.covers[0].height, 256);
+    assert_eq!(assets.filei.len(), JPN_FILEI_NAMES.len());
+    for (index, filei) in assets.filei.iter().enumerate() {
+        assert_eq!(filei.width, 256, "backdrop {index}");
+        assert_eq!(filei.height, 120, "backdrop {index}");
+    }
+    assert_eq!(assets.textm.len(), JPN_TEXTM_NAMES.len());
+    for (index, page) in assets.textm.iter().enumerate() {
+        assert_eq!((page.width, page.height), (256, 256), "page pack {index}");
+    }
+
+    // Room 1001 is Jill's; list slot 0 is file index 0x0F in both lists, and
+    // the page tables give it five half-pages.
+    let id = RoomId::parse("1001").unwrap();
+    let room = arklay::rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+    let mut game = GameState::new(id, &room);
+    game.set_file_collected(0x0F, true);
+    assert!(game.document_collected(FILE_ITEM_MIN + 0x0F));
+
+    let menu = MenuAssets::load(&pack).expect("the pack has the menu art");
+    let text = Text::load(&pack, Some("en-US"));
+    let mut screen = FileScreen::default();
+    screen.open(&game);
+    assert_eq!(screen.mode, FileMode::List);
+    assert_eq!(screen.slot, 0);
+
+    // The selector settles its entry slide after the tab opens.
+    settle_list(&mut screen);
+
+    // Two list renders are byte-identical and repaint a meaningful area.
+    let mut first = Framebuffer::new();
+    let mut second = Framebuffer::new();
+    screen.draw(&mut first, &assets, &menu, &text, &game);
+    screen.draw(&mut second, &assets, &menu, &text, &game);
+    assert_eq!(first.rgba, second.rgba, "two list renders differ");
+    let mut background = Framebuffer::new();
+    background.clear();
+    assert!(
+        non_black(&Image {
+            width: first.width,
+            height: first.height,
+            rgba: first.rgba.clone(),
+        }) > 5000
+    );
+
+    // Open the reader and walk every half-page; each one draws content and
+    // consecutive pages differ. Each page change runs the original's slide
+    // animation, so settle it before drawing.
+    screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
+    settle_reader(&mut screen);
+    assert_eq!(screen.mode, FileMode::Reader);
+    assert_eq!(screen.reader_state, ReaderState::Idle);
+    assert!(screen.reader_page_loaded);
+    let count = page_count(0x0F);
+    let mut previous: Option<Vec<u8>> = None;
+    for page in 0..count {
+        assert_eq!(screen.page, page);
+        let Some(_) = page_index(0x0F, page) else {
+            panic!("page {page} has no TEXTM index");
+        };
+        let mut frame = Framebuffer::new();
+        screen.draw(&mut frame, &assets, &menu, &text, &game);
+        let drawn = non_black(&Image {
+            width: frame.width,
+            height: frame.height,
+            rgba: frame.rgba.clone(),
+        });
+        assert!(drawn > 5000, "page {page} drew only {drawn} pixels");
+        if let Some(previous) = previous {
+            assert_ne!(previous, frame.rgba, "page {page} did not change");
+        }
+        previous = Some(frame.rgba);
+        if page + 1 < count {
+            screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Right);
+            assert_eq!(screen.reader_state, ReaderState::SlideOutLeft);
+            settle_reader(&mut screen);
+        }
+    }
+    // Leave a deterministic reader capture behind for inspection.
+    let capture =
+        std::env::temp_dir().join(format!("arklay-file-reader-{}.bmp", std::process::id()));
+    let final_page = previous.expect("at least one page");
+    bmp::encode(
+        &Image {
+            width: 320,
+            height: 240,
+            rgba: final_page,
+        },
+        &capture,
+    )
+    .unwrap();
+    println!("wrote {}", capture.display());
+
+    // Confirm exits on the last page through the reader's exit slide (the
+    // last half-page has to be acknowledged first, like the original's
+    // FILE_SAVEFLAG).
+    screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Right);
+    assert!(screen.reader_last_page);
+    screen.handle_input(&mut game, arklay::ui::main_menu::MenuInput::Confirm);
+    // The request is raised after the reader's own render ran, so the confirm
+    // frame still draws the settled page and the slide starts on the next
+    // tick.
+    assert_eq!(screen.reader_state, ReaderState::Idle);
+    assert!(
+        screen.input_locked(),
+        "the exit request holds the busy lock"
+    );
+    screen.tick();
+    assert_eq!(screen.reader_state, ReaderState::ExitSlide);
+    settle_reader(&mut screen);
+    assert_eq!(
+        screen.mode,
+        FileMode::List,
+        "confirm exits on the last page"
+    );
+
+    // The document pick-up path (`open_pickup`) enters the reader directly on
+    // the picked entry: item 0x5F is document 0, whose shared 0xFE list slot
+    // resolves to it once collected.
+    game.set_file_collected(0, true);
+    let mut pickup = FileScreen::default();
+    pickup.open_pickup(&game, FILE_ITEM_MIN);
+    assert_eq!(pickup.mode, FileMode::Reader);
+    assert_eq!(pickup.book, 0);
+    assert_eq!(pickup.slot, 2, "the 0xFE list slot holds document 0");
+    assert_eq!(pickup.reader_state, ReaderState::Backdrop);
+    settle_reader(&mut pickup);
+    assert_eq!(pickup.page, 0);
+    let mut frame = Framebuffer::new();
+    pickup.draw(&mut frame, &assets, &menu, &text, &game);
+    let drawn = non_black(&Image {
+        width: frame.width,
+        height: frame.height,
+        rgba: frame.rgba.clone(),
+    });
+    assert!(drawn > 5000, "the pick-up reader drew only {drawn} pixels");
+}
+
+/// Advance the selector until its entry slide settles.
+fn settle_list(screen: &mut FileScreen) {
+    for _ in 0..16 {
+        if !screen.input_locked() {
+            return;
+        }
+        screen.tick();
+    }
+    panic!("the selector entry slide did not settle");
+}
+
+/// Advance the toggle-only reader until its state machine settles: either the
+/// reader is idle and unlocked, or its exit handed the screen back to the
+/// selector.
+fn settle_reader(screen: &mut FileScreen) {
+    for _ in 0..64 {
+        let settled = match screen.mode {
+            FileMode::Reader => screen.reader_state == ReaderState::Idle && !screen.input_locked(),
+            FileMode::List => !screen.input_locked(),
+        };
+        if settled {
+            return;
+        }
+        screen.tick();
+    }
+    panic!("the reader slide did not settle");
+}
+
+#[test]
+#[ignore = "requires a converted pack via ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_file_capture_is_deterministic_and_draws_the_list() {
+    let Some((_root, path)) = common::asset_env() else {
+        return;
+    };
+    let dir = std::env::temp_dir().join(format!("arklay-file-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let saves = dir.join("saves");
+    let first = dir.join("file_a.bmp");
+    let second = dir.join("file_b.bmp");
+    let menu_path = dir.join("menu.bmp");
+
+    engine::run_ui_with_options(&path, "file", Some(&first), &saves, 0).unwrap();
+    engine::run_ui_with_options(&path, "file", Some(&second), &saves, 0).unwrap();
+    // The same capture path without the FILE tab: the room, camera and panel
+    // beneath are the same, so the delta is the file selector's own layer.
+    engine::run_ui_with_options(&path, "menu", Some(&menu_path), &saves, 0).unwrap();
+
+    let first_bytes = std::fs::read(&first).unwrap();
+    let second_bytes = std::fs::read(&second).unwrap();
+    assert_eq!(first_bytes, second_bytes, "two file captures differ");
+    let image = bmp::decode(&first_bytes).unwrap();
+    assert_eq!((image.width, image.height), (320, 240));
+    assert!(
+        non_black(&image) > 5000,
+        "the file capture is mostly black: {} pixels",
+        non_black(&image)
+    );
+
+    // A missing FILE layer would leave the menu over the same room; require a
+    // known delta so that case cannot pass.
+    let menu = bmp::decode(&std::fs::read(&menu_path).unwrap()).unwrap();
+    let changed = image
+        .rgba
+        .iter()
+        .zip(&menu.rgba)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("file vs menu: {changed} changed pixels");
+    // The selector draws into the panel's `0x28,0x18 0xf0x0xc0` screen area
+    // (the original masks it with the panel's chrome), so its own layer can
+    // only repaint that much.
+    assert!(
+        changed > 20000,
+        "the FILE tab only repainted {changed} pixels over the menu"
+    );
+    println!("wrote {}", first.display());
+}

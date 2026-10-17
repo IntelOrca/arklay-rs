@@ -197,7 +197,7 @@ Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
 pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
 refused.
 
-The ignored `tests/m16_ui_real.rs` golden harness compares sampled
+The ignored `tests/real/m16_ui_real.rs` golden harness compares sampled
 room/message/NPC/UI frames against a locally generated set when
 `ARKLAY_RE1_GOLDEN` points at it; the set is never committed and is a
 regression/cross-check, not an independent oracle. `docs/m16-deviations.md`
@@ -214,9 +214,13 @@ lists every approximation M16 leaves.
   ignored performance test.
 - The local CI mirror: `./scripts/check.sh` runs fmt, clippy
   `--all-targets --all-features -D warnings`, the `--no-default-features`
-  check, debug and release tests and the doc build; `./scripts/check.sh --full`
-  adds the ignored real-asset suite when `ARKLAY_RE1_ROOT` and
-  `ARKLAY_RE1_PACK` are set.
+  check, the debug tests, the `test-release` tests (release code without thin
+  LTO) and the doc build; `./scripts/check.sh --full` adds the ignored
+  real-asset suite when `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` are set.
+- The real-asset tests are one binary, `tests/real/main.rs`; a module name
+  stays a filter, so `cargo test --profile test-release --test real
+  stairs_real:: -- --ignored` runs one module's tests and `... --test real --
+  --ignored` runs them all.
 - CI gates those commands on Linux and Windows plus a 1.88 MSRV check, and
   uploads `arklay-linux-x86_64.tar.gz` and `arklay-windows-x86_64.zip`
   artifacts (binary, README, LICENSE). A scheduled, non-gating fuzz workflow
@@ -225,9 +229,11 @@ lists every approximation M16 leaves.
   stable compile gate `cargo check --manifest-path fuzz/Cargo.toml` runs in
   `scripts/check.sh` and CI.
 - A full-game soak (`tests/soak_real.rs`, ignored) walks every RDT with
-  transitions and save round-trips under memory and wall-clock ceilings:
-  `ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... cargo test --release --test
-  soak_real -- --ignored --nocapture`.
+  transitions and save round-trips under memory and wall-clock ceilings. It
+  takes half an hour or more, so it is release-only and opt-in and no routine
+  pass runs it:
+  `ARKLAY_SOAK=1 cargo test --profile test-release --test soak_real --
+  --ignored --nocapture`, or `./scripts/check.sh --soak` for the whole gate.
 
 ## License
 

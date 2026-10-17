@@ -63,7 +63,7 @@ before. What follows is what the milestone's tools deliberately do not prove.
   up to four hops, with a visited set, so cycles and long chains cannot run
   away.
 - **Typewriters are sampled.** The soak drives `simulate_typewriter` for rooms
-  1000/1001 (the two `tests/save_real.rs` also drives) and counts the other
+  1000/1001 (the two `tests/real/save_real.rs` also drives) and counts the other
   rooms that declare the action without driving them: the headless seam's
   prompt probe is the expensive fallback and the other typewriters depend on
   progression state the fresh-game soak does not hold. Each sampled attempt

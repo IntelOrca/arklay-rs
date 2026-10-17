@@ -4,7 +4,7 @@ A milestone-by-milestone feature table, the parser/format coverage a fresh
 `arklay verify` reports, the verification-spine checklist with what is still
 missing, the known `TODO(parity)` sites and their dispositions, and the
 completed enemy milestone's closing state. Numbers below were measured on 2026-10-10 with the
-workspace install (`/home/ted/openre/assets/re1`) and its converted pack.
+workspace install (`/path/to/re1`) and its converted pack.
 
 ## Milestones
 
@@ -461,7 +461,7 @@ flame and rocket rounds) remain as before. The synthetic suite covers the
 weapon matrix (each class fires and damages, ammo decrements, the empty clip
 clicks, the reload refills), the aim/holster locomotion hand-off, the
 hand-joint FX attach and the flamethrower cues; the real-asset
-`tests/weapons_real.rs` parses every packed weapon asset, kills ROOM30C0's web
+`tests/real/weapons_real.rs` parses every packed weapon asset, kills ROOM30C0's web
 through the weapon input path, and captures the raised weapon in a shipped
 room.
 
@@ -494,7 +494,7 @@ the new `tim` row green; `--ui death` boots the deterministic capture over
 ROOM101 with `--character` selecting the corpse. The synthetic suite covers
 the control gate (death, hit pre-emption, poison), the fall and pool, the
 room-variant dispatch and the screen machine's frame counts and strip math;
-the real-asset `tests/death_real.rs` decodes the shipped page, captures the
+the real-asset `tests/real/death_real.rs` decodes the shipped page, captures the
 deterministic DIED screen, and kills ROOM100's player through the real damage
 helper to reach the screen and return to the title. Documented deviations: the
 Plant 42 DIED-screen joint-hide variant, the attract-demo replay and the
@@ -626,21 +626,21 @@ replaces the retired executable `text/*.bin` tables.
 
 | Commitment | Where | State |
 |---|---|---|
-| Golden capture harness | `tests/m16_ui_real.rs` (ignored, local goldens) | present; goldens are regression cross-checks, not an oracle |
-| Movie decode goldens | `tests/m14_real.rs` (ignored) | present |
-| Deterministic captures/states/saves | M16 tests, `tests/save_real.rs`, soak round-trip | present |
-| Save round-trip | `tests/save_real.rs`, `tests/soak_real.rs`, synthetic M16 slice-10 test | present |
+| Golden capture harness | `tests/real/m16_ui_real.rs` (ignored, local goldens) | present; goldens are regression cross-checks, not an oracle |
+| Movie decode goldens | `tests/real/m14_real.rs` (ignored) | present |
+| Deterministic captures/states/saves | M16 tests, `tests/real/save_real.rs`, soak round-trip | present |
+| Save round-trip | `tests/real/save_real.rs`, `tests/soak_real.rs`, synthetic M16 slice-10 test | present |
 | Stable torture matrix (>=10k mutated inputs) | `tests/torture.rs` (parallel budget slice) | present, 18 formats |
 | cargo-fuzz targets and seeds | `fuzz/` package (parallel fuzz slice) | present, 19 targets with committed synthetic seeds |
-| Enemy spawn census | `tests/enemy_census.rs` (ignored) | present; every corpus record allocates, scripted set exact, zero script errors |
-| Per-id enemy boots | `tests/enemy_real.rs` (ignored) | present; one shipped room per scripted id |
-| Weapon/damage/death suites | `tests/weapons_real.rs`, `tests/combat_real.rs`, `tests/death_real.rs` (ignored) | present; real input kills, table decode, shipped DIED screen |
+| Enemy spawn census | `tests/real/enemy_census.rs` (ignored) | present; every corpus record allocates, scripted set exact, zero script errors |
+| Per-id enemy boots | `tests/real/enemy_real.rs` (ignored) | present; one shipped room per scripted id |
+| Weapon/damage/death suites | `tests/real/weapons_real.rs`, `tests/real/combat_real.rs`, `tests/real/death_real.rs` (ignored) | present; real input kills, table decode, shipped DIED screen |
 | Scheduled fuzz workflow | `.github/workflows/fuzz.yml` | present, nightly, non-gating |
 | Decode budgets and memory ceilings | `src/budget.rs` (parallel budget slice), `tests/memory.rs` | present |
 | `arklay verify` | `src/verify.rs`, `tests/cli.rs` | present |
 | CLI error paths and atomic outputs | `src/atomic.rs`, `tests/cli.rs` | present |
-| `--stats` frame-time report | `src/stats.rs`, `tests/cli.rs`, `tests/perf_real.rs` | present |
-| Full-game soak | `tests/soak_real.rs` (ignored) | present |
+| `--stats` frame-time report | `src/stats.rs`, `tests/cli.rs`, `tests/real/perf_real.rs` | present |
+| Full-game soak | `tests/soak_real.rs` (ignored, `ARKLAY_SOAK=1`, release only) | present |
 | CI matrix (Linux/Windows/release/MSRV/artifact) | `.github/workflows/ci.yml` | present |
 | Local gate | `scripts/check.sh` | present |
 | `docs/architecture.md`, `docs/status.md`, `docs/m17-deviations.md` | this docs set | present |
@@ -652,7 +652,8 @@ Still missing by design:
   and the stable `cargo check --manifest-path fuzz/Cargo.toml` compile gate.
 - The real-asset tests, goldens and budgets need a local install and are never
   run in CI with game data; they are ignored tests behind
-  `ARKLAY_RE1_ROOT`/`ARKLAY_RE1_PACK`.
+  `ARKLAY_RE1_ROOT`/`ARKLAY_RE1_PACK`. The full-game soak is additionally
+  behind `ARKLAY_SOAK=1` and runs only at release time.
 - Performance budgets are machine-specific policy; the numbers and the
   reference machine are recorded in `docs/performance.md`.
 

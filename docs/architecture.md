@@ -293,24 +293,24 @@ claims about the original.
 |---|---|---|---|
 | `.akpak` pack | `pack::Pack::from_bytes` | `MAX_PACK_ENTRIES` (1M), `MAX_ENTRY_BYTES` (1 GiB, also the zstd decompression cap) | `pack` unit tests, `tests/torture`, `fuzz/pack` |
 | `manifest.toml` | `manifest::Manifest::parse` | line/key/value length caps | `manifest` unit tests, `tests/torture`, `fuzz/manifest` |
-| RDT room | `rdt::parse` | section counts bounded by remaining bytes; `MAX_RECORDS` | `rdt` unit tests, `tests/m16_game_real.rs`, `tests/soak_real.rs`, `tests/torture`, `fuzz/rdt` |
+| RDT room | `rdt::parse` | section counts bounded by remaining bytes; `MAX_RECORDS` | `rdt` unit tests, `tests/real/m16_game_real.rs`, `tests/soak_real.rs`, `tests/torture`, `fuzz/rdt` |
 | SCD scripts | `scd::reader::parse` | instructions per block, `MAX_SCD_EVENTS` event-table cap | `scd` unit tests, `fuzz/scd` |
 | SCD assembler | `scd::asm::assemble` | input size, line count, `MAX_ASM_OUTPUT` (64 MiB) | `scd` unit tests, `tests/cli.rs`, `fuzz/scd_asm` |
-| `.dor` door | `door::parse` | bytecode bounded by input; `MAX_SCRIPTS` | `door` unit tests, `tests/torture`, `fuzz/dor`, `tests/doors_scan.rs` |
+| `.dor` door | `door::parse` | bytecode bounded by input; `MAX_SCRIPTS` | `door` unit tests, `tests/torture`, `fuzz/dor`, `tests/real/doors_scan.rs` |
 | TIM | `tim::decode`, `decode_8bpp`, `decode_4bpp` | `MAX_PIXELS` (4096x4096), CLUT entry cap, `budget::alloc` | `tim` unit tests, `tests/torture`, `fuzz/tim` |
 | TMD | `tmd::parse` | objects/vertices/normals/primitives, `try_reserve_exact` | `tmd` unit tests, `fuzz/tmd` |
 | EMD/EMW | `emd::parse`, `parse_emw`, `parse_room_anim` | skeletons/keyframes/clips | `emd` unit tests, `fuzz/emd` |
 | IVM | `ivm::parse` | objects/vertices/texture caps | `ivm` unit tests, `fuzz/ivm` |
-| AVI | `avi::Avi::parse` | streams/chunks/frames bounded by the file size | `avi` unit tests, `fuzz/avi`, `tests/m14_real.rs` |
-| Cinepak | `cinepak::Decoder::decode` | canvas `MAX_PIXELS`, 32 strips | `cinepak` unit tests, `fuzz/cinepak`, `tests/m14_real.rs` |
+| AVI | `avi::Avi::parse` | streams/chunks/frames bounded by the file size | `avi` unit tests, `fuzz/avi`, `tests/real/m14_real.rs` |
+| Cinepak | `cinepak::Decoder::decode` | canvas `MAX_PIXELS`, 32 strips | `cinepak` unit tests, `fuzz/cinepak`, `tests/real/m14_real.rs` |
 | LZW | `lzw::decode` | `MAX_LZW_OUTPUT` (64 MiB), reset-before-full guard | `lzw` unit tests, `fuzz/lzw` |
 | BMP | `bmp::decode`, `decode_mask` | dimensions bounded by input | `bmp` unit tests, `tests/torture`, `fuzz/bmp` |
-| Save block | `save::SaveFile::from_bytes` | fixed 0x800 layout | `save` unit tests, `tests/save_real.rs`, `tests/soak_real.rs`, `fuzz/save` |
-| Mask table | `mask::parse` | sprite/group counts | `mask` unit tests, `tests/mask_render_real.rs`, `fuzz/mask` |
-| WAV | `audio::parse_wav` | sample count bounded by the `data` chunk | `audio` unit tests, `fuzz/wav`, `tests/m13_real.rs` |
+| Save block | `save::SaveFile::from_bytes` | fixed 0x800 layout | `save` unit tests, `tests/real/save_real.rs`, `tests/soak_real.rs`, `fuzz/save` |
+| Mask table | `mask::parse` | sprite/group counts | `mask` unit tests, `tests/real/mask_render_real.rs`, `fuzz/mask` |
+| WAV | `audio::parse_wav` | sample count bounded by the `data` chunk | `audio` unit tests, `fuzz/wav`, `tests/real/m13_real.rs` |
 | Lua source | `lua::LuaVm::load`, `lua::verify_source` | 16 MiB VM, source-size cap | `lua` unit tests, `fuzz/lua`, `arklay verify` |
-| Map tables | `ui::map::MapTables::parse` | fixed blob size/magic | `ui::map` unit tests, `tests/m16_ui_real.rs` |
-| Combat tables | `combat::CombatTables::parse` | fixed blob size/magic/version, `MAX_COMBAT_TABLE_BYTES` (64 KiB) | `combat` unit tests, `tests/combat_real.rs`, `tests/torture`, `fuzz/combat` |
+| Map tables | `ui::map::MapTables::parse` | fixed blob size/magic | `ui::map` unit tests, `tests/real/m16_ui_real.rs` |
+| Combat tables | `combat::CombatTables::parse` | fixed blob size/magic/version, `MAX_COMBAT_TABLE_BYTES` (64 KiB) | `combat` unit tests, `tests/real/combat_real.rs`, `tests/torture`, `fuzz/combat` |
 | BioCard prefix | `data/bio_card.dat` | 0x200 required | `save` unit tests, `arklay verify` |
 | `roomcut`/`roommask` BMP | `bmp::decode`, `decode_mask` | BMP caps | `arklay verify`, `tests/soak_real.rs` |
 
@@ -334,7 +334,7 @@ These hold across every milestone and are the regression gate:
   model is missing parks inert.
 - **A fixed save layout.** `SaveFile` is the original 0x800-byte block field
   for field; capture, serialization, parsing and apply are round-trip stable
-  (`tests/save_real.rs`, the soak).
+  (`tests/real/save_real.rs`, the soak).
 - **No behaviour change without a golden update.** A change that alters a
   deterministic capture, state hash, save byte or pack byte for a valid input
   is a bug until a milestone explicitly re-baselines its golden set.
@@ -348,27 +348,37 @@ These hold across every milestone and are the regression gate:
 - Always-run integration tests (`tests/*.rs`, unignored subset): synthetic
   packs, CLI spawning, torture matrix, stats plumbing, the synthetic
   transition + save round-trip. `cargo test`.
-- Release-profile green run: `cargo test --release`.
+- Release-profile green run: `cargo test --profile test-release`. The
+  `test-release` profile is `release` without thin LTO: the tests run at
+  release speed, the link skips the pass only a shipped binary needs.
 - No-Lua build: `cargo check --no-default-features`.
 - Documents: `cargo doc --no-deps`.
-- Real-asset suite (ignored; needs both env vars):
-  `ARKLAY_RE1_ROOT=/path/to/re1 ARKLAY_RE1_PACK=/path/re1.akpak cargo test -- --ignored`.
-  The corpus audit, the soak, the memory passes, the performance budgets and
-  the capture/movie/UI goldens live here.
-- Full-game soak (release):
-  `cargo test --release --test soak_real -- --ignored --nocapture`.
-- Performance budgets (release):
-  `cargo test --release --test perf_real -- --ignored --nocapture`;
-  `ARKLAY_PERF_BUDGET_MS=<ms>` overrides the per-tick p95 budget.
+- Real-asset suite (ignored; needs both env vars): one binary,
+  `tests/real/main.rs`, holding every real-asset module.
+  `ARKLAY_RE1_ROOT=/path/to/re1 ARKLAY_RE1_PACK=/path/re1.akpak cargo test
+  --profile test-release --test real -- --ignored` runs all of them; a name
+  filter targets one module, e.g. `--test real stairs_real::`. The corpus
+  audit, the performance budgets and the capture/movie/UI goldens live here.
+- Full-game soak (ignored, release-only, opt-in): `ARKLAY_SOAK=1 cargo test
+  --profile test-release --test soak_real -- --ignored --nocapture`. The soak
+  keeps its own binary because its counting allocator measures process-wide
+  live bytes, so it must run alone; without `ARKLAY_SOAK=1` it skips with a
+  printed note. No routine pass runs it.
+- Performance budgets (release): `cargo test --profile test-release --test
+  real perf_real:: -- --ignored --nocapture`; `ARKLAY_PERF_BUDGET_MS=<ms>`
+  overrides the per-tick p95 budget.
 - Fuzzing (nightly, separate package):
   `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=300`.
   The stable compile gate is `cargo check --manifest-path fuzz/Cargo.toml`.
 - The mirror of the CI gate: `./scripts/check.sh` (add `--full` to include the
-  ignored suite when the asset variables are set).
+  ignored suite when the asset variables are set; `--soak` adds the release
+  soak).
 
-CI runs fmt, clippy `--all-targets --all-features -D warnings`, debug and
-release tests, the `--no-default-features` check, the doc build and the Linux
-artifact smoke on Ubuntu; tests and the release artifact on Windows; and a
-`cargo check --all-features` MSRV job on 1.88.0. A scheduled, non-gating fuzz
-workflow runs each target for 300 seconds, and the fuzz package's stable
-compile gate runs in CI and `scripts/check.sh`.
+CI runs fmt, clippy `--all-targets --all-features -D warnings`, the debug and
+`test-release` tests, the `--no-default-features` check, the doc build and the
+Linux artifact smoke on Ubuntu; tests and the release artifact on Windows; and
+a `cargo check --all-features` MSRV job on 1.88.0. The soak never runs in CI:
+hosted runners have no game install, so it stays a release check on a machine
+with the assets. A scheduled, non-gating fuzz workflow runs each target for
+300 seconds, and the fuzz package's stable compile gate runs in CI and
+`scripts/check.sh`.

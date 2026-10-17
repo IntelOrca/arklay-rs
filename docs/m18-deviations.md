@@ -141,9 +141,10 @@ Targeted commands used (root and pack from the local install):
 ```
 cargo test --lib
 ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
-  cargo test --test objects_real room_20a0_water_tank_blend_weight_rebaselines_its_capture -- --ignored --nocapture
+  cargo test --profile test-release --test real \
+  objects_real::room_20a0_water_tank_blend_weight_rebaselines_its_capture -- --ignored --nocapture
 ARKLAY_RE1_ROOT=... ARKLAY_RE1_PACK=... \
-  cargo test --test walk_real real_corpus_zone_paths_never_panic -- --ignored
+  cargo test --profile test-release --test real walk_real::real_corpus_zone_paths_never_panic -- --ignored
 ```
 
 The audio tests are offline (no device): the pan samples and the
