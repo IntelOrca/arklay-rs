@@ -96,6 +96,10 @@ fn real_typewriter_save_consumes_a_ribbon_and_reloads() {
         sim.state_after_load.entities[0].pos
     );
     assert_eq!(
+        sim.state_after_save.entities[0].id, sim.state_after_load.entities[0].id,
+        "the continue restores the player entity's character id"
+    );
+    assert_eq!(
         sim.state_after_save.entities[0].angle,
         sim.state_after_load.entities[0].angle
     );
@@ -117,6 +121,11 @@ fn real_typewriter_save_consumes_a_ribbon_and_reloads() {
     assert!(!sim.ink_ribbon, "Jill's first playthrough saves for free");
     assert_eq!(sim.saved.used_item, 0);
     assert_eq!(sim.saved.character, 1);
+    // `InitializeGame` restores the selected character into the player
+    // entity's id on the continue path too, the same write the new-game and
+    // arbitrary-room boots make in `seed_start_health`; the room scripts read
+    // it (`g_playerEntity.id & 3` is Jill) to pick their item declarations.
+    assert_eq!(sim.state_after_load.entities[0].id, 1);
     assert_eq!(sim.state_after_save.item_count(items::ITEM_INK_RIBBONS), 3);
     assert_eq!(sim.state_after_load.item_count(items::ITEM_INK_RIBBONS), 3);
 }
