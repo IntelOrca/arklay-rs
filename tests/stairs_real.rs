@@ -61,7 +61,7 @@ fn tick(
     // The zone test follows the probe, the reference's `check_action_object`
     // hand-off.
     if action {
-        game.player_zone_press(player);
+        game.player_zone_behavior(player, true);
     }
     game.apply_stair_state(player);
 }
@@ -92,7 +92,7 @@ fn ladder_tick(
     let probe_action = action && player.locked == player::LockedAction::None;
     game.interact(player.pos, player.angle, probe_action);
     if probe_action {
-        game.player_zone_press(player);
+        game.player_zone_behavior(player, true);
     }
     game.tick_objects(room, player);
     game.apply_stair_state(player);
@@ -680,6 +680,61 @@ fn room106_return_stair_fires_with_real_input() {
         run.player.pos,
         run.game.entities[0].state()
     );
+}
+
+/// Room 203's balcony stairs are an in-room `check_door` zone, not a door:
+/// the action press runs `action_behavior` 0x11, which plays the room's climb
+/// clip and warps the player `0x10FE` along X and `0xB45` up onto the balcony
+/// without a room change. (The reference's oracle trace for a walk that
+/// presses on the first blocked tick lands at 24097 = 19747 + 0x10FE.)
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn room203_balcony_stairs_climb_inside_the_room() {
+    let Some(path) = pack_path() else {
+        return;
+    };
+    let pack = Pack::open(&path).unwrap();
+    let id = RoomId::parse("2030").unwrap();
+    let simulate = |ticks: usize| {
+        arklay::engine::simulate_room_prepared(
+            &pack,
+            id,
+            &[],
+            ticks,
+            |_game, player| {
+                // The middle landing, facing the east flight.
+                player.pos = [18500, 0, 25650];
+                player.collision_mirror = [18500, 25650];
+                player.angle = 0;
+            },
+            |tick| Input {
+                // Walk into the foot of the flight, press once against it, and
+                // let go before the climb lands.
+                up: tick < 70,
+                action_pressed: tick == 60,
+                ..Input::default()
+            },
+        )
+        .unwrap()
+    };
+    // Where the press happens: the walk has stopped against the flight.
+    let foot = simulate(60).player.pos;
+    let run = simulate(200);
+    assert!(
+        run.transitions.is_empty(),
+        "no room change: {:?}",
+        run.transitions
+    );
+    assert_eq!(
+        run.player.pos,
+        [
+            foot[0] + player::STAIRS_SIDE,
+            -player::STAIRS_ACROSS,
+            foot[2]
+        ],
+        "the climb from {foot:?}"
+    );
+    assert_eq!(run.player.locked, player::LockedAction::None);
 }
 
 /// The same real-input drive for the Jill RDT variant (`ROOM2031`): the stair

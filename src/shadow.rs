@@ -124,11 +124,26 @@ pub fn offset_y(id: RoomId, camera: usize) -> i32 {
 /// while a door transition owns the player, so the door flag is implicit; the
 /// `set_stairs_zone` latch survives for the whole room, while a stair ramp's
 /// `stairs_height_update` height does not raise a zone flag on its own.
-pub fn visible(id: RoomId, room: &RoomState, camera: usize, player: &PlayerState) -> bool {
+///
+/// `check_door`'s side bits (`0x10`, `0x40` for `check_door_side`) are never
+/// cleared by the per-frame probe, so after an in-room stairway they keep the
+/// shadow up on their own. A climb onto an object raises the same `0x10`, but
+/// the vault also sets the flag that hides the shadow until the player climbs
+/// back down, which the port tracks as the vault latch.
+pub fn visible(
+    id: RoomId,
+    room: &RoomState,
+    camera: usize,
+    player: &PlayerState,
+    zone_flags: u8,
+) -> bool {
     if id.stage == STAGE_GUARDHOUSE && id.room == ROOM_WATER_TANK_ENTRY {
         return true;
     }
     if player.stairs.in_zone {
+        return true;
+    }
+    if zone_flags & 0x50 != 0 && !player.vault_bit {
         return true;
     }
     let header = room
@@ -294,11 +309,11 @@ mod tests {
     fn shadow_is_visible_inside_the_camera_switch_zone() {
         let room = room_with_header();
         let id = RoomId::parse("1000").unwrap();
-        assert!(visible(id, &room, 0, &player_at([500, 0, 500])));
+        assert!(visible(id, &room, 0, &player_at([500, 0, 500]), 0));
         // Outside the header zone the shadow is skipped.
-        assert!(!visible(id, &room, 0, &player_at([2000, 0, 500])));
+        assert!(!visible(id, &room, 0, &player_at([2000, 0, 500]), 0));
         // A different camera id has no zone group here.
-        assert!(!visible(id, &room, 1, &player_at([500, 0, 500])));
+        assert!(!visible(id, &room, 1, &player_at([500, 0, 500]), 0));
     }
 
     #[test]
@@ -309,17 +324,32 @@ mod tests {
         // does not bring the shadow back outside the camera zone.
         let mut player = player_at([2000, 0, 500]);
         player.stairs.height = Some(300);
-        assert!(!visible(id, &room, 0, &player));
+        assert!(!visible(id, &room, 0, &player, 0));
         // The set_stairs_zone latch (zone flag 0x20) does.
         player.stairs.height = None;
         player.stairs = StairState {
             in_zone: true,
             ..StairState::default()
         };
-        assert!(visible(id, &room, 0, &player));
+        assert!(visible(id, &room, 0, &player, 0));
 
         let water_tank = RoomId::parse("40D0").unwrap();
         let outside = player_at([2000, 0, 500]);
-        assert!(visible(water_tank, &room, 0, &outside));
+        assert!(visible(water_tank, &room, 0, &outside, 0));
+    }
+
+    #[test]
+    fn the_door_check_side_bits_keep_the_shadow_up_until_a_vault_hides_it() {
+        let room = room_with_header();
+        let id = RoomId::parse("1000").unwrap();
+        let mut player = player_at([2000, 0, 500]);
+        // `check_door_side`'s 0x40 and the reversed-approach 0x10 outlive the
+        // per-frame probe, which only clears 0x20.
+        assert!(visible(id, &room, 0, &player, 0x40));
+        assert!(visible(id, &room, 0, &player, 0x10));
+        // The vault raises the same 0x10 but hides the shadow while it is
+        // latched.
+        player.vault_bit = true;
+        assert!(!visible(id, &room, 0, &player, 0x10));
     }
 }

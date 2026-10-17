@@ -5839,6 +5839,18 @@ impl GameState {
         self.probe_actions(pos, angle, 1, pos, action_press);
     }
 
+    /// `check_action_object` (0x0041c150): the action-key probe
+    /// `player_input_to_behavior` runs on the press edge, at the top of the
+    /// player's frame-0 dispatch and so from the frame-start position.
+    ///
+    /// Only entries with flag bits `0x80` and `0x01` take part, and the first
+    /// one whose zone holds the reach point (or the player, for `0x40`)
+    /// fires. The per-frame [`Self::interact`] pass that follows the movement
+    /// then runs without the press.
+    pub fn check_action_object(&mut self, pos: [i32; 3], angle: u16) {
+        self.probe_actions(pos, angle, 0, pos, true);
+    }
+
     /// One `update_player_position` walk with an explicit frame mask.
     ///
     /// `mask` is the original's entry-flag selector: the player's own pass uses
@@ -6518,6 +6530,9 @@ impl GameState {
         }
         let zone_bit = if axis_z { 0x60 } else { 0x20 };
         if approach != 0 {
+            // The approach side lands in `attackDirection`, the word the
+            // stairway's warp scales its displacement by.
+            entity.action_ticks_counter = approach as u16;
             entity.animation_frame_id = 0;
             self.message_flags &= !0x0040;
             entity.zone_flags &= !0x10;
@@ -6821,9 +6836,9 @@ impl GameState {
 
     /// `player_input_to_behavior`'s action-key branches (0x004956a0): the
     /// press edge scans for a climbable object (a door's vault). The stairs/
-    /// ladder zone branch is split out into [`Self::player_zone_press`]
+    /// ladder zone branch is split out into [`Self::player_zone_behavior`]
     /// because the original runs the action-key room probe
-    /// (`check_action_object`) between this scan and that test.
+    /// ([`Self::check_action_object`]) between this scan and that test.
     ///
     /// The engine calls this at the top of the player's frame-0 dispatch -
     /// before the tick's movement, the original's point - so the scan reads
@@ -6891,28 +6906,55 @@ impl GameState {
         }
     }
 
-    /// `player_input_to_behavior`'s stairs/ladder zone branch: with the
-    /// action-key probe's `set_stairs_zone` already run this frame, the marked
-    /// zone and the ladder mode bit start the climb. Called right after the
-    /// room probe, the reference's point between `check_action_object` and
-    /// this test; a probe that consumed the press (a pickup's reach) leaves
-    /// the player locked and wins.
-    pub fn player_zone_press(&mut self, player: &mut PlayerState) {
+    /// `player_input_to_behavior`'s stairs/ladder zone branch (0x00495727 on
+    /// the press edge, and its twin after the push test without one): a
+    /// raised zone flag `0x20`
+    /// starts the in-room stairway (`action_behavior` 0x11) or, with the
+    /// ladder mode bit up, the ladder climb (0x0B).
+    ///
+    /// On a press the action-key probe ([`Self::check_action_object`]) has
+    /// already run this frame, so the zone it marked starts the behaviour on
+    /// the same tick; a probe that consumed the press (a pickup's reach)
+    /// leaves the player locked and wins. Without a press the flag is one a
+    /// per-frame probe or a script's `aot_on` raised, and the original tests
+    /// the push bit first, so a push in progress keeps the tick.
+    pub fn player_zone_behavior(&mut self, player: &mut PlayerState, pressed: bool) {
         if player.locked != crate::player::LockedAction::None {
             return;
         }
         if player.vault_bit {
             return;
         }
-        if self.entities[0].zone_flags & 0x20 == 0 || !self.ladder_down() {
+        if !pressed && player.object_push {
             return;
         }
-        player.locked = crate::player::LockedAction::Ladder;
+        if self.entities[0].zone_flags & 0x20 == 0 {
+            return;
+        }
+        // The port raises the zone flag on a stairwell door's climb as well;
+        // the original's door handler does not, and its room change follows
+        // at the end of the frame, so a pending transition starts nothing.
+        if self.transition.is_some() {
+            return;
+        }
         player.action_state = 0;
         player.move_speed_current = 0;
         self.entities[0].is_being_attacked = 0x80;
         self.entities[0].animation_frame_id = 1;
         self.message_flags &= 0xFFBF;
+        if self.ladder_down() {
+            player.locked = crate::player::LockedAction::Ladder;
+            return;
+        }
+        let zone_flags = self.entities[0].zone_flags;
+        player.locked = crate::player::LockedAction::Stairs;
+        // `check_door` left the approach side in `attackDirection`; when its
+        // facing test failed the word still holds whatever the idle countdown
+        // wrote there, and the warp scales by it all the same.
+        player.attack_direction = self.entities[0].action_ticks_counter as i16 as i8;
+        player.stairs_reverse = zone_flags & 0x10 != 0;
+        player.stairs_side_z = zone_flags & 0x40 != 0;
+        player.stairs_floor = None;
     }
 
     /// `update_room_objects` (0x00474090): one pass over the built omodel
@@ -6928,6 +6970,12 @@ impl GameState {
     pub fn tick_objects(&mut self, room: &RoomState, player: &mut PlayerState) {
         use crate::objects;
 
+        // The stairway's warp returns the message flag the action scan
+        // cleared and consumes `check_door`'s turn latch.
+        if std::mem::take(&mut player.door_release) {
+            self.message_flags |= 0x0040;
+            self.flags[5].apply(MSF2_DOOR_TURN_PENDING, 1);
+        }
         // A finished ladder climb (state 8) returns the zone flag, the ladder
         // mode bit and the message flag the climb locked out.
         if player.ladder_release {
@@ -12399,14 +12447,14 @@ mod tests {
         state.interact(player.pos, 0, true);
         assert_eq!(state.entities[0].zone_flags & 0x30, 0x30);
         assert!(state.ladder_down());
-        state.player_zone_press(&mut player);
+        state.player_zone_behavior(&mut player, true);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert_eq!(player.action_state, 0);
 
         // A second press mid-climb neither flips the vault nor restarts.
         player.input.action_pressed = true;
-        state.player_zone_press(&mut player);
+        state.player_zone_behavior(&mut player, true);
         state.tick_objects(&RoomState::default(), &mut player);
         assert_eq!(player.locked, crate::player::LockedAction::Ladder);
         assert!(!player.vault_bit);
@@ -16334,6 +16382,83 @@ mod tests {
         assert_eq!(state.entities[0].zone_flags & 0x20, 0x20);
         assert_eq!(state.entities[0].zone_flags & 0x10, 0, "no side resolved");
         assert!(state.flags[5].bit(MSF2_DOOR_TURN_PENDING));
+    }
+
+    #[test]
+    fn an_action_key_door_check_starts_the_in_room_stairway() {
+        let mut state = game();
+        // Room 203's balcony stairs: an action-key (0x81) `check_door` zone.
+        state.room_actions[4] = Some(RoomAction {
+            slot: 4,
+            kind: RoomActionKind::DoorCheck,
+            zone: [20220, 23900, 3540, 3500],
+            sce: HANDLER_DOOR_CHECK,
+            handler: HANDLER_DOOR_CHECK,
+            flags: 0x81,
+            params: [HANDLER_DOOR_CHECK, 0x81, 0, 0, 0, 0, 0, 0],
+            item_data: None,
+            room_items_flag: 0xFF,
+            reach_animation: false,
+        });
+        let mut player =
+            crate::player::spawn(RoomId::parse("2030").unwrap(), &RoomState::default());
+        player.pos = [19747, 0, 25650];
+        player.angle = 0;
+        state.sync_entity_from_player(&player);
+        state.message_flags |= 0x0040;
+
+        // The per-frame pass never fires an action-key entry.
+        state.interact(player.pos, player.angle, false);
+        state.player_zone_behavior(&mut player, false);
+        assert_eq!(player.locked, crate::player::LockedAction::None);
+
+        // The press probe marks the zone from the near side, facing in, and
+        // the zone branch starts behaviour 0x11 on the same tick.
+        state.check_action_object(player.pos, player.angle);
+        assert_eq!(state.entities[0].zone_flags & 0x70, 0x20);
+        assert_eq!(state.entities[0].action_ticks_counter, 1);
+        state.player_zone_behavior(&mut player, true);
+        assert_eq!(player.locked, crate::player::LockedAction::Stairs);
+        assert_eq!(player.attack_direction, 1);
+        assert!(!player.stairs_reverse && !player.stairs_side_z);
+        assert_eq!(state.entities[0].is_being_attacked, 0x80);
+        assert_eq!(state.message_flags & 0x0040, 0);
+        assert!(state.flags[5].bit(MSF2_DOOR_TURN_PENDING));
+
+        // The warp's release returns the message bit and consumes the latch.
+        player.locked = crate::player::LockedAction::None;
+        player.door_release = true;
+        state.tick_objects(&RoomState::default(), &mut player);
+        assert_eq!(state.message_flags & 0x0040, 0x0040);
+        assert!(!state.flags[5].bit(MSF2_DOOR_TURN_PENDING));
+        assert!(!player.door_release);
+    }
+
+    #[test]
+    fn the_zone_branch_defers_to_a_push_without_a_press_and_to_a_room_change() {
+        let mut state = game();
+        let mut player =
+            crate::player::spawn(RoomId::parse("2070").unwrap(), &RoomState::default());
+        // A script's `aot_on` of `check_door_side` raised 0x60 with no press.
+        state.entities[0].zone_flags = 0x60;
+        player.object_push = true;
+        state.player_zone_behavior(&mut player, false);
+        assert_eq!(player.locked, crate::player::LockedAction::None);
+
+        // A stairwell door's pending room change starts nothing either.
+        player.object_push = false;
+        state.transition = Some(RoomTransition {
+            target: RoomId::parse("10B0").unwrap(),
+            pos: [0, 0, 0],
+            angle: 0,
+        });
+        state.player_zone_behavior(&mut player, false);
+        assert_eq!(player.locked, crate::player::LockedAction::None);
+
+        state.transition = None;
+        state.player_zone_behavior(&mut player, false);
+        assert_eq!(player.locked, crate::player::LockedAction::Stairs);
+        assert!(player.stairs_side_z);
     }
 
     // ------------------------------------------------------------------

@@ -87,3 +87,11 @@ Save mode (each header names its save):
 - `save_screen.txt` — `typewriter_chris_118.dat`: the typewriter prompt,
   the Yes answer, the fade hand-off and the SAVE GAME screen (stopped before
   a slot is written).
+- `stairs_203.txt` — `stairs_chris_203.dat`: an in-room stairway (#30). The
+  action press at the foot of the balcony flight starts `action_behavior`
+  0x11, the climb clip and the warp onto the balcony with no room change.
+- `stairs_207.txt` — `stairs_chris_207.dat`: the same climb started by a
+  script: the flight's event `aot_on`s `check_door_side`, and the zone
+  branch starts 0x11 on the next tick without a press. Run it for 180 ticks:
+  a zombie's walk diverges from the reference later in the room, separately
+  from the stairs.

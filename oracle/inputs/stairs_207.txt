@@ -1,0 +1,14 @@
+# In-room stairs (room 207): walk onto the flight's event with action tapped.
+# The event's `aot_on` raises `check_door_side`'s zone flags, and the next
+# player tick starts `action_behavior` 0x11 from the zone branch without a
+# press; the warp lands the player on the upper floor (-0xB45 Y) along Z.
+5 up
+10 up confirm
+11 up
+14 up confirm
+15 up
+18 up confirm
+19 up
+22 up confirm
+23 up
+40

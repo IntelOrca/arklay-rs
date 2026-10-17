@@ -1513,9 +1513,9 @@ impl EntityMesh<'_> {
 
 /// A ground shadow ready to be interleaved with the masks and the model.
 ///
-/// The quad spans `[-half_x, +half_x] x [-half_z, +half_z]` in the entity's
-/// local frame, is yawed by `angle` and placed at `pos` (Y is the floor
-/// height). `texture` is the baked coverage page: white texels whose alpha is
+/// The quad spans `[-half_x, +half_x] x [-half_z, +half_z]` around `shift`
+/// in the entity's local frame, is yawed by `angle` and placed at `pos` (Y is
+/// the floor height). `texture` is the baked coverage page: white texels whose alpha is
 /// how far the destination is multiplied towards `tint`. `lift` is the
 /// per-(room, camera) view-space Y offset of the placement record.
 #[derive(Debug, Clone, Copy)]
@@ -1531,6 +1531,9 @@ pub struct Shadow<'a> {
     pub half_x: i32,
     /// Half-extent along the entity's local Z.
     pub half_z: i32,
+    /// The quad's centre in the entity's local X/Z: an uneven
+    /// `BillboardSetRect` (the player's stairway quad) sits off the entity.
+    pub shift: [i32; 2],
     /// The placement record's view-space Y offset, added to the primitive's
     /// translation row. Positive values drop the quad down the screen.
     pub lift: i32,
@@ -1784,13 +1787,19 @@ fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<Scen
         return;
     }
     let entity = anim::entity_matrix(shadow.pos, shadow.angle);
-    let half_x = shadow.half_x as i16;
-    let half_z = shadow.half_z as i16;
+    let (left, right) = (
+        (shadow.shift[0] - shadow.half_x) as i16,
+        (shadow.shift[0] + shadow.half_x) as i16,
+    );
+    let (back, front) = (
+        (shadow.shift[1] - shadow.half_z) as i16,
+        (shadow.shift[1] + shadow.half_z) as i16,
+    );
     let local = [
-        [-half_x, 0, half_z],
-        [half_x, 0, half_z],
-        [-half_x, 0, -half_z],
-        [half_x, 0, -half_z],
+        [left, 0, front],
+        [right, 0, front],
+        [left, 0, back],
+        [right, 0, back],
     ];
     let view: [[i32; 3]; 4] = local.map(|corner| camera.view_position(fixed_mul(&entity, corner)));
 
@@ -3954,6 +3963,7 @@ mod tests {
             angle: 0,
             half_x,
             half_z,
+            shift: [0, 0],
             lift: 0,
             tint: [0, 0, 1],
         }

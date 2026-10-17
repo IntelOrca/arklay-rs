@@ -1,0 +1,16 @@
+# In-room stairs (room 203): walk into the foot of the balcony flight with
+# action tapped every fourth tick. The first tap against it starts
+# `action_behavior` 0x11 on that tick; the climb clip plays and the warp
+# lands the player on the balcony (+0x10FE X, -0xB45 Y) with no room change.
+5 up
+20 up confirm
+21 up
+24 up confirm
+25 up
+28 up confirm
+29 up
+40 up confirm
+41 up
+60 up confirm
+61 up
+130

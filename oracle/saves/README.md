@@ -39,6 +39,8 @@ All saves were generated from the Japanese MediaKite assets at
 | `equip_chris_101.dat` | room 101, Chris | Beretta (`0x02`) + handgun ammo (`0x0B`). |
 | `itembox_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's item-box action rect + mixed inventory/box. |
 | `typewriter_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's typewriter action rect + an ink ribbon. |
+| `stairs_chris_203.dat` | room 203, Chris | player on the 2F main hall's middle landing, facing the east flight up to the balcony. |
+| `stairs_chris_207.dat` | room 207, Chris | player on room 207's lower landing, facing the flight up to the 2F floor. |
 
 ## Format notes
 
