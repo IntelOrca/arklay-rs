@@ -4264,7 +4264,8 @@ mod imp {
             );
 
             // `ApplyMatrixLV`: rotate a vector by a joint's world matrix
-            // (translation ignored), the grab lift offset.
+            // (translation ignored, the game's Y-sign conjugation and
+            // per-term truncation), the grab lift offset.
             methods.add_method(
                 "apply_matrix_lv",
                 |_lua, api, (joint, x, y, z): (i64, i64, i64, i64)| {
@@ -4274,15 +4275,10 @@ mod imp {
                     else {
                         return Ok((0, 0, 0));
                     };
-                    let vector = [x as i32, y as i32, z as i32];
-                    let mut out = [0i32; 3];
-                    for (row, value) in matrix.r.iter().zip(out.iter_mut()) {
-                        let mut sum = 0i64;
-                        for (element, input) in row.iter().zip(&vector) {
-                            sum += i64::from(*element) * i64::from(*input);
-                        }
-                        *value = ((sum + ((sum >> 63) & 0xFFF)) >> 12) as i32;
-                    }
+                    let out = crate::enemy::custom_anim::apply_matrix_lv(
+                        &matrix,
+                        [x as i32, y as i32, z as i32],
+                    );
                     Ok((out[0], out[1], out[2]))
                 },
             );

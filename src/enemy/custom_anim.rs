@@ -16,7 +16,7 @@
 use crate::anim::{AnimPlayer, Mat4x3, fix_wrap};
 use crate::enemy::EntityAnim;
 use crate::game::Entity;
-use crate::model::{Clip, Keyframe, Skeleton};
+use crate::model::{Clip, ClipFrame, Keyframe, Skeleton};
 use crate::state::RoomState;
 
 /// The Plant 42 animator's clock step. See the module comment for how it
@@ -137,16 +137,16 @@ fn plant42_step(
         return false;
     }
 
-    let index = if player.frame < clip.frames.len() {
-        player.frame
+    // An idle reroll swaps `animationId` without resetting the frame, so the
+    // frame can sit past the new clip's end. The original indexes the EDD
+    // frame list unchecked and reads the neighbouring clip's entries.
+    let index = player.frame;
+    let entry = if player.reverse {
+        clip.frames.len() as isize - 1 - index as isize
     } else {
-        0
+        index as isize
     };
-    let data = if player.reverse {
-        clip.frames[clip.frames.len() - 1 - index]
-    } else {
-        clip.frames[index]
-    };
+    let data = edd_frame(clips, player.clip, entry).unwrap_or(clip.frames[0]);
 
     // The sub-frame blend: only once the counter has run out and the hold is
     // still running. `blend_step` is never zero at a shipped call site; a
@@ -166,7 +166,7 @@ fn plant42_step(
         };
         player.set_applied_pose(Some(pose));
     }
-    player.display_frame = index;
+    player.display_frame = index.min(clip.frames.len() - 1);
 
     // The frame advances only when the hold has expired.
     if player.timing == 0 {
@@ -178,6 +178,27 @@ fn plant42_step(
         }
     }
     false
+}
+
+/// Frame `index` of `clip` read the way the original's unchecked pointer
+/// arithmetic does. The EDD stores every clip's frame list back to back in
+/// clip order, so an index past the end (or before the start) lands in the
+/// following (or preceding) clip's entries. `None` past the whole table.
+fn edd_frame(clips: &[Clip], clip: usize, index: isize) -> Option<ClipFrame> {
+    let mut clip = clip;
+    let mut index = index;
+    while index < 0 {
+        clip = clip.checked_sub(1)?;
+        index += clips[clip].frames.len() as isize;
+    }
+    loop {
+        let frames = &clips.get(clip)?.frames;
+        if (index as usize) < frames.len() {
+            return Some(frames[index as usize]);
+        }
+        index -= frames.len() as isize;
+        clip += 1;
+    }
 }
 
 /// `ScaleMatrixCols`: scale the rotation columns of `matrix` by `[x, y, z]`
@@ -932,7 +953,7 @@ fn gte_fixed_mul12(a: i32, b: i32) -> i32 {
 
 /// `ApplyMatrixLV`: rotate a vector by the matrix's 4.12 rotation with the
 /// game's Y-sign conjugation. The translation is not read.
-fn apply_matrix_lv(matrix: &Mat4x3, v: [i32; 3]) -> [i32; 3] {
+pub(crate) fn apply_matrix_lv(matrix: &Mat4x3, v: [i32; 3]) -> [i32; 3] {
     let source = [v[0], v[1].wrapping_neg(), v[2]];
     let mut out = [0i32; 3];
     for (row, value) in matrix.r.iter().zip(out.iter_mut()) {
