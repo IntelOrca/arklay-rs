@@ -1548,6 +1548,7 @@ fn hit_reaction(game: &mut GameState, player: &mut PlayerState, room: &RoomState
             }
             let speed = game.entities[0].move_speed_current as i16;
             walk::advance_xz(&mut game.entities[0], 0, speed);
+            player.pos = game.entities[0].pos;
             return;
         }
         0x68 => {
@@ -1556,8 +1557,11 @@ fn hit_reaction(game: &mut GameState, player: &mut PlayerState, room: &RoomState
         }
         _ => return,
     }
+    // `Add_speedXZ` moves the entity matrix; mirror the knock-back onto the
+    // visible player so the engine's entity sync does not clobber it.
     let speed = game.entities[0].move_speed_current as i16;
     walk::advance_xz(&mut game.entities[0], 0x800, speed);
+    player.pos = game.entities[0].pos;
 }
 
 /// The shared hit-reaction body: install the clip and hold, then advance the

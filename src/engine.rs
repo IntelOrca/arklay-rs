@@ -6578,6 +6578,7 @@ fn finish_transition(
     // records reload the pair too, even though the room stays.
     if session.camera_only {
         loaded.room.room_sfx = session.door.sfx;
+        game.reset_message_flags_after_door();
         // The original re-tests the current camera's switch zones in place
         // (room_transition_load's camera-only branch calls
         // check_camera_switch(1)); the record's entry camera only feeds the

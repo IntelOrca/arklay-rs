@@ -633,7 +633,14 @@ local function behavior_swipe(e)
     local player_distance_z = e:reach_test(6, 100, 0, 0, 800) and 1 or 0
     local scaled = e:reach_test(10, 100, 0, 0, 800) and 1 or 0
 
-    if e:line_of_sight() == 0 and e.player_attacked == 0
+    -- `check_line_of_sight` stores its result in the same `player_distance_z`
+    -- scratch the first claw's reach test just wrote, so a clear line of sight
+    -- zeroes it: only the second claw can land the swipe, and the first
+    -- claw's impact billboards never spawn.
+    local los = e:line_of_sight()
+    player_distance_z = los
+
+    if los == 0 and e.player_attacked == 0
         and (player_distance_z ~= 0 or scaled ~= 0)
         and ((e.animation_frame_id - 7) & 0xFF) < 6 then
         e:spawn_player_effect(0, 0, 0, -0x9D8, 0, 0x200)

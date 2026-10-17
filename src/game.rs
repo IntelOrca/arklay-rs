@@ -7578,6 +7578,11 @@ impl GameState {
             angle: door.next_angle as u16 & 0x0FFF,
         });
         self.transition_door = Some(*door);
+        // The original's `door_begin_transition` zeroes `g_message_flags`, so
+        // the rest of the frame runs with the player machine gated off: a
+        // door the scripts open (`cmd_room_action`) stops the player's update
+        // on the frame it fires. The room load restores the word.
+        self.message_flags = 0;
         // A stairwell or ladder door runs the climb behaviour: the original's
         // `check_door` raises the stair zone flag and `player_door_open_sequence`
         // owns the player's Y while the collision pass is suspended. The climb
@@ -7597,6 +7602,19 @@ impl GameState {
             self.stair_climb = true;
         }
         true
+    }
+
+    /// Restore the message word a camera-only door zeroed. The original's
+    /// gameplay loop re-enters through its `0xFD3F` reset after every door;
+    /// a full load gets it from [`Self::enter_room`]. A message the door
+    /// animation raised keeps its pause mask and releases to the reset word.
+    pub fn reset_message_flags_after_door(&mut self) {
+        self.message_flags_backup = MESSAGE_FLAGS_INITIAL;
+        self.message_flags = if self.message.active {
+            MESSAGE_FLAGS_INITIAL & !self.message.pause
+        } else {
+            MESSAGE_FLAGS_INITIAL
+        };
     }
 
     /// Request a message by id, exactly like the original's
