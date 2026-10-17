@@ -12044,24 +12044,31 @@ mod tests {
         let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
         let mut event_vm = scd::vm::EventVm::new(&loaded.scripts);
         let mut npc_models = enemy::EntityModelCache::default();
-        tick_room(
-            &mut command_vm,
-            &mut event_vm,
-            RoomContext {
-                room: &mut loaded.room,
-                game: &mut game,
-                player: &mut player_state,
-                player_assets: None,
-                pack: &pack,
-                npc_models: &mut npc_models,
-                enemy_lua: None,
-            },
+        // The first tick is the player's state-0 init, which reads no pad;
+        // the press lands on the tick after it.
+        for input in [
+            player::Input::default(),
             player::Input {
                 action_pressed: true,
                 action_held: true,
                 ..player::Input::default()
             },
-        );
+        ] {
+            tick_room(
+                &mut command_vm,
+                &mut event_vm,
+                RoomContext {
+                    room: &mut loaded.room,
+                    game: &mut game,
+                    player: &mut player_state,
+                    player_assets: None,
+                    pack: &pack,
+                    npc_models: &mut npc_models,
+                    enemy_lua: None,
+                },
+                input,
+            );
+        }
         assert_eq!(game.desk.state, 35, "the action probe opened the desk");
         assert_eq!(game.camera.current_cut, 3, "the desk cut is selected");
         assert_eq!(
@@ -18272,6 +18279,7 @@ off_0010:
         session.player.pos = [center_x - dx, 0, center_z - dz];
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
+        settle_control(&mut session, &pack);
         // Freeze the frame before the message exists; the tick loop below does
         // not render, so it still holds this scene when the window is drawn.
         session.render(&pack);
