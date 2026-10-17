@@ -12,7 +12,8 @@
 //!
 //! `--profile test-release` is the release profile without thin LTO: the
 //! tests run at release speed, but the link skips an optimisation pass only a
-//! shipped binary needs. `scripts/check.sh --full` runs exactly this.
+//! shipped binary needs. `scripts/check.sh --full` runs it as part of its
+//! ignored pass.
 //!
 //! Target one module or one test with a name filter, the way
 //! `cargo test --test <file>` used to before the files were merged:

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The local CI gate: exactly the commands the workflows run, minus the
-# artifact packaging. Run from anywhere; `--full` also runs the ignored
-# real-asset suite when ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK are set, and
-# `--soak` adds the full-game soak on top of that.
+# artifact packaging. Run from anywhere; `--full` also runs every ignored test
+# (the real-asset suite and the asset-gated unit tests) when ARKLAY_RE1_ROOT
+# and ARKLAY_RE1_PACK are set, and `--soak` adds the full-game soak on top of
+# that.
 #
 #   ./scripts/check.sh          fmt, clippy, debug + release tests, docs
 #   ./scripts/check.sh --full   the above plus the ignored real-asset suite
@@ -50,16 +51,16 @@ cargo doc --no-deps
 
 if [[ "$full" == "1" ]]; then
     if [[ -n "${ARKLAY_RE1_ROOT:-}" && -n "${ARKLAY_RE1_PACK:-}" ]]; then
-        echo "==> cargo test --profile test-release --test real -- --ignored (real assets)"
-        cargo test --profile test-release --test real -- --ignored
         if [[ "$soak" == "1" ]]; then
-            echo "==> cargo test --profile test-release --test soak_real -- --ignored --nocapture (full-game soak)"
-            ARKLAY_SOAK=1 cargo test --profile test-release --test soak_real -- --ignored --nocapture
+            echo "==> cargo test --profile test-release -- --ignored (ARKLAY_SOAK=1: the full-game soak is included)"
+            ARKLAY_SOAK=1 cargo test --profile test-release -- --ignored
         else
+            echo "==> cargo test --profile test-release -- --ignored (real assets; the soak skips)"
+            cargo test --profile test-release -- --ignored
             echo "    (the full-game soak was skipped; pass --soak to include it)"
         fi
     else
-        echo "==> skipped the real-asset suite: set ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"
+        echo "==> skipped the ignored suite: set ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"
     fi
 fi
 

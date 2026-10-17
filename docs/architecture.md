@@ -370,9 +370,9 @@ These hold across every milestone and are the regression gate:
 - Fuzzing (nightly, separate package):
   `cd fuzz && cargo +nightly fuzz run <target> -- -max_total_time=300`.
   The stable compile gate is `cargo check --manifest-path fuzz/Cargo.toml`.
-- The mirror of the CI gate: `./scripts/check.sh` (add `--full` to include the
-  ignored suite when the asset variables are set; `--soak` adds the release
-  soak).
+- The mirror of the CI gate: `./scripts/check.sh` (add `--full` to include
+  every ignored test, the real-asset suite and the asset-gated unit tests,
+  when the asset variables are set; `--soak` adds the release soak).
 
 CI runs fmt, clippy `--all-targets --all-features -D warnings`, the debug and
 `test-release` tests, the `--no-default-features` check, the doc build and the

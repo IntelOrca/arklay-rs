@@ -215,8 +215,9 @@ lists every approximation M16 leaves.
 - The local CI mirror: `./scripts/check.sh` runs fmt, clippy
   `--all-targets --all-features -D warnings`, the `--no-default-features`
   check, the debug tests, the `test-release` tests (release code without thin
-  LTO) and the doc build; `./scripts/check.sh --full` adds the ignored
-  real-asset suite when `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` are set.
+  LTO) and the doc build; `./scripts/check.sh --full` adds every ignored test
+  (the real-asset suite and the asset-gated unit tests) when
+  `ARKLAY_RE1_ROOT` and `ARKLAY_RE1_PACK` are set.
 - The real-asset tests are one binary, `tests/real/main.rs`; a module name
   stays a filter, so `cargo test --profile test-release --test real
   stairs_real:: -- --ignored` runs one module's tests and `... --test real --

@@ -398,7 +398,7 @@ fn room_ids(pack: &Pack) -> Vec<RoomId> {
 #[test]
 #[ignore = "the full-game soak; opt in with ARKLAY_SOAK=1 (release only)"]
 fn real_soak_walks_the_corpus_transitions_and_saves() {
-    if std::env::var_os("ARKLAY_SOAK").is_none() {
+    if std::env::var("ARKLAY_SOAK").as_deref() != Ok("1") {
         eprintln!(
             "skipping the full-game soak: set ARKLAY_SOAK=1 to run it (release only, \
              tens of minutes)"
