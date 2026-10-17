@@ -1,0 +1,11 @@
+# Stairwell door (room 10B -> 207): hold up into the door and tap action. The
+# door transition's animation frames are traced by both engines (the room id
+# switches mid-animation, the RNG is frozen) before 207's gameplay resumes.
+5 up
+10 up confirm
+11 up
+14 up confirm
+15 up
+18 up confirm
+19 up
+22

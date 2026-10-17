@@ -415,7 +415,14 @@ pub fn run_with_options(
                     run_lua_tick_hooks(lua.as_ref(), &mut game, message_before);
                     if let Some(request) = requested {
                         let record = game.transition_door.take().unwrap_or_default();
-                        door_transition = Some(start_transition(&pack, &record, &request)?);
+                        game.door_yield = None;
+                        door_transition = Some(start_transition(
+                            &pack,
+                            &record,
+                            &request,
+                            loaded.id,
+                            &transition::Fade::inactive(),
+                        )?);
                     }
                     play_snd3d_requests(
                         &mut no_mixer,
@@ -2065,8 +2072,18 @@ impl GameSession {
         // during the door task, and the running timeline owns the overlay.
         if let Some(transition) = transition {
             let record = self.game.transition_door.take().unwrap_or_default();
+            let door_yield = self.game.door_yield.take();
             if self.transition.is_none() {
-                self.transition = Some(start_transition(pack, &record, &transition)?);
+                self.transition = Some(start_transition(
+                    pack,
+                    &record,
+                    &transition,
+                    self.loaded.id,
+                    &self.room_fade,
+                )?);
+                if let Some(session) = self.transition.as_mut() {
+                    session.door_yield = door_yield;
+                }
             }
         } else if let Some(id) = self.game.take_fmv_request() {
             if let Err(err) = self.start_movie(pack, id, self.game.id.player_flag) {
@@ -3320,15 +3337,18 @@ impl GameSession {
         self.map = Some(ui::map::MapScreen::open(pack, &self.game));
     }
 
-    /// Advance an active transition animation one fixed frame. The finished
-    /// flag is held until [`GameSession::finish_transition`] runs after the
-    /// frame was presented.
+    /// Advance an active transition one `main_loop` frame and run the parts
+    /// of `room_transition_load` the frame reached: the placement, the
+    /// destination's `room_set` and, on the frame it returns, its tail. The
+    /// finished flag is held until [`GameSession::finish_transition`] drops
+    /// the timeline after the frame was presented.
     fn tick_transition(&mut self, pack: &Pack, skip: bool) {
         let Some(mut session) = self.transition.take() else {
             return;
         };
         let frame = session.transition.tick(skip);
         session.frame = frame;
+        session.door_yield = None;
         for effect in session.transition.stepper_mut().take_sfx() {
             play_door_animation_sfx(
                 &mut self.music,
@@ -3345,7 +3365,16 @@ impl GameSession {
         // has to wait.
         session.transition.set_sound_busy(false);
         self.transition_finished = frame.finished;
+        if frame.place {
+            place_transition_player(&mut session, &mut self.game, &mut self.loaded);
+        }
         self.transition = Some(session);
+        if frame.load {
+            self.enter_transition_destination(pack);
+        }
+        if frame.finished {
+            self.end_transition(pack);
+        }
         // The original's `main_loop` ramps the cutscene screen intensity once
         // per platform frame regardless of the door task, and only skips
         // *drawing* the bars while the transition owns the screen. The room's
@@ -3355,58 +3384,39 @@ impl GameSession {
         self.tick_screen_intensity();
     }
 
-    /// Tear the finished transition down.
-    ///
-    /// A full load was already entered at the transition's start (the
-    /// original's `room_transition_load` runs `room_set` before it waits the
-    /// animation task out), so this only drops the timeline. A camera-only
-    /// record never entered (its branch re-tests the switch zones after the
-    /// wait), so its teardown happens here.
-    fn finish_transition(&mut self, pack: &Pack) {
+    /// Drop the finished transition's timeline once its last frame was
+    /// presented; [`GameSession::tick_transition`] already ran the tail.
+    fn finish_transition(&mut self, _pack: &Pack) {
+        self.transition = None;
+        self.transition_finished = false;
+    }
+
+    /// The tail of `room_transition_load` and `game_loop`'s return into
+    /// gameplay, on the frame the animation task's exit is noticed: a
+    /// camera-only record re-tests the switch zones, the close SE plays and a
+    /// full load arms the destination's entry fade.
+    fn end_transition(&mut self, pack: &Pack) {
         let Some(mut session) = self.transition.take() else {
             return;
         };
-        self.transition_finished = false;
-        if session.entered {
-            // The destination was already swapped in when the animation began
-            // (the original loads the room before it waits the door task out);
-            // the close SE still fires at the end, like `room_transition_load`.
-            play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
-            return;
+        if session.camera_only {
+            finish_transition(
+                &mut session,
+                &mut self.game,
+                &mut self.player,
+                &mut self.loaded,
+            );
         }
-        // The BGM state machine needs the source room to resolve the outgoing
-        // group for a same-group toggle (`g_AttractMode_RoomCameraId`).
-        let from = self.loaded.id;
-        // Only a full load re-enters the destination; a camera-only record
-        // keeps the room and must not arm the entry fade.
-        let arms_fade = session.destination.is_some();
-        finish_transition(
-            &mut session,
-            &mut self.game,
-            &mut self.player,
-            &mut self.loaded,
-        );
         play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
-        if arms_fade {
-            let scripts = Rc::new(self.loaded.scripts.clone());
-            self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
-            self.event_vm = scd::vm::EventVm::from_scripts(scripts);
-            self.enter_room(pack, Some(from));
-            // `room_set` runs `room_events_check` once with the message gate
-            // forced open, so an event the init script queued executes exactly
-            // one opcode during the load (RoomInit.cpp 0x00477c45), the same
-            // pass the new-game boot models.
-            {
-                let mut host = game::ScdGameHost::new(&mut self.game);
-                self.event_vm.step(&mut host);
-            }
-            self.apply_screen_border();
+        let entered = session.entered;
+        self.transition = Some(session);
+        if entered {
             self.arm_room_entry_fade();
         }
     }
 
-    /// Enter a full-load transition's destination while the `.dor` timeline
-    /// keeps playing.
+    /// Run a full-load transition's destination `room_set` while the `.dor`
+    /// timeline keeps playing.
     ///
     /// The original's `room_transition_load` latches the door record, spawns
     /// the animation task, places the player and then loads the destination
@@ -3424,14 +3434,13 @@ impl GameSession {
             self.transition = Some(session);
             return;
         }
-        let from = self.loaded.id;
+        let from = session.source;
         finish_transition(
             &mut session,
             &mut self.game,
             &mut self.player,
             &mut self.loaded,
         );
-        session.entered = true;
         self.transition = Some(session);
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -3445,7 +3454,6 @@ impl GameSession {
             let mut host = game::ScdGameHost::new(&mut self.game);
             self.event_vm.step(&mut host);
         }
-        self.arm_room_entry_fade();
     }
 
     /// Arm the room-entry fade exactly like `game_loop`'s outer loop plus the
@@ -3723,22 +3731,44 @@ impl GameSession {
     /// (open, fade-in or close) that menu fade owns it; otherwise it is the
     /// room-entry fade.
     fn trace_tick<'a>(&'a self, frame: &Framebuffer) -> trace::TraceTick<'a> {
-        let (fade_counter, fade_state) = if !self.death.is_idle() {
+        // A running door owns the shared `g_fading_*` pair until the frame
+        // its `room_transition_load` returns and arms the room-entry fade.
+        let door_fade = self
+            .transition
+            .as_ref()
+            .filter(|_| !self.transition_finished)
+            .map(|session| session.transition.fade());
+        let (fade_counter, fade_state) = if let Some(fade) = door_fade {
+            (fade.counter(), fade.state())
+        } else if !self.death.is_idle() {
             (self.death.fade_counter(), self.death.fade_state())
         } else if self.menu_fade_phase != MenuFadePhase::None {
             (self.menu_fade.counter(), self.menu_fade.state())
         } else {
             (self.room_fade.counter(), self.room_fade.state())
         };
+        // The frame a door fires is seen at the original's mid-pass yield.
+        let door_yield = self
+            .transition
+            .as_ref()
+            .and_then(|session| session.door_yield.as_ref());
+        let (rng, rseed, entities) = match door_yield {
+            Some(view) => (view.rand_state, view.rand_seed, &view.entities[..]),
+            None => (
+                self.game.rand_state,
+                self.game.rand_seed,
+                &self.game.entities[..],
+            ),
+        };
         trace::TraceTick {
             room: self.loaded.id,
-            rng: self.game.rand_state,
-            rseed: self.game.rand_seed,
+            rng,
+            rseed,
             fade_counter: fade_counter as i16,
             fade_state,
             cam: self.loaded.room.current_cut as u8,
             player_flags: self.game.player_flags,
-            entities: &self.game.entities,
+            entities,
             frame_hash: trace::frame_hash(frame),
         }
     }
@@ -5519,15 +5549,12 @@ impl App {
         Ok(())
     }
 
-    /// After presenting: enter a door's destination (the tick after the door
-    /// fired, while the animation still plays) and tear down a finished
-    /// transition; then feed the mixer.
+    /// After presenting: tear down a finished transition, then feed the
+    /// mixer.
     fn post_present(&mut self) {
         if let Mode::Play(session) = &mut self.mode {
             if session.transition_finished {
                 session.finish_transition(&self.pack);
-            } else if session.transition.as_ref().is_some_and(|t| !t.entered) {
-                session.enter_transition_destination(&self.pack);
             }
             session.update_audio();
         }
@@ -5910,8 +5937,11 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
     }
     // A door transition's animation frames are not gameplay ticks: the
     // reference's `room_transition_load` blocks its gameplay loop until the
-    // door-animation task finishes, so those frames produce no trace line.
-    // `--ticks` counts gameplay ticks, so the loop keeps iterating (with a
+    // door-animation task finishes, so its `game_loop` hook emits no line for
+    // them. With scripted input the reference traces every `main_loop` frame
+    // instead (`--test-input`), so the door's frames are traced here too and
+    // the script's ticks land on the same frames on both sides of the door.
+    // `--ticks` counts traced lines, so the loop keeps iterating (with a
     // safety bound) until that many lines have been written.
     let mut emitted = 0u32;
     let mut iterations = 0u32;
@@ -5964,7 +5994,7 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         // the creation frame.
         if let Mode::Play(session) = &app.mode
             && was_play
-            && !in_transition
+            && (!in_transition || options.input.is_some())
             && !screen_before
         {
             let index = writer.tick_index();
@@ -6349,10 +6379,17 @@ struct TransitionMode {
     camera_only: bool,
     /// Record bit `0x40`: suppress the post-load door sound.
     silent: bool,
+    /// The room the door was taken in.
+    source: RoomId,
+    /// The press frame's trace view, until the timeline's first frame.
+    door_yield: Option<game::DoorYield>,
     /// Destination room loaded behind the black frames.
     destination: Option<LoadedRoom>,
-    /// The destination was swapped in and booted at the transition's start;
-    /// the timeline now only owns the overlay and the input gate.
+    /// The player was placed at the record's entry point and the destination
+    /// swapped in (`room_transition_load` before its `room_set`).
+    placed: bool,
+    /// The destination's `room_set` ran; the timeline now only owns the
+    /// overlay and the input gate.
     entered: bool,
     /// The most recent timeline frame, for rendering.
     frame: transition::TransitionFrame,
@@ -6424,10 +6461,11 @@ impl DoorAnimation {
 impl DoorStepper for DoorAnimation {
     fn step(&mut self) -> transition::DoorFrame {
         if let (Some(_), Some(vm)) = (self.dor.as_ref(), self.vm.as_mut()) {
+            let writes = vm.fade_writes();
             let frame = vm.step();
             self.sfx.extend(frame.sfx.iter().copied());
             self.messages.extend(frame.messages.iter().copied());
-            return transition::DoorFrame {
+            let mut door_frame = transition::DoorFrame {
                 camera: transition::Camera {
                     from: frame.camera.from,
                     to: frame.camera.to,
@@ -6436,12 +6474,16 @@ impl DoorStepper for DoorAnimation {
                 fade_type: frame.fade.fade_type,
                 fade_counter: frame.fade.counter,
                 fade_state: frame.fade.state,
+                fade_written: false,
                 done: frame.done,
                 phase: frame.phase,
                 hold: frame.hold,
                 black: frame.black,
-                sound_busy: vm.sound_busy(),
+                sound_busy: false,
             };
+            door_frame.fade_written = vm.fade_writes() != writes;
+            door_frame.sound_busy = vm.sound_busy();
+            return door_frame;
         }
 
         self.fallback_frames += 1;
@@ -6472,6 +6514,8 @@ fn start_transition(
     pack: &Pack,
     record: &game::Door,
     transition: &game::RoomTransition,
+    source: RoomId,
+    fade: &transition::Fade,
 ) -> Result<TransitionMode> {
     let camera_only = record.camera & 0x80 != 0;
     let silent = record.camera & 0x40 != 0;
@@ -6482,13 +6526,21 @@ fn start_transition(
     } else {
         Some(load_room(pack, transition.target)?)
     };
+    // A destination byte of 0x20 and up changes stage: `init_room` yields a
+    // frame before its `room_set`.
+    let stage_change = record.next_room >= 0x20;
     Ok(TransitionMode {
-        transition: transition::Transition::new(animation),
+        transition: transition::Transition::new(animation)
+            .with_fade(fade.fade_type(), fade.counter(), fade.state())
+            .with_load(camera_only, stage_change),
         door: *record,
         target: transition.target,
         camera_only,
         silent,
+        source,
+        door_yield: None,
         destination,
+        placed: false,
         entered: false,
         frame: transition::TransitionFrame {
             black: true,
@@ -6557,13 +6609,14 @@ fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
     render::draw_door_scene(framebuffer, dor, &frame);
 }
 
-/// Tear the transition down: swap in the destination room and place the player.
+/// Tear the transition down: swap in the destination room and place the
+/// player. The interactive session runs the two halves on the frames the
+/// original's `room_transition_load` reaches them; the headless drivers run
+/// whatever is left when the animation ends.
 ///
 /// The door's close SE (`play_sfx(0, 1, 0)`) belongs to the *end* of the
 /// original's `room_transition_load`, after the animation task has been waited
-/// out; the callers that tear down at the animation's end play it via
-/// [`play_room_close_sfx`], while the interactive destination entry (which
-/// mirrors the load half that runs before the wait) does not.
+/// out; every caller plays it via [`play_room_close_sfx`] on that frame.
 ///
 /// The BGM handoff runs later, in [`GameSession::enter_room`], after the
 /// destination's init script has had its say (the original's ordering).
@@ -6585,12 +6638,33 @@ fn finish_transition(
         apply_camera(&mut loaded.room, game, Some(player_state.pos));
         return;
     }
+    place_transition_player(session, game, loaded);
+    load_transition_destination(session, game, player_state, loaded);
+}
 
+/// The first half of `room_transition_load`'s full load: place the player at
+/// the record's entry point, snapshot and tear down the outgoing room's
+/// enemies and switch the room id. The destination's `room_set` runs later
+/// ([`load_transition_destination`]); a stage change's `init_room` yields a
+/// frame in between, which the oracle trace sees.
+fn place_transition_player(
+    session: &mut TransitionMode,
+    game: &mut game::GameState,
+    loaded: &mut LoadedRoom,
+) {
+    if session.camera_only || session.placed {
+        return;
+    }
     let Some(destination) = session.destination.take() else {
         return;
     };
+    session.placed = true;
+    // `g_roomCameraId` keeps the source cut until the destination's
+    // `room_set` picks its own.
+    let source_cut = loaded.room.current_cut;
     *loaded = destination;
     loaded.room.room_sfx = session.door.sfx;
+    loaded.room.current_cut = source_cut;
     // The original snapshots the outgoing room's live enemies and tears the
     // list down before the destination's `room_set` wipes the slots. The
     // snapshot ages only when the destination room differs from the source.
@@ -6600,10 +6674,26 @@ fn finish_transition(
     // The original's door load resets the player's animation id before the
     // destination room boots, so the next update re-initialises state 0 back
     // to the pad-driven state 1 instead of resuming the source room's scripted
-    // state 8 behaviour over its stale target.
-    game.entities[0].set_state(0);
-    game.entities[0].action_behavior = 0;
-    game.entities[0].action_state = 0;
+    // state 8 behaviour over its stale target. The behaviour and action state
+    // keep their source-room values until that update.
+    let player = &mut game.entities[0];
+    player.set_state(0);
+    player.pos = session.door.next_pos;
+    player.angle = session.door.next_angle as u16 & 0x0FFF;
+}
+
+/// The destination's `room_set`: boot the room state and spawn the player at
+/// the placed entry point.
+fn load_transition_destination(
+    session: &mut TransitionMode,
+    game: &mut game::GameState,
+    player_state: &mut player::PlayerState,
+    loaded: &mut LoadedRoom,
+) {
+    if session.camera_only || !session.placed || session.entered {
+        return;
+    }
+    session.entered = true;
     game.enter_room(session.target, &loaded.room);
     *player_state = player::spawn(session.target, &loaded.room);
     player_state.pos = session.door.next_pos;
@@ -6703,8 +6793,15 @@ pub fn simulate_door(
         .transition
         .with_context(|| format!("door {slot} did not request a transition"))?;
     let record = game.transition_door.take().unwrap_or(door);
+    game.door_yield = None;
 
-    let mut session = start_transition(pack, &record, &request)?;
+    let mut session = start_transition(
+        pack,
+        &record,
+        &request,
+        loaded.id,
+        &transition::Fade::inactive(),
+    )?;
     let mut mixer: Option<Mixer> = None;
     let mut sfx_cache = SfxCache::default();
     let mut framebuffer = Framebuffer::new();
@@ -7167,7 +7264,14 @@ fn simulate_loaded_with(
         // plays the `.dor` timeline and reboots the destination room.
         if let Some(request) = requested {
             let record = game.transition_door.take().unwrap_or_default();
-            door_transition = Some(start_transition(pack, &record, &request)?);
+            game.door_yield = None;
+            door_transition = Some(start_transition(
+                pack,
+                &record,
+                &request,
+                loaded.id,
+                &transition::Fade::inactive(),
+            )?);
         }
         play_snd3d_requests(
             &mut no_mixer,
@@ -12923,7 +13027,10 @@ mod tests {
             target: id,
             camera_only: true,
             silent: true,
+            source: id,
+            door_yield: None,
             destination: None,
+            placed: false,
             entered: false,
             frame: transition::TransitionFrame::default(),
         };
@@ -12949,6 +13056,9 @@ mod tests {
             target,
             camera_only: false,
             silent: true,
+            source: id,
+            door_yield: None,
+            placed: false,
             destination: Some(LoadedRoom {
                 id: target,
                 room: RoomState {

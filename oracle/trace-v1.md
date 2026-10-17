@@ -136,3 +136,30 @@ Both place the player at that centre with the new game's health and run the
 room-entry fade; tick 0 is the first gameplay tick of the requested room.
 The reference window must be 320x240 (`config.ini [Display] Width/Height`) so
 the capture frames and hashes match arklay's logical size.
+
+## Which frames are traced
+
+Without scripted input both engines trace gameplay ticks only: the
+reference's `game_loop` hook, arklay's room ticks. A door transition, the
+pause menu and the DIED screen produce no lines.
+
+With scripted input (`--test-input` / `--input`) the reference traces every
+`main_loop` frame past the arm point, and arklay does the same for door
+transitions: one line per frame of the original's door, so input keyed by
+`t` lands on the same frame in both engines across a room change. Those frames
+follow the original's task schedule (see `src/transition.rs`):
+
+- the press frame is seen at `door_begin_transition`'s mid-pass sleep, so the
+  rest of that gameplay pass (the player's behaviour, later RNG draws) shows on
+  the next line;
+- the menu path's frame, `set_fading(2, 0x600)` and the animation task's init;
+- the animation passes, with the gameplay task suspended until the opening
+  fade runs out; that frame runs a second scheduler pass, which places the
+  player and loads the destination (a stage change's `init_room` yields a
+  frame before its `room_set`, so the cut and the destination's entities
+  appear one line later);
+- the teardown frame (`g_fading_state = -1`) and the frame
+  `room_transition_load` returns and the room-entry fade is armed.
+
+`fade=` on those lines is the shared `g_fading_counter:g_fading_state` pair the
+door's `FADE_IN`/`FADE_OUT` ops write.

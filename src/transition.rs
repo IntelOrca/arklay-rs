@@ -252,6 +252,9 @@ pub struct DoorFrame {
     pub fade_counter: i32,
     /// Scripted fade start/current accumulator.
     pub fade_state: i16,
+    /// A `FADE_IN`/`FADE_OUT` op ran during this step, so the shared fade
+    /// takes the `fade_*` values.
+    pub fade_written: bool,
     /// The animation's script has reached `END`.
     pub done: bool,
     /// The animation's phase counter.
@@ -322,10 +325,68 @@ pub struct TransitionFrame {
     pub phase: i16,
     /// Animation hold counter.
     pub hold: u8,
-    /// The animation is over; the engine may tear the transition down.
+    /// `room_transition_load` placed the player at the record's entry point
+    /// this frame (the snapshot, the room id and the placement, before the
+    /// destination's `room_set`).
+    pub place: bool,
+    /// `room_transition_load` ran the destination's `room_set` this frame.
+    pub load: bool,
+    /// `room_transition_load` returned this frame: the engine runs its tail
+    /// (camera, close SE, entry fade) now and gameplay resumes on the next
+    /// tick.
     pub finished: bool,
     /// The animation's sound-busy wait state.
     pub sound_busy: bool,
+}
+
+/// What one frame's scheduler passes did.
+#[derive(Debug, Default)]
+struct FrameOut {
+    overlay: Option<Overlay>,
+    black: bool,
+    drew: bool,
+    place: bool,
+    load: bool,
+    finished: bool,
+}
+
+/// `game_loop`'s menu path opens a door with `set_fading(2, 0x600)` before it
+/// calls `room_transition_load`.
+const DOOR_FADE_TYPE: u8 = 2;
+const DOOR_FADE_COUNTER: i32 = 0x600;
+
+/// The gameplay task (task 0) while it runs a door: the end of `game_loop`'s
+/// inner loop, its menu path and `room_transition_load`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainTask {
+    /// The inner loop's last pass with the menu flag raised.
+    Settle,
+    /// The menu path: `set_fading(2, 0x600)`, then `room_transition_load`
+    /// spawns the animation task and sleeps.
+    Spawn,
+    /// Woken after the spawn: place the player and load the destination.
+    Place,
+    /// A stage change's `init_room` yielded once before its `room_set`.
+    Load,
+    /// Polling the animation task's `MSF_ROOM_TRANSITION` bit.
+    Wait,
+    /// `room_transition_load` returned.
+    Done,
+}
+
+/// The door-animation task (task 1, `DoorAnimTask`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimTask {
+    /// Not spawned yet.
+    Idle,
+    /// Spawned: its first run is `DoorAnimInit`.
+    Start,
+    /// `DoorAnimLoop`: one pass per run.
+    Run,
+    /// The loop ended: its next run is `DoorAnimTeardown`.
+    Teardown,
+    /// `Task_exit`.
+    Exited,
 }
 
 /// The door-transition state machine.
@@ -334,6 +395,14 @@ pub struct TransitionFrame {
 /// a [`DoorStepper`] once per tick. While [`Transition::input_locked`] is true
 /// the engine must not run gameplay ticks; only the skip flag passed to
 /// [`Transition::tick`] is meaningful input.
+///
+/// Each tick is one `main_loop` frame of the original, which runs the task
+/// scheduler over the gameplay task (`room_transition_load`) and the
+/// door-animation task, around the shared `g_fading_counter`/`g_fading_state`
+/// fade. The menu path's `set_fading` raises `MSF_FADE_ACTIVE`, whose branch
+/// suspends the gameplay task until the accumulator runs negative; on that
+/// frame the branch resumes it and falls through into a second scheduler
+/// pass, so the animation steps twice and the destination loads behind it.
 #[derive(Debug, Clone)]
 pub struct Transition<S> {
     stepper: S,
@@ -341,14 +410,30 @@ pub struct Transition<S> {
     phase: i16,
     hold: u8,
     fade: Fade,
-    latched_fade: Option<(u8, i32, i16)>,
+    /// `MSF_FADE_ACTIVE`.
+    fade_active: bool,
+    /// The fade branch suspended the gameplay task and owns its resume.
+    main_suspended: bool,
+    main: MainTask,
+    anim: AnimTask,
+    /// The animation task holds `MSF_ROOM_TRANSITION`.
+    anim_running: bool,
+    /// The destination is a stage change (`init_room` yields once).
+    load_yields: bool,
+    /// Camera-only record: `room_transition_load` loads no room.
+    camera_only: bool,
     last: DoorFrame,
+    /// The counters of the last drawn door pass.
+    drawn: (u32, i16, u8),
+    last_black: bool,
     sound_busy: bool,
-    finished: bool,
 }
 
 impl<S: DoorStepper> Transition<S> {
-    /// Start a transition over `stepper`.
+    /// Start a transition over `stepper` on the tick after the door fired.
+    ///
+    /// The shared fade starts inactive; [`Transition::with_fade`] seeds it
+    /// with the room's live values.
     pub fn new(stepper: S) -> Self {
         Self {
             stepper,
@@ -356,71 +441,194 @@ impl<S: DoorStepper> Transition<S> {
             phase: 0,
             hold: 0,
             fade: Fade::inactive(),
-            latched_fade: None,
+            fade_active: false,
+            main_suspended: false,
+            main: MainTask::Settle,
+            anim: AnimTask::Idle,
+            anim_running: false,
+            load_yields: false,
+            camera_only: false,
             last: DoorFrame::default(),
+            drawn: (0, 0, 0),
+            last_black: true,
             sound_busy: false,
-            finished: false,
         }
     }
 
-    /// Advance one 30 Hz tick.
+    /// Seed the shared fade with the values the room left in
+    /// `g_fading_counter`/`g_fading_state`.
+    pub fn with_fade(mut self, fade_type: u8, counter: i32, state: i16) -> Self {
+        self.fade.set(fade_type, counter, state);
+        self
+    }
+
+    /// Describe the load `room_transition_load` runs: a camera-only record
+    /// loads nothing, and a stage change's `init_room` yields one frame
+    /// before its `room_set`.
+    pub fn with_load(mut self, camera_only: bool, stage_change: bool) -> Self {
+        self.camera_only = camera_only;
+        self.load_yields = stage_change && !camera_only;
+        self
+    }
+
+    /// Advance one `main_loop` frame.
     ///
-    /// `skip_held` is the engine's confirm/cancel pad state; the transition
-    /// only acts on it once the animation is past [`SKIP_AFTER_FRAME`]. The
-    /// returned frame is the one to render this tick; when `finished` is set,
-    /// render it once and then tear down.
+    /// `skip_held` is the engine's confirm/cancel pad state; the animation
+    /// only acts on it once it is past [`SKIP_AFTER_FRAME`]. The returned
+    /// frame is the one to render this tick; when `finished` is set, render
+    /// it once and then tear down.
     pub fn tick(&mut self, skip_held: bool) -> TransitionFrame {
-        if self.finished {
+        let mut out = FrameOut::default();
+        if self.main == MainTask::Done {
             return self.output();
         }
+        if self.fade_active {
+            // The fade branch: a fresh fade starts its accumulator at 0 (at
+            // 0x7FFF when it counts down) and suspends the gameplay task.
+            if self.fade.state() < 0 {
+                let start = if self.fade.counter() < 1 { i16::MAX } else { 0 };
+                self.fade
+                    .set(self.fade.fade_type(), self.fade.counter(), start);
+                self.main_suspended = true;
+            }
+            out.overlay = self.fade.overlay();
+            self.pass(skip_held, &mut out);
+            self.fade_step();
+            if self.fade.state() < 0 {
+                self.fade.set(self.fade.fade_type(), 0, 0);
+                self.fade_active = false;
+                self.main_suspended = false;
+                self.idle_branch(skip_held, &mut out);
+            }
+        } else {
+            self.idle_branch(skip_held, &mut out);
+        }
+        self.output_into(out)
+    }
 
+    /// `main_loop`'s non-fade branch: a scheduler pass, then the accumulator
+    /// draws and steps while it is non-negative.
+    fn idle_branch(&mut self, skip_held: bool, out: &mut FrameOut) {
+        self.pass(skip_held, out);
+        if self.fade.is_active() {
+            if out.overlay.is_none() {
+                out.overlay = self.fade.overlay();
+            }
+            self.fade_step();
+        }
+    }
+
+    /// Add the counter to the 16-bit accumulator, like both of `main_loop`'s
+    /// branches.
+    fn fade_step(&mut self) {
+        let state = self.fade.state().wrapping_add(self.fade.counter() as i16);
+        self.fade
+            .set(self.fade.fade_type(), self.fade.counter(), state);
+    }
+
+    /// One `TaskScheduler_Update`: the gameplay task, then the animation
+    /// task. Every sleep is one pass long, so a task that yielded in the
+    /// previous pass runs again (even within the same frame).
+    fn pass(&mut self, skip_held: bool, out: &mut FrameOut) {
+        if !self.main_suspended {
+            self.run_main(out);
+        }
+        self.run_anim(skip_held, out);
+    }
+
+    fn run_main(&mut self, out: &mut FrameOut) {
+        match self.main {
+            MainTask::Settle => self.main = MainTask::Spawn,
+            MainTask::Spawn => {
+                // `set_fading` only latches while the accumulator is idle.
+                if self.fade.state() < 1 {
+                    self.fade_active = true;
+                    self.fade
+                        .set(DOOR_FADE_TYPE, DOOR_FADE_COUNTER, self.fade.state());
+                }
+                self.anim = AnimTask::Start;
+                self.main = MainTask::Place;
+            }
+            MainTask::Place => {
+                out.place = !self.camera_only;
+                if self.load_yields {
+                    self.main = MainTask::Load;
+                } else {
+                    out.load = !self.camera_only;
+                    self.wait(out);
+                }
+            }
+            MainTask::Load => {
+                out.load = true;
+                self.wait(out);
+            }
+            MainTask::Wait => self.wait(out),
+            MainTask::Done => {}
+        }
+    }
+
+    /// `room_transition_load`'s wait for the animation task.
+    fn wait(&mut self, out: &mut FrameOut) {
+        if self.anim_running {
+            self.main = MainTask::Wait;
+        } else {
+            self.main = MainTask::Done;
+            out.finished = true;
+        }
+    }
+
+    fn run_anim(&mut self, skip_held: bool, out: &mut FrameOut) {
+        match self.anim {
+            AnimTask::Idle | AnimTask::Exited => {}
+            AnimTask::Start => {
+                self.anim_running = true;
+                self.anim = AnimTask::Run;
+            }
+            AnimTask::Run => self.anim_pass(skip_held, out),
+            AnimTask::Teardown => {
+                self.fade
+                    .set(self.fade.fade_type(), self.fade.counter(), -1);
+                self.anim_running = false;
+                self.anim = AnimTask::Exited;
+            }
+        }
+    }
+
+    /// One `DoorAnimLoop` pass.
+    fn anim_pass(&mut self, skip_held: bool, out: &mut FrameOut) {
         let raw = self.stepper.step();
         self.last = raw;
         self.sound_busy = raw.sound_busy;
-        self.latch_fade(&raw);
-
+        if raw.fade_written {
+            self.fade
+                .set(raw.fade_type, raw.fade_counter, raw.fade_state);
+        }
         let frame = self.frame;
-        let phase = self.phase;
-        let hold = self.hold;
-        // The original queues the fade rect after the animation task ran, so
-        // this frame shows the accumulator before the tick's addition.
-        let overlay = self.fade.overlay();
-        let black = frame < BLACK_FRAMES || raw.black;
+        self.drawn = (self.frame, self.phase, self.hold);
+        self.last_black = frame < BLACK_FRAMES || raw.black;
+        out.black |= self.last_black;
+        out.drew = true;
 
         // The pass that reaches `END` is the last one the original runs: it is
         // drawn, then the loop exits, skipping the phase-2 hold and the
-        // frame-counter increment. A held-input skip ends the timeline the same
+        // frame-counter increment. A held-input skip ends the loop the same
         // way.
-        if raw.done {
-            self.finished = true;
-        } else if skip_held && frame > SKIP_AFTER_FRAME {
+        let mut ended = raw.done;
+        if !ended && skip_held && frame > SKIP_AFTER_FRAME {
             self.stepper.finish();
-            self.finished = true;
+            ended = true;
         }
-
-        if !self.finished {
-            // Phase 2 holds for five extra frames with the frame counter
-            // frozen.
-            if self.phase == 2 && self.hold < PHASE2_HOLD_FRAMES {
-                self.hold += 1;
-            } else {
-                self.hold = 0;
-                self.phase += 1;
-                self.frame += 1;
-            }
+        if ended {
+            self.anim = AnimTask::Teardown;
+            return;
         }
-
-        self.fade.tick();
-
-        TransitionFrame {
-            camera: raw.camera,
-            overlay,
-            black,
-            frame,
-            phase,
-            hold,
-            finished: self.finished,
-            sound_busy: self.sound_busy,
+        // Phase 2 holds for five extra frames with the frame counter frozen.
+        if self.phase == 2 && self.hold < PHASE2_HOLD_FRAMES {
+            self.hold += 1;
+        } else {
+            self.hold = 0;
+            self.phase += 1;
+            self.frame += 1;
         }
     }
 
@@ -448,24 +656,26 @@ impl<S: DoorStepper> Transition<S> {
         self.hold
     }
 
-    /// The fade accumulator.
+    /// The shared `g_fading_counter`/`g_fading_state` fade.
     pub fn fade(&self) -> &Fade {
         &self.fade
     }
 
     /// Whether the transition is over and the engine may tear it down.
     pub fn is_finished(&self) -> bool {
-        self.finished
+        self.main == MainTask::Done
     }
 
     /// Whether gameplay input must stay locked.
     pub fn input_locked(&self) -> bool {
-        !self.finished
+        !self.is_finished()
     }
 
-    /// Whether the screen is black this frame.
+    /// Whether the screen is black this frame: the animation is not drawing
+    /// a door pass (before its loop, after its teardown) or the pass is one
+    /// of the black frames.
     pub fn black(&self) -> bool {
-        self.frame < BLACK_FRAMES || self.last.black
+        self.anim != AnimTask::Run || self.last_black
     }
 
     /// The last sound-busy state reported by the stepper.
@@ -488,25 +698,35 @@ impl<S: DoorStepper> Transition<S> {
         &mut self.stepper
     }
 
-    fn latch_fade(&mut self, raw: &DoorFrame) {
-        let spec = (raw.fade_type, raw.fade_counter, raw.fade_state);
-        if self.latched_fade != Some(spec) {
-            self.latched_fade = Some(spec);
-            self.fade
-                .set(raw.fade_type, raw.fade_counter, raw.fade_state);
+    fn output_into(&self, out: FrameOut) -> TransitionFrame {
+        TransitionFrame {
+            overlay: out.overlay,
+            black: out.black || !out.drew,
+            place: out.place,
+            load: out.load,
+            finished: out.finished,
+            ..self.output_with()
+        }
+    }
+
+    fn output_with(&self) -> TransitionFrame {
+        let (frame, phase, hold) = self.drawn;
+        TransitionFrame {
+            camera: self.last.camera,
+            frame,
+            phase,
+            hold,
+            sound_busy: self.sound_busy,
+            ..TransitionFrame::default()
         }
     }
 
     fn output(&self) -> TransitionFrame {
         TransitionFrame {
-            camera: self.last.camera,
             overlay: self.fade.overlay(),
             black: self.black(),
-            frame: self.frame,
-            phase: self.phase,
-            hold: self.hold,
-            finished: self.finished,
-            sound_busy: self.sound_busy,
+            finished: self.is_finished(),
+            ..self.output_with()
         }
     }
 }
@@ -518,6 +738,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeStepper {
         next: DoorFrame,
+        /// A fade op the next step runs (once).
+        fade_op: Option<(u8, i32, i16)>,
         steps: u32,
         finish_calls: u32,
         busy_calls: Vec<bool>,
@@ -526,7 +748,14 @@ mod tests {
     impl DoorStepper for FakeStepper {
         fn step(&mut self) -> DoorFrame {
             self.steps += 1;
-            self.next
+            let mut frame = self.next;
+            if let Some((fade_type, counter, state)) = self.fade_op.take() {
+                frame.fade_type = fade_type;
+                frame.fade_counter = counter;
+                frame.fade_state = state;
+                frame.fade_written = true;
+            }
+            frame
         }
 
         fn finish(&mut self) {
@@ -540,13 +769,97 @@ mod tests {
         }
     }
 
+    /// The shipped doors open on `FADE_IN 2, 8, 0x2200`.
+    const DOOR_FADE_IN: (u8, i32, i16) = (2, -(8 << 7), 0x2200);
+
+    /// A door over the shipped opening fade, with the room's settled fade
+    /// (`-6144:-4097`) in the shared pair.
     fn transition() -> Transition<FakeStepper> {
-        Transition::new(FakeStepper::default())
+        let stepper = FakeStepper {
+            fade_op: Some(DOOR_FADE_IN),
+            ..FakeStepper::default()
+        };
+        Transition::new(stepper).with_fade(2, -6144, -4097)
+    }
+
+    /// Run the two frames before the animation's first pass.
+    fn lead_in(transition: &mut Transition<FakeStepper>) {
+        for _ in 0..2 {
+            let frame = transition.tick(false);
+            assert!(frame.black && !frame.place && !frame.load && !frame.finished);
+        }
+        assert_eq!(transition.stepper().steps, 0);
+    }
+
+    fn fade(transition: &Transition<FakeStepper>) -> (i32, i16) {
+        (transition.fade().counter(), transition.fade().state())
+    }
+
+    #[test]
+    fn the_menu_path_runs_two_frames_before_the_animation() {
+        let mut transition = transition();
+        // The inner loop's last pass leaves the room's fade alone.
+        transition.tick(false);
+        assert_eq!(fade(&transition), (-6144, -4097));
+        // The menu path's `set_fading(2, 0x600)` latches only the counter.
+        transition.tick(false);
+        assert_eq!(fade(&transition), (0x600, -4097));
+        assert_eq!(transition.stepper().steps, 0);
+        // The fade branch starts the accumulator at 0, the first pass's
+        // `FADE_IN` replaces it and the frame steps it once.
+        transition.tick(false);
+        assert_eq!(transition.stepper().steps, 1);
+        assert_eq!(fade(&transition), (-(8 << 7), 0x2200 - (8 << 7)));
+    }
+
+    #[test]
+    fn the_load_waits_for_the_fade_and_shares_its_frame_with_a_second_pass() {
+        let mut transition = transition();
+        lead_in(&mut transition);
+        // 0x2200 counts down by 0x400 for eight frames with the gameplay task
+        // suspended.
+        for _ in 0..8 {
+            let frame = transition.tick(false);
+            assert!(!frame.place && !frame.load);
+        }
+        assert_eq!(fade(&transition), (-(8 << 7), 512));
+        assert_eq!(transition.stepper().steps, 8);
+        // The accumulator runs out: the branch clears the pair, resumes the
+        // gameplay task and runs a second pass in the same frame.
+        let frame = transition.tick(false);
+        assert!(frame.place && frame.load);
+        assert_eq!(fade(&transition), (0, 0));
+        assert_eq!(transition.stepper().steps, 10);
+        assert!(!frame.finished);
+    }
+
+    #[test]
+    fn a_stage_change_loads_one_frame_after_the_placement() {
+        let mut transition = transition().with_load(false, true);
+        lead_in(&mut transition);
+        for _ in 0..8 {
+            transition.tick(false);
+        }
+        let frame = transition.tick(false);
+        assert!(frame.place && !frame.load);
+        let frame = transition.tick(false);
+        assert!(!frame.place && frame.load);
+    }
+
+    #[test]
+    fn a_camera_only_record_loads_nothing() {
+        let mut transition = transition().with_load(true, true);
+        lead_in(&mut transition);
+        for _ in 0..30 {
+            let frame = transition.tick(false);
+            assert!(!frame.place && !frame.load);
+        }
     }
 
     #[test]
     fn black_covers_the_first_three_frames_and_the_phase_two_hold() {
         let mut transition = transition();
+        lead_in(&mut transition);
 
         let black: Vec<bool> = (0..10).map(|_| transition.tick(false).black).collect();
 
@@ -559,8 +872,9 @@ mod tests {
     #[test]
     fn phase_two_holds_for_five_extra_frames() {
         let mut transition = transition();
+        lead_in(&mut transition);
 
-        let states: Vec<(i16, u8, u32)> = (0..9)
+        let states: Vec<(i16, u8, u32)> = (0..8)
             .map(|_| {
                 let frame = transition.tick(false);
                 (frame.phase, frame.hold, frame.frame)
@@ -578,9 +892,12 @@ mod tests {
                 (2, 3, 2),
                 (2, 4, 2),
                 (2, 5, 2),
-                (3, 0, 3),
             ]
         );
+        // The ninth frame runs two passes (frames 3 and 4) and reports the
+        // last one drawn.
+        let frame = transition.tick(false);
+        assert_eq!((frame.phase, frame.hold, frame.frame), (4, 0, 4));
     }
 
     #[test]
@@ -613,57 +930,73 @@ mod tests {
     }
 
     #[test]
-    fn fade_specs_from_the_animation_are_latched_and_accumulated() {
+    fn a_fade_op_after_the_load_draws_then_steps() {
         let mut transition = transition();
-        transition.stepper_mut().next.fade_type = 2;
-        transition.stepper_mut().next.fade_counter = 10 << 7;
-        transition.stepper_mut().next.fade_state = 2;
+        lead_in(&mut transition);
+        for _ in 0..12 {
+            transition.tick(false);
+        }
+        assert_eq!(fade(&transition), (0, 0));
 
-        let alpha = |transition: &mut Transition<FakeStepper>| {
-            transition.tick(false).overlay.expect("fade overlay").alpha
-        };
-
-        assert_eq!(alpha(&mut transition), 0);
-        assert_eq!(alpha(&mut transition), 10);
-        assert_eq!(alpha(&mut transition), 20);
-
-        // A later fade op replaces the accumulator instead of continuing it.
-        transition.stepper_mut().next.fade_state = 0x2200;
-        transition.stepper_mut().next.fade_counter = -(8 << 7);
-        assert_eq!(alpha(&mut transition), (0x2200i32 >> 7) as u8);
-        assert_eq!(alpha(&mut transition), ((0x2200 - (8 << 7)) >> 7) as u8);
+        // A `FADE_OUT 2, 14, 0x200` pass: the frame draws the written value,
+        // then the accumulator steps.
+        transition.stepper_mut().fade_op = Some((2, 14 << 7, 0x200));
+        let frame = transition.tick(false);
+        assert_eq!(frame.overlay.expect("fade overlay").alpha, 4);
+        assert_eq!(fade(&transition), (14 << 7, 0x200 + (14 << 7)));
+        // The same op again restarts the accumulator rather than continuing.
+        transition.stepper_mut().fade_op = Some((2, 14 << 7, 0x200));
+        transition.tick(false);
+        assert_eq!(fade(&transition), (14 << 7, 0x200 + (14 << 7)));
     }
 
     #[test]
     fn held_input_skips_only_after_frame_ten() {
         let mut transition = transition();
+        lead_in(&mut transition);
 
-        for _ in 0..16 {
+        // Ticks return frames 0, 1, 2 (held five times), 3+4, 5..=10.
+        for _ in 0..15 {
             let frame = transition.tick(true);
-            assert!(
-                !frame.finished,
-                "frame {} must not be skippable",
-                frame.frame
-            );
-            assert!(transition.input_locked());
+            assert!(frame.frame <= SKIP_AFTER_FRAME);
+            assert!(!frame.finished);
         }
+        assert_eq!(transition.stepper().finish_calls, 0);
 
+        // Frame 11 is skippable: the loop ends on that pass, the teardown
+        // runs on the next frame and `room_transition_load` returns on the
+        // one after.
         let frame = transition.tick(true);
-        assert!(frame.finished);
-        assert!(!transition.input_locked());
+        assert_eq!(frame.frame, 11);
+        assert!(!frame.finished);
         assert_eq!(transition.stepper().finish_calls, 1);
+        assert!(!transition.tick(true).finished);
+        assert!(transition.input_locked());
+        assert!(transition.tick(true).finished);
+        assert!(!transition.input_locked());
     }
 
     #[test]
-    fn completion_waits_for_the_animation_to_report_done() {
+    fn completion_runs_the_teardown_frame_then_returns() {
         let mut transition = transition();
+        lead_in(&mut transition);
         for _ in 0..20 {
             assert!(!transition.tick(false).finished);
         }
 
         transition.stepper_mut().next.done = true;
         let frame = transition.tick(false);
-        assert!(frame.finished);
+        assert!(!frame.finished && !frame.black, "the END pass is drawn");
+        let steps = transition.stepper().steps;
+
+        // `DoorAnimTeardown`: the accumulator goes inactive, nothing is drawn.
+        let frame = transition.tick(false);
+        assert!(!frame.finished && frame.black);
+        assert_eq!(transition.fade().state(), -1);
+
+        let frame = transition.tick(false);
+        assert!(frame.finished && frame.black);
+        assert_eq!(transition.stepper().steps, steps);
         assert_eq!(
             transition.stepper().finish_calls,
             0,
@@ -672,41 +1005,31 @@ mod tests {
     }
 
     #[test]
-    fn an_immediate_end_finishes_after_one_black_frame() {
+    fn an_immediate_end_still_waits_for_the_fade() {
         let mut transition = transition();
         transition.stepper_mut().next.done = true;
+        lead_in(&mut transition);
 
         let frame = transition.tick(false);
-        assert!(frame.finished);
         assert!(frame.black, "pass 0 is one of the black frames");
         assert_eq!(frame.frame, 0);
+        let mut ticks = 1;
+        while !transition.tick(false).finished {
+            ticks += 1;
+            assert!(ticks < 64, "the transition never returned");
+        }
         assert!(!transition.input_locked());
+        assert_eq!(transition.stepper().steps, 1);
 
         // A finished timeline stops stepping the animation.
-        let steps = transition.stepper().steps;
         assert!(transition.tick(false).finished);
-        assert_eq!(transition.stepper().steps, steps);
-    }
-
-    #[test]
-    fn an_end_after_the_black_frames_finishes_on_that_pass() {
-        let mut transition = transition();
-        // Ticks 1..=12 return frames 0, 1, 2, then the hold's five 2s, then
-        // 3..=6; the next pass is frame 7.
-        for _ in 0..12 {
-            assert!(!transition.tick(false).finished);
-        }
-        transition.stepper_mut().next.done = true;
-
-        let frame = transition.tick(false);
-        assert!(frame.finished);
-        assert_eq!(frame.frame, 7);
-        assert!(!frame.black, "passes past the third are not black");
+        assert_eq!(transition.stepper().steps, 1);
     }
 
     #[test]
     fn sound_busy_is_forwarded_and_keeps_the_timeline_running() {
         let mut transition = transition();
+        lead_in(&mut transition);
         transition.set_sound_busy(true);
         assert_eq!(transition.stepper().busy_calls, [true]);
 
@@ -727,22 +1050,12 @@ mod tests {
     #[test]
     fn a_stepper_black_flag_extends_the_black_screen() {
         let mut transition = transition();
-        transition.stepper_mut().next.black = true;
-        assert!(transition.tick(false).black);
-    }
-
-    #[test]
-    fn a_finished_transition_stops_stepping() {
-        let mut transition = transition();
-        transition.stepper_mut().next.done = true;
-        for _ in 0..8 {
+        lead_in(&mut transition);
+        for _ in 0..12 {
             transition.tick(false);
         }
-        assert!(transition.is_finished());
-
-        let steps = transition.stepper().steps;
-        let frame = transition.tick(false);
-        assert!(frame.finished);
-        assert_eq!(transition.stepper().steps, steps);
+        assert!(!transition.tick(false).black);
+        transition.stepper_mut().next.black = true;
+        assert!(transition.tick(false).black);
     }
 }

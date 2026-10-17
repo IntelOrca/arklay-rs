@@ -1,0 +1,6 @@
+# Same-stage door (room 103 -> 101): tap action at the door. The transition
+# frames are traced by both engines; 101 gameplay resumes on the same tick.
+5 confirm
+6
+9 confirm
+10
