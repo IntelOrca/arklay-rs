@@ -2420,6 +2420,10 @@ pub(crate) struct CollisionResolution {
     /// zombie walk behaviours read back on frames that skip the pathfinder.
     /// The last write of the resolve wins.
     pub entity_bkp: Option<u32>,
+    /// Pass 1 classified a shape-4 soft zone. The original's handler
+    /// (`collision_flag_set`) only raises `collisionFlags` bit 3 on the
+    /// entity; the zombie's walk reads it to start its vomit behaviour.
+    pub soft_zone: bool,
 }
 
 /// The two-pass resolve with the scratch snapshot [`CollisionResolution`]
@@ -2437,6 +2441,7 @@ pub(crate) fn resolve_collision_full(
     let mut floor_step = 0i16;
     let mut push_z = None;
     let mut entity_bkp = None;
+    let mut soft_zone = false;
 
     for rect in records {
         if collision_flags & 0x04 != 0 && rect.flags & 0x100 == 0 {
@@ -2450,6 +2455,10 @@ pub(crate) fn resolve_collision_full(
             let (axis, bkp) = match shape {
                 1 | 5 => push_rect(rect, prev, &mut pos, radius),
                 3 => (push_circle(rect, &mut pos, radius), None),
+                4 => {
+                    soft_zone = true;
+                    (None, None)
+                }
                 _ => (None, None),
             };
             if axis.is_some() {
@@ -2470,6 +2479,7 @@ pub(crate) fn resolve_collision_full(
             scratch: proposed,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
 
@@ -2501,6 +2511,7 @@ pub(crate) fn resolve_collision_full(
             scratch,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
     if still_hit == 0 {
@@ -2511,6 +2522,7 @@ pub(crate) fn resolve_collision_full(
             scratch,
             push_z,
             entity_bkp,
+            soft_zone,
         };
     }
     CollisionResolution {
@@ -2520,6 +2532,7 @@ pub(crate) fn resolve_collision_full(
         scratch,
         push_z,
         entity_bkp,
+        soft_zone,
     }
 }
 
