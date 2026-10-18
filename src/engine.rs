@@ -12151,11 +12151,12 @@ fn render_frame_on(
     // previous tick and this one (a no-op unless the render rate tweens).
     tween.begin(id, room.current_cut);
     // The frame's screen shake, rolled by `roll_screen_shake` at the top of the
-    // gameplay tick. It shifts the camera projection and the background's
-    // display origin; the room's view matrix stays untouched.
+    // gameplay tick. The screen offset shifts the camera projection and the
+    // live shake the background's display origin; the room's view matrix
+    // stays untouched.
     let shake = game.screen_shake();
     let mut camera = Camera::from_cut(cut);
-    camera.screen = shake;
+    camera.screen = game.screen_offset();
     let lighting = Lighting::from_room(room);
 
     let page = if cut.masks.is_empty() || cut.mask_active == 0 {

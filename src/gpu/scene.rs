@@ -226,14 +226,13 @@ fn light_vector(
         dir
     };
     let l = apply_matrix_sv(stored, vec);
+    // The draw matrix is `MulMatrix0`'s rounded 4.12 short product.
+    let draw = mul_matrix0(stored, &joint.r).map(|row| row.map(|entry| entry as i16));
     let mut out = [0.0f32; 4];
     for (k, slot) in out.iter_mut().take(3).enumerate() {
         let mut sum = 0.0f64;
         for (row, &l_row) in l.iter().enumerate() {
-            let m: f64 = (0..3)
-                .map(|j| f64::from(stored[row][j]) * f64::from(joint.r[j][k]))
-                .sum();
-            sum += m * f64::from(l_row);
+            sum += f64::from(draw[row][k]) * 4096.0 * f64::from(l_row);
         }
         *slot = (sum / 4096f64.powi(4)) as f32;
     }
@@ -768,12 +767,14 @@ mod tests {
             per_joint_light: false,
         };
         let stored = stored_camera_matrix(camera.from, camera.look_at);
+        let draw_matrix = mul_matrix0(&stored, &joint.r)
+            .map(|row| row.map(|entry| f32::from(entry as i16) / 4096.0));
         for room_object in [false, true] {
             let uniforms = draw_uniforms(&camera, &entity, &light, room_object, None);
             for normal in [[0i16, -4096, 0], [2896, 0, 2896], [-1000, 3000, -2000]] {
                 let reference = render::reference_vertex_shade(
                     &stored,
-                    &joint.r,
+                    &draw_matrix,
                     normal,
                     &light,
                     room_object.then_some(&joint.r),

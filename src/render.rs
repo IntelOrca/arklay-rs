@@ -2899,9 +2899,10 @@ fn collect_triangles(
     };
     let vertices = project_pool(-1.0);
     let mut raw_vertices: Option<Vec<Option<Projected>>> = None;
-    // The reference lights the raw TMD normal through `camera * joint`, so the
-    // stored camera matrix and the joint's 4.12 rotation are all it needs.
-    let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
+    // The reference lights the normal through the object's draw matrix and
+    // the light rows through `g_RoomCameraData`.
+    let light_camera = ref_camera(camera).0;
+    let normal_matrix = projection.rotation.map(|row| row.map(|entry| entry as f32));
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
@@ -2995,8 +2996,8 @@ fn collect_triangles(
                 (Some(_), Some(light)) if !full_bright => {
                     let mut shade = match normal {
                         Some(normal) => reference_vertex_shade(
-                            &stored_camera,
-                            &joint.r,
+                            &light_camera,
+                            &normal_matrix,
                             normal,
                             &light,
                             room_object.then_some(&joint.r),
@@ -3112,9 +3113,27 @@ impl RefProjection {
         // `SetRotAndTransMatrix` negates the translation's Y.
         translation[1] = translation[1].wrapping_neg();
         let focal = f64::from(camera.fov);
+        let mut rotation = rotation.map(|row| row.map(|entry| f32::from(entry) / 4096.0));
+        let mut translation = translation.map(|entry| entry as f32);
+        if let Some(tilt) = shake_tilt(camera) {
+            // `FUN_0048c730` then `FUN_0048c820`: the tilt rotates the
+            // object's rotation and translation alike.
+            rotation = std::array::from_fn(|row| {
+                std::array::from_fn(|column| {
+                    rotation[0][column] * tilt[row][0]
+                        + rotation[1][column] * tilt[row][1]
+                        + rotation[2][column] * tilt[row][2]
+                })
+            });
+            translation = std::array::from_fn(|row| {
+                tilt[row][0] * translation[0]
+                    + tilt[row][1] * translation[1]
+                    + tilt[row][2] * translation[2]
+            });
+        }
         Self {
-            rotation: rotation.map(|row| row.map(|entry| f64::from(entry) / 4096.0)),
-            translation: translation.map(|entry| f64::from(entry as f32)),
+            rotation: rotation.map(|row| row.map(f64::from)),
+            translation: translation.map(f64::from),
             center: [
                 f64::from(CENTER_X + camera.screen[0]),
                 f64::from(CENTER_Y + camera.screen[1]),
@@ -3145,9 +3164,38 @@ impl RefProjection {
     }
 }
 
-/// `CompMatrix(g_RoomCameraData, joint)`: the camera composed onto `joint`,
-/// as the 4.12 short rotation and the integer translation.
-fn ref_composed(camera: &Camera, joint: &anim::Mat4x3) -> ([[i16; 3]; 3], [i32; 3]) {
+/// `FUN_00486190`'s view rotation while the screen is shaken: the look-at from
+/// `(0, 0, -f)` towards `(-shake_x, shake_y, 0)` (`FUN_0048cc50`), which the
+/// reference folds into every TMD object's matrix on top of the shifted
+/// projection centre. At rest it is the identity and is skipped.
+fn shake_tilt(camera: &Camera) -> Option<[[f32; 3]; 3]> {
+    if camera.screen == [0, 0] {
+        return None;
+    }
+    let dx = -camera.screen[0] as f32;
+    let dy = camera.screen[1] as f32;
+    let dz = camera.fov as f32;
+    let mut length = (dx * dx + dy * dy + dz * dz).sqrt();
+    if length == 0.0 {
+        length = 1.0;
+    }
+    let inverse = 1.0 / length;
+    let ny = -(dy * inverse);
+    let horizontal = (1.0 - ny * ny).sqrt();
+    let (nx, nz) = if horizontal == 0.0 {
+        (0.0, 1.0)
+    } else {
+        (-((dx * inverse) / horizontal), (dz * inverse) / horizontal)
+    };
+    Some([
+        [nz, 0.0, nx],
+        [-(nx * ny), horizontal, nz * ny],
+        [-(nx * horizontal), -ny, nz * horizontal],
+    ])
+}
+
+/// `g_RoomCameraData`: the stored camera rotation and translation.
+fn ref_camera(camera: &Camera) -> ([[i32; 3]; 3], [i32; 3]) {
     let mut view = stored_camera_matrix(camera.from, camera.look_at);
     let mut view_t = apply_matrix_lv(&view, camera.from.map(i32::wrapping_neg));
     if camera.mirrored {
@@ -3156,6 +3204,13 @@ fn ref_composed(camera: &Camera, joint: &anim::Mat4x3) -> ([[i16; 3]; 3], [i32; 
         view[0] = view[0].map(|entry| -entry);
         view_t[0] = -view_t[0];
     }
+    (view, view_t)
+}
+
+/// `CompMatrix(g_RoomCameraData, joint)`: the camera composed onto `joint`,
+/// as the 4.12 short rotation and the integer translation.
+fn ref_composed(camera: &Camera, joint: &anim::Mat4x3) -> ([[i16; 3]; 3], [i32; 3]) {
+    let (view, view_t) = ref_camera(camera);
     // `MulMatrix0` stores shorts.
     let rotation = mul_matrix0(&view, &joint.r).map(|row| row.map(|entry| entry as i16));
     let moved = apply_matrix_lv(&view, joint.t);
@@ -3206,38 +3261,35 @@ pub(crate) fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
 
 /// The reference's `TmdComputeLight` (TmdRenderer.cpp) for one vertex.
 ///
-/// `camera` is `g_RoomCameraData`; `rot` is the object's or joint's 4.12 world
-/// matrix; `normal` is the raw TMD normal. Room objects multiply the stored
-/// light row by the object's rotation before the camera transform
+/// `camera` is `g_RoomCameraData`; `matrix` is the object's float draw matrix
+/// ([`RefProjection`]'s rotation: `camera * rot` as 4.12 shorts, turned by the
+/// shake tilt when the screen is shaken); `normal` is the raw TMD normal. Room objects multiply
+/// the stored light row by the object's rotation before the camera transform
 /// (`RoomObjectRender`), the item viewer by the camera itself
 /// (`MulMatrix0(&g_lightMatrix, &g_RoomCameraData)`), both through
 /// `light_rot`; entities use the stored row as-is. Every path then
 /// rotate the normal (Y-negated and scaled like the vertex buffer's
-/// `PSXObjVtx`) by `camera * rot`, negate the transformed light direction, and
-/// accumulate `max(0, -(n_view . l)) * colour` over the ambient. The scale of
-/// the dot is 4.12 (the light vectors) against unit (the normal).
+/// `PSXObjVtx`) by the draw matrix, negate the transformed light direction,
+/// and accumulate `max(0, -(n_view . l)) * colour` over the ambient. The light
+/// rows never see the shake tilt. The scale of the dot is 4.12 (the light
+/// vectors) against unit (the normal).
 pub(crate) fn reference_vertex_shade(
     camera: &[[i32; 3]; 3],
-    rot: &[[i32; 3]; 3],
+    matrix: &[[f32; 3]; 3],
     normal: [i16; 3],
     light: &EntityLight,
     light_rot: Option<&[[i32; 3]; 3]>,
 ) -> [f64; 3] {
     // The reference accumulates in 32-bit floats (`TmdComputeLight`), so the
     // port matches its rounding exactly rather than using doubles.
-    let normal = [normal[0] as f32, -(normal[1] as f32), normal[2] as f32];
-    let mut n_view = [0.0f32; 3];
-    for row in 0..3 {
-        let mut sum = 0.0f32;
-        for k in 0..3 {
-            let mut inner = 0.0f32;
-            for j in 0..3 {
-                inner += camera[row][j] as f32 * rot[j][k] as f32;
-            }
-            sum += inner * normal[k];
-        }
-        n_view[row] = sum / (4096.0 * 4096.0 * 4096.0);
-    }
+    let normal = [
+        f32::from(normal[0]) / 4096.0,
+        -f32::from(normal[1]) / 4096.0,
+        f32::from(normal[2]) / 4096.0,
+    ];
+    let n_view: [f32; 3] = std::array::from_fn(|row| {
+        matrix[row][0] * normal[0] + matrix[row][1] * normal[1] + matrix[row][2] * normal[2]
+    });
     let mut shade = light.ambient.map(|value| value as f32);
     for source in &light.sources {
         let vec = match light_rot {
@@ -3273,6 +3325,15 @@ fn collect_ivm_triangles(
     triangles: &mut Vec<Triangle>,
 ) {
     let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
+    // The viewer's normal transform: `camera * rot` in floats, unrounded.
+    let draw_matrix: [[f32; 3]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..3)
+                .map(|k| stored_camera[row][k] as f32 * joint.r[k][column] as f32)
+                .sum::<f32>()
+                / (4096.0 * 4096.0)
+        })
+    });
     let vertices: Vec<[i32; 3]> = object
         .vertices
         .iter()
@@ -3367,7 +3428,7 @@ fn collect_ivm_triangles(
                         let mut shade = match normal {
                             Some(normal) => reference_vertex_shade(
                                 &stored_camera,
-                                &joint.r,
+                                &draw_matrix,
                                 normal,
                                 light,
                                 Some(&stored_camera),
@@ -4130,6 +4191,26 @@ mod tests {
             None,
         );
         assert_eq!(framebuffer_pixel(&all, 180, 100), [0, 0, 254, 255]);
+    }
+
+    #[test]
+    fn screen_shake_tilts_the_object_matrix() {
+        let mut camera = straight_camera();
+        camera.fov = 207;
+        assert_eq!(shake_tilt(&camera), None);
+        // Offset (161, 121) with f = 207, as `FUN_0048cc50` builds it.
+        camera.screen = [1, 1];
+        let tilt = shake_tilt(&camera).expect("a shaken screen tilts");
+        let expected = [
+            [0.999_988, 0.0, 0.004_830_86],
+            [0.000_023_337, 0.999_988, -0.004_830_75],
+            [-0.004_830_81, 0.004_830_81, 0.999_977],
+        ];
+        for (row, expected) in tilt.iter().zip(&expected) {
+            for (&value, &expected) in row.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-6, "{tilt:?}");
+            }
+        }
     }
 
     #[test]

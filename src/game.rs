@@ -3617,6 +3617,12 @@ pub struct GameState {
     /// rolled at the top of the gameplay tick while `MSF2_SCREEN_SHAKE` is set
     /// and read by the renderer. See [`GameState::roll_screen_shake`].
     pub screen_shake: [i32; 2],
+    /// The last rolled shake offset as the original's `g_ScreenOffsetX/Y` and
+    /// `g_SubpixelOffsetX/Y` hold it, relative to the screen centre. A
+    /// screen-border room (`MSF2_SCREEN_BORDER`) never re-centres them, so
+    /// once its shake stops the projection keeps the final roll until the
+    /// next room load. See [`GameState::screen_offset`].
+    pub screen_offset: [i32; 2],
     /// The effect pool (64 slots).
     pub effects: Box<effects::EffectPool>,
     /// The room's runtime object-model records, one per declared omodel slot;
@@ -3807,6 +3813,7 @@ impl Default for GameState {
             rand_state: 1,
             rand_seed: 0,
             screen_shake: [0, 0],
+            screen_offset: [0, 0],
             effects: Box::new(effects::EffectPool::new()),
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
@@ -4478,13 +4485,28 @@ impl GameState {
             let x = i32::from(platform_rand(&mut self.rand_state) & 1);
             let y = i32::from(platform_rand(&mut self.rand_state) & 1);
             let direction = platform_rand(&mut self.rand_state) & 3;
-            match direction {
+            let roll = match direction {
                 1 => [x, -y],
                 2 => [-x, y],
                 3 => [-x, -y],
                 _ => [x, y],
-            }
+            };
+            self.screen_offset = roll;
+            roll
         };
+    }
+
+    /// The frame's screen offset, which shifts the 3D projection, the masks
+    /// and the sprites. `main_loop` re-centres it every frame through
+    /// `ResetScreenAndRebuildSprites`, re-applying a live roll, except in a
+    /// screen-border room: `ApplyShakeAndRebuildSprites` moves only the
+    /// background there, so the last roll persists after the shake stops.
+    pub fn screen_offset(&self) -> [i32; 2] {
+        if self.flags[5].bit(MSF2_SCREEN_BORDER) {
+            self.screen_offset
+        } else {
+            self.screen_shake
+        }
     }
 
     /// The screen-shake offset rolled for this frame by
@@ -4988,6 +5010,8 @@ impl GameState {
         self.special_light_masks = [0; 3];
         self.got_item_slot = None;
         self.pending_reach = None;
+        // The load re-centres the screen offset (`CenterScreenOrigin`).
+        self.screen_offset = [0, 0];
         // The original's door-animation window clears the 0x80 reach lock when
         // a transition runs, so an abandoned reach cannot freeze the
         // destination's scripted walks.
@@ -12056,6 +12080,22 @@ mod tests {
         state.roll_screen_shake();
         assert_eq!(state.screen_shake(), [0, 1]);
         assert_eq!(state.rand_state, 1_030_492_215, "six draws consumed");
+    }
+
+    #[test]
+    fn a_screen_border_room_keeps_the_last_shake_offset() {
+        let mut state = game();
+        state.flags[5].apply(MSF2_SCREEN_SHAKE, 0);
+        state.roll_screen_shake();
+        assert_eq!(state.screen_offset(), [-1, 1]);
+        state.flags[5].apply(MSF2_SCREEN_SHAKE, 1);
+        state.roll_screen_shake();
+        // An ordinary room re-centres as soon as the shake stops ...
+        assert_eq!(state.screen_shake(), [0, 0]);
+        assert_eq!(state.screen_offset(), [0, 0]);
+        // ... a screen-border room keeps the final roll.
+        state.flags[5].apply(MSF2_SCREEN_BORDER, 0);
+        assert_eq!(state.screen_offset(), [-1, 1]);
     }
 
     #[test]
