@@ -976,8 +976,13 @@ mod tests {
 
     /// A pack holding `base`, layered with a mod pack holding `layer`.
     fn layered_pack(base: &[(&str, &[u8])], layer: &[(&str, &[u8])]) -> crate::pack::Pack {
+        // A per-call label, not a pointer: a slice's `{:p}` renders as
+        // `Pointer { addr: ..., metadata: ... }`, which no filesystem accepts
+        // (Windows rejects the braces and colon outright).
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let label = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("arklay-assets-{}-{:p}", std::process::id(), layer));
+            std::env::temp_dir().join(format!("arklay-assets-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let base_path = dir.join("base.akpak");
