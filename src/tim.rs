@@ -19,6 +19,26 @@ const CLUT_ROW_LEN: usize = 16;
 /// The BGR555 word's semi-transparency (STP) bit.
 const STP_BIT: u16 = 0x8000;
 
+/// The TIM header's color mode: `0` 4bpp indexed, `1` 8bpp indexed, `2` 16bpp
+/// direct.
+///
+/// Lets a general image loader pick [`decode_4bpp`], [`decode_8bpp`] or
+/// [`decode`] from the file itself instead of the entry name.
+pub fn mode(data: &[u8]) -> Result<u8> {
+    if data.len() < HEADER_LEN {
+        bail!(
+            "TIM is truncated: {} bytes, need at least {HEADER_LEN}",
+            data.len()
+        );
+    }
+    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if magic != TIM_MAGIC {
+        bail!("not a TIM file: magic 0x{magic:08X}, expected 0x{TIM_MAGIC:08X}");
+    }
+    let flags = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    Ok((flags & 7) as u8)
+}
+
 /// Decode a PSX TIM image. Only 16bpp direct color (mode 2) is supported.
 ///
 /// The image block length field is ignored: the shipped paks store only the

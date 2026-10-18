@@ -200,9 +200,11 @@ caption; up/down step the rooms of the current floor plan, left/right step
 between the plans the owned maps unlock, and confirm shows the full plan of
 the current area. A pack without `map/` leaves the tab blank.
 
-Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
-pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
-refused.
+Saves live as `savedat*.dat` under `--save-dir` (default `<config
+dir>/save`, `~/.config/arklay/save`). The title starts on LOAD GAME when a
+save exists; with none, LOAD is refused. `arklay.toml` in the same config
+directory selects the save/load screen (`save_screen = "cr"` runs the built-in
+Classic REbirth-style Lua screen), the language and the save directory.
 
 The ignored `tests/real/m16_ui_real.rs` golden harness compares sampled
 room/message/NPC/UI frames against a locally generated set when

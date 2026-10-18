@@ -48,6 +48,16 @@ fn run(args: &[&str]) -> Output {
         .expect("the arklay binary runs")
 }
 
+/// [`run`] with extra environment variables.
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arklay"));
+    command.args(args);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("the arklay binary runs")
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -525,6 +535,75 @@ fn a_failed_output_rename_keeps_the_destination_and_removes_the_temporary() {
         .filter(|name| name.to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+}
+
+#[test]
+fn the_config_file_and_the_save_screen_flag_are_read() {
+    let dir = TempDir::new("config");
+    let path = dir.join("game.akpak");
+    write_room_pack(&path);
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("arklay.toml");
+    let capture = dir.join("capture.bmp");
+    let saves = dir.join("cfg-saves");
+    let config_env = config_dir.to_str().unwrap();
+
+    // A config selecting the Lua screen and a save location: the pack has no
+    // screen script, so the run warns and falls back to the ported original.
+    std::fs::write(
+        &config,
+        format!("save_screen = \"cr\"\nsave_dir = \"{}\"\n", saves.display()),
+    )
+    .unwrap();
+    let output = run_env(
+        &[
+            path.to_str().unwrap(),
+            "--ui",
+            "load",
+            "--capture",
+            capture.to_str().unwrap(),
+        ],
+        &[("ARKLAY_CONFIG_DIR", config_env)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("lua save screen"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(capture.is_file());
+
+    // A malformed config is reported instead of ignored.
+    std::fs::write(&config, "save_screen = 3\n").unwrap();
+    let output = run_env(
+        &[
+            path.to_str().unwrap(),
+            "--ui",
+            "load",
+            "--capture",
+            capture.to_str().unwrap(),
+        ],
+        &[("ARKLAY_CONFIG_DIR", config_env)],
+    );
+    assert_failure(&output, "expects a quoted string");
+
+    // `--save-screen` overrides the file; an empty value is refused. (The
+    // config file is valid again, so the flag's own error is the one shown.)
+    std::fs::write(&config, "save_screen = \"vanilla\"\n").unwrap();
+    let output = run_env(
+        &[
+            path.to_str().unwrap(),
+            "--ui",
+            "load",
+            "--save-screen",
+            "",
+            "--capture",
+            capture.to_str().unwrap(),
+        ],
+        &[("ARKLAY_CONFIG_DIR", config_env)],
+    );
+    assert_failure(&output, "save_screen is empty");
 }
 
 #[test]

@@ -1673,6 +1673,12 @@ ROOM_71C_TEXT_05 = " くろずんだ血がこびりついている\n 一体何�
 
 UI_SAVE_CHARACTER_0_NAME = "ク{s}リ{s}ス{s}"
 UI_SAVE_CHARACTER_1_NAME = "ジ{s}ル{s} {s}"
+UI_SAVE_CR_DO_NOT_LOAD = "ロードしない"
+UI_SAVE_CR_DO_NOT_SAVE = "セーブしない"
+UI_SAVE_CR_EXIT = "やめる"
+UI_SAVE_CR_LOAD = "ロード"
+UI_SAVE_CR_SAVE = "セーブ"
+UI_SAVE_CR_UNLOADABLE = "ロードできません"
 UI_SAVE_ERROR_0 = "ハードディスクの空きがたりません"
 UI_SAVE_EXIT_0 = "セーブ"
 UI_SAVE_EXIT_1 = "ロード"

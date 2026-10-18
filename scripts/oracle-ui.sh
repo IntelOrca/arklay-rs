@@ -145,6 +145,7 @@ LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvm
 echo "== arklay: $WHAT, input $INPUT, $TICKS ticks"
 "$ARK_BIN" "$PACK" "${ARK_BOOT[@]}" \
     --language "$LANGUAGE" --ticks "$TICKS" --no-mods \
+    --save-screen vanilla \
     --input "$INPUT" \
     --trace "$OUT/ark.trace" \
     --capture-every "$EVERY" --capture-dir "$OUT/arkcaps"

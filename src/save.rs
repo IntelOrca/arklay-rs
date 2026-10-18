@@ -11,7 +11,10 @@
 //!
 //! Slots live under a save directory as `savedat1.dat`..`savedat8.dat`
 //! (zero-based slot indexes). [`scan_slots`] reports which slots hold data for
-//! the load screen; missing or truncated files read as empty.
+//! the load screen; missing or truncated files read as empty. The default save
+//! directory is `<config dir>/save` ([`crate::config`]); [`scan_dir`] is the
+//! folder-wide variant the Lua save screen uses: every regular file, sorted,
+//! with the parsed header and modification time of each.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,8 +45,8 @@ pub const SAVE_SLOT_COUNT: usize = 8;
 pub const ROOM_BGM_LEN: usize = crate::game::ROOM_BGM_LEN;
 /// Player inventory slots in the block (Chris uses 6, Jill 8).
 pub const PLAYER_SLOT_COUNT: usize = 12;
-/// Default save directory beside the pack.
-pub const DEFAULT_SAVE_DIR: &str = "saves";
+/// Longest file name a save-screen action accepts, in bytes.
+pub const MAX_FILE_NAME: usize = 255;
 /// Pack entry the bio-card prefix comes from.
 pub const SAVE_PREFIX_ENTRY: &str = "data/bio_card.dat";
 
@@ -524,18 +527,10 @@ pub fn slot_path(dir: &Path, index: usize) -> Option<PathBuf> {
     slot_name(index).map(|name| dir.join(name))
 }
 
-/// The default save directory beside the pack.
+/// The default save directory: `<config dir>/save` (`~/.config/arklay/save`
+/// on Linux, `%APPDATA%\arklay\save` on Windows).
 pub fn default_save_dir() -> PathBuf {
-    PathBuf::from(DEFAULT_SAVE_DIR)
-}
-
-/// The default save directory: `saves/` beside `pack`, or `saves/` in the
-/// working directory when the pack path has no parent.
-pub fn default_save_dir_for_pack(pack: &Path) -> PathBuf {
-    match pack.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(DEFAULT_SAVE_DIR),
-        _ => PathBuf::from(DEFAULT_SAVE_DIR),
-    }
+    crate::config::Config::default_save_dir()
 }
 
 /// Header fields the save/load screen shows on a slot row.
@@ -560,6 +555,127 @@ impl SaveSlotInfo {
             stage: file.stage,
             room: file.room,
         }
+    }
+}
+
+/// One file in the save directory, as the folder-based screen sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveEntry {
+    /// The file's path.
+    pub path: PathBuf,
+    /// The file's name with its extension.
+    pub name: String,
+    /// The file's name without its extension, the screen's row label.
+    pub base: String,
+    /// Modification time in Unix seconds, or `0` when unavailable.
+    pub timestamp: i64,
+    /// The parsed header, when the file is a loadable save block.
+    pub info: Option<SaveSlotInfo>,
+}
+
+impl SaveEntry {
+    /// Whether the file parses as a save block.
+    pub fn loadable(&self) -> bool {
+        self.info.is_some()
+    }
+}
+
+/// Scan every regular file in `dir`, sorted by lowercased file name.
+///
+/// A missing directory is an empty list. Each file is read and parsed; a file
+/// that is not a save block (or is over [`budget::MAX_SAVE_BYTES`]) is still
+/// listed, with `info` `None`, so the screen can show it as unloadable.
+pub fn scan_dir(dir: &Path) -> Vec<SaveEntry> {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<SaveEntry> = read_dir
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            let base = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(SaveEntry {
+                path,
+                name,
+                base,
+                timestamp: timestamp(&entry),
+                info: None,
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        a.name
+            .to_ascii_lowercase()
+            .cmp(&b.name.to_ascii_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for entry in &mut entries {
+        entry.info = read_slot_info_path(&entry.path);
+    }
+    entries
+}
+
+/// Read a save block's header from an explicit path, or `None` when the file
+/// does not parse.
+fn read_slot_info_path(path: &Path) -> Option<SaveSlotInfo> {
+    let bytes = read_slot_bytes(path).ok()?;
+    let file = SaveFile::from_bytes(&bytes).ok()?;
+    Some(SaveSlotInfo::from_file(&file))
+}
+
+/// A directory entry's modification time in Unix seconds, or `0`.
+fn timestamp(entry: &fs::DirEntry) -> i64 {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_secs().min(i64::MAX as u64) as i64)
+}
+
+/// Resolve a screen-supplied file name under `dir`.
+///
+/// The name must be one plain file name — no directory part, no `.`/`..`, not
+/// empty, at most [`MAX_FILE_NAME`] bytes — so a script cannot escape the save
+/// directory. The extension is the caller's choice.
+pub fn file_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.len() > MAX_FILE_NAME || name.contains('\0') {
+        return None;
+    }
+    let path = Path::new(name);
+    if path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return None;
+    }
+    Some(dir.join(path))
+}
+
+/// Write `file` to an explicit path, creating the parent directory.
+pub fn save_to_path(path: &Path, file: &SaveFile) -> Result<()> {
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    fs::write(path, file.to_bytes()).with_context(|| format!("failed to write {}", path.display()))
+}
+
+/// Remove a save file. A missing file is not an error.
+pub fn remove_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("failed to remove {}", path.display())),
     }
 }
 
@@ -1055,15 +1171,74 @@ mod tests {
             slot_path(Path::new("saves"), 2).unwrap(),
             Path::new("saves").join("savedat3.dat")
         );
-        assert_eq!(default_save_dir(), PathBuf::from("saves"));
         assert_eq!(
-            default_save_dir_for_pack(Path::new("/games/re1.akpak")),
-            Path::new("/games/saves")
+            default_save_dir(),
+            crate::config::Config::default_save_dir()
         );
-        assert_eq!(
-            default_save_dir_for_pack(Path::new("re1.akpak")),
-            Path::new("saves")
-        );
+    }
+
+    #[test]
+    fn the_folder_scan_lists_sorted_files_with_their_headers() {
+        let dir = TempDir::new("scan-dir");
+        let file = filled();
+        fs::create_dir_all(&dir.path).unwrap();
+        fs::write(dir.path.join("beta.dat"), file.to_bytes()).unwrap();
+        fs::write(dir.path.join("alpha.dat"), file.to_bytes()).unwrap();
+        fs::write(dir.path.join("notes.txt"), b"not a save").unwrap();
+        fs::create_dir_all(dir.path.join("subdir")).unwrap();
+
+        let entries = scan_dir(&dir.path);
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, ["alpha.dat", "beta.dat", "notes.txt"]);
+        assert_eq!(entries[0].base, "alpha");
+        assert!(entries[0].loadable());
+        assert_eq!(entries[0].info, Some(SaveSlotInfo::from_file(&file)));
+        assert_eq!(entries[0].path, dir.path.join("alpha.dat"));
+        assert!(entries[0].timestamp > 0, "the mtime is recorded");
+        assert!(!entries[2].loadable());
+        assert_eq!(entries[2].info, None);
+
+        // A missing directory is an empty list, not an error.
+        assert!(scan_dir(&dir.path.join("missing")).is_empty());
+    }
+
+    #[test]
+    fn a_truncated_file_still_appears_as_unloadable() {
+        let dir = TempDir::new("scan-truncated");
+        fs::write(dir.path.join("broken.dat"), [0u8; 8]).unwrap();
+        let entries = scan_dir(&dir.path);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].loadable());
+    }
+
+    #[test]
+    fn explicit_paths_write_remove_and_validate_names() {
+        let dir = TempDir::new("explicit");
+        let file = filled();
+        let path = dir.path.join("Jill_01.dat");
+        save_to_path(&path, &file).unwrap();
+        assert_eq!(load_file(&path).unwrap(), file);
+
+        assert_eq!(file_path(&dir.path, "Jill_01.dat"), Some(path.clone()));
+        assert_eq!(file_path(&dir.path, "a/b.dat"), None);
+        assert_eq!(file_path(&dir.path, ".."), None);
+        assert_eq!(file_path(&dir.path, "."), None);
+        assert_eq!(file_path(&dir.path, ""), None);
+        assert_eq!(file_path(&dir.path, "/abs.dat"), None);
+        assert_eq!(file_path(&dir.path, &"x".repeat(MAX_FILE_NAME + 1)), None);
+
+        remove_file(&path).unwrap();
+        assert!(!path.exists());
+        remove_file(&path).unwrap();
+        remove_file(&dir.path.join("missing.dat")).unwrap();
+    }
+
+    #[test]
+    fn an_unwritable_explicit_path_is_reported() {
+        let dir = TempDir::new("explicit-blocked");
+        let blocked = dir.path.join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+        assert!(save_to_path(&blocked.join("x.dat"), &filled()).is_err());
     }
 
     #[test]

@@ -95,8 +95,14 @@ pub struct TitleScreen {
     stage: Stage,
     /// `1` NEW GAME, `2` LOAD GAME.
     selection: u8,
-    /// Whether any `savedat*.dat` exists in the save directory.
+    /// Whether any save exists in the save directory. The probe follows the
+    /// selected save screen: the ported original checks its eight slots, a
+    /// Lua screen's folder listing checks every loadable file (CR's
+    /// replacement for the original's "does a save exist" probe).
     any_saves: bool,
+    /// Whether the save directory's whole folder counts (a Lua screen), not
+    /// just the eight `savedatN.dat` slots.
+    folder_probe: bool,
     /// PRESS brightness byte, `0..=0x80`.
     press_brightness: u8,
     /// The full-screen overlay accumulator: the opening black fade-in, then
@@ -122,6 +128,7 @@ impl TitleScreen {
             stage: Stage::Press,
             selection: 1,
             any_saves: false,
+            folder_probe: false,
             press_brightness: 0,
             // The title has no entry fade: the reference only arms the
             // `0xFC00` black fade-in when the attract demo returns to the
@@ -133,6 +140,11 @@ impl TitleScreen {
             ticks: 0,
             exit: None,
         }
+    }
+
+    /// Select the save/load screen whose existence probe this title uses.
+    pub fn set_save_screen(&mut self, choice: &crate::config::SaveScreen) {
+        self.folder_probe = !choice.is_vanilla();
     }
 
     /// Whether LOAD GAME can be chosen: at least one save file exists.
@@ -238,7 +250,13 @@ impl Screen for TitleScreen {
                 None
             }
         };
-        self.any_saves = save::scan_slots(cx.save_dir).iter().any(Option::is_some);
+        self.any_saves = if self.folder_probe {
+            save::scan_dir(cx.save_dir)
+                .iter()
+                .any(save::SaveEntry::loadable)
+        } else {
+            save::scan_slots(cx.save_dir).iter().any(Option::is_some)
+        };
         self.selection = if self.any_saves { 2 } else { 1 };
         self.press_brightness = 0;
         self.fade = Fade::inactive();
@@ -436,6 +454,59 @@ mod tests {
         // The context's save directory is empty.
         assert!(!screen.load_enabled());
         assert_eq!(screen.selection(), 1);
+    }
+
+    #[test]
+    fn the_folder_probe_follows_a_lua_screen() {
+        // A private pack and save directory: the shared context's directory
+        // must stay empty for the other tests.
+        let mut writer = crate::pack::PackWriter::new();
+        writer.add("unused", Vec::new()).unwrap();
+        let pack: &'static crate::pack::Pack = Box::leak(Box::new(
+            crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap(),
+        ));
+        let dir = std::env::temp_dir().join(format!(
+            "arklay-title-folder-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A save that is not one of the eight slots.
+        crate::save::save_to_path(&dir.join("save_01.dat"), &crate::save::SaveFile::default())
+            .unwrap();
+
+        let mut cx = UiContext {
+            pack,
+            save_dir: &dir,
+            font: None,
+            text: None,
+            ticks: 0,
+            cues: Default::default(),
+        };
+
+        // The ported original's probe only looks at `savedat1..8.dat`.
+        let mut screen = TitleScreen::new();
+        screen.open(&mut cx).unwrap();
+        assert!(!screen.load_enabled());
+        assert_eq!(screen.selection(), 1);
+
+        // A Lua screen's folder probe finds the file, like CR's replacement
+        // for the original's "does a save exist" check.
+        let mut screen = TitleScreen::new();
+        screen.set_save_screen(&crate::config::SaveScreen::Lua("screen/save_cr.lua".into()));
+        screen.open(&mut cx).unwrap();
+        assert!(screen.load_enabled());
+        assert_eq!(screen.selection(), 2);
+
+        // A junk file alone does not count.
+        std::fs::remove_file(dir.join("save_01.dat")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"junk").unwrap();
+        let mut screen = TitleScreen::new();
+        screen.set_save_screen(&crate::config::SaveScreen::Lua("screen/save_cr.lua".into()));
+        screen.open(&mut cx).unwrap();
+        assert!(!screen.load_enabled());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

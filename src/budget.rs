@@ -127,6 +127,8 @@ pub const MAX_LUA_CHUNKS: usize = 256;
 pub const MAX_LUA_CHUNK: usize = 1 << 20;
 /// Largest save slot file accepted.
 pub const MAX_SAVE_BYTES: usize = 1 << 20;
+/// Largest number of pack images one Lua screen may decode and cache.
+pub const MAX_SCREEN_IMAGES: usize = 64;
 /// Largest combat table blob accepted (`data/combat.bin`).
 pub const MAX_COMBAT_TABLE_BYTES: usize = 1 << 16;
 /// Largest language-file entry count.

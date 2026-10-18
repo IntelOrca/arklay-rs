@@ -71,6 +71,6 @@ for name in "${selected[@]}"; do
         --ui game --room "$room" --player "$player" --character "$character" \
         --setup-script "$SAVE_DIR/$name.lua" \
         --save-out "$SAVE_DIR/$name.dat" \
-        --language "$LANGUAGE" --no-mods
+        --language "$LANGUAGE" --no-mods --save-screen vanilla
 done
 echo "regenerated ${#selected[@]} save(s) in $SAVE_DIR"
