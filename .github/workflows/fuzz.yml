@@ -36,6 +36,9 @@ jobs:
           - save
           - mask
           - wav
+          - ogg
+          - png
+          - webp
           - dor
           - lua
     steps:

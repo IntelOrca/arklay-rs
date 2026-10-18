@@ -80,6 +80,7 @@ use sdl3_sys::video::{
 };
 
 use crate::anim;
+use crate::assets;
 use crate::audio::{self, Mixer};
 use crate::bgm;
 use crate::bmp;
@@ -95,10 +96,10 @@ use crate::items;
 use crate::lua;
 use crate::mask;
 use crate::message::MessageInput;
-use crate::model::{Clip, Emd, Texture8};
+use crate::model::{Clip, Emd};
 use crate::movie::{self, MovieSession, MovieTick};
 use crate::objects;
-use crate::pack::Pack;
+use crate::pack::{AssetClass, Pack};
 use crate::player;
 use crate::player_script;
 use crate::rdt;
@@ -112,7 +113,6 @@ use crate::shadow;
 use crate::state::{Image, RoomId, RoomState};
 use crate::stats;
 use crate::text::Text;
-use crate::tim;
 use crate::trace;
 use crate::transition::{self, DoorStepper};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
@@ -1159,7 +1159,7 @@ struct GameSession {
     /// The player's death sequence: the delay, the fades and the DIED screen.
     death: ui::death::DeathSequence,
     /// The decoded `ui/died.tim` page, loaded when the DIED screen first opens.
-    died_texture: Option<Texture8>,
+    died_texture: Option<assets::Artwork>,
     /// Whether the died-page load was attempted; a missing entry is not
     /// retried on every frame.
     died_texture_tried: bool,
@@ -3556,18 +3556,21 @@ impl GameSession {
         }
     }
 
-    /// Load and decode `ui/died.tim` once, when the DIED screen first opens.
+    /// Load and decode the `ui/died` page once, when the DIED screen first
+    /// opens. The screen samples fixed quadrants of the page, so a replacement
+    /// keeps the shipped page's dimensions.
     fn ensure_died_texture(&mut self, pack: &Pack) {
         if self.died_texture_tried {
             return;
         }
         self.died_texture_tried = true;
-        match pack.read("ui/died.tim") {
-            Ok(bytes) => match tim::decode_8bpp(&bytes) {
-                Ok(texture) => self.died_texture = Some(texture),
-                Err(err) => eprintln!("warning: invalid ui/died.tim: {err:#}"),
+        match pack.read_asset("ui/died", AssetClass::Image) {
+            Ok(Some(asset)) => match assets::decode_page(&asset, assets::Geometry::Shipped) {
+                Ok(art) => self.died_texture = Some(art),
+                Err(err) => eprintln!("warning: invalid {}: {err:#}", asset.path()),
             },
-            Err(err) => eprintln!("warning: missing ui/died.tim: {err:#}"),
+            Ok(None) => eprintln!("warning: missing ui/died.tim"),
+            Err(err) => eprintln!("warning: unreadable ui/died: {err:#}"),
         }
     }
 
@@ -7863,29 +7866,34 @@ impl SfxCache {
     /// Load and parse `se/{name}.wav` (lower-case) from the pack, caching both
     /// hits and misses.
     fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
-        let path = format!("se/{}.wav", name.to_ascii_lowercase());
-        if let Some(wav) = self.wavs.get(&path) {
+        let stem = format!("se/{}", name.to_ascii_lowercase());
+        if let Some(wav) = self.wavs.get(&stem) {
             return Some(wav.clone());
         }
-        if self.missing.contains(&path) {
+        if self.missing.contains(&stem) {
             return None;
         }
-        let bytes = match pack.read(&path) {
-            Ok(bytes) => bytes,
+        let asset = match pack.read_asset(&stem, AssetClass::Audio) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                eprintln!("warning: missing sound effect {stem}.wav");
+                self.missing.insert(stem);
+                return None;
+            }
             Err(err) => {
-                eprintln!("warning: missing sound effect {path}: {err}");
-                self.missing.insert(path);
+                eprintln!("warning: unreadable sound effect {stem}: {err:#}");
+                self.missing.insert(stem);
                 return None;
             }
         };
-        match audio::parse_wav(&bytes) {
+        match assets::decode_audio(&asset) {
             Ok(wav) => {
-                self.wavs.insert(path, wav.clone());
+                self.wavs.insert(stem, wav.clone());
                 Some(wav)
             }
             Err(err) => {
-                eprintln!("warning: invalid sound effect {path}: {err:#}");
-                self.missing.insert(path);
+                eprintln!("warning: invalid sound effect {}: {err:#}", asset.path());
+                self.missing.insert(stem);
                 None
             }
         }
@@ -7982,27 +7990,39 @@ struct VoiceCache {
 }
 
 impl VoiceCache {
-    /// Load and parse the pack entry `path`, caching hits and misses.
+    /// Load and parse the entry `path` resolves to, caching hits and misses.
+    ///
+    /// The request names the shipped `.wav` entry; the lookup is by stem, so a
+    /// mod may replace a line with OGG Vorbis.
     fn load(&mut self, pack: &Pack, path: &str) -> Option<audio::Wav> {
-        if let Some(wav) = self.wavs.get(path) {
+        let key = assets::stem(path).to_owned();
+        if let Some(wav) = self.wavs.get(&key) {
             return Some(wav.clone());
         }
-        if self.missing.contains(path) {
+        if self.missing.contains(&key) {
             return None;
         }
-        let Ok(bytes) = pack.read(path) else {
-            eprintln!("warning: missing voice line {path}");
-            self.missing.insert(path.to_owned());
-            return None;
+        let asset = match pack.read_asset(&key, AssetClass::Audio) {
+            Ok(Some(asset)) => asset,
+            Ok(None) => {
+                eprintln!("warning: missing voice line {path}");
+                self.missing.insert(key);
+                return None;
+            }
+            Err(err) => {
+                eprintln!("warning: unreadable voice line {path}: {err:#}");
+                self.missing.insert(key);
+                return None;
+            }
         };
-        match audio::parse_wav(&bytes) {
+        match assets::decode_audio(&asset) {
             Ok(wav) => {
-                self.wavs.insert(path.to_owned(), wav.clone());
+                self.wavs.insert(key, wav.clone());
                 Some(wav)
             }
             Err(err) => {
-                eprintln!("warning: invalid voice line {path}: {err:#}");
-                self.missing.insert(path.to_owned());
+                eprintln!("warning: invalid voice line {}: {err:#}", asset.path());
+                self.missing.insert(key);
                 None
             }
         }
@@ -8081,8 +8101,9 @@ struct MaskCache {
 }
 
 impl MaskCache {
-    /// The mask page of `camera`, loading `roommask/{room3}_{camera:03}.bmp`
-    /// from the pack on first use. Missing pages are remembered as absent.
+    /// The mask page of `camera`, loading the `roommask/{room3}_{camera:03}`
+    /// stem from the pack on first use. Missing pages are remembered as
+    /// absent.
     fn page_for(&mut self, pack: &Pack, id: RoomId, camera: usize) -> Option<&Image> {
         if self.room != Some(id) {
             self.room = Some(id);
@@ -8090,18 +8111,23 @@ impl MaskCache {
             self.missing.clear();
         }
         if !self.pages.contains_key(&camera) && !self.missing.contains(&camera) {
-            let entry = id.roommask_entry(camera);
-            match pack.read(&entry) {
-                Ok(bytes) => match bmp::decode_mask(&bytes) {
-                    Ok(image) => {
-                        self.pages.insert(camera, image);
+            let stem = id.roommask_stem(camera);
+            // A mask page is addressed by the cut's sprite UVs, so a
+            // replacement keeps the shipped page's dimensions.
+            match pack.read_asset(&stem, AssetClass::Image) {
+                Ok(Some(asset)) => {
+                    match assets::decode_picture(&asset, assets::Geometry::Shipped, Some([0, 0, 0]))
+                    {
+                        Ok(image) => {
+                            self.pages.insert(camera, image);
+                        }
+                        Err(err) => {
+                            eprintln!("warning: invalid room mask {}: {err:#}", asset.path());
+                            self.missing.insert(camera);
+                        }
                     }
-                    Err(err) => {
-                        eprintln!("warning: invalid room mask {entry}: {err:#}");
-                        self.missing.insert(camera);
-                    }
-                },
-                Err(_) => {
+                }
+                _ => {
                     self.missing.insert(camera);
                 }
             }
@@ -8121,15 +8147,17 @@ struct ShadowCache {
 }
 
 impl ShadowCache {
-    /// The baked shadow page, loading `shadow/kage.tim` on first use.
+    /// The baked shadow page, loading the `shadow/kage` stem on first use.
     fn page_for(&mut self, pack: &Pack) -> Option<&Image> {
         if !self.attempted {
             self.attempted = true;
-            if let Ok(bytes) = pack.read(shadow::KAGE_ENTRY) {
-                match shadow::decode(&bytes) {
+            if let Ok(Some(asset)) = pack.read_asset(shadow::KAGE_STEM, AssetClass::Image) {
+                match assets::decode_page(&asset, assets::Geometry::Shipped)
+                    .and_then(|art| shadow::bake(&art))
+                {
                     Ok(image) => self.page = Some(image),
                     Err(err) => {
-                        eprintln!("warning: invalid {}: {err:#}", shadow::KAGE_ENTRY);
+                        eprintln!("warning: invalid {}: {err:#}", asset.path());
                     }
                 }
             }
@@ -8182,25 +8210,6 @@ fn transparent_effect_page() -> Image {
     }
 }
 
-/// Convert a decoded indexed sheet into an RGBA page with texture entry zero
-/// transparent.
-fn effect_page_image(texture: &crate::model::Texture8) -> Image {
-    let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
-    for &index in &texture.indices {
-        if index == 0 {
-            rgba.extend_from_slice(&[0, 0, 0, 0]);
-        } else {
-            let texel = texture.palette(0, index);
-            rgba.extend_from_slice(&[texel[0], texel[1], texel[2], 255]);
-        }
-    }
-    Image {
-        width: texture.width,
-        height: texture.height,
-        rgba,
-    }
-}
-
 /// Blit one room sprite's embedded TIM into a page at `(0, v)` using palette
 /// row `row`; entry zero stays transparent.
 fn blit_effect_sprite(page: &mut Image, texture: &crate::model::Texture8, v: u32, row: usize) {
@@ -8241,13 +8250,16 @@ fn build_effect_pages(pack: &Pack, id: RoomId, room: &effects::RoomEffects) -> E
         let Some(name) = effects::pages::room_effect_sheet(stage, room_byte, page) else {
             continue;
         };
-        let path = format!("effspr/{name}.tim");
-        let Ok(bytes) = pack.read(&path) else {
-            continue;
-        };
-        match tim::decode_8bpp(&bytes) {
-            Ok(texture) => pages.base[page] = Some(effect_page_image(&texture)),
-            Err(err) => eprintln!("warning: invalid effect page {path}: {err:#}"),
+        let stem = format!("effspr/{name}");
+        // The RDT's sprite TIMs composite onto the sheet at fixed V offsets,
+        // so a replacement keeps the shipped sheet's dimensions.
+        match pack.read_asset(&stem, AssetClass::Image) {
+            Ok(Some(asset)) => match assets::decode_page(&asset, assets::Geometry::Shipped) {
+                Ok(art) => pages.base[page] = Some(art.to_rgba()),
+                Err(err) => eprintln!("warning: invalid effect page {}: {err:#}", asset.path()),
+            },
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: unreadable effect page {stem}: {err:#}"),
         }
     }
 
@@ -8505,11 +8517,14 @@ fn load_room(pack: &Pack, id: RoomId) -> Result<LoadedRoom> {
         bail!("room {} has no camera cuts", id.room3());
     }
     for cut in &mut room.cuts {
-        let path = id.cut_entry(cut.index);
-        let bytes = pack
-            .read(&path)
+        let stem = id.cut_stem(cut.index);
+        let asset = pack
+            .read_asset(&stem, AssetClass::Image)?
             .with_context(|| format!("missing background for cut {}", cut.index))?;
-        cut.background = Some(bmp::decode(&bytes).with_context(|| format!("invalid {path}"))?);
+        cut.background = Some(
+            assets::decode_picture(&asset, assets::Geometry::Free, None)
+                .with_context(|| format!("invalid {}", asset.path()))?,
+        );
     }
     let (scripts, script_source) = match pack.read(&id.scd_entry()) {
         Ok(bytes) => (
@@ -13404,7 +13419,8 @@ mod tests {
             return;
         };
         let pack = Pack::open(&font_pack).unwrap();
-        let font = font::Font::new(tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
+        let font =
+            font::Font::new(crate::tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).unwrap());
         assert_eq!((font.texture.width, font.texture.height), (768, 256));
         assert_eq!(font.metrics, font::FontMetrics::from_sheet_width(768));
 

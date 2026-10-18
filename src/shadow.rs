@@ -21,12 +21,13 @@
 
 use anyhow::{Context, Result};
 
-use crate::model::Texture8;
 use crate::player::PlayerState;
 use crate::state::{Image, RoomId, RoomState};
 
 /// Pack entry of the shadow mask page.
 pub const KAGE_ENTRY: &str = "shadow/kage.tim";
+/// Pack stem of the shadow mask page.
+pub const KAGE_STEM: &str = "shadow/kage";
 
 /// Half-extent of the player shadow along the entity's local X, in room units.
 pub const PLAYER_HALF_X: i32 = 500;
@@ -49,21 +50,46 @@ const ROOM_WATER_TANK_ENTRY: u8 = 0x0D;
 /// (`r5 == 0`) bake to zero alpha.
 pub fn decode(data: &[u8]) -> Result<Image> {
     let texture = crate::tim::decode_8bpp(data).context("invalid shadow mask TIM")?;
-    Ok(bake(&texture))
+    bake(&crate::assets::Artwork::Indexed(texture))
 }
 
-/// Bake a decoded 8bpp shadow texture into a white RGBA page with the
-/// coverage-derived alpha.
-pub fn bake(texture: &Texture8) -> Image {
-    let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
-    for &index in &texture.indices {
-        let red = texture.palette(0, index)[0];
-        rgba.extend_from_slice(&[255, 255, 255, coverage_alpha(red)]);
-    }
-    Image {
-        width: texture.width,
-        height: texture.height,
-        rgba,
+/// Bake a decoded shadow page into a white RGBA page with the coverage alpha.
+///
+/// An indexed page derives the alpha from the palette's red ramp; an RGBA
+/// replacement carries its own alpha, which the bake keeps verbatim (its
+/// colour is replaced with white, exactly like the indexed form's).
+pub fn bake(art: &crate::assets::Artwork) -> Result<Image> {
+    match art {
+        crate::assets::Artwork::Indexed(texture) => {
+            let mut rgba = Vec::with_capacity(texture.indices.len() * 4);
+            for &index in &texture.indices {
+                let red = texture.palette(0, index)[0];
+                rgba.extend_from_slice(&[255, 255, 255, coverage_alpha(red)]);
+            }
+            Ok(Image {
+                width: texture.width,
+                height: texture.height,
+                rgba,
+            })
+        }
+        crate::assets::Artwork::Rgba(page) => {
+            if page.rgba.len() != (page.width as usize * page.height as usize) * 4 {
+                anyhow::bail!(
+                    "shadow page is {} bytes but {}x{} needs {}",
+                    page.rgba.len(),
+                    page.width,
+                    page.height,
+                    page.width as usize * page.height as usize * 4
+                );
+            }
+            let mut page = page.clone();
+            for pixel in page.rgba.as_chunks_mut::<4>().0 {
+                pixel[0] = 255;
+                pixel[1] = 255;
+                pixel[2] = 255;
+            }
+            Ok(page)
+        }
     }
 }
 
@@ -156,6 +182,7 @@ pub fn visible(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Texture8;
     use crate::player::{StairState, spawn};
     use crate::state::Zone;
 
@@ -192,11 +219,22 @@ mod tests {
     #[test]
     fn bake_marks_transparent_entries_and_keeps_the_page_shape() {
         let texture = texture(vec![0, 1, 2], &[0, 12, 0]);
-        let image = bake(&texture);
+        let image = bake(&crate::assets::Artwork::Indexed(texture)).unwrap();
         assert_eq!((image.width, image.height), (3, 1));
         assert_eq!(&image.rgba[0..4], &[255, 255, 255, 0]);
         assert_eq!(&image.rgba[4..8], &[255, 255, 255, 99]);
         assert_eq!(&image.rgba[8..12], &[255, 255, 255, 0]);
+    }
+
+    #[test]
+    fn bake_keeps_an_rgba_replacements_own_alpha() {
+        let page = Image {
+            width: 2,
+            height: 1,
+            rgba: vec![1, 2, 3, 0, 4, 5, 6, 200],
+        };
+        let image = bake(&crate::assets::Artwork::Rgba(page)).unwrap();
+        assert_eq!(image.rgba, [255, 255, 255, 0, 255, 255, 255, 200]);
     }
 
     #[test]

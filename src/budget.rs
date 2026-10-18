@@ -19,7 +19,7 @@
 //! | [`MAX_ENTRY_BYTES`] | 1 GiB | ~40 MiB | one pack entry |
 //! | [`MAX_DECODE_ALLOC`] | 512 MiB | ~64 MiB | one transient decode buffer |
 //! | [`MAX_ZSTD_OUTPUT`] | 512 MiB | ~40 MiB | one decompressed zstd entry |
-//! | [`MAX_PIXELS`] | 16,777,216 | 320x240 | TIM/BMP/IVM/cinepak canvas |
+//! | [`MAX_PIXELS`] | 16,777,216 | 320x240 | TIM/BMP/PNG/WebP/IVM/cinepak canvas |
 //! | [`MAX_LZW_OUTPUT`] | 64 MiB | ~1 MiB | one LZW stream |
 //! | [`MAX_RECORDS`] | 1,048,576 | 348 RDTs total | per-format record lists |
 //! | [`MAX_TEXT_BYTES`] | 16 MiB | a few KiB | manifest, `.s` source, language file |
@@ -35,7 +35,7 @@
 //! | [`MAX_MASK_GROUPS`] | 32 | 20 | camera mask groups |
 //! | [`MAX_MASK_SPRITES`] | 65,536 | 53 | camera mask sprites |
 //! | [`MAX_WAV_DATA`] | 64 MiB | ~8 MiB | WAV `data` chunk |
-//! | [`MAX_WAV_SAMPLES`] | 134,217,728 | ~3.6M per SE | converted mono samples |
+//! | [`MAX_WAV_SAMPLES`] | 134,217,728 | ~3.6M per SE | converted mono samples (WAV and OGG alike) |
 //! | [`MAX_SCD_BLOCKS`] | 65,536 | a handful | SCD container blocks |
 //! | [`MAX_SCD_EVENTS`] | 256 | 59 | SCD event table |
 //! | [`MAX_SCD_INSTRUCTIONS`] | 1,048,576 | a few thousand | one SCD container/table |

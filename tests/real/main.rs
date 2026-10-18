@@ -47,6 +47,7 @@ mod entities_real;
 mod file_real;
 mod fire_real;
 mod font_real;
+mod hd_real;
 mod inventory_real;
 mod item_box_real;
 mod item_view_real;

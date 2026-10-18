@@ -21,7 +21,6 @@ use crate::font;
 use crate::language::{self, Catalog};
 use crate::pack::Pack;
 use crate::state::RoomState;
-use crate::tim;
 
 /// Every string source a session reads.
 #[derive(Debug, Clone, Default)]
@@ -42,7 +41,7 @@ impl Text {
         Self {
             catalog: Catalog::load(pack, language, script),
             script,
-            pack_script: sheet_script(pack, font::DEFAULT_ENTRY).unwrap_or_default(),
+            pack_script: sheet_script(pack, font::DEFAULT_STEM).unwrap_or_default(),
         }
     }
 
@@ -181,10 +180,13 @@ pub fn script_for(pack: &Pack, requested: Option<&str>) -> Script {
     sheet_script(pack, font::session_entry(pack, script)).unwrap_or_default()
 }
 
-/// The script a sheet entry's width selects, read from the TIM header alone.
-fn sheet_script(pack: &Pack, entry: &str) -> Option<Script> {
-    let bytes = pack.read(entry).ok()?;
-    let width = tim::image_width(&bytes).ok()?;
+/// The script a sheet's stem selects, read from its header where it has one.
+fn sheet_script(pack: &Pack, stem: &str) -> Option<Script> {
+    let asset = pack
+        .read_asset(stem, crate::pack::AssetClass::Image)
+        .ok()
+        .flatten()?;
+    let (width, _) = crate::assets::image_dimensions(&asset).ok()?;
     Some(if width >= font::JPN_SHEET_WIDTH {
         Script::Japanese
     } else {

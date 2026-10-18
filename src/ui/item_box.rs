@@ -12,21 +12,22 @@
 //! in reverse draw order and the accessors below return them in the order the
 //! original's backwards walk draws them.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
+use crate::assets::Artwork;
 use crate::font::Tint;
 use crate::game::GameState;
-use crate::model::Texture8;
 use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::text::Text;
-use crate::tim;
 
 use super::main_menu::{
     MenuAssets, MenuInput, draw_item_icon_slice, draw_item_quantity_clipped, item_name_bytes,
 };
 
 /// Pack entry of the item-box frame sheet.
+pub const ITEMBOX_STEM: &str = "ui/itemboxn";
+/// Pack entry of the box frame sheet.
 pub const ITEMBOX_ENTRY: &str = "ui/itemboxn.tim";
 /// Number of box slots (8bpp sheet and save block agree on 48).
 pub const ITEMBOX_SLOTS_TOTAL: usize = 48;
@@ -145,18 +146,14 @@ pub const SLOT_CLIP_BOTTOM: i32 = 0x80;
 
 /// The item-box screen's drawable art.
 pub struct ItemBoxAssets {
-    /// `ui/itemboxn.tim` frame sheet.
-    pub itemboxn: Texture8,
+    /// The `ui/itemboxn` frame sheet.
+    pub itemboxn: Artwork,
 }
 
 impl ItemBoxAssets {
     /// Load the item-box sheet from `pack`.
     pub fn load(pack: &Pack) -> Result<Self> {
-        let bytes = pack
-            .read(ITEMBOX_ENTRY)
-            .with_context(|| format!("missing {ITEMBOX_ENTRY}"))?;
-        let itemboxn =
-            tim::decode_8bpp(&bytes).with_context(|| format!("invalid {ITEMBOX_ENTRY}"))?;
+        let itemboxn = super::load_page(pack, ITEMBOX_STEM)?;
         Ok(Self { itemboxn })
     }
 }
@@ -471,7 +468,7 @@ impl ItemBox {
             return;
         };
         let tex_u = if self.cursor_dim() { 0xA8 } else { 0x80 };
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.status,
             [tex_u, 0xE0, 40, 30],
             [i32::from(position[0]), i32::from(position[1]), 40, 30],
@@ -504,7 +501,7 @@ impl ItemBox {
             let stack = game.item_box[usize::from(slot)];
             if visible > 0 {
                 if stack.id == 0 {
-                    framebuffer.draw_indexed_sprite(
+                    framebuffer.draw_page_sprite(
                         &menu.blue,
                         [0, 0, i32::from(SLOT_SIZE[0]), visible],
                         [i32::from(SLOT_POS[0]), y, i32::from(SLOT_SIZE[0]), visible],
@@ -641,7 +638,7 @@ impl ItemBox {
             }
             for x in 0..6 {
                 let y = i32::from(TICK_Y) + i32::from(tick);
-                framebuffer.draw_indexed_sprite(
+                framebuffer.draw_page_sprite(
                     &assets.itemboxn,
                     [0x40 + x, 0x38, 1, 1],
                     [i32::from(TICK_X) + x, y, 1, 1],
@@ -664,10 +661,10 @@ fn rect_dst(rect: Rect) -> [i32; 4] {
     ]
 }
 
-fn draw_part(framebuffer: &mut Framebuffer, texture: &Texture8, part: FramePart) {
+fn draw_part(framebuffer: &mut Framebuffer, texture: &Artwork, part: FramePart) {
     let [x, y] = part.pos;
     let [w, h] = part.size;
-    framebuffer.draw_indexed_sprite(
+    framebuffer.draw_page_sprite(
         texture,
         [
             i32::from(part.uv[0]),
@@ -709,6 +706,10 @@ mod tests {
         state
     }
 
+    fn solid_page(width: u32, height: u32, index: u8, color: [u8; 4]) -> Artwork {
+        Artwork::Indexed(solid_texture(width, height, index, color))
+    }
+
     fn solid_texture(width: u32, height: u32, index: u8, color: [u8; 4]) -> Texture8 {
         let mut palettes = vec![[0u8; 4]; PALETTE_ROW_LEN];
         palettes[usize::from(index)] = color;
@@ -725,10 +726,10 @@ mod tests {
     /// detectable in the framebuffer.
     fn test_menu_assets() -> MenuAssets {
         MenuAssets {
-            status: solid_texture(256, 256, 1, [50, 60, 70, 255]),
-            blue: solid_texture(64, 64, 1, [0, 0, 255, 255]),
-            statface: solid_texture(64, 64, 1, [255, 255, 0, 255]),
-            staitem: solid_texture(64, 64, 1, [1, 2, 3, 255]),
+            status: solid_page(256, 256, 1, [50, 60, 70, 255]),
+            blue: solid_page(64, 64, 1, [0, 0, 255, 255]),
+            statface: solid_page(64, 64, 1, [255, 255, 0, 255]),
+            staitem: solid_page(64, 64, 1, [1, 2, 3, 255]),
             item_all: Image {
                 width: 40,
                 height: 2160,
@@ -1097,7 +1098,7 @@ mod tests {
         let mut item_box = ItemBox::default();
         item_box.open(&state, 8);
         let assets = ItemBoxAssets {
-            itemboxn: solid_texture(128, 208, 1, [9, 9, 9, 255]),
+            itemboxn: solid_page(128, 208, 1, [9, 9, 9, 255]),
         };
         let menu = test_menu_assets();
         let text = Text::default();
@@ -1132,7 +1133,7 @@ mod tests {
         let state = game();
         let mut item_box = ItemBox::default();
         let assets = ItemBoxAssets {
-            itemboxn: solid_texture(128, 208, 1, [9, 9, 9, 255]),
+            itemboxn: solid_page(128, 208, 1, [9, 9, 9, 255]),
         };
         let menu = test_menu_assets();
         let text = Text::default();

@@ -20,7 +20,7 @@ responsibility.
 
 | Module | Owner | Responsibility |
 |---|---|---|
-| `pack` | Container | `.akpak` v1 reader/writer with raw and zstd-compressed entries, layered mod packs, entry lookup, atomic `PackWriter::write` |
+| `pack` | Container | `.akpak` v1 reader/writer with raw and zstd-compressed entries, layered mod packs, exact-path and `AssetClass` stem lookup, atomic `PackWriter::write` |
 | `budget` | Container | Fixed per-format decode caps and checked allocation shared by every parser |
 | `manifest` | Container | `manifest.toml` grammar (`format`, `kind`, `base`, `load_order`, `rdt_version`, `scd_version`, Lua hooks) |
 | `modding` | Tooling | Sibling `mods/` discovery and the `mod build` source-directory builder |
@@ -73,6 +73,7 @@ responsibility.
 | `avi` | Format | RIFF/AVI demuxer for the shipped Cinepak films |
 | `cinepak` | Format | Cinepak (`cvid`) frame decoder |
 | `bmp` | Format | BMP encode/decode, including the black-key room-mask decode |
+| `assets` | Format | Replacement-format resolution (`webp > png > bmp > tim > pix`, `ogg > wav`) and the PNG/WebP/OGG decoders behind the default-on `hd` feature; an image page is an indexed `Texture8` or an RGBA `Image` |
 | `lzw` | Format | RE1 `.pak` LZW decoder |
 | `shadow` | Presentation | The player's baked ground shadow: decode and placement |
 | `font` | Presentation | Glyph decoding, per-glyph metrics measured from the sheet's ink, and tinted drawing; draws the synthetic missing-glyph box |
@@ -312,7 +313,10 @@ claims about the original.
 | Map tables | `ui::map::MapTables::parse` | fixed blob size/magic | `ui::map` unit tests, `tests/real/m16_ui_real.rs` |
 | Combat tables | `combat::CombatTables::parse` | fixed blob size/magic/version, `MAX_COMBAT_TABLE_BYTES` (64 KiB) | `combat` unit tests, `tests/real/combat_real.rs`, `tests/torture`, `fuzz/combat` |
 | BioCard prefix | `data/bio_card.dat` | 0x200 required | `save` unit tests, `arklay verify` |
-| `roomcut`/`roommask` BMP | `bmp::decode`, `decode_mask` | BMP caps | `arklay verify`, `tests/soak_real.rs` |
+| `roomcut`/`roommask` image | `assets::decode_picture` (`bmp`/`png`/`webp`/`tim`/`pix`) | BMP/TIM/PNG/WebP caps, `MAX_PIXELS` | `arklay verify`, `tests/soak_real.rs`, `tests/real/hd_real.rs` |
+| PNG replacement | `assets::decode_image_bytes("png", ..)` | `MAX_PIXELS` (4096x4096), decoder allocation cap | `assets` unit tests, `tests/torture`, `fuzz/png` |
+| WebP replacement | `assets::decode_image_bytes("webp", ..)` | `MAX_PIXELS`, decoder memory cap | `assets` unit tests, `tests/torture`, `fuzz/webp` |
+| OGG Vorbis replacement | `assets::decode_audio_bytes("ogg", ..)` | `MAX_WAV_SAMPLES` (134M samples) | `assets` unit tests, `tests/torture`, `fuzz/ogg`, `tests/real/hd_real.rs` |
 
 `arklay verify` maps entry paths to these readers, requires every RDT camera's
 `roomcut/{room}_{camera:03}.bmp` to be present, and counts unknown entries as

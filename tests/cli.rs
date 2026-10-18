@@ -6,6 +6,7 @@
 //! message on stderr (or stdout for `verify`'s report) and the absence of
 //! `panicked at` in both streams.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -103,6 +104,19 @@ fn write_room_pack(path: &Path) {
     writer.add(&id.rdt_entry(), synthetic_rdt()).unwrap();
     writer.add(&id.cut_entry(0), background()).unwrap();
     writer.write(path).unwrap();
+}
+
+/// A 2x2 RGBA PNG, hand-built so the suite needs no encoder.
+fn tiny_png() -> Vec<u8> {
+    const TINY_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x06, 0x00, 0x00, 0x00, 0x72,
+        0xB6, 0x0D, 0x24, 0x00, 0x00, 0x00, 0x14, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0xF8,
+        0xCF, 0xC0, 0xF0, 0x1F, 0x0C, 0x81, 0x34, 0x10, 0x30, 0xFC, 0x07, 0x00, 0x47, 0xCA, 0x08,
+        0xF8, 0x5B, 0x9A, 0xA4, 0xBE, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+        0x60, 0x82,
+    ];
+    TINY_PNG.to_vec()
 }
 
 /// A minimal valid 16bpp TIM.
@@ -413,6 +427,115 @@ fn verify_merges_mod_layers_before_classifying() {
         out.contains("verify: 3 entries, 2 ok, 1 failed, 0 opaque"),
         "{out}"
     );
+}
+
+#[test]
+fn verify_validates_the_checked_in_hd_mods_png_and_ogg_replacements() {
+    // The `mods/hd` example ships a PNG background, a PNG UI page and an OGG
+    // BGM track; `mod build` packs them verbatim and `verify` decodes each
+    // with the replacement-format decoder.
+    let dir = TempDir::new("verify-hd");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("mods/hd");
+    let pack = dir.join("hd.akpak");
+    let built = run(&[
+        "mod",
+        "build",
+        source.to_str().unwrap(),
+        "--out",
+        pack.to_str().unwrap(),
+    ]);
+    assert!(built.status.success(), "stderr: {}", stderr(&built));
+
+    let output = run(&["verify", pack.to_str().unwrap()]);
+    let out = stdout(&output);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(out.contains("roomcut"), "{out}");
+    assert!(out.contains("png"), "{out}");
+    assert!(out.contains("webp"), "{out}");
+    assert!(out.contains("ogg"), "{out}");
+    assert!(
+        out.contains("verify: 5 entries, 5 ok, 0 failed, 0 opaque"),
+        "{out}"
+    );
+
+    // A replacement whose format is refused fails verification by name.
+    let bad = dir.join("bad.akpak");
+    let mut writer = PackWriter::new();
+    writer
+        .add(
+            manifest::ENTRY,
+            manifest::Manifest::base("bad").render().into_bytes(),
+        )
+        .unwrap();
+    writer.add("bgm/013.ogg", b"not vorbis".to_vec()).unwrap();
+    writer.write(&bad).unwrap();
+    let output = run(&["verify", bad.to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(
+        stdout(&output).contains("bgm/013.ogg"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn mod_build_does_not_warn_about_a_format_override() {
+    // A replacement whose stem matches a base entry is an override, not a new
+    // file, whatever its extension.
+    let dir = TempDir::new("override-warn");
+    let base = dir.join("base.akpak");
+    let source = dir.join("mod");
+    fs::create_dir_all(source.join("roomcut")).unwrap();
+    fs::create_dir_all(source.join("ui")).unwrap();
+    fs::create_dir_all(source.join("extra")).unwrap();
+    fs::create_dir_all(source.join("bgm")).unwrap();
+    let mut writer = PackWriter::new();
+    writer
+        .add(
+            manifest::ENTRY,
+            manifest::Manifest::base("re1").render().into_bytes(),
+        )
+        .unwrap();
+    writer.add("roomcut/100_000.bmp", background()).unwrap();
+    writer.add("ui/itemboxn.tim", tiny_tim().to_vec()).unwrap();
+    writer.add("bgm/013.wav", b"RIFF".to_vec()).unwrap();
+    writer.write(&base).unwrap();
+
+    fs::write(
+        source.join("manifest.toml"),
+        manifest::Manifest {
+            kind: manifest::PackKind::Mod,
+            base: Some("re1".to_string()),
+            ..manifest::Manifest::base("overrides")
+        }
+        .render(),
+    )
+    .unwrap();
+    // A PNG over the BMP background, an OGG over the WAV sample and a file the
+    // base cannot serve.
+    fs::write(source.join("roomcut/100_000.png"), tiny_png()).unwrap();
+    fs::write(source.join("bgm/013.ogg"), b"not vorbis").unwrap();
+    fs::write(source.join("extra/new.bin"), b"new").unwrap();
+
+    let out = dir.join("overrides.akpak");
+    let built = run(&[
+        "mod",
+        "build",
+        source.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--base",
+        base.to_str().unwrap(),
+    ]);
+    assert!(built.status.success(), "stderr: {}", stderr(&built));
+    let warnings = stdout(&built);
+    assert!(
+        warnings.contains("1 override(s) are new files"),
+        "only the extra file is new: {warnings}"
+    );
+    assert!(warnings.contains("extra/new.bin"), "{warnings}");
+    assert!(!warnings.contains("100_000.png"), "{warnings}");
+    assert!(!warnings.contains("013.ogg"), "{warnings}");
 }
 
 #[test]

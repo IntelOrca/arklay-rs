@@ -35,14 +35,20 @@ pub enum Format {
     Rdt,
     /// `scd/*.scd`, a standalone script override.
     Scd,
-    /// `roomcut/*.bmp`, a camera background.
+    /// `roomcut/*`, a camera background.
     Cut,
-    /// `roommask/*.bmp`, a camera mask page.
+    /// `roommask/*`, a camera mask page.
     Mask,
     /// Any other `*.bmp`.
     Bmp,
     /// `*.tim`, mode-dispatched.
     Tim,
+    /// `*.png`, a replacement image.
+    Png,
+    /// `*.webp`, a replacement image.
+    Webp,
+    /// `*.ogg`, a replacement audio stream.
+    Ogg,
     /// `*.ivm`, an item-view model.
     Ivm,
     /// `*.emd`, a character model.
@@ -82,6 +88,9 @@ impl Format {
             Self::Mask => "roommask",
             Self::Bmp => "bmp",
             Self::Tim => "tim",
+            Self::Png => "png",
+            Self::Webp => "webp",
+            Self::Ogg => "ogg",
             Self::Ivm => "ivm",
             Self::Emd => "emd",
             Self::Emw => "emw",
@@ -102,6 +111,19 @@ impl Format {
     pub fn known(self) -> bool {
         self != Self::Opaque
     }
+}
+
+/// The lowercased extension of a pack path.
+fn path_extension(path: &str) -> &str {
+    path.rsplit_once('.').map_or("", |(_, extension)| extension)
+}
+
+/// Whether a lowercased path ends in one of the image class's extensions.
+fn is_image_extension(lower: &str) -> bool {
+    crate::pack::AssetClass::Image
+        .extensions()
+        .iter()
+        .any(|extension| lower.ends_with(&format!(".{extension}")))
 }
 
 /// Select the format for one pack path.
@@ -136,10 +158,10 @@ pub fn classify(path: &str) -> Format {
     if lower.starts_with("language/") && lower.ends_with(".txt") {
         return Format::Language;
     }
-    if lower.starts_with("roomcut/") && lower.ends_with(".bmp") {
+    if lower.starts_with("roomcut/") && is_image_extension(&lower) {
         return Format::Cut;
     }
-    if lower.starts_with("roommask/") && lower.ends_with(".bmp") {
+    if lower.starts_with("roommask/") && is_image_extension(&lower) {
         return Format::Mask;
     }
     if lower.starts_with("movie/") && lower.ends_with(".avi") {
@@ -148,6 +170,9 @@ pub fn classify(path: &str) -> Format {
     match lower.rsplit_once('.') {
         Some((_, "bmp")) => Format::Bmp,
         Some((_, "tim")) => Format::Tim,
+        Some((_, "png")) => Format::Png,
+        Some((_, "webp")) => Format::Webp,
+        Some((_, "ogg")) => Format::Ogg,
         Some((_, "ivm")) => Format::Ivm,
         Some((_, "emd")) => Format::Emd,
         Some((_, "emw")) => Format::Emw,
@@ -307,9 +332,12 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
                 bail!("room has no camera cuts");
             }
             for cut in &room.cuts {
-                let cut_path = id.cut_entry(cut.index);
-                if !pack.contains(&cut_path) {
-                    bail!("RDT references missing background {cut_path}");
+                let stem = id.cut_stem(cut.index);
+                if !pack.has_asset(&stem, crate::pack::AssetClass::Image) {
+                    bail!(
+                        "RDT references missing background {}",
+                        id.cut_entry(cut.index)
+                    );
                 }
             }
             // The engine prefers a standalone `scd/{id}.scd` override and only
@@ -329,13 +357,19 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
             crate::scd::reader::parse(data)?;
         }
         Format::Cut => {
-            crate::bmp::decode(data)?;
+            crate::assets::decode_image_bytes(path_extension(path), data)?;
         }
         Format::Mask => {
-            crate::bmp::decode_mask(data)?;
+            crate::assets::decode_image_bytes(path_extension(path), data)?;
         }
         Format::Bmp => {
             crate::bmp::decode(data)?;
+        }
+        Format::Png | Format::Webp => {
+            crate::assets::decode_image_bytes(path_extension(path), data)?;
+        }
+        Format::Ogg => {
+            crate::assets::decode_audio_bytes("ogg", data)?;
         }
         Format::Tim => {
             let flags = data
@@ -460,8 +494,14 @@ mod tests {
         assert_eq!(classify("room/1000.rdt"), Format::Rdt);
         assert_eq!(classify("ROOM/1000.RDT"), Format::Rdt);
         assert_eq!(classify("roomcut/100_000.bmp"), Format::Cut);
+        assert_eq!(classify("roomcut/100_000.png"), Format::Cut);
+        assert_eq!(classify("roommask/100_000.webp"), Format::Mask);
         assert_eq!(classify("roommask/100_000.bmp"), Format::Mask);
         assert_eq!(classify("ui/blue.tim"), Format::Tim);
+        assert_eq!(classify("ui/blue.png"), Format::Png);
+        assert_eq!(classify("ui/blue.webp"), Format::Webp);
+        assert_eq!(classify("bgm/013.ogg"), Format::Ogg);
+        assert_eq!(classify("roomcut/100_000.ogg"), Format::Ogg);
         assert_eq!(classify("item/i00v.ivm"), Format::Ivm);
         assert_eq!(classify("enemy/em20.emd"), Format::Emd);
         assert_eq!(classify("player/00.emw"), Format::Emw);

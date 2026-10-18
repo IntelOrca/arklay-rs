@@ -139,6 +139,18 @@ fn run_wav(data: &[u8]) {
     let _ = audio::parse_wav(data);
 }
 
+fn run_ogg(data: &[u8]) {
+    let _ = arklay::assets::decode_audio_bytes("ogg", data);
+}
+
+fn run_png(data: &[u8]) {
+    let _ = arklay::assets::decode_image_bytes("png", data);
+}
+
+fn run_webp(data: &[u8]) {
+    let _ = arklay::assets::decode_image_bytes("webp", data);
+}
+
 fn run_dor(data: &[u8]) {
     let _ = door::parse(data);
 }
@@ -546,6 +558,21 @@ fn seed_wav() -> Vec<u8> {
     out
 }
 
+/// The checked-in example mod's OGG Vorbis BGM track.
+fn seed_ogg() -> Vec<u8> {
+    include_bytes!("../mods/hd/bgm/013.ogg").to_vec()
+}
+
+/// The checked-in example mod's 2x PNG room background.
+fn seed_png() -> Vec<u8> {
+    include_bytes!("../mods/hd/roomcut/100_000.png").to_vec()
+}
+
+/// The checked-in example mod's lossless WebP UI page.
+fn seed_webp() -> Vec<u8> {
+    include_bytes!("../mods/hd/ui/itemboxn.webp").to_vec()
+}
+
 /// One RIFF chunk: fourcc, little-endian size, body and the pad byte.
 fn avi_chunk(id: &[u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -766,6 +793,21 @@ fn targets() -> Vec<Target> {
             run: run_wav,
         },
         Target {
+            name: "ogg",
+            seed: seed_ogg,
+            run: run_ogg,
+        },
+        Target {
+            name: "png",
+            seed: seed_png,
+            run: run_png,
+        },
+        Target {
+            name: "webp",
+            seed: seed_webp,
+            run: run_webp,
+        },
+        Target {
             name: "dor",
             seed: seed_dor,
             run: run_dor,
@@ -963,7 +1005,7 @@ fn torture_matrix_never_panics() {
         total >= 10_000,
         "torture matrix ran {total} cases, below the 10,000 floor"
     );
-    assert_eq!(per_format.len(), 19, "every target must run");
+    assert_eq!(per_format.len(), 22, "every target must run");
 }
 
 /// Regenerate the committed cargo-fuzz seed corpus from these builders.

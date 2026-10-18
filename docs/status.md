@@ -617,6 +617,14 @@ not cover yet, and `data/core00.esp`/`data/core00.etm`, the effect tables
 whose pair parser is not in the path classifier; `--strict` turns them into
 failures by design.
 
+A mod layer's replacement entries are classified by their own formats too:
+`roomcut/*` and `roommask/*` accept any image-class extension, and `png`,
+`webp` and `ogg` get their own rows with the replacement decoders behind them
+(the `hd` feature). The converted base pack above carries none of them, so its
+table is unchanged. `arklay verify` therefore validates a replacement mod pack
+before it is ever layered, exactly as `tests/real/hd_real.rs` does for the
+checked-in `mods/hd`.
+
 The one pack carries everything: the 533 positional voice `wav` entries and
 the 27 shipped `avi` films (251,624,740 bytes) sit beside the room, audio, UI
 and `language/` entries, and all three formats verify clean. `language/`

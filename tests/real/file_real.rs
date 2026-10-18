@@ -49,16 +49,20 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     };
     let assets = FileAssets::load(&pack).expect("the pack has the slice-8 file art");
     assert_eq!(assets.covers.len(), 2);
-    assert_eq!(assets.covers[0].width, 256);
-    assert_eq!(assets.covers[0].height, 256);
+    assert_eq!(assets.covers[0].width(), 256);
+    assert_eq!(assets.covers[0].height(), 256);
     assert_eq!(assets.filei.len(), JPN_FILEI_NAMES.len());
     for (index, filei) in assets.filei.iter().enumerate() {
-        assert_eq!(filei.width, 256, "backdrop {index}");
-        assert_eq!(filei.height, 120, "backdrop {index}");
+        assert_eq!(filei.width(), 256, "backdrop {index}");
+        assert_eq!(filei.height(), 120, "backdrop {index}");
     }
     assert_eq!(assets.textm.len(), JPN_TEXTM_NAMES.len());
     for (index, page) in assets.textm.iter().enumerate() {
-        assert_eq!((page.width, page.height), (256, 256), "page pack {index}");
+        assert_eq!(
+            (page.width(), page.height()),
+            (256, 256),
+            "page pack {index}"
+        );
     }
 
     // Room 1001 is Jill's; list slot 0 is file index 0x0F in both lists, and

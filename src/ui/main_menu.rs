@@ -30,32 +30,42 @@
 
 use anyhow::{Context, Result};
 
-use crate::bmp;
+use crate::assets::{Artwork, Geometry};
 use crate::font::{Font, Tint};
 use crate::game::{CombineResult, GameState, InventoryItem, STATE_BYTE_CHARACTER, UseResult};
 use crate::items;
-use crate::model::Texture8;
 use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::state::Image;
 use crate::text::Text;
-use crate::tim;
 
 use super::layout;
 use super::status::HealthBar;
 
+/// Pack stem of the status frame sheet.
+pub const STATUS_STEM: &str = "ui/status";
 /// Pack entry of the status frame sheet.
 pub const STATUS_ENTRY: &str = "ui/status.tim";
+/// Pack stem of the empty-slot sheet.
+pub const BLUE_STEM: &str = "ui/blue";
 /// Pack entry of the empty-slot sheet.
 pub const BLUE_ENTRY: &str = "ui/blue.tim";
+/// Pack stem of the character portrait sheet.
+pub const STATFACE_STEM: &str = "ui/statface";
 /// Pack entry of the character portrait sheet.
 pub const STATFACE_ENTRY: &str = "ui/statface.tim";
+/// Pack stem of the special-item sheet.
+pub const STAITEM_STEM: &str = "ui/staitem";
 /// Pack entry of the special-item sheet.
 pub const STAITEM_ENTRY: &str = "ui/staitem.tim";
+/// Pack stem of the item-icon atlas.
+pub const ITEM_ALL_STEM: &str = "item/item_all";
 /// Pack entry of the item-icon atlas.
 pub const ITEM_ALL_ENTRY: &str = items::ITEM_ALL_ENTRY;
+/// Pack stem of the font sheet.
+pub const FONT_STEM: &str = crate::font::DEFAULT_STEM;
 /// Pack entry of the font sheet.
-pub const FONT_ENTRY: &str = "font/font.tim";
+pub const FONT_ENTRY: &str = crate::font::DEFAULT_ENTRY;
 
 /// The message shown when a combine needs the guardhouse drug store.
 pub const MESSAGE_NEEDS_DRUG_STORE: u16 = 0xF2;
@@ -127,13 +137,13 @@ pub enum MenuMode {
 /// The pause menu's drawable assets.
 pub struct MenuAssets {
     /// `ui/status.tim` frames, faces, digits and cursor art.
-    pub status: Texture8,
+    pub status: crate::assets::Artwork,
     /// `ui/blue.tim` empty-slot plate.
-    pub blue: Texture8,
+    pub blue: crate::assets::Artwork,
     /// `ui/statface.tim` character portraits.
-    pub statface: Texture8,
+    pub statface: crate::assets::Artwork,
     /// `ui/staitem.tim` Ingram/Minimi icons.
-    pub staitem: Texture8,
+    pub staitem: crate::assets::Artwork,
     /// `item/item_all.bmp` 40x30 icon atlas (black keyed transparent).
     pub item_all: Image,
     /// The text font.
@@ -146,23 +156,16 @@ impl MenuAssets {
     /// the language files encode in — falling back to the pack's default
     /// sheet when the caller has none (tests and capture-less helpers).
     pub fn load(pack: &Pack, font: Option<&Font>) -> Result<Self> {
-        let status = decode_texture(pack, STATUS_ENTRY)?;
-        let blue = decode_texture(pack, BLUE_ENTRY)?;
-        let statface = decode_texture(pack, STATFACE_ENTRY)?;
-        let staitem = decode_texture(pack, STAITEM_ENTRY)?;
-        let item_all = bmp::decode_mask(
-            &pack
-                .read(ITEM_ALL_ENTRY)
-                .with_context(|| format!("missing {ITEM_ALL_ENTRY}"))?,
-        )
-        .with_context(|| format!("invalid {ITEM_ALL_ENTRY}"))?;
+        let status = load_page(pack, STATUS_STEM)?;
+        let blue = load_page(pack, BLUE_STEM)?;
+        let statface = load_page(pack, STATFACE_STEM)?;
+        let staitem = load_page(pack, STAITEM_STEM)?;
+        let item_all =
+            super::load_picture(pack, ITEM_ALL_STEM, Geometry::Shipped, Some([0, 0, 0]))?;
         let font = match font {
             Some(font) => font.clone(),
-            None => Font::new(tim::decode_4bpp(
-                &pack
-                    .read(FONT_ENTRY)
-                    .with_context(|| format!("missing {FONT_ENTRY}"))?,
-            )?),
+            None => crate::font::load_session(pack, crate::charset::Script::Latin)
+                .with_context(|| format!("missing {FONT_ENTRY}"))?,
         };
         Ok(Self {
             status,
@@ -175,11 +178,9 @@ impl MenuAssets {
     }
 }
 
-fn decode_texture(pack: &Pack, entry: &str) -> Result<Texture8> {
-    let bytes = pack
-        .read(entry)
-        .with_context(|| format!("missing {entry}"))?;
-    tim::decode_8bpp(&bytes).with_context(|| format!("invalid {entry}"))
+/// Load one UI page by stem: the shipped TIM or a mod's replacement.
+fn load_page(pack: &Pack, stem: &str) -> Result<crate::assets::Artwork> {
+    super::load_page(pack, stem)
 }
 
 /// The pause menu's screen state.
@@ -707,7 +708,7 @@ impl MainMenu {
         let character = game.state_bytes[usize::from(STATE_BYTE_CHARACTER)] & 3;
         let [x, y] = layout::PORTRAIT_POS;
         let [w, h] = layout::PORTRAIT_SIZE;
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.statface,
             [
                 i32::from(character & 1) * 32,
@@ -756,7 +757,7 @@ impl MainMenu {
         }
         if self.submenu_ready() {
             // Selected action highlight behind the option list.
-            framebuffer.draw_indexed_sprite(
+            framebuffer.draw_page_sprite(
                 &assets.status,
                 [0x30, 0x60, i32::from(fw), i32::from(fh)],
                 [
@@ -771,7 +772,7 @@ impl MainMenu {
             );
         }
         for (option, v) in labels.into_iter().enumerate() {
-            framebuffer.draw_indexed_sprite(
+            framebuffer.draw_page_sprite(
                 &assets.status,
                 [0x30, i32::from(v), w, h],
                 [
@@ -803,7 +804,7 @@ impl MainMenu {
         let Some(position) = layout::cursor_position(cursor, self.slots) else {
             return;
         };
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.status,
             [
                 0,
@@ -836,7 +837,7 @@ impl MainMenu {
         if layout::is_tab(cursor) {
             return;
         }
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.status,
             [0x80, 0xE0, 40, 30],
             [i32::from(position[0]), i32::from(position[1]), 40, 30],
@@ -941,10 +942,10 @@ pub fn item_name_bytes<'a>(text: &'a Text, item: u8, examined: &[u8; 4]) -> Opti
     }
 }
 
-fn draw_part(framebuffer: &mut Framebuffer, texture: &Texture8, part: layout::FramePart) {
+fn draw_part(framebuffer: &mut Framebuffer, texture: &Artwork, part: layout::FramePart) {
     let [x, y] = part.pos;
     let [w, h] = part.size;
-    framebuffer.draw_indexed_sprite(
+    framebuffer.draw_page_sprite(
         texture,
         [
             i32::from(part.uv[0]),
@@ -959,7 +960,7 @@ fn draw_part(framebuffer: &mut Framebuffer, texture: &Texture8, part: layout::Fr
     );
 }
 
-fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::FrameTile) {
+fn draw_tile(framebuffer: &mut Framebuffer, texture: &Artwork, tile: layout::FrameTile) {
     let [x, y] = tile.part.pos;
     let [w, h] = tile.part.size;
     // The tiled record's flag byte maps straight onto the sprite mirror bits
@@ -973,7 +974,7 @@ fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::Fr
         } else {
             (i32::from(index) * i32::from(w), 0)
         };
-        framebuffer.draw_indexed_sprite_mirrored(
+        framebuffer.draw_page_sprite_mirrored(
             texture,
             [
                 i32::from(tile.part.uv[0]),
@@ -997,7 +998,7 @@ fn draw_tile(framebuffer: &mut Framebuffer, texture: &Texture8, tile: layout::Fr
 
 /// Draw an empty inventory slot from `ui/blue.tim`.
 fn draw_empty_slot(framebuffer: &mut Framebuffer, assets: &MenuAssets, position: [i16; 2]) {
-    framebuffer.draw_indexed_sprite(
+    framebuffer.draw_page_sprite(
         &assets.blue,
         [0, 0, 40, 30],
         [i32::from(position[0]), i32::from(position[1]), 40, 30],
@@ -1054,7 +1055,7 @@ pub fn draw_item_icon_slice(
         );
     } else {
         let row = i32::from(item - 0x6F);
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.staitem,
             [0, row * 30 + source_v, 40, height],
             dst,
@@ -1100,7 +1101,7 @@ pub fn draw_item_quantity_clipped(
         return;
     }
     if infinite {
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             &assets.status,
             [152, 112, 10, height],
             [x + 6, y, 10, height],
@@ -1125,7 +1126,7 @@ pub fn draw_item_quantity_clipped(
     for (index, digit) in digits.into_iter().enumerate() {
         let last = index == 2;
         if digit != 0 || drawn || last {
-            framebuffer.draw_indexed_sprite(
+            framebuffer.draw_page_sprite(
                 &assets.status,
                 [column, i32::from(digit) * 8, 8, height],
                 [cursor, y, 8, height],
@@ -1146,6 +1147,7 @@ mod tests {
     use super::*;
     use crate::game::{STATE_BYTE_EQUIPPED, STATE_BYTE_SELECTED_ITEM, STATE_BYTE_USED_ITEM};
     use crate::model::PALETTE_ROW_LEN;
+    use crate::model::Texture8;
     use crate::state::{RoomId, RoomState};
 
     fn new_game() -> GameState {
@@ -1172,6 +1174,10 @@ mod tests {
             }
         }
         event
+    }
+
+    fn solid_page(width: u32, height: u32, patches: &[([u32; 4], u8, [u8; 4])]) -> Artwork {
+        Artwork::Indexed(solid_texture(width, height, patches))
     }
 
     fn solid_texture(width: u32, height: u32, patches: &[([u32; 4], u8, [u8; 4])]) -> Texture8 {
@@ -1213,7 +1219,7 @@ mod tests {
     fn assets() -> MenuAssets {
         MenuAssets {
             // Tabs, frames, cursor and quantity glyphs all sample from here.
-            status: solid_texture(
+            status: solid_page(
                 256,
                 256,
                 &[
@@ -1226,9 +1232,9 @@ mod tests {
                     ([152, 112, 10, 8], 7, [255, 255, 255, 255]),
                 ],
             ),
-            blue: solid_texture(64, 64, &[([0, 0, 40, 30], 1, [0, 0, 255, 255])]),
-            statface: solid_texture(64, 64, &[([0, 0, 32, 32], 1, [255, 255, 0, 255])]),
-            staitem: solid_texture(64, 64, &[([0, 0, 40, 30], 1, [1, 2, 3, 255])]),
+            blue: solid_page(64, 64, &[([0, 0, 40, 30], 1, [0, 0, 255, 255])]),
+            statface: solid_page(64, 64, &[([0, 0, 32, 32], 1, [255, 255, 0, 255])]),
+            staitem: solid_page(64, 64, &[([0, 0, 40, 30], 1, [1, 2, 3, 255])]),
             item_all: image(40, 2160, [0, 255, 0, 255]),
             font: Font::new(Texture8 {
                 width: 768,
@@ -1825,7 +1831,7 @@ mod tests {
         // the original's tab art is partly transparent so the bar shows only
         // where the glyph does not cover it.
         let mut assets = assets();
-        assets.status = solid_texture(
+        assets.status = solid_page(
             256,
             256,
             &[
