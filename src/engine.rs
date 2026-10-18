@@ -906,9 +906,8 @@ enum PickupPhase {
 /// The item-viewer flow the engine drives itself (the original's main-menu
 /// modes 3, 4 and 8).
 ///
-/// Unlike the examine viewer (a boxed [`ui::Screen`] modal that owns all of
-/// its state) a pick-up shares the game's message window and the inventory
-/// panel, so the engine owns its state machine: the viewer's intro/exit
+/// Like the examine viewer, a pick-up shares the game's message window and
+/// the inventory panel, so the engine owns its state machine: the viewer's intro/exit
 /// animation steps in [`GameSession::tick_pickup_view`] and the message is
 /// resolved by [`game::GameState::update_message`] exactly like a menu
 /// message. A document pick-up runs the FILE reader on the picked entry
@@ -931,18 +930,15 @@ struct PickupView {
 /// `--room` builds one through [`GameSession::from_room`] and the app's Play
 /// mode through [`GameSession::new`] or [`GameSession::from_save`]. The engine
 /// drives it one fixed tick at a time and renders through the session's own
-/// framebuffer, so a gameplay modal can freeze the room and still show the
-/// last frame underneath.
-/// The message window, the inventory menu, the item box and the FILE tab are
-/// **not** driven through the [`ui::Screen`] modal hook: the message is part
-/// of [`game::GameState`] and keeps running on the gameplay tick, while the
-/// others freeze the room but keep drawing the last gameplay frame, read
-/// their art from the session and mutate the same `GameState`. The item box is
-/// opened by a room `item_box` action and shares the inventory panel the menu
-/// draws underneath it; the FILE tab is opened from the menu's top tab row
-/// (the Tab key cycles it). The boxed modal hook is kept for screens that own
-/// all of their state (the item viewer); it still freezes the room and draws
-/// over the last gameplay frame exactly as before.
+/// framebuffer, so a frozen overlay can still show the last frame underneath.
+/// The message window, the inventory menu, the item box, the examine viewer
+/// and the FILE tab are driven explicitly rather than through the
+/// [`ui::Screen`] trait: the message is part of [`game::GameState`] and keeps
+/// running on the gameplay tick, while the others freeze the room but keep
+/// drawing the last gameplay frame, read their art from the session and
+/// mutate the same `GameState`. The item box is opened by a room `item_box`
+/// action and shares the inventory panel the menu draws underneath it; the
+/// FILE tab is opened from the menu's top tab row (the Tab key cycles it).
 /// The pause-menu open/close fade phase.
 ///
 /// The original fades the frozen frame to black before revealing the menu
@@ -1082,23 +1078,15 @@ struct GameSession {
     titled_cut: usize,
     transition: Option<TransitionMode>,
     transition_finished: bool,
-    /// Gameplay modal hook.
-    ///
-    /// A gameplay agent (the item viewer) installs a boxed [`ui::Screen`]
-    /// here. While one is present the engine must not call
-    /// [`GameSession::tick`]: the room stays frozen, the modal advances
-    /// through its own [`ui::Screen::update`], and the app draws the last
-    /// gameplay frame from [`GameSession::frame`] underneath before calling
-    /// the modal's draw and applying its [`ui::Screen::fade`] overlay. A modal
-    /// closes by reporting [`ScreenAction::Resume`].
-    modal: Option<Box<dyn ui::Screen>>,
-    /// The ground/scripted item pick-up viewer. It is engine-driven rather
-    /// than a boxed modal because it shares the game's message window and the
-    /// pause menu's inventory panel; see [`PickupView`].
+    /// The ground/scripted item pick-up viewer. It is engine-driven because
+    /// it shares the game's message window and the pause menu's inventory
+    /// panel; see [`PickupView`].
     pickup_view: Option<PickupView>,
-    /// The item the open viewer was asked to examine; leaving the viewer
-    /// marks it examined in [`game::GameState`].
-    viewed_item: Option<u8>,
+    /// The pause menu's examine viewer (CHECK, or the radio tab without a
+    /// transmission). It runs inside the live menu: the menu keeps ticking
+    /// and drawing underneath, and the viewer's messages go through the
+    /// game's message window.
+    examine: Option<ui::item_view::ItemViewScreen>,
     /// A message dismissal consumed the action key while it was still held;
     /// the room tick keeps ignoring the action until the key is released,
     /// matching the original's cleared held/previous-held pad bits.
@@ -1458,9 +1446,8 @@ impl GameSession {
             titled_cut: usize::MAX,
             transition: None,
             transition_finished: false,
-            modal: None,
             pickup_view: None,
-            viewed_item: None,
+            examine: None,
             swallow_action: false,
             boot_message: None,
             room_fade: transition::Fade::inactive(),
@@ -1956,6 +1943,7 @@ impl GameSession {
                 action,
                 left: raw.left,
                 right: raw.right,
+                cancel: raw.run || ui.cancel,
             },
             &self.loaded.room,
             &self.text,
@@ -2229,7 +2217,6 @@ impl GameSession {
             || self.file.is_some()
             || self.map.is_some()
             || self.save_screen.is_some()
-            || self.modal.is_some()
             || self.debug_menu.is_some()
             || self.return_title.is_some()
             || self.computer.is_some()
@@ -2361,6 +2348,7 @@ impl GameSession {
     /// [`player::PlayerState::menu_exit_restore`]).
     fn close_menu(&mut self) {
         self.menu = None;
+        self.examine = None;
         self.item_box = None;
         self.game.message_menu = false;
         if let Some(assets) = self.loaded.player_assets.as_ref() {
@@ -2662,28 +2650,99 @@ impl GameSession {
         Ok(())
     }
 
-    /// Open the item viewer as a gameplay modal over the frozen menu.
-    ///
-    /// The menu stays up underneath and the room stays frozen; leaving the
-    /// viewer through [`ScreenAction::Resume`] returns to the menu unchanged.
-    /// The frozen frame is painted here so booting straight into the viewer
-    /// (`--ui view`) shows the menu under the model exactly like the
-    /// interactive CHECK path.
+    /// Open the examine viewer on `item` inside the open menu. It starts on
+    /// its setup state: the first [`GameSession::tick_examine`] runs the
+    /// setup and the first intro frame together.
     fn open_item_view(&mut self, pack: &Pack, item: u8) {
-        self.render(pack);
         let mut screen = ui::item_view::ItemViewScreen::new(item);
-        screen.open_with(pack, &self.text, &self.game.examined_flags());
-        self.viewed_item = Some(item);
-        self.open_modal(Box::new(screen));
+        screen.open_with(pack, &self.text);
+        self.examine = Some(screen);
     }
 
-    /// Close the gameplay modal and run its close-out side effects. Returning
-    /// from the item viewer marks the examined item, so the next name lookup
-    /// shows its real name.
-    fn close_modal(&mut self) {
-        self.modal = None;
-        if let Some(item) = self.viewed_item.take() {
-            self.game.mark_examined(item);
+    /// One frame of the examine viewer and the CHECK slide around it
+    /// (`menu_item_view_model` and `FUN_0044e1b0`).
+    ///
+    /// The menu ticks first (its health monitor, and the slide); the frame
+    /// the slide-out finishes starts the viewer and runs its first frame. The
+    /// viewer's confirm runs the examine check against the game state and
+    /// shows its message or the item description in the game's window; the
+    /// frame its closing animation finishes the options start sliding back.
+    fn tick_examine(&mut self, pack: &Pack, ui: UiInput) {
+        let Some(menu) = self.menu.as_mut() else {
+            self.examine = None;
+            return;
+        };
+        if let Some(MenuEvent::ViewItem(item)) = menu.tick(&mut self.game) {
+            self.open_item_view(pack, item);
+        }
+        let Self {
+            examine,
+            menu,
+            game,
+            text,
+            ..
+        } = self;
+        let (Some(viewer), Some(menu)) = (examine.as_mut(), menu.as_mut()) else {
+            return;
+        };
+        let input = ui::item_view::ExamineInput {
+            confirm: ui.confirm,
+            cancel: ui.cancel,
+            up: ui.up || ui.held_up,
+            down: ui.down || ui.held_down,
+            left: ui.left || ui.held_left,
+            right: ui.right || ui.held_right,
+            message_active: game.message.active,
+        };
+        let slot = ui::layout::slot_of_cursor(menu.cursor);
+        match viewer.step_examine(input) {
+            ui::item_view::ExamineEvent::None => {}
+            ui::item_view::ExamineEvent::Confirm => {
+                let context = ui::item_view::ExamineContext {
+                    slot_quantity: slot
+                        .and_then(|slot| game.inventory.get(slot))
+                        .map_or(0, |stack| stack.quantity),
+                    item13_message: game.flag_test(game::BANK_SCENARIO, 0x13, false)
+                        || game.flag_test(game::BANK_SCENARIO, 0x00, false),
+                };
+                match viewer.confirm(context) {
+                    ui::item_view::ConfirmOutcome::Description => {
+                        if let Some(bytes) = viewer.description() {
+                            game.show_item_description(viewer.item().wrapping_sub(1), bytes);
+                        }
+                    }
+                    ui::item_view::ConfirmOutcome::Zoom => {}
+                    ui::item_view::ConfirmOutcome::Message {
+                        id,
+                        mark_examined,
+                        select,
+                    } => {
+                        if mark_examined {
+                            game.mark_examined(viewer.item());
+                        }
+                        if let Some(item) = select {
+                            game.select_item(Some(item));
+                        }
+                        game.show_message(id, 0);
+                    }
+                }
+            }
+            ui::item_view::ExamineEvent::Message(id) => game.show_message(id, 0),
+            ui::item_view::ExamineEvent::MarkExaminedBit(bit) => game.mark_examined_bit(bit),
+            ui::item_view::ExamineEvent::Medal(item) => {
+                if let Some(stack) = slot.and_then(|slot| game.inventory.get_mut(slot)) {
+                    *stack = game::InventoryItem {
+                        id: item,
+                        quantity: 1,
+                    };
+                }
+                menu.reselect(game);
+                viewer.open_with(pack, text);
+            }
+            ui::item_view::ExamineEvent::Closed => {
+                *examine = None;
+                menu.view_closed();
+            }
         }
     }
 
@@ -2724,7 +2783,7 @@ impl GameSession {
                 } else {
                     ui::item_view::ItemViewScreen::new_got_item(item)
                 };
-                screen.open_with(pack, &self.text, &self.game.examined_flags());
+                screen.open_with(pack, &self.text);
                 (Some(screen), None, PickupPhase::Intro)
             }
             PickupKind::Document => {
@@ -2767,6 +2826,7 @@ impl GameSession {
                 action,
                 left: input.left,
                 right: input.right,
+                cancel: input.run || ui.cancel,
             },
             &self.loaded.room,
             &self.text,
@@ -3049,16 +3109,26 @@ impl GameSession {
             self.tick_pickup_view(pack, ui, input, action);
             return;
         }
+        let message_input = MessageInput {
+            action,
+            left: input.left,
+            right: input.right,
+            cancel: input.run || ui.cancel,
+        };
+        // The CHECK slide and the examine viewer own the frame, messages
+        // included: the viewer waits on its own messages. The original's menu
+        // task runs before the message task, so a description the viewer asks
+        // for starts revealing this frame and a dismissal reaches the viewer
+        // on the next one.
+        if self.examine.is_some() || self.menu.as_ref().is_some_and(MainMenu::viewing) {
+            self.tick_examine(pack, ui);
+            self.game
+                .update_message(message_input, &self.loaded.room, &self.text);
+            return;
+        }
         let message_was_up = self.game.message.active;
-        self.game.update_message(
-            MessageInput {
-                action,
-                left: input.left,
-                right: input.right,
-            },
-            &self.loaded.room,
-            &self.text,
-        );
+        self.game
+            .update_message(message_input, &self.loaded.room, &self.text);
         if message_was_up || self.game.message.active {
             // The message owns the input, but the original's menu task still
             // runs `menu_draw_health_bar` under it (the status-screen message
@@ -3204,6 +3274,10 @@ impl GameSession {
             return;
         }
         let Some(event_input) = menu_input(ui) else {
+            // An idle navigation frame counts the cursor blink down.
+            if menu.mode == MenuMode::Navigation {
+                menu.blink();
+            }
             return;
         };
         let was_navigation = menu.mode == MenuMode::Navigation;
@@ -3231,7 +3305,8 @@ impl GameSession {
             MenuEvent::None => {}
             MenuEvent::Close => self.begin_menu_close(pack),
             MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
-            // CHECK opens the item viewer over the frozen menu.
+            // CHECK's slide-out finished: the viewer starts. The slide's own
+            // frames run through `tick_examine`, which handles this itself.
             MenuEvent::ViewItem(item) => self.open_item_view(pack, item),
             MenuEvent::Tab(cursor) => self.handle_tab(pack, cursor),
             MenuEvent::Changed => {}
@@ -3637,6 +3712,7 @@ impl GameSession {
                 action,
                 left: input.left,
                 right: input.right,
+                cancel: input.run,
             },
             &self.loaded.room,
             &self.text,
@@ -3873,7 +3949,7 @@ impl GameSession {
             let show_item_name = menu_ready
                 && !self.game.message.active
                 && self.pickup_view.is_none()
-                && self.modal.is_none();
+                && self.examine.is_none();
             // While the item box is open its interaction draws the shared slot
             // cursor itself (`itembox_draw_cursor`), with the box's own blink
             // counter; the menu only keeps a cursor on the tab row, which the
@@ -3893,6 +3969,19 @@ impl GameSession {
                     show_item_name,
                 );
             }
+        }
+        // The examine viewer draws over the live menu: the model, its
+        // rotation arrows and the item name.
+        if let Some(viewer) = &self.examine
+            && !self.menu_fade_hides()
+        {
+            viewer.draw_examine(
+                &mut self.framebuffer,
+                self.menu_assets.as_ref().map(|assets| &assets.status),
+                self.font.as_ref(),
+                &self.text,
+                &self.game.examined_flags(),
+            );
         }
         if self.item_box.is_some() && !self.menu_fade_hides() {
             self.ensure_item_box_assets(pack);
@@ -4024,18 +4113,9 @@ impl GameSession {
         }
     }
 
-    /// The last rendered frame; gameplay modals draw over it.
+    /// The last rendered frame.
     fn frame(&self) -> &Framebuffer {
         &self.framebuffer
-    }
-
-    /// Install a gameplay modal screen; the room freezes until it resumes.
-    ///
-    /// This hook is for screens that own all of their state (the item
-    /// viewer); the message window and pause menu are handled explicitly in
-    /// [`GameSession::tick`] because they share [`game::GameState`].
-    fn open_modal(&mut self, screen: Box<dyn ui::Screen>) {
-        self.modal = Some(screen);
     }
 
     /// Open the lab computer terminal if the room's scripts raised the
@@ -4559,6 +4639,10 @@ pub const DEATH_ROOM: &str = "101";
 
 /// Fixed ticks the headless menu capture settles before the frame is drawn.
 const MENU_CAPTURE_TICKS: u32 = 30;
+
+/// Fixed ticks the headless `--ui view` capture settles: the menu's, then the
+/// viewer's 0x40-frame intro, so the frame shows the resting turntable.
+const VIEW_CAPTURE_TICKS: u32 = MENU_CAPTURE_TICKS + 0x40;
 /// Fixed ticks the headless item-box capture settles before the frame.
 const ITEM_BOX_CAPTURE_TICKS: u32 = 30;
 /// Fixed ticks the headless FILE capture settles before the frame.
@@ -5251,8 +5335,6 @@ impl App {
                     // whether or not the player wrote a slot.
                     self.ending = None;
                     self.open_title()?;
-                } else if let Mode::Play(session) = &mut self.mode {
-                    session.close_modal();
                 }
             }
             ScreenAction::EndingResult => self.open_result()?,
@@ -5336,48 +5418,16 @@ impl App {
         result
     }
 
-    /// Tick the gameplay session or its modal.
+    /// Tick the gameplay session.
     fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
-        let mut cues: Vec<ui::UiCue> = Vec::new();
         let mut return_title = false;
         let mut death_finished = false;
         {
-            let App {
-                pack,
-                save_dir,
-                font,
-                text,
-                mode,
-                ticks,
-                ..
-            } = self;
+            let App { pack, mode, .. } = self;
             let Mode::Play(session) = mode else {
                 return Ok(AppFlow::Continue);
             };
-            if let Some(modal) = session.modal.as_mut() {
-                // The original's menu task keeps running
-                // `menu_update_status_screen` under the model viewer (the
-                // status-screen cases 4 and 6 both call `menu_draw_health_bar`
-                // with the viewer up), so its health-monitor `rand()` draws
-                // stay in step.
-                if let Some(menu) = session.menu.as_mut() {
-                    menu.tick(&mut session.game);
-                }
-                let cx = UiContext {
-                    pack,
-                    save_dir,
-                    font: font.as_ref(),
-                    text: Some(text),
-                    ticks: *ticks,
-                    cues: std::cell::RefCell::new(Vec::new()),
-                };
-                match modal.update(&cx, ui) {
-                    ScreenResult::Done(ScreenAction::Resume) => session.close_modal(),
-                    ScreenResult::Done(ScreenAction::Quit) => return Ok(AppFlow::Quit),
-                    _ => {}
-                }
-                cues = cx.cues.into_inner();
-            } else if !session.transition_finished {
+            if !session.transition_finished {
                 if session.transition.is_some() {
                     // The original's `room_transition_load` blocks the gameplay
                     // loop while the door-animation task runs: the room is
@@ -5392,7 +5442,6 @@ impl App {
                 death_finished = session.death.finished;
             }
         }
-        self.play_ui_cues(cues);
         if return_title {
             if death_finished {
                 // The tick the death finished is still a traced gameplay tick
@@ -5493,22 +5542,8 @@ impl App {
                 framebuffer.fade_overlay(screen.overlay());
             }
             Mode::Play(session) => {
-                if session.modal.is_none() {
-                    session.render(pack);
-                }
+                session.render(pack);
                 framebuffer.copy_from(session.frame());
-                if let Some(modal) = session.modal.as_mut() {
-                    let cx = UiContext {
-                        pack,
-                        save_dir,
-                        font: font.as_ref(),
-                        text: Some(text),
-                        ticks: *ticks,
-                        cues: std::cell::RefCell::new(Vec::new()),
-                    };
-                    modal.draw(&cx, framebuffer);
-                    framebuffer.fade_overlay(modal.overlay());
-                }
             }
             Mode::Movie(session) => {
                 framebuffer.rgba.copy_from_slice(session.frame_rgba());
@@ -5821,7 +5856,7 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
-                app.settle(MENU_CAPTURE_TICKS)?;
+                app.settle(VIEW_CAPTURE_TICKS)?;
             }
             AppBoot::Death(character) => {
                 app.open_death_capture(character)?;
@@ -14082,60 +14117,6 @@ mod tests {
         );
     }
 
-    /// A modal that counts its updates and draws nothing.
-    struct CountingModal {
-        updates: std::rc::Rc<std::cell::Cell<u32>>,
-    }
-
-    impl Screen for CountingModal {
-        fn open(&mut self, _cx: &mut UiContext<'_>) -> Result<()> {
-            Ok(())
-        }
-
-        fn update(&mut self, _cx: &UiContext<'_>, _input: UiInput) -> ScreenResult {
-            self.updates.set(self.updates.get() + 1);
-            ScreenResult::Continue
-        }
-
-        fn draw(&mut self, _cx: &UiContext<'_>, _framebuffer: &mut Framebuffer) {}
-    }
-
-    #[test]
-    fn a_modal_freezes_the_room_tick() {
-        let dir = TempDir::new();
-        let pack_path = new_game_pack(&dir);
-        let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::new(pack, dir.0.join("saves"), false);
-        app.boot(AppBoot::NewGame {
-            character: 0,
-            room: None,
-        })
-        .unwrap();
-
-        let updates = std::rc::Rc::new(std::cell::Cell::new(0));
-        let before = match &app.mode {
-            Mode::Play(session) => session.game.frame,
-            _ => panic!("expected a play mode"),
-        };
-        {
-            let Mode::Play(session) = &mut app.mode else {
-                unreachable!();
-            };
-            session.open_modal(Box::new(CountingModal {
-                updates: std::rc::Rc::clone(&updates),
-            }));
-        }
-
-        app.update(UiInput::default(), player::Input::default(), false)
-            .unwrap();
-
-        let Mode::Play(session) = &app.mode else {
-            panic!("expected a play mode");
-        };
-        assert_eq!(session.game.frame, before, "the room tick must stay frozen");
-        assert_eq!(updates.get(), 1, "the modal must advance each tick");
-    }
-
     fn solid_image(color: [u8; 4]) -> Image {
         let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
         for _ in 0..WIDTH * HEIGHT {
@@ -16781,8 +16762,34 @@ off_0010:
         );
     }
 
+    fn press(confirm: bool, cancel: bool) -> UiInput {
+        UiInput {
+            confirm,
+            cancel,
+            ..UiInput::default()
+        }
+    }
+
+    /// Ticks the session with no input until `done` holds, up to `limit`.
+    fn idle_until(
+        session: &mut GameSession,
+        pack: &Pack,
+        limit: u32,
+        done: impl Fn(&GameSession) -> bool,
+    ) -> u32 {
+        for tick in 0..limit {
+            if done(session) {
+                return tick;
+            }
+            session
+                .tick(pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        panic!("the condition never held within {limit} ticks");
+    }
+
     #[test]
-    fn check_opens_the_item_viewer_modal_and_resume_returns_to_the_menu() {
+    fn check_slides_into_the_examine_viewer_and_cancel_slides_back() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
@@ -16806,17 +16813,9 @@ off_0010:
         settle_menu_fade(&mut session, &pack);
 
         // Slot 0 holds the knife: confirm opens the action submenu, down
-        // selects CHECK, confirm installs the viewer.
+        // selects CHECK, confirm starts the slide into the viewer.
         session
-            .tick(
-                &pack,
-                UiInput {
-                    confirm: true,
-                    ..UiInput::default()
-                },
-                player::Input::default(),
-                false,
-            )
+            .tick(&pack, press(true, false), player::Input::default(), false)
             .unwrap();
         settle_submenu_open(&mut session, &pack);
         for ui in [
@@ -16824,53 +16823,53 @@ off_0010:
                 down: true,
                 ..UiInput::default()
             },
-            UiInput {
-                confirm: true,
-                ..UiInput::default()
-            },
+            press(true, false),
         ] {
             session
                 .tick(&pack, ui, player::Input::default(), false)
                 .unwrap();
         }
-        // The viewer action runs on the frame after the confirm.
-        session
-            .tick(&pack, UiInput::default(), player::Input::default(), false)
-            .unwrap();
-        assert!(session.modal.is_some(), "CHECK installs the item viewer");
-        assert!(session.menu.is_some(), "the menu stays underneath");
+        assert!(session.menu.as_ref().is_some_and(MainMenu::viewing));
         let frozen = session.game.frame;
-        session
-            .tick(&pack, UiInput::default(), player::Input::default(), false)
-            .unwrap();
+        // The submenu slides out for eight frames before the viewer starts.
+        let slide = idle_until(&mut session, &pack, 20, |session| session.examine.is_some());
+        assert_eq!(slide, 8, "the viewer starts once the slide reaches 8");
+        assert_eq!(
+            session
+                .examine
+                .as_ref()
+                .map(ui::item_view::ItemViewScreen::item),
+            Some(ITEM_KNIFE)
+        );
+        idle_until(&mut session, &pack, 0x80, |session| {
+            session
+                .examine
+                .as_ref()
+                .is_some_and(ui::item_view::ItemViewScreen::turntable_ready)
+        });
         assert_eq!(session.game.frame, frozen, "the room stays frozen");
 
-        // The modal owns the input from here: cancel reports Resume, which the
-        // app applies by dropping the modal and returning to the menu.
-        let mut modal = session.modal.take().unwrap();
-        let cx = UiContext {
-            pack: &pack,
-            save_dir: Path::new("."),
-            font: None,
-            text: Some(&session.text),
-            ticks: 0,
-            cues: Default::default(),
-        };
-        assert_eq!(
-            modal.update(
-                &cx,
-                UiInput {
-                    cancel: true,
-                    ..UiInput::default()
-                },
-            ),
-            ScreenResult::Done(ScreenAction::Resume)
+        // Cancel runs the exit animation, then the submenu slides back in
+        // and the menu owns the input again.
+        session
+            .tick(&pack, press(false, true), player::Input::default(), false)
+            .unwrap();
+        assert!(session.examine.is_some(), "the exit animation still draws");
+        idle_until(&mut session, &pack, 0x80, |session| {
+            session.examine.is_none()
+        });
+        idle_until(&mut session, &pack, 20, |session| {
+            !session.menu.as_ref().is_some_and(MainMenu::viewing)
+        });
+        assert!(
+            session.menu.is_some(),
+            "leaving the viewer lands on the menu"
         );
-        assert!(session.menu.is_some(), "resuming lands back on the menu");
+        assert_eq!(session.game.frame, frozen, "the room stays frozen");
     }
 
     #[test]
-    fn resuming_the_item_viewer_marks_the_item_examined() {
+    fn confirming_a_plain_key_in_the_viewer_marks_it_examined() {
         let dir = TempDir::new();
         let pack_path = message_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
@@ -16878,41 +16877,44 @@ off_0010:
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
 
-        // The sword key's name class is 3: it starts unexamined and its real
-        // name is hidden until the viewer has run.
+        // Lab key A's name class is 7 with no angle combo: confirming on the
+        // turntable shows the class message and marks the class examined,
+        // which reveals the key's real name.
         assert!(!crate::message::examined_bit(
             &session.game.examined_flags(),
-            3
+            7
         ));
-        session.open_item_view(&pack, ITEM_SWORD_KEY);
-        assert!(session.modal.is_some());
-
-        // The modal reports Resume on cancel; the app applies that through
-        // `close_modal`, which is where the examine mark lands.
-        let mut modal = session.modal.take().unwrap();
-        let cx = UiContext {
-            pack: &pack,
-            save_dir: Path::new("."),
-            font: None,
-            text: Some(&session.text),
-            ticks: 0,
-            cues: Default::default(),
-        };
-        assert_eq!(
-            modal.update(
-                &cx,
+        session
+            .tick(
+                &pack,
                 UiInput {
-                    cancel: true,
+                    start: true,
                     ..UiInput::default()
                 },
-            ),
-            ScreenResult::Done(ScreenAction::Resume)
-        );
-        session.close_modal();
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_menu_fade(&mut session, &pack);
+        session.open_item_view(&pack, 0x37);
+        idle_until(&mut session, &pack, 0x80, |session| {
+            session
+                .examine
+                .as_ref()
+                .is_some_and(ui::item_view::ItemViewScreen::turntable_ready)
+        });
+        assert!(!crate::message::examined_bit(
+            &session.game.examined_flags(),
+            7
+        ));
+        session
+            .tick(&pack, press(true, false), player::Input::default(), false)
+            .unwrap();
         assert!(
-            crate::message::examined_bit(&session.game.examined_flags(), 3),
-            "leaving the viewer marks the item examined"
+            crate::message::examined_bit(&session.game.examined_flags(), 7),
+            "the confirm marks the item examined"
         );
+        assert!(session.game.message.active, "the class message is up");
     }
 
     #[test]
