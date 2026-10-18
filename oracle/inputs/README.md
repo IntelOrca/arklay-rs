@@ -84,6 +84,10 @@ Save mode (each header names its save):
 - `itembox_open.txt`, `itembox_page.txt` — `itembox_chris_118.dat`: the item
   box world action, its overlay, the D-pad pages, a swap and the box cancel
   (the whole menu exits through `menu_exit_cleanup` and the room resumes).
+- `itembox_cam.txt` — `itembox_cam_chris_118.dat`: walk up to the box on
+  camera 1 (which frames it), confirm to open it and cancel the overlay. The
+  lid swing, its settle and the hand-off to the overlay are visible in the
+  world frames (the lid stays open until the overlay closes).
 - `save_screen.txt` — `typewriter_chris_118.dat`: the typewriter prompt,
   the Yes answer, the fade hand-off and the SAVE GAME screen (stopped before
   a slot is written).

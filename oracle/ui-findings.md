@@ -141,8 +141,15 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   ramped backdrop).
 
 - **Item box world action and handshake.** `open_itembox` arms the lid; the
-  reference then runs three frames of menu handshake between the lid settling
-  and the panel fade (the room keeps ticking with the player frozen), and the
+  lid swings to -441 (the 41st `check_itembox_state` call: the accumulator
+  grows *before* the -199 test reverses it, so the ease-back starts at 21, not
+  19) and the settle frame is `game_loop`'s last: the same iteration raises the
+  menu request after the room has drawn the settled lid, and the next frame is
+  the panel fade (confirmed by logging the reference's lid angle per tick under
+  gdb). The lid stays open on screen until the overlay closes; state 4 resets
+  it on the first room frame after. arklay settled two ticks early
+  (-400, 39 calls) and ran three handshake frames, so the lid snapped shut two
+  frames before the overlay (#59); the `itembox_cam` scenario shows it. The
   panel fade steps straight after its arm (no draw-then-add frame). A browse
   cancel (and a confirm on a cursor without a slot) restores the lid and runs
   `menu_exit_cleanup`: the whole pause menu fades out and the room resumes -

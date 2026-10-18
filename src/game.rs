@@ -6645,6 +6645,9 @@ impl GameState {
 
     /// State 2 of the lid flow: swing the lid further and grow the step. A
     /// missing lid record skips the swing but still runs the state machine.
+    /// The step grows before the -199 test reverses it, so the easing-back
+    /// phase starts from the grown step (the lid ends at -441, settling on the
+    /// 41st call).
     fn itembox_tick_lid(&mut self) {
         let timer = self.itembox.open_timer as i16;
         let angle = match self.itembox_cover_mut() {
@@ -6654,14 +6657,14 @@ impl GameState {
             }
             None => -200,
         };
-        if angle < -199 {
-            self.itembox.state = 3;
-            self.itembox.counter_increase = -1;
-        }
         self.itembox.open_timer = self
             .itembox
             .open_timer
             .wrapping_add(self.itembox.counter_increase as u16);
+        if angle < -199 {
+            self.itembox.state = 3;
+            self.itembox.counter_increase = -self.itembox.counter_increase;
+        }
     }
 
     fn itembox_cover_mut(&mut self) -> Option<&mut crate::objects::ObjectRecord> {
@@ -16172,7 +16175,11 @@ mod tests {
             }
         }
         assert!(minimum < -199, "the lid only reached {minimum}");
-        assert!(settled.is_some(), "the lid never settled");
+        assert_eq!(settled, Some(40), "the lid settles on the 41st call");
+        assert_eq!(
+            state.objects.records[0].rotation[2], -441,
+            "the lid stays open at the settle"
+        );
         assert!(state.flags[5].bit(MSF_MENU_MODE_ITEMBOX));
         assert_eq!(
             state.message_flags, 0xFFFF,
