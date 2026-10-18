@@ -29,7 +29,7 @@ workspace install (`/path/to/re1`) and its converted pack.
 | E1 Enemy scripting | `enemy` namespace, sandboxed enemy-script VM from the pack, monster spawn/model dispatch, SpiderWeb (0x13) | done |
 | E2 NPC port | Character states 0/1/8/9 in `enemy/lib/npc.lua` + per-id data scripts; native driver kept as the differential oracle | done |
 | E3 Roots + shared helpers | Plant 42's roots (0x0e) spawn-kind/phase machine; named scratch words, joint-scale render, per-entity SCA record, enemy sound bank, additive model tint, direct RNG draw | done |
-| E4 Shared damage layer | Combat tables decoded from the install's executable into `data/combat.bin`; the shared weapon-damage pipeline with hit detectors, hit records and reactions; player-hurt helpers; saved-enemy door snapshots | done |
+| E4 Shared damage layer | The shared weapon-damage pipeline with hit detectors, hit records and reactions over the built-in combat tables; player-hurt helpers; saved-enemy door snapshots | done |
 | E5 Adder + Wasp | The adder (0x0a): four-state machine over the four spawn-kind decisions and seven behaviours, the ballistic drop, the joint-1 bite reach, the tail-hiding flinch and both death paths with the retreat's self-respawn. The wasp (0x07): the nest/ignore/behaviour three-level machine, hover drift, contact sting and cutscene grab, the per-character player poses, the big-wasp variant and the nest respawn cycle. Per-frame joint world matrices and joint-anchored billboards, the range/LOS and path-keep helpers they need | done |
 | E6 Crow + spiders | The crow (0x05): the 14-behaviour flight machine, perching/take-off scatter, the altitude envelope and off-map death, obstacle swerve/latch steering, the floor-step channel, the stored-speed vector and the player animation/mash accessors. The WebSpinner (0x03) and BlackTiger (0x04): the three spawn-kind pickers and twelve behaviours, the three web shooters, the shared Rust web-clone arena with its own seven-state machine, room teardown and render pass, the two-volume SCA profile, 32-bit joint flags, the leg-reach probe and the per-type web-joint registries | done |
 | E7 Cerberus + Chimera | The hound (0x02): the 16-slot state/behaviour block read through two bases, the five sub-tables and the wall-follow switch, all ten behaviours, the forward/turn collision probes with the `position`-word save/restore, the head-track steering and the bite→tumble/maul forks. The chimera (0x09): the four-state table with the hit/death layers, the seventeen behaviours (three doubling as the variant brains), the dive-arc drop/swoop/knockdown/death drivers, the ceiling attachment and the grab with its mash meter | done |
@@ -41,7 +41,7 @@ workspace install (`/path/to/re1`) and its converted pack.
 | E10d Tyrant | The Tyrant (ids `0x0c` lab, `0x10` heliport; one shared `enemy/em0c.lua` machine plus the thin `em10.lua` alias): the ten-slot state table (init, think+act, the hit reaction's `+0x174` state restore, the forced state and the SCD state), the two behaviour dispatch bases (state 1 adds the +2 bias, state 3 runs it unbent with no pathfinding), the sixteen behaviours (restrained slab, SCD yield, 60-frame pause, waypoint walk with the walk/run root-motion sets, swipe/slash/thrust/backhand with their reach windows, damage frames and kill latches, the impale grab, charge and rush with their save/restore collision probes, the eruption entrance, rise, and the two per-id decision layers) and the eighteen-slot SCD table (pod → glass break with its 53-entry shard draw order → the scripted Wesker impale → idle, the walk/strike/face/animation handlers, and the heliport rocket death that launches five joints as free bodies and stops at `health = -1` / `SysFlags 0x1F`). The root-motion extractor (`e:tyrant_root_motion`) turns the claw chains into the frame's speed and slides the entity; the ribbon history (`e:tyrant_trail_alloc`/`e:tyrant_trail_arm`/`e:tyrant_trail_update`, the nine matrix/midpoint/near-far slots with the `0x8000` arm bit), the two claw ghosts (`e:tyrant_ghosts_tick`, the signed-byte 3000..6000 scale pair) and the limb physics (`e:tyrant_limb_launch`/`e:tyrant_limb_update`) keep the original's exact state; the exposed heart rides joint 1 through the companion arena with its own beat ramp and rocket-death drop. The player-side Tyrant stagger table (backhand/swipe stagger and the knock-back with the wall slam and reverse get-up) runs in the shared state-6 window; `e:latch_player_attacker`, `e:snap_grab_slot`, `e:add_entity_anim_offset`, the `ty_*` scratch views, `e:angle_quadrant`, `e:store_camera_speed` and the travelled-distance third return of `e:resolve_collision` are the new surface. The corpus census now finds twenty-one scripted monster ids (adding `0x0c` and `0x10`) with no script errors, and the real-asset tests boot ROOM5130's pod Tyrant with its heart and ROOM3030's suspended heliport Tyrant | done |
 | E11a Player weapons | The player weapon runtime: the aim/fire/reload state machine (0x12–0x1a guns, the knife's own aim/hold/swing/holster/turn) driven by the new aim/fire pad keys, the per-weapon `W*.EMW` clip selection and the knife/gun/projectile fire paths through `apply_weapon_damage_with`, the clip/reserve ammo model (`weapon_autoaim_check`, the reload transfer and the volley latch), the fire data tables (fire frames, sounds, muzzle and secondary flash offsets, end frames, special frame windows, aim heights), the held weapon drawn at joint 14 with the player/character texture page, the muzzle/secondary flashes and shells attached to the weapon joints, the state-8 held-weapon joint refresh, and the flamethrower enemy-bank cues | done |
 | E11b Player death | The player damage/death state machine: the state-1 entry checks (the HP<0 death trigger with the back-shot facing flip and the cannot-die guard, the hit pre-emption into the generic reaction, the poison status drain), the death fall (state 3: the scream, the body clip, the slide, the blood pool that reuses the ground quad and grows 16 a frame for 148 frames, and the blocked state), the game-over machine (the 90-frame delay, the room-variant immediate fades for the two Yawn rooms and the water tank, the scripted-death rooms that skip the pool, the white-out and the black fade-out), and the DIED screen (`src/ui/death.rs`: the `died.tim` mirrored static backdrop, the fixed camera over the corpse with the 8-unit-per-frame spin, the 256-column sine-wavy strip with its exact phase/amplitude ramps, the black overlay ramp and the confirm skip), returning to the title; `ui/died.tim` is packed and `--ui death` joins the debug boot list | done |
-| E12 Enemy verification | The closing gate over the whole arc: the corpus spawn census re-measured across all 348 rooms with twenty-one scripted monster ids and zero script errors, the per-id real-asset boots (`enemy_real`), the real weapon/damage kills (`weapons_real`/`combat_real`), the shipped DIED-screen run (`death_real`), the NPC/actor/walk/entities/fire regression suites, `verify` on the reconverted pack (the new `combat`/`emw`/`tmd` rows green, `tim` 122/122), and the status/deviations close-out | done |
+| E12 Enemy verification | The closing gate over the whole arc: the corpus spawn census re-measured across all 348 rooms with twenty-one scripted monster ids and zero script errors, the per-id real-asset boots (`enemy_real`), the real weapon/damage kills (`weapons_real`/`combat_real`), the shipped DIED-screen run (`death_real`), the NPC/actor/walk/entities/fire regression suites, `verify` on the reconverted pack (the new `emw`/`tmd` rows green, `tim` 124/124), and the status/deviations close-out | done |
 
 Enemy behaviour now lives in the pack as `enemy/em{id:02x}.lua` scripts (with
 shared `enemy/lib/**.lua` modules) behind the same sandbox as the mod hooks;
@@ -72,13 +72,13 @@ endings, the DC-only Forest zombie and the documented render-contract items
 remain deferred; every one is listed below or in the milestone deviations
 files.
 
-E4 added the shared damage/death layer those scripts consume. The converter
-now decodes the install's own combat data — the per-weapon hit ranges, both
-playthroughs' hit records, the hit-joint lists, the per-type hit reactions,
-the reference type's init profile and collision records, the shared player
-collision records and the entity-model path table — validates every region's
-shape and pointer partitions, and packs it as `data/combat.bin`; a pack
-without the entry falls back to the built-in documented tables.
+E4 added the shared damage/death layer those scripts consume. The combat
+tables — the per-weapon hit ranges, both playthroughs' hit records, the
+hit-joint lists, the per-type hit reactions, the reference type's init
+profile and collision records, the shared player collision records and the
+entity-model path table — are the engine's built-in documented values; a pack
+that carries its own `data/combat.bin` (an older conversion or a mod)
+overrides them.
 `GameState::apply_weapon_damage` runs the original's per-shot pipeline in
 slot order (knife/gun/projectile detectors, the two arcade cones, the
 line-of-sight layers below weapon slot 5, first/second-playthrough record
@@ -556,13 +556,13 @@ park) allocating their recorded id/behaviour/position/animation/slot with
 zero script errors and an exact deferred set; `enemy_real` boots one shipped
 room per id through its script; `weapons_real` fires the real weapon set
 through the input path at a shipped web and captures the held weapon in the
-hand; `combat_real` re-decodes the packed combat tables against a fresh
-decode and kills through the shared pipeline; `death_real` reaches the
+hand; `combat_real` drives the built-in combat tables through the shared
+pipeline and kills a real web; `death_real` reaches the
 shipped DIED screen from a real room and returns to the title; the NPC
 differential and the actor/walk/entities/fire suites stay green, so the
 character port and the monster scripts share one verified runtime. The pack
-reconverts deterministically with the `combat`/`emw`/`tmd` rows green and
-the `tim` row at 122/122; the remaining 28 `rdt` failures are the documented
+reconverts deterministically with the `emw`/`tmd` rows green and
+the `tim` row at 124/124; the remaining 28 `rdt` failures are the documented
 four-byte stub rooms. The milestone deviations (render-contract items, the
 attract demo, the endings, the DC branches) are catalogued in
 `docs/m18-deviations.md` and the module docs.
@@ -584,14 +584,14 @@ converted base pack on the reference install reports:
 
 ```
 pack: re1.akpak
-3261 entries, 484033461 bytes
+3266 entries, 484370780 bytes
 format       entries        ok    failed          bytes
 manifest           1         1         0            106
 rdt              348       320        28       51364907
 roomcut          842       842         0       42258554
 roommask         601       601         0        4194392
-bmp               12        12         0         269296
-tim              122       122         0         776669
+bmp               17        17         0         600063
+tim              124       124         0         784016
 ivm               77        77         0        1581983
 emd               63        63         0        4062003
 emw               32        32         0         446942
@@ -599,13 +599,11 @@ tmd                7         7         0           8822
 dor               34        34         0         888924
 wav             1039      1039         0      126174536
 language           8         8         0         205617
-maptables          1         1         0             72
-combat             1         1         0           1017
 biocard            1         1         0            335
 avi               27        27         0      251624740
-lua               39        39         0         151044
+lua               39        39         0         151338
 opaque             6         6         0          23502
-verify: 3261 entries, 3233 ok, 28 failed, 6 opaque
+verify: 3266 entries, 3238 ok, 28 failed, 6 opaque
 ```
 
 The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
@@ -642,7 +640,7 @@ replaces the retired executable `text/*.bin` tables.
 | cargo-fuzz targets and seeds | `fuzz/` package (parallel fuzz slice) | present, 19 targets with committed synthetic seeds |
 | Enemy spawn census | `tests/real/enemy_census.rs` (ignored) | present; every corpus record allocates, scripted set exact, zero script errors |
 | Per-id enemy boots | `tests/real/enemy_real.rs` (ignored) | present; one shipped room per scripted id |
-| Weapon/damage/death suites | `tests/real/weapons_real.rs`, `tests/real/combat_real.rs`, `tests/real/death_real.rs` (ignored) | present; real input kills, table decode, shipped DIED screen |
+| Weapon/damage/death suites | `tests/real/weapons_real.rs`, `tests/real/combat_real.rs`, `tests/real/death_real.rs` (ignored) | present; real input kills over the built-in tables, shipped DIED screen |
 | Scheduled fuzz workflow | `.github/workflows/fuzz.yml` | present, nightly, non-gating |
 | Decode budgets and memory ceilings | `src/budget.rs` (parallel budget slice), `tests/memory.rs` | present |
 | `arklay verify` | `src/verify.rs`, `tests/cli.rs` | present |
@@ -719,7 +717,7 @@ scripted in the game pack (ids `0x00`-`0x15`; the DC-only Forest zombie
 weapons and the death/game-over flow are live, and the verification spine
 covers them end to end: the spawn census across all 348 rooms, the per-id
 real-asset boots, the real weapon/damage/death suites, the reconverted
-`verify` table with the combat and weapon rows green, and the always-run
+`verify` table with the weapon rows green, and the always-run
 synthetic suites for every machine.
 
 Still open, by design:

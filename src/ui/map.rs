@@ -16,12 +16,12 @@
 //! view of the current area; cancel returns to the browser and then closes
 //! the tab.
 //!
-//! The area/layout/room tables come from `map/tables.bin`, extracted from the
-//! executable by the converter exactly like the text tables. The full-display
-//! zoom animation and the objective highlight are deliberate approximations:
-//! the zoom is a single swap and the objective rule is transcribed from the
-//! scenario flags rather than extracted. A pack without the map entries leaves
-//! the tab blank with a warning.
+//! The area/layout/room tables come from the built-in [`MapTables::default`]
+//! values; a pack that carries `map/tables.bin` (an older conversion or a mod)
+//! overrides them. The full-display zoom animation and the objective highlight
+//! are deliberate approximations: the zoom is a single swap and the objective
+//! rule is transcribed from the scenario flags rather than extracted. A pack
+//! without the map art entries leaves the tab blank with a warning.
 //!
 //! Everything here is data-driven and draw-only: the room-flags/SCD bit that
 //! records a map pick-up is raised by [`crate::game::GameState::pick_up_map`].
@@ -38,7 +38,8 @@ use crate::state::Image;
 use super::layout;
 use super::main_menu::MenuInput;
 
-/// Pack entry of the extracted map tables.
+/// Pack entry carrying the map bookkeeping tables; the built-ins are used
+/// when a pack has none.
 pub const TABLES_ENTRY: &str = "map/tables.bin";
 /// Pack stem of the map backdrop.
 pub const BLUE_STEM: &str = "map/blue";
@@ -583,14 +584,15 @@ impl MapScreen {
             Ok(data) => match MapTables::parse(&data) {
                 Ok(tables) => tables,
                 Err(err) => {
-                    eprintln!("warning: invalid {TABLES_ENTRY}: {err:#}; the map tab stays blank");
+                    eprintln!(
+                        "warning: invalid {TABLES_ENTRY}: {err:#}; the map tab uses the built-in tables"
+                    );
                     MapTables::default()
                 }
             },
-            Err(err) => {
-                eprintln!("warning: missing {TABLES_ENTRY}: {err:#}; the map tab stays blank");
-                MapTables::default()
-            }
+            // A converted pack carries no tables entry; the built-ins are the
+            // documented values.
+            Err(_) => MapTables::default(),
         };
         let mut screen = Self {
             tables,
