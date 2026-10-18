@@ -93,6 +93,7 @@ fn player_triangle(camera: &Camera, corners: [(f64, f64); 3], depth: f64) -> Tmd
                 raw_y: false,
                 flat_color: None,
                 quad: None,
+                uv_nudge: [0; 3],
             }],
         }],
     }
