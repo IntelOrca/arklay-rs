@@ -1537,6 +1537,7 @@ impl GameSession {
         call_lua_room_load(self.lua.as_ref(), &mut self.game, self.loaded.id);
         self.game.sync_player(&mut self.player);
         drain_mask_toggles(&mut self.loaded.room, &mut self.game);
+        reset_room_camera_id(&mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
         // The original runs `update_room_bgm` after the destination's init
         // script (so a `room_bgm_state_set` it performs is visible) and after the
@@ -9100,6 +9101,19 @@ fn update_window_title(
     Ok(())
 }
 
+/// `room_set`'s camera block: the room camera id is zeroed before the
+/// switch-zone scan, so the walk starts from camera 0 and the pre-scan id is
+/// discarded - whether the room's init script wrote it or a save block was
+/// loaded with it. The BioCard byte at 0x202 *is* `g_roomCameraId`, so a
+/// continue must not keep the saved cut (#42). A room script that re-locked
+/// the camera keeps the cut it selected instead: the original takes
+/// `display_room_camera_bg`'s branch (RoomInit.cpp:670-676).
+fn reset_room_camera_id(game: &mut game::GameState) {
+    if !game.camera.locked {
+        game.set_camera_cut(0);
+    }
+}
+
 /// Apply the SCD camera state to the room.
 ///
 /// When the scripts hold the camera lock, their cut wins; otherwise the M2 zone
@@ -12065,6 +12079,40 @@ mod tests {
             }
         }
         assert_eq!(game.desk.state, 33, "the per-frame desk state machine ran");
+    }
+
+    #[test]
+    fn reset_room_camera_id_keeps_a_locked_script_cut() {
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut game = game::GameState::new(id, &RoomState::default());
+
+        // The block's saved id or a pre-scan script write is discarded, so the
+        // boot walk always starts from camera 0.
+        game.set_camera_cut(2);
+        reset_room_camera_id(&mut game);
+        assert_eq!(game.camera.current_cut, 0);
+        assert_eq!(
+            game.state_bytes[usize::from(game::STATE_BYTE_ROOM_CAMERA)],
+            0
+        );
+
+        // A room script that re-locked the camera keeps the cut it selected:
+        // `room_set` takes `display_room_camera_bg`'s branch instead.
+        game.set_camera_cut(2);
+        game.camera.locked = true;
+        reset_room_camera_id(&mut game);
+        assert_eq!(
+            game.camera.current_cut, 2,
+            "the lock keeps the script's cut"
+        );
+        assert_eq!(
+            game.state_bytes[usize::from(game::STATE_BYTE_ROOM_CAMERA)],
+            2
+        );
     }
 
     #[test]
@@ -18320,6 +18368,48 @@ off_0010:
             continued.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)],
             2,
             "the saved 1 plus the continue path's increment"
+        );
+    }
+
+    /// A continue discards the block's saved camera id: `room_set`'s camera
+    /// block zeroes `g_roomCameraId` before the switch-zone scan, so the walk
+    /// re-homes from camera 0 at the saved position. Regression for #42: the
+    /// block's camera byte is the cut that was live when the game was saved,
+    /// not the cut the saved position selects. The block is the checked-in
+    /// differential fixture, so a fixture or boot-camera change fails here.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_continue_rehomes_the_camera_from_zero() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("oracle/saves/bootcam_chris_104.dat");
+        let parsed = save::load_file(&fixture).unwrap();
+        // Room 104 (Chris) inside the far wall's collision volume, saved while
+        // the room boot had cut 2 live.
+        assert_eq!(parsed.room, 0x04);
+        assert_eq!(parsed.pos_x, 3700);
+        assert_eq!(parsed.pos_z, 6600);
+        assert_eq!(parsed.camera, 2, "the block carries the live cut");
+        let continued = GameSession::from_save(&pack, &parsed, Path::new("saves")).unwrap();
+        assert_eq!(continued.player.pos, [3700, 0, 6600]);
+        let expected = player::camera_for_position(&continued.loaded.room, 0, continued.player.pos);
+        assert_ne!(
+            expected,
+            usize::from(parsed.camera),
+            "the saved cut must be discarded"
+        );
+        assert_eq!(
+            continued.game.camera.current_cut, expected,
+            "the continue re-homes the camera from camera 0"
+        );
+        assert_eq!(continued.loaded.room.current_cut, expected);
+        assert_eq!(
+            continued.game.state_bytes[usize::from(game::STATE_BYTE_ROOM_CAMERA)],
+            expected as u8,
+            "the BioCard camera byte follows the re-homed cut"
         );
     }
 
