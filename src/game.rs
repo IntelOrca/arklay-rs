@@ -5480,6 +5480,14 @@ impl GameState {
         self.message.examined = bank.to_le_bytes();
     }
 
+    /// Set one bit of the examined bank directly (the red book's read zoom
+    /// sets bit `0x0D`).
+    pub fn mark_examined_bit(&mut self, bit: u8) {
+        let bank = u32::from_le_bytes(self.message.examined);
+        let bank = bank | (0x8000_0000u32 >> (bit & 0x1F));
+        self.message.examined = bank.to_le_bytes();
+    }
+
     /// Whether the player carries the radio (scenario bank 0, bit `0x7F`),
     /// which enables the pause menu's radio tab.
     pub fn has_radio(&self) -> bool {
@@ -7658,6 +7666,18 @@ impl GameState {
         if self.begin_message(id, pause) {
             self.sync_message_choice();
         }
+    }
+
+    /// Show an item description in the message window
+    /// (`set_item_description_message`): the menu line, no pause mask, and
+    /// the reveal's speed-up always on. `id` is the description index.
+    pub fn show_item_description(&mut self, id: u8, bytes: &[u8]) {
+        if !self.begin_message(id, 0) {
+            return;
+        }
+        self.message.feed_source(bytes);
+        self.message.force_speed_up();
+        self.sync_message_choice();
     }
 
     /// The request head shared by [`GameState::show_message`] and the

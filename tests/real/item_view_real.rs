@@ -10,37 +10,23 @@
 //!
 //! The tests cover the four slice-7 acceptance paths: every shipped `.ivm`
 //! parses, the combat knife renders a non-empty model (stable across two
-//! draws, and different after a rotation), the description window draws
-//! through the real font, and the `--ui view` capture is deterministic.
+//! draws, and different after a rotation), the knife's confirm asks for its
+//! description, and the `--ui view` capture is deterministic.
 
 use crate::common;
 
-use std::path::Path;
-
 use arklay::engine;
-use arklay::font::Font;
 use arklay::ivm;
 use arklay::pack::Pack;
 use arklay::render::Framebuffer;
 use arklay::text::Text;
-use arklay::tim;
-use arklay::ui::item_view::ItemViewScreen;
-use arklay::ui::{Screen, ScreenResult, UiContext, UiInput};
+use arklay::ui::item_view::{
+    ConfirmOutcome, ExamineContext, ExamineEvent, ExamineInput, ItemViewScreen,
+};
 
 fn pack() -> Option<Pack> {
     let (_, path) = common::asset_env()?;
     Some(Pack::open(&path).unwrap())
-}
-
-fn context<'a>(pack: &'a Pack, text: &'a Text, font: Option<&'a Font>) -> UiContext<'a> {
-    UiContext {
-        pack,
-        save_dir: Path::new("."),
-        font,
-        text: Some(text),
-        ticks: 0,
-        cues: Default::default(),
-    }
 }
 
 fn painted(framebuffer: &Framebuffer) -> usize {
@@ -78,6 +64,17 @@ fn every_shipped_item_model_parses_from_the_pack() {
     }
 }
 
+/// Steps the examine viewer with no input until its turntable is up.
+fn settle(screen: &mut ItemViewScreen) {
+    for _ in 0..0x100 {
+        screen.step_examine(ExamineInput::default());
+        if screen.turntable_ready() {
+            return;
+        }
+    }
+    panic!("the viewer intro never settled");
+}
+
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn the_combat_knife_renders_a_non_empty_model() {
@@ -85,14 +82,14 @@ fn the_combat_knife_renders_a_non_empty_model() {
         return;
     };
     let text = Text::load(&pack, Some("en-US"));
-    let cx = context(&pack, &text, None);
 
     let mut screen = ItemViewScreen::new(1);
-    screen.open_with(&pack, &text, &[0; 4]);
+    screen.open_with(&pack, &text);
     assert!(screen.model().is_some(), "the knife's model loaded");
+    settle(&mut screen);
 
     let mut first = Framebuffer::new();
-    screen.draw(&cx, &mut first);
+    screen.draw_model(&mut first);
     let first_painted = painted(&first);
     assert!(
         first_painted > 500,
@@ -100,77 +97,55 @@ fn the_combat_knife_renders_a_non_empty_model() {
     );
 
     let mut second = Framebuffer::new();
-    screen.draw(&cx, &mut second);
+    screen.draw_model(&mut second);
     assert_eq!(first.rgba, second.rgba, "two knife renders differ");
 
-    // A half turn must move the model: spin right 0x20 * 0x40 = 0x800.
+    // Holding right turns the turntable.
     for _ in 0..0x40 {
-        assert_eq!(
-            screen.update(
-                &cx,
-                UiInput {
-                    right: true,
-                    ..UiInput::default()
-                },
-            ),
-            ScreenResult::Continue
-        );
+        screen.step_examine(ExamineInput {
+            right: true,
+            ..ExamineInput::default()
+        });
     }
-    assert_eq!(screen.yaw, 0x800);
+    assert_ne!(screen.yaw, 0);
     let mut turned = Framebuffer::new();
-    screen.draw(&cx, &mut turned);
+    screen.draw_model(&mut turned);
     assert_ne!(first.rgba, turned.rgba, "the turntable angle is ignored");
 }
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn the_description_window_draws_over_the_model() {
+fn the_knife_confirm_shows_its_description() {
     let Some(pack) = pack() else {
         return;
     };
     let text = Text::load(&pack, Some("en-US"));
-    let font = Font::new(
-        tim::decode_4bpp(&pack.read("font/font.tim").unwrap()).expect("font/font.tim decodes"),
-    );
-    let cx = context(&pack, &text, Some(&font));
 
     let mut screen = ItemViewScreen::new(1);
-    screen.open_with(&pack, &text, &[0; 4]);
+    screen.open_with(&pack, &text);
     assert!(
-        screen.description().is_some(),
+        screen.description().is_some_and(|bytes| !bytes.is_empty()),
         "the knife has a description"
     );
-
-    let mut base = Framebuffer::new();
-    screen.draw(&cx, &mut base);
-
+    settle(&mut screen);
     assert_eq!(
-        screen.update(
-            &cx,
-            UiInput {
-                confirm: true,
-                ..UiInput::default()
-            },
-        ),
-        ScreenResult::Continue
+        screen.step_examine(ExamineInput {
+            confirm: true,
+            ..ExamineInput::default()
+        }),
+        ExamineEvent::Confirm
     );
-    assert!(screen.message_active(), "confirm opened the description");
-    for _ in 0..300 {
-        screen.update(&cx, UiInput::default());
-    }
-
-    let mut described = Framebuffer::new();
-    screen.draw(&cx, &mut described);
-    let changed = base
-        .rgba
-        .iter()
-        .zip(&described.rgba)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(
-        changed > 100,
-        "the description window drew only {changed} pixels"
+    // The knife is not examinable: the engine shows its description in the
+    // game's message window and the viewer waits for it.
+    assert_eq!(
+        screen.confirm(ExamineContext::default()),
+        ConfirmOutcome::Description
     );
+    screen.step_examine(ExamineInput {
+        message_active: true,
+        ..ExamineInput::default()
+    });
+    assert!(!screen.turntable_ready());
 }
 
 #[test]

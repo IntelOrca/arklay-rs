@@ -115,7 +115,8 @@ pub enum MenuEvent {
     Close,
     /// Show a menu message through the message window.
     Message(u16),
-    /// CHECK: hand the item to the item viewer (slice 7).
+    /// CHECK: the submenu's slide-out finished, start the item viewer on
+    /// this frame.
     ViewItem(u8),
     /// A top tab was chosen: the raw cursor (`0` map, `2` file, `4` radio).
     Tab(u8),
@@ -132,6 +133,18 @@ pub enum MenuMode {
     Actions,
     /// The MOVE combine cursor.
     Move,
+}
+
+/// Where the CHECK action's submenu slide is (`menu_item_view_model`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewPhase {
+    /// The options slide out to the right, one step per frame, before the
+    /// viewer starts.
+    Out(u8),
+    /// The item viewer owns the frame.
+    Viewing,
+    /// The viewer has closed and the options slide back in.
+    Back,
 }
 
 /// The pause menu's drawable assets.
@@ -221,6 +234,20 @@ pub struct MainMenu {
     /// Whether the whole menu exits when the close animation finishes (the
     /// original's `DAT_00ae9f13 & 0x80` key/special/book close bit).
     close_after_submenu: bool,
+    /// Whether the close animation shrinks toward the box's bottom-right (an
+    /// action closed it, `DAT_00ae9f27 & 0x80` clear) rather than toward its
+    /// top-left (a cancel).
+    closing_from_action: bool,
+    /// The CHECK action's slide state, `None` while the submenu is idle.
+    pub view: Option<ViewPhase>,
+    /// How far the options have slid out (`DAT_00ae9f28`): `0` at rest,
+    /// `8` hides them while the viewer runs.
+    pub view_slide: u8,
+    /// The cursor blink counter (`DAT_00ae9f18`): bit `0x20` draws the bright
+    /// cursor. It restarts on every move and accepted confirm, counts down on
+    /// every idle navigation frame, and holds at `0` (dim) under the
+    /// submenu.
+    pub cursor_blink: u8,
 }
 
 /// A submenu action deferred to the next frame.
@@ -228,8 +255,6 @@ pub struct MainMenu {
 enum PendingAction {
     /// Use the selected item (action 0, non-equippable).
     Use,
-    /// Open the item viewer for the selected item (action 1).
-    View(u8),
 }
 
 impl MainMenu {
@@ -248,6 +273,10 @@ impl MainMenu {
             pending_action: None,
             submenu_closing: false,
             close_after_submenu: false,
+            closing_from_action: false,
+            view: None,
+            view_slide: 0,
+            cursor_blink: 0,
         }
     }
 
@@ -264,6 +293,10 @@ impl MainMenu {
         self.pending_action = None;
         self.submenu_closing = false;
         self.close_after_submenu = false;
+        self.closing_from_action = false;
+        self.view = None;
+        self.view_slide = 0;
+        self.cursor_blink = 0;
         self.refresh_selection(game);
     }
 
@@ -277,14 +310,23 @@ impl MainMenu {
     /// runs before `menu_draw_health_bar`), then the health monitor, then the
     /// cursor mirror. Returns the event a deferred action produced.
     pub fn tick(&mut self, game: &mut GameState) -> Option<MenuEvent> {
-        let mut event = match self.pending_action.take() {
-            Some(PendingAction::Use) => Some(self.use_selected(game)),
-            Some(PendingAction::View(item)) => {
-                self.mode = MenuMode::Navigation;
-                Some(MenuEvent::ViewItem(item))
+        let mut event = self
+            .pending_action
+            .take()
+            .map(|PendingAction::Use| self.use_selected(game));
+        match self.view {
+            // The options step right each frame; the eighth step hides them
+            // and the viewer starts on the same frame.
+            Some(ViewPhase::Out(item)) => {
+                self.view_slide += 1;
+                if self.view_slide & 8 != 0 {
+                    self.view = Some(ViewPhase::Viewing);
+                    event = Some(MenuEvent::ViewItem(item));
+                }
             }
-            None => None,
-        };
+            Some(ViewPhase::Back) => self.step_view_back(),
+            _ => {}
+        }
         if self.submenu_closing {
             // The close walks the open sequence backwards; the cursor only
             // returns to the inventory when the box is gone.
@@ -309,6 +351,42 @@ impl MainMenu {
         self.health_bar
             .update(health, max_health, status, &mut game.rand_state);
         event
+    }
+
+    /// Whether the CHECK slide or the viewer owns the frame: the menu takes
+    /// no input until the options are back.
+    pub fn viewing(&self) -> bool {
+        self.view.is_some()
+    }
+
+    /// The viewer has finished its closing animation: the options start
+    /// sliding back on the same frame.
+    pub fn view_closed(&mut self) {
+        if self.view == Some(ViewPhase::Viewing) {
+            self.view = Some(ViewPhase::Back);
+            self.step_view_back();
+        }
+    }
+
+    /// One frame of the slide back; the submenu takes input again from the
+    /// frame after the options land.
+    fn step_view_back(&mut self) {
+        self.view_slide = self.view_slide.saturating_sub(1);
+        if self.view_slide == 0 {
+            self.view = None;
+        }
+    }
+
+    /// One navigation frame without a move or confirm: the cursor blink
+    /// counts down.
+    pub fn blink(&mut self) {
+        self.cursor_blink = self.cursor_blink.wrapping_sub(1);
+    }
+
+    /// Re-read the item under the cursor, e.g. after the viewer rewrote its
+    /// slot.
+    pub fn reselect(&mut self, game: &mut GameState) {
+        self.refresh_selection(game);
     }
 
     /// Move the cursor to `cursor` and re-read the item under it.
@@ -359,22 +437,29 @@ impl MainMenu {
             MenuInput::Left | MenuInput::Right => {
                 self.cursor = layout::move_sideways(self.cursor);
                 self.refresh_selection(game);
+                self.cursor_blink = 0;
                 MenuEvent::None
             }
             MenuInput::Up => {
                 self.cursor = layout::move_up(self.cursor, self.slots);
                 self.refresh_selection(game);
+                self.cursor_blink = 0;
                 MenuEvent::None
             }
             MenuInput::Down => {
                 self.cursor = layout::move_down(self.cursor, self.slots);
                 self.refresh_selection(game);
+                self.cursor_blink = 0;
                 MenuEvent::None
             }
             MenuInput::Cancel => MenuEvent::Close,
-            MenuInput::PageLeft | MenuInput::PageRight => MenuEvent::None,
+            MenuInput::PageLeft | MenuInput::PageRight => {
+                self.blink();
+                MenuEvent::None
+            }
             MenuInput::Confirm => {
                 if layout::is_tab(self.cursor) {
+                    self.cursor_blink = 0;
                     return if self.cursor == 6 {
                         MenuEvent::Close
                     } else {
@@ -382,8 +467,11 @@ impl MainMenu {
                     };
                 }
                 if self.selected_item == 0 {
+                    // The refused confirm still counts the blink down.
+                    self.blink();
                     return MenuEvent::None;
                 }
+                self.cursor_blink = 0;
                 self.mode = MenuMode::Actions;
                 self.action = 0;
                 self.move_cursor = self.cursor;
@@ -398,7 +486,11 @@ impl MainMenu {
     fn action_input(&mut self, game: &mut GameState, input: MenuInput) -> MenuEvent {
         match input {
             MenuInput::Cancel => {
-                self.mode = MenuMode::Navigation;
+                // The cancel runs the close animation toward the box's
+                // top-left, and its first step lands on this frame.
+                self.submenu_closing = true;
+                self.closing_from_action = false;
+                self.submenu_frames = self.submenu_frames.saturating_sub(1);
                 MenuEvent::None
             }
             MenuInput::Up => {
@@ -425,6 +517,7 @@ impl MainMenu {
                 // The original's equip toggle also closes the submenu through
                 // its state-3 animation (`DAT_00ae9f21 = 3`).
                 self.submenu_closing = true;
+                self.closing_from_action = true;
                 MenuEvent::Changed
             }
             0 => {
@@ -432,7 +525,8 @@ impl MainMenu {
                 MenuEvent::None
             }
             1 => {
-                self.pending_action = Some(PendingAction::View(item));
+                self.view = Some(ViewPhase::Out(item));
+                self.view_slide = 0;
                 MenuEvent::None
             }
             2 => {
@@ -470,6 +564,7 @@ impl MainMenu {
                 // key/special/book item also arms the menu's close bit, so the
                 // whole menu exits when the animation finishes.
                 self.submenu_closing = true;
+                self.closing_from_action = true;
                 self.close_after_submenu = closes_inventory(item);
                 MenuEvent::Changed
             }
@@ -580,7 +675,14 @@ impl MainMenu {
         show_cursor: bool,
         show_item_name: bool,
     ) {
-        self.draw_background(framebuffer);
+        self.draw_clear(framebuffer);
+        // The submenu sits at depth 0x23, behind the border masks (0x1E) and
+        // the frames: the CHECK slide pushes the options under the right
+        // mask, which clips them.
+        if (self.mode != MenuMode::Navigation || self.submenu_closing) && self.view_slide & 8 == 0 {
+            self.draw_submenu(framebuffer, assets);
+        }
+        self.draw_masks(framebuffer);
         if show_cursor {
             self.draw_tab_cursor(framebuffer, assets);
         }
@@ -589,9 +691,6 @@ impl MainMenu {
         self.draw_portrait(framebuffer, assets, game);
         self.health_bar.draw(framebuffer, &assets.status);
         self.draw_tabs(framebuffer, assets, game.has_radio());
-        if self.mode != MenuMode::Navigation || self.submenu_closing {
-            self.draw_submenu(framebuffer, assets);
-        }
         if show_cursor {
             self.draw_slot_cursor(framebuffer, assets);
         }
@@ -606,7 +705,7 @@ impl MainMenu {
     /// The centre viewport rect stays black (the original renders the
     /// character model over the same screen clear), so the frozen room never
     /// shows through the menu.
-    fn draw_background(&self, framebuffer: &mut Framebuffer) {
+    fn draw_clear(&self, framebuffer: &mut Framebuffer) {
         layout::fill_rect(
             framebuffer,
             layout::Rect {
@@ -615,6 +714,10 @@ impl MainMenu {
             },
             MENU_CLEAR,
         );
+    }
+
+    /// The four black border masks over the clear.
+    fn draw_masks(&self, framebuffer: &mut Framebuffer) {
         for rect in layout::black_rects() {
             layout::fill_rect(framebuffer, rect, [0, 0, 0, 255]);
         }
@@ -748,21 +851,35 @@ impl MainMenu {
         // The original grows the box from nothing at (0x90, 0x39): each open
         // frame samples a 6px-wider, 3px-taller region of the option art, so
         // the full 48x24 is revealed over eight frames. The options' screen
-        // rows are at the full 0x18 pitch throughout.
+        // rows are at the full 0x18 pitch throughout. A cancel shrinks it back
+        // the same way; a close after an action (`DAT_00ae9f27 & 0x80` clear)
+        // shrinks it toward the bottom-right instead, sampling the art's
+        // bottom-right corner.
         let frame = self.submenu_frames.min(layout::SUBMENU_OPEN_FRAMES);
         let w = i32::from(fw).min(i32::from(frame) * 6);
         let h = i32::from(fh).min(i32::from(frame) * 3);
         if w <= 0 || h <= 0 {
             return;
         }
-        if self.submenu_ready() {
+        let shrink = 8 - i32::from(frame);
+        let (x, y, u, dv) = if self.submenu_closing && self.closing_from_action {
+            (
+                i32::from(x) + shrink * 6,
+                (0x1B - i32::from(frame)) * 3,
+                0x30 + shrink * 6,
+                shrink * 3,
+            )
+        } else {
+            (i32::from(x), i32::from(y), 0x30, 0)
+        };
+        if self.submenu_ready() && !self.submenu_closing && self.view_slide == 0 {
             // Selected action highlight behind the option list.
             framebuffer.draw_page_sprite(
                 &assets.status,
                 [0x30, 0x60, i32::from(fw), i32::from(fh)],
                 [
-                    i32::from(x),
-                    i32::from(y) + i32::from(self.action) * i32::from(fh),
+                    x,
+                    y + i32::from(self.action) * i32::from(fh),
                     i32::from(fw),
                     i32::from(fh),
                 ],
@@ -772,15 +889,13 @@ impl MainMenu {
             );
         }
         for (option, v) in labels.into_iter().enumerate() {
+            // The CHECK slide staggers the options: each one trails the one
+            // above by a step.
+            let slide = (i32::from(self.view_slide) - option as i32).max(0) * 8;
             framebuffer.draw_page_sprite(
                 &assets.status,
-                [0x30, i32::from(v), w, h],
-                [
-                    i32::from(x),
-                    i32::from(y) + option as i32 * i32::from(fh),
-                    w,
-                    h,
-                ],
+                [u, i32::from(v) + dv, w, h],
+                [x + slide, y + option as i32 * i32::from(fh), w, h],
                 0,
                 0,
                 Tint::White,
@@ -826,10 +941,18 @@ impl MainMenu {
 
     /// The item-slot cursor, the topmost layer of the screen.
     fn draw_slot_cursor(&self, framebuffer: &mut Framebuffer, assets: &MenuAssets) {
-        let cursor = match self.mode {
-            MenuMode::Move => self.move_cursor,
-            MenuMode::Navigation => self.cursor,
-            MenuMode::Actions => return,
+        // The navigation and submenu cursor blinks between the bright and
+        // the dim cell; the counter holds at zero (dim) under the submenu.
+        let (cursor, u) = match self.mode {
+            MenuMode::Move => (self.move_cursor, 0x80),
+            MenuMode::Navigation | MenuMode::Actions => (
+                self.cursor,
+                if self.cursor_blink & 0x20 != 0 {
+                    0x80
+                } else {
+                    0xA8
+                },
+            ),
         };
         let Some(position) = layout::cursor_position(cursor, self.slots) else {
             return;
@@ -839,7 +962,7 @@ impl MainMenu {
         }
         framebuffer.draw_page_sprite(
             &assets.status,
-            [0x80, 0xE0, 40, 30],
+            [u, 0xE0, 40, 30],
             [i32::from(position[0]), i32::from(position[1]), 40, 30],
             0,
             0,
@@ -1306,16 +1429,36 @@ mod tests {
         menu.handle_input(&mut game, MenuInput::Down);
         assert_eq!(menu.action, 2);
         menu.handle_input(&mut game, MenuInput::Cancel);
+        assert!(menu.submenu_closing, "cancel shrinks the submenu away");
+        while menu.submenu_closing {
+            menu.tick(&mut game);
+        }
         assert_eq!(menu.mode, MenuMode::Navigation);
 
-        // CHECK returns the viewer action.
+        // CHECK slides the options out, then starts the viewer.
         menu.handle_input(&mut game, MenuInput::Confirm);
+        while !menu.submenu_ready() {
+            menu.tick(&mut game);
+        }
         menu.handle_input(&mut game, MenuInput::Down);
         assert_eq!(menu.action, 1);
-        assert_eq!(
-            confirm_action(&mut menu, &mut game),
-            Some(MenuEvent::ViewItem(0x44))
-        );
+        menu.handle_input(&mut game, MenuInput::Confirm);
+        let mut frames = 0;
+        let event = loop {
+            frames += 1;
+            assert!(frames < 20, "the slide never finished");
+            if let Some(event) = menu.tick(&mut game) {
+                break event;
+            }
+        };
+        assert_eq!(event, MenuEvent::ViewItem(0x44));
+        assert!(menu.viewing());
+        // The viewer closing slides the options back in.
+        menu.view_closed();
+        while menu.viewing() {
+            menu.tick(&mut game);
+        }
+        assert_eq!(menu.mode, MenuMode::Actions);
 
         // An empty slot refuses to open the submenu.
         let mut empty = new_game();
@@ -1635,6 +1778,9 @@ mod tests {
         menu.open(&mut game);
         let assets = assets();
         let text = Text::default();
+        // A freshly reset blink draws the dim cursor; one idle frame
+        // brightens it.
+        menu.blink();
         let mut framebuffer = Framebuffer::new();
         menu.draw(&mut framebuffer, &assets, &text, &game);
 
@@ -1649,6 +1795,7 @@ mod tests {
 
         // Moving the cursor to the empty slot paints the slot cursor there.
         menu.handle_input(&mut game, MenuInput::Right);
+        menu.blink();
         let mut framebuffer = Framebuffer::new();
         menu.draw(&mut framebuffer, &assets, &text, &game);
         assert_eq!(pixel(&framebuffer, 280, 70), [255, 0, 255, 255]);

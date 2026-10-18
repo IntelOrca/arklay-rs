@@ -89,6 +89,9 @@ pub struct MessageInput {
     pub left: bool,
     /// Right d-pad held.
     pub right: bool,
+    /// Cancel/run held. The original dismisses a finished page or a closing
+    /// wait on either button (`0xC000`), but only confirm answers a yes/no.
+    pub cancel: bool,
 }
 
 /// The visible phase of [`MessageWindow`]. `Idle` is the Rust-side resting
@@ -328,6 +331,12 @@ impl MessageWindow {
         true
     }
 
+    /// Turn the reveal's speed-up on whatever the id says: the item
+    /// descriptions force `g_MessageSpeedUpFlag = 0x80`.
+    pub fn force_speed_up(&mut self) {
+        self.speed_up = true;
+    }
+
     /// Resolve the pending request's bytes. A message id with no stream reads
     /// as an empty message and dismisses.
     pub fn feed_source(&mut self, bytes: &[u8]) {
@@ -362,6 +371,7 @@ impl MessageWindow {
         let pressed_action = input.action && !self.previous.action;
         let pressed_left = input.left && !self.previous.left;
         let pressed_right = input.right && !self.previous.right;
+        let pressed_dismiss = pressed_action || (input.cancel && !self.previous.cancel);
         let shifted = self.menu;
 
         match self.phase {
@@ -374,7 +384,7 @@ impl MessageWindow {
             }
             MessagePhase::Reveal => self.update_reveal(input, text, shifted),
             MessagePhase::PageWait => {
-                if pressed_action {
+                if pressed_dismiss {
                     self.render_start = match self.ptr {
                         Cursor::Message(index) => index,
                         Cursor::Name(_) => self.render_start,
@@ -413,7 +423,7 @@ impl MessageWindow {
                 }
             }
             MessagePhase::WaitInput => {
-                if pressed_action {
+                if pressed_dismiss {
                     self.menu_choice &= 0x7F;
                     self.active = false;
                     self.phase = MessagePhase::Idle;
@@ -1253,6 +1263,47 @@ mod tests {
         assert!(!window.active);
         assert_eq!(window.phase(), MessagePhase::Idle);
         assert_eq!(window.menu_choice_id(), 0);
+    }
+
+    #[test]
+    fn cancel_dismisses_a_page_or_a_wait_but_never_answers_a_yes_no() {
+        let text = text();
+        let cancel = MessageInput {
+            cancel: true,
+            ..MessageInput::default()
+        };
+
+        // A page break resumes on cancel like on confirm.
+        let mut window = MessageWindow::default();
+        assert!(window.start(1, 0, &[0x0C, 0x03, 0x00, 0x0D, 0x01, 0x00], false));
+        for _ in 0..7 {
+            tick(&mut window, &text, held(false));
+        }
+        assert_eq!(window.phase(), MessagePhase::PageWait);
+        tick(&mut window, &text, cancel);
+        assert_eq!(window.phase(), MessagePhase::Reveal);
+
+        // The closing wait dismisses on a fresh cancel press only.
+        let mut window = MessageWindow::default();
+        assert!(window.start(1, 0, &[0x0C, 0x01, 0x00], false));
+        for _ in 0..10 {
+            tick(&mut window, &text, cancel);
+        }
+        assert_eq!(window.phase(), MessagePhase::WaitInput);
+        assert!(window.active, "a held cancel is not a press");
+        tick(&mut window, &text, held(false));
+        tick(&mut window, &text, cancel);
+        assert!(!window.active);
+
+        // The yes/no prompt reads confirm alone.
+        let mut window = MessageWindow::default();
+        assert!(window.start(1, 0, &[0x0C, 0x08, 0x00, 0x01, 0x00], false));
+        reveal_all(&mut window, &text);
+        assert_eq!(window.phase(), MessagePhase::YesNo);
+        window.update(MessageInput::default(), &text, 0);
+        window.update(cancel, &text, 0);
+        assert_eq!(window.phase(), MessagePhase::YesNo);
+        assert!(window.active);
     }
 
     #[test]

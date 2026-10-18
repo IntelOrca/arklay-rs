@@ -143,78 +143,65 @@ fn builtin_map_tables_match_sampled_rooms() {
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_item_examine_combos_gate_the_description() {
     use arklay::text::Text;
-    use arklay::ui::item_view::{ExamineOutcome, ItemViewScreen};
-    use arklay::ui::{Screen, UiContext, UiInput};
+    use arklay::ui::item_view::{
+        ConfirmOutcome, ExamineContext, ExamineEvent, ExamineInput, ItemViewScreen,
+    };
 
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
     let text = Text::load(&pack, Some("en-US"));
-    let cx = UiContext {
-        pack: &pack,
-        save_dir: Path::new("."),
-        font: None,
-        text: Some(&text),
-        ticks: 0,
-        cues: Default::default(),
+    let open = |item| {
+        let mut view = ItemViewScreen::new(item);
+        view.open_with(&pack, &text);
+        for _ in 0..0x100 {
+            view.step_examine(ExamineInput::default());
+            if view.turntable_ready() {
+                return view;
+            }
+        }
+        panic!("the viewer intro never settled");
     };
 
     // The sword key (0x33) is one of the rotation-gated items: record 1 wants
-    // yaw and pitch near 0 and the roll window at 0x5D0..0xA30.
-    let mut view = ItemViewScreen::new(0x33);
-    view.open_with(&pack, &text, &[0; 4]);
+    // yaw near 0 and the roll window at 0x5D0..0xA30. Aligned, it shows its
+    // class message and marks the class examined.
+    let mut view = open(0x33);
     view.pitch = 0x0F00;
     view.roll = 0x800;
-    assert_eq!(view.examine(), ExamineOutcome::Open);
-    view.update(
-        &cx,
-        UiInput {
-            confirm: true,
-            ..UiInput::default()
-        },
-    );
-    assert!(
-        view.message_active(),
-        "the aligned sword key opens its description"
+    assert!(matches!(
+        view.confirm(ExamineContext::default()),
+        ConfirmOutcome::Message {
+            mark_examined: true,
+            ..
+        }
+    ));
+
+    // The resting pose is outside the window: the plain description.
+    let mut view = open(0x33);
+    assert_eq!(
+        view.confirm(ExamineContext::default()),
+        ConfirmOutcome::Description
     );
 
-    // The resting pose is outside the window and the confirm is refused.
-    let mut view = ItemViewScreen::new(0x33);
-    view.open_with(&pack, &text, &[0; 4]);
-    assert_eq!(view.examine(), ExamineOutcome::Refused);
-    view.update(
-        &cx,
-        UiInput {
-            confirm: true,
-            ..UiInput::default()
-        },
-    );
-    assert!(!view.message_active());
-
-    // The red book's matched pose takes the zoom path and lands on the
-    // description.
-    let mut view = ItemViewScreen::new(0x3E);
-    view.open_with(&pack, &text, &[0; 4]);
+    // The red book's matched pose takes the zoom, which ends on its message.
+    let mut view = open(0x3E);
     view.yaw = 0x400;
-    assert_eq!(view.examine(), ExamineOutcome::Zoom);
-    view.update(
-        &cx,
-        UiInput {
-            confirm: true,
-            ..UiInput::default()
-        },
+    assert_eq!(
+        view.confirm(ExamineContext::default()),
+        ConfirmOutcome::Zoom
     );
-    assert!(view.zooming());
     let mut ticks = 0;
-    while view.zooming() && ticks < 200 {
-        view.update(&cx, UiInput::default());
+    let event = loop {
         ticks += 1;
-    }
-    assert!(
-        view.message_active(),
-        "the red book zoom opens the description"
-    );
+        assert!(ticks < 200, "the red book zoom never finished");
+        match view.step_examine(ExamineInput::default()) {
+            ExamineEvent::None => {}
+            event => break event,
+        }
+    };
+    assert!(matches!(event, ExamineEvent::Message(_)));
 }
 
 /// The sampled golden-frame scenarios, in `hashes_fnv.txt` order.
