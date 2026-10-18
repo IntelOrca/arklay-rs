@@ -363,7 +363,7 @@ gameplay from a save screen, back to the title from the load screen).
 | `api:string(key)` | A `language/<tag>.txt` string, decoded to characters; `nil` when no language carries the key. |
 | `api:character_name(index)` | The save screen's name for character `0`/`1`, decoded. |
 | `api:text_width(text[, tight])` | The pixel width `text` draws at (the session's tight metrics unless `tight` is given). |
-| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. |
+| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open` and `update` and play after the call; the engine drops them in a capture run, which stays silent. |
 | `api:save(name)` | Write the pending block to `<save_dir>/<name>` and return `ok, err`. `name` is one plain file name (no directory part); the extension is the script's choice. Save mode only. |
 | `api:remove(name)` | Delete `<save_dir>/<name>`, ignoring a missing file. Returns `ok, err`. |
 | `api:load(name)` | Load `<save_dir>/<name>`: the engine continues from that save on the next tick. Returns `ok, err`. Load mode only. |

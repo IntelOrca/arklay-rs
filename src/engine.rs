@@ -2937,9 +2937,10 @@ impl GameSession {
         let file = self.snapshot_save(pack);
         let choice = self.save_screen_choice.clone();
         let mut cx = self.ui_context(pack);
-        self.save_screen = Some(ui::save_load::open_save_screen(
-            &choice, &mut cx, file, ink_ribbon,
-        ));
+        let screen = ui::save_load::open_save_screen(&choice, &mut cx, file, ink_ribbon);
+        let cues = cx.cues.into_inner();
+        self.save_screen = Some(screen);
+        self.play_ui_cue_names(pack, cues);
     }
 
     /// Select the save/load screen this session opens.
@@ -5031,12 +5032,15 @@ impl App {
         Ok(())
     }
 
-    /// Open the load screen.
+    /// Open the load screen. A script's `on_open` may queue cues before the
+    /// first tick; they are played here, like a tick's.
     fn open_load(&mut self) -> Result<()> {
         let choice = self.save_screen.clone();
         let mut cx = self.context();
         let screen = ui::save_load::open_load_screen(&choice, &mut cx);
+        let cues = cx.cues.into_inner();
         self.mode = Mode::Load(screen);
+        self.play_ui_cues(cues);
         Ok(())
     }
 
@@ -5235,7 +5239,9 @@ impl App {
         let choice = self.save_screen.clone();
         let mut cx = self.context();
         let screen = ui::save_load::open_save_screen(&choice, &mut cx, file, false);
+        let cues = cx.cues.into_inner();
         self.mode = Mode::Save(screen);
+        self.play_ui_cues(cues);
         Ok(())
     }
 

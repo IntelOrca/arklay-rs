@@ -1457,6 +1457,27 @@ end
 
     #[cfg(feature = "lua")]
     #[test]
+    fn on_open_sounds_queue_before_the_first_tick() {
+        let fixture = Fixture::new(
+            "on-open-sound",
+            r#"
+function on_open(api)
+    api:sound("save_confirm")
+end
+
+function update(api, input) end
+"#,
+        );
+        let mut cx = fixture.context();
+        let _screen = LuaScreen::open_load("screen/save.lua", &mut cx).unwrap();
+        assert_eq!(
+            cx.cues.borrow().as_slice(),
+            &[crate::ui::UiCue::SaveConfirm]
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
     fn sounds_queue_the_screen_cues() {
         let fixture = Fixture::new(
             "sounds",
