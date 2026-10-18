@@ -269,9 +269,11 @@ gameplay from a save screen, back to the title from the load screen).
 ### Drawing
 
 The draw methods are only available inside `draw`; calling one from
-`on_open`/`update` raises an error. Every colour is either `0xRRGGBB`,
-`"#RRGGBB"`, or — for text — a tint name (`white`, `green`, `red`, `grey`,
-`yellow`) or a CLUT row number, the rules the vanilla screens use.
+`on_open`/`update` raises an error. Every colour is `0xRRGGBB` or `"#RRGGBB"`;
+text also takes a tint name (`white`, `green`, `red`, `grey`, `yellow`) or a
+CLUT row number, the rules the vanilla screens use. A text `"#RRGGBB"` is a
+per-channel multiplier over the sheet's grey ramp, so `"#3F7DFA"` draws the
+blue the built-in screen's save rows use.
 
 | Method | Effect |
 | --- | --- |

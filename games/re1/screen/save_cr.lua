@@ -13,10 +13,17 @@
 local VISIBLE_ROWS = 10 -- rows drawn at once (CR shows ten)
 local ROW_Y = 49 -- the first row's y
 local ROW_PITCH = 15 -- row pitch, CR's 15 px
-local TITLE_Y = 27 -- the centred title's y
-local DETAIL_Y = 216 -- the detail line's y
-local PANEL_X = 32 -- the list panel's x
-local PANEL_W = 256 -- the list panel's width
+local TITLE_Y = 19 -- the centred title's y (CR's ink sits at 21..33)
+local DETAIL_Y = 215 -- the detail line's y (CR's ink sits at 217..229)
+local TEXT_LIFT = -1 -- rows draw one pixel above the band, like CR
+-- The list panel and the selection band, measured from CR 1.1.3: a grey wash
+-- over the full ten-row list and a dark band across the selected row.
+local PANEL_X = 10
+local PANEL_W = 300
+local PANEL_Y = 45
+local PANEL_H = 156
+local BAND_H = 14
+local BLUE = "#3F7DFA" -- CR's save-row blue, over the sheet's grey ramp
 
 local mode = "load"
 local saves = {}
@@ -186,45 +193,48 @@ function draw(api)
     draw_line(api, title, TITLE_Y)
 
     local rows = row_count()
-    api:rect(PANEL_X, ROW_Y - 5, PANEL_W, rows * ROW_PITCH + 8, 0x000000, 96)
+    api:rect(PANEL_X, PANEL_Y, PANEL_W, PANEL_H, 0x797979, 76)
 
     -- The selection band follows the cursor.
-    local band_y = ROW_Y + (cursor - scroll) * ROW_PITCH - 2
-    api:rect(PANEL_X, band_y, PANEL_W, ROW_PITCH - 2, 0xC0C0C0, 72)
+    local band_y = ROW_Y + (cursor - scroll) * ROW_PITCH
+    api:rect(PANEL_X, band_y, PANEL_W, BAND_H, 0x000000, 191)
 
     for index = 0, VISIBLE_ROWS - 1 do
         local row = scroll + index
         if row >= rows then
             break
         end
-        local y = ROW_Y + index * ROW_PITCH
+        local y = ROW_Y + index * ROW_PITCH + TEXT_LIFT
         local entry = saves[row + 1]
         if entry then
-            draw_line(api, entry.base, y, entry.loadable and "white" or "grey")
+            -- CR draws a save file's name blue and the exit row white.
+            draw_line(api, entry.base, y, entry.loadable and BLUE or "grey")
         else
             draw_line(api, string_or(api, "UI_SAVE_CR_EXIT", "Exit"), y)
         end
     end
 
     local entry = selected()
-    local detail
-    if entry then
-        if entry.loadable then
-            detail = string.format(
-                "%s/%02d/%s",
-                entry.character_name or "?",
-                entry.saves or 0,
-                entry.location or ""
-            )
-        else
-            detail = string_or(api, "UI_SAVE_CR_UNLOADABLE", "Not loadable")
-        end
-    elseif mode == "save" then
-        detail = string_or(api, "UI_SAVE_CR_DO_NOT_SAVE", "Do not save")
+    if entry and entry.loadable then
+        -- CR draws the character name blue and the count/location white, the
+        -- whole line centred.
+        local name = entry.character_name or "?"
+        local rest = string.format("/%02d/%s", entry.saves or 0, entry.location or "")
+        local name_w = api:text_width(name)
+        local x = (320 - name_w - api:text_width(rest)) // 2
+        api:text(x, DETAIL_Y, name, { colour = BLUE })
+        api:text(x + name_w, DETAIL_Y, rest)
     else
-        detail = string_or(api, "UI_SAVE_CR_DO_NOT_LOAD", "Do not load")
+        local detail
+        if entry then
+            detail = string_or(api, "UI_SAVE_CR_UNLOADABLE", "Not loadable")
+        elseif mode == "save" then
+            detail = string_or(api, "UI_SAVE_CR_DO_NOT_SAVE", "Do not save")
+        else
+            detail = string_or(api, "UI_SAVE_CR_DO_NOT_LOAD", "Do not load")
+        end
+        draw_line(api, detail, DETAIL_Y)
     end
-    draw_line(api, detail, DETAIL_Y)
 
     if message then
         draw_line(api, message, 224, "red")

@@ -83,6 +83,9 @@ pub enum Tint {
     Red,
     Grey,
     Yellow,
+    /// An explicit per-channel multiplier, for a caller that has a colour of
+    /// its own (the Lua screen API's `#RRGGBB`).
+    Rgb(u8, u8, u8),
 }
 
 impl Tint {
@@ -106,6 +109,7 @@ impl Tint {
             Self::Red => [255, 0, 0],
             Self::Grey => [204, 204, 204],
             Self::Yellow => [255, 255, 0],
+            Self::Rgb(red, green, blue) => [red, green, blue],
         }
     }
 }
@@ -3952,6 +3956,7 @@ mod tests {
         assert_eq!(Tint::from_clut_row(8), Tint::Green);
         assert_eq!(Tint::from_clut_row(4), Tint::Yellow);
         assert_eq!(Tint::from_clut_row(-1), Tint::Yellow);
+        assert_eq!(Tint::Rgb(1, 2, 3).rgb(), [1, 2, 3]);
         assert_eq!(Tint::Grey.rgb(), [204, 204, 204]);
         assert_eq!(Tint::Yellow.rgb(), [255, 255, 0]);
     }

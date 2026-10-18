@@ -15,14 +15,27 @@ keys are the 1-based `ROOM_<room3>_NAME_SAVE` names, so every vanilla row for
 stage 1 read blank. `Text::save_location` now adds one, and both screens use
 it. The Lua screen's `location` field resolves through the same helper.
 
-## Bounded: the screen's layout is measured, not pixel-exact
+## Measured: the screen's geometry and colours
 
-The CR screen's geometry follows the disassembly notes (title at y 27, ten
-15-px rows from y 49, the detail line at y 216, the list centred), but the
-list panel's extent and the highlight band's grey and alpha are read from the
-notes' description rather than a captured frame of the running DLL, so the
-built-in script's panel and band are a close approximation. A mod can shadow
-`screen/save_cr.lua` and adjust them; the API is the same.
+The layout was measured against the running CR 1.1.3 captures in
+`docs/images/cr-load-screen-*.png` (the reference's game space is the 320x240
+frame at 2x), not only the disassembly notes:
+
+| Element | Measurement |
+| --- | --- |
+| Title | Centred, ink rows 21..33, i.e. drawn at y 19 (the notes' "y ≈ 27" is the ink's centre) |
+| Rows | 14-px selection band from y 49 at a 15-px pitch, text one pixel above the band |
+| Detail line | Centred at y 215 (ink rows 217..229) |
+| List panel | `x 10, y 45, 300x156` — a fixed ten-row panel, not one that grows with the entry count |
+| Panel colour | Grey `0x797979` at alpha 76 (fits `out = 0.703*bg + 36` across the capture's pixels) |
+| Band colour | Black at alpha 191 (`out = 0.25*panel`) |
+| Text | Save rows and the detail line's character name blue (`#3F7DFA` over the sheet's grey ramp); the exit row and the rest of the detail line white |
+
+The port's font advances differ from CR's own text metrics, so a line is
+wider in the port (CR draws `Jill/01/Hall 1F` in 80 px, the port's tight
+metrics in 122 px): the script draws the same glyphs with the engine's
+metrics, which every other screen shares. The list contents, row order and
+labels match.
 
 ## Bounded: the save-mode flow
 

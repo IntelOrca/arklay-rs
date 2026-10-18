@@ -480,17 +480,26 @@ mod imp {
         Ok(parsed)
     }
 
-    /// A text colour: a tint name or a CLUT row number.
+    /// A text colour: a tint name, a CLUT row number or `"#RRGGBB"`.
     pub(super) fn colour_tint(value: &Value) -> mlua::Result<Tint> {
         match value {
             Value::Integer(row) => Ok(Tint::from_clut_row(*row as i32)),
-            Value::String(text) => match tint_named(&text.to_string_lossy()) {
-                Some(tint) => Ok(tint),
-                None => Err(mlua::Error::RuntimeError(format!(
-                    "unknown colour `{}` (white, green, red, grey, yellow, or a CLUT row)",
-                    text.to_string_lossy()
-                ))),
-            },
+            Value::String(text) => {
+                let text = text.to_string_lossy();
+                if let Some(hex) = text.strip_prefix('#') {
+                    return parse_hex_colour(hex)
+                        .map(|[red, green, blue]| Tint::Rgb(red, green, blue))
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!("invalid colour `{text}`"))
+                        });
+                }
+                match tint_named(&text) {
+                    Some(tint) => Ok(tint),
+                    None => Err(mlua::Error::RuntimeError(format!(
+                        "unknown colour `{text}` (white, green, red, grey, yellow, a CLUT row, or \"#RRGGBB\")"
+                    ))),
+                }
+            }
             other => Err(mlua::Error::RuntimeError(format!(
                 "expected a colour name or CLUT row, got {}",
                 other.type_name()
@@ -1608,6 +1617,10 @@ end
         assert_eq!(
             colour_rgb(&mlua::Value::String(lua.create_string("#A0B0C0").unwrap())).unwrap(),
             [0xA0, 0xB0, 0xC0]
+        );
+        assert_eq!(
+            colour_tint(&mlua::Value::String(lua.create_string("#3F7DFA").unwrap())).unwrap(),
+            Tint::Rgb(0x3F, 0x7D, 0xFA)
         );
         assert!(colour_rgb(&mlua::Value::String(lua.create_string("#zz").unwrap())).is_err());
     }
