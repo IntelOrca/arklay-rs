@@ -1379,127 +1379,112 @@ impl Framebuffer {
 
     fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
         triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        let mut depth = self.depth_buffer();
         for triangle in &triangles {
-            self.rasterize(texture, triangle);
+            self.rasterize(texture, triangle, &mut depth);
         }
     }
 
-    fn rasterize(&mut self, texture: &Texture8, triangle: &Triangle) {
+    /// A cleared 24-bit depth buffer covering the framebuffer.
+    fn depth_buffer(&self) -> Vec<u32> {
+        vec![crate::raster::DEPTH_CLEAR; self.width as usize * self.height as usize]
+    }
+
+    /// Draw one model triangle the way the reference's GL path does on
+    /// llvmpipe: `DrawTriangles3D` under `GL_SRC_ALPHA` blending, a
+    /// `GL_LEQUAL` test against the 24-bit depth buffer and a depth write for
+    /// opaque triangles only.
+    fn rasterize(&mut self, texture: &Texture8, triangle: &Triangle, depth: &mut [u32]) {
         if texture.width == 0 || texture.height == 0 {
             return;
         }
-        let [a, b, c] = &triangle.raster;
-        let area = (b.position[0] - a.position[0]) * (c.position[1] - a.position[1])
-            - (c.position[0] - a.position[0]) * (b.position[1] - a.position[1]);
-        if triangle.cull && !faces_camera(area) {
-            return;
-        }
-
-        let min_x = a.position[0].min(b.position[0]).min(c.position[0]).floor() as i64;
-        let max_x = a.position[0].max(b.position[0]).max(c.position[0]).ceil() as i64;
-        let min_y = a.position[1].min(b.position[1]).min(c.position[1]).floor() as i64;
-        let max_y = a.position[1].max(b.position[1]).max(c.position[1]).ceil() as i64;
-        let min_x = min_x.max(0);
-        let min_y = min_y.max(0);
-        let max_x = max_x.min(i64::from(self.width) - 1);
-        let max_y = max_y.min(i64::from(self.height) - 1);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let width = self.width as usize;
-        for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let weight0 = ((b.position[0] - px) * (c.position[1] - py)
-                    - (c.position[0] - px) * (b.position[1] - py))
-                    / area;
-                let weight1 = ((c.position[0] - px) * (a.position[1] - py)
-                    - (a.position[0] - px) * (c.position[1] - py))
-                    / area;
-                let weight2 = 1.0 - weight0 - weight1;
-                if weight0 < 0.0 || weight1 < 0.0 || weight2 < 0.0 {
-                    continue;
-                }
-
-                let inv_z = weight0 * a.inv_z + weight1 * b.inv_z + weight2 * c.inv_z;
-                if inv_z.is_nan() || inv_z <= 0.0 {
-                    continue;
-                }
-                let u =
-                    (weight0 * a.u * a.inv_z + weight1 * b.u * b.inv_z + weight2 * c.u * c.inv_z)
-                        / inv_z;
-                let v =
-                    (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
-                        / inv_z;
-                // An untextured gouraud polygon keeps its packet colour; every
-                // other polygon samples the texture page through its row. The
-                // sampled palette index also selects per-texel STP blending.
-                let (color, palette_index) = match triangle.flat {
-                    Some(flat) => ([flat[0], flat[1], flat[2], 255], None),
-                    None => {
-                        let Some(texel_u) = wrap_texel(u, texture.width) else {
-                            continue;
-                        };
-                        let Some(texel_v) = wrap_texel(v, texture.height) else {
-                            continue;
-                        };
-                        let index = texel_v as usize * texture.width as usize + texel_u as usize;
-                        let Some(&palette_index) = texture.indices.get(index) else {
-                            continue;
-                        };
-                        // Palette entry zero is the PSX colour key: the PC's
-                        // model-texture conversion maps an indexed page's
-                        // entry 0 to alpha 0, so the texel is skipped instead
-                        // of painted (the room-105 blood decals' black
-                        // background). The untextured path has no index and
-                        // stays opaque.
-                        if palette_index == 0 {
-                            continue;
-                        }
-                        (
-                            texture.palette(triangle.palette_row, palette_index),
-                            Some(palette_index),
-                        )
-                    }
-                };
-
-                let shade = [
-                    weight0 * a.shade[0] + weight1 * b.shade[0] + weight2 * c.shade[0],
-                    weight0 * a.shade[1] + weight1 * b.shade[1] + weight2 * c.shade[1],
-                    weight0 * a.shade[2] + weight1 * b.shade[2] + weight2 * c.shade[2],
-                ];
-                let mut pixel = [
-                    channel(color[0], shade[0]),
-                    channel(color[1], shade[1]),
-                    channel(color[2], shade[2]),
-                    255,
-                ];
-                let offset = (y as usize * width + x as usize) * 4;
-                // A packet carrying the ABE bit blends only where the sampled
-                // palette entry carries the STP bit. A palette row with no STP
-                // entries has no blend texels at all, so the packet is fully
-                // opaque there; the STP selector is the whole story.
-                let blend = triangle.blend
-                    && palette_index
-                        .is_some_and(|index| texture.palette_stp(triangle.palette_row, index));
-                if blend && let Some(dst) = self.rgba.get(offset..offset + 4) {
-                    // The record's background weight in 256ths; `None` keeps
-                    // the M16 per-packet half blend.
-                    let background = u32::from(triangle.blend_weight.unwrap_or(0x80));
-                    let source = 256 - background;
-                    for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
-                        *channel = ((u32::from(*channel) * source
-                            + u32::from(destination) * background)
-                            / 256) as u8;
-                    }
-                }
-                if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
-                    slot.copy_from_slice(&pixel);
-                }
+        let texture_width = f64::from(texture.width);
+        let texture_height = f64::from(texture.height);
+        // A blending packet's vertex alpha is the record's foreground weight;
+        // `None` keeps the M16 per-packet half blend.
+        let alpha = if triangle.blend {
+            1.0 - f32::from(triangle.blend_weight.unwrap_or(0x80)) / 256.0
+        } else {
+            1.0
+        };
+        let vertices = std::array::from_fn(|corner| {
+            let vertex = &triangle.raster[corner];
+            let nudge = triangle.uv_nudge[corner];
+            // `PSXObject_Store` stores normalised coordinates and nudges a
+            // degenerate corner by 0.003 on the stored float.
+            let mut u = (f64::from(vertex.u) / texture_width) as f32;
+            let mut v = (f64::from(vertex.v) / texture_height) as f32;
+            if nudge & 1 != 0 {
+                u = (f64::from(u) + f64::from(0.003f32)) as f32;
             }
-        }
+            if nudge & 2 != 0 {
+                v = (f64::from(v) + f64::from(0.003f32)) as f32;
+            }
+            crate::raster::GlVertex {
+                x: vertex.position[0],
+                y: vertex.position[1],
+                depth: depth_ndc(vertex.w),
+                w: vertex.w,
+                u,
+                v,
+                color: [vertex.shade[0], vertex.shade[1], vertex.shade[2], alpha],
+            }
+        });
+        let width = self.width as usize;
+        let rgba = &mut self.rgba;
+        crate::raster::draw_triangle(&vertices, self.width, self.height, |fragment| {
+            let pixel = fragment.y * width + fragment.x;
+            let Some(stored) = depth.get_mut(pixel) else {
+                return;
+            };
+            if fragment.depth > *stored {
+                return;
+            }
+            // The blended pass and its knockout twin leave depth alone; an
+            // opaque triangle writes it even where its texel is transparent,
+            // since the shader never discards.
+            if !triangle.blend {
+                *stored = fragment.depth;
+            }
+            // An untextured packet samples the white texture; every other
+            // packet samples its page through the palette row. Palette entry
+            // zero is the PSX colour key (alpha 0), which leaves the pixel.
+            let (texel, blend) = match triangle.flat {
+                Some(_) => ([255, 255, 255], false),
+                None => {
+                    let texel_u = clamp_texel(fragment.u, texture.width);
+                    let texel_v = clamp_texel(fragment.v, texture.height);
+                    let index = texel_v * texture.width as usize + texel_u;
+                    let Some(&palette_index) = texture.indices.get(index) else {
+                        return;
+                    };
+                    if palette_index == 0 {
+                        return;
+                    }
+                    let color = texture.palette(triangle.palette_row, palette_index);
+                    // A blending packet blends only its STP texels; the rest
+                    // go down opaque through the knockout twin.
+                    let blend =
+                        triangle.blend && texture.palette_stp(triangle.palette_row, palette_index);
+                    ([color[0], color[1], color[2]], blend)
+                }
+            };
+            let offset = pixel * 4;
+            let Some(slot) = rgba.get_mut(offset..offset + 4) else {
+                return;
+            };
+            let source_alpha = if blend {
+                unorm8(fragment.color[3])
+            } else {
+                255
+            };
+            for (index, destination) in slot[..3].iter_mut().enumerate() {
+                let source =
+                    unorm8(f32::from(texel[index]) * (1.0 / 255.0) * fragment.color[index]);
+                *destination = blend_unorm8(source, *destination, source_alpha);
+            }
+            slot[3] = 255;
+        });
     }
 
     /// Paint a sorted scene list: each triangle selects its own texture page,
@@ -1512,6 +1497,7 @@ impl Framebuffer {
         effect_pages: &[Option<&Image>],
         items: &[SceneItem<'_>],
     ) {
+        let mut depth = self.depth_buffer();
         for item in items {
             match item {
                 SceneItem::Shadow(poly) => {
@@ -1519,7 +1505,7 @@ impl Framebuffer {
                 }
                 SceneItem::Triangle(triangle) => {
                     if let Some(texture) = textures.get(triangle.texture) {
-                        self.rasterize(texture, triangle);
+                        self.rasterize(texture, triangle, &mut depth);
                     }
                 }
                 SceneItem::Mask(quad) => {
@@ -2341,6 +2327,9 @@ pub struct Camera {
     pub screen: [i32; 2],
     pub from: [i32; 3],
     pub look_at: [i32; 3],
+    /// The camera was reflected about a mirror plane ([`Camera::mirrored`]);
+    /// the reference negates `g_RoomCameraData`'s X row to match.
+    pub mirrored: bool,
 }
 
 /// `a * b` for two 4.12 rotation matrices, each product truncated toward zero
@@ -2433,6 +2422,7 @@ impl Camera {
             screen: [0, 0],
             from,
             look_at: to,
+            mirrored: false,
         }
     }
 
@@ -2467,6 +2457,7 @@ impl Camera {
         camera.screen = self.screen;
         camera.view[0] = camera.view[0].map(|entry| -entry);
         camera.trans[0] = -camera.trans[0];
+        camera.mirrored = true;
         camera
     }
 
@@ -2696,13 +2687,18 @@ fn integer_sqrt(value: i64) -> i64 {
     root
 }
 
-/// One projected vertex ready for rasterization.
+/// One projected vertex ready for rasterization, in the reference's GL
+/// vertex terms ([`crate::raster::GlVertex`]).
 struct RasterVertex {
-    position: [f64; 2],
-    inv_z: f64,
-    u: f64,
-    v: f64,
-    shade: [f64; 3],
+    /// Screen position (game pixels, Y down).
+    position: [f32; 2],
+    /// View-space Z.
+    w: f32,
+    /// Texture coordinates in texels; the rasterizer normalises them.
+    u: f32,
+    v: f32,
+    /// Vertex colour, `1.0` = the texel as stored.
+    shade: [f32; 3],
 }
 
 /// One triangle ready for rasterization.
@@ -2714,7 +2710,6 @@ struct Triangle {
     /// Index of the mesh's texture page in the frame's texture list.
     texture: usize,
     palette_row: usize,
-    cull: bool,
     /// A solid gouraud colour; `None` samples the texture instead.
     flat: Option<[u8; 3]>,
     /// The packet's semi-transparency bit: rasterize with a per-texel blend
@@ -2723,6 +2718,9 @@ struct Triangle {
     /// The record's background blend weight in 256ths. `None` is the M16
     /// per-packet half blend; see [`EntityMesh::blend_weight`].
     blend_weight: Option<u8>,
+    /// Per corner, `PSXObject_Store`'s degenerate-UV nudge: bit 0 adds
+    /// `0.003` to the normalised u, bit 1 to v.
+    uv_nudge: [u8; 3],
 }
 
 /// One projected shadow vertex: screen position, inverse view Z and the
@@ -2863,68 +2861,67 @@ fn collect_triangles(
     room_object: bool,
     triangles: &mut Vec<Triangle>,
 ) {
-    let vertices: Vec<[i32; 3]> = object
-        .vertices
-        .iter()
-        .map(|vertex| fixed_mul(joint, *vertex))
-        .collect();
-    // The raw-Y form's vertices skip the standard input Y negation; the pool
-    // is built lazily so the common path pays nothing.
-    let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
+    // The reference transforms and projects every vertex in floating point
+    // through `camera * joint` (see [`RefProjection`]). The vertex buffer
+    // holds `(x, -y, z)`; the raw-Y form skips the negation, and its pool is
+    // built lazily so the common path pays nothing.
+    let projection = RefProjection::new(camera, joint);
+    let project_pool = |sign: f64| -> Vec<Option<([f32; 2], f32)>> {
+        object
+            .vertices
+            .iter()
+            .map(|vertex| {
+                projection.project([
+                    f64::from(vertex[0]),
+                    sign * f64::from(vertex[1]),
+                    f64::from(vertex[2]),
+                ])
+            })
+            .collect()
+    };
+    let vertices = project_pool(-1.0);
+    let mut raw_vertices: Option<Vec<Option<Projected>>> = None;
     // The reference lights the raw TMD normal through `camera * joint`, so the
     // stored camera matrix and the joint's 4.12 rotation are all it needs.
     let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
-            raw_vertices.get_or_insert_with(|| {
-                object
-                    .vertices
-                    .iter()
-                    .map(|vertex| fixed_mul_raw_y(joint, *vertex))
-                    .collect()
-            })
+            raw_vertices.get_or_insert_with(|| project_pool(1.0))
         } else {
             &vertices
         };
-        // The whole packet is dropped when any corner is inside the near plane;
-        // a plain triangle gets the same test through its three projections
-        // below, while a quad must check its fourth corner too.
-        if let Some(quad) = prim.quad
-            && quad.iter().any(|&index| {
-                pool.get(usize::from(index))
-                    .is_none_or(|vertex| camera.project(*vertex).is_none())
-            })
-        {
+        let corner = |index: u16| pool.get(usize::from(index)).copied().flatten();
+        // The whole packet is dropped when any corner is inside the near
+        // plane, and culled on its first three corners in index order - for a
+        // quad, its first fan triangle - so a quad never loses only one half.
+        let packet = match prim.quad {
+            Some(quad) => {
+                if quad.iter().any(|&index| corner(index).is_none()) {
+                    continue;
+                }
+                [quad[0], quad[1], quad[3]]
+            }
+            None => prim.vertices,
+        };
+        let (Some(first), Some(second), Some(third)) =
+            (corner(packet[0]), corner(packet[1]), corner(packet[2]))
+        else {
+            continue;
+        };
+        let [x0, y0] = first.0.map(f64::from);
+        let [x1, y1] = second.0.map(f64::from);
+        let [x2, y2] = third.0.map(f64::from);
+        if cull && !faces_camera((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) {
             continue;
         }
-        let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
-            pool.get(usize::from(prim.vertices[0])),
-            pool.get(usize::from(prim.vertices[1])),
-            pool.get(usize::from(prim.vertices[2])),
+        let (Some((position0, depth0)), Some((position1, depth1)), Some((position2, depth2))) = (
+            corner(prim.vertices[0]),
+            corner(prim.vertices[1]),
+            corner(prim.vertices[2]),
         ) else {
             continue;
         };
-        let (Some(screen0), Some(screen1), Some(screen2)) = (
-            camera.project(*vertex0),
-            camera.project(*vertex1),
-            camera.project(*vertex2),
-        ) else {
-            continue;
-        };
-
-        let position0 = [screen0[0] as f64, screen0[1] as f64];
-        let position1 = [screen1[0] as f64, screen1[1] as f64];
-        let position2 = [screen2[0] as f64, screen2[1] as f64];
-        let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
-            - (position2[0] - position0[0]) * (position1[1] - position0[1]);
-        if cull && !faces_camera(area) {
-            continue;
-        }
-
-        let depth0 = f64::from(camera.view_position(*vertex0)[2]);
-        let depth1 = f64::from(camera.view_position(*vertex1)[2]);
-        let depth2 = f64::from(camera.view_position(*vertex2)[2]);
 
         // The packet's CLUT word carries the ABE bit; a packet with it blends
         // and is drawn full-bright, so the room lights do not apply. The TIM
@@ -2998,26 +2995,28 @@ fn collect_triangles(
             };
             RasterVertex {
                 position,
-                inv_z: 1.0 / depth,
-                u: f64::from(uv[0]) + page_x,
-                v: f64::from(uv[1]) + page_y,
-                shade,
+                w: depth,
+                u: (f64::from(uv[0]) + page_x) as f32,
+                v: (f64::from(uv[1]) + page_y) as f32,
+                shade: shade.map(|channel| (channel / CHANNEL_MAX) as f32),
             }
         });
 
-        let depth = (depth0 + depth1 + depth2) / 3.0;
+        // The sort key is the mean view Z, stored as a float.
+        let depth =
+            f64::from(((f64::from(depth0) + f64::from(depth1) + f64::from(depth2)) / 3.0) as f32);
         triangles.push(Triangle {
             raster,
             depth,
             key: triangle_depth_key(depth),
             texture,
             palette_row,
-            cull,
             // An untextured packet paints its per-corner colour through the
             // shade; the sampled colour is white.
             flat: prim.flat_color.map(|_| [255, 255, 255]),
             blend,
             blend_weight,
+            uv_nudge: prim.uv_nudge,
         });
     }
 }
@@ -3047,6 +3046,99 @@ pub(crate) fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3
             (dz / len * 4096.0) as i32,
         ],
     ]
+}
+
+/// `ApplyMatrixLV`: rotate a long vector by a 4.12 matrix with the GTE's Y
+/// negation on input and output and per-product rounding toward zero.
+fn apply_matrix_lv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
+    let source = [i64::from(v[0]), -i64::from(v[1]), i64::from(v[2])];
+    let row = |row: usize| -> i64 {
+        (0..3)
+            .map(|k| {
+                let value = i64::from(m[row][k]) * source[k];
+                (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS
+            })
+            .sum()
+    };
+    [row(0) as i32, -row(1) as i32, row(2) as i32]
+}
+
+/// The reference's float projection of one object (`FlushTmdObjects`).
+///
+/// The object's matrix is `CompMatrix(g_RoomCameraData, joint)` pushed
+/// through `SetRotAndTransMatrix` (translation Y negated), and every vertex
+/// is transformed and projected in floating point without ever rounding to
+/// whole pixels: `sx = cx + vx * (f / vz)`, `sy = cy - vy * (f / vz)`. The
+/// x87 build keeps the intermediates in extended precision, which doubles
+/// stand in for; only the stored screen position and view Z round to `f32`.
+struct RefProjection {
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    center: [f64; 2],
+    focal: f64,
+    near: f64,
+}
+
+impl RefProjection {
+    fn new(camera: &Camera, joint: &anim::Mat4x3) -> Self {
+        let mut view = stored_camera_matrix(camera.from, camera.look_at);
+        let mut view_t = apply_matrix_lv(&view, camera.from.map(i32::wrapping_neg));
+        if camera.mirrored {
+            // `entity_draw_mirror_reflection` composes a negated-X identity
+            // into the reflected camera, rotation and translation alike.
+            view[0] = view[0].map(|entry| -entry);
+            view_t[0] = -view_t[0];
+        }
+        // `MulMatrix0` stores shorts.
+        let rotation = mul_matrix0(&view, &joint.r).map(|row| row.map(|entry| entry as i16));
+        let moved = apply_matrix_lv(&view, joint.t);
+        let translation = [
+            moved[0].wrapping_add(view_t[0]),
+            moved[1].wrapping_add(view_t[1]).wrapping_neg(),
+            moved[2].wrapping_add(view_t[2]),
+        ];
+        let focal = f64::from(camera.fov);
+        Self {
+            rotation: rotation.map(|row| row.map(|entry| f64::from(entry) / 4096.0)),
+            translation: translation.map(|entry| f64::from(entry as f32)),
+            center: [
+                f64::from(CENTER_X + camera.screen[0]),
+                f64::from(CENTER_Y + camera.screen[1]),
+            ],
+            focal,
+            near: (2.0 * focal).max(1.0),
+        }
+    }
+
+    /// Project one vertex-buffer position (`x, -y, z`, or the raw Y form):
+    /// the screen position and view Z, or `None` inside the near plane.
+    fn project(&self, vertex: [f64; 3]) -> Option<([f32; 2], f32)> {
+        let [vx, vy, vz] = std::array::from_fn(|row| {
+            let m = self.rotation[row];
+            m[0] * vertex[0] + m[1] * vertex[1] + m[2] * vertex[2] + self.translation[row]
+        });
+        if vz.is_nan() || vz < self.near {
+            return None;
+        }
+        let iz = self.focal / vz;
+        Some((
+            [
+                (self.center[0] + vx * iz) as f32,
+                (self.center[1] - vy * iz) as f32,
+            ],
+            vz as f32,
+        ))
+    }
+}
+
+/// A projected corner: screen position and view Z.
+type Projected = ([f32; 2], f32);
+
+/// `TmdDepthNdc`: view Z on the linear `[0, 1]` depth-buffer ramp.
+fn depth_ndc(view_z: f32) -> f32 {
+    const NEAR: f32 = 1.0;
+    const FAR: f32 = 131_072.0;
+    ((view_z - NEAR) * (1.0 / (FAR - NEAR))).clamp(0.0, 1.0)
 }
 
 /// `MulMatrix0`: `m2 = m0 * m1` over 4.12 matrices with the reference's
@@ -3258,11 +3350,11 @@ fn collect_ivm_triangles(
                     None => colour,
                 };
                 RasterVertex {
-                    position,
-                    inv_z: 1.0 / depth,
-                    u: f64::from(prim.uv[index][0]),
-                    v: f64::from(prim.uv[index][1]),
-                    shade,
+                    position: position.map(|axis| axis as f32),
+                    w: depth as f32,
+                    u: f32::from(prim.uv[index][0]),
+                    v: f32::from(prim.uv[index][1]),
+                    shade: shade.map(|channel| (channel / CHANNEL_MAX) as f32),
                 }
             });
 
@@ -3273,10 +3365,10 @@ fn collect_ivm_triangles(
                 key: triangle_depth_key(depth),
                 texture: 0,
                 palette_row: 0,
-                cull: true,
                 flat,
                 blend: prim.blend,
                 blend_weight: None,
+                uv_nudge: [0; 3],
             });
         }
     }
@@ -3290,25 +3382,6 @@ fn fixed_mul(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     let v = [
         i128::from(vertex[0]),
         -i128::from(vertex[1]),
-        i128::from(vertex[2]),
-    ];
-    std::array::from_fn(|row| {
-        let r = joint.r[row];
-        let sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
-        let mut scaled = (sum + ((sum >> 127) & i128::from(0xFFF))) >> FIXED_BITS;
-        if row == 1 {
-            scaled = -scaled;
-        }
-        clamp_i32(scaled + i128::from(joint.t[row]))
-    })
-}
-
-/// [`fixed_mul`] for a `0x25010607` raw-Y packet: the PSX vertex reader for
-/// that form does not negate the stored Y, so neither does this.
-fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
-    let v = [
-        i128::from(vertex[0]),
-        i128::from(vertex[1]),
         i128::from(vertex[2]),
     ];
     std::array::from_fn(|row| {
@@ -3351,6 +3424,11 @@ fn top_left(from: [f64; 2], to: [f64; 2], positive: bool) -> bool {
     }
 }
 
+/// GL_NEAREST under CLAMP_TO_EDGE: the texel under a normalised coordinate.
+fn clamp_texel(coordinate: f32, size: u32) -> usize {
+    ((coordinate * size as f32).floor().max(0.0) as usize).min(size as usize - 1)
+}
+
 /// Wrap a texture coordinate around one dimension.
 fn wrap_texel(coordinate: f64, size: u32) -> Option<u32> {
     if size == 0 {
@@ -3359,14 +3437,23 @@ fn wrap_texel(coordinate: f64, size: u32) -> Option<u32> {
     Some(coordinate.rem_euclid(f64::from(size)) as u32)
 }
 
-/// Multiply a texture channel by a 0..255 shade.
-///
-/// The reference multiplies through the GL pipeline in normalized floats, so
-/// the result rounds to nearest rather than truncating.
-fn channel(texel: u8, shade: f64) -> u8 {
-    (f32::from(texel) * shade as f32 / 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8
+/// llvmpipe's float to unorm8 conversion: clamp, scale by 255 and round to
+/// nearest even.
+fn unorm8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8
+}
+
+/// llvmpipe's 8-bit normalised multiply, `round(a * b / 255)` (the
+/// `lp_build_mul_norm` double-blend trick).
+fn mul_unorm8(a: u8, b: u8) -> u32 {
+    let product = u32::from(a) * u32::from(b) + 128;
+    (product + (product >> 8)) >> 8
+}
+
+/// The reference's `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` blend as llvmpipe
+/// runs it on an RGBA8 target: both terms in unorm8, added with saturation.
+fn blend_unorm8(source: u8, destination: u8, alpha: u8) -> u8 {
+    (mul_unorm8(source, alpha) + mul_unorm8(destination, 255 - alpha)).min(255) as u8
 }
 
 #[cfg(test)]
@@ -3412,7 +3499,8 @@ mod tests {
             roll: 0,
             screen: [0, 0],
             from: [0, 0, 0],
-            look_at: [100, 0, 0],
+            look_at: [0, 0, 100],
+            mirrored: false,
         }
     }
 
@@ -3429,7 +3517,7 @@ mod tests {
 
     /// The standard screen-facing triangle, its plane at view-space Z `z`.
     fn mesh_at(z: i16, reversed: bool) -> Tmd {
-        let mut vertices = vec![[0i16, 0, z], [0, 1000, z], [1000, 0, z]];
+        let mut vertices = vec![[0i16, 0, z], [0, -1000, z], [1000, 0, z]];
         if reversed {
             vertices.swap(1, 2);
         }
@@ -3448,6 +3536,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: None,
+                    uv_nudge: [0; 3],
                 }],
             }],
         }
@@ -3502,7 +3591,7 @@ mod tests {
     #[test]
     fn synthetic_triangle_render_matches_golden_hash() {
         let framebuffer = render_triangle(false);
-        assert_eq!(fnv1a(&framebuffer.rgba), 12_035_862_220_174_893_125);
+        assert_eq!(fnv1a(&framebuffer.rgba), 9_570_522_492_068_598_149);
     }
 
     #[test]
@@ -3726,16 +3815,6 @@ mod tests {
         // negated again before the translation is added, so the pitched joint
         // maps +Z to -Y (a plain product would map it to +Y).
         assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
-
-        // The raw-Y form reads the stored Y as-is; for the same pitched joint
-        // a positive Y maps to -Z through the first row of the rotation.
-        assert_eq!(fixed_mul_raw_y(&joint, [0, 100, 0]), [10, 20, -69]);
-        // Zero Y is unaffected, so both forms agree on the rotation plane.
-        assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
-        assert_eq!(
-            fixed_mul_raw_y(&joint, [0, 0, 100]),
-            fixed_mul(&joint, [0, 0, 100])
-        );
     }
 
     #[test]
@@ -3813,7 +3892,7 @@ mod tests {
         SceneItem::Triangle(Triangle {
             raster: std::array::from_fn(|_| RasterVertex {
                 position: [0.0; 2],
-                inv_z: 1.0,
+                w: 1.0,
                 u: 0.0,
                 v: 0.0,
                 shade: [0.0; 3],
@@ -3822,11 +3901,17 @@ mod tests {
             key,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: false,
             blend_weight: None,
+            uv_nudge: [0; 3],
         })
+    }
+
+    /// Draw one triangle against a freshly cleared depth buffer.
+    fn rasterize_alone(framebuffer: &mut Framebuffer, texture: &Texture8, triangle: &Triangle) {
+        let mut depth = framebuffer.depth_buffer();
+        framebuffer.rasterize(texture, triangle, &mut depth);
     }
 
     fn framebuffer_pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
@@ -5225,7 +5310,7 @@ mod tests {
         assert_eq!(triangles.len(), 1);
         assert!(triangles[0].blend, "the ABE bit must set the blend flag");
         assert_eq!(
-            triangles[0].raster[0].shade, [CHANNEL_MAX; 3],
+            triangles[0].raster[0].shade, [1.0; 3],
             "a blended packet is full-bright"
         );
 
@@ -5262,10 +5347,10 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
-        // (255 + 100) / 2 truncates to 177 where the triangle covers.
+        // llvmpipe's unorm8 blend at alpha 128: 128 + 50 = 178.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 200, 100),
-            [177, 177, 177, 255]
+            [178, 178, 178, 255]
         );
         // Untouched grey outside it.
         assert_eq!(
@@ -5287,12 +5372,12 @@ mod tests {
         texture.palettes[1] = [255, 255, 255, 255];
         texture.palettes[2] = [255, 255, 255, 255];
         texture.stp[2] = true;
-        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+        let raster_vertex = |position: [f32; 2], u: f32, v: f32| RasterVertex {
             position,
-            inv_z: 1.0 / 1000.0,
+            w: 1000.0,
             u,
             v,
-            shade: [CHANNEL_MAX; 3],
+            shade: [1.0; 3],
         };
         let triangle = Triangle {
             raster: [
@@ -5304,22 +5389,22 @@ mod tests {
             key: 1000,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: true,
             blend_weight: None,
+            uv_nudge: [0; 3],
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle);
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
         // The opaque texel overwrites; the STP texel halves with the grey.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
         );
         assert_eq!(
-            framebuffer_pixel(&framebuffer, 18, 11),
-            [177, 177, 177, 255]
+            framebuffer_pixel(&framebuffer, 17, 11),
+            [178, 178, 178, 255]
         );
 
         // With no STP entries there are no blend texels: the packet is fully
@@ -5328,7 +5413,7 @@ mod tests {
         texture.stp = vec![false; 2 * crate::model::PALETTE_ROW_LEN];
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle);
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
@@ -5352,6 +5437,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: None,
+                    uv_nudge: [0; 3],
                 }],
             }],
         };
@@ -5392,12 +5478,12 @@ mod tests {
     fn a_record_blend_weight_scales_the_per_texel_mix() {
         let mut texture = solid_texture([255, 255, 255, 255]);
         texture.stp = vec![false, true];
-        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+        let raster_vertex = |position: [f32; 2], u: f32, v: f32| RasterVertex {
             position,
-            inv_z: 1.0 / 1000.0,
+            w: 1000.0,
             u,
             v,
-            shade: [CHANNEL_MAX; 3],
+            shade: [1.0; 3],
         };
         let triangle = |blend_weight| Triangle {
             raster: [
@@ -5409,33 +5495,33 @@ mod tests {
             key: 1000,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: true,
             blend_weight,
+            uv_nudge: [0; 3],
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
 
         // The 0x33 override weight (0.2 background): (255 * 205 + 100 * 51) /
         // 256 = 224.
-        framebuffer.rasterize(&texture, &triangle(Some(0x33)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0x33)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [224, 224, 224, 255]
         );
 
-        // The 0x80 half blend: (255 * 128 + 100 * 128) / 256 = 177.
+        // The 0x80 half blend in unorm8: alpha 128 gives 128 + 50 = 178.
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle(Some(0x80)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0x80)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [177, 177, 177, 255]
+            [178, 178, 178, 255]
         );
 
         // A zero background weight is opaque, the ABR 1 `B + F` rule.
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle(Some(0)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
@@ -5470,9 +5556,9 @@ mod tests {
             objects: vec![TmdObject {
                 vertices: vec![
                     [0, 0, 1000],
-                    [0, 0, if behind { 0 } else { 1000 }],
+                    [1000, -1000, if behind { 0 } else { 1000 }],
                     [1000, 0, 1000],
-                    [0, 1000, 1000],
+                    [0, -1000, 1000],
                 ],
                 normals: vec![[0, 0, 4096]],
                 prims: vec![TmdPrim {
@@ -5486,6 +5572,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: Some([0, 1, 3, 2]),
+                    uv_nudge: [0; 3],
                 }],
             }],
         };

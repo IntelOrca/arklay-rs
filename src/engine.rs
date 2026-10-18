@@ -24336,6 +24336,7 @@ end
                         raw_y: false,
                         flat_color: None,
                         quad: None,
+                        uv_nudge: [0; 3],
                     }],
                 }],
             },

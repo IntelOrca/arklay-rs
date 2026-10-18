@@ -261,6 +261,7 @@ fn decode_prim(
                 raw_y: false,
                 flat_color: None,
                 quad: None,
+                uv_nudge: [0; 3],
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -283,6 +284,7 @@ fn decode_prim(
                 raw_y: false,
                 flat_color: None,
                 quad: None,
+                uv_nudge: [0; 3],
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -309,6 +311,7 @@ fn decode_prim(
                 raw_y: true,
                 flat_color: None,
                 quad: None,
+                uv_nudge: [0; 3],
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -337,6 +340,7 @@ fn decode_prim(
                 raw_y: false,
                 flat_color: Some(colour),
                 quad: None,
+                uv_nudge: [0; 3],
             };
             check_prim(&prim, vertex_count, normals.len())?;
             vec![prim]
@@ -382,6 +386,7 @@ fn decode_prim(
                     raw_y: false,
                     flat_color: None,
                     quad: Some(vertices),
+                    uv_nudge: [0; 3],
                 };
                 check_prim(&prim, vertex_count, normals.len())?;
                 prims.push(prim);
@@ -390,6 +395,16 @@ fn decode_prim(
         }
         _ => unreachable!("unknown commands are rejected before the word reads"),
     };
+    // `PSXObject_Store` nudges the packet's corner 1 off any shared u or v
+    // among its first three corners; a quad's corner 1 sits in its first
+    // fan triangle only.
+    let mut decoded = decoded;
+    if let Some(first) = decoded.first_mut().filter(|prim| prim.textured) {
+        let shared = |axis: usize| {
+            uv[0][axis] == uv[1][axis] || uv[2][axis] == uv[1][axis] || uv[0][axis] == uv[2][axis]
+        };
+        first.uv_nudge[1] = u8::from(shared(0)) | (u8::from(shared(1)) << 1);
+    }
     let key = if command & 0x0400_0000 != 0 {
         (command, (w1 >> 16) as u16, ((w2 >> 16) & 0x1F) as u16)
     } else {
@@ -610,7 +625,12 @@ mod tests {
                 (1 << 16) | 0,
             ]
         };
-        let tmd = parse(&sample_tmd(&[&flat(2, 0x80), &flat(1, 0x80), &flat(3, 0x81)])).unwrap();
+        let tmd = parse(&sample_tmd(&[
+            &flat(2, 0x80),
+            &flat(1, 0x80),
+            &flat(3, 0x81),
+        ]))
+        .unwrap();
         let prims = &tmd.objects[0].prims;
         assert_eq!(prims[0].normals, [2, 2, 2]);
         assert_eq!(prims[1].normals, [1, 2, 2]);

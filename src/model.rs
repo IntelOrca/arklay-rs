@@ -38,6 +38,10 @@ pub struct TmdPrim {
     /// The renderer drops the whole quad when any of the four is inside the
     /// near plane, exactly like the original's per-packet clip test.
     pub quad: Option<[u16; 4]>,
+    /// Per corner, the reference's degenerate-UV nudge (`PSXObject_Store`):
+    /// when two of the packet's first three corners share a u (bit 0) or a
+    /// v (bit 1), corner 1's normalised coordinate gains `0.003`.
+    pub uv_nudge: [u8; 3],
 }
 
 /// A TMD object: one vertex pool, one normal pool and the primitives using them.
