@@ -1200,9 +1200,28 @@ impl Framebuffer {
         joints: &[anim::Mat4x3],
         camera: &Camera,
     ) {
+        self.draw_ivm(ivm, joints, camera, None);
+    }
+
+    /// Draw an item-view (`.ivm`) model, lit when `light` is given.
+    ///
+    /// The examine screen lights its model like an entity
+    /// (`TmdComputeLight`): every corner normal is evaluated against the
+    /// viewer's three lights over the ambient, the sum clamps at full scale and
+    /// an untextured polygon then multiplies in its packet colour. The
+    /// viewer's light rows are pre-multiplied by the camera
+    /// (`MulMatrix0(&g_lightMatrix, &g_RoomCameraData)`) before the usual
+    /// camera transform. `None` is the full-bright path.
+    pub fn draw_ivm(
+        &mut self,
+        ivm: &crate::ivm::Ivm,
+        joints: &[anim::Mat4x3],
+        camera: &Camera,
+        light: Option<&EntityLight>,
+    ) {
         let mut triangles: Vec<Triangle> = Vec::new();
         for (object, joint) in ivm.objects.iter().zip(joints) {
-            collect_ivm_triangles(object, joint, camera, &mut triangles);
+            collect_ivm_triangles(object, joint, camera, light, &mut triangles);
         }
         self.rasterize_triangles(&ivm.texture, triangles);
     }
@@ -2748,7 +2767,7 @@ fn collect_triangles(
                             &joint.r,
                             normal,
                             &light,
-                            room_object,
+                            room_object.then_some(&joint.r),
                         ),
                         None => light.ambient,
                     };
@@ -2856,7 +2875,9 @@ fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
 /// `camera` is `g_RoomCameraData`; `rot` is the object's or joint's 4.12 world
 /// matrix; `normal` is the raw TMD normal. Room objects multiply the stored
 /// light row by the object's rotation before the camera transform
-/// (`RoomObjectRender`); entities use the stored row as-is. Both paths then
+/// (`RoomObjectRender`), the item viewer by the camera itself
+/// (`MulMatrix0(&g_lightMatrix, &g_RoomCameraData)`), both through
+/// `light_rot`; entities use the stored row as-is. Every path then
 /// rotate the normal (Y-negated and scaled like the vertex buffer's
 /// `PSXObjVtx`) by `camera * rot`, negate the transformed light direction, and
 /// accumulate `max(0, -(n_view . l)) * colour` over the ambient. The scale of
@@ -2866,7 +2887,7 @@ fn reference_vertex_shade(
     rot: &[[i32; 3]; 3],
     normal: [i16; 3],
     light: &EntityLight,
-    room_object: bool,
+    light_rot: Option<&[[i32; 3]; 3]>,
 ) -> [f64; 3] {
     // The reference accumulates in 32-bit floats (`TmdComputeLight`), so the
     // port matches its rounding exactly rather than using doubles.
@@ -2885,10 +2906,9 @@ fn reference_vertex_shade(
     }
     let mut shade = light.ambient.map(|value| value as f32);
     for source in &light.sources {
-        let vec = if room_object {
-            mul_matrix0(&[source.dir, [0; 3], [0; 3]], rot)[0]
-        } else {
-            source.dir
+        let vec = match light_rot {
+            Some(light_rot) => mul_matrix0(&[source.dir, [0; 3], [0; 3]], light_rot)[0],
+            None => source.dir,
         };
         let l = apply_matrix_sv(camera, vec);
         let d =
@@ -2915,8 +2935,10 @@ fn collect_ivm_triangles(
     object: &crate::ivm::IvmObject,
     joint: &anim::Mat4x3,
     camera: &Camera,
+    light: Option<&EntityLight>,
     triangles: &mut Vec<Triangle>,
 ) {
+    let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
     let vertices: Vec<[i32; 3]> = object
         .vertices
         .iter()
@@ -2989,16 +3011,48 @@ fn collect_ivm_triangles(
             ];
             let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
                 let (position, depth, index) = corner_data[corner];
+                // The packet colour the lit sum multiplies: an untextured
+                // polygon's own colour, white for a textured one.
+                let colour = if gouraud {
+                    prim.colors[index.min(2)].map(f64::from)
+                } else {
+                    [CHANNEL_MAX; 3]
+                };
+                let shade = match light {
+                    Some(light) => {
+                        // A flat packet carries one normal for every corner.
+                        let normal_slot = if prim.kind == crate::ivm::IvmPrimKind::TexturedFlat {
+                            0
+                        } else {
+                            index
+                        };
+                        let normal = object
+                            .normals
+                            .get(usize::from(prim.normals[normal_slot]))
+                            .copied();
+                        let mut shade = match normal {
+                            Some(normal) => reference_vertex_shade(
+                                &stored_camera,
+                                &joint.r,
+                                normal,
+                                light,
+                                Some(&stored_camera),
+                            ),
+                            None => light.ambient,
+                        };
+                        for (channel, &scale) in shade.iter_mut().zip(&colour) {
+                            *channel = channel.min(CHANNEL_MAX) * scale / CHANNEL_MAX;
+                        }
+                        shade
+                    }
+                    None => colour,
+                };
                 RasterVertex {
                     position,
                     inv_z: 1.0 / depth,
                     u: f64::from(prim.uv[index][0]),
                     v: f64::from(prim.uv[index][1]),
-                    shade: if gouraud {
-                        prim.colors[index.min(2)].map(f64::from)
-                    } else {
-                        [CHANNEL_MAX; 3]
-                    },
+                    shade,
                 }
             });
 
