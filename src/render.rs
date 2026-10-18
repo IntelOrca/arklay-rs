@@ -620,6 +620,53 @@ impl Framebuffer {
         }
     }
 
+    /// [`Framebuffer::draw_indexed_sprite`] with an explicit blend mode.
+    ///
+    /// The Lua screen API's `blend` option needs the modes the sprite queue
+    /// supports without going through a `SpriteDraw`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_sprite_blended(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+        blend: SpriteBlend,
+    ) {
+        self.draw_indexed_sprite_full(
+            texture,
+            src,
+            dst,
+            clut_row,
+            brightness_scale(brightness),
+            tint,
+            blend,
+            [false, false],
+        );
+    }
+
+    /// [`Framebuffer::draw_rgba_sprite`] with an explicit blend mode.
+    pub fn draw_rgba_sprite_blended(
+        &mut self,
+        image: &Image,
+        src: [i32; 4],
+        dst: [i32; 4],
+        brightness: u8,
+        blend: SpriteBlend,
+    ) {
+        self.draw_rgba_sprite_full(
+            image,
+            src,
+            dst,
+            brightness_scale(brightness),
+            Tint::White,
+            blend,
+            [false, false],
+        );
+    }
+
     /// Draw one RGBA sprite with nearest sampling, clipped to the framebuffer.
     ///
     /// Zero-alpha texels are transparent; `brightness` scales the colour

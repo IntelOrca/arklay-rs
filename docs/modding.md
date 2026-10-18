@@ -368,7 +368,8 @@ script lists the directory itself.
 Screen scripts are not hooks: `lua/**.lua` entries run once when a session
 opens, while a screen script is loaded and run only when its screen opens.
 
-A screen script defines up to three globals:
+A screen script defines three globals (`update` is required; `on_open` and
+`draw` are optional):
 
 ```lua
 function on_open(api) end        -- once, before the first tick
@@ -376,18 +377,19 @@ function update(api, input) end  -- once per fixed tick
 function draw(api) end           -- once per frame
 ```
 
-The screen runs in the same sandbox as the hooks (base/`string`/`table` only,
-16 MiB, instruction budget) and draws in the 320x240 layout space. A script
-that fails to load leaves the engine on the ported original screen; a script
-that errors while running is logged once and the screen leaves (back to
-gameplay from a save screen, back to the title from the load screen).
+The screen runs in the hooks' sandbox — base/`string`/`table` only, 16 MiB, the
+instruction budget — in its own VM and draws in the 320x240 layout space. A
+screen that fails to load, or a missing `update`, leaves the engine on the
+ported original screen; a script that errors while running is logged once and
+the screen leaves (back to gameplay from a save screen, back to the title from
+the load screen).
 
 ### The `api` userdata
 
 | Method | Effect |
 | --- | --- |
 | `api:mode()` | `"save"` or `"load"`. |
-| `api:ticks()` | Fixed ticks since the screen opened. |
+| `api:ticks()` | Fixed ticks since the screen opened (0 during the first `update`). |
 | `api:saves()` | The save directory's files, sorted by name. Each entry is a table: `path`, `name` (`savedat1.dat`), `base` (`savedat1`), `timestamp` (Unix seconds), `loadable`; a loadable file also carries `character` (`0` Chris, `1` Jill), `character_name`, `saves`, `stage` (the block's 0-based stage byte), `room` and `location` (the resolved room label). The list is rescanned after a save or remove. |
 | `api:string(key)` | A `language/<tag>.txt` string, decoded to characters; `nil` when no language carries the key. |
 | `api:character_name(index)` | The save screen's name for character `0`/`1`, decoded. |
@@ -401,16 +403,17 @@ gameplay from a save screen, back to the title from the load screen).
 
 ### Drawing
 
-The draw methods are only available inside `draw`; calling one from
-`on_open`/`update` raises an error. Every colour is `0xRRGGBB` or `"#RRGGBB"`;
-text also takes a tint name (`white`, `green`, `red`, `grey`, `yellow`) or a
-CLUT row number, the rules the vanilla screens use. A text `"#RRGGBB"` is a
-per-channel multiplier over the sheet's grey ramp, so `"#3F7DFA"` draws the
-blue the built-in screen's save rows use.
+The drawing methods (`background`, `rect`, `text`, `sprite`, `sprite_region`)
+are only available inside `draw`; calling one from `on_open`/`update` raises an
+error, and every other method works from any of the three. Every colour is
+`0xRRGGBB` or `"#RRGGBB"`; text also takes a tint name (`white`, `green`,
+`red`, `grey`, `yellow`) or a CLUT row number, the rules the vanilla screens
+use. A text `"#RRGGBB"` is a per-channel multiplier over the sheet's grey ramp,
+so `"#3F7DFA"` draws the blue the built-in screen's save rows use.
 
 | Method | Effect |
 | --- | --- |
-| `api:background(entry[, opts])` | Draw the pack image `entry` over the whole screen, scaled. A 320x240 RGBA image with no options is blitted exactly. |
+| `api:background(entry[, opts])` | Draw the pack image `entry` over the whole screen, scaled. A 320x240 RGBA image with default options is blitted exactly; `colour` tints any background, and `brightness`/`blend` apply to an indexed one. |
 | `api:rect(x, y, w, h, colour[, alpha])` | A filled rectangle; `alpha` (default 255) blends it over what is already there. |
 | `api:text(x, y, text[, opts])` | Draw `text` through the game font and the session's text encoding, with the vanilla shadow. |
 | `api:sprite(entry, x, y[, opts])` | Draw the whole pack image at `(x, y)`. |
@@ -418,8 +421,10 @@ blue the built-in screen's save rows use.
 | `api:image_size(entry)` | The pack image's width and height. |
 | `api:fade(alpha)` | Set the screen's black-overlay opacity (`0` clear, `255` black). |
 
-Images are decoded once per screen and cached: `.tim` through the TIM decoder
-(4bpp/8bpp indexed, 16bpp RGBA) and everything else as a BMP. The `opts` table
+An image `entry` resolves like every other asset: by its stem, highest
+priority first `webp > png > bmp > tim > pix`, so a mod's replacement wins and
+a `.tim` keeps its palette (4bpp/8bpp indexed, 16bpp RGBA). Decoded images are
+cached per screen, up to 64 images and 64 MiB of pixels. The `opts` table
 is `{colour = "white"|3|"#RRGGBB", brightness = 2, tight = true, clut = 0,
 blend = "opaque"|"half"|"half_variant"}` — `brightness` is the font's `0..=30`
 scale, `clut` the indexed palette row and `blend` the sprite blend mode.

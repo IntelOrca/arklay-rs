@@ -83,6 +83,7 @@ mod imp {
 #[cfg(feature = "lua")]
 mod imp {
     use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
     use std::rc::Rc;
 
     use anyhow::Result;
@@ -358,7 +359,7 @@ mod imp {
         // A layer that names none contributes its own `lua/**.lua` entries in
         // lowercased-path order, which is exactly the single-pack rule.
         let mut paths: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for layer in std::iter::once(pack).chain(pack.overrides()) {
             let candidates: Vec<String> =
                 match layer.manifest().filter(|manifest| !manifest.lua.is_empty()) {
@@ -676,7 +677,11 @@ pub(crate) use imp::{Budget, new_sandboxed_state};
 pub fn registered_save_screen(pack: &crate::pack::Pack) -> Option<String> {
     let vm = match LuaVm::load(pack) {
         Ok(Some(vm)) => vm,
-        _ => return None,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!("warning: Lua hooks unavailable: {err:#}");
+            return None;
+        }
     };
     let mut probe = crate::game::GameState::default();
     vm.call_init(&mut probe);
@@ -697,8 +702,6 @@ pub fn verify_source(bytes: &[u8]) -> anyhow::Result<()> {
             .into_function()
             .map_err(|err| anyhow::anyhow!("lua compile: {err}"))?;
     }
-    #[cfg(not(feature = "lua"))]
-    let _ = bytes;
     Ok(())
 }
 

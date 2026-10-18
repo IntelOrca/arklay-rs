@@ -5016,7 +5016,14 @@ impl App {
     /// also queues the opening film (id 0) exactly once per process.
     fn open_title(&mut self) -> Result<()> {
         let mut screen = ui::title::TitleScreen::new();
-        screen.set_save_screen(self.save_screen.as_deref());
+        // A registration that names a missing entry falls back to the ported
+        // screen when it opens, which only lists the eight slots, so the
+        // folder probe follows the entry the pack actually carries.
+        let entry = self
+            .save_screen
+            .as_deref()
+            .filter(|entry| self.pack.contains(entry));
+        screen.set_save_screen(entry);
         screen.open(&mut self.context())?;
         self.mode = Mode::Title(screen);
         if self.films && !self.opening_played {
@@ -7466,12 +7473,21 @@ pub struct SimulatedTypewriter {
 ///
 /// This is the deterministic seam the real-asset tests use; it writes the slot
 /// through the same [`ui::save_load::SaveLoadScreen`] path the engine uses.
+///
+/// The seam drives the ported slot screen, so it reads slot 0 back by its
+/// fixed name. A pack that registers a Lua save screen names its own file, so
+/// this function refuses such a pack rather than guess the name.
 pub fn simulate_typewriter(
     pack: &Pack,
     id: RoomId,
     save_dir: &Path,
 ) -> Result<SimulatedTypewriter> {
     let mut session = GameSession::from_room(pack, id, save_dir)?;
+    if let Some(entry) = session.game.save_screen.as_deref() {
+        bail!(
+            "pack registers the Lua save screen {entry}: simulate_typewriter writes the ported slot 0"
+        );
+    }
     session.game.add_item(ITEM_KNIFE, 0);
     session.game.add_item(items::ITEM_INK_RIBBONS, 1);
     let action = session

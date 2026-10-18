@@ -591,7 +591,9 @@ pub fn scan_dir(dir: &Path) -> Vec<SaveEntry> {
     };
     let mut entries: Vec<SaveEntry> = read_dir
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        // `fs::metadata` (unlike `DirEntry::file_type`) follows symlinks, so a
+        // linked save file lists and loads like the vanilla slot reader's.
+        .filter(|entry| fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file()))
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?.to_string();

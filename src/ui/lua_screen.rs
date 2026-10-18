@@ -79,7 +79,6 @@ mod imp {
     use anyhow::{Context, Result};
     use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
 
-    use crate::bmp;
     use crate::budget;
     use crate::charset::{self, Script};
     use crate::font::Tint;
@@ -90,9 +89,12 @@ mod imp {
     use crate::save::{self, SaveEntry, SaveFile};
     use crate::state::Image;
     use crate::text::Text;
-    use crate::tim;
     use crate::ui::save_load::{SaveOutcome, consume_snapshot_ribbon};
     use crate::ui::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
+
+    /// The coordinate range the drawing API accepts; wider values are clamped
+    /// so the sprite and font cursors cannot overflow.
+    const DRAW_LIMIT: i32 = 4096;
 
     /// Which way the screen runs.
     #[derive(Debug, Clone)]
@@ -135,6 +137,11 @@ mod imp {
         tight: bool,
         /// The save directory's scan, refreshed on open and after a write.
         list: Vec<SaveEntry>,
+        /// Decoded pixels the image cache holds, against
+        /// [`budget::MAX_SCREEN_IMAGE_BYTES`].
+        image_bytes: usize,
+        /// Whether the missing-font warning has been logged.
+        missing_font_logged: bool,
         ticks: u64,
         fade: u8,
         outcome: Option<SaveOutcome>,
@@ -145,12 +152,22 @@ mod imp {
     }
 
     impl Host {
+        /// Report a text call on a pack with no font, once per screen.
+        fn note_missing_font(&mut self) {
+            if !self.missing_font_logged {
+                self.missing_font_logged = true;
+                eprintln!("[lua] the pack carries no font; screen text is not drawn");
+            }
+        }
+
         /// Rescan the save directory.
         fn rescan(&mut self) {
             self.list = save::scan_dir(&self.save_dir);
         }
 
-        /// The decoded pack image, cached.
+        /// The decoded pack image, cached. The cache is bounded by count and
+        /// by the pixels it holds, so a script cannot pin memory with many
+        /// large images.
         fn image<'a>(&'a mut self, pack: &Pack, entry: &str) -> Result<&'a Decoded> {
             if !self.images.contains_key(entry) {
                 budget::check_len(
@@ -159,6 +176,16 @@ mod imp {
                     "screen image cache size",
                 )?;
                 let decoded = decode_image(pack, entry)?;
+                let (width, height) = decoded.size();
+                let bytes = (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(4);
+                budget::check_len(
+                    self.image_bytes.saturating_add(bytes),
+                    budget::MAX_SCREEN_IMAGE_BYTES,
+                    "screen image cache bytes",
+                )?;
+                self.image_bytes = self.image_bytes.saturating_add(bytes);
                 self.images.insert(entry.to_string(), decoded);
             }
             Ok(self.images.get(entry).expect("just inserted"))
@@ -213,6 +240,8 @@ mod imp {
                 script: text.map(Text::script).unwrap_or_default(),
                 tight: text.map(Text::uses_tight_metrics).unwrap_or(true),
                 list: Vec::new(),
+                image_bytes: 0,
+                missing_font_logged: false,
                 ticks: 0,
                 fade: 0,
                 outcome: None,
@@ -263,12 +292,12 @@ mod imp {
         }
 
         fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
-            self.host.ticks = self.host.ticks.saturating_add(1);
             let Self { host, vm, entry } = self;
             if let Err(err) = vm.call_update(host, cx, input) {
                 eprintln!("[lua] save screen {entry} update failed: {err}");
                 host.failed = true;
             }
+            self.host.ticks = self.host.ticks.saturating_add(1);
             if let Some(path) = self.host.load.take() {
                 return ScreenResult::Done(ScreenAction::LoadFile(path));
             }
@@ -549,28 +578,37 @@ mod imp {
     }
 
     /// Parse `RRGGBB` or `RRGGBBAA` (alpha ignored).
-    fn parse_hex_colour(hex: &str) -> Option<[u8; 3]> {
-        if hex.len() != 6 && hex.len() != 8 {
+    ///
+    /// The input is checked as ASCII hex digits byte for byte: indexing a
+    /// `str` by byte would panic on a multi-byte character.
+    pub(super) fn parse_hex_colour(hex: &str) -> Option<[u8; 3]> {
+        let bytes = hex.as_bytes();
+        if bytes.len() != 6 && bytes.len() != 8 {
             return None;
         }
-        let byte = |index: usize| u8::from_str_radix(&hex[index..index + 2], 16).ok();
+        let digit = |byte: u8| (byte as char).to_digit(16).map(|value| value as u8);
+        let byte = |index: usize| Some(digit(bytes[index])? << 4 | digit(bytes[index + 1])?);
         Some([byte(0)?, byte(2)?, byte(4)?])
     }
 
-    /// Decode a pack image by its extension: `.tim` through the TIM decoder
-    /// (mode 0/1 indexed, mode 2 RGBA), anything else as a BMP.
+    /// Decode a pack image, resolving the entry the way every other screen
+    /// does: by its stem, so a mod's `webp`/`png`/`bmp`/`tim` replacement
+    /// wins like it does for the shipped art, and a `tim` keeps its palette
+    /// when it is indexed.
     fn decode_image(pack: &Pack, entry: &str) -> Result<Decoded> {
-        let bytes = pack
-            .read(entry)
+        let asset = pack
+            .read_asset(crate::assets::stem(entry), crate::pack::AssetClass::Image)?
             .with_context(|| format!("cannot read image {entry}"))?;
-        if entry.to_ascii_lowercase().ends_with(".tim") {
-            return Ok(match tim::mode(&bytes)? {
-                0 => Decoded::Indexed(tim::decode_4bpp(&bytes)?),
-                1 => Decoded::Indexed(tim::decode_8bpp(&bytes)?),
-                _ => Decoded::Rgba(tim::decode(&bytes)?),
-            });
+        match crate::assets::decode_page(&asset, crate::assets::Geometry::Free)? {
+            crate::assets::Artwork::Indexed(texture) => Ok(Decoded::Indexed(texture)),
+            crate::assets::Artwork::Rgba(image) => Ok(Decoded::Rgba(image)),
         }
-        Ok(Decoded::Rgba(bmp::decode(&bytes)?))
+    }
+
+    /// A drawing coordinate or size a script supplied, clamped to a range no
+    /// screen needs and no cursor arithmetic can overflow.
+    fn coord(value: i32) -> i32 {
+        value.clamp(-DRAW_LIMIT, DRAW_LIMIT)
     }
 
     /// Draw one decoded image at `dst`, scaling `src` into it.
@@ -585,17 +623,39 @@ mod imp {
         let src = src.unwrap_or([0, 0, width as i32, height as i32]);
         match image {
             Decoded::Rgba(image) => {
-                framebuffer.draw_rgba_sprite(image, src, dst, opts.brightness);
+                if opts.blend == SpriteBlend::Opaque {
+                    framebuffer.draw_rgba_sprite(image, src, dst, opts.brightness);
+                } else {
+                    framebuffer.draw_rgba_sprite_blended(
+                        image,
+                        src,
+                        dst,
+                        opts.brightness,
+                        opts.blend,
+                    );
+                }
             }
             Decoded::Indexed(texture) => {
-                framebuffer.draw_indexed_sprite(
-                    texture,
-                    src,
-                    dst,
-                    opts.clut,
-                    opts.brightness,
-                    opts.tint,
-                );
+                if opts.blend == SpriteBlend::Opaque {
+                    framebuffer.draw_indexed_sprite(
+                        texture,
+                        src,
+                        dst,
+                        opts.clut,
+                        opts.brightness,
+                        opts.tint,
+                    );
+                } else {
+                    framebuffer.draw_indexed_sprite_blended(
+                        texture,
+                        src,
+                        dst,
+                        opts.clut,
+                        opts.brightness,
+                        opts.tint,
+                        opts.blend,
+                    );
+                }
             }
         }
     }
@@ -707,10 +767,13 @@ mod imp {
                     .map(|text| text.decode(text.save().character_name(index & 1))))
             });
 
-            methods.add_method(
+            methods.add_method_mut(
                 "text_width",
                 |_lua, api, (text, tight): (String, Option<bool>)| {
-                    let font = api.cx.font.ok_or_else(no_font)?;
+                    let Some(font) = api.cx.font else {
+                        api.host.note_missing_font();
+                        return Ok(0);
+                    };
                     let mut bytes = Vec::new();
                     charset::encode(&text, api.host.script, &mut bytes);
                     Ok(font.advance(tight.unwrap_or(api.host.tight), &bytes))
@@ -834,6 +897,8 @@ mod imp {
                 |_lua,
                  api,
                  (x, y, w, h, colour, alpha): (i32, i32, i32, i32, Value, Option<i64>)| {
+                    let (x, y) = (coord(x), coord(y));
+                    let (w, h) = (coord(w), coord(h));
                     let rgb = colour_rgb(&colour)?;
                     let alpha = alpha.unwrap_or(255).clamp(0, 255) as u8;
                     let framebuffer = api
@@ -852,11 +917,19 @@ mod imp {
             methods.add_method_mut(
                 "text",
                 |_lua, api, (x, y, text, opts): (i32, i32, String, Option<Table>)| {
+                    let (x, y) = (coord(x), coord(y));
                     let opts = options(api.host, opts.as_ref())?;
-                    let font = api.cx.font.ok_or_else(no_font)?;
+                    // The framebuffer is taken first so a text call outside
+                    // `draw` is the error the API documents.
+                    let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+                    // A pack without a font draws no text anywhere in the
+                    // engine; the screen keeps running rather than dying.
+                    let Some(font) = api.cx.font else {
+                        api.host.note_missing_font();
+                        return Ok(());
+                    };
                     let mut bytes = Vec::new();
                     charset::encode(&text, api.host.script, &mut bytes);
-                    let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
                     font.draw_text(
                         framebuffer,
                         x,
@@ -873,6 +946,7 @@ mod imp {
             methods.add_method_mut(
                 "sprite",
                 |_lua, api, (entry, x, y, opts): (String, i32, i32, Option<Table>)| {
+                    let (x, y) = (coord(x), coord(y));
                     let opts = options(api.host, opts.as_ref())?;
                     let Api {
                         host,
@@ -910,6 +984,8 @@ mod imp {
                     i32,
                     Option<Table>,
                 )| {
+                    let (sx, sy, sw, sh) = (coord(sx), coord(sy), coord(sw), coord(sh));
+                    let (dx, dy, dw, dh) = (coord(dx), coord(dy), coord(dw), coord(dh));
                     let opts = options(api.host, opts.as_ref())?;
                     let Api {
                         host,
@@ -947,11 +1023,6 @@ mod imp {
     /// The error a draw method reports outside `draw`.
     fn no_draw() -> mlua::Error {
         mlua::Error::RuntimeError("draw methods need `draw(api)`".into())
-    }
-
-    /// The error a text method reports without a font.
-    fn no_font() -> mlua::Error {
-        mlua::Error::RuntimeError("the pack carries no font for this screen".into())
     }
 }
 
@@ -1006,6 +1077,29 @@ mod tests {
         .unwrap()
     }
 
+    /// A 320x240 RGBA PNG, blue with one half-transparent pixel, so the
+    /// screen's exact-size background blit can be told from the stretch path
+    /// that forces opaque alpha.
+    #[cfg(feature = "hd")]
+    fn full_png() -> Vec<u8> {
+        let (width, height) = (320u32, 240u32);
+        let mut rgba = vec![0u8; (width * height * 4) as usize];
+        for pixel in rgba.as_chunks_mut::<4>().0 {
+            pixel.copy_from_slice(&[0, 0, 255, 255]);
+        }
+        let index = (100 * width as usize + 100) * 4;
+        rgba[index + 3] = 128;
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&rgba).unwrap();
+        }
+        bytes
+    }
+
     /// A 4x4 4bpp TIM whose palette index 1 is blue.
     fn test_tim() -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1042,6 +1136,8 @@ mod tests {
             .unwrap();
         writer.add("art/bg.bmp", test_bmp()).unwrap();
         writer.add("art/dot.tim", test_tim()).unwrap();
+        #[cfg(feature = "hd")]
+        writer.add("art/full.png", full_png()).unwrap();
         writer
             .add(
                 "language/en-US.txt",
@@ -1645,5 +1741,128 @@ end
             Tint::Rgb(0x3F, 0x7D, 0xFA)
         );
         assert!(colour_rgb(&mlua::Value::String(lua.create_string("#zz").unwrap())).is_err());
+        // An eight-byte string whose `é` straddles the bytes a slice would
+        // split: rejected, not a panic.
+        assert!(colour_rgb(&mlua::Value::String(lua.create_string("#0é0000").unwrap())).is_err());
+    }
+
+    #[test]
+    fn hex_colour_parsing_never_slices_a_multibyte_string() {
+        use imp::parse_hex_colour;
+        // Six bytes with `é` occupying bytes 1..3: a `str` slice at byte 2
+        // would split the character and panic.
+        assert_eq!(parse_hex_colour("0é0000"), None);
+        assert_eq!(parse_hex_colour("123456"), Some([0x12, 0x34, 0x56]));
+        // The alpha byte of the eight-digit form is ignored.
+        assert_eq!(parse_hex_colour("12345678"), Some([0x12, 0x34, 0x56]));
+        assert_eq!(parse_hex_colour("12345"), None);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn extreme_coordinates_clamp_instead_of_overflowing() {
+        let fixture = Fixture::new(
+            "coords",
+            r#"
+function update(api, input) end
+function draw(api)
+    api:rect(0, 0, 2147483647, 2147483647, 0x101010)
+    api:text(2147483647, -2147483648, "edge")
+    api:sprite("art/bg.bmp", 2147483647, -2147483648)
+    api:sprite_region("art/dot.tim", 2147483647, -2147483648, 2147483647, -2147483648,
+        2147483647, -2147483648, 2147483647, 2147483647)
+end
+"#,
+        );
+        let mut screen = fixture.load();
+        let cx = fixture.context();
+        // Before the clamp, the sprite and font cursors overflowed on these
+        // values and the process panicked; the screen must keep running.
+        let _ = draw(&mut screen, &cx);
+        assert_eq!(
+            screen.update(&cx, UiInput::default()),
+            ScreenResult::Continue
+        );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn a_pack_without_a_font_draws_no_text_and_keeps_running() {
+        let fixture = Fixture::new(
+            "no-font",
+            r#"
+function update(api, input) end
+function draw(api)
+    api:text(8, 8, "Hello")
+    width = api:text_width("Hello")
+end
+"#,
+        );
+        let mut screen = fixture.load();
+        // The engine passes no font for a pack that carries none; the screen
+        // must degrade to drawing no text rather than leave.
+        let mut cx = fixture.context();
+        cx.font = None;
+        let _ = draw(&mut screen, &cx);
+        assert_eq!(
+            screen.update(&cx, UiInput::default()),
+            ScreenResult::Continue
+        );
+        assert_eq!(screen.test_global::<i32>("width"), 0);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn the_blend_option_mixes_a_sprite_with_the_backdrop() {
+        let fixture = Fixture::new(
+            "blend",
+            r#"
+function update(api, input) end
+function draw(api)
+    api:rect(0, 0, 320, 240, 0x808080)
+    api:sprite("art/bg.bmp", 10, 10, {blend = "half"})
+    api:sprite("art/bg.bmp", 20, 10)
+end
+"#,
+        );
+        let mut screen = fixture.load();
+        let cx = fixture.context();
+        let framebuffer = draw(&mut screen, &cx);
+        let pixel = |x: usize, y: usize| {
+            let index = (y * 320 + x) * 4;
+            [
+                framebuffer.rgba[index],
+                framebuffer.rgba[index + 1],
+                framebuffer.rgba[index + 2],
+            ]
+        };
+        // The BMP's top-left is red: "half" averages it with the grey
+        // backdrop per channel, the default blend overwrites it.
+        assert_eq!(pixel(10, 10), [191, 64, 64]);
+        assert_eq!(pixel(20, 10), [255, 0, 0]);
+    }
+
+    #[cfg(all(feature = "lua", feature = "hd"))]
+    #[test]
+    fn an_exact_size_background_is_blitted_with_its_alpha() {
+        let fixture = Fixture::new(
+            "blit",
+            r#"
+function update(api, input) end
+function draw(api)
+    api:background("art/full.png")
+end
+"#,
+        );
+        let mut screen = fixture.load();
+        let cx = fixture.context();
+        let framebuffer = draw(&mut screen, &cx);
+        let pixel = |x: usize, y: usize| {
+            let index = (y * 320 + x) * 4;
+            framebuffer.rgba[index..index + 4].to_vec()
+        };
+        assert_eq!(pixel(10, 10), [0, 0, 255, 255]);
+        // The stretch path forces opaque alpha; the 320x240 blit keeps it.
+        assert_eq!(pixel(100, 100), [0, 0, 255, 128]);
     }
 }
