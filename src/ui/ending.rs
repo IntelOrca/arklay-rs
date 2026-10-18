@@ -13,7 +13,7 @@
 //! [`EpilogueScreen`] mirrors `ending_epilogue_*` (`EndingScreen.cpp:687-836`):
 //! the `rc1121.pix` backdrop, the two caption plates from the same page and the
 //! spinning `i73v.ivm` rocket launcher, lit by the sequence's own light record
-//! (full ambient plus one white light, [`epilogue_light`]) through
+//! (full ambient plus one white light, `epilogue_light`) through
 //! [`Framebuffer::draw_ivm`], held for `0x10D` frames and faded out.
 //!
 //! Neither screen draws a letter rank or an item summary: the original has

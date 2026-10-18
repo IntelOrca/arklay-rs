@@ -24,11 +24,10 @@
 //! and up/down tip it toward or away from the camera, `0x20` 12-bit units per
 //! 30 Hz frame while the key is held. The original builds a small rotation
 //! from the held keys and pre-multiplies it onto the model's rotation matrix,
-//! then re-extracts the Euler angles the examine check reads
-//! ([`ItemViewScreen::apply_spin`]). Confirm runs the item's examine check and
-//! cancel starts the closing animation. A missing model (the placeholder
-//! name `m`, or a pack without `item_m2` art) logs a warning and leaves that
-//! layer empty instead of failing the screen.
+//! then re-extracts the Euler angles the examine check reads. Confirm runs the
+//! item's examine check and cancel starts the closing animation. A missing model
+//! (the placeholder name `m`, or a pack without `item_m2` art) logs a warning
+//! and leaves that layer empty instead of failing the screen.
 
 use anyhow::Result;
 
