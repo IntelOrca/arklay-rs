@@ -44,6 +44,7 @@ SAVES=(
     "stairs_chris_207|207|0|0"
     "door_chris_10B|10B|0|0"
     "door_chris_103|103|0|0"
+    "bootcam_chris_104|104|0|0"
 )
 
 selected=("$@")

@@ -64,6 +64,14 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   walk-zone centre. The first room tick anchored the collision resolve at that
   mirror and teleported the player back to the spawn whenever the saved spot
   differed, so any save not already standing on the spawn diverged on tick 1.
+- **Continue camera re-home.** `GameSession::from_save` restored the block's
+  camera byte and seeded the boot switch-zone walk with it, so a continue kept
+  the cut that was live when the game was saved. The original's `room_set`
+  zeroes `g_roomCameraId` - the BioCard byte at 0x202 itself, `RoomInit.cpp`
+  670-676 - after the room's init script and before `check_camera_switch`, so
+  every room load re-homes from camera 0. A save standing inside room 104's
+  collision volume booted on cut 2 in arklay and cut 0 in the reference for
+  the whole run (`bootcam_chris_104`).
 - **Item-action hand-off.** The original's submenu confirm only switches to
   state 4 (`DAT_00ae9f21 = 4; DAT_00ae9f22 = 0`) - the use/view action runs on
   the *next* frame, and the equip toggle and every successful use then run the
@@ -273,8 +281,25 @@ first FILE/MAP/radio/combine/use/equip/item-box/typewriter scenario attempts
 into the same tick-0 state on both engines (rng, fade, entities and pixels to
 match), which is what the save interchange exists for.
 
+`bootcam_chris_104` covers the boot camera itself: the block's cut (2) is the
+one the room had live when it was written while the saved position selects
+cut 0, so the continue proves the load discards the saved id and re-homes
+from camera 0 with no input at all (state and pixels match for 200 ticks).
+
 ## Open
 
+- **Bare `--room` boot camera.** The headless room boot (`arklay --room ROOM
+  --ticks/--capture/--trace`, `run_with_options`) places the player at the
+  walk-zone spawn *before* its switch-zone scan, so it picks the camera at that
+  point. The reference scans at the new-game position and only then moves the
+  player to the walk-zone centre without re-scanning (`room_set`'s camera
+  block, then `TestHooks_PlaceRoomSpawn`), which is what `--ui game --room`
+  reproduces: room 104 boots `cam=0` bare and `cam=2` there, while the
+  reference's room-mode trace says 2 in both cases. Left alone here because it
+  only feeds the port's own headless captures (the m16 golden scenarios) and
+  the oracle paths all use `--ui game`. `--save-out` on the bare path also
+  writes the block before the camera scan, so an authored block carries the
+  pre-scan id.
 - **FILE reader blink phase.** The reader's arrows and the selector's icons
   blink off the state block's shared `state[0x12]` counter, which the original
   advances only in the selector's display state and the reader's settled state

@@ -157,7 +157,10 @@ The hook order is:
 1. `on_room_load(api)` once a room's state exists (RDT, init script and room
    edits applied) and before its first tick. It runs again on every room
    entry, including a door transition; the Lua globals themselves persist for
-   the session (`granted` above is not reset).
+   the session (`granted` above is not reset). The room-load camera scan runs
+   after it, so `api:set_room_camera` only sticks when the room's init script
+   holds the camera lock; otherwise the cut is re-homed from camera 0 at the
+   player's position, exactly like the original's `room_set`.
 2. `on_tick(api, tick)` after every fixed 30 Hz room tick, before that tick's
    audio dispatch. `tick` is `game.frame`, the number of completed room ticks.
 3. `on_message(api, id)` when the tick raised a message; the returned id
