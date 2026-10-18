@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 
-use crate::bmp;
+use crate::assets::Geometry;
 use crate::font::{Font, Tint};
 use crate::game::InventoryItem;
 use crate::items;
@@ -421,16 +421,10 @@ impl Default for SaveLoadScreen {
 
 impl Screen for SaveLoadScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
-        self.background = match cx.pack.read("ui/type00.bmp") {
-            Ok(bytes) => match bmp::decode(&bytes) {
-                Ok(image) => Some(image),
-                Err(err) => {
-                    eprintln!("warning: invalid save/load background: {err:#}");
-                    None
-                }
-            },
+        self.background = match super::load_picture(cx.pack, "ui/type00", Geometry::Free, None) {
+            Ok(image) => Some(image),
             Err(err) => {
-                eprintln!("warning: missing save/load background: {err:#}");
+                eprintln!("warning: no save/load background: {err:#}");
                 None
             }
         };
@@ -548,7 +542,11 @@ impl Screen for SaveLoadScreen {
 
     fn draw(&mut self, cx: &UiContext<'_>, framebuffer: &mut Framebuffer) {
         match &self.background {
-            Some(background) => framebuffer.blit(background),
+            // A full-frame backdrop is stretched, so a replacement may be
+            // authored at any size.
+            Some(background) => {
+                framebuffer.draw_background(background, [0, 0], [255, 255, 255]);
+            }
             None => {
                 framebuffer.clear();
                 framebuffer.fill_rect(

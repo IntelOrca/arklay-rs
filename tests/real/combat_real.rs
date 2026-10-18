@@ -1,13 +1,11 @@
-//! Real-asset combat tests: the packed `data/combat.bin` must match a fresh
-//! decode of the install's executable, and the shared fire entry must drive a
-//! live spider web through the scripted damage -> death contract.
+//! Real-asset combat tests: the converted pack carries no `data/combat.bin`
+//! and the engine's built-in tables drive the shared fire entry through a
+//! live spider web and the scripted damage -> death contract.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/path/to/re1 ARKLAY_RE1_PACK=/path/to/re1.akpak cargo test --profile test-release --test real combat_real:: -- --ignored`
 
 use crate::common;
-
-use std::fs;
 
 use arklay::combat::CombatTables;
 use arklay::enemy::LuaEnemyHost;
@@ -22,24 +20,16 @@ const WEB_ROOM: &str = "30C0";
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn packed_combat_tables_match_a_fresh_executable_decode() {
-    let Some((root, pack_path)) = common::asset_env() else {
+fn the_pack_uses_the_builtin_combat_tables() {
+    let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let packed = CombatTables::parse(
-        &pack
-            .read(arklay::combat::COMBAT_ENTRY)
-            .expect("the converted pack carries data/combat.bin"),
-    )
-    .unwrap();
-
-    let exe = fs::read(root.join("Bio.exe")).expect("the install's executable");
-    let fresh = arklay::convert::extract_combat_tables(&exe).unwrap();
-    assert_eq!(
-        packed, fresh,
-        "the packed combat tables differ from a fresh decode"
+    assert!(
+        !pack.contains(arklay::combat::COMBAT_ENTRY),
+        "a converted pack carries no data/combat.bin; the engine uses the built-ins"
     );
+    let packed = CombatTables::load(&pack);
 
     // Structural invariants the pipeline depends on.
     assert!(

@@ -40,11 +40,13 @@ pub use screen_scripts::SCREEN_SCRIPTS;
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
+use crate::assets::{self, Artwork, Geometry};
 use crate::font::Font;
-use crate::pack::Pack;
+use crate::pack::{AssetClass, Pack};
 use crate::render::Framebuffer;
+use crate::state::Image;
 use crate::text::Text;
 use crate::transition::FadeColor;
 
@@ -171,6 +173,38 @@ impl UiCue {
             UiCue::SaveConfirm => crate::sfx::global_sfx(12, 15),
         }
     }
+}
+
+/// Load one UI page by stem: the shipped TIM or a mod's replacement.
+///
+/// A page is addressed by fixed UVs or sprite rectangles, so a replacement
+/// must keep the shipped page's dimensions; see [`Geometry::Shipped`].
+pub fn load_page(pack: &Pack, stem: &str) -> Result<Artwork> {
+    let asset = pack
+        .read_asset(stem, AssetClass::Image)
+        .with_context(|| format!("failed to read {stem}"))?
+        .with_context(|| format!("missing {stem}"))?;
+    assets::decode_page(&asset, Geometry::Shipped)
+        .with_context(|| format!("invalid {}", asset.path()))
+}
+
+/// Load one full-frame picture by stem, with an optional transparency key.
+///
+/// [`Geometry::Free`] accepts any size (the caller stretches the picture over
+/// its frame); [`Geometry::Shipped`] keeps a sheet that is sampled by fixed
+/// rectangles at the shipped dimensions.
+pub fn load_picture(
+    pack: &Pack,
+    stem: &str,
+    geometry: Geometry,
+    key: Option<[u8; 3]>,
+) -> Result<Image> {
+    let asset = pack
+        .read_asset(stem, AssetClass::Image)
+        .with_context(|| format!("failed to read {stem}"))?
+        .with_context(|| format!("missing {stem}"))?;
+    assets::decode_picture(&asset, geometry, key)
+        .with_context(|| format!("invalid {}", asset.path()))
 }
 
 /// Everything a screen may read while it runs.

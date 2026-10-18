@@ -20,11 +20,9 @@
 
 use anyhow::Result;
 
-use crate::bmp;
-use crate::model::Texture8;
+use crate::assets::{Artwork, Geometry};
 use crate::render::Framebuffer;
 use crate::state::Image;
-use crate::tim;
 use crate::transition::Fade;
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
@@ -106,7 +104,7 @@ pub struct CharSelectScreen {
     background: Option<Image>,
     cards: Option<Image>,
     /// The shipped screen's second selection sheet; kept loaded for parity.
-    extras: Option<Texture8>,
+    extras: Option<Artwork>,
     /// `0` Chris, `1` Jill: which card owns the front pose once a swap settles.
     selected: u8,
     /// The two cards' live poses, indexed by character.
@@ -434,16 +432,10 @@ impl Default for CharSelectScreen {
 
 impl Screen for CharSelectScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
-        self.background = match cx.pack.read("ui/sel_back.bmp") {
-            Ok(bytes) => match bmp::decode(&bytes) {
-                Ok(image) => Some(image),
-                Err(err) => {
-                    eprintln!("warning: invalid character-select background: {err:#}");
-                    None
-                }
-            },
+        self.background = match super::load_picture(cx.pack, "ui/sel_back", Geometry::Free, None) {
+            Ok(image) => Some(image),
             Err(err) => {
-                eprintln!("warning: missing character-select background: {err:#}");
+                eprintln!("warning: no character-select background: {err:#}");
                 None
             }
         };
@@ -451,29 +443,18 @@ impl Screen for CharSelectScreen {
         // original's BGR555 0x8000 cut-outs around the rounded corners and
         // the arrows); the converted 24-bit BMP cannot carry alpha, so key
         // black out here. The background sheet above keeps its black art.
-        self.cards = match cx.pack.read("ui/select_b.bmp") {
-            Ok(bytes) => match bmp::decode_mask(&bytes) {
+        self.cards =
+            match super::load_picture(cx.pack, "ui/select_b", Geometry::Shipped, Some([0, 0, 0])) {
                 Ok(image) => Some(image),
                 Err(err) => {
-                    eprintln!("warning: invalid character-select cards: {err:#}");
+                    eprintln!("warning: no character-select cards: {err:#}");
                     None
                 }
-            },
+            };
+        self.extras = match super::load_page(cx.pack, "ui/select_k") {
+            Ok(art) => Some(art),
             Err(err) => {
-                eprintln!("warning: missing character-select cards: {err:#}");
-                None
-            }
-        };
-        self.extras = match cx.pack.read("ui/select_k.tim") {
-            Ok(bytes) => match tim::decode_8bpp(&bytes) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    eprintln!("warning: invalid character-select sheet: {err:#}");
-                    None
-                }
-            },
-            Err(err) => {
-                eprintln!("warning: missing character-select sheet: {err:#}");
+                eprintln!("warning: no character-select sheet: {err:#}");
                 None
             }
         };
@@ -568,7 +549,11 @@ impl Screen for CharSelectScreen {
             return;
         }
         match &self.background {
-            Some(background) => framebuffer.blit(background),
+            // A full-frame backdrop is stretched, so a replacement may be
+            // authored at any size.
+            Some(background) => {
+                framebuffer.draw_background(background, [0, 0], [255, 255, 255]);
+            }
             None => {
                 framebuffer.clear();
                 framebuffer.fill_rect(

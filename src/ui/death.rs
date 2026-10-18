@@ -43,7 +43,7 @@
 //! off the top and half off the bottom; the two bands slam together and
 //! settle into the 16-ripple wave.
 
-use crate::model::Texture8;
+use crate::assets::Artwork;
 use crate::render::Framebuffer;
 use crate::state::RoomId;
 use crate::transition::{Fade, Overlay};
@@ -441,20 +441,39 @@ pub fn strip_wave(param: i16, column: usize) -> i16 {
 }
 
 /// One `died.tim` texel, or `None` for the colour-keyed black.
-fn texel(texture: &Texture8, u: u32, v: u32) -> Option<[u8; 4]> {
-    if u >= texture.width || v >= texture.height {
-        return None;
+///
+/// An indexed page keys its black out; an RGBA replacement uses its own
+/// alpha, so a mod may author the strip and the backdrop with real
+/// transparency.
+fn texel(art: &Artwork, u: u32, v: u32) -> Option<[u8; 4]> {
+    match art {
+        Artwork::Indexed(texture) => {
+            if u >= texture.width || v >= texture.height {
+                return None;
+            }
+            let index = texture.indices[(v * texture.width + u) as usize];
+            let colour = texture
+                .palettes
+                .get(usize::from(index))
+                .copied()
+                .unwrap_or([0, 0, 0, 0]);
+            if colour[0] == 0 && colour[1] == 0 && colour[2] == 0 {
+                return None;
+            }
+            Some(colour)
+        }
+        Artwork::Rgba(image) => {
+            if u >= image.width || v >= image.height {
+                return None;
+            }
+            let offset = ((v * image.width + u) * 4) as usize;
+            let colour = image.rgba.get(offset..offset + 4)?;
+            if colour[3] == 0 {
+                return None;
+            }
+            Some([colour[0], colour[1], colour[2], colour[3]])
+        }
     }
-    let index = texture.indices[(v * texture.width + u) as usize];
-    let colour = texture
-        .palettes
-        .get(usize::from(index))
-        .copied()
-        .unwrap_or([0, 0, 0, 0]);
-    if colour[0] == 0 && colour[1] == 0 && colour[2] == 0 {
-        return None;
-    }
-    Some(colour)
 }
 
 /// Write one opaque texel into the framebuffer.
@@ -477,7 +496,7 @@ const QUADRANTS: [(i32, i32, bool, bool); 4] = [
 
 /// Draw the `died.tim` static backdrop: four mirrored 160x120 quadrants of
 /// the page's lower region, colour-keyed on black.
-pub fn draw_backdrop(framebuffer: &mut Framebuffer, texture: &Texture8) {
+pub fn draw_backdrop(framebuffer: &mut Framebuffer, texture: &Artwork) {
     for (origin_x, origin_y, mirror_u, mirror_v) in QUADRANTS {
         for y in 0..120u32 {
             let v = if mirror_v { 119 - y } else { y } + 0x40;
@@ -498,7 +517,7 @@ pub fn draw_backdrop(framebuffer: &mut Framebuffer, texture: &Texture8) {
 
 /// Draw the wavy strip: 256 one-pixel columns of the page's top region, each
 /// displaced by its sine phase.
-pub fn draw_strip(framebuffer: &mut Framebuffer, texture: &Texture8, param: i16) {
+pub fn draw_strip(framebuffer: &mut Framebuffer, texture: &Artwork, param: i16) {
     let base = strip_base(param);
     for column in 0..256usize {
         let top = base.wrapping_sub(strip_wave(param, column)) as i32 + 120;

@@ -34,6 +34,7 @@
 //! an `.ivm` mesh and its own texture page.
 
 use crate::anim;
+use crate::assets::Artwork;
 use crate::mask;
 use crate::model::{Texture8, Tmd, TmdObject};
 use crate::state::{Cut, Image, Light, RoomId, RoomState};
@@ -491,6 +492,134 @@ impl Framebuffer {
         });
     }
 
+    /// Draw one artwork page: an indexed page samples its palette row, an
+    /// RGBA replacement samples its own pixels.
+    ///
+    /// This is the shared entry point for pack art that a mod may replace with
+    /// any image format; `clut_row` is ignored by an RGBA page, and `tint`
+    /// multiplies its colour channels exactly like an indexed page's.
+    pub fn draw_page_sprite(
+        &mut self,
+        art: &Artwork,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+    ) {
+        match art {
+            Artwork::Indexed(texture) => {
+                self.draw_indexed_sprite(texture, src, dst, clut_row, brightness, tint);
+            }
+            Artwork::Rgba(image) => self.draw_rgba_sprite_full(
+                image,
+                src,
+                dst,
+                brightness_scale(brightness),
+                tint,
+                SpriteBlend::Opaque,
+                [false; 2],
+            ),
+        }
+    }
+
+    /// [`Framebuffer::draw_page_sprite`] with a direct `0..=255` colour
+    /// multiplier, the fade path [`Framebuffer::draw_indexed_sprite_scaled`]
+    /// serves for indexed pages.
+    pub fn draw_page_sprite_scaled(
+        &mut self,
+        art: &Artwork,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        scale: u8,
+        tint: Tint,
+    ) {
+        match art {
+            Artwork::Indexed(texture) => {
+                self.draw_indexed_sprite_scaled(texture, src, dst, clut_row, scale, tint);
+            }
+            Artwork::Rgba(image) => self.draw_rgba_sprite_full(
+                image,
+                src,
+                dst,
+                scale,
+                tint,
+                SpriteBlend::Opaque,
+                [false; 2],
+            ),
+        }
+    }
+
+    /// [`Framebuffer::draw_page_sprite`] with explicit U/V mirror flags.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_page_sprite_mirrored(
+        &mut self,
+        art: &Artwork,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+        mirror: [bool; 2],
+    ) {
+        match art {
+            Artwork::Indexed(texture) => {
+                self.draw_indexed_sprite_mirrored(
+                    texture, src, dst, clut_row, brightness, tint, mirror,
+                );
+            }
+            Artwork::Rgba(image) => self.draw_rgba_sprite_full(
+                image,
+                src,
+                dst,
+                brightness_scale(brightness),
+                tint,
+                SpriteBlend::Opaque,
+                mirror,
+            ),
+        }
+    }
+
+    /// [`Framebuffer::draw_page_sprite`] with the FILE reader's `2 * ramp`
+    /// modulation and half-alpha blend.
+    pub fn draw_page_sprite_ramp(
+        &mut self,
+        art: &Artwork,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        ramp: u8,
+    ) {
+        match art {
+            Artwork::Indexed(texture) => {
+                self.draw_indexed_sprite_ramp(texture, src, dst, clut_row, ramp);
+            }
+            Artwork::Rgba(image) => {
+                if image.width == 0 || image.height == 0 {
+                    return;
+                }
+                let colour = u32::from(ramp) * 2;
+                self.draw_sprite(src, dst, [false; 2], SpriteBlend::HalfVariant, |u, v| {
+                    if u < 0 || v < 0 || u >= image.width as i32 || v >= image.height as i32 {
+                        return None;
+                    }
+                    let offset = (v as usize * image.width as usize + u as usize) * 4;
+                    let texel = image.rgba.get(offset..offset + 4)?;
+                    if texel[3] == 0 {
+                        return None;
+                    }
+                    Some([
+                        ((u32::from(texel[0]) * colour + 127) / 255) as u8,
+                        ((u32::from(texel[1]) * colour + 127) / 255) as u8,
+                        ((u32::from(texel[2]) * colour + 127) / 255) as u8,
+                        255,
+                    ])
+                });
+            }
+        }
+    }
+
     /// Draw one RGBA sprite with nearest sampling, clipped to the framebuffer.
     ///
     /// Zero-alpha texels are transparent; `brightness` scales the colour
@@ -507,6 +636,7 @@ impl Framebuffer {
             src,
             dst,
             brightness_scale(brightness),
+            Tint::White,
             SpriteBlend::Opaque,
             [false; 2],
         );
@@ -523,17 +653,27 @@ impl Framebuffer {
         dst: [i32; 4],
         scale: u8,
     ) {
-        self.draw_rgba_sprite_full(image, src, dst, scale, SpriteBlend::Opaque, [false; 2]);
+        self.draw_rgba_sprite_full(
+            image,
+            src,
+            dst,
+            scale,
+            Tint::White,
+            SpriteBlend::Opaque,
+            [false; 2],
+        );
     }
 
-    /// [`Framebuffer::draw_rgba_sprite_scaled`] with a blend mode and U/V
-    /// mirror flags.
+    /// [`Framebuffer::draw_rgba_sprite_scaled`] with a tint, blend mode and
+    /// U/V mirror flags.
+    #[allow(clippy::too_many_arguments)] // the indexed path's parameter set
     fn draw_rgba_sprite_full(
         &mut self,
         image: &Image,
         src: [i32; 4],
         dst: [i32; 4],
         scale: u8,
+        tint: Tint,
         blend: SpriteBlend,
         mirror: [bool; 2],
     ) {
@@ -541,6 +681,7 @@ impl Framebuffer {
             return;
         }
         let scale = u32::from(scale);
+        let tint = tint.rgb();
         self.draw_sprite(src, dst, mirror, blend, |u, v| {
             if u < 0 || v < 0 || u >= image.width as i32 || v >= image.height as i32 {
                 return None;
@@ -550,10 +691,15 @@ impl Framebuffer {
             if texel[3] == 0 {
                 return None;
             }
+            // A white tint is a no-op multiplier, so the existing RGBA
+            // callers keep their exact `channel * scale / 255` truncation.
+            let mix = |channel: u8, tint: u8| {
+                (u32::from(channel) * u32::from(tint) / 255 * scale / 255) as u8
+            };
             Some([
-                (u32::from(texel[0]) * scale / 255) as u8,
-                (u32::from(texel[1]) * scale / 255) as u8,
-                (u32::from(texel[2]) * scale / 255) as u8,
+                mix(texel[0], tint[0]),
+                mix(texel[1], tint[1]),
+                mix(texel[2], tint[2]),
                 texel[3],
             ])
         });
@@ -781,6 +927,7 @@ impl Framebuffer {
                     sprite.src,
                     sprite.dst,
                     brightness_scale(sprite.brightness),
+                    Tint::White,
                     sprite.blend,
                     sprite.mirror,
                 ),
@@ -3843,6 +3990,61 @@ mod tests {
                 [0, 0, 255, 255],
             ],
         )
+    }
+
+    #[test]
+    fn a_page_draw_dispatches_to_the_replacement_format() {
+        // The same sprite drawn as an indexed page and as a true-colour RGBA
+        // replacement lands on the same pixels, and an RGBA page honours its
+        // own alpha and the shared tint.
+        let indexed = checkered_texture();
+        let rgba = Artwork::Rgba(Image {
+            width: 2,
+            height: 2,
+            rgba: vec![
+                0, 0, 0, 0, //
+                255, 0, 0, 255, //
+                0, 255, 0, 255, //
+                0, 0, 255, 255,
+            ],
+        });
+
+        let mut from_indexed = Framebuffer::new();
+        from_indexed.draw_page_sprite(
+            &Artwork::Indexed(indexed),
+            [0, 0, 2, 2],
+            [0, 0, 4, 4],
+            0,
+            2,
+            Tint::White,
+        );
+        let mut from_rgba = Framebuffer::new();
+        from_rgba.draw_page_sprite(&rgba, [0, 0, 2, 2], [0, 0, 4, 4], 0, 2, Tint::White);
+        assert_eq!(from_indexed.rgba, from_rgba.rgba);
+
+        // Brightness and tint apply to an RGBA page exactly like an indexed
+        // one: brightness 15 dims, and a green tint keeps only green.
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_page_sprite(&rgba, [0, 0, 2, 2], [0, 0, 2, 2], 0, 15, Tint::Green);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 1, 0), [0, 0, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 1), [0, 127, 0, 255]);
+        assert_eq!(framebuffer_pixel(&framebuffer, 1, 1), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_page_ramp_draw_modulates_an_rgba_replacement() {
+        // The FILE reader's `2 * ramp` modulation and half-alpha blend.
+        let page = Artwork::Rgba(Image {
+            width: 1,
+            height: 1,
+            rgba: vec![148, 148, 148, 255],
+        });
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_page_sprite_ramp(&page, [0, 0, 1, 1], [0, 0, 1, 1], 0, 0x80);
+        // `2 * 0x80` is deliberately not clamped: 148 rounds to 149, then the
+        // variant-2 half blend lands on 74, the value the reference shows.
+        assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [74, 74, 74, 255]);
     }
 
     #[test]

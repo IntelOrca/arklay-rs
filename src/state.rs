@@ -92,12 +92,25 @@ impl RoomId {
 
     /// Pack path of a camera background, e.g. `roomcut/100_000.bmp`.
     pub fn cut_entry(self, camera: usize) -> String {
-        format!("roomcut/{}_{camera:03}.bmp", self.room3())
+        format!("{}.bmp", self.cut_stem(camera))
+    }
+
+    /// Pack stem of a camera background, e.g. `roomcut/100_000`.
+    ///
+    /// [`crate::pack::Pack::read_asset`] resolves the stem across replacement
+    /// formats; the shipped entry name is [`RoomId::cut_entry`].
+    pub fn cut_stem(self, camera: usize) -> String {
+        format!("roomcut/{}_{camera:03}", self.room3())
     }
 
     /// Pack path of a camera's mask page, e.g. `roommask/100_000.bmp`.
     pub fn roommask_entry(self, camera: usize) -> String {
-        format!("roommask/{}_{camera:03}.bmp", self.room3())
+        format!("{}.bmp", self.roommask_stem(camera))
+    }
+
+    /// Pack stem of a camera's mask page, e.g. `roommask/100_000`.
+    pub fn roommask_stem(self, camera: usize) -> String {
+        format!("roommask/{}_{camera:03}", self.room3())
     }
 
     /// Zero-based stage index for stage-indexed tables.

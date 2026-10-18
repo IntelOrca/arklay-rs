@@ -14,10 +14,11 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::assets;
 use crate::audio::{self, Mixer};
 use crate::game::{BGM_CHANNELS, BgmChannelState, GameState};
 use crate::music;
-use crate::pack::Pack;
+use crate::pack::{AssetClass, Pack};
 use crate::sfx;
 use crate::state::RoomId;
 
@@ -186,50 +187,53 @@ pub struct BgmCache {
 }
 
 impl BgmCache {
-    /// Load and parse the wav for the group-track `name`, caching hits and
+    /// Load and parse the track for the group-track `name`, caching hits and
     /// misses.
     ///
     /// `Bgm_*` names resolve through [`music::pack_path`]; every other group
     /// track (the `Se_*` tracks and the mixed dialogue `V110_00`) lives in the
     /// install's `sound/` directory and is read from `se/`, which conversion
     /// always packs for every group-track name.
+    ///
+    /// Both candidates resolve by *stem*, so a mod may replace either with
+    /// OGG Vorbis as well as WAV.
     pub fn load(&mut self, pack: &Pack, name: &str) -> Option<audio::Wav> {
         let mut candidates: Vec<String> = Vec::new();
         if let Some(path) = music::pack_path(name) {
-            candidates.push(path);
+            candidates.push(assets::stem(&path).to_string());
         }
-        let se = format!("se/{}.wav", name.to_ascii_lowercase());
+        let se = format!("se/{}", name.to_ascii_lowercase());
         if !candidates.iter().any(|path| path == &se) {
             candidates.push(se);
         }
 
-        for path in &candidates {
-            if let Some(wav) = self.wavs.get(path) {
+        for stem in &candidates {
+            if let Some(wav) = self.wavs.get(stem) {
                 return Some(wav.clone());
             }
         }
-        for path in &candidates {
-            if self.missing.contains(path) {
+        for stem in &candidates {
+            if self.missing.contains(stem) {
                 continue;
             }
-            let Ok(bytes) = pack.read(path) else {
+            let Ok(Some(asset)) = pack.read_asset(stem, AssetClass::Audio) else {
                 continue;
             };
-            match audio::parse_wav(&bytes) {
+            match assets::decode_audio(&asset) {
                 Ok(wav) => {
-                    self.wavs.insert(path.clone(), wav.clone());
+                    self.wavs.insert(stem.clone(), wav.clone());
                     return Some(wav);
                 }
                 Err(err) => {
-                    eprintln!("warning: invalid BGM track {path}: {err:#}");
+                    eprintln!("warning: invalid BGM track {}: {err:#}", asset.path());
                 }
             }
         }
         if let Some(first) = candidates.first() {
-            eprintln!("warning: missing BGM track {first}");
+            eprintln!("warning: missing BGM track {first}.wav");
         }
-        for path in candidates {
-            self.missing.insert(path);
+        for stem in candidates {
+            self.missing.insert(stem);
         }
         None
     }

@@ -16,30 +16,33 @@
 //! view of the current area; cancel returns to the browser and then closes
 //! the tab.
 //!
-//! The area/layout/room tables come from `map/tables.bin`, extracted from the
-//! executable by the converter exactly like the text tables. The full-display
-//! zoom animation and the objective highlight are deliberate approximations:
-//! the zoom is a single swap and the objective rule is transcribed from the
-//! scenario flags rather than extracted. A pack without the map entries leaves
-//! the tab blank with a warning.
+//! The area/layout/room tables come from the built-in [`MapTables::default`]
+//! values; a pack that carries `map/tables.bin` (an older conversion or a mod)
+//! overrides them. The full-display zoom animation and the objective highlight
+//! are deliberate approximations: the zoom is a single swap and the objective
+//! rule is transcribed from the scenario flags rather than extracted. A pack
+//! without the map art entries leaves the tab blank with a warning.
 //!
 //! Everything here is data-driven and draw-only: the room-flags/SCD bit that
 //! records a map pick-up is raised by [`crate::game::GameState::pick_up_map`].
 
 use anyhow::Result;
 
+use crate::assets;
 use crate::game::{self, GameState};
 use crate::model::Texture8;
 use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::state::Image;
-use crate::tim;
 
 use super::layout;
 use super::main_menu::MenuInput;
 
-/// Pack entry of the extracted map tables.
+/// Pack entry carrying the map bookkeeping tables; the built-ins are used
+/// when a pack has none.
 pub const TABLES_ENTRY: &str = "map/tables.bin";
+/// Pack stem of the map backdrop.
+pub const BLUE_STEM: &str = "map/blue";
 /// Pack entry of the map backdrop.
 pub const BLUE_ENTRY: &str = "map/blue.tim";
 /// The four browser floor-plan entries, indexed by layout. The browser loads
@@ -560,6 +563,20 @@ pub struct MapScreen {
     started: bool,
 }
 
+/// Load one map page by stem as indexed art.
+///
+/// The map browser composites its pages by palette index: the room markers
+/// are a fixed index range of the shipped art and the index-0 texels are the
+/// transparent key, so a replacement is re-indexed exactly and must keep the
+/// shipped page's dimensions.
+fn load_indexed(pack: &Pack, stem: &str) -> anyhow::Result<Texture8> {
+    let asset = pack
+        .read_asset(stem, crate::pack::AssetClass::Image)?
+        .ok_or_else(|| anyhow::anyhow!("missing {stem}"))?;
+    assets::decode_texture(&asset, assets::Geometry::Shipped)
+        .map_err(|err| err.context(format!("invalid {}", asset.path())))
+}
+
 impl MapScreen {
     /// Load the tables and art, and pick the initial view from `game`'s room.
     pub fn open(pack: &Pack, game: &GameState) -> Self {
@@ -567,14 +584,15 @@ impl MapScreen {
             Ok(data) => match MapTables::parse(&data) {
                 Ok(tables) => tables,
                 Err(err) => {
-                    eprintln!("warning: invalid {TABLES_ENTRY}: {err:#}; the map tab stays blank");
+                    eprintln!(
+                        "warning: invalid {TABLES_ENTRY}: {err:#}; the map tab uses the built-in tables"
+                    );
                     MapTables::default()
                 }
             },
-            Err(err) => {
-                eprintln!("warning: missing {TABLES_ENTRY}: {err:#}; the map tab stays blank");
-                MapTables::default()
-            }
+            // A converted pack carries no tables entry; the built-ins are the
+            // documented values.
+            Err(_) => MapTables::default(),
         };
         let mut screen = Self {
             tables,
@@ -602,16 +620,10 @@ impl MapScreen {
     }
 
     fn load_backdrop(&self, pack: &Pack) -> Option<Texture8> {
-        match pack.read(BLUE_ENTRY) {
-            Ok(bytes) => match tim::decode_8bpp(&bytes) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    eprintln!("warning: invalid {BLUE_ENTRY}: {err:#}");
-                    None
-                }
-            },
+        match load_indexed(pack, BLUE_STEM) {
+            Ok(texture) => Some(texture),
             Err(err) => {
-                eprintln!("warning: missing {BLUE_ENTRY}: {err:#}; the map tab stays blank");
+                eprintln!("warning: no map backdrop: {err:#}; the map tab stays blank");
                 None
             }
         }
@@ -627,17 +639,11 @@ impl MapScreen {
         if self.art_layout == layout as u8 {
             return;
         }
-        let entry = TAB_ENTRIES[layout];
-        self.art = match pack.read(entry) {
-            Ok(bytes) => match tim::decode_8bpp(&bytes) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    eprintln!("warning: invalid {entry}: {err:#}");
-                    None
-                }
-            },
+        let stem = assets::stem(TAB_ENTRIES[layout]);
+        self.art = match load_indexed(pack, stem) {
+            Ok(texture) => Some(texture),
             Err(err) => {
-                eprintln!("warning: missing {entry}: {err:#}; the map tab stays blank");
+                eprintln!("warning: no map page {stem}: {err:#}; the map tab stays blank");
                 None
             }
         };
@@ -647,17 +653,11 @@ impl MapScreen {
     /// Load the full-display plan of `area` on first use.
     fn load_display(&mut self, pack: &Pack, area: usize) {
         if self.display[area].is_none() {
-            let entry = AREA_ENTRIES[area];
-            self.display[area] = match pack.read(entry) {
-                Ok(bytes) => match tim::decode_8bpp(&bytes) {
-                    Ok(texture) => Some(texture),
-                    Err(err) => {
-                        eprintln!("warning: invalid {entry}: {err:#}");
-                        None
-                    }
-                },
+            let stem = assets::stem(AREA_ENTRIES[area]);
+            self.display[area] = match load_indexed(pack, stem) {
+                Ok(texture) => Some(texture),
                 Err(err) => {
-                    eprintln!("warning: missing {entry}: {err:#}; the map display stays blank");
+                    eprintln!("warning: no map plan {stem}: {err:#}; the map display stays blank");
                     None
                 }
             };

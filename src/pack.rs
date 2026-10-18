@@ -471,6 +471,112 @@ struct Entry {
     compression: Compression,
 }
 
+/// The asset classes a stem lookup resolves, with their replacement formats.
+///
+/// A loader looks an asset up by its *stem* (the entry path without its
+/// extension) and one of these classes. The winning layer is decided by
+/// `(load_order, id)` exactly like an exact-path lookup; within that layer the
+/// first extension of the class present wins, so a higher layer's PNG beats a
+/// lower layer's WebP and a mod's WebP beats its own PNG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssetClass {
+    /// Replacement art, highest priority first: `webp > png > bmp > tim > pix`.
+    Image,
+    /// Replacement audio, highest priority first: `ogg > wav`.
+    Audio,
+}
+
+impl AssetClass {
+    /// The accepted extensions, highest priority first.
+    pub const fn extensions(self) -> &'static [&'static str] {
+        match self {
+            Self::Image => &["webp", "png", "bmp", "tim", "pix"],
+            Self::Audio => &["ogg", "wav"],
+        }
+    }
+}
+
+/// One resolved copy of an asset entry: its path and readable bytes.
+#[derive(Debug)]
+pub struct AssetCopy<'a> {
+    path: &'a str,
+    data: Cow<'a, [u8]>,
+}
+
+impl<'a> AssetCopy<'a> {
+    /// The entry path with its original case and `/` separators.
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+
+    /// The readable bytes: borrowed when raw, decompressed when zstd.
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// The entry's extension in ASCII lowercase, without the dot.
+    pub fn extension(&self) -> String {
+        extension_of(self.path)
+    }
+}
+
+/// An asset resolved by stem through [`Pack::read_asset`].
+///
+/// The winning copy is the first the layered lookup finds; `shadowed` is the
+/// next copy in resolution order, when one exists, so a decoder that must keep
+/// the shipped geometry can read it.
+#[derive(Debug)]
+pub struct PackAsset<'a> {
+    winner: AssetCopy<'a>,
+    shadowed: Option<(&'a Pack, &'a Entry)>,
+}
+
+impl<'a> PackAsset<'a> {
+    /// The winning entry's path, with its original case and extension.
+    pub fn path(&self) -> &'a str {
+        self.winner.path
+    }
+
+    /// The winning entry's readable bytes.
+    pub fn data(&self) -> &[u8] {
+        self.winner.data()
+    }
+
+    /// The winning entry's extension in ASCII lowercase, without the dot.
+    pub fn extension(&self) -> String {
+        self.winner.extension()
+    }
+
+    /// Read the shadowed copy the winner replaces, decompressing it on demand.
+    ///
+    /// The copy is the next candidate in resolution order: the winning layer's
+    /// next-priority extension, or a lower layer's best, or nothing when the
+    /// winner is the only copy.
+    pub fn shadowed(&self) -> Result<Option<AssetCopy<'a>>> {
+        let Some((layer, entry)) = self.shadowed else {
+            return Ok(None);
+        };
+        let data = entry_bytes(&layer.data, entry)
+            .with_context(|| format!("failed to read asset entry {}", entry.path))?;
+        Ok(Some(AssetCopy {
+            path: &entry.path,
+            data,
+        }))
+    }
+}
+
+/// The extension of an entry path in ASCII lowercase, without the dot.
+///
+/// Only the last path component is considered, so a directory with a dot in
+/// its name cannot be mistaken for an extension.
+pub fn extension_of(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    match name.rfind('.') {
+        Some(dot) if dot != 0 && dot + 1 < name.len() => name[dot + 1..].to_ascii_lowercase(),
+        _ => String::new(),
+    }
+}
+
 /// A parsed `.akpak` pack, optionally layered over by mod packs.
 ///
 /// A plain [`Pack::open`] holds one pack image; [`Pack::open_layered`] adds an
@@ -754,6 +860,80 @@ impl Pack {
     /// Whether an entry with this path exists, ignoring ASCII case.
     pub fn contains(&self, path: &str) -> bool {
         self.winner(path).is_some()
+    }
+
+    /// Whether any layer holds a copy of the asset stem `stem` in `class`.
+    ///
+    /// This is the existence test of [`Pack::read_asset`] without reading the
+    /// bytes, so a caller can pick between fallbacks without paying for a
+    /// decompression it may not use.
+    pub fn has_asset(&self, stem: &str, class: AssetClass) -> bool {
+        let stem = stem.to_ascii_lowercase();
+        self.asset_layers()
+            .into_iter()
+            .any(|layer| layer.class_entry(&stem, class).is_some())
+    }
+
+    /// Read the winning copy of the asset stem `stem` in `class`.
+    ///
+    /// The stem is the entry path without its extension (`roomcut/100_000`,
+    /// `bgm/013`). Layers resolve last to first exactly like [`Pack::read`],
+    /// so a mod's copy wins whatever its format; within the winning layer the
+    /// class's extension priority decides, so a layer that ships both
+    /// `x.png` and `x.webp` resolves to the WebP. `Ok(None)` means no layer
+    /// holds the stem in this class.
+    ///
+    /// The resolved asset also carries the next copy in that same order — the
+    /// winning layer's next-priority extension or a lower layer's best — so a
+    /// decoder that must keep the shipped geometry can read it.
+    pub fn read_asset(&self, stem: &str, class: AssetClass) -> Result<Option<PackAsset<'_>>> {
+        let stem = stem.to_ascii_lowercase();
+        let mut winner: Option<AssetCopy<'_>> = None;
+        let mut shadowed: Option<(&Pack, &Entry)> = None;
+        'candidates: for layer in self.asset_layers() {
+            for extension in class.extensions() {
+                let Some(entry) = layer.stem_entry(&stem, extension) else {
+                    continue;
+                };
+                if winner.is_none() {
+                    let data = entry_bytes(&layer.data, entry)
+                        .with_context(|| format!("failed to read asset entry {}", entry.path))?;
+                    winner = Some(AssetCopy {
+                        path: &entry.path,
+                        data,
+                    });
+                } else {
+                    shadowed = Some((layer, entry));
+                    break 'candidates;
+                }
+            }
+        }
+        Ok(winner.map(|winner| PackAsset { winner, shadowed }))
+    }
+
+    /// The layers in lookup order: overlays last-applied first, then the base.
+    fn asset_layers(&self) -> Vec<&Pack> {
+        let mut layers: Vec<&Pack> = Vec::with_capacity(1 + self.overlays.len());
+        layers.extend(self.overlays.iter().rev());
+        layers.push(self);
+        layers
+    }
+
+    /// The entry `stem` resolves to in this single layer for one extension.
+    fn stem_entry(&self, stem: &str, extension: &str) -> Option<&Entry> {
+        // The caller has lowercased the stem, and the class's extensions are
+        // lowercase literals, so the key needs no further normalisation.
+        debug_assert!(!stem.bytes().any(|byte| byte.is_ascii_uppercase()));
+        let key = format!("{stem}.{extension}");
+        self.lookup.get(&key).map(|&index| &self.entries[index])
+    }
+
+    /// The entry a whole class resolves to in this single layer.
+    fn class_entry(&self, stem: &str, class: AssetClass) -> Option<&Entry> {
+        class
+            .extensions()
+            .iter()
+            .find_map(|extension| self.stem_entry(stem, extension))
     }
 
     /// Read an entry's data, looking the path up ignoring ASCII case.
@@ -1523,6 +1703,15 @@ mod tests {
         writer.write(path).unwrap();
     }
 
+    /// A pack holding exactly these entries.
+    fn pack_of(entries: &[(&str, &[u8])]) -> Pack {
+        let mut writer = PackWriter::new();
+        for (entry, data) in entries {
+            writer.add(entry, data.to_vec()).unwrap();
+        }
+        Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+    }
+
     /// The rendered bytes of a mod manifest.
     fn mod_manifest(id: &str, base: &str, load_order: i32) -> Vec<u8> {
         manifest::Manifest {
@@ -1854,6 +2043,122 @@ mod tests {
         );
         assert_eq!(plain.manifest(), None);
         assert!(memory.manifest().is_none());
+    }
+
+    #[test]
+    fn asset_stems_resolve_by_extension_priority() {
+        let pack = pack_of(&[
+            ("roomcut/100_000.bmp", b"bmp"),
+            ("roomcut/100_000.png", b"png"),
+            ("roomcut/100_000.webp", b"webp"),
+            ("roomcut/100_001.bmp", b"bmp-only"),
+            ("roomcut/100_002.tim", b"tim"),
+            ("roomcut/100_002.pix", b"pix"),
+        ]);
+        let asset = pack
+            .read_asset("roomcut/100_000", AssetClass::Image)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.path(), "roomcut/100_000.webp");
+        assert_eq!(asset.data(), b"webp");
+        assert_eq!(asset.extension(), "webp");
+        // The shadowed copy is the next candidate in the same order.
+        assert_eq!(
+            asset.shadowed().unwrap().unwrap().path(),
+            "roomcut/100_000.png"
+        );
+        assert_eq!(
+            pack.read_asset("roomcut/100_001", AssetClass::Image)
+                .unwrap()
+                .unwrap()
+                .data(),
+            b"bmp-only"
+        );
+        // A lower-priority extension still resolves when it is the only one.
+        let asset = pack
+            .read_asset("roomcut/100_002", AssetClass::Image)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.path(), "roomcut/100_002.tim");
+        assert_eq!(
+            asset.shadowed().unwrap().unwrap().path(),
+            "roomcut/100_002.pix"
+        );
+        assert!(
+            pack.read_asset("roomcut/999", AssetClass::Image)
+                .unwrap()
+                .is_none()
+        );
+        // Case is ignored on the stem as everywhere else.
+        assert_eq!(
+            pack.read_asset("ROOMCUT/100_000", AssetClass::Image)
+                .unwrap()
+                .unwrap()
+                .path(),
+            "roomcut/100_000.webp"
+        );
+        // An entry of another class does not resolve.
+        assert!(
+            pack.read_asset("roomcut/100_000", AssetClass::Audio)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pack.has_asset("roomcut/100_000", AssetClass::Image));
+        assert!(!pack.has_asset("roomcut/100_003", AssetClass::Image));
+    }
+
+    #[test]
+    fn layers_win_before_extension_priority() {
+        let dir = TempDir::new("asset-layers");
+        let base = dir.join("base.akpak");
+        let mod_a = dir.join("mod.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[
+                (manifest::ENTRY, &base_manifest),
+                ("roomcut/100_000.webp", b"base-webp"),
+                ("bgm/013.wav", b"base-wav"),
+            ],
+        );
+        write_pack(
+            &mod_a,
+            &[
+                (manifest::ENTRY, &mod_manifest("a", "base", 0)),
+                ("roomcut/100_000.bmp", b"mod-bmp"),
+                ("bgm/013.ogg", b"mod-ogg"),
+            ],
+        );
+
+        let layered = Pack::open_layered(&base, &[mod_a]).unwrap();
+        // The mod's lower-priority BMP beats the base's WebP: the override is
+        // decided per layer first.
+        let asset = layered
+            .read_asset("roomcut/100_000", AssetClass::Image)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.path(), "roomcut/100_000.bmp");
+        assert_eq!(
+            asset.shadowed().unwrap().unwrap().path(),
+            "roomcut/100_000.webp"
+        );
+        let asset = layered
+            .read_asset("bgm/013", AssetClass::Audio)
+            .unwrap()
+            .unwrap();
+        assert_eq!(asset.path(), "bgm/013.ogg");
+        assert_eq!(asset.shadowed().unwrap().unwrap().path(), "bgm/013.wav");
+        // `has_asset` sees the same resolution without reading any bytes.
+        assert!(layered.has_asset("bgm/013", AssetClass::Audio));
+        assert!(!layered.has_asset("bgm/999", AssetClass::Audio));
+    }
+
+    #[test]
+    fn an_unreadable_asset_entry_is_an_error() {
+        let mut bytes = single_entry_pack("a.webp", b"not a zstd frame");
+        bytes[HEADER_LEN + 24] = 1;
+        let pack = Pack::from_bytes(bytes).unwrap();
+        assert!(pack.read_asset("a", AssetClass::Image).is_err());
     }
 
     #[test]

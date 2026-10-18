@@ -14,15 +14,14 @@
 //! engine's Tab cycle can still land on them, where map is inert and the radio
 //! uses the carried radio through the scenario flag.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
+use crate::assets::Artwork;
 use crate::font::Tint;
 use crate::game::GameState;
-use crate::model::Texture8;
 use crate::pack::Pack;
 use crate::render::Framebuffer;
 use crate::text::Text;
-use crate::tim;
 
 use super::main_menu::{MenuAssets, MenuInput};
 
@@ -221,26 +220,26 @@ pub fn title_x(entry: u8) -> i16 {
 
 /// The document reader's loaded art.
 pub struct FileAssets {
-    /// The two book covers (`file000.tim`, `file001.tim`).
-    pub covers: [Texture8; 2],
+    /// The two book covers (`file000`, `file001`).
+    pub covers: [Artwork; 2],
     /// The 14 FILEI backdrops in [`JPN_FILEI_INDEX`] order.
-    pub filei: Vec<Texture8>,
+    pub filei: Vec<Artwork>,
     /// The 43 TEXTM page packs in [`JPN_TEXTM_NAMES`] order.
-    pub textm: Vec<Texture8>,
+    pub textm: Vec<Artwork>,
 }
 
 impl FileAssets {
     /// Load every cover, backdrop and page pack from `pack`.
     pub fn load(pack: &Pack) -> Result<Self> {
-        let cover0 = decode(pack, "file/file000.tim")?;
-        let cover1 = decode(pack, "file/file001.tim")?;
+        let cover0 = decode(pack, "file/file000")?;
+        let cover1 = decode(pack, "file/file001")?;
         let filei = JPN_FILEI_NAMES
             .iter()
-            .map(|name| decode(pack, &format!("file/{name}.tim")))
+            .map(|name| decode(pack, &format!("file/{name}")))
             .collect::<Result<Vec<_>>>()?;
         let textm = JPN_TEXTM_NAMES
             .iter()
-            .map(|name| decode(pack, &format!("file/{name}.tim")))
+            .map(|name| decode(pack, &format!("file/{name}")))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             covers: [cover0, cover1],
@@ -250,21 +249,18 @@ impl FileAssets {
     }
 
     /// The backdrop of document `entry`.
-    pub fn backdrop(&self, entry: u8) -> Option<&Texture8> {
+    pub fn backdrop(&self, entry: u8) -> Option<&Artwork> {
         self.filei.get(filei_index(entry)?)
     }
 
     /// The page pack holding half-page `page` of document `entry`.
-    pub fn page(&self, entry: u8, page: u8) -> Option<&Texture8> {
+    pub fn page(&self, entry: u8, page: u8) -> Option<&Artwork> {
         self.textm.get(page_index(entry, page)?)
     }
 }
 
-fn decode(pack: &Pack, entry: &str) -> Result<Texture8> {
-    let bytes = pack
-        .read(entry)
-        .with_context(|| format!("missing {entry}"))?;
-    tim::decode_8bpp(&bytes).with_context(|| format!("invalid {entry}"))
+fn decode(pack: &Pack, stem: &str) -> Result<Artwork> {
+    super::load_page(pack, stem)
 }
 
 /// Which view owns the FILE tab.
@@ -1017,7 +1013,7 @@ impl FileScreen {
             .covers
             .get(usize::from(self.book))
             .unwrap_or(&assets.covers[0]);
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             cover,
             [0, 0, i32::from(COVER_SIZE[0]), i32::from(COVER_SIZE[1])],
             [
@@ -1145,18 +1141,12 @@ impl FileScreen {
                 // byte as their colour, which over the black backdrop comes out
                 // as `colour * ramp / 255`: the fully ramped pieces sit at 50%.
                 for (src, dst) in READER_FRAME_PIECES {
-                    framebuffer.draw_indexed_sprite_ramp(
-                        backdrop,
-                        src,
-                        dst,
-                        0,
-                        self.reader_backdrop,
-                    );
+                    framebuffer.draw_page_sprite_ramp(backdrop, src, dst, 0, self.reader_backdrop);
                 }
             }
             if let Some(page) = assets.page(entry, self.page) {
                 let half = page_half(self.page);
-                framebuffer.draw_indexed_sprite(
+                framebuffer.draw_page_sprite(
                     page,
                     [0, half, i32::from(PAGE_SIZE[0]), i32::from(PAGE_SIZE[1])],
                     [
@@ -1212,7 +1202,7 @@ impl FileScreen {
             } else {
                 0x20
             } * 2;
-            framebuffer.draw_indexed_sprite_scaled(
+            framebuffer.draw_page_sprite_scaled(
                 &menu.status,
                 [0x80, 0x88, 0x18, 0x10],
                 [i32::from(EXIT_POS[0]), i32::from(EXIT_POS[1]), 0x18, 0x10],
@@ -1231,8 +1221,8 @@ fn slot_position(slot: u8) -> [i16; 2] {
     ]
 }
 
-fn draw_uv(framebuffer: &mut Framebuffer, texture: &Texture8, src: [i32; 4], pos: [i16; 2]) {
-    framebuffer.draw_indexed_sprite(
+fn draw_uv(framebuffer: &mut Framebuffer, texture: &Artwork, src: [i32; 4], pos: [i16; 2]) {
+    framebuffer.draw_page_sprite(
         texture,
         src,
         [i32::from(pos[0]), i32::from(pos[1]), src[2], src[3]],

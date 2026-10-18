@@ -22,14 +22,12 @@
 use anyhow::Result;
 
 use crate::anim::{self, Mat4x3};
-use crate::bmp;
+use crate::assets::{Artwork, Geometry};
 use crate::ending::{self, CREDIT_ENTRIES, EndStats, EndingRow, SlotKind};
 use crate::font::{GLYPH_HEIGHT, Tint};
 use crate::ivm::{self, Ivm};
-use crate::model::Texture8;
 use crate::render::{Camera, Framebuffer};
 use crate::state::Image;
-use crate::tim;
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 
@@ -71,12 +69,12 @@ fn shade_scale(shade: u8) -> u8 {
 /// The RESULT screen's character backdrop, the "escaped" still from the run's
 /// clear count: the already-cleared-once bit (0x7B) swaps in the alternate
 /// stills (`EndingScreen.cpp:875-898`).
-fn backdrop_entry(character: u8, second_playthrough: bool) -> &'static str {
+fn backdrop_stem(character: u8, second_playthrough: bool) -> &'static str {
     match (character & 1 == 0, second_playthrough) {
-        (true, false) => "ui/chris02.bmp",
-        (false, false) => "ui/jill02.bmp",
-        (true, true) => "ui/clis01.bmp",
-        (false, true) => "ui/jill01.bmp",
+        (true, false) => "ui/chris02",
+        (false, false) => "ui/jill02",
+        (true, true) => "ui/clis01",
+        (false, true) => "ui/jill01",
     }
 }
 
@@ -184,7 +182,7 @@ impl PlateSlot {
     fn draw(
         &self,
         framebuffer: &mut Framebuffer,
-        texture: Option<&Texture8>,
+        texture: Option<&Artwork>,
         font: Option<&crate::font::Font>,
         bytes: &[u8],
     ) {
@@ -201,7 +199,7 @@ impl PlateSlot {
                 let Some(texture) = texture else {
                     return;
                 };
-                framebuffer.draw_indexed_sprite_scaled(
+                framebuffer.draw_page_sprite_scaled(
                     texture,
                     [
                         0,
@@ -292,7 +290,7 @@ pub struct ResultScreen {
     /// (`EndingScreen.cpp:875-898`).
     second_playthrough: bool,
     row: EndingRow,
-    plate: Option<Texture8>,
+    plate: Option<Artwork>,
     backdrop: Option<Image>,
     /// The type-1 screen-colour slot: its fade drives the backdrop/screen.
     background: PlateSlot,
@@ -392,36 +390,24 @@ impl ResultScreen {
 
 impl Screen for ResultScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
-        let plate_entry = if self.row.background {
-            "ui/en07.tim"
+        let plate_stem = if self.row.background {
+            "ui/en07"
         } else {
-            "ui/en05.tim"
+            "ui/en05"
         };
-        self.plate = match cx.pack.read(plate_entry) {
-            Ok(bytes) => match tim::decode_4bpp(&bytes) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    eprintln!("warning: invalid {plate_entry}: {err:#}");
-                    None
-                }
-            },
+        self.plate = match super::load_page(cx.pack, plate_stem) {
+            Ok(art) => Some(art),
             Err(err) => {
-                eprintln!("warning: missing {plate_entry}: {err:#}");
+                eprintln!("warning: no result plate: {err:#}");
                 None
             }
         };
         if self.row.background {
-            let entry = backdrop_entry(self.stats.character, self.second_playthrough);
-            self.backdrop = match cx.pack.read(entry) {
-                Ok(bytes) => match bmp::decode(&bytes) {
-                    Ok(image) => Some(image),
-                    Err(err) => {
-                        eprintln!("warning: invalid {entry}: {err:#}");
-                        None
-                    }
-                },
+            let stem = backdrop_stem(self.stats.character, self.second_playthrough);
+            self.backdrop = match super::load_picture(cx.pack, stem, Geometry::Free, None) {
+                Ok(image) => Some(image),
                 Err(err) => {
-                    eprintln!("warning: missing {entry}: {err:#}");
+                    eprintln!("warning: no result backdrop: {err:#}");
                     None
                 }
             };
@@ -571,12 +557,10 @@ impl Screen for ResultScreen {
             [0, 0, 0, 255],
         );
         if let Some(backdrop) = &self.backdrop {
-            framebuffer.draw_rgba_sprite_scaled(
-                backdrop,
-                [0, 0, backdrop.width as i32, backdrop.height as i32],
-                [0, 0, backdrop.width as i32, backdrop.height as i32],
-                shade_scale(self.background.shade()),
-            );
+            // A full-frame still is stretched, so a replacement may be any
+            // size; for the shipped 320x240 page this is a 1:1 blit.
+            let shade = shade_scale(self.background.shade());
+            framebuffer.draw_background(backdrop, [0, 0], [shade, shade, shade]);
         }
         let plate = self.plate.as_ref();
         let font = cx.font;
@@ -598,7 +582,7 @@ impl Screen for ResultScreen {
 /// The rocket-launcher epilogue state machine.
 pub struct EpilogueScreen {
     backdrop: Option<Image>,
-    plate: Option<Texture8>,
+    plate: Option<Artwork>,
     captions: [PlateSlot; 2],
     model: Option<Ivm>,
     spin: i16,
@@ -693,29 +677,17 @@ impl Default for EpilogueScreen {
 
 impl Screen for EpilogueScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
-        self.backdrop = match cx.pack.read("ui/rc1121.bmp") {
-            Ok(bytes) => match bmp::decode(&bytes) {
-                Ok(image) => Some(image),
-                Err(err) => {
-                    eprintln!("warning: invalid ui/rc1121.bmp: {err:#}");
-                    None
-                }
-            },
+        self.backdrop = match super::load_picture(cx.pack, "ui/rc1121", Geometry::Free, None) {
+            Ok(image) => Some(image),
             Err(err) => {
-                eprintln!("warning: missing ui/rc1121.bmp: {err:#}");
+                eprintln!("warning: no epilogue backdrop: {err:#}");
                 None
             }
         };
-        self.plate = match cx.pack.read("ui/en07.tim") {
-            Ok(bytes) => match tim::decode_4bpp(&bytes) {
-                Ok(texture) => Some(texture),
-                Err(err) => {
-                    eprintln!("warning: invalid ui/en07.tim: {err:#}");
-                    None
-                }
-            },
+        self.plate = match super::load_page(cx.pack, "ui/en07") {
+            Ok(art) => Some(art),
             Err(err) => {
-                eprintln!("warning: missing ui/en07.tim: {err:#}");
+                eprintln!("warning: no epilogue plate: {err:#}");
                 None
             }
         };
@@ -779,12 +751,8 @@ impl Screen for EpilogueScreen {
             [0, 0, 0, 255],
         );
         if let Some(backdrop) = &self.backdrop {
-            framebuffer.draw_rgba_sprite_scaled(
-                backdrop,
-                [0, 0, backdrop.width as i32, backdrop.height as i32],
-                [0, 0, backdrop.width as i32, backdrop.height as i32],
-                shade_scale(fade_shade(EPILOGUE_BACKDROP_FADE)),
-            );
+            let shade = shade_scale(fade_shade(EPILOGUE_BACKDROP_FADE));
+            framebuffer.draw_background(backdrop, [0, 0], [shade, shade, shade]);
         }
         let plate = self.plate.as_ref();
         for slot in &self.captions {
@@ -913,10 +881,10 @@ mod tests {
 
     #[test]
     fn the_cleared_once_bit_swaps_the_backdrops() {
-        assert_eq!(backdrop_entry(0, false), "ui/chris02.bmp");
-        assert_eq!(backdrop_entry(1, false), "ui/jill02.bmp");
-        assert_eq!(backdrop_entry(0, true), "ui/clis01.bmp");
-        assert_eq!(backdrop_entry(1, true), "ui/jill01.bmp");
+        assert_eq!(backdrop_stem(0, false), "ui/chris02");
+        assert_eq!(backdrop_stem(1, false), "ui/jill02");
+        assert_eq!(backdrop_stem(0, true), "ui/clis01");
+        assert_eq!(backdrop_stem(1, true), "ui/jill01");
         // The epilogue's fixed backdrop shade (`s_bgSlot->fadeLevel` 0x6000).
         assert_eq!(fade_shade(EPILOGUE_BACKDROP_FADE), 0x60);
         assert_eq!(shade_scale(fade_shade(EPILOGUE_BACKDROP_FADE)), 191);
