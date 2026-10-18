@@ -461,31 +461,23 @@ pub fn scene_sprites<'a>(scene: &GameplayScene<'a>) -> Sprites<'a> {
     // The shadows keep their perspective-correct UVs: each projected corner
     // goes back to clip space with `w` = its view Z. They blend towards the
     // tint by the page's coverage alpha, far to near.
-    let mut shadows: Vec<_> = scene
-        .shadows
-        .iter()
-        .filter_map(|shadow| render::shadow_polygon(shadow, camera))
-        .collect();
+    let mut shadows = render::shadow_polys(scene.shadows, camera);
     shadows.sort_by_key(|poly| std::cmp::Reverse(poly.key));
     for poly in &shadows {
         let first = sprites.vertices.len();
         let depth = key_depth(poly.key, camera.fov);
-        let colour = poly.tint.map(|channel| f32::from(channel) / 255.0);
-        let corner = |index: usize| {
-            let vertex = &poly.corners[index];
-            let w = (1.0 / vertex.inv_z) as f32;
-            let [nx, ny] = ndc(vertex.position[0] as f32, vertex.position[1] as f32);
+        let corner = |vertex: &crate::raster::GlVertex| {
+            let w = vertex.w;
+            let [nx, ny] = ndc(vertex.x, vertex.y);
             SpriteVertex {
                 clip: [nx * w, ny * w, depth * w, w],
-                uv: [vertex.u as f32, vertex.v as f32],
-                colour: [colour[0], colour[1], colour[2], 1.0],
+                uv: [vertex.u, vertex.v],
+                colour: vertex.color,
                 mode: SPRITE_SHADOW,
             }
         };
-        for index in 1..poly.corners.len() - 1 {
-            sprites
-                .vertices
-                .extend([corner(0), corner(index), corner(index + 1)]);
+        for triangle in &poly.triangles {
+            sprites.vertices.extend(triangle.iter().map(corner));
         }
         sprites
             .before
@@ -668,6 +660,7 @@ mod tests {
             textured: true,
             blend: false,
             raw_y: false,
+            uv_nudge: [0; 3],
             flat_color: None,
             quad: None,
         }
@@ -771,6 +764,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         };
         let stored = stored_camera_matrix(camera.from, camera.look_at);
         for room_object in [false, true] {
@@ -828,6 +823,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         };
         let camera = Camera::from_points([0, 0, -5000], [0, 0, 0], 500);
         let light = Lighting {

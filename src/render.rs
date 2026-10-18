@@ -1519,7 +1519,7 @@ impl Framebuffer {
         for item in items {
             match item {
                 SceneItem::Shadow(poly) => {
-                    self.rasterize_shadow(poly.texture, poly);
+                    self.rasterize_shadow(poly, &depth);
                 }
                 SceneItem::Triangle(triangle) => {
                     if let Some(texture) = textures.get(triangle.texture) {
@@ -1541,119 +1541,37 @@ impl Framebuffer {
         }
     }
 
-    /// Rasterize one clipped ground-shadow polygon.
-    ///
-    /// The convex ring is fanned into triangles and sampled nearest with
-    /// perspective-correct UVs, exactly like the model path. A texel's alpha
-    /// multiplies the destination towards the polygon's tint; a zero-alpha
-    /// texel is a hole and leaves the framebuffer untouched.
-    fn rasterize_shadow(&mut self, texture: &Image, poly: &ShadowPoly) {
-        if texture.width == 0 || texture.height == 0 || poly.corners.len() < 3 {
+    /// Rasterize one ground shadow (`MarniDrawTrianglesPersp`): the model
+    /// pipeline with bilinear sampling, depth tested but never written, and
+    /// alpha-blended by the texel's coverage times the vertex colour.
+    fn rasterize_shadow(&mut self, poly: &ShadowPoly, depth: &[u32]) {
+        let texture = poly.texture;
+        if texture.width == 0 || texture.height == 0 {
             return;
         }
-        for corner in 1..poly.corners.len() - 1 {
-            self.rasterize_shadow_triangle(texture, poly, [0, corner, corner + 1]);
-        }
-    }
-
-    fn rasterize_shadow_triangle(
-        &mut self,
-        texture: &Image,
-        poly: &ShadowPoly,
-        indices: [usize; 3],
-    ) {
-        let (a, b, c) = (
-            &poly.corners[indices[0]],
-            &poly.corners[indices[1]],
-            &poly.corners[indices[2]],
-        );
-        let area = (b.position[0] - a.position[0]) * (c.position[1] - a.position[1])
-            - (c.position[0] - a.position[0]) * (b.position[1] - a.position[1]);
-        if area == 0.0 {
-            return;
-        }
-
-        let min_x = a.position[0].min(b.position[0]).min(c.position[0]).floor() as i64;
-        let max_x = a.position[0].max(b.position[0]).max(c.position[0]).ceil() as i64;
-        let min_y = a.position[1].min(b.position[1]).min(c.position[1]).floor() as i64;
-        let max_y = a.position[1].max(b.position[1]).max(c.position[1]).ceil() as i64;
-        let min_x = min_x.max(0);
-        let min_y = min_y.max(0);
-        let max_x = max_x.min(i64::from(self.width) - 1);
-        let max_y = max_y.min(i64::from(self.height) - 1);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
         let width = self.width as usize;
-        for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let weight0 = ((b.position[0] - px) * (c.position[1] - py)
-                    - (c.position[0] - px) * (b.position[1] - py))
-                    / area;
-                let weight1 = ((c.position[0] - px) * (a.position[1] - py)
-                    - (a.position[0] - px) * (c.position[1] - py))
-                    / area;
-                let weight2 = 1.0 - weight0 - weight1;
-                // The fan's triangles share their diagonals; the top-left
-                // rule assigns a sample exactly on a shared edge to one of
-                // them, so the translucent quad is not blended twice along
-                // the seam.
-                let positive = area > 0.0;
-                let inside = |weight: f64, from: [f64; 2], to: [f64; 2]| {
-                    if weight > 1e-9 {
-                        true
-                    } else if weight < -1e-9 {
-                        false
-                    } else {
-                        top_left(from, to, positive)
-                    }
-                };
-                if !inside(weight0, b.position, c.position)
-                    || !inside(weight1, c.position, a.position)
-                    || !inside(weight2, a.position, b.position)
+        let rgba = &mut self.rgba;
+        for triangle in &poly.triangles {
+            crate::raster::draw_triangle(triangle, self.width, self.height, |fragment| {
+                let pixel = fragment.y * width + fragment.x;
+                if depth
+                    .get(pixel)
+                    .is_none_or(|&stored| fragment.depth > stored)
                 {
-                    continue;
+                    return;
                 }
-
-                let inv_z = weight0 * a.inv_z + weight1 * b.inv_z + weight2 * c.inv_z;
-                if inv_z.is_nan() || inv_z <= 0.0 {
-                    continue;
+                let texel = sample_bilinear(texture, fragment.u, fragment.v);
+                let Some(slot) = rgba.get_mut(pixel * 4..pixel * 4 + 4) else {
+                    return;
+                };
+                let alpha = unorm8(f32::from(texel[3]) * (1.0 / 255.0) * fragment.color[3]);
+                for (index, destination) in slot[..3].iter_mut().enumerate() {
+                    let source =
+                        unorm8(f32::from(texel[index]) * (1.0 / 255.0) * fragment.color[index]);
+                    *destination = blend_unorm8(source, *destination, alpha);
                 }
-                let u =
-                    (weight0 * a.u * a.inv_z + weight1 * b.u * b.inv_z + weight2 * c.u * c.inv_z)
-                        / inv_z;
-                let v =
-                    (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
-                        / inv_z;
-                let Some(texel_u) = wrap_texel(u * f64::from(texture.width), texture.width) else {
-                    continue;
-                };
-                let Some(texel_v) = wrap_texel(v * f64::from(texture.height), texture.height)
-                else {
-                    continue;
-                };
-                let texel = (texel_v as usize * texture.width as usize + texel_u as usize) * 4;
-                let Some(texel) = texture.rgba.get(texel..texel + 4) else {
-                    continue;
-                };
-                let alpha = i64::from(texel[3]);
-                if alpha == 0 {
-                    continue;
-                }
-                let offset = (y as usize * width + x as usize) * 4;
-                let Some(pixel) = self.rgba.get_mut(offset..offset + 4) else {
-                    continue;
-                };
-                for (channel, &tint) in pixel[..3].iter_mut().zip(&poly.tint) {
-                    *channel =
-                        ((i64::from(*channel) * (255 - alpha) + i64::from(tint) * alpha + 127)
-                            / 255) as u8;
-                }
-                pixel[3] = 255;
-            }
+                slot[3] = 255;
+            });
         }
     }
 
@@ -2073,9 +1991,11 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     // The shadows are submitted before the models, so a mask or triangle whose
     // rounded key ties one wins the tie the way the original's later
     // submission into the shared ordering table does.
-    for shadow in shadows {
-        collect_shadow(shadow, camera, &mut items);
-    }
+    items.extend(
+        shadow_polys(shadows, camera)
+            .into_iter()
+            .map(SceneItem::Shadow),
+    );
 
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
@@ -2213,113 +2133,188 @@ pub(crate) fn mask_quads(layer: &MaskLayer<'_>, offset: [i32; 2]) -> Vec<MaskQua
     quads
 }
 
-/// Project and clip one ground shadow into the scene list.
-///
-/// The four corners are yawed into world space exactly like the model's root
-/// joint, clipped against the camera's near plane and projected. The painter's
-/// key is the truncating integer mean of the four *unclipped* corner view Zs,
-/// the same quantity and units a triangle's [`Triangle::depth`] uses, so it
-/// goes through [`triangle_depth_key`] like every other scene key.
-fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<SceneItem<'a>>) {
-    if let Some(poly) = shadow_polygon(shadow, camera) {
-        items.push(SceneItem::Shadow(poly));
+/// Every ground shadow's projected commands in `DrawFadeSpr`'s queue order,
+/// the items [`collect_shadow`] submits to the painter's sort.
+pub(crate) fn shadow_polys<'a>(shadows: &[Shadow<'a>], camera: &Camera) -> Vec<ShadowPoly<'a>> {
+    let mut items = Vec::new();
+    for (layer, &index) in shadow_order(shadows, camera).iter().enumerate() {
+        collect_shadow(&shadows[index], layer as i32, camera, &mut items);
     }
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            SceneItem::Shadow(poly) => Some(poly),
+            _ => None,
+        })
+        .collect()
 }
 
-/// One ground shadow's near-clipped, projected polygon and painter's key, the
-/// item [`collect_shadow`] submits; `None` when nothing survives the clip.
-pub(crate) fn shadow_polygon<'a>(shadow: &Shadow<'a>, camera: &Camera) -> Option<ShadowPoly<'a>> {
+/// `DrawFadeSpr`'s queue order: a selection pass over the shadows' mean
+/// entity-corner depths (`RotAverage4`, clamped like the queue's sort key),
+/// swapping whole records.
+fn shadow_order(shadows: &[Shadow<'_>], camera: &Camera) -> Vec<usize> {
+    let keys: Vec<u32> = shadows
+        .iter()
+        .map(|shadow| {
+            let (rotation, t) = shadow_matrix(shadow, 0, camera);
+            let (left, right) = (
+                shadow.shift[0] - shadow.half_x,
+                shadow.shift[0] + shadow.half_x,
+            );
+            let (back, front) = (
+                shadow.shift[1] - shadow.half_z,
+                shadow.shift[1] + shadow.half_z,
+            );
+            let sum: i32 = [(left, front), (right, front), (left, back), (right, back)]
+                .iter()
+                .map(|&(x, z)| {
+                    let r = i32::from(rotation[2][0]) * x + i32::from(rotation[2][2]) * z;
+                    (((r + ((r >> 31) & 0xFFF)) >> 12) + t[2]) >> 2
+                })
+                .sum();
+            let depth = ((sum + ((sum >> 31) & 3)) >> 2) as u32;
+            if depth > 0xFEF { 0xFF0 } else { depth }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..shadows.len()).collect();
+    for a in 0..order.len() {
+        for b in a + 1..order.len() {
+            if keys[order[b]] < keys[order[a]] {
+                order.swap(a, b);
+            }
+        }
+    }
+    order
+}
+
+/// The shadow's composed matrix: `CompMatrix(g_RoomCameraData, local)` with
+/// `local` the identity yawed by the entity angle and translated to the
+/// ground point, lifted by `layer` steps of 2 so queued shadows never share a
+/// plane.
+fn shadow_matrix(shadow: &Shadow<'_>, layer: i32, camera: &Camera) -> ([[i16; 3]; 3], [i32; 3]) {
+    let local = anim::Mat4x3 {
+        r: crate::player::rot_matrix_y(shadow.angle),
+        t: [shadow.pos[0], shadow.pos[1] + 2 * layer, shadow.pos[2]],
+    };
+    ref_composed(camera, &local)
+}
+
+/// Project and clip one ground shadow into the scene list (`DrawFadeSpr`
+/// and `AddFadePoly`).
+///
+/// The drawn quad spans `+-halfW x +-halfH` from the record's corner 1, in
+/// the composed matrix's integer 4.12 arithmetic. It is clipped against view
+/// Z 128 along the edge ring 0->1->3->2 and projected with truncating integer
+/// divides. A pentagon becomes two four-corner commands, each drawn as the
+/// fan (0,1,2) + (0,2,3). The painter's key is the truncating mean of the four
+/// *unclipped* corner view Zs.
+fn collect_shadow<'a>(
+    shadow: &Shadow<'a>,
+    layer: i32,
+    camera: &Camera,
+    items: &mut Vec<SceneItem<'a>>,
+) {
+    const FADE_NEAR: i32 = 128;
     if shadow.texture.width == 0 || shadow.texture.height == 0 {
-        return None;
+        return;
     }
-    let entity = anim::entity_matrix(shadow.pos, shadow.angle);
-    let (left, right) = (
-        (shadow.shift[0] - shadow.half_x) as i16,
-        (shadow.shift[0] + shadow.half_x) as i16,
-    );
-    let (back, front) = (
-        (shadow.shift[1] - shadow.half_z) as i16,
-        (shadow.shift[1] + shadow.half_z) as i16,
-    );
-    let local = [
-        [left, 0, front],
-        [right, 0, front],
-        [left, 0, back],
-        [right, 0, back],
-    ];
-    let view: [[i32; 3]; 4] = local.map(|corner| camera.view_position(fixed_mul(&entity, corner)));
-
-    let mean_depth = view.iter().map(|vertex| i64::from(vertex[2])).sum::<i64>() / 4;
-
-    // The texture's v axis runs towards the entity's local -Z and u along +X,
-    // matching the viewport quad's UV orientation.
-    let uv = [[0.0, 0.0], [4096.0, 0.0], [0.0, 4096.0], [4096.0, 4096.0]];
-    // The corners are laid out (-x,+z) (+x,+z) (-x,-z) (+x,-z), so the quad's
-    // edges are 0->1->3->2. Walking 0->1->2->3 would be a bowtie whose
-    // diagonals clip at the wrong places.
-    let edge = [0usize, 1, 3, 2];
-    let mut polygon: Vec<ShadowVertex> = Vec::with_capacity(5);
-    let near = 2.0 * f64::from(camera.fov);
+    let half_w = shadow.shift[0] + shadow.half_x;
+    let half_h = shadow.shift[1] + shadow.half_z;
+    if half_w <= 0 || half_h <= 0 {
+        return;
+    }
+    let (rotation, t) = shadow_matrix(shadow, layer, camera);
+    let mut cvx = [0i32; 4];
+    let mut cvy = [0i32; 4];
+    let mut cvz = [0i32; 4];
+    let mut cu = [0i32; 4];
+    let mut cv = [0i32; 4];
     for corner in 0..4 {
-        let index = edge[corner];
-        let next = edge[(corner + 1) & 3];
-        let a = view[index];
-        let b = view[next];
-        let a_in = f64::from(a[2]) >= near;
-        let b_in = f64::from(b[2]) >= near;
+        let cx = if corner == 0 || corner == 2 {
+            -half_w
+        } else {
+            half_w
+        };
+        let cz = if corner == 0 || corner == 1 {
+            half_h
+        } else {
+            -half_h
+        };
+        let rotate = |row: usize| {
+            let r = i32::from(rotation[row][0]) * cx + i32::from(rotation[row][2]) * cz;
+            ((r + ((r >> 31) & 0xFFF)) >> 12) + t[row]
+        };
+        cvx[corner] = rotate(0);
+        cvy[corner] = rotate(1);
+        cvz[corner] = rotate(2);
+        cu[corner] = ((cx + half_w) << 12) / (2 * half_w);
+        cv[corner] = ((half_h - cz) << 12) / (2 * half_h);
+    }
+
+    let edge = [0usize, 1, 3, 2];
+    // (x, y, z, u, v) per clipped corner.
+    let mut ring: Vec<[i32; 5]> = Vec::with_capacity(5);
+    for step in 0..4 {
+        let (a, b) = (edge[step], edge[(step + 1) & 3]);
+        let (za, zb) = (cvz[a], cvz[b]);
+        let a_in = za >= FADE_NEAR;
         if a_in {
-            polygon.push(project_shadow_vertex(a, uv[index], shadow.lift, camera));
+            ring.push([cvx[a], cvy[a], za, cu[a], cv[a]]);
         }
-        if a_in != b_in {
-            let t = (near - f64::from(a[2])) / f64::from(b[2] - a[2]);
-            let lerp =
-                |axis: usize| f64::from(a[axis]) + (f64::from(b[axis]) - f64::from(a[axis])) * t;
-            let clipped = [lerp(0) as i32, lerp(1) as i32, lerp(2) as i32];
-            let uv_clipped = [
-                uv[index][0] + (uv[next][0] - uv[index][0]) * t,
-                uv[index][1] + (uv[next][1] - uv[index][1]) * t,
-            ];
-            polygon.push(project_shadow_vertex(
-                clipped,
-                uv_clipped,
-                shadow.lift,
-                camera,
-            ));
+        if a_in != (zb >= FADE_NEAR) {
+            let t = ((FADE_NEAR - za) << 12) / (zb - za);
+            let lerp = |from: i32, to: i32| from + (((to - from) * t) >> 12);
+            ring.push([
+                lerp(cvx[a], cvx[b]),
+                lerp(cvy[a], cvy[b]),
+                FADE_NEAR,
+                lerp(cu[a], cu[b]),
+                lerp(cv[a], cv[b]),
+            ]);
         }
     }
-    if polygon.len() < 3 {
-        return None;
+    if ring.is_empty() {
+        return;
     }
 
-    Some(ShadowPoly {
-        key: triangle_depth_key(mean_depth as f64),
-        corners: polygon,
+    let focal = camera.fov;
+    let lift = shadow.lift;
+    let t1 = t[1];
+    let color = shadow.tint.map(|byte| f32::from(byte) * (1.0 / 255.0));
+    let corner = |k: usize| {
+        let [vx, vy, vz, u, v] = ring[k];
+        let px = (vx * focal) / vz + CENTER_X + camera.screen[0];
+        let py = ((t1 + lift - (vy - t1)) * focal) / vz + CENTER_Y + camera.screen[1];
+        let wz = f32::from(vz.min(30000) as i16);
+        crate::raster::GlVertex {
+            x: f32::from(px as i16),
+            y: f32::from(py as i16),
+            depth: depth_ndc(wz),
+            w: wz,
+            u: f32::from(u as i16) * (1.0 / 4096.0),
+            v: f32::from(v as i16) * (1.0 / 4096.0),
+            color: [color[0], color[1], color[2], 1.0],
+        }
+    };
+    let last = ring.len() - 1;
+    let commands: &[[usize; 4]] = if ring.len() > 4 {
+        &[[0, 1, 2, 3], [0, 3, 4, 4]]
+    } else {
+        &[[0, 1, 2, 3]]
+    };
+    let mut triangles = Vec::with_capacity(4);
+    for command in commands {
+        let quad = command.map(|k| corner(k.min(last)));
+        triangles.push([quad[0], quad[1], quad[2]]);
+        triangles.push([quad[0], quad[2], quad[3]]);
+    }
+
+    let sort_z = (cvz[0] + cvz[1] + cvz[2] + cvz[3]) / 4;
+    items.push(SceneItem::Shadow(ShadowPoly {
+        key: triangle_depth_key(f64::from(sort_z.max(0))),
+        triangles,
         texture: shadow.texture,
-        tint: shadow.tint,
-    })
-}
-
-/// Project one view-space shadow vertex to screen space.
-///
-/// `lift` joins the primitive's translation row, the same displacement the
-/// original applies to the quad origin: the translation grows downwards, so a
-/// positive lift drops the vertex down the screen. u/v stay in the texture's
-/// 0..4096 space and are scaled to texels by the rasterizer. The frame's screen
-/// offset (the shake) shifts the projected vertex like every other scene
-/// primitive.
-fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camera) -> ShadowVertex {
-    let focal = f64::from(camera.fov);
-    let inv_z = 1.0 / f64::from(view[2]);
-    ShadowVertex {
-        position: [
-            f64::from(CENTER_X) + f64::from(view[0]) * focal * inv_z + f64::from(camera.screen[0]),
-            f64::from(CENTER_Y) - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z
-                + f64::from(camera.screen[1]),
-        ],
-        inv_z,
-        u: uv[0] / 4096.0,
-        v: uv[1] / 4096.0,
-    }
+    }));
 }
 
 /// A cut camera: a 4.12 view rotation, a world-unit translation and the cut's
@@ -2760,29 +2755,15 @@ struct Triangle {
     uv_nudge: [u8; 3],
 }
 
-/// One projected shadow vertex: screen position, inverse view Z and the
-/// normalized texture coordinates.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ShadowVertex {
-    pub(crate) position: [f64; 2],
-    pub(crate) inv_z: f64,
-    /// Texture u over `0..=1`; the rasterizer scales by the page width.
-    pub(crate) u: f64,
-    /// Texture v over `0..=1`; the rasterizer scales by the page height.
-    pub(crate) v: f64,
-}
-
-/// A ground shadow's clipped convex polygon, ready for rasterization.
+/// A ground shadow's projected commands, ready for rasterization.
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowPoly<'a> {
     /// Painter's key from [`triangle_depth_key`].
     pub(crate) key: u32,
-    /// Convex ring of three to five vertices in edge order.
-    pub(crate) corners: Vec<ShadowVertex>,
+    /// The commands' triangles in draw order.
+    pub(crate) triangles: Vec<[crate::raster::GlVertex; 3]>,
     /// The baked coverage page this polygon samples.
     pub(crate) texture: &'a Image,
-    /// The colour the quad blends towards.
-    pub(crate) tint: [u8; 3],
 }
 
 /// One mask sprite of a camera's page, ready for rasterization.
@@ -3127,22 +3108,9 @@ struct RefProjection {
 
 impl RefProjection {
     fn new(camera: &Camera, joint: &anim::Mat4x3) -> Self {
-        let mut view = stored_camera_matrix(camera.from, camera.look_at);
-        let mut view_t = apply_matrix_lv(&view, camera.from.map(i32::wrapping_neg));
-        if camera.mirrored {
-            // `entity_draw_mirror_reflection` composes a negated-X identity
-            // into the reflected camera, rotation and translation alike.
-            view[0] = view[0].map(|entry| -entry);
-            view_t[0] = -view_t[0];
-        }
-        // `MulMatrix0` stores shorts.
-        let rotation = mul_matrix0(&view, &joint.r).map(|row| row.map(|entry| entry as i16));
-        let moved = apply_matrix_lv(&view, joint.t);
-        let translation = [
-            moved[0].wrapping_add(view_t[0]),
-            moved[1].wrapping_add(view_t[1]).wrapping_neg(),
-            moved[2].wrapping_add(view_t[2]),
-        ];
+        let (rotation, mut translation) = ref_composed(camera, joint);
+        // `SetRotAndTransMatrix` negates the translation's Y.
+        translation[1] = translation[1].wrapping_neg();
         let focal = f64::from(camera.fov);
         Self {
             rotation: rotation.map(|row| row.map(|entry| f64::from(entry) / 4096.0)),
@@ -3175,6 +3143,24 @@ impl RefProjection {
             vz as f32,
         ))
     }
+}
+
+/// `CompMatrix(g_RoomCameraData, joint)`: the camera composed onto `joint`,
+/// as the 4.12 short rotation and the integer translation.
+fn ref_composed(camera: &Camera, joint: &anim::Mat4x3) -> ([[i16; 3]; 3], [i32; 3]) {
+    let mut view = stored_camera_matrix(camera.from, camera.look_at);
+    let mut view_t = apply_matrix_lv(&view, camera.from.map(i32::wrapping_neg));
+    if camera.mirrored {
+        // `entity_draw_mirror_reflection` composes a negated-X identity
+        // into the reflected camera, rotation and translation alike.
+        view[0] = view[0].map(|entry| -entry);
+        view_t[0] = -view_t[0];
+    }
+    // `MulMatrix0` stores shorts.
+    let rotation = mul_matrix0(&view, &joint.r).map(|row| row.map(|entry| entry as i16));
+    let moved = apply_matrix_lv(&view, joint.t);
+    let translation = std::array::from_fn(|axis| moved[axis].wrapping_add(view_t[axis]));
+    (rotation, translation)
 }
 
 /// A projected corner: screen position and view Z.
@@ -3454,39 +3440,60 @@ fn faces_camera(area: f64) -> bool {
     area > 0.0
 }
 
-/// Whether a boundary sample on the directed edge `from -> to` belongs to the
-/// triangle under the top-left fill rule.
-///
-/// `positive` is the winding of the triangle's screen-space area. Two
-/// triangles sharing an edge see it in opposite directions, so exactly one of
-/// them keeps the samples lying on it.
-fn top_left(from: [f64; 2], to: [f64; 2], positive: bool) -> bool {
-    let dx = to[0] - from[0];
-    let dy = to[1] - from[1];
-    if positive {
-        dy < 0.0 || (dy == 0.0 && dx > 0.0)
-    } else {
-        dy > 0.0 || (dy == 0.0 && dx < 0.0)
-    }
-}
-
 /// GL_NEAREST under CLAMP_TO_EDGE: the texel under a normalised coordinate.
 fn clamp_texel(coordinate: f32, size: u32) -> usize {
     ((coordinate * size as f32).floor().max(0.0) as usize).min(size as usize - 1)
-}
-
-/// Wrap a texture coordinate around one dimension.
-fn wrap_texel(coordinate: f64, size: u32) -> Option<u32> {
-    if size == 0 {
-        return None;
-    }
-    Some(coordinate.rem_euclid(f64::from(size)) as u32)
 }
 
 /// llvmpipe's float to unorm8 conversion: clamp, scale by 255 and round to
 /// nearest even.
 fn unorm8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8
+}
+
+/// llvmpipe's AoS bilinear fetch of an RGBA8 clamp-to-edge texture.
+///
+/// Each coordinate becomes 8.8 fixed point centred on the texels,
+/// `round(c * size * 256) - 128`; the integer part picks the two clamped
+/// neighbours and the low byte weights them. The lerps run in 16-bit lanes
+/// with llvmpipe's rounding (`lp_build_lerp` on normalised 8-bit values).
+fn sample_bilinear(texture: &Image, u: f32, v: f32) -> [u8; 4] {
+    let axis = |coordinate: f32, size: u32| {
+        let scaled = (coordinate * (size as f32 * 256.0)).round_ties_even();
+        let fixed = scaled.clamp(-(1 << 24) as f32, (1 << 24) as f32) as i32 - 128;
+        let whole = fixed >> 8;
+        let last = size as i32 - 1;
+        (
+            whole.clamp(0, last) as usize,
+            (whole + 1).clamp(0, last) as usize,
+            (fixed & 0xFF) as u16,
+        )
+    };
+    let (x0, x1, fx) = axis(u, texture.width);
+    let (y0, y1, fy) = axis(v, texture.height);
+    let width = texture.width as usize;
+    let fetch = |x: usize, y: usize, channel: usize| {
+        texture
+            .rgba
+            .get((y * width + x) * 4 + channel)
+            .copied()
+            .unwrap_or(0)
+    };
+    std::array::from_fn(|channel| {
+        let top = lerp_unorm8(fx, fetch(x0, y0, channel), fetch(x1, y0, channel));
+        let bottom = lerp_unorm8(fx, fetch(x0, y1, channel), fetch(x1, y1, channel));
+        lerp_unorm8(fy, top, bottom)
+    })
+}
+
+/// `lp_build_lerp` for normalised 8-bit values in 16-bit lanes: the weight
+/// times the wrapped difference, rounded by `0x7F` plus the product's bit 8,
+/// shifted down and added back modulo 256.
+fn lerp_unorm8(weight: u16, from: u8, to: u8) -> u8 {
+    let delta = u16::from(to).wrapping_sub(u16::from(from));
+    let mut product = weight.wrapping_mul(delta);
+    product = product.wrapping_add(0x7F + ((product & 0x100) >> 8));
+    u16::from(from).wrapping_add(product >> 8) as u8
 }
 
 /// llvmpipe's 8-bit normalised multiply, `round(a * b / 255)` (the
@@ -4130,20 +4137,20 @@ mod tests {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
         let mut plain = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut plain);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut plain);
         let mut camera = straight_camera();
         camera.screen = [4, -3];
         let mut shaken = Vec::new();
-        collect_shadow(&shadow, &camera, &mut shaken);
+        collect_shadow(&shadow, 0, &camera, &mut shaken);
         let [SceneItem::Shadow(plain)] = &plain[..] else {
             panic!("expected one plain shadow");
         };
         let [SceneItem::Shadow(shifted)] = &shaken[..] else {
             panic!("expected one shaken shadow");
         };
-        for (plain, shifted) in plain.corners.iter().zip(&shifted.corners) {
-            assert_eq!(shifted.position[0], plain.position[0] + 4.0);
-            assert_eq!(shifted.position[1], plain.position[1] - 3.0);
+        for (plain, shifted) in shadow_corners(plain).iter().zip(&shadow_corners(shifted)) {
+            assert_eq!(shifted.x, plain.x + 4.0);
+            assert_eq!(shifted.y, plain.y - 3.0);
         }
 
         let cut = Cut {
@@ -4638,43 +4645,42 @@ mod tests {
         }
     }
 
+    /// The ring corners of a single-command shadow: the fan (0,1,2) + (0,2,3).
+    fn shadow_corners(poly: &ShadowPoly) -> Vec<crate::raster::GlVertex> {
+        assert_eq!(poly.triangles.len(), 2);
+        let [first, second] = [poly.triangles[0], poly.triangles[1]];
+        assert_eq!(first[0], second[0]);
+        assert_eq!(first[2], second[1]);
+        vec![first[0], first[1], first[2], second[2]]
+    }
+
     #[test]
     fn shadow_projection_keeps_the_quad_edge_order_and_uvs() {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
-        // Half the depth keeps every corner in front of the near plane
-        // (z = 2 * fov = 400).
         let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
 
         let [SceneItem::Shadow(poly)] = &items[..] else {
             panic!("expected one shadow item, got {}", items.len());
         };
         assert_eq!(poly.key, 1000);
-        assert_eq!(poly.corners.len(), 4);
         // Edge order 0->1->3->2, so the corners come out
         // (-x,+z) (+x,+z) (+x,-z) (-x,-z) with v running towards local -Z.
         // The near edge is wider than the far edge and every corner sits on
-        // the horizon line of the unpitched camera.
+        // the horizon line of the unpitched camera, at truncated integer
+        // screen positions.
+        let corners = shadow_corners(poly);
         let expected = [
-            (83.07692307692308, 0.0, 0.0),
-            (236.92307692307693, 1.0, 0.0),
-            (302.85714285714283, 1.0, 1.0),
-            (17.142857142857142, 0.0, 1.0),
+            (84.0, 0.0, 0.0),
+            (236.0, 1.0, 0.0),
+            (302.0, 1.0, 1.0),
+            (18.0, 0.0, 1.0),
         ];
-        for (corner, (x, u, v)) in poly.corners.iter().zip(expected) {
-            assert!(
-                (corner.position[0] - x).abs() < 1.0,
-                "x {} != {x}",
-                corner.position[0]
-            );
-            assert!((corner.position[1] - 120.0).abs() < 1e-9);
-            assert!((corner.u - u).abs() < 1e-9, "u {} != {u}", corner.u);
-            assert!((corner.v - v).abs() < 1e-9, "v {} != {v}", corner.v);
+        for (corner, (x, u, v)) in corners.iter().zip(expected) {
+            assert_eq!((corner.x, corner.y, corner.u, corner.v), (x, 120.0, u, v));
+            assert_eq!(corner.color, [0.0, 0.0, 1.0 / 255.0, 1.0]);
         }
-        let far_width = poly.corners[1].position[0] - poly.corners[0].position[0];
-        let near_width = poly.corners[2].position[0] - poly.corners[3].position[0];
-        assert!(near_width > far_width, "{near_width} <= {far_width}");
     }
 
     #[test]
@@ -4682,13 +4688,14 @@ mod tests {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 1000], 500, 700, &texture);
         let mut unlifted = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut unlifted);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut unlifted);
         let mut lifted = Vec::new();
         collect_shadow(
             &Shadow {
                 lift: 100,
                 ..shadow
             },
+            0,
             &straight_camera(),
             &mut lifted,
         );
@@ -4697,12 +4704,12 @@ mod tests {
         else {
             panic!("expected shadow items");
         };
-        // A positive placement lift drops the quad down the screen:
-        // screen y = 120 - (view_y - lift) * f / z.
-        let expected = base.corners[0].position[1]
-            + 100.0 * f64::from(straight_camera().fov) * base.corners[0].inv_z;
-        assert!((raised.corners[0].position[1] - expected).abs() < 1e-9);
-        assert!(raised.corners[0].position[1] > base.corners[0].position[1]);
+        // A positive placement lift drops the quad down the screen by
+        // lift * f / z: 100 * 200 / 1699 at the far corner (the yaw matrix's
+        // 4095 diagonal truncates 700 to 699).
+        let (base, raised) = (shadow_corners(base)[0], shadow_corners(raised)[0]);
+        assert_eq!(base.w, 1699.0);
+        assert_eq!(raised.y - base.y, 11.0);
     }
 
     #[test]
@@ -4710,22 +4717,19 @@ mod tests {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 0], 500, 700, &texture);
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
 
         let [SceneItem::Shadow(poly)] = &items[..] else {
             panic!("expected one shadow item, got {}", items.len());
         };
-        // Corners 1 and 3 are behind the near plane (z = 2 * fov = 400); each
-        // clipped edge contributes one vertex on the plane.
-        assert_eq!(poly.corners.len(), 4);
-        for corner in &poly.corners {
-            assert!(corner.inv_z > 0.0);
-        }
-        // The clipped vertices land on the plane at screen x = 160 +/- 250.
-        assert!((poly.corners[2].position[0] - 410.0).abs() < 1.0);
-        assert!((poly.corners[2].inv_z - 1.0 / 400.0).abs() < 1e-9);
-        assert!((poly.corners[3].position[0] + 90.0).abs() < 1.0);
-        assert!((poly.corners[3].inv_z - 1.0 / 400.0).abs() < 1e-9);
+        // Corners 2 and 3 are behind the near plane (view z 128); each
+        // clipped edge contributes one vertex on the plane, at screen
+        // x = 160 +/- 499 * 200 / 128 and v = (699 - 128) / 1398, all
+        // truncated.
+        let corners = shadow_corners(poly);
+        assert_eq!([corners[2].x, corners[2].w], [939.0, 128.0]);
+        assert_eq!([corners[3].x, corners[3].w], [-619.0, 128.0]);
+        assert_eq!(corners[2].v, 1672.0 / 4096.0);
     }
 
     #[test]
@@ -4734,6 +4738,7 @@ mod tests {
         let mut items = Vec::new();
         collect_shadow(
             &shadow_at([0, 0, -5000], 500, 700, &texture),
+            0,
             &straight_camera(),
             &mut items,
         );
@@ -4746,6 +4751,7 @@ mod tests {
         };
         collect_shadow(
             &shadow_at([0, 0, 1000], 500, 700, &empty),
+            0,
             &straight_camera(),
             &mut items,
         );
@@ -4754,37 +4760,31 @@ mod tests {
 
     /// A shadow polygon covering screen (10,10)..(20,20), sampling `texture`.
     fn shadow_poly(texture: &Image) -> ShadowPoly<'_> {
+        let corner = |x: f32, y: f32, u: f32, v: f32| crate::raster::GlVertex {
+            x,
+            y,
+            depth: depth_ndc(1000.0),
+            w: 1000.0,
+            u,
+            v,
+            color: [0.0, 0.0, 1.0 / 255.0, 1.0],
+        };
+        let quad = [
+            corner(10.0, 10.0, 0.0, 0.0),
+            corner(20.0, 10.0, 1.0, 0.0),
+            corner(20.0, 20.0, 1.0, 1.0),
+            corner(10.0, 20.0, 0.0, 1.0),
+        ];
         ShadowPoly {
             key: 1000,
-            corners: vec![
-                ShadowVertex {
-                    position: [10.0, 10.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 0.0,
-                    v: 0.0,
-                },
-                ShadowVertex {
-                    position: [20.0, 10.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 1.0,
-                    v: 0.0,
-                },
-                ShadowVertex {
-                    position: [20.0, 20.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 1.0,
-                    v: 1.0,
-                },
-                ShadowVertex {
-                    position: [10.0, 20.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 0.0,
-                    v: 1.0,
-                },
-            ],
+            triangles: vec![[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]],
             texture,
-            tint: [0, 0, 1],
         }
+    }
+
+    fn draw_shadow(framebuffer: &mut Framebuffer, poly: &ShadowPoly) {
+        let depth = framebuffer.depth_buffer();
+        framebuffer.rasterize_shadow(poly, &depth);
     }
 
     #[test]
@@ -4793,11 +4793,11 @@ mod tests {
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
-        // 200 * 127 / 255 + 1 * 128 / 255 rounds to 100 on every channel.
+        draw_shadow(&mut framebuffer, &poly);
+        // 200 * 127 / 255 rounds to 100; the tint's 1/255 blue adds one.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 15, 15),
-            [100, 100, 100, 255]
+            [100, 100, 101, 255]
         );
         assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [200, 200, 200, 255]);
 
@@ -4806,7 +4806,7 @@ mod tests {
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
+        draw_shadow(&mut framebuffer, &poly);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 15, 15),
             [200, 200, 200, 255]
@@ -4815,45 +4815,56 @@ mod tests {
 
     #[test]
     fn shadow_seam_blends_once_for_both_windings() {
-        // The fan's shared diagonal passes through (15, 15); a camera on the
-        // other side of the quad reverses the ring and must not double-blend
-        // the seam either.
+        // The fan's shared diagonal passes through (15, 15); the reversed
+        // winding must not double-blend the seam either.
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         for reversed in [false, true] {
             let mut poly = shadow_poly(&texture);
             if reversed {
-                poly.corners.reverse();
+                for triangle in &mut poly.triangles {
+                    triangle.reverse();
+                }
             }
             let mut framebuffer = Framebuffer::new();
             framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-            framebuffer.rasterize_shadow(&texture, &poly);
+            draw_shadow(&mut framebuffer, &poly);
             assert_eq!(
                 framebuffer_pixel(&framebuffer, 15, 15),
-                [100, 100, 100, 255],
+                [100, 100, 101, 255],
                 "reversed {reversed}"
             );
         }
     }
 
     #[test]
-    fn shadow_samples_the_page_at_its_texel_size() {
+    fn shadow_samples_the_page_bilinearly_with_clamped_edges() {
         // A 2x1 page: the left texel is transparent, the right one darkens.
-        // The quad's normalized u must scale by the page width, so each half
-        // of the quad samples its own texel.
+        // Near either edge both bilinear taps clamp onto the same texel; the
+        // middle column weights the two halves.
         let mut texture = solid_image(2, 1, [255, 255, 255, 128]);
         texture.rgba[3] = 0;
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
+        draw_shadow(&mut framebuffer, &poly);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 15),
             [200, 200, 200, 255]
         );
         assert_eq!(
             framebuffer_pixel(&framebuffer, 18, 15),
-            [100, 100, 100, 255]
+            [100, 100, 101, 255]
         );
+        let middle = framebuffer_pixel(&framebuffer, 15, 15);
+        assert!(middle[0] > 100 && middle[0] < 200, "{middle:?}");
+    }
+
+    #[test]
+    fn bilinear_lerp_matches_llvmpipe_rounding() {
+        assert_eq!(lerp_unorm8(0, 10, 200), 10);
+        assert_eq!(lerp_unorm8(128, 0, 255), 128);
+        assert_eq!(lerp_unorm8(128, 255, 0), 127);
+        assert_eq!(lerp_unorm8(255, 0, 255), 254);
     }
 
     #[test]
@@ -4872,7 +4883,7 @@ mod tests {
         let shadow = shadow_at([0, 0, 1024], 500, 300, &texture);
 
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
         collect_masks(&layer, [0, 0], &mut items);
         mask::order_far_to_near(&mut items, SceneItem::key);
         assert!(matches!(items[0], SceneItem::Shadow(_)));
@@ -4927,7 +4938,7 @@ mod tests {
         assert!(changed > 1000, "the shadow only repainted {changed} pixels");
         let center = camera.project([0, 0, 1000]).unwrap();
         let pixel = framebuffer_pixel(&with, center[0] as usize, center[1] as usize);
-        assert_eq!(pixel, [100, 100, 100, 255]);
+        assert_eq!(pixel, [100, 100, 101, 255]);
     }
     fn effect_image(pixels: &[[u8; 4]]) -> Image {
         Image {
@@ -6072,60 +6083,6 @@ mod tests {
         ];
         framebuffer.draw_sprites(&mut sprites);
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [99, 99, 99, 255]);
-    }
-
-    #[test]
-    fn shadow_depth_key_truncates_the_corner_mean() {
-        // The key is the truncating integer mean of the four unclipped corner
-        // Zs, not a rounded f64 mean. Search yaws, sizes and a pitched camera
-        // until a fixture's mean is not an exact integer, then pin it.
-        let texture = solid_image(1, 1, [255, 255, 255, 128]);
-        let cameras = [
-            straight_camera(),
-            Camera::from_cut(&Cut {
-                pos: [0, -1500, -1500],
-                look_at: [0, 0, 1000],
-                fov: 200,
-                ..Cut::default()
-            }),
-        ];
-        let mut exercised = false;
-        'search: for camera in &cameras {
-            for (half_x, half_z) in [(1234, 777), (500, 300), (61, 919), (1500, 1400)] {
-                for angle in (0x40..0x1000).step_by(0x40) {
-                    let shadow = Shadow {
-                        angle,
-                        ..shadow_at([0, 0, 1000], half_x, half_z, &texture)
-                    };
-                    let mut items = Vec::new();
-                    collect_shadow(&shadow, camera, &mut items);
-                    let [SceneItem::Shadow(poly)] = &items[..] else {
-                        panic!("expected one shadow");
-                    };
-                    let entity = anim::entity_matrix(shadow.pos, shadow.angle);
-                    let corners = [
-                        [-shadow.half_x as i16, 0, shadow.half_z as i16],
-                        [shadow.half_x as i16, 0, shadow.half_z as i16],
-                        [-shadow.half_x as i16, 0, -shadow.half_z as i16],
-                        [shadow.half_x as i16, 0, -shadow.half_z as i16],
-                    ];
-                    let sum: i64 = corners
-                        .iter()
-                        .map(|corner| {
-                            i64::from(camera.view_position(fixed_mul(&entity, *corner))[2])
-                        })
-                        .sum();
-                    let truncating = sum / 4;
-                    let rounded = (sum as f64 / 4.0).round() as i64;
-                    assert_eq!(i64::from(poly.key), truncating, "angle {angle:#x}");
-                    if truncating != rounded {
-                        exercised = true;
-                        break 'search;
-                    }
-                }
-            }
-        }
-        assert!(exercised, "no fixture made the corner mean non-integral");
     }
 
     #[test]

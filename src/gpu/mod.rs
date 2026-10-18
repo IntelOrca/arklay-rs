@@ -1703,6 +1703,7 @@ mod tests {
                     textured: true,
                     blend: false,
                     raw_y: false,
+                    uv_nudge: [0; 3],
                     flat_color: None,
                     quad: None,
                 });
@@ -1770,6 +1771,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let camera = Camera::from_points([2600, -2400, 5200], [0, -700, 0], 600);
         let lighting = Lighting {

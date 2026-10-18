@@ -2310,15 +2310,22 @@ pub(crate) fn rotate_speed(angle: u16, offset: u16, speed: i32) -> (i32, i32) {
 /// separately would round a unit away whenever the two fractions add up past
 /// one.
 pub(crate) fn rotate_xz(angle: u16, x: i32, z: i32) -> (i32, i32) {
+    let [[m00, _, m02], _, [m20, _, m22]] = rot_matrix_y(angle);
+    (
+        fixed_mul_12_sum(m00 * x + m02 * z),
+        fixed_mul_12_sum(m20 * x + m22 * z),
+    )
+}
+
+/// `RotMatrixY(angle, &identity)`: the 4.12 yaw matrix the original builds
+/// for an entity or a ground shadow.
+pub(crate) fn rot_matrix_y(angle: u16) -> [[i32; 3]; 3] {
     let angle = angle & 0x0FFF;
     let m00 = scale14_to_4_12(cos14(angle));
     let m02 = scale14_to_4_12(sin14(angle));
     let m20 = scale14_to_4_12(-sin14(angle));
     let m22 = scale14_to_4_12(cos14(angle));
-    (
-        fixed_mul_12_sum(m00 * x + m02 * z),
-        fixed_mul_12_sum(m20 * x + m22 * z),
-    )
+    [[m00, 0, m02], [0, 0x1000, 0], [m20, 0, m22]]
 }
 
 /// The original's matrix-vector row: sum the products, then truncate the sum
