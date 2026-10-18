@@ -403,7 +403,13 @@ fn decode_prim(
         let shared = |axis: usize| {
             uv[0][axis] == uv[1][axis] || uv[2][axis] == uv[1][axis] || uv[0][axis] == uv[2][axis]
         };
-        first.uv_nudge[1] = u8::from(shared(0)) | (u8::from(shared(1)) << 1);
+        // The gouraud triangle's store nudges by 0.0001 rather than 0.003.
+        let small = matches!(
+            command,
+            GOURAUD_TEXTURED_TRIANGLE | GOURAUD_TEXTURED_TRIANGLE_BLEND
+        );
+        first.uv_nudge[1] =
+            u8::from(shared(0)) | (u8::from(shared(1)) << 1) | (u8::from(small) << 2);
     }
     let key = if command & 0x0400_0000 != 0 {
         (command, (w1 >> 16) as u16, ((w2 >> 16) & 0x1F) as u16)

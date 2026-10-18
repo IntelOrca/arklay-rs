@@ -1380,8 +1380,10 @@ impl Framebuffer {
     fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
         triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
         let mut depth = self.depth_buffer();
+        let mut twins = KnockoutTwins::default();
         for triangle in &triangles {
-            self.rasterize(texture, triangle, &mut depth);
+            let twin = twins.get(texture, triangle);
+            self.rasterize(texture, triangle, twin, &mut depth);
         }
     }
 
@@ -1394,7 +1396,17 @@ impl Framebuffer {
     /// llvmpipe: `DrawTriangles3D` under `GL_SRC_ALPHA` blending, a
     /// `GL_LEQUAL` test against the 24-bit depth buffer and a depth write for
     /// opaque triangles only.
-    fn rasterize(&mut self, texture: &Texture8, triangle: &Triangle, depth: &mut [u32]) {
+    ///
+    /// A blending triangle blends every texel at its alpha. When the page has
+    /// a knock-out twin (`twin`), the reference draws the same triangle again
+    /// through it at full alpha, so the non-STP texels come out opaque.
+    fn rasterize(
+        &mut self,
+        texture: &Texture8,
+        triangle: &Triangle,
+        twin: bool,
+        depth: &mut [u32],
+    ) {
         if texture.width == 0 || texture.height == 0 {
             return;
         }
@@ -1403,7 +1415,11 @@ impl Framebuffer {
         // A blending packet's vertex alpha is the record's foreground weight;
         // `None` keeps the M16 per-packet half blend.
         let alpha = if triangle.blend {
-            1.0 - f32::from(triangle.blend_weight.unwrap_or(0x80)) / 256.0
+            match triangle.blend_weight {
+                // `CreateTmdObjectInternal`'s 0.2f background weight.
+                Some(0x33) => 1.0 - 0.2f32,
+                weight => 1.0 - f32::from(weight.unwrap_or(0x80)) / 256.0,
+            }
         } else {
             1.0
         };
@@ -1414,11 +1430,12 @@ impl Framebuffer {
             // degenerate corner by 0.003 on the stored float.
             let mut u = (f64::from(vertex.u) / texture_width) as f32;
             let mut v = (f64::from(vertex.v) / texture_height) as f32;
+            let step = f64::from(if nudge & 4 != 0 { 0.0001f32 } else { 0.003f32 });
             if nudge & 1 != 0 {
-                u = (f64::from(u) + f64::from(0.003f32)) as f32;
+                u = (f64::from(u) + step) as f32;
             }
             if nudge & 2 != 0 {
-                v = (f64::from(v) + f64::from(0.003f32)) as f32;
+                v = (f64::from(v) + step) as f32;
             }
             crate::raster::GlVertex {
                 x: vertex.position[0],
@@ -1462,10 +1479,10 @@ impl Framebuffer {
                         return;
                     }
                     let color = texture.palette(triangle.palette_row, palette_index);
-                    // A blending packet blends only its STP texels; the rest
-                    // go down opaque through the knockout twin.
-                    let blend =
-                        triangle.blend && texture.palette_stp(triangle.palette_row, palette_index);
+                    // A blending triangle blends every texel unless the
+                    // knock-out twin paints its non-STP texels back opaque.
+                    let blend = triangle.blend
+                        && (!twin || texture.palette_stp(triangle.palette_row, palette_index));
                     ([color[0], color[1], color[2]], blend)
                 }
             };
@@ -1498,6 +1515,7 @@ impl Framebuffer {
         items: &[SceneItem<'_>],
     ) {
         let mut depth = self.depth_buffer();
+        let mut twins = KnockoutTwins::default();
         for item in items {
             match item {
                 SceneItem::Shadow(poly) => {
@@ -1505,7 +1523,8 @@ impl Framebuffer {
                 }
                 SceneItem::Triangle(triangle) => {
                     if let Some(texture) = textures.get(triangle.texture) {
-                        self.rasterize(texture, triangle, &mut depth);
+                        let twin = twins.get(texture, triangle);
+                        self.rasterize(texture, triangle, twin, &mut depth);
                     }
                 }
                 SceneItem::Mask(quad) => {
@@ -2701,6 +2720,24 @@ struct RasterVertex {
     shade: [f32; 3],
 }
 
+/// Per draw, which (page, palette row) pairs have an STP knock-out twin.
+#[derive(Default)]
+struct KnockoutTwins(std::collections::HashMap<(usize, usize), bool>);
+
+impl KnockoutTwins {
+    /// Whether `triangle` blends through a page with a knock-out twin.
+    fn get(&mut self, texture: &Texture8, triangle: &Triangle) -> bool {
+        if !triangle.blend || triangle.flat.is_some() {
+            return false;
+        }
+        let key = (texture.indices.as_ptr() as usize, triangle.palette_row);
+        *self
+            .0
+            .entry(key)
+            .or_insert_with(|| texture.has_knockout_twin(triangle.palette_row))
+    }
+}
+
 /// One triangle ready for rasterization.
 struct Triangle {
     raster: [RasterVertex; 3],
@@ -2926,7 +2963,14 @@ fn collect_triangles(
         // The packet's CLUT word carries the ABE bit; a packet with it blends
         // and is drawn full-bright, so the room lights do not apply. The TIM
         // decoder keeps each palette entry's STP flag for the per-texel blend.
-        let blend = prim.blend || prim.clut & ABE_BIT != 0;
+        // A record with a blend weight is the reference's transparent TMD:
+        // every primitive blends at the record weight (none at weight 0) and
+        // draws full-bright.
+        let blend = match blend_weight {
+            Some(weight) => weight != 0,
+            None => prim.blend || prim.clut & ABE_BIT != 0,
+        };
+        let full_bright = blend_weight.is_some() || blend;
         let (page_x, page_y, palette_row) = match lighting {
             Some(_) => (
                 f64::from(u32::from(prim.tsb & 0xF) * 128),
@@ -2967,7 +3011,7 @@ fn collect_triangles(
                 // The gameplay path evaluates each corner normal against the
                 // latched light directions, clamps the accumulated light, then
                 // folds in the vertex colour and the mesh tint.
-                (Some(_), Some(light)) if !blend => {
+                (Some(_), Some(light)) if !full_bright => {
                     let mut shade = match normal {
                         Some(normal) => reference_vertex_shade(
                             &stored_camera,
@@ -3003,8 +3047,10 @@ fn collect_triangles(
         });
 
         // The sort key is the mean view Z, stored as a float.
-        let depth =
-            f64::from(((f64::from(depth0) + f64::from(depth1) + f64::from(depth2)) / 3.0) as f32);
+        let depth = f64::from(
+            ((f64::from(depth0) + f64::from(depth1) + f64::from(depth2)) * f64::from(1.0f32 / 3.0))
+                as f32,
+        );
         triangles.push(Triangle {
             raster,
             depth,
@@ -3911,7 +3957,8 @@ mod tests {
     /// Draw one triangle against a freshly cleared depth buffer.
     fn rasterize_alone(framebuffer: &mut Framebuffer, texture: &Texture8, triangle: &Triangle) {
         let mut depth = framebuffer.depth_buffer();
-        framebuffer.rasterize(texture, triangle, &mut depth);
+        let twin = texture.has_knockout_twin(triangle.palette_row);
+        framebuffer.rasterize(texture, triangle, twin, &mut depth);
     }
 
     fn framebuffer_pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
@@ -5361,11 +5408,12 @@ mod tests {
 
     #[test]
     fn per_texel_stp_selects_which_texels_blend() {
-        // A two-texel page: entry 1 is opaque, entry 2 carries the STP bit.
+        // A three-texel page: entry 1 is opaque, entry 2 carries the STP bit.
+        // Opaque texels outnumber STP ones, so the page gets a knock-out twin.
         let mut texture = Texture8 {
-            width: 2,
+            width: 3,
             height: 1,
-            indices: vec![1, 2],
+            indices: vec![1, 1, 2],
             palettes: vec![[0u8; 4]; 2 * crate::model::PALETTE_ROW_LEN],
             stp: vec![false; 2 * crate::model::PALETTE_ROW_LEN],
         };
@@ -5382,7 +5430,7 @@ mod tests {
         let triangle = Triangle {
             raster: [
                 raster_vertex([10.0, 10.0], 0.0, 0.0),
-                raster_vertex([20.0, 10.0], 2.0, 0.0),
+                raster_vertex([20.0, 10.0], 3.0, 0.0),
                 raster_vertex([10.0, 20.0], 0.0, 0.0),
             ],
             depth: 1000.0,
@@ -5397,7 +5445,7 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         rasterize_alone(&mut framebuffer, &texture, &triangle);
-        // The opaque texel overwrites; the STP texel halves with the grey.
+        // The twin paints the opaque texel back; the STP texel stays blended.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
@@ -5407,16 +5455,24 @@ mod tests {
             [178, 178, 178, 255]
         );
 
-        // With no STP entries there are no blend texels: the packet is fully
-        // opaque, exactly the original's per-texel selector with an all-clear
-        // mask.
+        // With no STP texels there is no twin, so every texel blends.
         texture.stp = vec![false; 2 * crate::model::PALETTE_ROW_LEN];
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         rasterize_alone(&mut framebuffer, &texture, &triangle);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [255, 255, 255, 255]
+            [178, 178, 178, 255]
+        );
+
+        // Nor when STP texels are the majority.
+        texture.stp[1] = true;
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 17, 11),
+            [178, 178, 178, 255]
         );
     }
 

@@ -40,7 +40,8 @@ pub struct TmdPrim {
     pub quad: Option<[u16; 4]>,
     /// Per corner, the reference's degenerate-UV nudge (`PSXObject_Store`):
     /// when two of the packet's first three corners share a u (bit 0) or a
-    /// v (bit 1), corner 1's normalised coordinate gains `0.003`.
+    /// v (bit 1), corner 1's normalised coordinate gains `0.003`, or
+    /// `0.0001` when bit 2 is set (the gouraud triangle's store).
     pub uv_nudge: [u8; 3],
 }
 
@@ -89,6 +90,21 @@ impl Texture8 {
             .get(row * PALETTE_ROW_LEN + index as usize)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Whether the reference builds an STP knock-out twin for this page under
+    /// palette `row`: some texels are STP and the opaque (non-STP, non-zero)
+    /// texels outnumber them.
+    pub fn has_knockout_twin(&self, row: usize) -> bool {
+        let (mut stp, mut opaque) = (0usize, 0usize);
+        for &index in &self.indices {
+            if self.palette_stp(row, index) {
+                stp += 1;
+            } else if index != 0 {
+                opaque += 1;
+            }
+        }
+        stp > 0 && opaque > stp
     }
 
     /// Whether any entry of palette `row` carries the STP bit.

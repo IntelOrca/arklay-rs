@@ -61,9 +61,49 @@ struct SetupVertex {
     attributes: [f32; 6],
 }
 
+/// A vertex as the draw module holds it: the clip-space position, the
+/// window position (`x, y, z, 1/w`) and the raw shader outputs.
+#[derive(Clone, Copy)]
+struct DrawVertex {
+    clip: [f32; 4],
+    window: [f32; 4],
+    outputs: [f32; 6],
+}
+
+impl DrawVertex {
+    /// The setup stage's view: attributes premultiplied by `1/w`.
+    fn setup(&self) -> SetupVertex {
+        SetupVertex {
+            position: self.window,
+            attributes: self.outputs.map(|value| value * self.window[3]),
+        }
+    }
+
+    /// The JIT cliptest's outcode: bit `n` selects `draw->plane[n]`.
+    fn clipmask(&self) -> u32 {
+        let [x, y, z, w] = self.clip;
+        u32::from(x > w)
+            | u32::from(0.0 > x + w) << 1
+            | u32::from(y > w) << 2
+            | u32::from(0.0 > y + w) << 3
+            | u32::from(0.0 > z + w) << 4
+            | u32::from(z > w) << 5
+    }
+}
+
+/// `draw->plane[0..6]`, the view volume.
+const PLANES: [[f32; 4]; 6] = [
+    [-1.0, 0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0, 1.0],
+    [0.0, 0.0, 1.0, 1.0],
+    [0.0, 0.0, -1.0, 1.0],
+];
+
 /// The vertex shader and the draw module's viewport stage for a
 /// `width` x `height` target.
-fn transform(vertex: &GlVertex, width: u32, height: u32) -> SetupVertex {
+fn transform(vertex: &GlVertex, width: u32, height: u32) -> DrawVertex {
     // `uMVP`: a Y-down ortho mapping game pixels onto clip space.
     let scale_x = 2.0f32 / width as f32;
     let scale_y = -2.0f32 / height as f32;
@@ -79,23 +119,128 @@ fn transform(vertex: &GlVertex, width: u32, height: u32) -> SetupVertex {
     let half_height = height as f32 * 0.5;
     // The window-system framebuffer is Y_0_TOP, so the state tracker flips
     // the viewport's Y scale.
-    let position = [
+    let window = [
         (clip_x * one_over_w).mul_add(half_width, half_width),
         (clip_y * one_over_w).mul_add(-half_height, half_height),
         (clip_z * one_over_w).mul_add(0.5, 0.5),
         one_over_w,
     ];
-    let source = [
-        vertex.u,
-        vertex.v,
-        vertex.color[0],
-        vertex.color[1],
-        vertex.color[2],
-        vertex.color[3],
+    DrawVertex {
+        clip: [clip_x, clip_y, clip_z, w],
+        window,
+        outputs: [
+            vertex.u,
+            vertex.v,
+            vertex.color[0],
+            vertex.color[1],
+            vertex.color[2],
+            vertex.color[3],
+        ],
+    }
+}
+
+/// `draw_pipe_clip.c`'s `interp`: the vertex at `t` from `out` towards
+/// `in_`, its window position rederived through the C viewport transform.
+fn interpolate(t: f32, out: &DrawVertex, in_: &DrawVertex, width: u32, height: u32) -> DrawVertex {
+    let lerp = |out: f32, in_: f32| out + t * (in_ - out);
+    let clip: [f32; 4] = std::array::from_fn(|index| lerp(out.clip[index], in_.clip[index]));
+    let outputs = std::array::from_fn(|index| lerp(out.outputs[index], in_.outputs[index]));
+    let half_width = width as f32 * 0.5;
+    let half_height = height as f32 * 0.5;
+    let scale = [half_width, -half_height, 0.5];
+    let translate = [half_width, half_height, 0.5];
+    let oow = 1.0 / clip[3];
+    let window = [
+        clip[0] * oow * scale[0] + translate[0],
+        clip[1] * oow * scale[1] + translate[1],
+        clip[2] * oow * scale[2] + translate[2],
+        oow,
     ];
-    SetupVertex {
-        position,
-        attributes: source.map(|value| value * one_over_w),
+    DrawVertex {
+        clip,
+        window,
+        outputs,
+    }
+}
+
+/// `dot4` against one clip plane, summed left to right.
+fn plane_distance(vertex: &DrawVertex, plane: &[f32; 4]) -> f32 {
+    vertex.clip[0] * plane[0]
+        + vertex.clip[1] * plane[1]
+        + vertex.clip[2] * plane[2]
+        + vertex.clip[3] * plane[3]
+}
+
+/// `do_clip_tri`: clip against every plane in `clipmask`, then fan the
+/// polygon into triangles in GL's provoking-vertex-last order.
+fn clip_triangle(
+    vertices: [DrawVertex; 3],
+    mut clipmask: u32,
+    width: u32,
+    height: u32,
+    mut emit: impl FnMut([SetupVertex; 3]),
+) {
+    let mut polygon: Vec<DrawVertex> = vertices.to_vec();
+    while clipmask != 0 && polygon.len() >= 3 {
+        let plane = &PLANES[clipmask.trailing_zeros() as usize];
+        clipmask &= clipmask - 1;
+        let mut previous = polygon[0];
+        let mut previous_distance = plane_distance(&previous, plane);
+        if !previous_distance.is_finite() {
+            return;
+        }
+        let mut output = Vec::with_capacity(polygon.len() + 1);
+        for index in 1..=polygon.len() {
+            let vertex = polygon[index % polygon.len()];
+            let distance = plane_distance(&vertex, plane);
+            if !distance.is_finite() {
+                return;
+            }
+            let different_sign = if previous_distance >= 0.0 {
+                output.push(previous);
+                distance < 0.0
+            } else {
+                // `!(dp < 0)`; both distances are finite here.
+                distance >= 0.0
+            };
+            if different_sign {
+                let denominator = distance - previous_distance;
+                let new_vertex = if distance < 0.0 {
+                    if -distance < previous_distance {
+                        interpolate(distance / denominator, &vertex, &previous, width, height)
+                    } else {
+                        interpolate(
+                            -previous_distance / denominator,
+                            &previous,
+                            &vertex,
+                            width,
+                            height,
+                        )
+                    }
+                } else if -previous_distance < distance {
+                    interpolate(
+                        -previous_distance / denominator,
+                        &previous,
+                        &vertex,
+                        width,
+                        height,
+                    )
+                } else {
+                    interpolate(distance / denominator, &vertex, &previous, width, height)
+                };
+                output.push(new_vertex);
+            }
+            previous = vertex;
+            previous_distance = distance;
+        }
+        polygon = output;
+    }
+    for index in 2..polygon.len() {
+        emit([
+            polygon[index - 1].setup(),
+            polygon[index].setup(),
+            polygon[0].setup(),
+        ]);
     }
 }
 
@@ -197,9 +342,32 @@ pub fn draw_triangle(
     height: u32,
     mut fragment: impl FnMut(Fragment),
 ) {
-    let mut setup = vertices
+    let transformed = vertices
         .each_ref()
         .map(|vertex| transform(vertex, width, height));
+    let masks = transformed.map(|vertex| vertex.clipmask());
+    let clipmask = masks[0] | masks[1] | masks[2];
+    if clipmask == 0 {
+        rasterize(
+            transformed.map(|vertex| vertex.setup()),
+            width,
+            height,
+            &mut fragment,
+        );
+    } else if masks[0] & masks[1] & masks[2] == 0 {
+        clip_triangle(transformed, clipmask, width, height, |setup| {
+            rasterize(setup, width, height, &mut fragment);
+        });
+    }
+}
+
+/// Triangle setup and rasterisation of one post-clip triangle.
+fn rasterize(
+    mut setup: [SetupVertex; 3],
+    width: u32,
+    height: u32,
+    fragment: &mut impl FnMut(Fragment),
+) {
     if setup
         .iter()
         .any(|vertex| vertex.position.iter().any(|value| !value.is_finite()))
