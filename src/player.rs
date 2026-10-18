@@ -371,11 +371,12 @@ pub const LADDER_WALK_AWAY_FOOTSTEP_FRAME: usize = 8;
 pub const LADDER_STEP_OFF: i32 = 1000;
 /// Descend step-off distance on the variant ladder.
 pub const LADDER_STEP_OFF_VARIANT: i32 = 2000;
-/// Height the variant climb sets on its shift frame.
+/// Height of the variant ladder's top: the shadow floor from its shift frame
+/// and the player's height after the step-off.
 pub const LADDER_VARIANT_HEIGHT: i32 = 0xA8C;
-/// Z displacement the variant clip applies on its shift frame.
+/// Z offset the variant clip's shift frame adds to the ground shadow.
 pub const LADDER_VARIANT_SLIDE: i32 = 0x708;
-/// Variant-clip frame that applies the Z displacement and the height.
+/// Variant-clip frame that moves the shadow to the ladder's top.
 pub const LADDER_VARIANT_SHIFT_FRAME: usize = 0x0F;
 /// Variant-clip frame that plays the climb grunt.
 pub const LADDER_VARIANT_GRUNT_FRAME: usize = 0x1A;
@@ -404,24 +405,6 @@ pub const LADDER_STEP_FRAMES: [u8; 64] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
-
-/// A camera screen-effect rectangle written by the climb behaviours (the
-/// original's `BillboardSetRect`). The camera-scroll consumer is not ported,
-/// so the values are recorded for tests and a later slice; the eight words the
-/// original writes map `right` to `+0x60`/`+0x70`, `-left` to
-/// `+0x58`/`+0x68`, `front` to `+0x5C`/`+0x64` and `-back` to
-/// `+0x6C`/`+0x74`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ScreenEffect {
-    /// The rectangle's `right` argument.
-    pub right: u16,
-    /// The rectangle's `left` argument.
-    pub left: u16,
-    /// The rectangle's `front` argument.
-    pub front: u16,
-    /// The rectangle's `back` argument.
-    pub back: u16,
-}
 
 /// A one-shot player sound request (the original's `Play3DSnd` and
 /// `PlayEntitySnd` calls in the action behaviours). The engine resolves
@@ -521,13 +504,13 @@ pub struct PlayerState {
     /// clear. Survives frozen ticks, exactly like the reference's live
     /// `action_behavior` byte.
     pub last_behavior_id: u8,
-    /// The vault's warp ran this tick: the original's door sequence clears
-    /// `isBeingAttackedFlag` (the 0x80 the action scan raised) in the same
-    /// case, so the engine zeroes the entity byte.
+    /// The vault's or stairway's warp ran this tick: the original's door
+    /// sequence clears `isBeingAttackedFlag` (the 0x80 the action scan raised)
+    /// in the same case, so `tick_room` zeroes the entity byte.
     pub clear_attacked_flag: bool,
-    /// The stairway's warp ran this tick: the original's door sequence raises
-    /// `g_message_flags` bit `0x40` and consumes `check_door`'s turn latch in
-    /// the same case, so the game state returns both.
+    /// The vault's or stairway's warp ran this tick: the original's door
+    /// sequence raises `g_message_flags` bit `0x40` and consumes `check_door`'s
+    /// turn latch in the same case, so the game state returns both.
     pub door_release: bool,
     /// The reference's `position` (x, z) mirror: the last position a room
     /// collision pass *accepted*. The original's `check_room_collision` uses it
@@ -637,9 +620,6 @@ pub struct PlayerState {
     sounds: Vec<PlayerSound>,
     /// Footstep events emitted since the last [`PlayerState::take_footsteps`].
     footsteps: Vec<Footstep>,
-    /// Camera screen-effect rectangles recorded since the last
-    /// [`PlayerState::take_screen_effects`].
-    screen_effects: Vec<ScreenEffect>,
 }
 
 /// Spawn in the middle of the first walkable zone (or the origin when none).
@@ -706,7 +686,6 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         stairs_shadow_sample: false,
         sounds: Vec::new(),
         footsteps: Vec::new(),
-        screen_effects: Vec::new(),
     }
 }
 
@@ -1784,12 +1763,7 @@ fn update_ladder(
             player.set_clip(ClipSource::Room, clip);
             player.move_speed_current = 0;
             player.action_state = 4;
-            player.screen_effects.push(ScreenEffect {
-                right: 800,
-                left: 700,
-                front: 700,
-                back: 700,
-            });
+            player.set_shadow_rect(800, 700, 700, 700);
             ladder_climb_tick(player, emd_clips, emw_clips, room_clips);
         }
         4 => ladder_climb_tick(player, emd_clips, emw_clips, room_clips),
@@ -1837,13 +1811,16 @@ fn ladder_climb_tick(
     let frame = player.anim.display_frame;
     if player.stairs.ladder {
         if frame == LADDER_VARIANT_SHIFT_FRAME {
+            // The original writes `pushVelocity.z` and `posY` here: the
+            // ground shadow moves to the ladder's top, while the clip's root
+            // joint carries the body and state 5 places the player.
             let slide = if player.angle > 0x800 {
                 LADDER_VARIANT_SLIDE
             } else {
                 -LADDER_VARIANT_SLIDE
             };
-            player.pos[2] += slide;
-            player.pos[1] = LADDER_VARIANT_HEIGHT;
+            player.shadow_offset[1] = i32::from((player.shadow_offset[1] + slide) as i16);
+            player.stairs_floor = Some(LADDER_VARIANT_HEIGHT);
         }
         if frame == LADDER_VARIANT_GRUNT_FRAME {
             player.queue_sound(SE_LADDER_GRUNT);
@@ -1886,12 +1863,7 @@ fn ladder_descend(player: &mut PlayerState) {
     };
     // The original's case 5 writes the `position` mirror from the matrix.
     player.collision_mirror = [player.pos[0], player.pos[2]];
-    player.screen_effects.push(ScreenEffect {
-        right: 500,
-        left: 500,
-        front: 700,
-        back: 700,
-    });
+    player.restore_shadow();
     if player.stairs.ladder {
         player.action_state = 8;
     } else {
@@ -1925,11 +1897,6 @@ fn rotate_toward(player: &mut PlayerState, target_x: i32, target_z: i32, step: u
 }
 
 impl PlayerState {
-    /// Drain the camera screen-effect rectangles recorded since the last call.
-    pub fn take_screen_effects(&mut self) -> Vec<ScreenEffect> {
-        std::mem::take(&mut self.screen_effects)
-    }
-
     /// Whether the vault's selected room clip exists and has frames.
     fn vault_clip_present(&self, room_clips: &[Clip]) -> bool {
         room_clips
@@ -1965,9 +1932,10 @@ impl PlayerState {
             self.vault_return = false;
         }
         // The reference's case 3 clears `isBeingAttackedFlag` (the 0x80 the
-        // input path raised) in the same tick as the warp; the engine reads
-        // this and zeroes the entity byte.
+        // input path raised) and returns `g_message_flags` bit `0x40` in the
+        // same tick as the warp; the game state applies both.
         self.clear_attacked_flag = true;
+        self.door_release = true;
         self.locked = LockedAction::None;
         self.action_state = 0;
         self.move_speed_current = 0;
@@ -1984,6 +1952,20 @@ impl PlayerState {
         self.shadow_half_x = (right + left) / 2;
         self.shadow_half_z = (front + back) / 2;
         self.shadow_shift = [(right - left) / 2, (front - back) / 2];
+    }
+
+    /// The door and ladder sequences' closing writes: `pushVelocity` and
+    /// `posY` back to the entity's own point and the quad to the shadow's
+    /// normal 500/700 extents.
+    fn restore_shadow(&mut self) {
+        self.stairs_floor = None;
+        self.shadow_offset = [0, 0];
+        self.set_shadow_rect(
+            crate::shadow::PLAYER_HALF_X as u16,
+            crate::shadow::PLAYER_HALF_X as u16,
+            crate::shadow::PLAYER_HALF_Z as u16,
+            crate::shadow::PLAYER_HALF_Z as u16,
+        );
     }
 
     /// The stairway's case 3: move the player onto the other floor and hand
@@ -2009,14 +1991,7 @@ impl PlayerState {
         // The original writes the `position` mirror from the matrix in the
         // same case, so the next collision pass measures from the new floor.
         self.collision_mirror = [self.pos[0], self.pos[2]];
-        self.stairs_floor = None;
-        self.shadow_offset = [0, 0];
-        self.set_shadow_rect(
-            crate::shadow::PLAYER_HALF_X as u16,
-            crate::shadow::PLAYER_HALF_X as u16,
-            crate::shadow::PLAYER_HALF_Z as u16,
-            crate::shadow::PLAYER_HALF_Z as u16,
-        );
+        self.restore_shadow();
         self.clear_attacked_flag = true;
         self.door_release = true;
         self.locked = LockedAction::None;
@@ -3102,7 +3077,6 @@ mod tests {
             stairs_shadow_sample: false,
             sounds: Vec::new(),
             footsteps: Vec::new(),
-            screen_effects: Vec::new(),
         }
     }
 
@@ -4803,6 +4777,10 @@ mod tests {
         // The warp: dir -1, X not sideways -> X = -(-0x73A), Y = -0x708.
         assert_eq!(player.pos, [1000 + VAULT_SIDE, -VAULT_ACROSS, 1000]);
         assert!(
+            player.door_release && player.clear_attacked_flag,
+            "the warp returns the message flag and clears the attacked byte"
+        );
+        assert!(
             sounds.iter().filter(|id| **id == SE_VAULT_STEP).count() >= 2,
             "vault cues missing: {sounds:?}"
         );
@@ -5101,7 +5079,8 @@ mod tests {
     }
 
     /// Drive a locked ladder climb, collecting every queued sound id and the
-    /// screen-effect records, until control returns.
+    /// widest ground-quad half extent along X the climb sized, until control
+    /// returns.
     fn ladder_drive(
         player: &mut PlayerState,
         room: &RoomState,
@@ -5109,21 +5088,21 @@ mod tests {
         emw: &[Clip],
         room_clips: &[Clip],
         ticks: usize,
-    ) -> (Vec<u16>, Vec<ScreenEffect>, Vec<(usize, u16)>) {
+    ) -> (Vec<u16>, i32, Vec<(usize, u16)>) {
         let mut sounds = Vec::new();
-        let mut effects = Vec::new();
+        let mut widest = player.shadow_half_x;
         let mut frames = Vec::new();
         for _ in 0..ticks {
             let before = player.anim.display_frame;
             update_with_room(player, room, emd, emw, room_clips, Input::default());
             frames.push((player.anim.clip, before as u16));
             sounds.extend(player.take_sounds().into_iter().map(|sound| sound.id));
-            effects.extend(player.take_screen_effects());
+            widest = widest.max(player.shadow_half_x);
             if player.locked == LockedAction::None {
                 break;
             }
         }
-        (sounds, effects, frames)
+        (sounds, widest, frames)
     }
 
     #[test]
@@ -5140,28 +5119,16 @@ mod tests {
         player.stairs.base = [100, 0];
         player.stairs.ladder = false;
 
-        let (sounds, effects, frames) =
+        let (sounds, widest, frames) =
             ladder_drive(&mut player, &room, &emd, &emw, &room_clips, 300);
 
-        assert_eq!(effects.len(), 2, "the climb writes two screen effects");
-        assert_eq!(
-            effects[0],
-            ScreenEffect {
-                right: 800,
-                left: 700,
-                front: 700,
-                back: 700,
-            }
-        );
-        assert_eq!(
-            effects[1],
-            ScreenEffect {
-                right: 500,
-                left: 500,
-                front: 700,
-                back: 700,
-            }
-        );
+        // The climb widens the ground quad (800/700 right/left) and the
+        // step-off restores the shadow's normal extents.
+        assert_eq!(widest, 750);
+        assert_eq!(player.shadow_half_x, crate::shadow::PLAYER_HALF_X);
+        assert_eq!(player.shadow_shift, [0, 0]);
+        assert_eq!(player.stairs_floor, None);
+        assert_eq!(player.shadow_offset, [0, 0]);
         // The step SE fires on the transcribed frames; the end SE on frame 0x32.
         let step_frames = [12u16, 29, 39];
         for frame in step_frames {
@@ -5189,7 +5156,7 @@ mod tests {
     }
 
     #[test]
-    fn ladder_variant_shift_sets_the_height_and_slide() {
+    fn ladder_variant_shift_moves_the_shadow_not_the_player() {
         let room = RoomState::default();
         let emd = clips();
         let emw = clips();
@@ -5210,8 +5177,11 @@ mod tests {
             &room_clips,
             Input::default(),
         );
-        assert_eq!(player.pos[2], LADDER_VARIANT_SLIDE, "the +Z shift");
-        assert_eq!(player.pos[1], LADDER_VARIANT_HEIGHT);
+        // The shift frame writes `pushVelocity.z` and `posY`: the shadow goes
+        // to the ladder's top; the player's own position waits for state 5.
+        assert_eq!(player.shadow_offset, [0, LADDER_VARIANT_SLIDE]);
+        assert_eq!(player.stairs_floor, Some(LADDER_VARIANT_HEIGHT));
+        assert_eq!(player.pos, [0, 0, 0]);
         assert!(player.take_sounds().is_empty());
 
         // Frame 0x1A plays the grunt instead of a step SE.
@@ -5242,7 +5212,7 @@ mod tests {
         player.stairs.ladder = true;
         player.angle = 0xC00;
 
-        let (sounds, effects, _) = ladder_drive(&mut player, &room, &emd, &emw, &room_clips, 300);
+        let (sounds, _, _) = ladder_drive(&mut player, &room, &emd, &emw, &room_clips, 300);
 
         assert!(sounds.contains(&SE_LADDER_GRUNT), "{sounds:?}");
         assert!(!sounds.contains(&SE_LADDER_STEP), "variant has no step SE");
@@ -5251,13 +5221,18 @@ mod tests {
             player.pos[1], LADDER_VARIANT_HEIGHT,
             "the variant holds the upper height"
         );
-        // The variant step-off is +2000 Z after the +0x708 shift.
+        // State 5 steps the player off 2000 Z along the ladder.
         assert!(
-            player.pos[2] >= LADDER_VARIANT_SLIDE + LADDER_STEP_OFF_VARIANT,
+            player.pos[2] >= LADDER_STEP_OFF_VARIANT,
             "variant travel {}",
             player.pos[2]
         );
-        assert_eq!(effects.len(), 2);
+        assert_eq!(player.stairs_floor, None, "state 5 returns `posY`");
+        assert_eq!(
+            player.shadow_offset,
+            [0, 0],
+            "state 5 zeroes `pushVelocity`"
+        );
         assert!(
             player.ladder_release,
             "state 8 must raise the release for the room probe"

@@ -6968,12 +6968,6 @@ impl GameState {
         if self.entities[0].zone_flags & 0x20 == 0 {
             return;
         }
-        // The port raises the zone flag on a stairwell door's climb as well;
-        // the original's door handler does not, and its room change follows
-        // at the end of the frame, so a pending transition starts nothing.
-        if self.transition.is_some() {
-            return;
-        }
         player.action_state = 0;
         player.move_speed_current = 0;
         self.entities[0].is_being_attacked = 0x80;
@@ -7007,8 +7001,8 @@ impl GameState {
     pub fn tick_objects(&mut self, room: &RoomState, player: &mut PlayerState) {
         use crate::objects;
 
-        // The stairway's warp returns the message flag the action scan
-        // cleared and consumes `check_door`'s turn latch.
+        // A vault's or stairway's warp returns the message flag the action
+        // scan cleared and consumes `check_door`'s turn latch.
         if std::mem::take(&mut player.door_release) {
             self.message_flags |= 0x0040;
             self.flags[5].apply(MSF2_DOOR_TURN_PENDING, 1);
@@ -7626,13 +7620,13 @@ impl GameState {
         // on the frame it fires. The room load restores the word.
         self.message_flags = 0;
         // A stairwell or ladder door runs the climb behaviour: the original's
-        // `check_door` raises the stair zone flag and `player_door_open_sequence`
-        // owns the player's Y while the collision pass is suspended. The climb
-        // faces the doorway and is torn down when the destination loads.
+        // `player_door_open_sequence` owns the player's Y while the collision
+        // pass is suspended. The climb faces the doorway and is torn down
+        // when the destination loads. The original's door handler raises no
+        // zone flag here, so none is latched.
         if crate::door::is_stair_type(door.door_type) {
             let target_x = i32::from(door.zone[0]) + i32::from(door.zone[2]) / 2;
             let target_z = i32::from(door.zone[1]) + i32::from(door.zone[3]) / 2;
-            self.entities[0].zone_flags |= 0x20;
             self.stair_entry = Some(StairEntryState {
                 slot: door.slot,
                 ladder: crate::door::is_ladder_type(door.door_type),
@@ -16537,7 +16531,7 @@ mod tests {
     }
 
     #[test]
-    fn the_zone_branch_defers_to_a_push_without_a_press_and_to_a_room_change() {
+    fn the_zone_branch_defers_to_a_push_without_a_press() {
         let mut state = game();
         let mut player =
             crate::player::spawn(RoomId::parse("2070").unwrap(), &RoomState::default());
@@ -16547,8 +16541,10 @@ mod tests {
         state.player_zone_behavior(&mut player, false);
         assert_eq!(player.locked, crate::player::LockedAction::None);
 
-        // A stairwell door's pending room change starts nothing either.
+        // A stairwell door's pending room change raises no zone flag, so
+        // there is nothing to start.
         player.object_push = false;
+        state.entities[0].zone_flags = 0;
         state.transition = Some(RoomTransition {
             target: RoomId::parse("10B0").unwrap(),
             pos: [0, 0, 0],
@@ -16557,7 +16553,9 @@ mod tests {
         state.player_zone_behavior(&mut player, false);
         assert_eq!(player.locked, crate::player::LockedAction::None);
 
+        // A script's zone flag with no transition still starts the stairway.
         state.transition = None;
+        state.entities[0].zone_flags = 0x60;
         state.player_zone_behavior(&mut player, false);
         assert_eq!(player.locked, crate::player::LockedAction::Stairs);
         assert!(player.stairs_side_z);
