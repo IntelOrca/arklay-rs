@@ -11,6 +11,7 @@ pub mod budget;
 pub mod charset;
 pub mod cinepak;
 pub mod combat;
+pub mod config;
 pub mod convert;
 pub mod demo;
 pub mod door;

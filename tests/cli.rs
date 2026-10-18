@@ -43,10 +43,25 @@ impl Drop for TempDir {
 }
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_arklay"))
-        .args(args)
-        .output()
-        .expect("the arklay binary runs")
+    run_env(args, &[])
+}
+
+/// [`run`] with extra environment variables.
+///
+/// Every run points `ARKLAY_CONFIG_DIR` at a directory that does not exist, so
+/// a developer's own `arklay.toml` cannot change a test's behaviour; a test
+/// that wants a config names the variable itself.
+fn run_env(args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_arklay"));
+    command.args(args);
+    command.env(
+        "ARKLAY_CONFIG_DIR",
+        std::env::temp_dir().join("arklay-cli-no-config"),
+    );
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.output().expect("the arklay binary runs")
 }
 
 fn stdout(output: &Output) -> String {
@@ -648,6 +663,142 @@ fn a_failed_output_rename_keeps_the_destination_and_removes_the_temporary() {
         .filter(|name| name.to_string_lossy().contains(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+}
+
+#[test]
+fn the_config_file_is_read_and_a_bad_one_is_reported() {
+    let dir = TempDir::new("config");
+    let path = dir.join("game.akpak");
+    write_room_pack(&path);
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("arklay.toml");
+    let capture = dir.join("capture.bmp");
+    let saves = dir.join("cfg-saves");
+    let config_env = config_dir.to_str().unwrap();
+
+    // A config naming a save location: the load screen runs from it, and the
+    // pack carries no Lua, so the ported original screen opens.
+    std::fs::write(
+        &config,
+        // The literal string form keeps a Windows path valid without escaping.
+        format!("save_dir = '{}'\n", saves.display()),
+    )
+    .unwrap();
+    let output = run_env(
+        &[
+            path.to_str().unwrap(),
+            "--ui",
+            "load",
+            "--capture",
+            capture.to_str().unwrap(),
+        ],
+        &[("ARKLAY_CONFIG_DIR", config_env)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(capture.is_file());
+
+    // A malformed config is reported instead of ignored.
+    std::fs::write(&config, "save_dir = 3\n").unwrap();
+    let output = run_env(
+        &[
+            path.to_str().unwrap(),
+            "--ui",
+            "load",
+            "--capture",
+            capture.to_str().unwrap(),
+        ],
+        &[("ARKLAY_CONFIG_DIR", config_env)],
+    );
+    assert_failure(&output, "expects a quoted string");
+}
+
+/// A pack whose Lua hook registers a probe save screen: the screen logs
+/// `saves=<count>`, the number of files in the save directory it was given.
+#[cfg(feature = "lua")]
+fn write_lua_screen_pack(path: &Path) {
+    let id = RoomId::parse("1000").unwrap();
+    let rdt_entry = id.rdt_entry();
+    let cut_entry = id.cut_entry(0);
+    let rdt = synthetic_rdt();
+    let cut = background();
+    let manifest = manifest::Manifest {
+        lua: vec!["lua/hook.lua".to_string()],
+        ..manifest::Manifest::base("probe")
+    };
+    let hook = b"\
+function on_init(api)
+    api:register_save_screen(\"script/probe.lua\")
+end
+";
+    let screen = b"\
+function on_open(api)
+    api:log(\"saves=\" .. #api:saves())
+end
+function update(api, input)
+end
+";
+    write_manifest_pack(
+        path,
+        &manifest,
+        &[
+            (&rdt_entry, &rdt),
+            (&cut_entry, &cut),
+            ("lua/hook.lua", hook),
+            ("script/probe.lua", screen),
+        ],
+    );
+}
+
+/// The config's `save_dir` is the directory the screen lists: the probe screen
+/// logs the number of files it sees, so the count proves which directory was
+/// read.
+#[cfg(feature = "lua")]
+#[test]
+fn the_config_save_dir_drives_a_registered_lua_screen() {
+    let dir = TempDir::new("config-save-dir");
+    let path = dir.join("game.akpak");
+    write_lua_screen_pack(&path);
+    let config_dir = dir.join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let config = config_dir.join("arklay.toml");
+    let capture = dir.join("capture.bmp");
+    let saves = dir.join("cfg-saves");
+    let config_env = config_dir.to_str().unwrap();
+    let load = || {
+        run_env(
+            &[
+                path.to_str().unwrap(),
+                "--ui",
+                "load",
+                "--capture",
+                capture.to_str().unwrap(),
+            ],
+            &[("ARKLAY_CONFIG_DIR", config_env)],
+        )
+    };
+
+    // The configured directory exists but is empty.
+    std::fs::write(&config, format!("save_dir = '{}'\n", saves.display())).unwrap();
+    let output = load();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(capture.is_file());
+    assert!(stderr(&output).contains("saves=0"), "{}", stderr(&output));
+
+    // A save written there is what the screen lists.
+    let file = arklay::save::SaveFile::from_state(&arklay::game::GameState::default());
+    std::fs::create_dir_all(&saves).unwrap();
+    arklay::save::save_to_path(&saves.join("savedat1.dat"), &file).unwrap();
+    let output = load();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("saves=1"), "{}", stderr(&output));
+
+    // Without the key the screen reads the default location, not the
+    // configured one, so the file that sits there is not listed.
+    std::fs::remove_file(&config).unwrap();
+    let output = load();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains("saves=0"), "{}", stderr(&output));
 }
 
 #[test]

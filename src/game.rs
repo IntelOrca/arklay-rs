@@ -3591,6 +3591,10 @@ pub struct GameState {
     /// when the spawn failed. The floor-splash behaviour reads it to merge its
     /// light factor into the child.
     pub last_effect_spawn: Option<u8>,
+    /// The save/load screen a pack's scripts registered through the hook API
+    /// (`api:register_save_screen`), or `None` for the ported original screen.
+    /// It is pack-level UI state, not part of a save block.
+    pub save_screen: Option<String>,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -3734,6 +3738,7 @@ impl Default for GameState {
             last_tracked_effect: None,
             effect_placeholder_hits: [0; effects::EFFECT_BEHAVIOR_COUNT],
             last_effect_spawn: None,
+            save_screen: None,
         }
     }
 }

@@ -84,6 +84,9 @@ pub enum Tint {
     Red,
     Grey,
     Yellow,
+    /// An explicit per-channel multiplier, for a caller that has a colour of
+    /// its own (the Lua screen API's `#RRGGBB`).
+    Rgb(u8, u8, u8),
 }
 
 impl Tint {
@@ -107,6 +110,7 @@ impl Tint {
             Self::Red => [255, 0, 0],
             Self::Grey => [204, 204, 204],
             Self::Yellow => [255, 255, 0],
+            Self::Rgb(red, green, blue) => [red, green, blue],
         }
     }
 }
@@ -614,6 +618,53 @@ impl Framebuffer {
                 });
             }
         }
+    }
+
+    /// [`Framebuffer::draw_indexed_sprite`] with an explicit blend mode.
+    ///
+    /// The Lua screen API's `blend` option needs the modes the sprite queue
+    /// supports without going through a `SpriteDraw`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_indexed_sprite_blended(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        clut_row: usize,
+        brightness: u8,
+        tint: Tint,
+        blend: SpriteBlend,
+    ) {
+        self.draw_indexed_sprite_full(
+            texture,
+            src,
+            dst,
+            clut_row,
+            brightness_scale(brightness),
+            tint,
+            blend,
+            [false, false],
+        );
+    }
+
+    /// [`Framebuffer::draw_rgba_sprite`] with an explicit blend mode.
+    pub fn draw_rgba_sprite_blended(
+        &mut self,
+        image: &Image,
+        src: [i32; 4],
+        dst: [i32; 4],
+        brightness: u8,
+        blend: SpriteBlend,
+    ) {
+        self.draw_rgba_sprite_full(
+            image,
+            src,
+            dst,
+            brightness_scale(brightness),
+            Tint::White,
+            blend,
+            [false, false],
+        );
     }
 
     /// Draw one RGBA sprite with nearest sampling, clipped to the framebuffer.
@@ -4154,6 +4205,7 @@ mod tests {
         assert_eq!(Tint::from_clut_row(8), Tint::Green);
         assert_eq!(Tint::from_clut_row(4), Tint::Yellow);
         assert_eq!(Tint::from_clut_row(-1), Tint::Yellow);
+        assert_eq!(Tint::Rgb(1, 2, 3).rgb(), [1, 2, 3]);
         assert_eq!(Tint::Grey.rgb(), [204, 204, 204]);
         assert_eq!(Tint::Yellow.rgb(), [255, 255, 0]);
     }

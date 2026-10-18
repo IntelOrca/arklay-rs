@@ -97,8 +97,9 @@ pub enum SaveLoadMode {
 /// an ink ribbon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaveOutcome {
-    /// Zero-based slot that was written.
-    pub slot: usize,
+    /// The zero-based slot the vanilla screen wrote; `None` when the screen
+    /// chose its own file (a Lua screen names the file itself).
+    pub slot: Option<usize>,
     /// Whether one ink ribbon must be consumed from the live game state.
     pub ink_ribbon: bool,
 }
@@ -306,7 +307,7 @@ impl SaveLoadScreen {
             Ok(()) => {
                 self.slots[self.cursor] = Some(SaveSlotInfo::from_file(&file));
                 self.outcome = Some(SaveOutcome {
-                    slot: self.cursor,
+                    slot: Some(self.cursor),
                     ink_ribbon: pending.ink_ribbon,
                 });
                 let name = cx
@@ -330,6 +331,84 @@ impl SaveLoadScreen {
             }
         }
     }
+}
+
+/// A save/load screen the engine can open: the ported original screen or a
+/// Lua script from the pack.
+///
+/// Both implementations write (or load) their files themselves and report a
+/// completed write through [`SaveScreen::take_outcome`]; the engine mirrors
+/// the write into the live state (ink ribbon, save counter).
+pub trait SaveScreen: Screen {
+    /// The completed save, once the screen left through a write.
+    fn take_outcome(&mut self) -> Option<SaveOutcome>;
+}
+
+impl SaveScreen for SaveLoadScreen {
+    fn take_outcome(&mut self) -> Option<SaveOutcome> {
+        SaveLoadScreen::take_outcome(self)
+    }
+}
+
+/// Open the load screen: the pack entry its scripts registered, or the ported
+/// original. A Lua screen that cannot load falls back to the original with a
+/// warning, so a broken mod never leaves the player without a screen.
+pub fn open_load_screen(entry: Option<&str>, cx: &mut UiContext<'_>) -> Box<dyn SaveScreen> {
+    match entry {
+        Some(entry) => match super::lua_screen::LuaScreen::open_load(entry, cx) {
+            Ok(screen) => Box::new(screen),
+            Err(err) => {
+                eprintln!("warning: lua save screen {entry} unavailable: {err:#}");
+                vanilla_load_screen(cx)
+            }
+        },
+        None => vanilla_load_screen(cx),
+    }
+}
+
+/// Open the save screen for the pending `file`: the pack entry its scripts
+/// registered, or the ported original. `ink_ribbon` makes the write consume
+/// one.
+pub fn open_save_screen(
+    entry: Option<&str>,
+    cx: &mut UiContext<'_>,
+    file: SaveFile,
+    ink_ribbon: bool,
+) -> Box<dyn SaveScreen> {
+    match entry {
+        Some(entry) => {
+            match super::lua_screen::LuaScreen::open_save(entry, cx, file.clone(), ink_ribbon) {
+                Ok(screen) => Box::new(screen),
+                Err(err) => {
+                    eprintln!("warning: lua save screen {entry} unavailable: {err:#}");
+                    vanilla_save_screen(cx, file, ink_ribbon)
+                }
+            }
+        }
+        None => vanilla_save_screen(cx, file, ink_ribbon),
+    }
+}
+
+/// The ported original load screen, opened.
+fn vanilla_load_screen(cx: &mut UiContext<'_>) -> Box<dyn SaveScreen> {
+    let mut screen = SaveLoadScreen::load();
+    if let Err(err) = screen.open(cx) {
+        eprintln!("warning: save screen unavailable: {err:#}");
+    }
+    Box::new(screen)
+}
+
+/// The ported original save screen, opened.
+fn vanilla_save_screen(
+    cx: &mut UiContext<'_>,
+    file: SaveFile,
+    ink_ribbon: bool,
+) -> Box<dyn SaveScreen> {
+    let mut screen = SaveLoadScreen::save(file, ink_ribbon);
+    if let Err(err) = screen.open(cx) {
+        eprintln!("warning: save screen unavailable: {err:#}");
+    }
+    Box::new(screen)
 }
 
 impl Default for SaveLoadScreen {
@@ -703,7 +782,7 @@ fn push_padded(out: &mut Vec<u8>, src: &[u8], len: usize) {
 
 /// Remove one ink ribbon from the block the screen is about to write, the way
 /// the original's `use_room_action_item` does before assembling the file.
-fn consume_snapshot_ribbon(file: &mut SaveFile) {
+pub(crate) fn consume_snapshot_ribbon(file: &mut SaveFile) {
     let Some(index) = file
         .player_slots
         .iter()
@@ -933,7 +1012,7 @@ mod tests {
         assert_eq!(
             screen.take_outcome(),
             Some(SaveOutcome {
-                slot: 0,
+                slot: Some(0),
                 ink_ribbon: false
             })
         );
@@ -970,7 +1049,7 @@ mod tests {
         assert_eq!(
             screen.take_outcome(),
             Some(SaveOutcome {
-                slot: 0,
+                slot: Some(0),
                 ink_ribbon: true
             }),
             "the outcome is available while the reveal runs"

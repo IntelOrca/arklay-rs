@@ -212,9 +212,18 @@ caption; up/down step the rooms of the current floor plan, left/right step
 between the plans the owned maps unlock, and confirm shows the full plan of
 the current area. A pack without `map/` leaves the tab blank.
 
-Saves live as `savedat*.dat` under `--save-dir` (default `saves/` beside the
-pack). The title starts on LOAD GAME when a save exists; with none, LOAD is
-refused.
+Saves live as `savedat*.dat` under `--save-dir` (default `<config
+dir>/save`, `~/.config/arklay/save`). The title starts on LOAD GAME when a
+save exists; with none, LOAD is refused. `arklay.toml` in the same config
+directory sets the save directory and the language. The save/load screen is a
+mod: the checked-in `mods/crloadsave/` replaces the ported original with a
+Classic REbirth-style folder screen through `api:register_save_screen`, built
+and layered like any other mod:
+
+```sh
+cargo run -- mod build mods/crloadsave --out crloadsave.akpak
+cargo run -- re1.akpak --mod crloadsave.akpak
+```
 
 The ignored `tests/real/m16_ui_real.rs` golden harness compares sampled
 room/message/NPC/UI frames against a locally generated set when

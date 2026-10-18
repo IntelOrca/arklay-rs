@@ -1,0 +1,9 @@
+[pack]
+format = 1
+id = "crloadsave"
+name = "Classic REbirth-style save/load screen"
+version = "0.1.0"
+kind = "mod"
+base = "re1"
+load_order = 20
+lua = ["mod.lua"]

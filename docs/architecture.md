@@ -48,7 +48,8 @@ responsibility.
 | `effects` | Runtime | The 64-slot billboard effect pool, per-room sprite tables, packed texture pages, behaviours |
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
 | `message` | Runtime | The seven-state message window and its byte grammar |
-| `save` | Runtime | The 0x800-byte BioCard block, slot I/O, `Apply_to`/`from_state` round-trip |
+| `save` | Runtime | The 0x800-byte BioCard block, slot I/O, the folder scan and explicit-path actions the screen API uses, `Apply_to`/`from_state` round-trip |
+| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir` and `language`; the default `<config dir>/save` location |
 | `audio` | Runtime | WAV parsing and the single SDL3 software mixer used for SE, voice, BGM and film audio |
 | `bgm` | Runtime | The three-channel music state machine, ramps and channel hand-off |
 | `sfx` | Runtime | Per-room sound-name tables and footstep resolution |
@@ -81,7 +82,7 @@ responsibility.
 | `language` | Presentation | `language/<tag>.txt` grammar, the layered catalog, the fallback chain and OS locale detection |
 | `text` | Presentation | The runtime string facade: messages, item names/descriptions, save strings, room labels and `UI_*` |
 | `mask` | Presentation | Room mask (foreground overlay) sprites and depth ordering |
-| `ui` | UI | `Screen` contract, title, character select, pause menu, item box, FILE, map, item viewer, save/load; the port-only F1 room-select overlay (`ui/debug_menu.rs`) and the F9 return-to-title prompt (`ui/return_title.rs`) |
+| `ui` | UI | `Screen` contract, title, character select, pause menu, item box, FILE, map, item viewer, save/load (the ported original and the Lua screen surface, `ui/lua_screen.rs`, selected by the pack's own `api:register_save_screen`); the port-only F1 room-select overlay (`ui/debug_menu.rs`) and the F9 return-to-title prompt (`ui/return_title.rs`) |
 
 ### Strings and languages
 
@@ -278,7 +279,11 @@ Arklay's input class determines what the code may assume:
   hook logs and disables itself rather than failing the session. Enemy scripts
   (`enemy/em{id:02x}.lua` plus shared `enemy/lib/**.lua`) run in a second,
   identical sandbox owned by the session; they must hold no state of their own,
-  so resetting that VM between two updates cannot change behaviour. With
+  so resetting that VM between two updates cannot change behaviour. A screen
+  script (the entry a pack registers with `api:register_save_screen`) runs in a
+  third sandbox with the same limits; its only file access is the host's save
+  API, which validates every name to one component under the save directory. A
+  script that cannot load falls back to the ported original screen. With
   `--no-default-features` every hook and script compiles to a no-op.
 
 ## Format inventory

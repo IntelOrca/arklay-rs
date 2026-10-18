@@ -22,6 +22,7 @@ pub mod file;
 pub mod item_box;
 pub mod item_view;
 pub mod layout;
+pub mod lua_screen;
 pub mod main_menu;
 pub mod map;
 pub mod return_title;
@@ -84,7 +85,7 @@ pub struct UiInput {
 }
 
 /// What a screen reports after one tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScreenResult {
     /// Keep this screen and tick again.
     Continue,
@@ -93,12 +94,14 @@ pub enum ScreenResult {
 }
 
 /// A completed screen interaction, interpreted by the app's mode machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScreenAction {
     /// Start a new game as the character (`0` Chris, `1` Jill).
     NewGame { character: u8 },
     /// Continue from save slot `index` (zero-based, `savedat{index+1}.dat`).
     LoadGame { slot: usize },
+    /// Continue from an explicit save file, the file a Lua screen chose.
+    LoadFile(std::path::PathBuf),
     /// Play the next attract-demo reel (`demo/<hex>.dat`), then return to the
     /// title.
     Attract,
@@ -203,7 +206,8 @@ pub fn load_picture(
 pub struct UiContext<'a> {
     /// The open game pack.
     pub pack: &'a Pack,
-    /// Save directory (`--save-dir`, default `saves/` beside the pack).
+    /// Save directory (`--save-dir`, `arklay.toml`'s `save_dir`, default
+    /// `<config dir>/save`).
     pub save_dir: &'a Path,
     /// The decoded font, when the pack carries one.
     pub font: Option<&'a Font>,

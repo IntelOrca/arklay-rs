@@ -3198,9 +3198,11 @@ mod tests {
             "no character model entries"
         );
         assert_eq!(
-            pack.paths().filter(|path| path.ends_with(".lua")).count(),
+            pack.paths()
+                .filter(|path| path.starts_with("enemy/") && path.ends_with(".lua"))
+                .count(),
             crate::enemy::ENEMY_SCRIPTS.len(),
-            "the checked-in scripts are independent of the install"
+            "the checked-in enemy scripts are independent of the install"
         );
 
         // Present files resolve; only the missing two are named.

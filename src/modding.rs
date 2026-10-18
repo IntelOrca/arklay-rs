@@ -717,6 +717,47 @@ mod tests {
     }
 
     #[test]
+    fn checked_in_cr_loadsave_builds_to_the_planned_entries() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mod_dir = root.join("mods/crloadsave");
+        let dir = TempDir::new("crloadsave");
+        let out = dir.path.join("crloadsave.akpak");
+
+        let summary = build_mod(&mod_dir, &out, None).unwrap();
+        assert_eq!(summary.warnings, Vec::<String>::new());
+        assert_eq!(
+            summary
+                .entries
+                .iter()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "language/en-US.txt",
+                "language/ja-JP.txt",
+                "manifest.toml",
+                "mod.lua",
+                "script/loadsave.lua",
+            ]
+        );
+
+        let pack = Pack::open(&out).unwrap();
+        let manifest = pack.manifest().unwrap();
+        assert_eq!(manifest.id, "crloadsave");
+        assert_eq!(manifest.kind, manifest::PackKind::Mod);
+        assert_eq!(manifest.base.as_deref(), Some("re1"));
+        assert_eq!(manifest.lua, ["mod.lua"]);
+
+        // The registration names the screen entry, and the screen script
+        // parses as Lua (the same check the pack verifier runs).
+        assert!(
+            std::str::from_utf8(&pack.read("mod.lua").unwrap())
+                .unwrap()
+                .contains("register_save_screen")
+        );
+        crate::lua::verify_source(&pack.read("script/loadsave.lua").unwrap()).unwrap();
+    }
+
+    #[test]
     fn checked_in_demo_builds_to_the_planned_entries() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let demo = root.join("mods/demo");

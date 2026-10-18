@@ -16,7 +16,7 @@
 //! [`crate::font::session_entry`] names for it, so the strings and the font
 //! can never disagree.
 
-use crate::charset::Script;
+use crate::charset::{self, Script};
 use crate::font;
 use crate::language::{self, Catalog};
 use crate::pack::Pack;
@@ -73,6 +73,26 @@ impl Text {
     /// Global message `id` (`0..64`), encoded for the message state machine.
     pub fn global(&self, id: usize) -> Option<&[u8]> {
         self.catalog.get(&format!("MESSAGE_{id:02X}"))
+    }
+
+    /// Decode a game-text byte stream in the session's script (the inverse of
+    /// the encode the catalog stores).
+    pub fn decode(&self, bytes: &[u8]) -> String {
+        let mut out = String::new();
+        charset::decode(bytes, self.script, &mut out);
+        out
+    }
+
+    /// `KEY` along the chain, decoded to characters; `None` when no language
+    /// knows the key.
+    pub fn text(&self, key: &str) -> Option<String> {
+        self.get(key).map(|bytes| self.decode(bytes))
+    }
+
+    /// The save screen's shorthand location label of the room a block was
+    /// saved in; `stage` is the block's 0-based stage byte.
+    pub fn save_location(&self, stage: u8, room: u8) -> Option<&[u8]> {
+        self.room_label(stage.saturating_add(1), room)
     }
 
     /// Item-name entry for the `item_id`; `None` when the item has no name.
@@ -366,6 +386,27 @@ mod tests {
     }
 
     #[test]
+    fn save_locations_use_the_blocks_zero_based_stage() {
+        let pack = pack_with(&[(
+            "language/en-US.txt",
+            "ROOM_100_NAME_SAVE = \"M. Room 1F\"\n",
+        )]);
+        let text = Text::load(&pack, Some("en-US"));
+        // The block's stage byte is 0-based; the key is 1-based.
+        assert_eq!(
+            text.save_location(0, 0x00).map(|bytes| text.decode(bytes)),
+            Some("M. Room 1F".to_string())
+        );
+        // A stage/room no language carries at all misses.
+        assert_eq!(text.save_location(0xF, 0x7F), None);
+        assert_eq!(
+            text.text("ROOM_100_NAME_SAVE").as_deref(),
+            Some("M. Room 1F")
+        );
+        assert_eq!(text.text("NO_SUCH_KEY"), None);
+    }
+
+    #[test]
     fn the_save_strings_read_their_keys() {
         let pack = pack_with(&[(
             "language/en-US.txt",
@@ -452,8 +493,9 @@ impl SaveStrings<'_> {
         })
     }
 
-    /// The shorthand location label of the room a save was made in.
+    /// The shorthand location label of the room a save was made in. `stage`
+    /// is the save block's 0-based stage byte, the original's `g_stageId`.
     pub fn location(&self, stage: u8, room: u8) -> &[u8] {
-        self.text.room_label(stage, room).unwrap_or(&[])
+        self.text.save_location(stage, room).unwrap_or(&[])
     }
 }

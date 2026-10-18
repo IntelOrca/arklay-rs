@@ -64,6 +64,9 @@ mod imp {
             )
         }
 
+        /// No-op pack-init hook.
+        pub fn call_init(&self, _game: &mut GameState) {}
+
         /// No-op room-entry hook.
         pub fn call_room_load(&self, _game: &mut GameState, _id: RoomId) {}
 
@@ -80,6 +83,7 @@ mod imp {
 #[cfg(feature = "lua")]
 mod imp {
     use std::cell::{Cell, RefCell};
+    use std::collections::HashSet;
     use std::rc::Rc;
 
     use anyhow::Result;
@@ -176,6 +180,7 @@ mod imp {
     /// The hook functions looked up once after every chunk has run.
     #[derive(Default)]
     struct Hooks {
+        init: Option<Function>,
         room_load: Option<Function>,
         tick: Option<Function>,
         message: Option<Function>,
@@ -228,6 +233,7 @@ mod imp {
                 _ => None,
             };
             let hooks = Hooks {
+                init: lookup("on_init"),
                 room_load: lookup("on_room_load"),
                 tick: lookup("on_tick"),
                 message: lookup("on_message"),
@@ -275,6 +281,19 @@ mod imp {
                     function.call::<()>(api)
                 })
                 .map_err(|err| anyhow::anyhow!("{name}: {err}"))
+        }
+
+        /// Run `on_init(api)` once the pack's chunks have run, before any
+        /// room. A pack uses it to register things the engine reads before a
+        /// session exists, such as a save/load screen.
+        pub fn call_init(&self, game: &mut GameState) {
+            let Some(function) = self.hooks.borrow().init.clone() else {
+                return;
+            };
+            if let Err(err) = self.call::<Value>(&function, game, Value::Nil) {
+                eprintln!("[lua] on_init disabled: {err}");
+                self.hooks.borrow_mut().init = None;
+            }
         }
 
         /// Run `on_room_load(api)` after the room state exists.
@@ -335,13 +354,30 @@ mod imp {
     /// The hook paths to load: the manifest's ordered list, or every
     /// `lua/**.lua` entry in lowercased-path order.
     fn hook_paths(pack: &Pack) -> Vec<String> {
-        if let Some(manifest) = pack.manifest()
-            && !manifest.lua.is_empty()
-        {
-            return manifest.lua.clone();
+        // Every layer may name its hooks: the base first, then each mod in
+        // applied order, so a mod's manifest list is honoured like the base's.
+        // A layer that names none contributes its own `lua/**.lua` entries in
+        // lowercased-path order, which is exactly the single-pack rule.
+        let mut paths: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
+        for layer in std::iter::once(pack).chain(pack.overrides()) {
+            let candidates: Vec<String> =
+                match layer.manifest().filter(|manifest| !manifest.lua.is_empty()) {
+                    Some(manifest) => manifest.lua.clone(),
+                    None => discovered_hooks(layer.own_paths()),
+                };
+            for path in candidates {
+                if seen.insert(path.to_ascii_lowercase()) {
+                    paths.push(path);
+                }
+            }
         }
-        let mut paths: Vec<String> = pack
-            .paths()
+        paths
+    }
+
+    /// Every `lua/**.lua` entry of `paths`, in lowercased-path order.
+    fn discovered_hooks<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+        let mut paths: Vec<String> = paths
             .filter(|path| path.len() > 4)
             .filter(|path| path[..4].eq_ignore_ascii_case("lua/"))
             .filter(|path| path.to_ascii_lowercase().ends_with(".lua"))
@@ -593,6 +629,31 @@ mod imp {
                 Ok(())
             });
 
+            // `register_save_screen(entry)`: the pack entry the engine runs
+            // as the save/load screen instead of the ported original; `nil`
+            // clears a registration. The entry is read when a screen opens, so
+            // a missing one falls back with a warning rather than failing here.
+            methods.add_method_mut(
+                "register_save_screen",
+                |_lua, game, entry: Option<String>| {
+                    match entry {
+                        Some(entry) if entry.is_empty() => {
+                            return Err(mlua::Error::RuntimeError(
+                                "register_save_screen needs a pack entry path".to_string(),
+                            ));
+                        }
+                        Some(entry) if entry.contains('\0') => {
+                            return Err(mlua::Error::RuntimeError(
+                                "register_save_screen entry contains a NUL byte".to_string(),
+                            ));
+                        }
+                        Some(entry) => game.save_screen = Some(entry),
+                        None => game.save_screen = None,
+                    }
+                    Ok(())
+                },
+            );
+
             methods.add_method("log", |_lua, _game, text: mlua::String| {
                 eprintln!("[lua] {}", text.to_string_lossy());
                 Ok(())
@@ -605,6 +666,27 @@ pub use imp::LuaVm;
 
 #[cfg(feature = "lua")]
 pub(crate) use imp::{Budget, new_sandboxed_state};
+
+/// The save/load screen entry a pack's scripts register, if any.
+///
+/// The app needs the registration before any session exists (the title's LOAD
+/// GAME and the load screen both run first), so this loads the pack's hooks in
+/// a throwaway VM and runs `on_init` over a scratch state. Only a
+/// registration is read from it: the state is dropped, and every session keeps
+/// its own VM and its own state.
+pub fn registered_save_screen(pack: &crate::pack::Pack) -> Option<String> {
+    let vm = match LuaVm::load(pack) {
+        Ok(Some(vm)) => vm,
+        Ok(None) => return None,
+        Err(err) => {
+            eprintln!("warning: Lua hooks unavailable: {err:#}");
+            return None;
+        }
+    };
+    let mut probe = crate::game::GameState::default();
+    vm.call_init(&mut probe);
+    probe.save_screen
+}
 
 /// Compile a Lua source entry without running it, for the pack verifier.
 ///
@@ -620,8 +702,6 @@ pub fn verify_source(bytes: &[u8]) -> anyhow::Result<()> {
             .into_function()
             .map_err(|err| anyhow::anyhow!("lua compile: {err}"))?;
     }
-    #[cfg(not(feature = "lua"))]
-    let _ = bytes;
     Ok(())
 }
 
@@ -665,6 +745,142 @@ mod tests {
             .map(|(path, data)| (path.as_str(), data.as_slice()))
             .collect();
         pack(&borrowed)
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn on_init_registers_a_save_screen_for_the_app_and_the_session() {
+        let source = r#"
+function on_init(api)
+    api:register_save_screen("script/mine.lua")
+end
+"#;
+        let pack = lua_pack(&["lua/init.lua"], &[("lua/init.lua", source)]);
+        // The app reads the registration from a throwaway VM and state.
+        assert_eq!(
+            registered_save_screen(&pack).as_deref(),
+            Some("script/mine.lua")
+        );
+
+        // A session's own VM runs the same hook over its live state.
+        let vm = LuaVm::load(&pack).unwrap().expect("a Lua VM");
+        let mut game = GameState::default();
+        assert_eq!(game.save_screen, None);
+        vm.call_init(&mut game);
+        assert_eq!(game.save_screen.as_deref(), Some("script/mine.lua"));
+        // `nil` clears a registration.
+        let clear = lua_pack(
+            &["lua/init.lua"],
+            &[(
+                "lua/init.lua",
+                "function on_init(api) api:register_save_screen(nil) end",
+            )],
+        );
+        let vm = LuaVm::load(&clear).unwrap().expect("a Lua VM");
+        let mut game = GameState::default();
+        game.save_screen = Some("script/mine.lua".to_string());
+        vm.call_init(&mut game);
+        assert_eq!(game.save_screen, None);
+        assert!(registered_save_screen(&clear).is_none());
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn register_save_screen_rejects_a_bad_entry() {
+        let pack = lua_pack(
+            &["lua/init.lua"],
+            &[(
+                "lua/init.lua",
+                "function on_init(api) api:register_save_screen(\"\") end",
+            )],
+        );
+        let vm = LuaVm::load(&pack).unwrap().expect("a Lua VM");
+        let mut game = GameState::default();
+        // The failure disables the hook rather than failing the session.
+        vm.call_init(&mut game);
+        assert_eq!(game.save_screen, None);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn every_layer_contributes_its_hooks() {
+        // A mod's manifest `lua` list is honoured like the base's, and a layer
+        // that names none contributes its discovered `lua/` entries: the mod
+        // layer in the repository keeps its `mod.lua` at the pack root and
+        // names it, so this is the rule it relies on.
+        use crate::manifest::{Manifest, PackKind};
+        use crate::pack::PackWriter;
+
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        // Only the last chunk may define `on_room_load`: the hooks are single
+        // globals, so each chunk's definition replaces the previous one. The
+        // order the chunks ran in is what the test reads.
+        let chunk_a = "order = (order or \"\") .. \"a\"\n";
+        let chunk_b = "order = (order or \"\") .. \"b\"\n\
+                       function on_room_load(api)\n\
+                           api:flag_set(0, 1, order == \"ab\")\n\
+                       end\n";
+        let mut base_writer = PackWriter::new();
+        base_writer
+            .add(
+                crate::manifest::ENTRY,
+                Manifest {
+                    id: "re1".to_string(),
+                    kind: PackKind::Base,
+                    ..Manifest::base("re1")
+                }
+                .render()
+                .into_bytes(),
+            )
+            .unwrap();
+        let base_path = dir.join(format!("arklay-hooks-base-{tag}.akpak"));
+        base_writer.write(&base_path).unwrap();
+
+        let mut layer_paths = Vec::new();
+        for (index, (id, lua_list, source)) in [
+            ("a", vec!["lua/a.lua".to_string()], chunk_a),
+            ("b", Vec::new(), chunk_b),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut writer = PackWriter::new();
+            writer
+                .add(
+                    crate::manifest::ENTRY,
+                    Manifest {
+                        id: id.to_string(),
+                        kind: PackKind::Mod,
+                        base: Some("re1".to_string()),
+                        load_order: index as i32 * 10,
+                        lua: lua_list,
+                        ..Manifest::base(id)
+                    }
+                    .render()
+                    .into_bytes(),
+                )
+                .unwrap();
+            writer
+                .add(&format!("lua/{id}.lua"), source.as_bytes().to_vec())
+                .unwrap();
+            let path = dir.join(format!("arklay-hooks-{id}-{tag}.akpak"));
+            writer.write(&path).unwrap();
+            layer_paths.push(path);
+        }
+        let layered = Pack::open_layered(&base_path, &layer_paths).unwrap();
+        let vm = LuaVm::load(&layered).unwrap().expect("a Lua VM");
+        let mut game = GameState::default();
+        let id = game.id;
+        vm.call_room_load(&mut game, id);
+        assert!(
+            game.flags[0].bit(1),
+            "the named hook and the discovered one both ran, in layer order"
+        );
+        for path in layer_paths {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(base_path);
     }
 
     #[cfg(feature = "lua")]

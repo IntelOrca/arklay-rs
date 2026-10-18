@@ -181,6 +181,45 @@ pub fn encode(text: &str, script: Script, out: &mut Vec<u8>) {
     }
 }
 
+/// Decode a game-text byte stream back into characters, appending to `out`.
+///
+/// The inverse of [`encode`] for every cell the sheet names. Stream controls
+/// are not characters: `0x01`/`0x07` end the stream, `0x02` is a newline,
+/// `0x03`..`0x06` and `0x08` skip their operands, `0xFB`/`0xFF` are spacing
+/// controls, and [`MISSING`] decodes as `?` so an unspellable character stays
+/// visible. A byte no cell names is skipped.
+pub fn decode(bytes: &[u8], script: Script, out: &mut String) {
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        match byte {
+            0x01 | 0x07 => break,
+            0x00 => out.push(' '),
+            0x02 => out.push('\n'),
+            0x03..=0x06 => index += 1,
+            0x08 => index += 3,
+            0xFB | 0xFF => {}
+            0xF8..=0xFA => {
+                let Some(&operand) = bytes.get(index) else {
+                    break;
+                };
+                index += 1;
+                if byte == 0xFA && operand == 0xFF {
+                    out.push('?');
+                } else if let Some(cell) = extended_cell(byte, operand, script) {
+                    out.push_str(cell);
+                }
+            }
+            _ => {
+                if let Some(cell) = plain_cell(byte, script) {
+                    out.push_str(cell);
+                }
+            }
+        }
+    }
+}
+
 /// The cell a plain glyph byte (`0x0C..=0xF7`) selects.
 pub fn plain_cell(byte: u8, script: Script) -> Option<&'static str> {
     if byte >= 0xF8 {
@@ -281,6 +320,73 @@ mod tests {
         let mut out = Vec::new();
         encode(text, Script::Latin, &mut out);
         out
+    }
+
+    #[test]
+    fn decode_is_the_inverse_of_encode() {
+        // Every string round-trips in a script that can spell it: the
+        // Japanese sheet spells Latin letters, the Western one no kana.
+        for (script, text) in [
+            (Script::Japanese, "Combat Knife"),
+            (Script::Japanese, "M. Room 1F"),
+            (Script::Japanese, "セーブしない"),
+            (Script::Japanese, "S.T.A.R.S."),
+            (Script::Latin, "Combat Knife"),
+            (Script::Latin, "M. Room 1F"),
+            (Script::Latin, "S.T.A.R.S."),
+            (Script::Latin, "a b  c"),
+        ] {
+            let mut bytes = Vec::new();
+            encode(text, script, &mut bytes);
+            let mut decoded = String::new();
+            decode(&bytes, script, &mut decoded);
+            assert_eq!(decoded, text, "{text:?} in {script:?}");
+        }
+    }
+
+    #[test]
+    fn decode_reads_controls_and_the_missing_marker() {
+        // The `0x01` terminator ends the stream; `0x02` is a newline.
+        let mut decoded = String::new();
+        decode(&[0x1D, 0x1E, 0x01, 0x1F], Script::Latin, &mut decoded);
+        assert_eq!(decoded, "AB");
+
+        decoded.clear();
+        decode(&[0x1D, 0x02, 0x1E], Script::Latin, &mut decoded);
+        assert_eq!(decoded, "A\nB");
+
+        // Colour/clear/scroll tags and their operands are not characters.
+        decoded.clear();
+        decode(
+            &[0x05, 0x01, 0x1D, 0x03, 0x02, 0x1E],
+            Script::Latin,
+            &mut decoded,
+        );
+        assert_eq!(decoded, "AB");
+
+        // The unspellable marker stays visible, spacing bytes vanish.
+        decoded.clear();
+        decode(
+            &[0x1D, 0xFA, 0xFF, 0xFB, 0xFF, 0x1E],
+            Script::Latin,
+            &mut decoded,
+        );
+        assert_eq!(decoded, "A?B");
+
+        // An extended cell decodes through its page.
+        decoded.clear();
+        decode(&[0xF9, 0x09], Script::Japanese, &mut decoded);
+        assert_eq!(decoded, "館");
+    }
+
+    #[test]
+    fn decode_tolerates_truncated_streams() {
+        let mut decoded = String::new();
+        decode(&[0xF9], Script::Japanese, &mut decoded);
+        assert_eq!(decoded, "");
+        decoded.clear();
+        decode(&[], Script::Japanese, &mut decoded);
+        assert_eq!(decoded, "");
     }
 
     #[test]
@@ -459,6 +565,17 @@ mod tests {
         assert_eq!(latin("ＳＴＡＲＳ"), [0x74, 0x75, 0x76, 0x77, 0x74]);
         // A plain "STARS" keeps the plain letters.
         assert_eq!(latin("STARS"), [0x2F, 0x30, 0x1D, 0x2E, 0x2F]);
+    }
+
+    #[test]
+    fn latin_spells_the_slash_as_its_backslash_cell() {
+        // The Western sheet has no `/` cell; the USA save screen's separators
+        // are its backslash, so the substitute keeps localized text readable.
+        assert_eq!(latin("/"), latin("\\"));
+        assert_eq!(latin("/"), [0x38]);
+        assert_eq!(latin("10/18"), latin("10\\18"));
+        // The Japanese sheet spells both itself.
+        assert_eq!(encoded("/"), encoded("\\"));
     }
 
     #[test]

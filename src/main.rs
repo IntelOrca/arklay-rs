@@ -41,7 +41,8 @@ struct Cli {
     #[arg(long, value_name = "SCREEN", requires = "pack")]
     ui: Option<String>,
 
-    /// Directory holding `savedat*.dat` (default: `saves/` beside the pack)
+    /// Directory holding save files (default: `<config dir>/save`, or
+    /// `save_dir` in `arklay.toml`)
     #[arg(long, value_name = "DIR", requires = "pack")]
     save_dir: Option<PathBuf>,
 
@@ -614,6 +615,8 @@ fn main() -> Result<()> {
                 Some(path) => Some(arklay::engine::InputScript::from_file(path)?),
                 None => None,
             };
+            let config = arklay::config::Config::load_default()?;
+            let language = cli.language.clone().or_else(|| config.language.clone());
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),
                 capture_every: cli.capture_every.unwrap_or(0),
@@ -628,7 +631,9 @@ fn main() -> Result<()> {
             };
             let save_dir = cli
                 .save_dir
-                .unwrap_or_else(|| arklay::save::default_save_dir_for_pack(&pack));
+                .clone()
+                .or_else(|| config.save_dir.clone())
+                .unwrap_or_else(arklay::config::Config::default_save_dir);
             if let Some(id) = cli.ending {
                 return arklay::engine::run_ending(
                     &pack,
@@ -674,7 +679,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,
-                    cli.language.as_deref(),
+                    language.as_deref(),
                     trace_options,
                     authoring,
                 );
@@ -693,7 +698,7 @@ fn main() -> Result<()> {
                     &cli.mods,
                     cli.no_mods,
                     cli.debug_menu,
-                    cli.language.as_deref(),
+                    language.as_deref(),
                     trace_options,
                     authoring,
                 );
@@ -709,7 +714,7 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.stats,
                     cli.debug_menu,
-                    cli.language.as_deref(),
+                    language.as_deref(),
                     trace_options,
                     authoring,
                 );
@@ -724,7 +729,7 @@ fn main() -> Result<()> {
                 &cli.mods,
                 cli.no_mods,
                 cli.debug_menu,
-                cli.language.as_deref(),
+                language.as_deref(),
             )
         }
     }

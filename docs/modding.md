@@ -233,11 +233,18 @@ events are inert.
 
 A pack opts into scripting by carrying `lua/**.lua` entries. The manifest's
 `lua` list selects and orders them; without one, every `lua/` entry runs in
-lowercased-path order. Each chunk is compiled and run once when the session
-opens; the globals `on_room_load`, `on_tick` and `on_message` are then called:
+lowercased-path order. In a layered run each layer contributes its own list
+(the base first, then each mod in applied order), so a mod names its hooks in
+its own manifest. Each chunk is compiled and run once when the session opens;
+the globals `on_init`, `on_room_load`, `on_tick` and `on_message` are then
+called:
 
 ```lua
 local granted = false
+
+function on_init(api)
+    api:register_save_screen("script/mine.lua")  -- before any room
+end
 
 function on_room_load(api)
     api:log("entered " .. api:room())
@@ -258,16 +265,21 @@ end
 
 The hook order is:
 
-1. `on_room_load(api)` once a room's state exists (RDT, init script and room
+1. `on_init(api)` once the pack's scripts have loaded and before any room. It
+   is where a pack registers things the engine reads outside a room, such as
+   the save/load screen (`api:register_save_screen`). The app runs it once in
+   a throwaway VM and scratch state before the title appears; every session's
+   own VM runs it again over its live state.
+2. `on_room_load(api)` once a room's state exists (RDT, init script and room
    edits applied) and before its first tick. It runs again on every room
    entry, including a door transition; the Lua globals themselves persist for
    the session (`granted` above is not reset). The room-load camera scan runs
    after it, so `api:set_room_camera` only sticks when the room's init script
    holds the camera lock; otherwise the cut is re-homed from camera 0 at the
    player's position, exactly like the original's `room_set`.
-2. `on_tick(api, tick)` after every fixed 30 Hz room tick, before that tick's
+3. `on_tick(api, tick)` after every fixed 30 Hz room tick, before that tick's
    audio dispatch. `tick` is `game.frame`, the number of completed room ticks.
-3. `on_message(api, id)` when the tick raised a message; the returned id
+4. `on_message(api, id)` when the tick raised a message; the returned id
    replaces it (must fit a byte, else the original stays). The window's bytes
    are resolved on the next tick, so the new id is the one displayed.
 
@@ -302,6 +314,7 @@ exist (Lua colon syntax):
 | `api:set_state_byte(index, value)` | Write one BioCard state-image byte. |
 | `api:kill_event(slot)` | Deactivate a running event slot. |
 | `api:message(id)` | Request a room/global message. |
+| `api:register_save_screen(entry)` | Run `entry` (a pack path) as the save/load screen instead of the ported original; `nil` restores the original. See [Screen scripts](#screen-scripts). |
 | `api:log(text)` | Write one `[lua]` line to stderr. |
 
 The state-authoring methods (`set_*`, `clear_inventory`, `item_box_*`) exist
@@ -326,6 +339,104 @@ to a no-op and runs stay byte-identical.
 
 Hooks cannot spawn enemies: the hook API has no such operation by
 construction. Entity behaviour is the separate enemy-script surface below.
+
+## Screen scripts
+
+A pack may carry Lua scripts that implement whole screens, and register one as
+the save/load screen. Nothing about a screen is built into the engine: the
+ported original is the default, and a registered script replaces it. The
+checked-in `mods/crloadsave/` is the reference — a Classic REbirth-style
+folder screen:
+
+```
+mods/crloadsave/manifest.toml        lua = ["mod.lua"]
+mods/crloadsave/mod.lua              function on_init(api) api:register_save_screen("script/loadsave.lua") end
+mods/crloadsave/script/loadsave.lua  the screen itself
+mods/crloadsave/language/*.txt       its UI_SAVE_CR_* strings
+```
+
+`on_init` is the hook that runs once the pack's scripts have loaded, before
+any room; `api:register_save_screen(entry)` names the screen script (or `nil`
+to go back to the ported original). The registration is pack-level: the app
+runs the pack's scripts once in a throwaway VM before the title appears, so
+the title's LOAD GAME and the load screen honour it, and every session's own
+VM runs `on_init` again over its live state for the typewriter. A registered
+screen also changes the title's existence probe: it counts every loadable file
+in the save directory rather than the eight `savedatN.dat` slots, since a
+script lists the directory itself.
+
+Screen scripts are not hooks: `lua/**.lua` entries run once when a session
+opens, while a screen script is loaded and run only when its screen opens.
+
+A screen script defines three globals (`update` is required; `on_open` and
+`draw` are optional):
+
+```lua
+function on_open(api) end        -- once, before the first tick
+function update(api, input) end  -- once per fixed tick
+function draw(api) end           -- once per frame
+```
+
+The screen runs in the hooks' sandbox — base/`string`/`table` only, 16 MiB, the
+instruction budget — in its own VM and draws in the 320x240 layout space. A
+screen that fails to load, or a missing `update`, leaves the engine on the
+ported original screen; a script that errors while running is logged once and
+the screen leaves (back to gameplay from a save screen, back to the title from
+the load screen).
+
+### The `api` userdata
+
+| Method | Effect |
+| --- | --- |
+| `api:mode()` | `"save"` or `"load"`. |
+| `api:ticks()` | Fixed ticks since the screen opened (0 during the first `update`). |
+| `api:saves()` | The save directory's files, sorted by name. Each entry is a table: `path`, `name` (`savedat1.dat`), `base` (`savedat1`), `timestamp` (Unix seconds), `loadable`; a loadable file also carries `character` (`0` Chris, `1` Jill), `character_name`, `saves`, `stage` (the block's 0-based stage byte), `room` and `location` (the resolved room label). The list is rescanned after a save or remove. |
+| `api:string(key)` | A `language/<tag>.txt` string, decoded to characters; `nil` when no language carries the key. |
+| `api:character_name(index)` | The save screen's name for character `0`/`1`, decoded. |
+| `api:text_width(text[, tight])` | The pixel width `text` draws at (the session's tight metrics unless `tight` is given). |
+| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open` and `update` and play after the call; the engine drops them in a capture run, which stays silent. |
+| `api:save(name)` | Write the pending block to `<save_dir>/<name>` and return `ok, err`. `name` is one plain file name (no directory part); the extension is the script's choice. Save mode only. |
+| `api:remove(name)` | Delete `<save_dir>/<name>`, ignoring a missing file. Returns `ok, err`. |
+| `api:load(name)` | Load `<save_dir>/<name>`: the engine continues from that save on the next tick. Returns `ok, err`. Load mode only. |
+| `api:exit()` | Leave the screen (back to gameplay from a save screen, back to the title from the load screen). |
+| `api:log(text)` | Write one `[lua]` line to stderr. |
+
+### Drawing
+
+The drawing methods (`background`, `rect`, `text`, `sprite`, `sprite_region`)
+are only available inside `draw`; calling one from `on_open`/`update` raises an
+error, and every other method works from any of the three. Every colour is
+`0xRRGGBB` or `"#RRGGBB"`; text also takes a tint name (`white`, `green`,
+`red`, `grey`, `yellow`) or a CLUT row number, the rules the vanilla screens
+use. A text `"#RRGGBB"` is a per-channel multiplier over the sheet's grey ramp,
+so `"#3F7DFA"` draws the blue the built-in screen's save rows use.
+
+| Method | Effect |
+| --- | --- |
+| `api:background(entry[, opts])` | Draw the pack image `entry` over the whole screen, scaled. A 320x240 RGBA image with default options is blitted exactly; `colour` tints any background, and `brightness`/`blend` apply to an indexed one. |
+| `api:rect(x, y, w, h, colour[, alpha])` | A filled rectangle; `alpha` (default 255) blends it over what is already there. |
+| `api:text(x, y, text[, opts])` | Draw `text` through the game font and the session's text encoding, with the vanilla shadow. |
+| `api:sprite(entry, x, y[, opts])` | Draw the whole pack image at `(x, y)`. |
+| `api:sprite_region(entry, sx, sy, sw, sh, dx, dy, dw, dh[, opts])` | Draw the `src` region of the pack image, scaled into the `dst` rectangle. |
+| `api:image_size(entry)` | The pack image's width and height. |
+| `api:fade(alpha)` | Set the screen's black-overlay opacity (`0` clear, `255` black). |
+
+An image `entry` resolves like every other asset: by its stem, highest
+priority first `webp > png > bmp > tim > pix`, so a mod's replacement wins and
+a `.tim` keeps its palette (4bpp/8bpp indexed, 16bpp RGBA). Decoded images are
+cached per screen, up to 64 images and 64 MiB of pixels. The `opts` table
+is `{colour = "white"|3|"#RRGGBB", brightness = 2, tight = true, clut = 0,
+blend = "opaque"|"half"|"half_variant"}` — `brightness` is the font's `0..=30`
+scale, `clut` the indexed palette row and `blend` the sprite blend mode.
+
+### The input table
+
+`update(api, input)` receives the tick's edges: `up`, `down`, `left`, `right`,
+`confirm`, `cancel`, `page_left`, `page_right`, `start`, `any`, plus the
+original pad words `pad` (the edge word) and `held` (the held directions).
+The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
+`0x0008`, up `0x0010`, down `0x0020`, left `0x0040`, right `0x0080`, L1
+`0x0400`, R1 `0x0800`.
 
 ## Enemy scripts
 

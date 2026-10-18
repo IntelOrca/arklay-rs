@@ -144,6 +144,7 @@ pub fn lua(data: &[u8]) {
     };
     let mut game = GameState::default();
     let id = game.id;
+    vm.call_init(&mut game);
     vm.call_room_load(&mut game, id);
     vm.call_tick(&mut game, 1);
     let _ = vm.filter_message(&mut game, 1);

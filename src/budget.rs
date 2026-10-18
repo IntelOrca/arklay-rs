@@ -48,6 +48,8 @@
 //! | [`MAX_LUA_CHUNKS`] | 256 | a handful | loaded Lua chunks |
 //! | [`MAX_LUA_CHUNK`] | 1 MiB | a few KiB | one Lua chunk |
 //! | [`MAX_SAVE_BYTES`] | 1 MiB | 2 KiB | save slot file |
+//! | [`MAX_SCREEN_IMAGES`] | 64 | a handful | Lua screen image cache |
+//! | [`MAX_SCREEN_IMAGE_BYTES`] | 64 MiB | a few hundred KiB | Lua screen image cache |
 //! | [`MAX_COMBAT_TABLE_BYTES`] | 64 KiB | ~7 KiB | `data/combat.bin` |
 //!
 //! Raising a cap is a policy change: measure the new corpus peak, update the
@@ -127,6 +129,10 @@ pub const MAX_LUA_CHUNKS: usize = 256;
 pub const MAX_LUA_CHUNK: usize = 1 << 20;
 /// Largest save slot file accepted.
 pub const MAX_SAVE_BYTES: usize = 1 << 20;
+/// Largest number of pack images one Lua screen may decode and cache.
+pub const MAX_SCREEN_IMAGES: usize = 64;
+/// Largest total pixel storage one Lua screen's image cache may hold.
+pub const MAX_SCREEN_IMAGE_BYTES: usize = 64 << 20;
 /// Largest combat table blob accepted (`data/combat.bin`).
 pub const MAX_COMBAT_TABLE_BYTES: usize = 1 << 16;
 /// Largest language-file entry count.
