@@ -4927,31 +4927,9 @@ impl App {
             AppBoot::CharSelect => self.open_select(),
             AppBoot::SaveLoad => self.open_load(),
             AppBoot::Save => self.open_save_capture(),
-            AppBoot::NewGame { character, room } => {
-                let mut session = match room {
-                    Some(id) => {
-                        GameSession::new_in_room(&self.pack, id, character, &self.save_dir)?
-                    }
-                    None => GameSession::new(&self.pack, character, &self.save_dir)?,
-                };
-                // The interactive arbitrary-room boot lands on the walk zone
-                // centre right away; the trace path re-places after the
-                // room-set event pass instead (see `arm_new_game_boot`).
-                session.place_room_boot_spawn();
-                self.start_session(session);
-                Ok(())
-            }
-            AppBoot::Continue { path } => {
-                let file = save::load_file(&path)?;
-                let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
-                self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
-                Ok(())
-            }
-            AppBoot::Demo(index) => {
-                let session = GameSession::from_demo_index(&self.pack, index, &self.save_dir)?;
-                self.start_session(session);
-                Ok(())
-            }
+            AppBoot::NewGame { character, room } => self.boot_new_game(character, room),
+            AppBoot::Continue { path } => self.boot_continue(&path),
+            AppBoot::Demo(index) => self.boot_demo(index),
             AppBoot::Menu => self.open_menu(),
             AppBoot::ItemBox => self.open_item_box_capture(),
             AppBoot::File => self.open_file_capture(),
@@ -4977,6 +4955,41 @@ impl App {
                 self.open_epilogue()
             }
         }
+    }
+
+    /// The interactive `AppBoot::NewGame` arm.
+    ///
+    /// The by-value session lives here rather than in [`App::boot`]'s match:
+    /// a debug build materialises every `GameSession` temporary as a stack
+    /// slot, and the three session arms used to push that function's frame
+    /// past the Windows main thread's 1 MiB stack (the same split keeps
+    /// `App::apply`'s frame bounded; see `App::start_new_game`).
+    fn boot_new_game(&mut self, character: u8, room: Option<RoomId>) -> Result<()> {
+        let mut session = match room {
+            Some(id) => GameSession::new_in_room(&self.pack, id, character, &self.save_dir)?,
+            None => GameSession::new(&self.pack, character, &self.save_dir)?,
+        };
+        // The interactive arbitrary-room boot lands on the walk zone centre
+        // right away; the trace path re-places after the room-set event pass
+        // instead (see `arm_new_game_boot`).
+        session.place_room_boot_spawn();
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// The interactive `AppBoot::Continue` arm.
+    fn boot_continue(&mut self, path: &Path) -> Result<()> {
+        let file = save::load_file(path)?;
+        let session = GameSession::from_save(&self.pack, &file, &self.save_dir)?;
+        self.start_narrated_session(session, game::MESSAGE_BOOT_CONTINUE);
+        Ok(())
+    }
+
+    /// The interactive `AppBoot::Demo` arm.
+    fn boot_demo(&mut self, index: u8) -> Result<()> {
+        let session = GameSession::from_demo_index(&self.pack, index, &self.save_dir)?;
+        self.start_session(session);
+        Ok(())
     }
 
     /// The interactive root boot: enable the automatic films and queue the
@@ -5759,6 +5772,37 @@ pub fn run_root(
     )
 }
 
+/// Build the capture-path new-game session and start it.
+///
+/// The session lives here rather than in [`run_ui_impl`]'s arm: a debug build
+/// materialises every by-value `GameSession` temporary as a stack slot, and
+/// the three session arms used to push that function's frame past the Windows
+/// main thread's 1 MiB stack. The same split keeps `App::apply`'s frame
+/// bounded (see `App::start_new_game`).
+fn start_capture_game(app: &mut App, character: u8, room: Option<RoomId>) -> Result<()> {
+    let session = match room {
+        Some(id) => GameSession::new_in_room(&app.pack, id, character, &app.save_dir)?,
+        None => GameSession::new(&app.pack, character, &app.save_dir)?,
+    };
+    app.start_session(session);
+    Ok(())
+}
+
+/// Build the capture-path continue session and start it.
+fn start_capture_continue(app: &mut App, path: &Path) -> Result<()> {
+    let file = save::load_file(path)?;
+    let session = GameSession::from_save(&app.pack, &file, &app.save_dir)?;
+    app.start_session(session);
+    Ok(())
+}
+
+/// Build the capture-path attract-demo session and start it.
+fn start_capture_demo(app: &mut App, index: u8) -> Result<()> {
+    let session = GameSession::from_demo_index(&app.pack, index, &app.save_dir)?;
+    app.start_session(session);
+    Ok(())
+}
+
 /// The shared body of the `--ui` boot and the interactive root boot.
 #[allow(clippy::too_many_arguments)] // the boot options are all needed
 fn run_ui_impl(
@@ -5806,28 +5850,21 @@ fn run_ui_impl(
                 app.settle(SAVE_CAPTURE_TICKS)?;
             }
             AppBoot::NewGame { character, room } => {
-                let session = match room {
-                    Some(id) => GameSession::new_in_room(&app.pack, id, character, &app.save_dir)?,
-                    None => GameSession::new(&app.pack, character, &app.save_dir)?,
-                };
-                app.start_session(session);
+                start_capture_game(&mut app, character, room)?;
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
                 run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Continue { path } => {
-                let file = save::load_file(&path)?;
-                let session = GameSession::from_save(&app.pack, &file, &app.save_dir)?;
-                app.start_session(session);
+                start_capture_continue(&mut app, &path)?;
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
                 run_game_trace(&mut app, &trace)?;
             }
             AppBoot::Demo(index) => {
-                let session = GameSession::from_demo_index(&app.pack, index, &app.save_dir)?;
-                app.start_session(session);
+                start_capture_demo(&mut app, index)?;
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }

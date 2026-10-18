@@ -601,6 +601,12 @@ player, so a broken mod never costs the typewriter. The CR layout follows the
 disassembly notes: ten 15-px rows from y 49, a highlight band, the centred
 detail line at y 216, folder-based save names and overwrite-by-delete.
 
+The milestone also bounds two debug stack frames: `run_ui_impl` and `App::boot`
+gave their session arms ~1 MB each (a debug build puts a stack slot behind
+every by-value `GameSession` temporary), which overflowed the Windows debug
+binary's 1 MiB main-thread stack for every `--ui` boot; both now build the
+session in a small helper, the split `App::apply` already used.
+
 The default save location is a user-visible change: saves written by earlier
 builds under `saves/` beside the pack are not found automatically. Point
 `save_dir` (or `--save-dir`) at the old directory to keep using them, or copy
