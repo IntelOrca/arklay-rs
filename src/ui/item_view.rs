@@ -33,10 +33,10 @@
 use anyhow::Result;
 
 use crate::anim::{self, Mat4x3};
+use crate::assets::Artwork;
 use crate::font::{Font, Tint};
 use crate::items;
 use crate::ivm::{self, Ivm};
-use crate::model::Texture8;
 use crate::pack::Pack;
 use crate::render::{Camera, EntityLight, EntityLightSource, Framebuffer};
 use crate::text::Text;
@@ -744,7 +744,7 @@ impl ItemViewScreen {
     pub fn draw_examine(
         &self,
         framebuffer: &mut Framebuffer,
-        status: Option<&Texture8>,
+        status: Option<&Artwork>,
         font: Option<&Font>,
         text: &Text,
         examined: &[u8; 4],
@@ -759,7 +759,7 @@ impl ItemViewScreen {
                 } else {
                     ARROW_IDLE_U
                 };
-                framebuffer.draw_indexed_sprite(
+                framebuffer.draw_page_sprite(
                     status,
                     [u, v, ARROW_SIZE, ARROW_SIZE],
                     [position[0], position[1], ARROW_SIZE, ARROW_SIZE],
