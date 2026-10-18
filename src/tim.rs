@@ -316,6 +316,45 @@ fn block_header(data: &[u8], offset: usize, what: &str) -> Result<[u8; BLOCK_HEA
         .context("TIM block header is truncated")
 }
 
+/// The pixel width a 4bpp TIM's image block declares, read from the block
+/// headers alone (no pixel decode).
+///
+/// The image block's width field counts 16-bit units, so the pixel width is
+/// four times it: the Japanese `FONT.TIM` declares 192 and is 768 wide, the
+/// Western `fontus.tim` declares 64 and is 256 wide.
+pub fn image_width(data: &[u8]) -> Result<u32> {
+    if data.len() < HEADER_LEN {
+        bail!(
+            "TIM is truncated: {} bytes, need at least {HEADER_LEN}",
+            data.len()
+        );
+    }
+    let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    if magic != TIM_MAGIC {
+        bail!("not a TIM file: magic 0x{magic:08X}, expected 0x{TIM_MAGIC:08X}");
+    }
+    let flags = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if flags & 7 != MODE_4BPP {
+        bail!("TIM is not 4bpp indexed: flags 0x{flags:02X}");
+    }
+    let mut offset = HEADER_LEN;
+    if flags & CLUT_FLAG != 0 {
+        let length = u32::from_le_bytes(
+            block_header(data, offset, "CLUT")?[0..4]
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset = offset
+            .checked_add(length)
+            .context("TIM CLUT block length overflows")?;
+    }
+    let block = block_header(data, offset, "image")?;
+    let width_units = u16::from_le_bytes(block[8..10].try_into().unwrap()) as u32;
+    width_units
+        .checked_mul(4)
+        .context("TIM image width overflows")
+}
+
 fn expand_bgr555(value: u16) -> [u8; 4] {
     let r = value & 31;
     let g = (value >> 5) & 31;

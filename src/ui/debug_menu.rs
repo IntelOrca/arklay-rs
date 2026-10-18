@@ -146,7 +146,7 @@ impl DebugMenu {
             }
             let room3 = id.room3();
             let mut label = Vec::new();
-            charset::encode(&room3, &mut label);
+            charset::encode(&room3, text.script(), &mut label);
             let tint = if Some(index) == self.current {
                 Tint::Green
             } else {

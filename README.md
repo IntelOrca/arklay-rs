@@ -34,6 +34,13 @@ cargo run -- convert-game /path/to/re1 --out re1.akpak --verbose
 # Limit the conversion to N workers (default: one per available CPU)
 cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 
+# Convert the Steam release's install root: the walk finds the language trees
+# (english/USA, french/FRA, german/GER, japanese/JPN), converts the first one
+# (English) and packs every game-text sheet it carries, so the one pack renders
+# English/French/German with the original 8px Latin glyphs and `ja-JP` with the
+# Japanese sheet
+cargo run -- convert-game /path/to/steam/4249100_Biohazard --out re1.akpak
+
 # List every pack entry with its size, then the entry count and total bytes
 cargo run -- list re1.akpak
 

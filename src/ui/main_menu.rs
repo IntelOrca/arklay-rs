@@ -142,7 +142,10 @@ pub struct MenuAssets {
 
 impl MenuAssets {
     /// Load every asset the menu draws from `pack`.
-    pub fn load(pack: &Pack) -> Result<Self> {
+    /// Load the menu art. `font` is the session's glyph sheet — the script
+    /// the language files encode in — falling back to the pack's default
+    /// sheet when the caller has none (tests and capture-less helpers).
+    pub fn load(pack: &Pack, font: Option<&Font>) -> Result<Self> {
         let status = decode_texture(pack, STATUS_ENTRY)?;
         let blue = decode_texture(pack, BLUE_ENTRY)?;
         let statface = decode_texture(pack, STATFACE_ENTRY)?;
@@ -153,11 +156,14 @@ impl MenuAssets {
                 .with_context(|| format!("missing {ITEM_ALL_ENTRY}"))?,
         )
         .with_context(|| format!("invalid {ITEM_ALL_ENTRY}"))?;
-        let font = Font::new(tim::decode_4bpp(
-            &pack
-                .read(FONT_ENTRY)
-                .with_context(|| format!("missing {FONT_ENTRY}"))?,
-        )?);
+        let font = match font {
+            Some(font) => font.clone(),
+            None => Font::new(tim::decode_4bpp(
+                &pack
+                    .read(FONT_ENTRY)
+                    .with_context(|| format!("missing {FONT_ENTRY}"))?,
+            )?),
+        };
         Ok(Self {
             status,
             blue,

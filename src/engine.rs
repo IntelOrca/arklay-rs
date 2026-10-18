@@ -1420,17 +1420,11 @@ impl GameSession {
         let command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         let event_vm = scd::vm::EventVm::from_scripts(scripts);
         // The message window's glyph sheet is optional: a pack without one
-        // still runs the state machine and simply draws nothing.
-        let font = match pack.read("font/font.tim") {
-            Ok(bytes) => match tim::decode_4bpp(&bytes) {
-                Ok(texture) => Some(font::Font::new(texture)),
-                Err(err) => {
-                    eprintln!("warning: invalid font/font.tim: {err:#}");
-                    None
-                }
-            },
-            Err(_) => None,
-        };
+        // still runs the state machine and simply draws nothing. The sheet
+        // follows the script the language files encode in, so a pack that
+        // ships both sheets draws each language with its own.
+        let text = Text::load(pack, pack.language());
+        let font = font::load_session(pack, text.script());
         let mut session = Self {
             loaded,
             game,
@@ -1447,7 +1441,7 @@ impl GameSession {
             npc_models: enemy::EntityModelCache::default(),
             enemy_lua: enemy::LuaEnemyHost::new(),
             music: None,
-            text: Text::load(pack, pack.language()),
+            text,
             font,
             menu_assets: None,
             menu_assets_loaded: false,
@@ -2304,7 +2298,8 @@ impl GameSession {
             return;
         }
         self.menu_assets_loaded = true;
-        match MenuAssets::load(pack) {
+        let font = self.font.as_ref();
+        match MenuAssets::load(pack, font) {
             Ok(assets) => self.menu_assets = Some(assets),
             Err(err) => eprintln!("warning: pause-menu art unavailable: {err:#}"),
         }
@@ -4694,17 +4689,8 @@ impl App {
     /// Open the pack's shared assets; the mode machine starts on the title.
     /// `audio` opens the mixer when a game session or film starts.
     fn new(pack: Pack, save_dir: PathBuf, audio: bool) -> Self {
-        let font = match pack.read("font/font.tim") {
-            Ok(bytes) => match tim::decode_4bpp(&bytes) {
-                Ok(texture) => Some(font::Font::new(texture)),
-                Err(err) => {
-                    eprintln!("warning: invalid font/font.tim: {err:#}");
-                    None
-                }
-            },
-            Err(_) => None,
-        };
         let text = Text::load(&pack, pack.language());
+        let font = font::load_session(&pack, text.script());
         let demos = demo::entries(&pack);
         Self {
             pack,
@@ -6172,11 +6158,11 @@ fn run_font_ui(
     no_mods: bool,
 ) -> Result<()> {
     let pack = open_game_pack(pack_path, mods, no_mods, None)?;
-    let bytes = pack
-        .read("font/font.tim")
-        .context("the pack has no font/font.tim (re-run convert-game)")?;
-    let texture = tim::decode_4bpp(&bytes).context("failed to decode font/font.tim")?;
-    let font = font::Font::new(texture);
+    // The sampler shows the sheet the session's language would draw with, so
+    // `--language en-US --ui font` samples a packed Western sheet.
+    let text = Text::load(&pack, pack.language());
+    let font = font::load_session(&pack, text.script())
+        .context("the pack has no usable font (re-run convert-game)")?;
 
     if capture.is_some() {
         unsafe {

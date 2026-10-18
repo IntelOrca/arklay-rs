@@ -928,7 +928,7 @@ fn conversion_packs_the_shipped_films_in_the_single_pack() {
     };
     let dir = TempDir::new("convert");
     let out = dir.0.join("re1.akpak");
-    convert_game_with_options(&root, &out, None, 0, false).unwrap();
+    convert_game_with_options(&root, &out, 0, false).unwrap();
 
     let pack = Pack::open(&out).unwrap();
     let film_paths: Vec<&str> = pack

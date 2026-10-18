@@ -66,15 +66,15 @@ fn the_japanese_seed_matches_the_executable_tables() {
     let mut checked = 0;
     checked += check_table(&pack, "text/messages.bin", |index| {
         file.get(&format!("MESSAGE_{index:02X}"))
-            .map(|entry| entry.encode())
+            .map(|entry| entry.encode(arklay::charset::Script::Japanese))
     });
     checked += check_table(&pack, "text/names.bin", |index| {
         file.get(&format!("ITEM_{:02X}_NAME", index + 1))
-            .map(|entry| entry.encode())
+            .map(|entry| entry.encode(arklay::charset::Script::Japanese))
     });
     checked += check_table(&pack, "text/idesc.bin", |index| {
         file.get(&format!("ITEM_{:02X}_DESCRIPTION", index + 1))
-            .map(|entry| entry.encode())
+            .map(|entry| entry.encode(arklay::charset::Script::Japanese))
     });
     checked += check_table(&pack, "text/save.bin", |index| {
         let key = match index {
@@ -94,7 +94,8 @@ fn the_japanese_seed_matches_the_executable_tables() {
             13 => "UI_SAVE_ERROR_1",
             _ => return None,
         };
-        file.get(key).map(|entry| entry.encode())
+        file.get(key)
+            .map(|entry| entry.encode(arklay::charset::Script::Japanese))
     });
     // A pack converted by this tree carries no text tables; a legacy pack
     // does, and then the check must be substantial.
@@ -155,7 +156,7 @@ fn the_japanese_seed_matches_every_room_message() {
             let Some(entry) = entry else {
                 continue; // a room message the seed does not carry
             };
-            let encoded = entry.encode();
+            let encoded = entry.encode(arklay::charset::Script::Japanese);
             // Message streams carry the `0x01` terminator and the action byte;
             // an RDT message block can end right at the text (1170's last
             // message is cut by the section boundary), so allow the stream to

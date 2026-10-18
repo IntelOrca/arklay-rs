@@ -69,7 +69,7 @@ fn real_file_art_loads_and_a_collected_document_pages_through() {
     game.set_file_collected(0x0F, true);
     assert!(game.document_collected(FILE_ITEM_MIN + 0x0F));
 
-    let menu = MenuAssets::load(&pack).expect("the pack has the menu art");
+    let menu = MenuAssets::load(&pack, None).expect("the pack has the menu art");
     let text = Text::load(&pack, Some("en-US"));
     let mut screen = FileScreen::default();
     screen.open(&game);

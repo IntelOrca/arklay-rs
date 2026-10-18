@@ -14,6 +14,7 @@
 //! remapped to the sheet's round parentheses; see its own note.
 
 use crate::model::Texture8;
+use crate::pack::Pack;
 use crate::render::{Framebuffer, SpriteBlend, SpriteDraw};
 
 pub use crate::render::Tint;
@@ -22,6 +23,47 @@ pub use crate::render::Tint;
 pub const GLYPH_HEIGHT: i32 = 14;
 /// Width at which a sheet selects the 14px Japanese metrics.
 pub const JPN_SHEET_WIDTH: u32 = 768;
+
+/// The default sheet entry: whatever font the converted install ships, the
+/// Japanese `FONT.TIM` or the Western `fontus.tim`.
+pub const DEFAULT_ENTRY: &str = "font/font.tim";
+/// The Japanese sheet as a script-specific override, packed when the install
+/// carries a Western default too.
+pub const JAPANESE_ENTRY: &str = "font/jpn.tim";
+/// The Western sheet as a script-specific override, packed when the install
+/// carries a Japanese default.
+pub const LATIN_ENTRY: &str = "font/latin.tim";
+
+/// The pack entry a session in `script` draws with: the script's own sheet
+/// when the pack ships one, else the default.
+pub fn session_entry(pack: &Pack, script: crate::charset::Script) -> &'static str {
+    let entry = match script {
+        crate::charset::Script::Japanese => JAPANESE_ENTRY,
+        crate::charset::Script::Latin => LATIN_ENTRY,
+    };
+    if pack.contains(entry) {
+        entry
+    } else {
+        DEFAULT_ENTRY
+    }
+}
+
+/// Decode the sheet a session in `script` draws with, or `None` when the pack
+/// carries no usable font.
+pub fn load_session(pack: &Pack, script: crate::charset::Script) -> Option<Font> {
+    let entry = session_entry(pack, script);
+    let bytes = match pack.read(entry) {
+        Ok(bytes) => bytes,
+        Err(_) => return None,
+    };
+    match crate::tim::decode_4bpp(&bytes) {
+        Ok(texture) => Some(Font::new(texture)),
+        Err(err) => {
+            eprintln!("warning: invalid {entry}: {err:#}");
+            None
+        }
+    }
+}
 
 /// A font sheet's glyph metrics, selected by the sheet width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -506,11 +548,25 @@ impl Font {
         }
     }
 
+    /// The script the sheet's width selects: the 768-wide Japanese sheet or
+    /// the 256-wide Western one. Every stream the session draws must be
+    /// encoded in this script's byte space.
+    pub fn script(&self) -> crate::charset::Script {
+        if self.texture.width >= JPN_SHEET_WIDTH {
+            crate::charset::Script::Japanese
+        } else {
+            crate::charset::Script::Latin
+        }
+    }
+
     /// The decoded glyph stream of game-text `bytes`, with the tight table
     /// when `tight`.
     fn glyphs<'a>(&'a self, tight: bool, bytes: &'a [u8]) -> Glyphs<'a> {
         let glyphs = Glyphs::new(bytes, self.metrics);
-        if tight {
+        // The tight table compensates for the Japanese sheet's full-width
+        // Latin glyphs. The Western sheet was drawn at its own 8px advances
+        // by the original, so it ignores the flag and every cell is whole.
+        if tight && self.script() == crate::charset::Script::Japanese {
             glyphs.tight(&self.glyph_table)
         } else {
             glyphs
@@ -1239,6 +1295,42 @@ mod tests {
     }
 
     #[test]
+    fn the_western_sheet_ignores_the_tight_flag() {
+        // The tight table compensates for the Japanese sheet's full-width
+        // Latin glyphs. The Western sheet was drawn whole by the original, so
+        // a narrow cell keeps its 8px advance even when the language asks for
+        // tight metrics (issue #32).
+        let width = 256u32;
+        let height = 256u32;
+        let mut indices = vec![0u8; (width * height) as usize];
+        // `I` is plain cell 0x25: row 2, column 1 -> u 8, v 28 + 2*14.
+        for y in 56..56 + GLYPH_HEIGHT {
+            for x in 10..=12 {
+                indices[(y as u32 * width + x as u32) as usize] = 1;
+            }
+        }
+        let mut palettes = vec![[0u8; 4]; crate::model::PALETTE_ROW_LEN];
+        palettes[1] = [255, 255, 255, 255];
+        let font = Font::new(Texture8 {
+            width,
+            height,
+            indices,
+            palettes,
+            stp: Vec::new(),
+        });
+        assert_eq!(font.script(), crate::charset::Script::Latin);
+        assert_eq!(font.metrics.glyph_w, 8);
+        assert_eq!(font.advance(true, &[0x25]), 8, "the Western sheet is whole");
+        assert_eq!(font.advance(false, &[0x25]), 8);
+
+        // The same strip on the Japanese sheet is trimmed to its ink.
+        let jpn = Font::new(sheet_with_ink(&[(14, 56, 2, 4)]));
+        assert_eq!(jpn.script(), crate::charset::Script::Japanese);
+        assert_eq!(jpn.advance(true, &[0x25]), 4, "the Japanese sheet trims");
+        assert_eq!(jpn.advance(false, &[0x25]), 14);
+    }
+
+    #[test]
     fn ascii_parentheses_remap_to_the_sheet_paren_cells() {
         // `PrintText8x14`'s buffer is ASCII: 40/41 are `(` and `)`, which the
         // remap sends to the sheet's round parentheses. The ASCII letter L —
@@ -1420,7 +1512,7 @@ mod tests {
         // time: the letter covers columns 0..=3, the parenthesis 4..=6.
         let font = Font::new(sheet_with_ink(&[(56, 56, 0, 3), (56, 224, 4, 6)]));
         let mut name = Vec::new();
-        crate::charset::encode("Lockpick", &mut name);
+        crate::charset::encode("Lockpick", crate::charset::Script::Japanese, &mut name);
         assert_eq!(name[0], 0x28, "the charset spells L as 0x28");
 
         fn pixel(framebuffer: &Framebuffer, x: usize) -> [u8; 4] {
