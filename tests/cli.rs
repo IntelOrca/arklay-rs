@@ -553,7 +553,8 @@ fn the_config_file_and_the_save_screen_flag_are_read() {
     // screen script, so the run warns and falls back to the ported original.
     std::fs::write(
         &config,
-        format!("save_screen = \"cr\"\nsave_dir = \"{}\"\n", saves.display()),
+        // The literal string form keeps a Windows path valid without escaping.
+        format!("save_screen = \"cr\"\nsave_dir = '{}'\n", saves.display()),
     )
     .unwrap();
     let output = run_env(

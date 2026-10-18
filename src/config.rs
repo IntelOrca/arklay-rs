@@ -4,7 +4,9 @@
 //! (`$XDG_CONFIG_HOME/arklay`, else `~/.config/arklay`, else
 //! `%APPDATA%\arklay`) and is optional: a missing file is the default
 //! configuration. The grammar is the same small TOML subset the pack manifest
-//! uses — comments, blank lines and `key = "value"` — with three keys:
+//! uses — comments, blank lines and `key = "value"`, plus TOML's literal
+//! `key = 'value'` strings so a Windows path needs no escaping — with three
+//! keys:
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
@@ -166,7 +168,7 @@ impl Config {
             };
             let key = key.trim();
             let value = value.trim();
-            if !value.starts_with('"') {
+            if !value.starts_with(['"', '\'']) {
                 bail!("line {line}: `{key}` expects a quoted string");
             }
             let value = parse_quoted(value, line)?;
@@ -240,32 +242,52 @@ fn env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-/// Drop a trailing `#` comment, honouring quotes.
+/// Drop a trailing `#` comment, honouring quoted strings: a `#` inside a value
+/// is not a comment, and an escape only applies inside a basic `"..."` string.
 fn strip_comment(line: &str) -> &str {
-    let mut quoted = false;
+    let mut quote: Option<char> = None;
     let mut escaped = false;
     for (index, ch) in line.char_indices() {
         if escaped {
             escaped = false;
             continue;
         }
-        match ch {
-            '\\' if quoted => escaped = true,
-            '"' => quoted = !quoted,
-            '#' if !quoted => return &line[..index],
-            _ => {}
+        match quote {
+            Some('"') => match ch {
+                '\\' => escaped = true,
+                '"' => quote = None,
+                _ => {}
+            },
+            Some(_) => {
+                if ch == '\'' {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '#' => return &line[..index],
+                _ => {}
+            },
         }
     }
     line
 }
 
-/// Parse one quoted string, with the manifest's escapes.
+/// Parse one quoted string: `"..."` with the manifest's escapes, or `'...'`
+/// verbatim (TOML's literal string, so a Windows path needs no escaping).
 fn parse_quoted(value: &str, line: usize) -> Result<String> {
-    if !value.ends_with('"') || value.len() < 2 {
+    let Some(quote @ ('"' | '\'')) = value.chars().next() else {
+        bail!("line {line}: expected a quoted string");
+    };
+    if !value.ends_with(quote) || value.len() < 2 {
         bail!("line {line}: unterminated string");
     }
+    let inner = &value[1..value.len() - 1];
+    if quote == '\'' {
+        return Ok(inner.to_string());
+    }
     let mut out = String::new();
-    let mut chars = value[1..value.len() - 1].chars();
+    let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
             out.push(ch);
@@ -343,6 +365,27 @@ mod tests {
         ] {
             assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
         }
+    }
+
+    #[test]
+    fn literal_strings_need_no_escaping() {
+        // TOML's single-quoted literal string: a Windows path is written as
+        // it is, backslashes and all.
+        let config = Config::parse(
+            "save_dir = 'C:\\Users\\me\\saves'   # a comment\n\
+             language = 'en-US'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.save_dir.as_deref(),
+            Some(Path::new("C:\\Users\\me\\saves"))
+        );
+        assert_eq!(config.language.as_deref(), Some("en-US"));
+        // A `#` inside either string form is not a comment, and a backslash
+        // inside a literal one is not an escape.
+        let config = Config::parse("save_dir = 'C:\\temp\\a#b'\n").unwrap();
+        assert_eq!(config.save_dir.as_deref(), Some(Path::new("C:\\temp\\a#b")));
+        assert!(Config::parse("save_dir = 'unterminated\n").is_err());
     }
 
     #[test]
