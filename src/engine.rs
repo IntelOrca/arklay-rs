@@ -24,9 +24,6 @@
 //! - the original's stage-5 texture-bank and palette overrides are documented
 //!   no-ops, as is the positional fix-up path; the model's own decoded texture
 //!   is used everywhere;
-//! - the climb's camera screen-effect rectangles are recorded
-//!   ([`crate::player::ScreenEffect`]) but the camera-scroll consumer that
-//!   reads them is not ported;
 //! - the original's fixed ordering-table depths (the flooded guardhouse and
 //!   courtyard water rooms, the 1F right-stairs objects with type < 2, and the
 //!   2F study/front-lesson open lid at slot 0x33) are not modelled: the port
@@ -1907,11 +1904,6 @@ impl GameSession {
             },
             input,
         );
-        // The vault's warp tick clears the entity's `isBeingAttackedFlag` the
-        // original's door sequence zeroes in its warp case.
-        if std::mem::take(&mut self.player.clear_attacked_flag) {
-            self.game.entities[0].is_being_attacked = 0;
-        }
         // While the pad-driven locomotion owns the player, mirror its
         // reference scratch into entity 0: `player_behavior_00_idle` keeps
         // `action_state` as the idle phase and `attackDirection` as the
@@ -8743,6 +8735,94 @@ struct RoomContext<'a> {
     enemy_lua: Option<&'a mut enemy::LuaEnemyHost>,
 }
 
+/// The pad-driven half of the player's frame: the control gate has passed, so
+/// the action-key scan, the stair/ladder zone branch and then the locomotion
+/// (or weapon) machine run in the original's order.
+fn tick_pad_driven_player(context: &mut RoomContext<'_>, pad: player::Input) {
+    // `player_input_to_behavior`'s action-key scan runs at the top of the
+    // player's frame-0 dispatch, before the behaviour it selects executes on
+    // the same tick (`update_player_anim`, 0x00480ebd). `pad` is already
+    // blanked for a closed controls latch, and the message gate is open here.
+    if pad.action_pressed {
+        context.game.player_action_press(context.player);
+        // `check_action_object` follows the climb scan in the same dispatch,
+        // still from the frame-start position, and only while no locked or
+        // weapon behaviour owns the frame-1 dispatch.
+        if context.player.locked == player::LockedAction::None
+            && context.player.weapon.behavior == 0
+        {
+            context
+                .game
+                .check_action_object(context.player.pos, context.player.angle);
+            // A gated press queued its reach: the 0x0c behaviour owns this
+            // tick.
+            if let Some(request) = context.game.take_pending_reach() {
+                context.player.begin_interact(request);
+            }
+        }
+    }
+    // The zone branch: a zone the press just marked, or one a script or the
+    // previous frame's probe raised, starts the stairway or ladder before the
+    // locomotion would run.
+    if context.player.weapon.behavior == 0 {
+        context
+            .game
+            .player_zone_behavior(context.player, pad.action_pressed);
+    }
+    if let Some(assets) = context.player_assets {
+        run_player_machine(context, assets, pad);
+    }
+}
+
+/// The locomotion and weapon machine, which needs the player's model assets.
+fn run_player_machine(context: &mut RoomContext<'_>, assets: &PlayerAssets, pad: player::Input) {
+    // A scripted state can hand the player back mid-settle: `action_state`
+    // already 1, the settle's pose words written on the entity. The
+    // reference's idle then skips its case-0 entry and the settle's first
+    // `Joint_move` snaps the body clip straight to the written frame with the
+    // written blend counter. Adopt the words before the pad-driven machine's
+    // entry check runs.
+    if std::mem::take(&mut context.player.scripted_hold) {
+        context
+            .player
+            .adopt_scripted_handback(&context.game.entities[0]);
+    }
+    let room_clips = context
+        .room
+        .room_anim
+        .as_ref()
+        .map(|anim| anim.clips.as_slice())
+        .unwrap_or(&[]);
+    // The active weapon's bank: the machine's loaded file while it runs,
+    // otherwise the equipped item's, so the frame the aim starts reads the
+    // right clips.
+    let weapon_file = context.player.weapon.weapon_file.or_else(|| {
+        context
+            .game
+            .equipped
+            .and_then(|item| crate::weapons::weapon_emw_id(context.game.id.player_flag & 3, item))
+    });
+    let weapon = assets.weapon(weapon_file);
+    let no_weapon = crate::model::Emw {
+        skeleton: Default::default(),
+        keyframes: Vec::new(),
+        clips: Vec::new(),
+        mesh: Default::default(),
+    };
+    let weapon = weapon.unwrap_or(&no_weapon);
+    let clips = crate::weapons::WeaponClips {
+        emd: &assets.emd.clips,
+        emw: &assets.emw.clips,
+        room: room_clips,
+        weapon: &weapon.clips,
+        emd_keyframes: &assets.emd.keyframes,
+        emd_skeleton: &assets.emd.skeleton,
+        weapon_keyframes: &weapon.keyframes,
+        weapon_skeleton: &weapon.skeleton,
+    };
+    crate::weapons::update(context.game, context.player, context.room, &clips, pad);
+}
+
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
 /// Returns the door transition the tick requested, if any.
 ///
@@ -8767,7 +8847,7 @@ fn tick_room(
 fn tick_room_timed(
     command_vm: &mut scd::vm::CommandVm,
     event_vm: &mut scd::vm::EventVm,
-    context: RoomContext<'_>,
+    mut context: RoomContext<'_>,
     input: player::Input,
     mut phases: Option<&mut stats::PhaseTotals>,
 ) -> Option<game::RoomTransition> {
@@ -8839,7 +8919,7 @@ fn tick_room_timed(
         context.room,
         context.npc_models,
         context.pack,
-        context.enemy_lua,
+        context.enemy_lua.as_deref_mut(),
     );
     // Scripts may have moved the player entity directly (dir_set, actor
     // motion); mirror that onto the visible player before physics run.
@@ -8952,83 +9032,7 @@ fn tick_room_timed(
             player_script::update_banks(context.game, context.player, context.room, &banks);
         }
     } else if !player_script::control_gate(context.game, context.player) {
-        // `player_input_to_behavior`'s action-key scan runs at the top of the
-        // player's frame-0 dispatch, before the behaviour it selects executes
-        // on the same tick (`update_player_anim`, 0x00480ebd). `pad` is
-        // already blanked for a closed controls latch, and the message gate is
-        // open in this branch.
-        if pad.action_pressed {
-            context.game.player_action_press(context.player);
-            // `check_action_object` follows the climb scan in the same
-            // dispatch, still from the frame-start position, and only while
-            // no locked or weapon behaviour owns the frame-1 dispatch.
-            if context.player.locked == player::LockedAction::None
-                && context.player.weapon.behavior == 0
-            {
-                context
-                    .game
-                    .check_action_object(context.player.pos, context.player.angle);
-                // A gated press queued its reach: the 0x0c behaviour owns this
-                // tick.
-                if let Some(request) = context.game.take_pending_reach() {
-                    context.player.begin_interact(request);
-                }
-            }
-        }
-        // The zone branch: a zone the press just marked, or one a script or
-        // the previous frame's probe raised, starts the stairway or ladder
-        // before the locomotion would run.
-        if context.player.weapon.behavior == 0 {
-            context
-                .game
-                .player_zone_behavior(context.player, pad.action_pressed);
-        }
-        if let Some(assets) = context.player_assets {
-            // A scripted state can hand the player back mid-settle: `action_state`
-            // already 1, the settle's pose words written on the entity. The
-            // reference's idle then skips its case-0 entry and the settle's first
-            // `Joint_move` snaps the body clip straight to the written frame with
-            // the written blend counter. Adopt the words before the pad-driven
-            // machine's entry check runs.
-            if std::mem::take(&mut context.player.scripted_hold) {
-                context
-                    .player
-                    .adopt_scripted_handback(&context.game.entities[0]);
-            }
-            let room_clips = context
-                .room
-                .room_anim
-                .as_ref()
-                .map(|anim| anim.clips.as_slice())
-                .unwrap_or(&[]);
-            // The active weapon's bank: the machine's loaded file while it runs,
-            // otherwise the equipped item's, so the frame the aim starts reads the
-            // right clips.
-            let weapon_file = context.player.weapon.weapon_file.or_else(|| {
-                context.game.equipped.and_then(|item| {
-                    crate::weapons::weapon_emw_id(context.game.id.player_flag & 3, item)
-                })
-            });
-            let weapon = assets.weapon(weapon_file);
-            let no_weapon = crate::model::Emw {
-                skeleton: Default::default(),
-                keyframes: Vec::new(),
-                clips: Vec::new(),
-                mesh: Default::default(),
-            };
-            let weapon = weapon.unwrap_or(&no_weapon);
-            let clips = crate::weapons::WeaponClips {
-                emd: &assets.emd.clips,
-                emw: &assets.emw.clips,
-                room: room_clips,
-                weapon: &weapon.clips,
-                emd_keyframes: &assets.emd.keyframes,
-                emd_skeleton: &assets.emd.skeleton,
-                weapon_keyframes: &weapon.keyframes,
-                weapon_skeleton: &weapon.skeleton,
-            };
-            crate::weapons::update(context.game, context.player, context.room, &clips, pad);
-        }
+        tick_pad_driven_player(&mut context, pad);
     }
     // `update_player_anim` runs `EntityUpdateLookAtAngles` after the state
     // function and before the collision pass, whether or not the message gate
@@ -9181,9 +9185,11 @@ fn tick_room_timed(
     // The stair probe wrote `player.pos[1]`; mirror it onto entity 0 so the
     // renderer and the next script tick see the resolved height.
     context.game.sync_entity_from_player(context.player);
-    // The climb's camera-scroll consumer is not ported; drop the queued
-    // screen-effect rectangles each tick so the list cannot grow unbounded.
-    context.player.take_screen_effects();
+    // The vault's and the stairway's warp cases clear `isBeingAttackedFlag`
+    // (the 0x80 the action scan raised) in the tick they warp.
+    if std::mem::take(&mut context.player.clear_attacked_flag) {
+        context.game.entities[0].is_being_attacked = 0;
+    }
     context.game.transition.take()
 }
 

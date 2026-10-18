@@ -329,7 +329,8 @@ type LadderLog = Vec<(u8, usize, [i32; 3])>;
 
 /// Drive one ladder leg from `start_angle` (`x`, `y`, `z`, `angle`): press
 /// action on the first tick and tick until control returns. Returns the queued
-/// sound ids, the recorded screen effects and the per-tick log.
+/// sound ids, the widest ground-quad half extent along X the climb sized and
+/// the per-tick log.
 fn drive_ladder(
     player: &mut PlayerState,
     room: &RoomState,
@@ -338,12 +339,12 @@ fn drive_ladder(
     emw_clips: &[arklay::model::Clip],
     start_angle: [i32; 4],
     ticks: usize,
-) -> (Vec<u16>, Vec<player::ScreenEffect>, LadderLog) {
+) -> (Vec<u16>, i32, LadderLog) {
     player.pos = [start_angle[0], start_angle[1], start_angle[2]];
     player.angle = start_angle[3] as u16;
     game.sync_entity_from_player(player);
     let mut sounds = Vec::new();
-    let mut effects = Vec::new();
+    let mut widest = player.shadow_half_x;
     let mut log = Vec::new();
     for tick in 0..ticks {
         let pressed = tick == 0;
@@ -353,13 +354,13 @@ fn drive_ladder(
         };
         ladder_tick(player, room, game, emd_clips, emw_clips, input, pressed);
         sounds.extend(player.take_sounds().iter().map(|sound| sound.id));
-        effects.extend(player.take_screen_effects());
+        widest = widest.max(player.shadow_half_x);
         log.push((player.action_state, player.anim.display_frame, player.pos));
         if tick > 0 && player.locked == player::LockedAction::None {
             break;
         }
     }
-    (sounds, effects, log)
+    (sounds, widest, log)
 }
 
 #[test]
@@ -390,10 +391,11 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
     let emw = emd::parse_emw(&pack.read("player/00.emw").unwrap()).unwrap();
     let mut player = player::spawn(id, &room);
 
-    // Bottom leg: slot 2's variant zone starts the 0x35 clip, which shifts the
-    // player +0x708 in Z on frame 0x0F, raises the height to 0xA8C and grunts.
+    // Bottom leg: slot 2's variant zone starts the 0x35 clip, which moves the
+    // shadow +0x708 in Z and up to 0xA8C on frame 0x0F, grunts, and lands the
+    // player on the far side of the wall at the upper height.
     let start = [22200, 0, 10250];
-    let (sounds, effects, log) = drive_ladder(
+    let (sounds, widest, log) = drive_ladder(
         &mut player,
         &room,
         &mut game,
@@ -412,14 +414,17 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
         !sounds.contains(&player::SE_LADDER_STEP),
         "the variant must not play the plain step SE"
     );
-    assert_eq!(effects.len(), 2, "two screen-effect writes per climb");
+    assert_eq!(widest, 750, "the climb widens the ground quad");
+    assert_eq!(player.shadow_half_x, arklay::shadow::PLAYER_HALF_X);
+    assert_eq!(player.shadow_offset, [0, 0]);
+    assert_eq!(player.stairs_floor, None);
     assert_eq!(
         player.pos[1],
         player::LADDER_VARIANT_HEIGHT,
         "the variant ride holds the upper height"
     );
     assert!(
-        player.pos[2] >= start[2] + player::LADDER_VARIANT_SLIDE + player::LADDER_STEP_OFF_VARIANT,
+        player.pos[2] >= start[2] + player::LADDER_STEP_OFF_VARIANT,
         "variant displacement: {:?}",
         player.pos
     );
@@ -436,15 +441,14 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
         "the entry word toggled"
     );
     println!(
-        "ROOM301 bottom (variant 0x35): {start:?} -> {:?}, sounds {sounds:?}, effects {}",
-        player.pos,
-        effects.len()
+        "ROOM301 bottom (variant 0x35): {start:?} -> {:?}, sounds {sounds:?}",
+        player.pos
     );
 
     // Top leg: slot 3's plain zone (variant word 0) plays 0x33 with the three
     // step SEs, the frame 0x32 end SE, the -1000 step-off and the walk-away.
     let top = [22200, 0, 26100];
-    let (sounds, effects, log) = drive_ladder(
+    let (sounds, widest, log) = drive_ladder(
         &mut player,
         &room,
         &mut game,
@@ -468,7 +472,8 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
         sounds.contains(&player::SE_FOOTSTEP),
         "walk-away footstep missing: {sounds:?}"
     );
-    assert_eq!(effects.len(), 2);
+    assert_eq!(widest, 750, "the climb widens the ground quad");
+    assert_eq!(player.shadow_half_x, arklay::shadow::PLAYER_HALF_X);
     assert_eq!(player.pos[1], 0, "the plain descent returns to the floor");
     assert!(
         player.pos[2] <= top[2] - player::LADDER_STEP_OFF,
@@ -478,9 +483,8 @@ fn room_301_ladder_climbs_the_shaft_both_ways() {
     assert_eq!(game.room_actions[3].unwrap().param_word(0), 1);
     assert!(!game.ladder_down());
     println!(
-        "ROOM301 top (plain 0x33): {top:?} -> {:?}, sounds {sounds:?}, effects {}",
-        player.pos,
-        effects.len()
+        "ROOM301 top (plain 0x33): {top:?} -> {:?}, sounds {sounds:?}",
+        player.pos
     );
 }
 
@@ -519,7 +523,11 @@ fn main_hall_stairwell_door_runs_the_climb_and_lands_in_106() {
     let entry = game.stair_entry.expect("climb entry");
     assert!(!entry.ladder);
     assert!(game.stair_climb);
-    assert_eq!(game.entities[0].zone_flags & 0x20, 0x20);
+    assert_eq!(
+        game.entities[0].zone_flags & 0x20,
+        0,
+        "the door handler raises no zone flag"
+    );
 
     // The full animation reaches the 1F main hall.
     let sim = simulate_door(&pack, id, 0, None).unwrap();
