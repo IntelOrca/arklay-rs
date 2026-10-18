@@ -124,6 +124,11 @@ pub const TRACK_TOP: Rect = rect([0xD2, 0x10], [0x5E, 0x10]);
 pub const TRACK_SIDE: Rect = rect([0xD2, 0x20], [0x2F, 0x10]);
 /// The item-name list's left edge.
 pub const NAME_X: i16 = 0x2A;
+/// The list frame's width (`FRAME_PARTS_C`'s third part): the widest English
+/// name the Western sheet draws ("Hand Gun Bullets", 128px) just fills it. A
+/// name wider than this, which Latin drawn through the Japanese sheet can be,
+/// is condensed to fit instead of spilling over the scrollbar.
+pub const NAME_MAX_WIDTH: i32 = 128;
 /// The first item-name list row's y.
 pub const NAME_Y: i16 = 0x23;
 /// Vertical step between name rows.
@@ -575,7 +580,7 @@ impl ItemBox {
                     NOTHING_LABEL,
                 );
             } else if let Some(name) = item_name_bytes(text, stack.id, &game.examined_flags()) {
-                menu.font.draw_text(
+                menu.font.draw_text_fit(
                     framebuffer,
                     i32::from(NAME_X),
                     y,
@@ -583,6 +588,7 @@ impl ItemBox {
                     0,
                     name,
                     text.uses_tight_metrics(),
+                    NAME_MAX_WIDTH,
                 );
             }
             slot = if slot >= ITEMBOX_SLOTS_TOTAL as u8 - 1 {

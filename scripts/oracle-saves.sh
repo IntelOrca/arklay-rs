@@ -39,6 +39,7 @@ SAVES=(
     "use_chris_101|101|0|0"
     "equip_chris_101|101|0|0"
     "itembox_chris_118|118|0|0"
+    "itembox_cam_chris_118|118|0|0"
     "typewriter_chris_118|118|0|0"
     "stairs_chris_203|203|0|0"
     "stairs_chris_207|207|0|0"

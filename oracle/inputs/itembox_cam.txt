@@ -1,0 +1,11 @@
+# Item box seen from the camera that frames it: walk into the box's action rect
+# on camera 1, open the box and let the overlay take over, then cancel. The lid
+# swings open in the world, settles, and the overlay replaces the room; the
+# frames either side of that hand-off must show the lid in the same pose in
+# both engines.
+5 up
+18
+30 confirm
+31
+130 cancel
+131

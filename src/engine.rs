@@ -1654,12 +1654,13 @@ impl GameSession {
             self.tick_boot_message(input, action);
             return Ok(());
         }
-        // The item box's menu handshake: three frames after the lid settles
-        // the panel fade arms and the frame is owned by the menu (the
-        // original's `g_openMenuFlag` walk keeps game_loop running for two
-        // frames, then main_loop hands the frame to main_menu). Opening here,
-        // before the room tick, keeps the settle handshake's rand draws in
-        // step with the reference.
+        // The item box's menu handshake: the frame after the lid settles the
+        // panel fade arms and the frame is owned by the menu (the settle
+        // frame is game_loop's last: it raises the menu request after the
+        // room has drawn the settled lid, then main_loop hands the next frame
+        // to main_menu). Opening here, before the room tick, keeps the lid
+        // open on screen until the UI closes and the settle handshake's rand
+        // draws in step with the reference.
         if self.itembox_open_delay > 0 {
             self.itembox_open_delay -= 1;
             if self.itembox_open_delay == 0 {
@@ -2092,7 +2093,7 @@ impl GameSession {
             // The lid settled: arm the menu handshake; the opening frame is
             // owned by the head check (no room tick), like the reference. The
             // flag stays up until then so the player machine stays frozen.
-            self.itembox_open_delay = 3;
+            self.itembox_open_delay = 1;
         } else if let Some(request) = self.game.item_view_request() {
             // A room action armed the item viewer: the original's main loop
             // opens its menu over the frozen room. It waits for an active

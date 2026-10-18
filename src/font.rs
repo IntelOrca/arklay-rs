@@ -617,7 +617,32 @@ impl Font {
         bytes: &[u8],
         tight: bool,
     ) {
-        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, tight);
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, tight, None);
+    }
+
+    /// [`Font::draw_text`], condensed horizontally when the stream's advance
+    /// is wider than `max_width`.
+    ///
+    /// A window sized for the original's own text overflows when a pack
+    /// draws Latin through the Japanese sheet's wider letters. Over budget,
+    /// every glyph's position and width scale by `max_width / advance`
+    /// (nearest sampling), so the whole line stays inside the window; text
+    /// that already fits draws exactly as [`Font::draw_text`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_fit(
+        &self,
+        framebuffer: &mut Framebuffer,
+        x: i32,
+        y: i32,
+        tint: Tint,
+        brightness: u8,
+        bytes: &[u8],
+        tight: bool,
+        max_width: i32,
+    ) {
+        let advance = self.advance(tight, bytes);
+        let fit = (max_width > 0 && advance > max_width).then_some((max_width, advance));
+        self.draw_glyphs(framebuffer, x, y, tint, brightness, bytes, tight, fit);
     }
 
     /// Draw a plain byte string with the original's `PrintText8x14`
@@ -662,8 +687,15 @@ impl Font {
         brightness: u8,
         bytes: &[u8],
         tight: bool,
+        fit: Option<(i32, i32)>,
     ) {
         let glyphs = self.glyphs(tight, bytes);
+        // Offsets from `x` scale by `fit` = (budget, advance); a glyph's
+        // width is the gap between its scaled edges so neighbours still abut.
+        let scale = |offset: i32| match fit {
+            Some((budget, advance)) => (offset * budget).div_euclid(advance),
+            None => offset,
+        };
         // Every glyph queues its shadow pass first and its text pass second,
         // both at the pending-sprite depth the brightness selects; the stable
         // order keeps the shadow under the glyph. The shadow is one pixel down
@@ -674,7 +706,13 @@ impl Font {
         for glyph in glyphs {
             if glyph.visible() {
                 // The tight path trims the cell's left bearing.
-                let left = cursor - glyph.indent;
+                let offset = cursor - x - glyph.indent;
+                let left = x + scale(offset);
+                let width = if fit.is_some() {
+                    (x + scale(offset + glyph.width) - left).max(1)
+                } else {
+                    glyph.width
+                };
                 let src = [glyph.u, glyph.v, glyph.width, glyph.height];
                 let texture = if glyph.missing {
                     &self.missing
@@ -686,7 +724,7 @@ impl Font {
                         SpriteDraw::indexed(
                             texture,
                             src,
-                            [left + 1, y + 1, glyph.width, glyph.height],
+                            [left + 1, y + 1, width, glyph.height],
                             0,
                             brightness,
                             Tint::White,
@@ -697,7 +735,7 @@ impl Font {
                 sprites.push(SpriteDraw::indexed(
                     texture,
                     src,
-                    [left, y, glyph.width, glyph.height],
+                    [left, y, width, glyph.height],
                     0,
                     brightness,
                     tint,
@@ -1387,6 +1425,31 @@ mod tests {
         // Brightness 15 dims the white glyph to 127.
         font.draw_text(&mut framebuffer, 10, 50, Tint::White, 15, &[0x0C], false);
         assert_eq!(pixel(&framebuffer, 10, 50), [127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn draw_text_fit_condenses_only_a_line_wider_than_the_budget() {
+        let font = Font::new(sheet_with_cell(168, 28));
+        let line = [0x0C, 0x0C, 0x0C];
+        let inked = |framebuffer: &Framebuffer| -> Vec<usize> {
+            (0..320)
+                .filter(|&x| framebuffer.rgba[(10 * 320 + x) * 4 + 3] != 0)
+                .collect()
+        };
+
+        // Three 14px cells advance 42px: a 42px budget draws them untouched.
+        let mut plain = Framebuffer::new();
+        font.draw_text(&mut plain, 10, 10, Tint::White, 0, &line, false);
+        let mut roomy = Framebuffer::new();
+        font.draw_text_fit(&mut roomy, 10, 10, Tint::White, 0, &line, false, 42);
+        assert_eq!(plain.rgba, roomy.rgba);
+        assert_eq!(inked(&plain), (10..52).collect::<Vec<_>>());
+
+        // A 21px budget halves every position and width: the ink spans
+        // exactly x 10..31 with no gap and nothing past the window.
+        let mut condensed = Framebuffer::new();
+        font.draw_text_fit(&mut condensed, 10, 10, Tint::White, 0, &line, false, 21);
+        assert_eq!(inked(&condensed), (10..31).collect::<Vec<_>>());
     }
 
     #[test]
