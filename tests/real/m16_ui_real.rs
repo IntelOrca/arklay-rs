@@ -1,5 +1,5 @@
 //! M16 slices 9 and 11 real-asset checks: the UI captures (including the map
-//! tab), the extracted map tables, and the golden-frame harness.
+//! tab), the built-in map tables, and the golden-frame harness.
 //!
 //! Run with:
 //! `TMPDIR=$PWD/target/tmp-test ARKLAY_RE1_ROOT=/path/to/re1 \
@@ -83,7 +83,7 @@ fn real_ui_captures_are_deterministic_and_the_map_draws() {
     };
     let pack = Pack::open(&pack_path).unwrap();
     assert!(
-        pack.contains(arklay::ui::map::TABLES_ENTRY),
+        pack.contains("map/map0e.tim"),
         "ARKLAY_RE1_PACK predates M16's map entries; re-convert the install"
     );
 
@@ -105,17 +105,16 @@ fn real_ui_captures_are_deterministic_and_the_map_draws() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn real_map_tables_match_sampled_rooms() {
+fn builtin_map_tables_match_sampled_rooms() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
-    let tables = MapTables::parse(
-        &pack
-            .read(arklay::ui::map::TABLES_ENTRY)
-            .expect("the pack carries map/tables.bin"),
-    )
-    .unwrap();
+    assert!(
+        !pack.contains(arklay::ui::map::TABLES_ENTRY),
+        "a converted pack carries no map/tables.bin; the map tab uses the built-ins"
+    );
+    let tables = MapTables::default();
 
     // Sampled rooms and the area/layout their first camera maps to. The room
     // digit is the RDT room number; the group is `(stage - 1) % 5`.

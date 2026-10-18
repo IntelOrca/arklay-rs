@@ -263,10 +263,8 @@ Arklay's input class determines what the code may assume:
 - **The game installation is semi-trusted.** `convert-game` may assume the
   shipped file layout, but a missing or surprising file is a reported warning
   or a category error, never a panic; conversion skips what it does not know.
-  The shared combat tables are decoded from the executable by matching the
-  documented table shapes and cross-checking the pointer partitions; a region
-  that does not validate is a warning and the pack simply omits
-  `data/combat.bin`.
+  The shared combat tables are the engine's built-ins; conversion never reads
+  the executable, so a converted pack carries no `data/combat.bin`.
 - **The packed combat tables are untrusted.** `combat::CombatTables::parse`
   checks the fixed blob size, magic and version against
   `MAX_COMBAT_TABLE_BYTES` and fails cleanly; a pack without the entry (or a

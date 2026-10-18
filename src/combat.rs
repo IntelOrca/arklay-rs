@@ -7,10 +7,9 @@
 //!   hit records, the per-enemy hit-joint lists and hit reactions, the
 //!   per-type init data (the reference type's health/stagger/animation-id
 //!   tables and collision records), the shared player collision records and
-//!   the entity-model path table. The converter decodes it from the player's
-//!   own executable into the pack entry [`COMBAT_ENTRY`]; a pack without the
-//!   entry (a mod, or an install the decoder cannot read) falls back to the
-//!   built-in [`CombatTables::default`].
+//!   the entity-model path table. A pack may carry its own copy as the entry
+//!   [`COMBAT_ENTRY`] (an older conversion or a mod); without it the engine
+//!   falls back to the built-in [`CombatTables::default`].
 //! - [`GameState::apply_weapon_damage`] runs the original's per-shot pipeline:
 //!   collect the active enemy list in the original's slot order, pick the
 //!   closest candidate through the per-class hit detector, apply the

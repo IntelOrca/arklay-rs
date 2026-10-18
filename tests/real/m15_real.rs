@@ -634,12 +634,18 @@ fn conversion_adds_exactly_the_manifest_entry() {
     assert_eq!(manifest.kind, manifest::PackKind::Base);
     assert_eq!(manifest.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
 
-    // The manifest and M16's map entries are part of every converted pack now;
-    // filter them from both sides so the comparison covers the game content.
+    // The manifest is part of every converted pack, and the map art and the
+    // optional combat-table entry may differ between an older pack and a
+    // current conversion; filter them from both sides so the comparison
+    // covers the game content.
     let filter = |paths: Vec<&str>| -> Vec<String> {
         paths
             .into_iter()
-            .filter(|path| !path.eq_ignore_ascii_case(manifest::ENTRY) && !path.starts_with("map/"))
+            .filter(|path| {
+                !path.eq_ignore_ascii_case(manifest::ENTRY)
+                    && !path.starts_with("map/")
+                    && !path.eq_ignore_ascii_case(arklay::combat::COMBAT_ENTRY)
+            })
             .map(str::to_owned)
             .collect()
     };

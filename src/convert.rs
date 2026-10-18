@@ -31,7 +31,6 @@ use crate::pack::PackWriter;
 use crate::progress::{Progress, format_duration};
 use crate::sfx;
 use crate::state::{Image, RoomId};
-use crate::ui::map::MapTables;
 use crate::voice;
 use crate::voice_table;
 use crate::{bmp, door, lzw, rdt, tim};
@@ -262,10 +261,8 @@ fn format_size(bytes: u64) -> String {
 
 /// Convert the game installation under `root` into the `.akpak` pack `out`.
 ///
-/// The map and combat tables are extracted from a `Bio.exe` discovered under
-/// `root`. A root that carries none — the Steam release's trees ship an
-/// Enigma-packed executable under a different name — packs without them and
-/// the engine uses its built-in copies, which are the same values.
+/// The pack carries no map or combat tables: the engine's built-in copies are
+/// the sole source, so no original executable is needed.
 pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
     convert_game_with_options(root, out, 0, false)
 }
@@ -318,16 +315,6 @@ pub fn convert_game_with_options(
         movie_dir_found,
         mut warnings,
     } = build_plan_with_progress(root, jobs, &mut progress)?;
-    let exe = match discover_exe(root)? {
-        Some(path) => Some(path),
-        None => {
-            warnings.push(
-                "no Bio.exe found; the map and combat tables will use the engine's built-ins"
-                    .to_string(),
-            );
-            None
-        }
-    };
     if !voice_dir_found {
         warnings.push(format!(
             "no voice directory found; {} voice line(s) will be missing",
@@ -495,10 +482,6 @@ pub fn convert_game_with_options(
         &mut warnings,
         jobs,
     )?;
-    let (maptbl_count, maptbl_bytes) =
-        copy_map_tables(exe.as_deref(), &mut writer, &mut progress, &mut warnings)?;
-    let (combat_count, combat_bytes) =
-        copy_combat_tables(exe.as_deref(), &mut writer, &mut progress, &mut warnings)?;
     let (manifest_count, manifest_bytes) = copy_manifest(&mut writer, &language)?;
 
     // Voice and film land in the same pack as every other category, so a
@@ -618,8 +601,6 @@ pub fn convert_game_with_options(
         writeln!(report, "ivm: {ivm_count} entries, {ivm_bytes} bytes")?;
         writeln!(report, "file: {file_count} entries, {file_bytes} bytes")?;
         writeln!(report, "map: {map_count} entries, {map_bytes} bytes")?;
-        writeln!(report, "maptbl: {maptbl_count} entry, {maptbl_bytes} bytes")?;
-        writeln!(report, "combat: {combat_count} entry, {combat_bytes} bytes")?;
         writeln!(
             report,
             "manifest: {manifest_count} entry, {manifest_bytes} bytes (base \"{}\")",
@@ -1490,423 +1471,6 @@ const IVM_COUNT: usize = 77;
 const FILEI_COUNT: usize = 17;
 const TEXTM_COUNT: usize = 43;
 
-/// One PE section: the virtual range and the file bytes backing it.
-#[derive(Debug, Clone, Copy)]
-struct PeSection {
-    virtual_address: u32,
-    virtual_size: u32,
-    raw_offset: u32,
-    raw_size: u32,
-}
-
-/// A parsed PE image: the image base and section table used to map the
-/// executable's virtual addresses to file offsets.
-struct PeImage<'a> {
-    data: &'a [u8],
-    image_base: u32,
-    sections: Vec<PeSection>,
-}
-
-impl<'a> PeImage<'a> {
-    /// Parse the DOS stub, PE signature, optional header and section table.
-    fn parse(data: &'a [u8]) -> Result<Self> {
-        let dos = data
-            .get(0..0x40)
-            .context("executable is too short for a DOS header")?;
-        if &dos[0..2] != b"MZ" {
-            bail!("executable has no MZ signature");
-        }
-        let pe = read_u32_at(data, 0x3C)? as usize;
-        let signature = data
-            .get(pe..pe + 4)
-            .context("executable is too short for its PE signature")?;
-        if signature != b"PE\0\0" {
-            bail!("executable has no PE signature at 0x{pe:X}");
-        }
-        let coff = data
-            .get(pe + 4..pe + 24)
-            .context("executable COFF header is truncated")?;
-        let section_count = usize::from(u16::from_le_bytes([coff[2], coff[3]]));
-        let optional_size = usize::from(u16::from_le_bytes([coff[16], coff[17]]));
-        let optional = data
-            .get(pe + 24..pe + 24 + optional_size)
-            .context("executable optional header is truncated")?;
-        let magic = optional
-            .get(0..2)
-            .map(|raw| u16::from_le_bytes([raw[0], raw[1]]))
-            .context("executable optional header is missing its magic")?;
-        if magic != 0x10B {
-            bail!("unsupported PE optional header magic 0x{magic:04X}; expected PE32 (0x010B)");
-        }
-        let image_base = optional
-            .get(28..32)
-            .map(|raw| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
-            .context("executable optional header is missing its image base")?;
-
-        let table_start = pe + 24 + optional_size;
-        let table = data
-            .get(table_start..table_start + section_count * 40)
-            .with_context(|| {
-                format!("section table for {section_count} section(s) is truncated")
-            })?;
-        let sections = table
-            .as_chunks::<40>()
-            .0
-            .iter()
-            .map(|entry| PeSection {
-                virtual_size: u32::from_le_bytes(entry[8..12].try_into().unwrap()),
-                virtual_address: u32::from_le_bytes(entry[12..16].try_into().unwrap()),
-                raw_size: u32::from_le_bytes(entry[16..20].try_into().unwrap()),
-                raw_offset: u32::from_le_bytes(entry[20..24].try_into().unwrap()),
-            })
-            .collect();
-        Ok(Self {
-            data,
-            image_base,
-            sections,
-        })
-    }
-
-    /// Map a virtual address to a file offset. An address in a section's
-    /// zero-filled tail is not backed by file bytes and maps to `None`.
-    fn va_to_offset(&self, va: u32) -> Option<usize> {
-        let rva = va.checked_sub(self.image_base)?;
-        for section in &self.sections {
-            let Some(delta) = rva.checked_sub(section.virtual_address) else {
-                continue;
-            };
-            if delta >= section.virtual_size.max(section.raw_size) {
-                continue;
-            }
-            if delta >= section.raw_size {
-                return None;
-            }
-            let offset = section.raw_offset.checked_add(delta)? as usize;
-            return (offset < self.data.len()).then_some(offset);
-        }
-        None
-    }
-}
-
-/// JPN virtual addresses of the map bookkeeping tables. The tables are
-/// contiguous in the data segment but two of them overlap (the group table
-/// starts on the layout table's last byte and the layout room count on the
-/// group table's tail), so each is read as its own range and packed into the
-/// port's contiguous `map/tables.bin` format.
-const MAP_STAGE_ROOM_OFFSETS_VA: u32 = 0x4B1BC8;
-const MAP_ROOM_COUNTS_VA: u32 = 0x4B1BD0;
-const MAP_AREA_VA: u32 = 0x4B1BD8;
-const MAP_LAYOUTS_VA: u32 = 0x4B1BE8;
-const MAP_GROUPS_VA: u32 = 0x4B1BF7;
-const MAP_LAYOUT_ROOM_COUNT_VA: u32 = 0x4B1C03;
-const MAP_LAYOUT_OFFSET_VA: u32 = 0x4B1C07;
-
-/// Extract the seven map bookkeeping tables from the executable image.
-fn extract_map_tables(data: &[u8]) -> Result<MapTables> {
-    let image = PeImage::parse(data)?;
-    let read = |va: u32, len: usize| -> Result<Vec<u8>> {
-        let offset = image
-            .va_to_offset(va)
-            .with_context(|| format!("map table address 0x{va:08X} is not in the image"))?;
-        data.get(offset..offset + len)
-            .map(<[u8]>::to_vec)
-            .with_context(|| format!("map table at 0x{va:08X} is truncated"))
-    };
-    Ok(MapTables {
-        stage_room_offsets: read(MAP_STAGE_ROOM_OFFSETS_VA, 6)?.try_into().unwrap(),
-        room_counts: read(MAP_ROOM_COUNTS_VA, 6)?.try_into().unwrap(),
-        area: read(MAP_AREA_VA, 16)?.try_into().unwrap(),
-        layouts: read(MAP_LAYOUTS_VA, 16)?.try_into().unwrap(),
-        groups: read(MAP_GROUPS_VA, 16)?.try_into().unwrap(),
-        layout_room_count: read(MAP_LAYOUT_ROOM_COUNT_VA, 4)?.try_into().unwrap(),
-        layout_offset: read(MAP_LAYOUT_OFFSET_VA, 4)?.try_into().unwrap(),
-    })
-}
-
-/// The distinctive 48-byte blood-spurt joint list that heads the weapon
-/// block in the executable's data segment.
-const COMBAT_HIT_JOINT_PATTERN: [u8; 48] = [
-    2, 3, 4, 5, 7, 8, 3, 4, 5, 6, 7, 8, 2, 3, 4, 5, 6, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2,
-    4, 5, 8, 9, 4, 5, 6, 7, 8, 9, 0, 0, 0, 0, 0, 0,
-];
-
-/// The 32-byte reference-type init profile (health roll followed by the
-/// initial-animation table).
-const COMBAT_TYPE_PROFILE_PATTERN: [u8; 32] = [
-    59, 59, 79, 59, 59, 39, 59, 79, 79, 99, 59, 79, 59, 59, 79, 59, 0, 0, 9, 9, 0, 12, 9, 29, 0, 0,
-    9, 0, 0, 0, 0, 0,
-];
-
-/// The documented shared player collision records, used to confirm the
-/// adjacent triple the executable stores.
-const COMBAT_CHRIS_SCA: [u8; 16] = [
-    0x00, 0x80, 0x00, 0x00, 0x06, 0xFA, 0x00, 0x00, 0xFA, 0x05, 0xA6, 0x01, 0x00, 0x00, 0x00, 0x00,
-];
-const COMBAT_DATA2_SCA: [u8; 16] = [
-    0x00, 0x80, 0x00, 0x00, 0x90, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-];
-const COMBAT_JILL_SCA: [u8; 16] = [
-    0x00, 0x80, 0x00, 0x00, 0xBA, 0xFA, 0x00, 0x00, 0x46, 0x05, 0x74, 0x01, 0x00, 0x00, 0x00, 0x00,
-];
-
-/// Find the single occurrence of `needle` in the executable, naming it on
-/// failure.
-fn find_unique_combat_table(data: &[u8], needle: &[u8], what: &str) -> Result<usize> {
-    let mut matches = data
-        .windows(needle.len())
-        .enumerate()
-        .filter(|(_, window)| *window == needle)
-        .map(|(index, _)| index);
-    let first = matches
-        .next()
-        .with_context(|| format!("the {what} was not found in the executable"))?;
-    if matches.next().is_some() {
-        bail!("the {what} is not unique in the executable");
-    }
-    Ok(first)
-}
-
-/// Find the entity-model path table by its four model names and 17-byte
-/// stride.
-fn find_combat_model_table(data: &[u8]) -> Result<usize> {
-    let needle = b"enemy/char10.emd";
-    let mut found = None;
-    for index in 0..data.len().saturating_sub(needle.len()) {
-        if &data[index..index + needle.len()] != needle {
-            continue;
-        }
-        let usable = (0..crate::combat::MODEL_ENTRIES).all(|entry| {
-            let start = index + entry * crate::combat::MODEL_ENTRY_LEN;
-            let Some(bytes) = data.get(start..start + crate::combat::MODEL_ENTRY_LEN) else {
-                return false;
-            };
-            bytes.starts_with(b"enemy/") && bytes[6..].contains(&0)
-        });
-        if usable {
-            if found.is_some() {
-                bail!("the entity-model path table is not unique in the executable");
-            }
-            found = Some(index);
-        }
-    }
-    found.context("the entity-model path table was not found in the executable")
-}
-
-fn read_combat_bytes<'a>(
-    data: &'a [u8],
-    offset: usize,
-    len: usize,
-    what: &str,
-) -> Result<&'a [u8]> {
-    data.get(offset..offset + len)
-        .with_context(|| format!("the {what} at file offset 0x{offset:X} is truncated"))
-}
-
-/// Decode the shared combat tables from the executable image, validating
-/// every region's shape and cross-checking the pointer tables before any
-/// value is trusted. This is also the public decode seam the real-asset
-/// verification test compares the packed `data/combat.bin` against.
-pub fn extract_combat_tables(data: &[u8]) -> Result<crate::combat::CombatTables> {
-    use crate::combat::{HIT_RECORD_ROWS, MODEL_ENTRIES, MODEL_ENTRY_LEN, WEAPON_SLOTS};
-
-    let image = PeImage::parse(data)?;
-    let joints = find_unique_combat_table(
-        data,
-        &COMBAT_HIT_JOINT_PATTERN,
-        "blood-spurt joint list table",
-    )?;
-    let ranges_offset = joints + 0x78;
-    let first_offset = joints + 0xC8;
-    let second_offset = first_offset + HIT_RECORD_ROWS * 12 + 6;
-
-    let mut weapon_ranges = [[0u32; WEAPON_SLOTS]; 2];
-    let range_bytes = read_combat_bytes(data, ranges_offset, WEAPON_SLOTS * 2 * 4, "hit ranges")?;
-    for (index, slot) in weapon_ranges.iter_mut().flatten().enumerate() {
-        *slot = u32::from_le_bytes(range_bytes[index * 4..index * 4 + 4].try_into().unwrap());
-        if *slot == 0 || *slot > 0x10000 {
-            bail!("decoded hit range {index} is implausible: {slot}");
-        }
-    }
-
-    // The reaction pointer table sits ahead of the joint list; its pointer
-    // partition must match the documented per-id reaction classes.
-    const EXPECTED_REACTIONS: [u8; 20] =
-        [4, 4, 4, 1, 1, 1, 2, 1, 3, 0, 1, 0, 0, 0, 0, 0, 0, 4, 0, 0];
-    let reaction_bytes = read_combat_bytes(data, joints - 0x50, 80, "hit reaction table")?;
-    let mut reaction_pointers = [0u32; 20];
-    for (index, pointer) in reaction_pointers.iter_mut().enumerate() {
-        *pointer = u32::from_le_bytes(reaction_bytes[index * 4..index * 4 + 4].try_into().unwrap());
-        if image.va_to_offset(*pointer).is_none() {
-            bail!("the hit reaction pointer {index} does not point into the executable image");
-        }
-    }
-    for i in 0..20 {
-        for j in i + 1..20 {
-            let same = reaction_pointers[i] == reaction_pointers[j];
-            if same != (EXPECTED_REACTIONS[i] == EXPECTED_REACTIONS[j]) {
-                bail!(
-                    "the hit reaction pointer layout does not match the documented per-type table \
-                     (ids {i} and {j})"
-                );
-            }
-        }
-    }
-
-    let record_bytes =
-        read_combat_bytes(data, first_offset, HIT_RECORD_ROWS * 12, "hit record table")?;
-    let mut first_run = [crate::combat::HitRecordFirst::default(); HIT_RECORD_ROWS];
-    for (index, record) in first_run.iter_mut().enumerate() {
-        let bytes = &record_bytes[index * 12..index * 12 + 12];
-        record.knockback = [
-            i16::from_le_bytes(bytes[0..2].try_into().unwrap()),
-            i16::from_le_bytes(bytes[2..4].try_into().unwrap()),
-            i16::from_le_bytes(bytes[4..6].try_into().unwrap()),
-        ];
-        record.damage = i16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        record.effect_type = bytes[8];
-        record.effect_data = bytes[9];
-        record.hit = bytes[10];
-    }
-    let mut second_run = [crate::combat::HitRecordSecond::default(); HIT_RECORD_ROWS];
-    let second_bytes = read_combat_bytes(
-        data,
-        second_offset,
-        HIT_RECORD_ROWS * 12,
-        "second-run hit records",
-    )?;
-    for (index, record) in second_run.iter_mut().enumerate() {
-        let bytes = &second_bytes[index * 12..index * 12 + 12];
-        record.damage = i16::from_le_bytes(bytes[0..2].try_into().unwrap());
-        record.hit = bytes[4];
-    }
-    if !first_run.iter().any(|record| record.damage != 0)
-        || !second_run.iter().any(|record| record.damage != 0)
-    {
-        bail!("the hit records decode to all-zero damage");
-    }
-
-    let hit_joints = std::array::from_fn(|id| {
-        let start = id * 6;
-        data[joints + start..joints + start + 6].try_into().unwrap()
-    });
-    let reactions = std::array::from_fn(|id| match EXPECTED_REACTIONS[id] {
-        1 => crate::combat::HitReaction::Basic,
-        2 => crate::combat::HitReaction::Head,
-        3 => crate::combat::HitReaction::Blood,
-        4 => crate::combat::HitReaction::Zombie,
-        _ => crate::combat::HitReaction::None,
-    });
-
-    let model_offset = find_combat_model_table(data)?;
-    let model_bytes = read_combat_bytes(
-        data,
-        model_offset,
-        MODEL_ENTRIES * MODEL_ENTRY_LEN,
-        "model table",
-    )?;
-    let model_entries: [[u8; MODEL_ENTRY_LEN]; MODEL_ENTRIES] = std::array::from_fn(|entry| {
-        model_bytes[entry * MODEL_ENTRY_LEN..(entry + 1) * MODEL_ENTRY_LEN]
-            .try_into()
-            .unwrap()
-    });
-    if &model_entries[0][..16] != b"enemy/char10.emd"
-        || &model_entries[53][..16] != b"enemy/char10.emd"
-        || &model_entries[89][..16] != b"enemy/em1020.emd"
-    {
-        bail!("the entity-model path table's scenario blocks are not aligned as expected");
-    }
-
-    let profile_offset = find_unique_combat_table(
-        data,
-        &COMBAT_TYPE_PROFILE_PATTERN,
-        "reference-type init profile",
-    )?;
-    let sca_offset = profile_offset
-        .checked_sub(0x28)
-        .context("the reference-type collision records precede the executable image")?;
-    let sca_bytes = read_combat_bytes(data, sca_offset, 32, "reference-type collision records")?;
-    let type_sca: [[i16; 8]; 2] = std::array::from_fn(|record| {
-        std::array::from_fn(|value| {
-            i16::from_le_bytes(
-                sca_bytes[record * 16 + value * 2..record * 16 + value * 2 + 2]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
-    });
-    if type_sca[0][0] >= 0 || type_sca[1][0] >= 0 || type_sca[0][5] <= 0 || type_sca[1][5] <= 0 {
-        bail!("the reference-type collision records are malformed");
-    }
-    // The pointer pair ahead of the profile must name the two records.
-    let pointer_bytes = read_combat_bytes(data, profile_offset - 8, 8, "type collision pointers")?;
-    let first_pointer = u32::from_le_bytes(pointer_bytes[0..4].try_into().unwrap());
-    let second_pointer = u32::from_le_bytes(pointer_bytes[4..8].try_into().unwrap());
-    if image.va_to_offset(first_pointer) != Some(sca_offset)
-        || image.va_to_offset(second_pointer) != Some(sca_offset + 16)
-    {
-        bail!("the reference-type collision pointers do not name the adjacent records");
-    }
-    let type_health = data[profile_offset..profile_offset + 16]
-        .try_into()
-        .unwrap();
-    let type_anim = data[profile_offset + 16..profile_offset + 32]
-        .try_into()
-        .unwrap();
-    let type_stagger = data[profile_offset + 32..profile_offset + 64]
-        .try_into()
-        .unwrap();
-    if !data[profile_offset..profile_offset + 16]
-        .iter()
-        .all(|&health| health > 0)
-        || !data[profile_offset + 32..profile_offset + 64]
-            .iter()
-            .all(|&value| (3..=5).contains(&value))
-    {
-        bail!("the reference-type init profile's value ranges are implausible");
-    }
-
-    // The shared player collision records: a unique adjacent triple that must
-    // match the documented constants.
-    let mut player_offset = None;
-    for index in 0..data.len().saturating_sub(48) {
-        if data[index..index + 16] == COMBAT_CHRIS_SCA
-            && data[index + 16..index + 32] == COMBAT_DATA2_SCA
-            && data[index + 32..index + 48] == COMBAT_JILL_SCA
-        {
-            if player_offset.is_some() {
-                bail!("the shared player collision records are not unique in the executable");
-            }
-            player_offset = Some(index);
-        }
-    }
-    let player_offset =
-        player_offset.context("the shared player collision records were not found")?;
-    let player_bytes = read_combat_bytes(data, player_offset, 48, "player collision records")?;
-    let player_sca: [[i16; 8]; 3] = std::array::from_fn(|record| {
-        std::array::from_fn(|value| {
-            i16::from_le_bytes(
-                player_bytes[record * 16 + value * 2..record * 16 + value * 2 + 2]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
-    });
-
-    Ok(crate::combat::CombatTables {
-        weapon_ranges,
-        first_run,
-        second_run,
-        hit_joints,
-        reactions,
-        model_entries,
-        player_sca,
-        type_sca,
-        type_health,
-        type_anim,
-        type_stagger,
-    })
-}
-
 /// Add the checked-in `language/<tag>.txt` sources to the pack.
 ///
 /// Every source is parsed before it is packed, so a malformed checked-in file
@@ -2071,105 +1635,6 @@ fn copy_map_art(
     }
 
     copy_raw_files(files, "map", writer, progress, jobs)
-}
-
-/// Extract the map bookkeeping tables into `map/tables.bin`.
-///
-/// A missing or unreadable executable is a warning: the map tab falls back to
-/// its built-in defaults and still reports the visited/owned bits.
-fn copy_map_tables(
-    exe: Option<&Path>,
-    writer: &mut PackWriter,
-    progress: &mut Progress,
-    warnings: &mut Vec<String>,
-) -> Result<(usize, usize)> {
-    // Always report the phase, even when the tables cannot be extracted, so the
-    // overall bar's phase count matches the run.
-    progress.begin("maptbl", 1);
-    let Some(path) = exe else {
-        progress.end_phase();
-        return Ok((0, 0));
-    };
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) => {
-            warnings.push(format!(
-                "failed to read executable {}: {error}; the map tables will be missing",
-                path.display()
-            ));
-            progress.end_phase();
-            return Ok((0, 0));
-        }
-    };
-    let tables = match extract_map_tables(&data) {
-        Ok(tables) => tables,
-        Err(error) => {
-            warnings.push(format!(
-                "failed to extract the map tables from {}: {error:#}; the map tab uses its defaults",
-                path.display()
-            ));
-            progress.end_phase();
-            return Ok((0, 0));
-        }
-    };
-    let bytes = tables.encode();
-    let len = bytes.len();
-    writer
-        .add(crate::ui::map::TABLES_ENTRY, bytes)
-        .with_context(|| format!("failed to add {}", crate::ui::map::TABLES_ENTRY))?;
-    progress.advance(crate::ui::map::TABLES_ENTRY);
-    progress.end_phase();
-    Ok((1, len))
-}
-
-/// Decode the shared combat tables from the executable into
-/// `data/combat.bin`.
-///
-/// A missing or undecodable executable is a warning: the engine falls back to
-/// its built-in tables, exactly like the original data on this install.
-fn copy_combat_tables(
-    exe: Option<&Path>,
-    writer: &mut PackWriter,
-    progress: &mut Progress,
-    warnings: &mut Vec<String>,
-) -> Result<(usize, usize)> {
-    // Reported unconditionally like the map tables, so the overall bar's phase
-    // count matches the run.
-    progress.begin("combat", 1);
-    let Some(path) = exe else {
-        progress.end_phase();
-        return Ok((0, 0));
-    };
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) => {
-            warnings.push(format!(
-                "failed to read executable {}: {error}; the combat tables will use the built-in data",
-                path.display()
-            ));
-            progress.end_phase();
-            return Ok((0, 0));
-        }
-    };
-    let tables = match extract_combat_tables(&data) {
-        Ok(tables) => tables,
-        Err(error) => {
-            warnings.push(format!(
-                "failed to decode the combat tables from {}: {error:#}; the built-in tables are used",
-                path.display()
-            ));
-            progress.end_phase();
-            return Ok((0, 0));
-        }
-    };
-    let bytes = tables.encode();
-    let len = bytes.len();
-    writer
-        .add(crate::combat::COMBAT_ENTRY, bytes)
-        .with_context(|| format!("failed to add {}", crate::combat::COMBAT_ENTRY))?;
-    progress.advance(crate::combat::COMBAT_ENTRY);
-    progress.end_phase();
-    Ok((1, len))
 }
 
 /// The id of the pack `convert-game` writes.
@@ -2493,28 +1958,6 @@ fn sheet_script_of(path: &Path) -> crate::charset::Script {
     }
 }
 
-/// Find the game executable `Bio.exe` (case-insensitive) up to `MAX_DEPTH`
-/// directory levels below `root`.
-fn discover_exe(root: &Path) -> Result<Option<PathBuf>> {
-    let mut queue = VecDeque::from([(root.to_path_buf(), 0usize)]);
-    while let Some((dir, depth)) = queue.pop_front() {
-        for entry in read_dir_sorted(&dir)? {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                if depth < MAX_DEPTH {
-                    queue.push_back((entry.path(), depth + 1));
-                }
-            } else if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case("bio.exe"))
-            {
-                return Ok(Some(entry.path()));
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// `stage1`..`stage7` (case-insensitive) -> `Some(1..=7)`.
 fn stage_dir_digit(name: &str) -> Option<u8> {
     if name.len() != 6 || !name.get(..5)?.eq_ignore_ascii_case("stage") {
@@ -2685,9 +2128,9 @@ fn conversion_phase_count(
     data: &DataPlan,
 ) -> u64 {
     // scan, room, roomcut, roommask, six model phases (player, weapon, npc,
-    // monster, enemy scripts, effect sheets), ui, core00, language, map tables,
-    // combat tables, voice, film, compress, write.
-    let mut phases: u64 = 19;
+    // monster, enemy scripts, effect sheets), ui, core00, language, voice,
+    // film, compress, write.
+    let mut phases: u64 = 17;
     phases += 2 * u64::from(sound.is_some()); // bgm, se
     phases += u64::from(item_m1.is_some()); // door
     phases += u64::from(fonts.primary.is_some()); // font
@@ -3233,14 +2676,6 @@ fn bmp_bpp(data: &[u8]) -> Result<u16> {
         .get(BMP_BPP_OFFSET..BMP_BPP_OFFSET + 2)
         .context("encoded BMP is missing its bit depth field")?;
     Ok(u16::from_le_bytes([raw[0], raw[1]]))
-}
-
-/// Read a little-endian `u32` from `data`.
-fn read_u32_at(data: &[u8], offset: usize) -> Result<u32> {
-    let raw = data
-        .get(offset..offset + 4)
-        .with_context(|| format!("read of 4 byte(s) at offset 0x{offset:X} is out of bounds"))?;
-    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
 #[cfg(test)]
@@ -4756,99 +4191,14 @@ mod tests {
         }
     }
 
-    const SYNTHETIC_SECTION_VA: u32 = 0xB0000;
-    const SYNTHETIC_SECTION_SIZE: usize = 0x20000;
-    const SYNTHETIC_RAW_OFFSET: usize = 0x400;
-
-    /// A minimal PE32 image with one section covering RVAs `0xB0000..0xD0000`.
-    fn synthetic_pe() -> Vec<u8> {
-        let mut data = vec![0u8; SYNTHETIC_RAW_OFFSET + SYNTHETIC_SECTION_SIZE];
-        data[0] = b'M';
-        data[1] = b'Z';
-        data[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
-        data[0x80..0x84].copy_from_slice(b"PE\0\0");
-        data[0x86..0x88].copy_from_slice(&1u16.to_le_bytes());
-        data[0x94..0x96].copy_from_slice(&0xE0u16.to_le_bytes());
-        let optional = 0x80 + 24;
-        data[optional..optional + 2].copy_from_slice(&0x10Bu16.to_le_bytes());
-        data[optional + 28..optional + 32].copy_from_slice(&0x400000u32.to_le_bytes());
-        let section = optional + 0xE0;
-        data[section..section + 5].copy_from_slice(b".data");
-        data[section + 8..section + 12]
-            .copy_from_slice(&((SYNTHETIC_SECTION_SIZE + 0x8000) as u32).to_le_bytes());
-        data[section + 12..section + 16].copy_from_slice(&SYNTHETIC_SECTION_VA.to_le_bytes());
-        data[section + 16..section + 20]
-            .copy_from_slice(&(SYNTHETIC_SECTION_SIZE as u32).to_le_bytes());
-        data[section + 20..section + 24]
-            .copy_from_slice(&(SYNTHETIC_RAW_OFFSET as u32).to_le_bytes());
-        data
-    }
-
-    /// Write `bytes` at virtual address `va` of a synthetic image.
-    fn pe_place(pe: &mut [u8], va: u32, bytes: &[u8]) {
-        let offset = SYNTHETIC_RAW_OFFSET + (va - 0x400000 - SYNTHETIC_SECTION_VA) as usize;
-        pe[offset..offset + bytes.len()].copy_from_slice(bytes);
-    }
-
-    /// A synthetic executable holding the map bookkeeping tables at their JPN
-    /// virtual addresses, overlaps and all.
-    fn synthetic_map_exe() -> Vec<u8> {
-        let mut pe = synthetic_pe();
-        let tables = MapTables::default();
-        pe_place(
-            &mut pe,
-            MAP_STAGE_ROOM_OFFSETS_VA,
-            &tables.stage_room_offsets,
-        );
-        pe_place(&mut pe, MAP_ROOM_COUNTS_VA, &tables.room_counts);
-        pe_place(&mut pe, MAP_AREA_VA, &tables.area);
-        pe_place(&mut pe, MAP_LAYOUTS_VA, &tables.layouts);
-        pe_place(&mut pe, MAP_GROUPS_VA, &tables.groups);
-        pe_place(&mut pe, MAP_LAYOUT_ROOM_COUNT_VA, &tables.layout_room_count);
-        pe_place(&mut pe, MAP_LAYOUT_OFFSET_VA, &tables.layout_offset);
-        pe
-    }
-
     #[test]
-    fn extracts_map_tables_from_a_synthetic_executable() {
-        let data = synthetic_map_exe();
-        let tables = extract_map_tables(&data).unwrap();
-        assert_eq!(tables, MapTables::default());
-        assert_eq!(tables.encode().len(), crate::ui::map::TABLES_BYTES);
-        // A truncated image fails loudly instead of defaulting.
-        assert!(extract_map_tables(&synthetic_pe()[..0x20]).is_err());
-        assert!(extract_map_tables(&[]).is_err());
-    }
-
-    #[test]
-    fn maps_virtual_addresses_through_the_section_table() {
-        let data = synthetic_pe();
-        let image = PeImage::parse(&data).unwrap();
-
-        assert_eq!(image.image_base, 0x400000);
-        assert_eq!(image.va_to_offset(0x4B0000), Some(SYNTHETIC_RAW_OFFSET));
-        assert_eq!(image.va_to_offset(0x4B01FF), Some(0x5FF));
-        // The section's zero-filled tail has no file bytes.
-        assert_eq!(image.va_to_offset(0x4D0000), None);
-        assert_eq!(image.va_to_offset(0x4AFFFF), None);
-        assert_eq!(image.va_to_offset(0x500000), None);
-        assert!(PeImage::parse(&data[..0x20]).is_err());
-        assert!(PeImage::parse(&[0u8; 0x100]).is_err());
-    }
-    #[test]
-    fn discovers_item_m2_and_the_executable() {
+    fn discovers_item_m2() {
         let root = TempDir::new("item-m2-discover");
         make_stage_dirs(&root.path);
         fs::create_dir_all(root.path.join("install/ItEm_M2")).unwrap();
-        fs::write(root.path.join("install/Bio.exe"), b"MZ").unwrap();
 
         let layout = discover_layout(&root.path).unwrap();
         assert_eq!(layout.item_m2.unwrap(), root.path.join("install/ItEm_M2"));
-        assert_eq!(
-            discover_exe(&root.path).unwrap().unwrap(),
-            root.path.join("install/Bio.exe")
-        );
-        assert_eq!(discover_exe(&root.path.join("STAGE1")).unwrap(), None);
     }
 
     #[test]
@@ -4902,7 +4252,6 @@ mod tests {
         let root = TempDir::new("text-item-file");
         make_stage_dirs(&root.path);
         fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
-        fs::write(root.path.join("Bio.exe"), synthetic_map_exe()).unwrap();
         let dir = root.path.join("ITEM_M2");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("I00V.IVM"), b"ivm0").unwrap();
@@ -4944,75 +4293,18 @@ mod tests {
         }
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
-        assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
+        assert_eq!(count("map/"), 16, "15 plans and the backdrop");
         assert_eq!(pack.read("item/mini.ivm").unwrap().as_ref(), b"ivm1");
         assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
         assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
         assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
-        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
-        assert_eq!(tables, MapTables::default());
-    }
-    #[test]
-    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-    fn extracts_real_map_tables() {
-        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
-            return;
-        };
-        let path = PathBuf::from(root).join("Bio.exe");
-        let data = fs::read(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-
-        let tables = extract_map_tables(&data).unwrap();
-        assert_eq!(
-            tables,
-            MapTables::default(),
-            "the installed map tables match the documented values"
+        assert!(
+            !pack.contains(crate::ui::map::TABLES_ENTRY),
+            "no map tables are packed"
         );
-    }
-
-    #[test]
-    fn unique_combat_table_search_rejects_missing_and_duplicate_patterns() {
-        let missing = find_unique_combat_table(&[0u8; 16], &COMBAT_HIT_JOINT_PATTERN, "test table");
-        assert!(missing.is_err(), "a missing pattern must error");
-
-        let mut duplicated = Vec::new();
-        duplicated.extend_from_slice(&COMBAT_HIT_JOINT_PATTERN);
-        duplicated.extend_from_slice(&[0u8; 8]);
-        duplicated.extend_from_slice(&COMBAT_HIT_JOINT_PATTERN);
-        let ambiguous =
-            find_unique_combat_table(&duplicated, &COMBAT_HIT_JOINT_PATTERN, "test table");
-        assert!(ambiguous.is_err(), "a duplicated pattern must error");
-    }
-
-    #[test]
-    #[ignore = "requires a real RE1 installation via ARKLAY_RE1_ROOT"]
-    fn extracts_real_combat_tables() {
-        let Ok(root) = std::env::var("ARKLAY_RE1_ROOT") else {
-            return;
-        };
-        let path = PathBuf::from(root).join("Bio.exe");
-        let data = fs::read(&path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-
-        let tables = extract_combat_tables(&data).unwrap();
-        // The shared tables decode to the documented values on this install.
-        let default = crate::combat::CombatTables::default();
-        assert_eq!(tables.weapon_ranges, default.weapon_ranges);
-        assert_eq!(tables.first_run, default.first_run);
-        assert_eq!(tables.second_run, default.second_run);
-        assert_eq!(tables.hit_joints, default.hit_joints);
-        assert_eq!(tables.reactions, default.reactions);
-        assert_eq!(tables.model_entries, default.model_entries);
-        assert_eq!(tables.type_sca, default.type_sca);
-        assert_eq!(tables.type_health, default.type_health);
-        assert_eq!(tables.type_anim, default.type_anim);
-        assert_eq!(tables.type_stagger, default.type_stagger);
-        assert_eq!(tables.player_sca, default.player_sca);
-        // And the packed entry round-trips through the engine parser.
-        let encoded = tables.encode();
-        assert_eq!(
-            crate::combat::CombatTables::parse(&encoded).unwrap(),
-            tables
+        assert!(
+            !pack.contains(crate::combat::COMBAT_ENTRY),
+            "no combat tables are packed"
         );
     }
 
@@ -5093,9 +4385,15 @@ mod tests {
             "15 character models, 44 monster models and the checked-in scripts"
         );
         assert_eq!(count("effspr/"), 33);
-        assert_eq!(count("map/"), 17, "15 plans, the backdrop and the tables");
-        let tables = MapTables::parse(&pack.read(crate::ui::map::TABLES_ENTRY).unwrap()).unwrap();
-        assert_eq!(tables, MapTables::default(), "the installed tables match");
+        assert_eq!(count("map/"), 16, "15 plans and the backdrop");
+        assert!(
+            !pack.contains(crate::ui::map::TABLES_ENTRY),
+            "no map tables are packed"
+        );
+        assert!(
+            !pack.contains(crate::combat::COMBAT_ENTRY),
+            "no combat tables are packed"
+        );
         assert!(pack.contains("enemy/em20.emd"));
         assert!(pack.contains("enemy/em2e.emd"));
         assert!(pack.contains("enemy/em000.emd"));
