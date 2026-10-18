@@ -146,7 +146,8 @@ pub enum UiCue {
     SelectConfirm,
     /// The save/load cursor move (`type01`, title bank slot 14).
     SaveCursor,
-    /// The save/load confirm (`type02`, title bank slot 15).
+    /// The save/load confirm (`type02`, title bank slot 15). The typed
+    /// reveal's "typewriter" tick plays the same slot per revealed character.
     SaveConfirm,
 }
 

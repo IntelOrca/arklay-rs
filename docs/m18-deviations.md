@@ -33,6 +33,12 @@ behaviour. The engine-level test
 `engine::tests::same_bank_entity_footsteps_restart_the_engine_voice` locks the
 bank keying through the real `play_entity_sounds` path.
 
+The UI append's one audible consequence: the vanilla save screen's typed
+reveal ticks `type02` every six fixed ticks (`Reveal::cues_tick` in
+`src/ui/save_load.rs`, issue #65), and the sample runs 314 ms (6918 frames at
+22.05 kHz), so about three voices overlap where the reference retriggers its
+single buffer.
+
 ## Closed: per-record background blend weight
 
 A mesh record's TMD now carries the original's remapped `+0x68` background

@@ -150,6 +150,17 @@ impl Reveal {
     fn finished(&self) -> bool {
         self.length + REVEAL_STEP + REVEAL_STEP > REVEAL_LEN + 1
     }
+
+    /// Whether the slice drawn at the current length asks for the reference's
+    /// "typewriter" tick: `play_sfx(sfxBank, 31)` for every revealed
+    /// non-space byte - the byte two back from the copy end (spaces are
+    /// `0x00`). The first slice's copy is the one `new` drew.
+    fn cues_tick(&self) -> bool {
+        let Some(index) = self.length.checked_sub(REVEAL_STEP) else {
+            return false;
+        };
+        self.bytes.get(index).is_some_and(|&byte| byte != 0)
+    }
 }
 
 /// The save/load screen's state.
@@ -277,7 +288,9 @@ impl SaveLoadScreen {
                     self.blink_timer = BLINK_TICKS;
                     self.stage = Stage::ConfirmOverwrite;
                 } else {
-                    self.begin_save(cx);
+                    // The caller queued the slot's confirm cue (the same bank
+                    // slot as the first slice's typewriter tick).
+                    self.begin_save(cx, true);
                 }
             }
         }
@@ -294,7 +307,15 @@ impl SaveLoadScreen {
     }
 
     /// Write the pending block to the cursor's slot and start the reveal.
-    fn begin_save(&mut self, cx: &UiContext<'_>) {
+    ///
+    /// `slot_cued` says the tick that arrived here already queued the slot's
+    /// confirm cue - the navigation confirm plays it, while the overwrite
+    /// dialog's YES is silent. The reference plays `play_sfx(sfxBank, 31)` on
+    /// the confirm frame and, when the byte is not a space, again on its first
+    /// `STATE_SAVE_ANIM_STEP1` frame; the port draws the first slice on the
+    /// write's own tick, so only the silent overwrite path adds that first
+    /// slice's tick here.
+    fn begin_save(&mut self, cx: &UiContext<'_>, slot_cued: bool) {
         let Some(pending) = self.pending.as_ref() else {
             self.stage = Stage::Error;
             return;
@@ -322,7 +343,11 @@ impl SaveLoadScreen {
                     .text
                     .map(|text| text.save().location(file.stage, file.room).to_vec())
                     .unwrap_or_default();
-                self.reveal = Some(Reveal::new(build_reveal(&name, file.saves, &location)));
+                let reveal = Reveal::new(build_reveal(&name, file.saves, &location));
+                if !slot_cued && reveal.cues_tick() {
+                    cx.play_cue(UiCue::SaveConfirm);
+                }
+                self.reveal = Some(reveal);
                 self.stage = Stage::SaveAnim;
             }
             Err(err) => {
@@ -493,7 +518,9 @@ impl Screen for SaveLoadScreen {
                         self.blink_state = false;
                         self.blink_timer = BLINK_TICKS;
                     } else {
-                        self.begin_save(cx);
+                        // The dialog's YES is silent in the reference, so the
+                        // write's own tick plays the first slice's tick.
+                        self.begin_save(cx, false);
                     }
                 } else if input.cancel {
                     self.stage = Stage::Idle;
@@ -514,6 +541,9 @@ impl Screen for SaveLoadScreen {
                     } else {
                         reveal.length += REVEAL_STEP;
                         reveal.timer = REVEAL_TICKS;
+                        if reveal.cues_tick() {
+                            cx.play_cue(UiCue::SaveConfirm);
+                        }
                     }
                 } else {
                     reveal.timer -= 1;
@@ -1138,6 +1168,175 @@ mod tests {
             lengths.iter().all(|&length| length <= REVEAL_LEN),
             "the reveal never runs past the string"
         );
+    }
+
+    #[test]
+    fn the_reveal_plays_the_typewriter_tick_for_every_non_space_slice() {
+        let dir = TempDir::new("reveal-tick");
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        let mut cx = context(&dir.path);
+        screen.open(&mut cx).unwrap();
+
+        // The write's own tick plays the slot-confirm cue (the same bank slot
+        // as the first slice's tick) and draws the reveal's first slice; the
+        // steps that follow cue as they reveal.
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::SaveAnim);
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+
+        let bytes = screen.reveal().unwrap().to_vec();
+        let mut lengths = Vec::new();
+        for _ in 0..(REVEAL_LEN + REVEAL_STEP) * (usize::from(REVEAL_TICKS) + 1) {
+            if screen.stage != Stage::SaveAnim {
+                break;
+            }
+            cx.cues.borrow_mut().clear();
+            screen.update(&cx, neutral());
+            if !cx.cues.borrow().is_empty() {
+                lengths.push(screen.reveal_len());
+            }
+        }
+        assert_ne!(screen.stage, Stage::SaveAnim, "the reveal finished");
+        // Only the separators (0x38) and the count digits (0x0C) are
+        // non-space: the test pack has no save strings, so the name and
+        // location are blank-padded. The steps that cue are the ones whose
+        // slice revealed a non-space byte two back from the copy end
+        // (`REVEAL_LEN - 1` is the last drawn slice; the terminator pass
+        // draws none and never cues).
+        let cued: Vec<usize> = (2 * REVEAL_STEP..=REVEAL_LEN - 1)
+            .step_by(REVEAL_STEP)
+            .filter(|&length| bytes[length - REVEAL_STEP] != 0)
+            .collect();
+        assert_eq!(cued, [8, 10, 12, 14]);
+        assert_eq!(lengths, cued);
+        assert_eq!(
+            screen.reveal_len(),
+            REVEAL_LEN - 1,
+            "the reveal ran to its last drawn slice"
+        );
+    }
+
+    #[test]
+    fn the_reveal_tick_reads_the_byte_two_back_from_the_copy_end() {
+        let dir = TempDir::new("reveal-offset");
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        let mut cx = context(&dir.path);
+        screen.open(&mut cx).unwrap();
+
+        // A slice whose last byte and last-but-two byte are not spaces and
+        // whose byte two back from the copy end is: the step to four bytes
+        // checks that byte and stays silent (a `length - 1` or `length - 3`
+        // check would cue here).
+        let mut bytes = vec![0u8; REVEAL_LEN];
+        bytes[REVEAL_STEP - 1] = SEPARATOR;
+        bytes[REVEAL_STEP + 1] = SEPARATOR;
+        screen.reveal = Some(Reveal {
+            bytes,
+            length: REVEAL_STEP,
+            timer: 0,
+        });
+        screen.stage = Stage::SaveAnim;
+        screen.update(&cx, neutral());
+        assert_eq!(screen.reveal_len(), 2 * REVEAL_STEP, "the step ran");
+        assert!(
+            cx.cues.borrow().is_empty(),
+            "the byte two back from the copy end is a space"
+        );
+    }
+
+    #[test]
+    fn the_write_tick_cues_the_first_slice_once_on_both_paths() {
+        let dir = TempDir::new("reveal-first-slice");
+        let text = crate::text::Text::embedded();
+        let mut cx = context(&dir.path);
+        cx.text = Some(&text);
+
+        // An empty slot: the navigation confirm's tick already plays the
+        // slot's confirm cue, and the first slice's tick shares its bank
+        // slot, so the write's own tick adds nothing.
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        screen.open(&mut cx).unwrap();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::SaveAnim);
+        assert_ne!(
+            screen.reveal().unwrap()[0],
+            0,
+            "the embedded name is not a space"
+        );
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+
+        // The overwrite dialog's YES is silent in the reference, so the
+        // write's own tick carries the first slice's tick itself. (The write
+        // above left slot 0 occupied, which is what opens the dialog.)
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        screen.open(&mut cx).unwrap();
+        cx.cues.borrow_mut().clear();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::ConfirmOverwrite);
+        cx.cues.borrow_mut().clear();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::SaveAnim);
+        assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+    }
+
+    #[test]
+    fn the_overwrite_write_stays_silent_when_the_first_slice_is_a_space() {
+        let dir = TempDir::new("reveal-blank-slice");
+        save::save(&dir.path, 0, &SaveFile::default()).unwrap();
+        let mut screen = SaveLoadScreen::save(SaveFile::default(), false);
+        let mut cx = context(&dir.path);
+        screen.open(&mut cx).unwrap();
+
+        // Open the dialog (the slot's own confirm cue), then YES: the write's
+        // own tick takes the first slice's tick, and a blank first byte is a
+        // space, so it stays silent like the reference's `animBuf[0] != 0`.
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::ConfirmOverwrite);
+        cx.cues.borrow_mut().clear();
+        screen.update(
+            &cx,
+            UiInput {
+                confirm: true,
+                ..neutral()
+            },
+        );
+        assert_eq!(screen.stage, Stage::SaveAnim);
+        assert_eq!(
+            screen.reveal().unwrap()[0],
+            0,
+            "the test pack has no save strings, so the name is blank"
+        );
+        assert!(cx.cues.borrow().is_empty(), "a space never cues");
     }
 
     #[test]
