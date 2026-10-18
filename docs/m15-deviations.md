@@ -104,3 +104,14 @@ no-combat scope of the engine is unchanged and is covered by
     reference's `--test-load <path>` take paths from the command line only.
     All three flags are documented as test-only seams, not mod-facing ones;
     a normal mod pack cannot reach them.
+
+15. **Replacement formats are feature-gated and per-class.** PNG, WebP and OGG
+    Vorbis decoding lives behind the default-on `hd` feature: a
+    `--no-default-features` build resolves a mod's replacement by stem but
+    refuses to decode it, naming the feature (the lean build's dependency list
+    stays `zstd` plus the optional `mlua`). Fixed-geometry art (UI sheets, the
+    font sheets, the map pages, effect sheets, the shadow page) must keep the
+    shipped page's dimensions, and the two palette consumers (fonts and map
+    pages) require at most 255 opaque colours so their indices can be rebuilt
+    exactly; both refusals name the entry and the reason. See
+    `docs/modding.md` for the full override table.

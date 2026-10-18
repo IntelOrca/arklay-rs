@@ -1,0 +1,10 @@
+[pack]
+format = 1
+id = "hd"
+name = "HD replacement demo"
+version = "0.1.0"
+kind = "mod"
+base = "re1"
+load_order = 20
+rdt = "re1"
+scd = "re1"

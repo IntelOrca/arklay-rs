@@ -67,6 +67,103 @@ layers at all the engine takes exactly the single-pack path, so a run without
 too; `pack info` prints the manifest, the applied layers and the merged entry
 table.
 
+## Replacement formats
+
+Mods are authored in WebP/PNG and OGG Vorbis while the pack stores the art and
+audio the original shipped. Every loader therefore looks an asset up by *stem*
+— the entry path without its extension — and the pack resolves the formats:
+
+| class | priority, highest first |
+| --- | --- |
+| image | `webp` > `png` > `bmp` > `tim` > `pix` |
+| audio | `ogg` > `wav` |
+
+**Any entry in a mod whose stem matches a known asset is an override.** The
+winning layer is still decided by `(load_order, id)` exactly as above, and only
+then does the extension priority pick within that layer: `roomcut/100_000.png`
+replaces the background `roomcut/100_000.bmp`, `ui/itemboxn.webp` replaces the
+page `ui/itemboxn.tim`, `bgm/013.ogg` replaces `bgm/013.wav`, and a layer that
+ships both `x.png` and `x.webp` gets the WebP. A higher layer's PNG beats a
+lower layer's WebP, because the override is decided per layer first.
+
+PNG, WebP and OGG Vorbis are decoded by the pure-Rust `png`, `image-webp` and
+`lewton` crates behind the default-on `hd` feature (the same switch `cargo
+build --no-default-features` turns off, keeping that build's dependency list to
+`zstd`). A build without `hd` still resolves replacements by stem but refuses
+to decode those formats, naming the feature. BMP, TIM and WAV stay the port's
+own decoders with the same size budgets as the shipped formats. `mod build`
+packs replacement sources verbatim and stores them raw, and `convert-game`
+needs no change: it reads the install's own BMP/TIM/WAV/PIX sources, which
+never carry a replacement format.
+
+### What each class accepts
+
+| class | entry stems (one example) | formats | size |
+| --- | --- | --- | --- |
+| room background | `roomcut/100_000` | webp, png, bmp, tim, pix | any size: stretched over the 320x240 frame |
+| camera mask | `roommask/100_000` | webp, png, bmp, tim, pix | the shipped page's; black is a hole |
+| full-frame UI backdrop | `ui/title`, `ui/sel_back`, `ui/type00`, `ui/chris02`, `ui/jill02`, `ui/clis01`, `ui/jill01`, `ui/rc1121` | webp, png, bmp, tim | any size: stretched |
+| UI sheets | `ui/status`, `ui/blue`, `ui/statface`, `ui/staitem`, `ui/itemboxn`, `ui/select_b`, `ui/select_k`, `ui/t_press`, `ui/t_start`, `ui/died`, `ui/en05`, `ui/en07` | webp, png, bmp, tim | the shipped page's; an RGBA replacement uses its own alpha |
+| item art | `item/item_all`, `item/item_mix`, `item/medal` | webp, png, bmp, tim | the shipped sheet's; black is a hole |
+| item-view / enemy / player art | (inside `item/*.ivm`, `enemy/em*.emd`, `player/*.emd`) | — | override the whole model entry |
+| doors | (inside `door/*.dor`) | — | override the whole entry |
+| font sheets | `font/font`, `font/jpn`, `font/latin` | webp, png, bmp, tim | the shipped sheet's; at most 255 opaque colours |
+| map pages | `map/blue`, `map/map00` … `map/map0e` | webp, png, bmp, tim | the shipped page's; at most 255 opaque colours |
+| FILE pages | `file/file000`, `file/file001`, `file/filei*`, `file/textm_*` | webp, png, bmp, tim | the shipped page's |
+| room effect sheets | `effspr/esp000`, `effspr/esp2xx` | webp, png, bmp, tim | the shipped page's (the room's own sprites composite onto it) |
+| player shadow | `shadow/kage` | webp, png, bmp, tim | the shipped page's; an RGBA page's alpha is the coverage |
+| BGM | `bgm/013`, `bgm/024_00` | ogg, wav | any |
+| sound effect | `se/a_mcn03`, `se/chain1`, `se/v110_00` | ogg, wav | any |
+| voice | `voice/01_09` | ogg, wav | any |
+
+The stems are the shipped entries' names without their extensions: `roomcut` and
+`roommask` use `{stage}{room:02X}_{camera:03}` (`RoomId::cut_stem`), `bgm` uses
+`{id:03x}` plus an optional `_{variant:02}` (`music::pack_path`), `voice` uses
+the 1-based stage row and the lowercase hex id (`voice::entry_path`), and
+everything else is the literal name `arklay list` prints.
+
+### Mismatch behaviour
+
+A replacement is the winning entry, so it is validated exactly like a shipped
+entry, with these extra rules:
+
+- **Format.** A replacement that does not decode fails like a corrupt shipped
+  entry: a required asset (a room background, the menu or font art a screen
+  opens with) aborts that load with the entry's own path in the message, and an
+  optional one logs a warning and leaves its layer empty.
+- **Size.** Fixed-geometry art is addressed by UVs or sprite rectangles, so a
+  page replacement must keep the dimensions of the entry it replaces; a
+  mismatch is refused with a message naming the replacement's size, the shipped
+  size and the reason. Full-frame pictures (room backgrounds and the `ui/*`
+  backdrops) may be any size: they are stretched over the frame, which is what
+  an HD replacement wants. `.pix` is headerless, so it takes the shipped
+  entry's dimensions and is refused when it shadows nothing.
+- **Colours.** An indexed consumer (the font sheets and the map pages, whose
+  layouts the engine addresses by palette index) accepts a true-colour
+  replacement with at most 255 distinct opaque colours and re-indexes it colour
+  for colour; more colours is an error naming the count. The other sheet
+  classes take a true-colour replacement as-is.
+- **Layering.** A replacement the engine cannot classify (a fifth format, an
+  `.ogg` for an image class) is not a lookup candidate at all, so it stays an
+  ordinary new entry and the shipped asset is drawn.
+
+### The checked-in example
+
+`mods/hd/` is the reference replacement mod: a 640x480 PNG `roomcut/100_000`
+(a 2x background), a 128x208 `ui/itemboxn` shipped as both PNG and WebP (so the
+layer's own priority picks the WebP), and an OGG Vorbis `bgm/013`.
+
+```sh
+arklay mod build mods/hd --out hd.akpak
+arklay verify hd.akpak                 # the png and ogg rows
+arklay re1.akpak --mod hd.akpak --room 100 --ticks 120 --capture hd.bmp
+arklay re1.akpak --mod hd.akpak --ui box --capture hd-box.bmp
+```
+
+`arklay mod build --base <base.akpak>` counts a format override as an override:
+`roomcut/100_000.png` over the base's `.bmp` is not reported as a new file.
+
+
 ## Language files
 
 A mod may ship `language/<tag>.txt` with any subset of strings. Every layer's
@@ -101,7 +198,10 @@ arklay re1.akpak --mod fr.akpak --language fr-FR --room 100
 equal to its directory-relative path, and a `scd/<stem>.s` source is assembled
 into `scd/<stem>.scd` (the `.s` itself is not packed). `--base <base.akpak>`
 checks the declared base id and reports override paths the base does not hold
-as a warning, never an error.
+as a warning, never an error; a replacement whose stem matches a base entry of
+its own class (the previous section) is an override, not a new file. PNG, WebP
+and OGG sources are packed verbatim and stored raw, exactly like the formats
+that carry their own compression.
 
 The checked-in `mods/demo/` is the reference mod:
 
@@ -112,6 +212,10 @@ arklay re1.akpak --mod demo.akpak --room 100 --capture demo.bmp
 
 It carries a manifest, a whole-room script override for RDT 1000, a Lua hook
 and a generated 320x240 background, but no game assets.
+
+The checked-in `mods/hd/` is the replacement-format reference: a 2x PNG room
+background, a UI page shipped as both PNG and WebP, and an OGG Vorbis BGM
+track, with no game assets either.
 
 ## The `.s` script assembler
 

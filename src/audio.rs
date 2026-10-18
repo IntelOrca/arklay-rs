@@ -65,6 +65,26 @@ pub struct Wav {
     pub data: Vec<u8>,
 }
 
+impl Wav {
+    /// Build the WAV form from already-decoded interleaved 16-bit samples.
+    ///
+    /// The OGG Vorbis decoder hands back PCM rather than a container, so a
+    /// decoded stream is returned in the same shape the mixer consumes a WAV
+    /// in: signed 16-bit little-endian samples, one run per channel.
+    pub fn from_s16(samples: &[i16], channels: u16, sample_rate: u32) -> Self {
+        let mut data = Vec::with_capacity(samples.len() * 2);
+        for &sample in samples {
+            data.extend_from_slice(&sample.to_le_bytes());
+        }
+        Self {
+            format: WavFormat::S16Le,
+            channels,
+            sample_rate,
+            data,
+        }
+    }
+}
+
 /// Parse a RIFF/WAVE image, returning its format and `data` chunk bytes.
 ///
 /// Walks the chunk list, skipping anything that is not `fmt ` or `data`.

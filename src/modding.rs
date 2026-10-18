@@ -31,6 +31,27 @@ pub struct ModSummary {
     pub warnings: Vec<String>,
 }
 
+/// Whether `path` overrides an entry of `base` in the merged view.
+///
+/// A mod entry whose stem matches a base entry of the same class (for example
+/// `roomcut/100_000.png` over `roomcut/100_000.bmp`) is an override even
+/// though its exact path is new, so the new-file warning only names entries
+/// the base could never serve.
+fn is_override(base: &Pack, path: &str) -> bool {
+    if base.contains(path) {
+        return true;
+    }
+    let class = if crate::pack::AssetClass::Audio
+        .extensions()
+        .contains(&crate::pack::extension_of(path).as_str())
+    {
+        crate::pack::AssetClass::Audio
+    } else {
+        crate::pack::AssetClass::Image
+    };
+    base.has_asset(crate::assets::stem(path), class)
+}
+
 /// Build the mod source directory `dir` into the pack `out`.
 ///
 /// When `base` is given, the source manifest's declared base id must match the
@@ -121,7 +142,7 @@ pub fn build_mod(dir: &Path, out: &Path, base: Option<&Path>) -> Result<ModSumma
         let new_paths: Vec<&str> = entries
             .iter()
             .map(|(path, _)| path.as_str())
-            .filter(|path| *path != manifest::ENTRY && !base_pack.contains(path))
+            .filter(|path| *path != manifest::ENTRY && !is_override(&base_pack, path))
             .collect();
         if !new_paths.is_empty() {
             warnings.push(format!(

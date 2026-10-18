@@ -109,6 +109,18 @@ pub fn wav(data: &[u8]) {
     let _ = audio::parse_wav(data);
 }
 
+pub fn ogg(data: &[u8]) {
+    let _ = arklay::assets::decode_audio_bytes("ogg", data);
+}
+
+pub fn png(data: &[u8]) {
+    let _ = arklay::assets::decode_image_bytes("png", data);
+}
+
+pub fn webp(data: &[u8]) {
+    let _ = arklay::assets::decode_image_bytes("webp", data);
+}
+
 pub fn dor(data: &[u8]) {
     let _ = door::parse(data);
 }

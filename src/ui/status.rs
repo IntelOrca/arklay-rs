@@ -13,8 +13,8 @@
 //! framebuffer's RGBA buffer; the EKG uses a Bresenham line so no renderer
 //! primitive beyond the existing sprite path is needed.
 
+use crate::assets::Artwork;
 use crate::game::platform_rand;
-use crate::model::Texture8;
 use crate::render::{Framebuffer, Tint};
 
 use super::layout;
@@ -334,7 +334,7 @@ impl HealthBar {
     }
 
     /// Draw the health face and EKG into `framebuffer` from `texture`.
-    pub fn draw(&self, framebuffer: &mut Framebuffer, texture: &Texture8) {
+    pub fn draw(&self, framebuffer: &mut Framebuffer, texture: &Artwork) {
         self.draw_face(framebuffer, texture);
         if self.state == 2 || self.state == 3 {
             self.draw_flush(framebuffer);
@@ -359,7 +359,7 @@ impl HealthBar {
     }
 
     /// Draw the face tile selected by the health state and sweep position.
-    fn draw_face(&self, framebuffer: &mut Framebuffer, texture: &Texture8) {
+    fn draw_face(&self, framebuffer: &mut Framebuffer, texture: &Artwork) {
         let row = if self.poisoned { 4 } else { self.health_state };
         let (table, base, flash) = match row {
             0 => (&FACE_DANGER_SPAN[..], 0x30, &FACE_DANGER_FLASH[..]),
@@ -380,10 +380,10 @@ impl HealthBar {
         self.draw_face_tile(framebuffer, texture, select * 8 + base);
     }
 
-    fn draw_face_tile(&self, framebuffer: &mut Framebuffer, texture: &Texture8, v: u8) {
+    fn draw_face_tile(&self, framebuffer: &mut Framebuffer, texture: &Artwork, v: u8) {
         let [x, y] = layout::HEALTH_FACE_POS;
         let [w, h] = layout::HEALTH_FACE_SIZE;
-        framebuffer.draw_indexed_sprite(
+        framebuffer.draw_page_sprite(
             texture,
             [0x60, i32::from(v), i32::from(w), i32::from(h)],
             [i32::from(x), i32::from(y), i32::from(w), i32::from(h)],

@@ -16,11 +16,15 @@ and linked statically, so no separate DLL is needed.
 
 ```sh
 cargo build
-# A lean build with no Lua runtime (every hook is a no-op)
+# A lean build with no Lua runtime (every hook is a no-op) and no PNG/WebP/OGG
+# replacement decoders
 cargo build --no-default-features
 ```
 
 Lua 5.4 is vendored and compiled from source by the default-on `lua` feature.
+The `hd` feature (also default) pulls the pure-Rust `png`, `image-webp` and
+`lewton` crates that decode a mod's replacement art and audio; without it the
+engine still resolves replacements by stem but refuses to decode those formats.
 
 ## Usage
 
@@ -124,7 +128,10 @@ artifact behind.
 ## Mods and authoring
 
 Packs layer. Any entry of a mod pack shadows the base pack's entry, including a
-whole-room `scd/{id}.scd` script override and `lua/**` hooks:
+whole-room `scd/{id}.scd` script override and `lua/**` hooks. Art and audio may
+be shipped in the format they are authored in — WebP or PNG images and OGG
+Vorbis audio — and the engine resolves them by entry stem with a fixed
+extension priority (`webp > png > bmp > tim > pix`, `ogg > wav`):
 
 ```sh
 # Build the checked-in demo sources into a pack (no game assets included)
@@ -132,6 +139,11 @@ cargo run -- mod build mods/demo --out demo.akpak
 
 # Layer it explicitly; --mod is repeatable, later load_order wins
 cargo run -- re1.akpak --mod demo.akpak --room 100 --ticks 40 --capture demo.bmp
+
+# The replacement-format example: a PNG background, a PNG/WebP UI page and an
+# OGG BGM track over the shipped art
+cargo run -- mod build mods/hd --out hd.akpak
+cargo run -- re1.akpak --mod hd.akpak --room 100 --ticks 120 --capture hd.bmp
 
 # A clean vanilla run: no --mod and no sibling mods/ discovery
 cargo run -- re1.akpak --no-mods --room 100
@@ -147,13 +159,13 @@ cargo run -- scd export ROOM1000.RDT --out 1000.s
 cargo run -- scd build 1000.s --out scd/1000.scd
 ```
 
-`docs/modding.md` documents the manifest grammar, the `.s` grammar, the mod
-source convention, the language-file overrides and the sandboxed Lua hook API;
-`docs/language.md` documents the `language/<tag>.txt` format, the key
-registry, the fallback chain and the missing-glyph box; `docs/m15-deviations.md`
-records the deliberate limits (whole-room script replacement, sandbox,
-error/budget policy). A run without any layer stays byte-identical to a
-pre-M15 run, Lua or not.
+`docs/modding.md` documents the manifest grammar, the replacement formats and
+their override table, the `.s` grammar, the mod source convention, the
+language-file overrides and the sandboxed Lua hook API; `docs/language.md`
+documents the `language/<tag>.txt` format, the key registry, the fallback chain
+and the missing-glyph box; `docs/m15-deviations.md` records the deliberate
+limits (whole-room script replacement, sandbox, error/budget policy). A run
+without any layer stays byte-identical to a pre-M15 run, Lua or not.
 
 `convert-game` and `extract` report progress on stderr as a single bar for the
 whole command. `convert-game` runs its asset categories (RDTs, camera cuts,

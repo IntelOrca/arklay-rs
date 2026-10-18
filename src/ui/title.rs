@@ -19,11 +19,11 @@
 
 use anyhow::Result;
 
-use crate::bmp;
+use crate::assets::{Artwork, Geometry};
+use crate::pack::AssetClass;
 use crate::render::Framebuffer;
 use crate::save;
 use crate::state::Image;
-use crate::tim;
 use crate::transition::{Fade, FadeColor};
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
@@ -91,7 +91,7 @@ enum Stage {
 /// The title screen state.
 pub struct TitleScreen {
     background: Option<Image>,
-    prompt: Option<crate::model::Texture8>,
+    prompt: Option<Artwork>,
     stage: Stage,
     /// `1` NEW GAME, `2` LOAD GAME.
     selection: u8,
@@ -209,25 +209,19 @@ impl Default for TitleScreen {
 
 impl Screen for TitleScreen {
     fn open(&mut self, cx: &mut UiContext<'_>) -> Result<()> {
-        self.background = match cx.pack.read("ui/title.bmp") {
-            Ok(bytes) => match bmp::decode(&bytes) {
-                Ok(image) => Some(image),
-                Err(err) => {
-                    eprintln!("warning: invalid title background: {err:#}");
-                    None
-                }
-            },
+        self.background = match super::load_picture(cx.pack, "ui/title", Geometry::Free, None) {
+            Ok(image) => Some(image),
             Err(err) => {
-                eprintln!("warning: missing title background: {err:#}");
+                eprintln!("warning: no title background: {err:#}");
                 None
             }
         };
-        let prompt = ["ui/t_press.tim", "ui/t_start.tim"]
+        let stem = ["ui/t_press", "ui/t_start"]
             .into_iter()
-            .find_map(|entry| cx.pack.read(entry).ok());
-        self.prompt = match prompt {
-            Some(bytes) => match tim::decode_4bpp(&bytes) {
-                Ok(texture) => Some(texture),
+            .find(|stem| cx.pack.has_asset(stem, AssetClass::Image));
+        self.prompt = match stem {
+            Some(stem) => match super::load_page(cx.pack, stem) {
+                Ok(art) => Some(art),
                 Err(err) => {
                     eprintln!("warning: invalid title prompt sheet: {err:#}");
                     None
@@ -343,7 +337,11 @@ impl Screen for TitleScreen {
 
     fn draw(&mut self, _cx: &UiContext<'_>, framebuffer: &mut Framebuffer) {
         match &self.background {
-            Some(background) => framebuffer.blit(background),
+            // A full-frame backdrop is stretched, so a replacement may be
+            // authored at any size (an HD title screen, for example).
+            Some(background) => {
+                framebuffer.draw_background(background, [0, 0], [255, 255, 255]);
+            }
             None => {
                 framebuffer.clear();
                 framebuffer.fill_rect(
@@ -366,7 +364,7 @@ impl Screen for TitleScreen {
                 (row, 255)
             }
         };
-        framebuffer.draw_indexed_sprite_scaled(
+        framebuffer.draw_page_sprite_scaled(
             prompt,
             [0, row.v, 256, row.height],
             [

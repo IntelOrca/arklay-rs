@@ -14,7 +14,7 @@
 //! remapped to the sheet's round parentheses; see its own note.
 
 use crate::model::Texture8;
-use crate::pack::Pack;
+use crate::pack::{AssetClass, Pack};
 use crate::render::{Framebuffer, SpriteBlend, SpriteDraw};
 
 pub use crate::render::Tint;
@@ -33,33 +33,35 @@ pub const JAPANESE_ENTRY: &str = "font/jpn.tim";
 /// The Western sheet as a script-specific override, packed when the install
 /// carries a Japanese default.
 pub const LATIN_ENTRY: &str = "font/latin.tim";
+/// The default sheet's pack stem, the key a replacement resolves by.
+pub const DEFAULT_STEM: &str = "font/font";
 
-/// The pack entry a session in `script` draws with: the script's own sheet
+/// The pack stem a session in `script` draws with: the script's own sheet
 /// when the pack ships one, else the default.
+///
+/// The lookup is by stem, so a mod may replace a sheet with any image format
+/// and either script's override may be introduced by a mod.
 pub fn session_entry(pack: &Pack, script: crate::charset::Script) -> &'static str {
-    let entry = match script {
-        crate::charset::Script::Japanese => JAPANESE_ENTRY,
-        crate::charset::Script::Latin => LATIN_ENTRY,
+    let stem = match script {
+        crate::charset::Script::Japanese => "font/jpn",
+        crate::charset::Script::Latin => "font/latin",
     };
-    if pack.contains(entry) {
-        entry
+    if pack.has_asset(stem, AssetClass::Image) {
+        stem
     } else {
-        DEFAULT_ENTRY
+        DEFAULT_STEM
     }
 }
 
 /// Decode the sheet a session in `script` draws with, or `None` when the pack
 /// carries no usable font.
 pub fn load_session(pack: &Pack, script: crate::charset::Script) -> Option<Font> {
-    let entry = session_entry(pack, script);
-    let bytes = match pack.read(entry) {
-        Ok(bytes) => bytes,
-        Err(_) => return None,
-    };
-    match crate::tim::decode_4bpp(&bytes) {
+    let stem = session_entry(pack, script);
+    let asset = pack.read_asset(stem, AssetClass::Image).ok().flatten()?;
+    match crate::assets::decode_texture(&asset, crate::assets::Geometry::Shipped) {
         Ok(texture) => Some(Font::new(texture)),
         Err(err) => {
-            eprintln!("warning: invalid {entry}: {err:#}");
+            eprintln!("warning: invalid {}: {err:#}", asset.path());
             None
         }
     }
