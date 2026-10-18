@@ -5,14 +5,12 @@
 //! `%APPDATA%\arklay`) and is optional: a missing file is the default
 //! configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
-//! `key = 'value'` strings so a Windows path needs no escaping — with three
+//! `key = 'value'` strings so a Windows path needs no escaping — with two
 //! keys:
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
 //! save_dir = "~/.config/arklay/save"
-//! # `vanilla` (the default), `cr`, or a pack entry with the screen script.
-//! save_screen = "cr"
 //! # The language tag, when `--language` is not given.
 //! language = "en-US"
 //! ```
@@ -37,65 +35,12 @@ pub const DIR_NAME: &str = "arklay";
 pub const DIR_ENV: &str = "ARKLAY_CONFIG_DIR";
 /// The default save directory's name inside the configuration directory.
 pub const SAVE_DIR_NAME: &str = "save";
-/// The pack entry the built-in Classic REbirth-style screen ships as.
-pub const CR_SCREEN_ENTRY: &str = "screen/save_cr.lua";
-
-/// Which save/load screen the engine opens.
-///
-/// `Vanilla` is the ported original screen (the default). `Lua(entry)` runs
-/// the pack entry's Lua script instead; `save_screen = "cr"` selects the
-/// built-in [`CR_SCREEN_ENTRY`], and any other value is taken as a pack entry
-/// path so a mod can ship its own screen.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum SaveScreen {
-    /// The ported original screen (USA/MediaKite layouts).
-    #[default]
-    Vanilla,
-    /// A Lua screen script, named by its pack entry.
-    Lua(String),
-}
-
-impl SaveScreen {
-    /// Parse a `save_screen` setting: `vanilla`/`rust`/`default`, `cr`, or a
-    /// pack entry path.
-    pub fn parse(value: &str) -> Result<Self> {
-        let value = value.trim();
-        if value.is_empty() {
-            bail!("save_screen is empty");
-        }
-        match value.to_ascii_lowercase().as_str() {
-            "vanilla" | "rust" | "default" => Ok(Self::Vanilla),
-            "cr" => Ok(Self::Lua(CR_SCREEN_ENTRY.to_string())),
-            _ => {
-                if value.contains('\0') {
-                    bail!("save_screen contains a NUL byte");
-                }
-                Ok(Self::Lua(value.to_string()))
-            }
-        }
-    }
-
-    /// Whether this selects the ported original screen.
-    pub fn is_vanilla(&self) -> bool {
-        matches!(self, Self::Vanilla)
-    }
-
-    /// The pack entry the selection names, for a Lua screen.
-    pub fn entry(&self) -> Option<&str> {
-        match self {
-            Self::Vanilla => None,
-            Self::Lua(entry) => Some(entry),
-        }
-    }
-}
 
 /// The user configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Config {
     /// Where saves are read and written; `None` means the default location.
     pub save_dir: Option<PathBuf>,
-    /// Which save/load screen to open.
-    pub save_screen: SaveScreen,
     /// The language tag to use when `--language` is not given.
     pub language: Option<String>,
 }
@@ -179,7 +124,6 @@ impl Config {
                     }
                     config.save_dir = Some(PathBuf::from(value));
                 }
-                "save_screen" => config.save_screen = SaveScreen::parse(&value)?,
                 "language" => {
                     if value.is_empty() {
                         bail!("line {line}: language is empty");
@@ -197,15 +141,6 @@ impl Config {
         let mut out = String::new();
         if let Some(dir) = &self.save_dir {
             out.push_str(&format!("save_dir = \"{}\"\n", dir.display()));
-        }
-        match &self.save_screen {
-            SaveScreen::Vanilla => {}
-            SaveScreen::Lua(entry) if entry == CR_SCREEN_ENTRY => {
-                out.push_str("save_screen = \"cr\"\n");
-            }
-            SaveScreen::Lua(entry) => {
-                out.push_str(&format!("save_screen = \"{entry}\"\n"));
-            }
         }
         if let Some(language) = &self.language {
             out.push_str(&format!("language = \"{language}\"\n"));
@@ -316,7 +251,6 @@ mod tests {
             std::env::temp_dir().join(format!("arklay-config-{}-missing", std::process::id()));
         let path = dir.join("arklay.toml");
         assert_eq!(Config::load(&path).unwrap(), Config::default());
-        assert!(Config::default().save_screen.is_vanilla());
     }
 
     #[test]
@@ -324,32 +258,11 @@ mod tests {
         let config = Config::parse(
             "# a comment\n\
              save_dir = \"/tmp/saves\"   # trailing\n\
-             save_screen = \"cr\"\n\
              language = \"ja-JP\"\n",
         )
         .unwrap();
         assert_eq!(config.save_dir.as_deref(), Some(Path::new("/tmp/saves")));
-        assert_eq!(config.save_screen, SaveScreen::Lua(CR_SCREEN_ENTRY.into()));
         assert_eq!(config.language.as_deref(), Some("ja-JP"));
-    }
-
-    #[test]
-    fn screen_names_and_entry_paths_resolve() {
-        assert_eq!(SaveScreen::parse("vanilla").unwrap(), SaveScreen::Vanilla);
-        assert_eq!(SaveScreen::parse("RUST").unwrap(), SaveScreen::Vanilla);
-        assert_eq!(
-            SaveScreen::parse("cr").unwrap(),
-            SaveScreen::Lua(CR_SCREEN_ENTRY.into())
-        );
-        assert_eq!(
-            SaveScreen::parse("screen/mine.lua").unwrap(),
-            SaveScreen::Lua("screen/mine.lua".into())
-        );
-        assert_eq!(
-            SaveScreen::parse("cr").unwrap().entry(),
-            Some(CR_SCREEN_ENTRY)
-        );
-        assert!(SaveScreen::parse("").is_err());
     }
 
     #[test]
@@ -359,7 +272,6 @@ mod tests {
             "save_dir = \"unterminated\n",
             "save_dir = \"a\" trailing\n",
             "unknown_key = \"x\"\n",
-            "save_screen = \"\"\n",
             "language = \"\"\n",
             "save_dir\n",
         ] {
@@ -394,14 +306,10 @@ mod tests {
         assert_eq!(config.save_dir.as_deref(), Some(Path::new("a\\b\"c")));
         let text = Config {
             save_dir: Some(PathBuf::from("/tmp/saves")),
-            save_screen: SaveScreen::Lua(CR_SCREEN_ENTRY.into()),
             language: Some("en-US".into()),
         }
         .render();
-        assert_eq!(
-            text,
-            "save_dir = \"/tmp/saves\"\nsave_screen = \"cr\"\nlanguage = \"en-US\"\n"
-        );
+        assert_eq!(text, "save_dir = \"/tmp/saves\"\nlanguage = \"en-US\"\n");
         assert_eq!(
             Config::parse(&text).unwrap().language.as_deref(),
             Some("en-US")
@@ -453,10 +361,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("arklay.toml");
-        fs::write(&path, "save_screen = \"cr\"\n").unwrap();
+        fs::write(&path, "language = \"ja-JP\"\n").unwrap();
         assert_eq!(
-            Config::load(&path).unwrap().save_screen,
-            SaveScreen::Lua(CR_SCREEN_ENTRY.into())
+            Config::load(&path).unwrap().language.as_deref(),
+            Some("ja-JP")
         );
 
         // A directory where the file should be is an error, not a default.

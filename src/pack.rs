@@ -1010,6 +1010,12 @@ impl Pack {
             .collect()
     }
 
+    /// This pack's own entry paths, ignoring any layers: a layered base's own
+    /// table of contents where [`Pack::paths`] is the merged view.
+    pub fn own_paths(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.path.as_str())
+    }
+
     /// Original-case entry paths in table-of-contents order, or the merged
     /// view in lowercased-path order when layered.
     pub fn paths(&self) -> impl Iterator<Item = &str> {

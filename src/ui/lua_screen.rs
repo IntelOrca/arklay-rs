@@ -1,8 +1,9 @@
 //! A save/load screen implemented by a pack Lua script.
 //!
-//! The screen is a normal pack entry (`screen/save_cr.lua` ships with the
-//! base pack) selected by `save_screen` in `arklay.toml`. The engine loads it
-//! in the same sandbox the hooks use and drives three optional globals:
+//! The screen is a normal pack entry, and the pack's scripts register it with
+//! `api:register_save_screen` from their `on_init` hook (the checked-in
+//! `mods/crloadsave` is the reference). The engine loads it in the same
+//! sandbox the hooks use and drives three optional globals:
 //!
 //! ```lua
 //! function on_open(api) end        -- once, before the first tick

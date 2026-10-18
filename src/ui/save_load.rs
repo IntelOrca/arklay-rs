@@ -350,14 +350,11 @@ impl SaveScreen for SaveLoadScreen {
     }
 }
 
-/// Open the configured load screen and its art. A Lua screen that cannot load
-/// falls back to the ported original with a warning, so a broken mod never
-/// leaves the player without a screen.
-pub fn open_load_screen(
-    choice: &crate::config::SaveScreen,
-    cx: &mut UiContext<'_>,
-) -> Box<dyn SaveScreen> {
-    match choice.entry() {
+/// Open the load screen: the pack entry its scripts registered, or the ported
+/// original. A Lua screen that cannot load falls back to the original with a
+/// warning, so a broken mod never leaves the player without a screen.
+pub fn open_load_screen(entry: Option<&str>, cx: &mut UiContext<'_>) -> Box<dyn SaveScreen> {
+    match entry {
         Some(entry) => match super::lua_screen::LuaScreen::open_load(entry, cx) {
             Ok(screen) => Box::new(screen),
             Err(err) => {
@@ -369,15 +366,16 @@ pub fn open_load_screen(
     }
 }
 
-/// Open the configured save screen for the pending `file`; `ink_ribbon` makes
-/// the write consume one.
+/// Open the save screen for the pending `file`: the pack entry its scripts
+/// registered, or the ported original. `ink_ribbon` makes the write consume
+/// one.
 pub fn open_save_screen(
-    choice: &crate::config::SaveScreen,
+    entry: Option<&str>,
     cx: &mut UiContext<'_>,
     file: SaveFile,
     ink_ribbon: bool,
 ) -> Box<dyn SaveScreen> {
-    match choice.entry() {
+    match entry {
         Some(entry) => {
             match super::lua_screen::LuaScreen::open_save(entry, cx, file.clone(), ink_ribbon) {
                 Ok(screen) => Box::new(screen),

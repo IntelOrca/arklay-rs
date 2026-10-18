@@ -661,7 +661,7 @@ fn a_failed_output_rename_keeps_the_destination_and_removes_the_temporary() {
 }
 
 #[test]
-fn the_config_file_and_the_save_screen_flag_are_read() {
+fn the_config_file_is_read_and_a_bad_one_is_reported() {
     let dir = TempDir::new("config");
     let path = dir.join("game.akpak");
     write_room_pack(&path);
@@ -672,12 +672,12 @@ fn the_config_file_and_the_save_screen_flag_are_read() {
     let saves = dir.join("cfg-saves");
     let config_env = config_dir.to_str().unwrap();
 
-    // A config selecting the Lua screen and a save location: the pack has no
-    // screen script, so the run warns and falls back to the ported original.
+    // A config naming a save location: the load screen runs from it, and the
+    // pack carries no Lua, so the ported original screen opens.
     std::fs::write(
         &config,
         // The literal string form keeps a Windows path valid without escaping.
-        format!("save_screen = \"cr\"\nsave_dir = '{}'\n", saves.display()),
+        format!("save_dir = '{}'\n", saves.display()),
     )
     .unwrap();
     let output = run_env(
@@ -691,15 +691,10 @@ fn the_config_file_and_the_save_screen_flag_are_read() {
         &[("ARKLAY_CONFIG_DIR", config_env)],
     );
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(
-        stderr(&output).contains("lua save screen"),
-        "{}",
-        stderr(&output)
-    );
     assert!(capture.is_file());
 
     // A malformed config is reported instead of ignored.
-    std::fs::write(&config, "save_screen = 3\n").unwrap();
+    std::fs::write(&config, "save_dir = 3\n").unwrap();
     let output = run_env(
         &[
             path.to_str().unwrap(),
@@ -711,23 +706,6 @@ fn the_config_file_and_the_save_screen_flag_are_read() {
         &[("ARKLAY_CONFIG_DIR", config_env)],
     );
     assert_failure(&output, "expects a quoted string");
-
-    // `--save-screen` overrides the file; an empty value is refused. (The
-    // config file is valid again, so the flag's own error is the one shown.)
-    std::fs::write(&config, "save_screen = \"vanilla\"\n").unwrap();
-    let output = run_env(
-        &[
-            path.to_str().unwrap(),
-            "--ui",
-            "load",
-            "--save-screen",
-            "",
-            "--capture",
-            capture.to_str().unwrap(),
-        ],
-        &[("ARKLAY_CONFIG_DIR", config_env)],
-    );
-    assert_failure(&output, "save_screen is empty");
 }
 
 #[test]

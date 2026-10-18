@@ -280,7 +280,6 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         false,
         false,
         None,
-        &crate::config::SaveScreen::default(),
         trace::TraceOptions::default(),
         Authoring::default(),
     )
@@ -308,7 +307,6 @@ pub fn run_with_options(
     stats: bool,
     _debug_menu: bool,
     language: Option<&str>,
-    save_screen: &crate::config::SaveScreen,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
@@ -329,6 +327,7 @@ pub fn run_with_options(
         game.sync_entity_from_player(&player_state);
         run_room_init(&mut loaded, &mut game);
         let lua = load_lua(&pack);
+        call_lua_init(lua.as_ref(), &mut game);
         call_lua_room_load(lua.as_ref(), &mut game, id);
         run_setup_chunk(lua.as_ref(), &mut game, authoring.setup_script)?;
         game.sync_player(&mut player_state);
@@ -534,7 +533,6 @@ pub fn run_with_options(
     }
 
     let mut session = GameSession::from_room(&pack, id, &save_dir)?;
-    session.set_save_screen(save_screen.clone());
     session.run_setup_script(authoring.setup_script)?;
     let title = window_title(
         &session.loaded.id.room3(),
@@ -608,6 +606,15 @@ fn load_lua(pack: &Pack) -> Option<lua::LuaVm> {
             eprintln!("warning: Lua hooks unavailable: {err:#}");
             None
         }
+    }
+}
+
+/// Run `on_init` once the pack's hooks have loaded, before any room. A pack
+/// uses it to register a save/load screen, which the engine reads before a
+/// session exists too (see [`lua::registered_save_screen`]).
+fn call_lua_init(lua: Option<&lua::LuaVm>, game: &mut game::GameState) {
+    if let Some(lua) = lua {
+        lua.call_init(game);
     }
 }
 
@@ -1076,9 +1083,6 @@ struct GameSession {
     map: Option<ui::map::MapScreen>,
     /// The typewriter save screen; the room stays frozen while it is up.
     save_screen: Option<Box<dyn ui::save_load::SaveScreen>>,
-    /// Which save/load screen the session opens (`arklay.toml`'s
-    /// `save_screen`).
-    save_screen_choice: crate::config::SaveScreen,
     /// Where save files live for this session.
     save_dir: PathBuf,
     /// The pack's sandboxed Lua hooks, when it ships any: one VM per session,
@@ -1431,6 +1435,12 @@ impl GameSession {
         // ships both sheets draws each language with its own.
         let text = Text::load(pack, pack.language());
         let font = font::load_session(pack, text.script());
+        // The pack's scripts load once per session; `on_init` runs before the
+        // room's own hook so a screen registration is in place for the
+        // typewriter.
+        let lua = load_lua(pack);
+        let mut game = game;
+        call_lua_init(lua.as_ref(), &mut game);
         let mut session = Self {
             loaded,
             game,
@@ -1458,9 +1468,8 @@ impl GameSession {
             file_assets: None,
             map: None,
             save_screen: None,
-            save_screen_choice: crate::config::SaveScreen::default(),
             save_dir: save_dir.to_path_buf(),
-            lua: load_lua(pack),
+            lua,
             framebuffer: Framebuffer::new(),
             titled_cut: usize::MAX,
             transition: None,
@@ -2927,25 +2936,25 @@ impl GameSession {
     /// was confirmed. The last gameplay frame is painted first so the screen
     /// fades in over it; the pending block is the state snapshot plus the
     /// bio-card prefix, and `ink_ribbon` makes the write consume one. The
-    /// configured screen is the ported original or a Lua script; a Lua screen
-    /// that cannot load falls back to the original.
+    /// screen is the pack entry its scripts registered (`on_init` has run by
+    /// now), else the ported original; a Lua screen that cannot load falls
+    /// back to the original.
     fn open_typewriter_save(&mut self, pack: &Pack, ink_ribbon: bool) {
         if self.save_screen.is_some() {
             return;
         }
         self.render(pack);
         let file = self.snapshot_save(pack);
-        let choice = self.save_screen_choice.clone();
         let mut cx = self.ui_context(pack);
-        let screen = ui::save_load::open_save_screen(&choice, &mut cx, file, ink_ribbon);
+        let screen = ui::save_load::open_save_screen(
+            self.game.save_screen.as_deref(),
+            &mut cx,
+            file,
+            ink_ribbon,
+        );
         let cues = cx.cues.into_inner();
         self.save_screen = Some(screen);
         self.play_ui_cue_names(pack, cues);
-    }
-
-    /// Select the save/load screen this session opens.
-    pub fn set_save_screen(&mut self, choice: crate::config::SaveScreen) {
-        self.save_screen_choice = choice;
     }
 
     /// Capture the current game state as a save block with the bio-card
@@ -4639,8 +4648,9 @@ struct PendingMovie {
 struct App {
     pack: Pack,
     save_dir: PathBuf,
-    /// Which save/load screen the app and its sessions open.
-    save_screen: crate::config::SaveScreen,
+    /// The save/load screen entry the pack's scripts registered (`None` for
+    /// the ported original).
+    save_screen: Option<String>,
     font: Option<font::Font>,
     text: Text,
     mode: Mode,
@@ -4708,17 +4718,12 @@ enum AppFlow {
 impl App {
     /// Open the pack's shared assets; the mode machine starts on the title.
     /// `audio` opens the mixer when a game session or film starts.
+    ///
+    /// The pack's scripts also load once here, in a throwaway VM, so a
+    /// registration they make (the save/load screen) is known before the title
+    /// appears; sessions keep their own VMs.
     fn new(pack: Pack, save_dir: PathBuf, audio: bool) -> Self {
-        Self::with_save_screen(pack, save_dir, crate::config::SaveScreen::default(), audio)
-    }
-
-    /// [`App::new`] with an explicit save/load screen selection.
-    fn with_save_screen(
-        pack: Pack,
-        save_dir: PathBuf,
-        save_screen: crate::config::SaveScreen,
-        audio: bool,
-    ) -> Self {
+        let save_screen = lua::registered_save_screen(&pack);
         let text = Text::load(&pack, pack.language());
         let font = font::load_session(&pack, text.script());
         let demos = demo::entries(&pack);
@@ -5011,7 +5016,7 @@ impl App {
     /// also queues the opening film (id 0) exactly once per process.
     fn open_title(&mut self) -> Result<()> {
         let mut screen = ui::title::TitleScreen::new();
-        screen.set_save_screen(&self.save_screen);
+        screen.set_save_screen(self.save_screen.as_deref());
         screen.open(&mut self.context())?;
         self.mode = Mode::Title(screen);
         if self.films && !self.opening_played {
@@ -5035,9 +5040,9 @@ impl App {
     /// Open the load screen. A script's `on_open` may queue cues before the
     /// first tick; they are played here, like a tick's.
     fn open_load(&mut self) -> Result<()> {
-        let choice = self.save_screen.clone();
+        let entry = self.save_screen.clone();
         let mut cx = self.context();
-        let screen = ui::save_load::open_load_screen(&choice, &mut cx);
+        let screen = ui::save_load::open_load_screen(entry.as_deref(), &mut cx);
         let cues = cx.cues.into_inner();
         self.mode = Mode::Load(screen);
         self.play_ui_cues(cues);
@@ -5047,7 +5052,6 @@ impl App {
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
         session.set_debug_menu(self.debug_menu);
-        session.set_save_screen(self.save_screen.clone());
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -5172,7 +5176,6 @@ impl App {
         let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
         session.seed_menu_capture();
         session.game.add_item(items::ITEM_INK_RIBBONS, 1);
-        session.set_save_screen(self.save_screen.clone());
         session.open_typewriter_save(&self.pack, true);
         self.start_session(session);
         Ok(())
@@ -5236,9 +5239,9 @@ impl App {
                 return self.open_title();
             }
         };
-        let choice = self.save_screen.clone();
+        let entry = self.save_screen.clone();
         let mut cx = self.context();
-        let screen = ui::save_load::open_save_screen(&choice, &mut cx, file, false);
+        let screen = ui::save_load::open_save_screen(entry.as_deref(), &mut cx, file, false);
         let cues = cx.cues.into_inner();
         self.mode = Mode::Save(screen);
         self.play_ui_cues(cues);
@@ -5669,7 +5672,6 @@ pub fn run_ui_with_options(
         false,
         false,
         None,
-        &crate::config::SaveScreen::default(),
         trace::TraceOptions::default(),
         Authoring::default(),
     )
@@ -5695,7 +5697,6 @@ pub fn run_ui_with_mods(
     no_mods: bool,
     _debug_menu: bool,
     language: Option<&str>,
-    save_screen: &crate::config::SaveScreen,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
@@ -5746,7 +5747,6 @@ pub fn run_ui_with_mods(
         no_mods,
         _debug_menu,
         language,
-        save_screen,
         trace,
         authoring,
     )
@@ -5764,7 +5764,6 @@ pub fn run_root(
     no_mods: bool,
     _debug_menu: bool,
     language: Option<&str>,
-    save_screen: &crate::config::SaveScreen,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -5775,7 +5774,6 @@ pub fn run_root(
         no_mods,
         _debug_menu,
         language,
-        save_screen,
         trace::TraceOptions::default(),
         Authoring::default(),
     )
@@ -5823,14 +5821,12 @@ fn run_ui_impl(
     no_mods: bool,
     _debug_menu: bool,
     language: Option<&str>,
-    save_screen: &crate::config::SaveScreen,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
     if capture.is_some() || trace.path.is_some() || authoring.save_out.is_some() {
         let pack = open_game_pack(pack, mods, no_mods, language)?;
-        let mut app =
-            App::with_save_screen(pack, save_dir.to_path_buf(), save_screen.clone(), false);
+        let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
             // A root-boot capture is the title capture: no automatic films.
             AppBoot::Boot | AppBoot::Title => {
@@ -5959,7 +5955,7 @@ fn run_ui_impl(
     }
 
     let pack = open_game_pack(pack, mods, no_mods, language)?;
-    let mut app = App::with_save_screen(pack, save_dir.to_path_buf(), save_screen.clone(), true);
+    let mut app = App::new(pack, save_dir.to_path_buf(), true);
     app.boot(boot)?;
     if let Mode::Play(session) = &mut app.mode {
         session.run_setup_script(authoring.setup_script)?;
@@ -6202,7 +6198,6 @@ pub fn run_ending(
     ticks: u32,
     mods: &[PathBuf],
     no_mods: bool,
-    save_screen: &crate::config::SaveScreen,
 ) -> Result<()> {
     // The debug entry plays a no-save first run: a zero clear time, the
     // shipped card's initial save counter (one, i.e. no saves) and no
@@ -6224,7 +6219,7 @@ pub fn run_ending(
     }
     let save_dir = save::default_save_dir();
     let pack = open_game_pack(pack, mods, no_mods, None)?;
-    let mut app = App::with_save_screen(pack, save_dir, save_screen.clone(), capture.is_none());
+    let mut app = App::new(pack, save_dir, capture.is_none());
     // Keep the missing-film diagnostic the pre-sequence entry had: a pack
     // without the films would otherwise warn per film and run the RESULT
     // screen silently.
@@ -7262,6 +7257,7 @@ fn simulate_loaded_with(
     let mut event_vm = scd::vm::EventVm::from_scripts(scripts);
     apply_event_requests(&mut game, &mut event_vm);
     let lua = load_lua(pack);
+    call_lua_init(lua.as_ref(), &mut game);
     call_lua_room_load(lua.as_ref(), &mut game, id);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
@@ -14080,7 +14076,6 @@ mod tests {
             false,
             false,
             None,
-            &crate::config::SaveScreen::default(),
             trace::TraceOptions::default(),
             Authoring {
                 setup_script: Some(&script),
@@ -14108,7 +14103,6 @@ mod tests {
             false,
             false,
             None,
-            &crate::config::SaveScreen::default(),
             trace::TraceOptions {
                 path: Some(&trace_path),
                 capture_every: 0,
@@ -14224,13 +14218,21 @@ mod tests {
     /// The test game pack plus the shipped screen scripts, language files and
     /// a synthetic font, so the Lua save screen runs end to end.
     #[cfg(feature = "lua")]
-    fn pack_with_lua_screen(dir: &TempDir, base: &Path) -> PathBuf {
+    fn pack_with_lua_screen(dir: &TempDir, base: &Path) -> (PathBuf, PathBuf) {
         let pack = Pack::open(base).unwrap();
         let mut writer = PackWriter::new();
         for path in pack.paths() {
             writer.add(path, pack.read(path).unwrap().to_vec()).unwrap();
         }
         writer.add("font/font.tim", synthetic_font_tim()).unwrap();
+        // The base pack names itself, so the mod layer's `base = "re1"`
+        // resolves like it does over a converted pack.
+        writer
+            .add(
+                crate::manifest::ENTRY,
+                crate::manifest::Manifest::base("re1").render().into_bytes(),
+            )
+            .unwrap();
         // Room 1001 is the typewriter capture's room (`MENU_ROOM`).
         for player_flag in 0..=1u8 {
             let mut id = RoomId::parse(MENU_ROOM).unwrap();
@@ -14245,21 +14247,45 @@ mod tests {
                 bmp::encode_to_vec(&test_image()).unwrap(),
             )
             .unwrap();
-        for (entry, source) in crate::ui::SCREEN_SCRIPTS {
-            writer.add(entry, source.as_bytes().to_vec()).unwrap();
-        }
         for (entry, source) in crate::language::LANGUAGE_FILES {
             writer.add(entry, source.as_bytes().to_vec()).unwrap();
         }
         let path = dir.0.join("lua-screen.akpak");
         writer.write(&path).unwrap();
-        path
-    }
 
-    /// The Lua save screen's pack entry.
-    #[cfg(feature = "lua")]
-    fn cr_screen() -> crate::config::SaveScreen {
-        crate::config::SaveScreen::Lua(crate::config::CR_SCREEN_ENTRY.to_string())
+        // The checked-in CR save-screen mod as its own layer: `mod.lua`
+        // registers the screen through the hook API, so the app finds it the
+        // way a player's `--mod` layer would be found.
+        let manifest = crate::manifest::Manifest {
+            kind: crate::manifest::PackKind::Mod,
+            base: Some("re1".to_string()),
+            lua: vec!["mod.lua".to_string()],
+            ..crate::manifest::Manifest::base("crloadsave")
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(crate::manifest::ENTRY, manifest.render().into_bytes())
+            .unwrap();
+        for (entry, source) in [
+            ("mod.lua", include_str!("../mods/crloadsave/mod.lua")),
+            (
+                "script/loadsave.lua",
+                include_str!("../mods/crloadsave/script/loadsave.lua"),
+            ),
+            (
+                "language/en-US.txt",
+                include_str!("../mods/crloadsave/language/en-US.txt"),
+            ),
+            (
+                "language/ja-JP.txt",
+                include_str!("../mods/crloadsave/language/ja-JP.txt"),
+            ),
+        ] {
+            writer.add(entry, source.as_bytes().to_vec()).unwrap();
+        }
+        let mod_path = dir.0.join("crloadsave.akpak");
+        writer.write(&mod_path).unwrap();
+        (path, mod_path)
     }
 
     #[cfg(feature = "lua")]
@@ -14267,7 +14293,7 @@ mod tests {
     fn app_title_load_runs_the_lua_screen_and_loads_its_chosen_file() {
         let dir = TempDir::new();
         let base = new_game_pack(&dir);
-        let pack_path = pack_with_lua_screen(&dir, &base);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
         let saves = dir.0.join("saves");
         std::fs::create_dir_all(&saves).unwrap();
 
@@ -14287,8 +14313,8 @@ mod tests {
         };
         save::save_to_path(&saves.join("a_other.dat"), &file).unwrap();
 
-        let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::with_save_screen(pack, saves, cr_screen(), false);
+        let pack = Pack::open_layered(&pack_path, &[mod_path]).unwrap();
+        let mut app = App::new(pack, saves, false);
         app.boot(AppBoot::Title).unwrap();
 
         assert!(run_until(&mut app, 256, |app| matches!(
@@ -14326,7 +14352,7 @@ mod tests {
     fn the_lua_save_screen_capture_is_deterministic() {
         let dir = TempDir::new();
         let base = new_game_pack(&dir);
-        let pack_path = pack_with_lua_screen(&dir, &base);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
         let saves = dir.0.join("saves");
         std::fs::create_dir_all(&saves).unwrap();
         let mut file = save::SaveFile {
@@ -14350,11 +14376,10 @@ mod tests {
                 0,
                 None,
                 0,
-                &[],
+                std::slice::from_ref(&mod_path),
                 false,
                 false,
                 None,
-                &cr_screen(),
                 trace::TraceOptions::default(),
                 Authoring::default(),
             )
@@ -14379,7 +14404,7 @@ mod tests {
     fn the_lua_save_screen_writes_a_file_and_consumes_the_ribbon() {
         let dir = TempDir::new();
         let base = new_game_pack(&dir);
-        let pack_path = pack_with_lua_screen(&dir, &base);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
         let saves = dir.0.join("saves");
         std::fs::create_dir_all(&saves).unwrap();
         let old = save::SaveFile {
@@ -14391,8 +14416,8 @@ mod tests {
         };
         save::save_to_path(&saves.join("old.dat"), &old).unwrap();
 
-        let pack = Pack::open(&pack_path).unwrap();
-        let mut app = App::with_save_screen(pack, saves.clone(), cr_screen(), false);
+        let pack = Pack::open_layered(&pack_path, &[mod_path]).unwrap();
+        let mut app = App::new(pack, saves.clone(), false);
         app.open_save_capture().unwrap();
         let Mode::Play(session) = &app.mode else {
             panic!("expected the typewriter session");
@@ -14432,7 +14457,7 @@ mod tests {
     fn the_typewriter_capture_runs_the_lua_screen() {
         let dir = TempDir::new();
         let base = new_game_pack(&dir);
-        let pack_path = pack_with_lua_screen(&dir, &base);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
         let saves = dir.0.join("saves");
         let first = dir.0.join("cr_save_a.bmp");
         let second = dir.0.join("cr_save_b.bmp");
@@ -14445,11 +14470,10 @@ mod tests {
                 0,
                 None,
                 0,
-                &[],
+                std::slice::from_ref(&mod_path),
                 false,
                 false,
                 None,
-                &cr_screen(),
                 trace::TraceOptions::default(),
                 Authoring::default(),
             )

@@ -460,7 +460,6 @@ pub fn convert_game_with_options(
     let (demo_count, demo_bytes) = copy_demos(&data, &mut writer, &mut progress)?;
     let (core_count, core_bytes) = copy_core_effects(&data, &mut writer, &mut progress, jobs)?;
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
-    let (screen_count, screen_bytes) = copy_screen_scripts(&mut writer, &mut progress)?;
     let (language_count, language_bytes) = copy_language_files(&mut writer, &mut progress)?;
     let (ivm_count, ivm_bytes) = copy_item_models(
         item_m2.as_deref(),
@@ -594,10 +593,6 @@ pub fn convert_game_with_options(
         writeln!(
             report,
             "shadow: {shadow_count} entries, {shadow_bytes} bytes"
-        )?;
-        writeln!(
-            report,
-            "screen: {screen_count} entries, {screen_bytes} bytes"
         )?;
         writeln!(
             report,
@@ -942,24 +937,6 @@ fn copy_enemy_scripts(writer: &mut PackWriter, progress: &mut Progress) -> Resul
     let mut count = 0usize;
     let mut bytes = 0usize;
     for (entry, source) in crate::enemy::ENEMY_SCRIPTS {
-        bytes += source.len();
-        count += 1;
-        writer
-            .add(entry, source.as_bytes().to_vec())
-            .with_context(|| format!("failed to add {entry}"))?;
-        progress.advance(entry);
-    }
-    progress.end_phase();
-    Ok((count, bytes))
-}
-
-/// Add the checked-in screen scripts to the pack under their `screen/`
-/// entries.
-fn copy_screen_scripts(writer: &mut PackWriter, progress: &mut Progress) -> Result<(usize, usize)> {
-    progress.begin("screen", crate::ui::SCREEN_SCRIPTS.len() as u64);
-    let mut count = 0usize;
-    let mut bytes = 0usize;
-    for (entry, source) in crate::ui::SCREEN_SCRIPTS {
         bytes += source.len();
         count += 1;
         writer
@@ -2151,9 +2128,9 @@ fn conversion_phase_count(
     data: &DataPlan,
 ) -> u64 {
     // scan, room, roomcut, roommask, six model phases (player, weapon, npc,
-    // monster, enemy scripts, effect sheets), ui, core00, screen scripts,
-    // language, voice, film, compress, write.
-    let mut phases: u64 = 18;
+    // monster, enemy scripts, effect sheets), ui, core00, language, voice,
+    // film, compress, write.
+    let mut phases: u64 = 17;
     phases += 2 * u64::from(sound.is_some()); // bgm, se
     phases += u64::from(item_m1.is_some()); // door
     phases += u64::from(fonts.primary.is_some()); // font
@@ -3226,13 +3203,6 @@ mod tests {
                 .count(),
             crate::enemy::ENEMY_SCRIPTS.len(),
             "the checked-in enemy scripts are independent of the install"
-        );
-        assert_eq!(
-            pack.paths()
-                .filter(|path| path.starts_with("screen/") && path.ends_with(".lua"))
-                .count(),
-            crate::ui::SCREEN_SCRIPTS.len(),
-            "the checked-in screen scripts are independent of the install"
         );
 
         // Present files resolve; only the missing two are named.

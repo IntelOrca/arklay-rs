@@ -2,10 +2,12 @@
 
 M19 adds the `arklay.toml` user configuration, moves the default save
 directory to `<config dir>/save`, and ships the Classic REbirth-style
-save/load screen as the Lua pack entry `screen/save_cr.lua` driven through the
-general screen surface in `src/ui/lua_screen.rs`. This document records the
-deliberate approximations and the parts of CR's screen that are not
-reproduced.
+save/load screen as an ordinary mod (`mods/crloadsave`) driven through the
+general screen surface in `src/ui/lua_screen.rs`. The engine keeps only the
+registration hook (`on_init` + `api:register_save_screen`) and the ported
+original screen; nothing in `src/` or `games/re1` names the CR screen. This
+document records the deliberate approximations and the parts of CR's screen
+that are not reproduced.
 
 ## Closed: the 1-based save location
 
@@ -62,6 +64,16 @@ There is no confirmation dialog, matching CR's overwrite-by-delete. The
 typewriter's ink-ribbon consumption and the save counter stay in the engine
 and are unchanged by the screen choice.
 
+## Bounded: the app's registration pass
+
+The title's LOAD GAME and the load screen run before any session, so the app
+loads the pack's scripts once in a throwaway VM and runs `on_init` over a
+scratch state to read a registration. A pack's chunk-level code therefore runs
+one extra time per process (the app's pass plus each session's own VM); only
+`on_init` should do work there, and the scratch state is discarded, so a
+registration is the only thing the pass can carry. A registration that names a
+missing entry logs a warning and the ported original opens.
+
 ## Deviation: save file naming
 
 CR names new saves `<name>_<NN>_<timestamp>.dat`. The shipped script uses the
@@ -92,4 +104,5 @@ falls back to a black frame when the entry is missing.
 CR's ModSDK can replace the screen's text and assets. The port's equivalent is
 the language catalog (`UI_SAVE_CR_*` keys, en-US and ja-JP; other languages
 fall back per key) plus pack-entry shadowing, so a mod replaces strings
-through `language/<tag>.txt` and the script through `screen/save_cr.lua`.
+through `language/<tag>.txt` and the script through the mod's own entry
+(`script/loadsave.lua`).

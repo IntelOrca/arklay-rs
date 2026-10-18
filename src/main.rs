@@ -46,12 +46,6 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "pack")]
     save_dir: Option<PathBuf>,
 
-    /// Which save/load screen to open: `vanilla` (the ported original, the
-    /// default), `cr` (the built-in Lua screen) or a pack entry holding the
-    /// screen script. Overrides `save_screen` in `arklay.toml`
-    #[arg(long, value_name = "SCREEN", requires = "pack")]
-    save_screen: Option<String>,
-
     /// Load the save block (`savedatN.dat`) at FILE and boot its saved game
     /// immediately instead of starting a new one: the saved stage, room,
     /// character, position, health, inventory and flags drive the session.
@@ -640,10 +634,6 @@ fn main() -> Result<()> {
                 .clone()
                 .or_else(|| config.save_dir.clone())
                 .unwrap_or_else(arklay::config::Config::default_save_dir);
-            let save_screen = match cli.save_screen.as_deref() {
-                Some(value) => arklay::config::SaveScreen::parse(value)?,
-                None => config.save_screen.clone(),
-            };
             if let Some(id) = cli.ending {
                 return arklay::engine::run_ending(
                     &pack,
@@ -653,7 +643,6 @@ fn main() -> Result<()> {
                     cli.ticks,
                     &cli.mods,
                     cli.no_mods,
-                    &save_screen,
                 );
             }
             if let Some(id) = cli.fmv {
@@ -691,7 +680,6 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.debug_menu,
                     language.as_deref(),
-                    &save_screen,
                     trace_options,
                     authoring,
                 );
@@ -711,7 +699,6 @@ fn main() -> Result<()> {
                     cli.no_mods,
                     cli.debug_menu,
                     language.as_deref(),
-                    &save_screen,
                     trace_options,
                     authoring,
                 );
@@ -728,7 +715,6 @@ fn main() -> Result<()> {
                     cli.stats,
                     cli.debug_menu,
                     language.as_deref(),
-                    &save_screen,
                     trace_options,
                     authoring,
                 );
@@ -744,7 +730,6 @@ fn main() -> Result<()> {
                 cli.no_mods,
                 cli.debug_menu,
                 language.as_deref(),
-                &save_screen,
             )
         }
     }

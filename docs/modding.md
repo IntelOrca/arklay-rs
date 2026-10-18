@@ -233,11 +233,18 @@ events are inert.
 
 A pack opts into scripting by carrying `lua/**.lua` entries. The manifest's
 `lua` list selects and orders them; without one, every `lua/` entry runs in
-lowercased-path order. Each chunk is compiled and run once when the session
-opens; the globals `on_room_load`, `on_tick` and `on_message` are then called:
+lowercased-path order. In a layered run each layer contributes its own list
+(the base first, then each mod in applied order), so a mod names its hooks in
+its own manifest. Each chunk is compiled and run once when the session opens;
+the globals `on_init`, `on_room_load`, `on_tick` and `on_message` are then
+called:
 
 ```lua
 local granted = false
+
+function on_init(api)
+    api:register_save_screen("script/mine.lua")  -- before any room
+end
 
 function on_room_load(api)
     api:log("entered " .. api:room())
@@ -258,16 +265,21 @@ end
 
 The hook order is:
 
-1. `on_room_load(api)` once a room's state exists (RDT, init script and room
+1. `on_init(api)` once the pack's scripts have loaded and before any room. It
+   is where a pack registers things the engine reads outside a room, such as
+   the save/load screen (`api:register_save_screen`). The app runs it once in
+   a throwaway VM and scratch state before the title appears; every session's
+   own VM runs it again over its live state.
+2. `on_room_load(api)` once a room's state exists (RDT, init script and room
    edits applied) and before its first tick. It runs again on every room
    entry, including a door transition; the Lua globals themselves persist for
    the session (`granted` above is not reset). The room-load camera scan runs
    after it, so `api:set_room_camera` only sticks when the room's init script
    holds the camera lock; otherwise the cut is re-homed from camera 0 at the
    player's position, exactly like the original's `room_set`.
-2. `on_tick(api, tick)` after every fixed 30 Hz room tick, before that tick's
+3. `on_tick(api, tick)` after every fixed 30 Hz room tick, before that tick's
    audio dispatch. `tick` is `game.frame`, the number of completed room ticks.
-3. `on_message(api, id)` when the tick raised a message; the returned id
+4. `on_message(api, id)` when the tick raised a message; the returned id
    replaces it (must fit a byte, else the original stays). The window's bytes
    are resolved on the next tick, so the new id is the one displayed.
 
@@ -302,6 +314,7 @@ exist (Lua colon syntax):
 | `api:set_state_byte(index, value)` | Write one BioCard state-image byte. |
 | `api:kill_event(slot)` | Deactivate a running event slot. |
 | `api:message(id)` | Request a room/global message. |
+| `api:register_save_screen(entry)` | Run `entry` (a pack path) as the save/load screen instead of the ported original; `nil` restores the original. See [Screen scripts](#screen-scripts). |
 | `api:log(text)` | Write one `[lua]` line to stderr. |
 
 The state-authoring methods (`set_*`, `clear_inventory`, `item_box_*`) exist
@@ -329,15 +342,31 @@ construction. Entity behaviour is the separate enemy-script surface below.
 
 ## Screen scripts
 
-A pack may carry Lua scripts that implement whole screens. The engine's own
-folder-based save/load screen ships as `screen/save_cr.lua` and is selected
-with `save_screen = "cr"` in `arklay.toml` (or `--save-screen cr`); any other
-value is taken as a pack entry path, so a mod ships its own screen the same
-way. The ported original screen stays the default. A screen script is a normal
-pack entry, so a mod overrides the built-in one by carrying its own
-`screen/save_cr.lua`. Screen scripts are not hooks: `lua/**.lua` entries run
-once at session start, while a screen script is loaded and run only when its
-screen opens.
+A pack may carry Lua scripts that implement whole screens, and register one as
+the save/load screen. Nothing about a screen is built into the engine: the
+ported original is the default, and a registered script replaces it. The
+checked-in `mods/crloadsave/` is the reference — a Classic REbirth-style
+folder screen:
+
+```
+mods/crloadsave/manifest.toml        lua = ["mod.lua"]
+mods/crloadsave/mod.lua              function on_init(api) api:register_save_screen("script/loadsave.lua") end
+mods/crloadsave/script/loadsave.lua  the screen itself
+mods/crloadsave/language/*.txt       its UI_SAVE_CR_* strings
+```
+
+`on_init` is the hook that runs once the pack's scripts have loaded, before
+any room; `api:register_save_screen(entry)` names the screen script (or `nil`
+to go back to the ported original). The registration is pack-level: the app
+runs the pack's scripts once in a throwaway VM before the title appears, so
+the title's LOAD GAME and the load screen honour it, and every session's own
+VM runs `on_init` again over its live state for the typewriter. A registered
+screen also changes the title's existence probe: it counts every loadable file
+in the save directory rather than the eight `savedatN.dat` slots, since a
+script lists the directory itself.
+
+Screen scripts are not hooks: `lua/**.lua` entries run once when a session
+opens, while a screen script is loaded and run only when its screen opens.
 
 A screen script defines up to three globals:
 

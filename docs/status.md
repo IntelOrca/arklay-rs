@@ -42,7 +42,7 @@ workspace install (`/path/to/re1`) and its converted pack.
 | E11a Player weapons | The player weapon runtime: the aim/fire/reload state machine (0x12–0x1a guns, the knife's own aim/hold/swing/holster/turn) driven by the new aim/fire pad keys, the per-weapon `W*.EMW` clip selection and the knife/gun/projectile fire paths through `apply_weapon_damage_with`, the clip/reserve ammo model (`weapon_autoaim_check`, the reload transfer and the volley latch), the fire data tables (fire frames, sounds, muzzle and secondary flash offsets, end frames, special frame windows, aim heights), the held weapon drawn at joint 14 with the player/character texture page, the muzzle/secondary flashes and shells attached to the weapon joints, the state-8 held-weapon joint refresh, and the flamethrower enemy-bank cues | done |
 | E11b Player death | The player damage/death state machine: the state-1 entry checks (the HP<0 death trigger with the back-shot facing flip and the cannot-die guard, the hit pre-emption into the generic reaction, the poison status drain), the death fall (state 3: the scream, the body clip, the slide, the blood pool that reuses the ground quad and grows 16 a frame for 148 frames, and the blocked state), the game-over machine (the 90-frame delay, the room-variant immediate fades for the two Yawn rooms and the water tank, the scripted-death rooms that skip the pool, the white-out and the black fade-out), and the DIED screen (`src/ui/death.rs`: the `died.tim` mirrored static backdrop, the fixed camera over the corpse with the 8-unit-per-frame spin, the 256-column sine-wavy strip with its exact phase/amplitude ramps, the black overlay ramp and the confirm skip), returning to the title; `ui/died.tim` is packed and `--ui death` joins the debug boot list | done |
 | E12 Enemy verification | The closing gate over the whole arc: the corpus spawn census re-measured across all 348 rooms with twenty-one scripted monster ids and zero script errors, the per-id real-asset boots (`enemy_real`), the real weapon/damage kills (`weapons_real`/`combat_real`), the shipped DIED-screen run (`death_real`), the NPC/actor/walk/entities/fire regression suites, `verify` on the reconverted pack (the new `emw`/`tmd` rows green, `tim` 124/124), and the status/deviations close-out | done |
-| M19 Config and Lua screens | The `arklay.toml` user config and the `<config dir>/save` default location; the general Lua screen surface (`screen/*.lua`: the save list, save/load/remove, the pad edges, the screen sounds and immediate-mode drawing) and the built-in Classic REbirth-style save/load screen (`save_screen = "cr"`) | done |
+| M19 Config and Lua screens | The `arklay.toml` user config and the `<config dir>/save` default location; the general Lua screen surface (`on_init` + `api:register_save_screen`, the save list, save/load/remove, the pad edges, the screen sounds and immediate-mode drawing) and the Classic REbirth-style save/load screen as the `mods/crloadsave` mod | done |
 
 Enemy behaviour now lives in the pack as `enemy/em{id:02x}.lua` scripts (with
 shared `enemy/lib/**.lua` modules) behind the same sandbox as the mod hooks;
@@ -580,26 +580,42 @@ returns to the title screen and any other key cancels and resumes the sounds.
 M19 moves the user-facing knobs into `arklay.toml` (in `~/.config/arklay`,
 else `$XDG_CONFIG_HOME/arklay`, `%APPDATA%\arklay`, or `$ARKLAY_CONFIG_DIR`):
 `save_dir` (default `<config dir>/save` — saved games moved out of the
-`saves/` directory beside the pack), `language` and `save_screen`. A missing
-file is the default configuration, so a run without one behaves exactly like
-the port did before apart from the save location, and `--save-dir`,
-`--language` and `--save-screen` override the file.
+`saves/` directory beside the pack) and `language`. A missing file is the
+default configuration, so a run without one behaves exactly like the port did
+before apart from the save location, and `--save-dir`/`--language` override the
+file.
 
-`save_screen = "cr"` selects the Classic REbirth-style screen, shipped as the
-pack entry `screen/save_cr.lua` (packed by `convert-game` from
-`games/re1/screen/`, overridable by any mod that carries its own copy). The
-screen is not special-cased: it runs on the general Lua screen surface
-documented in `docs/modding.md` — `on_open`/`update`/`draw`, `api:saves()`
-(the folder scan with each file's parsed character, save count, stage/room,
-resolved location, timestamp and loadability), `api:save`/`api:load`/
-`api:remove`/`api:exit`, the pad edges and words, `api:sound` for the screen
-cues and immediate-mode drawing (`background`, `rect`, `text`, `sprite`,
-`sprite_region`, `image_size`, `fade`) in the 320x240 layout space. The ported
-original screen stays the default, and a script that cannot load or errors
-while running falls back to it (or leaves the screen) instead of trapping the
-player, so a broken mod never costs the typewriter. The CR layout follows the
-disassembly notes: ten 15-px rows from y 49, a highlight band, the centred
-detail line at y 216, folder-based save names and overwrite-by-delete.
+The milestone's other half is the Lua screen surface, and the proof is that
+the Classic REbirth-style screen is an ordinary mod rather than an engine
+feature. `mods/crloadsave/` carries `manifest.toml`, a `mod.lua` whose
+`on_init` calls `api:register_save_screen("script/loadsave.lua")`, the screen
+script and its `UI_SAVE_CR_*` strings; nothing in the engine or the base pack
+names it. The new `on_init` hook runs once the pack's scripts load and before
+any room, the app runs it in a throwaway VM before the title appears (so the
+title's LOAD GAME and the load screen honour the registration), and every
+session runs it over its live state for the typewriter. A registered screen
+also makes the title's existence probe count every loadable file in the save
+directory rather than the eight `savedatN.dat` slots, since a script lists the
+directory itself.
+
+The screen script runs on the general Lua screen surface documented in
+`docs/modding.md` — `on_open`/`update`/`draw`, `api:saves()` (the folder scan
+with each file's parsed character, save count, stage/room, resolved location,
+timestamp and loadability), `api:save`/`api:load`/`api:remove`/`api:exit`, the
+pad edges and words, `api:sound` for the screen cues and immediate-mode
+drawing (`background`, `rect`, `text`, `sprite`, `sprite_region`,
+`image_size`, `fade`) in the 320x240 layout space. The ported original screen
+stays the default, and a script that cannot load or errors while running falls
+back to it (or leaves the screen) instead of trapping the player, so a broken
+mod never costs the typewriter. The CR layout follows the disassembly notes
+and the running DLL's captures: ten 15-px rows from y 49, the measured panel
+and selection band, the centred detail line, folder-based save names and
+overwrite-by-delete.
+
+Mod hooks are read per layer now: a mod's manifest `lua` list used to be
+ignored when the base pack named hooks, so a mod had to bury its registration
+in `lua/**.lua` discovery; `Pack::own_paths` and the layered hook walk fixed
+that, and `mods/crloadsave` keeps `mod.lua` at its root.
 
 The milestone also bounds two debug stack frames: `run_ui_impl` and `App::boot`
 gave their session arms ~1 MB each (a debug build puts a stack slot behind
@@ -623,7 +639,7 @@ converted base pack on the reference install reports:
 
 ```
 pack: re1.akpak
-3267 entries, 484373384 bytes
+3266 entries, 484370780 bytes
 format       entries        ok    failed          bytes
 manifest           1         1         0            106
 rdt              348       320        28       51364907
@@ -637,17 +653,17 @@ emw               32        32         0         446942
 tmd                7         7         0           8822
 dor               34        34         0         888924
 wav             1039      1039         0      126174536
-language           8         8         0         205733
+language           8         8         0         205617
 biocard            1         1         0            335
 avi               27        27         0      251624740
-lua               40        40         0         153826
+lua               39        39         0         151338
 opaque             6         6         0          23502
-verify: 3267 entries, 3239 ok, 28 failed, 6 opaque
+verify: 3266 entries, 3238 ok, 28 failed, 6 opaque
 ```
 
-The `lua` row's fortieth entry is the M19 screen script
-(`screen/save_cr.lua`); the `bmp`/`tim` rows grew with the DIED screen's and
-the RESULT plates' art since the previous measurement.
+The `bmp`/`tim` rows grew with the DIED screen's and the RESULT plates' art
+since the previous measurement. The CR save-screen script is not in the base
+pack: it ships in `mods/crloadsave` and is layered like any other mod.
 
 The 28 failing `room/*.rdt` entries are the converter's four-byte stub rooms
 whose header declares no camera cuts: the engine refuses them on load and the

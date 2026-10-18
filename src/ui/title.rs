@@ -142,9 +142,12 @@ impl TitleScreen {
         }
     }
 
-    /// Select the save/load screen whose existence probe this title uses.
-    pub fn set_save_screen(&mut self, choice: &crate::config::SaveScreen) {
-        self.folder_probe = !choice.is_vanilla();
+    /// Set the save/load screen the title probes for, as the pack entry its
+    /// scripts registered (`None` for the ported original). A registered
+    /// screen lists the save directory itself, so the probe counts every
+    /// loadable file rather than the eight `savedatN.dat` slots.
+    pub fn set_save_screen(&mut self, entry: Option<&str>) {
+        self.folder_probe = entry.is_some();
     }
 
     /// Whether LOAD GAME can be chosen: at least one save file exists.
@@ -492,7 +495,7 @@ mod tests {
         // A Lua screen's folder probe finds the file, like CR's replacement
         // for the original's "does a save exist" check.
         let mut screen = TitleScreen::new();
-        screen.set_save_screen(&crate::config::SaveScreen::Lua("screen/save_cr.lua".into()));
+        screen.set_save_screen(Some("script/loadsave.lua"));
         screen.open(&mut cx).unwrap();
         assert!(screen.load_enabled());
         assert_eq!(screen.selection(), 2);
@@ -501,7 +504,7 @@ mod tests {
         std::fs::remove_file(dir.join("save_01.dat")).unwrap();
         std::fs::write(dir.join("notes.txt"), b"junk").unwrap();
         let mut screen = TitleScreen::new();
-        screen.set_save_screen(&crate::config::SaveScreen::Lua("screen/save_cr.lua".into()));
+        screen.set_save_screen(Some("script/loadsave.lua"));
         screen.open(&mut cx).unwrap();
         assert!(!screen.load_enabled());
         let _ = std::fs::remove_dir_all(&dir);

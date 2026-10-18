@@ -5,10 +5,10 @@
 -- band, and a detail line shows the highlighted save's character, save count
 -- and location. The last row is `Exit`.
 --
--- The screen is selected with `save_screen = "cr"` in arklay.toml (or
--- `--save-screen cr`). It is a normal pack entry, so a mod overrides it by
--- carrying its own `screen/save_cr.lua`. The API it uses is the general
--- screen surface documented in docs/modding.md.
+-- The mod's `mod.lua` registers this entry with `api:register_save_screen`;
+-- the engine knows nothing about the screen itself. The API it uses is the
+-- general screen surface documented in docs/modding.md, and its strings are
+-- the `UI_SAVE_CR_*` keys this mod ships under `language/`.
 
 local VISIBLE_ROWS = 10 -- rows drawn at once (CR shows ten)
 local ROW_Y = 49 -- the first row's y

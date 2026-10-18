@@ -1,0 +1,6 @@
+UI_SAVE_CR_DO_NOT_LOAD = "ロードしない"
+UI_SAVE_CR_DO_NOT_SAVE = "セーブしない"
+UI_SAVE_CR_EXIT = "やめる"
+UI_SAVE_CR_LOAD = "ロード"
+UI_SAVE_CR_SAVE = "セーブ"
+UI_SAVE_CR_UNLOADABLE = "ロードできません"
