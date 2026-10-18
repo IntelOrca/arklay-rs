@@ -4881,10 +4881,11 @@ impl GameState {
             }
             "tw_abs_pos" => {
                 if let Some(mut fields) = self.tween_fields() {
+                    // A pad byte, then the three shorts at +2/+4/+6.
                     fields.pos = [
-                        i32::from(operand_i16(operands, 0)),
                         i32::from(operand_i16(operands, 1)),
                         i32::from(operand_i16(operands, 2)),
+                        i32::from(operand_i16(operands, 3)),
                     ];
                     self.write_tween_fields(fields);
                 }
@@ -4923,9 +4924,9 @@ impl GameState {
             "tw_abs_rot" => {
                 if let Some(mut fields) = self.tween_fields() {
                     fields.rotation = [
-                        operand_u16(operands, 0) as i16,
                         operand_u16(operands, 1) as i16,
                         operand_u16(operands, 2) as i16,
+                        operand_u16(operands, 3) as i16,
                     ];
                     self.write_tween_fields(fields);
                 }
@@ -12490,15 +12491,15 @@ mod tests {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
         assert_eq!(
-            host.on_misc(tween_op(0x07).unwrap(), &operands(&[10, 20, 30, 0])),
+            host.on_misc(tween_op(0x07).unwrap(), &operands(&[0, 10, 20, 30])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_misc(tween_op(0x0B).unwrap(), &operands(&[1, 2, 3, 0])),
+            host.on_misc(tween_op(0x0B).unwrap(), &operands(&[0, 1, 2, 3])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_misc(tween_op(0x0A).unwrap(), &operands(&[3, 96, 0])),
+            host.on_misc(tween_op(0x0A).unwrap(), &operands(&[3, 96])),
             StepResult::Continue
         );
         assert_eq!(

@@ -151,13 +151,11 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
         );
 
         // An `obj` operand is zero-extended on X/Z, so a built record starts in
-        // the 16-bit room coordinate space. Event tweens can then move it with
-        // `tw_abs_pos`, whose operands the original casts to `short` and stores
-        // sign-extended - so a moved record can sit at the i16 reading of the
-        // same 16-bit word (ROOM113 moves one to 0x8800/-30720). The record must
-        // stay inside the 16-bit wrap; the collision margin then catches wild
-        // placements while allowing the shipped decorative records that
-        // legitimately sit past the last boundary (ROOM113).
+        // the 16-bit room coordinate space; an event tween's `tw_abs_pos` stores
+        // sign-extended shorts. The record must stay inside the 16-bit wrap; the
+        // collision margin then catches wild placements while allowing the
+        // shipped decorative records that legitimately sit past the last
+        // boundary (ROOM113).
         let bounds = collision_bounds(&sim.room);
         for (slot, record) in sim.game.objects.records.iter().enumerate() {
             if !record.active() {
@@ -169,14 +167,7 @@ fn real_m11_corpus_audit_has_no_implemented_placeholders() {
                 "ROOM{id:?} object {slot} at {:?} left the 16-bit room space",
                 record.pos
             );
-            // The margin probe only applies to records still in the built
-            // coordinate space; a record an event moved off-map (ROOM113's
-            // event 0) is script-driven and intentionally leaves it.
-            let built_space =
-                (0..=0xFFFF).contains(&record.pos[0]) && (0..=0xFFFF).contains(&record.pos[2]);
-            if let Some(([min_x, min_z], [max_x, max_z])) = bounds
-                && built_space
-            {
+            if let Some(([min_x, min_z], [max_x, max_z])) = bounds {
                 let margin = 0x4000;
                 assert!(
                     record.pos[0] >= min_x - margin

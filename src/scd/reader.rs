@@ -812,6 +812,35 @@ mod tests {
     }
 
     #[test]
+    fn tween_absolute_ops_read_three_words_after_a_pad_byte() {
+        // ROOM5130 event 2's first move: the glass tube to (8180, -520, 12600).
+        let event = bytes(&[
+            0x02, // tween begin
+            0x07, 0x00, 0xF4, 0x1F, 0xF8, 0xFD, 0x38, 0x31, // tw_abs_pos
+            0x0B, 0x00, 0x00, 0x00, 0xA8, 0xFD, 0x00, 0x00, // tw_abs_rot
+            0x0A, 0x02, 0x34, 0x12, // tw_set_sel
+            0x01, // tw_end -> state 0
+            0xFF, // evt_finish
+        ]);
+        let mut builder = RdtBuilder::new();
+        builder.push_section(MAIN_SLOT_OFFSET, &container(&[]));
+        builder.push_section(EVENT_SLOT_OFFSET, &event_table(&[&event]));
+        let data = builder.finish_with_event_sentinel();
+
+        let scripts = parse(&data).unwrap();
+        let values = |index: usize| -> Vec<i64> {
+            scripts.events[0].insns[index]
+                .operands
+                .iter()
+                .map(|operand| operand.value)
+                .collect()
+        };
+        assert_eq!(values(1), [0, 8180, -520, 12600]);
+        assert_eq!(values(2), [0, 0, 0xFDA8, 0]);
+        assert_eq!(values(3), [2, 0x1234]);
+    }
+
+    #[test]
     fn event_single_do_and_state_transitions() {
         let event = bytes(&[
             0x07, 0x04, 0x0E, 0x00, // evt_single: one nop command
