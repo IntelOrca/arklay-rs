@@ -875,6 +875,8 @@ fn capture_player_partway_up_the_lab_stairway() {
         tint: [255; 3],
         blend_weight: None,
         hidden_joints: 0,
+        light_pos: None,
+        per_joint_light: false,
     }];
     let mut framebuffer = Framebuffer::new();
     render::draw_gameplay_scene(

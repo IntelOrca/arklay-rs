@@ -1844,6 +1844,14 @@ pub struct EntityMesh<'a> {
     /// (not even in the mirror copy), the port's stand-in for the joint flag
     /// byte's bit 0.
     pub hidden_joints: u32,
+    /// Where the room lights latch (`update_entity_lighting`): an entity's
+    /// own matrix translation (`ent + 0x34`, its feet), not its root joint.
+    /// `None` latches at the first joint, which for a room object or item
+    /// record is the record position the original passes (`obj + 0x34`).
+    pub light_pos: Option<[i32; 3]>,
+    /// Yawn (ids `0x0D`/`0x12`): `render_entity` re-latches the lights at
+    /// every joint's world translation before drawing it.
+    pub per_joint_light: bool,
 }
 
 /// The original's `GetTmdBlendMode` plus `CreateTmdObjectInternal`'s remap:
@@ -2066,7 +2074,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
 
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
-        let light = lighting.latched(root_position(mesh.joints));
+        let light = lighting.latched(mesh.light_pos.unwrap_or(root_position(mesh.joints)));
         // The room's own object and item models come first in the list (the
         // original's room pass, which uses its own D3D light setup); every
         // later mesh is an entity and uses the world-space dot.
@@ -2075,6 +2083,11 @@ pub fn draw_gameplay_scene_with_effects<'a>(
             if !mesh.joint_visible(index) {
                 continue;
             }
+            let light = if mesh.per_joint_light {
+                lighting.latched(joint.t)
+            } else {
+                light
+            };
             collect_triangles(
                 object,
                 joint,
@@ -2096,11 +2109,16 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     // pass re-runs the character joints, never the room's own objects.
     if let Some(mirror) = mirror {
         for (texture, mesh) in meshes.iter().enumerate().skip(mirror_from) {
-            let light = lighting.latched(root_position(mesh.joints));
+            let light = lighting.latched(mesh.light_pos.unwrap_or(root_position(mesh.joints)));
             for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
                 if !mesh.joint_visible(index) || !mirror.joint_visible(joint.t) {
                     continue;
                 }
+                let light = if mesh.per_joint_light {
+                    lighting.latched(joint.t)
+                } else {
+                    light
+                };
                 // The mirrored X scale reverses screen-space winding, so the
                 // usual back-face test would drop every front face; the
                 // reflection is submitted unculled (the original culls with
@@ -2924,29 +2942,15 @@ fn collect_triangles(
             None => (0.0, 0.0, 0),
         };
 
-        // Corner normals; a zero-length normal borrows the packet's first real
-        // one (the original substitutes and still draws the packet), and a
-        // packet with no usable normal at all is dropped on the lit path.
-        let mut corner_normals = [
+        // Corner normals. `tmd::parse` already pointed every missing corner
+        // (a flat packet's corners 1 and 2, a zero-length normal) at its
+        // kind's first normal, the one the original substitutes; a zero
+        // normal that remains lights at the ambient level.
+        let corner_normals = [
             object.normals.get(usize::from(prim.normals[0])).copied(),
             object.normals.get(usize::from(prim.normals[1])).copied(),
             object.normals.get(usize::from(prim.normals[2])).copied(),
         ];
-        if lighting.is_some() {
-            let Some(substitute) = corner_normals
-                .iter()
-                .flatten()
-                .copied()
-                .find(|normal| normal != &[0; 3])
-            else {
-                continue;
-            };
-            for normal in &mut corner_normals {
-                if normal.is_none() || normal == &Some([0; 3]) {
-                    *normal = Some(substitute);
-                }
-            }
-        }
 
         // An untextured packet's colour word is a per-corner vertex colour in
         // the original's 1/1024 scale; the sampled flat colour is white and the
@@ -3861,6 +3865,8 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
             },
             EntityMesh {
                 mesh: &mesh1,
@@ -3869,6 +3875,8 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
             },
         ];
         let lighting = Lighting {
@@ -3940,6 +3948,8 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
             }
         }
         let lighting = Lighting {
@@ -4133,6 +4143,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let lighting = Lighting {
             ambient: [4095; 3],
@@ -4921,6 +4933,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let camera = straight_camera();
         let lighting = Lighting {
@@ -5027,6 +5041,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0b1,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5056,6 +5072,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5114,6 +5132,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
 
         let render = |mirror_from: usize, mirror: Option<&MirrorPass>| {
@@ -5159,6 +5179,8 @@ mod tests {
             tint: [128, 128, 128],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(

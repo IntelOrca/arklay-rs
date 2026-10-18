@@ -497,6 +497,8 @@ fn a_real_actor_room_draws_player_and_npc_shadows_in_one_frame() {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         })
         .collect();
     let cut = &sim.room.cuts[camera_cut];

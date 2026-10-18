@@ -145,15 +145,49 @@ fn parse_prims(
     let capacity = count.min(data.len().saturating_sub(start) / 4);
     let mut prims = budget::alloc::<TmdPrim>(capacity, "TMD primitive list")?;
     let mut cursor = start;
+    // The original stores each distinct packet kind (`PSXObject_EnumKind`:
+    // the command word, plus the CBA and texture page for a textured packet)
+    // as its own vertex buffer, and its renderer lights a corner with no
+    // normal (a flat packet's corners 1 and 2, or a zero-length normal) with
+    // that buffer's FIRST normal: corner 0 of the kind's first packet.
+    let mut kind_first: Vec<(KindKey, u16)> = Vec::new();
     for packet in 0..count {
-        let (decoded, size) = decode_prim(data, cursor, vertices.len(), normals)
+        let (mut decoded, size, kind) = decode_prim(data, cursor, vertices.len(), normals)
             .map_err(|error| anyhow::anyhow!("object {object} primitive {packet}: {error:#}"))?;
         cursor = cursor
             .checked_add(size)
             .context("TMD primitive cursor overflows")?;
+        let first = match kind_first.iter().find(|(key, _)| *key == kind.key) {
+            Some(&(_, first)) => first,
+            None => {
+                kind_first.push((kind.key, kind.first_normal));
+                kind.first_normal
+            }
+        };
+        for prim in &mut decoded {
+            for (corner, normal) in prim.normals.iter_mut().enumerate() {
+                let absent = kind.flat && corner != 0;
+                if absent || normals[usize::from(*normal)] == [0; 3] {
+                    *normal = first;
+                }
+            }
+        }
         prims.extend(decoded);
     }
     Ok(prims)
+}
+
+/// A packet's `PSXObject_EnumKind` identity: the full command word, and for a
+/// textured packet the CBA word and the texture-page bits.
+type KindKey = (u32, u16, u16);
+
+/// What [`parse_prims`] needs from one packet to resolve its missing normals.
+struct PacketKind {
+    key: KindKey,
+    /// The normal index the packet's corner 0 stores in the kind's buffer.
+    first_normal: u16,
+    /// A flat packet stores a normal on corner 0 only.
+    flat: bool,
 }
 
 /// Decode one variable-length primitive packet at `offset`.
@@ -169,7 +203,7 @@ fn decode_prim(
     offset: usize,
     vertex_count: usize,
     normals: &mut Vec<[i16; 3]>,
-) -> Result<(Vec<TmdPrim>, usize)> {
+) -> Result<(Vec<TmdPrim>, usize, PacketKind)> {
     let command = data
         .get(offset..offset + 4)
         .map(|raw| u32::from_le_bytes(raw.try_into().unwrap()))
@@ -356,7 +390,17 @@ fn decode_prim(
         }
         _ => unreachable!("unknown commands are rejected before the word reads"),
     };
-    Ok((decoded, size))
+    let key = if command & 0x0400_0000 != 0 {
+        (command, (w1 >> 16) as u16, ((w2 >> 16) & 0x1F) as u16)
+    } else {
+        (command, 0, 0)
+    };
+    let kind = PacketKind {
+        key,
+        first_normal: decoded[0].normals[0],
+        flat: command == FLAT_TEXTURED_TRIANGLE,
+    };
+    Ok((decoded, size, kind))
 }
 
 /// Bounds-check one decoded primitive's vertex and normal indices.
@@ -548,6 +592,29 @@ mod tests {
         assert_eq!(prim.uv, [[5, 0x40], [6, 0x41], [7, 0x42]]);
         assert!(prim.textured);
         assert!(!prim.blend);
+    }
+
+    #[test]
+    fn flat_corners_take_the_first_normal_of_their_kind() {
+        // Two flat packets of one kind (same command, CBA and page): the
+        // second packet's corners 1 and 2 light with the FIRST packet's
+        // normal, the first vertex of the kind's buffer. A packet with a
+        // different page is its own kind.
+        let flat = |normal: u32, page: u32| {
+            [
+                FLAT_TEXTURED_TRIANGLE,
+                (0x7800u32 << 16) | (0x40 << 8) | 5,
+                (page << 16) | (0x41 << 8) | 6,
+                (0x42 << 8) | 7,
+                (2 << 16) | normal,
+                (1 << 16) | 0,
+            ]
+        };
+        let tmd = parse(&sample_tmd(&[&flat(2, 0x80), &flat(1, 0x80), &flat(3, 0x81)])).unwrap();
+        let prims = &tmd.objects[0].prims;
+        assert_eq!(prims[0].normals, [2, 2, 2]);
+        assert_eq!(prims[1].normals, [1, 2, 2]);
+        assert_eq!(prims[2].normals, [3, 3, 3]);
     }
 
     #[test]

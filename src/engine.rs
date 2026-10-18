@@ -12285,6 +12285,9 @@ fn render_frame_on(
     let mut npc_tints: Vec<[u8; 3]> = Vec::new();
     let mut npc_weapon_ids: Vec<Option<u16>> = Vec::new();
     let mut npc_zone_gate: Vec<bool> = Vec::new();
+    // Each character's light latch point (its own matrix translation) and
+    // whether it re-latches per joint (Yawn, ids 0x0D/0x12).
+    let mut npc_lights: Vec<([i32; 3], bool)> = Vec::new();
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
         if !entity.active() {
@@ -12387,6 +12390,7 @@ fn render_frame_on(
             entity.behavior_flags,
         ));
         npc_zone_gate.push(entity.has_enter_switch_zone & 0x7F != 0);
+        npc_lights.push((entity.pos, matches!(entity.id, 0x0D | 0x12)));
     }
 
     // The room's object and item models are submitted before the NPC and
@@ -12437,6 +12441,8 @@ fn render_frame_on(
             // creator's remap lives in `record_blend_weight`.
             blend_weight: render::record_blend_weight(&asset.model, record.blend_override),
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         });
     }
     for ((asset, _, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
@@ -12447,16 +12453,19 @@ fn render_frame_on(
             tint: [255; 3],
             blend_weight: render::record_blend_weight(&asset.model, None),
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         });
     }
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for (((model, joints), hidden), tint) in models
+    for ((((model, joints), hidden), tint), &(light_pos, per_joint_light)) in models
         .iter()
         .zip(&npc_joints)
         .zip(&npc_hidden)
         .zip(&npc_tints)
+        .zip(&npc_lights)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12465,6 +12474,8 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: Some(light_pos),
+            per_joint_light,
         });
     }
     // The held-weapon meshes of the scripted characters draw with the
@@ -12498,6 +12509,10 @@ fn render_frame_on(
             tint: npc_tints[*index],
             blend_weight: None,
             hidden_joints: 0,
+            // The weapon slot is one of the character's joints: it shares
+            // the character's latch.
+            light_pos: Some(npc_lights[*index].0),
+            per_joint_light: false,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -12519,6 +12534,8 @@ fn render_frame_on(
             tint: game.player_tint,
             blend_weight: None,
             hidden_joints: hidden,
+            light_pos: Some(game.entities[0].pos),
+            per_joint_light: false,
         });
     }
     // The held weapon's mesh draws at the hand joint while the weapon bank
@@ -12546,6 +12563,8 @@ fn render_frame_on(
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: Some(game.entities[0].pos),
+            per_joint_light: false,
         });
     }
 
@@ -12558,6 +12577,7 @@ fn render_frame_on(
     let mut web_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut web_hidden: Vec<u32> = Vec::new();
     let mut web_tints: Vec<[u8; 3]> = Vec::new();
+    let mut web_lights: Vec<[i32; 3]> = Vec::new();
     for (clone_index, clone) in game.web_clones.iter().enumerate() {
         let Some(clone) = clone else {
             continue;
@@ -12607,12 +12627,14 @@ fn render_frame_on(
         web_joints.push(joints);
         web_hidden.push(hidden);
         web_tints.push(clone.entity.model_tint_rgb());
+        web_lights.push(clone.entity.pos);
     }
-    for (((model, joints), hidden), tint) in web_models
+    for ((((model, joints), hidden), tint), &light_pos) in web_models
         .iter()
         .zip(&web_joints)
         .zip(&web_hidden)
         .zip(&web_tints)
+        .zip(&web_lights)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12621,6 +12643,8 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: Some(light_pos),
+            per_joint_light: false,
         });
     }
 
@@ -12715,6 +12739,8 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: None,
+            per_joint_light: false,
         });
     }
 
@@ -12784,6 +12810,8 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: None,
+            per_joint_light: false,
         });
     }
 
@@ -16174,6 +16202,8 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
