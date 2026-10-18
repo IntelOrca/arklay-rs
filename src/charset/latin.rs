@@ -196,8 +196,14 @@ pub(super) static ENCODE_TWO: [(&str, &[u8]); 4] = [
 /// Characters with no cell of their own that localized text still uses;
 /// each maps to the closest cell the Western sheet draws. Sorted by
 /// character; no target is itself a substitution key.
+///
+/// `/` is the load-bearing one: the Western sheet has no slash cell, but the
+/// releases use one as the save screen's field separator — the USA art spells
+/// it `\` (`SaveLoadScreen.cpp`'s `"     \  \"`) where the Japanese sheet
+/// spells it `/` — so a `/` in Latin text draws the sheet's backslash.
 #[rustfmt::skip]
-pub(super) static SUBSTITUTIONS: [(char, &str); 18] = [
+pub(super) static SUBSTITUTIONS: [(char, &str); 19] = [
+    ('/', "\\"),
     ('_', "-"),
     ('\u{ab}', "“"),
     ('\u{bb}', "”"),

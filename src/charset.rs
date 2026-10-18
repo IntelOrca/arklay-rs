@@ -568,6 +568,17 @@ mod tests {
     }
 
     #[test]
+    fn latin_spells_the_slash_as_its_backslash_cell() {
+        // The Western sheet has no `/` cell; the USA save screen's separators
+        // are its backslash, so the substitute keeps localized text readable.
+        assert_eq!(latin("/"), latin("\\"));
+        assert_eq!(latin("/"), [0x38]);
+        assert_eq!(latin("10/18"), latin("10\\18"));
+        // The Japanese sheet spells both itself.
+        assert_eq!(encoded("/"), encoded("\\"));
+    }
+
+    #[test]
     fn latin_punctuation_cells_differ_from_the_japanese_sheet() {
         assert_eq!(latin(","), [0x18]);
         assert_eq!(encoded(","), [0x17]);

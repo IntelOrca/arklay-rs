@@ -31,11 +31,27 @@ frame at 2x), not only the disassembly notes:
 | Band colour | Black at alpha 191 (`out = 0.25*panel`) |
 | Text | Save rows and the detail line's character name blue (`#3F7DFA` over the sheet's grey ramp); the exit row and the rest of the detail line white |
 
-The port's font advances differ from CR's own text metrics, so a line is
-wider in the port (CR draws `Jill/01/Hall 1F` in 80 px, the port's tight
-metrics in 122 px): the script draws the same glyphs with the engine's
-metrics, which every other screen shares. The list contents, row order and
-labels match.
+The port's advances match CR's when the pack carries the Western sheet, and
+widen when it does not:
+
+| Pack | Title | Row label | Detail line |
+| --- | --- | --- | --- |
+| CR 1.1.3 | 30 px | 56 px | 102 px |
+| USA/Steam install (`fontus.tim` present) | 30 px | 61 px | 117 px |
+| MediaKite JPN install (no Western sheet) | 40 px | 74 px | 125 px |
+
+CR draws its English screen text with the Western font even on the MediaKite
+install, which has no `fontus.tim`; a pack converted from that install has
+only the 14-px Japanese sheet, so a Latin session falls back to the Japanese
+sheet's wider advances (the documented `font::session_entry` fallback, shared
+with every other screen). The list contents, row order and labels match
+either way.
+
+The Western sheet has no `/` cell, so `charset::latin` now substitutes one
+with the sheet's slash-shaped backslash cell (0x38): the USA release's own
+save screen spells its field separators that way (`SaveLoadScreen.cpp`'s
+`"     \  \"`), and the port's `UI_SAVE_SLOT_FILLED` template — authored on
+the Japanese grid — had been drawing missing-glyph boxes on a USA pack.
 
 ## Bounded: the save-mode flow
 
