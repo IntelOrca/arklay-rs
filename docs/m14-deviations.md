@@ -91,7 +91,7 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    the per-slot `0x800` fade ramps, the step-4 input gate (any button or the
    `0x708` timeout), the ending-6 fifth plate, the two epilogue captions, the
    `rc1121.pix` backdrop, the root->spin->leaf composition of `i73v.ivm` and
-   the next-cycle card's grants and flags. Five details are bounded
+   the next-cycle card's grants and flags. Six details are bounded
    approximations:
 
    - The no-save confetti (`Effect_CreateBillboard(0x0B, 0x0A)`) is a
@@ -110,6 +110,13 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
      addressing over the shipped font sheet, including the raw `0x5E`
      separator (`ending_draw_text`), rather than the port's encoded-text path,
      so the digits land cell for cell on the original's.
+   - The epilogue's model is lit by the sequence's own record
+     (`FUN_0040ac80(0, ...)` with `(100,100,100)` and `setBackColor(0xFFF,
+     0xFFF, 0xFFF)`), but only light 0 is set: the reference never rewrites
+     slots 1 and 2, so they keep whatever the last room or menu left in
+     `g_d3dLightData`, which a boot straight into the ending cannot
+     reproduce. With the ambient already at full scale their contribution is
+     at most the last step to saturation.
 
    No clear count is persisted (the port has no config/settings store), and the
    Director's Cut epilogue guards (advanced difficulty, the infinite Colt

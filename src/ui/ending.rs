@@ -12,7 +12,9 @@
 //!
 //! [`EpilogueScreen`] mirrors `ending_epilogue_*` (`EndingScreen.cpp:687-836`):
 //! the `rc1121.pix` backdrop, the two caption plates from the same page and the
-//! spinning `i73v.ivm` rocket launcher, held for `0x10D` frames and faded out.
+//! spinning `i73v.ivm` rocket launcher, lit by the sequence's own light record
+//! (full ambient plus one white light, `epilogue_light`) through
+//! [`Framebuffer::draw_ivm`], held for `0x10D` frames and faded out.
 //!
 //! Neither screen draws a letter rank or an item summary: the original has
 //! neither. The plate fades are the reference's signed `0x800` ramps, and the
@@ -26,7 +28,7 @@ use crate::assets::{Artwork, Geometry};
 use crate::ending::{self, CREDIT_ENTRIES, EndStats, EndingRow, SlotKind};
 use crate::font::{GLYPH_HEIGHT, Tint};
 use crate::ivm::{self, Ivm};
-use crate::render::{Camera, Framebuffer};
+use crate::render::{Camera, EntityLight, EntityLightSource, Framebuffer};
 use crate::state::Image;
 
 use super::{Screen, ScreenAction, ScreenResult, UiContext, UiInput};
@@ -54,6 +56,60 @@ const EPILOGUE_FADE_STEP: i32 = 16;
 const EPILOGUE_SPIN_STEP: i16 = 0x20;
 /// The epilogue camera focal length (`0x1A4`).
 const EPILOGUE_FOV: i32 = 0x1A4;
+/// The epilogue's ambient colour: `setBackColor(0xFFF, 0xFFF, 0xFFF)`
+/// (`EndingScreen.cpp:750`), the 12-bit channels converted to the rasterizer's
+/// `0..=255` scale by the reference's own `(value * 255) / 4096`.
+const EPILOGUE_AMBIENT: f64 = ((0xFFF * 255) / 4096) as f64;
+/// The epilogue's single light position, `s_lightData[0..3] = 100, 100, 100`
+/// handed to `FUN_0040ac80` (`EndingScreen.cpp:742-749`). The light is
+/// directional: the vector is normalized into a 4.12 direction, not used as a
+/// world point.
+const EPILOGUE_LIGHT_POSITION: [i32; 3] = [100, 100, 100];
+/// The epilogue light's colour bytes (`0xFF, 0xFF, 0xFF`), capped at the
+/// reference's `0x80` full-scale byte (`FUN_0040ac80`).
+const EPILOGUE_LIGHT_COLOR: [u8; 3] = [0x80; 3];
+
+/// The epilogue model's lighting (`ending_epilogue_build`,
+/// `EndingScreen.cpp:742-750`): full ambient plus one white light, which the
+/// draw re-points into camera space every frame
+/// (`MulMatrix0(&g_lightMatrix, &g_RoomCameraData)`, `EndingScreen.cpp:829-832`).
+///
+/// The stored direction is the reference's `FUN_0040ac80` record: the position
+/// vector normalized to 4.12 with its Y negated. [`Framebuffer::draw_ivm`]
+/// applies the camera to it, so only the record itself is built here. The
+/// reference leaves light slots 1 and 2 untouched - they keep whatever the
+/// previous screen left in `g_d3dLightData` - so they are dark here; with the
+/// ambient already at full scale their contribution is at most the last step to
+/// saturation.
+fn epilogue_light() -> EntityLight {
+    let length = EPILOGUE_LIGHT_POSITION
+        .iter()
+        .map(|&value| f64::from(value).powi(2))
+        .sum::<f64>()
+        .sqrt()
+        .max(1.0);
+    EntityLight {
+        ambient: [EPILOGUE_AMBIENT; 3],
+        sources: [
+            EntityLightSource {
+                dir: [
+                    (f64::from(EPILOGUE_LIGHT_POSITION[0]) / length * 4096.0) as i32,
+                    (-f64::from(EPILOGUE_LIGHT_POSITION[1]) / length * 4096.0) as i32,
+                    (f64::from(EPILOGUE_LIGHT_POSITION[2]) / length * 4096.0) as i32,
+                ],
+                color: EPILOGUE_LIGHT_COLOR,
+            },
+            EntityLightSource {
+                dir: [0; 3],
+                color: [0; 3],
+            },
+            EntityLightSource {
+                dir: [0; 3],
+                color: [0; 3],
+            },
+        ],
+    }
+}
 
 /// The shade a slot's fade level contributes: the high byte of the signed
 /// 16-bit ramp, `0..=0x80` (`EndingScreen.cpp:352`).
@@ -760,7 +816,7 @@ impl Screen for EpilogueScreen {
         }
         if let Some(model) = &self.model {
             let joints = vec![self.joint_matrix(); model.objects.len()];
-            framebuffer.draw_ivm_unlit(model, &joints, &self.camera());
+            framebuffer.draw_ivm(model, &joints, &self.camera(), Some(&epilogue_light()));
         }
     }
 
@@ -772,6 +828,8 @@ impl Screen for EpilogueScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::model::Texture8;
 
     /// Run `screen` until `predicate` holds, with a tick cap.
     fn drive_until(
@@ -786,6 +844,115 @@ mod tests {
             screen.update(&result_ctx(), UiInput::default());
         }
         predicate(screen)
+    }
+
+    /// A white `.ivm` page: every texel samples palette entry 1, which is full
+    /// white (entry 0 is the PSX colour key the rasterizer skips), so the
+    /// rasterized pixels show the shade alone.
+    fn white_page() -> Texture8 {
+        Texture8 {
+            width: 1,
+            height: 1,
+            indices: vec![1],
+            palettes: vec![[255, 255, 255, 255]; 256],
+            stp: Vec::new(),
+        }
+    }
+
+    /// One flat textured `.ivm` triangle with a single packet normal, centred
+    /// on the camera axis at `screen_y` units off it.
+    fn flat_triangle(normal: [i16; 3], screen_y: i32) -> crate::ivm::Ivm {
+        crate::ivm::Ivm {
+            texture: white_page(),
+            objects: vec![crate::ivm::IvmObject {
+                vertices: vec![
+                    [0, (screen_y - 600) as i16, -800],
+                    [0, (screen_y + 600) as i16, -800],
+                    [0, screen_y as i16, 800],
+                ],
+                normals: vec![normal],
+                prims: vec![crate::ivm::IvmPrim {
+                    kind: crate::ivm::IvmPrimKind::TexturedFlat,
+                    vertex_count: 3,
+                    vertices: [0, 2, 1, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255; 3]; 3],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        }
+    }
+
+    /// The identity joint the lighting tests draw through.
+    fn identity() -> Mat4x3 {
+        Mat4x3 {
+            r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+            t: [0, 0, 0],
+        }
+    }
+
+    /// The centroid pixel of `ivm`'s triangle drawn with or without a light.
+    fn centre_pixel(
+        ivm: &crate::ivm::Ivm,
+        camera: &Camera,
+        light: Option<&EntityLight>,
+    ) -> [u8; 4] {
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_ivm(ivm, &[identity()], camera, light);
+        // An identity joint maps a raw vertex straight to its world position.
+        let projected: Vec<[i32; 2]> = ivm.objects[0].vertices[..3]
+            .iter()
+            .map(|v| {
+                camera
+                    .project([i32::from(v[0]), i32::from(v[1]), i32::from(v[2])])
+                    .expect("the triangle is on screen")
+            })
+            .collect();
+        let x = (projected[0][0] + projected[1][0] + projected[2][0]) / 3;
+        let y = (projected[0][1] + projected[1][1] + projected[2][1]) / 3;
+        let index = (y as usize * framebuffer.width as usize + x as usize) * 4;
+        framebuffer.rgba[index..index + 4].try_into().unwrap()
+    }
+
+    #[test]
+    fn the_epilogue_light_is_the_reference_record() {
+        // `ending_epilogue_build`: `FUN_0040ac80(0, (100,100,100 | 0xFFFFFF))`
+        // then `setBackColor(0xFFF, 0xFFF, 0xFFF)`. The direction is the
+        // normalized position with its Y negated, the colour caps at 0x80 and
+        // the 12-bit ambient converts with the reference's `* 255 / 4096`.
+        let light = epilogue_light();
+        assert_eq!(light.ambient, [254.0; 3]);
+        assert_eq!(light.sources[0].dir, [2364, -2364, 2364]);
+        assert_eq!(light.sources[0].color, [0x80; 3]);
+        // Slots 1 and 2 are left as the previous screen left them; the port
+        // keeps them dark.
+        assert!(light.sources[1..].iter().all(|s| s.color == [0; 3]));
+    }
+
+    #[test]
+    fn the_epilogue_light_lifts_the_faces_it_reaches_over_the_ambient() {
+        let camera = EpilogueScreen::new().camera();
+        let light = epilogue_light();
+        // A face looking into the light's direction (the record's own -Z, with
+        // the camera-applied direction in front of it) saturates at full white;
+        // the opposite face only sees the full-scale ambient, one level down.
+        // The unlit path shows both at full white, which is the bug: the
+        // ambient is not the only thing the reference's model sees.
+        let towards = flat_triangle([0, 0, -4096], -1500);
+        let away = flat_triangle([0, 0, 4096], 1500);
+        assert_eq!(
+            centre_pixel(&towards, &camera, Some(&light)),
+            [255, 255, 255, 255]
+        );
+        assert_eq!(
+            centre_pixel(&away, &camera, Some(&light)),
+            [254, 254, 254, 255]
+        );
+        assert_eq!(centre_pixel(&towards, &camera, None), [255, 255, 255, 255]);
+        assert_eq!(centre_pixel(&away, &camera, None), [255, 255, 255, 255]);
     }
 
     #[test]
