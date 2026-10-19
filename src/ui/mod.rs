@@ -16,7 +16,6 @@
 pub mod computer_lab;
 pub mod death;
 pub mod debug_menu;
-pub mod ending;
 pub mod file;
 pub mod item_box;
 pub mod item_view;

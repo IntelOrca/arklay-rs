@@ -513,3 +513,179 @@ fn select_the_confirm_and_cancel_fades_draw_over_black() {
         );
     }
 }
+
+// ---- ending ----------------------------------------------------------------
+
+fn result_screen(harness: &Harness, ending_id: i64, no_save: bool) -> LuaScreen {
+    harness.open(
+        "ending_result",
+        &[
+            ("ending_id", ScreenArg::Int(ending_id)),
+            ("no_save", ScreenArg::Bool(no_save)),
+            ("background", ScreenArg::Bool(ending_id >= 4)),
+        ],
+    )
+}
+
+fn step(screen: &LuaScreen) -> i64 {
+    screen.test_eval("return M.state.step")
+}
+
+fn active(screen: &LuaScreen, slot: usize) -> bool {
+    screen.test_eval(&format!("return M.state.slots[{slot}].active"))
+}
+
+/// Tick neutrally until the RESULT machine reaches `target`, with a cap.
+fn drive_to(screen: &mut LuaScreen, cx: &UiContext<'_>, target: i64, cap: usize) {
+    for _ in 0..cap {
+        if step(screen) == target {
+            return;
+        }
+        screen.update(cx, neutral());
+    }
+    assert_eq!(step(screen), target, "the machine reaches step {target}");
+}
+
+#[test]
+fn ending_result_runs_the_reference_step_machine() {
+    let harness = Harness::new("result-steps");
+    let cx = harness.context();
+    let mut screen = result_screen(&harness, 1, false);
+    assert_eq!(step(&screen), 0);
+    // Step 0 arms the background fade and builds the hidden slots.
+    screen.update(&cx, neutral());
+    assert_eq!(step(&screen), 1);
+    assert!(screen.test_eval::<i64>("return M.state.background.fade_vel") > 0);
+    assert!((1..=5).all(|slot| !active(&screen, slot)));
+    // Steps 1-2 reveal the plates in pairs.
+    drive_to(&mut screen, &cx, 2, 0x80);
+    assert!(active(&screen, 1) && active(&screen, 2));
+    drive_to(&mut screen, &cx, 3, 0x80);
+    assert!(active(&screen, 3) && active(&screen, 4));
+    // Step 3 is the reveal hold; step 4 waits for input.
+    drive_to(&mut screen, &cx, 4, 0x80);
+    screen.update(&cx, neutral());
+    assert_eq!(step(&screen), 4, "step 4 holds without input");
+
+    // A button press leaves step 4 (ending 1 -> step 5 -> step 10 -> done).
+    screen.update(&cx, press(|i| i.any = true));
+    assert_eq!(step(&screen), 5);
+    let (action, _) = run_to_result(&mut screen, &cx, 0x400);
+    assert_eq!(action, ScreenAction::EndingEpilogue);
+}
+
+#[test]
+fn ending_result_step_four_times_out_without_input() {
+    let harness = Harness::new("result-timeout");
+    let cx = harness.context();
+    let mut screen = result_screen(&harness, 2, false);
+    drive_to(&mut screen, &cx, 4, 0x100);
+    drive_to(&mut screen, &cx, 5, 0x710);
+}
+
+#[test]
+fn ending_six_takes_the_extra_plate_steps() {
+    let harness = Harness::new("result-six");
+    let cx = harness.context();
+    let mut screen = result_screen(&harness, 6, false);
+    drive_to(&mut screen, &cx, 4, 0x100);
+    screen.update(&cx, press(|i| i.any = true));
+    assert_eq!(step(&screen), 6, "ending 6 diverts to the fifth plate");
+    // The fifth plate activates after the 0x5A hold.
+    drive_to(&mut screen, &cx, 8, 0x100);
+    assert!(active(&screen, 5));
+    assert!(screen.test_eval::<bool>("return M.state.slots[5].additive"));
+    let (action, _) = run_to_result(&mut screen, &cx, 0x400);
+    assert_eq!(action, ScreenAction::EndingEpilogue);
+}
+
+#[test]
+fn ending_result_a_no_save_run_enables_the_confetti_bonus() {
+    for no_save in [false, true] {
+        let harness = Harness::new("result-confetti");
+        let cx = harness.context();
+        let mut screen = result_screen(&harness, 1, no_save);
+        screen.update(&cx, neutral());
+        screen.test_eval::<()>("M.state.step = 10 M.state.timer = 0x1E");
+        screen.update(&cx, neutral());
+        assert_eq!(step(&screen), 11);
+        assert_eq!(screen.test_eval::<bool>("return M.state.effects"), no_save);
+        assert_eq!(
+            screen.test_eval::<i64>("return #M.state.confetti"),
+            if no_save { 48 } else { 0 }
+        );
+        let cues = cx.cues.borrow();
+        if no_save {
+            assert_eq!(cues.as_slice(), &[UiCue::Decide]);
+        } else {
+            assert!(cues.is_empty());
+        }
+    }
+}
+
+#[test]
+fn ending_fade_shade_and_scale_ramp_to_full() {
+    let harness = Harness::new("ending-shade");
+    let screen = result_screen(&harness, 1, false);
+    let eval = |body: &str| -> i64 {
+        screen.test_eval(&format!("local E = require('lib/ending') return {body}"))
+    };
+    assert_eq!(eval("E.fade_shade(0)"), 0);
+    assert_eq!(eval("E.fade_shade(E.FADE_FULL)"), 0x80);
+    assert_eq!(eval("E.fade_shade(-1)"), 0);
+    assert_eq!(eval("E.shade_scale(0)"), 0);
+    assert_eq!(eval("E.shade_scale(0x80)"), 255);
+    assert_eq!(eval("E.shade_scale(0x40)"), 127);
+    // The epilogue's fixed backdrop shade (`s_bgSlot->fadeLevel` 0x6000).
+    assert_eq!(eval("E.fade_shade(0x6000)"), 0x60);
+    assert_eq!(eval("E.shade_scale(E.fade_shade(0x6000))"), 191);
+}
+
+#[test]
+fn ending_result_lays_the_slots_out_from_the_credit_table() {
+    let harness = Harness::new("result-layout");
+    let cx = harness.context();
+    let slot = |screen: &LuaScreen, n: usize| -> (String, i64, i64) {
+        screen.test_eval(&format!(
+            "local s = M.state.slots[{n}] return s.kind, s.x, s.y"
+        ))
+    };
+    // The plain rows (endings 1-3) use entries 8-12.
+    let mut plain = result_screen(&harness, 1, false);
+    plain.update(&cx, neutral());
+    assert_eq!(slot(&plain, 2), ("clear_time".into(), 0x80, 0x58));
+    assert_eq!(slot(&plain, 4), ("save_count".into(), 0x98, 0xB8));
+    // The background rows shift right for Jill.
+    let mut jill = harness.open(
+        "ending_result",
+        &[
+            ("ending_id", ScreenArg::Int(4)),
+            ("character", ScreenArg::Int(1)),
+            ("background", ScreenArg::Bool(true)),
+        ],
+    );
+    jill.update(&cx, neutral());
+    assert_eq!(slot(&jill, 1), ("sprite".into(), 0x9C, 0x30));
+    assert_eq!(slot(&jill, 2), ("clear_time".into(), 0x30 + 0x9C, 0x50));
+}
+
+#[test]
+fn ending_epilogue_runs_and_spins_the_model() {
+    let harness = Harness::new("epilogue");
+    let cx = harness.context();
+    let mut screen = harness.open("ending_epilogue", &[]);
+    assert_eq!(
+        screen.test_eval::<i64>("return M.state.captions[1].fade_level"),
+        0x8000
+    );
+    let (action, ticks) = run_to_result(&mut screen, &cx, 0x1000);
+    assert_eq!(action, ScreenAction::EndingSave);
+    // The 0x10D hold (plus the build tick and the step past it), then the
+    // 16-step fade out.
+    assert_eq!(ticks, 1 + 0x10E + 16);
+    assert_ne!(
+        screen.test_eval::<i64>("return M.state.spin"),
+        0,
+        "the model spins"
+    );
+}

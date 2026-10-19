@@ -476,13 +476,14 @@ impl ScreenVm {
         Ok(())
     }
 
-    /// Evaluate `body` with the module table bound to `M`, for the unit
-    /// tests.
+    /// Evaluate `body` with the module table bound to `M` in the scripts'
+    /// environment, for the unit tests.
     #[cfg(test)]
     fn eval<T: mlua::FromLuaMulti>(&self, body: &str) -> mlua::Result<T> {
         let function: Function = self
             .lua
             .load(format!("return function(M) {body} end"))
+            .set_environment(self.env.clone())
             .eval()?;
         function.call(self.module.clone())
     }

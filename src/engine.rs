@@ -5484,9 +5484,9 @@ enum Mode {
     /// A film owns the whole app until it ends.
     Movie(Box<MovieSession>),
     /// The post-film RESULT screen.
-    Ending(Box<ui::ending::ResultScreen>),
+    Ending(Box<ui::lua_screen::LuaScreen>),
     /// The rocket-launcher epilogue.
-    Epilogue(Box<ui::ending::EpilogueScreen>),
+    Epilogue(Box<ui::lua_screen::LuaScreen>),
     /// The next-cycle save screen (save mode), which reports `Resume` on exit.
     Save(Box<dyn ui::save_load::SaveScreen>),
 }
@@ -6108,12 +6108,32 @@ impl App {
         let Some(flow) = self.ending else {
             return self.open_title();
         };
-        let mut screen = ui::ending::ResultScreen::new(flow.stats, flow.second_playthrough);
-        {
-            let mut cx = self.context();
-            screen.open(&mut cx)?;
-        }
+        let stats = flow.stats;
+        let row = ending::row(stats.ending_id).unwrap_or(ending::ROWS[0]);
+        let text = |bytes: Vec<u8>| ScreenArg::Str(String::from_utf8_lossy(&bytes).into_owned());
+        let args = [
+            ("ending_id", ScreenArg::Int(stats.ending_id.into())),
+            ("character", ScreenArg::Int(stats.character.into())),
+            ("time_ticks", ScreenArg::Int(stats.time_ticks.into())),
+            ("clear_text", text(stats.clear_time_bytes())),
+            ("save_text", text(stats.save_count_bytes())),
+            ("no_save", ScreenArg::Bool(stats.no_save())),
+            ("background", ScreenArg::Bool(row.background)),
+            (
+                "second_playthrough",
+                ScreenArg::Bool(flow.second_playthrough),
+            ),
+        ];
+        let mut cx = self.context();
+        let screen = ui::lua_screen::LuaScreen::open_screen(
+            "ending_result",
+            &args,
+            ScreenAction::EndingEpilogue,
+            &mut cx,
+        )?;
+        let cues = cx.cues.into_inner();
         self.mode = Mode::Ending(Box::new(screen));
+        self.play_ui_cues(cues);
         Ok(())
     }
 
@@ -6139,12 +6159,16 @@ impl App {
 
     /// Open the rocket-launcher epilogue.
     fn open_epilogue(&mut self) -> Result<()> {
-        let mut screen = ui::ending::EpilogueScreen::new();
-        {
-            let mut cx = self.context();
-            screen.open(&mut cx)?;
-        }
+        let mut cx = self.context();
+        let screen = ui::lua_screen::LuaScreen::open_screen(
+            "ending_epilogue",
+            &[],
+            ScreenAction::EndingSave,
+            &mut cx,
+        )?;
+        let cues = cx.cues.into_inner();
         self.mode = Mode::Epilogue(Box::new(screen));
+        self.play_ui_cues(cues);
         Ok(())
     }
 

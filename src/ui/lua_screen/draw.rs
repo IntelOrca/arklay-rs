@@ -9,11 +9,15 @@
 
 use std::collections::HashMap;
 
-use mlua::{UserDataMethods, Value};
+use mlua::{Table, UserDataMethods, Value};
 
+use crate::anim::{self, Mat4x3};
 use crate::assets::{Artwork, Geometry};
 use crate::budget;
+use crate::font::{GLYPH_HEIGHT, Tint};
+use crate::ivm::{self, Ivm};
 use crate::pack::{AssetClass, Pack};
+use crate::render::{Camera, EntityLight, EntityLightSource, Framebuffer};
 use crate::state::Image;
 
 use super::{Api, colour_rgb, colour_tint, coord, no_draw};
@@ -24,6 +28,8 @@ enum Asset {
     Picture(Image),
     /// A sprite page in its native shape: indexed with CLUT rows, or RGBA.
     Page(Artwork),
+    /// An item-view model and the size of the file it was parsed from.
+    Model(Box<Ivm>, usize),
 }
 
 impl Asset {
@@ -31,6 +37,19 @@ impl Asset {
         match self {
             Self::Picture(image) => (image.width, image.height),
             Self::Page(art) => (art.width(), art.height()),
+            Self::Model(model, _) => (model.texture.width, model.texture.height),
+        }
+    }
+
+    /// The bytes the asset holds, against the screen's art budget.
+    fn bytes(&self) -> usize {
+        let (width, height) = self.size();
+        let pixels = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        match self {
+            Self::Model(_, file) => pixels.saturating_add(*file),
+            _ => pixels,
         }
     }
 }
@@ -62,10 +81,7 @@ impl Assets {
             "screen art count",
         )?;
         let asset = load()?;
-        let (width, height) = asset.size();
-        let bytes = (width as usize)
-            .saturating_mul(height as usize)
-            .saturating_mul(4);
+        let bytes = asset.bytes();
         budget::check_len(
             self.bytes.saturating_add(bytes),
             budget::MAX_SCREEN_IMAGE_BYTES,
@@ -88,8 +104,8 @@ impl Assets {
     fn picture(&self, handle: usize) -> mlua::Result<&Image> {
         match self.get(handle)? {
             Asset::Picture(image) => Ok(image),
-            Asset::Page(_) => Err(mlua::Error::RuntimeError(format!(
-                "art handle {handle} is a page, not a picture"
+            _ => Err(mlua::Error::RuntimeError(format!(
+                "art handle {handle} is not a picture"
             ))),
         }
     }
@@ -97,8 +113,17 @@ impl Assets {
     fn page(&self, handle: usize) -> mlua::Result<&Artwork> {
         match self.get(handle)? {
             Asset::Page(art) => Ok(art),
-            Asset::Picture(_) => Err(mlua::Error::RuntimeError(format!(
-                "art handle {handle} is a picture, not a page"
+            _ => Err(mlua::Error::RuntimeError(format!(
+                "art handle {handle} is not a page"
+            ))),
+        }
+    }
+
+    fn model(&self, handle: usize) -> mlua::Result<&Ivm> {
+        match self.get(handle)? {
+            Asset::Model(model, _) => Ok(model),
+            _ => Err(mlua::Error::RuntimeError(format!(
+                "art handle {handle} is not a model"
             ))),
         }
     }
@@ -120,6 +145,117 @@ fn rect(x: i32, y: i32, w: i32, h: i32) -> [i32; 4] {
 /// A colour channel or alpha byte.
 fn byte(value: i64) -> u8 {
     value.clamp(0, 255) as u8
+}
+
+/// An integer field of `table`, `0` when absent.
+fn field(table: &Table, key: &str) -> mlua::Result<i32> {
+    Ok(table.get::<Option<i32>>(key)?.unwrap_or(0))
+}
+
+/// A `{x, y, z}` triple.
+fn triple(table: &Table, key: &str) -> mlua::Result<[i32; 3]> {
+    let value: Table = table.get(key)?;
+    Ok([value.get(1)?, value.get(2)?, value.get(3)?])
+}
+
+/// The joint matrix a `joints` list composes, root first. Each joint is
+/// `{rx, ry, rz, tx, ty, tz}` in the engine's 12-bit angles.
+fn joint_matrix(joints: Option<Table>) -> mlua::Result<Mat4x3> {
+    // The chain starts at the root joint itself: composing onto the table's
+    // zero rotation would skew it, as that is not an exact 4.12 identity.
+    let mut matrix: Option<Mat4x3> = None;
+    if let Some(joints) = joints {
+        for joint in joints.sequence_values::<Table>() {
+            let joint = joint?;
+            let local = Mat4x3 {
+                r: anim::rotation_matrix(
+                    field(&joint, "rx")?,
+                    field(&joint, "ry")?,
+                    field(&joint, "rz")?,
+                ),
+                t: [
+                    field(&joint, "tx")?,
+                    field(&joint, "ty")?,
+                    field(&joint, "tz")?,
+                ],
+            };
+            matrix = Some(match matrix {
+                Some(parent) => anim::compose(&parent, &local),
+                None => local,
+            });
+        }
+    }
+    Ok(matrix.unwrap_or(Mat4x3 {
+        r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+        t: [0; 3],
+    }))
+}
+
+/// A light record: `{ambient = 12-bit level, sources = {{pos = {x, y, z},
+/// color = {r, g, b}}, ...}}`. As the reference's `FUN_0040ac80` builds it,
+/// each position is a direction, normalized to 4.12 with Y negated, and each
+/// colour byte caps at the `0x80` full scale; the ambient converts by
+/// `(value * 255) / 4096`. Missing sources are dark.
+fn light(table: &Table) -> mlua::Result<EntityLight> {
+    let ambient = f64::from(field(table, "ambient")?.clamp(0, 0xFFFF) * 255 / 4096);
+    let dark = EntityLightSource {
+        dir: [0; 3],
+        color: [0; 3],
+    };
+    let mut sources = [dark, dark, dark];
+    if let Some(list) = table.get::<Option<Table>>("sources")? {
+        for (slot, source) in sources.iter_mut().zip(list.sequence_values::<Table>()) {
+            let source = source?;
+            let pos = triple(&source, "pos")?.map(f64::from);
+            let length = pos.iter().map(|v| v * v).sum::<f64>().sqrt().max(1.0);
+            let color = triple(&source, "color")?;
+            *slot = EntityLightSource {
+                dir: [
+                    (pos[0] / length * 4096.0) as i32,
+                    (-pos[1] / length * 4096.0) as i32,
+                    (pos[2] / length * 4096.0) as i32,
+                ],
+                color: color.map(|c| c.clamp(0, 0x80) as u8),
+            };
+        }
+    }
+    Ok(EntityLight {
+        ambient: [ambient; 3],
+        sources,
+    })
+}
+
+/// Draw `bytes` through the font sheet's own grid addressing: `u = (c % 18)
+/// * glyph_w`, `v = (c / 18) * 14`, no header offset (the reference's
+/// `ending_draw_text`, `EndingScreen.cpp:296-324`). The bytes are raw sheet
+/// cells, so a `0x5E` lands on the sheet's own separator cell.
+fn draw_grid_text(
+    framebuffer: &mut Framebuffer,
+    font: &crate::font::Font,
+    origin: [i32; 2],
+    scale: u8,
+    bytes: &[u8],
+) {
+    let glyph_w = font.metrics.glyph_w;
+    if glyph_w <= 0 {
+        return;
+    }
+    let [mut pen, y] = origin;
+    for &byte in bytes {
+        if byte != b' ' {
+            let u = i32::from(byte % 18) * glyph_w;
+            let v = i32::from(byte / 18) * GLYPH_HEIGHT;
+            framebuffer.draw_indexed_sprite_scaled(
+                &font.texture,
+                [u, v, glyph_w, GLYPH_HEIGHT],
+                [pen, y, glyph_w, GLYPH_HEIGHT],
+                0,
+                scale,
+                Tint::White,
+            );
+        }
+        pen = pen.saturating_add(glyph_w);
+    }
 }
 
 /// Register the handle-based art and drawing methods.
@@ -167,6 +303,16 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         })))
     });
 
+    methods.add_method_mut("ivm", |_lua, api, entry: String| {
+        let pack: &Pack = api.cx.pack;
+        let cache_key = format!("ivm:{entry}");
+        Ok(loaded(api.host.assets.load(cache_key, || {
+            let bytes = pack.read(&entry)?;
+            let model = ivm::parse(&bytes)?;
+            Ok(Asset::Model(Box::new(model), bytes.len()))
+        })))
+    });
+
     methods.add_method("art_size", |_lua, api, handle: usize| {
         Ok(api.host.assets.get(handle)?.size())
     });
@@ -184,6 +330,50 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             framebuffer.fill_rect(
                 rect(x, y, w, h),
                 [byte(r), byte(g), byte(b), byte(a.unwrap_or(255))],
+            );
+            Ok(())
+        },
+    );
+
+    // `draw_ivm(model, {joints = {...}, camera = {from, to, fov}, light})`:
+    // every object of the model takes the one composed joint matrix.
+    methods.add_method_mut("draw_ivm", |_lua, api, (handle, spec): (usize, Table)| {
+        let Api {
+            host, framebuffer, ..
+        } = api;
+        let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+        let model = host.assets.model(handle)?;
+        let joint = joint_matrix(spec.get("joints")?)?;
+        let camera: Table = spec.get("camera")?;
+        let camera = Camera::from_points(
+            triple(&camera, "from")?,
+            triple(&camera, "to")?,
+            field(&camera, "fov")?,
+        );
+        let light = match spec.get::<Option<Table>>("light")? {
+            Some(table) => Some(light(&table)?),
+            None => None,
+        };
+        let joints = vec![joint; model.objects.len()];
+        framebuffer.draw_ivm(model, &joints, &camera, light.as_ref());
+        Ok(())
+    });
+
+    // `grid_text(x, y, scale, bytes)`: raw font-sheet cells, see
+    // [`draw_grid_text`]. Without a font nothing draws.
+    methods.add_method_mut(
+        "grid_text",
+        |_lua, api, (x, y, scale, text): (i32, i32, i64, mlua::String)| {
+            let Some(font) = api.cx.font else {
+                return Ok(());
+            };
+            let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            draw_grid_text(
+                framebuffer,
+                font,
+                [coord(x), coord(y)],
+                byte(scale),
+                &text.as_bytes(),
             );
             Ok(())
         },
@@ -287,4 +477,51 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             Ok(())
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_epilogue_light_is_the_reference_record() {
+        // `ending_epilogue_build`: `FUN_0040ac80(0, (100,100,100 | 0xFFFFFF))`
+        // then `setBackColor(0xFFF, 0xFFF, 0xFFF)`. The direction is the
+        // normalized position with its Y negated, the colour caps at 0x80 and
+        // the 12-bit ambient converts with the reference's `* 255 / 4096`.
+        let lua = mlua::Lua::new();
+        let table: Table = lua
+            .load(
+                "return { ambient = 0xFFF, sources = { \
+                 { pos = { 100, 100, 100 }, color = { 0xFF, 0xFF, 0xFF } } } }",
+            )
+            .eval()
+            .unwrap();
+        let light = light(&table).unwrap();
+        assert_eq!(light.ambient, [254.0; 3]);
+        assert_eq!(light.sources[0].dir, [2364, -2364, 2364]);
+        assert_eq!(light.sources[0].color, [0x80; 3]);
+        // The unset slots stay dark.
+        assert!(light.sources[1..].iter().all(|s| s.color == [0; 3]));
+    }
+
+    #[test]
+    fn a_joint_chain_starts_at_its_root_joint() {
+        let lua = mlua::Lua::new();
+        let joints: Table = lua
+            .load("return { { rx = 0x95C, ty = 500 }, { rz = 0x120 } }")
+            .eval()
+            .unwrap();
+        let root = Mat4x3 {
+            r: anim::rotation_matrix(0x95C, 0, 0),
+            t: [0, 500, 0],
+        };
+        let spin = Mat4x3 {
+            r: anim::rotation_matrix(0, 0, 0x120),
+            t: [0; 3],
+        };
+        let expected = anim::compose(&root, &spin);
+        let actual = joint_matrix(Some(joints)).unwrap();
+        assert_eq!((actual.r, actual.t), (expected.r, expected.t));
+    }
 }
