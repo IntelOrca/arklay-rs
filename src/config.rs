@@ -31,6 +31,8 @@
 //! display = 1            # the display to open on, from 1
 //! render_scale = 100     # GPU: the 3D scene's size, % of the viewport (25..400)
 //! msaa = 1               # GPU: the 3D scene's samples per pixel (1, 2, 4, 8)
+//! frame_rate = 30        # presented frames per second (30..1000); the game
+//!                        # still runs at 30 Hz and higher rates tween
 //!
 //! # Discovered mods (the game pack's sibling `mods/` and `<config dir>/mods`).
 //! # `enabled` narrows the discovered set when present; `disabled` always
@@ -340,6 +342,12 @@ impl Config {
         })
     }
 
+    /// Persist `[graphics] frame_rate` into the file at `path`, keeping its
+    /// other keys. Rewritten like [`Config::save_bindings`].
+    pub fn save_frame_rate(path: &Path, frame_rate: u32) -> Result<()> {
+        Self::update(path, |config| config.graphics.frame_rate = frame_rate)
+    }
+
     /// Read the file at `path` (a missing one is empty), apply `change` and
     /// write it back in its canonical form. A file that does not parse is
     /// left alone and reported.
@@ -504,6 +512,9 @@ fn parse_graphics_key(graphics: &mut Graphics, key: &str, value: &str, line: usi
             }
             graphics.msaa = samples;
         }
+        "frame_rate" => {
+            graphics.frame_rate = integer(video::MIN_FRAME_RATE..=video::MAX_FRAME_RATE)?
+        }
         other => bail!("line {line}: unknown key `{other}`"),
     }
     Ok(())
@@ -545,6 +556,7 @@ fn render_graphics(graphics: &Graphics) -> String {
         ("display", graphics.display, defaults.display),
         ("render_scale", graphics.render_scale, defaults.render_scale),
         ("msaa", graphics.msaa, defaults.msaa),
+        ("frame_rate", graphics.frame_rate, defaults.frame_rate),
     ] {
         if value != default {
             out.push_str(&format!("{key} = {value}\n"));
@@ -881,7 +893,8 @@ mod tests {
              window_height = 1024\n\
              display = 2\n\
              render_scale = 150\n\
-             msaa = 4\n",
+             msaa = 4\n\
+             frame_rate = 75\n",
         )
         .unwrap();
         assert_eq!(
@@ -894,6 +907,7 @@ mod tests {
                 display: 2,
                 render_scale: 150,
                 msaa: 4,
+                frame_rate: 75,
             }
         );
         let text = config.render();
@@ -918,6 +932,8 @@ mod tests {
             "[graphics]\ndisplay = 0\n",
             "[graphics]\nrender_scale = 10\n",
             "[graphics]\nmsaa = 3\n",
+            "[graphics]\nframe_rate = 29\n",
+            "[graphics]\nframe_rate = 1001\n",
             "[graphics]\nvsync = true\n",
             "[graphics]\nmsaa = 1\nmsaa = 2\n",
             "[graphics]\n[graphics]\n",
@@ -1028,6 +1044,7 @@ mod tests {
             display: 2,
             render_scale: 200,
             msaa: 8,
+            frame_rate: 120,
         };
         Config::save_window(&path, &run).unwrap();
         let (saved, warnings) = Config::load(&path);
@@ -1045,6 +1062,23 @@ mod tests {
             },
             "only the window keys are written"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_the_frame_rate_keeps_the_other_keys() {
+        let dir = std::env::temp_dir().join(format!("arklay-config-{}-rate", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "[graphics]\nmsaa = 4\n").unwrap();
+        Config::save_frame_rate(&path, 144).unwrap();
+        let (saved, warnings) = Config::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!((saved.graphics.msaa, saved.graphics.frame_rate), (4, 144));
+        // The default rate is not written.
+        Config::save_frame_rate(&path, 30).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[graphics]\nmsaa = 4\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

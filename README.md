@@ -118,8 +118,15 @@ cargo run -- re1.akpak --ending 1
 
 # Frame-time report for a 600-tick room run: per-tick min/avg/p95/max, the
 # load/update/effect/render phase totals and the entity/effect high-water
-# marks. Needs no --capture; the budgets live in docs/performance.md
+# marks. Needs no --capture; the budgets live in docs/performance.md. Adding
+# --frame-rate 120 also times the frames a 120 fps display would draw between
+# the ticks against the per-frame budget
 cargo run -- re1.akpak --room 100 --ticks 600 --stats
+
+# Present 120 frames per second (the simulation stays at 30 Hz; the scene is
+# drawn between ticks). With --stats and no --ticks the room is played in the
+# window and the actual presented rate is printed when it closes
+cargo run -- re1.akpak --room 100 --frame-rate 120 --stats
 
 # Draw the 3D scene on the GPU (SDL_GPU over Vulkan) at the window's
 # resolution, here at 150% of it with 4x MSAA; falls back to software without
@@ -128,9 +135,9 @@ cargo run -- re1.akpak --renderer gpu --render-scale 150 --msaa 4
 
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
-# CLEAR GAME, CONTROLS). Confirm opens a tool, Esc backs out one level, F1 closes
-# from anywhere and reopening returns to the same tool. `--ui debug` captures
-# the tool list
+# CLEAR GAME, CONTROLS, DISPLAY). Confirm opens a tool, Esc backs out one
+# level, F1 closes from anywhere and reopening returns to the same tool.
+# `--ui debug` captures the tool list
 cargo run -- re1.akpak --room 100
 cargo run -- re1.akpak --ui debug --capture debug.bmp
 ```
@@ -279,7 +286,19 @@ window_height = 720 # of 320x240); a window too big for its display shrinks
 display = 1        # the display to open on, numbered from 1
 render_scale = 100 # GPU only: the 3D scene's resolution, % of the screen area it fills (25..400)
 msaa = 4           # GPU only: anti-aliasing samples per pixel (1, 2, 4 or 8)
+frame_rate = 120   # presented frames per second, 30..1000 (default 30)
 ```
+
+`frame_rate` only changes presentation: the game always simulates at the
+original's 30 Hz, so input timing, scripts and traces are identical at every
+rate. Above 30 each frame draws the characters, objects, shadows, effect
+sprites and room fades between the last two ticks (one tick behind, like any
+interpolation); camera cuts, room loads, teleports, door transitions, films
+and the 2D screens snap. Any rate from 30 to 1000 is accepted, though vsync
+caps it at the display's refresh rate; the title, menus and door transitions,
+which tick every 16 ms, present once per tick (about 62 fps) at any rate below
+that. The F1 menu's DISPLAY tool steps it through 30,
+60, 120, 144, 165 and 240 and saves the choice.
 
 The GPU renderer draws its 3D scene at the size the frame fills on screen, so
 `render_scale` above 100 supersamples and below 100 trades sharpness for

@@ -2,8 +2,8 @@
 //!
 //! This is a development aid the retail game never shipped. F1 while playing
 //! freezes the room and opens a tool list: ROOM SELECT, INVENTORY, PLAYER,
-//! FLAGS, CHEATS, SAVE, ITEM BOX, CLEAR GAME and CONTROLS (the input rebind
-//! screen). Up/down move the cursor,
+//! FLAGS, CHEATS, SAVE, ITEM BOX, CLEAR GAME, CONTROLS (the input rebind
+//! screen) and DISPLAY (the presented frame rate). Up/down move the cursor,
 //! confirm enters a tool, cancel backs out one level (tool, main list, closed)
 //! and F1 closes the menu from anywhere. The menu is always available
 //! (`--debug-menu` is accepted for compatibility only).
@@ -43,6 +43,7 @@ use crate::state::RoomId;
 use crate::text::Text;
 use crate::ui::UiInput;
 use crate::ui::main_menu::{self, MenuAssets};
+use crate::video;
 
 /// One text row's height in pixels (the font's glyph height).
 const ROW_HEIGHT: i32 = font::GLYPH_HEIGHT;
@@ -80,6 +81,9 @@ pub enum DebugMenuEvent {
     ClearGame(u8),
     /// The CONTROLS tool changed the bindings; the menu stays open.
     BindingsChanged,
+    /// The DISPLAY tool picked this presented frame rate; the menu stays
+    /// open.
+    FrameRateChanged(u32),
 }
 
 /// The main list's tools, in order.
@@ -103,10 +107,12 @@ pub enum Tool {
     ClearGame,
     /// The input rebind screen.
     Controls,
+    /// The display options (the presented frame rate).
+    Display,
 }
 
 /// The main list, in order.
-pub const TOOLS: [Tool; 9] = [
+pub const TOOLS: [Tool; 10] = [
     Tool::Rooms,
     Tool::Inventory,
     Tool::Player,
@@ -116,6 +122,7 @@ pub const TOOLS: [Tool; 9] = [
     Tool::ItemBox,
     Tool::ClearGame,
     Tool::Controls,
+    Tool::Display,
 ];
 
 impl Tool {
@@ -131,6 +138,7 @@ impl Tool {
             Tool::ItemBox => "UI_DEBUG_TOOL_ITEM_BOX",
             Tool::ClearGame => "UI_DEBUG_TOOL_CLEAR_GAME",
             Tool::Controls => "UI_DEBUG_TOOL_CONTROLS",
+            Tool::Display => "UI_DEBUG_TOOL_DISPLAY",
         }
     }
 
@@ -142,6 +150,7 @@ impl Tool {
             Tool::Player => ["UI_DEBUG_HINT_PLAYER_1", "UI_DEBUG_HINT_PLAYER_2"],
             Tool::Flags => ["UI_DEBUG_HINT_FLAGS_1", "UI_DEBUG_HINT_FLAGS_2"],
             Tool::Controls => ["UI_DEBUG_HINT_CONTROLS_1", "UI_DEBUG_HINT_CONTROLS_2"],
+            Tool::Display => ["UI_DEBUG_HINT_DISPLAY_1", "UI_DEBUG_HINT_DISPLAY_2"],
             Tool::Cheats | Tool::Save | Tool::ItemBox | Tool::ClearGame => {
                 ["UI_DEBUG_HINT_SELECT_1", "UI_DEBUG_HINT_SELECT_2"]
             }
@@ -222,6 +231,8 @@ pub struct DebugMenu {
     save_row: usize,
     ending_row: usize,
     controls: ControlsEditor,
+    /// The presented frame rate the DISPLAY tool shows and steps.
+    frame_rate: u32,
 }
 
 impl DebugMenu {
@@ -239,7 +250,18 @@ impl DebugMenu {
             save_row: 0,
             ending_row: usize::from(default_ending(game).clamp(1, 7) - 1),
             controls: ControlsEditor::new(bindings),
+            frame_rate: video::TICK_RATE,
         }
+    }
+
+    /// Show the window's current presented frame rate in the DISPLAY tool.
+    pub fn set_frame_rate(&mut self, frame_rate: u32) {
+        self.frame_rate = frame_rate;
+    }
+
+    /// The DISPLAY tool's frame rate.
+    pub fn frame_rate(&self) -> u32 {
+        self.frame_rate
     }
 
     /// Reattach the menu to the live session after it was closed: the open
@@ -309,6 +331,7 @@ impl DebugMenu {
                 (step, false) => step,
                 (_, true) => Step::Event(DebugMenuEvent::BindingsChanged),
             },
+            Tool::Display => self.handle_display(input),
         };
         match step {
             Step::Stay => DebugMenuEvent::None,
@@ -366,6 +389,24 @@ impl DebugMenu {
         }
         game.debug.pending_player = (choice != current).then_some(choice);
         Step::Stay
+    }
+
+    /// DISPLAY: left/right step the frame rate through
+    /// [`video::FRAME_RATE_PRESETS`] (confirm steps up); each change applies
+    /// at once and is saved to `arklay.toml` by the engine.
+    fn handle_display(&mut self, input: UiInput) -> Step {
+        if input.cancel {
+            return Step::Back;
+        }
+        let delta = if input.left {
+            -1
+        } else if input.right || input.confirm {
+            1
+        } else {
+            return Step::Stay;
+        };
+        self.frame_rate = video::step_frame_rate(self.frame_rate, delta);
+        Step::Event(DebugMenuEvent::FrameRateChanged(self.frame_rate))
     }
 
     /// CHEATS: up/down pick the row, left/right/confirm toggle it.
@@ -463,6 +504,7 @@ impl DebugMenu {
             Some(Tool::Save) => draw_list(&mut pen, &SAVE_ROWS, self.save_row),
             Some(Tool::ClearGame) => self.draw_clear(&mut pen, game),
             Some(Tool::Controls) => self.controls.draw(&mut pen),
+            Some(Tool::Display) => self.draw_display(&mut pen),
             Some(Tool::ItemBox) => {}
         }
         for (line, key) in hints.iter().enumerate() {
@@ -514,6 +556,36 @@ impl DebugMenu {
         pen.fit(
             TEXT_LEFT,
             BODY_Y + 3 * ROW_HEIGHT,
+            Tint::Grey,
+            note,
+            PANEL_RIGHT - TEXT_LEFT,
+        );
+    }
+
+    fn draw_display(&self, pen: &mut Pen) {
+        let value_x = TEXT_LEFT + 12 * pen.font.metrics.glyph_w;
+        pen.cursor(TEXT_LEFT - 16, BODY_Y);
+        pen.bytes(
+            TEXT_LEFT,
+            BODY_Y,
+            Tint::White,
+            pen.text.ui("UI_DEBUG_DISPLAY_FRAME_RATE"),
+        );
+        pen.ascii(
+            value_x,
+            BODY_Y,
+            Tint::Yellow,
+            &format!("{}", self.frame_rate),
+        );
+        let note = if self.frame_rate > video::TICK_RATE {
+            "UI_DEBUG_DISPLAY_TWEENED"
+        } else {
+            "UI_DEBUG_DISPLAY_NATIVE"
+        };
+        let note = pen.text.ui(note);
+        pen.fit(
+            TEXT_LEFT,
+            BODY_Y + 2 * ROW_HEIGHT,
             Tint::Grey,
             note,
             PANEL_RIGHT - TEXT_LEFT,
@@ -717,7 +789,7 @@ mod tests {
         let mut menu = menu(&game);
         assert_eq!(menu.tool(), None);
         menu.handle_input(up(), &mut game);
-        assert_eq!(TOOLS[menu.main_cursor()], Tool::Controls, "up wraps");
+        assert_eq!(TOOLS[menu.main_cursor()], Tool::Display, "up wraps");
         menu.handle_input(down(), &mut game);
         assert_eq!(menu.main_cursor(), 0);
         for tool in TOOLS {
@@ -737,6 +809,34 @@ mod tests {
             menu.handle_input(cancel(), &mut game),
             DebugMenuEvent::Close
         );
+    }
+
+    #[test]
+    fn display_steps_the_frame_rate_and_stays_open() {
+        let mut game = GameState::default();
+        let mut menu = menu(&game);
+        menu.set_frame_rate(60);
+        assert_eq!(
+            enter(&mut menu, &mut game, Tool::Display),
+            DebugMenuEvent::None
+        );
+        assert_eq!(
+            menu.handle_input(right(), &mut game),
+            DebugMenuEvent::FrameRateChanged(120)
+        );
+        assert_eq!(
+            menu.handle_input(confirm(), &mut game),
+            DebugMenuEvent::FrameRateChanged(144)
+        );
+        assert_eq!(
+            menu.handle_input(left(), &mut game),
+            DebugMenuEvent::FrameRateChanged(120)
+        );
+        assert_eq!(menu.handle_input(up(), &mut game), DebugMenuEvent::None);
+        assert_eq!(menu.frame_rate(), 120);
+        assert_eq!(menu.tool(), Some(Tool::Display));
+        assert_eq!(menu.handle_input(cancel(), &mut game), DebugMenuEvent::None);
+        assert_eq!(menu.tool(), None);
     }
 
     #[test]

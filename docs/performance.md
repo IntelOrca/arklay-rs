@@ -29,6 +29,7 @@ these numbers exclude the interactive mixer and presentation costs.
 | One capture render | 2.9-3.7 ms | 30 ms | ~8x |
 | Script/entity/player update, 600 ticks | 8.7-13.6 ms (2026-10-16) | 25 ms | ~2x |
 | Effect update, 600 ticks | 0.24-0.31 ms | not asserted | - |
+| Presented frame at `--frame-rate 120` (software, tweened) | avg 0.7-3.2 ms, max <= 5.6 ms on rooms 101, 105, 106, 203, 30B, 50F (2026-10-19, XPS 15) | 8.3 ms (1/120 s) | ~1.5x worst case |
 | 600-tick room run, process start and pack open included | 318-524 ms | 5 s | ~10x |
 | Full-game soak, one pass | 394.1 / 395.8 / 393.1 s | 900 s | ~2.3x |
 | Full-game soak, all three passes | 1183.0 s | - | - |
@@ -55,6 +56,14 @@ opcode dispatched is the documented `0x05` flag-bank fallback. The soak's live
 bytes are exactly the pack's own allocation after every pass (727.1 MiB,
 measured with the pre-zstd pack image), so the three-pass check sees no drift
 at all on the reference machine.
+
+The `stats render` line times presented frames. Headless, it appears only
+with `--frame-rate` (never from the config, so the 600-tick rows above are
+unaffected) and times the frames a display at that rate would draw between
+the ticks; interactively (`--stats` without `--ticks`), it times the frames
+actually presented at the configured `frame_rate`, with the measured rate. `over`
+counts frames that missed the `1 / frame_rate` budget. A frame's time is the
+draw alone, not the vsync wait.
 
 The p95 is the upper edge of a power-of-two microsecond histogram bucket
 (`src/stats.rs`), clamped between the mean and the maximum. A tick p95 below

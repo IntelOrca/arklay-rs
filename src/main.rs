@@ -172,10 +172,14 @@ struct Cli {
     #[arg(long, value_name = "DIR", requires = "pack")]
     capture_dir: Option<PathBuf>,
 
-    /// Print a frame-time report after the run: per-tick min/avg/p95/max, the
-    /// load/update/effect/render phase totals and the entity/effect high-water
-    /// marks. Requires `--ticks`; a `--capture` is not needed.
-    #[arg(long, requires = "ticks", conflicts_with_all = ["ui", "ending", "fmv"])]
+    /// Print a frame-time report after the run. With `--ticks` the run is
+    /// headless: per-tick min/avg/p95/max, the load/update/effect/render phase
+    /// totals and the entity/effect high-water marks (with `--frame-rate`,
+    /// also the draw time of the frames a display at that rate would present
+    /// against its per-frame budget); a `--capture` is not needed. Without `--ticks` the room is
+    /// played in the window and the actual presented frame rate and draw times
+    /// are printed when it closes
+    #[arg(long, conflicts_with_all = ["ui", "ending", "fmv"])]
     stats: bool,
 
     /// Renderer for the interactive window's gameplay scene (default: the
@@ -209,6 +213,17 @@ struct Cli {
         value_parser = parse_msaa
     )]
     msaa: Option<u32>,
+
+    /// Presented frames per second, 30 to 1000 (default: the config's `[graphics]
+    /// frame_rate`, else 30). The simulation always ticks at 30 Hz; a higher
+    /// rate draws the scene between ticks
+    #[arg(
+        long,
+        value_name = "FPS",
+        requires = "pack",
+        value_parser = clap::value_parser!(u32).range(i64::from(arklay::video::MIN_FRAME_RATE)..=i64::from(arklay::video::MAX_FRAME_RATE))
+    )]
+    frame_rate: Option<u32>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -628,6 +643,7 @@ fn main() -> Result<()> {
             }
             renderer.render_scale = cli.render_scale.unwrap_or(renderer.render_scale);
             renderer.msaa = cli.msaa.unwrap_or(renderer.msaa);
+            renderer.frame_rate = cli.frame_rate.unwrap_or(renderer.frame_rate);
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
                 && ((screen != "game" && screen != "demo") || !tracing)
@@ -698,6 +714,7 @@ fn main() -> Result<()> {
                 setup_script: cli.setup_script.as_deref(),
                 save_out: cli.save_out.as_deref(),
                 renderer,
+                stats_frame_rate: cli.frame_rate,
             };
             let save_dir = cli
                 .save_dir

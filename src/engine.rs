@@ -79,7 +79,7 @@ use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_SCALEMODE_PIXELART,
     SDL_Surface,
 };
-use sdl3_sys::timer::SDL_GetTicks;
+use sdl3_sys::timer::{SDL_DelayNS, SDL_GetTicksNS};
 use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_DisplayID, SDL_GetDisplayForWindow,
     SDL_GetDisplayUsableBounds, SDL_GetDisplays, SDL_GetPrimaryDisplay, SDL_GetWindowBordersSize,
@@ -110,6 +110,7 @@ use crate::message::MessageInput;
 use crate::model::{Clip, Emd};
 use crate::movie::{self, MovieSession, MovieTick};
 use crate::objects;
+use crate::pacer::{FramePacer, Pace};
 use crate::pack::{AssetClass, LayerOptions, ModLayer, Pack};
 use crate::player;
 use crate::player_script;
@@ -126,6 +127,7 @@ use crate::stats;
 use crate::text::Text;
 use crate::trace;
 use crate::transition::{self, DoorStepper};
+use crate::tween::{self, Tween};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
@@ -271,6 +273,11 @@ pub struct Authoring<'a> {
     /// The `[graphics]` options with `--renderer`, `--render-scale` and
     /// `--msaa` applied: the interactive window and what it draws with.
     pub renderer: Graphics,
+    /// `--frame-rate` as given on the command line: a headless `--stats`
+    /// run also draws and times the frames a display at this rate would
+    /// present. Never taken from the config, so the report does not depend
+    /// on the machine's settings.
+    pub stats_frame_rate: Option<u32>,
 }
 
 /// Load `id` from `pack`, simulate it and optionally capture one frame.
@@ -326,7 +333,11 @@ pub fn run_with_options(
     let save_dir = save::default_save_dir();
     let pack = open_game_pack(pack, mods, language)?;
 
-    if capture.is_some() || stats || trace.path.is_some() || authoring.save_out.is_some() {
+    if capture.is_some()
+        || (stats && ticks > 0)
+        || trace.path.is_some()
+        || authoring.save_out.is_some()
+    {
         let mut timings = stats::Stats::new();
         let load_start = Instant::now();
         let mut loaded = load_room(&pack, id)?;
@@ -367,6 +378,12 @@ pub fn run_with_options(
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
         let mut framebuffer = Framebuffer::new();
+        // `--stats --frame-rate` also draws the frames a display at that rate
+        // would present between the ticks, off to the side of the simulation.
+        let mut presentation = authoring
+            .stats_frame_rate
+            .filter(|_| stats)
+            .map(Presentation::new);
         if ticks > 0 {
             let scripts = Rc::new(loaded.scripts.clone());
             let mut command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
@@ -461,6 +478,18 @@ pub fn run_with_options(
                 }
                 timings.record_tick(tick_start.elapsed());
                 timings.observe_high_water(active_entities(&game), game.effects.active_count());
+                if let Some(presentation) = presentation.as_mut() {
+                    presentation.tick(
+                        &pack,
+                        &loaded,
+                        &player_state,
+                        &mut game,
+                        &mut npc_models,
+                        &mut masks,
+                        &mut shadows,
+                        &mut effect_pages,
+                    );
+                }
                 // The room boot path arms no room-entry fade (that is a
                 // session behaviour), so the trace reports the port's inactive
                 // fade: step 0, accumulator -1.
@@ -538,6 +567,7 @@ pub fn run_with_options(
             display.capture(capture_path)?;
         }
         if stats {
+            timings.render = presentation.map(|presentation| presentation.render);
             let stdout = std::io::stdout();
             let mut out = stdout.lock();
             timings.report(&mut out)?;
@@ -554,7 +584,88 @@ pub fn run_with_options(
     );
     let mut display = Display::new(&title, false, authoring.renderer)?;
     session.start_audio(&pack);
-    run_session_loop(&pack, &mut session, &mut display)
+    run_session_loop(&pack, &mut session, &mut display, stats)
+}
+
+/// The presentation frames of a headless `--stats` run: after each tick, the
+/// frames a display presenting `frame_rate` frames per second would draw
+/// before the next one (one exact frame per tick at or below the tick rate,
+/// tweened frames above it, as [`crate::pacer`] schedules them), each timed
+/// against the per-frame budget. They are drawn into their own framebuffer and
+/// the player's exact joints are restored afterwards, so the simulation, the
+/// trace and the capture never see them.
+struct Presentation {
+    tween: Tween,
+    render: stats::RenderStats,
+    framebuffer: Framebuffer,
+    ticks: u64,
+}
+
+impl Presentation {
+    fn new(frame_rate: u32) -> Self {
+        Self {
+            tween: Tween::default(),
+            render: stats::RenderStats::new(frame_rate),
+            framebuffer: Framebuffer::new(),
+            ticks: 0,
+        }
+    }
+
+    /// The tween positions of the frames presented between tick `tick` and
+    /// the next: frame `m` is presented at `m / frame_rate` seconds, between
+    /// ticks `n` and `n + 1` at `alpha = m * TICK_RATE / frame_rate - n`.
+    fn alphas(frame_rate: u32, tick: u64) -> Vec<Option<f32>> {
+        let rate = u64::from(frame_rate.max(1));
+        let ticks = u64::from(video::TICK_RATE);
+        if rate <= ticks {
+            return vec![None];
+        }
+        let first = (tick * rate).div_ceil(ticks);
+        let end = ((tick + 1) * rate).div_ceil(ticks);
+        (first..end)
+            .map(|frame| Some(((frame * ticks) as f64 / rate as f64 - tick as f64) as f32))
+            .collect()
+    }
+
+    /// Draw and time this tick's presentation frames.
+    #[allow(clippy::too_many_arguments)]
+    fn tick(
+        &mut self,
+        pack: &Pack,
+        loaded: &LoadedRoom,
+        player_state: &player::PlayerState,
+        game: &mut game::GameState,
+        npc_models: &mut enemy::EntityModelCache,
+        masks: &mut MaskCache,
+        shadows: &mut ShadowCache,
+        effect_cache: &mut EffectPageCache,
+    ) {
+        self.tween.advance();
+        let exact_joints = game.joint_worlds[0].clone();
+        for alpha in Self::alphas(self.render.frame_rate, self.ticks) {
+            self.tween.set_alpha(alpha);
+            let start = Instant::now();
+            render_frame_on(
+                &mut self.framebuffer,
+                None,
+                pack,
+                loaded.id,
+                &loaded.room,
+                player_state,
+                game,
+                loaded.player_assets.as_ref(),
+                npc_models,
+                masks,
+                shadows,
+                effect_cache,
+                &mut self.tween,
+            );
+            self.render.record_frame(start.elapsed());
+        }
+        game.joint_worlds[0] = exact_joints;
+        self.ticks += 1;
+        self.render.elapsed = std::time::Duration::from_secs(self.ticks) / video::TICK_RATE;
+    }
 }
 
 /// Number of active entity slots, slot 0 (the player) included.
@@ -757,18 +868,108 @@ fn session_tick_interval(transition_active: bool, menu_active: bool) -> f64 {
     }
 }
 
-/// The interactive gameplay loop shared by `--room` and the app's Play mode.
-fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Display) -> Result<()> {
+/// The interactive loops' clock: wall time feeds the fixed-tick accumulator
+/// and a [`FramePacer`] decides when a frame is presented (see
+/// [`crate::pacer`]). Nothing here feeds the simulation but the accumulator.
+struct LoopClock {
+    last_ns: u64,
+    /// Unspent wall time since the last tick, in milliseconds.
+    accumulator: f64,
+    pacer: FramePacer,
+    /// `--stats`: the presented frames and when the loop started.
+    render: Option<(stats::RenderStats, u64)>,
+}
+
+impl LoopClock {
+    /// The longest stretch of wall time one pass catches up, in milliseconds.
+    const MAX_CATCH_UP_MS: f64 = 250.0;
+
+    fn new(frame_rate: u32, stats: bool) -> Self {
+        let now = unsafe { SDL_GetTicksNS() };
+        Self {
+            last_ns: now,
+            accumulator: 0.0,
+            pacer: FramePacer::new(frame_rate),
+            render: stats.then(|| (stats::RenderStats::new(frame_rate), now)),
+        }
+    }
+
+    /// Add the wall time since the last pass to the accumulator.
+    fn advance(&mut self) {
+        let now = unsafe { SDL_GetTicksNS() };
+        self.accumulator += now.saturating_sub(self.last_ns) as f64 / 1e6;
+        self.last_ns = now;
+        if self.accumulator > Self::MAX_CATCH_UP_MS {
+            self.accumulator = Self::MAX_CATCH_UP_MS;
+        }
+    }
+
+    /// Spend one tick of `tick_ms` from the accumulator.
+    fn ticked(&mut self, tick_ms: f64) {
+        self.accumulator -= tick_ms;
+        self.pacer.ticked();
+    }
+
+    /// Whether to present now; `force` presents at once (exactly, without
+    /// tweening), for a pass that must be drawn before it is torn down.
+    fn pace(&mut self, tick_ms: f64, force: bool) -> Pace {
+        if force {
+            return self.pacer.force();
+        }
+        // Count the time the ticks just took, so a tweened frame's `alpha`
+        // is where the wall clock is now rather than where this pass began.
+        self.advance();
+        self.pacer.poll(self.last_ns, self.accumulator, tick_ms)
+    }
+
+    /// Change the presented frame rate.
+    fn set_rate(&mut self, rate: u32) {
+        self.pacer.set_rate(rate);
+        if let Some((render, _)) = &mut self.render {
+            render.frame_rate = rate.max(1);
+        }
+    }
+
+    /// `--stats`: record a frame drawn since `start`.
+    fn frame_drawn(&mut self, start: Instant) {
+        let Some((render, start_ns)) = &mut self.render else {
+            return;
+        };
+        render.record_frame(start.elapsed());
+        // The rate counts from the loop's start, so it is frames per second
+        // of wall time rather than of the span between the first and last.
+        let now = unsafe { SDL_GetTicksNS() };
+        render.elapsed = std::time::Duration::from_nanos(now.saturating_sub(*start_ns));
+    }
+
+    /// `--stats`: print the render-rate report.
+    fn report(&self) -> Result<()> {
+        if let Some((render, _)) = &self.render {
+            render.report(&mut std::io::stdout().lock())?;
+        }
+        Ok(())
+    }
+}
+
+/// The interactive gameplay loop shared by `--room` and the app's Play mode:
+/// fixed ticks from the latched input, frames presented at the display's
+/// `frame_rate` (tweened between the last two ticks above the tick rate).
+/// With `stats` the presented frames are reported at exit.
+fn run_session_loop(
+    pack: &Pack,
+    session: &mut GameSession,
+    display: &mut Display,
+    stats: bool,
+) -> Result<()> {
     let mut framebuffer = Framebuffer::new();
     let mut input = InputState::interactive();
     session.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
-    let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut accumulator = 0.0f64;
+    let mut clock = LoopClock::new(display.frame_rate(), stats);
     loop {
         let mut cut_delta = 0i32;
         if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
-            return Ok(());
+            return clock.report();
         }
         if cut_delta != 0 {
             session.step_camera_cut(cut_delta);
@@ -776,21 +977,21 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Displa
         if let Some(bindings) = session.take_bindings_change() {
             input.apply_bindings_change(bindings);
         }
+        if let Some(rate) = session.take_frame_rate_change() {
+            display.set_frame_rate(rate);
+            clock.set_rate(rate);
+        }
+        session.set_frame_rate(display.frame_rate());
         session.update_window_title(display.window)?;
 
-        let now = unsafe { SDL_GetTicks() };
-        accumulator += now.saturating_sub(last_ticks) as f64;
-        last_ticks = now;
-        if accumulator > 250.0 {
-            accumulator = 250.0;
-        }
-        // The film skip state advances on the render frame, not the gameplay
+        clock.advance();
+        // The film skip state advances on every loop pass, not the gameplay
         // tick, exactly like the original's platform-driven film update.
         session.poll_movie_skip(movie_buttons_held(input.held_word()));
         let tick_ms = session_tick_interval(session.transition.is_some(), session.room_frozen());
-        while accumulator >= tick_ms {
+        while clock.accumulator >= tick_ms {
             if session.transition_finished {
-                accumulator = 0.0;
+                clock.accumulator = 0.0;
                 break;
             }
             // Each fixed tick consumes its own latched press, so a frame that
@@ -804,19 +1005,32 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Displa
                 if session.transition.is_some() {
                     // The original drops the remainder of the frame's time
                     // when a door hands control to its transition phase.
-                    accumulator = 0.0;
+                    clock.ticked(tick_ms);
+                    clock.accumulator = 0.0;
                     break;
                 }
             }
-            accumulator -= tick_ms;
+            clock.ticked(tick_ms);
         }
 
-        // The pass that ends a transition is drawn once before teardown.
+        // The pass that ends a transition is drawn at once, before teardown.
+        let alpha = match clock.pace(tick_ms, session.transition_finished) {
+            Pace::Present { alpha } => alpha,
+            Pace::Wait(ns) => {
+                session.update_audio();
+                unsafe { SDL_DelayNS(ns) };
+                continue;
+            }
+        };
+        session.tween.set_alpha(alpha);
+        let draw = Instant::now();
         if let Some(gpu) = display.gpu() {
             session.render_layers(pack, gpu);
+            clock.frame_drawn(draw);
             display.present_layers(session.frame(), session.white_frame())?;
         } else {
             session.render(pack);
+            clock.frame_drawn(draw);
             framebuffer.copy_from(session.frame());
             display.present(&framebuffer)?;
         }
@@ -976,6 +1190,24 @@ impl Display {
         let path = crate::config::Config::default_path();
         if let Err(err) = crate::config::Config::save_window(&path, graphics) {
             eprintln!("warning: window settings not saved: {err:#}");
+        }
+    }
+
+    /// The presented frames per second (the tick rate for a capture).
+    fn frame_rate(&self) -> u32 {
+        self.graphics
+            .map_or(video::TICK_RATE, |graphics| graphics.frame_rate)
+    }
+
+    /// Change the frame rate from the options screen and persist it.
+    fn set_frame_rate(&mut self, rate: u32) {
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        graphics.frame_rate = rate;
+        let path = crate::config::Config::default_path();
+        if let Err(err) = crate::config::Config::save_frame_rate(&path, rate) {
+            eprintln!("warning: frame rate not saved: {err:#}");
         }
     }
 
@@ -1325,6 +1557,9 @@ struct GameSession {
     /// and by [`Self::tick_room_fade`] for the stepped frames, so the draw
     /// matches the reference while the traced state stays the post-step value.
     room_fade_draw: Option<transition::Overlay>,
+    /// The presentation cache that draws the scene between the last two
+    /// ticks when the render rate is above 30 fps (see [`crate::tween`]).
+    tween: Tween,
     /// The original's room-events gate (`g_message_flags & 0x80`) for a
     /// new-game boot: the boot's entry fade keeps the bit clear, so
     /// `room_events_check` does not step an event the room's init script
@@ -1363,6 +1598,10 @@ struct GameSession {
     /// The CONTROLS tool changed [`Self::bindings`]; taken once by the loop,
     /// which applies and persists them.
     bindings_changed: bool,
+    /// The window's presented frame rate, shown by the F1 DISPLAY tool.
+    frame_rate: u32,
+    /// The DISPLAY tool changed [`GameSession::frame_rate`].
+    frame_rate_changed: bool,
     /// The open F9 return-to-title prompt; the room stays frozen and the game
     /// sounds are paused while it is up.
     return_title: Option<ReturnTitlePrompt>,
@@ -1705,6 +1944,7 @@ impl GameSession {
             boot_message: None,
             room_fade: transition::Fade::inactive(),
             room_fade_draw: None,
+            tween: Tween::default(),
             room_boot_gate: false,
             room_boot_grace: false,
             room_boot_respawn: false,
@@ -1731,6 +1971,8 @@ impl GameSession {
             debug_menu_memory: None,
             bindings: controls::Bindings::default(),
             bindings_changed: false,
+            frame_rate: video::TICK_RATE,
+            frame_rate_changed: false,
             return_title: None,
             return_title_requested: false,
             load_slot_requested: None,
@@ -1873,6 +2115,7 @@ impl GameSession {
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        self.tween.advance();
         let result = self.tick_inner(pack, ui, input, action);
         // `main_loop` ramps the cutscene screen intensity in its draw phase,
         // after this frame's scripts, entities and message window have run, so
@@ -2880,6 +3123,16 @@ impl GameSession {
         self.bindings = bindings;
     }
 
+    /// The window's presented frame rate, for the F1 DISPLAY tool.
+    fn set_frame_rate(&mut self, frame_rate: u32) {
+        self.frame_rate = frame_rate;
+    }
+
+    /// Take the frame rate the DISPLAY tool picked, once.
+    fn take_frame_rate_change(&mut self) -> Option<u32> {
+        std::mem::take(&mut self.frame_rate_changed).then_some(self.frame_rate)
+    }
+
     /// Take the bindings the CONTROLS tool changed, once.
     fn take_bindings_change(&mut self) -> Option<controls::Bindings> {
         std::mem::take(&mut self.bindings_changed).then(|| self.bindings.clone())
@@ -2952,13 +3205,14 @@ impl GameSession {
     /// tool and cursors it was left on.
     fn open_debug_menu(&mut self, pack: &Pack) {
         self.ensure_menu_assets(pack);
-        let menu = match self.debug_menu_memory.take() {
+        let mut menu = match self.debug_menu_memory.take() {
             Some(mut menu) => {
                 menu.reopen(self.loaded.id, &self.game, &self.bindings);
                 menu
             }
             None => DebugMenu::open(pack, self.loaded.id, &self.game, &self.bindings),
         };
+        menu.set_frame_rate(self.frame_rate);
         self.debug_menu = Some(menu);
     }
 
@@ -3005,11 +3259,19 @@ impl GameSession {
             }
             return;
         }
+        if let DebugMenuEvent::FrameRateChanged(rate) = event {
+            self.frame_rate = rate;
+            self.frame_rate_changed = true;
+            return;
+        }
         if event != DebugMenuEvent::None {
             self.debug_menu_memory = self.debug_menu.take();
         }
         match event {
-            DebugMenuEvent::None | DebugMenuEvent::Close | DebugMenuEvent::BindingsChanged => {}
+            DebugMenuEvent::None
+            | DebugMenuEvent::Close
+            | DebugMenuEvent::BindingsChanged
+            | DebugMenuEvent::FrameRateChanged(_) => {}
             DebugMenuEvent::Jump(target) => {
                 if let Err(err) = self.debug_jump(pack, target)
                     && self.debug_failed.insert(target.rdt_number())
@@ -3046,6 +3308,7 @@ impl GameSession {
         let from = self.loaded.id;
         let loaded = load_room(pack, target)?;
         self.loaded = loaded;
+        self.tween.reset();
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
@@ -3845,6 +4108,7 @@ impl GameSession {
     /// finished flag is held until [`GameSession::finish_transition`] drops
     /// the timeline after the frame was presented.
     fn tick_transition(&mut self, pack: &Pack, skip: bool) {
+        self.tween.advance();
         let Some(mut session) = self.transition.take() else {
             return;
         };
@@ -3891,6 +4155,9 @@ impl GameSession {
     fn finish_transition(&mut self, _pack: &Pack) {
         self.transition = None;
         self.transition_finished = false;
+        // A door back into the same room and cut must not tween from the
+        // pre-door poses.
+        self.tween.reset();
     }
 
     /// The tail of `room_transition_load` and `game_loop`'s return into
@@ -4059,7 +4326,7 @@ impl GameSession {
     /// Blend the room-entry fade over the frame just rendered, at the alpha the
     /// original draws (the pre-step accumulator value).
     fn draw_room_fade(&mut self) {
-        if let Some(overlay) = self.room_fade_draw {
+        if let Some(overlay) = self.tween.fade(self.room_fade_draw) {
             self.framebuffer.fade_to_black(overlay.alpha);
         }
     }
@@ -4415,6 +4682,7 @@ impl GameSession {
                         &mut self.masks,
                         &mut self.shadows,
                         &mut self.effect_pages,
+                        &mut self.tween,
                     );
                 }
             }
@@ -6234,10 +6502,45 @@ impl App {
     /// After presenting: tear down a finished transition, then feed the
     /// mixer.
     fn post_present(&mut self) {
+        if let Mode::Play(session) = &mut self.mode
+            && session.transition_finished
+        {
+            session.finish_transition(&self.pack);
+        }
+        self.update_audio();
+    }
+
+    /// Whether the playing session's door transition has finished and waits
+    /// for its last frame to be presented.
+    fn transition_finished(&self) -> bool {
+        matches!(&self.mode, Mode::Play(session) if session.transition_finished)
+    }
+
+    /// The tween position of the next drawn frame (see [`crate::tween`]).
+    fn set_tween_alpha(&mut self, alpha: Option<f32>) {
         if let Mode::Play(session) = &mut self.mode {
-            if session.transition_finished {
-                session.finish_transition(&self.pack);
-            }
+            session.tween.set_alpha(alpha);
+        }
+    }
+
+    /// Tell the playing session the window's presented frame rate.
+    fn set_frame_rate(&mut self, frame_rate: u32) {
+        if let Mode::Play(session) = &mut self.mode {
+            session.set_frame_rate(frame_rate);
+        }
+    }
+
+    /// A frame-rate change from the playing session's options screen.
+    fn take_frame_rate_change(&mut self) -> Option<u32> {
+        match &mut self.mode {
+            Mode::Play(session) => session.take_frame_rate_change(),
+            _ => None,
+        }
+    }
+
+    /// Feed the mixers.
+    fn update_audio(&mut self) {
+        if let Mode::Play(session) = &mut self.mode {
             session.update_audio();
         }
         // The UI screens' cue mixer streams independently of the gameplay one;
@@ -6738,14 +7041,13 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
 }
 
 /// The interactive app loop shared by `--ui` and the standalone `--fmv`
-/// playback: fixed 30 Hz ticks from the latched input, then one presented
-/// frame.
+/// playback: fixed ticks from the latched input, frames presented at the
+/// display's `frame_rate` like [`run_session_loop`].
 fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
     let mut input = InputState::interactive();
     app.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
-    let mut last_ticks = unsafe { SDL_GetTicks() };
-    let mut accumulator = 0.0f64;
+    let mut clock = LoopClock::new(display.frame_rate(), false);
     loop {
         let mut cut_delta = 0i32;
         if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
@@ -6757,25 +7059,34 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
         if let Some(bindings) = app.take_bindings_change() {
             input.apply_bindings_change(bindings);
         }
+        if let Some(rate) = app.take_frame_rate_change() {
+            display.set_frame_rate(rate);
+            clock.set_rate(rate);
+        }
+        app.set_frame_rate(display.frame_rate());
         app.update_window_title(display.window)?;
 
-        let now = unsafe { SDL_GetTicks() };
-        accumulator += now.saturating_sub(last_ticks) as f64;
-        last_ticks = now;
-        if accumulator > 250.0 {
-            accumulator = 250.0;
-        }
-        // The film skip state advances on the render frame, not the fixed
+        clock.advance();
+        // The film skip state advances on every loop pass, not the fixed
         // tick, exactly like the original's platform-driven film update.
         app.poll_movie_skip(movie_buttons_held(input.held_word()));
         let tick_ms = app.tick_interval();
-        while accumulator >= tick_ms {
+        while clock.accumulator >= tick_ms {
             let tick = input.tick();
             if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
                 return Ok(());
             }
-            accumulator -= tick_ms;
+            clock.ticked(tick_ms);
         }
+        let alpha = match clock.pace(tick_ms, app.transition_finished()) {
+            Pace::Present { alpha } => alpha,
+            Pace::Wait(ns) => {
+                app.update_audio();
+                unsafe { SDL_DelayNS(ns) };
+                continue;
+            }
+        };
+        app.set_tween_alpha(alpha);
         if let Some(gpu) = display.gpu() {
             app.draw_layers(gpu);
             display.present_layers(app.frame(), app.white_frame())?;
@@ -9183,13 +9494,16 @@ const ROOM_LESSON: u8 = 0x0C;
 ///
 /// Slots are visited 63 down to 0, the original's submission order, so equal
 /// depth keys resolve in the stable sort exactly like the original's ordering
-/// table.
+/// table. Each billboard is drawn between the previous tick's rectangle and
+/// this one's by `tween` (the shake is added after the blend, since it
+/// snaps).
 fn build_effect_quads(
     game: &game::GameState,
     room: &RoomState,
     id: RoomId,
     camera: &Camera,
     pages: &EffectPages,
+    tween: &mut Tween,
 ) -> Vec<EffectQuad> {
     let mut quads = Vec::new();
     let stage = usize::from(id.stage_index());
@@ -9320,13 +9634,23 @@ fn build_effect_quads(
             .wrapping_mul(0x40)
             .wrapping_sub(scale_y as u32);
 
+        let uv = [effect.uv[0], tex_v, effect.uv[2], effect.uv[3]];
+        let mut pos = [left - camera.screen[0], top - camera.screen[1]];
+        let mut size = [right - left, bottom - top];
+        let spawn = [
+            i32::from(effect.anim_id) << 8 | i32::from(effect.effect_type),
+            effect.spawn_pos[0],
+            effect.spawn_pos[1],
+            effect.spawn_pos[2],
+        ];
+        tween.billboard(index, spawn, uv, &mut pos, &mut size);
         quads.push(EffectQuad {
             key,
             page: quad_page,
-            uv: [effect.uv[0], tex_v, effect.uv[2], effect.uv[3]],
+            uv,
             source: effect.size,
-            pos: [left, top],
-            size: [right - left, bottom - top],
+            pos: [pos[0] + camera.screen[0], pos[1] + camera.screen[1]],
+            size,
             tint,
             blend,
         });
@@ -10565,7 +10889,8 @@ fn store_player_joint_worlds(
     }
 }
 
-/// The room objects to submit for `camera`, in declared slot order.
+/// The room objects to submit for `camera`, in declared slot order, each
+/// with its slot.
 ///
 /// A record is visible while its active bit is set, its declared pair decoded
 /// into the room's asset table, and its switch-zone probe point inside the
@@ -10582,6 +10907,7 @@ fn visible_objects<'a>(
     &'a objects::ObjectAsset,
     &'a objects::ObjectRecord,
     anim::Mat4x3,
+    usize,
 )> {
     let mut visible = Vec::new();
     for (slot, record) in objects.records.iter().enumerate() {
@@ -10610,7 +10936,7 @@ fn visible_objects<'a>(
         if room.stage == 3 && room.room == 0x03 && (1..5).contains(&(record.model & 0x3F)) {
             world.t[2] += 1000;
         }
-        visible.push((asset, record, world));
+        visible.push((asset, record, world, slot));
     }
     visible
 }
@@ -10633,6 +10959,7 @@ fn visible_items<'a>(
     &'a objects::ObjectAsset,
     &'a objects::ItemRecord,
     anim::Mat4x3,
+    usize,
 )> {
     let mut visible = Vec::new();
     for (slot, record) in items.records.iter().enumerate() {
@@ -10651,7 +10978,7 @@ fn visible_items<'a>(
         if !enemy::in_camera_zone(room, camera, world.t) {
             continue;
         }
-        visible.push((asset, record, world));
+        visible.push((asset, record, world, slot));
     }
     visible
 }
@@ -10805,6 +11132,7 @@ fn render_frame(
         masks,
         shadows,
         effect_cache,
+        &mut Tween::default(),
     );
 }
 
@@ -10829,11 +11157,15 @@ fn render_frame_on(
     masks: &mut MaskCache,
     shadows: &mut ShadowCache,
     effect_cache: &mut EffectPageCache,
+    tween: &mut Tween,
 ) -> bool {
     let Some(cut) = room.cuts.get(room.current_cut) else {
         framebuffer.clear();
         return false;
     };
+    // Every moving thing below is recorded exactly and drawn between the
+    // previous tick and this one (a no-op unless the render rate tweens).
+    tween.begin(id, room.current_cut);
     // The frame's screen shake, rolled by `roll_screen_shake` at the top of the
     // gameplay tick. It shifts the camera projection and the background's
     // display origin; the room's view matrix stays untouched.
@@ -10873,14 +11205,17 @@ fn render_frame_on(
         // The quad sits at the player's `pushVelocity` offset and `posY`, which
         // only the stairway moves away from the entity's own point.
         let pos = player_state.pos;
+        let mut shadow_pos = [
+            pos[0] + player_state.shadow_offset[0],
+            player_state.stairs_floor.unwrap_or(pos[1]),
+            pos[2] + player_state.shadow_offset[1],
+        ];
+        let mut shadow_angle = player_state.angle;
+        tween.shadow(tween::Key::Player, &mut shadow_pos, &mut shadow_angle);
         shadow_list.push(render::Shadow {
             texture,
-            pos: [
-                pos[0] + player_state.shadow_offset[0],
-                player_state.stairs_floor.unwrap_or(pos[1]),
-                pos[2] + player_state.shadow_offset[1],
-            ],
-            angle: player_state.angle,
+            pos: shadow_pos,
+            angle: shadow_angle,
             half_x: player_state.shadow_half_x,
             half_z: player_state.shadow_half_z,
             shift: player_state.shadow_shift,
@@ -10951,6 +11286,12 @@ fn render_frame_on(
     if let Some(joints) = player_joints.as_ref() {
         game.joint_worlds[0] = joints.clone();
     }
+    // Tweened after the exact copy above: the simulation never reads a
+    // presentation-only pose.
+    let mut player_joints = player_joints;
+    if let Some(joints) = player_joints.as_mut() {
+        tween.joints(tween::Key::Player, joints);
+    }
 
     // The parsed NPC models are held in `models` so the mesh references built
     // below stay alive for the draw call.
@@ -11013,7 +11354,12 @@ fn render_frame_on(
             } else {
                 None
             };
-            if let Some(shadow) = shadow {
+            if let Some(mut shadow) = shadow {
+                tween.shadow(
+                    tween::Key::Npc(slot, entity.id),
+                    &mut shadow.pos,
+                    &mut shadow.angle,
+                );
                 shadow_list.push(shadow);
             }
         }
@@ -11047,6 +11393,7 @@ fn render_frame_on(
             entity.joint_flags,
             &joints,
         );
+        tween.joints(tween::Key::Npc(slot, entity.id), &mut joints);
         models.push(model);
         npc_joints.push(std::mem::take(&mut joints));
         npc_hidden.push(hidden);
@@ -11079,17 +11426,21 @@ fn render_frame_on(
         game.entities[0].angle,
     );
     let mut object_joints: Vec<Vec<anim::Mat4x3>> = Vec::with_capacity(visible.len());
-    for (_, _, world) in &visible {
-        object_joints.push(vec![*world]);
+    for (_, _, world, slot) in &visible {
+        let mut joints = vec![*world];
+        tween.joints(tween::Key::Object(*slot), &mut joints);
+        object_joints.push(joints);
     }
     let mut item_joints: Vec<Vec<anim::Mat4x3>> = Vec::with_capacity(visible_item_models.len());
-    for (_, _, world) in &visible_item_models {
-        item_joints.push(vec![*world]);
+    for (_, _, world, slot) in &visible_item_models {
+        let mut joints = vec![*world];
+        tween.joints(tween::Key::Item(*slot), &mut joints);
+        item_joints.push(joints);
     }
 
     let mut meshes: Vec<EntityMesh<'_>> =
         Vec::with_capacity(visible.len() + visible_item_models.len() + 1 + models.len());
-    for ((asset, record, _), joints) in visible.iter().zip(&object_joints) {
+    for ((asset, record, _, _), joints) in visible.iter().zip(&object_joints) {
         meshes.push(EntityMesh {
             mesh: &asset.model,
             texture: &asset.texture,
@@ -11104,7 +11455,7 @@ fn render_frame_on(
             hidden_joints: 0,
         });
     }
-    for ((asset, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
+    for ((asset, _, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
         meshes.push(EntityMesh {
             mesh: &asset.model,
             texture: &asset.texture,
@@ -11217,7 +11568,10 @@ fn render_frame_on(
     let mut web_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut web_hidden: Vec<u32> = Vec::new();
     let mut web_tints: Vec<[u8; 3]> = Vec::new();
-    for clone in game.web_clones.iter().flatten() {
+    for (clone_index, clone) in game.web_clones.iter().enumerate() {
+        let Some(clone) = clone else {
+            continue;
+        };
         if !clone.live || clone.entity.has_enter_switch_zone == 0 {
             continue;
         }
@@ -11225,14 +11579,17 @@ fn render_frame_on(
             && (clone.entity.shadow_half_x != 0 || clone.entity.shadow_half_z != 0)
             && let Some(texture) = shadow_texture
         {
+            let mut pos = [
+                clone.entity.pos[0] + i32::from(clone.entity.shadow_offset[0]),
+                clone.entity.pos[1] + i32::from(clone.entity.shadow_offset[1]),
+                clone.entity.pos[2] + i32::from(clone.entity.shadow_offset[2]),
+            ];
+            let mut angle = clone.entity.angle;
+            tween.shadow(tween::Key::Web(clone_index), &mut pos, &mut angle);
             shadow_list.push(render::Shadow {
                 texture,
-                pos: [
-                    clone.entity.pos[0] + i32::from(clone.entity.shadow_offset[0]),
-                    clone.entity.pos[1] + i32::from(clone.entity.shadow_offset[1]),
-                    clone.entity.pos[2] + i32::from(clone.entity.shadow_offset[2]),
-                ],
-                angle: clone.entity.angle,
+                pos,
+                angle,
                 half_x: i32::from(clone.entity.shadow_half_x),
                 half_z: i32::from(clone.entity.shadow_half_z),
                 shift: [0, 0],
@@ -11243,7 +11600,7 @@ fn render_frame_on(
         let Some(model) = npc_models.get(pack, clone.entity.id, id.player_flag & 1) else {
             continue;
         };
-        let joints = clone.anim.joint_worlds(&clone.entity, &model.clips);
+        let mut joints = clone.anim.joint_worlds(&clone.entity, &model.clips);
         if joints.is_empty() {
             continue;
         }
@@ -11255,6 +11612,7 @@ fn render_frame_on(
             clone.entity.joint_flags,
             &joints,
         );
+        tween.joints(tween::Key::Web(clone_index), &mut joints);
         web_models.push(model);
         web_joints.push(joints);
         web_hidden.push(hidden);
@@ -11285,7 +11643,10 @@ fn render_frame_on(
     let mut companion_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut companion_hidden: Vec<u32> = Vec::new();
     let mut companion_tints: Vec<[u8; 3]> = Vec::new();
-    for companion in game.companions.iter().flatten() {
+    for (companion_index, companion) in game.companions.iter().enumerate() {
+        let Some(companion) = companion else {
+            continue;
+        };
         let heart = companion.kind == enemy::companion::CompanionKind::Heart;
         if !companion.live
             || !game
@@ -11303,14 +11664,17 @@ fn render_frame_on(
             && (companion.entity.shadow_half_x != 0 || companion.entity.shadow_half_z != 0)
             && let Some(texture) = shadow_texture
         {
+            let mut pos = [
+                companion.entity.pos[0] + i32::from(companion.entity.shadow_offset[0]),
+                companion.entity.pos[1] + i32::from(companion.entity.shadow_offset[1]),
+                companion.entity.pos[2] + i32::from(companion.entity.shadow_offset[2]),
+            ];
+            let mut angle = companion.entity.angle;
+            tween.shadow(tween::Key::Companion(companion_index), &mut pos, &mut angle);
             shadow_list.push(render::Shadow {
                 texture,
-                pos: [
-                    companion.entity.pos[0] + i32::from(companion.entity.shadow_offset[0]),
-                    companion.entity.pos[1] + i32::from(companion.entity.shadow_offset[1]),
-                    companion.entity.pos[2] + i32::from(companion.entity.shadow_offset[2]),
-                ],
-                angle: companion.entity.angle,
+                pos,
+                angle,
                 half_x: i32::from(companion.entity.shadow_half_x),
                 half_z: i32::from(companion.entity.shadow_half_z),
                 shift: [0, 0],
@@ -11342,6 +11706,7 @@ fn render_frame_on(
         if let Some(slot) = joints.get_mut(object) {
             *slot = matrix;
         }
+        tween.joints(tween::Key::Companion(companion_index), &mut joints);
         companion_models.push(model);
         companion_joints.push(joints);
         companion_hidden.push(!(1u32 << object));
@@ -11400,7 +11765,7 @@ fn render_frame_on(
                 .max()
                 .unwrap_or(0),
         );
-        for (object, matrix) in draws {
+        for (draw, (object, matrix)) in draws.into_iter().enumerate() {
             let identity = anim::Mat4x3 {
                 r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
                 t: [0, 0, 0],
@@ -11409,6 +11774,7 @@ fn render_frame_on(
             if let Some(target) = joints.get_mut(object) {
                 *target = matrix;
             }
+            tween.joints(tween::Key::Tyrant(slot, draw), &mut joints);
             tyrant_models.push(Arc::clone(&model));
             tyrant_joints.push(joints);
             tyrant_hidden.push(!(1u32 << object));
@@ -11432,7 +11798,7 @@ fn render_frame_on(
     }
 
     let pages = effect_cache.pages_for(pack, id, &game.room_effects);
-    let quads = build_effect_quads(game, room, id, &camera, pages);
+    let quads = build_effect_quads(game, room, id, &camera, pages, tween);
     let mut page_refs: Vec<Option<&Image>> = Vec::with_capacity(16);
     page_refs.extend(pages.base.iter().map(Option::as_ref));
     page_refs.extend(pages.variants.iter().map(Option::as_ref));
@@ -14234,6 +14600,7 @@ mod tests {
                 &mut session.masks,
                 &mut session.shadows,
                 &mut session.effect_pages,
+                &mut Tween::default(),
             ));
             let hardware = gpu.read_scene().unwrap();
             if let Ok(dir) = std::env::var("ARKLAY_GPU_TEST_DUMP") {
@@ -19094,6 +19461,24 @@ off_0010:
     }
 
     #[test]
+    fn stats_presentation_frames_follow_the_pacer_schedule() {
+        assert_eq!(Presentation::alphas(30, 7), vec![None]);
+        assert_eq!(Presentation::alphas(20, 7), vec![None]);
+        assert_eq!(
+            Presentation::alphas(120, 3),
+            vec![Some(0.0), Some(0.25), Some(0.5), Some(0.75)]
+        );
+        assert_eq!(Presentation::alphas(60, 0), vec![Some(0.0), Some(0.5)]);
+        // A rate that is not a multiple of the tick still presents its frames
+        // on time: 75 fps is 2 or 3 frames a tick, 75 a second.
+        let frames: Vec<Vec<Option<f32>>> =
+            (0..30).map(|tick| Presentation::alphas(75, tick)).collect();
+        assert_eq!(frames.iter().map(Vec::len).sum::<usize>(), 75);
+        let close = |a: Option<f32>, b: f32| (a.unwrap() - b).abs() < 1e-5;
+        assert!(close(frames[1][0], 0.2) && close(frames[1][1], 0.6));
+    }
+
+    #[test]
     fn the_session_step_switches_to_the_door_interval() {
         assert_eq!(session_tick_interval(false, false), TICK_MS);
         assert_eq!(session_tick_interval(true, false), UI_TICK_MS);
@@ -19128,6 +19513,43 @@ off_0010:
             MovieTick::Skipped,
             "L1 must be able to skip a skippable film"
         );
+    }
+
+    #[test]
+    fn a_film_skip_tap_between_ticks_is_polled_and_ends_the_film() {
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("film.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add("movie/oj.avi", crate::movie::test_avi(400))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let session = MovieSession::open(&pack, 0, 0).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        app.queue_movie(session, None);
+        let l1 = movie_buttons(
+            UiInput {
+                page_left: true,
+                ..UiInput::default()
+            },
+            player::Input::default(),
+        );
+        // The loop's order: every pass polls the skip, then runs its ticks.
+        let tick = |app: &mut App, held| {
+            app.poll_movie_skip(held);
+            app.update(UiInput::default(), player::Input::default(), false)
+                .unwrap()
+        };
+        for _ in 0..150 {
+            assert!(matches!(tick(&mut app, 0), AppFlow::Continue));
+        }
+        // A tap pressed and released on passes that ran no tick (frames
+        // presented faster than ticks, or waits between them) is still seen,
+        // and the next tick ends the film.
+        app.poll_movie_skip(l1);
+        app.poll_movie_skip(0);
+        assert!(matches!(tick(&mut app, 0), AppFlow::Quit));
     }
 
     /// Run the app until `predicate` holds, returning the film ids seen in
@@ -21334,7 +21756,7 @@ off_0010:
 
         let camera = Camera::from_cut(&room.cuts[0]);
         let pages = effect_test_pages();
-        let quads = build_effect_quads(&game, &room, id, &camera, &pages);
+        let quads = build_effect_quads(&game, &room, id, &camera, &pages, &mut Tween::default());
 
         assert_eq!(quads.len(), 1, "the far effect must be culled");
         let quad = &quads[0];
@@ -21349,7 +21771,7 @@ off_0010:
         // The frame's screen offset (the shake) shifts the billboard.
         let mut shaken = camera;
         shaken.screen = [5, -4];
-        let quads = build_effect_quads(&game, &room, id, &shaken, &pages);
+        let quads = build_effect_quads(&game, &room, id, &shaken, &pages, &mut Tween::default());
         assert_eq!(quads[0].pos, [82, 14]);
     }
 
@@ -21375,7 +21797,14 @@ off_0010:
         game.tick_effects(&room);
 
         let camera = Camera::from_cut(&room.cuts[0]);
-        let quads = build_effect_quads(&game, &room, id, &camera, &effect_test_pages());
+        let quads = build_effect_quads(
+            &game,
+            &room,
+            id,
+            &camera,
+            &effect_test_pages(),
+            &mut Tween::default(),
+        );
         assert_eq!(quads.len(), 1);
         assert_eq!(quads[0].page, 1);
         assert_eq!(quads[0].tint, [0xFF, 0xFF, 0xFF]);

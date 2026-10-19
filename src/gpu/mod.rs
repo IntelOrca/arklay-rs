@@ -68,9 +68,9 @@ pub const MAX_SCALE: u32 = 8;
 /// The largest scene target side, whatever the window and `render_scale`.
 const MAX_SCENE_SIDE: u32 = 8192;
 
-/// The present interval of a renderer whose swapchain does not wait for
-/// vsync.
-const PRESENT_INTERVAL: std::time::Duration = std::time::Duration::from_micros(16_667);
+/// How long a present that had no swapchain image waits, so a loop held
+/// back only by vsync does not spin while the window is hidden.
+const HIDDEN_PRESENT_WAIT: std::time::Duration = std::time::Duration::from_millis(4);
 
 const LAYER_WIDTH: u32 = 320;
 const LAYER_HEIGHT: u32 = 240;
@@ -180,9 +180,9 @@ pub struct GpuRenderer {
     retiring: bool,
     /// The entries the scene being recorded created.
     fresh: Vec<Upload>,
-    /// The last present, when presentation does not wait for vsync and the
-    /// renderer limits itself to [`PRESENT_INTERVAL`].
-    pace: Option<std::time::Instant>,
+    /// Whether presentation uses mailbox, which never waits for vsync; the
+    /// caller's frame pacing ([`crate::pacer`]) then sets the present rate.
+    mailbox: bool,
 }
 
 impl GpuRenderer {
@@ -213,7 +213,7 @@ impl GpuRenderer {
         // FIFO presentation can block indefinitely on a compositor that
         // stops sending frame callbacks (a hidden or unmapped Wayland
         // window), which would also stop the event loop. Mailbox never
-        // waits; the renderer paces its own presents instead.
+        // waits; the loop's frame pacer limits presents to `frame_rate`.
         if unsafe {
             SDL_WindowSupportsGPUPresentMode(renderer.device, window, SDL_GPU_PRESENTMODE_MAILBOX)
         } && unsafe {
@@ -224,7 +224,7 @@ impl GpuRenderer {
                 SDL_GPU_PRESENTMODE_MAILBOX,
             )
         } {
-            renderer.pace = Some(std::time::Instant::now());
+            renderer.mailbox = true;
         }
         let format = unsafe { SDL_GetGPUSwapchainTextureFormat(renderer.device, window) };
         renderer.pipelines.composite = renderer.composite_pipeline(format)?;
@@ -290,7 +290,7 @@ impl GpuRenderer {
             frame: 0,
             retiring: false,
             fresh: Vec::new(),
-            pace: None,
+            mailbox: false,
         };
         // From here a failure drops `renderer`, which releases whatever was
         // created so far.
@@ -1386,13 +1386,6 @@ impl GpuRenderer {
         }
         unsafe { SDL_EndGPUCopyPass(copy) };
 
-        if let Some(last) = self.pace {
-            let elapsed = last.elapsed();
-            if elapsed < PRESENT_INTERVAL {
-                std::thread::sleep(PRESENT_INTERVAL - elapsed);
-            }
-            self.pace = Some(std::time::Instant::now());
-        }
         // Never wait for an image: with every image in flight (or a hidden
         // window) this frame is skipped and the uploads still run.
         let mut swapchain = std::ptr::null_mut();
@@ -1411,8 +1404,8 @@ impl GpuRenderer {
         }
         if swapchain.is_null() {
             // Nothing to draw to: keep a vsync-paced loop from spinning.
-            if self.pace.is_none() {
-                std::thread::sleep(PRESENT_INTERVAL / 4);
+            if !self.mailbox {
+                std::thread::sleep(HIDDEN_PRESENT_WAIT);
             }
         } else {
             let target = SDL_GPUColorTargetInfo {

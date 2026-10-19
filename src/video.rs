@@ -12,6 +12,7 @@
 //! | `display`      | both       | the display (1-based) the window opens on                  |
 //! | `render_scale` | GPU        | the 3D scene target as a percentage of the viewport        |
 //! | `msaa`         | GPU        | samples per pixel of the 3D scene target                   |
+//! | `frame_rate`   | both       | presented frames per second (see below)                    |
 //!
 //! The viewport is the largest 4:3 rectangle centred in the window's client
 //! area ([`fit`]), black around it. A window F8 sized is exactly a multiple of
@@ -23,8 +24,18 @@
 //! straddles two of them. The GPU 3D scene renders at the viewport size times
 //! `render_scale` and is filtered to the viewport when the two differ.
 //!
+//! `frame_rate` only changes presentation. The simulation always steps at the
+//! original's fixed 30 Hz tick (16 ms for the non-gameplay screens); at a
+//! higher rate the loop presents several frames per tick and draws the scene
+//! between the last two ticks ([`crate::tween`]). Every tick is still
+//! presented at least once, so the lowest accepted rate is the tick rate, 30.
+//! The 16 ms non-gameplay screens (title, menus, door transitions) present
+//! once per tick at about 62 fps whatever the rate below that.
+//!
 //! `--capture`, traces and tests never read these options: a capture draws
-//! the exact 320x240 frame in software through a fixed 3x window.
+//! the exact 320x240 frame in software through a fixed 3x window. A headless
+//! `--stats` run times presentation frames only at an explicit
+//! `--frame-rate`.
 
 /// The engine's frame size.
 pub const NATIVE_WIDTH: u32 = 320;
@@ -40,6 +51,36 @@ pub const MAX_DISPLAY: u32 = 64;
 pub const RENDER_SCALE_RANGE: std::ops::RangeInclusive<u32> = 25..=400;
 /// The accepted `msaa` sample counts.
 pub const MSAA_COUNTS: [u32; 4] = [1, 2, 4, 8];
+/// The simulation's tick rate and the default `frame_rate`.
+pub const TICK_RATE: u32 = 30;
+/// The smallest accepted `frame_rate`: the loop presents every tick, so a
+/// lower rate could not be honoured.
+pub const MIN_FRAME_RATE: u32 = TICK_RATE;
+/// The largest accepted `frame_rate`.
+pub const MAX_FRAME_RATE: u32 = 1000;
+/// The rates the options screen steps through (the config takes any
+/// integer from [`MIN_FRAME_RATE`] to [`MAX_FRAME_RATE`]).
+pub const FRAME_RATE_PRESETS: [u32; 6] = [30, 60, 120, 144, 165, 240];
+
+/// The preset after (`delta > 0`) or before `rate`, wrapping; a rate
+/// between two presets steps to the neighbour on that side.
+pub fn step_frame_rate(rate: u32, delta: i32) -> u32 {
+    let presets = &FRAME_RATE_PRESETS;
+    if delta > 0 {
+        presets
+            .iter()
+            .copied()
+            .find(|&preset| preset > rate)
+            .unwrap_or(presets[0])
+    } else {
+        presets
+            .iter()
+            .rev()
+            .copied()
+            .find(|&preset| preset < rate)
+            .unwrap_or(presets[presets.len() - 1])
+    }
+}
 
 /// Which renderer an interactive window draws the gameplay scene with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -72,7 +113,7 @@ impl RendererKind {
 }
 
 /// The `[graphics]` options of `arklay.toml` (after the command line's
-/// overrides). Captures, `--stats` runs and tests ignore them.
+/// overrides). Captures, traces, tests and headless runs ignore them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Graphics {
     pub renderer: RendererKind,
@@ -87,6 +128,8 @@ pub struct Graphics {
     pub render_scale: u32,
     /// The GPU scene target's samples per pixel.
     pub msaa: u32,
+    /// Presented frames per second; the simulation stays at [`TICK_RATE`].
+    pub frame_rate: u32,
 }
 
 impl Default for Graphics {
@@ -99,6 +142,7 @@ impl Default for Graphics {
             display: 1,
             render_scale: 100,
             msaa: 1,
+            frame_rate: TICK_RATE,
         }
     }
 }
@@ -178,6 +222,18 @@ pub fn step_window(graphics: &mut Graphics, room: (u32, u32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_steps_through_the_presets_and_wraps() {
+        assert_eq!(step_frame_rate(30, 1), 60);
+        assert_eq!(step_frame_rate(240, 1), 30);
+        assert_eq!(step_frame_rate(30, -1), 240);
+        assert_eq!(step_frame_rate(144, -1), 120);
+        // A configured rate between presets steps to the neighbour.
+        assert_eq!(step_frame_rate(75, 1), 120);
+        assert_eq!(step_frame_rate(75, -1), 60);
+        assert_eq!(step_frame_rate(1000, 1), 30);
+    }
 
     #[test]
     fn fit_centres_the_largest_four_by_three_rectangle() {

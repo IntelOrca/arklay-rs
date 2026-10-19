@@ -612,6 +612,8 @@ fn stats_runs_without_a_capture_and_reports_ordered_counters() {
         "--ticks",
         "30",
         "--stats",
+        "--frame-rate",
+        "60",
     ]);
     let out = stdout(&output);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
@@ -636,6 +638,73 @@ fn stats_runs_without_a_capture_and_reports_ordered_counters() {
         assert!(phase.contains(&key), "phase line lacks {key}: {phase:?}");
     }
     assert!(line("stats high_water ").contains("entities"));
+    // Two presentation frames a tick at 60 fps, timed against 1/60 s.
+    let render: Vec<&str> = line("stats render ").split_whitespace().collect();
+    let field = |key: &str| render[render.iter().position(|word| *word == key).unwrap() + 1];
+    assert_eq!(field("frame_rate"), "60");
+    assert_eq!(field("frames"), "60");
+    assert_eq!(field("budget_us"), "16666");
+}
+
+#[test]
+fn the_frame_rate_never_changes_a_trace() {
+    let dir = TempDir::new("frame-rate-trace");
+    let pack = dir.join("game.akpak");
+    write_room_pack(&pack);
+    let trace = |name: &str, extra: &[&str]| {
+        let path = dir.join(name);
+        let mut args = vec![
+            pack.to_str().unwrap(),
+            "--room",
+            "100",
+            "--ticks",
+            "30",
+            "--trace",
+            path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let output = run(&args);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        (std::fs::read(&path).unwrap(), stdout(&output))
+    };
+    let (plain, _) = trace("plain.trace", &[]);
+    let (tweened, out) = trace("tweened.trace", &["--frame-rate", "120", "--stats"]);
+    assert!(!plain.is_empty());
+    assert!(plain == tweened, "a 120 fps --stats run changed the trace");
+    assert!(
+        out.contains("stats render frame_rate 120 frames 120 "),
+        "{out}"
+    );
+    // Without --frame-rate a headless report draws no presentation frames,
+    // whatever the config says.
+    let config = dir.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("arklay.toml"), "[graphics]\nframe_rate = 240\n").unwrap();
+    let output = run_env(
+        &[
+            pack.to_str().unwrap(),
+            "--room",
+            "100",
+            "--ticks",
+            "30",
+            "--stats",
+        ],
+        &[("ARKLAY_CONFIG_DIR", config.to_str().unwrap())],
+    );
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+    assert!(
+        !stdout(&output).contains("stats render"),
+        "{}",
+        stdout(&output)
+    );
+}
+
+#[test]
+fn a_frame_rate_outside_30_to_1000_is_refused() {
+    for rate in ["0", "29", "1001"] {
+        let output = run(&["game.akpak", "--room", "100", "--frame-rate", rate]);
+        assert_failure(&output, "--frame-rate");
+    }
 }
 
 #[test]
