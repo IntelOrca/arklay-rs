@@ -11893,6 +11893,7 @@ fn visible_objects<'a>(
     anim::Mat4x3,
     usize,
 )> {
+    let view = room.cuts.get(camera).map(Camera::from_cut);
     let mut visible = Vec::new();
     for (slot, record) in objects.records.iter().enumerate() {
         if !record.active() {
@@ -11919,6 +11920,16 @@ fn visible_objects<'a>(
         // Z before submission; the cull above used the unshifted position).
         if room.stage == 3 && room.room == 0x03 && (1..5).contains(&(record.model & 0x3F)) {
             world.t[2] += 1000;
+        }
+        // `FUN_00483270` drops the whole object when its origin sits behind
+        // the eye (GTE `t[2] < 0`), unless the room pins it to the fixed
+        // ordering-table slot instead of sorting by depth.
+        if !object_fixed_depth(room, record)
+            && view
+                .as_ref()
+                .is_some_and(|view| view.view_position(world.t)[2] < 0)
+        {
+            continue;
         }
         visible.push((asset, record, world, slot));
     }
@@ -11974,6 +11985,18 @@ fn visible_items<'a>(
 /// visible model lives elsewhere (mirror/door frames), plus the boulder that
 /// is dropped once it rolls within ~3600 units of the camera. The stage
 /// folding uses the port's 1-based stage digit.
+/// Whether `RoomObjectRender` pins an omodel to the fixed ordering-table slot
+/// (`DAT_00ae9ef8`) instead of sorting it by GTE depth: the flooded guardhouse
+/// rooms, the courtyard water gate and objects 0-1 of room 20B.
+fn object_fixed_depth(room: &RoomState, record: &objects::ObjectRecord) -> bool {
+    match room.stage % 5 {
+        4 => matches!(room.room, 0x0D..=0x11),
+        3 => room.room == 0x01,
+        2 => room.room == 0x0B && record.model & 0x3F < 2,
+        _ => false,
+    }
+}
+
 fn object_render_skipped(room: &RoomState, camera: usize, record: &objects::ObjectRecord) -> bool {
     let model = record.model & 0x3F;
     // Guardhouse 002's mirror stand-in on camera 4.
@@ -12455,7 +12478,10 @@ fn render_frame_on(
             // creator's remap lives in `record_blend_weight`.
             blend_weight: render::record_blend_weight(&asset.model, record.blend_override),
             hidden_joints: 0,
-            light_pos: None,
+            // `update_entity_lighting(record + 0x34)`: the record's own
+            // position, not the composed one, so a parented object lights
+            // from its local offset.
+            light_pos: Some(record.pos),
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
@@ -13354,6 +13380,60 @@ mod tests {
             height: HEIGHT as u32,
             rgba,
         }
+    }
+
+    #[test]
+    fn visible_objects_drop_a_record_whose_origin_is_behind_the_eye() {
+        use crate::objects::{OBJECT_FLAG_ACTIVE, ObjectAsset, ObjectTable};
+
+        let room = RoomState {
+            stage: 3,
+            room: 0x07,
+            object_models: vec![ObjectAsset {
+                pair_index: 0,
+                model: crate::model::Tmd::default(),
+                texture: crate::model::Texture8 {
+                    width: 0,
+                    height: 0,
+                    indices: Vec::new(),
+                    palettes: Vec::new(),
+                    stp: Vec::new(),
+                },
+            }],
+            cuts: vec![crate::state::Cut {
+                pos: [2000, 0, 2000],
+                look_at: [2000, 0, 3000],
+                fov: 500,
+                ..crate::state::Cut::default()
+            }],
+            zones: vec![crate::state::Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0, 0], [0, 5000], [5000, 5000], [5000, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let mut objects = ObjectTable::new(1);
+        {
+            let record = objects.record_mut(0).unwrap();
+            record.flag = OBJECT_FLAG_ACTIVE;
+            record.asset = Some(0);
+            record.pos = [2000, 0, 2300];
+        }
+        assert_eq!(visible_objects(&room, &objects, 0, [0, 0, 0], 0).len(), 1);
+
+        // Inside the zone but behind the camera: `FUN_00483270` returns on a
+        // negative GTE depth before queueing any triangle.
+        objects.record_mut(0).unwrap().pos = [2000, 0, 1700];
+        assert!(visible_objects(&room, &objects, 0, [0, 0, 0], 0).is_empty());
+
+        // A room pinned to the fixed ordering-table slot keeps it.
+        let pinned = RoomState {
+            stage: 4,
+            room: 0x0E,
+            ..room
+        };
+        assert_eq!(visible_objects(&pinned, &objects, 0, [0, 0, 0], 0).len(), 1);
     }
 
     #[test]

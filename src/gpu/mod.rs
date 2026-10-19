@@ -1773,6 +1773,7 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
             complex_object: None,
             aliased_light: false,
         }];
