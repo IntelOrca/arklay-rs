@@ -50,7 +50,8 @@ use sdl3_sys::events::{
     SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_AXIS_MOTION, SDL_EVENT_GAMEPAD_BUTTON_DOWN,
     SDL_EVENT_GAMEPAD_BUTTON_UP, SDL_EVENT_GAMEPAD_REMOVED, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP,
     SDL_EVENT_KEYBOARD_REMOVED, SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP,
-    SDL_EVENT_MOUSE_WHEEL, SDL_EVENT_QUIT, SDL_EVENT_WINDOW_FOCUS_LOST, SDL_Event, SDL_PollEvent,
+    SDL_EVENT_MOUSE_WHEEL, SDL_EVENT_QUIT, SDL_EVENT_WINDOW_DISPLAY_CHANGED,
+    SDL_EVENT_WINDOW_FOCUS_LOST, SDL_Event, SDL_PollEvent,
 };
 use sdl3_sys::gamepad::{
     SDL_AddGamepadMappingsFromFile, SDL_CloseGamepad, SDL_Gamepad, SDL_OpenGamepad,
@@ -58,23 +59,33 @@ use sdl3_sys::gamepad::{
 use sdl3_sys::hints::{SDL_HINT_RENDER_DRIVER, SDL_HINT_VIDEO_DRIVER, SDL_SetHint};
 use sdl3_sys::init::{SDL_INIT_GAMEPAD, SDL_INIT_VIDEO, SDL_Init, SDL_InitSubSystem, SDL_Quit};
 use sdl3_sys::joystick::SDL_JoystickID;
-use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_PERIOD};
+use sdl3_sys::keycode::{SDL_KMOD_ALT, SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
 use sdl3_sys::mouse::SDL_MOUSEWHEEL_FLIPPED;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
+use sdl3_sys::rect::{SDL_FRect, SDL_Rect};
 use sdl3_sys::render::{
     SDL_CreateRenderer, SDL_CreateTexture, SDL_DestroyRenderer, SDL_DestroyTexture,
-    SDL_RenderClear, SDL_RenderPresent, SDL_RenderReadPixels, SDL_RenderTexture, SDL_Renderer,
-    SDL_SetRenderDrawColor, SDL_SetRenderVSync, SDL_SetTextureBlendMode, SDL_SetTextureScaleMode,
-    SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
+    SDL_GetCurrentRenderOutputSize, SDL_RenderClear, SDL_RenderPresent, SDL_RenderReadPixels,
+    SDL_RenderTexture, SDL_Renderer, SDL_SetRenderDrawColor, SDL_SetRenderVSync,
+    SDL_SetTextureBlendMode, SDL_SetTextureScaleMode, SDL_TEXTUREACCESS_STREAMING, SDL_Texture,
+    SDL_UpdateTexture,
 };
-use sdl3_sys::scancode::SDL_Scancode;
+use sdl3_sys::scancode::{
+    SDL_SCANCODE_F8, SDL_SCANCODE_KP_ENTER, SDL_SCANCODE_RETURN, SDL_Scancode,
+};
+use sdl3_sys::stdinc::SDL_free;
 use sdl3_sys::surface::{
-    SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
+    SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_SCALEMODE_PIXELART,
+    SDL_Surface,
 };
 use sdl3_sys::timer::SDL_GetTicks;
 use sdl3_sys::video::{
-    SDL_CreateWindow, SDL_DestroyWindow, SDL_SetWindowTitle, SDL_Window, SDL_WindowFlags,
+    SDL_CreateWindow, SDL_DestroyWindow, SDL_DisplayID, SDL_GetDisplayForWindow,
+    SDL_GetDisplayUsableBounds, SDL_GetDisplays, SDL_GetPrimaryDisplay, SDL_GetWindowBordersSize,
+    SDL_GetWindowPixelDensity, SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode,
+    SDL_SetWindowPosition, SDL_SetWindowSize, SDL_SetWindowTitle, SDL_ShowWindow,
+    SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window, SDL_WindowFlags,
 };
 
 use crate::anim;
@@ -121,6 +132,7 @@ use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
+use crate::video::{self, Graphics, RendererKind};
 use crate::weapons;
 
 const WIDTH: i32 = 320;
@@ -256,9 +268,9 @@ pub struct Authoring<'a> {
     /// `--save-out`: write the session's current save block to this path and
     /// exit before ticking. The oracle's deterministic save generator.
     pub save_out: Option<&'a Path>,
-    /// `--renderer` and `--render-scale`: what an interactive window draws
-    /// with.
-    pub renderer: RendererSettings,
+    /// The `[graphics]` options with `--renderer`, `--render-scale` and
+    /// `--msaa` applied: the interactive window and what it draws with.
+    pub renderer: Graphics,
 }
 
 /// Load `id` from `pack`, simulate it and optionally capture one frame.
@@ -523,7 +535,7 @@ pub fn run_with_options(
                 loaded.room.current_cut,
                 loaded.room.cuts.len(),
             );
-            let mut display = Display::new(&title, true, RendererSettings::default())?;
+            let mut display = Display::new(&title, true, Graphics::default())?;
             display.present(&framebuffer)?;
             display.capture(capture_path)?;
         }
@@ -723,7 +735,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Displa
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
-        if poll_events(&mut event, &mut input, &mut cut_delta) {
+        if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
             return Ok(());
         }
         if cut_delta != 0 {
@@ -784,36 +796,6 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Displa
     }
 }
 
-/// Which renderer an interactive window draws the gameplay scene with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum RendererKind {
-    /// The software rasterizer, scaled to the window (the default).
-    #[default]
-    Software,
-    /// The SDL_GPU scene renderer ([`crate::gpu`]) at a higher internal
-    /// resolution; falls back to software when no device is available.
-    Gpu,
-}
-
-/// The renderer an interactive window opens with (`--renderer` and
-/// `--render-scale`). Captures, `--stats` runs and tests always draw in
-/// software: the setting only applies to a window a player looks at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RendererSettings {
-    pub kind: RendererKind,
-    /// The GPU scene's internal resolution multiplier.
-    pub scale: u32,
-}
-
-impl Default for RendererSettings {
-    fn default() -> Self {
-        Self {
-            kind: RendererKind::Software,
-            scale: crate::gpu::DEFAULT_SCALE,
-        }
-    }
-}
-
 /// How a [`Display`] puts frames on screen.
 enum Backend {
     /// An SDL renderer scaling a streaming 320x240 texture. The texture is
@@ -835,12 +817,16 @@ struct Display {
     _window: WindowHandle,
     _sdl: SdlHandle,
     window: *mut SDL_Window,
+    /// The window options F8 and Alt+Enter change; `None` for a capture,
+    /// whose window is always the fixed 960x720 one.
+    graphics: Option<Graphics>,
 }
 
 impl Display {
-    /// Open the 960x720 window; `capture` selects SDL's offscreen software
-    /// driver for headless captures, which ignore `renderer`.
-    fn new(title: &str, capture: bool, renderer: RendererSettings) -> Result<Self> {
+    /// Open the window `graphics` describes (see [`crate::video`]); `capture`
+    /// instead opens a fixed 960x720 window on SDL's offscreen software
+    /// driver for headless captures, which ignore `graphics`.
+    fn new(title: &str, capture: bool, graphics: Graphics) -> Result<Self> {
         if capture {
             unsafe {
                 SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
@@ -861,24 +847,30 @@ impl Display {
             Err(err) => return Err(err),
         };
 
-        let title = CString::new(title).context("window title contains a NUL byte")?;
-        let window = unsafe {
-            SDL_CreateWindow(
-                title.as_ptr(),
-                WINDOW_WIDTH,
-                WINDOW_HEIGHT,
-                SDL_WindowFlags::default(),
-            )
+        // An interactive window starts hidden at 1x so it can be sized and
+        // placed on its display before it is first shown.
+        let (size, flags) = if capture {
+            ((WINDOW_WIDTH, WINDOW_HEIGHT), SDL_WindowFlags::default())
+        } else {
+            ((WIDTH, HEIGHT), SDL_WINDOW_HIDDEN)
         };
+        let title = CString::new(title).context("window title contains a NUL byte")?;
+        let window = unsafe { SDL_CreateWindow(title.as_ptr(), size.0, size.1, flags) };
         if window.is_null() {
             bail!("SDL_CreateWindow failed: {}", sdl_error());
         }
         let window = WindowHandle(window);
+        let mut graphics = graphics;
+        if !capture {
+            let display = display_id(graphics.display);
+            place_window(window.0, &mut graphics, display);
+            unsafe { SDL_ShowWindow(window.0) };
+        }
 
-        let gpu = if !capture && renderer.kind == RendererKind::Gpu {
+        let gpu = if !capture && graphics.renderer == RendererKind::Gpu {
             // SAFETY: the window outlives the backend (field order) and has
             // no SDL renderer yet.
-            match unsafe { GpuRenderer::new(window.0, renderer.scale) } {
+            match unsafe { GpuRenderer::new(window.0, graphics.render_scale, graphics.msaa) } {
                 Ok(gpu) => Some(gpu),
                 Err(err) => {
                     eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
@@ -897,7 +889,62 @@ impl Display {
             window: window.0,
             _window: window,
             _sdl: sdl,
+            graphics: (!capture).then_some(graphics),
         })
+    }
+
+    /// F8: the next window size, borderless fullscreen once the next size
+    /// would not fit, then back to 1x ([`video::step_window`]).
+    fn step_window(&mut self) {
+        let window = self.window;
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        let display = unsafe { SDL_GetDisplayForWindow(window) };
+        let room = window_room(window, display)
+            .unwrap_or((video::MAX_WINDOW_SIDE, video::MAX_WINDOW_SIDE));
+        video::step_window(graphics, room);
+        place_window(window, graphics, display);
+        self.save_window();
+    }
+
+    /// Alt+Enter: toggle borderless fullscreen and the window.
+    fn toggle_fullscreen(&mut self) {
+        let window = self.window;
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        graphics.fullscreen = !graphics.fullscreen;
+        let display = unsafe { SDL_GetDisplayForWindow(window) };
+        place_window(window, graphics, display);
+        self.save_window();
+    }
+
+    /// Record the display the window is now on, so the next run opens there.
+    fn display_changed(&mut self) {
+        let display = unsafe { SDL_GetDisplayForWindow(self.window) };
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        let Some(number) = display_number(display) else {
+            return;
+        };
+        if graphics.display != number {
+            graphics.display = number;
+            self.save_window();
+        }
+    }
+
+    /// Persist the window options to `arklay.toml`; a failure is reported and
+    /// the change still applies for this run.
+    fn save_window(&self) {
+        let Some(graphics) = &self.graphics else {
+            return;
+        };
+        let path = crate::config::Config::default_path();
+        if let Err(err) = crate::config::Config::save_window(&path, graphics) {
+            eprintln!("warning: window settings not saved: {err:#}");
+        }
     }
 
     /// The SDL renderer and streaming texture of the software backend.
@@ -6261,7 +6308,7 @@ pub fn run_root(
     no_mods: bool,
     _debug_menu: bool,
     language: Option<&str>,
-    renderer: RendererSettings,
+    renderer: Graphics,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -6617,7 +6664,7 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
     let mut accumulator = 0.0f64;
     loop {
         let mut cut_delta = 0i32;
-        if poll_events(&mut event, &mut input, &mut cut_delta) {
+        if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
             return Ok(());
         }
         if cut_delta != 0 {
@@ -6673,7 +6720,7 @@ pub fn run_fmv(
     ticks: u32,
     mods: &[PathBuf],
     no_mods: bool,
-    renderer: RendererSettings,
+    renderer: Graphics,
 ) -> Result<()> {
     let save_dir = save::default_save_dir();
     if let Some(capture_path) = capture {
@@ -6683,7 +6730,7 @@ pub fn run_fmv(
             // Audio-free: the fixed 30 Hz tick is the clock.
             session.tick(0, None);
         }
-        let mut display = Display::new("Arklay - fmv", true, RendererSettings::default())?;
+        let mut display = Display::new("Arklay - fmv", true, Graphics::default())?;
         let mut framebuffer = Framebuffer::new();
         framebuffer.rgba.copy_from_slice(session.frame_rgba());
         display.present(&framebuffer)?;
@@ -6717,7 +6764,7 @@ pub fn run_ending(
     ticks: u32,
     mods: &[PathBuf],
     no_mods: bool,
-    renderer: RendererSettings,
+    renderer: Graphics,
 ) -> Result<()> {
     // The debug entry plays a no-save first run: a zero clear time, the
     // shipped card's initial save counter (one, i.e. no saves) and no
@@ -6839,7 +6886,7 @@ fn run_font_ui(
     let mut cut_delta = 0i32;
     let mut input = InputState::default();
     loop {
-        if poll_events(&mut event, &mut input, &mut cut_delta) {
+        if poll_events(&mut event, &mut input, &mut cut_delta, None) {
             return Ok(());
         }
         present(renderer, texture, &framebuffer)?;
@@ -8440,7 +8487,14 @@ fn play_entity_sounds(
 /// `SDL_GetKeyboardState` later, because the render loop runs at the display's
 /// refresh rate while the simulation runs at a fixed 30 Hz: a press that lands
 /// between two ticks must still be there when the next tick asks.
-fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i32) -> bool {
+///
+/// F8 and Alt+Enter change `display`'s window and never reach the game.
+fn poll_events(
+    event: &mut SDL_Event,
+    input: &mut InputState,
+    cut_delta: &mut i32,
+    mut display: Option<&mut Display>,
+) -> bool {
     use controls::{Source, Wheel};
     let mut quit = false;
     while unsafe { SDL_PollEvent(event) } {
@@ -8452,6 +8506,22 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
             let scancode = unsafe { event.key.scancode };
             let modifiers = unsafe { event.key.r#mod };
             let repeat = unsafe { event.key.repeat };
+            if let Some(display) = display.as_deref_mut() {
+                if scancode == SDL_SCANCODE_F8 {
+                    if !repeat {
+                        display.step_window();
+                    }
+                    continue;
+                }
+                if matches!(scancode, SDL_SCANCODE_RETURN | SDL_SCANCODE_KP_ENTER)
+                    && modifiers & SDL_KMOD_ALT != SDL_KMOD_NONE
+                {
+                    if !repeat {
+                        display.toggle_fullscreen();
+                    }
+                    continue;
+                }
+            }
             input.key_down(scancode, repeat);
             if modifiers & SDL_KMOD_SHIFT != SDL_KMOD_NONE {
                 if key == SDLK_COMMA {
@@ -8505,6 +8575,10 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
         } else if kind == SDL_EVENT_GAMEPAD_AXIS_MOTION {
             let axis = unsafe { event.gaxis };
             input.axis_motion(axis.which.0, i32::from(axis.axis), axis.value);
+        } else if kind == SDL_EVENT_WINDOW_DISPLAY_CHANGED {
+            if let Some(display) = display.as_deref_mut() {
+                display.display_changed();
+            }
         } else if kind == SDL_EVENT_WINDOW_FOCUS_LOST {
             // Focusing away never delivers the held inputs' release events;
             // drop them so nothing sticks down.
@@ -10076,17 +10150,11 @@ impl InputState {
 
     /// The latch an interactive window reads: the gamepads started and the
     /// bindings from `arklay.toml` (the defaults when it has none, or when
-    /// it cannot be read).
+    /// it cannot be read; the launch already reported its warnings).
     fn interactive() -> Self {
         Gamepads::init();
-        let bindings = match crate::config::Config::load_default() {
-            Ok(config) => config.bindings_or_default(),
-            Err(err) => {
-                eprintln!("warning: using the default bindings: {err:#}");
-                controls::Bindings::default()
-            }
-        };
-        Self::new(bindings)
+        let (config, _) = crate::config::Config::load_default();
+        Self::new(config.bindings_or_default())
     }
 
     /// The action map in use.
@@ -11401,10 +11469,132 @@ fn present(
     if !unsafe { SDL_RenderClear(renderer) } {
         bail!("SDL_RenderClear failed: {}", sdl_error());
     }
-    if !unsafe { SDL_RenderTexture(renderer, texture, std::ptr::null(), std::ptr::null()) } {
+    // The frame fills the largest centred 4:3 viewport: nearest at a whole
+    // zoom (the exact 3x a capture reads back), pixel-art sampling between.
+    let (mut width, mut height) = (0, 0);
+    if !unsafe { SDL_GetCurrentRenderOutputSize(renderer, &mut width, &mut height) } {
+        bail!("SDL_GetCurrentRenderOutputSize failed: {}", sdl_error());
+    }
+    let viewport = video::fit(width.max(1) as u32, height.max(1) as u32);
+    let mode = if viewport.is_whole_zoom() {
+        SDL_SCALEMODE_NEAREST
+    } else {
+        SDL_SCALEMODE_PIXELART
+    };
+    if !unsafe { SDL_SetTextureScaleMode(texture, mode) } {
+        bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
+    }
+    let destination = SDL_FRect {
+        x: viewport.x as f32,
+        y: viewport.y as f32,
+        w: viewport.width as f32,
+        h: viewport.height as f32,
+    };
+    if !unsafe { SDL_RenderTexture(renderer, texture, std::ptr::null(), &destination) } {
         bail!("SDL_RenderTexture failed: {}", sdl_error());
     }
     Ok(())
+}
+
+/// Size and place `window` for `graphics` on `display`: borderless fullscreen
+/// there, or the `window_width` x `window_height` window centred on it. A
+/// window too large for the display shrinks to the largest whole multiple of
+/// 320x240 that fits, in `graphics` too.
+fn place_window(window: *mut SDL_Window, graphics: &mut Graphics, display: SDL_DisplayID) {
+    if graphics.fullscreen {
+        unsafe {
+            SDL_SetWindowPosition(
+                window,
+                SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+                SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+            );
+            // A null mode is the desktop mode: borderless fullscreen.
+            SDL_SetWindowFullscreenMode(window, std::ptr::null());
+            SDL_SetWindowFullscreen(window, true);
+        }
+        return;
+    }
+    unsafe {
+        SDL_SetWindowFullscreen(window, false);
+    }
+    // A window that does not fit its display shrinks to the largest whole
+    // multiple of 320x240 that does.
+    if let Some((room_width, room_height)) = window_room(window, display)
+        && (graphics.window_width > room_width || graphics.window_height > room_height)
+    {
+        (graphics.window_width, graphics.window_height) =
+            video::largest_window((room_width, room_height));
+    }
+    // The size is in window coordinates; the client area is to be exactly
+    // `window_width` x `window_height` pixels.
+    let density = window_pixel_density(window);
+    let coordinates = |pixels: u32| (pixels as f32 / density).round() as i32;
+    unsafe {
+        SDL_SetWindowSize(
+            window,
+            coordinates(graphics.window_width),
+            coordinates(graphics.window_height),
+        );
+        SDL_SetWindowPosition(
+            window,
+            SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+            SDL_WINDOWPOS_CENTERED_DISPLAY(display),
+        );
+    }
+}
+
+/// The client area, in pixels, a window on `display` can have with its
+/// decorations inside the display's usable area (less the task bar).
+fn window_room(window: *mut SDL_Window, display: SDL_DisplayID) -> Option<(u32, u32)> {
+    let mut usable = SDL_Rect::default();
+    if !unsafe { SDL_GetDisplayUsableBounds(display, &mut usable) } {
+        return None;
+    }
+    let (mut top, mut left, mut bottom, mut right) = (0, 0, 0, 0);
+    if !unsafe { SDL_GetWindowBordersSize(window, &mut top, &mut left, &mut bottom, &mut right) } {
+        // Unknown decorations: allow for a typical title bar.
+        top = 32;
+    }
+    // In pixels, like `window_width` and `window_height`.
+    let density = window_pixel_density(window);
+    let pixels = |coordinates: i32| (coordinates.max(0) as f32 * density) as u32;
+    Some((
+        pixels(usable.w).saturating_sub(pixels(left + right)),
+        pixels(usable.h).saturating_sub(pixels(top + bottom)),
+    ))
+}
+
+/// Pixels per window coordinate (1 unless the platform scales windows).
+fn window_pixel_density(window: *mut SDL_Window) -> f32 {
+    let density = unsafe { SDL_GetWindowPixelDensity(window) };
+    if density > 0.0 { density } else { 1.0 }
+}
+
+/// SDL's displays, in its order.
+fn displays() -> Vec<SDL_DisplayID> {
+    let mut count = 0;
+    let list = unsafe { SDL_GetDisplays(&mut count) };
+    if list.is_null() {
+        return Vec::new();
+    }
+    let ids = unsafe { std::slice::from_raw_parts(list, count.max(0) as usize) }.to_vec();
+    unsafe { SDL_free(list.cast()) };
+    ids
+}
+
+/// The display a 1-based `display` option names, else the primary display.
+fn display_id(number: u32) -> SDL_DisplayID {
+    let index = number.saturating_sub(1) as usize;
+    displays()
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| unsafe { SDL_GetPrimaryDisplay() })
+}
+
+/// The 1-based `display` option for `display`.
+fn display_number(display: SDL_DisplayID) -> Option<u32> {
+    let index = displays().iter().position(|&id| id == display)?;
+    Some(index as u32 + 1)
 }
 
 /// Load the player's character model and no-weapon clips for the RDT flag.
@@ -13623,9 +13813,10 @@ mod tests {
     fn gpu_display_presents_layered_frames() {
         let _lock = crate::audio::test_lock::sdl();
         unsafe { SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr()) };
-        let renderer = RendererSettings {
-            kind: RendererKind::Gpu,
-            scale: 2,
+        let renderer = Graphics {
+            renderer: RendererKind::Gpu,
+            render_scale: 200,
+            ..Graphics::default()
         };
         let display = Display::new("Arklay GPU test", false, renderer);
         let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(SDL_HINT_VIDEO_DRIVER) };
@@ -15242,8 +15433,8 @@ mod tests {
         use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_ResetHint, SDL_SetHint};
 
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
-        let display = Display::new("Arklay test", true, RendererSettings::default())
-            .expect("offscreen display");
+        let display =
+            Display::new("Arklay test", true, Graphics::default()).expect("offscreen display");
         let mixer = Mixer::open().expect("dummy audio device should open");
         let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
 

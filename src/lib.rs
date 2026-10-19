@@ -57,6 +57,7 @@ pub mod trace;
 pub mod transition;
 pub mod ui;
 pub mod verify;
+pub mod video;
 pub mod voice;
 pub mod voice_table;
 pub mod weapons;

@@ -178,26 +178,48 @@ struct Cli {
     #[arg(long, requires = "ticks", conflicts_with_all = ["ui", "ending", "fmv"])]
     stats: bool,
 
-    /// Renderer for the interactive window's gameplay scene. `gpu` draws the
-    /// 3D scene with SDL_GPU at `--render-scale` times 320x240 (it needs a
-    /// Vulkan driver and falls back to software without one). Captures,
-    /// traces and `--stats` always draw in software
-    #[arg(long, value_enum, default_value_t = RendererArg::Software, requires = "pack")]
-    renderer: RendererArg,
+    /// Renderer for the interactive window's gameplay scene (default: the
+    /// config's `[graphics] renderer`, else software). `gpu` draws the 3D
+    /// scene with SDL_GPU at the window's resolution (it needs a Vulkan driver
+    /// and falls back to software without one). Captures, traces and
+    /// `--stats` always draw in software
+    #[arg(long, value_enum, requires = "pack")]
+    renderer: Option<RendererArg>,
 
-    /// The `--renderer gpu` scene's internal resolution as a multiple of
-    /// 320x240
+    /// The `--renderer gpu` scene's resolution as a percentage of the
+    /// viewport, e.g. 50, 75, 100, 150 or 200 (default: the config's
+    /// `[graphics] render_scale`, else 100)
     #[arg(
         long,
-        value_name = "N",
-        default_value_t = arklay::gpu::DEFAULT_SCALE,
+        value_name = "PERCENT",
         requires = "pack",
-        value_parser = clap::value_parser!(u32).range(1..=i64::from(arklay::gpu::MAX_SCALE))
+        value_parser = clap::value_parser!(u32).range(
+            i64::from(*arklay::video::RENDER_SCALE_RANGE.start())
+                ..=i64::from(*arklay::video::RENDER_SCALE_RANGE.end())
+        )
     )]
-    render_scale: u32,
+    render_scale: Option<u32>,
+
+    /// The `--renderer gpu` scene's multisample anti-aliasing: 1, 2, 4 or 8
+    /// samples per pixel (default: the config's `[graphics] msaa`, else 1)
+    #[arg(
+        long,
+        value_name = "SAMPLES",
+        requires = "pack",
+        value_parser = parse_msaa
+    )]
+    msaa: Option<u32>,
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Parse `--msaa`: one of [`arklay::video::MSAA_COUNTS`].
+fn parse_msaa(text: &str) -> Result<u32, String> {
+    text.parse::<u32>()
+        .ok()
+        .filter(|samples| arklay::video::MSAA_COUNTS.contains(samples))
+        .ok_or_else(|| "expected 1, 2, 4 or 8".to_string())
 }
 
 /// The `--renderer` choices.
@@ -593,13 +615,19 @@ fn main() -> Result<()> {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
             let tracing = cli.trace.is_some();
-            let renderer = arklay::engine::RendererSettings {
-                kind: match cli.renderer {
-                    RendererArg::Software => arklay::engine::RendererKind::Software,
-                    RendererArg::Gpu => arklay::engine::RendererKind::Gpu,
-                },
-                scale: cli.render_scale,
-            };
+            let (config, warnings) = arklay::config::Config::load_default();
+            for warning in warnings {
+                eprintln!("warning: {warning}");
+            }
+            let mut renderer = config.graphics;
+            if let Some(kind) = cli.renderer {
+                renderer.renderer = match kind {
+                    RendererArg::Software => arklay::video::RendererKind::Software,
+                    RendererArg::Gpu => arklay::video::RendererKind::Gpu,
+                };
+            }
+            renderer.render_scale = cli.render_scale.unwrap_or(renderer.render_scale);
+            renderer.msaa = cli.msaa.unwrap_or(renderer.msaa);
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
                 && ((screen != "game" && screen != "demo") || !tracing)
@@ -647,7 +675,6 @@ fn main() -> Result<()> {
                 Some(path) => Some(arklay::engine::InputScript::from_file(path)?),
                 None => None,
             };
-            let config = arklay::config::Config::load_default()?;
             let language = cli.language.clone().or_else(|| config.language.clone());
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),

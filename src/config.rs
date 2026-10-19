@@ -6,7 +6,8 @@
 //! configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! keys and one table:
+//! keys and two tables (the `[graphics]` table also takes bare integers and
+//! booleans):
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
@@ -18,6 +19,18 @@
 //! # left out keeps its default (see `crate::controls`).
 //! [bindings]
 //! aim = ["key:C", "mouse:right", "axis:lefttrigger+"]
+//!
+//! # The interactive window (see `crate::video`); a key left out keeps its
+//! # default. F8 and Alt+Enter rewrite `fullscreen` and the window size, and
+//! # moving the window to another display rewrites `display`.
+//! [graphics]
+//! renderer = "software"  # or "gpu"; `--renderer` overrides it
+//! fullscreen = false     # borderless fullscreen
+//! window_width = 960     # the window's client size in pixels (F8 picks
+//! window_height = 720    # multiples of 320x240; any size is letterboxed)
+//! display = 1            # the display to open on, from 1
+//! render_scale = 100     # GPU: the 3D scene's size, % of the viewport (25..400)
+//! msaa = 1               # GPU: the 3D scene's samples per pixel (1, 2, 4, 8)
 //! ```
 //!
 //! Saved games default to `<config dir>/save` (the `savedat1..8.dat` slot
@@ -31,6 +44,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::budget;
 use crate::controls::{ACTIONS, Action, Bindings, Source};
+use crate::video::{self, Graphics, RendererKind};
 
 /// The configuration file's name inside the configuration directory.
 pub const FILE_NAME: &str = "arklay.toml";
@@ -52,6 +66,18 @@ pub struct Config {
     /// The `[bindings]` table over the defaults; `None` when the file has
     /// none (the shipped defaults).
     pub bindings: Option<Bindings>,
+    /// The `[graphics]` table over the defaults.
+    pub graphics: Graphics,
+}
+
+/// The table the parser is in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Table {
+    Root,
+    Bindings,
+    Graphics,
+    /// A table that could not be used; its keys are skipped.
+    Ignored,
 }
 
 impl Config {
@@ -84,105 +110,116 @@ impl Config {
         Self::dir().join(SAVE_DIR_NAME)
     }
 
-    /// Read the configuration file; a missing file is the default
-    /// configuration.
-    pub fn load(path: &Path) -> Result<Self> {
+    /// Read the configuration file, never failing: a missing file is the
+    /// default configuration, and anything wrong with it (an unreadable file,
+    /// a bad line or value) is a warning while that part keeps its default.
+    pub fn load(path: &Path) -> (Self, Vec<String>) {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::default(), Vec::new());
+            }
             Err(err) => {
-                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+                let warning = format!("{}: {err}; using the defaults", path.display());
+                return (Self::default(), vec![warning]);
             }
         };
-        let mut config =
-            Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
+        let (mut config, warnings) = Self::parse_lenient(&text);
         config.save_dir = config.save_dir.map(|dir| expand_tilde(&dir));
-        Ok(config)
+        let warnings = warnings
+            .into_iter()
+            .map(|warning| format!("{}: {warning}", path.display()))
+            .collect();
+        (config, warnings)
     }
 
-    /// Read the default configuration file.
-    pub fn load_default() -> Result<Self> {
+    /// Read the default configuration file ([`Config::load`]).
+    pub fn load_default() -> (Self, Vec<String>) {
         Self::load(&Self::default_path())
     }
 
-    /// Parse the file text. Unknown keys and malformed lines are errors, so a
-    /// typo is reported instead of silently ignored.
+    /// Parse the file text strictly: any problem [`Config::parse_lenient`]
+    /// would warn about is an error. Saving uses this, so a file with a
+    /// mistake in it is never rewritten (and the mistake lost).
     pub fn parse(text: &str) -> Result<Self> {
+        let (config, warnings) = Self::parse_lenient(text);
+        if !warnings.is_empty() {
+            bail!("{}", warnings.join("; "));
+        }
+        Ok(config)
+    }
+
+    /// Parse the file text, skipping what it cannot use: an unknown key or
+    /// table, a malformed line or an out-of-range value is reported in the
+    /// returned warnings and leaves that setting at its default, so a typo is
+    /// reported without stopping the game.
+    pub fn parse_lenient(text: &str) -> (Self, Vec<String>) {
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-        budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "config file size")?;
+        if let Err(err) = budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "config file size")
+        {
+            return (
+                Self::default(),
+                vec![format!("{err:#}; using the defaults")],
+            );
+        }
         let mut config = Self::default();
-        let mut in_bindings = false;
+        let mut warnings = Vec::new();
+        let mut table = Table::Root;
+        let mut seen_graphics = false;
         let mut bound = Vec::new();
+        let mut graphics_keys: Vec<String> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let content = strip_comment(raw).trim();
             if content.is_empty() {
                 continue;
             }
-            if let Some(table) = content.strip_prefix('[') {
-                match table.strip_suffix(']').map(str::trim) {
+            if let Some(header) = content.strip_prefix('[') {
+                table = match header.strip_suffix(']').map(str::trim) {
                     Some("bindings") if config.bindings.is_none() => {
-                        in_bindings = true;
                         config.bindings = Some(Bindings::default());
+                        Table::Bindings
                     }
-                    Some("bindings") => bail!("line {line}: duplicate [bindings] table"),
-                    Some(other) => bail!("line {line}: unknown table `[{other}]`"),
-                    None => bail!("line {line}: unterminated table header"),
-                }
-                continue;
-            }
-            let Some((key, value)) = content.split_once('=') else {
-                bail!("line {line}: expected `key = \"value\"`");
-            };
-            let key = key.trim();
-            let value = value.trim();
-            if in_bindings {
-                let Some(action) = Action::from_name(key) else {
-                    bail!("line {line}: unknown action `{key}`");
+                    Some("graphics") if !seen_graphics => {
+                        seen_graphics = true;
+                        Table::Graphics
+                    }
+                    Some(name @ ("bindings" | "graphics")) => {
+                        warnings.push(format!("line {line}: duplicate [{name}] table ignored"));
+                        Table::Ignored
+                    }
+                    Some(other) => {
+                        warnings.push(format!("line {line}: unknown table `[{other}]` ignored"));
+                        Table::Ignored
+                    }
+                    None => {
+                        warnings.push(format!("line {line}: unterminated table header"));
+                        Table::Ignored
+                    }
                 };
-                if bound.contains(&action) {
-                    bail!("line {line}: duplicate action `{key}`");
-                }
-                bound.push(action);
-                let mut sources = Vec::new();
-                for name in parse_string_array(value, line)? {
-                    let source = Source::parse(&name)
-                        .with_context(|| format!("line {line}: bad binding for `{key}`"))?;
-                    sources.push(source);
-                }
-                if let Some(bindings) = config.bindings.as_mut() {
-                    bindings.set(action, sources);
-                }
                 continue;
             }
-            if !value.starts_with(['"', '\'']) {
-                bail!("line {line}: `{key}` expects a quoted string");
-            }
-            let value = parse_quoted(value, line)?;
-            match key {
-                "save_dir" => {
-                    if value.is_empty() {
-                        bail!("line {line}: save_dir is empty");
-                    }
-                    config.save_dir = Some(PathBuf::from(value));
+            let parsed = match table {
+                Table::Ignored => Ok(()),
+                Table::Root => parse_root_key(&mut config, content, line),
+                Table::Graphics => {
+                    parse_graphics_line(&mut config.graphics, &mut graphics_keys, content, line)
                 }
-                "language" => {
-                    if value.is_empty() {
-                        bail!("line {line}: language is empty");
-                    }
-                    config.language = Some(value);
-                }
-                other => bail!("line {line}: unknown key `{other}`"),
+                Table::Bindings => parse_binding_line(&mut config, &mut bound, content, line),
+            };
+            if let Err(err) = parsed {
+                warnings.push(format!("{err:#}"));
             }
         }
         if let Some(action) = config.bindings.as_ref().and_then(Bindings::lockout) {
-            bail!(
+            warnings.push(format!(
                 "[bindings]: `{}` needs a keyboard key bound to none of up, down, left, right, \
-                 confirm, cancel and start",
+                 confirm, cancel and start; using the default bindings",
                 action.name()
-            );
+            ));
+            config.bindings = None;
         }
-        Ok(config)
+        (config, warnings)
     }
 
     /// Render the canonical file text (the documented keys, defaults omitted:
@@ -214,6 +251,14 @@ impl Config {
                 out.push_str(&format!("{} = [{}]\n", action.name(), names.join(", ")));
             }
         }
+        let graphics = render_graphics(&self.graphics);
+        if !graphics.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[graphics]\n");
+            out.push_str(&graphics);
+        }
         out
     }
 
@@ -229,6 +274,29 @@ impl Config {
     /// not kept; `save_dir` stays as written, `~` included). A file that does
     /// not parse is left alone and reported.
     pub fn save_bindings(path: &Path, bindings: &Bindings) -> Result<()> {
+        Self::update(path, |config| {
+            config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
+        })
+    }
+
+    /// Persist the window keys of `graphics` (`fullscreen`, `window_width`,
+    /// `window_height` and `display`) into the file at `path`, keeping its other keys. The
+    /// renderer keys stay as the file has them, since the command line may
+    /// have overridden them for this run. Rewritten like
+    /// [`Config::save_bindings`].
+    pub fn save_window(path: &Path, graphics: &Graphics) -> Result<()> {
+        Self::update(path, |config| {
+            config.graphics.fullscreen = graphics.fullscreen;
+            config.graphics.window_width = graphics.window_width;
+            config.graphics.window_height = graphics.window_height;
+            config.graphics.display = graphics.display;
+        })
+    }
+
+    /// Read the file at `path` (a missing one is empty), apply `change` and
+    /// write it back in its canonical form. A file that does not parse is
+    /// left alone and reported.
+    fn update(path: &Path, change: impl FnOnce(&mut Self)) -> Result<()> {
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -238,13 +306,163 @@ impl Config {
         };
         let mut config =
             Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
-        config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
+        change(&mut config);
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
         crate::atomic::write(path, config.render().as_bytes())
     }
+}
+
+/// Split a `key = value` line.
+fn key_value(content: &str, line: usize) -> Result<(&str, &str)> {
+    let Some((key, value)) = content.split_once('=') else {
+        bail!("line {line}: expected `key = \"value\"`");
+    };
+    Ok((key.trim(), value.trim()))
+}
+
+/// Parse one top-level `key = "value"` line into `config`.
+fn parse_root_key(config: &mut Config, content: &str, line: usize) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if !value.starts_with(['"', '\'']) {
+        bail!("line {line}: `{key}` expects a quoted string");
+    }
+    let value = parse_quoted(value, line)?;
+    match key {
+        "save_dir" => {
+            if value.is_empty() {
+                bail!("line {line}: save_dir is empty");
+            }
+            config.save_dir = Some(PathBuf::from(value));
+        }
+        "language" => {
+            if value.is_empty() {
+                bail!("line {line}: language is empty");
+            }
+            config.language = Some(value);
+        }
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
+/// Parse one `[bindings]` line into `config`; a bad line leaves the action
+/// at its default.
+fn parse_binding_line(
+    config: &mut Config,
+    bound: &mut Vec<Action>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    let Some(action) = Action::from_name(key) else {
+        bail!("line {line}: unknown action `{key}`");
+    };
+    if bound.contains(&action) {
+        bail!("line {line}: duplicate action `{key}`");
+    }
+    bound.push(action);
+    let mut sources = Vec::new();
+    for name in parse_string_array(value, line)? {
+        let source = Source::parse(&name)
+            .with_context(|| format!("line {line}: bad binding for `{key}`"))?;
+        sources.push(source);
+    }
+    if let Some(bindings) = config.bindings.as_mut() {
+        bindings.set(action, sources);
+    }
+    Ok(())
+}
+
+/// Parse one `[graphics]` line into `graphics`.
+fn parse_graphics_line(
+    graphics: &mut Graphics,
+    seen: &mut Vec<String>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if seen.iter().any(|seen| seen == key) {
+        bail!("line {line}: duplicate key `{key}`");
+    }
+    seen.push(key.to_string());
+    parse_graphics_key(graphics, key, value, line)
+}
+
+/// Parse one `[graphics]` key into `graphics`.
+fn parse_graphics_key(graphics: &mut Graphics, key: &str, value: &str, line: usize) -> Result<()> {
+    let integer = |range: std::ops::RangeInclusive<u32>| -> Result<u32> {
+        let Ok(number) = value.parse::<u32>() else {
+            bail!("line {line}: `{key}` expects an integer");
+        };
+        if !range.contains(&number) {
+            bail!(
+                "line {line}: `{key}` must be {}..={}",
+                range.start(),
+                range.end()
+            );
+        }
+        Ok(number)
+    };
+    match key {
+        "renderer" => {
+            let name = parse_quoted(value, line)?;
+            let Some(renderer) = RendererKind::from_name(&name) else {
+                bail!("line {line}: renderer must be \"software\" or \"gpu\"");
+            };
+            graphics.renderer = renderer;
+        }
+        "fullscreen" => {
+            graphics.fullscreen = match value {
+                "true" => true,
+                "false" => false,
+                _ => bail!("line {line}: `fullscreen` expects true or false"),
+            };
+        }
+        "window_width" => graphics.window_width = integer(1..=video::MAX_WINDOW_SIDE)?,
+        "window_height" => graphics.window_height = integer(1..=video::MAX_WINDOW_SIDE)?,
+        "display" => graphics.display = integer(1..=video::MAX_DISPLAY)?,
+        "render_scale" => graphics.render_scale = integer(video::RENDER_SCALE_RANGE)?,
+        "msaa" => {
+            let samples = integer(1..=8)?;
+            if !video::MSAA_COUNTS.contains(&samples) {
+                bail!("line {line}: `msaa` must be 1, 2, 4 or 8");
+            }
+            graphics.msaa = samples;
+        }
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
+/// The `[graphics]` keys that differ from the defaults.
+fn render_graphics(graphics: &Graphics) -> String {
+    let defaults = Graphics::default();
+    let mut out = String::new();
+    if graphics.renderer != defaults.renderer {
+        out.push_str(&format!("renderer = {}\n", quote(graphics.renderer.name())));
+    }
+    if graphics.fullscreen != defaults.fullscreen {
+        out.push_str(&format!("fullscreen = {}\n", graphics.fullscreen));
+    }
+    for (key, value, default) in [
+        ("window_width", graphics.window_width, defaults.window_width),
+        (
+            "window_height",
+            graphics.window_height,
+            defaults.window_height,
+        ),
+        ("display", graphics.display, defaults.display),
+        ("render_scale", graphics.render_scale, defaults.render_scale),
+        ("msaa", graphics.msaa, defaults.msaa),
+    ] {
+        if value != default {
+            out.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    out
 }
 
 /// A basic `"..."` string with the escapes [`parse_quoted`] reads back.
@@ -403,7 +621,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("arklay-config-{}-missing", std::process::id()));
         let path = dir.join("arklay.toml");
-        assert_eq!(Config::load(&path).unwrap(), Config::default());
+        assert_eq!(Config::load(&path), (Config::default(), Vec::new()));
     }
 
     #[test]
@@ -461,6 +679,7 @@ mod tests {
             save_dir: Some(PathBuf::from("/tmp/saves")),
             language: Some("en-US".into()),
             bindings: None,
+            graphics: Graphics::default(),
         }
         .render();
         assert_eq!(text, "save_dir = \"/tmp/saves\"\nlanguage = \"en-US\"\n");
@@ -537,11 +756,11 @@ mod tests {
         let mut bindings = Bindings::default();
         assert!(bindings.bind(Action::Aim, usize::MAX, Source::Mouse(3)));
         Config::save_bindings(&path, &bindings).unwrap();
-        let loaded = Config::load(&path).unwrap();
+        let (loaded, _) = Config::load(&path);
         assert_eq!(loaded.language.as_deref(), Some("ja-JP"), "other keys kept");
         assert_eq!(loaded.bindings_or_default(), bindings);
         Config::save_bindings(&path, &Bindings::default()).unwrap();
-        assert_eq!(Config::load(&path).unwrap().bindings, None);
+        assert_eq!(Config::load(&path).0.bindings, None);
         assert_eq!(fs::read_to_string(&path).unwrap(), "language = \"ja-JP\"\n");
         // A file that does not parse is never overwritten.
         fs::write(&path, "garbage\n").unwrap();
@@ -560,6 +779,132 @@ mod tests {
         Config::save_bindings(&path, &bindings).unwrap();
         let saved = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(saved.save_dir.as_deref(), Some(Path::new("~/saves")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_graphics_table_sets_the_window_and_renderer_options() {
+        let config = Config::parse(
+            "[graphics]\n\
+             renderer = \"gpu\"\n\
+             fullscreen = true  # borderless\n\
+             window_width = 1280\n\
+             window_height = 1024\n\
+             display = 2\n\
+             render_scale = 150\n\
+             msaa = 4\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.graphics,
+            Graphics {
+                renderer: RendererKind::Gpu,
+                fullscreen: true,
+                window_width: 1280,
+                window_height: 1024,
+                display: 2,
+                render_scale: 150,
+                msaa: 4,
+            }
+        );
+        let text = config.render();
+        assert!(text.starts_with("[graphics]\n"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), config);
+        // Keys left out keep their defaults, and defaults are not written.
+        let config = Config::parse("[graphics]\nwindow_width = 640\n").unwrap();
+        assert_eq!(config.graphics.msaa, 1);
+        assert_eq!(config.graphics.window_height, 720);
+        assert_eq!(config.render(), "[graphics]\nwindow_width = 640\n");
+    }
+
+    #[test]
+    fn bad_graphics_values_warn_and_keep_their_defaults() {
+        for text in [
+            "[graphics]\nrenderer = \"opengl\"\n",
+            "[graphics]\nrenderer = gpu\n",
+            "[graphics]\nfullscreen = \"yes\"\n",
+            "[graphics]\nwindow_width = 0\n",
+            "[graphics]\nwindow_height = \"720\"\n",
+            "[graphics]\nwindow_width = 99999\n",
+            "[graphics]\ndisplay = 0\n",
+            "[graphics]\nrender_scale = 10\n",
+            "[graphics]\nmsaa = 3\n",
+            "[graphics]\nvsync = true\n",
+            "[graphics]\nmsaa = 1\nmsaa = 2\n",
+            "[graphics]\n[graphics]\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
+            let (config, warnings) = Config::parse_lenient(text);
+            assert_eq!(warnings.len(), 1, "{text:?}: {warnings:?}");
+            assert_eq!(config.graphics, Graphics::default(), "{text:?}");
+        }
+        // Only the bad line falls back; the rest of the file still applies.
+        let (config, warnings) = Config::parse_lenient(
+            "language = \"ja-JP\"\n\
+             [graphics]\n\
+             renderer = \"gpu\"\n\
+             msaa = 3\n\
+             window_width = 640\n\
+             [bindings]\n\
+             aim = [\"key:NoSuchKey\"]\n\
+             fire = \"wheel:up\"\n",
+        );
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("line 4"), "{warnings:?}");
+        assert_eq!(config.language.as_deref(), Some("ja-JP"));
+        assert_eq!(config.graphics.renderer, RendererKind::Gpu);
+        assert_eq!(config.graphics.msaa, 1);
+        assert_eq!(config.graphics.window_width, 640);
+        let bindings = config.bindings_or_default();
+        assert_eq!(
+            bindings.get(Action::Aim),
+            Bindings::default().get(Action::Aim)
+        );
+        assert_eq!(
+            bindings.get(Action::Fire),
+            [Source::Wheel(crate::controls::Wheel::Up)]
+        );
+        // A bindings table that locks out the menus falls back as a whole.
+        let (config, warnings) = Config::parse_lenient("[bindings]\nconfirm = []\n");
+        assert_eq!((config.bindings, warnings.len()), (None, 1));
+    }
+
+    #[test]
+    fn saving_the_window_keeps_the_renderer_keys() {
+        let dir = std::env::temp_dir().join(format!("arklay-config-{}-window", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            &path,
+            "language = \"ja-JP\"\n[graphics]\nrender_scale = 50\n",
+        )
+        .unwrap();
+        let run = Graphics {
+            renderer: RendererKind::Gpu,
+            fullscreen: true,
+            window_width: 1600,
+            window_height: 1200,
+            display: 2,
+            render_scale: 200,
+            msaa: 8,
+        };
+        Config::save_window(&path, &run).unwrap();
+        let (saved, warnings) = Config::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(saved.language.as_deref(), Some("ja-JP"));
+        assert_eq!(
+            saved.graphics,
+            Graphics {
+                fullscreen: true,
+                window_width: 1600,
+                window_height: 1200,
+                display: 2,
+                render_scale: 50,
+                ..Graphics::default()
+            },
+            "only the window keys are written"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -609,15 +954,20 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("arklay.toml");
         fs::write(&path, "language = \"ja-JP\"\n").unwrap();
-        assert_eq!(
-            Config::load(&path).unwrap().language.as_deref(),
-            Some("ja-JP")
-        );
+        assert_eq!(Config::load(&path).0.language.as_deref(), Some("ja-JP"));
 
-        // A directory where the file should be is an error, not a default.
+        // A directory where the file should be is reported, and the defaults
+        // apply.
         let blocked = dir.join("blocked");
         fs::create_dir_all(&blocked).unwrap();
-        assert!(Config::load(&blocked).is_err());
+        let (config, warnings) = Config::load(&blocked);
+        assert_eq!(config, Config::default());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // A bad value is reported with the file's path.
+        fs::write(&path, "[graphics]\nmsaa = 3\n").unwrap();
+        let (config, warnings) = Config::load(&path);
+        assert_eq!(config, Config::default());
+        assert!(warnings[0].contains("arklay.toml"), "{warnings:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

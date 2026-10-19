@@ -666,7 +666,7 @@ fn a_failed_output_rename_keeps_the_destination_and_removes_the_temporary() {
 }
 
 #[test]
-fn the_config_file_is_read_and_a_bad_one_is_reported() {
+fn the_config_file_is_read_and_a_bad_value_is_a_warning() {
     let dir = TempDir::new("config");
     let path = dir.join("game.akpak");
     write_room_pack(&path);
@@ -698,7 +698,8 @@ fn the_config_file_is_read_and_a_bad_one_is_reported() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(capture.is_file());
 
-    // A malformed config is reported instead of ignored.
+    // A malformed value is reported as a warning and the run goes on with
+    // its default.
     std::fs::write(&config, "save_dir = 3\n").unwrap();
     let output = run_env(
         &[
@@ -710,7 +711,12 @@ fn the_config_file_is_read_and_a_bad_one_is_reported() {
         ],
         &[("ARKLAY_CONFIG_DIR", config_env)],
     );
-    assert_failure(&output, "expects a quoted string");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("warning:") && stderr(&output).contains("expects a quoted string"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 /// A pack whose Lua hook registers a probe save screen: the screen logs

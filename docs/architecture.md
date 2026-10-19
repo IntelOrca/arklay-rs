@@ -49,7 +49,7 @@ responsibility.
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
 | `message` | Runtime | The seven-state message window and its byte grammar |
 | `save` | Runtime | The 0x800-byte BioCard block, slot I/O, the folder scan and explicit-path actions the screen API uses, `Apply_to`/`from_state` round-trip |
-| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir` and `language`; the default `<config dir>/save` location |
+| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]` and `[graphics]`; the default `<config dir>/save` location |
 | `audio` | Runtime | WAV parsing and the single SDL3 software mixer used for SE, voice, BGM and film audio |
 | `bgm` | Runtime | The three-channel music state machine, ramps and channel hand-off |
 | `sfx` | Runtime | Per-room sound-name tables and footstep resolution |
@@ -66,6 +66,7 @@ responsibility.
 |---|---|---|
 | `render` | Presentation | Deterministic software rasterizer: framebuffer, models, masks, shadows, effect billboards, lighting |
 | `gpu` | Presentation | Optional interactive SDL_GPU renderer for the gameplay scene (`--renderer gpu`); never used by captures, traces or tests of record |
+| `video` | Presentation | The `[graphics]` options, the 4:3 viewport fit and the F8 window steps |
 | `model` | Presentation | Shared decoded model types (`Texture8`, mesh/skeleton vocabulary) |
 | `anim` | Presentation | Fixed-point skeletal animation and clip playback |
 | `tmd` | Format | PSX TMD mesh parser |
@@ -330,13 +331,33 @@ the shipped packs.
 
 ## The optional GPU renderer
 
-`--renderer gpu` draws the gameplay scene with SDL_GPU at `--render-scale`
-times 320x240 (default 3, the window size). It is interactive only: captures,
+`--renderer gpu` (or `[graphics] renderer = "gpu"`) draws the gameplay scene
+with SDL_GPU. It is interactive only: captures,
 traces, `--stats`, the oracle and every golden draw through the software
 rasterizer, which stays the reference. Without a usable device (the shaders
 are SPIR-V, so it needs Vulkan) the window warns and falls back to software;
 a failure while drawing or presenting does the same mid-game.
 
+- **Resolutions.** Every frame is the 320x240 one; only its presentation
+  varies. The window's client area is `window_width` x `window_height`
+  (F8 sets whole multiples of 320x240), or the
+  whole display in borderless fullscreen, and the frame fills the largest
+  centred 4:3 viewport in it (`video::fit`). The table below is what each
+  stage draws at for a viewport of `W`x`H`:
+
+  | Stage | Software | GPU |
+  |---|---|---|
+  | Backgrounds, masks, models, shadows, effects | 320x240 | `W`x`H` times `render_scale`%, `msaa` samples, resolved and filtered bilinearly to `W`x`H` |
+  | Sprites, UI, messages, fades | 320x240 | 320x240 (the two software layers) |
+  | To the screen | the 320x240 frame scaled to `W`x`H` | the layers scaled to `W`x`H`, composited over the scene |
+
+  A 320x240 layer reaches the viewport with nearest sampling at a whole
+  zoom (always, windowed) and with sharp (pixel-art) sampling at a fractional
+  one, so every source pixel keeps one width and only the screen pixel that
+  straddles two blends them (`SDL_SCALEMODE_PIXELART` in software, the same
+  formula in `composite.frag`). A capture never reads these options: it
+  draws in software through a fixed 960x720 window, so captures and traces
+  are the same at every setting.
 - **What it draws.** `render::GameplayScene` is the one description of a
   frame both renderers consume. `gpu::scene` turns it into GPU input: a static
   vertex buffer per TMD (rigid skinning by a per-vertex joint index), per-draw

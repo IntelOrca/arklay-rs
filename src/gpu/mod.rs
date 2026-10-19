@@ -3,8 +3,11 @@
 //! The software rasterizer in [`crate::render`] stays authoritative: the
 //! oracle, the goldens, `--capture`, `--trace`, `--stats` and every test draw
 //! through it. This renderer is an interactive-only alternative selected with
-//! `--renderer gpu`. It draws the same [`GameplayScene`] at a higher internal
-//! resolution:
+//! `--renderer gpu`. It draws the same [`GameplayScene`] at the window's
+//! resolution (see [`crate::video`]): the scene target is the viewport's size
+//! times `render_scale` percent, optionally multisampled (`msaa`), and is
+//! filtered into the viewport when the two differ.
+//!
 //!
 //! * Every TMD is expanded once into a static vertex buffer
 //!   ([`scene::mesh_vertices`]) and stays resident while it is drawn. An
@@ -42,11 +45,12 @@ use anyhow::{Result, bail};
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::gpu::*;
 use sdl3_sys::pixels::SDL_FColor;
-use sdl3_sys::video::SDL_Window;
+use sdl3_sys::video::{SDL_GetWindowSizeInPixels, SDL_Window};
 
 use crate::model::{Texture8, Tmd};
 use crate::render::{Framebuffer, GameplayScene, root_position};
 use crate::state::Image;
+use crate::video;
 
 use scene::{DrawUniforms, MeshVertex, SpriteRun, SpriteVertex};
 
@@ -59,10 +63,10 @@ const COMPOSITE_FRAG: &[u8] = include_bytes!("shaders/composite.frag.spv");
 
 /// Scene frames an unused upload stays resident before it is released.
 pub const EVICT_AFTER_FRAMES: u64 = 300;
-/// The default internal resolution multiplier (960x720, the window size).
-pub const DEFAULT_SCALE: u32 = 3;
-/// The largest accepted internal resolution multiplier.
+/// The largest accepted offscreen resolution multiplier.
 pub const MAX_SCALE: u32 = 8;
+/// The largest scene target side, whatever the window and `render_scale`.
+const MAX_SCENE_SIDE: u32 = 8192;
 
 /// The present interval of a renderer whose swapchain does not wait for
 /// vsync.
@@ -143,10 +147,22 @@ pub struct GpuRenderer {
     device: *mut SDL_GPUDevice,
     /// The claimed window; null for an offscreen renderer.
     window: *mut SDL_Window,
-    scale: u32,
+    /// The scene target's size as a percentage of the viewport.
+    render_scale: u32,
+    /// The scene target's size in pixels.
+    scene_size: (u32, u32),
+    /// Samples per scene pixel; above one the scene draws into
+    /// `scene_samples` and resolves into `scene_colour`.
+    samples: SDL_GPUSampleCount,
+    depth_format: SDL_GPUTextureFormat,
     pipelines: Pipelines,
     sampler: *mut SDL_GPUSampler,
+    /// The composite's sampler: the layers' sharp upscale and the scene's
+    /// filtering both build on bilinear taps.
+    linear: *mut SDL_GPUSampler,
     scene_colour: *mut SDL_GPUTexture,
+    /// The multisampled colour target; null without MSAA.
+    scene_samples: *mut SDL_GPUTexture,
     scene_depth: *mut SDL_GPUTexture,
     layer_black: *mut SDL_GPUTexture,
     layer_white: *mut SDL_GPUTexture,
@@ -172,19 +188,28 @@ pub struct GpuRenderer {
 impl GpuRenderer {
     /// Create a device, claim `window` for it and build the pipelines.
     ///
-    /// `scale` multiplies the 320x240 logical frame for the scene's internal
-    /// resolution (clamped to `1..=MAX_SCALE`).
+    /// The scene target follows the window: [`crate::video::fit`]'s viewport
+    /// of its client area, times `render_scale` percent, with `msaa` samples
+    /// per pixel (or the most the device supports below that).
     ///
     /// # Safety
     ///
     /// `window` must be a live SDL window that outlives the renderer and is
     /// not claimed by another device or an SDL renderer.
-    pub unsafe fn new(window: *mut SDL_Window, scale: u32) -> Result<Self> {
-        let mut renderer = Self::create(scale)?;
+    pub unsafe fn new(window: *mut SDL_Window, render_scale: u32, msaa: u32) -> Result<Self> {
+        let mut renderer = Self::create(
+            (LAYER_WIDTH, LAYER_HEIGHT),
+            render_scale.clamp(
+                *video::RENDER_SCALE_RANGE.start(),
+                *video::RENDER_SCALE_RANGE.end(),
+            ),
+            msaa,
+        )?;
         if !unsafe { SDL_ClaimWindowForGPUDevice(renderer.device, window) } {
             bail!("SDL_ClaimWindowForGPUDevice failed: {}", sdl_error());
         }
         renderer.window = window;
+        renderer.follow_window()?;
         // FIFO presentation can block indefinitely on a compositor that
         // stops sending frame callbacks (a hidden or unmapped Wayland
         // window), which would also stop the event loop. Mailbox never
@@ -220,12 +245,14 @@ impl GpuRenderer {
 
     /// A renderer with no window, for tests and tools: it records scenes and
     /// reads them back with [`GpuRenderer::read_scene`].
+    /// Its scene target is `scale` times 320x240 (clamped to
+    /// `1..=MAX_SCALE`), single-sampled.
     pub fn offscreen(scale: u32) -> Result<Self> {
-        Self::create(scale)
+        let scale = scale.clamp(1, MAX_SCALE);
+        Self::create((LAYER_WIDTH * scale, LAYER_HEIGHT * scale), 100, 1)
     }
 
-    fn create(scale: u32) -> Result<Self> {
-        let scale = scale.clamp(1, MAX_SCALE);
+    fn create(scene_size: (u32, u32), render_scale: u32, msaa: u32) -> Result<Self> {
         let device =
             unsafe { SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, std::ptr::null()) };
         if device.is_null() {
@@ -234,7 +261,10 @@ impl GpuRenderer {
         let mut renderer = Self {
             device,
             window: std::ptr::null_mut(),
-            scale,
+            render_scale,
+            scene_size,
+            samples: SDL_GPU_SAMPLECOUNT_1,
+            depth_format: SDL_GPU_TEXTUREFORMAT_D24_UNORM,
             pipelines: Pipelines {
                 mesh_opaque: std::ptr::null_mut(),
                 mesh_blend: std::ptr::null_mut(),
@@ -245,7 +275,9 @@ impl GpuRenderer {
                 composite: std::ptr::null_mut(),
             },
             sampler: std::ptr::null_mut(),
+            linear: std::ptr::null_mut(),
             scene_colour: std::ptr::null_mut(),
+            scene_samples: std::ptr::null_mut(),
             scene_depth: std::ptr::null_mut(),
             layer_black: std::ptr::null_mut(),
             layer_white: std::ptr::null_mut(),
@@ -262,7 +294,7 @@ impl GpuRenderer {
         };
         // From here a failure drops `renderer`, which releases whatever was
         // created so far.
-        let depth_format = if unsafe {
+        renderer.depth_format = if unsafe {
             SDL_GPUTextureSupportsFormat(
                 device,
                 SDL_GPU_TEXTUREFORMAT_D32_FLOAT,
@@ -274,21 +306,8 @@ impl GpuRenderer {
         } else {
             SDL_GPU_TEXTUREFORMAT_D24_UNORM
         };
-        let (width, height) = renderer.scene_size();
-        renderer.scene_colour = renderer.texture(
-            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            width,
-            height,
-            SDL_GPUTextureUsageFlags(
-                SDL_GPU_TEXTUREUSAGE_SAMPLER.0 | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET.0,
-            ),
-        )?;
-        renderer.scene_depth = renderer.texture(
-            depth_format,
-            width,
-            height,
-            SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
-        )?;
+        renderer.samples = renderer.sample_count(msaa);
+        renderer.create_scene_targets()?;
         renderer.layer_black = renderer.texture(
             SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
             LAYER_WIDTH,
@@ -310,27 +329,124 @@ impl GpuRenderer {
         if renderer.layer_transfer.is_null() {
             bail!("SDL_CreateGPUTransferBuffer failed: {}", sdl_error());
         }
-        let sampler_info = SDL_GPUSamplerCreateInfo {
-            min_filter: SDL_GPU_FILTER_NEAREST,
-            mag_filter: SDL_GPU_FILTER_NEAREST,
+        renderer.sampler = renderer.create_sampler(SDL_GPU_FILTER_NEAREST)?;
+        renderer.linear = renderer.create_sampler(SDL_GPU_FILTER_LINEAR)?;
+        renderer.build_scene_pipelines()?;
+        renderer.clear_scene()?;
+        Ok(renderer)
+    }
+
+    /// The most samples up to `msaa` both scene formats support.
+    fn sample_count(&self, msaa: u32) -> SDL_GPUSampleCount {
+        let counts = [
+            (8, SDL_GPU_SAMPLECOUNT_8),
+            (4, SDL_GPU_SAMPLECOUNT_4),
+            (2, SDL_GPU_SAMPLECOUNT_2),
+        ];
+        for (samples, count) in counts {
+            if samples <= msaa
+                && unsafe {
+                    SDL_GPUTextureSupportsSampleCount(
+                        self.device,
+                        SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                        count,
+                    ) && SDL_GPUTextureSupportsSampleCount(self.device, self.depth_format, count)
+                }
+            {
+                return count;
+            }
+        }
+        SDL_GPU_SAMPLECOUNT_1
+    }
+
+    fn create_sampler(&self, filter: SDL_GPUFilter) -> Result<*mut SDL_GPUSampler> {
+        let info = SDL_GPUSamplerCreateInfo {
+            min_filter: filter,
+            mag_filter: filter,
             mipmap_mode: SDL_GPU_SAMPLERMIPMAPMODE_NEAREST,
             address_mode_u: SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             address_mode_v: SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             address_mode_w: SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE,
             ..Default::default()
         };
-        renderer.sampler = unsafe { SDL_CreateGPUSampler(device, &sampler_info) };
-        if renderer.sampler.is_null() {
+        let sampler = unsafe { SDL_CreateGPUSampler(self.device, &info) };
+        if sampler.is_null() {
             bail!("SDL_CreateGPUSampler failed: {}", sdl_error());
         }
-        renderer.build_scene_pipelines(depth_format)?;
-        renderer.clear_scene()?;
-        Ok(renderer)
+        Ok(sampler)
+    }
+
+    /// Create the scene's colour, multisample and depth targets at
+    /// `scene_size`.
+    fn create_scene_targets(&mut self) -> Result<()> {
+        let (width, height) = self.scene_size;
+        self.scene_colour = self.texture(
+            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            width,
+            height,
+            SDL_GPUTextureUsageFlags(
+                SDL_GPU_TEXTUREUSAGE_SAMPLER.0 | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET.0,
+            ),
+        )?;
+        if self.samples != SDL_GPU_SAMPLECOUNT_1 {
+            self.scene_samples = self.target(
+                SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+                width,
+                height,
+                SDL_GPU_TEXTUREUSAGE_COLOR_TARGET,
+                self.samples,
+            )?;
+        }
+        self.scene_depth = self.target(
+            self.depth_format,
+            width,
+            height,
+            SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET,
+            self.samples,
+        )?;
+        Ok(())
+    }
+
+    /// Release the scene targets. SDL keeps a texture alive until the work
+    /// already submitted against it is done.
+    fn release_scene_targets(&mut self) {
+        for texture in [
+            &mut self.scene_colour,
+            &mut self.scene_samples,
+            &mut self.scene_depth,
+        ] {
+            if !texture.is_null() {
+                unsafe { SDL_ReleaseGPUTexture(self.device, *texture) };
+                *texture = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// Resize the scene targets to the window's current viewport times
+    /// `render_scale`; a renderer with no window keeps its size.
+    fn follow_window(&mut self) -> Result<()> {
+        if self.window.is_null() {
+            return Ok(());
+        }
+        let (mut width, mut height) = (0, 0);
+        if !unsafe { SDL_GetWindowSizeInPixels(self.window, &mut width, &mut height) } {
+            bail!("SDL_GetWindowSizeInPixels failed: {}", sdl_error());
+        }
+        let viewport = video::fit(width.max(1) as u32, height.max(1) as u32);
+        let (width, height) = video::scene_size(viewport, self.render_scale);
+        let size = (width.min(MAX_SCENE_SIDE), height.min(MAX_SCENE_SIDE));
+        if size == self.scene_size && !self.scene_colour.is_null() {
+            return Ok(());
+        }
+        self.release_scene_targets();
+        self.scene_size = size;
+        self.create_scene_targets()?;
+        self.clear_scene()
     }
 
     /// The scene target's size in pixels.
     pub fn scene_size(&self) -> (u32, u32) {
-        (LAYER_WIDTH * self.scale, LAYER_HEIGHT * self.scale)
+        self.scene_size
     }
 
     fn texture(
@@ -340,6 +456,18 @@ impl GpuRenderer {
         height: u32,
         usage: SDL_GPUTextureUsageFlags,
     ) -> Result<*mut SDL_GPUTexture> {
+        self.target(format, width, height, usage, SDL_GPU_SAMPLECOUNT_1)
+    }
+
+    /// [`GpuRenderer::texture`] with `samples` per pixel.
+    fn target(
+        &self,
+        format: SDL_GPUTextureFormat,
+        width: u32,
+        height: u32,
+        usage: SDL_GPUTextureUsageFlags,
+        samples: SDL_GPUSampleCount,
+    ) -> Result<*mut SDL_GPUTexture> {
         let info = SDL_GPUTextureCreateInfo {
             r#type: SDL_GPU_TEXTURETYPE_2D,
             format,
@@ -348,7 +476,7 @@ impl GpuRenderer {
             height,
             layer_count_or_depth: 1,
             num_levels: 1,
-            sample_count: SDL_GPU_SAMPLECOUNT_1,
+            sample_count: samples,
             ..Default::default()
         };
         let texture = unsafe { SDL_CreateGPUTexture(self.device, &info) };
@@ -396,6 +524,7 @@ impl GpuRenderer {
         blend: bool,
         depth: Option<(SDL_GPUTextureFormat, bool)>,
         colour_format: SDL_GPUTextureFormat,
+        samples: SDL_GPUSampleCount,
     ) -> Result<*mut SDL_GPUGraphicsPipeline> {
         let buffer = SDL_GPUVertexBufferDescription {
             slot: 0,
@@ -459,6 +588,10 @@ impl GpuRenderer {
                 enable_depth_clip: true,
                 ..Default::default()
             },
+            multisample_state: SDL_GPUMultisampleState {
+                sample_count: samples,
+                ..Default::default()
+            },
             depth_stencil_state,
             target_info: SDL_GPUGraphicsPipelineTargetInfo {
                 color_target_descriptions: &colour_target,
@@ -476,7 +609,8 @@ impl GpuRenderer {
         Ok(pipeline)
     }
 
-    fn build_scene_pipelines(&mut self, depth_format: SDL_GPUTextureFormat) -> Result<()> {
+    fn build_scene_pipelines(&mut self) -> Result<()> {
+        let depth_format = self.depth_format;
         let attribute = |location: u32, format: SDL_GPUVertexElementFormat, offset: u32| {
             SDL_GPUVertexAttribute {
                 location,
@@ -516,6 +650,7 @@ impl GpuRenderer {
                 blend,
                 Some((depth_format, write)),
                 colour,
+                this.samples,
             )
         };
         let sprite = |this: &Self, write| {
@@ -528,6 +663,7 @@ impl GpuRenderer {
                 true,
                 Some((depth_format, write)),
                 colour,
+                this.samples,
             )
         };
         // Each pipeline is stored as soon as it exists, so a later failure
@@ -556,6 +692,7 @@ impl GpuRenderer {
             false,
             None,
             format,
+            SDL_GPU_SAMPLECOUNT_1,
         )
     }
 
@@ -966,6 +1103,7 @@ impl GpuRenderer {
     /// Draw `scene` into the scene target. The result persists until the next
     /// call, so a frozen frame (the pause menu) keeps compositing it.
     pub fn record_scene(&mut self, scene: &GameplayScene<'_>) -> Result<()> {
+        self.follow_window()?;
         self.frame += 1;
         self.fresh.clear();
         let command = self.command_buffer()?;
@@ -1031,18 +1169,33 @@ impl GpuRenderer {
         unsafe { SDL_EndGPUCopyPass(copy) };
         let (meshes, sprites, sprite_textures) = uploads?;
 
-        let colour = SDL_GPUColorTargetInfo {
-            texture: self.scene_colour,
-            clear_color: SDL_FColor {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 1.0,
-            },
-            load_op: SDL_GPU_LOADOP_CLEAR,
-            store_op: SDL_GPU_STOREOP_STORE,
-            cycle: true,
-            ..Default::default()
+        let clear_color = SDL_FColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        // With MSAA the samples resolve into the target the composite reads.
+        let colour = if self.scene_samples.is_null() {
+            SDL_GPUColorTargetInfo {
+                texture: self.scene_colour,
+                clear_color,
+                load_op: SDL_GPU_LOADOP_CLEAR,
+                store_op: SDL_GPU_STOREOP_STORE,
+                cycle: true,
+                ..Default::default()
+            }
+        } else {
+            SDL_GPUColorTargetInfo {
+                texture: self.scene_samples,
+                clear_color,
+                load_op: SDL_GPU_LOADOP_CLEAR,
+                store_op: SDL_GPU_STOREOP_RESOLVE,
+                resolve_texture: self.scene_colour,
+                cycle: true,
+                cycle_resolve_texture: true,
+                ..Default::default()
+            }
         };
         let depth = SDL_GPUDepthStencilTargetInfo {
             texture: self.scene_depth,
@@ -1243,13 +1396,14 @@ impl GpuRenderer {
         // Never wait for an image: with every image in flight (or a hidden
         // window) this frame is skipped and the uploads still run.
         let mut swapchain = std::ptr::null_mut();
+        let (mut width, mut height) = (0, 0);
         if !unsafe {
             SDL_AcquireGPUSwapchainTexture(
                 command,
                 self.window,
                 &mut swapchain,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut width,
+                &mut height,
             )
         } {
             unsafe { SDL_CancelGPUCommandBuffer(command) };
@@ -1279,11 +1433,21 @@ impl GpuRenderer {
                     [self.layer_black, self.layer_white, self.scene_colour].map(|texture| {
                         SDL_GPUTextureSamplerBinding {
                             texture,
-                            sampler: self.sampler,
+                            sampler: self.linear,
                         }
                     });
+                let fit = video::fit(width, height);
+                let viewport = SDL_GPUViewport {
+                    x: fit.x as f32,
+                    y: fit.y as f32,
+                    w: fit.width as f32,
+                    h: fit.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
                 unsafe {
                     SDL_BindGPUGraphicsPipeline(pass, self.pipelines.composite);
+                    SDL_SetGPUViewport(pass, &viewport);
                     SDL_BindGPUFragmentSamplers(pass, 0, samplers.as_ptr(), 3);
                     SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
                     SDL_EndGPURenderPass(pass);
@@ -1409,6 +1573,7 @@ impl Drop for GpuRenderer {
             SDL_WaitForGPUIdle(self.device);
         }
         self.release_residency();
+        self.release_scene_targets();
         unsafe {
             let pipelines = [
                 self.pipelines.mesh_opaque,
@@ -1422,12 +1587,7 @@ impl Drop for GpuRenderer {
             for pipeline in pipelines.into_iter().filter(|p| !p.is_null()) {
                 SDL_ReleaseGPUGraphicsPipeline(self.device, pipeline);
             }
-            let textures = [
-                self.scene_colour,
-                self.scene_depth,
-                self.layer_black,
-                self.layer_white,
-            ];
+            let textures = [self.layer_black, self.layer_white];
             for texture in textures.into_iter().filter(|t| !t.is_null()) {
                 SDL_ReleaseGPUTexture(self.device, texture);
             }
@@ -1437,8 +1597,10 @@ impl Drop for GpuRenderer {
             if !self.layer_transfer.is_null() {
                 SDL_ReleaseGPUTransferBuffer(self.device, self.layer_transfer);
             }
-            if !self.sampler.is_null() {
-                SDL_ReleaseGPUSampler(self.device, self.sampler);
+            for sampler in [self.sampler, self.linear] {
+                if !sampler.is_null() {
+                    SDL_ReleaseGPUSampler(self.device, sampler);
+                }
             }
             if !self.window.is_null() {
                 SDL_ReleaseWindowFromGPUDevice(self.device, self.window);

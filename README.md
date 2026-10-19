@@ -116,10 +116,10 @@ cargo run -- re1.akpak --ending 1
 # marks. Needs no --capture; the budgets live in docs/performance.md
 cargo run -- re1.akpak --room 100 --ticks 600 --stats
 
-# Draw the 3D scene on the GPU (SDL_GPU over Vulkan) at 4x the 320x240
-# internal resolution; falls back to software without a device. Captures and
-# --stats always use the software renderer
-cargo run -- re1.akpak --renderer gpu --render-scale 4
+# Draw the 3D scene on the GPU (SDL_GPU over Vulkan) at the window's
+# resolution, here at 150% of it with 4x MSAA; falls back to software without
+# a device. Captures and --stats always use the software renderer
+cargo run -- re1.akpak --renderer gpu --render-scale 150 --msaa 4
 
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
@@ -240,9 +240,41 @@ Sources are `key:<SDL key name>`, `mouse:left|middle|right|x1|x2`,
 number (`key:#N`, `mouse:N`, `pad:#N`, `axis:#N+`). The actions are `up`, `down`, `left`, `right`,
 `confirm`, `cancel`, `run`, `aim`, `fire`, `start`, `page_left` and
 `page_right`. Saving rewrites the file in canonical form (comments are not
-kept) and never touches a file that fails to parse. Gamepads are picked up
-when plugged in; extra controller mappings can be dropped into
-`gamecontrollerdb.txt` in the config directory (or `SDL_GAMECONTROLLERCONFIG`).
+kept). A bad line or value in `arklay.toml` (an unknown key, `msaa = 3`, a
+binding to a key that does not exist) never stops the game: it is reported
+as a warning and that setting keeps its default. The file is not rewritten
+while it has such a mistake in it, so a change made in game (a rebinding, F8)
+then applies for the run only. Gamepads are picked up when plugged in; extra
+controller mappings can be dropped into `gamecontrollerdb.txt` in the config
+directory (or `SDL_GAMECONTROLLERCONFIG`).
+
+`F8` steps the window up to the next whole multiple of 320x240, switches to
+borderless fullscreen once the next size would not fit the display, and goes
+back to 320x240 after that; `Alt+Enter` toggles borderless fullscreen. The
+window cannot be resized by hand, but `window_width` and `window_height` can
+be set to any size. The 4:3 frame always fits the window or screen, centred
+with black bars where the shape differs: a whole zoom stays exactly
+pixel-sharp, and a fractional one keeps every pixel the same size, blending
+only along their edges. The window size, fullscreen and the display it is on
+are saved to the `[graphics]` table of `arklay.toml`, so the next run opens
+the same way on the same screen:
+
+```toml
+[graphics]
+renderer = "gpu"   # "software" (default) or "gpu"; --renderer overrides it
+fullscreen = false # borderless fullscreen (Alt+Enter)
+window_width = 960 # the window's client size in pixels (F8 sets multiples
+window_height = 720 # of 320x240); a window too big for its display shrinks
+display = 1        # the display to open on, numbered from 1
+render_scale = 100 # GPU only: the 3D scene's resolution, % of the screen area it fills (25..400)
+msaa = 4           # GPU only: anti-aliasing samples per pixel (1, 2, 4 or 8)
+```
+
+The GPU renderer draws its 3D scene at the size the frame fills on screen, so
+`render_scale` above 100 supersamples and below 100 trades sharpness for
+speed, while `msaa` smooths the polygon edges. The software renderer always
+draws the original 320x240 frame and only scales it up.
+
 Any bound or unbound key, mouse button, wheel notch or gamepad input counts as
 "any key" for prompts that take one. `Shift` + `,`/`.` stay the fixed
 camera-cut keys, so binding `,` or `.` to an action also steps the camera when
@@ -259,7 +291,8 @@ the current area. A pack without `map/` leaves the tab blank.
 Saves live as `savedat*.dat` under `--save-dir` (default `<config
 dir>/save`, `~/.config/arklay/save`). The title starts on LOAD GAME when a
 save exists; with none, LOAD is refused. `arklay.toml` in the same config
-directory sets the save directory, the language and the control bindings. The save/load screen is a
+directory sets the save directory, the language, the control bindings and
+the graphics options. The save/load screen is a
 mod: the checked-in `mods/crloadsave/` replaces the ported original with a
 Classic REbirth-style folder screen through `api:register_save_screen`, built
 and layered like any other mod:
