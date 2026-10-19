@@ -1788,6 +1788,20 @@ impl GameSession {
             self.player.angle = angle;
             self.game.sync_entity_from_player(&self.player);
         }
+        // `room_set` zeroes `g_roomCameraId` before its switch-zone scan, so a
+        // room load selects its cut from camera 0. The boot scan above ran at
+        // the walk-zone spawn (or, for a debug jump, at the source room's
+        // position), which can select a different group; without the reset the
+        // scan starts from that stale cut and misses the group-0 zone that
+        // covers the door arrival (room 101 boots on cut 3, where the debug
+        // jump lands, not the spawn's cut 1). A camera lock from the init
+        // script survives, exactly like `room_set`'s branch.
+        reset_room_camera_id(&mut self.game);
+        // A room script that sets `MSF_CAMERA_DEFER` makes the boot scan raise
+        // the deferred redisplay instead of switching; that camera describes
+        // the pre-placement position and must not make `apply_camera` skip the
+        // scan. `room_set` tests its zones directly, so drop it here.
+        self.game.flags[5].apply(game::MSF_CAMERA_REDRAW, 1);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
     }
 
@@ -12046,13 +12060,27 @@ mod tests {
 
     /// Minimal one-camera RDT carrying `init` as its init script.
     fn synthetic_rdt(init: &[u8]) -> Vec<u8> {
+        synthetic_rdt_with_tables(init, 1, &[], &[])
+    }
+
+    /// Minimal RDT with `cameras` camera records plus the given camera-switch
+    /// and walkable zone tables.
+    fn synthetic_rdt_with_tables(
+        init: &[u8],
+        cameras: u8,
+        zones: &[crate::state::Zone],
+        walk_zones: &[crate::state::WalkZone],
+    ) -> Vec<u8> {
         const INIT_POINTER: usize = 0x48 + 6 * 4;
         const MAIN_POINTER: usize = 0x48 + 7 * 4;
         const EVENT_POINTER: usize = 0x48 + 8 * 4;
+        const ZONES_POINTER: usize = 0x48;
+        const WALK_ZONES_POINTER: usize = 0x48 + 4 * 4;
 
         let mut data = vec![0u8; 0x94];
-        data[0x01] = 1;
-        data.extend_from_slice(&[0u8; 44]);
+        data[0x01] = cameras;
+        // 44 bytes per camera record (the RDT's first cut starts at 0x94).
+        data.extend(std::iter::repeat_n(0u8, usize::from(cameras) * 44));
         while !data.len().is_multiple_of(4) {
             data.push(0);
         }
@@ -12063,6 +12091,36 @@ mod tests {
         data.extend_from_slice(&[0, 0, 0, 0]);
         let events_offset = data.len();
         data.extend_from_slice(&[0, 0, 0, 0]);
+
+        if !zones.is_empty() {
+            let offset = data.len();
+            for zone in zones {
+                data.extend_from_slice(&zone.cam_to.to_le_bytes());
+                data.extend_from_slice(&zone.cam_from.to_le_bytes());
+                for corner in zone.corners {
+                    data.extend_from_slice(&corner[0].to_le_bytes());
+                    data.extend_from_slice(&corner[1].to_le_bytes());
+                }
+            }
+            // The parser stops at the first cam_from outside the camera range.
+            data.extend_from_slice(&[0xFF; 0x14]);
+            data[ZONES_POINTER..ZONES_POINTER + 4].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        if !walk_zones.is_empty() {
+            // The table is a count byte plus a pad byte, then 12-byte records.
+            let offset = data.len();
+            data.push(u8::try_from(walk_zones.len()).unwrap());
+            data.push(0);
+            for zone in walk_zones {
+                for value in [zone.x1, zone.z1, zone.x2, zone.z2] {
+                    data.extend_from_slice(&value.to_le_bytes());
+                }
+                data.extend_from_slice(&zone.field_08.to_le_bytes());
+                data.extend_from_slice(&zone.flags.to_le_bytes());
+            }
+            data[WALK_ZONES_POINTER..WALK_ZONES_POINTER + 4]
+                .copy_from_slice(&(offset as u32).to_le_bytes());
+        }
 
         for (pointer, offset) in [
             (INIT_POINTER, init_offset),
@@ -12827,6 +12885,177 @@ mod tests {
             (b.stage, b.room),
             "the cursor follows the jumped-to room"
         );
+    }
+
+    /// An arbitrary-room boot selects the placement's cut from camera 0, like
+    /// `room_set`'s switch-zone scan. Starting from the cut the walk-zone spawn
+    /// selected can miss the group-0 zone that covers the door arrival: room
+    /// 101 spawns in the cut-1 corridor and arrives at the stairwell, whose
+    /// cut 3 is only reached from group 0 (#83).
+    #[test]
+    fn arbitrary_room_boot_rehomes_the_camera_from_zero_at_the_entry() {
+        use crate::state::{WalkZone, Zone};
+
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("entry-cut.akpak");
+        let a = RoomId::parse("1000").unwrap();
+        let b = RoomId::parse("1010").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        // A's record supplies B's paired arrival; B's own door points back to
+        // A, which is how `room_entry_placement` recognises the pair.
+        writer
+            .add(
+                &a.rdt_entry(),
+                synthetic_rdt(&door_init_record(1, [50, 0, 50], 0x200, 0)),
+            )
+            .unwrap();
+        writer
+            .add(
+                &b.rdt_entry(),
+                synthetic_rdt_with_tables(
+                    &door_init_record(0, [0, 0, 0], 0, 0),
+                    3,
+                    &[
+                        // Group 0 header, then the walk-zone spawn's zone
+                        // (switches to cut 2) and the door arrival's zone
+                        // (switches to cut 1).
+                        Zone {
+                            cam_to: 0,
+                            cam_from: 0,
+                            corners: [[0; 2]; 4],
+                        },
+                        Zone {
+                            cam_to: 2,
+                            cam_from: 0,
+                            corners: [[0, 0], [0, 20], [20, 20], [20, 0]],
+                        },
+                        Zone {
+                            cam_to: 1,
+                            cam_from: 0,
+                            corners: [[40, 40], [40, 60], [60, 60], [60, 40]],
+                        },
+                        // Group 2 header: there is no path from cut 2 to cut 1,
+                        // so a scan that starts there stays on cut 2.
+                        Zone {
+                            cam_to: 0,
+                            cam_from: 2,
+                            corners: [[0; 2]; 4],
+                        },
+                    ],
+                    &[WalkZone {
+                        x1: 0,
+                        z1: 0,
+                        x2: 20,
+                        z2: 20,
+                        field_08: 0,
+                        flags: 0,
+                    }],
+                ),
+            )
+            .unwrap();
+        for cut in 0..3 {
+            writer.add(&b.cut_entry(cut), bmp_bytes.clone()).unwrap();
+        }
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, b, Path::new("saves")).unwrap();
+        assert_eq!(session.player.pos, [50, 0, 50], "the paired arrival");
+        assert_eq!(
+            session.loaded.room.current_cut, 1,
+            "the arrival's group-0 zone wins over the spawn's cut 2"
+        );
+        assert_eq!(session.game.camera.current_cut, 1);
+
+        // A deferred redisplay the spawn scan raised describes the old camera;
+        // it must not make `apply_camera` skip the placement's entry scan.
+        session.game.set_camera_cut(2);
+        session.game.flags[5].apply(game::MSF_CAMERA_REDRAW, 0);
+        session.place_room_entry(&pack, b);
+        assert_eq!(
+            session.loaded.room.current_cut, 1,
+            "the entry scan still runs with a pending redraw"
+        );
+        assert_eq!(session.game.camera.current_cut, 1);
+    }
+
+    /// A debug jump into a room with no door or walk zone still re-homes the
+    /// camera at the destination spawn. `enter_room` scans against the source
+    /// room's position before the jump replaces the player, so the post-spawn
+    /// scan is what selects the spawn's cut.
+    #[test]
+    fn debug_jump_rehomes_the_camera_at_a_room_without_an_entry() {
+        use crate::state::{WalkZone, Zone};
+
+        let dir = TempDir::new();
+        let pack_path = dir.0.join("no-entry.akpak");
+        let source = RoomId::parse("1000").unwrap();
+        let target = RoomId::parse("1100").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        // The source's only walk zone puts the player at `[100, 0, 100]`,
+        // inside the target's group-0 switch zone.
+        writer
+            .add(
+                &source.rdt_entry(),
+                synthetic_rdt_with_tables(
+                    &[],
+                    1,
+                    &[],
+                    &[WalkZone {
+                        x1: 50,
+                        z1: 50,
+                        x2: 150,
+                        z2: 150,
+                        field_08: 0,
+                        flags: 0,
+                    }],
+                ),
+            )
+            .unwrap();
+        writer.add(&source.cut_entry(0), bmp_bytes.clone()).unwrap();
+        // The target has no doors and no walk zones: its spawn is the origin,
+        // outside every group-0 zone, so the spawn's scan must land on cut 0.
+        writer
+            .add(
+                &target.rdt_entry(),
+                synthetic_rdt_with_tables(
+                    &[],
+                    2,
+                    &[
+                        Zone {
+                            cam_to: 0,
+                            cam_from: 0,
+                            corners: [[0; 2]; 4],
+                        },
+                        Zone {
+                            cam_to: 1,
+                            cam_from: 0,
+                            corners: [[50, 50], [50, 150], [150, 150], [150, 50]],
+                        },
+                    ],
+                    &[],
+                ),
+            )
+            .unwrap();
+        for cut in 0..2 {
+            writer
+                .add(&target.cut_entry(cut), bmp_bytes.clone())
+                .unwrap();
+        }
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, source, Path::new("saves")).unwrap();
+        assert_eq!(session.player.pos, [100, 0, 100]);
+        session.debug_jump(&pack, target).unwrap();
+        assert_eq!(session.player.pos, [0, 0, 0], "the target's spawn");
+        assert_eq!(
+            session.loaded.room.current_cut, 0,
+            "the spawn's scan replaces the source-position cut"
+        );
+        assert_eq!(session.game.camera.current_cut, 0);
     }
 
     /// One session tick with a single UI edge.
@@ -20324,6 +20553,24 @@ off_0010:
             assert_eq!(session.player.pos, pos, "{room} placement");
             assert_eq!(session.player.angle, angle, "{room} angle");
         }
+    }
+
+    /// Issue #83: Jill's room 101 boot arrives at the stairwell door and must
+    /// select cut 3 there. The walk-zone spawn selects cut 1 first, so the
+    /// placement's re-scan has to start from camera 0.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_room_101_boots_on_the_stairwell_cut() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let session =
+            GameSession::from_room(&pack, RoomId::parse("1011").unwrap(), Path::new("saves"))
+                .unwrap();
+        assert_eq!(session.player.pos, [4300, 0, 3100], "the stairwell arrival");
+        assert_eq!(session.loaded.room.current_cut, 3);
+        assert_eq!(session.game.camera.current_cut, 3);
     }
 
     /// The real pack must boot each new game into room 106 (the main hall)
