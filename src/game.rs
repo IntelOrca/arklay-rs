@@ -3230,6 +3230,40 @@ pub struct PlayerChoice {
     pub costume: u8,
 }
 
+/// The INFINITE AMMO cheat's mode.
+///
+/// `Reload` leaves the normal clip drain alone but tops the equipped weapon
+/// back up to capacity when a shot empties it (or the trigger is pulled with
+/// an empty clip). `Infinite` pins the clip at capacity and never spends a
+/// round.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InfiniteAmmo {
+    /// Off: the clip drains and reloads from the reserve as usual.
+    #[default]
+    Off,
+    /// Drain normally, but refill the clip as soon as it reaches zero.
+    Reload,
+    /// Keep the clip full and never decrement it.
+    Infinite,
+}
+
+impl InfiniteAmmo {
+    /// Step through the modes in `delta` order, wrapping around:
+    /// off -> reload -> infinite -> off.
+    pub fn step(self, delta: i32) -> Self {
+        let index = match self {
+            Self::Off => 0,
+            Self::Reload => 1,
+            Self::Infinite => 2,
+        };
+        match (index + delta).rem_euclid(3) {
+            0 => Self::Off,
+            1 => Self::Reload,
+            _ => Self::Infinite,
+        }
+    }
+}
+
 /// The port-only debug tools' state (the F1 menu's cheats and its pending
 /// PLAYER selection). Session-only: it survives room loads but is never
 /// written to a save.
@@ -3239,6 +3273,8 @@ pub struct DebugTools {
     pub invincible: bool,
     /// Hostile characters cannot see or path to the player.
     pub ghost: bool,
+    /// The equipped weapon's ammo never runs out.
+    pub infinite_ammo: InfiniteAmmo,
     /// The character/outfit the next room load switches to.
     pub pending_player: Option<PlayerChoice>,
 }
@@ -5275,6 +5311,11 @@ impl GameState {
         // item's own id (the item-slot table maps every weapon to itself).
         self.equipped_weapon_id = item.unwrap_or(0);
         self.state_bytes[usize::from(STATE_BYTE_EQUIPPED)] = item.unwrap_or(0);
+        // The INFINITE AMMO cheat keeps every equipped weapon full, including
+        // one picked up or selected after the cheat was turned on.
+        if self.debug.infinite_ammo == InfiniteAmmo::Infinite {
+            crate::weapons::refill_clip(self);
+        }
     }
 
     /// Whether at least one `item` is held.

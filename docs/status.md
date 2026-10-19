@@ -590,7 +590,10 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
 - CHEATS: INVINCIBLE pins health and blocks death; GHOST hides the player from
   hostile characters' shared sight, range and pathfinding checks (partners
   still follow). Scripts that read the player position directly are not yet
-  covered (issue #77). Session-only, never saved.
+  covered (issue #77). AMMO cycles OFF/RELOAD/INFINITE: RELOAD still spends
+  rounds and tops the equipped clip back up whenever it empties, INFINITE
+  pins the clip at capacity and never decrements it. Session-only, never
+  saved.
 - SAVE: save opens the typewriter save screen; load opens the load screen and
   continues from the picked slot.
 - ITEM BOX: opens the item box anywhere.

@@ -36,7 +36,7 @@ use crate::charset;
 use crate::controls::Bindings;
 use crate::ending;
 use crate::font::{self, Font};
-use crate::game::{self, GameState};
+use crate::game::{self, GameState, InfiniteAmmo};
 use crate::pack::Pack;
 use crate::render::{Framebuffer, Tint};
 use crate::state::RoomId;
@@ -149,9 +149,10 @@ impl Tool {
             Tool::Inventory => ["UI_DEBUG_HINT_INVENTORY_1", "UI_DEBUG_HINT_INVENTORY_2"],
             Tool::Player => ["UI_DEBUG_HINT_PLAYER_1", "UI_DEBUG_HINT_PLAYER_2"],
             Tool::Flags => ["UI_DEBUG_HINT_FLAGS_1", "UI_DEBUG_HINT_FLAGS_2"],
+            Tool::Cheats => ["UI_DEBUG_HINT_CHEATS_1", "UI_DEBUG_HINT_CHEATS_2"],
             Tool::Controls => ["UI_DEBUG_HINT_CONTROLS_1", "UI_DEBUG_HINT_CONTROLS_2"],
             Tool::Display => ["UI_DEBUG_HINT_DISPLAY_1", "UI_DEBUG_HINT_DISPLAY_2"],
-            Tool::Cheats | Tool::Save | Tool::ItemBox | Tool::ClearGame => {
+            Tool::Save | Tool::ItemBox | Tool::ClearGame => {
                 ["UI_DEBUG_HINT_SELECT_1", "UI_DEBUG_HINT_SELECT_2"]
             }
         }
@@ -167,7 +168,11 @@ const COSTUME_NAMES: [&str; 3] = [
     "UI_DEBUG_COSTUME_ALT_2",
 ];
 /// The CHEATS rows.
-const CHEAT_NAMES: [&str; 2] = ["UI_DEBUG_CHEAT_INVINCIBLE", "UI_DEBUG_CHEAT_GHOST"];
+const CHEAT_NAMES: [&str; 3] = [
+    "UI_DEBUG_CHEAT_INVINCIBLE",
+    "UI_DEBUG_CHEAT_GHOST",
+    "UI_DEBUG_CHEAT_AMMO",
+];
 /// The SAVE rows.
 const SAVE_ROWS: [&str; 2] = ["UI_DEBUG_SAVE_GAME", "UI_DEBUG_LOAD_GAME"];
 /// The CLEAR GAME route hints, by ending id minus one.
@@ -409,20 +414,31 @@ impl DebugMenu {
         Step::Event(DebugMenuEvent::FrameRateChanged(self.frame_rate))
     }
 
-    /// CHEATS: up/down pick the row, left/right/confirm toggle it.
+    /// CHEATS: up/down pick the row, left/right/confirm toggle a boolean row
+    /// or step INFINITE AMMO through off/reload/infinite. Turning INFINITE on
+    /// fills the equipped clip at once.
     fn handle_cheats(&mut self, input: UiInput, game: &mut GameState) -> Step {
         if input.cancel {
             return Step::Back;
         }
-        if input.up || input.down {
-            self.cheat_row ^= 1;
-        } else if input.confirm || input.left || input.right {
-            let cheat = if self.cheat_row == 0 {
-                &mut game.debug.invincible
-            } else {
-                &mut game.debug.ghost
-            };
-            *cheat = !*cheat;
+        let count = CHEAT_NAMES.len();
+        if input.up {
+            self.cheat_row = (self.cheat_row + count - 1) % count;
+        } else if input.down {
+            self.cheat_row = (self.cheat_row + 1) % count;
+        } else if input.left || input.right || input.confirm {
+            let delta = if input.left { -1 } else { 1 };
+            match self.cheat_row {
+                0 => game.debug.invincible = !game.debug.invincible,
+                1 => game.debug.ghost = !game.debug.ghost,
+                2 => {
+                    game.debug.infinite_ammo = game.debug.infinite_ammo.step(delta);
+                    if game.debug.infinite_ammo == InfiniteAmmo::Infinite {
+                        crate::weapons::refill_clip(game);
+                    }
+                }
+                _ => {}
+            }
         }
         Step::Stay
     }
@@ -593,20 +609,34 @@ impl DebugMenu {
     }
 
     fn draw_cheats(&self, pen: &mut Pen, game: &GameState) {
-        let states = [game.debug.invincible, game.debug.ghost];
-        let value_x = TEXT_LEFT + 14 * pen.font.metrics.glyph_w;
-        for (index, (label, on)) in CHEAT_NAMES.iter().zip(states).enumerate() {
+        let on_off = |on: bool| {
+            if on {
+                ("UI_DEBUG_ON", Tint::Green)
+            } else {
+                ("UI_DEBUG_OFF", Tint::Grey)
+            }
+        };
+        let ammo = match game.debug.infinite_ammo {
+            InfiniteAmmo::Off => ("UI_DEBUG_OFF", Tint::Grey),
+            InfiniteAmmo::Reload => ("UI_DEBUG_AMMO_RELOAD", Tint::Yellow),
+            InfiniteAmmo::Infinite => ("UI_DEBUG_AMMO_INFINITE", Tint::Green),
+        };
+        let states = [
+            on_off(game.debug.invincible),
+            on_off(game.debug.ghost),
+            ammo,
+        ];
+        for (index, (label, (value, tint))) in CHEAT_NAMES.iter().zip(states).enumerate() {
             let y = BODY_Y + index as i32 * ROW_HEIGHT;
             if index == self.cheat_row {
                 pen.cursor(TEXT_LEFT - 16, y);
             }
             pen.bytes(TEXT_LEFT, y, Tint::White, pen.text.ui(label));
-            let (value, tint) = if on {
-                ("UI_DEBUG_ON", Tint::Green)
-            } else {
-                ("UI_DEBUG_OFF", Tint::Grey)
-            };
-            pen.bytes(value_x, y, tint, pen.text.ui(value));
+            // Place each value after its own label: the tri-state values are
+            // much wider than ON/OFF, and a fixed column overflows the panel
+            // with the wide Japanese glyphs.
+            let value_x = TEXT_LEFT + (label.len() as i32 + 1) * pen.font.metrics.glyph_w;
+            pen.fit(value_x, y, tint, pen.text.ui(value), PANEL_RIGHT - value_x);
         }
     }
 
@@ -868,6 +898,11 @@ mod tests {
         assert_eq!(loaded.inventory[0].id, 0x01);
         assert!(loaded.flag_test(group.bank, sel, false));
         assert!(!loaded.debug.invincible, "cheats are never saved");
+        assert_eq!(
+            loaded.debug.infinite_ammo,
+            InfiniteAmmo::Off,
+            "the ammo cheat is never saved"
+        );
     }
 
     #[test]
@@ -1044,6 +1079,35 @@ mod tests {
         menu.handle_input(left(), &mut game);
         assert!(!game.debug.ghost);
         assert!(game.debug.invincible);
+    }
+
+    #[test]
+    fn infinite_ammo_cycles_and_fills_the_clip() {
+        let mut game = GameState::default();
+        game.inventory
+            .push(game::InventoryItem { id: 2, quantity: 4 });
+        game.set_equipped(Some(2));
+        let mut menu = menu(&game);
+        enter(&mut menu, &mut game, Tool::Cheats);
+        menu.handle_input(down(), &mut game);
+        menu.handle_input(down(), &mut game);
+        assert_eq!(game.debug.infinite_ammo, InfiniteAmmo::Off);
+        menu.handle_input(confirm(), &mut game);
+        assert_eq!(game.debug.infinite_ammo, InfiniteAmmo::Reload);
+        assert_eq!(game.inventory[0].quantity, 4, "reload does not prefill");
+        menu.handle_input(confirm(), &mut game);
+        assert_eq!(game.debug.infinite_ammo, InfiniteAmmo::Infinite);
+        assert_eq!(game.inventory[0].quantity, 15, "infinite fills at once");
+        menu.handle_input(right(), &mut game);
+        assert_eq!(game.debug.infinite_ammo, InfiniteAmmo::Off, "wraps around");
+        game.inventory[0].quantity = 2;
+        menu.handle_input(left(), &mut game);
+        assert_eq!(
+            game.debug.infinite_ammo,
+            InfiniteAmmo::Infinite,
+            "left steps back"
+        );
+        assert_eq!(game.inventory[0].quantity, 15, "entering infinite refills");
     }
 
     #[test]
