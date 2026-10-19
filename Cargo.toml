@@ -7,10 +7,7 @@ description = "A from-scratch engine for the classic Resident Evil games"
 license = "MIT"
 
 [features]
-default = ["lua", "hd"]
-# Sandboxed Lua 5.4 scripting hooks (an optional dependency, so a
-# `--no-default-features` build compiles every hook to a no-op).
-lua = ["dep:mlua"]
+default = ["hd"]
 # The replacement-format decoders an HD mod pack needs: PNG and WebP art and
 # OGG Vorbis audio. They are pure-Rust crates and optional, so a
 # `--no-default-features` build stays lean; such a build still resolves
@@ -25,7 +22,7 @@ lewton = { version = "0.10", optional = true }
 mlua = { version = "0.10", default-features = false, features = [
     "lua54",
     "vendored",
-], optional = true }
+] }
 png = { version = "0.18", optional = true }
 sdl3-sys = { version = "0.7", default-features = false }
 zstd = "0.13"

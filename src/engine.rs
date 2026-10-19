@@ -16536,7 +16536,6 @@ mod tests {
 
     /// A synthetic 4bpp font sheet: 256x224, every texel palette index 1
     /// (white), so a drawn glyph is measurable without shipping art.
-    #[cfg(feature = "lua")]
     fn synthetic_font_tim() -> Vec<u8> {
         let (width, height) = (256u16, 224u16);
         let mut bytes = Vec::new();
@@ -16567,7 +16566,6 @@ mod tests {
 
     /// The test game pack plus the shipped screen scripts, language files and
     /// a synthetic font, so the Lua save screen runs end to end.
-    #[cfg(feature = "lua")]
     fn pack_with_lua_screen(dir: &TempDir, base: &Path) -> (PathBuf, PathBuf) {
         let pack = Pack::open(base).unwrap();
         let mut writer = PackWriter::new();
@@ -16638,7 +16636,6 @@ mod tests {
         (path, mod_path)
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn app_title_load_runs_the_lua_screen_and_loads_its_chosen_file() {
         let dir = TempDir::new();
@@ -16697,7 +16694,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_lua_save_screen_capture_is_deterministic() {
         let dir = TempDir::new();
@@ -16751,7 +16747,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_lua_save_screen_writes_a_file_and_consumes_the_ribbon() {
         let dir = TempDir::new();
@@ -16807,7 +16802,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_lua_save_screen_overwrites_the_selected_existing_row() {
         let dir = TempDir::new();
@@ -16856,7 +16850,6 @@ mod tests {
         assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_lua_save_screen_create_new_skips_a_case_variant_name() {
         let dir = TempDir::new();
@@ -16894,7 +16887,6 @@ mod tests {
         assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_typewriter_capture_runs_the_lua_screen() {
         let dir = TempDir::new();
@@ -17593,7 +17585,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_transition_reruns_on_room_load_for_the_destination() {
         use crate::manifest;
@@ -22272,7 +22263,6 @@ off_0010:
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn simulate_room_runs_the_lua_hooks_without_changing_the_frame() {
         use crate::manifest;

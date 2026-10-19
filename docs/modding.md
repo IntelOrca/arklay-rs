@@ -412,9 +412,8 @@ drive the collector, and the state carries a 16 MiB allocation ceiling. An
 instruction-budget hook aborts a script that runs away (the call errors out
 within a few million instructions). Every load or call error is logged once
 with a `[lua]` prefix and disables only the failing hook or chunk; the game
-session always continues. A pack with no `lua/` entries loads no VM, and a
-`--no-default-features` build has no Lua runtime at all: every hook compiles
-to a no-op and runs stay byte-identical.
+session always continues. A pack with no `lua/` entries loads no VM, and runs stay
+byte-identical.
 
 Hooks cannot spawn enemies: the hook API has no such operation by
 construction. Entity behaviour is the separate enemy-script surface below.

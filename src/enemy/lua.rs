@@ -1,6 +1,5 @@
 //! The enemy-script runtime: one sandboxed Lua VM per session hosting the
-//! per-id `enemy/em{id:02x}.lua` update functions behind the default-on `lua`
-//! feature.
+//! per-id `enemy/em{id:02x}.lua` update functions.
 //!
 //! A pack opts into enemy scripting by carrying `enemy/em{id:02x}.lua` entries;
 //! each defines `function update(e)`, called once per fixed tick for every
@@ -24,49 +23,8 @@
 //! The `e` argument is a scoped userdata over the live game state, valid only
 //! for the duration of one call. A script that fails to load, or a call that
 //! errors, is logged once and parks that entity id for the session; the other
-//! ids keep running. A pack with no enemy scripts loads no VM at all, and a
-//! `--no-default-features` build compiles every entry point to a no-op.
+//! ids keep running. A pack with no enemy scripts loads no VM at all.
 
-#[cfg(not(feature = "lua"))]
-mod imp {
-    use crate::game::GameState;
-    use crate::model::Clip;
-    use crate::pack::Pack;
-    use crate::state::RoomState;
-
-    /// The no-op enemy-script host compiled without the `lua` feature.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LuaEnemyHost;
-
-    impl LuaEnemyHost {
-        /// An empty host.
-        pub fn new() -> Self {
-            LuaEnemyHost
-        }
-
-        /// Drop nothing; the lean build has no VM.
-        pub fn reset(&mut self) {}
-
-        /// Never runs a script.
-        pub fn update(
-            &mut self,
-            _game: &mut GameState,
-            _room: &RoomState,
-            _pack: &Pack,
-            _slot: usize,
-            _clips: &[Clip],
-        ) -> bool {
-            false
-        }
-
-        /// No scripts exist in the lean build.
-        pub fn failed_scripts(&self) -> usize {
-            0
-        }
-    }
-}
-
-#[cfg(feature = "lua")]
 mod imp {
     use std::cell::{Cell, RefCell};
     use std::collections::{HashMap, HashSet};
@@ -162,8 +120,8 @@ mod imp {
 
         /// Run the `update(e)` function of the entity in `slot`.
         ///
-        /// Returns whether a script ran; an id with no script, a parked id or
-        /// a lean build returns `false` without touching the state. `clips`
+        /// Returns whether a script ran; an id with no script or a parked id
+        /// returns `false` without touching the state. `clips`
         /// are the entity model's animation clips, exposed to the script's
         /// animation helper.
         pub fn update(
@@ -5043,7 +5001,6 @@ mod tests {
     }
 
     /// The checked-in spider web script, so the tests exercise the real port.
-    #[cfg(feature = "lua")]
     fn spiderweb_source() -> &'static str {
         crate::enemy::ENEMY_SCRIPTS
             .iter()
@@ -5075,7 +5032,6 @@ mod tests {
         assert_eq!(game.entities[1].state(), 0, "the script never ran");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn spiderweb_script_initialises_and_idles() {
         let pack = pack(&[("enemy/em13.lua", spiderweb_source())]);
@@ -5098,7 +5054,6 @@ mod tests {
         assert_eq!(game.entities[1].status_flags, (1 & 0x1F) | 0x40);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn spiderweb_script_burns_and_destroys() {
         let pack = pack(&[("enemy/em13.lua", spiderweb_source())]);
@@ -5140,7 +5095,6 @@ mod tests {
 
     /// The shared fire entry drives a scripted web through the whole
     /// damage -> state 2/3 -> script reaction -> death-flag contract.
-    #[cfg(feature = "lua")]
     #[test]
     fn a_scripted_web_kill_runs_through_the_shared_damage_pipeline() {
         let pack = pack(&[("enemy/em13.lua", spiderweb_source())]);
@@ -5177,7 +5131,6 @@ mod tests {
     /// which is exactly the shared pipeline's `hit_state == 0` candidate
     /// gate, so no weapon ever reaches their state 2/3 entries and no death
     /// flag is raised.
-    #[cfg(feature = "lua")]
     #[test]
     fn the_roots_hit_state_gate_rejects_every_weapon() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -5213,7 +5166,6 @@ mod tests {
 
     /// The shared player-side helpers exposed to the attacking monsters:
     /// hurt, poison, the animation overrides and the grab pose.
-    #[cfg(feature = "lua")]
     #[test]
     fn the_player_hurt_helpers_write_the_player_state() {
         let pack = pack(&[(
@@ -5257,7 +5209,6 @@ end
     /// The ported NPC states 0 and 1 must match the native driver field for
     /// field, tick for tick, for every character id, idle behaviour, pose
     /// variant and the two flag-gated openings.
-    #[cfg(feature = "lua")]
     #[test]
     fn npc_states_zero_and_one_match_the_native_driver() {
         use crate::enemy::{FIRST_ID, LAST_ID};
@@ -5323,7 +5274,6 @@ end
     /// The ported NPC state-8 scripted-action handlers must match the native
     /// driver field for field, tick for tick, across every character id,
     /// behaviour handler, weapon id, entity flag bit and action state.
-    #[cfg(feature = "lua")]
     #[test]
     fn npc_state_eight_matches_the_native_driver() {
         use crate::effects::fixtures::{block, sprite};
@@ -5658,7 +5608,6 @@ end
     /// The real NPC script's state-8 tail: `scd_entity_flags` bit 2 runs the
     /// held-weapon anchor, shifting the entity so the displayed pose's hand
     /// chain end lands on the previous frame's hand world.
-    #[cfg(feature = "lua")]
     #[test]
     fn npc_state_eight_flag_two_anchors_the_held_weapon_hand() {
         use crate::model::{Clip, ClipFrame, Keyframe, Skeleton};
@@ -5721,7 +5670,6 @@ end
     /// driver field for field, tick for tick, across every behaviour, action
     /// state, distance ring, path result, animation reverse, footstep and
     /// collision case.
-    #[cfg(feature = "lua")]
     #[test]
     fn npc_state_nine_matches_the_native_driver() {
         use crate::game::Entity;
@@ -6548,7 +6496,6 @@ end
     }
 
     /// The checked-in adder script, so the tests exercise the real port.
-    #[cfg(feature = "lua")]
     fn adder_source() -> &'static str {
         crate::enemy::ENEMY_SCRIPTS
             .iter()
@@ -6560,7 +6507,6 @@ end
     /// The adder's synthetic model: four clips of 32 one-tick frames and a
     /// two-joint skeleton whose second joint sits 100 units along the model's
     /// X axis, so the bite reach has a joint to test.
-    #[cfg(feature = "lua")]
     fn adder_model() -> (
         Vec<crate::model::Clip>,
         std::sync::Arc<Vec<crate::model::Keyframe>>,
@@ -6594,7 +6540,6 @@ end
     }
 
     /// One active adder in slot 1 with the given spawn kind.
-    #[cfg(feature = "lua")]
     fn adder_game(kind: u8) -> GameState {
         let mut game = GameState::default();
         let entity = &mut game.entities[1];
@@ -6610,7 +6555,6 @@ end
 
     /// The adder rooms' sound-row fixture (stage 1 room 1), whose enemy column
     /// 0/1 names a cue.
-    #[cfg(feature = "lua")]
     fn adder_room() -> RoomState {
         RoomState {
             stage: 1,
@@ -6619,7 +6563,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     fn adder_step(
         host: &mut LuaEnemyHost,
         game: &mut GameState,
@@ -6630,7 +6573,6 @@ end
     }
 
     /// The checked-in wasp script, so the tests exercise the real port.
-    #[cfg(feature = "lua")]
     fn wasp_source() -> &'static str {
         crate::enemy::ENEMY_SCRIPTS
             .iter()
@@ -6642,7 +6584,6 @@ end
     /// The wasp's synthetic model: seven clips of 32 one-tick frames and a
     /// ten-joint skeleton, so the effect anchors, the wing joints and the
     /// counts the death paths use all exist.
-    #[cfg(feature = "lua")]
     fn wasp_model() -> (
         Vec<crate::model::Clip>,
         std::sync::Arc<Vec<crate::model::Keyframe>>,
@@ -6678,7 +6619,6 @@ end
     }
 
     /// One active wasp in slot 1 with the given nest kind.
-    #[cfg(feature = "lua")]
     fn wasp_game(kind: u8) -> GameState {
         use crate::effects::fixtures::{block, sprite};
         let mut game = GameState::default();
@@ -6698,7 +6638,6 @@ end
         game
     }
 
-    #[cfg(feature = "lua")]
     fn wasp_step(
         host: &mut LuaEnemyHost,
         game: &mut GameState,
@@ -6710,14 +6649,12 @@ end
 
     /// The wasp's manhattan distance word for the current player position,
     /// the value the script's `refresh_distance` writes.
-    #[cfg(feature = "lua")]
     fn wasp_distance(game: &GameState) -> u16 {
         let dx = (game.entities[0].pos[0] - game.entities[1].pos[0]).unsigned_abs() & 0xFFFF;
         let dz = (game.entities[0].pos[2] - game.entities[1].pos[2]).unsigned_abs() & 0xFFFF;
         dx.wrapping_add(dz) as u16
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_initialises_for_every_spawn_kind() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -6793,7 +6730,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_decide_tables_select_the_behaviour_in_order() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -6896,7 +6832,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_chase_draws_its_setup_and_wobble_in_order() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -6948,7 +6883,6 @@ end
 
     /// The bite applies its damage, poison and effect through the shared
     /// player helpers when the reach box, the aim gate and the path bit agree.
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_bite_hits_the_player_through_the_hit_frame() {
         use crate::effects::fixtures::{block, sprite};
@@ -7048,7 +6982,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_flinch_hides_the_tail_and_special_weapons_clear_the_latch() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -7102,7 +7035,6 @@ end
 
     /// The knife death writhe: the blood pool spreads and the branch ends in
     /// behaviour 4 with the spawn record's death flag raised.
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_knife_death_writhes_and_raises_the_event() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -7165,7 +7097,6 @@ end
     /// everywhere else. The retreat's own case-0 setup (the blood sprays) is
     /// only reached when behaviour 3 is entered with a clear sub-state, so it
     /// is exercised separately.
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_firearm_death_retreats_and_respawns_by_room() {
         use crate::effects::fixtures::{block, sprite};
@@ -7261,7 +7192,6 @@ end
     /// The retreat's case-0 setup, reached only when behaviour 3 is entered
     /// with a clear sub-state: animation 4 rebased to frame 0, and the two
     /// blood sprays anchored at the head and joint 5.
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_retreat_setup_sprays_blood_at_the_two_joints() {
         use crate::effects::fixtures::{block, sprite};
@@ -7319,7 +7249,6 @@ end
     /// A multi-tick scene spanning init, the ambush drop, a flinch and the
     /// death retreat must be byte-identical with and without a VM reset
     /// between every tick.
-    #[cfg(feature = "lua")]
     #[test]
     fn adder_reset_between_frames_preserves_the_scene() {
         let pack = pack(&[("enemy/em0a.lua", adder_source())]);
@@ -7402,7 +7331,6 @@ end
 
     /// The wasp init: every nest kind, the big-flag consumption, the dwell
     /// roll and the four-draw health roll, in exact draw order.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_initialises_for_every_nest_kind() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7462,7 +7390,6 @@ end
 
     /// The nest state machine: the dormant dwell, the early arm, the emerge,
     /// the roused short-circuit and both loose-wasp wake paths.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_nest_state_machine_arms_emerges_and_wakes() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7542,7 +7469,6 @@ end
 
     /// Hover: the wing blink, the bob ramp, the two altitude draws in order
     /// and the un-touched return before the attack gate.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_hover_blinks_the_wings_and_flips_altitude_in_draw_order() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7591,7 +7517,6 @@ end
 
     /// Victory and takeoff: the path-gated steering, the two altitude draws
     /// with the bob reset, and the takeoff spiral's speed/offset arithmetic.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_victory_and_takeoff_steer_and_draw_in_order() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7666,7 +7591,6 @@ end
 
     /// The hover attack gate: the contact sting commit, and the normal-wasp
     /// pin-and-sting pick when the player is not facing the wasp.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_hover_commits_to_the_sting_or_the_grab() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7720,7 +7644,6 @@ end
 
     /// The contact sting: first-run and second-playthrough damage, the
     /// attacked latch and behavior 100, and the big wasp's scripted kill.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_sting_damages_by_playthrough_and_big_kills_scriptedly() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7784,7 +7707,6 @@ end
 
     /// The pin-and-sting: the setup latch, the per-character root motion and
     /// hit frame, the sting cue and the payout.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_grab_latches_the_pose_and_pays_out() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7888,7 +7810,6 @@ end
 
     /// The knockdown: the drop, the landing tint, the growing shadow and the
     /// crush that drops a limp wasp into the death state.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_knockdown_falls_lands_and_is_crushed() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -7954,7 +7875,6 @@ end
 
     /// The death fork: the light corpse that crawls and respawns at the nest,
     /// the tenth respawn's big variant, and the heavy/big removal.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_death_corpse_respawns_and_big_is_removed() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -8078,7 +7998,6 @@ end
     /// A multi-tick scene spanning init, the nest, emerge, hover, a sting, a
     /// knockdown and a death respawn must be byte-identical with and without
     /// a VM reset between every tick.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_reset_between_frames_preserves_the_scene() {
         let pack = pack(&[("enemy/em07.lua", wasp_source())]);
@@ -8164,7 +8083,6 @@ end
     /// The wasp's typed property surface: the signed aliases over the shared
     /// scratch bytes, the two halves of the +0x178 dword, the path-keep into
     /// +0x16E and the player-side reads.
-    #[cfg(feature = "lua")]
     #[test]
     fn wasp_script_sees_typed_scratch_properties() {
         let pack = pack(&[(
@@ -8223,7 +8141,6 @@ end
     }
 
     /// The checked-in crow script, so the tests exercise the real port.
-    #[cfg(feature = "lua")]
     fn crow_source() -> &'static str {
         crate::enemy::ENEMY_SCRIPTS
             .iter()
@@ -8234,7 +8151,6 @@ end
 
     /// The crow's synthetic model: sixteen one-tick clips and a 13-joint
     /// skeleton, matching em1005.
-    #[cfg(feature = "lua")]
     fn crow_model() -> (
         Vec<crate::model::Clip>,
         std::sync::Arc<Vec<crate::model::Keyframe>>,
@@ -8270,7 +8186,6 @@ end
     }
 
     /// One active crow in slot 1 with the given spawn kind.
-    #[cfg(feature = "lua")]
     fn crow_game(kind: u8) -> GameState {
         use crate::effects::fixtures::{block, sprite};
         let mut game = GameState::default();
@@ -8294,7 +8209,6 @@ end
 
     /// The crow room's sound row and camera zone covering the spawn point, so
     /// the shadow gate is live.
-    #[cfg(feature = "lua")]
     fn crow_room() -> RoomState {
         use crate::state::Zone;
         RoomState {
@@ -8309,7 +8223,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     fn crow_step(
         host: &mut LuaEnemyHost,
         game: &mut GameState,
@@ -8319,7 +8232,6 @@ end
         host.update(game, &crow_room(), pack, 1, clips)
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_initialises_for_every_spawn_kind() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8399,7 +8311,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_perch_counts_down_and_rolls_the_idle_clip() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8489,7 +8400,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_scatter_takeoff_reads_the_player_state_word() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8580,7 +8490,6 @@ end
         assert_eq!(game.rand_state, before, "no draws while frozen");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_wingbeat_arcs_and_hands_over() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8650,7 +8559,6 @@ end
         assert_eq!(entity.action_behavior, 5);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_dive_and_glide_bounds() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8780,7 +8688,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_strike_run_and_dive_attack_vy_recipes() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -8881,7 +8788,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_peck_bites_and_latches_on() {
         for (second, damage) in [(false, 6u16), (true, 16)] {
@@ -9024,7 +8930,6 @@ end
         assert_eq!(game.entities[0].health, 100, "no second bite");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_grab_struggle_mashes_and_releases() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9109,7 +9014,6 @@ end
         assert_eq!(game.entities[1].struggle, -8);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_recoil_beats_up_and_recovers() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9165,7 +9069,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_death_lands_or_bursts_on_the_floor_step() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9239,7 +9142,6 @@ end
         assert_eq!(entity.shadow_half_z, 381);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_tail_clamps_and_shadow_gate() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9307,7 +9209,6 @@ end
         assert_eq!(game.entities[1].shadow_half_x, 0, "outside the zone");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_swerve_steers_when_stuck() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9377,7 +9278,6 @@ end
         game.entities[0].is_being_attacked = 0;
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_pause_gate_holds_the_machine_but_still_clamps() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9400,7 +9300,6 @@ end
         assert_eq!(entity.action_behavior, 7);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_script_sees_typed_scratch_properties() {
         let pack = pack(&[(
@@ -9465,7 +9364,6 @@ end
         assert_eq!(entity.pos[0], 1000 + 99 + 99, "move then advance_speed");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn crow_reset_between_frames_preserves_the_scene() {
         let pack = pack(&[("enemy/em05.lua", crow_source())]);
@@ -9525,7 +9423,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn scalar_properties_read_write_and_truncate() {
         let pack = pack(&[(
@@ -9554,7 +9451,6 @@ end
         assert_eq!(entity.shadow_tint, 0x00FF_FFFF, "u32 truncation");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn reset_between_frames_preserves_behaviour() {
         let pack = pack(&[("enemy/em13.lua", spiderweb_source())]);
@@ -9590,7 +9486,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn require_loads_pack_modules_relative_and_absolute() {
         let util = "local m = {} function m.set_health(e, v) e.health = v end return m";
@@ -9618,7 +9513,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn require_caches_modules_and_supports_nested_and_runtime_imports() {
         // helper is required relatively from inside util; em13 requires util
@@ -9645,7 +9539,6 @@ end
         assert_eq!(game.entities[1].health, 1);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn require_errors_on_missing_and_escaping_modules() {
         for name in ["nope", "../outside", "/../outside", ""] {
@@ -9659,7 +9552,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_failing_script_parks_only_its_own_id() {
         let pack = pack(&[
@@ -9681,7 +9573,6 @@ end
     }
 
     /// The checked-in roots script, so the tests exercise the real port.
-    #[cfg(feature = "lua")]
     fn roots_source() -> &'static str {
         crate::enemy::ENEMY_SCRIPTS
             .iter()
@@ -9692,7 +9583,6 @@ end
 
     /// One active roots entity in slot 1, spawned in room 40F0's slot 0 pose
     /// with the story's death event.
-    #[cfg(feature = "lua")]
     fn roots_game(behavior: u8) -> GameState {
         let mut game = GameState::default();
         let entity = &mut game.entities[1];
@@ -9710,7 +9600,6 @@ end
 
     /// The roots rooms' sound-table row (stage 4, room 0x0F, row 102), whose
     /// enemy columns name the two groans.
-    #[cfg(feature = "lua")]
     fn roots_room() -> RoomState {
         RoomState {
             stage: 4,
@@ -9719,7 +9608,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     fn roots_step(
         host: &mut LuaEnemyHost,
         game: &mut GameState,
@@ -9729,7 +9617,6 @@ end
         host.update(game, room, pack, 1, &[])
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_script_initialises_for_every_spawn_kind() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9768,7 +9655,6 @@ end
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_dormant_kind_never_moves() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9792,7 +9678,6 @@ end
         assert!(game.entity_sounds.is_empty());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_retract_kind_collapses_once_and_pins_the_spawn_point() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9835,7 +9720,6 @@ end
         assert_eq!((entity.pos[0], entity.pos[2]), (6695, 2896));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_writhe_cycle_runs_its_phase_table_and_flashes() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9911,7 +9795,6 @@ end
         assert_eq!(game.entities[1], latched);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_damage_reset_rewinds_the_cycle() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9931,7 +9814,6 @@ end
         assert_eq!(entity.hit_state, 0);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_raw_phase_states_dispatch_the_phase_table() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -9955,7 +9837,6 @@ end
         assert_eq!(game.entities[1].writhe_amplitude(), 0x200 - 0x70);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_groan_timer_draws_in_order_and_queues_the_enemy_bank() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -10012,7 +9893,6 @@ end
         assert!(game.entity_sounds.is_empty());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_cycle_start_cue_is_out_of_the_enemy_helper_range() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -10029,7 +9909,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_pause_gate_holds_the_machine_but_still_pins() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -10056,7 +9935,6 @@ end
         assert_eq!(game.entities[1].joint_scale, 0x9C4);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_reset_between_frames_preserves_the_cycle() {
         let pack = pack(&[("enemy/em0e.lua", roots_source())]);
@@ -10080,7 +9958,6 @@ end
         assert_eq!(cached_game.entities[1].ignore(), 2);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn roots_script_sees_typed_scratch_properties() {
         let pack = pack(&[(
@@ -10125,7 +10002,7 @@ end
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod pause_tests {
     use super::*;
     use crate::game::{GameState, MESSAGE_FLAG_MONSTERS};
@@ -10159,7 +10036,7 @@ mod pause_tests {
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod spider_tests {
     use std::sync::Arc;
 
@@ -10839,7 +10716,7 @@ end
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod zombie_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::{GameState, JointBlood};
@@ -12103,7 +11980,7 @@ end
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod cerberus_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::GameState;
@@ -12728,7 +12605,7 @@ end
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod chimera_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::GameState;
@@ -13299,7 +13176,7 @@ end
     }
 }
 
-#[cfg(all(feature = "lua", test))]
+#[cfg(test)]
 mod hunter_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::GameState;
@@ -13462,7 +13339,6 @@ mod hunter_tests {
     // Initialisation, spawn kinds and the partner pick
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_init_rolls_health_sca_and_partner() {
         let pack = pack();
@@ -13505,7 +13381,6 @@ mod hunter_tests {
         assert_eq!(game.entities[1].hunter_partner, 2);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_init_parks_scripted_unique_and_coward_variants() {
         let pack = pack();
@@ -13532,7 +13407,6 @@ mod hunter_tests {
     // The variant decisions and their draw order
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_variant_0_rewrites_the_empty_kind_and_reads_the_frame_seed() {
         let pack = pack();
@@ -13591,7 +13465,6 @@ mod hunter_tests {
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_variant_2_draws_low_then_mid_then_the_leap() {
         let pack = pack();
@@ -13632,7 +13505,6 @@ mod hunter_tests {
         let _ = (low, mid);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_variant_2_gates_on_the_player_health_and_distance() {
         let pack = pack();
@@ -13667,7 +13539,6 @@ mod hunter_tests {
     // The swipe, pounce and dodge action chains
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_swing_reaches_joint_nine_and_damages_the_player() {
         let pack = pack();
@@ -13724,7 +13595,6 @@ mod hunter_tests {
         assert_eq!(game.entities[0].health, 100);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_pounce_bite_grabs_and_tracks_the_player_head() {
         let pack = pack();
@@ -13801,7 +13671,6 @@ mod hunter_tests {
         assert_eq!(player.anim.clip, 0);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_dodge_swipe_walks_its_two_reach_rows() {
         let pack = pack();
@@ -13865,7 +13734,6 @@ mod hunter_tests {
         assert_eq!(entity.action_state, 2, "still airborne");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_pending_grab_cancels_into_the_leap_unless_below_the_floor() {
         let pack = pack();
@@ -13905,7 +13773,6 @@ mod hunter_tests {
     // Death paths
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_fall_death_raises_the_event_and_shrinks_the_shadow() {
         let pack = pack();
@@ -13949,7 +13816,6 @@ mod hunter_tests {
         assert_eq!(game.entities[1].action_state, 4);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_death_dispatch_seeds_its_behaviour_and_clears_the_latch() {
         let pack = pack();
@@ -13977,7 +13843,6 @@ mod hunter_tests {
     // The scripted intro
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_intro_selects_the_row_and_the_camera_variant() {
         let pack = pack();
@@ -14048,7 +13913,6 @@ mod hunter_tests {
     // The script-controlled table
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_scd_table_live_slots_all_run() {
         let pack = pack();
@@ -14097,7 +13961,6 @@ mod hunter_tests {
         assert_eq!(host.failed_scripts(), 0, "no SCD slot errored");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_scd_bite_writes_the_target_and_clears_its_latch() {
         let pack = pack();
@@ -14149,7 +14012,6 @@ mod hunter_tests {
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_scd_composite_slots_re_enter_their_sub_ranges() {
         let pack = pack();
@@ -14182,7 +14044,6 @@ mod hunter_tests {
     // The path latch, the reset contract and the typed scratch view
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_path_latch_arms_the_repause_and_sticks() {
         let pack = pack();
@@ -14208,7 +14069,6 @@ mod hunter_tests {
         assert_eq!(game.entities[1].hunter_repause(), before - 1, "it ticks");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_reset_between_frames_preserves_the_scene() {
         let pack = pack();
@@ -14280,7 +14140,6 @@ mod hunter_tests {
         }
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn ghost_hides_the_player_from_the_sight_bindings() {
         let pack = pack_with(&[(
@@ -14308,7 +14167,6 @@ end
         assert_eq!(game.player_distance_z, 1, "the blocked sight byte");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn ghost_leaves_npcs_tracking_the_player() {
         let pack = pack_with(&[(
@@ -14328,7 +14186,6 @@ end
         assert_eq!(game.entities[1].status_flags & 0x20, 0x20);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hunter_script_sees_typed_scratch_properties() {
         let pack = pack_with(&[(
@@ -14423,7 +14280,7 @@ end
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod monster_plant_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::GameState;
@@ -15069,7 +14926,7 @@ mod monster_plant_tests {
     }
 }
 
-#[cfg(all(test, feature = "lua"))]
+#[cfg(test)]
 mod computer_arms_tests {
     use crate::enemy::LuaEnemyHost;
     use crate::game::GameState;

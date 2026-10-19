@@ -1,4 +1,4 @@
-//! Sandboxed Lua 5.4 scripting hooks, behind the default-on `lua` feature.
+//! Sandboxed Lua 5.4 scripting hooks.
 //!
 //! A pack opts into scripting by carrying `lua/**.lua` entries: the mod
 //! manifest's `lua` list (ordered) or, when it names none, every `lua/` entry
@@ -27,60 +27,9 @@
 //! to nil before any chunk runs. An instruction-budget hook aborts a script
 //! that runs away, a memory limit bounds allocation, and every load or call
 //! error is logged once and disables only the failing hook (or skips the
-//! failing chunk), never the game session. A pack with no Lua entries, or a
-//! build without the `lua` feature, loads no VM: every hook is a no-op and
-//! captures stay byte-identical.
+//! failing chunk), never the game session. A pack with no Lua entries loads
+//! no VM: every hook is a no-op and captures stay byte-identical.
 
-#[cfg(not(feature = "lua"))]
-mod imp {
-    use anyhow::Result;
-
-    use crate::game::GameState;
-    use crate::pack::Pack;
-    use crate::state::RoomId;
-
-    /// The no-op Lua runtime compiled without the `lua` feature.
-    ///
-    /// Every hook call is a no-op and a pack with Lua entries is treated
-    /// exactly like one without, so a lean build stays deterministic.
-    #[derive(Debug, Default, Clone, Copy)]
-    pub struct LuaVm;
-
-    impl LuaVm {
-        /// Always `None`: the lean build has no Lua runtime.
-        pub fn load(_pack: &Pack) -> Result<Option<LuaVm>> {
-            Ok(None)
-        }
-
-        /// An empty VM. The lean build has none, so `--setup-script` fails.
-        pub fn empty() -> Result<LuaVm> {
-            Ok(LuaVm)
-        }
-
-        /// The lean build cannot run `--setup-script` chunks.
-        pub fn run_setup(&self, _game: &mut GameState, _bytes: &[u8], _name: &str) -> Result<()> {
-            anyhow::bail!(
-                "this build has no Lua runtime; `--setup-script` requires the `lua` feature"
-            )
-        }
-
-        /// No-op pack-init hook.
-        pub fn call_init(&self, _game: &mut GameState) {}
-
-        /// No-op room-entry hook.
-        pub fn call_room_load(&self, _game: &mut GameState, _id: RoomId) {}
-
-        /// No-op per-tick hook.
-        pub fn call_tick(&self, _game: &mut GameState, _tick: u64) {}
-
-        /// No message rewrite.
-        pub fn filter_message(&self, _game: &mut GameState, _id: u16) -> Option<u16> {
-            None
-        }
-    }
-}
-
-#[cfg(feature = "lua")]
 mod imp {
     use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
@@ -664,7 +613,6 @@ mod imp {
 
 pub use imp::LuaVm;
 
-#[cfg(feature = "lua")]
 pub(crate) use imp::{Budget, new_sandboxed_state};
 
 /// The save/load screen entry a pack's scripts register, if any.
@@ -691,17 +639,13 @@ pub fn registered_save_screen(pack: &crate::pack::Pack) -> Option<String> {
 /// Compile a Lua source entry without running it, for the pack verifier.
 ///
 /// The check the engine's reader performs is "the sandboxed state can compile
-/// this chunk"; the source-size cap is applied by the caller. Without the
-/// `lua` feature there is no Lua runtime, so every source verifies.
+/// this chunk"; the source-size cap is applied by the caller.
 pub fn verify_source(bytes: &[u8]) -> anyhow::Result<()> {
     crate::budget::check_len(bytes.len(), crate::budget::MAX_LUA_CHUNK, "lua source")?;
-    #[cfg(feature = "lua")]
-    {
-        let (lua, _budget) = new_sandboxed_state()?;
-        lua.load(bytes)
-            .into_function()
-            .map_err(|err| anyhow::anyhow!("lua compile: {err}"))?;
-    }
+    let (lua, _budget) = new_sandboxed_state()?;
+    lua.load(bytes)
+        .into_function()
+        .map_err(|err| anyhow::anyhow!("lua compile: {err}"))?;
     Ok(())
 }
 
@@ -709,7 +653,6 @@ pub fn verify_source(bytes: &[u8]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "lua")]
     use crate::budget;
     use crate::game::GameState;
     use crate::pack::Pack;
@@ -725,7 +668,6 @@ mod tests {
         Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
     }
 
-    #[cfg(feature = "lua")]
     fn lua_pack(manifest_lua: &[&str], scripts: &[(&str, &str)]) -> Pack {
         use crate::manifest;
 
@@ -747,7 +689,6 @@ mod tests {
         pack(&borrowed)
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn on_init_registers_a_save_screen_for_the_app_and_the_session() {
         let source = r#"
@@ -784,7 +725,6 @@ end
         assert!(registered_save_screen(&clear).is_none());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn register_save_screen_rejects_a_bad_entry() {
         let pack = lua_pack(
@@ -801,7 +741,6 @@ end
         assert_eq!(game.save_screen, None);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn every_layer_contributes_its_hooks() {
         // A mod's manifest `lua` list is honoured like the base's, and a layer
@@ -883,7 +822,6 @@ end
         let _ = std::fs::remove_file(base_path);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_pack_without_lua_entries_has_no_vm() {
         let pack = pack(&[(
@@ -893,7 +831,6 @@ end
         assert!(LuaVm::load(&pack).unwrap().is_none());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn chunks_run_in_manifest_order_then_discovery_order() {
         // Both chunks append their tag to a shared global and the second one
@@ -928,7 +865,6 @@ end
         assert!(game.flags[0].bit(1), "discovery sorts a before b");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn hooks_expose_room_flags_items_kills_messages_and_logs() {
         let source = r#"
@@ -982,7 +918,6 @@ end
         assert_eq!(vm.filter_message(&mut game, 9), Some(10));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_sandbox_removes_the_nondeterministic_libraries() {
         let source = r#"
@@ -1014,7 +949,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_memory_limit_stops_a_runaway_allocation() {
         let source = r#"
@@ -1037,7 +971,6 @@ end
         assert!(!game.flags[0].bit(6));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_failing_call_disables_only_that_hook() {
         let source = r#"
@@ -1068,7 +1001,6 @@ end
         assert!(game.flags[0].bit(9));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_runaway_script_hits_the_instruction_budget() {
         let source = r#"
@@ -1085,7 +1017,6 @@ end
         vm.call_tick(&mut game, 2);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn rejects_chunks_over_the_source_cap() {
         let source = "x".repeat(budget::MAX_LUA_CHUNK + 1);
@@ -1098,7 +1029,6 @@ end
         assert!(message.contains("limit"), "{message}");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_broken_chunk_is_skipped_and_the_rest_still_run() {
         let pack = lua_pack(
@@ -1118,7 +1048,6 @@ end
         assert!(game.flags[0].bit(7));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn an_undefined_hook_is_a_noop() {
         let pack = lua_pack(&["lua/none.lua"], &[("lua/none.lua", "local x = 1")]);
@@ -1131,7 +1060,6 @@ end
         assert_eq!(game, GameState::default());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn identical_packs_produce_identical_hook_effects() {
         let source = r#"
@@ -1153,22 +1081,5 @@ end
             second_vm.call_tick(&mut second, tick);
         }
         assert_eq!(first, second);
-    }
-
-    #[cfg(not(feature = "lua"))]
-    #[test]
-    fn the_lean_build_compiles_every_hook_to_a_noop() {
-        let pack = pack(&[]);
-        let vm = LuaVm::load(&pack).unwrap();
-        assert!(vm.is_none());
-        let mut game = GameState::default();
-        let before = game.clone();
-        let id = game.id;
-        if let Some(vm) = vm {
-            vm.call_room_load(&mut game, id);
-            vm.call_tick(&mut game, 1);
-            assert_eq!(vm.filter_message(&mut game, 5), None);
-        }
-        assert_eq!(game, before);
     }
 }

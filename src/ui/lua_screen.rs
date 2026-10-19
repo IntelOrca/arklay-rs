@@ -21,56 +21,6 @@
 //! leaves (returning to gameplay or the title) instead of trapping the
 //! player.
 
-#[cfg(not(feature = "lua"))]
-mod imp {
-    use anyhow::Result;
-
-    use crate::render::Framebuffer;
-    use crate::save::SaveFile;
-    use crate::ui::save_load::{SaveOutcome, SaveScreen as SaveScreenTrait};
-    use crate::ui::{Screen, ScreenResult, UiContext, UiInput};
-
-    /// The lean build's screen type: never constructed. Every script load
-    /// fails, so the factory falls back to the ported original screen.
-    pub struct LuaScreen;
-
-    impl LuaScreen {
-        /// The lean build has no Lua runtime.
-        pub fn open_load(entry: &str, _cx: &mut UiContext<'_>) -> Result<Self> {
-            anyhow::bail!("this build has no Lua runtime, so {entry} cannot run");
-        }
-
-        /// The lean build has no Lua runtime.
-        pub fn open_save(
-            entry: &str,
-            _cx: &mut UiContext<'_>,
-            _file: SaveFile,
-            _ink_ribbon: bool,
-        ) -> Result<Self> {
-            anyhow::bail!("this build has no Lua runtime, so {entry} cannot run");
-        }
-    }
-
-    impl Screen for LuaScreen {
-        fn open(&mut self, _cx: &mut UiContext<'_>) -> Result<()> {
-            Ok(())
-        }
-
-        fn update(&mut self, _cx: &UiContext<'_>, _input: UiInput) -> ScreenResult {
-            ScreenResult::Continue
-        }
-
-        fn draw(&mut self, _cx: &UiContext<'_>, _framebuffer: &mut Framebuffer) {}
-    }
-
-    impl SaveScreenTrait for LuaScreen {
-        fn take_outcome(&mut self) -> Option<SaveOutcome> {
-            None
-        }
-    }
-}
-
-#[cfg(feature = "lua")]
 mod imp {
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1033,7 +983,6 @@ mod tests {
     use super::*;
 
     use crate::pack::Pack;
-    #[cfg(feature = "lua")]
     use crate::save;
     use crate::save::SaveFile;
     use crate::text::Text;
@@ -1194,41 +1143,25 @@ mod tests {
             }
         }
 
-        #[cfg(feature = "lua")]
         fn load(&self) -> LuaScreen {
             let mut cx = self.context();
             LuaScreen::open_load("screen/save.lua", &mut cx).unwrap()
         }
 
-        #[cfg(feature = "lua")]
         fn save(&self, file: SaveFile, ink_ribbon: bool) -> LuaScreen {
             let mut cx = self.context();
             LuaScreen::open_save("screen/save.lua", &mut cx, file, ink_ribbon).unwrap()
         }
     }
 
-    #[cfg(not(feature = "lua"))]
-    #[test]
-    fn the_lean_build_has_no_lua_screen() {
-        let fixture = Fixture::new("lean", "local x = 1");
-        let mut cx = fixture.context();
-        assert!(LuaScreen::open_load("screen/save.lua", &mut cx).is_err());
-        assert!(
-            LuaScreen::open_save("screen/save.lua", &mut cx, SaveFile::default(), false).is_err()
-        );
-    }
-
-    #[cfg(feature = "lua")]
     use crate::ui::{Screen, ScreenAction, ScreenResult, UiInput};
 
-    #[cfg(feature = "lua")]
     fn draw(screen: &mut LuaScreen, cx: &crate::ui::UiContext<'_>) -> crate::render::Framebuffer {
         let mut framebuffer = crate::render::Framebuffer::new();
         screen.draw(cx, &mut framebuffer);
         framebuffer
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_script_draws_rects_and_text() {
         let fixture = Fixture::new(
@@ -1270,7 +1203,6 @@ end
         assert_eq!(screen.fade(), 64);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn sprites_and_backgrounds_draw_from_pack_images() {
         let fixture = Fixture::new(
@@ -1311,7 +1243,6 @@ end
         assert_eq!(screen.test_global::<u32>("size_h"), 4);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_missing_image_leaves_the_screen() {
         let fixture = Fixture::new(
@@ -1332,7 +1263,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn saves_lists_the_directory_with_parsed_metadata() {
         let fixture = Fixture::new(
@@ -1374,7 +1304,6 @@ end
         assert!(!second.get::<bool>("loadable").unwrap());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn save_writes_the_pending_block_and_records_the_outcome() {
         let fixture = Fixture::new(
@@ -1421,7 +1350,6 @@ end
         assert_eq!(names, ["new_01.dat"]);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn save_rejects_bad_names_and_the_wrong_mode() {
         let fixture = Fixture::new(
@@ -1452,7 +1380,6 @@ end
         assert!(!screen.test_global::<bool>("ok"));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn load_requests_the_chosen_file_and_exit_leaves() {
         let fixture = Fixture::new(
@@ -1495,7 +1422,6 @@ end
         assert_eq!(result, ScreenResult::Done(ScreenAction::Title));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn save_mode_exit_resumes_and_remove_deletes() {
         let fixture = Fixture::new(
@@ -1524,7 +1450,6 @@ end
         assert!(!fixture.dir.path.join("old.dat").exists());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn input_edges_reach_the_script() {
         let fixture = Fixture::new(
@@ -1552,7 +1477,6 @@ end
         assert!(screen.test_global::<bool>("confirm"));
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn on_open_sounds_queue_before_the_first_tick() {
         let fixture = Fixture::new(
@@ -1573,7 +1497,6 @@ function update(api, input) end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn sounds_queue_the_screen_cues() {
         let fixture = Fixture::new(
@@ -1614,7 +1537,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_failing_update_leaves_the_screen() {
         let fixture = Fixture::new("fail", r#"function update(api) error("boom") end"#);
@@ -1626,7 +1548,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_failing_draw_marks_the_screen_and_it_leaves_next_tick() {
         let fixture = Fixture::new(
@@ -1643,7 +1564,6 @@ function draw(api) error("boom") end"#,
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_sandbox_has_no_io_or_os() {
         let fixture = Fixture::new(
@@ -1670,7 +1590,6 @@ end
         assert!(LuaScreen::open_load("screen/none.lua", &mut cx).is_err());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_script_without_update_is_an_error() {
         let fixture = Fixture::new("no-update", r#"function draw(api) end"#);
@@ -1682,7 +1601,6 @@ end
         assert!(message.contains("update"), "{message}");
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_broken_script_is_an_error() {
         let fixture = Fixture::new("broken", "function update(api) return");
@@ -1690,7 +1608,6 @@ end
         assert!(LuaScreen::open_load("screen/save.lua", &mut cx).is_err());
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn pad_words_match_the_original_layout() {
         assert_eq!(imp::pad_word(UiInput::default()), 0);
@@ -1717,7 +1634,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn colour_parsing_covers_names_numbers_and_hex() {
         use crate::font::Tint;
@@ -1758,7 +1674,6 @@ end
         assert_eq!(parse_hex_colour("12345"), None);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn extreme_coordinates_clamp_instead_of_overflowing() {
         let fixture = Fixture::new(
@@ -1785,7 +1700,6 @@ end
         );
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn a_pack_without_a_font_draws_no_text_and_keeps_running() {
         let fixture = Fixture::new(
@@ -1811,7 +1725,6 @@ end
         assert_eq!(screen.test_global::<i32>("width"), 0);
     }
 
-    #[cfg(feature = "lua")]
     #[test]
     fn the_blend_option_mixes_a_sprite_with_the_backdrop() {
         let fixture = Fixture::new(
@@ -1842,7 +1755,7 @@ end
         assert_eq!(pixel(20, 10), [255, 0, 0]);
     }
 
-    #[cfg(all(feature = "lua", feature = "hd"))]
+    #[cfg(feature = "hd")]
     #[test]
     fn an_exact_size_background_is_blitted_with_its_alpha() {
         let fixture = Fixture::new(
