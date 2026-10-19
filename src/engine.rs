@@ -11041,7 +11041,7 @@ fn tick_room_timed(
         context.game.entities[0].target = target;
     }
     let look_at_origin = enemy::look_at_joint_origin(context.game, 0);
-    context.game.entity_anims[0].slew_look_at(&context.game.entities[0], look_at_origin);
+    context.game.entity_anims[0].slew_look_at(&mut context.game.entities[0], look_at_origin);
     // `update_player_anim`'s tail: the moved player is mirrored onto entity 0,
     // then `HandleEnemyPlayerCollisions` pushes the player out of every active
     // entity's SCA volume and the room collision resolves the result with the

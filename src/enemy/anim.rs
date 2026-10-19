@@ -346,15 +346,28 @@ impl EntityAnim {
     ///
     /// The pitch is stepped by the original's own routine, which mirrors the
     /// yaw slew but with the `+/-0x138` pitch cone and no zero-target decay.
-    pub fn slew_look_at(&mut self, entity: &Entity, joint_world: Option<[i32; 3]>) {
+    ///
+    /// Bit `0x40` is the one-shot glance: the first call doubles the
+    /// `target[2]` count, tags it with bit 16 and switches to absolute angles;
+    /// each yaw snap then mirrors the target yaw (`0x1000 - x`) and spends one
+    /// count, so the head swings side to side until the count runs out and the
+    /// flags park at `0x1C`, which lets the yaw decay home.
+    pub fn slew_look_at(&mut self, entity: &mut Entity, joint_world: Option<[i32; 3]>) {
         if entity.look_at_flags & 0x10 == 0 {
             return;
+        }
+        if entity.look_at_flags & 0x40 != 0 && entity.target[2] & 0x10000 == 0 {
+            entity.target[2] = entity.target[2].wrapping_mul(2) | 0x10000;
+            entity.look_at_flags |= 0x20;
+        }
+        if entity.look_at_flags & 0x40 != 0 && entity.target[2] & 0xFFFF == 0 {
+            entity.look_at_flags &= 0x1C;
         }
         let yaw_target = if entity.look_at_flags & 0x01 == 0 {
             0
         } else if entity.look_at_flags & 0x20 != 0 {
             // Bit 0x20: the target X field is the absolute yaw.
-            entity.target[0] as u16 & 0x0FFF
+            entity.target[0] as u16
         } else {
             crate::sfx::angle_between_xz(
                 entity.pos[0],
@@ -381,9 +394,24 @@ impl EntityAnim {
         } else {
             pitch_enable * i32::from(entity.target[1] as i16)
         };
+        let glance = entity.look_at_flags & 0x40 != 0;
+        let yaw_step = i32::from(entity.look_at_yaw_step);
+        let yaw_snaps = (yaw_step - i32::from(self.look_at_yaw) + i32::from(yaw_target)) & 0x0FFF
+            < yaw_step * 2;
         self.look_at_yaw = slew_yaw(self.look_at_yaw, yaw_target, entity.look_at_yaw_step);
+        if yaw_snaps && glance && entity.look_at_flags & 0x01 != 0 {
+            entity.target[0] = 0x1000 - entity.target[0];
+            entity.target[2] -= 1;
+        }
+        let pitch_step = i32::from(entity.look_at_pitch_step);
+        let pitch_snaps =
+            (pitch_step - i32::from(self.look_at_pitch) + pitch_target) & 0x0FFF < pitch_step * 2;
         self.look_at_pitch =
             slew_pitch(self.look_at_pitch, pitch_target, entity.look_at_pitch_step);
+        if pitch_snaps && glance && entity.look_at_flags & 0x01 == 0 {
+            entity.look_at_flags ^= 0x02;
+            entity.target[2] -= 1;
+        }
     }
 }
 
@@ -881,20 +909,20 @@ mod tests {
         entity.look_at_pitch_step = 0x40;
         // 45 degrees to the right of the entity's facing.
         entity.target = [1000, 0, 1000];
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_yaw, -0x40);
         for _ in 0..7 {
-            clock.slew_look_at(&entity, None);
+            clock.slew_look_at(&mut entity, None);
         }
         assert_eq!(clock.look_at_yaw, -0x200);
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_yaw, -0x200, "snapped and held");
 
         // Straight behind the entity the target lies outside the +/-0x2C8
         // cone, so the slew stops on the cone's edge.
         entity.target = [0, 0, 1000];
         for _ in 0..16 {
-            clock.slew_look_at(&entity, None);
+            clock.slew_look_at(&mut entity, None);
         }
         assert_eq!(clock.look_at_yaw, -0x2C8);
 
@@ -902,8 +930,36 @@ mod tests {
         let frozen = clock.look_at_yaw;
         entity.look_at_flags = 0;
         entity.target = [1000, 0, 0];
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_yaw, frozen);
+    }
+
+    #[test]
+    fn look_at_glance_swings_side_to_side_then_parks() {
+        // Room 514's Barry: flags 0x71 with yaw 400 and a count of 2. The
+        // reference tags the count 0x10004, steps 40 to 400, then mirrors the
+        // target to 3696 on the snap and spends one count.
+        let mut clock = EntityAnim::default();
+        let mut entity = entity(0, 0, 0);
+        entity.look_at_flags = 0x71;
+        entity.look_at_yaw_step = 40;
+        entity.look_at_pitch_step = 64;
+        entity.target = [400, 0, 2];
+        clock.slew_look_at(&mut entity, None);
+        assert_eq!((clock.look_at_yaw, entity.target), (40, [400, 0, 0x10004]));
+        for _ in 0..10 {
+            clock.slew_look_at(&mut entity, None);
+        }
+        assert_eq!(
+            (clock.look_at_yaw, entity.target),
+            (400, [3696, 0, 0x10003])
+        );
+        for _ in 0..200 {
+            clock.slew_look_at(&mut entity, None);
+        }
+        assert_eq!(entity.target[2], 0x10000);
+        assert_eq!(entity.look_at_flags, 0x10);
+        assert_eq!(clock.look_at_yaw, 0);
     }
 
     #[test]
@@ -920,7 +976,7 @@ mod tests {
         entity.target = [400, 3796, 0];
         let mut yaws = Vec::new();
         for _ in 0..4 {
-            clock.slew_look_at(&entity, None);
+            clock.slew_look_at(&mut entity, None);
             yaws.push(clock.look_at_yaw);
         }
         assert_eq!(yaws, [150, 300, 400, 400]);
@@ -928,7 +984,7 @@ mod tests {
         entity.target[0] = 3696;
         yaws.clear();
         for _ in 0..7 {
-            clock.slew_look_at(&entity, None);
+            clock.slew_look_at(&mut entity, None);
             yaws.push(clock.look_at_yaw);
         }
         assert_eq!(yaws, [250, 100, -50, -200, -350, -400, -400]);
@@ -957,13 +1013,13 @@ mod tests {
         // 250 below over 1000 horizontal: atan(0.25) in 12-bit units.
         let target_pitch = -(((0.25f64).atan() * (2048.0 / std::f64::consts::PI)) as i16);
         entity.target = [0, -250, 1000];
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_pitch, -0x40);
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_pitch, -0x80, "still stepping");
         // The remaining turn is under one step, so the third call snaps to
         // the target.
-        clock.slew_look_at(&entity, None);
+        clock.slew_look_at(&mut entity, None);
         assert_eq!(clock.look_at_pitch, target_pitch, "snapped");
         assert_eq!(clock.look_at_yaw, 0, "the yaw bit is clear");
 
@@ -975,7 +1031,7 @@ mod tests {
         let joint_target = angle_quadrant_value((-450 << 12) / 1000);
         assert_ne!(joint_target, i32::from(target_pitch));
         for _ in 0..16 {
-            joint_clock.slew_look_at(&entity, Some([0, 200, 0]));
+            joint_clock.slew_look_at(&mut entity, Some([0, 200, 0]));
         }
         assert_eq!(i32::from(joint_clock.look_at_pitch), joint_target);
     }

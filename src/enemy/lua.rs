@@ -3934,8 +3934,7 @@ mod imp {
                     game.entities[slot].target = target;
                 }
                 let origin = crate::enemy::look_at_joint_origin(game, slot);
-                let target = game.entities[slot];
-                game.entity_anims[slot].slew_look_at(&target, origin);
+                game.entity_anims[slot].slew_look_at(&mut game.entities[slot], origin);
                 Ok(())
             });
 

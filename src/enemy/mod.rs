@@ -391,7 +391,7 @@ pub fn update_entity(
         game.entities[slot].target = target;
     }
     let origin = look_at_joint_origin(game, slot);
-    game.entity_anims[slot].slew_look_at(&game.entities[slot], origin);
+    game.entity_anims[slot].slew_look_at(&mut game.entities[slot], origin);
     if game.entities[slot].look_at_flags != 0 {
         game.joint_worlds[slot] = game.entity_anims[slot].joint_worlds(&game.entities[slot], clips);
     }
