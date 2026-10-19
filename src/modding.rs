@@ -736,8 +736,12 @@ mod tests {
         write(&pack, b"pack");
         let mods = dir.path.join("mods");
         write(&mods.join("real.akpak"), b"mod");
+        // The link target lives outside `mods/`; a link to a pack already in
+        // the directory is deduplicated by canonical path.
+        let target = dir.path.join("elsewhere.akpak");
+        write(&target, b"mod");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(mods.join("real.akpak"), mods.join("link.akpak")).unwrap();
+        std::os::unix::fs::symlink(&target, mods.join("link.akpak")).unwrap();
         #[cfg(not(unix))]
         write(&mods.join("link.akpak"), b"mod");
 
