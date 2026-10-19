@@ -65,6 +65,11 @@ Room mode (from the new-game spawn):
 - `walk_forward.txt` — ROOM 101: hold `up` out of the idle, hand over to the
   run with `run` held and release; the pad-driven locomotion's rendered pose
   must step with the same clip frames as the reference.
+- `attacked_start.txt` — ROOM 101, Chris: the dining-room zombie's grab sets
+  `isBeingAttackedFlag` at t=100 and the first bite lands at t=121. Pressing
+  START at 121 is refused (the edge is already spent); the reference keeps the
+  room ticking and the health dropping, where arklay used to freeze on the
+  inventory panel. Releasing the key cannot open it later.
 
 Save mode (each header names its save):
 

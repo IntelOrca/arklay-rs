@@ -26,6 +26,17 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   reference still draws `g_RandSeed = rand()` (game_loop's first statement)
   before it detects the request; arklay opened the menu ahead of the room tick
   and skipped the draw. `GameState::draw_frame_rand` on the open path.
+- **START while being attacked.** The reference's menu-button detection
+  (game_loop 0x00480de8) only raises the menu request when
+  `g_playerEntity.isBeingAttackedFlag == 0`; a grabbed or bitten player stays
+  in gameplay through the press. arklay opened the pause menu regardless, so
+  the attack froze under the inventory panel and the RNG stream stopped. The
+  same gate arms the item box (`open_itembox`, 0x0041b990), which arklay also
+  checked only at the menu hand-off. `oracle/inputs/attacked_start.txt` pins
+  the menu case (ROOM 101, Chris: the grab sets the flag at t=100 and the first
+  bite lands at t=121): the reference ignores the press and takes the bite on
+  t=121 (health 140 -> 130), while the unfixed port froze that same tick on the
+  inventory panel. Both checks now require the flag to be exactly zero.
 - **Menu fade blend.** The black veil is `round(channel * (255 - alpha) / 255)`
   (verified exact against the oracle's fade frames), not `(256 - alpha) / 256`
   and not the truncated `/255`. The one-LSB mismatch diverged ~19% (round) or

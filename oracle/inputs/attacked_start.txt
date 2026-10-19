@@ -1,0 +1,7 @@
+# ROOM101, Chris: a dining-room zombie grabs the player at t=100, which sets
+# isBeingAttackedFlag; the first bite lands at t=121. START is pressed there:
+# the reference ignores the rising edge and keeps playing the attack out. The
+# press is edge-triggered, so releasing and pressing later is a new request;
+# this script releases on 122 and does not press again.
+121 start
+122

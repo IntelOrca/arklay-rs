@@ -6732,9 +6732,15 @@ impl GameState {
     /// The port's "message system ready" test is the message window being idle
     /// (the original checks `g_message_flags` bit 0x40, which its message
     /// system maintains outside this path). The lid record is latched from the
-    /// action record's +4 word.
+    /// action record's +4 word. The original also refuses while the player is
+    /// being attacked (`g_playerEntity.isBeingAttackedFlag == 0`, 0x0041b990),
+    /// so a grabbed or bitten player cannot arm the box.
     pub fn open_itembox(&mut self, slot: u8) -> bool {
-        if self.itembox.state != 0 || self.message.active || self.message_menu {
+        if self.itembox.state != 0
+            || self.entities[0].is_being_attacked != 0
+            || self.message.active
+            || self.message_menu
+        {
             return false;
         }
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
@@ -16371,6 +16377,42 @@ mod tests {
             reach_animation: false,
         });
         assert!(state.open_itembox(0));
+    }
+
+    #[test]
+    fn the_item_box_gate_refuses_while_the_player_is_attacked() {
+        let mut state = pushed_game(vec![]);
+        state.room_actions[0] = Some(RoomAction {
+            slot: 0,
+            kind: RoomActionKind::ItemBox,
+            zone: [0, 0, 0, 0],
+            sce: HANDLER_ITEMBOX,
+            handler: HANDLER_ITEMBOX,
+            flags: 0x01,
+            params: [0; 8],
+            item_data: None,
+            room_items_flag: 0xFF,
+            reach_animation: false,
+        });
+
+        // `open_itembox` (0x0041b990) requires isBeingAttackedFlag == 0, so
+        // both the grab/bite value and the scripted-pose high bit refuse to
+        // arm the lid. The check is at arm time: a lid already opening still
+        // settles and opens if the player is attacked during its animation.
+        for flag in [1, 0x80] {
+            state.entities[0].is_being_attacked = flag;
+            assert!(
+                !state.open_itembox(0),
+                "the box armed with is_being_attacked={flag:#04x}"
+            );
+            assert_eq!(state.itembox.state, 0);
+        }
+
+        state.entities[0].is_being_attacked = 0;
+        assert!(
+            state.open_itembox(0),
+            "the box arms once the player is clear"
+        );
     }
 
     #[test]

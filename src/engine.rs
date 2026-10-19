@@ -2133,7 +2133,19 @@ impl GameSession {
         // START opens the pause menu while no message owns the tick. The
         // window advances after the script pass, so the frame's start state
         // decides; the press that dismissed a window is spent on it.
-        if ui.start && !was_active {
+        //
+        // The original gates the request on `isBeingAttackedFlag == 0`
+        // (GameLoop.cpp 0x00480de8: `g_playerEntity.isBeingAttackedFlag == 0`),
+        // so a grabbed or bitten player cannot open the inventory mid-attack.
+        // The flag's high bit (0x80) marks the scripted door/climb poses and
+        // blocks the menu the same way; only an exact zero passes. This is the
+        // attack clause only: the reference also checks the message word's
+        // 0x100/0x40 bits and the menu-pending state, which `!was_active`
+        // covers for normal message windows. The gate runs before the room
+        // tick, so it reads the previous tick's entity state; a script that
+        // raises the flag during this frame's SCD pass would therefore differ
+        // by one frame (the reference checks after the script pass).
+        if ui.start && !was_active && self.game.entities[0].is_being_attacked == 0 {
             // The reference draws this frame's random seed before its menu
             // request is even detected (game_loop's first statement), then
             // opens the menu at the end of the same tick. arklay opens the menu
@@ -18389,6 +18401,60 @@ off_0010:
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert_eq!(session.game.frame, before + 1, "the room resumes");
+    }
+
+    #[test]
+    fn start_is_ignored_while_the_player_is_being_attacked() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+
+        // The reference's menu-button detection only opens when
+        // `g_playerEntity.isBeingAttackedFlag == 0` (GameLoop.cpp 0x00480de8),
+        // so a grabbed or bitten player cannot reach the inventory. The high
+        // bit is the scripted door/climb pose and blocks it too.
+        for flag in [1, 0x80] {
+            session.game.entities[0].is_being_attacked = flag;
+            session
+                .tick(
+                    &pack,
+                    UiInput {
+                        start: true,
+                        ..UiInput::default()
+                    },
+                    player::Input::default(),
+                    false,
+                )
+                .unwrap();
+            assert!(
+                session.menu.is_none(),
+                "START opened the menu with is_being_attacked={flag:#04x}"
+            );
+            assert_eq!(
+                session.menu_fade_phase,
+                MenuFadePhase::None,
+                "the menu fade started with is_being_attacked={flag:#04x}"
+            );
+        }
+
+        // Once the attack ends a fresh START press opens it, so the test pins
+        // the flag rather than a broken input path.
+        session.game.entities[0].is_being_attacked = 0;
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert!(session.menu.is_some(), "START opens the menu once clear");
     }
 
     #[test]
