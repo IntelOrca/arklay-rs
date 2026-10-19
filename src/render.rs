@@ -1247,6 +1247,7 @@ impl Framebuffer {
                 0,
                 [255; 3],
                 None,
+                None,
                 false,
                 &mut triangles,
             );
@@ -1281,6 +1282,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 None,
                 false,
                 &mut triangles,
@@ -1328,6 +1330,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 None,
                 false,
                 &mut triangles,
@@ -1880,7 +1883,13 @@ pub struct EntityMesh<'a> {
     /// with `m` the identity, run in place. See
     /// [`EntityLight::aliased_identity_product`].
     pub aliased_light: bool,
+    /// Per-joint `JointSetColorTint` colours (1/128 multipliers); a non-zero
+    /// entry draws the joint unlit in that colour.
+    pub joint_colours: [[u8; 3]; 32],
 }
+
+/// No joint carries a `JointSetColorTint` colour.
+pub const NO_JOINT_COLOURS: [[u8; 3]; 32] = [[0; 3]; 32];
 
 /// The original's `GetTmdBlendMode` plus `CreateTmdObjectInternal`'s remap:
 /// the background weight of the first semi-transparent primitive of `model`,
@@ -2136,6 +2145,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                 true,
                 texture,
                 mesh.tint,
+                mesh.joint_colours.get(index).copied(),
                 mesh.blend_weight,
                 room_object,
                 &mut triangles,
@@ -2171,6 +2181,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                     false,
                     texture,
                     mesh.tint,
+                    mesh.joint_colours.get(index).copied(),
                     mesh.blend_weight,
                     false,
                     &mut triangles,
@@ -3019,10 +3030,15 @@ fn collect_triangles(
     cull: bool,
     texture: usize,
     tint: [u8; 3],
+    colour: Option<[u8; 3]>,
     blend_weight: Option<u8>,
     room_object: bool,
     triangles: &mut Vec<Triangle>,
 ) {
+    // A `JointSetColorTint` colour turns the reference's unlit path on: the
+    // colour (1/128 scale) replaces the lighting outright. An all-zero colour
+    // is untinted.
+    let colour = colour.filter(|colour| *colour != [0; 3]);
     // The reference transforms and projects every vertex in floating point
     // through `camera * joint` (see [`RefProjection`]). The vertex buffer
     // holds `(x, -y, z)`; the raw-Y form skips the negation, and its pool is
@@ -3134,6 +3150,8 @@ fn collect_triangles(
         let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
             let (position, depth, uv, normal) = corners[corner];
             let shade = match (lighting, light) {
+                _ if let Some(colour) = colour => colour
+                    .map(|channel| (f64::from(channel) / 128.0 * CHANNEL_MAX).min(CHANNEL_MAX)),
                 // The gameplay path evaluates each corner normal against the
                 // latched light directions, clamps the accumulated light, then
                 // folds in the vertex colour and the mesh tint.
@@ -4353,6 +4371,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                joint_colours: NO_JOINT_COLOURS,
             },
             EntityMesh {
                 mesh: &mesh1,
@@ -4365,6 +4384,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                joint_colours: NO_JOINT_COLOURS,
             },
         ];
         let lighting = Lighting {
@@ -4440,6 +4460,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                joint_colours: NO_JOINT_COLOURS,
             }
         }
         let lighting = Lighting {
@@ -4657,6 +4678,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let lighting = Lighting {
             ambient: [4095; 3],
@@ -5453,6 +5475,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let camera = straight_camera();
         let lighting = Lighting {
@@ -5563,6 +5586,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5596,6 +5620,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5658,6 +5683,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
 
         let render = |mirror_from: usize, mirror: Option<&MirrorPass>| {
@@ -5707,6 +5733,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5721,6 +5748,47 @@ mod tests {
         // (200, 40) lies inside mesh_at's screen triangle.
         let pixel = framebuffer_pixel(&framebuffer, 200, 40);
         assert!(pixel[0] > 100 && pixel[0] < 160, "{pixel:?}");
+    }
+
+    #[test]
+    fn a_joint_colour_draws_the_joint_unlit_in_that_colour() {
+        // Zero light would paint black; the 0x30 red joint colour (0.375)
+        // replaces the lighting outright.
+        let texture = solid_texture([255, 255, 255, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+        let mut joint_colours = NO_JOINT_COLOURS;
+        joint_colours[0] = [0x30, 0, 0];
+        let tinted = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            blend_weight: None,
+            hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            joint_colours,
+        }];
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            &tinted,
+            &[],
+            &straight_camera(),
+            &lighting,
+            None,
+        );
+        let pixel = framebuffer_pixel(&framebuffer, 200, 40);
+        assert!((94..=97).contains(&pixel[0]), "{pixel:?}");
+        assert_eq!(&pixel[1..3], &[0, 0], "{pixel:?}");
     }
 
     #[test]
@@ -5745,6 +5813,7 @@ mod tests {
             0,
             [255; 3],
             None,
+            None,
             false,
             &mut triangles,
         );
@@ -5766,6 +5835,7 @@ mod tests {
             true,
             0,
             [255; 3],
+            None,
             None,
             false,
             &mut triangles,

@@ -171,6 +171,7 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 
     // Only group 1 is active, so no other overlay interferes.
@@ -273,6 +274,7 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 
     let camera = Camera::from_cut(cut);

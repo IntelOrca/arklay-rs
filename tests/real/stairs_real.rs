@@ -879,6 +879,7 @@ fn capture_player_partway_up_the_lab_stairway() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
     let mut framebuffer = Framebuffer::new();
     render::draw_gameplay_scene(

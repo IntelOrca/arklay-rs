@@ -1483,6 +1483,10 @@ pub struct Entity {
     /// The per-joint blood-scratch block `blood_splatter_physics` drives:
     /// counter, flags, X velocity and Y acceleration of the bleeding joint.
     pub joint_blood: [JointBlood; 32],
+    /// Per-joint `JointSetColorTint` colours (`r | g << 8 | b << 16`, each a
+    /// 1/128 multiplier): a non-zero entry draws that joint unlit in the
+    /// colour, the Hunter's blood-red claws after a lunge. Zero is untinted.
+    pub joint_colours: [[u8; 3]; 32],
     /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
     /// joint `i`'s flag bit. Scripted enemies set or clear the same bits
     /// through the `set_joint_visible` script helper. The spiders carry 20

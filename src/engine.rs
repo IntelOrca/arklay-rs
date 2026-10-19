@@ -12284,6 +12284,7 @@ fn render_frame_on(
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut npc_hidden: Vec<u32> = Vec::new();
     let mut npc_tints: Vec<[u8; 3]> = Vec::new();
+    let mut npc_joint_colours: Vec<[[u8; 3]; 32]> = Vec::new();
     let mut npc_weapon_ids: Vec<Option<u16>> = Vec::new();
     let mut npc_zone_gate: Vec<bool> = Vec::new();
     // Each character's light latch point (its own matrix translation) and
@@ -12397,6 +12398,7 @@ fn render_frame_on(
         npc_joints.push(std::mem::take(&mut joints));
         npc_hidden.push(hidden);
         npc_tints.push(entity.model_tint_rgb());
+        npc_joint_colours.push(entity.joint_colours);
         npc_weapon_ids.push(crate::weapons::character_weapon_id(
             entity.id,
             entity.behavior_flags,
@@ -12457,6 +12459,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     for ((asset, _, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
@@ -12471,17 +12474,20 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for ((((model, joints), hidden), tint), &(light_pos, per_joint_light)) in models
-        .iter()
-        .zip(&npc_joints)
-        .zip(&npc_hidden)
-        .zip(&npc_tints)
-        .zip(&npc_lights)
+    for (((((model, joints), hidden), tint), &(light_pos, per_joint_light)), joint_colours) in
+        models
+            .iter()
+            .zip(&npc_joints)
+            .zip(&npc_hidden)
+            .zip(&npc_tints)
+            .zip(&npc_lights)
+            .zip(&npc_joint_colours)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12494,6 +12500,7 @@ fn render_frame_on(
             per_joint_light,
             complex_object: None,
             aliased_light: false,
+            joint_colours: *joint_colours,
         });
     }
     // The held-weapon meshes of the scripted characters draw with the
@@ -12533,6 +12540,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -12558,6 +12566,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     // The held weapon's mesh draws at the hand joint while the weapon bank
@@ -12589,6 +12598,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12671,6 +12681,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12779,6 +12790,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: *complex,
             aliased_light: complex.is_none() && light_pos.is_some(),
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12852,6 +12864,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -16246,6 +16259,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);

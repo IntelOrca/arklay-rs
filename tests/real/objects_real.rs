@@ -275,6 +275,7 @@ fn room_107_objects_render() {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                joint_colours: arklay::render::NO_JOINT_COLOURS,
             })
             .collect();
         let mut framebuffer = Framebuffer::new();
@@ -1097,6 +1098,7 @@ fn room_112_mirror_renders_reflection_pixels() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
     // A stand-in room-object mesh with a flat blue page: it sits before the
     // entity meshes, so the mirror pass must never reflect it.
@@ -1119,6 +1121,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: arklay::render::NO_JOINT_COLOURS,
         },
         EntityMesh {
             mesh: &emd.mesh,
@@ -1131,6 +1134,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            joint_colours: arklay::render::NO_JOINT_COLOURS,
         },
     ];
 
