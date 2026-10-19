@@ -64,15 +64,15 @@ pub struct UiInput {
     pub held_left: bool,
     /// Held level of the direction keys, for continuous spin.
     pub held_right: bool,
-    /// Confirm (Space or Return).
+    /// Confirm (Space or Return by default).
     pub confirm: bool,
-    /// Cancel (X, Backspace or Escape).
+    /// Cancel (X, Backspace or Escape by default).
     pub cancel: bool,
-    /// L1 (`[`): pages the item box back.
+    /// L1 (`[` by default): pages the item box back.
     pub page_left: bool,
-    /// R1 (`]`): pages the item box forward.
+    /// R1 (`]` by default): pages the item box forward.
     pub page_right: bool,
-    /// START (Tab): opens the gameplay pause menu.
+    /// START (Tab by default): opens the gameplay pause menu.
     pub start: bool,
     /// F1: the port-only debug room overlay's edge. The overlay is always
     /// available; `--debug-menu` is accepted for compatibility only.
@@ -82,6 +82,9 @@ pub struct UiInput {
     pub return_title: bool,
     /// Any key went down this tick.
     pub any: bool,
+    /// The first bindable input pressed this tick, whatever it is bound to:
+    /// the rebind screen's capture.
+    pub captured: Option<crate::controls::Source>,
 }
 
 /// What a screen reports after one tick.

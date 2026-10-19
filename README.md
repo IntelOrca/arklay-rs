@@ -123,7 +123,7 @@ cargo run -- re1.akpak --renderer gpu --render-scale 4
 
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
-# CLEAR GAME). Confirm opens a tool, Esc backs out one level, F1 closes from
+# CLEAR GAME, CONTROLS). Confirm opens a tool, Esc backs out one level, F1 closes from
 # anywhere. `--ui debug` captures the tool list
 cargo run -- re1.akpak --room 100
 cargo run -- re1.akpak --ui debug --capture debug.bmp
@@ -198,19 +198,47 @@ would not shrink also stays raw.
 
 ### Controls
 
-| Key | Action |
-| --- | --- |
-| Arrow keys | Move / menu selection |
-| `Space`, `Return` | Confirm / action / dismiss a message |
-| `C` | Aim the equipped weapon (hold) |
-| `Z` | Fire / reload with the weapon aimed |
-| `Tab` | START: open/close the inventory (pause menu), cycle the top tabs |
-| `[`, `]` | L1/R1: page the item box |
-| `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |
+| Key | Gamepad | Action |
+| --- | --- | --- |
+| Arrow keys | D-pad, left stick | Move / menu selection |
+| `Space`, `Return` | South (A / Cross) | Confirm / action / dismiss a message |
+| `C` | Left trigger | Aim the equipped weapon (hold) |
+| `Z` | Right trigger | Fire / reload with the weapon aimed |
+| `Tab` | Start | START: open/close the inventory (pause menu), cycle the top tabs |
+| `[`, `]` | Left / right shoulder | L1/R1: page the item box |
+| `X`, `Backspace`, `Esc` | East (B / Circle) | Cancel (menus, character select, load screen) |
+| `Shift` | West (X / Square) | Run (hold) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `F1` | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game); Esc backs out one level, F1 closes |
+| `F1` | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls); Esc backs out one level, F1 closes |
 | `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
+
+Every action except the fixed `F1`/`F9` debug keys can be rebound, with any
+number of keyboard, mouse (buttons and wheel) and gamepad bindings each. The
+CONTROLS tool in the `F1` menu lists the actions: up/down pick one, left/right
+pick a binding slot (the last slot adds a new one), confirm captures the next
+key, button, wheel notch or stick/trigger push (it gives up after about five
+seconds), `Tab` clears the slot and RESET restores the defaults. A binding
+shared with another action is drawn red and the other actions are listed
+below. Up, down, confirm and cancel always keep at least one binding. Changes
+are saved to the `[bindings]` table of `arklay.toml`, which can also be edited
+by hand; actions it leaves out keep their defaults:
+
+```toml
+[bindings]
+confirm = ["key:Space", "key:Return", "pad:a", "mouse:left"]
+fire = ["key:Z", "axis:righttrigger+", "wheel:down"]
+```
+
+Sources are `key:<SDL key name>`, `mouse:left|middle|right|x1|x2`,
+`wheel:up|down|left|right`, `pad:<SDL gamepad button>` and
+`axis:<SDL gamepad axis>+|-`; the actions are `up`, `down`, `left`, `right`,
+`confirm`, `cancel`, `run`, `aim`, `fire`, `start`, `page_left` and
+`page_right`. Saving rewrites the file in canonical form (comments are not
+kept) and never touches a file that fails to parse. Gamepads are picked up
+when plugged in; extra controller mappings can be dropped into
+`gamecontrollerdb.txt` in the config directory (or `SDL_GAMECONTROLLERCONFIG`).
+Scripted `--input` runs are unaffected by bindings.
 
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm
@@ -223,7 +251,7 @@ the current area. A pack without `map/` leaves the tab blank.
 Saves live as `savedat*.dat` under `--save-dir` (default `<config
 dir>/save`, `~/.config/arklay/save`). The title starts on LOAD GAME when a
 save exists; with none, LOAD is refused. `arklay.toml` in the same config
-directory sets the save directory and the language. The save/load screen is a
+directory sets the save directory, the language and the control bindings. The save/load screen is a
 mod: the checked-in `mods/crloadsave/` replaces the ported original with a
 Classic REbirth-style folder screen through `api:register_save_screen`, built
 and layered like any other mod:

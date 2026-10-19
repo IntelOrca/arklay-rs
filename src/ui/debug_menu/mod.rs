@@ -2,7 +2,8 @@
 //!
 //! This is a development aid the retail game never shipped. F1 while playing
 //! freezes the room and opens a tool list: ROOM SELECT, INVENTORY, PLAYER,
-//! FLAGS, CHEATS, SAVE, ITEM BOX and CLEAR GAME. Up/down move the cursor,
+//! FLAGS, CHEATS, SAVE, ITEM BOX, CLEAR GAME and CONTROLS (the input rebind
+//! screen). Up/down move the cursor,
 //! confirm enters a tool, cancel backs out one level (tool, main list, closed)
 //! and F1 closes the menu from anywhere. The menu is always available
 //! (`--debug-menu` is accepted for compatibility only).
@@ -18,15 +19,19 @@
 //! its flag editor's views and names are mirrored, while the room columns, the
 //! icon picker and the cheats are port-designed.
 
+mod controls;
 mod flags;
 mod inventory;
 mod rooms;
+
+pub use controls::{CAPTURE_TICKS, ControlsEditor, Note};
 
 pub use flags::{FlagEditor, FlagGroup, FlagName, GROUPS, flag_name};
 pub use inventory::{InventoryEditor, Picker};
 pub use rooms::{RoomSelect, RoomVariants, room_entries, room_variants};
 
 use crate::charset;
+use crate::controls::Bindings;
 use crate::ending;
 use crate::font::{self, Font};
 use crate::game::{self, GameState};
@@ -71,6 +76,8 @@ pub enum DebugMenuEvent {
     ItemBox,
     /// Start ending `id`'s film chain.
     ClearGame(u8),
+    /// The CONTROLS tool changed the bindings; the menu stays open.
+    BindingsChanged,
 }
 
 /// The main list's tools, in order.
@@ -92,10 +99,12 @@ pub enum Tool {
     ItemBox,
     /// The ending chooser.
     ClearGame,
+    /// The input rebind screen.
+    Controls,
 }
 
 /// The main list, in order.
-pub const TOOLS: [Tool; 8] = [
+pub const TOOLS: [Tool; 9] = [
     Tool::Rooms,
     Tool::Inventory,
     Tool::Player,
@@ -104,6 +113,7 @@ pub const TOOLS: [Tool; 8] = [
     Tool::Save,
     Tool::ItemBox,
     Tool::ClearGame,
+    Tool::Controls,
 ];
 
 impl Tool {
@@ -118,6 +128,7 @@ impl Tool {
             Tool::Save => "UI_DEBUG_TOOL_SAVE",
             Tool::ItemBox => "UI_DEBUG_TOOL_ITEM_BOX",
             Tool::ClearGame => "UI_DEBUG_TOOL_CLEAR_GAME",
+            Tool::Controls => "UI_DEBUG_TOOL_CONTROLS",
         }
     }
 
@@ -128,6 +139,7 @@ impl Tool {
             Tool::Inventory => ["UI_DEBUG_HINT_INVENTORY_1", "UI_DEBUG_HINT_INVENTORY_2"],
             Tool::Player => ["UI_DEBUG_HINT_PLAYER_1", "UI_DEBUG_HINT_PLAYER_2"],
             Tool::Flags => ["UI_DEBUG_HINT_FLAGS_1", "UI_DEBUG_HINT_FLAGS_2"],
+            Tool::Controls => ["UI_DEBUG_HINT_CONTROLS_1", "UI_DEBUG_HINT_CONTROLS_2"],
             Tool::Cheats | Tool::Save | Tool::ItemBox | Tool::ClearGame => {
                 ["UI_DEBUG_HINT_SELECT_1", "UI_DEBUG_HINT_SELECT_2"]
             }
@@ -207,11 +219,13 @@ pub struct DebugMenu {
     cheat_row: usize,
     save_row: usize,
     ending_row: usize,
+    controls: ControlsEditor,
 }
 
 impl DebugMenu {
-    /// Open the main list with every tool seeded from the live state.
-    pub fn open(pack: &Pack, current: RoomId, game: &GameState) -> Self {
+    /// Open the main list with every tool seeded from the live state and the
+    /// window's `bindings`.
+    pub fn open(pack: &Pack, current: RoomId, game: &GameState, bindings: &Bindings) -> Self {
         Self {
             tool: None,
             main_cursor: 0,
@@ -222,7 +236,13 @@ impl DebugMenu {
             cheat_row: 0,
             save_row: 0,
             ending_row: usize::from(default_ending(game).clamp(1, 7) - 1),
+            controls: ControlsEditor::new(bindings),
         }
+    }
+
+    /// The CONTROLS tool's state (its bindings are the edited map).
+    pub fn controls(&self) -> &ControlsEditor {
+        &self.controls
     }
 
     /// The open tool (`None` on the main list).
@@ -272,6 +292,10 @@ impl DebugMenu {
             Tool::Save => self.handle_save(input),
             Tool::ClearGame => self.handle_clear(input),
             Tool::ItemBox => Step::Back,
+            Tool::Controls => match self.controls.handle_input(input) {
+                (step, false) => step,
+                (_, true) => Step::Event(DebugMenuEvent::BindingsChanged),
+            },
         };
         match step {
             Step::Stay => DebugMenuEvent::None,
@@ -425,6 +449,7 @@ impl DebugMenu {
             Some(Tool::Cheats) => self.draw_cheats(&mut pen, game),
             Some(Tool::Save) => draw_list(&mut pen, &SAVE_ROWS, self.save_row),
             Some(Tool::ClearGame) => self.draw_clear(&mut pen, game),
+            Some(Tool::Controls) => self.controls.draw(&mut pen),
             Some(Tool::ItemBox) => {}
         }
         for (line, key) in hints.iter().enumerate() {
@@ -657,7 +682,12 @@ mod tests {
 
     fn menu(game: &GameState) -> DebugMenu {
         let pack = pack_with(&["room/1000.rdt", "room/1001.rdt", "room/1010.rdt"]);
-        DebugMenu::open(&pack, RoomId::parse("1000").unwrap(), game)
+        DebugMenu::open(
+            &pack,
+            RoomId::parse("1000").unwrap(),
+            game,
+            &Bindings::default(),
+        )
     }
 
     /// Walk the main list to `tool` and enter it.
@@ -674,7 +704,7 @@ mod tests {
         let mut menu = menu(&game);
         assert_eq!(menu.tool(), None);
         menu.handle_input(up(), &mut game);
-        assert_eq!(TOOLS[menu.main_cursor()], Tool::ClearGame, "up wraps");
+        assert_eq!(TOOLS[menu.main_cursor()], Tool::Controls, "up wraps");
         menu.handle_input(down(), &mut game);
         assert_eq!(menu.main_cursor(), 0);
         for tool in TOOLS {

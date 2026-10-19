@@ -6,13 +6,18 @@
 //! configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! keys:
+//! keys and one table:
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
 //! save_dir = "~/.config/arklay/save"
 //! # The language tag, when `--language` is not given.
 //! language = "en-US"
+//!
+//! # Input bindings, one single-line array of sources per action; an action
+//! # left out keeps its default (see `crate::controls`).
+//! [bindings]
+//! aim = ["key:C", "mouse:right", "axis:lefttrigger+"]
 //! ```
 //!
 //! Saved games default to `<config dir>/save` (the `savedat1..8.dat` slot
@@ -25,6 +30,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 
 use crate::budget;
+use crate::controls::{ACTIONS, Action, Bindings, Source};
 
 /// The configuration file's name inside the configuration directory.
 pub const FILE_NAME: &str = "arklay.toml";
@@ -43,6 +49,9 @@ pub struct Config {
     pub save_dir: Option<PathBuf>,
     /// The language tag to use when `--language` is not given.
     pub language: Option<String>,
+    /// The `[bindings]` table over the defaults; `None` when the file has
+    /// none (the shipped defaults).
+    pub bindings: Option<Bindings>,
 }
 
 impl Config {
@@ -102,10 +111,23 @@ impl Config {
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "config file size")?;
         let mut config = Self::default();
+        let mut in_bindings = false;
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let content = strip_comment(raw).trim();
             if content.is_empty() {
+                continue;
+            }
+            if let Some(table) = content.strip_prefix('[') {
+                match table.strip_suffix(']').map(str::trim) {
+                    Some("bindings") if config.bindings.is_none() => {
+                        in_bindings = true;
+                        config.bindings = Some(Bindings::default());
+                    }
+                    Some("bindings") => bail!("line {line}: duplicate [bindings] table"),
+                    Some(other) => bail!("line {line}: unknown table `[{other}]`"),
+                    None => bail!("line {line}: unterminated table header"),
+                }
                 continue;
             }
             let Some((key, value)) = content.split_once('=') else {
@@ -113,6 +135,21 @@ impl Config {
             };
             let key = key.trim();
             let value = value.trim();
+            if in_bindings {
+                let Some(action) = Action::from_name(key) else {
+                    bail!("line {line}: unknown action `{key}`");
+                };
+                let mut sources = Vec::new();
+                for name in parse_string_array(value, line)? {
+                    let source = Source::parse(&name)
+                        .with_context(|| format!("line {line}: bad binding for `{key}`"))?;
+                    sources.push(source);
+                }
+                if let Some(bindings) = config.bindings.as_mut() {
+                    bindings.set(action, sources);
+                }
+                continue;
+            }
             if !value.starts_with(['"', '\'']) {
                 bail!("line {line}: `{key}` expects a quoted string");
             }
@@ -145,8 +182,98 @@ impl Config {
         if let Some(language) = &self.language {
             out.push_str(&format!("language = \"{language}\"\n"));
         }
+        if let Some(bindings) = &self.bindings {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[bindings]\n");
+            for action in ACTIONS {
+                let names: Vec<String> = bindings
+                    .get(action)
+                    .iter()
+                    .map(|source| quote(&source.to_string()))
+                    .collect();
+                out.push_str(&format!("{} = [{}]\n", action.name(), names.join(", ")));
+            }
+        }
         out
     }
+
+    /// The configured bindings, or the shipped defaults.
+    pub fn bindings_or_default(&self) -> Bindings {
+        self.bindings.clone().unwrap_or_default()
+    }
+
+    /// Persist `bindings` into the file at `path`, keeping its other keys.
+    ///
+    /// Bindings equal to the defaults drop the table, so a reset leaves a
+    /// fresh file. The file is rewritten in its canonical form (comments are
+    /// not kept). A file that does not parse is left alone and reported.
+    pub fn save_bindings(path: &Path, bindings: &Bindings) -> Result<()> {
+        let mut config = Self::load(path)?;
+        config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create {}", dir.display()))?;
+        }
+        fs::write(path, config.render())
+            .with_context(|| format!("failed to write {}", path.display()))
+    }
+}
+
+/// A basic `"..."` string with the escapes [`parse_quoted`] reads back.
+fn quote(text: &str) -> String {
+    let mut out = String::from('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Parse a one-line array of quoted strings (`["a", 'b']`), or a lone quoted
+/// string as a one-element array.
+fn parse_string_array(value: &str, line: usize) -> Result<Vec<String>> {
+    if value.starts_with(['"', '\'']) {
+        return Ok(vec![parse_quoted(value, line)?]);
+    }
+    let Some(inner) = value.strip_prefix('[').and_then(|v| v.strip_suffix(']')) else {
+        bail!("line {line}: expected an array of quoted strings");
+    };
+    let mut items = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        let end = quoted_end(rest)
+            .ok_or_else(|| anyhow::anyhow!("line {line}: expected a quoted string in the array"))?;
+        items.push(parse_quoted(&rest[..end], line)?);
+        rest = rest[end..].trim_start();
+        match rest.strip_prefix(',') {
+            Some(after) => rest = after.trim_start(),
+            None if rest.is_empty() => {}
+            None => bail!("line {line}: expected `,` between array items"),
+        }
+    }
+    Ok(items)
+}
+
+/// The byte length of the quoted string `text` starts with, quotes included.
+fn quoted_end(text: &str) -> Option<usize> {
+    let quote = text.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let mut escaped = false;
+    for (index, ch) in text.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if quote == '"' && ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            return Some(index + 1);
+        }
+    }
+    None
 }
 
 /// The home directory: `$HOME`, else `%USERPROFILE%`.
@@ -307,6 +434,7 @@ mod tests {
         let text = Config {
             save_dir: Some(PathBuf::from("/tmp/saves")),
             language: Some("en-US".into()),
+            bindings: None,
         }
         .render();
         assert_eq!(text, "save_dir = \"/tmp/saves\"\nlanguage = \"en-US\"\n");
@@ -314,6 +442,79 @@ mod tests {
             Config::parse(&text).unwrap().language.as_deref(),
             Some("en-US")
         );
+    }
+
+    #[test]
+    fn a_bindings_table_overrides_only_the_actions_it_names() {
+        let config = Config::parse(
+            "language = \"en-US\"\n\
+             \n\
+             [bindings]  # the input map\n\
+             aim = [\"key:C\", 'mouse:right', \"axis:lefttrigger+\"]  # three devices\n\
+             fire = \"wheel:up\"\n\
+             start = []\n",
+        )
+        .unwrap();
+        assert_eq!(config.language.as_deref(), Some("en-US"));
+        let bindings = config.bindings_or_default();
+        let names = |action| -> Vec<String> {
+            bindings.get(action).iter().map(|s| s.to_string()).collect()
+        };
+        assert_eq!(
+            names(Action::Aim),
+            ["key:C", "mouse:right", "axis:lefttrigger+"]
+        );
+        assert_eq!(names(Action::Fire), ["wheel:up"]);
+        assert!(names(Action::Start).is_empty(), "an empty array unbinds");
+        assert_eq!(
+            bindings.get(Action::Confirm),
+            Bindings::default().get(Action::Confirm),
+            "unnamed actions keep their defaults"
+        );
+        // The rendered table parses back to the same map.
+        let text = config.render();
+        assert!(text.contains("\n[bindings]\n"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), config);
+    }
+
+    #[test]
+    fn rejects_bad_bindings() {
+        for text in [
+            "[bindings]\nnope = [\"key:C\"]\n",
+            "[bindings]\naim = [\"key:NoSuchKey\"]\n",
+            "[bindings]\naim = [\"key:F1\"]\n",
+            "[bindings]\naim = [\"key:C\" \"key:Z\"]\n",
+            "[bindings]\naim = [\"key:C\"\n",
+            "[bindings]\nsave_dir = \"/tmp\"\n",
+            "[bindings]\n[bindings]\n",
+            "[other]\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn saved_bindings_survive_a_reload_and_a_reset_drops_them() {
+        let dir =
+            std::env::temp_dir().join(format!("arklay-config-{}-bindings", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "language = \"ja-JP\"\n").unwrap();
+        let mut bindings = Bindings::default();
+        assert!(bindings.bind(Action::Aim, usize::MAX, Source::Mouse(3)));
+        Config::save_bindings(&path, &bindings).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.language.as_deref(), Some("ja-JP"), "other keys kept");
+        assert_eq!(loaded.bindings_or_default(), bindings);
+        Config::save_bindings(&path, &Bindings::default()).unwrap();
+        assert_eq!(Config::load(&path).unwrap().bindings, None);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "language = \"ja-JP\"\n");
+        // A file that does not parse is never overwritten.
+        fs::write(&path, "garbage\n").unwrap();
+        assert!(Config::save_bindings(&path, &bindings).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "garbage\n");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -47,13 +47,20 @@ use anyhow::{Context, Result, bail};
 use sdl3_sys::blendmode::SDL_BLENDMODE_NONE;
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::events::{
-    SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP, SDL_EVENT_KEYBOARD_REMOVED, SDL_EVENT_QUIT,
-    SDL_EVENT_WINDOW_FOCUS_LOST, SDL_Event, SDL_PollEvent,
+    SDL_EVENT_GAMEPAD_ADDED, SDL_EVENT_GAMEPAD_AXIS_MOTION, SDL_EVENT_GAMEPAD_BUTTON_DOWN,
+    SDL_EVENT_GAMEPAD_BUTTON_UP, SDL_EVENT_GAMEPAD_REMOVED, SDL_EVENT_KEY_DOWN, SDL_EVENT_KEY_UP,
+    SDL_EVENT_KEYBOARD_REMOVED, SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP,
+    SDL_EVENT_MOUSE_WHEEL, SDL_EVENT_QUIT, SDL_EVENT_WINDOW_FOCUS_LOST, SDL_Event, SDL_PollEvent,
+};
+use sdl3_sys::gamepad::{
+    SDL_AddGamepadMappingsFromFile, SDL_CloseGamepad, SDL_Gamepad, SDL_OpenGamepad,
 };
 use sdl3_sys::hints::{SDL_HINT_RENDER_DRIVER, SDL_HINT_VIDEO_DRIVER, SDL_SetHint};
-use sdl3_sys::init::{SDL_INIT_VIDEO, SDL_Init, SDL_Quit};
+use sdl3_sys::init::{SDL_INIT_GAMEPAD, SDL_INIT_VIDEO, SDL_Init, SDL_InitSubSystem, SDL_Quit};
+use sdl3_sys::joystick::SDL_JoystickID;
 use sdl3_sys::keycode::{SDL_KMOD_NONE, SDL_KMOD_SHIFT, SDLK_COMMA, SDLK_PERIOD};
 use sdl3_sys::main::SDL_SetMainReady;
+use sdl3_sys::mouse::SDL_MOUSEWHEEL_FLIPPED;
 use sdl3_sys::pixels::SDL_PIXELFORMAT_ABGR8888;
 use sdl3_sys::render::{
     SDL_CreateRenderer, SDL_CreateTexture, SDL_DestroyRenderer, SDL_DestroyTexture,
@@ -61,13 +68,7 @@ use sdl3_sys::render::{
     SDL_SetRenderDrawColor, SDL_SetRenderVSync, SDL_SetTextureBlendMode, SDL_SetTextureScaleMode,
     SDL_TEXTUREACCESS_STREAMING, SDL_Texture, SDL_UpdateTexture,
 };
-use sdl3_sys::scancode::{
-    SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_C, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE,
-    SDL_SCANCODE_F1, SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
-    SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
-    SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
-    SDL_SCANCODE_Z, SDL_Scancode,
-};
+use sdl3_sys::scancode::SDL_Scancode;
 use sdl3_sys::surface::{
     SDL_ConvertSurface, SDL_DestroySurface, SDL_SCALEMODE_NEAREST, SDL_Surface,
 };
@@ -81,6 +82,7 @@ use crate::assets;
 use crate::audio::{self, Mixer};
 use crate::bgm;
 use crate::bmp;
+use crate::controls::{self, Action};
 use crate::demo;
 use crate::door;
 use crate::effects;
@@ -714,7 +716,8 @@ fn session_tick_interval(transition_active: bool, menu_active: bool) -> f64 {
 /// The interactive gameplay loop shared by `--room` and the app's Play mode.
 fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Display) -> Result<()> {
     let mut framebuffer = Framebuffer::new();
-    let mut input = InputState::default();
+    let mut input = InputState::interactive();
+    session.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
@@ -725,6 +728,9 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Displa
         }
         if cut_delta != 0 {
             session.step_camera_cut(cut_delta);
+        }
+        if let Some(bindings) = session.take_bindings_change() {
+            input.apply_bindings_change(bindings);
         }
         session.update_window_title(display.window)?;
 
@@ -1269,6 +1275,12 @@ struct GameSession {
     /// The open debug room-select overlay; the room stays frozen while it is
     /// up and the last gameplay frame stays under it.
     debug_menu: Option<DebugMenu>,
+    /// The action map the window reads, which the debug menu's CONTROLS
+    /// tool edits.
+    bindings: controls::Bindings,
+    /// The CONTROLS tool changed [`Self::bindings`]; taken once by the loop,
+    /// which applies and persists them.
+    bindings_changed: bool,
     /// The open F9 return-to-title prompt; the room stays frozen and the game
     /// sounds are paused while it is up.
     return_title: Option<ReturnTitlePrompt>,
@@ -1622,6 +1634,8 @@ impl GameSession {
             sprite_anim_intensity: 0,
             debug_menu_enabled: true,
             debug_menu: None,
+            bindings: controls::Bindings::default(),
+            bindings_changed: false,
             return_title: None,
             return_title_requested: false,
             load_slot_requested: None,
@@ -2730,6 +2744,16 @@ impl GameSession {
         self.debug_menu_enabled = enabled;
     }
 
+    /// The action map the window reads, for the CONTROLS tool to start from.
+    fn set_bindings(&mut self, bindings: controls::Bindings) {
+        self.bindings = bindings;
+    }
+
+    /// Take the bindings the CONTROLS tool changed, once.
+    fn take_bindings_change(&mut self) -> Option<controls::Bindings> {
+        std::mem::take(&mut self.bindings_changed).then(|| self.bindings.clone())
+    }
+
     /// Open the F9 return-to-title prompt: pause the game sounds and freeze
     /// the room until a second F9 confirms or any other key cancels.
     fn open_return_title(&mut self) {
@@ -2795,7 +2819,12 @@ impl GameSession {
     /// Open the F1 debug menu on its tool list over the frozen room.
     fn open_debug_menu(&mut self, pack: &Pack) {
         self.ensure_menu_assets(pack);
-        self.debug_menu = Some(DebugMenu::open(pack, self.loaded.id, &self.game));
+        self.debug_menu = Some(DebugMenu::open(
+            pack,
+            self.loaded.id,
+            &self.game,
+            &self.bindings,
+        ));
     }
 
     /// Take the debug menu's pending LOAD GAME slot.
@@ -2834,11 +2863,18 @@ impl GameSession {
             Some(menu) => menu.handle_input(ui, &mut self.game),
             None => DebugMenuEvent::None,
         };
+        if event == DebugMenuEvent::BindingsChanged {
+            if let Some(menu) = &self.debug_menu {
+                self.bindings = menu.controls().bindings().clone();
+                self.bindings_changed = true;
+            }
+            return;
+        }
         if event != DebugMenuEvent::None {
             self.debug_menu = None;
         }
         match event {
-            DebugMenuEvent::None | DebugMenuEvent::Close => {}
+            DebugMenuEvent::None | DebugMenuEvent::Close | DebugMenuEvent::BindingsChanged => {}
             DebugMenuEvent::Jump(target) => {
                 if let Err(err) = self.debug_jump(pack, target)
                     && self.debug_failed.insert(target.rdt_number())
@@ -5052,6 +5088,8 @@ struct PendingMovie {
 struct App {
     pack: Pack,
     save_dir: PathBuf,
+    /// The action map the window reads, handed to every gameplay session.
+    bindings: controls::Bindings,
     /// The save/load screen entry the pack's scripts registered (`None` for
     /// the ported original).
     save_screen: Option<String>,
@@ -5134,6 +5172,7 @@ impl App {
         Self {
             pack,
             save_dir,
+            bindings: controls::Bindings::default(),
             save_screen,
             font,
             text,
@@ -5478,6 +5517,7 @@ impl App {
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: GameSession) {
         session.set_debug_menu(self.debug_menu);
+        session.set_bindings(self.bindings.clone());
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -6014,6 +6054,24 @@ impl App {
     }
 
     /// Step the camera cut when playing.
+    /// The action map the window reads, for every session to start from.
+    fn set_bindings(&mut self, bindings: controls::Bindings) {
+        if let Mode::Play(session) = &mut self.mode {
+            session.set_bindings(bindings.clone());
+        }
+        self.bindings = bindings;
+    }
+
+    /// Take the bindings the playing session's CONTROLS tool changed, once.
+    fn take_bindings_change(&mut self) -> Option<controls::Bindings> {
+        let Mode::Play(session) = &mut self.mode else {
+            return None;
+        };
+        let bindings = session.take_bindings_change()?;
+        self.bindings = bindings.clone();
+        Some(bindings)
+    }
+
     fn step_camera_cut(&mut self, delta: i32) {
         if let Mode::Play(session) = &mut self.mode {
             session.step_camera_cut(delta);
@@ -6544,7 +6602,8 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
 /// playback: fixed 30 Hz ticks from the latched input, then one presented
 /// frame.
 fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
-    let mut input = InputState::default();
+    let mut input = InputState::interactive();
+    app.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
     let mut accumulator = 0.0f64;
@@ -6555,6 +6614,9 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
         }
         if cut_delta != 0 {
             app.step_camera_cut(cut_delta);
+        }
+        if let Some(bindings) = app.take_bindings_change() {
+            input.apply_bindings_change(bindings);
         }
         app.update_window_title(display.window)?;
 
@@ -8366,11 +8428,12 @@ fn play_entity_sounds(
 /// Poll every queued SDL event into `input`, reporting whether the user quit
 /// and accumulating the shift+`,`/`.` camera-cut step.
 ///
-/// Keyboard transitions are latched here rather than sampled from
+/// Input transitions are latched here rather than sampled from
 /// `SDL_GetKeyboardState` later, because the render loop runs at the display's
 /// refresh rate while the simulation runs at a fixed 30 Hz: a press that lands
 /// between two ticks must still be there when the next tick asks.
 fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i32) -> bool {
+    use controls::{Source, Wheel};
     let mut quit = false;
     while unsafe { SDL_PollEvent(event) } {
         let kind = unsafe { event.r#type };
@@ -8391,13 +8454,112 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
             }
         } else if kind == SDL_EVENT_KEY_UP {
             input.key_up(unsafe { event.key.scancode });
+        } else if kind == SDL_EVENT_MOUSE_BUTTON_DOWN {
+            input.source_down(0, Source::Mouse(unsafe { event.button.button }), false);
+        } else if kind == SDL_EVENT_MOUSE_BUTTON_UP {
+            input.source_up(0, Source::Mouse(unsafe { event.button.button }));
+        } else if kind == SDL_EVENT_MOUSE_WHEEL {
+            let wheel = unsafe { event.wheel };
+            let sign = if wheel.direction == SDL_MOUSEWHEEL_FLIPPED {
+                -1.0
+            } else {
+                1.0
+            };
+            let (x, y) = (wheel.x * sign, wheel.y * sign);
+            for (delta, positive, negative) in
+                [(y, Wheel::Up, Wheel::Down), (x, Wheel::Right, Wheel::Left)]
+            {
+                if delta > 0.0 {
+                    input.source_tap(Source::Wheel(positive));
+                } else if delta < 0.0 {
+                    input.source_tap(Source::Wheel(negative));
+                }
+            }
+        } else if kind == SDL_EVENT_GAMEPAD_ADDED {
+            input.pads.open(unsafe { event.gdevice.which });
+        } else if kind == SDL_EVENT_GAMEPAD_REMOVED {
+            let which = unsafe { event.gdevice.which };
+            input.pads.close(which);
+            input.device_removed(which.0);
+        } else if kind == SDL_EVENT_GAMEPAD_BUTTON_DOWN {
+            let button = unsafe { event.gbutton };
+            input.source_down(
+                button.which.0,
+                Source::PadButton(i32::from(button.button)),
+                false,
+            );
+        } else if kind == SDL_EVENT_GAMEPAD_BUTTON_UP {
+            let button = unsafe { event.gbutton };
+            input.source_up(button.which.0, Source::PadButton(i32::from(button.button)));
+        } else if kind == SDL_EVENT_GAMEPAD_AXIS_MOTION {
+            let axis = unsafe { event.gaxis };
+            input.axis_motion(axis.which.0, i32::from(axis.axis), axis.value);
         } else if kind == SDL_EVENT_WINDOW_FOCUS_LOST || kind == SDL_EVENT_KEYBOARD_REMOVED {
             // Focusing away (or unplugging the keyboard) never delivers the
-            // held keys' key-up events; drop them so nothing sticks down.
+            // held inputs' release events; drop them so nothing sticks down.
             input.clear();
         }
     }
     quit
+}
+
+/// The gamepads open for input, by joystick instance id.
+///
+/// SDL reports every pad already connected as an `SDL_EVENT_GAMEPAD_ADDED`
+/// once the gamepad subsystem starts, and later ones as they are plugged in,
+/// so opening on that event covers both start-up and hot-plug.
+#[derive(Default)]
+struct Gamepads {
+    open: Vec<(SDL_JoystickID, *mut SDL_Gamepad)>,
+}
+
+impl Gamepads {
+    /// Start the gamepad subsystem for an interactive window: SDL's built-in
+    /// mapping database, `SDL_GAMECONTROLLERCONFIG`, plus an optional
+    /// `gamecontrollerdb.txt` beside `arklay.toml`. A failure only costs the
+    /// pads; the keyboard and mouse still work.
+    fn init() {
+        if !unsafe { SDL_InitSubSystem(SDL_INIT_GAMEPAD) } {
+            eprintln!("warning: gamepads unavailable: {}", sdl_error());
+            return;
+        }
+        let db = crate::config::Config::dir().join("gamecontrollerdb.txt");
+        if db.is_file()
+            && let Ok(path) = std::ffi::CString::new(db.to_string_lossy().into_owned())
+            && unsafe { SDL_AddGamepadMappingsFromFile(path.as_ptr()) } < 0
+        {
+            eprintln!("warning: failed to read {}: {}", db.display(), sdl_error());
+        }
+    }
+
+    fn open(&mut self, which: SDL_JoystickID) {
+        if self.open.iter().any(|&(id, _)| id == which) {
+            return;
+        }
+        let pad = unsafe { SDL_OpenGamepad(which) };
+        if pad.is_null() {
+            eprintln!("warning: failed to open gamepad: {}", sdl_error());
+        } else {
+            self.open.push((which, pad));
+        }
+    }
+
+    fn close(&mut self, which: SDL_JoystickID) {
+        self.open.retain(|&(id, pad)| {
+            if id == which {
+                unsafe { SDL_CloseGamepad(pad) };
+            }
+            id != which
+        });
+    }
+}
+
+impl Drop for Gamepads {
+    fn drop(&mut self) {
+        for (_, pad) in self.open.drain(..) {
+            unsafe { SDL_CloseGamepad(pad) };
+        }
+    }
 }
 
 /// Decoded WAV cache for one-shot sound effects, keyed by pack path.
@@ -8498,7 +8660,7 @@ fn movie_buttons_held(active: u32) -> u16 {
     if active & (KEY_CANCEL | KEY_RUN) != 0 {
         word |= 0x0002;
     }
-    if active & KEY_TAB != 0 {
+    if active & KEY_START != 0 {
         word |= 0x0008;
     }
     if active & KEY_UP != 0 {
@@ -8513,10 +8675,10 @@ fn movie_buttons_held(active: u32) -> u16 {
     if active & KEY_RIGHT != 0 {
         word |= 0x0080;
     }
-    if active & KEY_LEFTBRACKET != 0 {
+    if active & KEY_PAGE_LEFT != 0 {
         word |= 0x0400;
     }
-    if active & KEY_RIGHTBRACKET != 0 {
+    if active & KEY_PAGE_RIGHT != 0 {
         word |= 0x0800;
     }
     word
@@ -9721,60 +9883,22 @@ fn apply_camera(room: &mut RoomState, game: &mut game::GameState, pos: Option<[i
     room.current_cut = selected;
 }
 
-/// One bit per physical key the engine maps.
-///
-/// Confirm, cancel and run each accept several keys, so the bits stay per
-/// physical key: releasing Space while Return is still held must not clear
-/// confirm, and the same goes for X/Backspace/Escape and the two Shifts.
-const KEY_UP: u32 = 1 << 0;
-const KEY_DOWN: u32 = 1 << 1;
-const KEY_LEFT: u32 = 1 << 2;
-const KEY_RIGHT: u32 = 1 << 3;
-const KEY_SPACE: u32 = 1 << 4;
-const KEY_RETURN: u32 = 1 << 5;
-const KEY_X: u32 = 1 << 6;
-const KEY_BACKSPACE: u32 = 1 << 7;
-const KEY_LEFTBRACKET: u32 = 1 << 8;
-const KEY_RIGHTBRACKET: u32 = 1 << 9;
-const KEY_TAB: u32 = 1 << 10;
-const KEY_LSHIFT: u32 = 1 << 11;
-const KEY_RSHIFT: u32 = 1 << 12;
-const KEY_ESCAPE: u32 = 1 << 13;
-const KEY_F1: u32 = 1 << 14;
-const KEY_F9: u32 = 1 << 15;
-const KEY_AIM: u32 = 1 << 16;
-const KEY_FIRE: u32 = 1 << 17;
-/// Confirm (Space or Return).
-const KEY_CONFIRM: u32 = KEY_SPACE | KEY_RETURN;
-/// Cancel (X, Backspace or Escape).
-const KEY_CANCEL: u32 = KEY_X | KEY_BACKSPACE | KEY_ESCAPE;
-/// Run (either Shift).
-const KEY_RUN: u32 = KEY_LSHIFT | KEY_RSHIFT;
-
-/// The bit `scancode` maps to, or `None` for keys the engine ignores.
-fn key_bit(scancode: SDL_Scancode) -> Option<u32> {
-    Some(match scancode {
-        SDL_SCANCODE_UP => KEY_UP,
-        SDL_SCANCODE_DOWN => KEY_DOWN,
-        SDL_SCANCODE_LEFT => KEY_LEFT,
-        SDL_SCANCODE_RIGHT => KEY_RIGHT,
-        SDL_SCANCODE_SPACE => KEY_SPACE,
-        SDL_SCANCODE_RETURN => KEY_RETURN,
-        SDL_SCANCODE_X => KEY_X,
-        SDL_SCANCODE_BACKSPACE => KEY_BACKSPACE,
-        SDL_SCANCODE_LEFTBRACKET => KEY_LEFTBRACKET,
-        SDL_SCANCODE_RIGHTBRACKET => KEY_RIGHTBRACKET,
-        SDL_SCANCODE_TAB => KEY_TAB,
-        SDL_SCANCODE_LSHIFT => KEY_LSHIFT,
-        SDL_SCANCODE_RSHIFT => KEY_RSHIFT,
-        SDL_SCANCODE_ESCAPE => KEY_ESCAPE,
-        SDL_SCANCODE_F1 => KEY_F1,
-        SDL_SCANCODE_F9 => KEY_F9,
-        SDL_SCANCODE_C => KEY_AIM,
-        SDL_SCANCODE_Z => KEY_FIRE,
-        _ => return None,
-    })
-}
+/// The latched input words carry one bit per logical action
+/// ([`controls::Action::bit`]) plus the fixed port-only F1/F9 bits.
+const KEY_UP: u32 = Action::Up.bit();
+const KEY_DOWN: u32 = Action::Down.bit();
+const KEY_LEFT: u32 = Action::Left.bit();
+const KEY_RIGHT: u32 = Action::Right.bit();
+const KEY_CONFIRM: u32 = Action::Confirm.bit();
+const KEY_CANCEL: u32 = Action::Cancel.bit();
+const KEY_RUN: u32 = Action::Run.bit();
+const KEY_AIM: u32 = Action::Aim.bit();
+const KEY_FIRE: u32 = Action::Fire.bit();
+const KEY_START: u32 = Action::Start.bit();
+const KEY_PAGE_LEFT: u32 = Action::PageLeft.bit();
+const KEY_PAGE_RIGHT: u32 = Action::PageRight.bit();
+const KEY_F1: u32 = controls::DEBUG_MENU_BIT;
+const KEY_F9: u32 = controls::RETURN_TITLE_BIT;
 
 /// A scripted per-tick input playback for the oracle (`--input`).
 ///
@@ -9807,9 +9931,9 @@ fn script_button_bit(name: &str) -> Option<u32> {
         "run" => KEY_RUN,
         "aim" | "square" => KEY_AIM,
         "fire" => KEY_FIRE,
-        "start" | "inventory" => KEY_TAB,
-        "page_left" | "l1" => KEY_LEFTBRACKET,
-        "page_right" | "r1" => KEY_RIGHTBRACKET,
+        "start" | "inventory" => KEY_START,
+        "page_left" | "l1" => KEY_PAGE_LEFT,
+        "page_right" | "r1" => KEY_PAGE_RIGHT,
         _ => return None,
     })
 }
@@ -9873,22 +9997,41 @@ impl InputScript {
     }
 }
 
-/// The keyboard, latched from the SDL event queue.
+/// Every input device, latched from the SDL event queue and resolved through
+/// the action map.
 ///
 /// The render loop runs at the display's refresh rate, which is not the 30 Hz
 /// tick rate; deriving edges from `SDL_GetKeyboardState` every rendered frame
 /// drops presses (the frame that sees the edge may run no tick, and by the
 /// next tick the key is already held) and can replay one edge over a frame
-/// that catches up several ticks. Feeding every key event into this latch
+/// that catches up several ticks. Feeding every input event into this latch
 /// makes a press reach exactly one tick, whenever it arrived.
+///
+/// Held state is kept per physical source, so an action with several
+/// bindings stays held until the last of them is released: letting go of
+/// Space while Return (or the pad's south button) is still down must not
+/// clear confirm.
 #[derive(Default)]
 struct InputState {
-    /// Keys currently down, for continuous movement.
+    /// The action map every source is resolved through.
+    bindings: controls::Bindings,
+    /// Sources currently down, tagged by device (`0` for the keyboard and
+    /// mouse, else the gamepad's joystick instance id).
+    sources: Vec<(u32, controls::Source)>,
+    /// Each open gamepad axis's latched direction, keyed by device and axis.
+    axes: HashMap<(u32, i32), i8>,
+    /// Action bits currently down, for continuous movement.
     held: u32,
-    /// Keys that went down since the last tick; consumed by [`Self::tick`].
+    /// Action bits that went down since the last tick; consumed by
+    /// [`Self::tick`].
     pressed: u32,
-    /// A non-repeat key-down of any key since the last tick.
+    /// A non-repeat press of any input since the last tick.
     any_pressed: bool,
+    /// The first bindable source pressed since the last tick, for the rebind
+    /// screen's capture.
+    captured: Option<controls::Source>,
+    /// The open gamepads (none for a scripted or test latch).
+    pads: Gamepads,
 }
 
 /// One fixed tick of latched input, split into the shapes its consumers want.
@@ -9901,34 +10044,144 @@ struct TickInput {
     ui: UiInput,
 }
 
+/// The axis deflection that latches a direction.
+const AXIS_PRESS: i16 = 16_000;
+/// The deflection a latched direction holds down to (hysteresis, so a stick
+/// resting near the threshold does not chatter).
+const AXIS_RELEASE: i16 = 12_000;
+
 impl InputState {
-    /// Latch a key-down. Auto-repeat keeps the held bit fresh but is not a new
-    /// press, so holding a key cannot storm edges.
-    fn key_down(&mut self, scancode: SDL_Scancode, repeat: bool) {
-        if let Some(bit) = key_bit(scancode) {
-            self.held |= bit;
-            if !repeat {
-                self.pressed |= bit;
+    /// A latch resolving through `bindings`.
+    fn new(bindings: controls::Bindings) -> Self {
+        Self {
+            bindings,
+            ..Self::default()
+        }
+    }
+
+    /// The latch an interactive window reads: the gamepads started and the
+    /// bindings from `arklay.toml` (the defaults when it has none, or when
+    /// it cannot be read).
+    fn interactive() -> Self {
+        Gamepads::init();
+        let bindings = match crate::config::Config::load_default() {
+            Ok(config) => config.bindings_or_default(),
+            Err(err) => {
+                eprintln!("warning: using the default bindings: {err:#}");
+                controls::Bindings::default()
+            }
+        };
+        Self::new(bindings)
+    }
+
+    /// The action map in use.
+    fn bindings(&self) -> &controls::Bindings {
+        &self.bindings
+    }
+
+    /// Apply the CONTROLS tool's change and persist it to `arklay.toml`. A
+    /// write failure is reported and the change still applies for this run.
+    fn apply_bindings_change(&mut self, bindings: controls::Bindings) {
+        let path = crate::config::Config::default_path();
+        if let Err(err) = crate::config::Config::save_bindings(&path, &bindings) {
+            eprintln!("warning: bindings not saved: {err:#}");
+        }
+        self.set_bindings(bindings);
+    }
+
+    /// Switch to new bindings. The held sources are re-resolved, so a key
+    /// held across the change drives its new actions without a fresh edge.
+    fn set_bindings(&mut self, bindings: controls::Bindings) {
+        self.bindings = bindings;
+        self.refresh_held();
+    }
+
+    /// Recompute the held action word from the held sources.
+    fn refresh_held(&mut self) {
+        self.held = self
+            .sources
+            .iter()
+            .fold(0, |held, &(_, source)| held | self.bindings.mask(source));
+    }
+
+    /// Latch a source going down. A repeat keeps the held bits fresh but is
+    /// not a new press, so holding a key cannot storm edges.
+    fn source_down(&mut self, device: u32, source: controls::Source, repeat: bool) {
+        if !self.sources.contains(&(device, source)) {
+            self.sources.push((device, source));
+        }
+        let mask = self.bindings.mask(source);
+        self.held |= mask;
+        if !repeat {
+            self.pressed |= mask;
+            self.any_pressed = true;
+            if self.captured.is_none() && source.reserved_bit().is_none() {
+                self.captured = Some(source);
             }
         }
-        if !repeat {
-            self.any_pressed = true;
-        }
     }
 
-    /// Latch a key-up. A pending press is left alone: a tap released before
-    /// the tick must still reach it.
+    /// Latch a source going up. A pending press is left alone: a tap released
+    /// before the tick must still reach it.
+    fn source_up(&mut self, device: u32, source: controls::Source) {
+        self.sources.retain(|&held| held != (device, source));
+        self.refresh_held();
+    }
+
+    /// A momentary source (a wheel notch): one press with no hold.
+    fn source_tap(&mut self, source: controls::Source) {
+        self.source_down(0, source, false);
+        self.source_up(0, source);
+    }
+
+    /// Latch a keyboard key-down.
+    fn key_down(&mut self, scancode: SDL_Scancode, repeat: bool) {
+        self.source_down(0, controls::Source::key(scancode), repeat);
+    }
+
+    /// Latch a keyboard key-up.
     fn key_up(&mut self, scancode: SDL_Scancode) {
-        if let Some(bit) = key_bit(scancode) {
-            self.held &= !bit;
-        }
+        self.source_up(0, controls::Source::key(scancode));
     }
 
-    /// Drop every held and pending key (window focus loss, keyboard removal).
+    /// Latch a gamepad axis reading as a direction press or release.
+    fn axis_motion(&mut self, device: u32, axis: i32, value: i16) {
+        let state = self.axes.get(&(device, axis)).copied().unwrap_or(0);
+        let next = if value >= AXIS_PRESS || (state > 0 && value > AXIS_RELEASE) {
+            1
+        } else if value <= -AXIS_PRESS || (state < 0 && value < -AXIS_RELEASE) {
+            -1
+        } else {
+            0
+        };
+        if next == state {
+            return;
+        }
+        if state != 0 {
+            self.source_up(device, controls::Source::PadAxis(axis, state > 0));
+        }
+        if next != 0 {
+            self.source_down(device, controls::Source::PadAxis(axis, next > 0), false);
+        }
+        self.axes.insert((device, axis), next);
+    }
+
+    /// Drop every source a removed gamepad still held.
+    fn device_removed(&mut self, device: u32) {
+        self.sources.retain(|&(held, _)| held != device);
+        self.axes.retain(|&(held, _), _| held != device);
+        self.refresh_held();
+    }
+
+    /// Drop every held and pending input (window focus loss, keyboard
+    /// removal).
     fn clear(&mut self) {
+        self.sources.clear();
+        self.axes.clear();
         self.held = 0;
         self.pressed = 0;
         self.any_pressed = false;
+        self.captured = None;
     }
 
     /// The held word including presses not yet consumed by a tick.
@@ -9979,12 +10232,13 @@ impl InputState {
                 held_right: self.held & KEY_RIGHT != 0,
                 confirm: pressed & KEY_CONFIRM != 0,
                 cancel: pressed & KEY_CANCEL != 0,
-                page_left: pressed & KEY_LEFTBRACKET != 0,
-                page_right: pressed & KEY_RIGHTBRACKET != 0,
-                start: pressed & KEY_TAB != 0,
+                page_left: pressed & KEY_PAGE_LEFT != 0,
+                page_right: pressed & KEY_PAGE_RIGHT != 0,
+                start: pressed & KEY_START != 0,
                 debug_menu: pressed & KEY_F1 != 0,
                 return_title: pressed & KEY_F9 != 0,
                 any: std::mem::take(&mut self.any_pressed),
+                captured: self.captured.take(),
             },
         }
     }
@@ -11284,6 +11538,12 @@ mod tests {
     use super::*;
     use crate::model::{ClipFrame, Emw, Keyframe, Skeleton, Texture8, Tmd};
     use crate::pack::PackWriter;
+    use sdl3_sys::scancode::{
+        SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_F1,
+        SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT,
+        SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT,
+        SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+    };
 
     struct TempDir(std::path::PathBuf);
 
@@ -14841,6 +15101,7 @@ mod tests {
             input.key_up(scancode);
             let mut expected = expected;
             expected.any = true;
+            expected.captured = Some(controls::Source::key(scancode));
             assert_eq!(input.tick().ui, expected, "scancode {}", scancode.0);
         }
 
@@ -17860,7 +18121,7 @@ off_0010:
         let input = InputState {
             held: KEY_CONFIRM,
             pressed: KEY_CANCEL | KEY_UP,
-            any_pressed: false,
+            ..InputState::default()
         };
         assert_eq!(
             movie_buttons_held(input.held_word()),
