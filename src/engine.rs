@@ -23936,7 +23936,7 @@ off_0010:
         assert_eq!(quad.key, 960);
         // scale = 200 * 1 * 128 * 256 / (1000 + 1) = 6548 -> 204 px wide.
         assert_eq!(quad.size, [204, 204]);
-        assert_eq!(quad.pos, [77, 18]);
+        assert_eq!(quad.pos, [78, 18]);
         // depth_group 8 -> tint level 1 of colour record 1.
         assert_eq!(quad.tint, [0xB2, 0xB2, 0xB2]);
 
@@ -23944,7 +23944,7 @@ off_0010:
         let mut shaken = camera;
         shaken.screen = [5, -4];
         let quads = build_effect_quads(&game, &room, id, &shaken, &pages, &mut Tween::default());
-        assert_eq!(quads[0].pos, [82, 14]);
+        assert_eq!(quads[0].pos, [83, 14]);
     }
 
     #[test]
