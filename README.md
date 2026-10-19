@@ -39,8 +39,10 @@ cargo run -- convert-game /path/to/re1 --out re1.akpak --verbose
 cargo run -- convert-game /path/to/re1 --out re1.akpak --jobs 4
 
 # Convert the Steam release's install root: the walk finds the language trees
-# (english/USA, french/FRA, german/GER, japanese/JPN), converts the first one
-# (English) and packs every game-text sheet it carries, so the one pack renders
+# (english/USA, french/FRA, german/GER, japanese/JPN), takes the shared assets
+# from the first tree (English), fills in the Japanese-only document pages from
+# the other trees, resolves each release's film names to the canonical entries,
+# and packs every game-text sheet it carries, so the one pack renders
 # English/French/German with the original 8px Latin glyphs and `ja-JP` with the
 # Japanese sheet
 cargo run -- convert-game /path/to/steam/4249100_Biohazard --out re1.akpak

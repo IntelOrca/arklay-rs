@@ -283,7 +283,9 @@ pub fn convert_game(root: &Path, out: &Path) -> Result<()> {
 /// game-text sheet the root carries is packed — the tree the data comes from
 /// is the default and the other script's sheets ride along as `font/latin.tim`
 /// / `font/jpn.tim` — so the one pack renders every language with its own
-/// sheet.
+/// sheet. The other trees also fill in assets the conversion tree omits (the
+/// Japanese document pages) and their release-specific film names resolve to
+/// the canonical `movie/` entries.
 pub fn convert_game_with_options(
     root: &Path,
     out: &Path,
@@ -298,7 +300,7 @@ pub fn convert_game_with_options(
         rooms,
         sound,
         item_m1,
-        item_m2,
+        item_m2_dirs,
         players,
         weapons,
         npc,
@@ -324,7 +326,7 @@ pub fn convert_game_with_options(
     if !movie_dir_found {
         warnings.push(format!(
             "no movie directory found; {} film(s) will be missing",
-            movie::name_count()
+            movie::required_name_count()
         ));
     }
 
@@ -462,21 +464,21 @@ pub fn convert_game_with_options(
     let (shadow_count, shadow_bytes) = copy_shadow(&data, &mut writer, &mut progress)?;
     let (language_count, language_bytes) = copy_language_files(&mut writer, &mut progress)?;
     let (ivm_count, ivm_bytes) = copy_item_models(
-        item_m2.as_deref(),
+        &item_m2_dirs,
         &mut writer,
         &mut progress,
         &mut warnings,
         jobs,
     )?;
     let (file_count, file_bytes) = copy_file_art(
-        item_m2.as_deref(),
+        &item_m2_dirs,
         &mut writer,
         &mut progress,
         &mut warnings,
         jobs,
     )?;
     let (map_count, map_bytes) = copy_map_art(
-        item_m2.as_deref(),
+        &item_m2_dirs,
         &mut writer,
         &mut progress,
         &mut warnings,
@@ -1502,35 +1504,33 @@ fn copy_language_files(writer: &mut PackWriter, progress: &mut Progress) -> Resu
 /// Add every `ITEM_M2/*.IVM` item-view model to the pack under `item/`.
 ///
 /// The pack stores the canonical lower-case file name; the install's names are
-/// matched case-insensitively.
+/// matched case-insensitively. Every language tree is searched, the conversion
+/// tree first, because a Steam root keeps one `ITEM_M2` per tree and the
+/// Japanese tree also carries the `FILEI`/`TEXTM` document pages.
 fn copy_item_models(
-    item_m2: Option<&Path>,
+    item_m2: &[PathBuf],
     writer: &mut PackWriter,
     progress: &mut Progress,
     warnings: &mut Vec<String>,
     jobs: usize,
 ) -> Result<(usize, usize)> {
-    let Some(dir) = item_m2 else {
+    if item_m2.is_empty() {
         warnings.push("no ITEM_M2 directory found; item models will be missing".to_string());
         return Ok((0, 0));
-    };
-
-    let mut files = Vec::new();
-    for entry in read_dir_sorted(dir)? {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !name.to_ascii_lowercase().ends_with(".ivm") {
-            continue;
-        }
-        files.push((format!("item/{}", name.to_ascii_lowercase()), entry.path()));
     }
+
+    let index = index_dirs(item_m2, warnings)?;
+    let mut files: Vec<(String, PathBuf)> = index
+        .into_iter()
+        .filter(|(name, _)| name.ends_with(".ivm"))
+        .map(|(name, path)| (format!("item/{name}"), path))
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
     if files.len() != IVM_COUNT {
         warnings.push(format!(
             "found {} item model(s) in {}, expected {IVM_COUNT}",
             files.len(),
-            dir.display()
+            searched_dirs(item_m2)
         ));
     }
 
@@ -1541,18 +1541,18 @@ fn copy_item_models(
 /// the `FILEI` backdrops and every `TEXTM_*.TIM` page, copied raw with
 /// lower-case names.
 fn copy_file_art(
-    item_m2: Option<&Path>,
+    item_m2: &[PathBuf],
     writer: &mut PackWriter,
     progress: &mut Progress,
     warnings: &mut Vec<String>,
     jobs: usize,
 ) -> Result<(usize, usize)> {
-    let Some(dir) = item_m2 else {
+    if item_m2.is_empty() {
         warnings.push("no ITEM_M2 directory found; file art will be missing".to_string());
         return Ok((0, 0));
-    };
+    }
 
-    let index = index_dir(dir)?;
+    let index = index_dirs(item_m2, warnings)?;
     let mut missing = Vec::new();
     let mut files = Vec::new();
     for name in ["file000.tim", "file001.tim"] {
@@ -1572,7 +1572,7 @@ fn copy_file_art(
         warnings.push(format!(
             "missing {} document art file(s) in {}: {}",
             missing.len(),
-            dir.display(),
+            searched_dirs(item_m2),
             missing.join(", ")
         ));
     }
@@ -1586,7 +1586,7 @@ fn copy_file_art(
         warnings.push(format!(
             "found {} TEXTM page(s) in {}, expected {TEXTM_COUNT}",
             pages.len(),
-            dir.display()
+            searched_dirs(item_m2)
         ));
     }
     for name in pages {
@@ -1600,18 +1600,18 @@ fn copy_file_art(
 /// `MAP00`-`MAP0E` browser/display plans plus the `Map_blue` backdrop. The
 /// engine decodes them itself, so no conversion is needed.
 fn copy_map_art(
-    item_m2: Option<&Path>,
+    item_m2: &[PathBuf],
     writer: &mut PackWriter,
     progress: &mut Progress,
     warnings: &mut Vec<String>,
     jobs: usize,
 ) -> Result<(usize, usize)> {
-    let Some(dir) = item_m2 else {
+    if item_m2.is_empty() {
         warnings.push("no ITEM_M2 directory found; the map art will be missing".to_string());
         return Ok((0, 0));
-    };
+    }
 
-    let index = index_dir(dir)?;
+    let index = index_dirs(item_m2, warnings)?;
     let mut missing = Vec::new();
     let mut files = Vec::new();
     for number in 0..=0x0Eu32 {
@@ -1629,7 +1629,7 @@ fn copy_map_art(
         warnings.push(format!(
             "missing {} map art file(s) in {}: {}; the map tab degrades to blank",
             missing.len(),
-            dir.display(),
+            searched_dirs(item_m2),
             missing.join(", ")
         ));
     }
@@ -1718,9 +1718,17 @@ struct Layout {
     item_m1: Option<PathBuf>,
     data: Option<PathBuf>,
     item_m2: Option<PathBuf>,
+    /// Every `ITEM_M2` directory under the root, the conversion tree first.
+    /// The Japanese tree carries the document-reader pages the Western trees
+    /// omit, so the item and file phases merge all of them.
+    item_m2_dirs: Vec<PathBuf>,
     effspr: Option<PathBuf>,
     voice: Option<PathBuf>,
     movie: Option<PathBuf>,
+    /// Every `movie` directory under the root, the conversion tree first.
+    /// The Western and Japanese trees name the same films differently, so
+    /// each table row is resolved across all of them.
+    movie_dirs: Vec<PathBuf>,
     /// Every game-text sheet found under the root, in walk order: the first
     /// `font.tim` (the Japanese sheet) and the first `fontus.tim` (the
     /// Western one) of any install tree, so a Steam install converted from
@@ -1749,10 +1757,10 @@ fn discover_layout(root: &Path) -> Result<Layout> {
     let mut objspr = None;
     let mut item_m1 = None;
     let mut data = None;
-    let mut item_m2 = None;
+    let mut item_m2_dirs: Vec<PathBuf> = Vec::new();
     let mut effspr = None;
     let mut voice = None;
-    let mut movie = None;
+    let mut movie_dirs: Vec<PathBuf> = Vec::new();
     let mut fonts: Vec<FontSheet> = Vec::new();
 
     while let Some((dir, depth)) = queue.pop_front() {
@@ -1771,14 +1779,14 @@ fn discover_layout(root: &Path) -> Result<Layout> {
                 item_m1 = Some(dir.clone());
             } else if data.is_none() && name.eq_ignore_ascii_case("data") {
                 data = Some(dir.clone());
-            } else if item_m2.is_none() && name.eq_ignore_ascii_case("item_m2") {
-                item_m2 = Some(dir.clone());
+            } else if name.eq_ignore_ascii_case("item_m2") && !item_m2_dirs.contains(&dir) {
+                item_m2_dirs.push(dir.clone());
             } else if effspr.is_none() && name.eq_ignore_ascii_case("effspr") {
                 effspr = Some(dir.clone());
             } else if voice.is_none() && name.eq_ignore_ascii_case("voice") {
                 voice = Some(dir.clone());
-            } else if movie.is_none() && name.eq_ignore_ascii_case("movie") {
-                movie = Some(dir.clone());
+            } else if name.eq_ignore_ascii_case("movie") && !movie_dirs.contains(&dir) {
+                movie_dirs.push(dir.clone());
             }
             if name.eq_ignore_ascii_case("data") {
                 collect_fonts(&dir, &mut fonts);
@@ -1815,10 +1823,12 @@ fn discover_layout(root: &Path) -> Result<Layout> {
         objspr,
         item_m1,
         data,
-        item_m2,
+        item_m2: item_m2_dirs.first().cloned(),
+        item_m2_dirs,
         effspr,
         voice,
-        movie,
+        movie: movie_dirs.first().cloned(),
+        movie_dirs,
         fonts,
     })
 }
@@ -2073,7 +2083,9 @@ struct Plan {
     rooms: Vec<Room>,
     sound: Option<PathBuf>,
     item_m1: Option<PathBuf>,
-    item_m2: Option<PathBuf>,
+    /// Every `ITEM_M2` directory, the conversion tree first; the item, file
+    /// and map phases resolve each shipped name across all of them.
+    item_m2_dirs: Vec<PathBuf>,
     players: Vec<PlayerAsset>,
     /// The `W*.EMW` weapon animations and `WS*.TMD` held-weapon models,
     /// resolved by shipped file number.
@@ -2157,9 +2169,11 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         item_m1,
         data,
         item_m2,
+        item_m2_dirs,
         effspr,
         voice: voice_dir,
         movie: movie_dir,
+        movie_dirs,
         fonts: found_fonts,
     } = layout;
     // The game-text sheets: the chosen data directory's own font is the
@@ -2374,20 +2388,43 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
     // case-insensitively (the null id 10 is skipped) and the missing names are
     // aggregated into one warning. A missing `movie` directory is only
     // reported by the conversion summary, like the other optional categories.
-    let movie_index = movie_dir.as_deref().map(index_dir).transpose()?;
+    //
+    // The Steam install has one movie directory per language tree. The
+    // Western trees name the opening, endings and staff rolls differently
+    // from the Japanese table (`OU` for `OJ`, `STAF_R` for `STAF_B`, ...), so
+    // every row is searched in the conversion tree first (under either
+    // spelling) and then in the other trees. The Virgin logo is absent from
+    // every digital PC release, so it is not a conversion defect.
+    let mut movie_indexes: Vec<HashMap<String, PathBuf>> = Vec::new();
+    for (position, dir) in movie_dirs.iter().enumerate() {
+        match index_dir(dir) {
+            Ok(index) => movie_indexes.push(index),
+            Err(error) if position > 0 => {
+                warnings.push(format!(
+                    "failed to read {}: {error}; its films are ignored",
+                    dir.display()
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let mut movie_assets = Vec::new();
-    if let (Some(dir), Some(index)) = (movie_dir.as_deref(), movie_index.as_ref()) {
+    if movie_dir.is_some() {
         let mut missing_movies = Vec::new();
         for id in 0..=28u8 {
             let Some(name) = movie::name(id) else {
                 continue;
             };
-            let file = format!("{name}.avi");
-            match index.get(&file) {
+            let source = movie_indexes.iter().find_map(|index| {
+                movie::release_names(name)
+                    .find_map(|candidate| index.get(&format!("{candidate}.avi")).cloned())
+            });
+            match source {
                 Some(source) => movie_assets.push(MovieAsset {
                     entry: movie::pack_path(name),
-                    source: source.clone(),
+                    source,
                 }),
+                None if !movie::is_shipped(name) => {}
                 None => missing_movies.push(format!("{}.AVI", name.to_ascii_uppercase())),
             }
         }
@@ -2395,7 +2432,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
             warnings.push(format!(
                 "missing {} film file(s) in {}: {}",
                 missing_movies.len(),
-                dir.display(),
+                searched_dirs(&movie_dirs),
                 missing_movies.join(", ")
             ));
         }
@@ -2409,7 +2446,7 @@ fn build_plan_with_progress(root: &Path, jobs: usize, progress: &mut Progress) -
         rooms: rooms.into_values().collect(),
         sound,
         item_m1,
-        item_m2,
+        item_m2_dirs,
         players: resolve_players(enemy.as_deref(), players.as_deref())?,
         weapons: resolve_weapon_assets(players.as_deref())?,
         npc,
@@ -2675,6 +2712,43 @@ fn index_dir(dir: &Path) -> Result<HashMap<String, PathBuf>> {
         );
     }
     Ok(index)
+}
+
+/// Merge the files of `dirs`, the conversion tree first.
+///
+/// A name found in an earlier directory wins, so a localized file is
+/// preferred, while a file only another language tree ships (the Steam
+/// release's Japanese `ITEM_M2` pages) is still found. A fallback directory
+/// that cannot be read is skipped with a warning; the conversion tree's own
+/// failure still fails the run.
+fn index_dirs(dirs: &[PathBuf], warnings: &mut Vec<String>) -> Result<HashMap<String, PathBuf>> {
+    let mut index = HashMap::new();
+    for (position, dir) in dirs.iter().enumerate() {
+        let files = match index_dir(dir) {
+            Ok(files) => files,
+            Err(error) if position > 0 => {
+                warnings.push(format!(
+                    "failed to read {}: {error}; its files are ignored",
+                    dir.display()
+                ));
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        for (name, path) in files {
+            index.entry(name).or_insert(path);
+        }
+    }
+    Ok(index)
+}
+
+/// The directories a merged lookup searched, for a warning message. One
+/// directory reads exactly as before; a Steam root lists every language tree.
+fn searched_dirs(dirs: &[PathBuf]) -> String {
+    dirs.iter()
+        .map(|dir| dir.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Read a directory and sort its entries by file name.
@@ -3569,8 +3643,8 @@ mod tests {
             .iter()
             .find(|warning| warning.contains("film file"))
             .expect("aggregated missing-film warning");
-        assert!(warning.contains("26 film file"), "{warning}");
-        assert!(warning.contains("VLOGO.AVI"), "{warning}");
+        assert!(warning.contains("25 film file"), "{warning}");
+        assert!(!warning.contains("VLOGO.AVI"), "{warning}");
 
         // Without a movie directory no warning is raised here; the conversion
         // summary reports the whole missing category instead.
@@ -3579,6 +3653,322 @@ mod tests {
         assert!(plan.movie.is_empty());
         assert!(!plan.movie_dir_found);
         assert!(!plan.warnings.iter().any(|w| w.contains("film file")));
+    }
+
+    #[test]
+    fn resolves_western_film_names_to_the_canonical_entries() {
+        // The Steam release's English tree carries OU/PU/EU4/EU5 and the
+        // `_r` staff rolls, while the engine's table is the Japanese one.
+        // Every row must pack under the canonical name and the absent Virgin
+        // logo must not count as a missing film.
+        let root = TempDir::new("movie-western");
+        make_stage_dirs(&root.path);
+        let movie = root.path.join("english/USA/Movie");
+        fs::create_dir_all(&movie).unwrap();
+        for id in 0..=28u8 {
+            let Some(name) = movie::name(id) else {
+                continue;
+            };
+            if name == "vlogo" {
+                continue;
+            }
+            let western = movie::release_names(name).last().unwrap();
+            fs::write(
+                movie.join(format!("{}.AVI", western.to_ascii_uppercase())),
+                western.as_bytes(),
+            )
+            .unwrap();
+        }
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.movie.len(), 27);
+        assert!(
+            !plan.warnings.iter().any(|w| w.contains("film file")),
+            "{:?}",
+            plan.warnings
+        );
+        let source = |entry: &str| {
+            plan.movie
+                .iter()
+                .find(|asset| asset.entry == entry)
+                .map(|asset| file_name(&asset.source))
+                .unwrap_or_default()
+        };
+        assert_eq!(source("movie/oj.avi"), "OU.AVI");
+        assert_eq!(source("movie/pj.avi"), "PU.AVI");
+        assert_eq!(source("movie/ed4.avi"), "EU4.AVI");
+        assert_eq!(source("movie/ed5.avi"), "EU5.AVI");
+        assert_eq!(source("movie/staf_b.avi"), "STAF_R.AVI");
+    }
+
+    #[test]
+    fn prefers_the_conversion_trees_film_spelling_before_other_trees() {
+        // Each directory is searched under both spellings before the next
+        // tree: the primary canonical name wins, then its Western alias, and
+        // only then another tree's canonical file.
+        let root = TempDir::new("movie-precedence");
+        make_stage_dirs(&root.path);
+        let english = root.path.join("english/USA/Movie");
+        let japanese = root.path.join("japanese/JPN/Movie");
+        fs::create_dir_all(&english).unwrap();
+        fs::create_dir_all(&japanese).unwrap();
+        fs::write(english.join("OJ.AVI"), b"primary-canonical").unwrap();
+        fs::write(english.join("OU.AVI"), b"primary-western").unwrap();
+        fs::write(japanese.join("OJ.AVI"), b"fallback-canonical").unwrap();
+        fs::write(english.join("PU.AVI"), b"primary-western-pu").unwrap();
+        fs::write(japanese.join("PJ.AVI"), b"fallback-canonical-pj").unwrap();
+        fs::write(japanese.join("ED4.AVI"), b"fallback-ed4").unwrap();
+        fs::write(english.join("STAF_R.AVI"), b"primary-staf-r").unwrap();
+        fs::write(japanese.join("STAF_B.AVI"), b"fallback-staf-b").unwrap();
+
+        let plan = build_plan(&root.path).unwrap();
+        let source = |entry: &str| {
+            plan.movie
+                .iter()
+                .find(|asset| asset.entry == entry)
+                .map(|asset| file_name(&asset.source))
+                .unwrap_or_default()
+        };
+        assert_eq!(source("movie/oj.avi"), "OJ.AVI", "primary canonical wins");
+        assert_eq!(
+            source("movie/pj.avi"),
+            "PU.AVI",
+            "the primary tree's Western spelling beats a fallback canonical"
+        );
+        assert_eq!(
+            source("movie/ed4.avi"),
+            "ED4.AVI",
+            "a film only the fallback tree has is still packed"
+        );
+        assert_eq!(source("movie/staf_b.avi"), "STAF_R.AVI");
+    }
+
+    #[test]
+    fn merges_the_steam_language_trees_for_item_and_file_art() {
+        // The English tree has most of the shared assets; the Japanese tree
+        // adds the FILEI backdrops, TEXTM pages, one item model and one map.
+        // Every item phase must pack the merged set without a missing-file
+        // warning.
+        let root = TempDir::new("steam-item-art");
+        make_stage_dirs(&root.path);
+        let english = root.path.join("english/USA/Item_m2");
+        let japanese = root.path.join("japanese/JPN/Item_m2");
+        fs::create_dir_all(&english).unwrap();
+        fs::create_dir_all(&japanese).unwrap();
+        fs::write(english.join("MINI.IVM"), b"ivm1").unwrap();
+        fs::write(japanese.join("I00V.IVM"), b"ivm0").unwrap();
+        fs::write(english.join("FILE000.TIM"), b"cover0").unwrap();
+        fs::write(english.join("FILE001.TIM"), b"cover1").unwrap();
+        for number in 0..0x0Eu32 {
+            fs::write(
+                english.join(format!("MAP{number:02X}.TIM")),
+                format!("plan{number}"),
+            )
+            .unwrap();
+        }
+        fs::write(japanese.join("MAP0E.TIM"), b"plan14").unwrap();
+        fs::write(japanese.join("Map_blue.TIM"), b"blue").unwrap();
+        for number in 1..=FILEI_COUNT {
+            fs::write(
+                japanese.join(format!("FILEI{number:02}.TIM")),
+                format!("i{number}"),
+            )
+            .unwrap();
+        }
+        for number in 0..TEXTM_COUNT {
+            fs::write(
+                japanese.join(format!("TEXTM_{number:02}.TIM")),
+                format!("page{number}"),
+            )
+            .unwrap();
+        }
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.item_m2_dirs.len(), 2);
+        assert_eq!(plan.item_m2_dirs[0], english);
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new("test", 1);
+        let mut warnings = Vec::new();
+        let (items, _bytes) = copy_item_models(
+            &plan.item_m2_dirs,
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        let (files, _bytes) = copy_file_art(
+            &plan.item_m2_dirs,
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        let (maps, _bytes) = copy_map_art(
+            &plan.item_m2_dirs,
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        assert_eq!(items, 2);
+        assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
+        assert_eq!(maps, 16);
+        // The two-IVM fixture legitimately warns about the count; the merged
+        // file and map lookups must not warn at all.
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| warning.contains("item model")),
+            "{warnings:?}"
+        );
+
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.read("item/i00v.ivm").unwrap().as_ref(), b"ivm0");
+        assert_eq!(pack.read("item/mini.ivm").unwrap().as_ref(), b"ivm1");
+        assert_eq!(pack.read("file/filei17.tim").unwrap().as_ref(), b"i17");
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
+        assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
+        assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
+    }
+
+    #[test]
+    fn discovers_an_item_m2_only_in_a_fallback_tree() {
+        // A Steam root need not have an ITEM_M2 in every tree; the first one
+        // found is the primary and still supplies every item phase.
+        let root = TempDir::new("fallback-item-art");
+        make_stage_dirs(&root.path);
+        let japanese = root.path.join("japanese/JPN/Item_m2");
+        fs::create_dir_all(&japanese).unwrap();
+        fs::write(japanese.join("FILE000.TIM"), b"cover0").unwrap();
+        fs::write(japanese.join("FILE001.TIM"), b"cover1").unwrap();
+        for number in 1..=FILEI_COUNT {
+            fs::write(
+                japanese.join(format!("FILEI{number:02}.TIM")),
+                format!("i{number}"),
+            )
+            .unwrap();
+        }
+        for number in 0..TEXTM_COUNT {
+            fs::write(
+                japanese.join(format!("TEXTM_{number:02}.TIM")),
+                format!("page{number}"),
+            )
+            .unwrap();
+        }
+
+        let plan = build_plan(&root.path).unwrap();
+        assert_eq!(plan.item_m2_dirs, [japanese]);
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new("test", 1);
+        let mut warnings = Vec::new();
+        let (files, _bytes) = copy_file_art(
+            &plan.item_m2_dirs,
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn converts_two_steam_language_trees_into_one_complete_pack() {
+        // The end-to-end wiring: the English tree supplies the shared assets
+        // and its own film spellings, the Japanese tree supplies the document
+        // pages. The one pack must carry the canonical film entries and all
+        // 62 document-art entries.
+        let root = TempDir::new("steam-pack");
+        make_stage_dirs(&root.path);
+        fs::write(root.path.join("STAGE1/ROOM1100.RDT"), [0u8; 4]).unwrap();
+
+        let english_item = root.path.join("english/USA/Item_m2");
+        let japanese_item = root.path.join("japanese/JPN/Item_m2");
+        fs::create_dir_all(&english_item).unwrap();
+        fs::create_dir_all(&japanese_item).unwrap();
+        fs::write(english_item.join("MINI.IVM"), b"ivm1").unwrap();
+        fs::write(english_item.join("FILE000.TIM"), b"cover0").unwrap();
+        fs::write(english_item.join("FILE001.TIM"), b"cover1").unwrap();
+        for number in 1..=FILEI_COUNT {
+            fs::write(
+                japanese_item.join(format!("FILEI{number:02}.TIM")),
+                format!("i{number}"),
+            )
+            .unwrap();
+        }
+        for number in 0..TEXTM_COUNT {
+            fs::write(
+                japanese_item.join(format!("TEXTM_{number:02}.TIM")),
+                format!("page{number}"),
+            )
+            .unwrap();
+        }
+
+        let english_movie = root.path.join("english/USA/Movie");
+        fs::create_dir_all(&english_movie).unwrap();
+        let western = [
+            ("oj", "ou"),
+            ("pj", "pu"),
+            ("ed4", "eu4"),
+            ("ed5", "eu5"),
+            ("stfc_b", "stfc_r"),
+            ("stfj_b", "stfj_r"),
+            ("stfz_b", "stfz_r"),
+            ("staf_b", "staf_r"),
+        ];
+        for id in 0..=28u8 {
+            let Some(name) = movie::name(id) else {
+                continue;
+            };
+            if !movie::is_shipped(name) {
+                continue;
+            }
+            let file = western
+                .iter()
+                .find_map(|(canonical, file)| (*canonical == name).then_some(*file))
+                .unwrap_or(name);
+            fs::write(
+                english_movie.join(format!("{file}.AVI")),
+                format!("film-{name}"),
+            )
+            .unwrap();
+        }
+
+        let out = root.path.join("out.akpak");
+        convert_game(&root.path, &out).unwrap();
+        let pack = crate::pack::Pack::open(&out).unwrap();
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("movie/"))
+                .count(),
+            27
+        );
+        assert_eq!(
+            pack.paths()
+                .filter(|path| path.starts_with("file/"))
+                .count(),
+            2 + FILEI_COUNT + TEXTM_COUNT
+        );
+        for id in 0..=28u8 {
+            let Some(name) = movie::name(id) else {
+                continue;
+            };
+            if !movie::is_shipped(name) {
+                continue;
+            }
+            assert_eq!(
+                pack.read(&movie::pack_path(name)).unwrap().as_ref(),
+                format!("film-{name}").as_bytes(),
+                "{name}"
+            );
+        }
+        assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
+        assert!(!pack.contains("movie/vlogo.avi"));
     }
 
     #[test]
@@ -4274,10 +4664,22 @@ mod tests {
         let mut writer = PackWriter::new();
         let mut progress = Progress::new("test", 1);
         let mut warnings = Vec::new();
-        let (items, item_bytes) =
-            copy_item_models(Some(&dir), &mut writer, &mut progress, &mut warnings, 1).unwrap();
-        let (files, file_bytes) =
-            copy_file_art(Some(&dir), &mut writer, &mut progress, &mut warnings, 1).unwrap();
+        let (items, item_bytes) = copy_item_models(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        let (files, file_bytes) = copy_file_art(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(items, 2);
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);
@@ -4365,13 +4767,31 @@ mod tests {
         let mut writer = PackWriter::new();
         let mut progress = Progress::new("test", 1);
         let mut warnings = Vec::new();
-        let (items, items_bytes) =
-            copy_item_models(Some(&dir), &mut writer, &mut progress, &mut warnings, 1).unwrap();
-        let (files, files_bytes) =
-            copy_file_art(Some(&dir), &mut writer, &mut progress, &mut warnings, 1).unwrap();
+        let (items, items_bytes) = copy_item_models(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        let (files, files_bytes) = copy_file_art(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
 
-        let (maps, maps_bytes) =
-            copy_map_art(Some(&dir), &mut writer, &mut progress, &mut warnings, 1).unwrap();
+        let (maps, maps_bytes) = copy_map_art(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
 
         assert_eq!(items, 77);
         assert_eq!(files, 2 + FILEI_COUNT + TEXTM_COUNT);

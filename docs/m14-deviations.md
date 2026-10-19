@@ -66,7 +66,10 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
    `--capture`. Captures and `--ui` boots skip every automatic film so their
    deterministic BMPs do not change; the root-boot capture still boots the
    title directly. The absent `vlogo.avi` is logged and skipped by the same
-   missing-file path as any unpacked film.
+   missing-file path as any unpacked film. `convert-game` resolves the Western
+   release's alternate film names (`OU`/`PU`, `EU4`/`EU5` and the `_r` staff
+   rolls) to the canonical pack entries, and the Virgin logo, which no digital
+   PC release ships, is not reported as a missing conversion input.
 
 7. **Headless drains.** A capture's `--ticks` loop and `simulate_room` take and
    drop every film request, so a `movie_on` can never stall a headless run. A

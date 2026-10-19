@@ -101,9 +101,49 @@ pub fn name(id: u8) -> Option<&'static str> {
     NAMES.get(usize::from(id)).copied().flatten()
 }
 
+/// Every shipped basename for a canonical table name, the canonical one
+/// first.
+///
+/// The Japanese table uses the Biohazard names while the Western PC release
+/// renames the opening, the two Japanese-only endings and the four staff rolls
+/// (the reference's USA FMV table). A converter that only looks for `oj`,
+/// `ed4` or `staf_b` therefore misses the equivalent Western files, so both
+/// spellings resolve to the same pack entry.
+pub fn release_names(name: &str) -> impl Iterator<Item = &str> {
+    let western = match name {
+        "oj" => Some("ou"),
+        "pj" => Some("pu"),
+        "ed4" => Some("eu4"),
+        "ed5" => Some("eu5"),
+        "stfc_b" => Some("stfc_r"),
+        "stfj_b" => Some("stfj_r"),
+        "stfz_b" => Some("stfz_r"),
+        "staf_b" => Some("staf_r"),
+        _ => None,
+    };
+    std::iter::once(name).chain(western)
+}
+
 /// The number of named film ids the table carries (29 rows minus the null id).
 pub fn name_count() -> usize {
     NAMES.iter().filter(|name| name.is_some()).count()
+}
+
+/// Whether a digital PC release ships this film. Every release omits the
+/// Virgin logo (`vlogo`), which the table still carries for the scripted boot
+/// sequence, so it is not a missing conversion input.
+pub fn is_shipped(name: &str) -> bool {
+    !name.eq_ignore_ascii_case("vlogo")
+}
+
+/// The number of named film ids a digital PC release ships; see
+/// [`is_shipped`].
+pub fn required_name_count() -> usize {
+    NAMES
+        .iter()
+        .flatten()
+        .filter(|name| is_shipped(name))
+        .count()
 }
 
 /// Pack path for a film basename: `movie/{name}.avi`.
@@ -757,8 +797,29 @@ mod tests {
         }
         assert_eq!(name(29), None);
         assert_eq!(name(255), None);
+        assert_eq!(name_count(), 28);
+        assert_eq!(required_name_count(), 27);
+        assert!(!is_shipped(name(28).unwrap()));
+        assert!(is_shipped("staf_b"));
         assert_eq!(pack_path("PJ"), "movie/pj.avi");
         assert_eq!(pack_path("staf_b"), "movie/staf_b.avi");
+
+        // The Western PC release's names resolve to the same table row.
+        let western = [
+            ("oj", "ou"),
+            ("pj", "pu"),
+            ("ed4", "eu4"),
+            ("ed5", "eu5"),
+            ("stfc_b", "stfc_r"),
+            ("stfj_b", "stfj_r"),
+            ("stfz_b", "stfz_r"),
+            ("staf_b", "staf_r"),
+        ];
+        for (canonical, western) in western {
+            let names: Vec<&str> = release_names(canonical).collect();
+            assert_eq!(names, [canonical, western]);
+        }
+        assert_eq!(release_names("dm1").collect::<Vec<_>>(), ["dm1"]);
     }
 
     #[test]
