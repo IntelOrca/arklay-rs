@@ -100,7 +100,7 @@ pub fn segment_tick(game: &mut GameState, room: &RoomState, slot: usize) {
 
     let player_pos = game.entities[0].pos;
     // GHOST: the player is never in range.
-    if !game.debug.ghost {
+    if !game.ghost_hides_player_from(slot) {
         crate::enemy::walk::entity_check_visual_range(&mut game.entities[slot], player_pos, 4000);
     }
     if game.entities[slot].pos[1] < -0x5DC {

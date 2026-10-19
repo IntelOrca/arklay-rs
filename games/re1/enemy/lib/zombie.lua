@@ -392,7 +392,8 @@ state_check = function(e)
 
     local _, py, _ = e:player_pos()
     local vertical = py - e.pos_y
-    if vertical < -100 or vertical > 100 then
+    -- Port-only: the GHOST debug cheat keeps the floor-difference alert off.
+    if (vertical < -100 or vertical > 100) and not e:player_hidden() then
         e.status_flags = e.status_flags & 0x1F
         if vertical < 0 then
             e.status_flags = e.status_flags | 0x20

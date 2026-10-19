@@ -2743,6 +2743,7 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     let player_radius = player_radius(game.id.player_flag);
     let seed = game.rand_seed;
     let slow = game.flags[5].bit(crate::game::MSF2_EFFECT_ZONE);
+    let ghost = game.ghost_hides_player_from(slot);
 
     let GameState {
         entities,
@@ -2780,7 +2781,10 @@ pub fn update(game: &mut GameState, slot: usize, room: &RoomState, clips: &[Clip
     // the state-9 tail without rewriting it, so the tail must read the stored
     // word, not the current `pos`.
     let prev_pos = entity.saved_pos.unwrap_or(entity.pos);
-    entity_pathfind_update(room, entity, player_pos);
+    // GHOST: a hostile character's pathfinder loses the player.
+    if !ghost {
+        entity_pathfind_update(room, entity, player_pos);
+    }
     swap_behavior(entity, player_pos);
     entity.splatter_flag = walk_zone_find(room, entity.pos[0], entity.pos[2]).unwrap_or(0xFF);
     match entity.action_behavior {

@@ -581,10 +581,15 @@ anywhere. `--ui debug` captures the list.
 - PLAYER: character and outfit (normal, alt 1, alt 2) are pending and apply at
   the next room load, like the wardrobe; the alternate outfits load
   `em1030 + character + 2 * variant` as the original's `LoadEntityEMD` does.
+  The outfit does not survive a save/load: the costume bit lives in the
+  transient flag bank the load clears and the outfit byte is not in the save
+  block, so a loaded game wears the normal outfit.
 - FLAGS: thirteen flag banks (scenario, items, enemies, rooms, maps, ...)
   with port-only names; confirm toggles, L1/R1 set/clear.
 - CHEATS: INVINCIBLE pins health and blocks death; GHOST hides the player from
-  enemy sight and pathing. Session-only, never saved.
+  hostile characters' shared sight, range and pathfinding checks (partners
+  still follow). Scripts that read the player position directly are not yet
+  covered (issue #77). Session-only, never saved.
 - SAVE: save opens the typewriter save screen; load opens the load screen and
   continues from the picked slot.
 - ITEM BOX: opens the item box anywhere.

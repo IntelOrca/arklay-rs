@@ -384,7 +384,7 @@ fn read_u32(data: &[u8], offset: usize) -> Result<u32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -501,7 +501,9 @@ mod tests {
         data
     }
 
-    fn minimal_emd() -> Vec<u8> {
+    /// The smallest valid EMD: one two-joint skeleton, one keyframe and
+    /// clip, a one-object mesh and a 2x1 texture.
+    pub(crate) fn minimal_emd() -> Vec<u8> {
         let mut data = minimal_emr();
         let edd_offset = data.len();
         data.extend_from_slice(&minimal_edd());

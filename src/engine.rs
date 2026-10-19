@@ -5664,6 +5664,11 @@ impl App {
         if let Some(slot) = load_slot {
             if let Err(err) = self.continue_from_slot(slot) {
                 eprintln!("warning: save slot {slot} unavailable: {err:#}");
+                // Back to the debug tools rather than silently resuming.
+                let App { pack, mode, .. } = self;
+                if let Mode::Play(session) = mode {
+                    session.open_debug_menu(pack);
+                }
             }
             return Ok(AppFlow::Continue);
         }
@@ -9099,6 +9104,10 @@ fn tick_room_timed(
     // motion); mirror that onto the visible player before physics run.
     context.game.sync_player(context.player);
     context.game.advance_frame();
+    // The debug INVINCIBLE cheat restores health before the player machine
+    // reads it, so a lethal script or enemy hit this tick never starts the
+    // death fall.
+    context.game.apply_invincible();
     // The original gates the whole player animation state machine on
     // `g_message_flags & 1`: a message's pause word clears the bit, so no pad
     // mapping, movement or animation advance runs until the message is
@@ -12050,6 +12059,11 @@ mod tests {
         let (pack, a, _) = debug_menu_pack(&dir);
         let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
         session.game.debug.invincible = true;
+        // Settle into the pad-driven state before the lethal hit lands.
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.entities[0].state(), 1);
         session.game.entities[0].health = -5;
         session.game.set_health_status(0x80 | 0x62);
         session.game.poison_timer = 30;
@@ -12065,6 +12079,11 @@ mod tests {
         assert_eq!(session.game.poison_timer, 0);
         assert!(!session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
         assert!(session.death.is_idle(), "no death sequence starts");
+        assert_ne!(
+            session.game.entities[0].state(),
+            3,
+            "a lethal hit in the same tick never starts the death fall"
+        );
     }
 
     #[test]
@@ -12165,6 +12184,123 @@ mod tests {
             "the character change waits for a Jill room"
         );
         assert!(!session.game.flag_test(5, game::MSF2_COSTUME_VARIANT, false));
+    }
+
+    /// [`debug_menu_pack`] plus a Jill variant of the second room and
+    /// Chris's first alternate outfit.
+    fn debug_costume_pack(dir: &TempDir) -> (Pack, RoomId, RoomId) {
+        let path = dir.0.join("costume.akpak");
+        let (a, b) = (
+            RoomId::parse("1000").unwrap(),
+            RoomId::parse("1010").unwrap(),
+        );
+        let b_jill = RoomId::parse("1011").unwrap();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let mut writer = PackWriter::new();
+        for (id, door) in [
+            (a, door_init_record(1, [777, 0, 888], 0x200, 0)),
+            (b, door_init_record(0, [555, 0, 666], 1024, 0)),
+            (b_jill, door_init_record(0, [555, 0, 666], 1024, 0)),
+        ] {
+            writer
+                .add(
+                    &id.rdt_entry(),
+                    synthetic_rdt_with_blocking_collision(&door),
+                )
+                .unwrap();
+            // The backgrounds are shared between the character variants.
+            if id.player_flag == 0 {
+                writer.add(&id.cut_entry(0), bmp_bytes.clone()).unwrap();
+            }
+        }
+        writer
+            .add(
+                &crate::convert::costume_entry(0, 0),
+                crate::emd::tests::minimal_emd(),
+            )
+            .unwrap();
+        writer.write(&path).unwrap();
+        (Pack::open(&path).unwrap(), a, b)
+    }
+
+    #[test]
+    fn a_pending_jill_rewrites_the_door_target_to_her_variant() {
+        let dir = TempDir::new();
+        let (pack, a, b) = debug_costume_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        assert_eq!(
+            session.pending_player_target(&pack, b),
+            b,
+            "nothing pending"
+        );
+        session.game.debug.pending_player = Some(game::PlayerChoice {
+            character: 1,
+            costume: 0,
+        });
+        let b_jill = session.pending_player_target(&pack, b);
+        assert_eq!(
+            b_jill,
+            RoomId {
+                player_flag: 1,
+                ..b
+            }
+        );
+        // The door transition loads the rewritten target, as the menu's
+        // jump already does.
+        session.debug_jump(&pack, b_jill).unwrap();
+        assert_eq!(session.loaded.id, b_jill);
+        assert_eq!(session.game.debug.pending_player, None);
+        assert_eq!(session.game.max_health, 96, "Jill's maximum");
+    }
+
+    #[test]
+    fn the_outfit_bit_swaps_in_the_alternate_player_model() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_costume_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.loaded.player_assets = Some(synthetic_player_assets());
+        session.apply_costume_model(&pack);
+        assert_eq!(
+            session
+                .loaded
+                .player_assets
+                .as_ref()
+                .unwrap()
+                .emd
+                .texture
+                .width,
+            0,
+            "the base model without the outfit bit"
+        );
+        session.game.apply_flag(5, game::MSF2_COSTUME_VARIANT, 0);
+        session.apply_costume_model(&pack);
+        assert_eq!(
+            session
+                .loaded
+                .player_assets
+                .as_ref()
+                .unwrap()
+                .emd
+                .texture
+                .width,
+            2,
+            "player/00_alt0.emd replaced it"
+        );
+        // A missing variant keeps the current model.
+        session.game.costume_variant = 1;
+        session.loaded.player_assets = Some(synthetic_player_assets());
+        session.apply_costume_model(&pack);
+        assert_eq!(
+            session
+                .loaded
+                .player_assets
+                .as_ref()
+                .unwrap()
+                .emd
+                .texture
+                .width,
+            0
+        );
     }
 
     #[test]
@@ -14400,6 +14536,69 @@ mod tests {
         assert!(
             session.debug_menu_enabled,
             "start_session propagates the enabled overlay"
+        );
+    }
+
+    #[test]
+    fn app_debug_load_continues_from_the_slot_or_reopens_the_menu() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let file = save::SaveFile {
+            stage: 0,
+            room: NEW_GAME_ROOM,
+            health: 77,
+            ..save::SaveFile::default()
+        };
+        save::save(&saves, 0, &file).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, saves, false);
+        let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+
+        // A missing slot reopens the debug tools.
+        let Mode::Play(session) = &mut app.mode else {
+            panic!("expected a play mode");
+        };
+        session.load_slot_requested = Some(3);
+        app.update(UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        let Mode::Play(session) = &mut app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(session.debug_menu.is_some(), "the failure is visible");
+        session.debug_menu = None;
+
+        session.load_slot_requested = Some(0);
+        session.game.entities[0].health = 5;
+        app.update(UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert_eq!(session.game.entities[0].health, 77, "slot 0 loaded");
+        assert!(session.debug_menu.is_none());
+    }
+
+    #[test]
+    fn app_debug_clear_game_plays_the_ending_chain() {
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+        let Mode::Play(session) = &mut app.mode else {
+            panic!("expected a play mode");
+        };
+        session.clear_game_requested = Some(4);
+        app.update(UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(app.ending.is_some(), "the ending flow is recorded");
+        assert!(
+            !matches!(app.mode, Mode::Play(_)),
+            "the session hands over to the ending"
         );
     }
 

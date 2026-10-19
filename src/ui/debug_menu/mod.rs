@@ -697,6 +697,37 @@ mod tests {
     }
 
     #[test]
+    fn debug_edits_survive_a_save_round_trip_and_cheats_do_not() {
+        let mut game = GameState::default();
+        game.id = RoomId::parse("1000").unwrap();
+        let mut menu = menu(&game);
+        // INVENTORY: pick item 0x01 into the first slot.
+        enter(&mut menu, &mut game, Tool::Inventory);
+        menu.handle_input(confirm(), &mut game);
+        menu.handle_input(right(), &mut game);
+        menu.handle_input(confirm(), &mut game);
+        menu.handle_input(cancel(), &mut game);
+        // FLAGS: flip the first scenario flag.
+        enter(&mut menu, &mut game, Tool::Flags);
+        let (group, sel) = menu.flags().selected();
+        menu.handle_input(confirm(), &mut game);
+        menu.handle_input(cancel(), &mut game);
+        // CHEATS: INVINCIBLE on.
+        enter(&mut menu, &mut game, Tool::Cheats);
+        menu.handle_input(confirm(), &mut game);
+        assert!(game.debug.invincible);
+
+        let bytes = crate::save::SaveFile::from_state(&game).to_bytes();
+        let mut loaded = GameState::default();
+        crate::save::SaveFile::from_bytes(&bytes)
+            .unwrap()
+            .apply_to(&mut loaded);
+        assert_eq!(loaded.inventory[0].id, 0x01);
+        assert!(loaded.flag_test(group.bank, sel, false));
+        assert!(!loaded.debug.invincible, "cheats are never saved");
+    }
+
+    #[test]
     fn f1_closes_from_anywhere() {
         let mut game = GameState::default();
         let mut menu = menu(&game);
@@ -759,6 +790,22 @@ mod tests {
             game.debug.pending_player, None,
             "back to the current player"
         );
+    }
+
+    #[test]
+    fn an_outfit_only_choice_leaves_the_character_bytes_alone() {
+        let mut game = GameState::default();
+        game.id = RoomId::parse("1000").unwrap();
+        game.max_health = 120;
+        game.entities[0].id = 0x40;
+        game.apply_player_choice(PlayerChoice {
+            character: 0,
+            costume: 1,
+        });
+        assert!(game.flag_test(5, MSF2_COSTUME_VARIANT, false));
+        assert_eq!(game.costume_variant, 0);
+        assert_eq!(game.max_health, 120, "the same character keeps its maximum");
+        assert_eq!(game.entities[0].id, 0x40, "and its entity id");
     }
 
     #[test]

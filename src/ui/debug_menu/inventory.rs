@@ -46,12 +46,14 @@ pub fn default_quantity(item: u8) -> u8 {
     items::max_quantity(item).max(1)
 }
 
-/// Put `item` into `slot` (`0` clears it). A slot past the held stacks
-/// appends, since the inventory is a compact list.
-pub fn assign(game: &mut GameState, slot: usize, item: u8) {
+/// Put `item` into `slot` (`0` clears it) and return the slot it landed in.
+/// A slot past the held stacks appends, since the inventory is a compact
+/// list, so the item lands in the first empty slot.
+pub fn assign(game: &mut GameState, slot: usize, item: u8) -> usize {
     if slot >= game.inventory_capacity() {
-        return;
+        return slot;
     }
+    let mut landed = slot;
     if item == 0 {
         if slot < game.inventory.len() {
             game.inventory.remove(slot);
@@ -63,11 +65,15 @@ pub fn assign(game: &mut GameState, slot: usize, item: u8) {
         };
         match game.inventory.get_mut(slot) {
             Some(existing) => *existing = stack,
-            None => game.inventory.push(stack),
+            None => {
+                landed = game.inventory.len();
+                game.inventory.push(stack);
+            }
         }
     }
     game.clear_dangling_items();
     game.rebuild_slots();
+    landed
 }
 
 /// Step `slot`'s quantity by `delta` inside `1..=quantity_limit`; reaching 0
@@ -175,7 +181,8 @@ impl InventoryEditor {
             } else if input.confirm {
                 let item = picker.item();
                 self.picker = None;
-                assign(game, self.slot, item);
+                // The cursor follows the item to the slot it landed in.
+                self.slot = assign(game, self.slot, item);
             } else {
                 picker.step(input);
             }
@@ -354,7 +361,11 @@ mod tests {
         assert_eq!(game.inventory[0].id, 0x0C);
         assert_eq!(game.equipped, None, "the equipped Beretta is gone");
         assert_eq!(game.selected_item, None);
-        assign(&mut game, 5, 0x6F);
+        assert_eq!(
+            assign(&mut game, 5, 0x6F),
+            1,
+            "lands in the first empty slot"
+        );
         assert_eq!(game.inventory[1].id, 0x6F, "past the held stacks appends");
         assign(&mut game, 6, 0x03);
         assert_eq!(game.inventory.len(), 2, "Chris has no seventh slot");
@@ -399,6 +410,17 @@ mod tests {
         editor.handle_input(press(|i| i.cancel = true), &mut game);
         assert!(editor.picker().is_none());
         assert_eq!(game.inventory[0].id, 0x09, "cancel keeps the slot");
+        // Picking for an empty slot past the stacks moves the cursor to the
+        // slot the item landed in.
+        editor.handle_input(press(|i| i.down = true), &mut game);
+        editor.handle_input(press(|i| i.down = true), &mut game);
+        assert_eq!(editor.slot(), 2);
+        editor.handle_input(press(|i| i.confirm = true), &mut game);
+        editor.handle_input(press(|i| i.right = true), &mut game);
+        editor.handle_input(press(|i| i.confirm = true), &mut game);
+        assert_eq!(game.inventory[1].id, 0x01);
+        assert_eq!(editor.slot(), 1);
+        editor.handle_input(press(|i| i.up = true), &mut game);
         assert_eq!(
             editor.handle_input(press(|i| i.cancel = true), &mut game),
             Step::Back

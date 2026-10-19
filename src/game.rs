@@ -3237,7 +3237,7 @@ pub struct PlayerChoice {
 pub struct DebugTools {
     /// Pin the player's health at the maximum and never die.
     pub invincible: bool,
-    /// Enemies cannot see or path to the player.
+    /// Hostile characters cannot see or path to the player.
     pub ghost: bool,
     /// The character/outfit the next room load switches to.
     pub pending_player: Option<PlayerChoice>,
@@ -5127,19 +5127,23 @@ impl GameState {
     }
 
     /// Switch the player to `choice` after a room load into the matching RDT
-    /// variant: the character bytes, `MSF_CHAR_VARIANT`, the maximum health
-    /// (the current health is clamped to it), the outfit bit and byte, and the
-    /// inventory, which Jill-to-Chris truncates from eight slots to six.
+    /// variant: the outfit bit and byte and, when the character changes, the
+    /// character bytes, `MSF_CHAR_VARIANT`, the maximum health and the
+    /// inventory, which Jill-to-Chris truncates from eight slots to six. The
+    /// current health is only clamped to the new maximum, never raised: a
+    /// character switch is not a heal (INVINCIBLE is).
     pub fn apply_player_choice(&mut self, choice: PlayerChoice) {
         let character = choice.character & 1;
-        self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] = character;
-        self.state_bytes[usize::from(STATE_BYTE_CHARACTER_MODEL)] = character;
-        self.entities[0].id = character;
-        self.apply_flag(5, MSF_CHAR_VARIANT, if character == 1 { 0 } else { 1 });
-        self.max_health = character_max_health(character);
-        if self.entities[0].health > self.max_health {
-            self.entities[0].health = self.max_health;
-            self.set_health_copy(self.max_health);
+        if self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] != character {
+            self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] = character;
+            self.state_bytes[usize::from(STATE_BYTE_CHARACTER_MODEL)] = character;
+            self.entities[0].id = character;
+            self.apply_flag(5, MSF_CHAR_VARIANT, if character == 1 { 0 } else { 1 });
+            self.max_health = character_max_health(character);
+            if self.entities[0].health > self.max_health {
+                self.entities[0].health = self.max_health;
+                self.set_health_copy(self.max_health);
+            }
         }
         if choice.costume == 0 {
             self.apply_flag(5, MSF2_COSTUME_VARIANT, 1);
@@ -5566,9 +5570,10 @@ impl GameState {
         self.state_bytes[offset..offset + 2].copy_from_slice(&health.to_le_bytes());
     }
 
-    /// The INVINCIBLE cheat, once per tick after the room tick: health pinned
-    /// to the maximum and the poison bits (`0x02`/`0x20`/`0x40`) and countdown
-    /// cleared. The `0x80` reach lock is left alone.
+    /// The INVINCIBLE cheat, run before the player machine and again after
+    /// the room tick: health pinned to the maximum and the poison bits
+    /// (`0x02`/`0x20`/`0x40`) and countdown cleared. The `0x80` reach lock is
+    /// left alone.
     pub fn apply_invincible(&mut self) {
         if !self.debug.invincible {
             return;
@@ -5577,6 +5582,13 @@ impl GameState {
         self.set_health_copy(self.max_health);
         self.set_health_status(self.health_status & !0x62);
         self.poison_timer = 0;
+    }
+
+    /// Whether the GHOST cheat hides the player from entity `slot`: only
+    /// hostile characters (ids below the `0x20` NPC range) lose track, so
+    /// partners still follow.
+    pub fn ghost_hides_player_from(&self, slot: usize) -> bool {
+        self.debug.ghost && self.entities[slot].id < 0x20
     }
 
     /// Clear the per-frame item-use flag bank. The original zeroes both
@@ -10358,6 +10370,21 @@ mod tests {
         assert!(state.script_waiting());
         state.message.set_menu_choice_id(0x01);
         assert!(!state.script_waiting());
+    }
+
+    #[test]
+    fn the_wardrobe_model_byte_raises_the_outfit_bit_on_room_entry() {
+        let mut state = game();
+        let model = usize::from(STATE_BYTE_CHARACTER_MODEL);
+        state.entities[0].id = 0;
+        state.state_bytes[model] = 8;
+        state.enter_room(RoomId::parse("1010").unwrap(), &RoomState::default());
+        assert!(state.flag_test(5, MSF2_COSTUME_VARIANT, false));
+        assert_eq!(state.state_bytes[model], 0, "folded back to the character");
+        // A plain model byte leaves the bit alone.
+        state.apply_flag(5, MSF2_COSTUME_VARIANT, 1);
+        state.enter_room(RoomId::parse("1011").unwrap(), &RoomState::default());
+        assert!(!state.flag_test(5, MSF2_COSTUME_VARIANT, false));
     }
 
     #[test]

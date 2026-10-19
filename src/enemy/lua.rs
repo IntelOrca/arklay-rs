@@ -2820,7 +2820,7 @@ mod imp {
                 let slot = api.slot;
                 let game = api.game();
                 // GHOST: the pathfinder reports the target blocked.
-                if game.debug.ghost {
+                if game.ghost_hides_player_from(slot) {
                     return Ok(0);
                 }
                 Ok(crate::enemy::walk::entity_pathfind_update(
@@ -3258,11 +3258,21 @@ mod imp {
                 Ok(())
             });
 
+            // Whether the GHOST debug cheat hides the player from this
+            // entity; port-only, for script branches that read the player's
+            // position directly.
+            methods.add_method("player_hidden", |_lua, api, ()| {
+                Ok(api.game_ref().ghost_hides_player_from(api.slot))
+            });
+
             // The flat distance to the player with the visual-range status bit
             // write (`entity_check_visual_range`); the alert variant raises bit
             // 7 instead.
             methods.add_method_mut("check_visual_range", |_lua, api, range: i64| {
-                if api.game_ref().debug.ghost {
+                // GHOST: out of range, and a bit raised before the cheat
+                // was switched on is dropped.
+                if api.game_ref().ghost_hides_player_from(api.slot) {
+                    api.entity_mut().status_flags &= !0x20;
                     return Ok(crate::enemy::walk::GHOST_DISTANCE);
                 }
                 let player = api.game_ref().entities[0].pos;
@@ -3273,7 +3283,8 @@ mod imp {
                 ))
             });
             methods.add_method_mut("check_alert_range", |_lua, api, range: i64| {
-                if api.game_ref().debug.ghost {
+                if api.game_ref().ghost_hides_player_from(api.slot) {
+                    api.entity_mut().status_flags &= !0x80;
                     return Ok(crate::enemy::walk::GHOST_DISTANCE);
                 }
                 let player = api.game_ref().entities[0].pos;
@@ -3298,7 +3309,7 @@ mod imp {
             methods.add_method_mut(
                 "angular_view_and_distance",
                 |_lua, api, (fov_half, max_distance): (i64, i64)| {
-                    if api.game_ref().debug.ghost {
+                    if api.game_ref().ghost_hides_player_from(api.slot) {
                         return Ok(0);
                     }
                     let player = api.game_ref().entities[0].pos;
@@ -3317,7 +3328,7 @@ mod imp {
                 let room = unsafe { &*room };
                 let player = api.game_ref().entities[0].pos;
                 // GHOST: the sight line to the player is always blocked.
-                let result = if api.game_ref().debug.ghost {
+                let result = if api.game_ref().ghost_hides_player_from(api.slot) {
                     1
                 } else {
                     crate::enemy::walk::check_line_of_sight(room, api.entity(), player)
@@ -10917,6 +10928,25 @@ mod zombie_tests {
     }
 
     #[test]
+    fn ghost_skips_the_zombie_floor_difference_alert() {
+        let pack = pack();
+        for (ghost, expected) in [(false, 0x80), (true, 0)] {
+            let mut game = zombie_game(0x00, 0);
+            game.entities[0].pos = [1000, 2000, 0];
+            game.debug.ghost = ghost;
+            let mut host = LuaEnemyHost::new();
+            for _ in 0..3 {
+                assert!(step(&mut host, &mut game, &pack));
+            }
+            assert_eq!(
+                game.entities[1].status_flags & 0xA0,
+                expected,
+                "ghost {ghost}: the floor-difference bits"
+            );
+        }
+    }
+
+    #[test]
     fn zombie_scripts_load_and_initialise_for_every_id() {
         let pack = pack();
         for (id, radius) in [(0x00u8, 422i16), (0x01, 322), (0x11, 422)] {
@@ -14257,7 +14287,8 @@ mod hunter_tests {
             "enemy/em06.lua",
             r#"
 function update(e)
-    e.status_flags = 1
+    e.status_flags = 0xA1
+    assert(e:player_hidden())
     assert(e:check_visual_range(0x7000) == 0x7FFF)
     assert(e:check_alert_range(0x7000) == 0x7FFF)
     assert(e:angular_view_and_distance(0x800, 0x7000) == 0)
@@ -14270,8 +14301,31 @@ end
         game.debug.ghost = true;
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack, 1));
-        assert_eq!(game.entities[1].status_flags, 1, "no range bit is raised");
+        assert_eq!(
+            game.entities[1].status_flags, 1,
+            "no range bit is raised and the stale ones drop"
+        );
         assert_eq!(game.player_distance_z, 1, "the blocked sight byte");
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn ghost_leaves_npcs_tracking_the_player() {
+        let pack = pack_with(&[(
+            "enemy/em20.lua",
+            r#"
+function update(e)
+    assert(not e:player_hidden())
+    assert(e:check_visual_range(0x7000) == 4000)
+end
+"#,
+        )]);
+        let mut game = hunter(2);
+        game.entities[1].id = 0x20;
+        game.debug.ghost = true;
+        let mut host = LuaEnemyHost::new();
+        assert!(step(&mut host, &mut game, &pack, 1));
+        assert_eq!(game.entities[1].status_flags & 0x20, 0x20);
     }
 
     #[cfg(feature = "lua")]
