@@ -1693,20 +1693,30 @@ impl Framebuffer {
                     continue;
                 }
                 // `FlushSpriteCommands` hands the GPU an 8-bit vertex colour
-                // and alpha; the fragment multiplies the texel by it and the
-                // alpha blend rounds the result back to 8 bits.
-                let alpha = f32::from(texel[3]) / 255.0 * alpha;
+                // and alpha. llvmpipe stores the fragment's texel-times-colour
+                // as bytes and blends them in 8-bit fixed point, rounding
+                // each `x * y / 255` product.
+                let unorm = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u32;
+                let alpha = unorm(f32::from(texel[3]) / 255.0 * alpha);
                 for ((channel, &source), &color) in
                     slot[..3].iter_mut().zip(&texel[..3]).zip(&color)
                 {
-                    let source = f32::from(source) / 255.0 * color;
-                    let blended = source * alpha + f32::from(*channel) / 255.0 * (1.0 - alpha);
-                    *channel = (blended * 255.0).round().clamp(0.0, 255.0) as u8;
+                    let source = unorm(f32::from(source) / 255.0 * color);
+                    let blended =
+                        unorm_mul(source, alpha) + unorm_mul(u32::from(*channel), 255 - alpha);
+                    *channel = blended.min(255) as u8;
                 }
                 slot[3] = 255;
             }
         }
     }
+}
+
+/// llvmpipe's `lp_build_mul` on 8-bit normalised values: `a * b / 255`,
+/// rounded to nearest.
+fn unorm_mul(a: u32, b: u32) -> u32 {
+    let product = a * b + 0x80;
+    (product + (product >> 8)) >> 8
 }
 
 /// The texture-coordinate planes llvmpipe sets up for a `MarniDrawSprite`
