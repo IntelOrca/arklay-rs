@@ -5,7 +5,9 @@ written in Rust with SDL3. Each game is a game pack; everything game-specific
 lives in the pack. Mods layer on top with any asset overridable.
 
 The engine reads the player's own game installation: `convert-game` migrates a
-supported install into an `.akpak` pack, and the engine runs the pack.
+supported install into an `.akpak` pack, and the engine runs the pack. A pack
+may also be a directory of unpacked entries (the layout `arklay extract`
+writes); directory entries are read on demand, not loaded wholesale.
 
 ## Build
 
@@ -58,8 +60,9 @@ cargo run -- verify re1.akpak
 # Extract every pack entry below a directory, preserving relative paths
 cargo run -- extract re1.akpak --out extracted/
 
-# Launch room 100 as player 0 (RDT 1000)
+# Launch room 100 as player 0 (RDT 1000); the pack may also be a directory
 cargo run -- re1.akpak --room 100 --player 0
+cargo run -- extracted/ --room 100 --player 0
 
 # Pick the displayed language; the default is the OS locale, then en-US
 cargo run -- re1.akpak --room 100 --language ja-JP
@@ -148,18 +151,24 @@ extension priority (`webp > png > bmp > tim > pix`, `ogg > wav`):
 # Build the checked-in demo sources into a pack (no game assets included)
 cargo run -- mod build mods/demo --out demo.akpak
 
-# Layer it explicitly; --mod is repeatable, later load_order wins
+# Layer it explicitly; --mod is repeatable, later load_order wins. A mod
+# source directory can be passed directly, without `mod build` first.
 cargo run -- re1.akpak --mod demo.akpak --room 100 --ticks 40 --capture demo.bmp
+cargo run -- re1.akpak --mod mods/demo --room 100 --ticks 40 --capture demo.bmp
 
 # The replacement-format example: a PNG background, a PNG/WebP UI page and an
 # OGG BGM track over the shipped art
 cargo run -- mod build mods/hd --out hd.akpak
 cargo run -- re1.akpak --mod hd.akpak --room 100 --ticks 120 --capture hd.bmp
 
-# A clean vanilla run: no --mod and no sibling mods/ discovery
+# A clean vanilla run: no --mod and no discovery
 cargo run -- re1.akpak --no-mods --room 100
 
-# Every sibling mods/*.akpak applies automatically
+# Every mod in the pack's sibling mods/ and in <config dir>/mods applies
+# automatically. Only top-level *.akpak files and mod directories are
+# candidates; the per-user directory is %APPDATA%\arklay\mods on Windows and
+# <XDG config>/arklay/mods elsewhere. `[mods]` in arklay.toml enables,
+# disables and orders them by manifest id (see docs/modding.md).
 cargo run -- re1.akpak --room 100
 
 # Inspect a pack's manifest, layers and merged entries

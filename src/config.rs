@@ -6,8 +6,8 @@
 //! configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! keys and two tables (the `[graphics]` table also takes bare integers and
-//! booleans):
+//! root keys and three tables (the `[graphics]` table also takes bare integers
+//! and booleans):
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
@@ -31,6 +31,15 @@
 //! display = 1            # the display to open on, from 1
 //! render_scale = 100     # GPU: the 3D scene's size, % of the viewport (25..400)
 //! msaa = 1               # GPU: the 3D scene's samples per pixel (1, 2, 4, 8)
+//!
+//! # Discovered mods (the game pack's sibling `mods/` and `<config dir>/mods`).
+//! # `enabled` narrows the discovered set when present; `disabled` always
+//! # wins; `order` names ids applied first, in that order. Explicit `--mod`
+//! # layers bypass the enable/disable selection.
+//! [mods]
+//! enabled = ["hd", "demo"]
+//! disabled = ["balance"]
+//! order = ["demo", "hd"]
 //! ```
 //!
 //! Saved games default to `<config dir>/save` (the `savedat1..8.dat` slot
@@ -55,6 +64,21 @@ pub const DIR_NAME: &str = "arklay";
 pub const DIR_ENV: &str = "ARKLAY_CONFIG_DIR";
 /// The default save directory's name inside the configuration directory.
 pub const SAVE_DIR_NAME: &str = "save";
+/// The per-user mods directory's name inside the configuration directory.
+pub const MODS_DIR_NAME: &str = "mods";
+
+/// The `[mods]` selection over auto-discovered mod layers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Mods {
+    /// When `Some`, only these discovered mod ids apply; `None` means every
+    /// discovered mod that is not disabled.
+    pub enabled: Option<Vec<String>>,
+    /// Discovered mod ids that never apply.
+    pub disabled: Vec<String>,
+    /// Mod ids applied first, in this order; the rest follow by their
+    /// manifest `(load_order, id)`.
+    pub order: Vec<String>,
+}
 
 /// The user configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,6 +92,8 @@ pub struct Config {
     pub bindings: Option<Bindings>,
     /// The `[graphics]` table over the defaults.
     pub graphics: Graphics,
+    /// The `[mods]` enable/disable/order selection.
+    pub mods: Mods,
 }
 
 /// The table the parser is in.
@@ -76,6 +102,7 @@ enum Table {
     Root,
     Bindings,
     Graphics,
+    Mods,
     /// A table that could not be used; its keys are skipped.
     Ignored,
 }
@@ -108,6 +135,11 @@ impl Config {
     /// The default save directory: `<config dir>/save`.
     pub fn default_save_dir() -> PathBuf {
         Self::dir().join(SAVE_DIR_NAME)
+    }
+
+    /// The per-user mods directory: `<config dir>/mods`.
+    pub fn default_mods_dir() -> PathBuf {
+        Self::dir().join(MODS_DIR_NAME)
     }
 
     /// Read the configuration file, never failing: a missing file is the
@@ -166,8 +198,10 @@ impl Config {
         let mut warnings = Vec::new();
         let mut table = Table::Root;
         let mut seen_graphics = false;
+        let mut seen_mods = false;
         let mut bound = Vec::new();
         let mut graphics_keys: Vec<String> = Vec::new();
+        let mut mod_keys: Vec<String> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let content = strip_comment(raw).trim();
@@ -184,7 +218,11 @@ impl Config {
                         seen_graphics = true;
                         Table::Graphics
                     }
-                    Some(name @ ("bindings" | "graphics")) => {
+                    Some("mods") if !seen_mods => {
+                        seen_mods = true;
+                        Table::Mods
+                    }
+                    Some(name @ ("bindings" | "graphics" | "mods")) => {
                         warnings.push(format!("line {line}: duplicate [{name}] table ignored"));
                         Table::Ignored
                     }
@@ -205,6 +243,7 @@ impl Config {
                 Table::Graphics => {
                     parse_graphics_line(&mut config.graphics, &mut graphics_keys, content, line)
                 }
+                Table::Mods => parse_mods_line(&mut config.mods, &mut mod_keys, content, line),
                 Table::Bindings => parse_binding_line(&mut config, &mut bound, content, line),
             };
             if let Err(err) = parsed {
@@ -232,6 +271,14 @@ impl Config {
         }
         if let Some(language) = &self.language {
             out.push_str(&format!("language = {}\n", quote(language)));
+        }
+        let mods = render_mods(&self.mods);
+        if !mods.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[mods]\n");
+            out.push_str(&mods);
         }
         if let Some(bindings) = &self.bindings {
             if !out.is_empty() {
@@ -376,6 +423,31 @@ fn parse_binding_line(
     Ok(())
 }
 
+/// Parse one `[mods]` line into `mods`.
+fn parse_mods_line(
+    mods: &mut Mods,
+    seen: &mut Vec<String>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if seen.iter().any(|seen| seen == key) {
+        bail!("line {line}: duplicate key `{key}`");
+    }
+    seen.push(key.to_string());
+    let ids = parse_string_array(value, line)?;
+    if ids.iter().any(String::is_empty) {
+        bail!("line {line}: `{key}` contains an empty mod id");
+    }
+    match key {
+        "enabled" => mods.enabled = Some(ids),
+        "disabled" => mods.disabled = ids,
+        "order" => mods.order = ids,
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
 /// Parse one `[graphics]` line into `graphics`.
 fn parse_graphics_line(
     graphics: &mut Graphics,
@@ -435,6 +507,22 @@ fn parse_graphics_key(graphics: &mut Graphics, key: &str, value: &str, line: usi
         other => bail!("line {line}: unknown key `{other}`"),
     }
     Ok(())
+}
+
+/// The `[mods]` keys that are set; an absent `enabled` is not written.
+fn render_mods(mods: &Mods) -> String {
+    let mut out = String::new();
+    if let Some(enabled) = &mods.enabled {
+        let ids: Vec<String> = enabled.iter().map(|id| quote(id)).collect();
+        out.push_str(&format!("enabled = [{}]\n", ids.join(", ")));
+    }
+    for (key, ids) in [("disabled", &mods.disabled), ("order", &mods.order)] {
+        if !ids.is_empty() {
+            let ids: Vec<String> = ids.iter().map(|id| quote(id)).collect();
+            out.push_str(&format!("{key} = [{}]\n", ids.join(", ")));
+        }
+    }
+    out
 }
 
 /// The `[graphics]` keys that differ from the defaults.
@@ -680,6 +768,7 @@ mod tests {
             language: Some("en-US".into()),
             bindings: None,
             graphics: Graphics::default(),
+            mods: Mods::default(),
         }
         .render();
         assert_eq!(text, "save_dir = \"/tmp/saves\"\nlanguage = \"en-US\"\n");
@@ -867,6 +956,57 @@ mod tests {
         // A bindings table that locks out the menus falls back as a whole.
         let (config, warnings) = Config::parse_lenient("[bindings]\nconfirm = []\n");
         assert_eq!((config.bindings, warnings.len()), (None, 1));
+    }
+
+    #[test]
+    fn a_mods_table_selects_and_orders_discovered_mods() {
+        let config = Config::parse(
+            "[mods]\n\
+             enabled = [\"hd\", 'demo']  # only these discovered mods\n\
+             disabled = [\"balance\"]\n\
+             order = [\"demo\", \"hd\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.mods,
+            Mods {
+                enabled: Some(vec!["hd".into(), "demo".into()]),
+                disabled: vec!["balance".into()],
+                order: vec!["demo".into(), "hd".into()],
+            }
+        );
+        let text = config.render();
+        assert!(text.starts_with("[mods]\n"), "{text}");
+        assert_eq!(Config::parse(&text).unwrap(), config);
+        // An empty `enabled` list is meaningful (apply no discovered mods) and
+        // survives the round trip.
+        let config = Config::parse("[mods]\nenabled = []\n").unwrap();
+        assert_eq!(config.mods.enabled, Some(Vec::new()));
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+        // A config without the table keeps the all-discovered default.
+        assert_eq!(Config::parse("").unwrap().mods, Mods::default());
+    }
+
+    #[test]
+    fn bad_mods_values_warn_and_keep_their_defaults() {
+        for text in [
+            "[mods]\nenabled = [\"\"]\n",
+            "[mods]\nenabled = [\"hd\" \"demo\"]\n",
+            "[mods]\nenabled = [\"hd\"\n",
+            "[mods]\nunknown = [\"hd\"]\n",
+            "[mods]\nenabled = [\"hd\"]\norder = [\"hd\"]\norder = []\n",
+            "[mods]\n[mods]\n",
+            "[mods]\nenabled = 3\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
+            let (_, warnings) = Config::parse_lenient(text);
+            assert!(!warnings.is_empty(), "{text:?} must warn");
+        }
+        // A bad mods line does not lose the rest of the file.
+        let (config, warnings) =
+            Config::parse_lenient("language = \"ja-JP\"\n[mods]\nunknown = []\n");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(config.language.as_deref(), Some("ja-JP"));
     }
 
     #[test]

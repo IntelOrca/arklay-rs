@@ -2,8 +2,9 @@
 
 Arklay is a from-scratch engine for the classic Resident Evil games. A game
 installation is migrated into an `.akpak` pack by `convert-game`; the runtime
-opens the pack, loads one room and drives it at a fixed 30 Hz. Everything
-game-specific lives in the pack, so the engine has no hard-coded game data.
+opens the pack (an `.akpak` image or a directory of unpacked entries), loads
+one room and drives it at a fixed 30 Hz. Everything game-specific lives in the
+pack, so the engine has no hard-coded game data.
 
 This document is the map: the modules and their responsibilities, the frame
 data flow, the trust boundaries, the format inventory with each reader's
@@ -49,7 +50,7 @@ responsibility.
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
 | `message` | Runtime | The seven-state message window and its byte grammar |
 | `save` | Runtime | The 0x800-byte BioCard block, slot I/O, the folder scan and explicit-path actions the screen API uses, `Apply_to`/`from_state` round-trip |
-| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]` and `[graphics]`; the default `<config dir>/save` location |
+| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]`, `[graphics]` and `[mods]`; the default `<config dir>/save` and `<config dir>/mods` locations |
 | `audio` | Runtime | WAV parsing and the single SDL3 software mixer used for SE, voice, BGM and film audio |
 | `bgm` | Runtime | The three-channel music state machine, ramps and channel hand-off |
 | `sfx` | Runtime | Per-room sound-name tables and footstep resolution |

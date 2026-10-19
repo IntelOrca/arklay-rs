@@ -110,7 +110,7 @@ use crate::message::MessageInput;
 use crate::model::{Clip, Emd};
 use crate::movie::{self, MovieSession, MovieTick};
 use crate::objects;
-use crate::pack::{AssetClass, Pack};
+use crate::pack::{AssetClass, LayerOptions, ModLayer, Pack};
 use crate::player;
 use crate::player_script;
 use crate::rdt;
@@ -290,8 +290,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         id,
         capture,
         ticks,
-        &[],
-        false,
+        &ModOptions::default(),
         false,
         false,
         None,
@@ -302,9 +301,9 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 
 /// [`run`] with the runtime layers and the `--stats` frame-time report.
 ///
-/// `mods` are the explicit `--mod` layers and `no_mods` ignores them and the
-/// sibling `mods/` discovery, exactly like [`open_game_pack`]. With `stats` the
-/// fixed-tick run records a per-tick histogram and the load/update/effect/render
+/// `mods` is the runtime layer selection, exactly like [`open_game_pack`].
+/// With `stats` the fixed-tick run records a per-tick histogram and the
+/// load/update/effect/render
 /// phases and prints the [`crate::stats`] report to stdout at exit; it runs
 /// without a capture and without opening a display. `_debug_menu` is retained
 /// for CLI compatibility: the port-only F1 room-select overlay is always
@@ -317,8 +316,7 @@ pub fn run_with_options(
     id: RoomId,
     capture: Option<&Path>,
     ticks: u32,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     stats: bool,
     _debug_menu: bool,
     language: Option<&str>,
@@ -326,7 +324,7 @@ pub fn run_with_options(
     authoring: Authoring<'_>,
 ) -> Result<()> {
     let save_dir = save::default_save_dir();
-    let pack = open_game_pack(pack, mods, no_mods, language)?;
+    let pack = open_game_pack(pack, mods, language)?;
 
     if capture.is_some() || stats || trace.path.is_some() || authoring.save_out.is_some() {
         let mut timings = stats::Stats::new();
@@ -567,45 +565,79 @@ fn active_entities(game: &game::GameState) -> usize {
         .count()
 }
 
+/// The runtime mod layer selection.
+///
+/// `explicit` holds the `--mod` paths (always applied), `no_mods` ignores both
+/// the explicit and the discovered layers, `layers` is the user config's
+/// enable/disable/order selection over discovered mods, and `global_dir` is
+/// the per-user `mods/` directory (`None` disables that discovery, which keeps
+/// library/tests runs isolated).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModOptions {
+    /// Explicit `--mod` layers, applied even when the config disables their id.
+    pub explicit: Vec<PathBuf>,
+    /// Ignore the explicit layers and both discovery directories.
+    pub no_mods: bool,
+    /// The config's selection and order for discovered mods.
+    pub layers: LayerOptions,
+    /// The per-user mods directory to scan in addition to the pack's sibling
+    /// `mods/` directory.
+    pub global_dir: Option<PathBuf>,
+}
+
 /// Open a game pack together with its runtime mod layers.
 ///
-/// `mods` are the explicit `--mod` layers. Unless `no_mods` is set, the
-/// sibling `mods/` directory is scanned for `*.akpak` candidates as well; a
-/// pack discovered and also passed explicitly applies only once. `no_mods`
-/// ignores both the discovered and the explicit layers, giving the plain
+/// Unless `options.no_mods` is set, the pack's sibling `mods/` directory and
+/// `options.global_dir` are scanned for `.akpak` files and mod source
+/// directories; `options.explicit` adds the `--mod` layers. The config's
+/// [`LayerOptions`] filters and orders the discovered layers, while an
+/// explicit layer always applies. A layer discovered and also passed
+/// explicitly applies only once (as explicit). `no_mods` gives the plain
 /// single-pack path a vanilla run needs. Layer warnings are printed once here,
 /// and a non-fatal base without a manifest still boots.
-pub fn open_game_pack(
-    path: &Path,
-    mods: &[PathBuf],
-    no_mods: bool,
-    language: Option<&str>,
-) -> Result<Pack> {
-    if no_mods {
+pub fn open_game_pack(path: &Path, options: &ModOptions, language: Option<&str>) -> Result<Pack> {
+    if options.no_mods {
         let mut pack = Pack::open(path)?;
         pack.set_language(language);
         return Ok(pack);
     }
-    let mut layers: Vec<PathBuf> = Vec::new();
+    let mut explicit: HashSet<PathBuf> = HashSet::new();
+    for path in &options.explicit {
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        if !explicit.insert(canonical) {
+            bail!("duplicate mod layer path {}", path.display());
+        }
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for layer in crate::modding::discover_mods(path) {
+    for layer in crate::modding::discover_mods(path, options.global_dir.as_deref()) {
         let canonical = std::fs::canonicalize(&layer).unwrap_or_else(|_| layer.clone());
         if seen.insert(canonical) {
-            layers.push(layer);
+            candidates.push(layer);
         }
     }
-    for layer in mods {
+    for layer in &options.explicit {
         let canonical = std::fs::canonicalize(layer).unwrap_or_else(|_| layer.clone());
         if seen.insert(canonical) {
-            layers.push(layer.clone());
+            candidates.push(layer.clone());
         }
     }
-    if layers.is_empty() {
+    if candidates.is_empty() {
         let mut pack = Pack::open(path)?;
         pack.set_language(language);
         return Ok(pack);
     }
-    let mut pack = Pack::open_layered(path, &layers)?;
+    let layers: Vec<ModLayer<'_>> = candidates
+        .iter()
+        .map(|path| {
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            ModLayer {
+                path,
+                explicit: explicit.contains(&canonical),
+            }
+        })
+        .collect();
+    let mut pack = Pack::open_layered_with(path, &layers, &options.layers)?;
     pack.set_language(language);
     for warning in pack.warnings() {
         eprintln!("warning: {warning}");
@@ -6225,8 +6257,7 @@ pub fn run_ui_with_options(
         character,
         None,
         0,
-        &[],
-        false,
+        &ModOptions::default(),
         false,
         None,
         trace::TraceOptions::default(),
@@ -6234,8 +6265,8 @@ pub fn run_ui_with_options(
     )
 }
 
-/// [`run_ui_with_options`] with the runtime layers; `mods`/`no_mods` behave
-/// exactly like [`open_game_pack`]. `_debug_menu` is retained for CLI
+/// [`run_ui_with_options`] with the runtime layers; `mods` behaves exactly
+/// like [`open_game_pack`]. `_debug_menu` is retained for CLI
 /// compatibility: the port-only F1 room-select overlay is always enabled.
 /// `trace` enables the `--ui game` oracle run: `ticks` fixed updates with a
 /// trace line per tick and the `capture_every` BMP cadence. `authoring` adds
@@ -6250,8 +6281,7 @@ pub fn run_ui_with_mods(
     character: u8,
     room: Option<RoomId>,
     demo: u8,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     _debug_menu: bool,
     language: Option<&str>,
     trace: trace::TraceOptions<'_>,
@@ -6261,7 +6291,7 @@ pub fn run_ui_with_mods(
         bail!("--load is only supported with `--ui game`");
     }
     let boot = match screen {
-        "font" => return run_font_ui(pack, capture, mods, no_mods),
+        "font" => return run_font_ui(pack, capture, mods),
         "title" => AppBoot::Title,
         "select" => AppBoot::CharSelect,
         "load" => AppBoot::SaveLoad,
@@ -6302,7 +6332,6 @@ pub fn run_ui_with_mods(
         capture,
         save_dir,
         mods,
-        no_mods,
         _debug_menu,
         language,
         trace,
@@ -6318,8 +6347,7 @@ pub fn run_root(
     pack: &Path,
     capture: Option<&Path>,
     save_dir: &Path,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     _debug_menu: bool,
     language: Option<&str>,
     renderer: Graphics,
@@ -6330,7 +6358,6 @@ pub fn run_root(
         capture,
         save_dir,
         mods,
-        no_mods,
         _debug_menu,
         language,
         trace::TraceOptions::default(),
@@ -6379,15 +6406,14 @@ fn run_ui_impl(
     boot: AppBoot,
     capture: Option<&Path>,
     save_dir: &Path,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     _debug_menu: bool,
     language: Option<&str>,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
     if capture.is_some() || trace.path.is_some() || authoring.save_out.is_some() {
-        let pack = open_game_pack(pack, mods, no_mods, language)?;
+        let pack = open_game_pack(pack, mods, language)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
             // A root-boot capture is the title capture: no automatic films.
@@ -6523,7 +6549,7 @@ fn run_ui_impl(
         return Ok(());
     }
 
-    let pack = open_game_pack(pack, mods, no_mods, language)?;
+    let pack = open_game_pack(pack, mods, language)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
     app.boot(boot)?;
     if let Mode::Play(session) = &mut app.mode {
@@ -6732,13 +6758,12 @@ pub fn run_fmv(
     character: u8,
     capture: Option<&Path>,
     ticks: u32,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     renderer: Graphics,
 ) -> Result<()> {
     let save_dir = save::default_save_dir();
     if let Some(capture_path) = capture {
-        let pack = open_game_pack(pack, mods, no_mods, None)?;
+        let pack = open_game_pack(pack, mods, None)?;
         let mut session = MovieSession::open(&pack, id, character)?;
         for _ in 0..ticks {
             // Audio-free: the fixed 30 Hz tick is the clock.
@@ -6751,7 +6776,7 @@ pub fn run_fmv(
         return display.capture(capture_path);
     }
 
-    let pack = open_game_pack(pack, mods, no_mods, None)?;
+    let pack = open_game_pack(pack, mods, None)?;
     let session = MovieSession::open(&pack, id, character)?;
     let mut app = App::new(pack, save_dir, true);
     app.queue_movie(session, None);
@@ -6776,8 +6801,7 @@ pub fn run_ending(
     character: u8,
     capture: Option<&Path>,
     ticks: u32,
-    mods: &[PathBuf],
-    no_mods: bool,
+    mods: &ModOptions,
     renderer: Graphics,
 ) -> Result<()> {
     // The debug entry plays a no-save first run: a zero clear time, the
@@ -6799,7 +6823,7 @@ pub fn run_ending(
         bail!("ending id {id} is outside 1-7");
     }
     let save_dir = save::default_save_dir();
-    let pack = open_game_pack(pack, mods, no_mods, None)?;
+    let pack = open_game_pack(pack, mods, None)?;
     let mut app = App::new(pack, save_dir, capture.is_none());
     // Keep the missing-film diagnostic the pre-sequence entry had: a pack
     // without the films would otherwise warn per film and run the RESULT
@@ -6821,13 +6845,8 @@ pub fn run_ending(
 }
 
 /// The `--ui font` screen.
-fn run_font_ui(
-    pack_path: &Path,
-    capture: Option<&Path>,
-    mods: &[PathBuf],
-    no_mods: bool,
-) -> Result<()> {
-    let pack = open_game_pack(pack_path, mods, no_mods, None)?;
+fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> Result<()> {
+    let pack = open_game_pack(pack_path, mods, None)?;
     // The sampler shows the sheet the session's language would draw with, so
     // `--language en-US --ui font` samples a packed Western sheet.
     let text = Text::load(&pack, pack.language());
@@ -15885,8 +15904,7 @@ mod tests {
             0,
             None,
             0,
-            &[],
-            false,
+            &ModOptions::default(),
             false,
             None,
             trace::TraceOptions::default(),
@@ -15912,8 +15930,7 @@ mod tests {
             0,
             None,
             0,
-            &[],
-            false,
+            &ModOptions::default(),
             false,
             None,
             trace::TraceOptions {
@@ -16189,8 +16206,10 @@ mod tests {
                 0,
                 None,
                 0,
-                std::slice::from_ref(&mod_path),
-                false,
+                &ModOptions {
+                    explicit: vec![mod_path.clone()],
+                    ..ModOptions::default()
+                },
                 false,
                 None,
                 trace::TraceOptions::default(),
@@ -16283,8 +16302,10 @@ mod tests {
                 0,
                 None,
                 0,
-                std::slice::from_ref(&mod_path),
-                false,
+                &ModOptions {
+                    explicit: vec![mod_path.clone()],
+                    ..ModOptions::default()
+                },
                 false,
                 None,
                 trace::TraceOptions::default(),

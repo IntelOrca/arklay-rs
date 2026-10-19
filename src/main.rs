@@ -676,6 +676,16 @@ fn main() -> Result<()> {
                 None => None,
             };
             let language = cli.language.clone().or_else(|| config.language.clone());
+            let mods = arklay::engine::ModOptions {
+                explicit: cli.mods.clone(),
+                no_mods: cli.no_mods,
+                layers: arklay::pack::LayerOptions {
+                    enabled: config.mods.enabled.clone(),
+                    disabled: config.mods.disabled.clone(),
+                    order: config.mods.order.clone(),
+                },
+                global_dir: Some(arklay::config::Config::default_mods_dir()),
+            };
             let trace_options = arklay::trace::TraceOptions {
                 path: cli.trace.as_deref(),
                 capture_every: cli.capture_every.unwrap_or(0),
@@ -701,8 +711,7 @@ fn main() -> Result<()> {
                     cli.character,
                     cli.capture.as_deref(),
                     cli.ticks,
-                    &cli.mods,
-                    cli.no_mods,
+                    &mods,
                     renderer,
                 );
             }
@@ -713,8 +722,7 @@ fn main() -> Result<()> {
                     cli.character,
                     cli.capture.as_deref(),
                     cli.ticks,
-                    &cli.mods,
-                    cli.no_mods,
+                    &mods,
                     renderer,
                 );
             }
@@ -738,8 +746,7 @@ fn main() -> Result<()> {
                     cli.character,
                     room,
                     cli.demo,
-                    &cli.mods,
-                    cli.no_mods,
+                    &mods,
                     cli.debug_menu,
                     language.as_deref(),
                     trace_options,
@@ -757,8 +764,7 @@ fn main() -> Result<()> {
                     cli.character,
                     None,
                     cli.demo,
-                    &cli.mods,
-                    cli.no_mods,
+                    &mods,
                     cli.debug_menu,
                     language.as_deref(),
                     trace_options,
@@ -772,8 +778,7 @@ fn main() -> Result<()> {
                     id,
                     cli.capture.as_deref(),
                     cli.ticks,
-                    &cli.mods,
-                    cli.no_mods,
+                    &mods,
                     cli.stats,
                     cli.debug_menu,
                     language.as_deref(),
@@ -788,8 +793,7 @@ fn main() -> Result<()> {
                 &pack,
                 cli.capture.as_deref(),
                 &save_dir,
-                &cli.mods,
-                cli.no_mods,
+                &mods,
                 cli.debug_menu,
                 language.as_deref(),
                 renderer,
@@ -1148,6 +1152,79 @@ entries:
     }
 
     #[test]
+    fn runtime_layer_set_discovers_directory_game_packs_and_per_user_mods() {
+        use arklay::manifest;
+        use arklay::pack::LayerOptions;
+
+        let dir = TempDir::new("runtime-global-mods");
+        let game_dir = dir.path.join("game");
+        fs::create_dir_all(game_dir.join("room")).unwrap();
+        fs::write(
+            game_dir.join(manifest::ENTRY),
+            manifest::Manifest::base("re1").render(),
+        )
+        .unwrap();
+        fs::write(game_dir.join("room/1000.rdt"), b"base").unwrap();
+
+        let global = dir.path.join("config/mods");
+        let one = global.join("one.akpak");
+        let two = global.join("two");
+        let mod_manifest = |id: &str| {
+            manifest::Manifest {
+                kind: manifest::PackKind::Mod,
+                base: Some("re1".to_string()),
+                ..manifest::Manifest::base(id)
+            }
+            .render()
+            .into_bytes()
+        };
+        let mut writer = PackWriter::new();
+        writer.add(manifest::ENTRY, mod_manifest("one")).unwrap();
+        writer.add("room/1000.rdt", b"one".to_vec()).unwrap();
+        fs::create_dir_all(&global).unwrap();
+        writer.write(&one).unwrap();
+        fs::create_dir_all(two.join("room")).unwrap();
+        fs::write(two.join(manifest::ENTRY), mod_manifest("two")).unwrap();
+        fs::write(two.join("room/1000.rdt"), b"two").unwrap();
+
+        // A directory game pack plus the per-user mods directory: only the
+        // enabled mod applies.
+        let options = arklay::engine::ModOptions {
+            global_dir: Some(global.clone()),
+            layers: LayerOptions {
+                enabled: Some(vec!["one".into()]),
+                ..LayerOptions::default()
+            },
+            ..arklay::engine::ModOptions::default()
+        };
+        let pack = arklay::engine::open_game_pack(&game_dir, &options, None).unwrap();
+        assert!(pack.is_layered());
+        assert_eq!(&*pack.read("room/1000.rdt").unwrap(), b"one");
+
+        // Config order names the later layer: `two` wins over `one`.
+        let options = arklay::engine::ModOptions {
+            global_dir: Some(global),
+            layers: LayerOptions {
+                order: vec!["one".into(), "two".into()],
+                ..LayerOptions::default()
+            },
+            ..arklay::engine::ModOptions::default()
+        };
+        let pack = arklay::engine::open_game_pack(&game_dir, &options, None).unwrap();
+        assert_eq!(&*pack.read("room/1000.rdt").unwrap(), b"two");
+
+        // `--no-mods` ignores the per-user directory too.
+        let options = arklay::engine::ModOptions {
+            no_mods: true,
+            global_dir: Some(dir.path.join("config/mods")),
+            ..arklay::engine::ModOptions::default()
+        };
+        let vanilla = arklay::engine::open_game_pack(&game_dir, &options, None).unwrap();
+        assert!(!vanilla.is_layered());
+        assert_eq!(&*vanilla.read("room/1000.rdt").unwrap(), b"base");
+    }
+
+    #[test]
     fn runtime_layer_set_discovers_siblings_and_honours_no_mods() {
         use arklay::manifest;
         use arklay::pack::Pack;
@@ -1181,14 +1258,26 @@ entries:
         layer.write(&mod_path).unwrap();
 
         // The sibling directory is discovered.
-        let discovered = arklay::engine::open_game_pack(&pack_path, &[], false, None).unwrap();
+        let discovered = arklay::engine::open_game_pack(
+            &pack_path,
+            &arklay::engine::ModOptions::default(),
+            None,
+        )
+        .unwrap();
         assert!(discovered.is_layered());
         assert_eq!(discovered.read("room/1000.rdt").unwrap().as_ref(), b"layer");
 
         // `--no-mods` ignores both the discovery and an explicit `--mod`.
-        let vanilla =
-            arklay::engine::open_game_pack(&pack_path, std::slice::from_ref(&mod_path), true, None)
-                .unwrap();
+        let vanilla = arklay::engine::open_game_pack(
+            &pack_path,
+            &arklay::engine::ModOptions {
+                explicit: vec![mod_path],
+                no_mods: true,
+                ..arklay::engine::ModOptions::default()
+            },
+            None,
+        )
+        .unwrap();
         assert!(!vanilla.is_layered());
         assert_eq!(vanilla.read("room/1000.rdt").unwrap().as_ref(), b"base");
         assert_eq!(

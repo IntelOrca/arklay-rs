@@ -235,6 +235,52 @@ fn a_malformed_manifest_is_rejected_at_open() {
 }
 
 #[test]
+fn directory_packs_and_directory_mods_list_and_extract() {
+    let dir = TempDir::new("directory-pack");
+    let game = dir.join("game");
+    std::fs::create_dir_all(game.join("room")).unwrap();
+    std::fs::write(
+        game.join(manifest::ENTRY),
+        manifest::Manifest::base("re1").render(),
+    )
+    .unwrap();
+    std::fs::write(game.join("room/1000.rdt"), b"base").unwrap();
+    std::fs::write(game.join("notes.txt"), b"notes").unwrap();
+
+    let output = run(&["list", game.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let listed = stdout(&output);
+    assert!(listed.contains("room/1000.rdt"), "{listed}");
+    assert!(listed.contains("manifest.toml"), "{listed}");
+
+    let mod_dir = dir.join("moddir");
+    std::fs::create_dir_all(mod_dir.join("room")).unwrap();
+    let mod_manifest = manifest::Manifest {
+        kind: manifest::PackKind::Mod,
+        base: Some("re1".to_string()),
+        ..manifest::Manifest::base("demo")
+    };
+    std::fs::write(mod_dir.join(manifest::ENTRY), mod_manifest.render()).unwrap();
+    std::fs::write(mod_dir.join("room/1000.rdt"), b"mod").unwrap();
+
+    let out = dir.join("out");
+    let output = run(&[
+        "extract",
+        game.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--mod",
+        mod_dir.to_str().unwrap(),
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        std::fs::read(out.join("room/1000.rdt")).unwrap(),
+        b"mod",
+        "the directory mod layer did not win"
+    );
+}
+
+#[test]
 fn a_malformed_script_names_its_line() {
     let dir = TempDir::new("bad-s");
     let input = dir.join("bad.s");

@@ -7,9 +7,10 @@
 //! text source itself is not packed; every other file, including other `.toml`
 //! files, is packed verbatim.
 //!
-//! [`discover_mods`] scans a pack's sibling `mods/` directory for `*.akpak`
-//! candidates in stable sorted order; the engine then sorts the layers by
-//! their manifests when it opens them.
+//! [`discover_mods`] scans a pack's sibling `mods/` directory and the per-user
+//! `<config dir>/mods` directory for top-level `*.akpak` files and mod source
+//! directories in stable sorted order; the engine then filters and orders the
+//! layers from the user configuration when it opens them.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -197,34 +198,66 @@ pub fn build_mod(dir: &Path, out: &Path, base: Option<&Path>) -> Result<ModSumma
     })
 }
 
-/// Scan the sibling `mods/` directory of `pack` for `*.akpak` candidates.
+/// Scan the sibling `mods/` directory of `pack` and the per-user `global`
+/// directory for mod candidates.
 ///
+/// Only top-level entries are considered: an `.akpak` file, or a directory
+/// holding a `manifest.toml` mod source. Nested directories are not scanned.
 /// Returns the paths in stable sorted order (lowercased file name, then full
-/// path) and an empty list when the directory is absent.
-pub fn discover_mods(pack: &Path) -> Vec<PathBuf> {
-    let Some(dir) = pack.parent().map(|parent| parent.join("mods")) else {
-        return Vec::new();
-    };
-    let Ok(read) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut mods: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        // `Path::is_file` follows symlinks, so a pack linked into `mods/` is
-        // discovered like a regular file.
-        .filter(|path| path.is_file())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("akpak"))
-        })
-        .collect();
+/// path) and an empty list when a directory is absent. A candidate present in
+/// both locations (for example through a symlink) is returned once.
+pub fn discover_mods(pack: &Path, global: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::with_capacity(2);
+    if let Some(dir) = pack.parent().map(|parent| parent.join("mods")) {
+        dirs.push(dir);
+    }
+    if let Some(dir) = global {
+        dirs.push(dir.to_path_buf());
+    }
+
+    let mut mods: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for dir in dirs {
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut candidates: Vec<PathBuf> = read
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| is_mod_candidate(path))
+            .collect();
+        candidates.sort_by(|a, b| {
+            let a_name = a.file_name().unwrap_or_default().to_ascii_lowercase();
+            let b_name = b.file_name().unwrap_or_default().to_ascii_lowercase();
+            a_name.cmp(&b_name).then_with(|| a.cmp(b))
+        });
+        for candidate in candidates {
+            let canonical = fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            if seen.insert(canonical) {
+                mods.push(candidate);
+            }
+        }
+    }
     mods.sort_by(|a, b| {
         let a_name = a.file_name().unwrap_or_default().to_ascii_lowercase();
         let b_name = b.file_name().unwrap_or_default().to_ascii_lowercase();
         a_name.cmp(&b_name).then_with(|| a.cmp(b))
     });
     mods
+}
+
+/// Whether a top-level directory entry is a mod candidate.
+///
+/// A file must be an `.akpak` image; a directory must hold a `manifest.toml`,
+/// so an unrelated folder next to the packs is not treated as a mod. Both
+/// checks follow symlinks, so a linked pack or mod directory is discovered.
+fn is_mod_candidate(path: &Path) -> bool {
+    if path.is_file() {
+        return path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("akpak"));
+    }
+    path.is_dir() && path.join(manifest::ENTRY).is_file()
 }
 
 /// Assemble a text `.s` source into a standalone `.scd` container.
@@ -654,17 +687,46 @@ mod tests {
         write(&mods.join("a.akpak"), b"a");
         write(&mods.join("notes.txt"), b"n");
         write(&mods.join("sub/c.akpak"), b"c");
+        write(
+            &mods.join("folder/manifest.toml"),
+            mod_manifest_text("folder", "re1").as_bytes(),
+        );
 
-        let found = discover_mods(&pack);
+        let found = discover_mods(&pack, None);
         assert_eq!(
             found
                 .iter()
                 .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-            ["a.akpak", "b.AKPAK"]
+            ["a.akpak", "b.AKPAK", "folder"]
         );
 
-        assert!(discover_mods(&dir.path.join("elsewhere/missing.akpak")).is_empty());
+        assert!(discover_mods(&dir.path.join("elsewhere/missing.akpak"), None).is_empty());
+    }
+
+    #[test]
+    fn discover_mods_scans_the_global_directory_top_level_only() {
+        let dir = TempDir::new("discover-global");
+        let pack = dir.path.join("game.akpak");
+        write(&pack, b"pack");
+        let global = dir.path.join("config/mods");
+        write(&global.join("two.akpak"), b"two");
+        write(
+            &global.join("one/manifest.toml"),
+            mod_manifest_text("one", "re1").as_bytes(),
+        );
+        write(&global.join("nested/three.akpak"), b"three");
+        write(&global.join("unrelated/data.bin"), b"data");
+
+        let found = discover_mods(&pack, Some(&global));
+        assert_eq!(
+            found
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            ["one", "two.akpak"],
+            "only top-level mod files/directories are candidates"
+        );
     }
 
     #[test]
@@ -679,7 +741,7 @@ mod tests {
         #[cfg(not(unix))]
         write(&mods.join("link.akpak"), b"mod");
 
-        let found = discover_mods(&pack);
+        let found = discover_mods(&pack, None);
         assert_eq!(
             found
                 .iter()

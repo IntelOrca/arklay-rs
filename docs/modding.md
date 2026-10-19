@@ -46,26 +46,65 @@ A base pack without a manifest is tolerated as `id = <file stem>`,
 
 ## Layers at runtime
 
-```sh
-# Explicit layers, repeatable; later load_order wins a shared entry
-arklay re1.akpak --mod mods/balance.akpak --mod mods/demo.akpak --room 100
+A game pack — the positional argument, `--mod`, and every pack command — may
+be either an `.akpak` image or a directory of unpacked entries. A directory
+pack maps every regular file below it to an entry named by its
+directory-relative path (the layout `arklay extract` writes) and reads entries
+on demand, so it does not load the whole game into memory. A directory mod must
+hold `manifest.toml`; `arklay mod build` is optional when running directly.
 
-# Sibling mods/ discovery: every sibling mods/*.akpak is applied
+```sh
+# Explicit layers, repeatable; later load_order wins a shared entry. A mod may
+# be an .akpak or a source directory.
+arklay re1.akpak --mod mods/balance.akpak --mod mods/demo --room 100
+
+# Discovery: every top-level *.akpak or mod directory in the pack's sibling
+# mods/ and in the per-user <config dir>/mods directory is applied. On Windows
+# that is %APPDATA%\arklay\mods; ARKLAY_CONFIG_DIR relocates both.
 arklay re1.akpak --room 100
 
 # A clean vanilla run: no discovery, no --mod
 arklay re1.akpak --no-mods --room 100
 ```
 
-Mods sort by `(load_order, id)`; within one layer the existing ASCII
-case-insensitive lookup wins. Duplicate mod ids and duplicate layer paths are
-rejected, and a mod may only name a `base` matching the base pack's id. With no
-layers at all the engine takes exactly the single-pack path, so a run without
-`--mod` (and with no sibling `mods/`) is byte-identical to earlier releases.
+`<config dir>/mods` holds per-user mods next to the config file. Only its
+top-level entries are candidates: an `.akpak` file or a directory containing
+`manifest.toml`. A nested directory is not scanned, so a mod's own asset tree
+is never mistaken for another mod.
 
-`arklay list`, `arklay extract` and `arklay pack info` accept `--mod`
-too; `pack info` prints the manifest, the applied layers and the merged entry
-table.
+### Configuring discovered mods
+
+`arklay.toml`'s `[mods]` table selects and orders discovered mods by their
+manifest `id`:
+
+```toml
+[mods]
+# When present, only these discovered ids apply (an empty list applies none).
+enabled = ["hd", "demo"]
+# Always excluded from discovery.
+disabled = ["balance"]
+# Application order: these ids apply first in this order, then the rest by
+# (manifest load_order, id).
+order = ["demo", "hd"]
+```
+
+`disabled` wins over `enabled`. An explicit `--mod` layer always applies, even
+when the config excludes its id, and prints a warning; `--no-mods` ignores the
+explicit layers and both discovery directories. A missing `[mods]` table keeps
+the default: every discovered mod applies in `(load_order, id)` order. An
+`enabled` id that was not discovered is reported as a warning.
+
+Mods sort by the configured `order`, then by `(load_order, id)`; within one
+layer the existing ASCII case-insensitive lookup wins. Duplicate mod ids and
+duplicate layer paths are rejected, and a mod may only name a `base` matching
+the base pack's id. With no layers at all the engine takes exactly the
+single-pack path, so a run without `--mod` (and with no discovered mods) is
+byte-identical to earlier releases.
+
+`arklay list`, `arklay extract` and `arklay pack info` accept `--mod` too;
+`pack info` prints the manifest, the applied layers and the merged entry table.
+Their `--mod` paths accept directories, but they do not auto-discover the
+sibling or per-user directories.
 
 ## Replacement formats
 
@@ -1038,5 +1077,5 @@ them.
 
 A capture or headless run is deterministic. Lua hooks run in a fixed order on
 fixed ticks, and `api:log` writes to stderr only, so a `--capture` BMP with
-hooks still matches between runs; a run with no `--mod` and no sibling `mods/`
+hooks still matches between runs; a run with no `--mod` and no discovered mods
 matches the pre-M15 captures exactly.

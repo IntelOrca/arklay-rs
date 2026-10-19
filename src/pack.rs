@@ -469,6 +469,8 @@ struct Entry {
     offset: usize,
     length: usize,
     compression: Compression,
+    /// The backing file for a directory-backed pack; `None` reads `data`.
+    file: Option<PathBuf>,
 }
 
 /// The asset classes a stem lookup resolves, with their replacement formats.
@@ -556,7 +558,8 @@ impl<'a> PackAsset<'a> {
         let Some((layer, entry)) = self.shadowed else {
             return Ok(None);
         };
-        let data = entry_bytes(&layer.data, entry)
+        let data = layer
+            .entry_bytes(entry)
             .with_context(|| format!("failed to read asset entry {}", entry.path))?;
         Ok(Some(AssetCopy {
             path: &entry.path,
@@ -577,12 +580,54 @@ pub fn extension_of(path: &str) -> String {
     }
 }
 
-/// A parsed `.akpak` pack, optionally layered over by mod packs.
+/// One requested mod layer: an `.akpak` image or a mod source directory.
+#[derive(Debug, Clone, Copy)]
+pub struct ModLayer<'a> {
+    /// The pack image or mod source directory.
+    pub path: &'a Path,
+    /// Explicit `--mod` layers apply even when the config disables their id.
+    pub explicit: bool,
+}
+
+/// The user configuration's selection and order for discovered mods.
 ///
-/// A plain [`Pack::open`] holds one pack image; [`Pack::open_layered`] adds an
-/// owned list of mod layers. Every lookup then resolves the overlays last to
-/// first and the base last, so a mod can shadow any entry without any loader
-/// changing. A pack with no overlays follows exactly the single-pack path.
+/// Explicit [`ModLayer`]s bypass the enabled/disabled filter; the order still
+/// applies to every layer. A layer not named by [`LayerOptions::order`] sorts
+/// after the named ones by its manifest `(load_order, id)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayerOptions {
+    /// When `Some`, only these discovered mod ids apply; `None` applies every
+    /// discovered mod not in [`LayerOptions::disabled`].
+    pub enabled: Option<Vec<String>>,
+    /// Discovered mod ids that never apply.
+    pub disabled: Vec<String>,
+    /// Mod ids in application order, first applied first.
+    pub order: Vec<String>,
+}
+
+impl LayerOptions {
+    /// Whether a discovered mod with `id` is selected.
+    fn allows(&self, id: &str) -> bool {
+        !self.disabled.iter().any(|disabled| disabled == id)
+            && self
+                .enabled
+                .as_ref()
+                .is_none_or(|enabled| enabled.iter().any(|enabled| enabled == id))
+    }
+
+    /// The configured application rank of `id`, when it is named.
+    fn rank(&self, id: &str) -> Option<usize> {
+        self.order.iter().position(|ordered| ordered == id)
+    }
+}
+
+/// A parsed `.akpak` pack or directory pack, optionally layered over by mods.
+///
+/// A plain [`Pack::open`] holds one pack image or indexes one directory;
+/// [`Pack::open_layered`] adds an owned list of mod layers. Every lookup then
+/// resolves the overlays last to first and the base last, so a mod can shadow
+/// any entry without any loader changing. A pack with no overlays follows
+/// exactly the single-pack path.
 #[derive(Debug)]
 pub struct Pack {
     data: Vec<u8>,
@@ -604,17 +649,57 @@ pub struct Pack {
 impl Pack {
     /// Read and parse a pack from disk.
     ///
-    /// The file size is checked against [`budget::MAX_PACK_BYTES`] before the
-    /// image is read, so an oversized pack is rejected without allocating it.
+    /// A directory is treated as a pack whose entries are its regular files,
+    /// named by their directory-relative `/`-separated path. Those entries are
+    /// read lazily; the directory is only indexed here. A file is an `.akpak`
+    /// image, and its size is checked against [`budget::MAX_PACK_BYTES`]
+    /// before the image is read, so an oversized pack is rejected without
+    /// allocating it.
     pub fn open(path: &Path) -> Result<Self> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("failed to read pack {}", path.display()))?;
+        if metadata.is_dir() {
+            return Self::open_dir(path);
+        }
         budget::check_len_u64(metadata.len(), budget::MAX_PACK_BYTES, "pack file size")
             .with_context(|| format!("failed to read pack {}", path.display()))?;
         let data = std::fs::read(path)
             .with_context(|| format!("failed to read pack {}", path.display()))?;
         let mut pack = Self::from_bytes(data)?;
         pack.source = Some(path.to_path_buf());
+        Ok(pack)
+    }
+
+    /// Index every regular file below `root` as a lazily read pack entry.
+    fn open_dir(root: &Path) -> Result<Self> {
+        let mut entries = Vec::new();
+        collect_directory(root, "", &mut entries)?;
+        budget::check_len(entries.len(), budget::MAX_PACK_ENTRIES, "pack entry count")?;
+        entries.sort_by(|a, b| {
+            a.path
+                .to_ascii_lowercase()
+                .cmp(&b.path.to_ascii_lowercase())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+        let mut lookup = HashMap::new();
+        budget::reserve_map(&mut lookup, entries.len(), "pack lookup table")?;
+        for (index, entry) in entries.iter().enumerate() {
+            let key = entry.path.to_ascii_lowercase();
+            if lookup.insert(key, index).is_some() {
+                bail!("duplicate pack entry: {}", entry.path);
+            }
+        }
+        let mut pack = Self {
+            data: Vec::new(),
+            entries,
+            lookup,
+            manifest: None,
+            source: Some(root.to_path_buf()),
+            overlays: Vec::new(),
+            warnings: Vec::new(),
+            language: None,
+        };
+        pack.manifest = pack.read_manifest()?;
         Ok(pack)
     }
 
@@ -627,6 +712,29 @@ impl Pack {
     /// manifest is tolerated as `id = <pack stem>`, `kind = base`, RE1
     /// dialects, with a warning.
     pub fn open_layered(base: &Path, mods: &[PathBuf]) -> Result<Self> {
+        let layers: Vec<ModLayer<'_>> = mods
+            .iter()
+            .map(|path| ModLayer {
+                path,
+                explicit: true,
+            })
+            .collect();
+        Self::open_layered_with(base, &layers, &LayerOptions::default())
+    }
+
+    /// Open `base` and layer the requested `layers` over it, applying the
+    /// user configuration's enable/disable selection and application order.
+    ///
+    /// Explicit [`ModLayer`]s always apply; non-explicit ones are skipped when
+    /// [`LayerOptions`] does not select their manifest id. Mods named by
+    /// `options.order` apply first in that order, then the rest by their
+    /// manifest `(load_order, id)`. Everything else matches
+    /// [`Pack::open_layered`].
+    pub fn open_layered_with(
+        base: &Path,
+        layers: &[ModLayer<'_>],
+        options: &LayerOptions,
+    ) -> Result<Self> {
         let mut pack = Self::open(base)?;
         let mut warnings = Vec::new();
         let base_declared = pack.manifest.is_some();
@@ -646,17 +754,19 @@ impl Pack {
             .id
             .clone();
 
-        let mut layers = Vec::with_capacity(mods.len());
+        let mut applied = Vec::with_capacity(layers.len());
+        let mut discovered_ids: HashSet<String> = HashSet::new();
         let mut ids: HashMap<String, PathBuf> = HashMap::new();
         let mut paths: HashSet<PathBuf> = HashSet::new();
-        for path in mods {
-            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+        for layer in layers {
+            let path = layer.path;
+            let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             if !paths.insert(canonical) {
                 bail!("duplicate mod layer path {}", path.display());
             }
-            let layer = Self::open(path)
+            let opened = Self::open(path)
                 .with_context(|| format!("failed to open mod {}", path.display()))?;
-            let Some(manifest) = layer.manifest.clone() else {
+            let Some(manifest) = opened.manifest.clone() else {
                 bail!(
                     "mod {} has no {} entry and cannot be layered",
                     path.display(),
@@ -681,7 +791,17 @@ impl Pack {
                     path.display()
                 );
             }
-            if let Some(previous) = ids.insert(manifest.id.clone(), path.clone()) {
+            discovered_ids.insert(manifest.id.clone());
+            if !layer.explicit && !options.allows(&manifest.id) {
+                continue;
+            }
+            if layer.explicit && !options.allows(&manifest.id) {
+                warnings.push(format!(
+                    "explicit mod \"{}\" is disabled by the config; applying it anyway",
+                    manifest.id
+                ));
+            }
+            if let Some(previous) = ids.insert(manifest.id.clone(), path.to_path_buf()) {
                 bail!(
                     "duplicate mod id \"{}\": {} and {}",
                     manifest.id,
@@ -689,14 +809,26 @@ impl Pack {
                     path.display()
                 );
             }
-            layers.push((manifest, layer));
+            applied.push((manifest, opened));
         }
-        layers.sort_by(|a, b| {
-            a.0.load_order
-                .cmp(&b.0.load_order)
+        if let Some(enabled) = &options.enabled {
+            for id in enabled {
+                if !discovered_ids.contains(id) {
+                    warnings.push(format!(
+                        "configured mod \"{id}\" is enabled but was not discovered"
+                    ));
+                }
+            }
+        }
+        applied.sort_by(|a, b| {
+            let a_rank = options.rank(&a.0.id).unwrap_or(usize::MAX);
+            let b_rank = options.rank(&b.0.id).unwrap_or(usize::MAX);
+            a_rank
+                .cmp(&b_rank)
+                .then_with(|| a.0.load_order.cmp(&b.0.load_order))
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
-        pack.overlays = layers.into_iter().map(|(_, layer)| layer).collect();
+        pack.overlays = applied.into_iter().map(|(_, layer)| layer).collect();
         pack.warnings = warnings;
         Ok(pack)
     }
@@ -774,30 +906,52 @@ impl Pack {
                 offset: data_offset,
                 length,
                 compression,
+                file: None,
             });
         }
 
-        let manifest = match lookup.get(&manifest::ENTRY.to_ascii_lowercase()) {
-            Some(&index) => {
-                let entry = &entries[index];
-                let bytes = entry_bytes(&data, entry)?;
-                let text =
-                    std::str::from_utf8(&bytes).context("manifest.toml is not valid UTF-8")?;
-                Some(manifest::Manifest::parse(text).context("invalid manifest.toml")?)
-            }
-            None => None,
-        };
-
-        Ok(Self {
+        let mut pack = Self {
             data,
             entries,
             lookup,
-            manifest,
+            manifest: None,
             source: None,
             overlays: Vec::new(),
             warnings: Vec::new(),
             language: None,
-        })
+        };
+        pack.manifest = pack.read_manifest()?;
+        Ok(pack)
+    }
+
+    /// Parse this pack's own `manifest.toml` entry, when it has one.
+    fn read_manifest(&self) -> Result<Option<manifest::Manifest>> {
+        let Some(&index) = self.lookup.get(&manifest::ENTRY.to_ascii_lowercase()) else {
+            return Ok(None);
+        };
+        let bytes = self.entry_bytes(&self.entries[index])?;
+        let text = std::str::from_utf8(&bytes).context("manifest.toml is not valid UTF-8")?;
+        Ok(Some(
+            manifest::Manifest::parse(text).context("invalid manifest.toml")?,
+        ))
+    }
+
+    /// The readable bytes of one entry: read from disk for a directory pack,
+    /// borrowed when the image entry is raw, decompressed when it is zstd.
+    fn entry_bytes<'a>(&'a self, entry: &Entry) -> Result<Cow<'a, [u8]>> {
+        if let Some(file) = &entry.file {
+            let metadata = std::fs::metadata(file)
+                .with_context(|| format!("failed to read pack entry {}", entry.path))?;
+            budget::check_len_u64(
+                metadata.len(),
+                budget::MAX_ENTRY_BYTES,
+                &format!("pack entry {} size", entry.path),
+            )?;
+            let data = std::fs::read(file)
+                .with_context(|| format!("failed to read pack entry {}", entry.path))?;
+            return Ok(Cow::Owned(data));
+        }
+        entry_bytes(&self.data, entry)
     }
 
     /// The parsed `manifest.toml`, when the pack carries one.
@@ -896,7 +1050,8 @@ impl Pack {
                     continue;
                 };
                 if winner.is_none() {
-                    let data = entry_bytes(&layer.data, entry)
+                    let data = layer
+                        .entry_bytes(entry)
                         .with_context(|| format!("failed to read asset entry {}", entry.path))?;
                     winner = Some(AssetCopy {
                         path: &entry.path,
@@ -950,7 +1105,7 @@ impl Pack {
             .lookup
             .get(&path.to_ascii_lowercase())
             .expect("the winning layer holds the entry");
-        entry_bytes(&layer.data, &layer.entries[index])
+        layer.entry_bytes(&layer.entries[index])
     }
 
     /// Every layer's copy of `path`, base first and overlays in applied order.
@@ -965,7 +1120,7 @@ impl Pack {
         layers.extend(self.overlays.iter());
         for layer in layers {
             if let Some(index) = layer.lookup.get(&key)
-                && let Ok(bytes) = entry_bytes(&layer.data, &layer.entries[*index])
+                && let Ok(bytes) = layer.entry_bytes(&layer.entries[*index])
             {
                 stack.push(bytes);
             }
@@ -1050,6 +1205,69 @@ fn pack_stem(path: &Path) -> String {
         .and_then(|stem| stem.to_str())
         .unwrap_or("pack")
         .to_string()
+}
+
+/// Collect every regular file below `dir` as a directory-pack entry.
+///
+/// Symlinked files are followed, but symlinked directories are not, so a loop
+/// cannot make the scan run forever. Entry paths use `/` separators and are
+/// validated exactly like an image's table of contents.
+fn collect_directory(dir: &Path, prefix: &str, out: &mut Vec<Entry>) -> Result<()> {
+    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read pack directory {}", dir.display()))?
+        .collect::<std::io::Result<_>>()
+        .with_context(|| format!("failed to read pack directory {}", dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            bail!(
+                "file name {:?} under {} is not valid UTF-8",
+                name,
+                dir.display()
+            );
+        };
+        let relative = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        if file_type.is_dir() {
+            collect_directory(&entry.path(), &relative, out)?;
+            continue;
+        }
+        let file = entry.path();
+        if file_type.is_symlink() {
+            let metadata = std::fs::metadata(&file)
+                .with_context(|| format!("failed to inspect {}", file.display()))?;
+            if !metadata.is_file() {
+                continue;
+            }
+        } else if !file_type.is_file() {
+            continue;
+        }
+        validate_path(&relative)?;
+        let metadata = std::fs::metadata(&file)
+            .with_context(|| format!("failed to inspect {}", file.display()))?;
+        let length = usize::try_from(budget::check_len_u64(
+            metadata.len(),
+            budget::MAX_ENTRY_BYTES,
+            &format!("pack entry {relative} size"),
+        )?)
+        .context("pack entry size does not fit in memory")?;
+        out.push(Entry {
+            path: relative,
+            offset: 0,
+            length,
+            compression: Compression::None,
+            file: Some(file),
+        });
+        budget::check_len(out.len(), budget::MAX_PACK_ENTRIES, "pack entry count")?;
+    }
+    Ok(())
 }
 
 /// Validate an entry path for safe use on disk.
@@ -1673,6 +1891,190 @@ mod tests {
         let pack = Pack::open(&path).unwrap();
         assert_eq!(&*pack.read("A.BIN").unwrap(), &[7, 8, 9]);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn a_directory_pack_indexes_and_reads_regular_files_lazily() {
+        let dir = TempDir::new("directory");
+        std::fs::create_dir_all(dir.join("room")).unwrap();
+        std::fs::create_dir_all(dir.join("bgm")).unwrap();
+        std::fs::write(
+            dir.join("manifest.toml"),
+            manifest::Manifest::base("re1").render(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("room/1000.rdt"), b"rdt").unwrap();
+        std::fs::write(dir.join("bgm/013.wav"), b"wav").unwrap();
+
+        let pack = Pack::open(&dir.path).unwrap();
+        assert_eq!(pack.source(), Some(dir.path.as_path()));
+        assert_eq!(pack.manifest().unwrap().id, "re1");
+        assert_eq!(
+            pack.paths().collect::<Vec<_>>(),
+            ["bgm/013.wav", "manifest.toml", "room/1000.rdt"]
+        );
+        assert_eq!(
+            pack.entries().map(|entry| entry.size()).collect::<Vec<_>>(),
+            [3, manifest::Manifest::base("re1").render().len(), 3]
+        );
+        assert!(pack.contains("ROOM/1000.RDT"));
+        assert_eq!(&*pack.read("room/1000.rdt").unwrap(), b"rdt");
+        assert_eq!(&*pack.read("BGM/013.WAV").unwrap(), b"wav");
+        assert_eq!(pack.layer_of("room/1000.rdt"), Some(dir.path.as_path()));
+
+        // Directory entries are read on demand, not copied into the pack.
+        std::fs::remove_file(dir.join("room/1000.rdt")).unwrap();
+        assert!(pack.read("room/1000.rdt").is_err());
+    }
+
+    #[test]
+    fn a_directory_mod_layer_shadows_a_pack() {
+        let dir = TempDir::new("directory-layer");
+        let base = dir.join("base.akpak");
+        write_pack(
+            &base,
+            &[
+                (
+                    manifest::ENTRY,
+                    &manifest::Manifest::base("base").render().into_bytes(),
+                ),
+                ("x.txt", b"base"),
+            ],
+        );
+        let layer = dir.join("mod");
+        write_mod_dir(&layer, "dir-mod", "base", 10, b"layer");
+
+        let layered = Pack::open_layered(&base, std::slice::from_ref(&layer)).unwrap();
+        assert_eq!(&*layered.read("x.txt").unwrap(), b"layer");
+        assert_eq!(layered.layer_of("x.txt"), Some(layer.as_path()));
+        assert!(layered.warnings().is_empty());
+    }
+
+    #[test]
+    fn layer_options_filter_and_order_discovered_mods() {
+        let dir = TempDir::new("layer-options");
+        let base = dir.join("base.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[(manifest::ENTRY, &base_manifest), ("x.txt", b"base")],
+        );
+        let a = dir.join("a");
+        let b = dir.join("b");
+        let c = dir.join("c");
+        write_mod_dir(&a, "a", "base", 30, b"a");
+        write_mod_dir(&b, "b", "base", 20, b"b");
+        write_mod_dir(&c, "c", "base", 10, b"c");
+        let layers = [
+            ModLayer {
+                path: &a,
+                explicit: false,
+            },
+            ModLayer {
+                path: &b,
+                explicit: false,
+            },
+            ModLayer {
+                path: &c,
+                explicit: false,
+            },
+        ];
+
+        // The configured order puts a and b before the unlisted c; c's lower
+        // manifest load_order only breaks ties after the configured ranks.
+        let layered = Pack::open_layered_with(
+            &base,
+            &layers,
+            &LayerOptions {
+                order: vec!["b".into(), "a".into()],
+                ..LayerOptions::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<&str> = layered
+            .overrides()
+            .map(|layer| layer.manifest().unwrap().id.as_str())
+            .collect();
+        assert_eq!(ids, ["b", "a", "c"]);
+        assert_eq!(&*layered.read("x.txt").unwrap(), b"c");
+
+        // `enabled` narrows the discovered set, and `disabled` wins over it.
+        let layered = Pack::open_layered_with(
+            &base,
+            &layers,
+            &LayerOptions {
+                enabled: Some(vec!["a".into(), "b".into()]),
+                disabled: vec!["b".into()],
+                ..LayerOptions::default()
+            },
+        )
+        .unwrap();
+        let ids: Vec<&str> = layered
+            .overrides()
+            .map(|layer| layer.manifest().unwrap().id.as_str())
+            .collect();
+        assert_eq!(ids, ["a"]);
+        assert!(layered.warnings().is_empty());
+    }
+
+    #[test]
+    fn an_explicit_layer_bypasses_the_config_filter_with_a_warning() {
+        let dir = TempDir::new("explicit-layer");
+        let base = dir.join("base.akpak");
+        let base_manifest = manifest::Manifest::base("base").render().into_bytes();
+        write_pack(
+            &base,
+            &[(manifest::ENTRY, &base_manifest), ("x.txt", b"base")],
+        );
+        let a = dir.join("a");
+        write_mod_dir(&a, "a", "base", 0, b"a");
+        let layers = [ModLayer {
+            path: &a,
+            explicit: true,
+        }];
+        let layered = Pack::open_layered_with(
+            &base,
+            &layers,
+            &LayerOptions {
+                enabled: Some(Vec::new()),
+                disabled: vec!["a".into()],
+                ..LayerOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(&*layered.read("x.txt").unwrap(), b"a");
+        assert!(
+            layered.warnings()[0].contains("explicit mod \"a\" is disabled"),
+            "{:?}",
+            layered.warnings()
+        );
+
+        // An enabled id that was not discovered is reported once.
+        let layered = Pack::open_layered_with(
+            &base,
+            &[],
+            &LayerOptions {
+                enabled: Some(vec!["missing".into()]),
+                ..LayerOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            layered.warnings()[0].contains("enabled but was not discovered"),
+            "{:?}",
+            layered.warnings()
+        );
+    }
+
+    /// Write a directory mod source with one `x.txt` entry.
+    fn write_mod_dir(path: &Path, id: &str, base: &str, load_order: i32, data: &[u8]) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join(manifest::ENTRY),
+            mod_manifest(id, base, load_order),
+        )
+        .unwrap();
+        std::fs::write(path.join("x.txt"), data).unwrap();
     }
 
     /// Self-deleting temporary directory unique to this process and label.
