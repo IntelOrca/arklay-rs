@@ -16307,9 +16307,9 @@ mod tests {
         let saves_before = session.game.state_bytes[usize::from(game::STATE_BYTE_SAVES)];
         assert!(ribbons >= 1, "the capture seeds a ribbon");
 
-        // The script confirms the first row: it deletes the old file, writes
-        // a new one and leaves; the engine mirrors the write into the live
-        // state.
+        // The script's top row is `Create New` in save mode: it writes a new
+        // file and leaves without touching the existing one. The engine
+        // mirrors the write into the live state.
         for _ in 0..30 {
             app.update(confirm_input(), player::Input::default(), false)
                 .unwrap();
@@ -16323,7 +16323,10 @@ mod tests {
             ribbons - 1,
             "the write consumed the live ribbon"
         );
-        assert!(!saves.join("old.dat").exists(), "the old file was replaced");
+        assert!(
+            saves.join("old.dat").exists(),
+            "Create New replaced an existing file"
+        );
         let written = save::load_file(&saves.join("save_01.dat")).unwrap();
         assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
         assert_eq!(
@@ -16331,6 +16334,93 @@ mod tests {
             saves_before + 1,
             "the save counter advanced"
         );
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn the_lua_save_screen_overwrites_the_selected_existing_row() {
+        let dir = TempDir::new();
+        let base = new_game_pack(&dir);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let old = save::SaveFile {
+            stage: 0,
+            room: NEW_GAME_ROOM,
+            character: 0,
+            saves: 2,
+            ..save::SaveFile::default()
+        };
+        save::save_to_path(&saves.join("old.dat"), &old).unwrap();
+
+        let pack = Pack::open_layered(&pack_path, &[mod_path]).unwrap();
+        let mut app = App::new(pack, saves.clone(), false);
+        app.open_save_capture().unwrap();
+
+        // Row 0 is `Create New`; move to the first file before confirming.
+        app.update(
+            UiInput {
+                any: true,
+                down: true,
+                ..UiInput::default()
+            },
+            player::Input::default(),
+            false,
+        )
+        .unwrap();
+        for _ in 0..30 {
+            app.update(confirm_input(), player::Input::default(), false)
+                .unwrap();
+        }
+
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected the resumed session");
+        };
+        assert!(session.save_screen.is_none(), "the screen never closed");
+        assert!(
+            !saves.join("old.dat").exists(),
+            "the selected row was not replaced"
+        );
+        let written = save::load_file(&saves.join("save_01.dat")).unwrap();
+        assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn the_lua_save_screen_create_new_skips_a_case_variant_name() {
+        let dir = TempDir::new();
+        let base = new_game_pack(&dir);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let existing = save::SaveFile {
+            stage: 0,
+            room: NEW_GAME_ROOM,
+            character: 0,
+            ..save::SaveFile::default()
+        };
+        save::save_to_path(&saves.join("SAVE_01.DAT"), &existing).unwrap();
+
+        let pack = Pack::open_layered(&pack_path, &[mod_path]).unwrap();
+        let mut app = App::new(pack, saves.clone(), false);
+        app.open_save_capture().unwrap();
+
+        for _ in 0..30 {
+            app.update(confirm_input(), player::Input::default(), false)
+                .unwrap();
+        }
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected the resumed session");
+        };
+        assert!(session.save_screen.is_none(), "the screen never closed");
+        assert!(
+            saves.join("SAVE_01.DAT").exists(),
+            "Create New overwrote a case variant"
+        );
+        // The scan lowercases names, so the free name after SAVE_01.DAT is
+        // save_02.dat rather than an overlapping save_01.dat.
+        let written = save::load_file(&saves.join("save_02.dat")).unwrap();
+        assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
     }
 
     #[cfg(feature = "lua")]

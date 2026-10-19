@@ -817,6 +817,19 @@ mod tests {
                 .contains("register_save_screen")
         );
         crate::lua::verify_source(&pack.read("script/loadsave.lua").unwrap()).unwrap();
+
+        // The Japanese screen text must be spellable with the shipped 14-px
+        // sheet; an unsupported character would render as a missing-glyph box.
+        let japanese = pack.read("language/ja-JP.txt").unwrap();
+        let japanese = std::str::from_utf8(&japanese).unwrap();
+        let japanese = crate::language::Language::parse(japanese).unwrap();
+        for (key, entry) in japanese.iter() {
+            assert_eq!(
+                entry.missing_glyphs(crate::charset::Script::Japanese),
+                0,
+                "{key} wants a glyph the Japanese font lacks"
+            );
+        }
     }
 
     #[test]

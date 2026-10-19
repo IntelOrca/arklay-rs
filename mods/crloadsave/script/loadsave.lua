@@ -3,7 +3,8 @@
 -- The folder-based typewriter screen: every save file in the save directory
 -- is a row (labelled with its base name), the selected row is a highlight
 -- band, and a detail line shows the highlighted save's character, save count
--- and location. The last row is `Exit`.
+-- and location. Save mode puts a `Create New` row above the files; the last
+-- row is `Exit`.
 --
 -- The mod's `mod.lua` registers this entry with `api:register_save_screen`;
 -- the engine knows nothing about the screen itself. The API it uses is the
@@ -27,7 +28,7 @@ local BLUE = "#3F7DFA" -- CR's save-row blue, over the sheet's grey ramp
 
 local mode = "load"
 local saves = {}
-local cursor = 0 -- 0..count; the final row is Exit
+local cursor = 0 -- row index (not save index); the final row is Exit
 local scroll = 0 -- the first visible row
 local message = nil -- an error line, cleared by any key
 local leaving = false -- the load screen's fade-out is running
@@ -43,14 +44,29 @@ local function clamp(value, low, high)
     return value
 end
 
--- The row count: the save files plus the exit row.
-local function row_count()
-    return #saves + 1
+-- The row count: the save files, the save mode's `Create New` row and the
+-- exit row.
+local function new_rows()
+    return mode == "save" and 1 or 0
 end
 
--- The save entry under the cursor, or nil for the exit row.
+local function row_count()
+    return #saves + new_rows() + 1
+end
+
+-- The save file under the cursor, or nil for the `Create New` and exit rows.
 local function selected()
-    return saves[cursor + 1]
+    return saves[cursor + 1 - new_rows()]
+end
+
+-- Whether `row` is save mode's `Create New` row.
+local function is_new_row(row)
+    return mode == "save" and row == 0
+end
+
+-- Whether the cursor is on save mode's `Create New` row.
+local function create_new()
+    return is_new_row(cursor)
 end
 
 -- A language string, or `fallback` when the pack does not carry the key.
@@ -68,19 +84,24 @@ local function draw_line(api, text, y, colour)
     end
 end
 
--- The first free `save_NN.dat` name.
+-- The first free `save_NN.dat` name, or nil when every candidate is taken.
+-- Save names compare case-insensitively, like the save directory's own listing
+-- (Windows filesystems may hand back either case).
 local function new_name()
     local used = {}
     for _, entry in ipairs(saves) do
-        used[entry.name] = true
+        used[string.lower(entry.name)] = true
     end
     for index = 1, 9999 do
         local name = string.format("save_%02d.dat", index)
-        if not used[name] then
+        if not used[string.lower(name)] then
             return name
         end
     end
-    return "save.dat"
+    if not used["save.dat"] then
+        return "save.dat"
+    end
+    return nil
 end
 
 function on_open(api)
@@ -101,6 +122,51 @@ local function leave(api)
         api:exit()
     else
         leaving = true
+    end
+end
+
+-- Report that the save directory has no free file name.
+local function no_name(api)
+    api:sound("cancel")
+    message = string_or(api, "UI_SAVE_CR_NO_FREE_NAME", "No free save name")
+end
+
+-- Write the pending block to a fresh name and leave on success.
+local function save_new(api)
+    local name = new_name()
+    if not name then
+        no_name(api)
+        return
+    end
+    api:sound("save_confirm")
+    local ok, err = api:save(name)
+    if ok then
+        leave(api)
+    else
+        api:sound("cancel")
+        message = err
+    end
+end
+
+-- Replace the selected row: delete its file (when it is a save), write a new
+-- one and leave on success.
+local function save_over(api, entry)
+    local name = new_name()
+    if not name then
+        no_name(api)
+        return
+    end
+    api:sound("save_confirm")
+    -- CR overwrites by deleting the old file and writing a new one.
+    if entry.loadable then
+        api:remove(entry.name)
+    end
+    local ok, err = api:save(name)
+    if ok then
+        leave(api)
+    else
+        api:sound("cancel")
+        message = err
     end
 end
 
@@ -135,7 +201,9 @@ function update(api, input)
         api:sound("save_cursor")
     elseif input.confirm then
         local entry = selected()
-        if not entry then
+        if create_new() then
+            save_new(api)
+        elseif not entry then
             api:sound("cancel")
             leave(api)
         elseif mode == "load" then
@@ -150,18 +218,7 @@ function update(api, input)
                 api:sound("cancel")
             end
         else
-            api:sound("save_confirm")
-            -- CR overwrites by deleting the old file and writing a new one.
-            if entry.loadable then
-                api:remove(entry.name)
-            end
-            local ok, err = api:save(new_name())
-            if ok then
-                leave(api)
-            else
-                api:sound("cancel")
-                message = err
-            end
+            save_over(api, entry)
         end
     elseif input.cancel then
         api:sound("cancel")
@@ -205,8 +262,10 @@ function draw(api)
             break
         end
         local y = ROW_Y + index * ROW_PITCH + TEXT_LIFT
-        local entry = saves[row + 1]
-        if entry then
+        local entry = saves[row + 1 - new_rows()]
+        if is_new_row(row) then
+            draw_line(api, string_or(api, "UI_SAVE_CR_CREATE_NEW", "Create New"), y)
+        elseif entry then
             -- CR draws a save file's name blue and the exit row white.
             draw_line(api, entry.base, y, entry.loadable and BLUE or "grey")
         else
@@ -215,7 +274,9 @@ function draw(api)
     end
 
     local entry = selected()
-    if entry and entry.loadable then
+    if create_new() then
+        -- The `Create New` row has no save to describe.
+    elseif entry and entry.loadable then
         -- CR draws the character name blue and the count/location white, the
         -- whole line centred.
         local name = entry.character_name or "?"

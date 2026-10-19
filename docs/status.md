@@ -633,8 +633,8 @@ stays the default, and a script that cannot load or errors while running falls
 back to it (or leaves the screen) instead of trapping the player, so a broken
 mod never costs the typewriter. The CR layout follows the disassembly notes
 and the running DLL's captures: ten 15-px rows from y 49, the measured panel
-and selection band, the centred detail line, folder-based save names and
-overwrite-by-delete.
+and selection band, the centred detail line, folder-based save names,
+overwrite-by-delete and a white `Create New` row at the top of the save screen.
 
 Mod hooks are read per layer now: a mod's manifest `lua` list used to be
 ignored when the base pack named hooks, so a mod had to bury its registration

@@ -59,9 +59,11 @@ the Japanese grid — had been drawing missing-glyph boxes on a USA pack.
 
 CR's save mode was never captured (the notes record the load mode only), so
 the shipped script's save flow is the port's own reading of the disassembly:
-confirming a row deletes the old file, writes a new one and leaves the screen.
-There is no confirmation dialog, matching CR's overwrite-by-delete. The
-typewriter's ink-ribbon consumption and the save counter stay in the engine
+save mode always lists a white `Create New` row above the files, and
+confirming it writes the first free `save_NN.dat` and leaves the screen.
+Confirming an existing row keeps CR's overwrite-by-delete, writing a new file
+and leaving. There is no confirmation dialog, matching CR's overwrite-by-delete.
+The typewriter's ink-ribbon consumption and the save counter stay in the engine
 and are unchanged by the screen choice.
 
 ## Bounded: the app's registration pass

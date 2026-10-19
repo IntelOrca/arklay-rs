@@ -1,6 +1,8 @@
+UI_SAVE_CR_CREATE_NEW = "Create New"
 UI_SAVE_CR_DO_NOT_LOAD = "Do not load"
 UI_SAVE_CR_DO_NOT_SAVE = "Do not save"
 UI_SAVE_CR_EXIT = "Exit"
 UI_SAVE_CR_LOAD = "Load"
+UI_SAVE_CR_NO_FREE_NAME = "No free save name"
 UI_SAVE_CR_SAVE = "Save"
 UI_SAVE_CR_UNLOADABLE = "Not loadable"
