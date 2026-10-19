@@ -6774,7 +6774,11 @@ fn run_ui_impl(
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
-    if capture.is_some() || trace.path.is_some() || authoring.save_out.is_some() {
+    if capture.is_some()
+        || trace.path.is_some()
+        || trace.capture_dir.is_some()
+        || authoring.save_out.is_some()
+    {
         let pack = open_game_pack(pack, mods, language)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
         match boot {
@@ -6782,6 +6786,9 @@ fn run_ui_impl(
             AppBoot::Boot | AppBoot::Title => {
                 // Reach the option menu, then let the fade settle.
                 app.open_title()?;
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.update(
                     UiInput {
                         any: true,
@@ -6790,18 +6797,30 @@ fn run_ui_impl(
                     player::Input::default(),
                     false,
                 )?;
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(48)?;
             }
             AppBoot::CharSelect => {
                 app.open_select()?;
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(48)?;
             }
             AppBoot::SaveLoad => {
                 app.open_load()?;
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(48)?;
             }
             AppBoot::Save => {
                 app.open_save_capture()?;
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(SAVE_CAPTURE_TICKS)?;
             }
             AppBoot::NewGame { character, room } => {
@@ -6830,11 +6849,17 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::ItemBox => {
                 app.open_item_box_capture()?;
                 if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                if play_app_script(&mut app, &trace)? {
                     return Ok(());
                 }
                 app.settle(ITEM_BOX_CAPTURE_TICKS)?;
@@ -6844,11 +6869,17 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(DEBUG_CAPTURE_TICKS)?;
             }
             AppBoot::File => {
                 app.open_file_capture()?;
                 if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                if play_app_script(&mut app, &trace)? {
                     return Ok(());
                 }
                 app.settle(FILE_CAPTURE_TICKS)?;
@@ -6858,6 +6889,9 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(MENU_CAPTURE_TICKS)?;
             }
             AppBoot::View => {
@@ -6865,11 +6899,17 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(VIEW_CAPTURE_TICKS)?;
             }
             AppBoot::Death(character) => {
                 app.open_death_capture(character)?;
                 if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                if play_app_script(&mut app, &trace)? {
                     return Ok(());
                 }
                 app.settle(DEATH_CAPTURE_TICKS)?;
@@ -6885,6 +6925,9 @@ fn run_ui_impl(
                 if apply_authoring(&mut app, authoring)? {
                     return Ok(());
                 }
+                if play_app_script(&mut app, &trace)? {
+                    return Ok(());
+                }
                 app.settle(RESULT_CAPTURE_TICKS)?;
             }
             AppBoot::EndingEpilogue => {
@@ -6896,6 +6939,9 @@ fn run_ui_impl(
                 });
                 app.open_epilogue()?;
                 if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                if play_app_script(&mut app, &trace)? {
                     return Ok(());
                 }
                 app.settle(EPILOGUE_CAPTURE_TICKS)?;
@@ -6921,6 +6967,43 @@ fn run_ui_impl(
     }
     let mut display = Display::new("Arklay", false, authoring.renderer)?;
     run_app_loop(&mut app, &mut display)
+}
+
+/// Play a scripted `--input` over an app-level `--ui` boot (the title, the
+/// menus, the ending screens) when one is given without `--trace`: one app
+/// update per scripted tick, each followed by a draw and a `f%05d.bmp`
+/// capture on the `--capture-every` cadence. The screens' own regression
+/// captures drive them through whole interactions this way.
+///
+/// Returns `false` (nothing played) for a plain capture boot.
+fn play_app_script(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<bool> {
+    let Some(script) = options.input else {
+        return Ok(false);
+    };
+    if options.path.is_some() {
+        return Ok(false);
+    }
+    if let Some(dir) = options.capture_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+    }
+    let mut script_input = InputState::default();
+    for index in 0..options.ticks {
+        let tick = script_input.tick_scripted(script.word_at(index));
+        if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
+            break;
+        }
+        if let Mode::Play(session) = &mut app.mode {
+            session.movie = None;
+        }
+        app.pending_movie = None;
+        app.draw();
+        if options.capture_every > 0 && index % options.capture_every == 0 {
+            write_trace_capture(app, options, index)?;
+        }
+        app.post_present();
+    }
+    Ok(true)
 }
 
 /// Apply the CLI authoring seams to the session an app boot just opened:
