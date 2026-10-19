@@ -171,6 +171,20 @@ impl InventoryEditor {
         self.picker.as_ref()
     }
 
+    /// Clamp the remembered slot to the live capacity after the menu was
+    /// closed: a character change can shrink the inventory while it is
+    /// hidden, leaving the cursor past the last row.
+    pub(super) fn refresh(&mut self, game: &GameState) {
+        let capacity = game.inventory_capacity();
+        self.slot = self.slot.min(capacity.saturating_sub(1));
+        self.scroll = self.scroll.min(capacity.saturating_sub(VISIBLE_SLOTS));
+        if self.slot < self.scroll {
+            self.scroll = self.slot;
+        } else if self.slot >= self.scroll + VISIBLE_SLOTS {
+            self.scroll = self.slot + 1 - VISIBLE_SLOTS;
+        }
+    }
+
     /// One tick of input against the live inventory.
     pub(super) fn handle_input(&mut self, input: UiInput, game: &mut GameState) -> Step {
         let capacity = game.inventory_capacity();
@@ -425,6 +439,20 @@ mod tests {
             editor.handle_input(press(|i| i.cancel = true), &mut game),
             Step::Back
         );
+    }
+
+    #[test]
+    fn refresh_clamps_the_remembered_slot_to_the_new_capacity() {
+        let mut jill = game(1);
+        let mut editor = InventoryEditor::default();
+        // Jill has eight slots: up wraps to the last one and scrolls.
+        editor.handle_input(press(|i| i.up = true), &mut jill);
+        assert_eq!((editor.slot, editor.scroll), (7, 4));
+        // Chris has six: the remembered cursor lands on the last one and the
+        // window keeps four rows visible.
+        editor.refresh(&game(0));
+        assert_eq!(editor.slot, 5);
+        assert_eq!(editor.scroll, 2);
     }
 
     #[test]

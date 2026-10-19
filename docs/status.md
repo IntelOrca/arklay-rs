@@ -572,8 +572,9 @@ The F1 debug tools are a port-only development aid the retail game never
 shipped. They are always available (`--debug-menu` is accepted for
 compatibility only); they open only on F1, so captures and goldens that never
 press the key are unaffected. F1 freezes the room behind a dark panel listing
-eight tools; confirm opens one, cancel backs out one level and F1 closes from
-anywhere. `--ui debug` captures the list.
+nine tools; confirm opens one, cancel backs out one level and F1 closes from
+anywhere. Reopening returns to the same tool, and ROOM SELECT follows the room
+the player moved to while the panel was hidden. `--ui debug` captures the list.
 
 - ROOM SELECT: the pack's rooms in seven stage columns, the current room in
   green; a jump uses the pending character's room variant when it is packed.

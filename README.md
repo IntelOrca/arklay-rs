@@ -123,8 +123,9 @@ cargo run -- re1.akpak --renderer gpu --render-scale 4
 
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
-# CLEAR GAME, CONTROLS). Confirm opens a tool, Esc backs out one level, F1 closes from
-# anywhere. `--ui debug` captures the tool list
+# CLEAR GAME, CONTROLS). Confirm opens a tool, Esc backs out one level, F1 closes
+# from anywhere and reopening returns to the same tool. `--ui debug` captures
+# the tool list
 cargo run -- re1.akpak --room 100
 cargo run -- re1.akpak --ui debug --capture debug.bmp
 ```

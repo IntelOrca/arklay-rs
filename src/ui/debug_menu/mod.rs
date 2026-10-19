@@ -10,8 +10,10 @@
 //!
 //! The engine drives the menu like the pause menu: one state machine owning
 //! the current tool and every tool's state, ticked over the frozen room and
-//! drawn last. Edits that only touch [`GameState`] (inventory, flags, cheats,
-//! the pending player selection) happen inside
+//! drawn last. F1 closes it from anywhere and reopening returns to the tool
+//! and cursors it was left on; the room browser also follows a room change
+//! made while the menu was closed. Edits that only touch [`GameState`]
+//! (inventory, flags, cheats, the pending player selection) happen inside
 //! [`DebugMenu::handle_input`]; everything that needs the room-load path, the
 //! save directory or the app is returned as a [`DebugMenuEvent`].
 //!
@@ -238,6 +240,17 @@ impl DebugMenu {
             ending_row: usize::from(default_ending(game).clamp(1, 7) - 1),
             controls: ControlsEditor::new(bindings),
         }
+    }
+
+    /// Reattach the menu to the live session after it was closed: the open
+    /// tool and every cursor are kept, while the room browser follows
+    /// `current` if the room changed, the inventory cursor is clamped to the
+    /// live capacity and the CONTROLS editor picks up the window's
+    /// `bindings`.
+    pub fn reopen(&mut self, current: RoomId, game: &GameState, bindings: &Bindings) {
+        self.rooms.refresh(current);
+        self.inventory.refresh(game);
+        self.controls.refresh(bindings);
     }
 
     /// The CONTROLS tool's state (its bindings are the edited map).
@@ -766,6 +779,39 @@ mod tests {
         menu.handle_input(confirm(), &mut game);
         assert!(menu.inventory().picker().is_some());
         assert_eq!(menu.handle_input(f1(), &mut game), DebugMenuEvent::Close);
+    }
+
+    #[test]
+    fn reopening_keeps_the_tool_and_moves_the_room_cursor_with_the_session() {
+        let mut game = GameState::default();
+        let mut menu = menu(&game);
+        enter(&mut menu, &mut game, Tool::Rooms);
+        assert_eq!(
+            menu.rooms().selected().map(|room| (room.stage, room.room)),
+            Some((1, 0))
+        );
+        menu.handle_input(down(), &mut game);
+        assert_eq!(
+            menu.rooms().selected().map(|room| (room.stage, room.room)),
+            Some((1, 1))
+        );
+
+        // Staying in the same room keeps the cursor where the player left it.
+        menu.reopen(RoomId::parse("1000").unwrap(), &game, &Bindings::default());
+        assert_eq!(menu.tool(), Some(Tool::Rooms), "the tool is remembered");
+        assert_eq!(
+            menu.rooms().selected().map(|room| (room.stage, room.room)),
+            Some((1, 1))
+        );
+
+        // A room change while the menu was closed moves the cursor onto it.
+        menu.handle_input(up(), &mut game);
+        menu.reopen(RoomId::parse("1010").unwrap(), &game, &Bindings::default());
+        assert_eq!(menu.tool(), Some(Tool::Rooms));
+        assert_eq!(
+            menu.rooms().selected().map(|room| (room.stage, room.room)),
+            Some((1, 1))
+        );
     }
 
     #[test]

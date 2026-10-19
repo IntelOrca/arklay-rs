@@ -110,7 +110,7 @@ pub fn room_entries(pack: &Pack, preferred_player: u8) -> Vec<RoomId> {
 pub struct RoomSelect {
     /// The rooms of stage `index + 1`.
     columns: Vec<Vec<RoomVariants>>,
-    /// The session's room when the menu opened.
+    /// The session's room as the menu last saw it.
     current: (u8, u8),
     column: usize,
     rows: [usize; STAGE_COLUMNS],
@@ -172,6 +172,27 @@ impl RoomSelect {
     /// The room under the cursor (`None` in an empty column).
     pub fn selected(&self) -> Option<&RoomVariants> {
         self.columns[self.column].get(self.rows[self.column])
+    }
+
+    /// Follow the session after the menu was closed: when `current` changed
+    /// (a debug jump, a door), re-mark it and put the cursor on it. A reopen
+    /// with the same current room keeps the cursor where it was.
+    pub fn refresh(&mut self, current: RoomId) {
+        let room = (current.stage, current.room);
+        if self.current == room {
+            return;
+        }
+        self.current = room;
+        let column = usize::from(room.0).wrapping_sub(1);
+        if let Some(row) = self
+            .columns
+            .get(column)
+            .and_then(|rooms| rooms.iter().position(|entry| entry.room == room.1))
+        {
+            self.column = column;
+            self.rows[column] = row;
+            self.scroll_into_view();
+        }
     }
 
     /// One tick of input: the jump target in `character`'s variant on confirm.
@@ -383,6 +404,27 @@ mod tests {
         // The first column remembers its row.
         select.handle_input(press(|i| i.right = true), 0);
         assert_eq!((select.column(), select.row()), (0, 0));
+    }
+
+    #[test]
+    fn refresh_follows_a_room_across_stages_and_scrolls_the_columns() {
+        let pack = column_pack();
+        let mut select = RoomSelect::new(&pack, RoomId::parse("1000").unwrap());
+        assert_eq!((select.column(), select.scroll_column()), (0, 0));
+
+        // Stage 2 is already inside the visible window.
+        select.refresh(RoomId::parse("2010").unwrap());
+        assert_eq!((select.column(), select.row()), (1, 1));
+        assert_eq!(select.scroll_column(), 0);
+        let room = select.selected().unwrap();
+        assert_eq!((room.stage, room.room), (2, 1));
+
+        // Stage 7 is off the right edge, so the window scrolls to it.
+        select.refresh(RoomId::parse("7000").unwrap());
+        assert_eq!((select.column(), select.scroll_column()), (6, 4));
+        assert_eq!((select.row(), select.scroll_row()), (0, 0));
+        let room = select.selected().unwrap();
+        assert_eq!((room.stage, room.room), (7, 0));
     }
 
     #[test]

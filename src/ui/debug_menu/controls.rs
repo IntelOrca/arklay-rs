@@ -85,6 +85,14 @@ impl ControlsEditor {
         &self.bindings
     }
 
+    /// Reattach the editor to the window's `bindings` after the menu was
+    /// closed, dropping an armed capture and its status note.
+    pub fn refresh(&mut self, bindings: &Bindings) {
+        self.bindings = bindings.clone();
+        self.capture = None;
+        self.note = None;
+    }
+
     /// The selected `(row, slot)`.
     pub fn cursor(&self) -> (usize, usize) {
         (self.row, self.slot)
@@ -413,6 +421,30 @@ mod tests {
         }
         assert!(!editor.capturing(), "the capture gives up");
         assert_eq!(editor.bindings(), &Bindings::default());
+    }
+
+    #[test]
+    fn refresh_takes_the_session_bindings_and_drops_a_capture_and_note() {
+        let mut bindings = Bindings::default();
+        assert!(bindings.unbind(Action::Aim, 0));
+        let slot = bindings.get(Action::Aim).len();
+        let source = Source::key(sdl3_sys::scancode::SDL_SCANCODE_X);
+        assert!(bindings.bind(Action::Aim, slot, source));
+
+        let mut editor = ControlsEditor::new(&Bindings::default());
+        editor.handle_input(press(|i| i.confirm = true));
+        assert!(editor.capturing());
+        editor.refresh(&bindings);
+        assert_eq!(editor.bindings(), &bindings, "the session map wins");
+        assert!(!editor.capturing(), "the close dropped the capture");
+
+        // A duplicate leaves a note behind, which the reopen also clears.
+        editor.handle_input(press(|i| i.confirm = true));
+        editor.handle_input(captured(Bindings::default().get(Action::Up)[0]));
+        assert_eq!(editor.note(), Some(Note::Duplicate));
+        editor.refresh(&bindings);
+        assert_eq!(editor.bindings(), &bindings);
+        assert_eq!(editor.note(), None, "and its status note");
     }
 
     #[test]

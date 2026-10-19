@@ -1275,6 +1275,9 @@ struct GameSession {
     /// The open debug room-select overlay; the room stays frozen while it is
     /// up and the last gameplay frame stays under it.
     debug_menu: Option<DebugMenu>,
+    /// The debug overlay's state while it is closed, so F1 reopens the tool,
+    /// cursor and room selection it was left on.
+    debug_menu_memory: Option<DebugMenu>,
     /// The action map the window reads, which the debug menu's CONTROLS
     /// tool edits.
     bindings: controls::Bindings,
@@ -1634,6 +1637,7 @@ impl GameSession {
             sprite_anim_intensity: 0,
             debug_menu_enabled: true,
             debug_menu: None,
+            debug_menu_memory: None,
             bindings: controls::Bindings::default(),
             bindings_changed: false,
             return_title: None,
@@ -2816,15 +2820,19 @@ impl GameSession {
         std::mem::take(&mut self.return_title_requested)
     }
 
-    /// Open the F1 debug menu on its tool list over the frozen room.
+    /// Open the F1 debug menu on its tool list over the frozen room. The
+    /// state from the last time it was open is reused, so F1 returns to the
+    /// tool and cursors it was left on.
     fn open_debug_menu(&mut self, pack: &Pack) {
         self.ensure_menu_assets(pack);
-        self.debug_menu = Some(DebugMenu::open(
-            pack,
-            self.loaded.id,
-            &self.game,
-            &self.bindings,
-        ));
+        let menu = match self.debug_menu_memory.take() {
+            Some(mut menu) => {
+                menu.reopen(self.loaded.id, &self.game, &self.bindings);
+                menu
+            }
+            None => DebugMenu::open(pack, self.loaded.id, &self.game, &self.bindings),
+        };
+        self.debug_menu = Some(menu);
     }
 
     /// Take the debug menu's pending LOAD GAME slot.
@@ -2871,7 +2879,7 @@ impl GameSession {
             return;
         }
         if event != DebugMenuEvent::None {
-            self.debug_menu = None;
+            self.debug_menu_memory = self.debug_menu.take();
         }
         match event {
             DebugMenuEvent::None | DebugMenuEvent::Close | DebugMenuEvent::BindingsChanged => {}
@@ -12577,6 +12585,55 @@ mod tests {
                 session.player.collision_flags
             ),
             "the arrival lands outside collision"
+        );
+    }
+
+    /// F1 closes the overlay without forgetting the tool or its cursors.
+    #[test]
+    fn f1_reopens_the_debug_overlay_on_the_last_tool() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        debug_enter(&mut session, &pack, Tool::Flags);
+        debug_press(&mut session, &pack, |ui| ui.right = true);
+        let (group, row) = {
+            let menu = session.debug_menu.as_ref().unwrap();
+            (menu.flags().group(), menu.flags().row())
+        };
+        assert_eq!(group, 1, "the FLAGS group moved off the first one");
+
+        debug_press(&mut session, &pack, |ui| ui.debug_menu = true);
+        assert!(session.debug_menu.is_none(), "F1 hides the overlay");
+        debug_press(&mut session, &pack, |ui| ui.debug_menu = true);
+        let menu = session.debug_menu.as_ref().unwrap();
+        assert_eq!(menu.tool(), Some(Tool::Flags), "the tool is remembered");
+        assert_eq!(menu.flags().group(), group, "and so is the group");
+        assert_eq!(menu.flags().row(), row, "and the row");
+    }
+
+    /// The room browser follows a debug jump: reopening puts the cursor on
+    /// the room the jump landed in, not the one the menu was opened from.
+    #[test]
+    fn f1_after_a_debug_jump_reopens_the_room_tool_on_the_new_room() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, b) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        debug_enter(&mut session, &pack, Tool::Rooms);
+        debug_press(&mut session, &pack, |ui| ui.down = true);
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
+        assert_eq!(session.loaded.id, b, "the jump landed in B");
+        assert!(session.debug_menu.is_none(), "the jump closes the overlay");
+
+        debug_press(&mut session, &pack, |ui| ui.debug_menu = true);
+        let menu = session.debug_menu.as_ref().unwrap();
+        assert_eq!(menu.tool(), Some(Tool::Rooms), "ROOM SELECT is remembered");
+        let selected = menu.rooms().selected().unwrap();
+        assert_eq!(
+            (selected.stage, selected.room),
+            (b.stage, b.room),
+            "the cursor follows the jumped-to room"
         );
     }
 
