@@ -331,7 +331,7 @@ impl EntityAnim {
     ///
     /// A `0x10` look-at flag enables the slew; bit 0 enables the yaw and bit 1
     /// the pitch. The yaw target is the angle to the target minus the entity's
-    /// own facing; the pitch is the target's elevation over the horizontal
+    /// own facing (or, with bit `0x20`, the target X field itself); the pitch is the target's elevation over the horizontal
     /// distance. The yaw slew is the original's exact routine: it snaps only
     /// when the remaining turn is under one step, keeps the previous angle
     /// when the snap would land outside the +/-0x2C8 cone, decays a zero
@@ -350,7 +350,12 @@ impl EntityAnim {
         if entity.look_at_flags & 0x10 == 0 {
             return;
         }
-        let yaw_target = if entity.look_at_flags & 0x01 != 0 {
+        let yaw_target = if entity.look_at_flags & 0x01 == 0 {
+            0
+        } else if entity.look_at_flags & 0x20 != 0 {
+            // Bit 0x20: the target X field is the absolute yaw.
+            entity.target[0] as u16 & 0x0FFF
+        } else {
             crate::sfx::angle_between_xz(
                 entity.pos[0],
                 entity.pos[2],
@@ -359,8 +364,6 @@ impl EntityAnim {
             )
             .wrapping_sub(entity.angle)
                 & 0x0FFF
-        } else {
-            0
         };
         let origin = joint_world.unwrap_or(entity.pos);
         let pitch_enable = i32::from((entity.look_at_flags & 0x02) >> 1);
@@ -901,6 +904,34 @@ mod tests {
         entity.target = [1000, 0, 0];
         clock.slew_look_at(&entity, None);
         assert_eq!(clock.look_at_yaw, frozen);
+    }
+
+    #[test]
+    fn look_at_absolute_mode_reads_the_angles_from_the_target() {
+        // Room 40C's script: flags 0x33 aim Chris's head at yaw 400 and
+        // pitch 3796 directly, then swing the yaw to 3696. The reference
+        // steps 150, 300, 400 and back down through 250, 100, -50 ... -400.
+        let mut clock = EntityAnim::default();
+        let mut entity = entity(0, 0, 0);
+        entity.angle = 0x123; // ignored in absolute mode
+        entity.look_at_flags = 0x33;
+        entity.look_at_yaw_step = 150;
+        entity.look_at_pitch_step = 100;
+        entity.target = [400, 3796, 0];
+        let mut yaws = Vec::new();
+        for _ in 0..4 {
+            clock.slew_look_at(&entity, None);
+            yaws.push(clock.look_at_yaw);
+        }
+        assert_eq!(yaws, [150, 300, 400, 400]);
+        assert_eq!(clock.look_at_pitch, -300);
+        entity.target[0] = 3696;
+        yaws.clear();
+        for _ in 0..7 {
+            clock.slew_look_at(&entity, None);
+            yaws.push(clock.look_at_yaw);
+        }
+        assert_eq!(yaws, [250, 100, -50, -200, -350, -400, -400]);
     }
 
     #[test]

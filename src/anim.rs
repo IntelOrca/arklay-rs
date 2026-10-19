@@ -299,20 +299,42 @@ pub(crate) fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
     matrix
 }
 
-/// The look-at tracking joint's local rotation: a Y-X-Z Euler rotation with
-/// the given yaw and pitch, composed from the existing trig tables. The
-/// original builds it with `RotMatrixYXZ(0, yaw, pitch)` and composes it onto
-/// the joint's world matrix.
+/// The look-at tracking joint's local rotation, `RotMatrixYXZ(0, yaw, pitch)`
+/// (0x00409ed0): the yaw turns about Y and the pitch about Z, the angles
+/// handed to the component math are `(0x1000 - x, y, 0x1000 - z)`, and the
+/// nine 14-bit components are scaled to 4.12 with a truncating `>> 2`. The
+/// original composes it onto the joint's world matrix.
 pub fn look_at_matrix(yaw: i16, pitch: i16) -> Mat4x3 {
-    let yaw = Mat4x3 {
-        r: rotation_matrix(0, i32::from(yaw), 0),
-        t: [0; 3],
-    };
-    let pitch = Mat4x3 {
-        r: rotation_matrix(i32::from(pitch), 0, 0),
-        t: [0; 3],
-    };
-    compose(&yaw, &pitch)
+    let components = rotation_components_yxz(0x1000, i32::from(yaw), 0x1000 - i32::from(pitch));
+    let mut r = [[0i32; 3]; 3];
+    for (slot, component) in components.iter().enumerate() {
+        r[slot / 3][slot % 3] = (*component + ((*component >> 31) & 3)) >> 2;
+    }
+    Mat4x3 { r, t: [0; 3] }
+}
+
+/// `GteRotationMatrixYXZ` (0x00440b70): the nine 14-bit Y-X-Z components,
+/// built from sum and difference angles exactly like the original, each
+/// halving a truncating `/ 2` and each product a `>> 14` corrected toward
+/// zero.
+fn rotation_components_yxz(x: i32, y: i32, z: i32) -> [i32; 9] {
+    let shift = |temp: i32| (temp + ((temp >> 31) & 0x3FFF)) >> 14;
+    let (x_minus_y, x_plus_y, z_plus_y, y_minus_z) = (x - y, x + y, z + y, y - z);
+    [
+        shift((cos14(x_minus_y) - cos14(x_plus_y)) / 2 * sin14(z))
+            + (cos14(y_minus_z) + cos14(z_plus_y)) / 2,
+        shift((cos14(x_minus_y) - cos14(x_plus_y)) / 2 * cos14(z))
+            + (sin14(y_minus_z) - sin14(z_plus_y)) / 2,
+        (sin14(x_plus_y) - sin14(x_minus_y)) / 2,
+        (sin14(z + x) - sin14(x - z)) / 2,
+        (cos14(x - z) + cos14(z + x)) / 2,
+        -sin14(x),
+        shift((sin14(x_plus_y) + sin14(x_minus_y)) / 2 * sin14(z))
+            - (sin14(z_plus_y) + sin14(y_minus_z)) / 2,
+        shift((sin14(x_plus_y) + sin14(x_minus_y)) / 2 * cos14(z))
+            + (cos14(y_minus_z) - cos14(z_plus_y)) / 2,
+        (cos14(x_minus_y) + cos14(x_plus_y)) / 2,
+    ]
 }
 
 /// `a * b` for two [`Mat4x3`] values: rotation matrix product and the game's

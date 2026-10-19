@@ -1775,6 +1775,14 @@ pub struct EntityMesh<'a> {
     /// Yawn (ids `0x0D`/`0x12`): `render_entity` re-latches the lights at
     /// every joint's world translation before drawing it.
     pub per_joint_light: bool,
+    /// The mesh object the reference draws through its complex pool
+    /// (`ComplexTmdObjectSetup` / `FUN_00486df0`) instead of the TMD path:
+    /// Plant 42's root ball. See [`collect_complex_pool`].
+    pub complex_object: Option<usize>,
+    /// The Plant 42 body's light matrix: `MulMatrix0(g_lightMatrix, &m, &m)`
+    /// with `m` the identity, run in place. See
+    /// [`EntityLight::aliased_identity_product`].
+    pub aliased_light: bool,
 }
 
 /// The original's `GetTmdBlendMode` plus `CreateTmdObjectInternal`'s remap:
@@ -2008,8 +2016,17 @@ pub fn draw_gameplay_scene_with_effects<'a>(
             if !mesh.joint_visible(index) {
                 continue;
             }
+            if mesh.complex_object == Some(index) {
+                collect_complex_pool(object, joint, camera, texture, &mut triangles);
+                continue;
+            }
             let light = if mesh.per_joint_light {
                 lighting.latched(joint.t)
+            } else {
+                light
+            };
+            let light = if mesh.aliased_light {
+                light.aliased_identity_product()
             } else {
                 light
             };
@@ -2674,6 +2691,36 @@ pub struct EntityLight {
     pub sources: [EntityLightSource; 3],
 }
 
+impl EntityLight {
+    /// The light rows after the Plant 42 body's
+    /// `MulMatrix0(g_lightMatrix, &m, &m)` over an identity `m`. The product
+    /// is written element by element into its own right operand, so every
+    /// row after the first reads columns the earlier rows already
+    /// overwrote; only the first light keeps its direction.
+    pub fn aliased_identity_product(mut self) -> Self {
+        let rows = self.sources.map(|source| source.dir);
+        let mut product = [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]];
+        for (i, row) in rows.iter().enumerate() {
+            // Indexed on purpose: each store must be visible to the next read.
+            #[allow(clippy::needless_range_loop)]
+            for j in 0..3 {
+                let sum: i64 = (0..3)
+                    .map(|k| {
+                        let value = i64::from(row[k]) * i64::from(product[k][j]);
+                        (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS
+                    })
+                    .sum();
+                // `MulMatrix0` stores shorts.
+                product[i][j] = i32::from(sum as i16);
+            }
+        }
+        for (source, row) in self.sources.iter_mut().zip(product) {
+            source.dir = row;
+        }
+        self
+    }
+}
+
 /// One latched light in the reference's stored form: the 4.12 direction
 /// `F * normalize(entity - light)` (`FUN_0040ac80`) and its attenuated,
 /// `0x80`-capped colour byte.
@@ -3049,6 +3096,121 @@ fn collect_triangles(
     }
 }
 
+/// Project one object the way the reference's complex pool draws it.
+///
+/// `ComplexTmdObjectSetup` turns every textured triangle packet of the object
+/// into its own double-sided, unlit object (vertex colour 1.0), keyed by the
+/// view Z of its vertex centroid (`ApplyMatrixSV`). `FUN_00486df0` then
+/// selection-sorts the keys near to far and writes each object the raw GTE
+/// matrix - no `FUN_00486190` shake tilt - with its view Z pushed back by its
+/// sorted rank, so the `i`-th nearest triangle projects through `t[2] + i`.
+fn collect_complex_pool(
+    object: &TmdObject,
+    joint: &anim::Mat4x3,
+    camera: &Camera,
+    texture: usize,
+    triangles: &mut Vec<Triangle>,
+) {
+    let (rotation, _) = ref_composed(camera, joint);
+    let rotation = rotation.map(|row| row.map(i32::from));
+    let prims: Vec<&crate::model::TmdPrim> = object
+        .prims
+        .iter()
+        .filter(|prim| prim.textured && prim.quad.is_none() && !prim.raw_y)
+        .collect();
+    let mut keys: Vec<i32> = prims
+        .iter()
+        .map(|prim| {
+            let positions = prim.vertices.map(|index| {
+                object
+                    .vertices
+                    .get(usize::from(index))
+                    .copied()
+                    .unwrap_or_default()
+            });
+            // `(short)(a + b + c) / 3` per axis.
+            let centroid: [i32; 3] = std::array::from_fn(|axis| {
+                let sum: i32 = positions.iter().map(|p| i32::from(p[axis])).sum();
+                i32::from(sum as i16) / 3
+            });
+            apply_matrix_sv(&rotation, centroid)[2] as i16 as i32
+        })
+        .collect();
+    let mut ids: Vec<usize> = (0..prims.len()).collect();
+    // The original's selection sort, verbatim (it is not stable).
+    for i in 0..prims.len().saturating_sub(1) {
+        for j in i..prims.len() {
+            if keys[j] < keys[i] {
+                keys.swap(i, j);
+                ids.swap(i, j);
+            }
+        }
+    }
+    for (rank, &id) in ids.iter().enumerate() {
+        let prim = prims[id];
+        let projection = RefProjection::new_complex(camera, joint, rank);
+        let corner = |index: u16| {
+            object.vertices.get(usize::from(index)).and_then(|vertex| {
+                projection.project([
+                    f64::from(vertex[0]),
+                    -f64::from(vertex[1]),
+                    f64::from(vertex[2]),
+                ])
+            })
+        };
+        let (Some(first), Some(second), Some(third)) = (
+            corner(prim.vertices[0]),
+            corner(prim.vertices[1]),
+            corner(prim.vertices[2]),
+        ) else {
+            continue;
+        };
+        let [x0, y0] = first.0.map(f64::from);
+        let [x1, y1] = second.0.map(f64::from);
+        let [x2, y2] = third.0.map(f64::from);
+        // Both windings are listed, so exactly one survives the backface
+        // test unless the triangle is edge-on.
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if area == 0.0 || area.is_nan() {
+            continue;
+        }
+        let order = if faces_camera(area) {
+            [0, 1, 2]
+        } else {
+            [0, 2, 1]
+        };
+        let corners = [first, second, third];
+        let page_x = f64::from(u32::from(prim.tsb & 0xF) * 128);
+        let page_y = f64::from(u32::from((prim.tsb >> 4) & 1) * 256);
+        let raster: [RasterVertex; 3] = order.map(|corner| {
+            let (position, depth) = corners[corner];
+            let uv = prim.uv[corner];
+            RasterVertex {
+                position,
+                w: depth,
+                u: (f64::from(uv[0]) + page_x) as f32,
+                v: (f64::from(uv[1]) + page_y) as f32,
+                shade: [1.0; 3],
+            }
+        });
+        let depth = f64::from(
+            ((f64::from(first.1) + f64::from(second.1) + f64::from(third.1))
+                * f64::from(1.0f32 / 3.0)) as f32,
+        );
+        triangles.push(Triangle {
+            raster,
+            depth,
+            key: triangle_depth_key(depth),
+            texture,
+            palette_row: usize::from(((prim.clut >> 6) & 0x01FF).saturating_sub(480)),
+            flat: None,
+            blend: false,
+            blend_weight: None,
+            uv_nudge: [0; 3],
+        });
+    }
+}
+
 /// The reference's `g_RoomCameraData` view matrix (4.12) from the camera's
 /// from/look-at points, `MatrixToCamera` (0x0040a680). Every lighting stage
 /// uses this matrix, and it differs slightly from
@@ -3131,6 +3293,31 @@ impl RefProjection {
                     + tilt[row][2] * translation[2]
             });
         }
+        Self {
+            rotation: rotation.map(|row| row.map(f64::from)),
+            translation: translation.map(f64::from),
+            center: [
+                f64::from(CENTER_X + camera.screen[0]),
+                f64::from(CENTER_Y + camera.screen[1]),
+            ],
+            focal,
+            near: (2.0 * focal).max(1.0),
+        }
+    }
+
+    /// The complex pool's projection ([`collect_complex_pool`]): the raw GTE
+    /// matrix with no shake tilt and the view Z pushed back by `rank` (the
+    /// original's `M[14] = (float)i + (float)t[2]`).
+    fn new_complex(camera: &Camera, joint: &anim::Mat4x3, rank: usize) -> Self {
+        let (rotation, mut translation) = ref_composed(camera, joint);
+        translation[1] = translation[1].wrapping_neg();
+        let focal = f64::from(camera.fov);
+        let rotation = rotation.map(|row| row.map(|entry| f32::from(entry) / 4096.0));
+        let translation = [
+            translation[0] as f32,
+            translation[1] as f32,
+            rank as f32 + translation[2] as f32,
+        ];
         Self {
             rotation: rotation.map(|row| row.map(f64::from)),
             translation: translation.map(f64::from),
@@ -4067,6 +4254,8 @@ mod tests {
                 hidden_joints: 0,
                 light_pos: None,
                 per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
             },
             EntityMesh {
                 mesh: &mesh1,
@@ -4077,6 +4266,8 @@ mod tests {
                 hidden_joints: 0,
                 light_pos: None,
                 per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
             },
         ];
         let lighting = Lighting {
@@ -4150,6 +4341,8 @@ mod tests {
                 hidden_joints: 0,
                 light_pos: None,
                 per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
             }
         }
         let lighting = Lighting {
@@ -4365,6 +4558,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let lighting = Lighting {
             ambient: [4095; 3],
@@ -5159,6 +5354,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let camera = straight_camera();
         let lighting = Lighting {
@@ -5267,6 +5464,8 @@ mod tests {
             hidden_joints: 0b1,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5298,6 +5497,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5358,6 +5559,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
 
         let render = |mirror_from: usize, mirror: Option<&MirrorPass>| {
@@ -5405,6 +5608,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(

@@ -107,6 +107,8 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         hidden_joints: 0,
         light_pos: None,
         per_joint_light: false,
+        complex_object: None,
+        aliased_light: false,
     }];
 
     let background = bmp::decode(&pack.read(&id.cut_entry(camera_index)).unwrap()).unwrap();

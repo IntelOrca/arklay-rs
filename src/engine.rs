@@ -12325,11 +12325,14 @@ fn render_frame_on(
             } else if !entity.shadow_suppressed
                 && (entity.shadow_half_x != 0 || entity.shadow_half_z != 0)
             {
+                // Every monster's `entity_add_fade_sprite` call passes a zero
+                // height, and the draw places the quad at that height alone:
+                // a flying or hanging monster still shadows the floor.
                 Some(render::Shadow {
                     texture,
                     pos: [
                         entity.pos[0] + i32::from(entity.shadow_offset[0]),
-                        entity.pos[1] + i32::from(entity.shadow_offset[1]),
+                        0,
                         entity.pos[2] + i32::from(entity.shadow_offset[2]),
                     ],
                     angle: entity.angle,
@@ -12367,8 +12370,16 @@ fn render_frame_on(
             else {
                 continue;
             };
-            let entity_matrix =
-                anim::entity_matrix_scaled(entity.pos, entity.angle, entity.joint_scale);
+            // `EntityComputeJointWorldMatrices` rebuilds the entity matrix
+            // from the whole rotation vector, so a pitched or rolled monster
+            // (Plant 42's swaying vines) draws tilted.
+            let entity_matrix = anim::entity_matrix_rotated_scaled(
+                entity.pos,
+                entity.pitch,
+                entity.angle,
+                entity.roll,
+                entity.joint_scale,
+            );
             let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
             apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
             joints
@@ -12444,6 +12455,8 @@ fn render_frame_on(
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
     for ((asset, _, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
@@ -12456,6 +12469,8 @@ fn render_frame_on(
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
@@ -12477,6 +12492,8 @@ fn render_frame_on(
             hidden_joints: *hidden,
             light_pos: Some(light_pos),
             per_joint_light,
+            complex_object: None,
+            aliased_light: false,
         });
     }
     // The held-weapon meshes of the scripted characters draw with the
@@ -12514,6 +12531,8 @@ fn render_frame_on(
             // the character's latch.
             light_pos: Some(npc_lights[*index].0),
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -12537,6 +12556,8 @@ fn render_frame_on(
             hidden_joints: hidden,
             light_pos: Some(game.entities[0].pos),
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
     // The held weapon's mesh draws at the hand joint while the weapon bank
@@ -12566,6 +12587,8 @@ fn render_frame_on(
             hidden_joints: 0,
             light_pos: Some(game.entities[0].pos),
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
 
@@ -12646,6 +12669,8 @@ fn render_frame_on(
             hidden_joints: *hidden,
             light_pos: Some(light_pos),
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
 
@@ -12658,6 +12683,8 @@ fn render_frame_on(
     let mut companion_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut companion_hidden: Vec<u32> = Vec::new();
     let mut companion_tints: Vec<[u8; 3]> = Vec::new();
+    let mut companion_complex: Vec<Option<usize>> = Vec::new();
+    let mut companion_light_pos: Vec<Option<[i32; 3]>> = Vec::new();
     for (companion_index, companion) in game.companions.iter().enumerate() {
         let Some(companion) = companion else {
             continue;
@@ -12679,12 +12706,14 @@ fn render_frame_on(
             && (companion.entity.shadow_half_x != 0 || companion.entity.shadow_half_z != 0)
             && let Some(texture) = shadow_texture
         {
+            // `entity_add_fade_sprite(&body.t, quad, 0, 0)`: floor height
+            // and no yaw.
             let mut pos = [
                 companion.entity.pos[0] + i32::from(companion.entity.shadow_offset[0]),
-                companion.entity.pos[1] + i32::from(companion.entity.shadow_offset[1]),
+                0,
                 companion.entity.pos[2] + i32::from(companion.entity.shadow_offset[2]),
             ];
-            let mut angle = companion.entity.angle;
+            let mut angle = 0;
             tween.shadow(tween::Key::Companion(companion_index), &mut pos, &mut angle);
             shadow_list.push(render::Shadow {
                 texture,
@@ -12702,12 +12731,8 @@ fn render_frame_on(
         };
         let object = companion.mesh_object();
         let mut matrix = companion.matrix.unwrap_or_else(|| {
-            anim::entity_matrix_rotated(
-                companion.entity.pos,
-                companion.entity.pitch,
-                companion.entity.angle,
-                companion.entity.roll,
-            )
+            let [pitch, angle, roll] = companion.render_rotation();
+            anim::entity_matrix_rotated(companion.entity.pos, pitch, angle, roll)
         });
         enemy::custom_anim::scale_columns_xyz(&mut matrix, companion.render_scale());
         // One identity matrix per joint, with the companion's transform at
@@ -12726,12 +12751,22 @@ fn render_frame_on(
         companion_joints.push(joints);
         companion_hidden.push(!(1u32 << object));
         companion_tints.push(companion.entity.model_tint_rgb());
+        // The root ball's clone is built with `DAT_004d2bd8` set, which
+        // routes its object through the reference's complex pool.
+        companion_complex
+            .push((companion.kind == enemy::companion::CompanionKind::Roots).then_some(object));
+        // The plant companions latch the room lights at their own
+        // translation (`update_entity_lighting(&local.t)`), not at the
+        // placeholder first joint.
+        companion_light_pos.push((!heart).then_some(companion.entity.pos));
     }
-    for (((model, joints), hidden), tint) in companion_models
+    for (((((model, joints), hidden), tint), complex), light_pos) in companion_models
         .iter()
         .zip(&companion_joints)
         .zip(&companion_hidden)
         .zip(&companion_tints)
+        .zip(&companion_complex)
+        .zip(&companion_light_pos)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12740,8 +12775,10 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
-            light_pos: None,
+            light_pos: *light_pos,
             per_joint_light: false,
+            complex_object: *complex,
+            aliased_light: complex.is_none() && light_pos.is_some(),
         });
     }
 
@@ -12813,6 +12850,8 @@ fn render_frame_on(
             hidden_joints: *hidden,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         });
     }
 
@@ -16205,6 +16244,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);

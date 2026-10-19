@@ -765,6 +765,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         };
         let stored = stored_camera_matrix(camera.from, camera.look_at);
         let draw_matrix = mul_matrix0(&stored, &joint.r)
@@ -826,6 +828,8 @@ mod tests {
             hidden_joints: 0,
             light_pos: None,
             per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
         };
         let camera = Camera::from_points([0, 0, -5000], [0, 0, 0], 500);
         let light = Lighting {

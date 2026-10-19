@@ -19,8 +19,10 @@
 //!
 //! # Rendering
 //!
-//! The plant model carries two mesh objects beyond its joint skeleton: object
-//! 16 (the flower body, a broad leaf cluster) and object 17 (the root ball).
+//! The plant model carries two mesh objects beyond its joint skeleton: the
+//! clones take the anim slots `jointCount + 1` and `jointCount`, so object 17
+//! (the flower body, a broad leaf cluster) and object 16 (the root ball, the
+//! hanging curtain the reference draws through its complex pool).
 //! The clones are the original's per-object animation slots for those two
 //! objects, so the render pass draws exactly one object per companion at the
 //! companion's transform with the body's three scale factors (or the root
@@ -47,9 +49,9 @@ const PULSE: [u8; 90] = [
 /// Which Plant 42 companion a slot holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompanionKind {
-    /// The flower body: mesh object 16, the pulsing/shrivelling/falling core.
+    /// The flower body: mesh object 17, the pulsing/shrivelling/falling core.
     Body,
-    /// The root ball: mesh object 17, the pulsing/rising root.
+    /// The root ball: mesh object 16, the pulsing/rising root.
     Roots,
     /// The Tyrant's exposed heart: mesh object 15, riding joint 1 with its own
     /// beat and wobble scale.
@@ -120,6 +122,15 @@ pub struct Companion {
     /// The heart's own local translation (`+0x34`), the position words the
     /// drop integrates and the render composes under the joint anchor.
     pub local_t: [i32; 3],
+    /// The root ball's draw scale, latched each tick before its machine
+    /// runs: the original scales the local matrix from the timer and scale
+    /// word first and only then steps the machine. `None` until the first
+    /// tick.
+    pub latched_scale: Option<i32>,
+    /// The rotation vector (`pitch`, `angle`, `roll`) latched each tick
+    /// before the machine runs: the original's `RotMatrix` builds the local
+    /// matrix ahead of the machine's sway. `None` until the first tick.
+    pub latched_rotation: Option<[u16; 3]>,
 }
 
 impl Companion {
@@ -127,8 +138,8 @@ impl Companion {
     /// extra objects beyond its joint skeleton, or the Tyrant's heart object).
     pub fn mesh_object(&self) -> usize {
         match self.kind {
-            CompanionKind::Body => 16,
-            CompanionKind::Roots => 17,
+            CompanionKind::Body => 17,
+            CompanionKind::Roots => 16,
             CompanionKind::Heart => crate::enemy::tyrant::HEART_OBJECT,
         }
     }
@@ -141,11 +152,25 @@ impl Companion {
         match self.kind {
             CompanionKind::Body => self.scale,
             CompanionKind::Roots => {
-                let scale = i32::from(pulse(self.timer)) + i32::from(self.joint_scale);
+                let scale = self.latched_scale.unwrap_or_else(|| self.pulse_scale());
                 [scale, scale, scale]
             }
             CompanionKind::Heart => [0x1000; 3],
         }
+    }
+}
+
+impl Companion {
+    /// The rotation vector the draw uses: the one latched before the
+    /// machine ran, or the entity's own before the first tick.
+    pub fn render_rotation(&self) -> [u16; 3] {
+        self.latched_rotation
+            .unwrap_or([self.entity.pitch, self.entity.angle, self.entity.roll])
+    }
+
+    /// The root ball's pulse scale from its current timer and scale word.
+    fn pulse_scale(&self) -> i32 {
+        i32::from(pulse(self.timer)) + i32::from(self.joint_scale)
     }
 }
 
@@ -229,9 +254,12 @@ pub fn plant42_spawn(game: &mut GameState, slot: usize, flags: u8) -> Option<(u1
         vel: 0,
         tumble_z: 0,
         local_t: [0; 3],
+        latched_scale: None,
+        latched_rotation: None,
     };
-    // The clone fans by `remaining * 0x100` with one copy, so +0x100.
-    body.entity.angle = parent.angle.wrapping_add(0x100);
+    // The clone fans by `remaining * 0x100`, but the field setup that
+    // follows zeroes the whole rotation vector (`+0x72..+0x76`).
+    body.entity.angle = 0;
     body.entity.shadow_offset = [0, 0, 0];
     body.entity.shadow_half_x = 3000;
     body.entity.shadow_half_z = 3000;
@@ -284,6 +312,8 @@ pub fn plant42_spawn(game: &mut GameState, slot: usize, flags: u8) -> Option<(u1
         vel: 0,
         tumble_z: 0,
         local_t: [0; 3],
+        latched_scale: None,
+        latched_rotation: None,
     };
     roots.entity.angle = 0;
     roots.entity.pitch = 0;
@@ -564,6 +594,14 @@ pub fn plant42_tick(game: &mut GameState, room: &RoomState, slot: usize) {
             continue;
         };
         companion.live = true;
+        companion.latched_rotation = Some([
+            companion.entity.pitch,
+            companion.entity.angle,
+            companion.entity.roll,
+        ]);
+        if companion.kind == CompanionKind::Roots {
+            companion.latched_scale = Some(companion.pulse_scale());
+        }
         if !paused {
             match companion.kind {
                 CompanionKind::Body => match companion.state {
@@ -819,6 +857,8 @@ pub fn spawn_heart(game: &mut GameState, slot: usize) -> Option<u16> {
         vel: 0,
         tumble_z: 0,
         local_t: [0x138, -760, -287],
+        latched_scale: None,
+        latched_rotation: None,
     };
     heart.entity.pitch = 0;
     heart.entity.angle = 0;
@@ -971,7 +1011,7 @@ mod tests {
 
         let body_companion = game.companions[usize::from(body)].as_ref().unwrap();
         assert_eq!(body_companion.kind, CompanionKind::Body);
-        assert_eq!(body_companion.entity.angle, 0x300, "the clone fan");
+        assert_eq!(body_companion.entity.angle, 0, "the setup zeroes the fan");
         assert_eq!(body_companion.vine_pool, 4);
         assert_eq!(body_companion.scale, [0x1000; 3]);
         assert_eq!(body_companion.timer, 0x59);
@@ -1057,7 +1097,10 @@ mod tests {
         }
         plant42_tick(&mut game, &room, 1);
         let companion = game.companions[usize::from(body)].as_ref().unwrap();
-        assert_eq!(companion.entity.angle, 0x300 + 0x0F);
+        assert_eq!(
+            companion.entity.angle, 0x0F,
+            "the setup zeroed the fan angle"
+        );
         assert_eq!(companion.osc[2], 0x0E, "speed Y integrated by -Z");
         assert_eq!(companion.osc[3], -1, "the bounce flipped the acceleration");
         assert_eq!(companion.osc[0], -1, "position X integrated by -Y");
@@ -1078,10 +1121,8 @@ mod tests {
         assert_eq!(companion.action_state, 1);
         assert_eq!(companion.step, -0x10);
         assert_eq!(companion.joint_scale, 0x1000u16.wrapping_sub(0x40));
-        assert_eq!(
-            companion.render_scale(),
-            [0x1000 - 0x40, 0x1000 - 0x40, 0x1000 - 0x40]
-        );
+        // The draw scale was latched before the machine stepped the word.
+        assert_eq!(companion.render_scale(), [0x1000; 3]);
     }
 
     #[test]
