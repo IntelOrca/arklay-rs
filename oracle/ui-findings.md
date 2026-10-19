@@ -244,6 +244,15 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   fade-complete frame, two frames early (`itembox_open` 118-119,
   `inventory_open` 77-78, ~800 extra differing pixels on each). Fixed with
   `menu_reveal_delay`.
+- **Menu cursor blink.** The reference's slot cursor alternates between the
+  bright `texU 0x80` and dim `texU 0xA8` cells on the shared `DAT_00ae9f18`
+  counter (dim for the first 32 frames after any move or accepted confirm),
+  while arklay always drew it bright. `MainMenu::cursor_blink` now restarts on
+  open, move and accepted confirm, counts down on the idle navigation frames
+  and holds at zero under the submenu, and `draw_slot_cursor` picks the cell
+  from bit `0x20`. Landed with the examine-viewer rework (#57), so the
+  `inventory_open` frames that showed 158 differing pixels during the dim
+  phases (120-142/175-206/239-270) now match.
 
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,
@@ -345,14 +354,6 @@ from camera 0 with no input at all (state and pixels match for 200 ticks).
   confirm would be needed - and the port's single-swap `display_image`
   compositor stays the documented M16 simplification
   (`docs/m16-deviations.md` item 4).
-- **Menu cursor blink.** The reference's slot cursor alternates between the
-  bright `texU 0x80` and dim `texU 0xA8` cells every 32 frames of
-  `DAT_00ae9f18` (dim for the first 32 frames after any move/arm); arklay's
-  *menu* cursor is always bright, which shows up on the inventory/other menu
-  screens (not the item box, which draws its own blinking cursor now) as 158
-  differing pixels per frame during the dim phases - e.g. `inventory_open`
-  at frames 120-142/175-206/239-270 versus 0 outside them. The item box's own
-  counter and frame selection are already exact (`cursor_dim`).
 - **Portrait and health strip residual.** Every settled menu frame of every
   scenario keeps ~330 differing pixels on the character portrait
   (`ui/statface.tim`, the 30x30 window at x 22-51, y 146-175: the blue plate's
