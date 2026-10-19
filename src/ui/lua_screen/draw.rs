@@ -135,15 +135,26 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
 
     methods.add_method_mut(
         "picture",
-        |_lua, api, (stem, key): (String, Option<Value>)| {
+        |_lua, api, (stem, key, geometry): (String, Option<Value>, Option<String>)| {
             let key = match key {
                 Some(Value::Nil) | None => None,
                 Some(value) => Some(colour_rgb(&value)?),
             };
+            // "shipped" pins the art to the original sheet's size; the
+            // default lets a replacement be authored at any size.
+            let geometry = match geometry.as_deref() {
+                None | Some("free") => Geometry::Free,
+                Some("shipped") => Geometry::Shipped,
+                Some(other) => {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "unknown picture geometry {other:?}"
+                    )));
+                }
+            };
             let pack: &Pack = api.cx.pack;
-            let cache_key = format!("picture:{stem}:{key:?}");
+            let cache_key = format!("picture:{stem}:{key:?}:{geometry:?}");
             Ok(loaded(api.host.assets.load(cache_key, || {
-                crate::ui::load_picture(pack, &stem, Geometry::Free, key).map(Asset::Picture)
+                crate::ui::load_picture(pack, &stem, geometry, key).map(Asset::Picture)
             })))
         },
     );
@@ -173,6 +184,47 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             framebuffer.fill_rect(
                 rect(x, y, w, h),
                 [byte(r), byte(g), byte(b), byte(a.unwrap_or(255))],
+            );
+            Ok(())
+        },
+    );
+
+    methods.add_method_mut(
+        "blend_black_rect",
+        |_lua, api, (x, y, w, h, alpha): (i32, i32, i32, i32, i64)| {
+            let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            framebuffer.blend_black_rect(rect(x, y, w, h), byte(alpha));
+            Ok(())
+        },
+    );
+
+    #[allow(clippy::type_complexity)]
+    methods.add_method_mut(
+        "picture_sprite_scaled",
+        |_lua,
+         api,
+         (handle, sx, sy, sw, sh, dx, dy, dw, dh, scale): (
+            usize,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i64,
+        )| {
+            let Api {
+                host, framebuffer, ..
+            } = api;
+            let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            let image = host.assets.picture(handle)?;
+            framebuffer.draw_rgba_sprite_scaled(
+                image,
+                rect(sx, sy, sw, sh),
+                rect(dx, dy, dw, dh),
+                byte(scale),
             );
             Ok(())
         },

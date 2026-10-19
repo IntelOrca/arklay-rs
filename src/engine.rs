@@ -5478,7 +5478,7 @@ enum Mode {
     Boot,
     /// The title screen script.
     Title(Box<ui::lua_screen::LuaScreen>),
-    Select(Box<ui::char_select::CharSelectScreen>),
+    Select(Box<ui::lua_screen::LuaScreen>),
     Load(Box<dyn ui::save_load::SaveScreen>),
     Play(Box<GameSession>),
     /// A film owns the whole app until it ends.
@@ -5934,9 +5934,16 @@ impl App {
 
     /// Open the character-selection screen.
     fn open_select(&mut self) -> Result<()> {
-        let mut screen = ui::char_select::CharSelectScreen::new();
-        screen.open(&mut self.context())?;
+        let mut cx = self.context();
+        let screen = ui::lua_screen::LuaScreen::open_screen(
+            "char_select",
+            &[],
+            ScreenAction::Title,
+            &mut cx,
+        )?;
+        let cues = cx.cues.into_inner();
         self.mode = Mode::Select(Box::new(screen));
+        self.play_ui_cues(cues);
         Ok(())
     }
 
@@ -16517,8 +16524,8 @@ mod tests {
         let Mode::Title(screen) = &app.mode else {
             panic!("expected the title");
         };
-        assert_eq!(screen.value("load_enabled"), 1);
-        assert_eq!(screen.value("selection"), 2);
+        assert!(screen.test_eval::<bool>("return M.state.any_saves"));
+        assert_eq!(screen.test_eval::<u8>("return M.state.selection"), 2);
 
         assert!(
             run_until(&mut app, 256, |app| matches!(app.mode, Mode::Load(_))),
@@ -17010,8 +17017,8 @@ mod tests {
         let Mode::Select(screen) = &app.mode else {
             panic!("character select must stay open");
         };
-        assert!(!screen.swapping());
-        assert_eq!(screen.selected(), 1);
+        assert_eq!(screen.test_eval::<String>("return M.state.stage"), "idle");
+        assert_eq!(screen.test_eval::<u8>("return M.state.selected"), 1);
     }
 
     /// A minimal 8bpp TIM with four pixels and a 256-entry palette, enough for

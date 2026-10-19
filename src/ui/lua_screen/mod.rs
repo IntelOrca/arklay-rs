@@ -288,6 +288,16 @@ impl LuaScreen {
     }
 }
 
+#[cfg(test)]
+impl LuaScreen {
+    /// Evaluate `body` with the screen's module table bound to `M`.
+    pub(crate) fn test_eval<T: mlua::FromLuaMulti>(&self, body: &str) -> T {
+        self.vm
+            .eval(body)
+            .unwrap_or_else(|err| panic!("eval {body}: {err}"))
+    }
+}
+
 impl Screen for LuaScreen {
     /// Nothing to load: [`LuaScreen::open_load`]/[`LuaScreen::open_save`]
     /// read the script and ran `on_open` already.
@@ -347,6 +357,9 @@ struct ScreenVm {
     /// The entry chunk's environment, where a legacy script's globals live.
     #[cfg_attr(not(test), allow(dead_code))]
     env: Table,
+    /// The table the entry chunk returned (the env for a legacy script).
+    #[cfg_attr(not(test), allow(dead_code))]
+    module: Table,
     on_open: Option<Function>,
     update: Option<Function>,
     draw: Option<Function>,
@@ -390,6 +403,7 @@ impl ScreenVm {
             lua,
             budget,
             env,
+            module: table,
         })
     }
 
@@ -460,6 +474,17 @@ impl ScreenVm {
             })
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(())
+    }
+
+    /// Evaluate `body` with the module table bound to `M`, for the unit
+    /// tests.
+    #[cfg(test)]
+    fn eval<T: mlua::FromLuaMulti>(&self, body: &str) -> mlua::Result<T> {
+        let function: Function = self
+            .lua
+            .load(format!("return function(M) {body} end"))
+            .eval()?;
+        function.call(self.module.clone())
     }
 
     /// A Lua global, for the unit tests.
@@ -1157,5 +1182,7 @@ fn no_draw() -> mlua::Error {
     mlua::Error::RuntimeError("draw methods need `draw(api)`".into())
 }
 
+#[cfg(test)]
+mod screen_tests;
 #[cfg(test)]
 mod tests;
