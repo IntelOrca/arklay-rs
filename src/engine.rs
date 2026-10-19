@@ -254,6 +254,9 @@ pub struct Authoring<'a> {
     /// `--save-out`: write the session's current save block to this path and
     /// exit before ticking. The oracle's deterministic save generator.
     pub save_out: Option<&'a Path>,
+    /// `--renderer` and `--render-scale`: what an interactive window draws
+    /// with.
+    pub renderer: RendererSettings,
 }
 
 /// Load `id` from `pack`, simulate it and optionally capture one frame.
@@ -518,7 +521,7 @@ pub fn run_with_options(
                 loaded.room.current_cut,
                 loaded.room.cuts.len(),
             );
-            let display = Display::new(&title, true)?;
+            let mut display = Display::new(&title, true, RendererSettings::default())?;
             display.present(&framebuffer)?;
             display.capture(capture_path)?;
         }
@@ -537,9 +540,9 @@ pub fn run_with_options(
         session.loaded.room.current_cut,
         session.loaded.room.cuts.len(),
     );
-    let display = Display::new(&title, false)?;
+    let mut display = Display::new(&title, false, authoring.renderer)?;
     session.start_audio(&pack);
-    run_session_loop(&pack, &mut session, &display)
+    run_session_loop(&pack, &mut session, &mut display)
 }
 
 /// Number of active entity slots, slot 0 (the player) included.
@@ -709,7 +712,7 @@ fn session_tick_interval(transition_active: bool, menu_active: bool) -> f64 {
 }
 
 /// The interactive gameplay loop shared by `--room` and the app's Play mode.
-fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -> Result<()> {
+fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &mut Display) -> Result<()> {
     let mut framebuffer = Framebuffer::new();
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
@@ -760,7 +763,7 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
 
         // The pass that ends a transition is drawn once before teardown.
         if let Some(gpu) = display.gpu() {
-            session.render_layers(pack, &mut gpu.borrow_mut());
+            session.render_layers(pack, gpu);
             display.present_layers(session.frame(), session.white_frame())?;
         } else {
             session.render(pack);
@@ -786,30 +789,23 @@ pub enum RendererKind {
     Gpu,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RendererSettings {
-    kind: RendererKind,
-    scale: u32,
-}
-
-static RENDERER: std::sync::Mutex<RendererSettings> = std::sync::Mutex::new(RendererSettings {
-    kind: RendererKind::Software,
-    scale: crate::gpu::DEFAULT_SCALE,
-});
-
-/// Select the renderer interactive windows open with (`--renderer` and
+/// The renderer an interactive window opens with (`--renderer` and
 /// `--render-scale`). Captures, `--stats` runs and tests always draw in
 /// software: the setting only applies to a window a player looks at.
-pub fn set_renderer(kind: RendererKind, scale: u32) {
-    *RENDERER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = RendererSettings { kind, scale };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RendererSettings {
+    pub kind: RendererKind,
+    /// The GPU scene's internal resolution multiplier.
+    pub scale: u32,
 }
 
-fn renderer_settings() -> RendererSettings {
-    *RENDERER
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+impl Default for RendererSettings {
+    fn default() -> Self {
+        Self {
+            kind: RendererKind::Software,
+            scale: crate::gpu::DEFAULT_SCALE,
+        }
+    }
 }
 
 /// How a [`Display`] puts frames on screen.
@@ -821,7 +817,7 @@ enum Backend {
         renderer: RendererHandle,
     },
     /// The SDL_GPU device, which owns the window's swapchain.
-    Gpu(Box<std::cell::RefCell<GpuRenderer>>),
+    Gpu(Box<GpuRenderer>),
 }
 
 /// The SDL window and the backend every screen shares.
@@ -837,8 +833,8 @@ struct Display {
 
 impl Display {
     /// Open the 960x720 window; `capture` selects SDL's offscreen software
-    /// driver for headless captures.
-    fn new(title: &str, capture: bool) -> Result<Self> {
+    /// driver for headless captures, which ignore `renderer`.
+    fn new(title: &str, capture: bool, renderer: RendererSettings) -> Result<Self> {
         if capture {
             unsafe {
                 SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr());
@@ -873,11 +869,10 @@ impl Display {
         }
         let window = WindowHandle(window);
 
-        let settings = renderer_settings();
-        let gpu = if !capture && settings.kind == RendererKind::Gpu {
+        let gpu = if !capture && renderer.kind == RendererKind::Gpu {
             // SAFETY: the window outlives the backend (field order) and has
             // no SDL renderer yet.
-            match unsafe { GpuRenderer::new(window.0, settings.scale) } {
+            match unsafe { GpuRenderer::new(window.0, renderer.scale) } {
                 Ok(gpu) => Some(gpu),
                 Err(err) => {
                     eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
@@ -888,7 +883,7 @@ impl Display {
             None
         };
         let backend = match gpu {
-            Some(gpu) => Backend::Gpu(Box::new(std::cell::RefCell::new(gpu))),
+            Some(gpu) => Backend::Gpu(Box::new(gpu)),
             None => Self::software_backend(window.0)?,
         };
         Ok(Self {
@@ -935,26 +930,42 @@ impl Display {
     }
 
     /// The GPU renderer, when the window uses one.
-    fn gpu(&self) -> Option<&std::cell::RefCell<GpuRenderer>> {
-        match &self.backend {
+    fn gpu(&mut self) -> Option<&mut GpuRenderer> {
+        match &mut self.backend {
             Backend::Gpu(gpu) => Some(gpu),
             Backend::Software { .. } => None,
         }
     }
 
     /// Upload the framebuffer and draw it scaled to the window.
-    fn present(&self, framebuffer: &Framebuffer) -> Result<()> {
+    fn present(&mut self, framebuffer: &Framebuffer) -> Result<()> {
         self.present_layers(framebuffer, None)
     }
 
     /// Present a frame whose overlays were drawn over the GPU scene: `black`
     /// over a black scene and `white` over a white one (see
     /// [`GameSession::render_layers`]). `white == None` shows `black` alone.
-    fn present_layers(&self, black: &Framebuffer, white: Option<&Framebuffer>) -> Result<()> {
-        match &self.backend {
+    /// A GPU failure here drops this frame and continues in software.
+    fn present_layers(&mut self, black: &Framebuffer, white: Option<&Framebuffer>) -> Result<()> {
+        match &mut self.backend {
             Backend::Software { texture, renderer } => present(renderer.0, texture.0, black),
-            Backend::Gpu(gpu) => gpu.borrow_mut().present(black, white),
+            Backend::Gpu(gpu) => match gpu.present(black, white) {
+                Ok(()) => Ok(()),
+                Err(err) => self.fall_back_to_software(&err),
+            },
         }
+    }
+
+    /// Replace a failed GPU backend with the software one.
+    fn fall_back_to_software(&mut self, err: &anyhow::Error) -> Result<()> {
+        eprintln!("warning: GPU renderer failed ({err:#}); using software");
+        // The device must let go of the window before an SDL renderer can
+        // claim it.
+        if let Backend::Gpu(gpu) = &mut self.backend {
+            gpu.release_window();
+        }
+        self.backend = Self::software_backend(self.window)?;
+        Ok(())
     }
 
     /// Flip the drawn backbuffer to the screen. The GPU backend presents in
@@ -4115,13 +4126,13 @@ impl GameSession {
     /// black)`: opaque overlay pixels hide the scene, fades and blends scale
     /// it. Returns whether the frame shows the GPU scene; when it does not,
     /// `framebuffer` is the whole frame. See [`GameSession::white_frame`].
-    fn render_layers(&mut self, pack: &Pack, gpu: &mut GpuRenderer) -> bool {
+    fn render_layers(&mut self, pack: &Pack, gpu: &mut GpuRenderer) {
         // The pause-menu fade is consumed as it draws; the white pass draws
         // the same one.
         let menu_fade = self.menu_fade_draw;
         self.render_pass(pack, ScenePass::Record(gpu));
         if !self.gpu_scene_visible {
-            return false;
+            return;
         }
         self.menu_fade_draw = menu_fade;
         let mut white = self.framebuffer_white.take().unwrap_or_default();
@@ -4129,7 +4140,6 @@ impl GameSession {
         self.render_pass(pack, ScenePass::White);
         std::mem::swap(&mut self.framebuffer, &mut white);
         self.framebuffer_white = Some(white);
-        true
     }
 
     /// The frame drawn over a white scene, when the last
@@ -4189,15 +4199,27 @@ impl GameSession {
         // and the window over it.
         if self.menu.is_none() {
             match pass {
-                ScenePass::Software | ScenePass::Record(_) => {
-                    let gpu = match pass {
-                        ScenePass::Record(gpu) => {
-                            if self.gpu_room.replace(self.loaded.id) != Some(self.loaded.id) {
-                                gpu.retire();
-                            }
-                            Some(gpu)
+                // The scene was recorded by the black pass; this pass only
+                // redraws what lies over it.
+                ScenePass::White => {
+                    self.framebuffer
+                        .fill_rect([0, 0, WIDTH, HEIGHT], [255, 255, 255, 255]);
+                    draw_special_light(
+                        &mut self.framebuffer,
+                        &self.game,
+                        self.loaded.id,
+                        self.loaded.room.current_cut,
+                    );
+                }
+                pass => {
+                    let gpu = if let ScenePass::Record(gpu) = pass {
+                        // A new room retires the previous room's uploads.
+                        if self.gpu_room.replace(self.loaded.id) != Some(self.loaded.id) {
+                            gpu.retire();
                         }
-                        _ => None,
+                        Some(gpu)
+                    } else {
+                        None
                     };
                     self.gpu_scene_visible = render_frame_on(
                         &mut self.framebuffer,
@@ -4212,18 +4234,6 @@ impl GameSession {
                         &mut self.masks,
                         &mut self.shadows,
                         &mut self.effect_pages,
-                    );
-                }
-                // The scene was recorded by the black pass; this pass only
-                // redraws what lies over it.
-                ScenePass::White => {
-                    self.framebuffer
-                        .fill_rect([0, 0, WIDTH, HEIGHT], [255, 255, 255, 255]);
-                    draw_special_light(
-                        &mut self.framebuffer,
-                        &self.game,
-                        self.loaded.id,
-                        self.loaded.room.current_cut,
                     );
                 }
             }
@@ -5984,6 +5994,8 @@ impl App {
             session.render_layers(&self.pack, gpu);
             self.framebuffer.copy_from(session.frame());
         } else {
+            // Gameplay has ended (or yielded to a film): its uploads go.
+            gpu.release_residency();
             self.draw();
         }
     }
@@ -6183,6 +6195,7 @@ pub fn run_root(
     no_mods: bool,
     _debug_menu: bool,
     language: Option<&str>,
+    renderer: RendererSettings,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -6194,7 +6207,10 @@ pub fn run_root(
         _debug_menu,
         language,
         trace::TraceOptions::default(),
-        Authoring::default(),
+        Authoring {
+            renderer,
+            ..Authoring::default()
+        },
     )
 }
 
@@ -6388,8 +6404,8 @@ fn run_ui_impl(
     } else if authoring.setup_script.is_some() {
         bail!("--setup-script requires a boot that opens a game session");
     }
-    let display = Display::new("Arklay", false)?;
-    run_app_loop(&mut app, &display)
+    let mut display = Display::new("Arklay", false, authoring.renderer)?;
+    run_app_loop(&mut app, &mut display)
 }
 
 /// Apply the CLI authoring seams to the session an app boot just opened:
@@ -6527,7 +6543,7 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
 /// The interactive app loop shared by `--ui` and the standalone `--fmv`
 /// playback: fixed 30 Hz ticks from the latched input, then one presented
 /// frame.
-fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
+fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
     let mut input = InputState::default();
     let mut event = SDL_Event::default();
     let mut last_ticks = unsafe { SDL_GetTicks() };
@@ -6560,7 +6576,7 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
             accumulator -= tick_ms;
         }
         if let Some(gpu) = display.gpu() {
-            app.draw_layers(&mut gpu.borrow_mut());
+            app.draw_layers(gpu);
             display.present_layers(app.frame(), app.white_frame())?;
         } else {
             app.draw();
@@ -6578,6 +6594,7 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
 /// so the BMP is deterministic. Interactive playback uses the app's mode
 /// machine, so a real device drives the audio-led clock, a skippable film ends
 /// on a button and the app quits when the film finishes.
+#[allow(clippy::too_many_arguments)] // the CLI run options are all needed
 pub fn run_fmv(
     pack: &Path,
     id: u8,
@@ -6586,6 +6603,7 @@ pub fn run_fmv(
     ticks: u32,
     mods: &[PathBuf],
     no_mods: bool,
+    renderer: RendererSettings,
 ) -> Result<()> {
     let save_dir = save::default_save_dir();
     if let Some(capture_path) = capture {
@@ -6595,7 +6613,7 @@ pub fn run_fmv(
             // Audio-free: the fixed 30 Hz tick is the clock.
             session.tick(0, None);
         }
-        let display = Display::new("Arklay - fmv", true)?;
+        let mut display = Display::new("Arklay - fmv", true, RendererSettings::default())?;
         let mut framebuffer = Framebuffer::new();
         framebuffer.rgba.copy_from_slice(session.frame_rgba());
         display.present(&framebuffer)?;
@@ -6606,8 +6624,8 @@ pub fn run_fmv(
     let session = MovieSession::open(&pack, id, character)?;
     let mut app = App::new(pack, save_dir, true);
     app.queue_movie(session, None);
-    let display = Display::new("Arklay", false)?;
-    run_app_loop(&mut app, &display)
+    let mut display = Display::new("Arklay", false, renderer)?;
+    run_app_loop(&mut app, &mut display)
 }
 
 /// Play one ending chain (`id` 1-7) through the app's film mode, the
@@ -6629,6 +6647,7 @@ pub fn run_ending(
     ticks: u32,
     mods: &[PathBuf],
     no_mods: bool,
+    renderer: RendererSettings,
 ) -> Result<()> {
     // The debug entry plays a no-save first run: a zero clear time, the
     // shipped card's initial save counter (one, i.e. no saves) and no
@@ -6666,8 +6685,8 @@ pub fn run_ending(
         app.draw();
         return app.capture(capture_path);
     }
-    let display = Display::new("Arklay - ending", false)?;
-    run_app_loop(&mut app, &display)
+    let mut display = Display::new("Arklay - ending", false, renderer)?;
+    run_app_loop(&mut app, &mut display)
 }
 
 /// The `--ui font` screen.
@@ -13279,32 +13298,23 @@ mod tests {
     fn gpu_display_presents_layered_frames() {
         let _lock = crate::audio::test_lock::sdl();
         unsafe { SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr()) };
-        let Ok(_sdl) = SdlHandle::acquire() else {
-            eprintln!("skipping: SDL video unavailable");
-            return;
+        let renderer = RendererSettings {
+            kind: RendererKind::Gpu,
+            scale: 2,
         };
-        let window = unsafe {
-            SDL_CreateWindow(
-                c"Arklay GPU test".as_ptr(),
-                WINDOW_WIDTH,
-                WINDOW_HEIGHT,
-                SDL_WindowFlags::default(),
-            )
-        };
-        assert!(
-            !window.is_null(),
-            "SDL_CreateWindow failed: {}",
-            sdl_error()
-        );
-        let window = WindowHandle(window);
-        // SAFETY: `window` is dropped after `gpu` below.
-        let mut gpu = match unsafe { GpuRenderer::new(window.0, 2) } {
-            Ok(gpu) => gpu,
+        let display = Display::new("Arklay GPU test", false, renderer);
+        let _ = unsafe { sdl3_sys::hints::SDL_ResetHint(SDL_HINT_VIDEO_DRIVER) };
+        let mut display = match display {
+            Ok(display) => display,
             Err(err) => {
                 eprintln!("skipping: {err:#}");
                 return;
             }
         };
+        if display.gpu().is_none() {
+            eprintln!("skipping: no GPU device");
+            return;
+        }
         let mut black = Framebuffer::new();
         let mut white = Framebuffer::new();
         white.fill_rect([0, 0, WIDTH, HEIGHT], [255, 255, 255, 255]);
@@ -13313,11 +13323,18 @@ mod tests {
             layer.fade_to_black(128);
         }
         for _ in 0..3 {
-            gpu.present(&black, Some(&white)).unwrap();
-            gpu.present(&black, None).unwrap();
+            display.present_layers(&black, Some(&white)).unwrap();
+            display.present_layers(&black, None).unwrap();
         }
-        drop(gpu);
-        drop(window);
+
+        // A GPU failure hands the window to the software backend, which
+        // keeps presenting.
+        display
+            .fall_back_to_software(&anyhow::anyhow!("simulated device loss"))
+            .unwrap();
+        assert!(display.gpu().is_none());
+        display.present_layers(&black, Some(&white)).unwrap();
+        display.show().unwrap();
     }
 
     /// The GPU renderer draws real rooms (backgrounds, masks, models,
@@ -14899,7 +14916,8 @@ mod tests {
         use sdl3_sys::hints::{SDL_HINT_AUDIO_DRIVER, SDL_ResetHint, SDL_SetHint};
 
         let _ = unsafe { SDL_SetHint(SDL_HINT_AUDIO_DRIVER, c"dummy".as_ptr()) };
-        let display = Display::new("Arklay test", true).expect("offscreen display");
+        let display = Display::new("Arklay test", true, RendererSettings::default())
+            .expect("offscreen display");
         let mixer = Mixer::open().expect("dummy audio device should open");
         let _ = unsafe { SDL_ResetHint(SDL_HINT_AUDIO_DRIVER) };
 

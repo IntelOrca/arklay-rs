@@ -40,6 +40,18 @@ const PACKED_BLEND: u32 = 1 << 24;
 const PACKED_UNTEXTURED: u32 = 1 << 25;
 
 /// One mesh corner in the static vertex buffer (48 bytes).
+/// A `repr(C)` type made only of 4-byte scalars, with no padding, so its
+/// bytes can be uploaded as they are.
+///
+/// # Safety
+///
+/// Implementors must have no padding bytes.
+pub unsafe trait Plain: Copy {}
+
+// SAFETY: both vertex types are `repr(C)` runs of `f32`/`u32` fields.
+unsafe impl Plain for MeshVertex {}
+unsafe impl Plain for SpriteVertex {}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MeshVertex {
@@ -533,71 +545,109 @@ pub fn palette_rgba(texture: &Texture8) -> (u32, Vec<u8>) {
     (rows as u32, rgba)
 }
 
-/// A cheap identity check for a cached upload: the sizes, the allocation and
-/// a sparse sample of the contents. Residency is keyed on the asset's address,
-/// so this catches an address reused by a different asset after a teardown.
-pub fn fingerprint(parts: &[u64], bytes: &[u8]) -> u64 {
+/// The identity of a cached upload: `parts` (sizes and allocation
+/// addresses) and every byte of `chunks`, hashed a word at a time (a 320x240 background costs
+/// tens of microseconds). Residency is keyed on the asset's address, so this
+/// catches an address reused by a different asset, or contents changed in
+/// place.
+pub fn fingerprint(parts: &[u64], chunks: &[&[u8]]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     let mut mix = |value: u64| {
-        hash ^= value;
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
+        hash = (hash ^ value)
+            .wrapping_mul(0x0000_0100_0000_01b3)
+            .rotate_left(29);
     };
     for &part in parts {
         mix(part);
     }
-    mix(bytes.len() as u64);
-    mix(bytes.as_ptr() as u64);
-    if !bytes.is_empty() {
-        let step = (bytes.len() / 64).max(1);
-        for index in (0..bytes.len()).step_by(step) {
-            mix(u64::from(bytes[index]));
+    for bytes in chunks {
+        mix(bytes.len() as u64);
+        let (words, rest) = bytes.as_chunks::<8>();
+        for &word in words {
+            mix(u64::from_le_bytes(word));
+        }
+        for &byte in rest {
+            mix(u64::from(byte));
         }
     }
     hash
 }
 
-/// [`fingerprint`] of a TMD's geometry.
+/// [`fingerprint`] of a TMD's geometry: its vertices and packet layout.
 pub fn mesh_fingerprint(mesh: &Tmd) -> u64 {
     let mut parts = vec![mesh.objects.len() as u64, mesh.objects.as_ptr() as u64];
     for object in &mesh.objects {
-        parts.push(object.vertices.len() as u64);
         parts.push(object.prims.len() as u64);
+        parts.push(object.prims.as_ptr() as u64);
+        parts.push(object.vertices.len() as u64);
         parts.push(object.vertices.as_ptr() as u64);
-        if let Some(first) = object.vertices.first() {
-            parts.push(u64::from(first[0] as u16) << 32 | u64::from(first[2] as u16));
+        for vertex in &object.vertices {
+            parts.push(
+                u64::from(vertex[0] as u16)
+                    | u64::from(vertex[1] as u16) << 16
+                    | u64::from(vertex[2] as u16) << 32,
+            );
         }
     }
     fingerprint(&parts, &[])
 }
 
-/// [`fingerprint`] of an indexed texture page.
+/// [`fingerprint`] of an indexed texture page, its palettes and STP flags.
 pub fn texture_fingerprint(texture: &Texture8) -> u64 {
+    let stp: Vec<u8> = texture.stp.iter().map(|&flag| u8::from(flag)).collect();
     fingerprint(
         &[
             u64::from(texture.width),
             u64::from(texture.height),
-            texture.palettes.len() as u64,
+            texture.indices.as_ptr() as u64,
             texture.palettes.as_ptr() as u64,
-            texture
-                .palettes
-                .first()
-                .map_or(0, |entry| u64::from(u32::from_le_bytes(*entry))),
         ],
-        &texture.indices,
+        &[&texture.indices, texture.palettes.as_flattened(), &stp],
     )
 }
 
 /// [`fingerprint`] of an RGBA image.
 pub fn image_fingerprint(image: &Image) -> u64 {
     fingerprint(
-        &[u64::from(image.width), u64::from(image.height)],
-        &image.rgba,
+        &[
+            u64::from(image.width),
+            u64::from(image.height),
+            image.rgba.as_ptr() as u64,
+        ],
+        &[&image.rgba],
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprints_see_every_byte_and_the_stp_flags() {
+        let mut image = Image {
+            width: 320,
+            height: 240,
+            rgba: vec![0; 320 * 240 * 4],
+        };
+        let before = image_fingerprint(&image);
+        image.rgba[1234 * 4 + 1] = 1;
+        assert_ne!(image_fingerprint(&image), before);
+
+        let mut texture = Texture8 {
+            width: 4,
+            height: 4,
+            indices: vec![1; 16],
+            palettes: vec![[0; 4]; crate::model::PALETTE_ROW_LEN],
+            stp: vec![false; crate::model::PALETTE_ROW_LEN],
+        };
+        let before = texture_fingerprint(&texture);
+        assert_eq!(texture_fingerprint(&texture), before, "must be stable");
+        texture.stp[7] = true;
+        let stp = texture_fingerprint(&texture);
+        assert_ne!(stp, before);
+        texture.palettes[200][2] = 9;
+        assert_ne!(texture_fingerprint(&texture), stp);
+    }
     use crate::model::{TmdObject, TmdPrim};
     use crate::render::{EntityLightSource, Lighting};
 

@@ -334,7 +334,8 @@ the shipped packs.
 times 320x240 (default 3, the window size). It is interactive only: captures,
 traces, `--stats`, the oracle and every golden draw through the software
 rasterizer, which stays the reference. Without a usable device (the shaders
-are SPIR-V, so it needs Vulkan) the window warns and falls back to software.
+are SPIR-V, so it needs Vulkan) the window warns and falls back to software;
+a failure while drawing or presenting does the same mid-game.
 
 - **What it draws.** `render::GameplayScene` is the one description of a
   frame both renderers consume. `gpu::scene` turns it into GPU input: a static
@@ -347,10 +348,12 @@ are SPIR-V, so it needs Vulkan) the window warns and falls back to software.
 - **Visibility.** A depth buffer replaces the painter's sort. Masks write
   depth at their painter's key (converted to the same view-Z depth), shadows
   and effects test against it, and opaque mesh texels write it.
-- **Residency.** Uploads are keyed by the source's address plus a content
-  fingerprint and released after 300 scene frames unused. Entering a new
-  room retires the previous one: its first frame keeps what it draws (the
-  player, shared pages) and everything else is released at once.
+- **Residency.** Uploads are keyed by the source's address plus a
+  fingerprint of their full contents and released after 300 scene frames
+  unused. Entering a new room retires the previous one: its first frame keeps
+  what it draws (the player, shared pages) and everything else is released at
+  once. Leaving gameplay (the title, a film, the ending screens) releases
+  everything, and a recording that fails forgets the entries it created.
 - **Overlays.** The menus, messages and fades stay software. The session
   draws its overlays twice, over a black and over a white scene; every
   overlay operation is affine in the pixel underneath, so the composite shows

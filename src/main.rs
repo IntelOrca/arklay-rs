@@ -593,13 +593,13 @@ fn main() -> Result<()> {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
             let tracing = cli.trace.is_some();
-            arklay::engine::set_renderer(
-                match cli.renderer {
+            let renderer = arklay::engine::RendererSettings {
+                kind: match cli.renderer {
                     RendererArg::Software => arklay::engine::RendererKind::Software,
                     RendererArg::Gpu => arklay::engine::RendererKind::Gpu,
                 },
-                cli.render_scale,
-            );
+                scale: cli.render_scale,
+            };
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
                 && ((screen != "game" && screen != "demo") || !tracing)
@@ -660,6 +660,7 @@ fn main() -> Result<()> {
                 load: cli.load.as_deref(),
                 setup_script: cli.setup_script.as_deref(),
                 save_out: cli.save_out.as_deref(),
+                renderer,
             };
             let save_dir = cli
                 .save_dir
@@ -675,6 +676,7 @@ fn main() -> Result<()> {
                     cli.ticks,
                     &cli.mods,
                     cli.no_mods,
+                    renderer,
                 );
             }
             if let Some(id) = cli.fmv {
@@ -686,6 +688,7 @@ fn main() -> Result<()> {
                     cli.ticks,
                     &cli.mods,
                     cli.no_mods,
+                    renderer,
                 );
             }
             if let Some(screen) = cli.ui {
@@ -762,6 +765,7 @@ fn main() -> Result<()> {
                 cli.no_mods,
                 cli.debug_menu,
                 language.as_deref(),
+                renderer,
             )
         }
     }

@@ -7,12 +7,13 @@
 //! resolution:
 //!
 //! * Every TMD is expanded once into a static vertex buffer
-//!   ([`scene::mesh_vertices`]) and stays resident while it is drawn; an upload
-//!   unused for [`EVICT_AFTER_FRAMES`] scene frames is released, and a room
-//!   change ([`GpuRenderer::retire`]) releases at once whatever the new room's
-//!   first frame does not draw, so a room's models leave with the room. Indexed texture pages, palettes and RGBA
-//!   images (backgrounds, mask, shadow and effect pages) are cached the same
-//!   way.
+//!   ([`scene::mesh_vertices`]) and stays resident while it is drawn. An
+//!   upload unused for [`EVICT_AFTER_FRAMES`] scene frames is released; a
+//!   room change ([`GpuRenderer::retire`]) releases at once whatever the new
+//!   room's first frame does not draw, and leaving gameplay releases
+//!   everything ([`GpuRenderer::release_residency`]). Indexed texture pages,
+//!   palettes and RGBA images (backgrounds, mask, shadow and effect pages) are
+//!   cached the same way.
 //! * Per draw, only the joint matrices, the camera, the latched lights and the
 //!   tint/blend travel as uniforms; `mesh.vert` skins rigidly, lights each
 //!   corner like `reference_vertex_shade` and projects through the cut camera.
@@ -76,6 +77,30 @@ fn sdl_error() -> String {
         .into_owned()
 }
 
+/// The size of one overlay layer upload.
+const LAYER_BYTES: u32 = LAYER_WIDTH * LAYER_HEIGHT * 4;
+
+/// A compiled shader, released when dropped; a pipeline keeps what it needs.
+struct Shader {
+    device: *mut SDL_GPUDevice,
+    shader: *mut SDL_GPUShader,
+}
+
+impl Drop for Shader {
+    fn drop(&mut self) {
+        unsafe { SDL_ReleaseGPUShader(self.device, self.shader) };
+    }
+}
+
+/// A cache entry made by the scene being recorded, forgotten again if the
+/// recording fails before its uploads run.
+#[derive(Clone, Copy)]
+enum Upload {
+    Mesh(usize),
+    Page(usize),
+    Image(usize),
+}
+
 /// A cached upload and the frame it was last drawn in.
 struct Resident<T> {
     value: T,
@@ -125,6 +150,9 @@ pub struct GpuRenderer {
     scene_depth: *mut SDL_GPUTexture,
     layer_black: *mut SDL_GPUTexture,
     layer_white: *mut SDL_GPUTexture,
+    /// The persistent staging buffer of both overlay layers, cycled per
+    /// present.
+    layer_transfer: *mut SDL_GPUTransferBuffer,
     sprite_buffer: *mut SDL_GPUBuffer,
     sprite_capacity: u32,
     meshes: HashMap<usize, Resident<MeshBuffer>>,
@@ -134,6 +162,8 @@ pub struct GpuRenderer {
     /// Set by [`GpuRenderer::retire`]: the next eviction keeps only what the
     /// frame that follows drew.
     retiring: bool,
+    /// The entries the scene being recorded created.
+    fresh: Vec<Upload>,
     /// The last present, when presentation does not wait for vsync and the
     /// renderer limits itself to [`PRESENT_INTERVAL`].
     pace: Option<std::time::Instant>,
@@ -176,6 +206,18 @@ impl GpuRenderer {
         Ok(renderer)
     }
 
+    /// Give the window back once in-flight work is done, so an SDL renderer
+    /// can claim it; presenting fails from then on.
+    pub fn release_window(&mut self) {
+        if !self.window.is_null() {
+            unsafe {
+                SDL_WaitForGPUIdle(self.device);
+                SDL_ReleaseWindowFromGPUDevice(self.device, self.window);
+            }
+            self.window = std::ptr::null_mut();
+        }
+    }
+
     /// A renderer with no window, for tests and tools: it records scenes and
     /// reads them back with [`GpuRenderer::read_scene`].
     pub fn offscreen(scale: u32) -> Result<Self> {
@@ -207,6 +249,7 @@ impl GpuRenderer {
             scene_depth: std::ptr::null_mut(),
             layer_black: std::ptr::null_mut(),
             layer_white: std::ptr::null_mut(),
+            layer_transfer: std::ptr::null_mut(),
             sprite_buffer: std::ptr::null_mut(),
             sprite_capacity: 0,
             meshes: HashMap::new(),
@@ -214,6 +257,7 @@ impl GpuRenderer {
             images: HashMap::new(),
             frame: 0,
             retiring: false,
+            fresh: Vec::new(),
             pace: None,
         };
         // From here a failure drops `renderer`, which releases whatever was
@@ -257,6 +301,15 @@ impl GpuRenderer {
             LAYER_HEIGHT,
             SDL_GPU_TEXTUREUSAGE_SAMPLER,
         )?;
+        let transfer_info = SDL_GPUTransferBufferCreateInfo {
+            usage: SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            size: LAYER_BYTES * 2,
+            ..Default::default()
+        };
+        renderer.layer_transfer = unsafe { SDL_CreateGPUTransferBuffer(device, &transfer_info) };
+        if renderer.layer_transfer.is_null() {
+            bail!("SDL_CreateGPUTransferBuffer failed: {}", sdl_error());
+        }
         let sampler_info = SDL_GPUSamplerCreateInfo {
             min_filter: SDL_GPU_FILTER_NEAREST,
             mag_filter: SDL_GPU_FILTER_NEAREST,
@@ -311,7 +364,7 @@ impl GpuRenderer {
         stage: SDL_GPUShaderStage,
         samplers: u32,
         uniforms: u32,
-    ) -> Result<*mut SDL_GPUShader> {
+    ) -> Result<Shader> {
         let info = SDL_GPUShaderCreateInfo {
             code_size: code.len(),
             code: code.as_ptr(),
@@ -326,7 +379,10 @@ impl GpuRenderer {
         if shader.is_null() {
             bail!("SDL_CreateGPUShader failed: {}", sdl_error());
         }
-        Ok(shader)
+        Ok(Shader {
+            device: self.device,
+            shader,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -447,81 +503,42 @@ impl GpuRenderer {
         let colour = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 
         let mesh_vert = self.shader(MESH_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1)?;
-        let mesh_frag = self.shader(MESH_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1);
-        let sprite_vert = self.shader(SPRITE_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0);
-        let sprite_frag = self.shader(SPRITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0);
-        let shaders = [Ok(mesh_vert), mesh_frag, sprite_vert, sprite_frag];
-        let result = (|| -> Result<()> {
-            let [mesh_vert, mesh_frag, sprite_vert, sprite_frag] = [
-                *shaders[0]
-                    .as_ref()
-                    .map_err(|err| anyhow::anyhow!("{err:#}"))?,
-                *shaders[1]
-                    .as_ref()
-                    .map_err(|err| anyhow::anyhow!("{err:#}"))?,
-                *shaders[2]
-                    .as_ref()
-                    .map_err(|err| anyhow::anyhow!("{err:#}"))?,
-                *shaders[3]
-                    .as_ref()
-                    .map_err(|err| anyhow::anyhow!("{err:#}"))?,
-            ];
-            let mesh = |cull, blend, write| {
-                self.pipeline(
-                    mesh_vert,
-                    mesh_frag,
-                    mesh_stride,
-                    &mesh_attributes,
-                    cull,
-                    blend,
-                    Some((depth_format, write)),
-                    colour,
-                )
-            };
-            let mut built = Vec::new();
-            // Push each pipeline as it is made so a later failure still
-            // releases the earlier ones (via `Drop`).
-            let made = (|| -> Result<()> {
-                built.push(mesh(SDL_GPU_CULLMODE_BACK, false, true)?);
-                built.push(mesh(SDL_GPU_CULLMODE_BACK, true, false)?);
-                built.push(mesh(SDL_GPU_CULLMODE_NONE, false, true)?);
-                built.push(mesh(SDL_GPU_CULLMODE_NONE, true, false)?);
-                Ok(())
-            })();
-            let sprite = |write| {
-                self.pipeline(
-                    sprite_vert,
-                    sprite_frag,
-                    sprite_stride,
-                    &sprite_attributes,
-                    SDL_GPU_CULLMODE_NONE,
-                    true,
-                    Some((depth_format, write)),
-                    colour,
-                )
-            };
-            let made = made.and_then(|()| {
-                built.push(sprite(true)?);
-                built.push(sprite(false)?);
-                Ok(())
-            });
-            let slots = [
-                &mut self.pipelines.mesh_opaque,
-                &mut self.pipelines.mesh_blend,
-                &mut self.pipelines.mesh_opaque_unculled,
-                &mut self.pipelines.mesh_blend_unculled,
-                &mut self.pipelines.sprite_write,
-                &mut self.pipelines.sprite_test,
-            ];
-            for (slot, pipeline) in slots.into_iter().zip(built) {
-                *slot = pipeline;
-            }
-            made
-        })();
-        for shader in shaders.into_iter().flatten() {
-            unsafe { SDL_ReleaseGPUShader(self.device, shader) };
-        }
-        result
+        let mesh_frag = self.shader(MESH_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1)?;
+        let sprite_vert = self.shader(SPRITE_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
+        let sprite_frag = self.shader(SPRITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0)?;
+        let mesh = |this: &Self, cull, blend, write| {
+            this.pipeline(
+                mesh_vert.shader,
+                mesh_frag.shader,
+                mesh_stride,
+                &mesh_attributes,
+                cull,
+                blend,
+                Some((depth_format, write)),
+                colour,
+            )
+        };
+        let sprite = |this: &Self, write| {
+            this.pipeline(
+                sprite_vert.shader,
+                sprite_frag.shader,
+                sprite_stride,
+                &sprite_attributes,
+                SDL_GPU_CULLMODE_NONE,
+                true,
+                Some((depth_format, write)),
+                colour,
+            )
+        };
+        // Each pipeline is stored as soon as it exists, so a later failure
+        // still releases it (via `Drop`).
+        self.pipelines.mesh_opaque = mesh(self, SDL_GPU_CULLMODE_BACK, false, true)?;
+        self.pipelines.mesh_blend = mesh(self, SDL_GPU_CULLMODE_BACK, true, false)?;
+        self.pipelines.mesh_opaque_unculled = mesh(self, SDL_GPU_CULLMODE_NONE, false, true)?;
+        self.pipelines.mesh_blend_unculled = mesh(self, SDL_GPU_CULLMODE_NONE, true, false)?;
+        self.pipelines.sprite_write = sprite(self, true)?;
+        self.pipelines.sprite_test = sprite(self, false)?;
+        Ok(())
     }
 
     fn composite_pipeline(
@@ -529,28 +546,17 @@ impl GpuRenderer {
         format: SDL_GPUTextureFormat,
     ) -> Result<*mut SDL_GPUGraphicsPipeline> {
         let vertex = self.shader(COMPOSITE_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
-        let fragment = match self.shader(COMPOSITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 0) {
-            Ok(fragment) => fragment,
-            Err(err) => {
-                unsafe { SDL_ReleaseGPUShader(self.device, vertex) };
-                return Err(err);
-            }
-        };
-        let pipeline = self.pipeline(
-            vertex,
-            fragment,
+        let fragment = self.shader(COMPOSITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 3, 0)?;
+        self.pipeline(
+            vertex.shader,
+            fragment.shader,
             0,
             &[],
             SDL_GPU_CULLMODE_NONE,
             false,
             None,
             format,
-        );
-        unsafe {
-            SDL_ReleaseGPUShader(self.device, vertex);
-            SDL_ReleaseGPUShader(self.device, fragment);
-        }
-        pipeline
+        )
     }
 
     fn command_buffer(&self) -> Result<*mut SDL_GPUCommandBuffer> {
@@ -709,6 +715,7 @@ impl GpuRenderer {
             vertex_count: built.vertices.len() as u32,
             blend_start: built.blend_start,
         };
+        self.fresh.push(Upload::Mesh(key));
         if let Some(old) = self.meshes.insert(
             key,
             Resident {
@@ -728,10 +735,9 @@ impl GpuRenderer {
         copy: *mut SDL_GPUCopyPass,
         texture: &Texture8,
     ) -> Result<Option<PageTextures>> {
-        if texture.width == 0
-            || texture.height == 0
-            || texture.indices.len() < (texture.width * texture.height) as usize
-        {
+        // Like the software rasterizer, an empty page draws nothing; a
+        // truncated one draws its missing texels as index 0 (transparent).
+        if texture.width == 0 || texture.height == 0 {
             return Ok(None);
         }
         let key = texture as *const Texture8 as usize;
@@ -763,14 +769,19 @@ impl GpuRenderer {
         };
         let value = PageTextures { indices, palette };
         let pixels = (texture.width * texture.height) as usize;
+        let padded;
+        let page_indices = if texture.indices.len() >= pixels {
+            &texture.indices[..pixels]
+        } else {
+            padded = {
+                let mut padded = texture.indices.clone();
+                padded.resize(pixels, 0);
+                padded
+            };
+            &padded[..]
+        };
         let uploaded = self
-            .upload_texture(
-                copy,
-                indices,
-                texture.width,
-                texture.height,
-                &texture.indices[..pixels],
-            )
+            .upload_texture(copy, indices, texture.width, texture.height, page_indices)
             .and_then(|()| {
                 self.upload_texture(
                     copy,
@@ -784,6 +795,7 @@ impl GpuRenderer {
             self.release_page(value);
             return Err(err);
         }
+        self.fresh.push(Upload::Page(key));
         if let Some(old) = self.pages.insert(
             key,
             Resident {
@@ -828,6 +840,7 @@ impl GpuRenderer {
             unsafe { SDL_ReleaseGPUTexture(self.device, texture) };
             return Err(err);
         }
+        self.fresh.push(Upload::Image(key));
         if let Some(old) = self.images.insert(
             key,
             Resident {
@@ -907,6 +920,44 @@ impl GpuRenderer {
         self.retiring = true;
     }
 
+    /// Release every resident upload: gameplay has ended, so nothing cached
+    /// will be drawn soon.
+    pub fn release_residency(&mut self) {
+        for (_, entry) in std::mem::take(&mut self.meshes) {
+            self.release_mesh(entry.value);
+        }
+        for (_, entry) in std::mem::take(&mut self.pages) {
+            self.release_page(entry.value);
+        }
+        for (_, entry) in std::mem::take(&mut self.images) {
+            unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
+        }
+    }
+
+    /// Forget the entries a failed recording created: their uploads were
+    /// cancelled with its command buffer, so the data never arrived.
+    fn forget_fresh(&mut self) {
+        for upload in std::mem::take(&mut self.fresh) {
+            match upload {
+                Upload::Mesh(key) => {
+                    if let Some(entry) = self.meshes.remove(&key) {
+                        self.release_mesh(entry.value);
+                    }
+                }
+                Upload::Page(key) => {
+                    if let Some(entry) = self.pages.remove(&key) {
+                        self.release_page(entry.value);
+                    }
+                }
+                Upload::Image(key) => {
+                    if let Some(entry) = self.images.remove(&key) {
+                        unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
+                    }
+                }
+            }
+        }
+    }
+
     /// The number of resident meshes, pages and images.
     pub fn resident_counts(&self) -> (usize, usize, usize) {
         (self.meshes.len(), self.pages.len(), self.images.len())
@@ -916,18 +967,23 @@ impl GpuRenderer {
     /// call, so a frozen frame (the pause menu) keeps compositing it.
     pub fn record_scene(&mut self, scene: &GameplayScene<'_>) -> Result<()> {
         self.frame += 1;
+        self.fresh.clear();
         let command = self.command_buffer()?;
-        match self.record_scene_into(command, scene) {
-            Ok(()) => {
-                Self::submit(command)?;
-                self.evict();
-                Ok(())
-            }
+        let recorded = self.record_scene_into(command, scene);
+        let submitted = match recorded {
+            Ok(()) => Self::submit(command),
             Err(err) => {
                 unsafe { SDL_CancelGPUCommandBuffer(command) };
                 Err(err)
             }
+        };
+        if submitted.is_err() {
+            self.forget_fresh();
+        } else {
+            self.fresh.clear();
+            self.evict();
         }
+        submitted
     }
 
     fn record_scene_into(
@@ -1127,7 +1183,7 @@ impl GpuRenderer {
         for layer in std::iter::once(black).chain(white) {
             if layer.width != LAYER_WIDTH
                 || layer.height != LAYER_HEIGHT
-                || layer.rgba.len() != (LAYER_WIDTH * LAYER_HEIGHT * 4) as usize
+                || layer.rgba.len() != LAYER_BYTES as usize
             {
                 bail!(
                     "expected a {LAYER_WIDTH}x{LAYER_HEIGHT} framebuffer, got {}x{}",
@@ -1136,34 +1192,46 @@ impl GpuRenderer {
                 );
             }
         }
+        // Cycling the staging buffer and the layer textures lets this
+        // upload proceed while the previous present may still read them.
+        let mapped = unsafe { SDL_MapGPUTransferBuffer(self.device, self.layer_transfer, true) };
+        if mapped.is_null() {
+            bail!("SDL_MapGPUTransferBuffer failed: {}", sdl_error());
+        }
+        let layers = [black, white.unwrap_or(black)];
+        unsafe {
+            for (index, layer) in layers.iter().enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    layer.rgba.as_ptr(),
+                    mapped.cast::<u8>().add(index * LAYER_BYTES as usize),
+                    LAYER_BYTES as usize,
+                );
+            }
+            SDL_UnmapGPUTransferBuffer(self.device, self.layer_transfer);
+        }
         let command = self.command_buffer()?;
         let copy = unsafe { SDL_BeginGPUCopyPass(command) };
         if copy.is_null() {
             unsafe { SDL_CancelGPUCommandBuffer(command) };
             bail!("SDL_BeginGPUCopyPass failed: {}", sdl_error());
         }
-        let uploaded = self
-            .upload_texture(
-                copy,
-                self.layer_black,
-                LAYER_WIDTH,
-                LAYER_HEIGHT,
-                &black.rgba,
-            )
-            .and_then(|()| {
-                self.upload_texture(
-                    copy,
-                    self.layer_white,
-                    LAYER_WIDTH,
-                    LAYER_HEIGHT,
-                    &white.unwrap_or(black).rgba,
-                )
-            });
-        unsafe { SDL_EndGPUCopyPass(copy) };
-        if let Err(err) = uploaded {
-            unsafe { SDL_CancelGPUCommandBuffer(command) };
-            return Err(err);
+        for (index, texture) in [self.layer_black, self.layer_white].into_iter().enumerate() {
+            let source = SDL_GPUTextureTransferInfo {
+                transfer_buffer: self.layer_transfer,
+                offset: index as u32 * LAYER_BYTES,
+                pixels_per_row: LAYER_WIDTH,
+                rows_per_layer: LAYER_HEIGHT,
+            };
+            let destination = SDL_GPUTextureRegion {
+                texture,
+                w: LAYER_WIDTH,
+                h: LAYER_HEIGHT,
+                d: 1,
+                ..Default::default()
+            };
+            unsafe { SDL_UploadToGPUTexture(copy, &source, &destination, true) };
         }
+        unsafe { SDL_EndGPUCopyPass(copy) };
 
         if let Some(last) = self.pace {
             let elapsed = last.elapsed();
@@ -1328,9 +1396,8 @@ fn draw_mesh(
 }
 
 /// A slice of plain `repr(C)` vertices as bytes.
-fn as_bytes<T: Copy>(values: &[T]) -> &[u8] {
-    // SAFETY: only called with the `repr(C)` vertex types, which are made of
-    // 4-byte scalars with no padding.
+fn as_bytes<T: scene::Plain>(values: &[T]) -> &[u8] {
+    // SAFETY: `Plain` types have no padding, so every byte is initialised.
     unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     }
@@ -1341,15 +1408,7 @@ impl Drop for GpuRenderer {
         unsafe {
             SDL_WaitForGPUIdle(self.device);
         }
-        for (_, entry) in std::mem::take(&mut self.meshes) {
-            self.release_mesh(entry.value);
-        }
-        for (_, entry) in std::mem::take(&mut self.pages) {
-            self.release_page(entry.value);
-        }
-        for (_, entry) in std::mem::take(&mut self.images) {
-            unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
-        }
+        self.release_residency();
         unsafe {
             let pipelines = [
                 self.pipelines.mesh_opaque,
@@ -1374,6 +1433,9 @@ impl Drop for GpuRenderer {
             }
             if !self.sprite_buffer.is_null() {
                 SDL_ReleaseGPUBuffer(self.device, self.sprite_buffer);
+            }
+            if !self.layer_transfer.is_null() {
+                SDL_ReleaseGPUTransferBuffer(self.device, self.layer_transfer);
             }
             if !self.sampler.is_null() {
                 SDL_ReleaseGPUSampler(self.device, self.sampler);
