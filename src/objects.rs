@@ -337,6 +337,9 @@ pub struct ObjectTable {
     pub records: Vec<ObjectRecord>,
     /// `g_omodelCount`: how many `obj` calls have built a record.
     pub built: u8,
+    /// The pair the last `obj` bound, the original's `DAT_00bca0d4`
+    /// last-model cache that gates the palette fix-ups.
+    pub last_asset: Option<u8>,
 }
 
 impl ObjectTable {
@@ -345,6 +348,7 @@ impl ObjectTable {
         Self {
             records: vec![ObjectRecord::default(); slot_count],
             built: 0,
+            last_asset: None,
         }
     }
 
@@ -354,6 +358,7 @@ impl ObjectTable {
         self.records.clear();
         self.records.resize(slot_count, ObjectRecord::default());
         self.built = 0;
+        self.last_asset = None;
     }
 
     /// One record by slot.
@@ -379,8 +384,7 @@ impl ObjectTable {
     ///
     /// # Documented no-ops
     ///
-    /// The original's stage-5 texture-bank overrides, greenhouse/front-lesson
-    /// palette fix-ups, the `0x40000000`/`0x40000040` SCA scale word and the
+    /// The original's stage-5 texture-bank overrides, the `0x40000000`/`0x40000040` SCA scale word and the
     /// `0x80` texture-queue request have no analogue in the per-model texture
     /// design and are not ported (the model byte keeps both flag bits so the
     /// push grunt still reads `0x40`). The room/slot positional overrides are
@@ -446,7 +450,28 @@ impl ObjectTable {
             tween: TweenScratch::default(),
         };
         self.built = self.built.wrapping_add(1);
+        self.last_asset = Some(slot as u8);
         true
+    }
+
+    /// The palette fix-up `cmd_omodel_set` applies before binding slot
+    /// `slot`, if any.
+    ///
+    /// The original rewrites the pair's CLUT in the loaded RDT, and only when
+    /// it is the room's first `obj` or the model differs from the last bound
+    /// one, so call this before [`Self::build`] updates that cache.
+    pub fn palette_fixup(&self, operands: &[Operand], id: RoomId) -> Option<PaletteFixup> {
+        let slot = operand_u8(operands, 0) & 0x3F;
+        if slot != 0 || (self.built != 0 && self.last_asset == Some(slot)) {
+            return None;
+        }
+        if id.stage == 1 && id.room == 0x0C {
+            Some(PaletteFixup::Greenhouse)
+        } else if id.stage % 5 == 2 && id.room == 0x0B {
+            Some(PaletteFixup::FrontLesson)
+        } else {
+            None
+        }
     }
 
     /// `objtbl_b_set` (0x35): write byte 0 of an omodel or item model.
@@ -754,6 +779,52 @@ pub fn darken_map_palette(texture: &mut Texture8) {
         palette[0] = darken(palette[0]);
         palette[1] = darken(palette[1]);
         palette[2] = darken(palette[2]);
+    }
+}
+
+/// A room-specific CLUT rewrite from `cmd_omodel_set`'s slot-0 bind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteFixup {
+    /// The greenhouse (stage 1 room 0C): red +3, green and blue +2, each
+    /// clamped to 31, bit 15 kept.
+    Greenhouse,
+    /// The front lesson room (2F and its return, room 0B): entry 0 is zeroed
+    /// and every pure-white entry (bit 15 ignored) becomes `0x4E73`, a 19/31
+    /// grey with no STP bit.
+    FrontLesson,
+}
+
+/// Apply a [`PaletteFixup`] to the pair's first 256 CLUT entries, recovering
+/// each 5-bit channel from the decoded byte as [`darken_map_palette`] does.
+pub fn apply_palette_fixup(texture: &mut Texture8, fixup: PaletteFixup) {
+    let to5 = |channel: u8| (u32::from(channel) * 31 + 127) / 255;
+    let to8 = |value: u32| (value * 255 / 31) as u8;
+    let count = texture.palettes.len().min(256);
+    for index in 0..count {
+        let palette = &mut texture.palettes[index];
+        match fixup {
+            PaletteFixup::Greenhouse => {
+                for (channel, add) in palette.iter_mut().zip([3, 2, 2]) {
+                    *channel = to8((to5(*channel) + add).min(31));
+                }
+            }
+            PaletteFixup::FrontLesson => {
+                let white = palette[..3].iter().all(|&channel| to5(channel) == 31);
+                let grey = if index == 0 {
+                    Some(0)
+                } else if white {
+                    Some(19)
+                } else {
+                    None
+                };
+                if let Some(value) = grey {
+                    palette[..3].fill(to8(value));
+                    if let Some(stp) = texture.stp.get_mut(index) {
+                        *stp = false;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2121,6 +2192,55 @@ mod tests {
         darken_map_palette(&mut texture);
         assert_eq!(texture.palettes[0], [180, 8, 0, 255]);
         assert_eq!(texture.palettes[1], [0, 0, 0, 128]);
+    }
+
+    #[test]
+    fn palette_fixups_grey_the_front_lesson_whites_and_lift_the_greenhouse() {
+        let texture = || Texture8 {
+            width: 1,
+            height: 1,
+            indices: vec![0],
+            palettes: vec![[8, 8, 8, 255], [255, 255, 255, 255], [255, 8, 0, 255]],
+            stp: vec![true, true, true],
+        };
+        // Entry 0 zeroes, white becomes 0x4E73 (19/31 -> 156) without its
+        // STP bit, anything else is left alone.
+        let mut lesson = texture();
+        apply_palette_fixup(&mut lesson, PaletteFixup::FrontLesson);
+        assert_eq!(lesson.palettes[0], [0, 0, 0, 255]);
+        assert_eq!(lesson.palettes[1], [156, 156, 156, 255]);
+        assert_eq!(lesson.palettes[2], [255, 8, 0, 255]);
+        assert_eq!(lesson.stp, vec![false, false, true]);
+        // Red +3, green/blue +2, clamped to 31; STP kept.
+        let mut greenhouse = texture();
+        apply_palette_fixup(&mut greenhouse, PaletteFixup::Greenhouse);
+        assert_eq!(greenhouse.palettes[0], [32, 24, 24, 255]);
+        assert_eq!(greenhouse.palettes[2], [255, 24, 16, 255]);
+        assert_eq!(greenhouse.stp, vec![true, true, true]);
+
+        // Only the first slot-0 bind in the two rooms asks for one.
+        let lesson_id = RoomId::parse("70B").unwrap();
+        let mut objects = table(2);
+        let slot0 = obj_operands(0x80, OBJECT_FLAG_ACTIVE, 0xFF);
+        assert_eq!(
+            objects.palette_fixup(&obj_operands(1, 1, 0xFF), lesson_id),
+            None
+        );
+        assert_eq!(
+            objects.palette_fixup(&slot0, lesson_id),
+            Some(PaletteFixup::FrontLesson)
+        );
+        assert!(objects.build(&slot0, lesson_id));
+        assert_eq!(objects.palette_fixup(&slot0, lesson_id), None);
+        let fresh = table(1);
+        assert_eq!(
+            fresh.palette_fixup(&slot0, RoomId::parse("10C").unwrap()),
+            Some(PaletteFixup::Greenhouse)
+        );
+        assert_eq!(
+            fresh.palette_fixup(&slot0, RoomId::parse("10B").unwrap()),
+            None
+        );
     }
 
     #[test]

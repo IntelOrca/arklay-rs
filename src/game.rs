@@ -3635,6 +3635,9 @@ pub struct GameState {
     /// pair. The host has no room borrow, so the engine applies them with the
     /// other room edits.
     pub item_palette_edits: Vec<u8>,
+    /// Queued `obj` palette fix-ups by object pair, applied like
+    /// [`Self::item_palette_edits`].
+    pub object_palette_edits: Vec<(u8, crate::objects::PaletteFixup)>,
     /// Queued `inst_cfg` collision-boundary rewrites, applied by the engine's
     /// room tick before physics and cleared with it.
     pub collision_edits: Vec<CollisionEdit>,
@@ -3818,6 +3821,7 @@ impl Default for GameState {
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
             item_palette_edits: Vec::new(),
+            object_palette_edits: Vec::new(),
             collision_edits: Vec::new(),
             light_edits: Vec::new(),
             object_push: false,
@@ -5026,6 +5030,7 @@ impl GameState {
         self.objects.reset(usize::from(room.omodel_slot_count));
         self.items.reset(usize::from(room.item_count));
         self.item_palette_edits.clear();
+        self.object_palette_edits.clear();
         self.collision_edits.clear();
         self.light_edits.clear();
         self.zone_edits.clear();
@@ -5165,6 +5170,15 @@ impl GameState {
                 .find(|asset| asset.pair_index == usize::from(pair))
             {
                 crate::objects::darken_map_palette(&mut asset.texture);
+            }
+        }
+        for (pair, fixup) in self.object_palette_edits.drain(..) {
+            if let Some(asset) = room
+                .object_models
+                .iter_mut()
+                .find(|asset| asset.pair_index == usize::from(pair))
+            {
+                crate::objects::apply_palette_fixup(&mut asset.texture, fixup);
             }
         }
     }
@@ -9032,7 +9046,12 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_model(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x1F => {
-                self.state.objects.build(operands, self.state.id);
+                let fixup = self.state.objects.palette_fixup(operands, self.state.id);
+                if self.state.objects.build(operands, self.state.id)
+                    && let Some(fixup) = fixup
+                {
+                    self.state.object_palette_edits.push((0, fixup));
+                }
                 StepResult::Continue
             }
             // `inst_cfg` (0x30): queue the collision-boundary rewrite; the
