@@ -11556,9 +11556,15 @@ fn render_frame_on(
     // poses the body: the EMW's single mesh object is authored in joint 14's
     // space, exactly like the original's weapon-slot TMD.
     let mut weapon_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    // The weapon slot's TMD is the hand joint's mesh whenever a weapon is
+    // equipped, so it draws in every bank (idle, walk, turn), not just aiming.
+    let weapon_file = player_state.weapon.weapon_file.or_else(|| {
+        game.equipped
+            .and_then(|item| crate::weapons::weapon_emw_id(id.player_flag & 3, item))
+    });
     if let (Some(assets), Some(joints)) = (assets, &player_joints)
-        && player_state.clip_source == player::ClipSource::Weapon
-        && let Some(weapon) = assets.weapon(player_state.weapon.weapon_file)
+        && let Some(weapon) = assets.weapon(weapon_file)
+        && !weapon.mesh.objects.is_empty()
         && let Some(hand) = joints.get(crate::weapons::WEAPON_JOINT)
     {
         weapon_joints.push(vec![*hand]);

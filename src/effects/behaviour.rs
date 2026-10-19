@@ -29,13 +29,14 @@ const IDENTITY_MATRIX: [i16; 9] = [4096, 0, 0, 0, 4096, 0, 0, 0, 4096];
 ///
 /// The set covers the script-spawned ids (`1,2,3,12,13,18,26,30,33,41,47,51,
 /// 57,58`), their update partners (`0,12,15,19,26,38`), and the ids every
-/// shipped sprite's animation data adds. The combat-only projectile, flame and
-/// bullet/rocket entries (`10,37,43,45`) stay counted placeholders by design
-/// until combat exists.
+/// shipped sprite's animation data adds, including the falling projectile
+/// (`10`, the ejected shell casing). The combat-only flame and bullet/rocket
+/// entries (`37,43,45`) stay counted placeholders by design until combat
+/// exists.
 pub const fn implemented(id: u8) -> bool {
     matches!(
         id,
-        0..=9 | 11..=20 | 21..=36 | 38..=42 | 44 | 46..=63
+        0..=36 | 38..=42 | 44 | 46..=63
     )
 }
 
@@ -576,6 +577,86 @@ fn bounce_debris(game: &mut GameState, room: &RoomState, index: usize, spread: i
     slot.header[2] = effect.header[2].wrapping_neg();
 }
 
+/// `effect_behavior_projectile` (0x0040da90): once the fall passes the
+/// player's floor height, advance to a random one of the next `header[1]`
+/// blocks, adopt its update behaviour, bounce/drift words and yaw, freeze the
+/// vertical offset on the floor and, when the block's weapon tag matches the
+/// equipped weapon, play the weapon bank's landing sound.
+///
+/// The original's alternate branch (a room effect zone, comparing against an
+/// object-model pointer) is not reproduced: that compare reads a table pointer
+/// and never lands.
+fn projectile(game: &mut GameState, index: usize) {
+    let Some(effect) = game.effects.slot(index).copied() else {
+        return;
+    };
+    if game.flags[5].bit(crate::game::MSF2_EFFECT_ZONE) {
+        return;
+    }
+    let floor = game.entities[0].pos[1];
+    if floor >= i32::from(effect.pos[1]) + i32::from(h16(&effect, 0x0e)) {
+        return;
+    }
+    let spread = effect.header[1];
+    if spread == 0 {
+        return;
+    }
+    let Some(sprite) = find_sprite(&game.room_effects, &game.weapon_effects, &effect) else {
+        return;
+    };
+    let Some(frames) = row_frames(sprite, effect.anim_depth) else {
+        return;
+    };
+    let Some(flat) = flat_index(frames, &effect) else {
+        return;
+    };
+    let pick = flat + 1 + usize::from(game.rand_seed % u16::from(spread));
+    let Some((frame, block, chosen)) = block_at(frames, pick) else {
+        return;
+    };
+    let seed = game.rand_seed;
+    let weapon = game.equipped_weapon_id;
+    let Some(slot) = game.effects.slot_mut(index) else {
+        return;
+    };
+    let flags = slot.flags() | 0x400b;
+    slot.set_flags(flags);
+    slot.anim_frame = frame;
+    slot.anim_block = block;
+    slot.update_id = chosen.update_id();
+    let word = |offset: usize| i16::from_le_bytes([chosen.0[offset], chosen.0[offset + 1]]);
+    let horizontal = if slot.header[2] != 0 {
+        word(0x10).wrapping_neg()
+    } else {
+        word(0x10)
+    };
+    set_h16(slot, 0x0c, horizontal);
+    set_h16(slot, 0x0e, word(0x12));
+    let spin = ((seed % u16::from(spread)) as i16)
+        .wrapping_mul(10)
+        .wrapping_add(word(0x14));
+    set_h16(slot, 0x10, spin);
+    slot.yaw = slot.yaw.wrapping_add(chosen.yaw());
+    slot.rot_speed[1] = (floor - slot.sprite_offset[1] - i32::from(slot.local_offset[1])) as i16;
+    let tag = slot.header[3];
+    let pos = [
+        i32::from(slot.pos[0]),
+        i32::from(slot.pos[1]),
+        i32::from(slot.pos[2]),
+    ];
+    if weapon != 0
+        && tag == weapon.wrapping_sub(2)
+        && let Some(name) = crate::sfx::weapon_sound(weapon, 10)
+    {
+        game.entity_sounds.push(crate::game::EntitySound {
+            name,
+            bank: 1,
+            column: weapon,
+            pos,
+        });
+    }
+}
+
 /// The ground probe: walk the collision records of the quadrant the point
 /// falls in and OR their ground-contact flag bits. Returns 1 on a full ground
 /// contact (both flag bits set), otherwise the OR of the seen flag bits.
@@ -931,6 +1012,9 @@ fn run_behavior(game: &mut GameState, room: &RoomState, index: usize, id: u8) {
         // Bouncing debris: reflect the vertical speed on the floor and
         // re-randomize the spread while the fall is above the phase count.
         17 => bounce_debris(game, room, index, 0x1E, 2),
+        // Falling projectile (the ejected shell): on reaching the player's
+        // floor height pick a follow-up phase and settle.
+        10 => projectile(game, index),
         // Gravity impact: on contact go inert and mirror the horizontal speed.
         8 => {
             let Some(effect) = game.effects.slot(index).copied() else {
@@ -2374,7 +2458,7 @@ mod tests {
     #[test]
     fn the_implemented_set_matches_the_dispatch_table() {
         // The combat-only entries stay counted placeholders by design.
-        let placeholders = [10u8, 37, 43, 45];
+        let placeholders = [37u8, 43, 45];
         for id in 0..=63u8 {
             assert_eq!(
                 implemented(id),
@@ -2383,6 +2467,27 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn projectile_waits_above_the_floor_then_adopts_the_next_block() {
+        let mut first = raw_block(1, 10);
+        first[5] = 1; // one candidate block
+        let mut next = raw_block(1, 23);
+        next[0x10..0x12].copy_from_slice(&7i16.to_le_bytes());
+        next[0x12..0x14].copy_from_slice(&(-9i16).to_le_bytes());
+        let mut game = game_with_row(&[first, next]);
+        game.entities[0].pos[1] = 0;
+        let slot = spawn(&mut game, 0, [0, -500, 0], 0, 0);
+        run(&mut game, &room());
+        let effect = game.effects.slot(usize::from(slot)).unwrap();
+        assert_eq!(effect.update_id, 10, "still falling");
+
+        game.effects.slot_mut(usize::from(slot)).unwrap().pos[1] = 100;
+        run(&mut game, &room());
+        let effect = game.effects.slot(usize::from(slot)).unwrap();
+        assert_eq!(effect.update_id, 23, "the next block's update behaviour");
+        assert_eq!(effect.flags() & 0x400b, 0x400b);
+    }
+
     #[test]
     fn blink_toggles_the_hidden_bit() {
         let mut game = game_with_row(&[raw_block(14, 0)]);

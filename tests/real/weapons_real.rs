@@ -254,3 +254,53 @@ fn handgun_fire_queues_weapon_bank_sounds_that_are_packed() {
         assert!(pack.contains(&path), "{path} is missing from the pack");
     }
 }
+
+/// The equipped weapon is the hand joint's mesh in every bank: an idle player
+/// with a weapon equipped paints different pixels than an unarmed one.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn an_idle_player_paints_the_equipped_weapon() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1010").unwrap();
+
+    let unarmed = arklay::engine::simulate_room(&pack, id, 8, Input::default()).unwrap();
+    let armed = arklay::engine::simulate_room_prepared(
+        &pack,
+        id,
+        &[],
+        8,
+        |game, _player| {
+            game.inventory.push(arklay::game::InventoryItem {
+                id: 2,
+                quantity: 15,
+            });
+            game.set_equipped(Some(2));
+        },
+        |_| Input::default(),
+    )
+    .unwrap();
+    if let Ok(dir) = std::env::var("ARKLAY_DUMP_DIR") {
+        for (name, run) in [("unarmed", &unarmed), ("armed", &armed)] {
+            let mut png = Vec::new();
+            let mut enc = png::Encoder::new(&mut png, run.frame.width, run.frame.height);
+            enc.set_color(png::ColorType::Rgba);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&run.frame.rgba)
+                .unwrap();
+            std::fs::write(format!("{dir}/{name}.png"), png).unwrap();
+        }
+    }
+    let changed = unarmed
+        .frame
+        .rgba
+        .chunks(4)
+        .zip(armed.frame.rgba.chunks(4))
+        .filter(|(a, b)| a != b)
+        .count();
+    assert!(changed > 0, "the idle weapon painted no pixels");
+}
