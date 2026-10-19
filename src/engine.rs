@@ -1443,6 +1443,18 @@ const ITEM_SWORD_KEY: u8 = 0x33;
 /// Item id of the communication radio (the radio tab's used item).
 const ITEM_COMM_RADIO: u8 = 0x4D;
 
+/// When a room boot runs the per-room BGM handoff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoomBgmHandoff {
+    /// The room is live now: resolve its BGM table as part of the boot
+    /// (new game, save load, direct boot and the debug jump).
+    Now,
+    /// A door transition already loaded the destination behind its animation.
+    /// `room_transition_load` runs the handoff only after the animation task
+    /// finishes, so the boot leaves the outgoing track playing.
+    AtTransitionEnd,
+}
+
 impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): the shipped card's
     /// start room (the main hall), the original's start position, health,
@@ -1731,16 +1743,21 @@ impl GameSession {
             computer: None,
             computer_saved: None,
         });
-        session.enter_room(pack, None);
+        session.enter_room(pack, None, RoomBgmHandoff::Now);
         Ok(session)
     }
 
     /// Run the room boot: init script, queued events, the player mirror, mask
-    /// toggles, the camera zone scan and the per-room BGM handoff.
+    /// toggles, the camera zone scan and, when `bgm_handoff` is
+    /// [`RoomBgmHandoff::Now`], the per-room BGM handoff.
     ///
     /// `from` is the room the player came from, used by the BGM state machine
     /// to resolve the outgoing group; `None` for a direct boot or save load.
-    fn enter_room(&mut self, pack: &Pack, from: Option<RoomId>) {
+    /// A door transition passes [`RoomBgmHandoff::AtTransitionEnd`]: the
+    /// original loads the destination while the animation plays but runs
+    /// `update_room_bgm` only after the animation task finishes (see
+    /// [`GameSession::end_transition`]).
+    fn enter_room(&mut self, pack: &Pack, from: Option<RoomId>, bgm_handoff: RoomBgmHandoff) {
         self.apply_costume_model(pack);
         // The original stores the outgoing room id in
         // `g_AttractMode_RoomCameraId` on a same-stage door; a fresh or
@@ -1768,9 +1785,14 @@ impl GameSession {
         reset_room_camera_id(&mut self.game);
         apply_camera(&mut self.loaded.room, &mut self.game, Some(self.player.pos));
         // The original runs `update_room_bgm` after the destination's init
-        // script (so a `room_bgm_state_set` it performs is visible) and after the
-        // room's data is loaded.
-        bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
+        // script (so a `room_bgm_state_set` it performs is visible) and after
+        // the room's data is loaded. A transition defers this call to the end
+        // of the door animation, so the outgoing room's music keeps playing
+        // until the destination is on screen; the reconciliation still runs so
+        // a live BGM opcode in the init script reaches the mixer immediately.
+        if bgm_handoff == RoomBgmHandoff::Now {
+            bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
+        }
         bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
     }
 
@@ -3026,7 +3048,7 @@ impl GameSession {
         self.game.entities[0].action_behavior = 0;
         self.game.entities[0].action_state = 0;
         self.game.enter_room(target, &self.loaded.room);
-        self.enter_room(pack, Some(from));
+        self.enter_room(pack, Some(from), RoomBgmHandoff::Now);
         self.player = player::spawn(target, &self.loaded.room);
         self.place_room_entry(pack, target);
         self.arm_room_fade();
@@ -3861,8 +3883,9 @@ impl GameSession {
 
     /// The tail of `room_transition_load` and `game_loop`'s return into
     /// gameplay, on the frame the animation task's exit is noticed: a
-    /// camera-only record re-tests the switch zones, the close SE plays and a
-    /// full load arms the destination's entry fade.
+    /// camera-only record re-tests the switch zones, the destination's BGM
+    /// handoff runs, the close SE plays and a full load arms the destination's
+    /// entry fade.
     fn end_transition(&mut self, pack: &Pack) {
         let Some(mut session) = self.transition.take() else {
             return;
@@ -3875,6 +3898,15 @@ impl GameSession {
                 &mut self.loaded,
             );
         }
+        // `room_transition_load` waits the door-animation task out before it
+        // calls `update_room_bgm` (0x00481583), so the outgoing track keeps
+        // playing under the whole animation. A full load already booted the
+        // destination in `enter_transition_destination`, which is why its init
+        // script's `room_bgm_state_set` is visible here; a camera-only record
+        // never left the source room and re-runs the same room's table.
+        let from = session.source;
+        bgm::update_room_bgm(&mut self.game, self.loaded.id, Some(from));
+        bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
         play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
         let entered = session.entered;
         self.transition = Some(session);
@@ -3913,7 +3945,7 @@ impl GameSession {
         let scripts = Rc::new(self.loaded.scripts.clone());
         self.command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         self.event_vm = scd::vm::EventVm::from_scripts(scripts);
-        self.enter_room(pack, Some(from));
+        self.enter_room(pack, Some(from), RoomBgmHandoff::AtTransitionEnd);
         // `room_set` runs `room_events_check` once with the message gate
         // forced open, so an event the init script queued executes exactly one
         // opcode during the load (RoomInit.cpp 0x00477c45), the same pass the
@@ -7293,8 +7325,9 @@ fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
 /// original's `room_transition_load`, after the animation task has been waited
 /// out; every caller plays it via [`play_room_close_sfx`] on that frame.
 ///
-/// The BGM handoff runs later, in [`GameSession::enter_room`], after the
-/// destination's init script has had its say (the original's ordering).
+/// BGM handoff runs later, once the animation task has been waited out:
+/// [`GameSession::end_transition`] for the interactive session, and the
+/// headless drivers' own teardown once they reach `frame.finished`.
 fn finish_transition(
     session: &mut TransitionMode,
     game: &mut game::GameState,
@@ -7521,7 +7554,6 @@ pub fn simulate_door(
     }
     let frame_count = session.transition.frame();
     finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
-    play_room_close_sfx(&mut mixer, &mut sfx_cache, pack, &session);
 
     // The engine runs the destination's init when gameplay resumes; run it
     // here too so the captured frame matches the first rendered frame (mask
@@ -7530,6 +7562,11 @@ pub fn simulate_door(
     game.sync_player(&mut player_state);
     drain_mask_toggles(&mut loaded.room, &mut game);
     apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
+    // `room_transition_load` runs the handoff after the destination's init and
+    // camera setup and before the close SE, so the headless seam exposes the
+    // same BGM selection as the interactive session.
+    bgm::update_room_bgm(&mut game, loaded.id, Some(id));
+    play_room_close_sfx(&mut mixer, &mut sfx_cache, pack, &session);
 
     // The destination's first gameplay frame, drawn from the placed player and
     // the zone-selected cut, exactly as the engine's render loop would.
@@ -16629,10 +16666,8 @@ mod tests {
         (Pack::open(&pack_path).unwrap(), a, b)
     }
 
-    /// Walk `session` into its test door, run the animation out and tear it
-    /// down into the destination exactly like the interactive loop: trigger,
-    /// tick the timeline, render the finished frame, then finish.
-    fn walk_through_test_door(pack: &Pack, session: &mut GameSession) {
+    /// Trigger the test door in `session` without ticking its timeline.
+    fn trigger_test_door(pack: &Pack, session: &mut GameSession) {
         session.player.pos = [-450, 0, 250];
         session.player.angle = 0;
         session.game.sync_entity_from_player(&session.player);
@@ -16658,6 +16693,13 @@ mod tests {
             session.transition.is_some(),
             "the door never requested a transition"
         );
+    }
+
+    /// Walk `session` into its test door, run the animation out and tear it
+    /// down into the destination exactly like the interactive loop: trigger,
+    /// tick the timeline, render the finished frame, then finish.
+    fn walk_through_test_door(pack: &Pack, session: &mut GameSession) {
+        trigger_test_door(pack, session);
 
         for _ in 0..MAX_TRANSITION_FRAMES {
             session.tick_transition(pack, false);
@@ -16685,6 +16727,139 @@ mod tests {
         assert!(session.game.doors[0].is_none(), "the door table is rebuilt");
         assert!(!session.transition_finished);
         assert!(session.transition.is_none());
+    }
+
+    #[test]
+    fn a_door_transition_defers_the_destination_bgm_until_the_animation_ends() {
+        let dir = TempDir::new();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let source = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        // Room 1003 resolves group 0x00 (Bgm_00), unlike the source's 0x0B
+        // (Bgm_13) at state 0x08, so the handoff is observable.
+        let target = RoomId {
+            stage: 1,
+            room: 3,
+            player_flag: 0,
+        };
+        let pack_path = dir.0.join("game.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &source.rdt_entry(),
+                synthetic_rdt(&door_init_record(3, [555, 0, 666], 1024, 0)),
+            )
+            .unwrap();
+        writer
+            .add(&target.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&source.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&target.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, source, Path::new("saves")).unwrap();
+        // Boot the source room's group with its channel enabled so a premature
+        // handoff would visibly replace it.
+        session.game.room_bgm[usize::from(source.room)] = 0x08;
+        bgm::update_room_bgm(&mut session.game, source, None);
+        assert_eq!(session.game.bgm.state, 0x08);
+        assert_eq!(session.game.bgm.channels[0].name, Some("Bgm_13"));
+
+        trigger_test_door(&pack, &mut session);
+
+        let mut loaded_during_animation = false;
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, false);
+            if !session.transition_finished {
+                if session.loaded.id == target {
+                    loaded_during_animation = true;
+                }
+                assert_eq!(
+                    session.game.bgm.state, 0x08,
+                    "the destination BGM state must wait for the animation's end"
+                );
+                assert_eq!(
+                    session.game.bgm.channels[0].name,
+                    Some("Bgm_13"),
+                    "the outgoing room's track must keep playing under the door"
+                );
+            }
+            if session.transition_finished {
+                break;
+            }
+        }
+        assert!(session.transition_finished, "the transition never finished");
+        assert!(
+            loaded_during_animation,
+            "the destination must boot while the animation still runs"
+        );
+        assert_eq!(session.game.bgm.state, 0x08);
+        assert_eq!(
+            session.game.bgm.channels[0].name,
+            Some("Bgm_00"),
+            "the destination's group starts on the animation's final frame"
+        );
+    }
+
+    #[test]
+    fn a_camera_only_transition_defers_the_bgm_handoff_until_the_animation_ends() {
+        let dir = TempDir::new();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let room = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let pack_path = dir.0.join("game.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &room.rdt_entry(),
+                synthetic_rdt(&door_init_with_camera(0x80)),
+            )
+            .unwrap();
+        writer.add(&room.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, room, Path::new("saves")).unwrap();
+        session.game.room_bgm[usize::from(room.room)] = 0x08;
+        bgm::update_room_bgm(&mut session.game, room, None);
+        assert_eq!(session.game.bgm.state, 0x08);
+        // The door leaves the room loaded, so the table change is visible only
+        // to the handoff at the animation's end.
+        session.game.room_bgm[usize::from(room.room)] = 0x10;
+
+        trigger_test_door(&pack, &mut session);
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, false);
+            if !session.transition_finished {
+                assert_eq!(
+                    session.game.bgm.state, 0x08,
+                    "a camera-only record must not re-run the handoff early"
+                );
+                assert_eq!(session.game.bgm.channels[0].name, Some("Bgm_13"));
+            }
+            if session.transition_finished {
+                break;
+            }
+        }
+        assert!(session.transition_finished, "the transition never finished");
+        assert_eq!(session.loaded.id, room, "the room must not reload");
+        assert_eq!(session.game.id, room, "the room must not reload");
+        assert_eq!(
+            session.game.bgm.state, 0x10,
+            "the camera-only handoff runs on the animation's final frame"
+        );
+        assert_eq!(
+            session.game.bgm.channels[0].name,
+            Some("Bgm_13"),
+            "the same group keeps its loaded bank"
+        );
     }
 
     #[test]

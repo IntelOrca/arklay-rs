@@ -4,9 +4,10 @@
 //! ([`crate::game::GameState::room_bgm`]). On every room load or transition
 //! [`update_room_bgm`] resolves the target state, fades the outgoing banks when
 //! the group changes, loads the group's three tracks and starts the channels
-//! whose enable bits (`0x08`/`0x10`/`0x20`) are set. `bgmType` (the top two
-//! state bits) selects load-and-start (`0`), load-only (`1`), force-restart
-//! (`2`) or nothing (`3`).
+//! whose enable bits (`0x08`/`0x10`/`0x20`) are set. A door transition runs
+//! this only after its animation finishes, so the outgoing room's track keeps
+//! playing under the door. `bgmType` (the top two state bits) selects
+//! load-and-start (`0`), load-only (`1`), force-restart (`2`) or nothing (`3`).
 //!
 //! The script opcodes (`bgm_play`, `bgm_stop`, `bgm_restore`, `bgm_stop_all`)
 //! mutate the same game state after the scripts run; [`apply_live`] reconciles
