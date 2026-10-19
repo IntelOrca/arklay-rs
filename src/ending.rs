@@ -348,6 +348,12 @@ pub fn row(id: u8) -> Option<EndingRow> {
     ROWS.get(usize::from(id)).copied().filter(|_| id != 0)
 }
 
+/// Bank 1 (`g_ScenarioFlags2`) bit the original names
+/// `SCENARIO2_FLAG_PARTNER_ALIVE`: the partner survived.
+pub const SCENARIO2_FLAG_PARTNER_ALIVE: u8 = 0xC0;
+/// Bank 1 bit the original names `SCENARIO2_FLAG_SECOND_SURVIVOR`.
+pub const SCENARIO2_FLAG_SECOND_SURVIVOR: u8 = 0x4B;
+
 /// Select the ending row (1-7) from the two scenario flags and the player.
 ///
 /// The player always survives. `partner_alive` is the original's

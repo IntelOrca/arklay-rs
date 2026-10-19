@@ -33,7 +33,7 @@ struct Cli {
     demo: u8,
 
     /// UI screen to boot straight into instead of a room:
-    /// `title`, `select`, `game`, `demo`, `menu`, `box`, `file`, `map`,
+    /// `title`, `select`, `game`, `demo`, `menu`, `box`, `debug`, `file`, `map`,
     /// `view`, `save`, `load`, `death`, `result`, `epilogue` or `font`.
     /// `--ui game` also accepts `--room` to boot the new game straight into
     /// that room through the session flow (the oracle anchor for room-specific

@@ -401,6 +401,12 @@ pub const MSF2_DOOR_TURN_PENDING: u8 = 0x29;
 /// demo playback. The second dword of flag bank 5, i.e. selector
 /// `0x20 + 3 = 0x23` in the MSB-first flag bank.
 pub const MSF2_ATTRACT_DEMO: u8 = 0x23;
+/// `main_state_flags2` bit 0x04000000 (`MSF2_COSTUME_VARIANT`): the player
+/// wears an alternate outfit, picked by [`GameState::costume_variant`]. The
+/// original's `RoomInit` raises it when the wardrobe stores model id `8`, and
+/// `LoadEntityEMD` then loads `em1030 + character + 2 * variant`. Selector
+/// `0x20 + 5 = 0x25` in the MSB-first flag bank.
+pub const MSF2_COSTUME_VARIANT: u8 = 0x25;
 /// `main_state_flags2` bit 0x80000000 (`MSF2_DEATH_VARIANT`): the scripted
 /// death variant that skips the DIED screen. The second dword of flag bank 5,
 /// i.e. selector `0x20 + 0 = 0x20`.
@@ -3214,6 +3220,29 @@ pub struct DoorYield {
     pub rand_seed: u16,
 }
 
+/// A player character and outfit: the debug menu's PLAYER selection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerChoice {
+    /// 0 Chris, 1 Jill.
+    pub character: u8,
+    /// 0 the normal outfit, 1 and 2 the alternate outfits (costume variant
+    /// byte 0 and 1).
+    pub costume: u8,
+}
+
+/// The port-only debug tools' state (the F1 menu's cheats and its pending
+/// PLAYER selection). Session-only: it survives room loads but is never
+/// written to a save.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DebugTools {
+    /// Pin the player's health at the maximum and never die.
+    pub invincible: bool,
+    /// Enemies cannot see or path to the player.
+    pub ghost: bool,
+    /// The character/outfit the next room load switches to.
+    pub pending_player: Option<PlayerChoice>,
+}
+
 /// The game state the SCD scripts read and write.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
@@ -3461,10 +3490,11 @@ pub struct GameState {
     /// The alternate-outfit selector (`g_bCostumeVariant`): `costume_set`
     /// (0x4F) stores the operand's low bit and `costume_ck` (0x50) tests it.
     /// The original's `LoadEntityEMD` reads it to pick the alternate player
-    /// model; this port records and branches on the bit, but the alternate
-    /// model load is not wired (documented deviation), so the wardrobe room's
-    /// switch changes the flag without swapping the outfit.
+    /// model, and the session's room entry does the same through
+    /// [`crate::convert::costume_entry`].
     pub costume_variant: u8,
+    /// The F1 debug tools' session state; never saved.
+    pub debug: DebugTools,
     /// The item the inventory cursor last selected.
     pub selected_item: Option<u8>,
     /// The player's maximum health (`max_health >> 2` drives the EKG colour).
@@ -3686,6 +3716,7 @@ impl Default for GameState {
             entity_bkp: 0,
             zone_path_walk: crate::enemy::walk::ZoneWalk::default(),
             costume_variant: 0,
+            debug: DebugTools::default(),
             selected_item: None,
             max_health: 0,
             health_status: 0,
@@ -4929,6 +4960,15 @@ impl GameState {
         self.resolve_room_effects(room);
         self.id = id;
         self.mark_room_visited(id);
+        self.apply_pending_player(id);
+        // `RoomInit`'s model switch (0x00477904): the wardrobe stores model id
+        // `8`, which raises the alternate-outfit bit and folds back to the
+        // character id; the player's model then loads from the costume byte.
+        let model = usize::from(STATE_BYTE_CHARACTER_MODEL);
+        if self.state_bytes[model] & 8 != 0 && self.entities[0].id != self.state_bytes[model] {
+            self.apply_flag(5, MSF2_COSTUME_VARIANT, 0);
+            self.state_bytes[model] &= 7;
+        }
         self.state_bytes[0] = id.stage;
         self.state_bytes[1] = id.room;
         self.set_camera_cut(0);
@@ -5071,6 +5111,79 @@ impl GameState {
         target.is_some_and(|target| {
             crate::objects::within_distance(self.entities[0].pos, target, max_dist)
         })
+    }
+
+    /// The character and outfit the player currently has.
+    pub fn player_choice(&self) -> PlayerChoice {
+        let costume = if self.flag_test(5, MSF2_COSTUME_VARIANT, false) {
+            1 + (self.costume_variant & 1)
+        } else {
+            0
+        };
+        PlayerChoice {
+            character: self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] & 1,
+            costume,
+        }
+    }
+
+    /// Switch the player to `choice` after a room load into the matching RDT
+    /// variant: the character bytes, `MSF_CHAR_VARIANT`, the maximum health
+    /// (the current health is clamped to it), the outfit bit and byte, and the
+    /// inventory, which Jill-to-Chris truncates from eight slots to six.
+    pub fn apply_player_choice(&mut self, choice: PlayerChoice) {
+        let character = choice.character & 1;
+        self.state_bytes[usize::from(STATE_BYTE_CHARACTER)] = character;
+        self.state_bytes[usize::from(STATE_BYTE_CHARACTER_MODEL)] = character;
+        self.entities[0].id = character;
+        self.apply_flag(5, MSF_CHAR_VARIANT, if character == 1 { 0 } else { 1 });
+        self.max_health = character_max_health(character);
+        if self.entities[0].health > self.max_health {
+            self.entities[0].health = self.max_health;
+            self.set_health_copy(self.max_health);
+        }
+        if choice.costume == 0 {
+            self.apply_flag(5, MSF2_COSTUME_VARIANT, 1);
+        } else {
+            self.apply_flag(5, MSF2_COSTUME_VARIANT, 0);
+            self.costume_variant = (choice.costume - 1) & 1;
+        }
+        let capacity = self.inventory_capacity();
+        if self.inventory.len() > capacity {
+            self.inventory.truncate(capacity);
+        }
+        self.clear_dangling_items();
+        self.rebuild_slots();
+    }
+
+    /// Apply the debug menu's pending player selection on a room load into
+    /// `id`. The caller already picked `id`'s character variant when the pack
+    /// has it; when it does not, the outfit still applies and the character
+    /// change stays pending for the next load.
+    fn apply_pending_player(&mut self, id: RoomId) {
+        let Some(choice) = self.debug.pending_player else {
+            return;
+        };
+        let character = id.player_flag & 1;
+        self.apply_player_choice(PlayerChoice {
+            character,
+            costume: choice.costume,
+        });
+        self.debug.pending_player = (character != choice.character & 1).then_some(choice);
+    }
+
+    /// Clear the equipped and selected items when the inventory no longer
+    /// holds them (after a debug edit removed or replaced their slot).
+    pub fn clear_dangling_items(&mut self) {
+        if let Some(item) = self.equipped
+            && !self.has_item(item)
+        {
+            self.set_equipped(None);
+        }
+        if let Some(item) = self.selected_item
+            && !self.has_item(item)
+        {
+            self.select_item(None);
+        }
     }
 
     /// The number of inventory slots the current character uses.
@@ -5451,6 +5564,19 @@ impl GameState {
     pub fn set_health_copy(&mut self, health: i16) {
         let offset = usize::from(STATE_BYTE_HEALTH_COPY);
         self.state_bytes[offset..offset + 2].copy_from_slice(&health.to_le_bytes());
+    }
+
+    /// The INVINCIBLE cheat, once per tick after the room tick: health pinned
+    /// to the maximum and the poison bits (`0x02`/`0x20`/`0x40`) and countdown
+    /// cleared. The `0x80` reach lock is left alone.
+    pub fn apply_invincible(&mut self) {
+        if !self.debug.invincible {
+            return;
+        }
+        self.entities[0].health = self.max_health;
+        self.set_health_copy(self.max_health);
+        self.set_health_status(self.health_status & !0x62);
+        self.poison_timer = 0;
     }
 
     /// Clear the per-frame item-use flag bank. The original zeroes both

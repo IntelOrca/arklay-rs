@@ -104,6 +104,10 @@ pub fn entity_apply_walk_speed(entity: &mut Entity, speed: i16) {
     entity.move_speed_current = current as u16;
 }
 
+/// The distance the range checks report while the debug menu's GHOST cheat
+/// hides the player: beyond any enemy's range.
+pub const GHOST_DISTANCE: u32 = 0x7FFF;
+
 /// `entity_check_visual_range`: raise `status_flags` bit 5 when the flat
 /// distance from the entity to the player is inside `range`, and return the
 /// distance. Both axes are full 32-bit differences and the sum wraps through

@@ -35,7 +35,15 @@ pub fn parse(data: &[u8]) -> Result<Emd> {
     for (slot, value) in directory.iter_mut().enumerate() {
         *value = read_u32(data, directory_start + slot * 4)? as usize;
     }
-    check_order(&directory, directory_start, "EMD")?;
+    // Slot 0 is only a damage bank when it lands before the EMR chunk; some
+    // shipped models (EM1032, Chris's second alternate outfit) carry junk
+    // there, which the original dereferences blindly but never plays.
+    let checked = if directory[0] & !3 < directory[1] {
+        &directory[..]
+    } else {
+        &directory[1..]
+    };
+    check_order(checked, directory_start, "EMD")?;
     let emr_offset = directory[1];
     let edd_offset = directory[2];
     let tmd_offset = directory[3];
@@ -570,6 +578,18 @@ mod tests {
             emd.damage_keyframes.is_empty(),
             "a zero directory[0] has no reaction keyframes"
         );
+    }
+
+    #[test]
+    fn ignores_a_junk_damage_slot() {
+        let mut data = minimal_emd();
+        let directory_start = data.len() - EMD_DIRECTORY_LEN;
+        data[directory_start..directory_start + 4].copy_from_slice(&0x4646_4612u32.to_le_bytes());
+
+        let emd = parse(&data).unwrap();
+
+        assert!(emd.damage_clips.is_empty());
+        assert!(emd.damage_keyframes.is_empty());
     }
 
     #[test]

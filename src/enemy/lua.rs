@@ -2819,6 +2819,10 @@ mod imp {
                 let room = unsafe { &*room };
                 let slot = api.slot;
                 let game = api.game();
+                // GHOST: the pathfinder reports the target blocked.
+                if game.debug.ghost {
+                    return Ok(0);
+                }
                 Ok(crate::enemy::walk::entity_pathfind_update(
                     room,
                     &mut game.entities[slot],
@@ -3258,6 +3262,9 @@ mod imp {
             // write (`entity_check_visual_range`); the alert variant raises bit
             // 7 instead.
             methods.add_method_mut("check_visual_range", |_lua, api, range: i64| {
+                if api.game_ref().debug.ghost {
+                    return Ok(crate::enemy::walk::GHOST_DISTANCE);
+                }
                 let player = api.game_ref().entities[0].pos;
                 Ok(crate::enemy::walk::entity_check_visual_range(
                     api.entity_mut(),
@@ -3266,6 +3273,9 @@ mod imp {
                 ))
             });
             methods.add_method_mut("check_alert_range", |_lua, api, range: i64| {
+                if api.game_ref().debug.ghost {
+                    return Ok(crate::enemy::walk::GHOST_DISTANCE);
+                }
                 let player = api.game_ref().entities[0].pos;
                 Ok(crate::enemy::walk::entity_check_alert_range(
                     api.entity_mut(),
@@ -3288,6 +3298,9 @@ mod imp {
             methods.add_method_mut(
                 "angular_view_and_distance",
                 |_lua, api, (fov_half, max_distance): (i64, i64)| {
+                    if api.game_ref().debug.ghost {
+                        return Ok(0);
+                    }
                     let player = api.game_ref().entities[0].pos;
                     Ok(crate::enemy::walk::angular_view_and_distance(
                         api.entity(),
@@ -3303,7 +3316,12 @@ mod imp {
                 // whole call (see the type-level comment).
                 let room = unsafe { &*room };
                 let player = api.game_ref().entities[0].pos;
-                let result = crate::enemy::walk::check_line_of_sight(room, api.entity(), player);
+                // GHOST: the sight line to the player is always blocked.
+                let result = if api.game_ref().debug.ghost {
+                    1
+                } else {
+                    crate::enemy::walk::check_line_of_sight(room, api.entity(), player)
+                };
                 // The original stores the result byte in the shared
                 // `player_distance_z` scratch before returning it; the hunter
                 // reads the same word back after the call.
@@ -14230,6 +14248,30 @@ mod hunter_tests {
                 "the hunter scene diverged at tick {tick} (state {state})"
             );
         }
+    }
+
+    #[cfg(feature = "lua")]
+    #[test]
+    fn ghost_hides_the_player_from_the_sight_bindings() {
+        let pack = pack_with(&[(
+            "enemy/em06.lua",
+            r#"
+function update(e)
+    e.status_flags = 1
+    assert(e:check_visual_range(0x7000) == 0x7FFF)
+    assert(e:check_alert_range(0x7000) == 0x7FFF)
+    assert(e:angular_view_and_distance(0x800, 0x7000) == 0)
+    assert(e:line_of_sight() == 1)
+    assert(e:pathfind_update(4000, 0) == 0)
+end
+"#,
+        )]);
+        let mut game = hunter(2);
+        game.debug.ghost = true;
+        let mut host = LuaEnemyHost::new();
+        assert!(step(&mut host, &mut game, &pack, 1));
+        assert_eq!(game.entities[1].status_flags, 1, "no range bit is raised");
+        assert_eq!(game.player_distance_z, 1, "the blocked sight byte");
     }
 
     #[cfg(feature = "lua")]

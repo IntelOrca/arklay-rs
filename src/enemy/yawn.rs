@@ -99,7 +99,10 @@ pub fn segment_tick(game: &mut GameState, room: &RoomState, slot: usize) {
     game.entities[slot].status_flags &= 0x1F;
 
     let player_pos = game.entities[0].pos;
-    crate::enemy::walk::entity_check_visual_range(&mut game.entities[slot], player_pos, 4000);
+    // GHOST: the player is never in range.
+    if !game.debug.ghost {
+        crate::enemy::walk::entity_check_visual_range(&mut game.entities[slot], player_pos, 4000);
+    }
     if game.entities[slot].pos[1] < -0x5DC {
         game.entities[slot].status_flags |= 0xC0;
     }

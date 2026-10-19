@@ -2535,6 +2535,24 @@ fn resolve_players(enemy: Option<&Path>, players: Option<&Path>) -> Result<Vec<P
             None => missing.push(format!("ENEMY/Char1{id}.EMD")),
         }
     }
+    // The four alternate-outfit models (`ENEMY/EM1030..EM1033.EMD`): the
+    // ref's `LoadEntityEMD` picks `em1030`/`em1032` for Chris and
+    // `em1031`/`em1033` for Jill by the costume variant byte. They are packed
+    // as `player/{character:02}_alt{variant}.emd`; a missing file is skipped
+    // and the player keeps the base model.
+    for (file, character, variant) in [
+        ("em1030.emd", 0, 0),
+        ("em1031.emd", 1, 0),
+        ("em1032.emd", 0, 1),
+        ("em1033.emd", 1, 1),
+    ] {
+        if let Some(path) = enemy_index.as_ref().and_then(|index| index.get(file)) {
+            assets.push(PlayerAsset {
+                entry: costume_entry(character, variant),
+                source: path.clone(),
+            });
+        }
+    }
     for (id, file) in [(0usize, "w00.emw"), (1, "w10.emw")] {
         match players_index.as_ref().and_then(|index| index.get(file)) {
             Some(path) => assets.push(PlayerAsset {
@@ -2553,6 +2571,12 @@ fn resolve_players(enemy: Option<&Path>, players: Option<&Path>) -> Result<Vec<P
         );
     }
     Ok(assets)
+}
+
+/// The pack entry of `character`'s alternate-outfit model `variant` (the
+/// costume variant byte's low bit).
+pub fn costume_entry(character: u8, variant: u8) -> String {
+    format!("player/{:02}_alt{}.emd", character & 1, variant & 1)
 }
 
 /// Resolve the shipped weapon files under `PLAYERS/`: every `W*.EMW` weapon
@@ -2766,6 +2790,9 @@ mod tests {
         fs::write(enemy.join("CHAR11.EMD"), b"emd1").unwrap();
         fs::write(enemy.join("Char12.EMD"), b"emd2").unwrap();
         fs::write(enemy.join("char13.emd"), b"emd3").unwrap();
+        // Two of the four alternate outfits: the others are optional.
+        fs::write(enemy.join("EM1030.EMD"), b"alt-chris").unwrap();
+        fs::write(enemy.join("Em1031.emd"), b"alt-jill").unwrap();
         fs::write(players.join("W00.EMW"), b"emw0").unwrap();
         fs::write(players.join("w10.emw"), b"emw1").unwrap();
     }
@@ -3399,6 +3426,18 @@ mod tests {
 
         assert_eq!(pack.read("player/01.emd").unwrap().as_ref(), b"emd1");
         assert_eq!(pack.read("player/01.emw").unwrap().as_ref(), b"emw1");
+        assert_eq!(
+            pack.read("player/00_alt0.emd").unwrap().as_ref(),
+            b"alt-chris"
+        );
+        assert_eq!(
+            pack.read("player/01_alt0.emd").unwrap().as_ref(),
+            b"alt-jill"
+        );
+        assert!(
+            !pack.contains("player/00_alt1.emd"),
+            "missing outfits are skipped"
+        );
         // The NPC phase copies the fifteen character models raw, lower-cased.
         assert_eq!(pack.read("enemy/em20.emd").unwrap().as_ref(), b"npc-20");
         assert_eq!(pack.read("enemy/em2e.emd").unwrap().as_ref(), b"npc-2e");
@@ -3423,7 +3462,11 @@ mod tests {
             "one pack entry per named effect and per non-Bgm group track"
         );
         assert_eq!(count("door/"), 34);
-        assert_eq!(count("player/"), 6);
+        assert_eq!(
+            count("player/"),
+            8,
+            "four models and clips plus two outfit models"
+        );
         assert_eq!(
             pack.paths()
                 .filter(|path| path.starts_with("enemy/") && path.ends_with(".emd"))
@@ -3439,7 +3482,8 @@ mod tests {
             pack.paths()
                 .filter(|path| path.starts_with("player/") && path.ends_with(".emd"))
                 .count(),
-            4
+            6,
+            "four character models plus two outfit models"
         );
         assert_eq!(
             pack.paths()
@@ -4482,11 +4526,20 @@ mod tests {
         let expected = bmp::encode_texture8_to_vec(&texture).unwrap();
         assert_eq!(pack.read("roommask/100_000.bmp").unwrap(), expected);
 
-        // Four character models (Char10..Char13), the two no-weapon locomotion
-        // clips (W00, W10) and the shipped weapon animations/models under
-        // `PLAYERS/` (every other `W*.EMW` and `WS*.TMD`). player/01 is Jill,
-        // the character that owns ROOM1001.
-        assert_eq!(count("player/"), 4 + 2 + 37);
+        // Four character models (Char10..Char13), the four alternate outfits
+        // (EM1030..EM1033), the two no-weapon locomotion clips (W00, W10) and
+        // the shipped weapon animations/models under `PLAYERS/` (every other
+        // `W*.EMW` and `WS*.TMD`). player/01 is Jill, the character that owns
+        // ROOM1001.
+        assert_eq!(count("player/"), 4 + 4 + 2 + 37);
+        for entry in [
+            "player/00_alt0.emd",
+            "player/01_alt0.emd",
+            "player/00_alt1.emd",
+            "player/01_alt1.emd",
+        ] {
+            assert!(pack.contains(entry), "{entry}");
+        }
         assert!(pack.contains("player/01.emd"));
         assert!(pack.contains("player/01.emw"));
 

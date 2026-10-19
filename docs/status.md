@@ -568,10 +568,28 @@ four-byte stub rooms. The milestone deviations (render-contract items, the
 attract demo, the endings, the DC branches) are catalogued in
 `docs/m18-deviations.md` and the module docs.
 
-The F1 room-select overlay is a port-only development aid the retail game
-never shipped. It is always available (`--debug-menu` is accepted for
-compatibility only); it opens only on F1, so captures and goldens that never
-press the key are unaffected.
+The F1 debug tools are a port-only development aid the retail game never
+shipped. They are always available (`--debug-menu` is accepted for
+compatibility only); they open only on F1, so captures and goldens that never
+press the key are unaffected. F1 freezes the room behind a dark panel listing
+eight tools; confirm opens one, cancel backs out one level and F1 closes from
+anywhere. `--ui debug` captures the list.
+
+- ROOM SELECT: the pack's rooms in seven stage columns, the current room in
+  green; a jump uses the pending character's room variant when it is packed.
+- INVENTORY: edit each slot's item and quantity, with an icon picker.
+- PLAYER: character and outfit (normal, alt 1, alt 2) are pending and apply at
+  the next room load, like the wardrobe; the alternate outfits load
+  `em1030 + character + 2 * variant` as the original's `LoadEntityEMD` does.
+- FLAGS: thirteen flag banks (scenario, items, enemies, rooms, maps, ...)
+  with port-only names; confirm toggles, L1/R1 set/clear.
+- CHEATS: INVINCIBLE pins health and blocks death; GHOST hides the player from
+  enemy sight and pathing. Session-only, never saved.
+- SAVE: save opens the typewriter save screen; load opens the load screen and
+  continues from the picked slot.
+- ITEM BOX: opens the item box anywhere.
+- CLEAR GAME: plays ending 1-7 (defaulting to the one the current flags
+  select) and the result screen.
 
 The in-game F9 return-to-title prompt follows the original: the first F9
 freezes the room, dims the frame and pauses the game sounds; a second F9

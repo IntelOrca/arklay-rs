@@ -74,7 +74,7 @@ formatted-text renderers index the sheet. Only the original's ASCII-buffer
 | `ITEM_<nn>_DESCRIPTION` | item description by item id |
 | `UI_SAVE_*` | save-screen headers, exits, character names, slots, prompts, errors |
 | `UI_LAB_*` | lab terminal labels and the expected `UI_LAB_PASSWORD_*` credentials |
-| `UI_PROMPT_RETURN_TITLE_*`, `UI_DEBUG_*` | the F9 prompt and the F1 overlay |
+| `UI_PROMPT_RETURN_TITLE_*`, `UI_DEBUG_*` | the F9 prompt and the F1 debug tools (tool labels, hints, stage columns, ending names, flag group names; individual flag names are port-only code tables) |
 
 ## Mods
 

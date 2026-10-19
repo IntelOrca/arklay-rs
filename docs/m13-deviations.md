@@ -38,9 +38,12 @@ is a bounded no-op or a documented approximation rather than a silent failure.
    graceful no-op, so a scene that requests one advances instead of waiting.
    No AVI demuxer, Cinepak decoder or attract mode is part of this milestone.
 
-7. **Costume model swap.** `costume_set`/`costume_ck` (0x4F/0x50) store and
-   branch on the original's one-byte variant in the wardrobe rooms (11C in
-   stages 1 and 6), but the alternate player model (`em1030`/`em1031`) is not
-   loaded: the port's player assets resolve the base `player/{character}.emd`
-   only, so the outfit does not visibly change. The model selection is left for
-   the milestone that owns the outfit/menu path.
+7. **Costume model swap.** Resolved: `costume_set`/`costume_ck` (0x4F/0x50)
+   store and branch on the original's one-byte variant in the wardrobe rooms
+   (11C in stages 1 and 6), and the converter packs `em1030`..`em1033` as
+   `player/{character}_alt{variant}.emd`. When `MSF2_COSTUME_VARIANT` is set,
+   room entry swaps the player model for
+   `em1030 + character + 2 * variant`, as the original's `LoadEntityEMD`
+   does. EM1032 carries junk in its damage-bank directory slot, which the
+   original dereferences without validating; the parser treats a slot 0 that
+   is not before the EMR chunk as "no damage bank".

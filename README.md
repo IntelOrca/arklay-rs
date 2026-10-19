@@ -62,7 +62,7 @@ cargo run -- re1.akpak --room 100 --player 0
 # Pick the displayed language; the default is the OS locale, then en-US
 cargo run -- re1.akpak --room 100 --language ja-JP
 
-# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font)
+# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font|debug)
 cargo run -- re1.akpak
 
 # Play one attract reel directly (the reference's --test-demo oracle anchor):
@@ -116,9 +116,12 @@ cargo run -- re1.akpak --ending 1
 # marks. Needs no --capture; the budgets live in docs/performance.md
 cargo run -- re1.akpak --room 100 --ticks 600 --stats
 
-# Port-only debug room-select overlay: press F1 while playing to freeze the
-# room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes
+# Port-only debug tools: press F1 while playing to freeze the room and open
+# the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
+# CLEAR GAME). Confirm opens a tool, Esc backs out one level, F1 closes from
+# anywhere. `--ui debug` captures the tool list
 cargo run -- re1.akpak --room 100
+cargo run -- re1.akpak --ui debug --capture debug.bmp
 ```
 
 Captures, assembled scripts and converted packs are written to a sibling
@@ -201,7 +204,7 @@ would not shrink also stays raw.
 | `X`, `Backspace`, `Esc` | Cancel (menus, character select, load screen) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `F1` | Port-only debug room-select overlay: freeze the room and browse the pack's rooms; up/down move, confirm jumps, F1/Esc closes |
+| `F1` | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game); Esc backs out one level, F1 closes |
 | `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
 
 The character select slides the two cards between their poses while the pick

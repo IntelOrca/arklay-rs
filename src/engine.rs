@@ -1147,6 +1147,10 @@ struct GameSession {
     return_title: Option<ReturnTitlePrompt>,
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
+    /// A save slot the debug menu's LOAD GAME picked, taken once by the app.
+    load_slot_requested: Option<usize>,
+    /// An ending id the debug menu's CLEAR GAME picked, taken once by the app.
+    clear_game_requested: Option<u8>,
     /// The active attract-demo playback, when the session was booted (or
     /// handed off) into a `demo/<hex>.dat` reel. While it is set the session
     /// injects the recorded pad words and runs the reel-end watchdog.
@@ -1490,6 +1494,8 @@ impl GameSession {
             debug_menu: None,
             return_title: None,
             return_title_requested: false,
+            load_slot_requested: None,
+            clear_game_requested: None,
             attract: None,
             death: ui::death::DeathSequence::idle(),
             died_texture: None,
@@ -1508,6 +1514,7 @@ impl GameSession {
     /// `from` is the room the player came from, used by the BGM state machine
     /// to resolve the outgoing group; `None` for a direct boot or save load.
     fn enter_room(&mut self, pack: &Pack, from: Option<RoomId>) {
+        self.apply_costume_model(pack);
         // The original stores the outgoing room id in
         // `g_AttractMode_RoomCameraId` on a same-stage door; a fresh or
         // stage-change load resets it to 0x1F. The hunter's scripted intro
@@ -1538,6 +1545,26 @@ impl GameSession {
         // room's data is loaded.
         bgm::update_room_bgm(&mut self.game, self.loaded.id, from);
         bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
+    }
+
+    /// The alternate outfit (`LoadEntityEMD`): with the costume bit raised,
+    /// the player's model loads from the costume EMD (`EM1030`-`EM1033`)
+    /// instead of the character's own; the clips stay the character's. A
+    /// pack without the costume entry keeps the base model.
+    fn apply_costume_model(&mut self, pack: &Pack) {
+        if !self.game.flag_test(5, game::MSF2_COSTUME_VARIANT, false) {
+            return;
+        }
+        let Some(assets) = self.loaded.player_assets.as_mut() else {
+            return;
+        };
+        let entry =
+            crate::convert::costume_entry(self.loaded.id.player_flag, self.game.costume_variant);
+        match pack.read(&entry).map(|bytes| emd::parse(&bytes)) {
+            Ok(Ok(model)) => assets.emd = model,
+            Ok(Err(err)) => eprintln!("warning: invalid costume model {entry}: {err:#}"),
+            Err(err) => eprintln!("warning: missing costume model {entry}: {err:#}"),
+        }
     }
 
     /// Re-slice the loaded backgrounds to 316x236 when the room's
@@ -1834,7 +1861,7 @@ impl GameSession {
         // F1 opens the debug room overlay while playing, exactly like START
         // opens the pause menu.
         if self.debug_menu_enabled && ui.debug_menu {
-            self.debug_menu = Some(DebugMenu::open(pack, self.loaded.id));
+            self.open_debug_menu(pack);
             return Ok(());
         }
 
@@ -1904,6 +1931,7 @@ impl GameSession {
             },
             input,
         );
+        self.game.apply_invincible();
         // While the pad-driven locomotion owns the player, mirror its
         // reference scratch into entity 0: `player_behavior_00_idle` keeps
         // `action_state` as the idle phase and `attackDirection` as the
@@ -2062,7 +2090,8 @@ impl GameSession {
         // A door request raised by the destination's gameplay while its own
         // transition still draws is dropped: the original reads no gameplay
         // during the door task, and the running timeline owns the overlay.
-        if let Some(transition) = transition {
+        if let Some(mut transition) = transition {
+            transition.target = self.pending_player_target(pack, transition.target);
             let record = self.game.transition_door.take().unwrap_or_default();
             let door_yield = self.game.door_yield.take();
             if self.transition.is_none() {
@@ -2125,6 +2154,14 @@ impl GameSession {
     /// fade completes the DIED screen opens over the corpse.
     fn tick_death(&mut self) {
         if self.death.finished || self.death.screen_open() {
+            return;
+        }
+        // The INVINCIBLE cheat never enters the game-over machine.
+        if self.game.debug.invincible
+            && self.death.is_idle()
+            && !self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO)
+        {
+            self.game.apply_flag(5, game::MSF_PLAYER_DEAD, 1);
             return;
         }
         if self.game.entities[0].health < 0 && !self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO) {
@@ -2597,24 +2634,82 @@ impl GameSession {
         }
     }
 
+    /// A door's destination as the debug menu's pending character: the
+    /// other player variant of the room when the pack has it, else `target`
+    /// unchanged (the character change then stays pending).
+    fn pending_player_target(&self, pack: &Pack, target: RoomId) -> RoomId {
+        let Some(choice) = self.game.debug.pending_player else {
+            return target;
+        };
+        let wanted = RoomId {
+            player_flag: choice.character & 1,
+            ..target
+        };
+        if wanted == target || pack.contains(&wanted.rdt_entry()) {
+            wanted
+        } else {
+            eprintln!(
+                "warning: {} has no variant for the pending character; it stays pending",
+                target.room3()
+            );
+            target
+        }
+    }
+
     /// Take the pending return-to-title request, so the app routes to the
     /// title screen exactly once.
     fn take_return_title_request(&mut self) -> bool {
         std::mem::take(&mut self.return_title_requested)
     }
 
-    /// One frozen tick of the debug room-select overlay: F1 or cancel closes
-    /// it, up/down move the cursor and confirm jumps to the selected room.
+    /// Open the F1 debug menu on its tool list over the frozen room.
+    fn open_debug_menu(&mut self, pack: &Pack) {
+        self.ensure_menu_assets(pack);
+        self.debug_menu = Some(DebugMenu::open(pack, self.loaded.id, &self.game));
+    }
+
+    /// Take the debug menu's pending LOAD GAME slot.
+    fn take_load_slot_request(&mut self) -> Option<usize> {
+        self.load_slot_requested.take()
+    }
+
+    /// CLEAR GAME's ending flow from the live state, with the character the
+    /// films play as: the real clear time and save counter, the
+    /// second-playthrough bit and a held special key carry over. The run's
+    /// infinite-launcher ownership is not tracked, so it is never set.
+    fn ending_flow(&self, id: u8) -> (EndingFlow, u8) {
+        let character = self.game.player_choice().character;
+        let flow = EndingFlow {
+            stats: ending::EndStats::from_state(&self.game, id, character),
+            second_playthrough: self.game.flag_test(
+                game::BANK_SCENARIO,
+                game::SCENARIO_FLAG_SECOND_PLAYTHROUGH,
+                false,
+            ),
+            has_special_key: self.game.has_item(ending::ITEM_SPECIAL_KEY),
+            has_infinite_launcher: false,
+        };
+        (flow, character)
+    }
+
+    /// Take the debug menu's pending CLEAR GAME ending id.
+    fn take_clear_game_request(&mut self) -> Option<u8> {
+        self.clear_game_requested.take()
+    }
+
+    /// One frozen tick of the F1 debug menu. In-menu edits apply to the game
+    /// state directly; the events that leave the menu close it first.
     fn tick_debug_menu(&mut self, pack: &Pack, ui: UiInput) {
-        let event = self
-            .debug_menu
-            .as_mut()
-            .map_or(DebugMenuEvent::None, |menu| menu.handle_input(ui));
+        let event = match self.debug_menu.as_mut() {
+            Some(menu) => menu.handle_input(ui, &mut self.game),
+            None => DebugMenuEvent::None,
+        };
+        if event != DebugMenuEvent::None {
+            self.debug_menu = None;
+        }
         match event {
-            DebugMenuEvent::None => {}
-            DebugMenuEvent::Close => self.debug_menu = None,
+            DebugMenuEvent::None | DebugMenuEvent::Close => {}
             DebugMenuEvent::Jump(target) => {
-                self.debug_menu = None;
                 if let Err(err) = self.debug_jump(pack, target)
                     && self.debug_failed.insert(target.rdt_number())
                 {
@@ -2624,6 +2719,18 @@ impl GameSession {
                     );
                 }
             }
+            DebugMenuEvent::SaveGame => self.open_typewriter_save(pack, false),
+            DebugMenuEvent::LoadGame => {
+                self.render(pack);
+                let mut cx = self.ui_context(pack);
+                let screen =
+                    ui::save_load::open_load_screen(self.game.save_screen.as_deref(), &mut cx);
+                let cues = cx.cues.into_inner();
+                self.save_screen = Some(screen);
+                self.play_ui_cue_names(pack, cues);
+            }
+            DebugMenuEvent::ItemBox => self.begin_item_box_open(pack),
+            DebugMenuEvent::ClearGame(id) => self.clear_game_requested = Some(id),
         }
     }
 
@@ -3090,6 +3197,13 @@ impl GameSession {
         };
         self.play_ui_cue_names(pack, cues);
         if result == ScreenResult::Continue {
+            return;
+        }
+        // The debug menu's LOAD GAME: the chosen slot boots a new session,
+        // which the app owns.
+        if let ScreenResult::Done(ScreenAction::LoadGame { slot }) = result {
+            self.save_screen = None;
+            self.load_slot_requested = Some(slot);
             return;
         }
         if let Some(outcome) = self
@@ -4123,7 +4237,13 @@ impl GameSession {
         // The debug overlay is drawn last so it stays legible over the frozen
         // frame and any message the room raised before it opened.
         if let Some(debug_menu) = self.debug_menu.as_mut() {
-            debug_menu.draw(&mut self.framebuffer, self.font.as_ref(), &self.text);
+            debug_menu.draw(
+                &mut self.framebuffer,
+                self.font.as_ref(),
+                &self.text,
+                self.menu_assets.as_ref(),
+                &self.game,
+            );
         }
         // The return-to-title prompt draws over everything, including the
         // debug overlay, with its own full-screen dim.
@@ -4631,6 +4751,8 @@ pub enum AppBoot {
     Menu,
     /// The item box over the deterministic capture room.
     ItemBox,
+    /// The F1 debug menu's tool list over the deterministic capture room.
+    Debug,
     /// The FILE tab over the deterministic capture room.
     File,
     /// The map tab over the deterministic capture room.
@@ -4664,6 +4786,9 @@ const MENU_CAPTURE_TICKS: u32 = 30;
 const VIEW_CAPTURE_TICKS: u32 = MENU_CAPTURE_TICKS + 0x40;
 /// Fixed ticks the headless item-box capture settles before the frame.
 const ITEM_BOX_CAPTURE_TICKS: u32 = 30;
+/// Fixed ticks the headless debug-menu capture settles before the frame; the
+/// menu has no fade, so one frozen tick is enough.
+const DEBUG_CAPTURE_TICKS: u32 = 1;
 /// Fixed ticks the headless FILE capture settles before the frame.
 const FILE_CAPTURE_TICKS: u32 = 30;
 /// Fixed ticks the headless save-screen capture settles before the frame.
@@ -5018,6 +5143,7 @@ impl App {
             AppBoot::Demo(index) => self.boot_demo(index),
             AppBoot::Menu => self.open_menu(),
             AppBoot::ItemBox => self.open_item_box_capture(),
+            AppBoot::Debug => self.open_debug_capture(),
             AppBoot::File => self.open_file_capture(),
             AppBoot::Map => self.open_map_capture(),
             AppBoot::View => self.open_view(),
@@ -5113,6 +5239,20 @@ impl App {
         Ok(())
     }
 
+    /// Play ending `id`'s film chain into the RESULT screen, as the debug
+    /// menu's CLEAR GAME (the `--ending` path over the live run's stats).
+    fn clear_game(&mut self, id: u8, flow: EndingFlow, character: u8) -> Result<AppFlow> {
+        let films = ending::chain(
+            id,
+            character,
+            flow.second_playthrough,
+            flow.has_infinite_launcher,
+        );
+        self.ending = Some(flow);
+        let chain = films.iter().map(|&film| (film, character)).collect();
+        self.play_film_chain(chain, Some(ScreenAction::EndingResult))
+    }
+
     /// Open the character-selection screen.
     fn open_select(&mut self) -> Result<()> {
         let mut screen = ui::char_select::CharSelectScreen::new();
@@ -5200,6 +5340,17 @@ impl App {
         session.seed_menu_capture();
         session.seed_item_box_capture();
         session.open_item_box(&self.pack);
+        self.start_session(session);
+        Ok(())
+    }
+
+    /// Boot the debug-menu capture over [`MENU_ROOM`]: the capture
+    /// inventory with the F1 tool list open.
+    fn open_debug_capture(&mut self) -> Result<()> {
+        let id = RoomId::parse(MENU_ROOM)?;
+        let mut session = GameSession::from_room(&self.pack, id, &self.save_dir)?;
+        session.seed_menu_capture();
+        session.open_debug_menu(&self.pack);
         self.start_session(session);
         Ok(())
     }
@@ -5484,6 +5635,8 @@ impl App {
     fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         let mut return_title = false;
         let mut death_finished = false;
+        let mut load_slot = None;
+        let mut clear_game = None;
         {
             let App { pack, mode, .. } = self;
             let Mode::Play(session) = mode else {
@@ -5502,7 +5655,20 @@ impl App {
                 }
                 return_title = session.take_return_title_request();
                 death_finished = session.death.finished;
+                load_slot = session.take_load_slot_request();
+                clear_game = session
+                    .take_clear_game_request()
+                    .map(|id| (id, session.ending_flow(id)));
             }
+        }
+        if let Some(slot) = load_slot {
+            if let Err(err) = self.continue_from_slot(slot) {
+                eprintln!("warning: save slot {slot} unavailable: {err:#}");
+            }
+            return Ok(AppFlow::Continue);
+        }
+        if let Some((id, (flow, character))) = clear_game {
+            return self.clear_game(id, flow, character);
         }
         if return_title {
             if death_finished {
@@ -5756,6 +5922,7 @@ pub fn run_ui_with_mods(
         "demo" => AppBoot::Demo(demo),
         "menu" => AppBoot::Menu,
         "box" | "itembox" => AppBoot::ItemBox,
+        "debug" => AppBoot::Debug,
         "file" => AppBoot::File,
         "map" => AppBoot::Map,
         "view" => AppBoot::View,
@@ -5768,8 +5935,8 @@ pub fn run_ui_with_mods(
         other => {
             bail!(
                 "unknown --ui screen `{other}`; expected `font`, `title`, `select`, `game`, \
-                 `demo`, `menu`, `box`, `file`, `map`, `view`, `save`, `load`, `death`, \
-                 `result` or `epilogue`"
+                 `demo`, `menu`, `box`, `debug`, `file`, `map`, `view`, `save`, `load`, \
+                 `death`, `result` or `epilogue`"
             )
         }
     };
@@ -5923,6 +6090,13 @@ fn run_ui_impl(
                     return Ok(());
                 }
                 app.settle(ITEM_BOX_CAPTURE_TICKS)?;
+            }
+            AppBoot::Debug => {
+                app.open_debug_capture()?;
+                if apply_authoring(&mut app, authoring)? {
+                    return Ok(());
+                }
+                app.settle(DEBUG_CAPTURE_TICKS)?;
             }
             AppBoot::File => {
                 app.open_file_capture()?;
@@ -11747,7 +11921,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(session.debug_menu.as_ref().unwrap().cursor(), 1);
+        assert_eq!(session.debug_menu.as_ref().unwrap().main_cursor(), 1);
         assert_eq!(session.player.pos, pos, "the room does not move");
         assert_eq!(session.game.frame, frame, "the room does not tick");
 
@@ -11798,28 +11972,10 @@ mod tests {
                 false,
             )
             .unwrap();
-        session
-            .tick(
-                &pack,
-                UiInput {
-                    down: true,
-                    ..UiInput::default()
-                },
-                player::Input::default(),
-                false,
-            )
-            .unwrap();
-        session
-            .tick(
-                &pack,
-                UiInput {
-                    confirm: true,
-                    ..UiInput::default()
-                },
-                player::Input::default(),
-                false,
-            )
-            .unwrap();
+        // ROOM SELECT opens on the current room; the next row is B.
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
+        debug_press(&mut session, &pack, |ui| ui.down = true);
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
 
         assert!(session.debug_menu.is_none(), "confirm closes the overlay");
         assert_eq!(session.loaded.id, b);
@@ -11837,6 +11993,178 @@ mod tests {
             ),
             "the arrival lands outside collision"
         );
+    }
+
+    /// One session tick with a single UI edge.
+    fn debug_press(session: &mut GameSession, pack: &Pack, set: impl FnOnce(&mut UiInput)) {
+        let mut ui = UiInput::default();
+        set(&mut ui);
+        session
+            .tick(pack, ui, player::Input::default(), false)
+            .unwrap();
+    }
+
+    /// Open the debug menu and walk its main list to `tool`, then confirm.
+    fn debug_enter(session: &mut GameSession, pack: &Pack, tool: crate::ui::debug_menu::Tool) {
+        debug_press(session, pack, |ui| ui.debug_menu = true);
+        while crate::ui::debug_menu::TOOLS[session.debug_menu.as_ref().unwrap().main_cursor()]
+            != tool
+        {
+            debug_press(session, pack, |ui| ui.down = true);
+        }
+        debug_press(session, pack, |ui| ui.confirm = true);
+    }
+
+    #[test]
+    fn debug_menu_cancel_backs_out_one_level_and_f1_closes_from_a_tool() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        let frame = session.game.frame;
+        debug_enter(&mut session, &pack, Tool::Flags);
+        assert_eq!(
+            session.debug_menu.as_ref().unwrap().tool(),
+            Some(Tool::Flags)
+        );
+        debug_press(&mut session, &pack, |ui| ui.cancel = true);
+        assert_eq!(
+            session.debug_menu.as_ref().unwrap().tool(),
+            None,
+            "back to the list"
+        );
+        debug_press(&mut session, &pack, |ui| ui.cancel = true);
+        assert!(session.debug_menu.is_none(), "cancel on the list closes");
+        debug_enter(&mut session, &pack, Tool::Cheats);
+        debug_press(&mut session, &pack, |ui| ui.debug_menu = true);
+        assert!(session.debug_menu.is_none(), "F1 closes from inside a tool");
+        assert_eq!(
+            session.game.frame, frame,
+            "the room stayed frozen throughout"
+        );
+    }
+
+    #[test]
+    fn invincible_pins_health_and_skips_the_death_machine() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.game.debug.invincible = true;
+        session.game.entities[0].health = -5;
+        session.game.set_health_status(0x80 | 0x62);
+        session.game.poison_timer = 30;
+        session.game.apply_flag(5, game::MSF_PLAYER_DEAD, 0);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(session.game.entities[0].health, session.game.max_health);
+        assert_eq!(
+            session.game.health_status, 0x80,
+            "only the poison bits clear"
+        );
+        assert_eq!(session.game.poison_timer, 0);
+        assert!(!session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
+        assert!(session.death.is_idle(), "no death sequence starts");
+    }
+
+    #[test]
+    fn debug_save_opens_the_save_screen_without_a_ribbon() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, &dir.0.join("saves")).unwrap();
+        debug_enter(&mut session, &pack, Tool::Save);
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
+        assert!(
+            session.debug_menu.is_none(),
+            "the menu hands over to the screen"
+        );
+        assert!(
+            session.save_screen.is_some(),
+            "SAVE GAME opens the save screen"
+        );
+    }
+
+    #[test]
+    fn debug_load_opens_the_load_screen_and_raises_the_slot_request() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, &dir.0.join("saves")).unwrap();
+        debug_enter(&mut session, &pack, Tool::Save);
+        debug_press(&mut session, &pack, |ui| ui.down = true);
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
+        assert!(
+            session.save_screen.is_some(),
+            "LOAD GAME opens the load screen"
+        );
+        assert_eq!(session.take_load_slot_request(), None, "nothing picked yet");
+    }
+
+    #[test]
+    fn debug_item_box_opens_the_box_anywhere() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        debug_enter(&mut session, &pack, Tool::ItemBox);
+        assert!(session.debug_menu.is_none());
+        assert!(
+            session.item_box.is_some(),
+            "the box opens without a box in the room"
+        );
+    }
+
+    #[test]
+    fn debug_clear_game_raises_the_ending_request_once() {
+        use crate::ui::debug_menu::Tool;
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        // Chris with neither survivor: ending 4 is the default.
+        debug_enter(&mut session, &pack, Tool::ClearGame);
+        assert_eq!(session.debug_menu.as_ref().unwrap().ending(), 4);
+        debug_press(&mut session, &pack, |ui| ui.confirm = true);
+        assert!(session.debug_menu.is_none());
+        assert_eq!(session.take_clear_game_request(), Some(4));
+        assert_eq!(session.take_clear_game_request(), None, "taken once");
+        let (flow, character) = session.ending_flow(4);
+        assert_eq!(character, 0);
+        assert_eq!(flow.stats.ending_id, 4);
+        assert!(!flow.second_playthrough);
+    }
+
+    #[test]
+    fn a_pending_outfit_applies_on_the_debug_jump() {
+        let dir = TempDir::new();
+        let (pack, a, b) = debug_menu_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.game.debug.pending_player = Some(game::PlayerChoice {
+            character: 0,
+            costume: 2,
+        });
+        session.debug_jump(&pack, b).unwrap();
+        assert_eq!(session.game.debug.pending_player, None, "applied");
+        assert!(session.game.flag_test(5, game::MSF2_COSTUME_VARIANT, false));
+        assert_eq!(session.game.costume_variant, 1);
+        // Jill is pending but the pack has no Jill rooms: the door keeps the
+        // Chris variant and the change stays pending.
+        session.game.debug.pending_player = Some(game::PlayerChoice {
+            character: 1,
+            costume: 0,
+        });
+        assert_eq!(session.pending_player_target(&pack, a), a);
+        session.debug_jump(&pack, a).unwrap();
+        assert_eq!(
+            session
+                .game
+                .debug
+                .pending_player
+                .map(|choice| choice.character),
+            Some(1),
+            "the character change waits for a Jill room"
+        );
+        assert!(!session.game.flag_test(5, game::MSF2_COSTUME_VARIANT, false));
     }
 
     #[test]
