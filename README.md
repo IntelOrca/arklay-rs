@@ -116,6 +116,11 @@ cargo run -- re1.akpak --ending 1
 # marks. Needs no --capture; the budgets live in docs/performance.md
 cargo run -- re1.akpak --room 100 --ticks 600 --stats
 
+# Draw the 3D scene on the GPU (SDL_GPU over Vulkan) at 4x the 320x240
+# internal resolution; falls back to software without a device. Captures and
+# --stats always use the software renderer
+cargo run -- re1.akpak --renderer gpu --render-scale 4
+
 # Port-only debug tools: press F1 while playing to freeze the room and open
 # the tool list (ROOM SELECT, INVENTORY, PLAYER, FLAGS, CHEATS, SAVE, ITEM BOX,
 # CLEAR GAME). Confirm opens a tool, Esc backs out one level, F1 closes from

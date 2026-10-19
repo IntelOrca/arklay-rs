@@ -65,6 +65,7 @@ responsibility.
 | Module | Owner | Responsibility |
 |---|---|---|
 | `render` | Presentation | Deterministic software rasterizer: framebuffer, models, masks, shadows, effect billboards, lighting |
+| `gpu` | Presentation | Optional interactive SDL_GPU renderer for the gameplay scene (`--renderer gpu`); never used by captures, traces or tests of record |
 | `model` | Presentation | Shared decoded model types (`Texture8`, mesh/skeleton vocabulary) |
 | `anim` | Presentation | Fixed-point skeletal animation and clip playback |
 | `tmd` | Format | PSX TMD mesh parser |
@@ -326,6 +327,40 @@ claims about the original.
 *opaque*; `--strict` upgrades an unknown extension to a failure. The
 status matrix in `docs/status.md` records the counts a fresh verify reports for
 the shipped packs.
+
+## The optional GPU renderer
+
+`--renderer gpu` draws the gameplay scene with SDL_GPU at `--render-scale`
+times 320x240 (default 3, the window size). It is interactive only: captures,
+traces, `--stats`, the oracle and every golden draw through the software
+rasterizer, which stays the reference. Without a usable device (the shaders
+are SPIR-V, so it needs Vulkan) the window warns and falls back to software.
+
+- **What it draws.** `render::GameplayScene` is the one description of a
+  frame both renderers consume. `gpu::scene` turns it into GPU input: a static
+  vertex buffer per TMD (rigid skinning by a per-vertex joint index), per-draw
+  uniforms (joint rows, the cut camera, the latched lights, tint and blend),
+  and screen-space quads for the background, masks, shadows and effect
+  billboards. The fragment shader looks the CLUT row up itself, with STP in
+  the palette's alpha, so the semi-transparent texels of an ABE packet blend
+  in a second pass.
+- **Visibility.** A depth buffer replaces the painter's sort. Masks write
+  depth at their painter's key (converted to the same view-Z depth), shadows
+  and effects test against it, and opaque mesh texels write it.
+- **Residency.** Uploads are keyed by the source's address plus a content
+  fingerprint and released after 300 scene frames unused. Entering a new
+  room retires the previous one: its first frame keeps what it draws (the
+  player, shared pages) and everything else is released at once.
+- **Overlays.** The menus, messages and fades stay software. The session
+  draws its overlays twice, over a black and over a white scene; every
+  overlay operation is affine in the pixel underneath, so the composite shows
+  `black + scene * (white - black)` (`GameSession::render_layers`).
+- **Known differences** from the software frame: per-pixel depth instead of
+  per-packet sorting, hardware near-plane clipping instead of dropping a
+  crossing packet, float shading instead of the GTE's truncation, and
+  saturating overlays (a subtractive fade) become multiplicative over the
+  scene. `engine::tests::gpu_scene_matches_software_in_real_rooms` bounds the
+  difference on real rooms.
 
 ## Engine invariants
 

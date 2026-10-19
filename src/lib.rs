@@ -22,6 +22,7 @@ pub mod enemy;
 pub mod engine;
 pub mod font;
 pub mod game;
+pub mod gpu;
 pub mod items;
 pub mod ivm;
 pub mod language;

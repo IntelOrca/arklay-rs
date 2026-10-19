@@ -89,6 +89,7 @@ use crate::ending;
 use crate::enemy;
 use crate::font;
 use crate::game;
+use crate::gpu::GpuRenderer;
 use crate::items;
 use crate::lua;
 use crate::mask;
@@ -758,9 +759,14 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
         }
 
         // The pass that ends a transition is drawn once before teardown.
-        session.render(pack);
-        framebuffer.copy_from(session.frame());
-        display.present(&framebuffer)?;
+        if let Some(gpu) = display.gpu() {
+            session.render_layers(pack, &mut gpu.borrow_mut());
+            display.present_layers(session.frame(), session.white_frame())?;
+        } else {
+            session.render(pack);
+            framebuffer.copy_from(session.frame());
+            display.present(&framebuffer)?;
+        }
         display.show()?;
         if session.transition_finished {
             session.finish_transition(pack);
@@ -769,17 +775,63 @@ fn run_session_loop(pack: &Pack, session: &mut GameSession, display: &Display) -
     }
 }
 
-/// The SDL window, renderer and streaming texture every screen shares.
+/// Which renderer an interactive window draws the gameplay scene with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RendererKind {
+    /// The software rasterizer, scaled to the window (the default).
+    #[default]
+    Software,
+    /// The SDL_GPU scene renderer ([`crate::gpu`]) at a higher internal
+    /// resolution; falls back to software when no device is available.
+    Gpu,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RendererSettings {
+    kind: RendererKind,
+    scale: u32,
+}
+
+static RENDERER: std::sync::Mutex<RendererSettings> = std::sync::Mutex::new(RendererSettings {
+    kind: RendererKind::Software,
+    scale: crate::gpu::DEFAULT_SCALE,
+});
+
+/// Select the renderer interactive windows open with (`--renderer` and
+/// `--render-scale`). Captures, `--stats` runs and tests always draw in
+/// software: the setting only applies to a window a player looks at.
+pub fn set_renderer(kind: RendererKind, scale: u32) {
+    *RENDERER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = RendererSettings { kind, scale };
+}
+
+fn renderer_settings() -> RendererSettings {
+    *RENDERER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How a [`Display`] puts frames on screen.
+enum Backend {
+    /// An SDL renderer scaling a streaming 320x240 texture. The texture is
+    /// declared first so it is destroyed before its renderer.
+    Software {
+        texture: TextureHandle,
+        renderer: RendererHandle,
+    },
+    /// The SDL_GPU device, which owns the window's swapchain.
+    Gpu(Box<std::cell::RefCell<GpuRenderer>>),
+}
+
+/// The SDL window and the backend every screen shares.
 ///
-/// The guards are declared before the raw pointers so the texture, renderer,
+/// The guards are declared before the raw window pointer so the backend,
 /// window and SDL tear down in that order.
 struct Display {
-    _texture: TextureHandle,
-    _renderer: RendererHandle,
+    backend: Backend,
     _window: WindowHandle,
     _sdl: SdlHandle,
-    texture: *mut SDL_Texture,
-    renderer: *mut SDL_Renderer,
     window: *mut SDL_Window,
 }
 
@@ -821,7 +873,35 @@ impl Display {
         }
         let window = WindowHandle(window);
 
-        let renderer = unsafe { SDL_CreateRenderer(window.0, std::ptr::null()) };
+        let settings = renderer_settings();
+        let gpu = if !capture && settings.kind == RendererKind::Gpu {
+            // SAFETY: the window outlives the backend (field order) and has
+            // no SDL renderer yet.
+            match unsafe { GpuRenderer::new(window.0, settings.scale) } {
+                Ok(gpu) => Some(gpu),
+                Err(err) => {
+                    eprintln!("warning: GPU renderer unavailable ({err:#}); using software");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let backend = match gpu {
+            Some(gpu) => Backend::Gpu(Box::new(std::cell::RefCell::new(gpu))),
+            None => Self::software_backend(window.0)?,
+        };
+        Ok(Self {
+            backend,
+            window: window.0,
+            _window: window,
+            _sdl: sdl,
+        })
+    }
+
+    /// The SDL renderer and streaming texture of the software backend.
+    fn software_backend(window: *mut SDL_Window) -> Result<Backend> {
+        let renderer = unsafe { SDL_CreateRenderer(window, std::ptr::null()) };
         if renderer.is_null() {
             bail!("SDL_CreateRenderer failed: {}", sdl_error());
         }
@@ -851,26 +931,38 @@ impl Display {
         if !unsafe { SDL_SetRenderDrawColor(renderer.0, 0, 0, 0, 255) } {
             bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
         }
+        Ok(Backend::Software { texture, renderer })
+    }
 
-        Ok(Self {
-            texture: texture.0,
-            renderer: renderer.0,
-            window: window.0,
-            _texture: texture,
-            _renderer: renderer,
-            _window: window,
-            _sdl: sdl,
-        })
+    /// The GPU renderer, when the window uses one.
+    fn gpu(&self) -> Option<&std::cell::RefCell<GpuRenderer>> {
+        match &self.backend {
+            Backend::Gpu(gpu) => Some(gpu),
+            Backend::Software { .. } => None,
+        }
     }
 
     /// Upload the framebuffer and draw it scaled to the window.
     fn present(&self, framebuffer: &Framebuffer) -> Result<()> {
-        present(self.renderer, self.texture, framebuffer)
+        self.present_layers(framebuffer, None)
     }
 
-    /// Flip the drawn backbuffer to the screen.
+    /// Present a frame whose overlays were drawn over the GPU scene: `black`
+    /// over a black scene and `white` over a white one (see
+    /// [`GameSession::render_layers`]). `white == None` shows `black` alone.
+    fn present_layers(&self, black: &Framebuffer, white: Option<&Framebuffer>) -> Result<()> {
+        match &self.backend {
+            Backend::Software { texture, renderer } => present(renderer.0, texture.0, black),
+            Backend::Gpu(gpu) => gpu.borrow_mut().present(black, white),
+        }
+    }
+
+    /// Flip the drawn backbuffer to the screen. The GPU backend presents in
+    /// [`Display::present_layers`].
     fn show(&self) -> Result<()> {
-        if !unsafe { SDL_RenderPresent(self.renderer) } {
+        if let Backend::Software { renderer, .. } = &self.backend
+            && !unsafe { SDL_RenderPresent(renderer.0) }
+        {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
         }
         Ok(())
@@ -878,7 +970,10 @@ impl Display {
 
     /// Read the drawn frame back and write it as a BMP.
     fn capture(&self, path: &Path) -> Result<()> {
-        capture_frame(self.renderer, path)
+        match &self.backend {
+            Backend::Software { renderer, .. } => capture_frame(renderer.0, path),
+            Backend::Gpu(_) => bail!("captures always use the software renderer"),
+        }
     }
 }
 
@@ -965,6 +1060,17 @@ enum MenuFadePhase {
 /// first frame after the menu task exits still runs one gameplay tick before
 /// the suspension takes hold.
 const MENU_CLOSE_FREEZE_FRAMES: u8 = 4;
+
+/// Which of [`GameSession::render_pass`]'s variants draws the scene.
+enum ScenePass<'g> {
+    /// The software rasterizer draws it into the framebuffer.
+    Software,
+    /// The GPU records it; the framebuffer starts black (the overlay layer
+    /// over a black scene).
+    Record(&'g mut GpuRenderer),
+    /// The GPU scene of the black pass stands; the framebuffer starts white.
+    White,
+}
 
 struct GameSession {
     loaded: LoadedRoom,
@@ -1082,6 +1188,16 @@ struct GameSession {
     /// called on room entry and after every fixed tick.
     lua: Option<lua::LuaVm>,
     framebuffer: Framebuffer,
+    /// The GPU path's second overlay layer: the frame drawn over a white
+    /// scene (see [`GameSession::render_layers`]). Like `framebuffer`, it
+    /// persists so a frozen frame keeps drawing over the last one.
+    framebuffer_white: Option<Framebuffer>,
+    /// Whether the persisted framebuffers show the GPU scene: set by a frame
+    /// that recorded one and cleared by any frame that covered it.
+    gpu_scene_visible: bool,
+    /// The room the GPU residency was last recorded for; a change retires
+    /// the previous room's uploads.
+    gpu_room: Option<RoomId>,
     titled_cut: usize,
     transition: Option<TransitionMode>,
     transition_finished: bool,
@@ -1460,6 +1576,9 @@ impl GameSession {
             save_dir: save_dir.to_path_buf(),
             lua,
             framebuffer: Framebuffer::new(),
+            framebuffer_white: None,
+            gpu_scene_visible: false,
+            gpu_room: None,
             titled_cut: usize::MAX,
             transition: None,
             transition_finished: false,
@@ -3984,6 +4103,52 @@ impl GameSession {
     /// after the scene (and outside the transition path) so it is never
     /// covered by the menu and never dimmed by a fade or door overlay.
     fn render(&mut self, pack: &Pack) {
+        self.render_pass(pack, ScenePass::Software);
+    }
+
+    /// Render the frame for the GPU backend: the scene is recorded on `gpu`
+    /// and every software overlay is drawn twice, once over a black scene
+    /// (`framebuffer`) and once over a white one (`framebuffer_white`).
+    ///
+    /// Each overlay operation (sprites, text, fades, blends) is affine in the
+    /// pixel underneath, so the presented pixel is `black + scene * (white -
+    /// black)`: opaque overlay pixels hide the scene, fades and blends scale
+    /// it. Returns whether the frame shows the GPU scene; when it does not,
+    /// `framebuffer` is the whole frame. See [`GameSession::white_frame`].
+    fn render_layers(&mut self, pack: &Pack, gpu: &mut GpuRenderer) -> bool {
+        // The pause-menu fade is consumed as it draws; the white pass draws
+        // the same one.
+        let menu_fade = self.menu_fade_draw;
+        self.render_pass(pack, ScenePass::Record(gpu));
+        if !self.gpu_scene_visible {
+            return false;
+        }
+        self.menu_fade_draw = menu_fade;
+        let mut white = self.framebuffer_white.take().unwrap_or_default();
+        std::mem::swap(&mut self.framebuffer, &mut white);
+        self.render_pass(pack, ScenePass::White);
+        std::mem::swap(&mut self.framebuffer, &mut white);
+        self.framebuffer_white = Some(white);
+        true
+    }
+
+    /// The frame drawn over a white scene, when the last
+    /// [`GameSession::render_layers`] showed the GPU scene.
+    fn white_frame(&self) -> Option<&Framebuffer> {
+        self.framebuffer_white
+            .as_ref()
+            .filter(|_| self.gpu_scene_visible)
+    }
+
+    fn render_pass(&mut self, pack: &Pack, pass: ScenePass<'_>) {
+        // The screens below replace the whole frame, scene included.
+        if self.boot_message.is_some()
+            || self.movie.is_some()
+            || self.transition.is_some()
+            || self.death.screen_open()
+        {
+            self.gpu_scene_visible = false;
+        }
         // The loading narration shows only its typewriter message over black;
         // no world frame is drawn under it.
         if self.boot_message.is_some() {
@@ -4023,19 +4188,45 @@ impl GameSession {
         // opened over instead of re-rendering the scene, then draw the menu
         // and the window over it.
         if self.menu.is_none() {
-            render_frame(
-                &mut self.framebuffer,
-                pack,
-                self.loaded.id,
-                &self.loaded.room,
-                &self.player,
-                &mut self.game,
-                self.loaded.player_assets.as_ref(),
-                &mut self.npc_models,
-                &mut self.masks,
-                &mut self.shadows,
-                &mut self.effect_pages,
-            );
+            match pass {
+                ScenePass::Software | ScenePass::Record(_) => {
+                    let gpu = match pass {
+                        ScenePass::Record(gpu) => {
+                            if self.gpu_room.replace(self.loaded.id) != Some(self.loaded.id) {
+                                gpu.retire();
+                            }
+                            Some(gpu)
+                        }
+                        _ => None,
+                    };
+                    self.gpu_scene_visible = render_frame_on(
+                        &mut self.framebuffer,
+                        gpu,
+                        pack,
+                        self.loaded.id,
+                        &self.loaded.room,
+                        &self.player,
+                        &mut self.game,
+                        self.loaded.player_assets.as_ref(),
+                        &mut self.npc_models,
+                        &mut self.masks,
+                        &mut self.shadows,
+                        &mut self.effect_pages,
+                    );
+                }
+                // The scene was recorded by the black pass; this pass only
+                // redraws what lies over it.
+                ScenePass::White => {
+                    self.framebuffer
+                        .fill_rect([0, 0, WIDTH, HEIGHT], [255, 255, 255, 255]);
+                    draw_special_light(
+                        &mut self.framebuffer,
+                        &self.game,
+                        self.loaded.id,
+                        self.loaded.room.current_cut,
+                    );
+                }
+            }
             // The cutscene letterbox bars sit on the scene after the
             // room-entry fade has darkened it: `main_loop` draws the fading
             // rect first (0x0042... at the fade block) and then the two
@@ -4057,6 +4248,7 @@ impl GameSession {
             // the frozen room, so only the Out-pending frame skips the clear;
             // the closing request frame is already black in the reference.
             self.framebuffer.clear();
+            self.gpu_scene_visible = false;
         }
         // The computer terminal draws over the frozen monitor-camera scene.
         if self.computer.is_some() {
@@ -5784,6 +5976,26 @@ impl App {
         }
     }
 
+    /// [`App::draw`] for the GPU backend: a game session renders its two
+    /// overlay layers over the GPU scene (see [`GameSession::render_layers`]);
+    /// every other screen draws as usual.
+    fn draw_layers(&mut self, gpu: &mut GpuRenderer) {
+        if let Mode::Play(session) = &mut self.mode {
+            session.render_layers(&self.pack, gpu);
+            self.framebuffer.copy_from(session.frame());
+        } else {
+            self.draw();
+        }
+    }
+
+    /// The frame drawn over a white GPU scene, when the session shows one.
+    fn white_frame(&self) -> Option<&Framebuffer> {
+        match &self.mode {
+            Mode::Play(session) => session.white_frame(),
+            _ => None,
+        }
+    }
+
     /// The app framebuffer.
     fn frame(&self) -> &Framebuffer {
         &self.framebuffer
@@ -6347,8 +6559,13 @@ fn run_app_loop(app: &mut App, display: &Display) -> Result<()> {
             }
             accumulator -= tick_ms;
         }
-        app.draw();
-        display.present(app.frame())?;
+        if let Some(gpu) = display.gpu() {
+            app.draw_layers(&mut gpu.borrow_mut());
+            display.present_layers(app.frame(), app.white_frame())?;
+        } else {
+            app.draw();
+            display.present(app.frame())?;
+        }
         display.show()?;
         app.post_present();
     }
@@ -10137,9 +10354,47 @@ fn render_frame(
     shadows: &mut ShadowCache,
     effect_cache: &mut EffectPageCache,
 ) {
+    render_frame_on(
+        framebuffer,
+        None,
+        pack,
+        id,
+        room,
+        player_state,
+        game,
+        assets,
+        npc_models,
+        masks,
+        shadows,
+        effect_cache,
+    );
+}
+
+/// [`render_frame`], drawing the scene with `gpu` when given.
+///
+/// The GPU path leaves the framebuffer black with only the special-light
+/// overlay on it (the session composites it over the GPU scene) and returns
+/// `true`. It returns `false` when the frame has no GPU scene: there is no
+/// camera cut, or recording failed and the scene was drawn in software
+/// instead.
+#[allow(clippy::too_many_arguments)]
+fn render_frame_on(
+    framebuffer: &mut Framebuffer,
+    gpu: Option<&mut GpuRenderer>,
+    pack: &Pack,
+    id: RoomId,
+    room: &RoomState,
+    player_state: &player::PlayerState,
+    game: &mut game::GameState,
+    assets: Option<&PlayerAssets>,
+    npc_models: &mut enemy::EntityModelCache,
+    masks: &mut MaskCache,
+    shadows: &mut ShadowCache,
+    effect_cache: &mut EffectPageCache,
+) -> bool {
     let Some(cut) = room.cuts.get(room.current_cut) else {
         framebuffer.clear();
-        return;
+        return false;
     };
     // The frame's screen shake, rolled by `roll_screen_shake` at the top of the
     // gameplay tick. It shifts the camera projection and the background's
@@ -10768,26 +11023,60 @@ fn render_frame(
         shake
     };
     let global_colour = [255; 3];
-    render::draw_gameplay_scene_with_effects(
-        framebuffer,
-        cut.background.as_ref(),
-        display_origin,
-        global_colour,
-        &meshes,
-        &shadow_list,
-        &camera,
-        &lighting,
-        layer.as_ref(),
-        Some(&effect_layer),
-        visible.len() + visible_item_models.len(),
-        mirror.as_ref(),
-    );
-    // The special-room-light overlay (`0x1C`) is a full-screen saturated tint
-    // alpha-blended over the scene; the state advances once per gameplay tick
-    // in `tick_room`. Its absence (a parked state, an all-zero mask or a
-    // suppressing room) draws nothing, and the guardhouse control room draws
-    // the same rect twice.
-    if let Some(light) = game.special_light_rect(id, room.current_cut) {
+    let scene = render::GameplayScene {
+        background: cut.background.as_ref(),
+        origin: display_origin,
+        colour: global_colour,
+        meshes: &meshes,
+        shadows: &shadow_list,
+        camera: &camera,
+        lighting: &lighting,
+        mask_layer: layer.as_ref(),
+        effect_layer: Some(&effect_layer),
+        mirror_from: visible.len() + visible_item_models.len(),
+        mirror: mirror.as_ref(),
+    };
+    let on_gpu = match gpu {
+        Some(gpu) => match gpu.record_scene(&scene) {
+            Ok(()) => {
+                framebuffer.clear();
+                true
+            }
+            Err(err) => {
+                warn_gpu_scene_failed(&err);
+                scene.draw(framebuffer);
+                false
+            }
+        },
+        None => {
+            scene.draw(framebuffer);
+            false
+        }
+    };
+    draw_special_light(framebuffer, game, id, room.current_cut);
+    on_gpu
+}
+
+/// Report a failed GPU scene once per run; the frame falls back to software.
+fn warn_gpu_scene_failed(err: &anyhow::Error) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("warning: GPU scene failed ({err:#}); drawing it in software");
+    }
+}
+
+/// The special-room-light overlay (`0x1C`): a full-screen saturated tint
+/// alpha-blended over the scene; the state advances once per gameplay tick in
+/// `tick_room`. Its absence (a parked state, an all-zero mask or a suppressing
+/// room) draws nothing, and the guardhouse control room draws the same rect
+/// twice.
+fn draw_special_light(
+    framebuffer: &mut Framebuffer,
+    game: &game::GameState,
+    id: RoomId,
+    cut: usize,
+) {
+    if let Some(light) = game.special_light_rect(id, cut) {
         for _ in 0..light.draws {
             framebuffer.blend_rect([0, 0, WIDTH, HEIGHT], light.color, light.alpha);
         }
@@ -12981,6 +13270,179 @@ mod tests {
         let first = std::fs::read(&first_path).unwrap();
         let second = std::fs::read(&second_path).unwrap();
         assert_eq!(first, second, "two --ticks 60 captures differ");
+    }
+
+    /// The GPU display composites the two overlay layers over the scene and
+    /// presents through a real swapchain (SDL's offscreen video driver gives
+    /// Vulkan a headless surface). Skips without a SPIR-V capable GPU.
+    #[test]
+    fn gpu_display_presents_layered_frames() {
+        let _lock = crate::audio::test_lock::sdl();
+        unsafe { SDL_SetHint(SDL_HINT_VIDEO_DRIVER, c"offscreen".as_ptr()) };
+        let Ok(_sdl) = SdlHandle::acquire() else {
+            eprintln!("skipping: SDL video unavailable");
+            return;
+        };
+        let window = unsafe {
+            SDL_CreateWindow(
+                c"Arklay GPU test".as_ptr(),
+                WINDOW_WIDTH,
+                WINDOW_HEIGHT,
+                SDL_WindowFlags::default(),
+            )
+        };
+        assert!(
+            !window.is_null(),
+            "SDL_CreateWindow failed: {}",
+            sdl_error()
+        );
+        let window = WindowHandle(window);
+        // SAFETY: `window` is dropped after `gpu` below.
+        let mut gpu = match unsafe { GpuRenderer::new(window.0, 2) } {
+            Ok(gpu) => gpu,
+            Err(err) => {
+                eprintln!("skipping: {err:#}");
+                return;
+            }
+        };
+        let mut black = Framebuffer::new();
+        let mut white = Framebuffer::new();
+        white.fill_rect([0, 0, WIDTH, HEIGHT], [255, 255, 255, 255]);
+        for layer in [&mut black, &mut white] {
+            layer.fill_rect([10, 10, 40, 40], [200, 30, 30, 255]);
+            layer.fade_to_black(128);
+        }
+        for _ in 0..3 {
+            gpu.present(&black, Some(&white)).unwrap();
+            gpu.present(&black, None).unwrap();
+        }
+        drop(gpu);
+        drop(window);
+    }
+
+    /// The GPU renderer draws real rooms (backgrounds, masks, models,
+    /// shadows) close to the software rasterizer. Needs `ARKLAY_RE1_PACK` and
+    /// a SPIR-V capable GPU; skips without a GPU. `ARKLAY_GPU_TEST_DUMP=<dir>`
+    /// writes both frames as BMPs and `ARKLAY_GPU_TEST_SCALE=<n>` renders the
+    /// GPU scene at `n` times the resolution (compared at pixel centres).
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn gpu_scene_matches_software_in_real_rooms() {
+        let _lock = crate::audio::test_lock::sdl();
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let Ok(_sdl) = SdlHandle::acquire() else {
+            eprintln!("skipping: SDL video unavailable");
+            return;
+        };
+        let scale = std::env::var("ARKLAY_GPU_TEST_SCALE")
+            .ok()
+            .and_then(|scale| scale.parse().ok())
+            .unwrap_or(1);
+        let mut gpu = match GpuRenderer::offscreen(scale) {
+            Ok(gpu) => gpu,
+            Err(err) => {
+                eprintln!("skipping: {err:#}");
+                return;
+            }
+        };
+        let (gpu_width, gpu_height) = gpu.scene_size();
+        let scale = gpu_width / WIDTH as u32;
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let save_dir = TempDir::new();
+        let mut drawn = 0;
+        for (room, cut) in ["105", "106", "10B", "10D", "202", "1001"]
+            .into_iter()
+            .flat_map(|room| (0..8).map(move |cut| (room, cut)))
+        {
+            let id = RoomId::parse(room).unwrap();
+            let Ok(mut session) = GameSession::from_room(&pack, id, &save_dir.0) else {
+                continue;
+            };
+            if cut >= session.loaded.room.cuts.len() {
+                continue;
+            }
+            session.loaded.room.current_cut = cut;
+            // Let the room's scripts place and animate its entities.
+            for _ in 0..30 {
+                session
+                    .tick(&pack, UiInput::default(), player::Input::default(), false)
+                    .unwrap();
+            }
+            if session.loaded.room.current_cut != cut || session.transition.is_some() {
+                continue;
+            }
+            let room = format!("{room}-{cut}");
+            let mut software = Framebuffer::new();
+            render_frame(
+                &mut software,
+                &pack,
+                session.loaded.id,
+                &session.loaded.room,
+                &session.player,
+                &mut session.game,
+                session.loaded.player_assets.as_ref(),
+                &mut session.npc_models,
+                &mut session.masks,
+                &mut session.shadows,
+                &mut session.effect_pages,
+            );
+            let mut overlay = Framebuffer::new();
+            assert!(render_frame_on(
+                &mut overlay,
+                Some(&mut gpu),
+                &pack,
+                session.loaded.id,
+                &session.loaded.room,
+                &session.player,
+                &mut session.game,
+                session.loaded.player_assets.as_ref(),
+                &mut session.npc_models,
+                &mut session.masks,
+                &mut session.shadows,
+                &mut session.effect_pages,
+            ));
+            let hardware = gpu.read_scene().unwrap();
+            if let Ok(dir) = std::env::var("ARKLAY_GPU_TEST_DUMP") {
+                for (name, rgba, width, height) in [
+                    ("software", &software.rgba, WIDTH as u32, HEIGHT as u32),
+                    ("gpu", &hardware, gpu_width, gpu_height),
+                ] {
+                    let image = Image {
+                        width,
+                        height,
+                        rgba: rgba.clone(),
+                    };
+                    capture_bmp(&image, &Path::new(&dir).join(format!("{room}-{name}.bmp")))
+                        .unwrap();
+                }
+            }
+            let centre = |index: usize| {
+                let (x, y) = (index as u32 % WIDTH as u32, index as u32 / WIDTH as u32);
+                let offset = ((y * scale + scale / 2) * gpu_width + x * scale + scale / 2) * 4;
+                &hardware[offset as usize..offset as usize + 4]
+            };
+            let different = software
+                .rgba
+                .chunks(4)
+                .enumerate()
+                .filter(|(index, sw)| {
+                    let hw = centre(*index);
+                    (0..3).any(|c| sw[c].abs_diff(hw[c]) > 48)
+                })
+                .count();
+            let total = (WIDTH * HEIGHT) as usize;
+            eprintln!("room {room}: {different} of {total} pixels differ");
+            // Edges, depth-vs-painter ties and float shading differ; whole
+            // missing or misplaced layers would not fit in this budget.
+            assert!(
+                different * 10 < total,
+                "room {room}: {different} pixels differ"
+            );
+            drawn += 1;
+        }
+        assert!(drawn > 0);
     }
 
     #[test]

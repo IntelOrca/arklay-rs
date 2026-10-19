@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use arklay::pack::Pack;
 use arklay::progress::{Progress, format_duration};
@@ -178,8 +178,33 @@ struct Cli {
     #[arg(long, requires = "ticks", conflicts_with_all = ["ui", "ending", "fmv"])]
     stats: bool,
 
+    /// Renderer for the interactive window's gameplay scene. `gpu` draws the
+    /// 3D scene with SDL_GPU at `--render-scale` times 320x240 (it needs a
+    /// Vulkan driver and falls back to software without one). Captures,
+    /// traces and `--stats` always draw in software
+    #[arg(long, value_enum, default_value_t = RendererArg::Software, requires = "pack")]
+    renderer: RendererArg,
+
+    /// The `--renderer gpu` scene's internal resolution as a multiple of
+    /// 320x240
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = arklay::gpu::DEFAULT_SCALE,
+        requires = "pack",
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(arklay::gpu::MAX_SCALE))
+    )]
+    render_scale: u32,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// The `--renderer` choices.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererArg {
+    Software,
+    Gpu,
 }
 
 #[derive(Subcommand, Debug)]
@@ -568,6 +593,13 @@ fn main() -> Result<()> {
                 bail!("a game pack is required (or use `arklay convert-game`)");
             };
             let tracing = cli.trace.is_some();
+            arklay::engine::set_renderer(
+                match cli.renderer {
+                    RendererArg::Software => arklay::engine::RendererKind::Software,
+                    RendererArg::Gpu => arklay::engine::RendererKind::Gpu,
+                },
+                cli.render_scale,
+            );
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
                 && ((screen != "game" && screen != "demo") || !tracing)

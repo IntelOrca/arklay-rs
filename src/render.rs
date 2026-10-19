@@ -1723,7 +1723,7 @@ pub(crate) fn record_blend_weight(model: &Tmd, blend_override: Option<u8>) -> Op
 
 impl EntityMesh<'_> {
     /// Whether joint `index` draws.
-    fn joint_visible(&self, index: usize) -> bool {
+    pub(crate) fn joint_visible(&self, index: usize) -> bool {
         index < 32 && self.hidden_joints & (1 << index) == 0
     }
 }
@@ -1789,6 +1789,45 @@ impl<'a> MaskLayer<'a> {
             page,
             active: cut.mask_active,
         }
+    }
+}
+
+/// Every input of one gameplay frame, bundled so the software rasterizer
+/// ([`GameplayScene::draw`]) and the optional GPU renderer (`crate::gpu`) draw
+/// from the same description. The fields are the arguments of
+/// [`draw_gameplay_scene_with_effects`].
+#[derive(Debug, Clone, Copy)]
+pub struct GameplayScene<'a> {
+    pub background: Option<&'a Image>,
+    pub origin: [i32; 2],
+    pub colour: [u8; 3],
+    pub meshes: &'a [EntityMesh<'a>],
+    pub shadows: &'a [Shadow<'a>],
+    pub camera: &'a Camera,
+    pub lighting: &'a Lighting,
+    pub mask_layer: Option<&'a MaskLayer<'a>>,
+    pub effect_layer: Option<&'a EffectLayer<'a>>,
+    pub mirror_from: usize,
+    pub mirror: Option<&'a MirrorPass>,
+}
+
+impl GameplayScene<'_> {
+    /// Rasterize the scene in software; see [`draw_gameplay_scene_with_effects`].
+    pub fn draw(&self, framebuffer: &mut Framebuffer) {
+        draw_gameplay_scene_with_effects(
+            framebuffer,
+            self.background,
+            self.origin,
+            self.colour,
+            self.meshes,
+            self.shadows,
+            self.camera,
+            self.lighting,
+            self.mask_layer,
+            self.effect_layer,
+            self.mirror_from,
+            self.mirror,
+        );
     }
 }
 
@@ -1960,7 +1999,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
 
 /// The world position a mesh's light is latched from: its root joint's
 /// translation, which the entity matrix sets to the entity's own position.
-fn root_position(joints: &[anim::Mat4x3]) -> [i32; 3] {
+pub(crate) fn root_position(joints: &[anim::Mat4x3]) -> [i32; 3] {
     joints.first().map_or([0; 3], |joint| joint.t)
 }
 
@@ -1973,6 +2012,13 @@ fn root_position(joints: &[anim::Mat4x3]) -> [i32; 3] {
 /// the frame's screen offset (the shake), which the original adds to every
 /// mask sprite's screen position.
 fn collect_masks(layer: &MaskLayer<'_>, offset: [i32; 2], items: &mut Vec<SceneItem<'_>>) {
+    items.extend(mask_quads(layer, offset).into_iter().map(SceneItem::Mask));
+}
+
+/// A layer's active mask sprites in submission order, the list
+/// [`collect_masks`] feeds the painter's sort.
+pub(crate) fn mask_quads(layer: &MaskLayer<'_>, offset: [i32; 2]) -> Vec<MaskQuad> {
+    let mut quads = Vec::new();
     for index in mask::mask_submission_order(layer.room, layer.camera, layer.cut.masks.len()) {
         let Some(sprite) = layer.cut.masks.get(index) else {
             continue;
@@ -1983,13 +2029,14 @@ fn collect_masks(layer: &MaskLayer<'_>, offset: [i32; 2], items: &mut Vec<SceneI
         let Some(key) = mask::mask_sprite_key(layer.room, layer.camera, index, sprite) else {
             continue;
         };
-        items.push(SceneItem::Mask(MaskQuad {
+        quads.push(MaskQuad {
             key,
             uv: (u32::from(sprite.uv.0), u32::from(sprite.uv.1)),
             pos: (sprite.pos.0 + offset[0], sprite.pos.1 + offset[1]),
             size: (u32::from(sprite.size.0), u32::from(sprite.size.1)),
-        }));
+        });
     }
+    quads
 }
 
 /// Project and clip one ground shadow into the scene list.
@@ -2000,8 +2047,16 @@ fn collect_masks(layer: &MaskLayer<'_>, offset: [i32; 2], items: &mut Vec<SceneI
 /// the same quantity and units a triangle's [`Triangle::depth`] uses, so it
 /// goes through [`triangle_depth_key`] like every other scene key.
 fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<SceneItem<'a>>) {
+    if let Some(poly) = shadow_polygon(shadow, camera) {
+        items.push(SceneItem::Shadow(poly));
+    }
+}
+
+/// One ground shadow's near-clipped, projected polygon and painter's key, the
+/// item [`collect_shadow`] submits; `None` when nothing survives the clip.
+pub(crate) fn shadow_polygon<'a>(shadow: &Shadow<'a>, camera: &Camera) -> Option<ShadowPoly<'a>> {
     if shadow.texture.width == 0 || shadow.texture.height == 0 {
-        return;
+        return None;
     }
     let entity = anim::entity_matrix(shadow.pos, shadow.angle);
     let (left, right) = (
@@ -2059,15 +2114,15 @@ fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<Scen
         }
     }
     if polygon.len() < 3 {
-        return;
+        return None;
     }
 
-    items.push(SceneItem::Shadow(ShadowPoly {
+    Some(ShadowPoly {
         key: triangle_depth_key(mean_depth as f64),
         corners: polygon,
         texture: shadow.texture,
         tint: shadow.tint,
-    }));
+    })
 }
 
 /// Project one view-space shadow vertex to screen space.
@@ -2455,7 +2510,7 @@ pub struct EntityLightSource {
 }
 
 /// The ABE (semi-transparency) bit of a primitive's CLUT word.
-const ABE_BIT: u16 = 0x8000;
+pub(crate) const ABE_BIT: u16 = 0x8000;
 
 /// Integer square root with truncation, as the original's `SquareRoot0` does.
 fn integer_sqrt(value: i64) -> i64 {
@@ -2504,39 +2559,39 @@ struct Triangle {
 /// One projected shadow vertex: screen position, inverse view Z and the
 /// normalized texture coordinates.
 #[derive(Debug, Clone, Copy)]
-struct ShadowVertex {
-    position: [f64; 2],
-    inv_z: f64,
+pub(crate) struct ShadowVertex {
+    pub(crate) position: [f64; 2],
+    pub(crate) inv_z: f64,
     /// Texture u over `0..=1`; the rasterizer scales by the page width.
-    u: f64,
+    pub(crate) u: f64,
     /// Texture v over `0..=1`; the rasterizer scales by the page height.
-    v: f64,
+    pub(crate) v: f64,
 }
 
 /// A ground shadow's clipped convex polygon, ready for rasterization.
 #[derive(Debug, Clone)]
-struct ShadowPoly<'a> {
+pub(crate) struct ShadowPoly<'a> {
     /// Painter's key from [`triangle_depth_key`].
-    key: u32,
+    pub(crate) key: u32,
     /// Convex ring of three to five vertices in edge order.
-    corners: Vec<ShadowVertex>,
+    pub(crate) corners: Vec<ShadowVertex>,
     /// The baked coverage page this polygon samples.
-    texture: &'a Image,
+    pub(crate) texture: &'a Image,
     /// The colour the quad blends towards.
-    tint: [u8; 3],
+    pub(crate) tint: [u8; 3],
 }
 
 /// One mask sprite of a camera's page, ready for rasterization.
 #[derive(Debug, Clone, Copy)]
-struct MaskQuad {
+pub(crate) struct MaskQuad {
     /// Painter's key from [`mask::mask_sprite_key`].
-    key: u32,
+    pub(crate) key: u32,
     /// Top-left texel of the sprite in the page bitmap.
-    uv: (u32, u32),
+    pub(crate) uv: (u32, u32),
     /// Top-left screen pixel.
-    pos: (i32, i32),
+    pub(crate) pos: (i32, i32),
     /// Sprite size in pixels; equals the sampled region, so sampling is 1:1.
-    size: (u32, u32),
+    pub(crate) size: (u32, u32),
 }
 
 /// One decoded effect billboard, ready for rasterization.
@@ -2818,7 +2873,7 @@ fn collect_triangles(
 /// [`Camera::from_points_rolled`]'s angle-built view, so the port rebuilds it
 /// here rather than reusing the projection matrix. Roll is omitted exactly
 /// like the reference (every shipped RDT camera stores zero).
-fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3] {
+pub(crate) fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3] {
     let dx = f64::from(to[0] - from[0]);
     let dy = f64::from(to[1] - from[1]);
     let dz = f64::from(to[2] - from[2]);
@@ -2841,7 +2896,7 @@ fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3] {
 
 /// `MulMatrix0`: `m2 = m0 * m1` over 4.12 matrices with the reference's
 /// per-product rounding.
-fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
+pub(crate) fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
     std::array::from_fn(|i| {
         std::array::from_fn(|j| {
             let mut sum = 0i64;
@@ -2856,7 +2911,7 @@ fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
 
 /// `ApplyMatrixSV`: the PS1 GTE convention, Y negated on input and output,
 /// 4.12 in and out with the reference's rounding.
-fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
+pub(crate) fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
     let source = [v[0], -v[1], v[2]];
     let mut out = [0i32; 3];
     for row in 0..3 {
@@ -2882,7 +2937,7 @@ fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
 /// `PSXObjVtx`) by `camera * rot`, negate the transformed light direction, and
 /// accumulate `max(0, -(n_view . l)) * colour` over the ambient. The scale of
 /// the dot is 4.12 (the light vectors) against unit (the normal).
-fn reference_vertex_shade(
+pub(crate) fn reference_vertex_shade(
     camera: &[[i32; 3]; 3],
     rot: &[[i32; 3]; 3],
     normal: [i16; 3],
