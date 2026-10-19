@@ -282,7 +282,7 @@ mod imp {
         let meta = lua.create_table()?;
         meta.set("__index", lua.globals())?;
         env.set_metatable(Some(meta));
-        let require = make_require(lua, pack, modules, loading, dir_of(path))?;
+        let require = make_require(lua, pack, modules, loading, crate::lua::dir_of(path))?;
         env.set("require", require)?;
         Ok(env)
     }
@@ -331,7 +331,7 @@ mod imp {
                 )
             })?
         };
-        let entry = resolve_module(pack, base_dir, name)
+        let entry = crate::lua::resolve_module(|entry| pack.contains(entry), base_dir, name)
             .ok_or_else(|| mlua::Error::RuntimeError(format!("module not found: {name}")))?;
         if let Some(value) = modules.borrow().get(&entry) {
             return Ok(value.clone());
@@ -388,74 +388,6 @@ mod imp {
         } else {
             value
         })
-    }
-
-    /// Resolve `name` to a lowercased pack entry, or `None` when no candidate
-    /// exists or the path escapes the pack root.
-    fn resolve_module(pack: &Pack, base_dir: &str, name: &str) -> Option<String> {
-        if name.is_empty() || name.contains('\0') {
-            return None;
-        }
-        let rooted = name.starts_with('/');
-        let relative = name.starts_with("./") || name.starts_with("../");
-        let raw = name.trim_start_matches('/');
-        let mut candidates: Vec<String> = Vec::new();
-        if rooted {
-            candidates.push(raw.to_string());
-        } else if relative {
-            candidates.push(join_path(base_dir, raw));
-        } else {
-            candidates.push(raw.to_string());
-            candidates.push(join_path(base_dir, raw));
-        }
-        for candidate in candidates {
-            let candidate = if candidate.to_ascii_lowercase().ends_with(".lua") {
-                candidate
-            } else {
-                format!("{candidate}.lua")
-            };
-            let Some(normalized) = normalize_path(&candidate) else {
-                continue;
-            };
-            if pack.contains(&normalized) {
-                return Some(normalized);
-            }
-        }
-        None
-    }
-
-    /// `base/name`, or `name` from the pack root when `base` is empty.
-    fn join_path(base: &str, name: &str) -> String {
-        if base.is_empty() {
-            name.to_string()
-        } else {
-            format!("{base}/{name}")
-        }
-    }
-
-    /// The directory part of a pack entry (`enemy/em20.lua` -> `enemy`).
-    fn dir_of(path: &str) -> String {
-        path.rsplit_once('/')
-            .map_or(String::new(), |(dir, _)| dir.to_string())
-    }
-
-    /// Normalize `/`-separated path segments and lowercase the result.
-    /// Returns `None` for an empty path or one escaping the pack root.
-    fn normalize_path(path: &str) -> Option<String> {
-        let mut parts: Vec<&str> = Vec::new();
-        for part in path.split('/') {
-            match part {
-                "" | "." => {}
-                ".." => {
-                    parts.pop()?;
-                }
-                other => parts.push(other),
-            }
-        }
-        if parts.is_empty() {
-            return None;
-        }
-        Some(parts.join("/").to_ascii_lowercase())
     }
 
     /// The per-call API object Lua sees as the `e` argument.

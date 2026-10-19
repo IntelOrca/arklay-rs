@@ -28,9 +28,16 @@ pub mod map;
 pub mod return_title;
 pub mod save_load;
 pub mod status;
-pub mod title;
 
 use std::path::Path;
+
+mod scripts {
+    include!(concat!(env!("OUT_DIR"), "/ui_scripts.rs"));
+}
+/// The checked-in screen scripts (`games/re1/ui/**.lua`) as `(entry, source)`
+/// pairs. `convert-game` packs them; a pack that predates them (or a test
+/// pack) falls back to these copies, so every pack has its screens.
+pub use scripts::UI_SCRIPTS;
 
 use anyhow::{Context, Result};
 

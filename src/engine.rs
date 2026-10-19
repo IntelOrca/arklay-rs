@@ -131,6 +131,7 @@ use crate::tween::{self, Tween};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
 use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
+use crate::ui::lua_screen::ScreenArg;
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
@@ -5473,8 +5474,11 @@ const EPILOGUE_CAPTURE_TICKS: u32 = 160;
 
 /// The app's current screen.
 enum Mode {
-    Title(ui::title::TitleScreen),
-    Select(ui::char_select::CharSelectScreen),
+    /// No screen yet: [`App::new`]'s state until [`App::boot`] opens one.
+    Boot,
+    /// The title screen script.
+    Title(Box<ui::lua_screen::LuaScreen>),
+    Select(Box<ui::char_select::CharSelectScreen>),
     Load(Box<dyn ui::save_load::SaveScreen>),
     Play(Box<GameSession>),
     /// A film owns the whole app until it ends.
@@ -5604,7 +5608,7 @@ impl App {
             save_screen,
             font,
             text,
-            mode: Mode::Title(ui::title::TitleScreen::new()),
+            mode: Mode::Boot,
             framebuffer: Framebuffer::new(),
             ticks: 0,
             audio,
@@ -5739,13 +5743,13 @@ impl App {
     fn tick_interval(&self) -> f64 {
         match &self.mode {
             Mode::Title(screen) => {
-                if screen.game_active() {
+                if screen.value("game_active") != 0 {
                     TICK_MS
                 } else {
                     UI_TICK_MS
                 }
             }
-            Mode::Select(_) | Mode::Load(_) | Mode::Save(_) => UI_TICK_MS,
+            Mode::Boot | Mode::Select(_) | Mode::Load(_) | Mode::Save(_) => UI_TICK_MS,
             Mode::Play(session) => {
                 session_tick_interval(session.transition.is_some(), session.room_frozen())
             }
@@ -5887,17 +5891,23 @@ impl App {
     /// Open the title screen. On the interactive root boot the first entry
     /// also queues the opening film (id 0) exactly once per process.
     fn open_title(&mut self) -> Result<()> {
-        let mut screen = ui::title::TitleScreen::new();
         // A registration that names a missing entry falls back to the ported
         // screen when it opens, which only lists the eight slots, so the
         // folder probe follows the entry the pack actually carries.
-        let entry = self
+        let folder_saves = self
             .save_screen
             .as_deref()
-            .filter(|entry| self.pack.contains(entry));
-        screen.set_save_screen(entry);
-        screen.open(&mut self.context())?;
-        self.mode = Mode::Title(screen);
+            .is_some_and(|entry| self.pack.contains(entry));
+        let mut cx = self.context();
+        let screen = ui::lua_screen::LuaScreen::open_screen(
+            "title",
+            &[("folder_saves", ScreenArg::Bool(folder_saves))],
+            ScreenAction::Quit,
+            &mut cx,
+        )?;
+        let cues = cx.cues.into_inner();
+        self.mode = Mode::Title(Box::new(screen));
+        self.play_ui_cues(cues);
         if self.films && !self.opening_played {
             self.opening_played = true;
             match self.open_movie(TITLE_OPENING_ID, 0) {
@@ -5926,7 +5936,7 @@ impl App {
     fn open_select(&mut self) -> Result<()> {
         let mut screen = ui::char_select::CharSelectScreen::new();
         screen.open(&mut self.context())?;
-        self.mode = Mode::Select(screen);
+        self.mode = Mode::Select(Box::new(screen));
         Ok(())
     }
 
@@ -6293,7 +6303,7 @@ impl App {
                 Mode::Save(screen) => screen.update(&cx, ui),
                 Mode::Ending(screen) => screen.update(&cx, ui),
                 Mode::Epilogue(screen) => screen.update(&cx, ui),
-                Mode::Play(_) | Mode::Movie(_) => ScreenResult::Continue,
+                Mode::Boot | Mode::Play(_) | Mode::Movie(_) => ScreenResult::Continue,
             };
             (result, cx.cues.into_inner())
         };
@@ -6372,6 +6382,7 @@ impl App {
             ..
         } = self;
         match mode {
+            Mode::Boot => {}
             Mode::Title(screen) => {
                 let cx = UiContext {
                     pack,
@@ -16506,8 +16517,8 @@ mod tests {
         let Mode::Title(screen) = &app.mode else {
             panic!("expected the title");
         };
-        assert!(screen.load_enabled());
-        assert_eq!(screen.selection(), 2);
+        assert_eq!(screen.value("load_enabled"), 1);
+        assert_eq!(screen.value("selection"), 2);
 
         assert!(
             run_until(&mut app, 256, |app| matches!(app.mode, Mode::Load(_))),
@@ -19867,7 +19878,7 @@ off_0010:
         assert_eq!(pending.session.id(), 1);
         assert_eq!(pending.session.character(), 1, "the chosen character");
         assert_eq!(pending.action, Some(ScreenAction::NewGame { character: 1 }));
-        assert!(matches!(app.mode, Mode::Title(_)), "the session waits");
+        assert!(matches!(app.mode, Mode::Boot), "the session waits");
 
         // The intro finishes and the NewGame action builds the session.
         run_app_until(&mut app, |app| matches!(app.mode, Mode::Play(_)));

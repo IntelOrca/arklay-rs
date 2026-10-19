@@ -40,9 +40,9 @@ use crate::model::{Texture8, Tmd, TmdObject};
 use crate::state::{Cut, Image, Light, RoomId, RoomState};
 
 /// Default framebuffer width in pixels.
-const WIDTH: u32 = 320;
+pub const WIDTH: u32 = 320;
 /// Default framebuffer height in pixels.
-const HEIGHT: u32 = 240;
+pub const HEIGHT: u32 = 240;
 /// Fractional bits of the 4.12 fixed-point matrices.
 const FIXED_BITS: u32 = 12;
 /// Horizontal screen centre in pixels.

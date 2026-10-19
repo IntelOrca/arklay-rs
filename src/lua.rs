@@ -615,6 +615,83 @@ pub use imp::LuaVm;
 
 pub(crate) use imp::{Budget, new_sandboxed_state};
 
+/// Resolve a sandboxed `require(name)` to a lowercased pack entry, or `None`
+/// when no candidate exists (by `contains`) or the path escapes the pack root.
+///
+/// `name` is a pack path with the `.lua` suffix optional: `/a/b` is absolute
+/// from the pack root, `./b` and `../a/b` are relative to `base_dir` (the
+/// requiring module's directory), and a bare `a/b` is tried as an exact entry
+/// first and relative to `base_dir` second.
+pub(crate) fn resolve_module(
+    contains: impl Fn(&str) -> bool,
+    base_dir: &str,
+    name: &str,
+) -> Option<String> {
+    if name.is_empty() || name.contains('\0') {
+        return None;
+    }
+    let rooted = name.starts_with('/');
+    let relative = name.starts_with("./") || name.starts_with("../");
+    let raw = name.trim_start_matches('/');
+    let mut candidates: Vec<String> = Vec::new();
+    if rooted {
+        candidates.push(raw.to_string());
+    } else if relative {
+        candidates.push(join_path(base_dir, raw));
+    } else {
+        candidates.push(raw.to_string());
+        candidates.push(join_path(base_dir, raw));
+    }
+    for candidate in candidates {
+        let candidate = if candidate.to_ascii_lowercase().ends_with(".lua") {
+            candidate
+        } else {
+            format!("{candidate}.lua")
+        };
+        let Some(normalized) = normalize_path(&candidate) else {
+            continue;
+        };
+        if contains(&normalized) {
+            return Some(normalized);
+        }
+    }
+    None
+}
+
+/// `base/name`, or `name` from the pack root when `base` is empty.
+fn join_path(base: &str, name: &str) -> String {
+    if base.is_empty() {
+        name.to_string()
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
+/// The directory part of a pack entry (`enemy/em20.lua` -> `enemy`).
+pub(crate) fn dir_of(path: &str) -> String {
+    path.rsplit_once('/')
+        .map_or(String::new(), |(dir, _)| dir.to_string())
+}
+
+/// Normalize `/`-separated path segments and lowercase the result.
+/// Returns `None` for an empty path or one escaping the pack root.
+fn normalize_path(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("/").to_ascii_lowercase())
+}
+
 /// The save/load screen entry a pack's scripts register, if any.
 ///
 /// The app needs the registration before any session exists (the title's LOAD
