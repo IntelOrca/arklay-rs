@@ -53,7 +53,7 @@ use anyhow::{Result, bail};
 
 use crate::effects::Attach;
 use crate::game::{
-    BANK_ENEMIES, BANK_SCENARIO, ENTITY_COUNT, Entity, GameState, SCENARIO_FLAG_SECOND_PLAYTHROUGH,
+    BANK_ENEMIES, BANK_SCENARIO, Entity, GameState, SCENARIO_FLAG_SECOND_PLAYTHROUGH,
 };
 use crate::state::RoomState;
 
@@ -924,14 +924,15 @@ impl GameState {
 
         // First pass: collect the active list indices in the original's
         // fill order (it writes from the end backwards, and the candidate
-        // walk then starts at slot [0]).
+        // walk then starts at slot [0]). It walks the whole 30-entry list and
+        // stops once `enemy_count` active entries are found, so an empty slot
+        // between two enemies does not hide the later one.
         let mut found = Vec::with_capacity(count);
-        for index in 0..count {
-            let slot = 1 + index;
-            if slot >= ENTITY_COUNT {
+        for index in 0..ENEMY_LIST_LEN {
+            if found.len() == count {
                 break;
             }
-            if self.entities[slot].status_flags != 0 {
+            if self.entities[1 + index].status_flags != 0 {
                 found.push(index as u8);
             }
         }
@@ -2231,6 +2232,31 @@ mod tests {
         assert_eq!(game.apply_weapon_damage(&room, 1), 1);
         assert_eq!(game.entities[1].state(), 3);
         assert!(game.flags[usize::from(BANK_ENEMIES)].bit(7));
+    }
+
+    #[test]
+    fn an_enemy_past_an_empty_slot_is_still_a_candidate() {
+        // Room 103's Jill variant spawns its zombies into slots 1 and 3, so
+        // the live count (2) is smaller than the last occupied slot.
+        let room = RoomState::default();
+        let mut game = armed_game();
+        place_enemy(&mut game, 1, 0x13, [-5000, 0, 0]);
+        place_enemy(&mut game, 3, 0x13, [200, 0, 0]);
+        game.enemy_count = 2;
+        assert_eq!(game.apply_weapon_damage(&room, 1), 1);
+        assert_eq!(game.entities[3].health, 55 - 10);
+        assert_eq!(game.entities[1].health, 55);
+    }
+
+    #[test]
+    fn the_candidate_walk_stops_after_enemy_count_active_slots() {
+        let room = RoomState::default();
+        let mut game = armed_game();
+        place_enemy(&mut game, 1, 0x13, [-5000, 0, 0]);
+        place_enemy(&mut game, 3, 0x13, [200, 0, 0]);
+        game.enemy_count = 1;
+        assert_eq!(game.apply_weapon_damage(&room, 1), 0);
+        assert_eq!(game.entities[3].health, 55);
     }
 
     #[test]
