@@ -2408,8 +2408,10 @@ fn collect_shadow<'a>(
     let color = shadow.tint.map(|byte| f32::from(byte) * (1.0 / 255.0));
     let corner = |k: usize| {
         let [vx, vy, vz, u, v] = ring[k];
-        let px = (vx * focal) / vz + CENTER_X + camera.screen[0];
-        let py = ((t1 + lift - (vy - t1)) * focal) / vz + CENTER_Y + camera.screen[1];
+        // `DrawFadeSpr` projects about the fixed 160/120 centre: the shadow
+        // never follows the screen offset or shake the models and masks do.
+        let px = (vx * focal) / vz + CENTER_X;
+        let py = ((t1 + lift - (vy - t1)) * focal) / vz + CENTER_Y;
         let wz = f32::from(vz.min(30000) as i16);
         crate::raster::GlVertex {
             x: f32::from(px as i16),
@@ -4525,7 +4527,7 @@ mod tests {
     }
 
     #[test]
-    fn screen_shake_shifts_shadows_and_masks() {
+    fn screen_shake_shifts_masks_but_not_shadows() {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
         let mut plain = Vec::new();
@@ -4541,8 +4543,7 @@ mod tests {
             panic!("expected one shaken shadow");
         };
         for (plain, shifted) in shadow_corners(plain).iter().zip(&shadow_corners(shifted)) {
-            assert_eq!(shifted.x, plain.x + 4.0);
-            assert_eq!(shifted.y, plain.y - 3.0);
+            assert_eq!((shifted.x, shifted.y), (plain.x, plain.y));
         }
 
         let cut = Cut {
