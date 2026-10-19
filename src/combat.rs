@@ -888,7 +888,7 @@ impl GameState {
     /// Set the shared combat tables, replacing the built-in fallback. The
     /// engine calls this once per session after reading the pack.
     pub fn set_combat_tables(&mut self, tables: CombatTables) {
-        self.combat = tables;
+        *self.combat = tables;
     }
 
     /// Fire `weapon_id` through the shared damage pipeline from the player's

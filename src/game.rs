@@ -3311,12 +3311,16 @@ pub struct GameState {
     /// doors use this latch; the eight-state ladder climb is a player locked
     /// behaviour and raises only `MSF_LADDER_DOWN`.
     pub stair_climb: bool,
-    /// Scripted entities; slot 0 is the player.
-    pub entities: [Entity; ENTITY_COUNT],
+    /// Scripted entities; slot 0 is the player. This and the other large
+    /// tables (`entity_anims`, `combat`, `effects`) are boxed so a
+    /// `GameState` stays small: the debug build keeps a stack copy of the
+    /// state at every move, and an inline state overflowed the 1 MiB main
+    /// thread stack on the `--room` boot.
+    pub entities: Box<[Entity; ENTITY_COUNT]>,
     /// Per-slot animation clocks for the scripted entities, parallel to
     /// [`GameState::entities`]. The entity words stay authoritative; the clock
     /// remembers which frame the pose shows for the renderer.
-    pub entity_anims: [crate::enemy::EntityAnim; ENTITY_COUNT],
+    pub entity_anims: Box<[crate::enemy::EntityAnim; ENTITY_COUNT]>,
     /// Per-slot joint world matrices of the posed monster skeletons, computed
     /// by the enemy drivers at the end of every update (the original's
     /// `EntityComputeJointWorldMatrices` runs in the render pass, which is the
@@ -3386,7 +3390,7 @@ pub struct GameState {
     /// The shared combat tables: weapon ranges, hit records, reactions and
     /// the per-type init data. The engine loads the pack's `data/combat.bin`;
     /// the built-in fallback carries the documented values.
-    pub combat: crate::combat::CombatTables,
+    pub combat: Box<crate::combat::CombatTables>,
     /// The `behavior_flags` read by the last `get_eml_state`.
     pub last_enemy_flags: u8,
     /// Entity slot the current event operates on, or [`ENTITY_NONE`].
@@ -3570,7 +3574,7 @@ pub struct GameState {
     /// and read by the renderer. See [`GameState::roll_screen_shake`].
     pub screen_shake: [i32; 2],
     /// The effect pool (64 slots).
-    pub effects: effects::EffectPool,
+    pub effects: Box<effects::EffectPool>,
     /// The room's runtime object-model records, one per declared omodel slot;
     /// rebuilt by the init script and cleared on room entry.
     pub objects: ObjectTable,
@@ -3628,8 +3632,11 @@ pub struct GameState {
 }
 
 /// The initial entity array: only the player slot is spawned.
-fn initial_entities() -> [Entity; ENTITY_COUNT] {
-    let mut entities = [Entity::default(); ENTITY_COUNT];
+fn initial_entities() -> Box<[Entity; ENTITY_COUNT]> {
+    let mut entities: Box<[Entity; ENTITY_COUNT]> = vec![Entity::default(); ENTITY_COUNT]
+        .into_boxed_slice()
+        .try_into()
+        .expect("the entity table is a fixed-size block");
     entities[0].set_active(true);
     entities
 }
@@ -3665,7 +3672,10 @@ impl Default for GameState {
             stair_entry: None,
             stair_climb: false,
             entities: initial_entities(),
-            entity_anims: std::array::from_fn(|_| crate::enemy::EntityAnim::default()),
+            entity_anims: vec![crate::enemy::EntityAnim::default(); ENTITY_COUNT]
+                .into_boxed_slice()
+                .try_into()
+                .expect("the entity animation table is a fixed-size block"),
             joint_worlds: std::array::from_fn(|_| Vec::new()),
             // Build these arenas through a heap `Vec` so the (large) `Option`
             // slots are never materialised as one stack temporary: the debug
@@ -3693,7 +3703,7 @@ impl Default for GameState {
             enemy_count: 0,
             saved_enemies: [crate::combat::SavedEnemyState::default();
                 crate::combat::SAVED_ENEMY_SLOTS],
-            combat: crate::combat::CombatTables::default(),
+            combat: Box::default(),
             last_enemy_flags: 0,
             selected_entity: 0,
             last_picked_item: None,
@@ -3752,7 +3762,7 @@ impl Default for GameState {
             rand_state: 1,
             rand_seed: 0,
             screen_shake: [0, 0],
-            effects: effects::EffectPool::new(),
+            effects: Box::new(effects::EffectPool::new()),
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
             item_palette_edits: Vec::new(),
@@ -4976,8 +4986,7 @@ impl GameState {
         self.doors = [None; ROOM_ACTION_SLOTS];
         self.clear_stairs();
         let player_entity = self.entities[0];
-        let previous_entities = self.entities;
-        self.entities = initial_entities();
+        let previous_entities = std::mem::replace(&mut self.entities, initial_entities());
         self.entities[0] = player_entity;
         // `g_EnemiesList` is a static array: a room load only tears the live
         // status bits down (the snapshot/clear pass), so a slot respawned in
@@ -4995,7 +5004,8 @@ impl GameState {
                 slot.clone_count = 0;
             }
         }
-        self.entity_anims = std::array::from_fn(|_| crate::enemy::EntityAnim::default());
+        self.entity_anims
+            .fill_with(crate::enemy::EntityAnim::default);
         // The web-clone arena and the per-type web-joint registries reset with
         // the room (the original's room-data buffer is rebuilt on load), so no
         // thread or used-leg record leaks across a door.
@@ -7742,7 +7752,7 @@ impl GameState {
             target
         };
         self.door_yield = Some(DoorYield {
-            entities: Box::new(self.entities),
+            entities: self.entities.clone(),
             rand_state: self.rand_state,
             rand_seed: self.rand_seed,
         });

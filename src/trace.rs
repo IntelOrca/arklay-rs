@@ -262,7 +262,7 @@ mod tests {
             fade_state: -1,
             cam: 3,
             player_flags: 0,
-            entities: &game.entities,
+            entities: &*game.entities,
             frame_hash: 0xDEAD_BEEF,
         };
         writer.write_tick(&tick).unwrap();
@@ -297,7 +297,7 @@ mod tests {
             fade_state: -1,
             cam: 0,
             player_flags: 0,
-            entities: &game.entities,
+            entities: &*game.entities,
             frame_hash: 0,
         };
         for index in 0..3 {

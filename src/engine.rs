@@ -84,7 +84,7 @@ use sdl3_sys::video::{
     SDL_CreateWindow, SDL_DestroyWindow, SDL_DisplayID, SDL_GetDisplayForWindow,
     SDL_GetDisplayUsableBounds, SDL_GetDisplays, SDL_GetPrimaryDisplay, SDL_GetWindowBordersSize,
     SDL_GetWindowPixelDensity, SDL_SetWindowFullscreen, SDL_SetWindowFullscreenMode,
-    SDL_SetWindowPosition, SDL_SetWindowSize, SDL_SetWindowTitle, SDL_ShowWindow,
+    SDL_SetWindowPosition, SDL_SetWindowSize, SDL_SetWindowTitle, SDL_ShowWindow, SDL_SyncWindow,
     SDL_WINDOW_HIDDEN, SDL_WINDOWPOS_CENTERED_DISPLAY, SDL_Window, SDL_WindowFlags,
 };
 
@@ -490,7 +490,7 @@ pub fn run_with_options(
                         fade_state: inactive.state(),
                         cam: loaded.room.current_cut as u8,
                         player_flags: game.player_flags,
-                        entities: &game.entities,
+                        entities: &*game.entities,
                         frame_hash: trace::frame_hash(&framebuffer),
                     })?;
                     if trace.capture_every > 0
@@ -1415,7 +1415,7 @@ impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): the shipped card's
     /// start room (the main hall), the original's start position, health,
     /// items and room-item flags, then the room init/main/event VMs.
-    fn new(pack: &Pack, character: u8, save_dir: &Path) -> Result<Self> {
+    fn new(pack: &Pack, character: u8, save_dir: &Path) -> Result<Box<Self>> {
         let character = character & 1;
         let id = new_game_id(pack, character);
         let loaded = load_room(pack, id)?;
@@ -1438,7 +1438,7 @@ impl GameSession {
     /// arbitrary-room boot) re-places the player at the walk zone centre after
     /// the room-set event pass, in [`GameSession::place_room_boot_spawn`] and
     /// [`GameSession::arm_new_game_boot`].
-    fn new_in_room(pack: &Pack, id: RoomId, character: u8, save_dir: &Path) -> Result<Self> {
+    fn new_in_room(pack: &Pack, id: RoomId, character: u8, save_dir: &Path) -> Result<Box<Self>> {
         let character = character & 1;
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
@@ -1476,7 +1476,7 @@ impl GameSession {
     /// character, room, position, facing, items, equipped item, camera and
     /// health. `game_loop` seeds the platform stream with `srand(0)` for
     /// attract playback, so the reel replays its recorded draws exactly.
-    fn from_demo(pack: &Pack, entry: &str, save_dir: &Path) -> Result<Self> {
+    fn from_demo(pack: &Pack, entry: &str, save_dir: &Path) -> Result<Box<Self>> {
         let bytes = pack
             .read(entry)
             .with_context(|| format!("missing attract demo reel {entry}"))?;
@@ -1534,7 +1534,7 @@ impl GameSession {
 
     /// Boot the `index`-th entry of the pack's `demo/` enumeration (the
     /// reference's `--test-demo` anchor and the port's `--ui demo`).
-    fn from_demo_index(pack: &Pack, index: u8, save_dir: &Path) -> Result<Self> {
+    fn from_demo_index(pack: &Pack, index: u8, save_dir: &Path) -> Result<Box<Self>> {
         let entries = demo::entries(pack);
         let entry = entries.get(usize::from(index)).with_context(|| {
             format!(
@@ -1550,7 +1550,7 @@ impl GameSession {
     /// start health are seeded like a new game's, and the player is placed at
     /// the room's paired-door entry once the room boot has built the door
     /// table.
-    fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Self> {
+    fn from_room(pack: &Pack, id: RoomId, save_dir: &Path) -> Result<Box<Self>> {
         let loaded = load_room(pack, id)?;
         let mut game = new_game_state(pack, id, &loaded.room);
         seed_room_items(&mut game);
@@ -1564,7 +1564,7 @@ impl GameSession {
 
     /// Continue from a parsed save: the block replaces the state, the saved
     /// position and angle place the player and the saved room loads.
-    fn from_save(pack: &Pack, file: &save::SaveFile, save_dir: &Path) -> Result<Self> {
+    fn from_save(pack: &Pack, file: &save::SaveFile, save_dir: &Path) -> Result<Box<Self>> {
         let id = RoomId {
             // The block's stage byte is the original's 0-based `g_stageId`.
             stage: file.stage + 1,
@@ -1603,7 +1603,7 @@ impl GameSession {
         game: game::GameState,
         player_state: player::PlayerState,
         save_dir: &Path,
-    ) -> Result<Self> {
+    ) -> Result<Box<Self>> {
         let scripts = Rc::new(loaded.scripts.clone());
         let command_vm = scd::vm::CommandVm::from_scripts(Rc::clone(&scripts));
         let event_vm = scd::vm::EventVm::from_scripts(scripts);
@@ -1619,7 +1619,7 @@ impl GameSession {
         let lua = load_lua(pack);
         let mut game = game;
         call_lua_init(lua.as_ref(), &mut game);
-        let mut session = Self {
+        let mut session = Box::new(Self {
             loaded,
             game,
             player: player_state,
@@ -1698,7 +1698,7 @@ impl GameSession {
             debug_failed: HashSet::new(),
             computer: None,
             computer_saved: None,
-        };
+        });
         session.enter_room(pack, None);
         Ok(session)
     }
@@ -5570,13 +5570,13 @@ impl App {
     }
 
     /// Enter a gameplay session, opening audio on the interactive path.
-    fn start_session(&mut self, mut session: GameSession) {
+    fn start_session(&mut self, mut session: Box<GameSession>) {
         session.set_debug_menu(self.debug_menu);
         session.set_bindings(self.bindings.clone());
         if self.audio {
             session.start_audio(&self.pack);
         }
-        self.mode = Mode::Play(Box::new(session));
+        self.mode = Mode::Play(session);
     }
 
     /// Start a session for a new game or a continue through the original's
@@ -5586,7 +5586,7 @@ impl App {
     /// clears, so the first gameplay frames fade up from black. The
     /// deterministic `--ui` captures build their sessions directly and stay
     /// unnarrated and unfaded.
-    fn start_narrated_session(&mut self, mut session: GameSession, message: u8) {
+    fn start_narrated_session(&mut self, mut session: Box<GameSession>, message: u8) {
         session.request_boot_message(message);
         self.start_session(session);
     }
@@ -11511,6 +11511,7 @@ fn place_window(window: *mut SDL_Window, graphics: &mut Graphics, display: SDL_D
             // A null mode is the desktop mode: borderless fullscreen.
             SDL_SetWindowFullscreenMode(window, std::ptr::null());
             SDL_SetWindowFullscreen(window, true);
+            SDL_SyncWindow(window);
         }
         return;
     }
@@ -11540,6 +11541,7 @@ fn place_window(window: *mut SDL_Window, graphics: &mut Graphics, display: SDL_D
             SDL_WINDOWPOS_CENTERED_DISPLAY(display),
             SDL_WINDOWPOS_CENTERED_DISPLAY(display),
         );
+        SDL_SyncWindow(window);
     }
 }
 
