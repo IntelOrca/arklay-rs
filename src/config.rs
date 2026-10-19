@@ -112,6 +112,7 @@ impl Config {
         budget::check_len(text.len(), budget::MAX_TEXT_BYTES, "config file size")?;
         let mut config = Self::default();
         let mut in_bindings = false;
+        let mut bound = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let content = strip_comment(raw).trim();
@@ -139,6 +140,10 @@ impl Config {
                 let Some(action) = Action::from_name(key) else {
                     bail!("line {line}: unknown action `{key}`");
                 };
+                if bound.contains(&action) {
+                    bail!("line {line}: duplicate action `{key}`");
+                }
+                bound.push(action);
                 let mut sources = Vec::new();
                 for name in parse_string_array(value, line)? {
                     let source = Source::parse(&name)
@@ -170,24 +175,37 @@ impl Config {
                 other => bail!("line {line}: unknown key `{other}`"),
             }
         }
+        if let Some(action) = config.bindings.as_ref().and_then(Bindings::lockout) {
+            bail!(
+                "[bindings]: `{}` needs a keyboard key bound to none of up, down, left, right, \
+                 confirm, cancel and start",
+                action.name()
+            );
+        }
         Ok(config)
     }
 
-    /// Render the canonical file text (the documented keys, defaults omitted).
+    /// Render the canonical file text (the documented keys, defaults omitted:
+    /// the `[bindings]` table lists only the actions that differ from the
+    /// shipped layout, so the rest keep following it).
     pub fn render(&self) -> String {
         let mut out = String::new();
         if let Some(dir) = &self.save_dir {
-            out.push_str(&format!("save_dir = \"{}\"\n", dir.display()));
+            out.push_str(&format!("save_dir = {}\n", quote(&dir.to_string_lossy())));
         }
         if let Some(language) = &self.language {
-            out.push_str(&format!("language = \"{language}\"\n"));
+            out.push_str(&format!("language = {}\n", quote(language)));
         }
         if let Some(bindings) = &self.bindings {
             if !out.is_empty() {
                 out.push('\n');
             }
             out.push_str("[bindings]\n");
+            let defaults = Bindings::default();
             for action in ACTIONS {
+                if bindings.get(action) == defaults.get(action) {
+                    continue;
+                }
                 let names: Vec<String> = bindings
                     .get(action)
                     .iter()
@@ -208,16 +226,24 @@ impl Config {
     ///
     /// Bindings equal to the defaults drop the table, so a reset leaves a
     /// fresh file. The file is rewritten in its canonical form (comments are
-    /// not kept). A file that does not parse is left alone and reported.
+    /// not kept; `save_dir` stays as written, `~` included). A file that does
+    /// not parse is left alone and reported.
     pub fn save_bindings(path: &Path, bindings: &Bindings) -> Result<()> {
-        let mut config = Self::load(path)?;
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let mut config =
+            Self::parse(&text).with_context(|| format!("failed to parse {}", path.display()))?;
         config.bindings = (*bindings != Bindings::default()).then(|| bindings.clone());
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)
                 .with_context(|| format!("failed to create {}", dir.display()))?;
         }
-        fs::write(path, config.render())
-            .with_context(|| format!("failed to write {}", path.display()))
+        crate::atomic::write(path, config.render().as_bytes())
     }
 }
 
@@ -452,7 +478,7 @@ mod tests {
              [bindings]  # the input map\n\
              aim = [\"key:C\", 'mouse:right', \"axis:lefttrigger+\"]  # three devices\n\
              fire = \"wheel:up\"\n\
-             start = []\n",
+             page_left = []\n",
         )
         .unwrap();
         assert_eq!(config.language.as_deref(), Some("en-US"));
@@ -465,7 +491,7 @@ mod tests {
             ["key:C", "mouse:right", "axis:lefttrigger+"]
         );
         assert_eq!(names(Action::Fire), ["wheel:up"]);
-        assert!(names(Action::Start).is_empty(), "an empty array unbinds");
+        assert!(names(Action::PageLeft).is_empty(), "an empty array unbinds");
         assert_eq!(
             bindings.get(Action::Confirm),
             Bindings::default().get(Action::Confirm),
@@ -474,6 +500,10 @@ mod tests {
         // The rendered table parses back to the same map.
         let text = config.render();
         assert!(text.contains("\n[bindings]\n"), "{text}");
+        assert!(
+            !text.contains("confirm"),
+            "defaults are not written: {text}"
+        );
         assert_eq!(Config::parse(&text).unwrap(), config);
     }
 
@@ -488,6 +518,9 @@ mod tests {
             "[bindings]\nsave_dir = \"/tmp\"\n",
             "[bindings]\n[bindings]\n",
             "[other]\n",
+            "[bindings]\naim = []\naim = []\n",
+            "[bindings]\nconfirm = []\n",
+            "[bindings]\ncancel = [\"key:X\", \"key:Space\", \"key:Return\"]\n",
         ] {
             assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
         }
@@ -514,6 +547,19 @@ mod tests {
         fs::write(&path, "garbage\n").unwrap();
         assert!(Config::save_bindings(&path, &bindings).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "garbage\n");
+        // Paths that need escaping, and `~`, survive a save untouched.
+        let text = "save_dir = 'C:\\Users\\me \"x\"\\saves'\nlanguage = \"en-US\"\n";
+        fs::write(&path, text).unwrap();
+        Config::save_bindings(&path, &bindings).unwrap();
+        let saved = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved.save_dir.as_deref(),
+            Some(Path::new("C:\\Users\\me \"x\"\\saves"))
+        );
+        fs::write(&path, "save_dir = \"~/saves\"\n").unwrap();
+        Config::save_bindings(&path, &bindings).unwrap();
+        let saved = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.save_dir.as_deref(), Some(Path::new("~/saves")));
         let _ = fs::remove_dir_all(&dir);
     }
 

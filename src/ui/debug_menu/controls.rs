@@ -11,9 +11,10 @@
 //!
 //! A capture takes the next press whatever it is (Escape included), so it can
 //! only be abandoned by waiting it out ([`CAPTURE_TICKS`]) or with F1, which
-//! closes the whole menu. The last binding of the actions every menu needs
-//! ([`Action::is_essential`]) cannot be cleared, so the screen can never lock
-//! itself out.
+//! closes the whole menu. A change that would leave an action the screen
+//! itself needs ([`Action::is_essential`]) without a keyboard key of its own
+//! is refused ([`Bindings::lockout`]), so the screen can never lock itself
+//! out.
 
 use super::{BODY_Y, PANEL_RIGHT, Pen, ROW_HEIGHT, Step, TEXT_LEFT};
 use crate::controls::{ACTIONS, Action, Bindings};
@@ -35,8 +36,10 @@ pub const CAPTURE_TICKS: u32 = 300;
 pub enum Note {
     /// The captured input is already bound to this action.
     Duplicate,
-    /// The action's last binding cannot be cleared.
+    /// The change would leave an essential action without a key of its own.
     KeepOne,
+    /// The captured input has no name it could be saved under.
+    Unsaveable,
     /// The bindings were reset to the defaults.
     Reset,
 }
@@ -46,6 +49,7 @@ impl Note {
         match self {
             Note::Duplicate => "UI_CONTROLS_DUPLICATE",
             Note::KeepOne => "UI_CONTROLS_KEEP_ONE",
+            Note::Unsaveable => "UI_CONTROLS_UNSAVEABLE",
             Note::Reset => "UI_CONTROLS_RESET_DONE",
         }
     }
@@ -137,10 +141,12 @@ impl ControlsEditor {
             && let Some(action) = self.action()
             && self.slot < slots
         {
-            if action.is_essential() && slots == 1 {
+            let mut next = self.bindings.clone();
+            next.unbind(action, self.slot);
+            if next.lockout().is_some() {
                 self.note = Some(Note::KeepOne);
             } else {
-                self.bindings.unbind(action, self.slot);
+                self.bindings = next;
                 self.slot = self.slot.min(slots - 1);
                 return (Step::Stay, true);
             }
@@ -160,13 +166,18 @@ impl ControlsEditor {
             return false;
         };
         self.capture = None;
-        if self.bindings.bind(action, self.slot, source) {
-            self.note = None;
-            true
+        let mut next = self.bindings.clone();
+        self.note = if !source.round_trips() {
+            Some(Note::Unsaveable)
+        } else if !next.bind(action, self.slot, source) {
+            Some(Note::Duplicate)
+        } else if next.lockout().is_some() {
+            Some(Note::KeepOne)
         } else {
-            self.note = Some(Note::Duplicate);
-            false
-        }
+            self.bindings = next;
+            return true;
+        };
+        false
     }
 
     /// Step the row by `delta` (mod the row count), keeping it on screen and
@@ -408,19 +419,24 @@ mod tests {
     fn clearing_keeps_one_essential_binding_and_reset_restores_defaults() {
         let mut editor = ControlsEditor::new(&Bindings::default());
         go_to(&mut editor, Action::Confirm);
-        let count = Bindings::default().get(Action::Confirm).len();
-        for _ in 1..count {
-            assert_eq!(
-                editor.handle_input(press(|i| i.start = true)),
-                (Step::Stay, true)
-            );
-        }
-        assert_eq!(editor.bindings().get(Action::Confirm).len(), 1);
+        // Space clears; Return, the last key, is refused (pad:a alone would
+        // strand a keyboard player).
+        assert_eq!(
+            editor.handle_input(press(|i| i.start = true)),
+            (Step::Stay, true)
+        );
         assert_eq!(
             editor.handle_input(press(|i| i.start = true)),
             (Step::Stay, false)
         );
         assert_eq!(editor.note(), Some(Note::KeepOne));
+        assert!(
+            editor
+                .bindings()
+                .get(Action::Confirm)
+                .iter()
+                .any(|s| matches!(s, Source::Key(_)))
+        );
         // A non-essential action can be cleared completely.
         go_to(&mut editor, Action::Fire);
         while !editor.bindings().get(Action::Fire).is_empty() {
@@ -443,6 +459,31 @@ mod tests {
             editor.handle_input(press(|i| i.cancel = true)),
             (Step::Back, false)
         );
+    }
+
+    #[test]
+    fn a_capture_that_would_lock_out_or_cannot_be_saved_is_refused() {
+        use sdl3_sys::scancode::{SDL_SCANCODE_ESCAPE, SDL_SCANCODE_X};
+        let mut editor = ControlsEditor::new(&Bindings::default());
+        go_to(&mut editor, Action::Confirm);
+        // Space -> Escape still leaves Return as confirm's own key.
+        editor.handle_input(press(|i| i.confirm = true));
+        let escape = Source::key(SDL_SCANCODE_ESCAPE);
+        assert_eq!(editor.handle_input(captured(escape)), (Step::Stay, true));
+        // Return -> X would leave confirm only on cancel's keys.
+        editor.handle_input(press(|i| i.right = true));
+        editor.handle_input(press(|i| i.confirm = true));
+        let x = Source::key(SDL_SCANCODE_X);
+        assert_eq!(editor.handle_input(captured(x)), (Step::Stay, false));
+        assert_eq!(editor.note(), Some(Note::KeepOne));
+        assert_eq!(editor.bindings().lockout(), None);
+        // SDL's second `Return` scancode would reload as the first.
+        editor.handle_input(press(|i| i.confirm = true));
+        assert_eq!(
+            editor.handle_input(captured(Source::Key(158))),
+            (Step::Stay, false)
+        );
+        assert_eq!(editor.note(), Some(Note::Unsaveable));
     }
 
     #[test]

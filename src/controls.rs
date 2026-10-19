@@ -5,8 +5,9 @@
 //! directly. Each input source is looked up in [`Bindings`], which maps it to
 //! the [`Action`]s it drives; an action may carry any number of bindings from
 //! any device (aim on `C`, the right mouse button and the left trigger at
-//! once). The port-only debug keys (F1 debug menu, F9 return to title) are
-//! fixed and can never be bound: see [`Source::reserved_bit`].
+//! once). The port-only debug inputs (F1 or the gamepad's back button for the
+//! debug menu, F9 return to title) are fixed and can never be bound: see
+//! [`Source::reserved_bit`].
 //!
 //! Bindings persist in `arklay.toml`'s `[bindings]` table as one array of
 //! source names per action:
@@ -19,16 +20,19 @@
 //! A source name is `key:<SDL scancode name>`, `mouse:left|middle|right|x1|x2`,
 //! `wheel:up|down|left|right`, `pad:<SDL gamepad button>` (`a`, `b`, `dpup`,
 //! `leftshoulder`, `start`, ...) or `axis:<SDL gamepad axis>+|-` (`leftx-`,
-//! `lefttrigger+`, ...). An action the table leaves out keeps its default.
+//! `lefttrigger+`, ...). An input SDL has no name for is written by number:
+//! `key:#N`, `mouse:N`, `pad:#N`, `axis:#N+`. An action the table leaves out
+//! keeps its default.
 
 use std::ffi::{CStr, CString};
 use std::fmt;
 
 use anyhow::{Result, bail};
 use sdl3_sys::gamepad::{
-    SDL_GAMEPAD_AXIS_COUNT, SDL_GAMEPAD_AXIS_INVALID, SDL_GAMEPAD_BUTTON_COUNT,
-    SDL_GAMEPAD_BUTTON_INVALID, SDL_GamepadAxis, SDL_GamepadButton, SDL_GetGamepadAxisFromString,
-    SDL_GetGamepadButtonFromString, SDL_GetGamepadStringForAxis, SDL_GetGamepadStringForButton,
+    SDL_GAMEPAD_AXIS_COUNT, SDL_GAMEPAD_AXIS_INVALID, SDL_GAMEPAD_BUTTON_BACK,
+    SDL_GAMEPAD_BUTTON_COUNT, SDL_GAMEPAD_BUTTON_INVALID, SDL_GamepadAxis, SDL_GamepadButton,
+    SDL_GetGamepadAxisFromString, SDL_GetGamepadButtonFromString, SDL_GetGamepadStringForAxis,
+    SDL_GetGamepadStringForButton,
 };
 use sdl3_sys::keyboard::{SDL_GetScancodeFromName, SDL_GetScancodeName};
 use sdl3_sys::scancode::{
@@ -79,7 +83,7 @@ pub const ACTIONS: [Action; 12] = [
     Action::PageRight,
 ];
 
-/// The fixed F1 debug-menu bit, above every action bit.
+/// The fixed F1 (gamepad back) debug-menu bit, above every action bit.
 pub const DEBUG_MENU_BIT: u32 = 1 << 16;
 /// The fixed F9 return-to-title bit.
 pub const RETURN_TITLE_BIT: u32 = 1 << 17;
@@ -132,13 +136,18 @@ impl Action {
         }
     }
 
-    /// Whether every menu needs the action, so the rebind screen refuses to
-    /// clear its last binding (the screen itself could not be driven
-    /// without it).
+    /// Whether the rebind screen itself is driven by the action, so it must
+    /// always keep a keyboard key of its own (see [`Bindings::lockout`]).
     pub const fn is_essential(self) -> bool {
         matches!(
             self,
-            Action::Up | Action::Down | Action::Confirm | Action::Cancel
+            Action::Up
+                | Action::Down
+                | Action::Left
+                | Action::Right
+                | Action::Confirm
+                | Action::Cancel
+                | Action::Start
         )
     }
 }
@@ -190,14 +199,24 @@ impl Source {
         Source::Key(scancode.0)
     }
 
-    /// The fixed port-only bit a reserved key raises (F1, F9), or `None` for
-    /// a source that can be bound.
+    /// The fixed port-only bit a reserved input raises (F1 or the gamepad's
+    /// back button for the debug menu, F9), or `None` for a source that can
+    /// be bound.
     pub fn reserved_bit(self) -> Option<u32> {
         match self {
             Source::Key(code) if code == SDL_SCANCODE_F1.0 => Some(DEBUG_MENU_BIT),
             Source::Key(code) if code == SDL_SCANCODE_F9.0 => Some(RETURN_TITLE_BIT),
+            Source::PadButton(button) if button == SDL_GAMEPAD_BUTTON_BACK.0 => {
+                Some(DEBUG_MENU_BIT)
+            }
             _ => None,
         }
+    }
+
+    /// Whether the source's `device:name` form reads back as the same source,
+    /// so it can be saved (SDL names two scancodes `Return`, for one).
+    pub fn round_trips(self) -> bool {
+        Source::parse(&self.to_string()).is_ok_and(|parsed| parsed == self)
     }
 
     /// Parse a `[bindings]` source name.
@@ -207,22 +226,36 @@ impl Source {
         };
         let source = match device {
             "key" => {
-                let scancode = cstr_lookup(name, |c| unsafe { SDL_GetScancodeFromName(c) });
-                match scancode {
-                    Some(code) if code != SDL_SCANCODE_UNKNOWN => Source::key(code),
-                    _ => bail!("unknown key `{name}`"),
+                if let Some(code) = numbered(name, SDL_SCANCODE_COUNT.0) {
+                    if code == SDL_SCANCODE_UNKNOWN.0 {
+                        bail!("unknown key `{name}`");
+                    }
+                    Source::Key(code)
+                } else {
+                    let scancode = cstr_lookup(name, |c| unsafe { SDL_GetScancodeFromName(c) });
+                    match scancode {
+                        Some(code) if code != SDL_SCANCODE_UNKNOWN => Source::key(code),
+                        _ => bail!("unknown key `{name}`"),
+                    }
                 }
             }
             "mouse" => match MOUSE_NAMES.iter().find(|(_, n)| *n == name) {
                 Some(&(button, _)) => Source::Mouse(button),
-                None => bail!("unknown mouse button `{name}`"),
+                None => match name.parse::<u8>() {
+                    Ok(button) if button > 0 => Source::Mouse(button),
+                    _ => bail!("unknown mouse button `{name}`"),
+                },
             },
             "wheel" => match WHEEL_NAMES.iter().find(|(_, n)| *n == name) {
                 Some(&(wheel, _)) => Source::Wheel(wheel),
                 None => bail!("unknown wheel direction `{name}`"),
             },
             "pad" => {
-                let button = cstr_lookup(name, |c| unsafe { SDL_GetGamepadButtonFromString(c) });
+                let button = numbered(name, SDL_GAMEPAD_BUTTON_COUNT.0)
+                    .map(SDL_GamepadButton)
+                    .or_else(|| {
+                        cstr_lookup(name, |c| unsafe { SDL_GetGamepadButtonFromString(c) })
+                    });
                 match button {
                     Some(button) if button != SDL_GAMEPAD_BUTTON_INVALID => {
                         Source::PadButton(button.0)
@@ -238,7 +271,9 @@ impl Source {
                 } else {
                     bail!("gamepad axis `{name}` needs a `+` or `-` direction");
                 };
-                let axis = cstr_lookup(axis, |c| unsafe { SDL_GetGamepadAxisFromString(c) });
+                let axis = numbered(axis, SDL_GAMEPAD_AXIS_COUNT.0)
+                    .map(SDL_GamepadAxis)
+                    .or_else(|| cstr_lookup(axis, |c| unsafe { SDL_GetGamepadAxisFromString(c) }));
                 match axis {
                     Some(axis) if axis != SDL_GAMEPAD_AXIS_INVALID => {
                         Source::PadAxis(axis.0, positive)
@@ -318,6 +353,12 @@ impl fmt::Display for Source {
         let (device, name) = self.name();
         write!(f, "{device}:{name}")
     }
+}
+
+/// The `N` of a `#N` name, when below `count`.
+fn numbered(name: &str, count: i32) -> Option<i32> {
+    let index = name.strip_prefix('#')?.parse::<i32>().ok()?;
+    (0..count).contains(&index).then_some(index)
 }
 
 /// Run an SDL name lookup on `name` as a C string (`None` for an interior NUL).
@@ -484,10 +525,11 @@ impl Bindings {
 
     /// Bind `source` to `action` at `slot`: replace that binding, or append
     /// when `slot` is past the end. Returns `false` (and changes nothing) for
-    /// a reserved key or a source the action already has.
+    /// a reserved input, one that cannot be saved ([`Source::round_trips`])
+    /// or a source the action already has.
     pub fn bind(&mut self, action: Action, slot: usize, source: Source) -> bool {
         let list = &mut self.sources[action as usize];
-        if source.reserved_bit().is_some() || list.contains(&source) {
+        if source.reserved_bit().is_some() || !source.round_trips() || list.contains(&source) {
             return false;
         }
         match list.get_mut(slot) {
@@ -518,6 +560,22 @@ impl Bindings {
             }
         }
         mask
+    }
+
+    /// The first essential action ([`Action::is_essential`]) left without a
+    /// keyboard key of its own (bound to no other essential action), or
+    /// `None` when every one has one. Such bindings could leave the menus,
+    /// the rebind screen included, undrivable: a key shared with cancel
+    /// cancels before it confirms, and a gamepad can be unplugged.
+    pub fn lockout(&self) -> Option<Action> {
+        let essentials = || ACTIONS.into_iter().filter(|action| action.is_essential());
+        essentials().find(|&action| {
+            !self.get(action).iter().any(|&source| {
+                matches!(source, Source::Key(_))
+                    && essentials()
+                        .all(|other| other == action || !self.get(other).contains(&source))
+            })
+        })
     }
 
     /// The other actions `source` is also bound to, besides `action`.
@@ -580,8 +638,9 @@ mod tests {
             "wheel:up",
             "wheel:right",
             "pad:a",
-            "pad:back",
+            "pad:guide",
             "axis:righty-",
+            "mouse:6",
         ] {
             assert_eq!(Source::parse(name).unwrap().to_string(), name);
         }
@@ -605,9 +664,53 @@ mod tests {
             "joy:a",
             "key:F1",
             "key:F9",
+            "pad:back",
+            "key:#0",
+            "key:#99999",
+            "mouse:0",
+            "pad:#99",
         ] {
             assert!(Source::parse(name).is_err(), "{name} must be rejected");
         }
+    }
+
+    #[test]
+    fn nameless_inputs_are_saved_by_number_or_refused() {
+        // Scancode 1 has no SDL name; it is written and read back by number.
+        let nameless = Source::Key(1);
+        assert_eq!(nameless.to_string(), "key:#1");
+        assert!(nameless.round_trips());
+        assert_eq!(Source::parse("pad:#0").unwrap(), Source::PadButton(0));
+        assert_eq!(
+            Source::parse("axis:#1-").unwrap(),
+            Source::PadAxis(1, false)
+        );
+        let mut bindings = Bindings::default();
+        assert!(bindings.bind(Action::Aim, usize::MAX, nameless));
+        assert!(bindings.bind(Action::Aim, usize::MAX, Source::Mouse(9)));
+        // SDL names RETURN2 `Return` too, which would reload as RETURN: such
+        // an input is refused rather than saved as a different key.
+        let return2 = Source::Key(158);
+        assert_eq!(return2.to_string(), "key:Return");
+        assert!(!return2.round_trips());
+        assert!(!bindings.bind(Action::Aim, usize::MAX, return2));
+    }
+
+    #[test]
+    fn an_essential_action_needs_a_key_of_its_own() {
+        let mut bindings = Bindings::default();
+        assert_eq!(bindings.lockout(), None);
+        // Gamepad-only confirm: unplugging the pad would strand the menus.
+        bindings.set(Action::Confirm, vec![Source::PadButton(0)]);
+        assert_eq!(bindings.lockout(), Some(Action::Confirm));
+        // A key shared with cancel cancels before it confirms.
+        bindings.set(Action::Confirm, vec![Source::key(SDL_SCANCODE_ESCAPE)]);
+        assert_eq!(bindings.lockout(), Some(Action::Confirm));
+        // Sharing with a non-essential action is fine.
+        bindings.set(Action::Confirm, vec![Source::key(SDL_SCANCODE_Z)]);
+        assert_eq!(bindings.lockout(), None);
+        bindings.set(Action::Start, Vec::new());
+        assert_eq!(bindings.lockout(), Some(Action::Start));
     }
 
     #[test]
@@ -639,5 +742,8 @@ mod tests {
             DEBUG_MENU_BIT,
             "F1 stays fixed"
         );
+        let back = Source::PadButton(SDL_GAMEPAD_BUTTON_BACK.0);
+        assert!(!bindings.bind(Action::Fire, 0, back));
+        assert_eq!(bindings.mask(back), DEBUG_MENU_BIT, "pad back stays fixed");
     }
 }

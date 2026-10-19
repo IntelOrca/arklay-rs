@@ -8459,19 +8459,22 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
         } else if kind == SDL_EVENT_MOUSE_BUTTON_UP {
             input.source_up(0, Source::Mouse(unsafe { event.button.button }));
         } else if kind == SDL_EVENT_MOUSE_WHEEL {
+            // The integer deltas are whole notches (SDL accumulates a
+            // touchpad's fractional scroll into them), so smooth scrolling
+            // does not storm presses.
             let wheel = unsafe { event.wheel };
             let sign = if wheel.direction == SDL_MOUSEWHEEL_FLIPPED {
-                -1.0
+                -1
             } else {
-                1.0
+                1
             };
-            let (x, y) = (wheel.x * sign, wheel.y * sign);
+            let (x, y) = (wheel.integer_x * sign, wheel.integer_y * sign);
             for (delta, positive, negative) in
                 [(y, Wheel::Up, Wheel::Down), (x, Wheel::Right, Wheel::Left)]
             {
-                if delta > 0.0 {
+                if delta > 0 {
                     input.source_tap(Source::Wheel(positive));
-                } else if delta < 0.0 {
+                } else if delta < 0 {
                     input.source_tap(Source::Wheel(negative));
                 }
             }
@@ -8494,10 +8497,14 @@ fn poll_events(event: &mut SDL_Event, input: &mut InputState, cut_delta: &mut i3
         } else if kind == SDL_EVENT_GAMEPAD_AXIS_MOTION {
             let axis = unsafe { event.gaxis };
             input.axis_motion(axis.which.0, i32::from(axis.axis), axis.value);
-        } else if kind == SDL_EVENT_WINDOW_FOCUS_LOST || kind == SDL_EVENT_KEYBOARD_REMOVED {
-            // Focusing away (or unplugging the keyboard) never delivers the
-            // held inputs' release events; drop them so nothing sticks down.
+        } else if kind == SDL_EVENT_WINDOW_FOCUS_LOST {
+            // Focusing away never delivers the held inputs' release events;
+            // drop them so nothing sticks down.
             input.clear();
+        } else if kind == SDL_EVENT_KEYBOARD_REMOVED {
+            // Nor does unplugging a keyboard (which some gamepads also
+            // expose); the pads' own held inputs are still good.
+            input.device_removed(0);
         }
     }
     quit
@@ -8525,7 +8532,7 @@ impl Gamepads {
         }
         let db = crate::config::Config::dir().join("gamecontrollerdb.txt");
         if db.is_file()
-            && let Ok(path) = std::ffi::CString::new(db.to_string_lossy().into_owned())
+            && let Ok(path) = std::ffi::CString::new(db.as_os_str().as_encoded_bytes())
             && unsafe { SDL_AddGamepadMappingsFromFile(path.as_ptr()) } < 0
         {
             eprintln!("warning: failed to read {}: {}", db.display(), sdl_error());
@@ -11539,10 +11546,11 @@ mod tests {
     use crate::model::{ClipFrame, Emw, Keyframe, Skeleton, Texture8, Tmd};
     use crate::pack::PackWriter;
     use sdl3_sys::scancode::{
-        SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE, SDL_SCANCODE_F1,
-        SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET, SDL_SCANCODE_LSHIFT,
-        SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET, SDL_SCANCODE_RSHIFT,
-        SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+        SDL_SCANCODE_BACKSPACE, SDL_SCANCODE_C, SDL_SCANCODE_DOWN, SDL_SCANCODE_ESCAPE,
+        SDL_SCANCODE_F1, SDL_SCANCODE_F9, SDL_SCANCODE_LEFT, SDL_SCANCODE_LEFTBRACKET,
+        SDL_SCANCODE_LSHIFT, SDL_SCANCODE_RETURN, SDL_SCANCODE_RIGHT, SDL_SCANCODE_RIGHTBRACKET,
+        SDL_SCANCODE_RSHIFT, SDL_SCANCODE_SPACE, SDL_SCANCODE_TAB, SDL_SCANCODE_UP, SDL_SCANCODE_X,
+        SDL_SCANCODE_Z,
     };
 
     struct TempDir(std::path::PathBuf);
@@ -18127,6 +18135,131 @@ off_0010:
             movie_buttons_held(input.held_word()),
             0x0001 | 0x0002 | 0x0010
         );
+    }
+
+    #[test]
+    fn a_gamepad_axis_latches_with_hysteresis_and_flips_directly() {
+        use sdl3_sys::gamepad::SDL_GAMEPAD_AXIS_LEFTX;
+        let axis = SDL_GAMEPAD_AXIS_LEFTX.0;
+        let mut input = InputState::default();
+        input.axis_motion(7, axis, AXIS_PRESS - 1);
+        assert!(!input.tick().player.right, "below the press threshold");
+        input.axis_motion(7, axis, AXIS_PRESS);
+        let tick = input.tick();
+        assert!(tick.ui.right && tick.player.right);
+        // Held down to the release threshold without a second edge.
+        input.axis_motion(7, axis, AXIS_RELEASE + 1);
+        let tick = input.tick();
+        assert!(tick.player.right && !tick.ui.right);
+        input.axis_motion(7, axis, AXIS_RELEASE);
+        assert!(!input.tick().player.right, "released");
+        // A flick straight across releases one side and presses the other.
+        input.axis_motion(7, axis, i16::MAX);
+        input.tick();
+        input.axis_motion(7, axis, i16::MIN);
+        let tick = input.tick();
+        assert!(tick.ui.left && tick.player.left && !tick.player.right);
+    }
+
+    #[test]
+    fn removing_a_gamepad_releases_only_its_inputs() {
+        use sdl3_sys::gamepad::{SDL_GAMEPAD_AXIS_LEFTY, SDL_GAMEPAD_BUTTON_WEST};
+        let mut input = InputState::default();
+        input.source_down(
+            7,
+            controls::Source::PadButton(SDL_GAMEPAD_BUTTON_WEST.0),
+            false,
+        );
+        input.axis_motion(7, SDL_GAMEPAD_AXIS_LEFTY.0, i16::MAX);
+        input.key_down(SDL_SCANCODE_C, false);
+        let tick = input.tick();
+        assert!(tick.player.run && tick.player.down && tick.player.aim);
+        input.device_removed(7);
+        let tick = input.tick();
+        assert!(!tick.player.run && !tick.player.down, "pad inputs released");
+        assert!(tick.player.aim, "the keyboard's held key stays down");
+        // The pad's axis state went with it: a fresh push presses again.
+        input.axis_motion(7, SDL_GAMEPAD_AXIS_LEFTY.0, i16::MAX);
+        assert!(input.tick().ui.down);
+    }
+
+    #[test]
+    fn a_wheel_notch_is_one_press_with_no_hold() {
+        let mut bindings = controls::Bindings::default();
+        let wheel = controls::Source::Wheel(controls::Wheel::Down);
+        assert!(bindings.bind(controls::Action::Fire, usize::MAX, wheel));
+        let mut input = InputState::new(bindings);
+        input.source_tap(wheel);
+        let tick = input.tick();
+        assert!(tick.player.fire_pressed && tick.player.fire);
+        assert!(!input.tick().player.fire, "nothing stays held");
+    }
+
+    #[test]
+    fn mouse_buttons_and_rebinding_while_held_never_stick() {
+        let mut bindings = controls::Bindings::default();
+        let right = controls::Source::Mouse(3);
+        assert!(bindings.bind(controls::Action::Aim, usize::MAX, right));
+        let mut input = InputState::new(bindings.clone());
+        input.source_down(0, right, false);
+        let tick = input.tick();
+        assert!(tick.player.aim_pressed && tick.player.aim);
+        input.source_up(0, right);
+        assert!(!input.tick().player.aim);
+
+        // Z held for fire; fire moves to C while Z is down: fire releases at
+        // once, no stray edge appears, and Z's key-up leaves nothing behind.
+        input.key_down(SDL_SCANCODE_Z, false);
+        assert!(input.tick().player.fire);
+        bindings.set(
+            controls::Action::Fire,
+            vec![controls::Source::key(SDL_SCANCODE_C)],
+        );
+        input.set_bindings(bindings.clone());
+        let tick = input.tick();
+        assert!(!tick.player.fire && !tick.player.fire_pressed);
+        // C held across a change that binds it to fire drives fire at once,
+        // without a fresh press.
+        input.key_up(SDL_SCANCODE_Z);
+        input.key_down(SDL_SCANCODE_X, false);
+        input.tick();
+        let mut moved = bindings.clone();
+        moved.set(
+            controls::Action::Fire,
+            vec![controls::Source::key(SDL_SCANCODE_X)],
+        );
+        input.set_bindings(moved);
+        let tick = input.tick();
+        assert!(tick.player.fire && !tick.player.fire_pressed);
+        input.key_up(SDL_SCANCODE_X);
+        let tick = input.tick();
+        assert!(!tick.player.fire && !tick.ui.cancel);
+    }
+
+    #[test]
+    fn a_tick_captures_the_first_bindable_press_only() {
+        use sdl3_sys::gamepad::{SDL_GAMEPAD_BUTTON_BACK, SDL_GAMEPAD_BUTTON_SOUTH};
+        let mut input = InputState::default();
+        input.key_down(SDL_SCANCODE_F1, false);
+        input.source_down(0, controls::Source::Mouse(2), false);
+        input.key_down(SDL_SCANCODE_Z, false);
+        let tick = input.tick();
+        assert_eq!(tick.ui.captured, Some(controls::Source::Mouse(2)));
+        assert!(tick.ui.debug_menu, "F1 is never captured but still opens");
+        // A repeat is not a press, so it captures nothing.
+        input.key_down(SDL_SCANCODE_Z, true);
+        assert_eq!(input.tick().ui.captured, None);
+        // The pad's back button is the fixed debug-menu input; south is
+        // captured and confirms.
+        let back = controls::Source::PadButton(SDL_GAMEPAD_BUTTON_BACK.0);
+        input.source_down(7, back, false);
+        let tick = input.tick();
+        assert!(tick.ui.debug_menu && tick.ui.captured.is_none());
+        let south = controls::Source::PadButton(SDL_GAMEPAD_BUTTON_SOUTH.0);
+        input.source_down(7, south, false);
+        let tick = input.tick();
+        assert!(tick.ui.confirm);
+        assert_eq!(tick.ui.captured, Some(south));
     }
 
     #[test]

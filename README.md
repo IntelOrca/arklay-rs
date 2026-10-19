@@ -210,19 +210,22 @@ would not shrink also stays raw.
 | `Shift` | West (X / Square) | Run (hold) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `F1` | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls); Esc backs out one level, F1 closes |
+| `F1` (gamepad Back / Select) | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls); Esc backs out one level, F1 closes |
 | `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
 
-Every action except the fixed `F1`/`F9` debug keys can be rebound, with any
-number of keyboard, mouse (buttons and wheel) and gamepad bindings each. The
-CONTROLS tool in the `F1` menu lists the actions: up/down pick one, left/right
-pick a binding slot (the last slot adds a new one), confirm captures the next
-key, button, wheel notch or stick/trigger push (it gives up after about five
-seconds), `Tab` clears the slot and RESET restores the defaults. A binding
-shared with another action is drawn red and the other actions are listed
-below. Up, down, confirm and cancel always keep at least one binding. Changes
-are saved to the `[bindings]` table of `arklay.toml`, which can also be edited
-by hand; actions it leaves out keep their defaults:
+Every action except the fixed debug inputs (`F1` and the gamepad's Back
+button, `F9`) can be rebound, with any number of keyboard, mouse (buttons and
+wheel) and gamepad bindings each. The CONTROLS tool in the `F1` menu lists the
+actions: up/down pick one, left/right pick a binding slot (the last slot adds
+a new one), confirm captures the next key, button, wheel notch or
+stick/trigger push (it gives up after about five seconds), START (inventory)
+clears the slot and RESET restores the defaults. A binding shared with another
+action is drawn red and the other actions are listed below. Up, down, left,
+right, confirm, cancel and START must each keep a keyboard key bound to none
+of the others, so the menus can always be driven from the keyboard; a change
+that breaks this is refused. Changes are saved to the `[bindings]` table of
+`arklay.toml`, which can also be edited by hand; only the actions that differ
+from the defaults are written, and actions it leaves out keep their defaults:
 
 ```toml
 [bindings]
@@ -232,13 +235,17 @@ fire = ["key:Z", "axis:righttrigger+", "wheel:down"]
 
 Sources are `key:<SDL key name>`, `mouse:left|middle|right|x1|x2`,
 `wheel:up|down|left|right`, `pad:<SDL gamepad button>` and
-`axis:<SDL gamepad axis>+|-`; the actions are `up`, `down`, `left`, `right`,
+`axis:<SDL gamepad axis>+|-`; an input SDL has no name for is written by
+number (`key:#N`, `mouse:N`, `pad:#N`, `axis:#N+`). The actions are `up`, `down`, `left`, `right`,
 `confirm`, `cancel`, `run`, `aim`, `fire`, `start`, `page_left` and
 `page_right`. Saving rewrites the file in canonical form (comments are not
 kept) and never touches a file that fails to parse. Gamepads are picked up
 when plugged in; extra controller mappings can be dropped into
 `gamecontrollerdb.txt` in the config directory (or `SDL_GAMECONTROLLERCONFIG`).
-Scripted `--input` runs are unaffected by bindings.
+Any bound or unbound key, mouse button, wheel notch or gamepad input counts as
+"any key" for prompts that take one. `Shift` + `,`/`.` stay the fixed
+camera-cut keys, so binding `,` or `.` to an action also steps the camera when
+`Shift` is held. Scripted `--input` runs are unaffected by bindings.
 
 The character select slides the two cards between their poses while the pick
 changes; the item viewer spins the model while a direction is held and confirm
