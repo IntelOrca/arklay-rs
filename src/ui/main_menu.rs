@@ -19,9 +19,10 @@
 //!    gameplay frame, with the game's message window switched to the menu
 //!    line;
 //! 3. each frozen frame maps one pad edge to [`MenuInput`], calls
-//!    [`MainMenu::handle_input`] and consumes the [`MenuEvent`]: `Close`
-//!    unfreezes, `Message` starts a menu-paused window, `ViewItem` is a
-//!    stub until the viewer slice, and `Tab`/`Changed` just redraw;
+//!    [`MainMenu::handle_input`] and consumes the [`MenuEvent`]: `Close` and
+//!    `CloseSilent` unfreeze (the latter without the exit cue), `Message`
+//!    starts a menu-paused window, `ViewItem` is a stub until the viewer
+//!    slice, and `Tab`/`Changed` just redraw;
 //! 4. the session draws the frozen frame, then the menu, then the message
 //!    window over both.
 //!
@@ -111,8 +112,17 @@ pub enum MenuInput {
 pub enum MenuEvent {
     /// The input was consumed inside the menu.
     None,
-    /// Close the menu and unfreeze gameplay.
+    /// Close the menu and unfreeze gameplay through the reference's state-1
+    /// exit, which plays the character bank's cancel cue (`play_sfx(3, 5)`)
+    /// as it enters the close fade.
     Close,
+    /// Close the menu through the same fade without the exit cue.
+    ///
+    /// The exit tab's own action: the reference's `menu_tab_exit` runs
+    /// `menu_exit_cleanup` directly, with no `play_sfx(3, 5)` of its own - the
+    /// confirm that reached the tab already played the decide cue
+    /// (`play_sfx(3, 6)`).
+    CloseSilent,
     /// Show a menu message through the message window.
     Message(u16),
     /// CHECK: the submenu's slide-out finished, start the item viewer on
@@ -461,7 +471,7 @@ impl MainMenu {
                 if layout::is_tab(self.cursor) {
                     self.cursor_blink = 0;
                     return if self.cursor == 6 {
-                        MenuEvent::Close
+                        MenuEvent::CloseSilent
                     } else {
                         MenuEvent::Tab(self.cursor)
                     };
@@ -1482,9 +1492,11 @@ mod tests {
             MenuEvent::Tab(4)
         );
         menu.cursor = 6;
+        // The exit tab's confirm closes without the state-1 exit cue: the
+        // reference's `menu_tab_exit` runs `menu_exit_cleanup` directly.
         assert_eq!(
             menu.handle_input(&mut game, MenuInput::Confirm),
-            MenuEvent::Close
+            MenuEvent::CloseSilent
         );
         assert_eq!(
             menu.handle_input(&mut game, MenuInput::Cancel),

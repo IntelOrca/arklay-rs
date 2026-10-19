@@ -2969,8 +2969,11 @@ impl GameSession {
     }
 
     /// Close the pause menu through the same darkening fade without playing
-    /// the cancel cue. The pick-up flow uses this: its prompt already played
-    /// its own yes/no cue when it resolved.
+    /// the cancel cue. The reference's `menu_exit_cleanup` is silent; the
+    /// callers whose sub-function played its own cue use this: the item-box
+    /// browse cancel, the pick-up viewer's resolved yes/no prompt, and the
+    /// exit tab ([`MenuEvent::CloseSilent`]), whose confirm already played the
+    /// decide cue.
     fn begin_menu_close_silent(&mut self) {
         self.begin_menu_closing_fade();
     }
@@ -3979,12 +3982,19 @@ impl GameSession {
         let mode = menu.mode;
         // A confirm that did nothing (an empty slot) stays silent, exactly like
         // the original's `goto input_blink` path.
+        //
+        // The navigation cancel is silent here too: its `play_sfx(3, 5)` is the
+        // state-1 exit cue [`Self::begin_menu_close`] plays, and the reference
+        // reaches that exit without ever running `menu_handle_input`'s
+        // navigation path (the cancel bit fails `cond1`), which owns no cue of
+        // its own.
         let cue = match event_input {
             MenuInput::Confirm
                 if event == MenuEvent::None && was_navigation && mode == MenuMode::Navigation =>
             {
                 None
             }
+            MenuInput::Cancel if event == MenuEvent::Close => None,
             _ => menu_cue(event_input),
         };
         if let Some(cue) = cue {
@@ -3998,6 +4008,7 @@ impl GameSession {
         match event {
             MenuEvent::None => {}
             MenuEvent::Close => self.begin_menu_close(pack),
+            MenuEvent::CloseSilent => self.begin_menu_close_silent(),
             MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
             // CHECK's slide-out finished: the viewer starts. The slide's own
             // frames run through `tick_examine`, which handles this itself.
@@ -4029,6 +4040,10 @@ impl GameSession {
                 let transmitting = self.game.flags[usize::from(game::BANK_ITEM_USE)].bit(0x3F);
                 if transmitting {
                     self.game.record_used_item(ITEM_COMM_RADIO);
+                    // `menu_tab_radio`'s transmitting branch plays the
+                    // character bank's radio cue (slot 7) before the state-1
+                    // exit's cancel cue.
+                    self.play_character_bank_cue(pack, sfx::UI_RADIO, 7);
                     self.begin_menu_close(pack);
                 } else {
                     self.open_item_view(pack, ITEM_COMM_RADIO);
@@ -17618,6 +17633,32 @@ end
         pack_path
     }
 
+    /// A pack with one synthetic room, its cut background and the cancel cue
+    /// the pause menu plays, for the cue-counting tests.
+    fn menu_cue_pack(dir: &TempDir) -> PathBuf {
+        let pack_path = dir.0.join("menu-cues.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        // Long enough to outlive the tick: the count reads the live voices.
+        writer
+            .add("se/cancel.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
+        writer
+            .add("se/decide.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        pack_path
+    }
+
     #[test]
     fn a_paused_message_ignores_player_input_until_dismissed() {
         let dir = TempDir::new();
@@ -18998,6 +19039,115 @@ off_0010:
             "the room fades back in after the menu closes"
         );
     }
+
+    #[test]
+    fn the_pause_menu_cancel_plays_the_exit_cue_once() {
+        // The reference's state-1 exit plays exactly one `play_sfx(3, 5)` on
+        // the cancel frame (`MainMenu.cpp` 0x00463a6b-0x00463a9a: the cancel
+        // bit skips `menu_handle_input`, whose navigation path has no cue of
+        // its own, and the state falls through to `menu_exit_cleanup();
+        // play_sfx(3, 5);` once). The port's menu-cue layer and the close both
+        // sounded, so the cancel played twice.
+        let _sdl = crate::audio::test_lock::sdl();
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping cancel-cue test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let pack_path = menu_cue_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.music = Some(mixer);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_menu_fade(&mut session, &pack);
+        assert!(session.menu.is_some());
+        assert_eq!(session.music.as_ref().unwrap().active_sfx(), 0);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    cancel: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
+        assert_eq!(
+            session.music.as_ref().unwrap().active_sfx(),
+            1,
+            "the cancel close played the exit cue more than once"
+        );
+    }
+
+    #[test]
+    fn the_exit_tab_closes_silently_after_its_decide_cue() {
+        // The reference's exit tab (`menu_tab_exit`) runs `menu_exit_cleanup`
+        // directly: the confirm that reached it played `play_sfx(3, 6)`
+        // (`MainMenu.cpp` menu_handle_input's confirm path) and no
+        // `play_sfx(3, 5)` follows. The port used to close through the
+        // state-1 exit and add the cancel cue on top of the decide.
+        let _sdl = crate::audio::test_lock::sdl();
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping exit-tab cue test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let pack_path = menu_cue_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.music = Some(mixer);
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_menu_fade(&mut session, &pack);
+        session.menu.as_mut().unwrap().cursor = 6;
+
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
+        assert_eq!(
+            session.music.as_ref().unwrap().active_sfx(),
+            1,
+            "the exit tab's confirm played an extra cue"
+        );
+    }
+
     #[test]
     fn a_film_freezes_the_room_and_resumes_when_it_ends() {
         let dir = TempDir::new();

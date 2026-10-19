@@ -60,6 +60,21 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   from zero to full (`DAT_00ae9f27` `0x80..=0x88`, width `*6`, height `*3`)
   over eight frames after confirm. `MainMenu::submenu_frames` scales
   `draw_submenu` and gates the action input until it is open.
+- **Inventory cancel cue.** The original's state-1 exit plays `play_sfx(3, 5)`
+  once on the cancel frame: the cancel bit fails `cond1`
+  (`src/game/MainMenu.cpp` 498), so `menu_handle_input` (501) never runs - its
+  navigation path owns no cancel cue, only the confirm path's
+  `play_sfx(3, 6)` - and the state falls through to
+  `menu_exit_cleanup(); play_sfx(3, 5);` (510-511). arklay
+  queued the input's cancel cue *and* the close's exit cue, so a cancel close
+  sounded the same sample twice. The exit tab's own action (`menu_tab_exit` ->
+  `menu_exit_cleanup`, no cue) also picked up the exit cue on top of its
+  confirm's decide. `MenuEvent::Close` now owns the state-1 exit cue and the
+  new `MenuEvent::CloseSilent` is the exit tab's silent close; the cancel
+  input queues no cue of its own. Pinned by
+  `engine::tests::the_pause_menu_cancel_plays_the_exit_cue_once` (live mixer
+  voices on the cancel frame: 2 before, 1 after) and
+  `engine::tests::the_exit_tab_closes_silently_after_its_decide_cue`.
 - **Menu-close entity freeze.** The room-entry fade after a menu close suspends
   the reference's `game_loop` for its whole run. On its first frame the
   restored word has the player bit but not the entity/monster/effect bits, so
@@ -358,6 +373,12 @@ from camera 0 with no input at all (state and pixels match for 200 ticks).
   *held* before its state machine and exits the whole menu; the port's item
   box consumes the pad before `ui.start` is read, so START is silently lost
   while the box is up. No scenario presses it; low impact.
+- **Tab-cycle menu close.** The port's documented Tab shortcut cycles the top
+  tabs (`MainMenu::cycle_tab`); landing on the exit tab calls `close_menu`,
+  which drops the panel instantly and silently. The reference has no tab-cycle
+  button: START closes the whole menu through the state-1 exit
+  (`play_sfx(3, 5)` once, then the `0xC00` fade). Kept as the port shortcut;
+  the remaining cue gaps are tracked in #95.
 - **MAP full-display zoom.** The browser's confirm switches to the full map
   display (`map_display_update`: the area plan's zoom sprites, the blue
   backdrop page and the browser's own composite dimmed underneath). No

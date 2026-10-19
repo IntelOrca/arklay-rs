@@ -1893,6 +1893,9 @@ pub const UI_CURSOR: &str = "cursor";
 pub const UI_CANCEL: &str = "cancel";
 /// Decide cue name (see [`UI_CURSOR`]).
 pub const UI_DECIDE: &str = "decide";
+/// Radio-transmit cue name: slot 7 of every character table, played by the
+/// RADIO tab's transmitting branch (`play_sfx(3, 7)`).
+pub const UI_RADIO: &str = "Chris08";
 
 /// The non-combat global sound banks (`g_st11`..=`g_st15`), one 16-slot row
 /// each. Only the entries the title, character-select, ending and misc screens
@@ -2479,7 +2482,7 @@ static CHARACTER_SHARED: [Option<&'static str>; 7] = [
     Some(UI_CURSOR),
     Some(UI_CANCEL),
     Some(UI_DECIDE),
-    Some("Chris08"),
+    Some(UI_RADIO),
     Some("Chris10"),
     Some("Chris09"),
     Some("Mapled"),
@@ -3165,6 +3168,7 @@ mod tests {
         assert_eq!(character_sfx(7, 0), Some("Reb_ef01"));
         for table in 0..8 {
             assert_eq!(character_sfx(table, 4), Some("cursor"));
+            assert_eq!(character_sfx(table, 7), Some(UI_RADIO));
             assert_eq!(character_sfx(table, 10), Some("Mapled"));
             assert_eq!(character_sfx(table, 11), None);
             assert_eq!(character_sfx(table, 15), None);
