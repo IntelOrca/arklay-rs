@@ -3232,16 +3232,16 @@ pub struct PlayerChoice {
 
 /// The INFINITE AMMO cheat's mode.
 ///
-/// `Reload` leaves the normal clip drain alone but tops the equipped weapon
-/// back up to capacity when a shot empties it (or the trigger is pulled with
-/// an empty clip). `Infinite` pins the clip at capacity and never spends a
-/// round.
+/// `Reload` leaves the normal clip drain alone; the clip empties, and the
+/// next trigger press runs the normal reload animation and fills it without
+/// spending the reserve. `Infinite` pins the clip at capacity and never
+/// spends a round.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InfiniteAmmo {
     /// Off: the clip drains and reloads from the reserve as usual.
     #[default]
     Off,
-    /// Drain normally, but refill the clip as soon as it reaches zero.
+    /// Drain normally; the next trigger press reloads for free.
     Reload,
     /// Keep the clip full and never decrement it.
     Infinite,

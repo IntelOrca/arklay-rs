@@ -459,14 +459,7 @@ pub fn weapon_autoaim_check(game: &mut GameState) -> u8 {
             game.inventory[index].quantity = full;
             return full;
         }
-        InfiniteAmmo::Reload => {
-            if clip_is_empty(weapon, quantity) {
-                let full = refill_quantity(weapon, quantity);
-                game.inventory[index].quantity = full;
-                return full;
-            }
-        }
-        InfiniteAmmo::Off => {}
+        InfiniteAmmo::Reload | InfiniteAmmo::Off => {}
     }
     if weapon == ITEM_FLAMETHROWER {
         return quantity;
@@ -506,28 +499,16 @@ fn fire_ammo_volley_gate(game: &mut GameState) -> bool {
 /// Spend one round from the equipped weapon's clip slot for a shot.
 ///
 /// The INFINITE AMMO cheat hooks the same two places every shot decrements:
-/// INFINITE leaves the clip at capacity and RELOAD tops it up whenever this
-/// shot empties it.
+/// INFINITE leaves the clip at capacity, while RELOAD drains normally so the
+/// player still sees an empty clip and the reload animation.
 fn consume_round(game: &mut GameState, slot: usize) {
     let weapon = game.inventory[slot].id;
     let quantity = game.inventory[slot].quantity;
     let capacity = clip_capacity(weapon);
     game.inventory[slot].quantity = match game.debug.infinite_ammo {
         InfiniteAmmo::Infinite if capacity != 0 => refill_quantity(weapon, quantity),
-        InfiniteAmmo::Infinite => quantity,
-        InfiniteAmmo::Reload => {
-            if clip_is_empty(weapon, quantity) {
-                refill_quantity(weapon, quantity)
-            } else {
-                let remaining = quantity.wrapping_sub(1);
-                if clip_is_empty(weapon, remaining) {
-                    refill_quantity(weapon, remaining)
-                } else {
-                    remaining
-                }
-            }
-        }
-        InfiniteAmmo::Off => quantity.wrapping_sub(1),
+        _ if clip_is_empty(weapon, quantity) => quantity,
+        _ => quantity.wrapping_sub(1),
     };
 }
 
@@ -1283,7 +1264,14 @@ fn gun_hold_input(
         }
         if input.fire_pressed {
             play_weapon_sound(game, weapon, 9);
-            if weapon < 6 && game.has_item(weapon_ammo_item_id(weapon)) {
+            // The RELOAD ammo cheat supplies the clip even when the reserve
+            // is empty, so the normal reload animation still plays. Specials
+            // keep their original auto-refill instead.
+            let cheat_reload =
+                game.debug.infinite_ammo == InfiniteAmmo::Reload && weapon < SPECIAL_WEAPON_MIN;
+            if (weapon < 6 && game.has_item(weapon_ammo_item_id(weapon)))
+                || (cheat_reload && weapon != ITEM_KNIFE)
+            {
                 player.weapon.behavior = 0x18;
                 player.weapon.state = 0;
                 return;
@@ -2804,6 +2792,7 @@ mod tests {
         consume_round(&mut game, 0);
         assert_eq!(game.inventory[0].quantity, 4, "infinite never spends");
 
+        // The specials keep their original empty-clip refill under RELOAD.
         let (mut game, _player) = armed(ITEM_MINIMI, 0);
         game.debug.infinite_ammo = InfiniteAmmo::Reload;
         assert_eq!(weapon_autoaim_check(&mut game), 4, "empty refills");
@@ -2812,7 +2801,8 @@ mod tests {
         for _ in 0..3 {
             consume_round(&mut game, 0);
         }
-        assert_eq!(game.inventory[0].quantity, 4, "zero refills");
+        assert_eq!(game.inventory[0].quantity, 0, "the burst drained");
+        assert_eq!(weapon_autoaim_check(&mut game), 4, "and refilled");
     }
 
     #[test]
@@ -2834,13 +2824,13 @@ mod tests {
     }
 
     #[test]
-    fn reload_ammo_refills_when_a_shot_empties_the_clip() {
+    fn reload_ammo_leaves_the_clip_empty_until_the_next_press() {
         let (mut game, mut player) = armed(2, 1);
         game.debug.infinite_ammo = InfiniteAmmo::Reload;
         place_enemy(&mut game, 1, 0x00, [800, 0, 0]);
         drive_one_shot(&mut game, &mut player, 16, 40);
         assert_eq!(game.entities[1].health, 55 - 9, "the last round fired");
-        assert_eq!(game.inventory[0].quantity, 15, "zero refilled to capacity");
+        assert_eq!(game.inventory[0].quantity, 0, "the clip stays empty");
     }
 
     #[test]
@@ -2851,7 +2841,7 @@ mod tests {
         assert_eq!(game.inventory[0].quantity, 14, "the shot spent a round");
         game.inventory[0].quantity = 1;
         consume_round(&mut game, 0);
-        assert_eq!(game.inventory[0].quantity, 15, "the empty clip refilled");
+        assert_eq!(game.inventory[0].quantity, 0, "the last shot emptied it");
     }
 
     #[test]
@@ -2866,7 +2856,9 @@ mod tests {
 
         let (mut game, _player) = armed(6, 0);
         game.debug.infinite_ammo = InfiniteAmmo::Reload;
-        assert_eq!(weapon_autoaim_check(&mut game), 0xF0, "empty refills");
+        assert_eq!(weapon_autoaim_check(&mut game), 0, "the clip is empty");
+        fire_consume_ammo_stack(&mut game);
+        assert_eq!(game.inventory[0].quantity, 0xF0, "the reload refills it");
 
         let (mut game, _player) = armed(6, 0xFF);
         game.debug.infinite_ammo = InfiniteAmmo::Infinite;
@@ -2879,18 +2871,64 @@ mod tests {
 
     #[test]
     fn reload_ammo_handles_the_volley_latch_at_empty() {
-        // 0x81 has one round plus the latch: the shot spends it and refills.
+        // 0x81 has one round plus the latch: the shot spends the round and
+        // leaves the latch set.
         let (mut game, _player) = armed(2, 0x81);
         game.debug.infinite_ammo = InfiniteAmmo::Reload;
         consume_round(&mut game, 0);
-        assert_eq!(game.inventory[0].quantity, 15);
+        assert_eq!(game.inventory[0].quantity, 0x80);
 
         // 0x80 is an empty clip that still carries the latch; it must not
         // wrap to 127 rounds.
         let (mut game, _player) = armed(2, 0x80);
         game.debug.infinite_ammo = InfiniteAmmo::Reload;
         consume_round(&mut game, 0);
-        assert_eq!(game.inventory[0].quantity, 15);
+        assert_eq!(game.inventory[0].quantity, 0x80);
+    }
+
+    #[test]
+    fn reload_ammo_plays_the_reload_animation_before_refilling() {
+        let (mut game, mut player) = armed(2, 0);
+        game.debug.infinite_ammo = InfiniteAmmo::Reload;
+        let emd = clip_bank(0x24, 8);
+        let weapon_clips = clip_bank(15, 32);
+        let (skeleton, keyframes) = rig(-2400);
+        let room = RoomState::default();
+        let mut reached_reload = false;
+        let mut empty_during_reload = false;
+        for tick in 0..120 {
+            let input = Input {
+                aim: true,
+                fire: true,
+                fire_pressed: tick < 40,
+                ..Input::default()
+            };
+            let clips = WeaponClips {
+                emd: &emd,
+                emw: &emd,
+                room: &[],
+                weapon: &weapon_clips,
+                emd_keyframes: &keyframes,
+                emd_skeleton: &skeleton,
+                weapon_keyframes: &keyframes,
+                weapon_skeleton: &skeleton,
+            };
+            update(&mut game, &mut player, &room, &clips, input);
+            if player.weapon.behavior == 0x18 {
+                reached_reload = true;
+                empty_during_reload |= game.inventory[0].quantity == 0;
+            }
+            if game.inventory[0].quantity == 15 {
+                break;
+            }
+        }
+        assert!(reached_reload, "fire on an empty clip entered the reload");
+        assert!(
+            empty_during_reload,
+            "the clip stayed empty while the reload motion played"
+        );
+        assert_eq!(game.inventory[0].quantity, 15, "the clip was refilled");
+        assert_eq!(game.item_count(0x0B), 0, "no reserve ammo was needed");
     }
 
     #[test]
@@ -2901,10 +2939,9 @@ mod tests {
             id: 0x0B,
             quantity: 9,
         });
-        assert_eq!(weapon_autoaim_check(&mut game), 15, "empty check refills");
-        assert_eq!(game.inventory[0].quantity, 15);
+        assert_eq!(weapon_autoaim_check(&mut game), 0, "empty check stays zero");
+        assert_eq!(game.inventory[0].quantity, 0);
 
-        game.inventory[0].quantity = 0;
         fire_consume_ammo_stack(&mut game);
         assert_eq!(game.inventory[0].quantity, 15, "reload refills the clip");
         assert_eq!(game.item_count(0x0B), 9, "the reserve is untouched");
