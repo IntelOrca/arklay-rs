@@ -359,6 +359,28 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         Ok(())
     });
 
+    // `draw_actor(name, {from, to, fov})`: an engine-owned actor through
+    // the screen's camera; false when the engine has no such actor.
+    methods.add_method_mut(
+        "draw_actor",
+        |_lua, api, (name, camera): (String, Table)| {
+            let camera = Camera::from_points(
+                triple(&camera, "from")?,
+                triple(&camera, "to")?,
+                field(&camera, "fov")?,
+            );
+            let Api {
+                framebuffer,
+                actors,
+                ..
+            } = api;
+            let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            Ok(actors
+                .as_deref_mut()
+                .is_some_and(|draw| draw(&name, &camera, framebuffer)))
+        },
+    );
+
     // `grid_text(x, y, scale, bytes)`: raw font-sheet cells, see
     // [`draw_grid_text`]. Without a font nothing draws.
     methods.add_method_mut(
@@ -434,6 +456,46 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 byte(b.unwrap_or(255)),
             ];
             framebuffer.draw_background(image, [coord(x), coord(y)], colour);
+            Ok(())
+        },
+    );
+
+    // `page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut,
+    // brightness, mirror_u, mirror_v)`: a sheet region flipped per axis.
+    #[allow(clippy::type_complexity)]
+    methods.add_method_mut(
+        "page_sprite_mirrored",
+        |_lua,
+         api,
+         (handle, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v): (
+            usize,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            i32,
+            usize,
+            i64,
+            bool,
+            bool,
+        )| {
+            let Api {
+                host, framebuffer, ..
+            } = api;
+            let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            let art = host.assets.page(handle)?;
+            framebuffer.draw_page_sprite_mirrored(
+                art,
+                rect(sx, sy, sw, sh),
+                rect(dx, dy, dw, dh),
+                clut.min(255),
+                byte(brightness),
+                Tint::White,
+                [mirror_u, mirror_v],
+            );
             Ok(())
         },
     );

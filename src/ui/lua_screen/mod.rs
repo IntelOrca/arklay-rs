@@ -263,6 +263,21 @@ impl LuaScreen {
         self.host.values.get(key).copied().unwrap_or(0)
     }
 
+    /// [`Screen::draw`] with the engine's actors available to
+    /// `api:draw_actor`.
+    pub fn draw_with_actors(
+        &mut self,
+        cx: &UiContext<'_>,
+        framebuffer: &mut Framebuffer,
+        actors: Option<&mut ActorDraw<'_>>,
+    ) {
+        let Self { host, vm, entry } = self;
+        if let Err(err) = vm.call_draw(host, cx, framebuffer, actors) {
+            eprintln!("[lua] screen {entry} draw failed: {err}");
+            host.failed = true;
+        }
+    }
+
     /// The action an exit reports: the one the script named, else back to
     /// gameplay from a save screen, back to the title from the load screen
     /// and the opener's fallback from a named screen.
@@ -322,11 +337,7 @@ impl Screen for LuaScreen {
     }
 
     fn draw(&mut self, cx: &UiContext<'_>, framebuffer: &mut Framebuffer) {
-        let Self { host, vm, entry } = self;
-        if let Err(err) = vm.call_draw(host, cx, framebuffer) {
-            eprintln!("[lua] screen {entry} draw failed: {err}");
-            host.failed = true;
-        }
+        self.draw_with_actors(cx, framebuffer, None);
     }
 
     fn fade(&self) -> u8 {
@@ -425,6 +436,7 @@ impl ScreenVm {
                     host: &mut *host,
                     cx,
                     framebuffer: None,
+                    actors: None,
                 })?;
                 function.call::<()>((api, table))
             })
@@ -445,6 +457,7 @@ impl ScreenVm {
                     host: &mut *host,
                     cx,
                     framebuffer: None,
+                    actors: None,
                 })?;
                 function.call::<()>((api, table))
             })
@@ -458,6 +471,7 @@ impl ScreenVm {
         host: &mut Host,
         cx: &UiContext<'_>,
         framebuffer: &mut Framebuffer,
+        actors: Option<&mut ActorDraw<'_>>,
     ) -> Result<()> {
         let Some(function) = &self.draw else {
             return Ok(());
@@ -469,6 +483,8 @@ impl ScreenVm {
                     host: &mut *host,
                     cx,
                     framebuffer: Some(&mut *framebuffer),
+                    // Shorten the closure's bound to the scope's lifetime.
+                    actors: actors.map(|draw| draw as &mut ActorDraw<'_>),
                 })?;
                 function.call::<()>(api)
             })
@@ -541,7 +557,12 @@ struct Api<'a> {
     host: &'a mut Host,
     cx: &'a UiContext<'a>,
     framebuffer: Option<&'a mut Framebuffer>,
+    actors: Option<&'a mut ActorDraw<'a>>,
 }
+
+/// Draws an engine-owned actor (the DIED screen's corpse) named by
+/// `api:draw_actor` through the screen's camera; returns whether it drew.
+pub type ActorDraw<'a> = dyn FnMut(&str, &crate::render::Camera, &mut Framebuffer) -> bool + 'a;
 
 /// The draw options table shared by `text`, `sprite` and friends.
 struct Options {
@@ -1067,6 +1088,7 @@ impl UserData for Api<'_> {
                     host,
                     cx,
                     framebuffer,
+                    ..
                 } = api;
                 let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
                 let image = host.image(cx.pack, &entry).map_err(mlua::Error::external)?;
@@ -1145,6 +1167,7 @@ impl UserData for Api<'_> {
                     host,
                     cx,
                     framebuffer,
+                    ..
                 } = api;
                 let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
                 let image = host.image(cx.pack, &entry).map_err(mlua::Error::external)?;
@@ -1184,6 +1207,7 @@ impl UserData for Api<'_> {
                     host,
                     cx,
                     framebuffer,
+                    ..
                 } = api;
                 let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
                 let image = host.image(cx.pack, &entry).map_err(mlua::Error::external)?;

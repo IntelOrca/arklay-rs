@@ -1187,3 +1187,153 @@ fn return_title_text_comes_from_the_language_files() {
         assert!(!text.ui(key).is_empty(), "{key}");
     }
 }
+
+// ---- death -----------------------------------------------------------------
+
+fn death_screen(harness: &Harness) -> LuaScreen {
+    harness.open(
+        "death",
+        &[
+            ("x", ScreenArg::Int(1000)),
+            ("y", ScreenArg::Int(0)),
+            ("z", ScreenArg::Int(2000)),
+            ("angle", ScreenArg::Int(0x100)),
+            ("fov", ScreenArg::Int(221)),
+        ],
+    )
+}
+
+fn death_state(screen: &LuaScreen) -> i64 {
+    screen.test_eval("return M.state.state")
+}
+
+fn death_strip(screen: &LuaScreen) -> Option<i64> {
+    screen.test_eval("return M.state.strip")
+}
+
+fn death_rect(screen: &LuaScreen) -> i64 {
+    screen.test_eval("return M.state.rect")
+}
+
+/// The screen's fade overlay: colour name and alpha.
+fn death_overlay(screen: &LuaScreen) -> (Option<String>, Option<i64>) {
+    screen.test_eval("return M.state.fade:overlay()")
+}
+
+#[test]
+fn death_the_screen_machine_runs_its_states_in_order() {
+    let harness = Harness::new("death-machine");
+    let cx = harness.context();
+    let mut screen = death_screen(&harness);
+    let camera: (Vec<i64>, Vec<i64>) = screen.test_eval("return M.state.from, M.state.to");
+    assert_eq!(camera, (vec![6000, -7000, 2000], vec![1000, -1000, 2000]));
+
+    // The entry arms the white flash: the first frame is fully white.
+    assert_eq!(death_overlay(&screen), (Some("white".into()), Some(255)));
+    assert_eq!(death_state(&screen), 1);
+
+    // The flash decays over 86 ticks, then the reveal starts on the 87th.
+    assert_eq!(death_rect(&screen), 0);
+    let mut reveal = 0;
+    while death_state(&screen) == 1 {
+        assert_eq!(screen.update(&cx, neutral()), ScreenResult::Continue);
+        reveal += 1;
+        assert!(reveal < 200, "the flash must clear");
+    }
+    assert_eq!(reveal, 87);
+
+    // The black ramp starts at zero; the strip starts stepping once the ramp
+    // passes the threshold, 21 ticks later.
+    let mut first_strip = None;
+    let mut stepped = 0;
+    for tick in 0..200 {
+        screen.update(&cx, neutral());
+        if death_strip(&screen).is_some() {
+            first_strip.get_or_insert((tick, death_rect(&screen)));
+            stepped += 1;
+        }
+        if death_state(&screen) == 3 {
+            break;
+        }
+    }
+    let (tick, alpha) = first_strip.expect("the strip draws");
+    assert_eq!(alpha, 63, "the first strip frame is past the threshold");
+    assert_eq!(tick, 21);
+    assert_eq!(stepped, 56, "59 down to 4 is 56 stepped frames");
+
+    // The hold runs 49 frames at the settled amplitude.
+    for _ in 0..=0x30 {
+        assert_eq!(screen.update(&cx, neutral()), ScreenResult::Continue);
+    }
+    assert_eq!(death_state(&screen), 4);
+    // The black fade-out arms and re-waves the strip; the overlay holds the
+    // last ramped value.
+    screen.update(&cx, neutral());
+    assert_eq!(death_rect(&screen), 228);
+    assert_eq!(death_overlay(&screen).0.as_deref(), Some("black"));
+    let mut rewave = Vec::new();
+    let mut finished = None;
+    for _ in 0..200 {
+        if let ScreenResult::Done(action) = screen.update(&cx, neutral()) {
+            finished = Some(action);
+            break;
+        }
+        rewave.extend(death_strip(&screen));
+    }
+    assert_eq!(finished, Some(ScreenAction::Title));
+    assert_eq!(
+        rewave[..2],
+        [4, 5],
+        "the re-wave starts at the settled value"
+    );
+}
+
+#[test]
+fn death_the_corpse_spins_eight_units_a_tick() {
+    let harness = Harness::new("death-spin");
+    let cx = harness.context();
+    let mut screen = death_screen(&harness);
+    screen.update(&cx, neutral());
+    assert_eq!(screen.value("spin"), 0x108);
+    screen.update(&cx, neutral());
+    assert_eq!(screen.value("spin"), 0x110);
+}
+
+#[test]
+fn death_the_confirm_button_skips_the_screen() {
+    let harness = Harness::new("death-skip");
+    let cx = harness.context();
+    let mut screen = death_screen(&harness);
+    assert_eq!(screen.update(&cx, neutral()), ScreenResult::Continue);
+    assert_eq!(
+        screen.update(&cx, press(|i| i.confirm = true)),
+        ScreenResult::Done(ScreenAction::Title)
+    );
+}
+
+#[test]
+fn death_the_strip_math_matches_the_original() {
+    let harness = Harness::new("death-strip");
+    let screen = death_screen(&harness);
+    let base = |param: i64| -> i64 { screen.test_eval(&format!("return M.strip_base({param})")) };
+    let wave = |param: i64, column: i64| -> i64 {
+        screen.test_eval(&format!("return M.strip_wave({param}, {column})"))
+    };
+    assert_eq!(base(59), -152);
+    assert_eq!(base(3), -44);
+    assert_eq!(wave(59, 1), 665);
+    assert_eq!(wave(59, 2), 1230);
+    assert_eq!(wave(3, 1), 1);
+    // The unsigned shift wraps negative sine products below the baseline.
+    assert_eq!(wave(59, 255), -666);
+    assert_eq!(wave(3, 255), -2);
+    // The 16-entry sine table is the original's fix12 sine at every column
+    // phase: `(int)(sin(phase * 2^-12 * 2pi) * 4096)`.
+    let fsin = |angle: i64| -> i64 {
+        ((angle as f64 * (1.0 / 4096.0) * 6.283_185_482_025_146_5).sin() * 4096.0) as i64
+    };
+    for column in 0..256 {
+        let expected = ((fsin(column * 0x100) * 59 * 59) as u32 >> 13) as u16 as i16;
+        assert_eq!(wave(59, column), i64::from(expected), "column {column}");
+    }
+}

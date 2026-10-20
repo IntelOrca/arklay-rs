@@ -521,7 +521,7 @@ The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 
 The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
 `char_select`, `save_load`, `ending_result`, `ending_epilogue`,
-`return_title`, …), with shared code under `ui/lib/`. A pack or mod entry
+`return_title`, `death`, …), with shared code under `ui/lib/`. A pack or mod entry
 replaces the engine's built-in copy. An engine screen is a module rather than a
 set of globals:
 
@@ -564,7 +564,9 @@ A screen that fails to open or errors leaves through the opener's fallback.
 | `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
 | `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
 | `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
+| `api:page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v)` | A sheet region flipped per axis. |
 | `api:draw_ivm(model, {joints, camera = {from, to, fov}, light})` | Draw a model through one composed joint chain. |
+| `api:draw_actor(name, {from, to, fov})` | Draw an engine-owned actor through the camera and return whether it drew; the DIED screen offers `"player"`, the posed corpse. |
 
 ## Enemy scripts
 

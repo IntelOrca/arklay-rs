@@ -1617,11 +1617,8 @@ struct GameSession {
     attract: Option<demo::AttractState>,
     /// The player's death sequence: the delay, the fades and the DIED screen.
     death: ui::death::DeathSequence,
-    /// The decoded `ui/died.tim` page, loaded when the DIED screen first opens.
-    died_texture: Option<assets::Artwork>,
-    /// Whether the died-page load was attempted; a missing entry is not
-    /// retried on every frame.
-    died_texture_tried: bool,
+    /// The open DIED screen (`ui/death.lua`), once the death fade completed.
+    death_screen: Option<Box<ui::lua_screen::LuaScreen>>,
     /// Debug jump destinations that failed to load, so the warning is logged
     /// once per session instead of on every confirm.
     debug_failed: HashSet<u16>,
@@ -1979,8 +1976,7 @@ impl GameSession {
             clear_game_requested: None,
             attract: None,
             death: ui::death::DeathSequence::idle(),
-            died_texture: None,
-            died_texture_tried: false,
+            death_screen: None,
             debug_failed: HashSet::new(),
             computer: None,
             computer_saved: None,
@@ -2227,8 +2223,8 @@ impl GameSession {
         // The DIED screen owns the whole tick while it is up: the room stays
         // frozen and the screen's state machine, fade and spinning corpse
         // advance on their own, exactly like the original's display loop.
-        if self.death.screen_open() {
-            self.tick_death_screen(ui, input);
+        if self.death_screen.is_some() {
+            self.tick_death_screen(pack, ui, input);
             return Ok(());
         }
         // The lab computer terminal owns the whole tick while it is up: the
@@ -2644,7 +2640,7 @@ impl GameSession {
         }
         // The death machine runs at the end of the gameplay frame, after the
         // room tick noticed the health drop, exactly like the original.
-        self.tick_death();
+        self.tick_death(pack);
         // The attract watchdog runs after the gameplay tick: it advances the
         // playback counter and, once the reel is within ten frames of its
         // recorded end or a live button is held, raises the dead flag. The
@@ -2670,8 +2666,8 @@ impl GameSession {
     /// The game-over machine's pre-screen phase: notice a dead player, raise
     /// the dead flag, start the sequence and advance its delay/fade. Once the
     /// fade completes the DIED screen opens over the corpse.
-    fn tick_death(&mut self) {
-        if self.death.finished || self.death.screen_open() {
+    fn tick_death(&mut self, pack: &Pack) {
+        if self.death.finished || self.death_screen.is_some() {
             return;
         }
         // The INVINCIBLE cheat never enters the game-over machine.
@@ -2701,37 +2697,42 @@ impl GameSession {
             self.death.arm_fade_now();
         }
         match self.death.tick() {
-            ui::death::DeathTick::OpenScreen => self.open_death_screen(),
+            ui::death::DeathTick::OpenScreen => self.open_death_screen(pack),
             ui::death::DeathTick::Finished => self.finish_death(),
             ui::death::DeathTick::None => {}
         }
     }
 
-    /// The DIED screen's own tick: advance the screen machine and spin the
-    /// corpse 8 angle units, exactly like the original's display loop. The
-    /// confirm button skips the rest of the screen.
-    fn tick_death_screen(&mut self, ui: UiInput, input: player::Input) {
-        let confirm = ui.confirm || input.action_held;
-        let finished = self
-            .death
-            .screen
-            .as_mut()
-            .is_some_and(|screen| screen.tick(confirm));
-        if finished {
+    /// The DIED screen's own tick: advance the screen and apply the corpse
+    /// yaw it publishes, exactly like the original's display loop. The
+    /// confirm button (or a held action) skips the rest of the screen.
+    fn tick_death_screen(&mut self, pack: &Pack, ui: UiInput, input: player::Input) {
+        let Some(mut screen) = self.death_screen.take() else {
+            return;
+        };
+        let ui = UiInput {
+            confirm: ui.confirm || input.action_held,
+            ..ui
+        };
+        let (result, cues) = {
+            let cx = self.ui_context(pack);
+            let result = screen.update(&cx, ui);
+            (result, cx.cues.into_inner())
+        };
+        self.play_ui_cue_names(pack, cues);
+        if let ScreenResult::Done(_) = result {
             self.finish_death();
             return;
         }
-        // The original spins the corpse's facing 8 units a frame.
-        if let Some(screen) = self.death.screen.as_mut() {
-            screen.spin = screen.spin.wrapping_add(8);
-            self.player.angle = screen.spin;
-            self.game.entities[0].angle = screen.spin & 0x0FFF;
-        }
+        let spin = screen.value("spin") as u16;
+        self.player.angle = spin;
+        self.game.entities[0].angle = spin & 0x0FFF;
+        self.death_screen = Some(screen);
     }
 
     /// Open the DIED screen over the fallen player: the fixed camera anchors
     /// on the corpse, the head one-shot is consumed and the room's BGM stops.
-    fn open_death_screen(&mut self) {
+    fn open_death_screen(&mut self, pack: &Pack) {
         // The shared grab/death one-shot hides the head joint on the first
         // death screen, exactly like the original's image value.
         if self.game.hunter_grab_one_shot {
@@ -2747,7 +2748,26 @@ impl GameSession {
             .cuts
             .get(self.loaded.room.current_cut)
             .map_or(320, |cut| cut.fov);
-        self.death.screen = Some(ui::death::DeathScreen::open(anchor, angle, fov));
+        let args = [
+            ("x", ScreenArg::Int(i64::from(anchor[0]))),
+            ("y", ScreenArg::Int(i64::from(anchor[1]))),
+            ("z", ScreenArg::Int(i64::from(anchor[2]))),
+            ("angle", ScreenArg::Int(i64::from(angle))),
+            ("fov", ScreenArg::Int(i64::from(fov))),
+        ];
+        let mut cx = self.ui_context(pack);
+        let screen =
+            ui::lua_screen::LuaScreen::open_screen("death", &args, ScreenAction::Title, &mut cx);
+        let cues = cx.cues.into_inner();
+        self.play_ui_cue_names(pack, cues);
+        match screen {
+            Ok(screen) => self.death_screen = Some(Box::new(screen)),
+            Err(err) => {
+                eprintln!("warning: DIED screen unavailable: {err:#}");
+                self.finish_death();
+                return;
+            }
+        }
         if let Some(mixer) = &mut self.music {
             mixer.stop_all_bgm();
         }
@@ -2757,7 +2777,7 @@ impl GameSession {
     /// special-light state, then hand back to the app, which returns to the
     /// title.
     fn finish_death(&mut self) {
-        self.death.screen = None;
+        self.death_screen = None;
         self.death.finished = true;
         self.sprite_anim_intensity = 0;
         self.game.message.set_menu_choice_id(0);
@@ -4376,69 +4396,63 @@ impl GameSession {
         }
     }
 
-    /// Load and decode the `ui/died` page once, when the DIED screen first
-    /// opens. The screen samples fixed quadrants of the page, so a replacement
-    /// keeps the shipped page's dimensions.
-    fn ensure_died_texture(&mut self, pack: &Pack) {
-        if self.died_texture_tried {
-            return;
-        }
-        self.died_texture_tried = true;
-        match pack.read_asset("ui/died", AssetClass::Image) {
-            Ok(Some(asset)) => match assets::decode_page(&asset, assets::Geometry::Shipped) {
-                Ok(art) => self.died_texture = Some(art),
-                Err(err) => eprintln!("warning: invalid {}: {err:#}", asset.path()),
-            },
-            Ok(None) => eprintln!("warning: missing ui/died.tim"),
-            Err(err) => eprintln!("warning: unreadable ui/died: {err:#}"),
-        }
-    }
-
-    /// Draw the DIED screen: the static backdrop, the corpse posed at the
-    /// fall's terminal frame through the fixed orbit camera, the black
-    /// overlay, the wavy strip and the screen's own fade.
+    /// Draw the DIED screen. The script draws the backdrop, the strip and the
+    /// overlays; the engine supplies the corpse, posed at the fall's terminal
+    /// frame, through the screen's fixed camera.
     fn render_death_screen(&mut self, pack: &Pack) {
-        self.ensure_died_texture(pack);
-        let Some(screen) = self.death.screen.as_ref() else {
+        let Self {
+            death_screen,
+            save_dir,
+            font,
+            text,
+            game,
+            loaded,
+            player,
+            framebuffer,
+            ..
+        } = self;
+        let Some(screen) = death_screen.as_mut() else {
             return;
         };
-        let Some(texture) = self.died_texture.as_ref() else {
-            self.framebuffer.clear();
-            ui::death::draw_overlay(&mut self.framebuffer, screen.overlay());
-            return;
+        let cx = UiContext {
+            pack,
+            save_dir,
+            font: font.as_ref(),
+            text: Some(text),
+            ticks: game.frame,
+            cues: std::cell::RefCell::new(Vec::new()),
         };
-        self.framebuffer.clear();
-        ui::death::draw_backdrop(&mut self.framebuffer, texture);
-        if let Some(assets) = self.loaded.player_assets.as_ref()
-            && let Some(keyframe) = self
-                .player
+        let mut draw_actor = |name: &str, camera: &Camera, framebuffer: &mut Framebuffer| {
+            if name != "player" {
+                return false;
+            }
+            let Some(assets) = loaded.player_assets.as_ref() else {
+                return false;
+            };
+            let Some(keyframe) = player
                 .anim
                 .pose_keyframe(&assets.emd.clips, &assets.emd.keyframes)
-        {
-            let entity = crate::anim::entity_matrix(self.player.pos, self.player.angle);
+            else {
+                return false;
+            };
+            let entity = crate::anim::entity_matrix(player.pos, player.angle);
             let mut joints = crate::anim::joint_matrices(&assets.emd.skeleton, &keyframe, &entity);
-            apply_look_at(
-                &mut joints,
-                &self.game.entities[0],
-                &self.game.entity_anims[0],
-            );
-            let camera = Camera::from_points(screen.camera_from, screen.camera_to, screen.fov);
-            let lighting = Lighting::from_room(&self.loaded.room);
-            let hidden = self.game.entities[0].joint_flags;
-            self.framebuffer.draw_model_hidden(
+            apply_look_at(&mut joints, &game.entities[0], &game.entity_anims[0]);
+            let lighting = Lighting::from_room(&loaded.room);
+            framebuffer.draw_model_hidden(
                 &assets.emd.mesh,
                 &assets.emd.texture,
                 &joints,
-                &camera,
+                camera,
                 &lighting,
-                hidden,
+                game.entities[0].joint_flags,
             );
+            true
+        };
+        screen.draw_with_actors(&cx, framebuffer, Some(&mut draw_actor));
+        if let Some((color, alpha)) = screen.overlay() {
+            framebuffer.fade_to_color(color, alpha);
         }
-        ui::death::draw_rect(&mut self.framebuffer, screen.rect_alpha());
-        if let Some(param) = screen.strip_param() {
-            ui::death::draw_strip(&mut self.framebuffer, texture, param);
-        }
-        ui::death::draw_overlay(&mut self.framebuffer, screen.overlay());
     }
 
     /// Request the loading narration `id` (a global message) and hold the room
@@ -4640,7 +4654,7 @@ impl GameSession {
         if self.boot_message.is_some()
             || self.movie.is_some()
             || self.transition.is_some()
-            || self.death.screen_open()
+            || self.death_screen.is_some()
         {
             self.gpu_scene_visible = false;
         }
@@ -4675,7 +4689,7 @@ impl GameSession {
         }
         // The DIED screen owns the frame while it is up: the static backdrop,
         // the spinning corpse, the wavy strip and the screen's own fades.
-        if self.death.screen_open() {
+        if self.death_screen.is_some() {
             self.render_death_screen(pack);
             return;
         }
@@ -7173,7 +7187,8 @@ fn run_game_trace(app: &mut App, options: &trace::TraceOptions<'_>) -> Result<()
         // display loop is outside `game_loop`, so the tick that opens the
         // screen is the last traced one until the title cycles back into
         // gameplay.
-        let screen_before = matches!(&app.mode, Mode::Play(session) if session.death.screen_open());
+        let screen_before =
+            matches!(&app.mode, Mode::Play(session) if session.death_screen.is_some());
         // The scripted `--input` word is keyed by the trace tick, exactly like
         // the reference's `--test-input` (which reads it from its own `t`). An
         // iteration that emits no line (a door transition, the death screen)
@@ -8750,7 +8765,7 @@ pub fn simulate_death(pack: &Pack, id: RoomId, ticks: usize, hurt: i16) -> Resul
     let mut screen_ticks = 0usize;
     for _ in 0..ticks {
         session.tick(pack, UiInput::default(), player::Input::default(), false)?;
-        if session.death.screen_open() {
+        if session.death_screen.is_some() {
             screen_open = true;
             screen_ticks += 1;
             // Capture the reveal once the strip has started drawing.
@@ -22684,7 +22699,7 @@ end
             session
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
-            if session.death.screen_open() {
+            if session.death_screen.is_some() {
                 screen_open_at.get_or_insert(tick);
             }
             if session.take_return_title_request() {
@@ -22705,7 +22720,7 @@ end
         assert_eq!(screen_open_at, 217);
         let title_at = title_at.expect("the title returned");
         assert!(title_at > screen_open_at, "the screen ran before the title");
-        assert!(!session.death.screen_open());
+        assert!(!session.death_screen.is_some());
         assert!(session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
     }
 
@@ -22750,7 +22765,7 @@ end
             session
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
-            if session.death.screen_open() {
+            if session.death_screen.is_some() {
                 screen_open_at = Some(tick);
                 break;
             }
@@ -22797,7 +22812,7 @@ end
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
         }
-        assert!(session.death.screen_open(), "the screen is up");
+        assert!(session.death_screen.is_some(), "the screen is up");
         session.render(&pack);
         assert!(
             session
