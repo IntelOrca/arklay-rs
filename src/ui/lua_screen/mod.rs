@@ -805,6 +805,38 @@ impl UserData for Api<'_> {
         });
 
         methods.add_method("ticks", |_lua, api, ()| Ok(api.host.ticks));
+        // The eight numbered slots: `false` for an empty one, else
+        // `{character, saves, stage, room}`.
+        methods.add_method("slot_info", |lua, api, ()| {
+            let table = lua.create_table()?;
+            for (index, slot) in save::scan_slots(&api.host.save_dir).iter().enumerate() {
+                match slot {
+                    Some(info) => table.set(index + 1, slot_table(lua, info)?)?,
+                    None => table.set(index + 1, false)?,
+                }
+            }
+            Ok(table)
+        });
+
+        methods.add_method("has_font", |_lua, api, ()| Ok(api.cx.font.is_some()));
+        methods.add_method("has_text", |_lua, api, ()| Ok(api.cx.text.is_some()));
+
+        // The font-encoded bytes of the text table's `key`; nil without a
+        // text table. Draw them with `api:glyphs`.
+        methods.add_method("ui_bytes", |lua, api, key: String| {
+            api.cx
+                .text
+                .map(|text| lua.create_string(text.ui(&key)))
+                .transpose()
+        });
+
+        // The font-encoded shorthand location label of a save's room.
+        methods.add_method("location_bytes", |lua, api, (stage, room): (u8, u8)| {
+            api.cx
+                .text
+                .map(|text| lua.create_string(text.save().location(stage, room)))
+                .transpose()
+        });
 
         methods.add_method("saves", |lua, api, ()| {
             let table = lua.create_table()?;
@@ -895,6 +927,40 @@ impl UserData for Api<'_> {
                     Ok((true, None))
                 }
                 Err(err) => Ok((false, Some(format!("{err:#}")))),
+            }
+        });
+
+        // Write the pending block to numbered slot `slot` (0-7), consuming
+        // an ink ribbon when the opener asked: `true, info` with the
+        // written slot's `{character, saves, stage, room}`, or `false, err`.
+        methods.add_method_mut("save_slot", |lua, api, slot: usize| {
+            let Mode::Save { file, ink_ribbon } = &api.host.mode else {
+                return Ok((
+                    false,
+                    Value::String(lua.create_string("the screen is not in save mode")?),
+                ));
+            };
+            if slot >= save::SAVE_SLOT_COUNT {
+                return Ok((
+                    false,
+                    Value::String(lua.create_string(format!("no save slot {slot}"))?),
+                ));
+            }
+            let mut file = file.clone();
+            if *ink_ribbon {
+                consume_snapshot_ribbon(&mut file);
+            }
+            match save::save(&api.host.save_dir, slot, &file) {
+                Ok(()) => {
+                    api.host.outcome = Some(SaveOutcome {
+                        slot: Some(slot),
+                        ink_ribbon: *ink_ribbon,
+                    });
+                    api.host.rescan();
+                    let info = save::SaveSlotInfo::from_file(&file);
+                    Ok((true, Value::Table(slot_table(lua, &info)?)))
+                }
+                Err(err) => Ok((false, Value::String(lua.create_string(format!("{err:#}"))?))),
             }
         });
 
@@ -1131,6 +1197,31 @@ impl UserData for Api<'_> {
             },
         );
 
+        // `glyphs(x, y, bytes, opts)`: draw already font-encoded bytes (from
+        // `api:ui_bytes`, `api:location_bytes` or assembled by the script).
+        methods.add_method_mut(
+            "glyphs",
+            |_lua, api, (x, y, bytes, opts): (i32, i32, mlua::String, Option<Table>)| {
+                let (x, y) = (coord(x), coord(y));
+                let opts = options(api.host, opts.as_ref())?;
+                let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+                let Some(font) = api.cx.font else {
+                    api.host.note_missing_font();
+                    return Ok(());
+                };
+                font.draw_text(
+                    framebuffer,
+                    x,
+                    y,
+                    opts.tint,
+                    opts.brightness,
+                    &bytes.as_bytes(),
+                    opts.tight,
+                );
+                Ok(())
+            },
+        );
+
         methods.add_method_mut("image_size", |_lua, api, entry: String| {
             let image = api
                 .host
@@ -1147,6 +1238,16 @@ impl UserData for Api<'_> {
 
         draw::add_methods(methods);
     }
+}
+
+/// A save slot's header fields as a Lua table.
+fn slot_table(lua: &Lua, info: &save::SaveSlotInfo) -> mlua::Result<Table> {
+    let row = lua.create_table()?;
+    row.set("character", info.character)?;
+    row.set("saves", info.saves)?;
+    row.set("stage", info.stage)?;
+    row.set("room", info.room)?;
+    Ok(row)
 }
 
 /// The action an `api:exit(name, arg)` names.

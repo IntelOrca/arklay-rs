@@ -3293,7 +3293,10 @@ impl GameSession {
                 let screen =
                     ui::save_load::open_load_screen(self.game.save_screen.as_deref(), &mut cx);
                 let cues = cx.cues.into_inner();
-                self.save_screen = Some(screen);
+                match screen {
+                    Ok(screen) => self.save_screen = Some(screen),
+                    Err(err) => eprintln!("warning: load screen unavailable: {err:#}"),
+                }
                 self.play_ui_cue_names(pack, cues);
             }
             DebugMenuEvent::ItemBox => self.begin_item_box_open(pack),
@@ -3681,7 +3684,10 @@ impl GameSession {
             ink_ribbon,
         );
         let cues = cx.cues.into_inner();
-        self.save_screen = Some(screen);
+        match screen {
+            Ok(screen) => self.save_screen = Some(screen),
+            Err(err) => eprintln!("warning: save screen unavailable: {err:#}"),
+        }
         self.play_ui_cue_names(pack, cues);
     }
 
@@ -5954,6 +5960,13 @@ impl App {
         let mut cx = self.context();
         let screen = ui::save_load::open_load_screen(entry.as_deref(), &mut cx);
         let cues = cx.cues.into_inner();
+        let screen = match screen {
+            Ok(screen) => screen,
+            Err(err) => {
+                eprintln!("warning: load screen unavailable: {err:#}");
+                return self.open_title();
+            }
+        };
         self.mode = Mode::Load(screen);
         self.play_ui_cues(cues);
         Ok(())
@@ -6189,6 +6202,14 @@ impl App {
         let mut cx = self.context();
         let screen = ui::save_load::open_save_screen(entry.as_deref(), &mut cx, file, false);
         let cues = cx.cues.into_inner();
+        let screen = match screen {
+            Ok(screen) => screen,
+            Err(err) => {
+                eprintln!("warning: save screen unavailable: {err:#}");
+                self.ending = None;
+                return self.open_title();
+            }
+        };
         self.mode = Mode::Save(screen);
         self.play_ui_cues(cues);
         Ok(())

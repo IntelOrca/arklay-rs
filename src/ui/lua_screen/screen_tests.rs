@@ -3,8 +3,12 @@
 
 use super::*;
 
+use crate::game::InventoryItem;
+use crate::items;
 use crate::pack::Pack;
+use crate::save::{self, SaveFile};
 use crate::transition::FadeColor;
+use crate::ui::save_load::SaveOutcome;
 use crate::ui::{Screen, ScreenAction, ScreenResult, UiCue, UiInput};
 
 /// Self-deleting save directory unique to this process and label.
@@ -688,4 +692,433 @@ fn ending_epilogue_runs_and_spins_the_model() {
         0,
         "the model spins"
     );
+}
+
+// ---- save/load -------------------------------------------------------------
+
+const SAVE_LOAD: &str = "ui/save_load.lua";
+/// The assembled reveal's length (`name/count/location`).
+const REVEAL_LEN: usize = 31;
+/// The reveal slice grows two bytes per step.
+const REVEAL_STEP: usize = 2;
+/// Ticks between reveal steps.
+const REVEAL_TICKS: usize = 5;
+
+fn open_load(cx: &mut UiContext<'_>) -> LuaScreen {
+    LuaScreen::open_load(SAVE_LOAD, cx).unwrap()
+}
+
+fn open_save(cx: &mut UiContext<'_>, file: SaveFile, ink_ribbon: bool) -> LuaScreen {
+    LuaScreen::open_save(SAVE_LOAD, cx, file, ink_ribbon).unwrap()
+}
+
+fn confirm() -> UiInput {
+    press(|i| i.confirm = true)
+}
+
+fn cancel() -> UiInput {
+    press(|i| i.cancel = true)
+}
+
+fn cursor(screen: &LuaScreen) -> i64 {
+    screen.test_eval("return M.state.cursor")
+}
+
+fn reveal_bytes(screen: &LuaScreen) -> Vec<u8> {
+    screen
+        .test_eval::<mlua::String>("return M.state.reveal.bytes")
+        .as_bytes()
+        .to_vec()
+}
+
+fn reveal_len(screen: &LuaScreen) -> usize {
+    screen.test_eval("return M.state.reveal and M.state.reveal.length or 0")
+}
+
+fn lua_bytes(screen: &LuaScreen, body: &str) -> Vec<u8> {
+    screen.test_eval::<mlua::String>(body).as_bytes().to_vec()
+}
+
+#[test]
+fn save_load_empty_slots_refuse_and_exit_returns_to_title() {
+    let harness = Harness::new("sl-empty");
+    let mut cx = harness.context();
+    let mut screen = open_load(&mut cx);
+    assert_eq!(cursor(&screen), 0, "the original starts on slot 1");
+    assert!(screen.test_eval::<bool>(
+        "for _, slot in ipairs(M.state.slots) do if slot then return false end end return true"
+    ));
+
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "idle", "an empty slot refuses");
+
+    screen.test_eval::<()>("M.state.cursor = 8");
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "fade_out");
+    // The load screen fades its own overlay out, 16 a tick.
+    let (action, ticks) = run_to_result(&mut screen, &cx, 64);
+    assert_eq!(action, ScreenAction::Title);
+    assert_eq!(ticks, 16);
+    assert_eq!(screen.fade(), 255);
+}
+
+#[test]
+fn save_load_load_mode_cancel_returns_to_title_and_confirm_returns_the_slot() {
+    let harness = Harness::new("sl-load");
+    let file = SaveFile {
+        character: 1,
+        stage: 1,
+        room: 1,
+        ..SaveFile::default()
+    };
+    save::save(&harness.dir.0, 2, &file).unwrap();
+    let mut cx = harness.context();
+    let mut screen = open_load(&mut cx);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "idle", "an empty slot refuses");
+
+    screen.test_eval::<()>("M.state.cursor = 2");
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "fade_out");
+    let (action, _) = run_to_result(&mut screen, &cx, 64);
+    assert_eq!(action, ScreenAction::LoadGame { slot: 2 });
+
+    let mut screen = open_load(&mut cx);
+    screen.update(&cx, cancel());
+    let (action, _) = run_to_result(&mut screen, &cx, 64);
+    assert_eq!(action, ScreenAction::Title);
+}
+
+#[test]
+fn save_load_overwrite_confirm_yes_and_no_flow() {
+    let harness = Harness::new("sl-overwrite");
+    save::save(&harness.dir.0, 0, &SaveFile::default()).unwrap();
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+
+    // Confirm the occupied slot: the dialog opens with YES selected and the
+    // cursor hidden.
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "confirm_overwrite");
+    assert_eq!(screen.test_eval::<i64>("return M.state.confirm_choice"), 0);
+    assert!(screen.test_eval::<bool>("return M.state.blink_state"));
+
+    // NO with the right arrow, confirm: back to navigation, nothing saved.
+    screen.update(&cx, press(|i| i.right = true));
+    assert_eq!(screen.test_eval::<i64>("return M.state.confirm_choice"), 1);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "idle");
+    assert!(screen.take_outcome().is_none());
+
+    // Cancel out of the dialog.
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "confirm_overwrite");
+    screen.update(&cx, cancel());
+    assert_eq!(stage(&screen), "idle");
+
+    // YES (the default) writes and records the outcome.
+    screen.update(&cx, confirm());
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_eq!(
+        screen.take_outcome(),
+        Some(SaveOutcome {
+            slot: Some(0),
+            ink_ribbon: false
+        })
+    );
+    assert!(save::read_slot_info(&harness.dir.0, 0).is_some());
+}
+
+#[test]
+fn save_load_saving_an_empty_slot_skips_the_confirm_and_consumes_the_ribbon() {
+    let harness = Harness::new("sl-save-empty");
+    let mut file = SaveFile {
+        character: 0,
+        stage: 1,
+        room: 0,
+        saves: 4,
+        total_held: 1,
+        ..SaveFile::default()
+    };
+    file.player_slots[0] = InventoryItem {
+        id: items::ITEM_INK_RIBBONS,
+        quantity: 1,
+    };
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, file, true);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_eq!(
+        screen.take_outcome(),
+        Some(SaveOutcome {
+            slot: Some(0),
+            ink_ribbon: true
+        }),
+        "the outcome is available while the reveal runs"
+    );
+
+    // The block was written without the ribbon and the slot rescanned.
+    let written = save::load(&harness.dir.0, 0).unwrap();
+    assert_eq!(written.total_held, 0);
+    assert_eq!(written.player_slots[0].id, 0);
+    assert_eq!(written.used_item, items::ITEM_INK_RIBBONS);
+    assert_eq!(screen.test_eval::<i64>("return M.state.slots[1].saves"), 4);
+
+    // The reveal starts two bytes long and finishes back in gameplay, with
+    // no fade of its own.
+    assert_eq!(reveal_len(&screen), REVEAL_STEP);
+    let (action, _) = run_to_result(&mut screen, &cx, 600);
+    assert_eq!(action, ScreenAction::Resume);
+    assert_eq!(screen.fade(), 0);
+}
+
+#[test]
+fn save_load_the_reveal_grows_two_bytes_per_step_and_names_the_location() {
+    let harness = Harness::new("sl-reveal");
+    let file = SaveFile {
+        character: 1,
+        stage: 3,
+        room: 7,
+        saves: 7,
+        ..SaveFile::default()
+    };
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, file, false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+
+    let reveal = reveal_bytes(&screen);
+    assert_eq!(reveal.len(), REVEAL_LEN);
+    assert_eq!(
+        &reveal[6..14],
+        &[0x38, 0xFB, 0x0C, 0xFB, 0x13, 0xFB, 0x38, 0xFB],
+        "separator, count 07, separator"
+    );
+    assert!(
+        reveal[..6]
+            .iter()
+            .chain(&reveal[14..])
+            .all(|&byte| byte == 0),
+        "the test context has no text, so the name and location are blank-padded"
+    );
+
+    // The assembled layout against real-shaped strings.
+    let assembled = lua_bytes(
+        &screen,
+        "return M.build_reveal('\\xDB\\xFB\\xCF\\xFB\\x00\\xFB\\x01', 7, \
+         '\\xF9\\x09\\x00\\xFB\\x01')",
+    );
+    assert_eq!(&assembled[..6], &[0xDB, 0xFB, 0xCF, 0xFB, 0x00, 0xFB]);
+    assert_eq!(
+        &assembled[6..14],
+        &[0x38, 0xFB, 0x0C, 0xFB, 0x13, 0xFB, 0x38, 0xFB]
+    );
+    assert_eq!(&assembled[14..19], &[0xF9, 0x09, 0x00, 0xFB, 0x01]);
+    assert_eq!(assembled.len(), REVEAL_LEN);
+    assert!(assembled[19..].iter().all(|&byte| byte == 0));
+
+    // Steps advance every five ticks.
+    let mut lengths = vec![reveal_len(&screen)];
+    for _ in 0..8 {
+        for _ in 0..=REVEAL_TICKS {
+            screen.update(&cx, neutral());
+        }
+        if reveal_len(&screen) != *lengths.last().unwrap() {
+            lengths.push(reveal_len(&screen));
+        }
+    }
+    assert_eq!(&lengths[..4], &[2, 4, 6, 8]);
+    assert!(lengths.iter().all(|length| length % 2 == 0));
+    assert!(lengths.iter().all(|&length| length <= REVEAL_LEN));
+}
+
+#[test]
+fn save_load_the_reveal_plays_the_typewriter_tick_for_every_non_space_slice() {
+    let harness = Harness::new("sl-reveal-tick");
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+
+    // The write's own tick plays the slot-confirm cue (the same bank slot as
+    // the first slice's tick) and draws the first slice; the steps that
+    // follow cue as they reveal.
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+
+    let bytes = reveal_bytes(&screen);
+    let mut lengths = Vec::new();
+    for _ in 0..(REVEAL_LEN + REVEAL_STEP) * (REVEAL_TICKS + 1) {
+        if stage(&screen) != "save_anim" {
+            break;
+        }
+        cx.cues.borrow_mut().clear();
+        screen.update(&cx, neutral());
+        if !cx.cues.borrow().is_empty() {
+            lengths.push(reveal_len(&screen));
+        }
+    }
+    assert_ne!(stage(&screen), "save_anim", "the reveal finished");
+    // Only the separators and the count digits are non-space here. The
+    // steps that cue are the ones whose slice revealed a non-space byte two
+    // back from the copy end (`REVEAL_LEN - 1` is the last drawn slice).
+    let cued: Vec<usize> = (2 * REVEAL_STEP..=REVEAL_LEN - 1)
+        .step_by(REVEAL_STEP)
+        .filter(|&length| bytes[length - REVEAL_STEP] != 0)
+        .collect();
+    assert_eq!(cued, [8, 10, 12, 14]);
+    assert_eq!(lengths, cued);
+    assert_eq!(reveal_len(&screen), REVEAL_LEN - 1);
+}
+
+#[test]
+fn save_load_the_reveal_tick_reads_the_byte_two_back_from_the_copy_end() {
+    let harness = Harness::new("sl-reveal-offset");
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    // The last byte and the last-but-two byte of the next slice are not
+    // spaces, but the byte two back from the copy end is: the step to four
+    // bytes stays silent (a `length - 1` or `length - 3` check would cue).
+    screen.test_eval::<()>(
+        "M.state.reveal = { bytes = '\\0\\x38\\0\\x38' .. string.rep('\\0', 27), \
+         length = 2, timer = 0 } M.state.stage = 'save_anim'",
+    );
+    screen.update(&cx, neutral());
+    assert_eq!(reveal_len(&screen), 2 * REVEAL_STEP, "the step ran");
+    assert!(cx.cues.borrow().is_empty());
+}
+
+#[test]
+fn save_load_the_write_tick_cues_the_first_slice_once_on_both_paths() {
+    let harness = Harness::new("sl-first-slice");
+    let text = crate::text::Text::embedded();
+    let mut cx = harness.context();
+    cx.text = Some(&text);
+
+    // An empty slot: the navigation confirm already plays the slot's confirm
+    // cue, which shares the first slice's bank slot.
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_ne!(
+        reveal_bytes(&screen)[0],
+        0,
+        "the embedded name is not a space"
+    );
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+
+    // The overwrite dialog's YES is silent, so the write's own tick carries
+    // the first slice's tick. (The write above occupied slot 0.)
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "confirm_overwrite");
+    cx.cues.borrow_mut().clear();
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+}
+
+#[test]
+fn save_load_the_overwrite_write_stays_silent_when_the_first_slice_is_a_space() {
+    let harness = Harness::new("sl-blank-slice");
+    save::save(&harness.dir.0, 0, &SaveFile::default()).unwrap();
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "confirm_overwrite");
+    cx.cues.borrow_mut().clear();
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "save_anim");
+    assert_eq!(reveal_bytes(&screen)[0], 0, "no text, so the name is blank");
+    assert!(cx.cues.borrow().is_empty(), "a space never cues");
+}
+
+#[test]
+fn save_load_count_digits_follow_the_original_table() {
+    let harness = Harness::new("sl-count");
+    let mut cx = harness.context();
+    let screen = open_load(&mut cx);
+    let count = |saves: u32| lua_bytes(&screen, &format!("return M.count_bytes({saves})"));
+    assert_eq!(count(0), [0x0C, 0xFB, 0x0C, 0xFB]);
+    assert_eq!(count(7), [0x0C, 0xFB, 0x13, 0xFB]);
+    assert_eq!(count(42), [0x10, 0xFB, 0x0E, 0xFB]);
+    assert_eq!(count(107), [0x0C, 0xFB, 0x13, 0xFB]);
+    assert_eq!(screen.test_eval::<usize>("return M.REVEAL_LEN"), REVEAL_LEN);
+}
+
+#[test]
+fn save_load_save_mode_cancel_returns_to_gameplay_without_writing() {
+    let harness = Harness::new("sl-save-cancel");
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), true);
+    // The typewriter screen leaves on the cancel tick itself.
+    assert_eq!(
+        screen.update(&cx, cancel()),
+        ScreenResult::Done(ScreenAction::Resume)
+    );
+    assert!(screen.take_outcome().is_none());
+    assert!(save::read_slot_info(&harness.dir.0, 0).is_none());
+}
+
+#[test]
+fn save_load_a_failed_write_shows_the_error_line_until_a_key() {
+    let harness = Harness::new("sl-save-error");
+    // A file where the save directory should be makes the write fail.
+    let dir = harness.dir.0.join("saves");
+    std::fs::write(&dir, b"not a directory").unwrap();
+    let mut cx = harness.context();
+    cx.save_dir = &dir;
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "error");
+    assert!(screen.take_outcome().is_none());
+    screen.update(&cx, press(|i| i.any = true));
+    assert_eq!(stage(&screen), "idle");
+}
+
+#[test]
+fn save_load_cues_follow_the_original_bank_slots() {
+    let harness = Harness::new("sl-cues");
+    save::save(&harness.dir.0, 0, &SaveFile::default()).unwrap();
+    let mut cx = harness.context();
+    let mut screen = open_load(&mut cx);
+
+    screen.update(&cx, press(|i| i.down = true));
+    assert_eq!(cursor(&screen), 1);
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveCursor]);
+    cx.cues.borrow_mut().clear();
+
+    // Slot 2 is empty, but the confirm slot still plays.
+    screen.update(&cx, confirm());
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::SaveConfirm]);
+    assert_eq!(stage(&screen), "idle", "an empty slot refuses");
+    cx.cues.borrow_mut().clear();
+
+    // Up from the first row wraps to the exit row, which confirms with the
+    // cancel slot.
+    screen.update(&cx, press(|i| i.up = true));
+    screen.update(&cx, press(|i| i.up = true));
+    assert_eq!(cursor(&screen), 8);
+    cx.cues.borrow_mut().clear();
+    screen.update(&cx, confirm());
+    assert_eq!(cx.cues.borrow().as_slice(), &[UiCue::Cancel]);
+}
+
+#[test]
+fn save_load_the_overwrite_dialog_is_silent() {
+    let harness = Harness::new("sl-silent");
+    save::save(&harness.dir.0, 0, &SaveFile::default()).unwrap();
+    let mut cx = harness.context();
+    let mut screen = open_save(&mut cx, SaveFile::default(), false);
+    screen.update(&cx, confirm());
+    assert_eq!(stage(&screen), "confirm_overwrite");
+    cx.cues.borrow_mut().clear();
+    for input in [
+        press(|i| i.left = true),
+        press(|i| i.right = true),
+        cancel(),
+    ] {
+        screen.update(&cx, input);
+        assert!(cx.cues.borrow().is_empty(), "the dialog must be silent");
+    }
 }
