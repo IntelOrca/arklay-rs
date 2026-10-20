@@ -742,7 +742,15 @@ local function run(e)
         return
     end
 
-    local px, py, pz = e:player_pos()
+    -- Port-only: a hidden player leaves the crow steering by the last place
+    -- it latched them at, and (below) never close enough to strike.
+    local hidden = e:player_hidden()
+    local px, py, pz
+    if hidden then
+        px, py, pz = e.player_pos_x, 0, e.player_pos_z
+    else
+        px, py, pz = e:player_pos()
+    end
 
     if (bflags & 0x10) ~= 0 then
         if e.crow_touch ~= 0 and e.player_attacked == 0
@@ -816,6 +824,9 @@ local function run(e)
         dx = -dx
     end
     e.crow_dist = ((dx & 0xFFFF) + (dz & 0xFFFF)) & 0xFFFF
+    if hidden then
+        e.crow_dist = 0x7FFF
+    end
 
     local dispatch = true
     if e.ignore == 0 then

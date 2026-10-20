@@ -78,6 +78,20 @@ local function s16(value)
     return value
 end
 
+-- Port-only: whether the player is running (the swim speed-up trigger). A
+-- player hidden from the shark is never seen to run.
+local function player_running(e)
+    return not e:player_hidden() and e.player_action_behavior == 0xD
+end
+
+-- Port-only: steer at the player, or hold the heading when they are hidden
+-- (`px` is nil).
+local function rotate_toward_player(e, px, pz, step)
+    if px then
+        e:rotate_toward_target(px, pz, step)
+    end
+end
+
 -- `neptune_seed_from_dead_move`: stage the g_deadMoveValue + 0x14 block (the
 -- identity matrix's zero translation) into the shared sprite scratch. Every
 -- Neptune effect writes it first and then overwrites the axes it uses.
@@ -200,7 +214,7 @@ end
 -- 0x0043e030 - far away. Speed up and move to the near sub-state once the
 -- player is beyond 10000 units AND running (player action_behavior == 13).
 local function swim_far(e, disp)
-    if disp > 10000 and e.player_action_behavior == 0xD then
+    if disp > 10000 and player_running(e) then
         e.action_state = e.action_state + 1
         e.move_speed_current = 0x82
     end
@@ -209,7 +223,7 @@ end
 -- 0x0043e060 - the mirror of the above; drop back as soon as the player is
 -- inside 6000 or stops running.
 local function swim_near(e, disp)
-    if disp < 6000 or e.player_action_behavior ~= 0xD then
+    if disp < 6000 or not player_running(e) then
         e.action_state = e.action_state - 1
         e.move_speed_current = 100
     end
@@ -283,9 +297,13 @@ local function behavior_lunge(e, px, pz)
     end
 
     e:move(e:random() & 0xFFF, e.move_speed_current)
-    e.angle = e.angle - 0x400
-    e:rotate_toward_target(px, pz, 4)
-    e.angle = e.angle + 0x400
+    -- Port-only: with the player hidden (no `px`) there is no one to bank
+    -- around.
+    if px then
+        e.angle = e.angle - 0x400
+        e:rotate_toward_target(px, pz, 4)
+        e.angle = e.angle + 0x400
+    end
 end
 
 -- `neptune_retreat_actions`: TWO entries, not five (the header note).
@@ -384,7 +402,7 @@ local DEVOUR_ACTIONS = {}
 -- over their facing. `status_flags |= 2` is set twice in the original, once
 -- before and once after the sound - kept for fidelity.
 local function devour_seize(e, px, pz)
-    e:rotate_toward_target(px, pz, 0x100)
+    rotate_toward_player(e, px, pz, 0x100)
     e.animation_id = 6
     e.animation_frame_id = 0
     e.timing_control = 0
@@ -649,7 +667,7 @@ local function bite_close(e, px, pz)
         end
     end
 
-    e:rotate_toward_target(px, pz, 0x20)
+    rotate_toward_player(e, px, pz, 0x20)
 
     if e:reach_test(1, 200, 0, 0, 300) then
         e.action_state = e.action_state + 1
@@ -756,7 +774,7 @@ end
 -- 0x0043f6c0 - let go and give the player back their own animation. 0xFFF0 is
 -- -0x10 as the unsigned short the rotate helper takes.
 local function bite_release(e, px, pz)
-    e:rotate_toward_target(px, pz, 0xFFF0)
+    rotate_toward_player(e, px, pz, 0xFFF0)
 
     if e:advance_anim(0x80) then
         e.action_state = e.action_state + 1
@@ -785,7 +803,7 @@ end
 -- 0x0043f840 - settle, then resume swimming at action_state 1 (the
 -- 0x01000001 dword write again). 0xFFE0 is -0x20.
 local function bite_recover(e, px, pz)
-    e:rotate_toward_target(px, pz, 0xFFE0)
+    rotate_toward_player(e, px, pz, 0xFFE0)
     e:advance_anim(0x80)
 
     e.action_ticks_counter = e.action_ticks_counter - 1
@@ -859,7 +877,8 @@ local function choose_attack(e, px, pz, disp)
     end
 
     -- Lined up within 768 (a 0x300 half-window)?
-    if e:turn_toward_target(px, pz, 768) ~= 0 then
+    -- Port-only: no one to line up on when hidden.
+    if px == nil or e:turn_toward_target(px, pz, 768) ~= 0 then
         return
     end
 
@@ -880,13 +899,21 @@ end
 
 -- `neptune_state_run` (0x0043dcb0): the per-frame driver.
 local function state_run(e)
-    local px, _, pz = e:player_pos()
-    e:zone_path_update(px, pz)
+    local px, pz, disp
+    if e:player_hidden() then
+        -- Port-only: no path toward a hidden player, who is as far away as
+        -- `check_visual_range` reports; the shark keeps cruising.
+        disp = 0x7FFF
+    else
+        local _
+        px, _, pz = e:player_pos()
+        e:zone_path_update(px, pz)
 
-    -- Manhattan distance, computed and summed entirely in 32 bits.
-    local dx = px - e.pos_x
-    local dz = pz - e.pos_z
-    local disp = (dx < 0 and -dx or dx) + (dz < 0 and -dz or dz)
+        -- Manhattan distance, computed and summed entirely in 32 bits.
+        local dx = px - e.pos_x
+        local dz = pz - e.pos_z
+        disp = (dx < 0 and -dx or dx) + (dz < 0 and -dz or dz)
+    end
 
     e.status_flags = e.status_flags & 0x1F
     -- The aquarium boss never gets the "aligned" bit - it is always hostile.

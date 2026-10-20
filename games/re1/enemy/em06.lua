@@ -159,10 +159,44 @@ local function manhattan(dz, dx)
     return (dz < 0 and -dz or dz) + (dx < 0 and -dx or dx)
 end
 
+-- Port-only: the distance a hidden player reads as, matching what
+-- `check_visual_range` returns for it.
+local HIDDEN_DISTANCE = 0x7FFF
+
 -- The player's Manhattan distance into the shared displacement scratch.
 local function player_distance(e)
+    if e:player_hidden() then
+        return HIDDEN_DISTANCE
+    end
     local px, _, pz = e:player_pos()
     return manhattan(pz - e.pos_z, px - e.pos_x)
+end
+
+-- Port-only: the turn toward the player, or nil while the player is hidden.
+local function turn_to_player(e, step)
+    if e:player_hidden() then
+        return nil
+    end
+    local px, _, pz = e:player_pos()
+    return e:turn_toward_target(px, pz, step)
+end
+
+-- Whether the hunter already faces the player within `step`; never while the
+-- player is hidden.
+local function player_aligned(e, step)
+    local turn = turn_to_player(e, step)
+    return turn ~= nil and s16(turn) == 0
+end
+
+-- The steering waypoint pair `hunter_wander_turn` homes on, refreshed from the
+-- player's position unless the player is hidden.
+local function set_player_waypoint(e)
+    if e:player_hidden() then
+        return
+    end
+    local px, _, pz = e:player_pos()
+    e.player_pos_x = s16(px)
+    e.player_pos_z = s16(pz)
 end
 
 -- The partner's Manhattan distance into the shared line scratch.
@@ -257,10 +291,9 @@ local function variant_0(e)
     end
 
     if e.player_attacked == 0 then
-        local px, _, pz = e:player_pos()
         if e:line_of_sight() == 0
             and e.player_displacement < 3000
-            and s16(e:turn_toward_target(px, pz, 0x80)) == 0 then
+            and player_aligned(e, 0x80) then
             e.ignore = 1
             e.action_behavior = 4
             e.action_state = 0
@@ -269,7 +302,7 @@ local function variant_0(e)
         if e.hunter_path_latch ~= 0 and (e.behavior_flags & 0xF) ~= 7 then
             local wx, wz = e:partner_pos()
             if e.player_distance_z < e.player_displacement
-                and s16(e:turn_toward_target(px, pz, 0x20)) == 0
+                and player_aligned(e, 0x20)
                 and e.player_distance_z < 4000
                 and s16(e:turn_toward_target(wx, wz, 0x200)) == 0
                 and e:partner_move_speed() < 0x32 then
@@ -290,7 +323,7 @@ local function variant_0(e)
 
         e.player_displacement = player_distance(e)
         if e.player_displacement < 2000
-            and s16(e:turn_toward_target(px, pz, 0x100)) == 0
+            and player_aligned(e, 0x100)
             and e.hunter_pounce_latch ~= 0 then
             roll_leap(e)
         end
@@ -335,8 +368,7 @@ local function variant_2(e)
         e.hunter_pounce_latch = 0
     end
 
-    local px, _, pz = e:player_pos()
-    if s16(e:turn_toward_target(px, pz, 0x2C8)) == 0
+    if player_aligned(e, 0x2C8)
         and e.player_displacement < 0x1900
         and e.hunter_pounce_latch ~= 0 then
         roll_leap_fixed(e)
@@ -360,7 +392,7 @@ local function variant_2(e)
     if e.player_attacked == 0 then
         if e:line_of_sight() == 0
             and e.player_displacement < 3000
-            and s16(e:turn_toward_target(px, pz, 0x80)) == 0 then
+            and player_aligned(e, 0x80) then
             e.ignore = 1
             e.action_behavior = 4
             e.action_state = 0
@@ -369,7 +401,7 @@ local function variant_2(e)
         if e.hunter_path_latch ~= 0
             and (e.behavior_flags & 0xF) ~= 7
             and e.player_displacement > 0x1900
-            and s16(e:turn_toward_target(px, pz, 0x20)) == 0
+            and player_aligned(e, 0x20)
             and (e.player_action_behavior == 0x12
                 or (e.player_action_behavior == 0x13 and (e.rand_seed & 1) ~= 0))
             and not e:player_facing_entity() then
@@ -503,9 +535,9 @@ local function chase(e)
         e:play_enemy_sound(0)
     end
 
-    local px, _, pz = e:player_pos()
-    e.player_displacement = manhattan(pz - e.pos_z, px - e.pos_x)
+    e.player_displacement = player_distance(e)
     if e.player_displacement < 2000 then
+        local px, _, pz = e:player_pos()
         e:rotate_toward_target(px, pz, 0x18)
     end
 
@@ -545,9 +577,9 @@ local function approach(e)
     e:hunter_wander_turn(e.hunter_step_word, 0x60, 0x3C)
     e.hunter_ticks = e.hunter_ticks - 1
 
-    local px, _, pz = e:player_pos()
-    e.player_displacement = manhattan(pz - e.pos_z, px - e.pos_x)
+    e.player_displacement = player_distance(e)
     if e.player_displacement < 4000 then
+        local px, _, pz = e:player_pos()
         e:rotate_toward_target(px, pz, 0x60)
     end
     e:move(0, e.hunter_speed)
@@ -649,8 +681,7 @@ local function backstep(e)
         e.blend_counter = 7
         e.animation_id = 0x14
         e.hunter_speed = (e.player_displacement < 3000) and 0x96 or 0xFA
-        local px, _, pz = e:player_pos()
-        e.hunter_strafe_dir = (e:turn_toward_target(px, pz, 1) + 2) & 0xFF
+        e.hunter_strafe_dir = ((turn_to_player(e, 1) or 0) + 2) & 0xFF
     elseif st ~= 1 then
         e:move((s8(e.hunter_strafe_dir) << 10) & 0xFFFF, e.hunter_speed)
         return
@@ -834,13 +865,12 @@ act_swipe = function(e)
             return
         end
 
-        local px, _, pz = e:player_pos()
-        local turn = e:turn_toward_target(px, pz, 0x20)
-        e.player_displacement = s16(s16(turn) >> 5)
+        local turn = turn_to_player(e, 0x20)
+        e.player_displacement = turn and s16(s16(turn) >> 5) or HIDDEN_DISTANCE
 
         if (e:random() & 1) == 0 then
-            turn = e:turn_toward_target(px, pz, 0x80)
-            e.player_displacement = s16(s16(turn) >> 7)
+            turn = turn_to_player(e, 0x80)
+            e.player_displacement = turn and s16(s16(turn) >> 7) or HIDDEN_DISTANCE
             if e.player_displacement == 0 then
                 e.action_behavior = e.action_behavior + 5
                 e.ignore = 1
@@ -855,8 +885,7 @@ act_swipe = function(e)
             e.status_flags = e.status_flags & 0x1F
         end
 
-        e.player_pos_x = s16(px)
-        e.player_pos_z = s16(pz)
+        set_player_waypoint(e)
         e.hit_state = 0
 
         if (e.behavior_flags & 0x40) == 0 then
@@ -1261,9 +1290,7 @@ act_leapattack = function(e)
         end
         e.hunter_speed = 0
         e.hunter_grab_word = 0
-        local px, _, pz = e:player_pos()
-        e.player_pos_x = s16(px)
-        e.player_pos_z = s16(pz)
+        set_player_waypoint(e)
         e.hit_state = 0
         e.status_flags = e.status_flags | 0x40
         return
@@ -1800,16 +1827,16 @@ local function scd_stalk_player(e)
         e.timing_control = 0
         e.blend_counter = 0x1F
         e.hit_state = 0
-        local px, _, pz = e:player_pos()
-        if s16(e:turn_toward_target(px, pz, 0x400)) ~= 0 then
+        local turn = turn_to_player(e, 0x400)
+        if turn and s16(turn) ~= 0 then
             e.animation_id = 0x10
         end
         e.action_state = 1
         e.hunter_ticks = (e:random() & 0x3F) + 0x1E
     end
 
-    local px, _, pz = e:player_pos()
-    local delta = s16(e:turn_toward_target(px, pz, 100))
+    -- Port-only: a hidden player reads as already faced, ending the stalk.
+    local delta = s16(turn_to_player(e, 100) or 0)
     local ticks = e.hunter_ticks
     e.hunter_ticks = s16(ticks - 1)
     if ticks ~= 0 and delta ~= 0 then
@@ -1819,8 +1846,7 @@ local function scd_stalk_player(e)
     end
     e:raise_scd_flag()
     set_beh_word(e, 0)
-    e.player_pos_x = s16(px)
-    e.player_pos_z = s16(pz)
+    set_player_waypoint(e)
 end
 
 -- The 39-slot table. Slots 10-13 are composite wrappers that re-enter this
@@ -1891,20 +1917,22 @@ end
 -- result also arms the 60-frame re-pause), refresh the waypoint pair, then
 -- dispatch on action_behavior.
 behavior_update = function(e)
-    local px, _, pz = e:player_pos()
-    local path = e:pathfind_update(px, pz)
+    -- Port-only: a hidden player is neither path-tracked nor steered toward.
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        local path = e:pathfind_update(px, pz)
 
-    if e.hunter_path_latch == 0 then
-        if (path & 0xFE) == 0 then
-            e.hunter_path_latch = e.hunter_path_latch | (path & 1)
+        if e.hunter_path_latch == 0 then
+            if (path & 0xFE) == 0 then
+                e.hunter_path_latch = e.hunter_path_latch | (path & 1)
+            end
+            if e.hunter_path_latch ~= 0 then
+                e.hunter_repause = 0x3C
+            end
         end
-        if e.hunter_path_latch ~= 0 then
-            e.hunter_repause = 0x3C
-        end
+
+        e:zone_path_update(px, pz)
     end
-
-    e:zone_path_update(px, pz)
-
     local handler = BEHAVIOR[e.action_behavior + 1]
     if handler == nil then
         e:count_placeholder(e.action_behavior)
@@ -2057,14 +2085,17 @@ local function state_run(e)
     e.status_flags = (e.status_flags & 0x1F) | 0x40
     e:check_visual_range(4000)
 
-    local _, py, _ = e:player_pos()
-    local dy = py - e.pos_y
-    if dy ~= 0 then
-        e.status_flags = e.status_flags & 0x1F
-        if dy < 0 then
-            e.status_flags = e.status_flags | 0x20
-        else
-            e.status_flags = e.status_flags | 0x80
+    -- Port-only: the GHOST debug cheat keeps the floor-difference alert off.
+    if not e:player_hidden() then
+        local _, py, _ = e:player_pos()
+        local dy = py - e.pos_y
+        if dy ~= 0 then
+            e.status_flags = e.status_flags & 0x1F
+            if dy < 0 then
+                e.status_flags = e.status_flags | 0x20
+            else
+                e.status_flags = e.status_flags | 0x80
+            end
         end
     end
 

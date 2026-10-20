@@ -233,7 +233,10 @@ local VARIANTS = {
 -- The variant selector: a scripted record (bit 0x80) idles and marks itself
 -- visible instead, and the step/behaviour word is cleared either way.
 local function select_variant(e)
-    if (e.behavior_flags & 0x80) == 0 then
+    if (e.behavior_flags & 0xF) == 5 and e:player_hidden() then
+        -- Port-only: no one to strike at from hiding; idle until seen.
+        variant_0(e)
+    elseif (e.behavior_flags & 0x80) == 0 then
         local handler = VARIANTS[e.behavior_flags & 0xF]
         if handler then
             handler(e)
@@ -768,8 +771,13 @@ local function state_check(e)
         e.status_flags = e.status_flags | 0xC0
         e:check_visual_range(5000)
     end
-    local px, _, pz = e:player_pos()
-    e.mp_dist = abs(px - e.pos_x) + abs(pz - e.pos_z)
+    if e:player_hidden() then
+        -- Port-only: as far away as `check_visual_range` reports it.
+        e.mp_dist = 0x7FFF
+    else
+        local px, _, pz = e:player_pos()
+        e.mp_dist = abs(px - e.pos_x) + abs(pz - e.pos_z)
+    end
     if e.ignore == 0 then
         e.mp_step_word = 0
         select_variant(e)

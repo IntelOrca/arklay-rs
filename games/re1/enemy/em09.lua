@@ -209,13 +209,22 @@ end
 -- State 1 - the AI driver
 -- ---------------------------------------------------------------------------
 
--- The per-variant pre-AI roll: the Manhattan distance to the player, then the
--- brain through the table the behaviour slots 14-16 share.
-local function variant_ai(e)
+-- The Manhattan distance to the player.
+local function player_distance(e)
+    -- Port-only: a hidden player is as far as `check_visual_range` reports.
+    if e:player_hidden() then
+        return 0x7FFF
+    end
     local px, _, pz = e:player_pos()
     local dx = px - e.pos_x
     local dz = pz - e.pos_z
-    local dist = (dz < 0 and -dz or dz) + (dx < 0 and -dx or dx)
+    return (dz < 0 and -dz or dz) + (dx < 0 and -dx or dx)
+end
+
+-- The per-variant pre-AI roll: the distance to the player, then the brain
+-- through the table the behaviour slots 14-16 share.
+local function variant_ai(e)
+    local dist = player_distance(e)
     local brain = BRAINS[e.behavior_flags + 1]
     if brain == nil then
         e:count_placeholder(e.behavior_flags)
@@ -226,8 +235,12 @@ end
 
 -- The behaviour prologue: latch the pathfinder result's bit 0, then dispatch.
 local function behavior_dispatch(e)
-    local px, _, pz = e:player_pos()
-    local path = e:pathfind_update(px, pz)
+    -- Port-only: a hidden player is never pathed toward (the blocked result).
+    local path = 0
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        path = e:pathfind_update(px, pz)
+    end
     e:wasp_path_keep(path)
     local handler = BEHAVIORS[e.action_behavior + 1]
     if handler == nil then
@@ -293,7 +306,7 @@ brain_a = function(e, dist)
         end
     end
 
-    local px, _, pz = e:player_pos()
+    local hidden = e:player_hidden()
     local in_range = e:angular_view_and_distance(0x200, 0x5DC)
     if in_range == 0 or e:line_of_sight() ~= 0 or e.player_attacked ~= 0 then
         if (path_latch(e) == 0 and dist < 6000) or e.c_wall_frames > 0x14 then
@@ -301,7 +314,8 @@ brain_a = function(e, dist)
             set_beh(e, 0xB)
             e.c_wall_frames = 0
         end
-        if e.player_action_behavior == 0x14 and dist > 2000
+        -- Port-only: a hidden player's stance and attacked latch go unseen.
+        if not hidden and e.player_action_behavior == 0x14 and dist > 2000
             and not e:player_facing_entity() and e.player_action_state == 0 then
             e.ignore = 1
             set_beh(e, (e:random() & 1) * 4 + 7)
@@ -309,7 +323,7 @@ brain_a = function(e, dist)
                 set_beh(e, 0xB)
             end
         end
-        if e.player_attacked & 0x80 ~= 0 then
+        if not hidden and e.player_attacked & 0x80 ~= 0 then
             e.ignore = 1
             set_beh(e, 0xD)
         end
@@ -399,7 +413,8 @@ brain_b = function(e, dist)
         e.c_far_latch = 0
     end
 
-    if path_latch(e) ~= 0 then
+    local hidden = e:player_hidden()
+    if path_latch(e) ~= 0 and not hidden then
         if not e:player_facing_entity() and dist > 6000 then
             local px, _, pz = e:player_pos()
             local turn = e:turn_toward_target(px, pz, 0x40)
@@ -411,7 +426,7 @@ brain_b = function(e, dist)
         end
     end
 
-    if e.player_attacked & 0x80 ~= 0 then
+    if not hidden and e.player_attacked & 0x80 ~= 0 then
         e.ignore = 1
         set_beh(e, 0xD)
     end
@@ -457,14 +472,17 @@ brain_c = function(e, dist)
         e.c_far_latch = 0
     end
 
-    local px, _, pz = e:player_pos()
-    if dist > 15000 and e:turn_toward_target(px, pz, 0x200) == 0 then
-        e.ignore = 1
-        set_beh(e, 6)
-        e.c_far_latch = 0
+    local hidden = e:player_hidden()
+    if not hidden and dist > 15000 then
+        local px, _, pz = e:player_pos()
+        if e:turn_toward_target(px, pz, 0x200) == 0 then
+            e.ignore = 1
+            set_beh(e, 6)
+            e.c_far_latch = 0
+        end
     end
 
-    if e.player_attacked & 0x80 ~= 0 then
+    if not hidden and e.player_attacked & 0x80 ~= 0 then
         e.ignore = 1
         set_beh(e, 0xD)
     end
@@ -550,13 +568,16 @@ end
 -- 1 walk: with a path, refresh the zone waypoint and steer at it; without one,
 -- turn at the player scaled by the (zero) path latch.
 local function behavior_walk(e)
-    local px, _, pz = e:player_pos()
-    if path_latch(e) == 0 then
-        local turn = e:turn_toward_target(px, pz, 0x10)
-        e.angle = e.angle + turn * path_latch(e)
-    else
-        e:zone_path_update(px, pz)
-        e:rotate_toward_target(e.player_pos_x, e.player_pos_z, 0x40)
+    -- Port-only: a hidden player is never steered toward.
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        if path_latch(e) == 0 then
+            local turn = e:turn_toward_target(px, pz, 0x10)
+            e.angle = e.angle + turn * path_latch(e)
+        else
+            e:zone_path_update(px, pz)
+            e:rotate_toward_target(e.player_pos_x, e.player_pos_z, 0x40)
+        end
     end
 
     walk_timeout(e)
@@ -592,14 +613,21 @@ local function behavior_turn(e)
         if path_latch(e) ~= 0 then
             e.c_far_latch = 1
         end
-        local px, _, pz = e:player_pos()
-        e.player_pos_x = px
-        e.player_pos_z = pz
+        if not e:player_hidden() then
+            local px, _, pz = e:player_pos()
+            e.player_pos_x = px
+            e.player_pos_z = pz
+        end
         return
     end
 
-    local px, _, pz = e:player_pos()
-    local turn = e:turn_toward_target(px, pz, e.writhe_velocity)
+    -- Port-only: with the player hidden there is nothing to turn toward, so
+    -- the turn reads as aligned.
+    local turn = 0
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        turn = e:turn_toward_target(px, pz, e.writhe_velocity)
+    end
     local saved_turn = turn
     local prev = s16(e.action_ticks_counter)
     e.action_ticks_counter = prev - 1
@@ -838,20 +866,23 @@ local function behavior_drop(e)
         return
     end
 
-    -- The descent.
-    local px, _, pz = e:player_pos()
-    e.angle = e.angle + e:turn_toward_target(px, pz, 0x20)
-    if e.animation_frame_id == 0x19
-        and e:angular_view_and_distance(0x400, 2000) ~= 0
-        and e:line_of_sight() == 0
-        and e.player_attacked == 0
-        and e:player_facing_entity() then
-        e.action_behavior = 4
-        e.action_state = 0
-        e.angle = e:angle_to(px, pz)
-        e.player_attacked = 1
-        e.hit_state = 0
-        return
+    -- The descent; Port-only: a hidden player is neither steered toward nor
+    -- grabbed.
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        e.angle = e.angle + e:turn_toward_target(px, pz, 0x20)
+        if e.animation_frame_id == 0x19
+            and e:angular_view_and_distance(0x400, 2000) ~= 0
+            and e:line_of_sight() == 0
+            and e.player_attacked == 0
+            and e:player_facing_entity() then
+            e.action_behavior = 4
+            e.action_state = 0
+            e.angle = e:angle_to(px, pz)
+            e.player_attacked = 1
+            e.hit_state = 0
+            return
+        end
     end
     e.pos_y = -ARC[32 - e.animation_frame_id + 1]
     e.move_speed_current = DROP_SPEED[e.animation_frame_id + 1]
@@ -973,11 +1004,14 @@ local function behavior_flee(e)
         e.animation_id = 2
         e.move_speed_current = 200
     end
-    local px, _, pz = e:player_pos()
-    e.angle = e.angle + 0x800
-    local turn = e:turn_toward_target(px, pz, 0x10)
-    e.angle = e.angle + turn * path_latch(e)
-    e.angle = e.angle - 0x800
+    -- Port-only: a hidden player is never steered away from.
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        e.angle = e.angle + 0x800
+        local turn = e:turn_toward_target(px, pz, 0x10)
+        e.angle = e.angle + turn * path_latch(e)
+        e.angle = e.angle - 0x800
+    end
 
     walk_timeout(e)
     e:move(0x800, e.move_speed_current)
@@ -1002,15 +1036,21 @@ local function behavior_turn_back(e)
         end
         e.ignore = 0
         set_beh(e, 0)
-        local px, _, pz = e:player_pos()
-        e.player_pos_x = px
-        e.player_pos_z = pz
+        if not e:player_hidden() then
+            local px, _, pz = e:player_pos()
+            e.player_pos_x = px
+            e.player_pos_z = pz
+        end
         return
     end
 
     e.angle = e.angle + 0x800
-    local px, _, pz = e:player_pos()
-    local turn = e:turn_toward_target(px, pz, e.writhe_velocity)
+    -- Port-only: with the player hidden the turn reads as aligned.
+    local turn = 0
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        turn = e:turn_toward_target(px, pz, e.writhe_velocity)
+    end
     local saved_turn = turn
     local prev = s16(e.action_ticks_counter)
     e.action_ticks_counter = prev - 1
@@ -1069,21 +1109,24 @@ local function behavior_claw(e)
         return
     end
 
-    local px, py, pz = e:player_pos()
-    e.angle = e.angle + e:turn_toward_target(px, pz, 0x20) * path_latch(e)
+    -- Port-only: a hidden player is neither steered toward nor grabbed.
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        e.angle = e.angle + e:turn_toward_target(px, pz, 0x20) * path_latch(e)
 
-    if e.animation_frame_id == 10 then
-        if e:angular_view_and_distance(0x200, 2000) ~= 0
-            and e:line_of_sight() == 0
-            and e.player_attacked == 0 then
-            if e:player_facing_entity() then
-                e.collision_flags = e.collision_flags & 8
-                if e.collision_flags == 0 then
-                    set_beh(e, 4)
-                    e.angle = e:angle_to(px, pz)
-                    e.player_attacked = 1
-                    e.hit_state = 1
-                    return
+        if e.animation_frame_id == 10 then
+            if e:angular_view_and_distance(0x200, 2000) ~= 0
+                and e:line_of_sight() == 0
+                and e.player_attacked == 0 then
+                if e:player_facing_entity() then
+                    e.collision_flags = e.collision_flags & 8
+                    if e.collision_flags == 0 then
+                        set_beh(e, 4)
+                        e.angle = e:angle_to(px, pz)
+                        e.player_attacked = 1
+                        e.hit_state = 1
+                        return
+                    end
                 end
             end
         end
@@ -1099,6 +1142,7 @@ local function behavior_claw(e)
         local facing = player_facing(e)
         e.player_attacked = facing + 1
         e.player_action_behavior = facing + 0x66
+        local px, py, pz = e:player_pos()
         e:play_3d_sound_at(3, 0, px, py, pz)
     end
 

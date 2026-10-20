@@ -2593,6 +2593,9 @@ mod imp {
             // The spiders' shared player-distance scratch (`ws_dist`): the
             // flat Manhattan sum of the two axis differences.
             methods.add_method("web_distance", |_lua, api, ()| {
+                if api.game_ref().ghost_hides_player_from(api.slot) {
+                    return Ok(crate::enemy::walk::GHOST_DISTANCE as i32);
+                }
                 Ok(crate::enemy::walk::spider_distance(
                     api.entity(),
                     api.game_ref().entities[0].pos,
@@ -3148,8 +3151,8 @@ mod imp {
                 Ok(())
             });
 
-            // Whether the GHOST debug cheat hides the player from this
-            // entity; port-only, for script branches that read the player's
+            // Whether the player's hidden flag (the GHOST debug cheat) hides it
+            // from this entity; port-only, for script branches that read the player's
             // position directly.
             methods.add_method("player_hidden", |_lua, api, ()| {
                 Ok(api.game_ref().ghost_hides_player_from(api.slot))
@@ -10742,7 +10745,7 @@ mod zombie_tests {
         for (ghost, expected) in [(false, 0x80), (true, 0)] {
             let mut game = zombie_game(0x00, 0);
             game.entities[0].pos = [1000, 2000, 0];
-            game.debug.ghost = ghost;
+            game.entities[0].hidden_from_enemies = ghost;
             let mut host = LuaEnemyHost::new();
             for _ in 0..3 {
                 assert!(step(&mut host, &mut game, &pack));
@@ -14089,7 +14092,7 @@ end
 "#,
         )]);
         let mut game = hunter(2);
-        game.debug.ghost = true;
+        game.entities[0].hidden_from_enemies = true;
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack, 1));
         assert_eq!(
@@ -14112,7 +14115,7 @@ end
         )]);
         let mut game = hunter(2);
         game.entities[1].id = 0x20;
-        game.debug.ghost = true;
+        game.entities[0].hidden_from_enemies = true;
         let mut host = LuaEnemyHost::new();
         assert!(step(&mut host, &mut game, &pack, 1));
         assert_eq!(game.entities[1].status_flags & 0x20, 0x20);

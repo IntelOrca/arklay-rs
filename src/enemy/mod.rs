@@ -60,6 +60,8 @@ pub mod anim;
 pub mod companion;
 pub mod custom_anim;
 pub mod data;
+#[cfg(test)]
+mod ghost_tests;
 pub mod idle;
 pub mod lua;
 pub mod scd;

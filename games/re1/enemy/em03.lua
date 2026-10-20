@@ -74,9 +74,42 @@ local function set_behavior(e, behavior)
     e.action_state = 0
 end
 
--- The player is knocked down or grabbed.
+-- The player is knocked down or grabbed. Port-only: a hidden player is never
+-- noticed down.
 local function player_down(e)
+    if e:player_hidden() then
+        return false
+    end
     return e.player_action_behavior == 0x14 and e.player_action_state == 0
+end
+
+-- Port-only: the pathfinder's line-of-sight bit; a hidden player is never in
+-- sight.
+local function los_bit(e)
+    if e:player_hidden() then
+        return 0
+    end
+    return e.ws_path_word & 1
+end
+
+-- Port-only: the turn step toward the player, or nil while the player is
+-- hidden (nothing to steer toward, never lined up).
+local function player_turn(e, step)
+    if e:player_hidden() then
+        return nil
+    end
+    local px, _, pz = e:player_pos()
+    return e:turn_toward_target(px, pz, step)
+end
+
+-- Latch the player's position as the pathfinder waypoint (not while hidden).
+local function latch_player_pos(e)
+    if e:player_hidden() then
+        return
+    end
+    local px, _, pz = e:player_pos()
+    e.player_pos_x = px
+    e.player_pos_z = pz
 end
 
 -- The shared player-distance scratch (`ws_dist`): branchless Manhattan with
@@ -114,7 +147,7 @@ local function behavior_idle(e)
     if e.action_state == 0 then
         anim_start(e, 1, 3)
         e.animation_id = 0
-        local los = e.ws_path_word & 1
+        local los = los_bit(e)
         e.action_ticks_counter = ((1 - los) * 0x50 + (e:random() & 0x3F)) & 0xFFFF
     elseif e.action_state ~= 1 then
         return
@@ -125,7 +158,7 @@ local function behavior_idle(e)
     e.action_ticks_counter = d - 1
     if d == 0 then
         e.ignore = 0
-        local los = e.ws_path_word & 1
+        local los = los_bit(e)
         e.action_behavior = BEHAVIOR_PICK[(e:random() & 7) + los * 8 + 1]
         e.action_state = 0
     end
@@ -190,9 +223,8 @@ local function behavior_strafe(e)
     e.angle = e.angle + e.ws_turn
     e:advance_anim(0x400)
 
-    local px, _, pz = e:player_pos()
-    if (e.ws_path_word & 1) ~= 0 then
-        if e:turn_toward_target(px, pz, e.ws_turn) == 0 then
+    if los_bit(e) ~= 0 then
+        if player_turn(e, e.ws_turn) == 0 then
             e.action_behavior = 4
             e.action_state = 0
             return
@@ -203,7 +235,7 @@ local function behavior_strafe(e)
     e.action_ticks_counter = d - 1
     if d == 0 then
         e.ignore = 0
-        e.action_behavior = (e.ws_path_word & 1) << 2
+        e.action_behavior = los_bit(e) << 2
         e.action_state = 0
     end
 end
@@ -223,16 +255,14 @@ local function behavior_approach(e)
             return
         end
         e.ignore = 0
-        e.action_behavior = (e.ws_path_word & 1) * 0x0B
+        e.action_behavior = los_bit(e) * 0x0B
         e.action_state = 0
-        local px, _, pz = e:player_pos()
-        e.player_pos_x = px
-        e.player_pos_z = pz
+        latch_player_pos(e)
         return
     end
 
-    local px, _, pz = e:player_pos()
-    local turn = e:turn_toward_target(px, pz, e.ws_turn)
+    -- A hidden player leaves nothing to turn toward: the approach is done.
+    local turn = player_turn(e, e.ws_turn) or 0
     local d = signed_word(e.action_ticks_counter)
     e.action_ticks_counter = d - 1
     if d == 0 or turn == 0 then
@@ -271,15 +301,14 @@ local function behavior_lunge(e)
 
     if sub == 3 then
         e:advance_anim(0x400)
-        local px, _, pz = e:player_pos()
-        local turn = e:turn_toward_target(px, pz, 0x40)
-        e.angle = e.angle + turn
+        local turn = player_turn(e, 0x40)
+        e.angle = e.angle + (turn or 0)
         if turn == 0 then
             e.action_state = 4
         end
         local d = signed_word(e.action_ticks_counter)
         e.action_ticks_counter = d - 1
-        if d == 0 then
+        if d == 0 or turn == nil then
             e.action_state = 6
         end
         return
@@ -295,14 +324,13 @@ local function behavior_lunge(e)
 
     if sub == 5 then
         e:advance_anim(0x400)
-        local px, _, pz = e:player_pos()
-        e.angle = e.angle + e:turn_toward_target(px, pz, 0x10)
+        e.angle = e.angle + (player_turn(e, 0x10) or 0)
         e.move_speed_current = 300
         e:move(0, 300)
 
         local d = signed_word(e.action_ticks_counter)
         e.action_ticks_counter = d - 1
-        if d == 0 or e:turn_toward_target(px, pz, 0x200) ~= 0 then
+        if d == 0 or player_turn(e, 0x200) ~= 0 then
             e.action_state = 6
         end
 
@@ -433,7 +461,7 @@ local function behavior_circle(e)
         anim_start(e, 1, 3)
         e.animation_id = 6
         local base = (e:random() & 1) * -0x658 + 0x32C
-        local los = e.ws_path_word & 1
+        local los = los_bit(e)
         e.ws_turn = base + (los == 0 and 1 or 0) * (e:random() & 0xFFF)
         e.move_speed_current = (e:random() & 0x3F) + 200
         e:move(e.ws_turn, signed_word(e.move_speed_current))
@@ -443,15 +471,14 @@ local function behavior_circle(e)
         end
         e.hit_state = 0
         e.ignore = 0
-        e.action_behavior = (e.ws_path_word & 1) << 2
+        e.action_behavior = los_bit(e) << 2
         e.action_state = 0
         e.ws_count = 0
         return
     end
 
     e.action_state = e.action_state + (e:advance_anim(0x400) and 1 or 0)
-    local px, _, pz = e:player_pos()
-    e.angle = e.angle + e:turn_toward_target(px, pz, 0x40)
+    e.angle = e.angle + (player_turn(e, 0x40) or 0)
     e:advance_speed()
 end
 
@@ -461,7 +488,7 @@ end
 -- chase; a knocked-down player draws the circle.
 
 local function picker_a(e)
-    local los = e.ws_path_word & 1
+    local los = los_bit(e)
     if web_dist(e) < 6000 and los == 0 then
         e.ignore = 1
         e.action_behavior = 3
@@ -474,8 +501,7 @@ local function picker_a(e)
             e.action_state = 0
         end
         if web_dist(e) < 7000 then
-            local px, _, pz = e:player_pos()
-            if e:turn_toward_target(px, pz, 0x80) == 0 then
+            if player_turn(e, 0x80) == 0 then
                 e.ignore = 1
                 e.action_behavior = 6 + (e:random() & 1)
                 e.action_state = 0
@@ -494,7 +520,7 @@ local function picker_a(e)
         e.action_behavior = 10
         e.action_state = 0
     end
-    if (e.player_attacked & 0x80) ~= 0 then
+    if not e:player_hidden() and (e.player_attacked & 0x80) ~= 0 then
         e.ignore = 1
         e.action_behavior = 0xB
         e.action_state = 0
@@ -502,9 +528,8 @@ local function picker_a(e)
 end
 
 local function picker_b(e)
-    local px, _, pz = e:player_pos()
-    local turn_slow = e:turn_toward_target(px, pz, 0x80)
-    local turn_fast = e:turn_toward_target(px, pz, 0x100)
+    local turn_slow = player_turn(e, 0x80)
+    local turn_fast = player_turn(e, 0x100)
 
     if player_down(e) and turn_slow ~= 0 then
         e.ignore = 1
@@ -517,7 +542,7 @@ local function picker_b(e)
         e.action_state = 0
     end
     if e.ws_delay == 0 then
-        if web_dist(e) < 0x1D4C and (e.ws_path_word & 1) ~= 0 then
+        if web_dist(e) < 0x1D4C and los_bit(e) ~= 0 then
             e.ignore = 1
             e.action_behavior = 6 + (e:random() & 1)
             e.action_state = 0
@@ -560,8 +585,7 @@ local function picker_c(e)
         e.action_behavior = 2
         e.action_state = 0
         if web_dist(e) > 5000 then
-            local px, _, pz = e:player_pos()
-            if e:turn_toward_target(px, pz, 0x80) == 0 then
+            if player_turn(e, 0x80) == 0 then
                 e.ignore = 1
                 e.action_behavior = 0xB
                 e.action_state = 0
@@ -575,8 +599,13 @@ local PICKERS = { picker_a, picker_b, picker_c, picker_c }
 -- The action runner: refresh the pathfinder, keep its line-of-sight bit in
 -- the +0x16E word, then execute the selected behaviour.
 local function action_runner(e)
-    local px, _, pz = e:player_pos()
-    local path = e:pathfind_update(px, pz)
+    -- Port-only: a hidden player reports the target blocked, like the
+    -- pathfinder binding does.
+    local path = 0
+    if not e:player_hidden() then
+        local px, _, pz = e:player_pos()
+        path = e:pathfind_update(px, pz)
+    end
     e:spider_path_keep(path)
 
     local b = e.action_behavior
@@ -584,7 +613,7 @@ local function action_runner(e)
         behavior_idle(e)
     elseif b == 1 then
         e.animation_id = 3
-        e.angle = e.angle + e:turn_toward_target(px, pz, 0x10) * (e.ws_path_word & 1)
+        e.angle = e.angle + (player_turn(e, 0x10) or 0) * los_bit(e)
         behavior_walk_turn(e)
         e.move_speed_current = e.move_speed_current + 0x3C
         e:move(0, signed_word(e.move_speed_current))
@@ -596,7 +625,7 @@ local function action_runner(e)
         behavior_approach(e)
     elseif b == 4 then
         e.animation_id = 2
-        e.angle = e.angle + e:turn_toward_target(px, pz, 0x30)
+        e.angle = e.angle + (player_turn(e, 0x30) or 0)
         behavior_walk_turn(e)
         e.move_speed_current = e.move_speed_current + 100
         e:move(0, signed_word(e.move_speed_current))
@@ -616,7 +645,7 @@ local function action_runner(e)
         behavior_circle(e)
     elseif b == 11 then
         e.animation_id = 3
-        e.angle = e.angle + e:turn_toward_target(px, pz, 0x10)
+        e.angle = e.angle + (player_turn(e, 0x10) or 0)
         behavior_walk_turn(e)
         e.move_speed_current = e.move_speed_current + 0x14
         e:move(0, signed_word(e.move_speed_current))
@@ -657,11 +686,9 @@ local function web_build(e)
         e.ignore = 0
         e.action_behavior = (e.behavior_flags & 1) + 3
         e.action_state = 0
-        local px, _, pz = e:player_pos()
-        e.player_pos_x = px
-        e.player_pos_z = pz
+        latch_player_pos(e)
         e.hit_state = 0
-        if (e.ws_path_word & 1) == 0 then
+        if los_bit(e) == 0 then
             return
         end
         e.ignore = 1
