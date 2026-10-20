@@ -1756,3 +1756,522 @@ fn map_without_art_stays_blank() {
     let framebuffer = tab.draw();
     assert!(framebuffer.rgba.iter().all(|&c| c == 0));
 }
+
+/// The FILE tab over a game state whose FILE-collected bits are `files`.
+struct FileTab {
+    harness: Harness,
+    game: crate::game::GameState,
+    screen: LuaScreen,
+}
+
+impl FileTab {
+    fn new(label: &str, character: u8, files: &[u8], args: &[(&str, ScreenArg)]) -> Self {
+        let harness = Harness::new(label);
+        let mut game = crate::game::GameState::default();
+        game.id.player_flag = character;
+        for &file in files {
+            game.flags[usize::from(crate::game::BANK_ROOM_FLAGS)].apply(0x82 + file, 0);
+        }
+        let screen = {
+            let mut cx = UiContext {
+                game: Some(&game),
+                ..harness.context()
+            };
+            LuaScreen::open_screen("file", args, ScreenAction::Quit, &mut cx).unwrap()
+        };
+        Self {
+            harness,
+            game,
+            screen,
+        }
+    }
+
+    fn step(&mut self, input: UiInput) -> ScreenResult {
+        let cx = UiContext {
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        self.screen.update(&cx, input)
+    }
+
+    fn tick(&mut self) {
+        assert!(matches!(self.step(neutral()), ScreenResult::Continue));
+    }
+
+    fn draw(&mut self) -> crate::render::Framebuffer {
+        let cx = UiContext {
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        let mut framebuffer = crate::render::Framebuffer::new();
+        framebuffer.fill_rect([0, 0, 320, 240], [9, 9, 9, 255]);
+        self.screen.draw(&cx, &mut framebuffer);
+        framebuffer
+    }
+
+    fn int(&self, expr: &str) -> i64 {
+        self.screen.test_eval(&format!("return {expr}"))
+    }
+
+    fn flag(&self, expr: &str) -> bool {
+        self.screen.test_eval(&format!("return {expr}"))
+    }
+
+    fn state(&self) -> String {
+        self.screen.test_eval("return M.state.reader_state")
+    }
+
+    fn mode(&self) -> String {
+        self.screen.test_eval("return M.state.mode")
+    }
+
+    /// Advance the selector until its entry slide settles.
+    fn settle_list(&mut self) {
+        for _ in 0..16 {
+            if self.flag("M.state.list_ready") {
+                return;
+            }
+            self.tick();
+        }
+        panic!("the selector entry slide did not settle");
+    }
+
+    /// Advance until the reader (or the selector it returned to) reads the
+    /// pad again; a pick-up reader's finished exit is reported as `Done`.
+    fn settle_reader(&mut self) -> ScreenResult {
+        for _ in 0..128 {
+            let settled = self.screen.value("locked") == 0
+                && (self.mode() == "list" || self.state() == "idle");
+            if settled {
+                return ScreenResult::Continue;
+            }
+            let result = self.step(neutral());
+            if !matches!(result, ScreenResult::Continue) {
+                return result;
+            }
+        }
+        panic!("the reader slide did not settle");
+    }
+}
+
+#[test]
+fn file_tables_match_the_shipped_jpn_tables() {
+    let tab = FileTab::new("file-tables", 0, &[], &[]);
+    let chris: Vec<i64> = tab.screen.test_eval(
+        "local t = {} for i = 0, 15 do t[i + 1] = M.tables.key_items[0][i] end return t",
+    );
+    assert_eq!(
+        chris,
+        [
+            0x0F, 0x02, 0xFE, 0x03, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x0E, 0xFF,
+            0xFF, 0xFF
+        ]
+    );
+    let jill: Vec<i64> = tab.screen.test_eval(
+        "local t = {} for i = 0, 15 do t[i + 1] = M.tables.key_items[1][i] end return t",
+    );
+    assert_eq!(
+        jill,
+        [
+            0x0F, 0x02, 0xFE, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+            0x0E, 0xFF
+        ]
+    );
+    assert_eq!(tab.int("M.page_index(0, 0)"), 0);
+    assert_eq!(tab.int("M.page_index(0, 1)"), 0);
+    assert_eq!(tab.int("M.page_index(0, 2)"), 1);
+    assert_eq!(tab.int("M.page_index(1, 0)"), 2);
+    assert_eq!(tab.int("M.page_index(2, 10)"), 10);
+    assert!(
+        tab.flag("M.page_index(2, 11) == nil"),
+        "past the page count"
+    );
+    assert!(
+        tab.flag("M.page_index(16, 0) == nil"),
+        "past the document table"
+    );
+    // The starts are the cumulative ceil(count/2), ending at the 43 TIMs, and
+    // every backdrop index names one of the 14 shipped FILEI pages.
+    let mut expected = 0;
+    for entry in 0..16 {
+        assert_eq!(tab.int(&format!("M.tables.page_start[{entry}]")), expected);
+        let count = tab.int(&format!("M.tables.page_count[{entry}]"));
+        expected += (count + 1) / 2;
+        let filei = tab.int(&format!("M.tables.filei_index[{entry}]"));
+        assert!(
+            tab.flag(&format!("M.tables.filei[{filei}] ~= nil")),
+            "entry {entry}"
+        );
+    }
+    assert_eq!(expected, 43);
+    assert!(tab.flag("M.tables.textm[42] == 'textm_02' and M.tables.textm[43] == nil"));
+    assert_eq!(tab.int("M.tables.title_x[0]"), 42);
+    assert_eq!(tab.int("M.tables.title_x[15]"), 63);
+}
+
+#[test]
+fn file_list_entries_resolve_against_the_file_flags() {
+    // Nothing collected: the book has no selection.
+    assert_eq!(
+        FileTab::new("file-none", 0, &[], &[]).int("M.state.slot"),
+        0xFF
+    );
+    // The 0xFE marker (slot 2) lists document 0 or 1 once either is seen.
+    assert_eq!(
+        FileTab::new("file-fe0", 0, &[0], &[]).int("M.state.slot"),
+        2
+    );
+    assert_eq!(
+        FileTab::new("file-fe1", 0, &[1], &[]).int("M.state.slot"),
+        2
+    );
+    assert_eq!(
+        FileTab::new("file-0f", 0, &[0x0F, 1], &[]).int("M.state.slot"),
+        0
+    );
+    // Jill's list puts document 4 in book 0 slot 4, where Chris has 5.
+    let mut jill = FileTab::new("file-jill", 1, &[4], &[]);
+    assert_eq!(jill.int("M.state.slot"), 4);
+    let chris = FileTab::new("file-chris", 0, &[4], &[]);
+    assert_eq!(chris.int("M.state.slot"), 0xFF);
+    jill.settle_list();
+    jill.step(press(|i| i.right = true));
+    assert_eq!(jill.int("M.state.book"), 1);
+    assert_eq!(jill.int("M.state.slot"), 0xFF);
+}
+
+#[test]
+fn file_selector_navigation_skips_uncollected_documents() {
+    // Book 1: slots 0 (file 0x0F) and 3 (file 0x03) are collected.
+    let mut tab = FileTab::new("file-nav", 0, &[0x0F, 0x03], &[]);
+    assert_eq!(tab.int("M.state.book"), 0);
+    assert_eq!(tab.int("M.state.slot"), 0);
+    // The tab's first frame draws only the panel under it; the cover's entry
+    // slide starts on the next tick at `-0x7f` with speed `0x80`, and only
+    // the settled state reads the pad.
+    assert!(tab.flag("M.state.list_pending"));
+    assert_eq!(tab.screen.value("locked"), 1);
+    tab.tick();
+    assert_eq!(tab.int("M.state.slide_y"), -0x7f + 0x40);
+    tab.settle_list();
+    assert_eq!(tab.int("M.state.slide_y"), 0);
+
+    tab.step(press(|i| i.down = true));
+    assert_eq!(
+        tab.int("M.state.slot"),
+        3,
+        "down jumps to the next collected row"
+    );
+    tab.step(press(|i| i.down = true));
+    assert_eq!(tab.int("M.state.slot"), 3, "nowhere else to go");
+    tab.step(press(|i| i.up = true));
+    assert_eq!(tab.int("M.state.slot"), 0);
+
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.int("M.state.book"), 1);
+    assert_eq!(
+        tab.int("M.state.slot"),
+        0xFF,
+        "book 2 has nothing collected"
+    );
+    assert_eq!(tab.int("M.state.slide_x"), 0x78);
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.int("M.state.book"), 0);
+    assert_eq!(tab.int("M.state.slot"), 0);
+    assert_eq!(tab.int("M.state.slide_x"), -0x78);
+
+    // Confirm on a listed document starts the fade hand-off; the reader opens
+    // at page 0 when the ramp completes.
+    assert!(matches!(
+        tab.step(press(|i| i.confirm = true)),
+        ScreenResult::Continue
+    ));
+    assert!(tab.flag("M.state.fade_in"));
+    while tab.flag("M.state.fade_in") {
+        tab.tick();
+    }
+    assert_eq!(tab.mode(), "reader");
+    assert_eq!(tab.screen.value("reader"), 1);
+    assert_eq!(tab.int("M.state.page"), 0);
+}
+
+#[test]
+fn file_reader_pages_through_and_closes_on_the_last_page() {
+    let mut tab = FileTab::new("file-pages", 0, &[0x0F], &[]);
+    tab.settle_list();
+    tab.step(press(|i| i.confirm = true));
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "reader");
+
+    // List slot 0 is document 0x0F, five half-pages long. Walk to the last
+    // page; a further page-down only acknowledges it (FILE_SAVEFLAG).
+    let count = tab.int("M.tables.page_count[0x0F]");
+    assert_eq!(count, 5);
+    for page in 1..count {
+        tab.step(press(|i| i.right = true));
+        tab.settle_reader();
+        assert_eq!(tab.int("M.state.page"), page);
+    }
+    assert!(!tab.flag("M.state.reader_last_page"));
+    tab.step(press(|i| i.right = true));
+    tab.settle_reader();
+    assert_eq!(tab.int("M.state.page"), count - 1, "the last page holds");
+    assert!(
+        tab.flag("M.state.reader_last_page"),
+        "the last page is acknowledged"
+    );
+    // A page-up first withdraws the acknowledgement.
+    tab.step(press(|i| i.left = true));
+    assert!(!tab.flag("M.state.reader_last_page"));
+    assert_eq!(tab.int("M.state.page"), count - 1);
+    tab.step(press(|i| i.right = true));
+    assert!(tab.flag("M.state.reader_last_page"));
+
+    // Up/down and the paging buttons are not read by the reader.
+    for input in [
+        press(|i| i.down = true),
+        press(|i| i.up = true),
+        press(|i| i.page_right = true),
+    ] {
+        tab.step(input);
+        tab.settle_reader();
+        assert_eq!(tab.int("M.state.page"), count - 1);
+    }
+
+    tab.step(press(|i| i.confirm = true));
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "list", "confirm exits on the last page");
+
+    // Cancel from the reader returns to the list too, and a cancel from the
+    // settled list closes the tab.
+    tab.step(press(|i| i.confirm = true));
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "reader");
+    tab.step(press(|i| i.cancel = true));
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "list");
+    assert!(matches!(
+        tab.step(press(|i| i.cancel = true)),
+        ScreenResult::Done(_)
+    ));
+}
+
+#[test]
+fn file_reader_slides_the_page_on_and_off() {
+    let mut tab = FileTab::new("file-slides", 0, &[0x0F], &[]);
+    tab.settle_list();
+
+    // Opening the reader fades the selector out first; the reader then spends
+    // sixteen black frames ramping its backdrop in before the page even pages
+    // in, and only then starts the 0x128 entry slide.
+    tab.step(press(|i| i.confirm = true));
+    while tab.flag("M.state.fade_in") {
+        tab.tick();
+    }
+    assert_eq!(tab.mode(), "reader");
+    assert_eq!(tab.state(), "backdrop");
+    assert_eq!(tab.int("M.state.reader_slide"), 0);
+    for _ in 0..15 {
+        tab.tick();
+        assert_eq!(tab.int("M.state.reader_slide"), 0, "the page is not up yet");
+        assert!(!tab.flag("M.state.reader_page_loaded"));
+    }
+    // The sixteenth ramp frame completes the backdrop.
+    tab.tick();
+    assert_eq!(tab.state(), "page_load");
+    assert_eq!(tab.int("M.state.reader_backdrop"), 0x80);
+    assert!(
+        !tab.flag("M.state.reader_page_loaded"),
+        "the load frame draws black"
+    );
+    // The half-page's TIM pages in and falls into the slide's first step.
+    tab.tick();
+    assert_eq!(tab.state(), "slide_in");
+    assert!(tab.flag("M.state.reader_page_loaded"));
+    assert_eq!(
+        tab.int("M.state.reader_slide"),
+        146,
+        "300 / 2 slides the first step"
+    );
+    let mut positions = vec![146];
+    while tab.state() != "idle" {
+        tab.tick();
+        positions.push(tab.int("M.state.reader_slide"));
+    }
+    assert_eq!(positions.last(), Some(&0), "the page settles on the box");
+    assert_eq!(positions.len(), 8, "state 2 plus the seven state-3 frames");
+
+    // The busy lock releases one frame after the slide lands, and the input
+    // is only read the frame after that.
+    assert!(tab.flag("M.state.reader_busy"));
+    tab.tick();
+    assert!(!tab.flag("M.state.reader_busy"));
+    assert_eq!(
+        tab.screen.value("locked"),
+        1,
+        "the release frame still locks"
+    );
+    tab.tick();
+    assert_eq!(tab.screen.value("locked"), 0);
+
+    // A page-down first slides the current page off to the left, then eases
+    // the next one in from the right; the page advances only once the old one
+    // is clear.
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.state(), "slide_out_left");
+    assert_eq!(
+        tab.int("M.state.reader_slide"),
+        -1,
+        "the input frame steps the slide"
+    );
+    let mut min_slide = 0;
+    while tab.state() == "slide_out_left" {
+        tab.tick();
+        min_slide = min_slide.min(tab.int("M.state.reader_slide"));
+        if tab.state() == "slide_out_left" {
+            assert_eq!(
+                tab.int("M.state.page"),
+                0,
+                "the old page holds through the slide-out"
+            );
+        }
+    }
+    assert!(min_slide < -0x80, "the old page left through the left edge");
+    assert_eq!(tab.int("M.state.page"), 1);
+    // One load frame, then the right-hand entry slide.
+    tab.tick();
+    assert_eq!(tab.state(), "page_load");
+    tab.tick();
+    assert_eq!(tab.state(), "slide_in");
+    assert_eq!(tab.int("M.state.reader_slide"), 146);
+    tab.settle_reader();
+
+    // A page-up mirrors it: out to the right, then in from the left.
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.state(), "slide_out_right");
+    assert_eq!(tab.int("M.state.reader_slide"), 1);
+    let mut max_slide = 0;
+    while tab.state() == "slide_out_right" {
+        tab.tick();
+        max_slide = max_slide.max(tab.int("M.state.reader_slide"));
+    }
+    assert!(max_slide > 0x80, "the page left through the right edge");
+    assert_eq!(tab.int("M.state.page"), 0);
+    // The unpack frame (0xa) holds the +511 slide; the next frame is the
+    // load, which falls into the left entry's first step.
+    assert_eq!(tab.state(), "unpack_left");
+    assert_eq!(tab.int("M.state.reader_slide"), 511);
+    tab.tick();
+    assert_eq!(tab.state(), "prev_page");
+    assert_eq!(
+        tab.int("M.state.reader_slide"),
+        511,
+        "the load frame holds the slide"
+    );
+    tab.tick();
+    assert_eq!(tab.state(), "slide_in_left");
+    assert_eq!(
+        tab.int("M.state.reader_slide"),
+        -146,
+        "state 0xb halves the speed in"
+    );
+    tab.settle_reader();
+    assert_eq!(tab.int("M.state.reader_slide"), 0);
+
+    // Cancel draws the settled page on its own frame (the original notices
+    // the cancel after the reader's advance), then slides out.
+    tab.step(press(|i| i.cancel = true));
+    assert_eq!(
+        tab.int("M.state.reader_slide"),
+        0,
+        "the cancel frame still holds"
+    );
+    tab.tick();
+    assert_eq!(tab.state(), "exit_slide");
+    assert_eq!(tab.int("M.state.reader_slide"), -1);
+    let mut exit_frames = 1;
+    while tab.mode() != "list" {
+        tab.tick();
+        exit_frames += 1;
+    }
+    // One hold frame, one cover-load frame and the hand-off, then the
+    // eight-frame fade back over the selector. The selector inherits the exit
+    // slide's offset (its cover stays off-screen) until the ramp completes.
+    assert_eq!(exit_frames, 9 + 16 + 3);
+    assert_eq!(tab.int("M.state.fade"), 0xFF);
+    assert_eq!(
+        tab.int("M.state.slide_x"),
+        -511,
+        "the cover stays parked clear"
+    );
+    assert_eq!(tab.int("M.state.slide_y"), 0);
+    while tab.flag("M.state.fade_out") {
+        tab.tick();
+    }
+    assert_eq!(tab.int("M.state.fade"), 0);
+    assert_eq!(
+        tab.int("M.state.slide_x"),
+        0,
+        "the ramp completion resets the slide"
+    );
+}
+
+#[test]
+fn file_pickup_reader_exits_instead_of_returning_to_the_list() {
+    // Item 0x5F is document 0; its list slot is the 0xFE marker, resolved to
+    // 0 once the document is collected.
+    let mut tab = FileTab::new(
+        "file-pickup",
+        0,
+        &[0, 1],
+        &[("pickup", ScreenArg::Int(0x5F))],
+    );
+    assert_eq!(tab.mode(), "reader");
+    assert_eq!(tab.screen.value("reader"), 1);
+    assert_eq!(tab.int("M.state.book"), 0);
+    assert_eq!(
+        tab.int("M.state.slot"),
+        2,
+        "the 0xFE list slot resolves to file 0"
+    );
+    assert!(matches!(tab.settle_reader(), ScreenResult::Continue));
+
+    // Walking past document 0's last half-page ends the flow through the
+    // exit slide.
+    let count = tab.int("M.tables.page_count[0]");
+    for _ in 1..count {
+        tab.step(press(|i| i.right = true));
+        tab.settle_reader();
+    }
+    assert_eq!(tab.int("M.state.page"), count - 1);
+    tab.step(press(|i| i.right = true));
+    tab.settle_reader();
+    assert!(tab.flag("M.state.reader_last_page"));
+    tab.step(press(|i| i.confirm = true));
+    assert!(
+        matches!(tab.settle_reader(), ScreenResult::Done(_)),
+        "the pick-up reader exits once its slide-out finishes"
+    );
+    assert_eq!(
+        tab.mode(),
+        "reader",
+        "a pick-up reader never falls back to the selector"
+    );
+}
+
+#[test]
+fn file_reader_blacks_out_the_screen_and_the_first_list_frame_draws_nothing() {
+    let mut tab = FileTab::new("file-draw", 0, &[0x0F], &[]);
+    // The tab's first frame leaves the panel underneath alone.
+    let framebuffer = tab.draw();
+    assert!(framebuffer.rgba.chunks(4).all(|px| px == [9, 9, 9, 255]));
+    // The pick-up reader's own layer is an opaque black over everything.
+    let mut tab = FileTab::new(
+        "file-draw-reader",
+        0,
+        &[0],
+        &[("pickup", ScreenArg::Int(0x5F))],
+    );
+    let framebuffer = tab.draw();
+    assert!(framebuffer.rgba.chunks(4).all(|px| px == [0, 0, 0, 255]));
+}

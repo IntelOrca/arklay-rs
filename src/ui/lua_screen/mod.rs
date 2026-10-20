@@ -272,10 +272,13 @@ impl LuaScreen {
         actors: Option<&mut ActorDraw<'_>>,
     ) {
         let Self { host, vm, entry } = self;
+        // `api:clip` lasts for this draw only.
+        let clip = framebuffer.clip_rect();
         if let Err(err) = vm.call_draw(host, cx, framebuffer, actors) {
             eprintln!("[lua] screen {entry} draw failed: {err}");
             host.failed = true;
         }
+        framebuffer.set_clip_rect(clip);
     }
 
     /// The action an exit reports: the one the script named, else back to
@@ -855,16 +858,17 @@ impl UserData for Api<'_> {
                 .is_some_and(|flags| flags.bit(bit)))
         });
 
-        // `room()`: the paused session's stage, room and camera cut; nil
-        // outside a session.
+        // `room()`: the paused session's stage, room, camera cut and player
+        // digit (0 Chris, 1 Jill); nil outside a session.
         methods.add_method("room", |_lua, api, ()| {
             Ok(match api.cx.game {
                 Some(game) => (
                     Some(game.id.stage),
                     Some(game.id.room),
                     Some(game.camera.current_cut as i64),
+                    Some(game.id.player_flag),
                 ),
-                None => (None, None, None),
+                None => (None, None, None, None),
             })
         });
 
@@ -889,6 +893,16 @@ impl UserData for Api<'_> {
             api.cx
                 .text
                 .map(|text| lua.create_string(text.ui(&key)))
+                .transpose()
+        });
+
+        // The font-encoded name of item `id`; nil without a text table or
+        // a name.
+        methods.add_method("item_name_bytes", |lua, api, id: u16| {
+            api.cx
+                .text
+                .and_then(|text| text.item_name(id))
+                .map(|name| lua.create_string(name))
                 .transpose()
         });
 

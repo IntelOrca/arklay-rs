@@ -254,6 +254,11 @@ impl Framebuffer {
         self.clip = rect;
     }
 
+    /// The clip rect [`Framebuffer::set_clip_rect`] installed.
+    pub fn clip_rect(&self) -> Option<[i32; 4]> {
+        self.clip
+    }
+
     /// Copy `image` to the top-left corner, clipping to both images' bounds.
     pub fn blit(&mut self, image: &Image) {
         let rows = image.height.min(self.height) as usize;

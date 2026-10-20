@@ -439,6 +439,52 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         },
     );
 
+    // `clip(x, y, w, h)`: clip the rest of this draw to a screen rect;
+    // `clip()` lifts it.
+    methods.add_method_mut(
+        "clip",
+        |_lua, api, (x, y, w, h): (Option<i32>, Option<i32>, Option<i32>, Option<i32>)| {
+            let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            framebuffer.set_clip_rect(match (x, y, w, h) {
+                (Some(x), Some(y), Some(w), Some(h)) => Some(rect(x, y, w, h)),
+                _ => None,
+            });
+            Ok(())
+        },
+    );
+
+    // `darken(alpha)`: blend the whole frame towards black by `alpha`/255
+    // (the screens' black fade rect).
+    methods.add_method_mut("darken", |_lua, api, alpha: i64| {
+        let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+        framebuffer.fade_to_black_weighted(byte(alpha));
+        Ok(())
+    });
+
+    // `page_ramp(page, sx, sy, w, h, dx, dy, ramp)`: an unscaled page rect
+    // modulated by `2 * ramp` and half-blended over the frame (the FILE
+    // reader's backdrop pieces).
+    methods.add_method_mut(
+        "page_ramp",
+        |_lua,
+         api,
+         (handle, sx, sy, w, h, dx, dy, ramp): (usize, i32, i32, i32, i32, i32, i32, i64)| {
+            let Api {
+                host, framebuffer, ..
+            } = api;
+            let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            let art = host.assets.page(handle)?;
+            framebuffer.draw_page_sprite_ramp(
+                art,
+                rect(sx, sy, w, h),
+                rect(dx, dy, w, h),
+                0,
+                byte(ramp),
+            );
+            Ok(())
+        },
+    );
+
     methods.add_method_mut(
         "blend_black_rect",
         |_lua, api, (x, y, w, h, alpha): (i32, i32, i32, i32, i64)| {

@@ -129,7 +129,6 @@ use crate::trace;
 use crate::transition::{self, DoorStepper};
 use crate::tween::{self, Tween};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
-use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::lua_screen::ScreenArg;
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
@@ -1349,8 +1348,9 @@ struct PickupView {
     kind: PickupKind,
     /// The model viewer; `None` for the document reader flow.
     screen: Option<ui::item_view::ItemViewScreen>,
-    /// The document reader; `None` for the model-viewer flows.
-    reader: Option<ui::file::FileScreen>,
+    /// The document reader (`ui/file.lua` opened with `pickup`); `None` for
+    /// the model-viewer flows.
+    reader: Option<Box<ui::lua_screen::LuaScreen>>,
     /// Where the flow is.
     phase: PickupPhase,
 }
@@ -1501,10 +1501,9 @@ struct GameSession {
     item_box: Option<ItemBox>,
     /// Item-box art, loaded on the first open.
     item_box_assets: Option<ItemBoxAssets>,
-    /// The FILE tab selector/reader; the room stays frozen while it is up.
-    file: Option<FileScreen>,
-    /// FILE tab art, loaded on the first open.
-    file_assets: Option<FileAssets>,
+    /// The FILE tab selector/reader (`ui/file.lua`); the room stays frozen
+    /// while it is up.
+    file: Option<Box<ui::lua_screen::LuaScreen>>,
     /// The map tab (`ui/map.lua`); the room stays frozen while it is up.
     map: Option<Box<ui::lua_screen::LuaScreen>>,
     /// The typewriter save screen; the room stays frozen while it is up.
@@ -1954,7 +1953,6 @@ impl GameSession {
             item_box: None,
             item_box_assets: None,
             file: None,
-            file_assets: None,
             map: None,
             save_screen: None,
             save_dir: save_dir.to_path_buf(),
@@ -3545,10 +3543,20 @@ impl GameSession {
                 // it (`menu_update_status_screen`'s key-item scan); global
                 // 0xC6 arrives once the reader's exit slide has finished.
                 self.game.mark_file_collected(item);
-                self.ensure_file_assets(pack);
-                let mut reader = ui::file::FileScreen::default();
-                reader.open_pickup(&self.game, item);
-                (None, Some(reader), PickupPhase::Reader)
+                let reader = {
+                    let mut cx = self.ui_context(pack);
+                    ui::lua_screen::LuaScreen::open_screen(
+                        "file",
+                        &[("pickup", ScreenArg::Int(i64::from(item)))],
+                        ScreenAction::Resume,
+                        &mut cx,
+                    )
+                };
+                let reader = reader
+                    .map_err(|err| eprintln!("warning: FILE reader unavailable: {err:#}"))
+                    .ok()
+                    .map(Box::new);
+                (None, reader, PickupPhase::Reader)
             }
         };
         self.pickup_view = Some(PickupView {
@@ -3604,16 +3612,18 @@ impl GameSession {
             }
             PickupPhase::Reader => {
                 let (exit_done, missing) = {
-                    let Self {
-                        pickup_view, game, ..
-                    } = self;
-                    match pickup_view.as_mut().and_then(|p| p.reader.as_mut()) {
-                        Some(reader) => {
-                            reader.tick();
-                            if let Some(event_input) = menu_input(ui) {
-                                reader.handle_input(game, event_input);
+                    let input = menu_input(ui).map_or_else(UiInput::default, single_input);
+                    match self.pickup_view.as_mut().and_then(|p| p.reader.take()) {
+                        Some(mut reader) => {
+                            let result = {
+                                let cx = self.ui_context(pack);
+                                reader.update(&cx, input)
+                            };
+                            let done = !matches!(result, ScreenResult::Continue);
+                            if let Some(pickup) = self.pickup_view.as_mut() {
+                                pickup.reader = Some(reader);
                             }
-                            (reader.take_reader_exit(), false)
+                            (done, false)
                         }
                         None => (false, true),
                     }
@@ -3999,22 +4009,21 @@ impl GameSession {
             if let Some(menu) = self.menu.as_mut() {
                 menu.tick(&mut self.game);
             }
-            if let Some(file) = self.file.as_mut() {
-                file.tick();
-            }
-            let Some(event_input) = menu_input(ui) else {
+            // The screen takes the frame's one menu input; the engine plays
+            // its cue.
+            let event_input = menu_input(ui);
+            let Some(mut file) = self.file.take() else {
                 return;
             };
-            let cue = menu_cue(event_input);
-            let event = self
-                .file
-                .as_mut()
-                .map(|file| file.handle_input(&mut self.game, event_input));
-            if let Some(cue) = cue {
+            let result = {
+                let cx = self.ui_context(pack);
+                file.update(&cx, event_input.map_or_else(UiInput::default, single_input))
+            };
+            if let Some(cue) = event_input.and_then(menu_cue) {
                 self.play_ui_cue_names(pack, vec![cue]);
             }
-            if event == Some(FileEvent::Close) {
-                self.file = None;
+            if let ScreenResult::Continue = result {
+                self.file = Some(file);
             }
             return;
         }
@@ -4139,18 +4148,6 @@ impl GameSession {
         }
     }
 
-    /// Load the FILE tab art once; a missing TIM is logged and leaves that
-    /// layer blank.
-    fn ensure_file_assets(&mut self, pack: &Pack) {
-        if self.file_assets.is_some() {
-            return;
-        }
-        match FileAssets::load(pack) {
-            Ok(assets) => self.file_assets = Some(assets),
-            Err(err) => eprintln!("warning: FILE tab art unavailable: {err:#}"),
-        }
-    }
-
     /// Open the item box over the frozen inventory panel.
     fn open_item_box(&mut self, pack: &Pack) {
         if self.item_box.is_some() {
@@ -4174,11 +4171,15 @@ impl GameSession {
         if self.file.is_some() {
             return;
         }
-        self.ensure_file_assets(pack);
         self.open_menu(pack);
-        let mut file = FileScreen::default();
-        file.open(&self.game);
-        self.file = Some(file);
+        let screen = {
+            let mut cx = self.ui_context(pack);
+            ui::lua_screen::LuaScreen::open_screen("file", &[], ScreenAction::Resume, &mut cx)
+        };
+        match screen {
+            Ok(screen) => self.file = Some(Box::new(screen)),
+            Err(err) => eprintln!("warning: FILE tab unavailable: {err:#}"),
+        }
     }
 
     /// Open the map tab over the frozen inventory panel. The table/art load
@@ -4901,17 +4902,26 @@ impl GameSession {
             }
         }
         if self.file.is_some() {
-            self.ensure_file_assets(pack);
-            if let (Some(file), Some(file_assets), Some(menu_assets)) =
-                (&self.file, &self.file_assets, &self.menu_assets)
-            {
-                file.draw(
-                    &mut self.framebuffer,
-                    file_assets,
-                    menu_assets,
-                    &self.text,
-                    &self.game,
-                );
+            let Self {
+                file,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = file.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
+                screen.draw(&cx, framebuffer);
             }
         }
         if self.map.is_some() {
@@ -4979,11 +4989,8 @@ impl GameSession {
         // message so its intro/exit fade never dims the prompt text. A
         // document pick-up draws the FILE reader instead of the model viewer.
         if self.pickup_view.is_some() {
-            self.ensure_file_assets(pack);
             let Self {
                 pickup_view,
-                file_assets,
-                menu_assets,
                 save_dir,
                 font,
                 text,
@@ -4992,24 +4999,21 @@ impl GameSession {
                 ..
             } = self;
             if let Some(pickup) = pickup_view.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
                 if let Some(screen) = pickup.screen.as_mut() {
-                    let cx = UiContext {
-                        pack,
-                        save_dir,
-                        font: font.as_ref(),
-                        text: Some(text),
-                        ticks: game.frame,
-                        cues: std::cell::RefCell::new(Vec::new()),
-                        game: Some(game),
-                    };
                     screen.draw(&cx, framebuffer);
                     framebuffer.fade_overlay(screen.overlay());
                 }
-                if let Some(reader) = pickup.reader.as_mut()
-                    && let (Some(file_assets), Some(menu_assets)) =
-                        (file_assets.as_ref(), menu_assets.as_ref())
-                {
-                    reader.draw(framebuffer, file_assets, menu_assets, text, game);
+                if let Some(reader) = pickup.reader.as_mut() {
+                    reader.draw(&cx, framebuffer);
                 }
             }
         }
@@ -21053,8 +21057,7 @@ off_0010:
             |session| {
                 session.pickup_view.as_ref().is_some_and(|pickup| {
                     pickup.reader.as_ref().is_some_and(|reader| {
-                        reader.reader_state == crate::ui::file::ReaderState::Idle
-                            && !reader.input_locked()
+                        reader.value("idle") != 0 && reader.value("locked") == 0
                     })
                 })
             },
@@ -21443,7 +21446,7 @@ off_0010:
             )
             .unwrap();
         let file = session.file.as_ref().expect("the file tab opened");
-        assert_eq!(file.slot, 0);
+        assert_eq!(file.value("slot"), 0);
         assert!(session.menu.is_some(), "the menu stays open underneath");
 
         // Confirm opens the reader; let its entry slide settle, then cancel
@@ -21451,7 +21454,9 @@ off_0010:
         // the tab. The FILE tab's first frames still run the selector's own
         // entry slide, which holds its busy lock.
         tick_until(&mut session, &pack, 32, "the selector entry slide", |s| {
-            s.file.as_ref().is_some_and(|file| !file.input_locked())
+            s.file
+                .as_ref()
+                .is_some_and(|file| file.value("locked") == 0)
         });
         session
             .tick(
@@ -21470,7 +21475,7 @@ off_0010:
             session
                 .file
                 .as_ref()
-                .is_some_and(|file| file.mode == crate::ui::file::FileMode::Reader)
+                .is_some_and(|file| file.value("reader") != 0)
         });
         tick_until(
             &mut session,
@@ -21478,9 +21483,10 @@ off_0010:
             64,
             "the reader entry slide",
             |session| {
-                session.file.as_ref().is_some_and(|file| {
-                    file.reader_state == crate::ui::file::ReaderState::Idle && !file.input_locked()
-                })
+                session
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.value("idle") != 0 && file.value("locked") == 0)
             },
         );
         session
@@ -21500,15 +21506,13 @@ off_0010:
             64,
             "the reader exit slide",
             |session| {
-                session.file.as_ref().is_some_and(|file| {
-                    file.mode == crate::ui::file::FileMode::List && !file.input_locked()
-                })
+                session
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.value("reader") == 0 && file.value("locked") == 0)
             },
         );
-        assert_eq!(
-            session.file.as_ref().unwrap().mode,
-            crate::ui::file::FileMode::List
-        );
+        assert_eq!(session.file.as_ref().unwrap().value("reader"), 0);
         session
             .tick(
                 &pack,

@@ -15,7 +15,6 @@
 
 pub mod death;
 pub mod debug_menu;
-pub mod file;
 pub mod item_box;
 pub mod item_view;
 pub mod layout;
