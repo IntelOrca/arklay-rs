@@ -94,14 +94,15 @@ pack is left alone. Point `save_dir` (or `--save-dir`) at it to keep using
 those files, or copy them into the new directory. The block layout is
 unchanged, so both directions work.
 
-## Not ported: the PNG background override
+## Deviation: the PNG background override
 
-CR looks for `type.png` before the original TIM. Format-level asset overrides
-landed as a general feature (#53): a layer resolves a replacement by entry
-stem with the fixed extension priority `webp > png > bmp > tim > pix`, so a
-mod can ship `ui/type00.png` (or `.webp`) and it wins over the pack's
-`ui/type00.bmp`. Without a replacement the screen draws the pack's entry and
-falls back to a black frame when it is missing.
+CR looks for `type.png` beside the executable before the original TIM. The
+port has no such automatic lookup, but format-level asset overrides landed as
+a general feature (#53): a layer resolves a replacement by entry stem with the
+fixed extension priority `webp > png > bmp > tim > pix`, so a mod can ship
+`ui/type00.png` (or `.webp`) and it wins over the pack's `ui/type00.bmp`.
+Without a replacement the screen draws the pack's entry and falls back to a
+black frame when it is missing.
 
 ## Not ported: ModSDK text overrides
 
