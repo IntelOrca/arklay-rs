@@ -1122,3 +1122,68 @@ fn save_load_the_overwrite_dialog_is_silent() {
         assert!(cx.cues.borrow().is_empty(), "the dialog must be silent");
     }
 }
+
+// ---- return to title -------------------------------------------------------
+
+#[test]
+fn return_title_maps_confirm_cancel_and_idle() {
+    let harness = Harness::new("return-title");
+    let cx = harness.context();
+    let mut screen = harness.open("return_title", &[]);
+    assert_eq!(screen.update(&cx, neutral()), ScreenResult::Continue);
+    // The F9 edge wins over the same tick's `any`.
+    let f9 = press(|i| {
+        i.return_title = true;
+        i.any = true;
+    });
+    assert_eq!(
+        screen.update(&cx, f9),
+        ScreenResult::Done(ScreenAction::Title)
+    );
+    for other in [
+        press(|i| {
+            i.cancel = true;
+            i.any = true;
+        }),
+        press(|i| {
+            i.confirm = true;
+            i.any = true;
+        }),
+    ] {
+        let mut screen = harness.open("return_title", &[]);
+        assert_eq!(
+            screen.update(&cx, other),
+            ScreenResult::Done(ScreenAction::Resume),
+            "any other key cancels"
+        );
+    }
+}
+
+#[test]
+fn return_title_dims_the_whole_frame_without_a_font() {
+    let harness = Harness::new("return-title-dim");
+    let cx = harness.context();
+    let mut screen = harness.open("return_title", &[]);
+    let mut framebuffer = crate::render::Framebuffer::new();
+    framebuffer.fill_rect([0, 0, 320, 240], [255, 255, 255, 255]);
+    screen.draw(&cx, &mut framebuffer);
+    let pixel = |x: usize, y: usize| -> [u8; 4] {
+        let offset = (y * 320 + x) * 4;
+        framebuffer.rgba[offset..offset + 4].try_into().unwrap()
+    };
+    // 255 * (255 - 100) / 255 = 155.
+    assert_eq!(pixel(0, 0), [155, 155, 155, 255]);
+    assert_eq!(pixel(319, 239), [155, 155, 155, 255]);
+}
+
+#[test]
+fn return_title_text_comes_from_the_language_files() {
+    let text = crate::text::Text::embedded();
+    for key in [
+        "UI_PROMPT_RETURN_TITLE_1",
+        "UI_PROMPT_RETURN_TITLE_2",
+        "UI_PROMPT_RETURN_TITLE_3",
+    ] {
+        assert!(!text.ui(key).is_empty(), "{key}");
+    }
+}

@@ -510,11 +510,61 @@ scale, `clut` the indexed palette row and `blend` the sprite blend mode.
 ### The input table
 
 `update(api, input)` receives the tick's edges: `up`, `down`, `left`, `right`,
-`confirm`, `cancel`, `page_left`, `page_right`, `start`, `any`, plus the
+`confirm`, `cancel`, `page_left`, `page_right`, `start`, `return_title` (F9),
+`any`, plus the
 original pad words `pad` (the edge word) and `held` (the held directions).
 The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 `0x0008`, up `0x0010`, down `0x0020`, left `0x0040`, right `0x0080`, L1
 `0x0400`, R1 `0x0800`.
+
+### Engine screens
+
+The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
+`char_select`, `save_load`, `ending_result`, `ending_epilogue`,
+`return_title`, …), with shared code under `ui/lib/`. A pack or mod entry
+replaces the engine's built-in copy. An engine screen is a module rather than a
+set of globals:
+
+```lua
+local M = {}
+function M.open(api, args) end    -- once; `args` is the opener's table
+function M.update(api, input) end -- once per fixed tick
+function M.draw(api) end          -- once per frame
+return M
+```
+
+It gets every method above plus the ones below. The layout space is
+`api:width()` x `api:height()`; a screen centres its 320x240 art on
+`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size.
+A screen that fails to open or errors leaves through the opener's fallback.
+
+| Method | Effect |
+| --- | --- |
+| `api:width()`, `api:height()` | The layout size. |
+| `api:exit([action[, arg]])` | Leave the screen, reporting `action`: `title`, `char_select`, `save_load`, `attract`, `resume`, `quit`, `ending_result`, `ending_epilogue`, `ending_save`, `new_game` (`arg` the character) or `load_game` (`arg` the slot `0..=7`). |
+| `api:set(key, value)` | Publish an integer/boolean the engine reads back (`nil` clears it); up to 64 keys. |
+| `api:overlay(colour, alpha)` | A `"black"`/`"white"` full-screen overlay at `alpha`, or `nil` for none. |
+| `api:has_font()`, `api:has_text()` | Whether the pack has a game font / text table. |
+| `api:ui_bytes(key)` | The text table's font-encoded bytes for `key`; `nil` without a text table. |
+| `api:location_bytes(stage, room)` | The font-encoded location label of a save's room. |
+| `api:wrap(bytes, max_width[, opts])` | Font-encoded `bytes` broken at spaces into a table of rows no wider than `max_width` pixels; one row without a font. |
+| `api:glyphs(x, y, bytes[, opts])` | Draw font-encoded bytes (white, brightness 2, the session's metrics; `{tight = false}` draws on the fixed grid). |
+| `api:grid_text(x, y, scale, bytes)` | Draw raw font-sheet cells. |
+| `api:save_slots()` | Eight booleans: which numbered slots hold a save. |
+| `api:slot_info()` | Eight entries: `false` for an empty slot, else `{character, saves, stage, room}`. |
+| `api:save_slot(slot)` | Save mode: write the pending block to numbered slot `0..=7` (consuming an ink ribbon when the opener asked) and return `true, info` or `false, err`. |
+| `api:has_image(stem)` | Whether the pack has the image. |
+| `api:picture(stem[, key[, geometry]])` | Load a full-colour image and return a handle; `key` is a transparent colour, `geometry` `"free"` (default) or `"shipped"` (pinned to the original sheet's size). |
+| `api:page(stem)` | Load an indexed UI sheet and return a handle. |
+| `api:ivm(entry)` | Load a model and return a handle. |
+| `api:art_size(handle)` | A handle's width and height. |
+| `api:clear()` | Clear the frame to black. |
+| `api:fill_rect(x, y, w, h, r, g, b[, a])` | A filled rectangle. |
+| `api:blend_black_rect(x, y, w, h, alpha)` | Darken a rectangle. |
+| `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
+| `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
+| `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
+| `api:draw_ivm(model, {joints, camera = {from, to, fov}, light})` | Draw a model through one composed joint chain. |
 
 ## Enemy scripts
 

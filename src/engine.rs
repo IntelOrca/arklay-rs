@@ -133,7 +133,6 @@ use crate::ui::file::{FileAssets, FileEvent, FileScreen};
 use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::lua_screen::ScreenArg;
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
-use crate::ui::return_title::{ReturnTitleEvent, ReturnTitlePrompt};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 use crate::video::{self, Graphics, RendererKind};
 use crate::weapons;
@@ -1605,7 +1604,7 @@ struct GameSession {
     frame_rate_changed: bool,
     /// The open F9 return-to-title prompt; the room stays frozen and the game
     /// sounds are paused while it is up.
-    return_title: Option<ReturnTitlePrompt>,
+    return_title: Option<Box<ui::lua_screen::LuaScreen>>,
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
     /// A save slot the debug menu's LOAD GAME picked, taken once by the app.
@@ -2335,7 +2334,7 @@ impl GameSession {
         // a second F9 confirms and any other key cancels, exactly like the
         // original's prompt.
         if self.return_title.is_some() {
-            self.tick_return_title(ui);
+            self.tick_return_title(pack, ui);
             return Ok(());
         }
         // The port-only debug room overlay owns the frozen tick while it is
@@ -2348,7 +2347,7 @@ impl GameSession {
         // F9 opens the return-to-title prompt before the pause-menu checks so
         // it works over the pause menu, exactly like the original.
         if ui.return_title {
-            self.open_return_title();
+            self.open_return_title(pack);
             return Ok(());
         }
         if self.menu_fade_phase != MenuFadePhase::None {
@@ -3144,31 +3143,47 @@ impl GameSession {
 
     /// Open the F9 return-to-title prompt: pause the game sounds and freeze
     /// the room until a second F9 confirms or any other key cancels.
-    fn open_return_title(&mut self) {
-        if self.return_title.is_none() {
-            if let Some(mixer) = &mut self.music {
-                mixer.pause_game_sounds();
-            }
-            self.return_title = Some(ReturnTitlePrompt::new());
+    fn open_return_title(&mut self, pack: &Pack) {
+        if self.return_title.is_some() {
+            return;
         }
+        let mut cx = self.ui_context(pack);
+        let screen = ui::lua_screen::LuaScreen::open_screen(
+            "return_title",
+            &[],
+            ScreenAction::Resume,
+            &mut cx,
+        );
+        let cues = cx.cues.into_inner();
+        match screen {
+            Ok(screen) => {
+                if let Some(mixer) = &mut self.music {
+                    mixer.pause_game_sounds();
+                }
+                self.return_title = Some(Box::new(screen));
+            }
+            Err(err) => eprintln!("warning: return-to-title prompt unavailable: {err:#}"),
+        }
+        self.play_ui_cue_names(pack, cues);
     }
 
     /// One frozen tick of the F9 return-to-title prompt: a second F9 sets the
     /// pending return request and any other key cancels and resumes the
     /// sounds.
-    fn tick_return_title(&mut self, ui: UiInput) {
-        let event = self
-            .return_title
-            .as_ref()
-            .map_or(ReturnTitleEvent::None, |prompt| prompt.handle_input(ui));
-        match event {
-            ReturnTitleEvent::None => {}
-            ReturnTitleEvent::Confirm => {
-                self.return_title = None;
-                self.return_title_requested = true;
-            }
-            ReturnTitleEvent::Cancel => {
-                self.return_title = None;
+    fn tick_return_title(&mut self, pack: &Pack, ui: UiInput) {
+        let Some(mut screen) = self.return_title.take() else {
+            return;
+        };
+        let (result, cues) = {
+            let cx = self.ui_context(pack);
+            let result = screen.update(&cx, ui);
+            (result, cx.cues.into_inner())
+        };
+        self.play_ui_cue_names(pack, cues);
+        match result {
+            ScreenResult::Continue => self.return_title = Some(screen),
+            ScreenResult::Done(ScreenAction::Title) => self.return_title_requested = true,
+            ScreenResult::Done(_) => {
                 if let Some(mixer) = &mut self.music {
                     mixer.resume_game_sounds();
                 }
@@ -4920,8 +4935,27 @@ impl GameSession {
         }
         // The return-to-title prompt draws over everything, including the
         // debug overlay, with its own full-screen dim.
-        if let Some(return_title) = self.return_title.as_ref() {
-            return_title.draw(&mut self.framebuffer, self.font.as_ref(), &self.text);
+        if self.return_title.is_some() {
+            let Self {
+                return_title,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = return_title.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                };
+                screen.draw(&cx, framebuffer);
+            }
         }
     }
 
@@ -10590,6 +10624,7 @@ fn script_button_bit(name: &str) -> Option<u32> {
         "start" | "inventory" => KEY_START,
         "page_left" | "l1" => KEY_PAGE_LEFT,
         "page_right" | "r1" => KEY_PAGE_RIGHT,
+        "f9" | "return_title" => KEY_F9,
         _ => return None,
     })
 }

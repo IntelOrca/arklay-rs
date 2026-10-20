@@ -526,6 +526,7 @@ fn input_table(lua: &Lua, input: UiInput) -> mlua::Result<Table> {
     table.set("page_right", input.page_right)?;
     table.set("start", input.start)?;
     table.set("any", input.any)?;
+    table.set("return_title", input.return_title)?;
     table.set("pad", pad_word(input))?;
     table.set("held", held_word(input))?;
     Ok(table)
@@ -1194,6 +1195,31 @@ impl UserData for Api<'_> {
                     &opts,
                 );
                 Ok(())
+            },
+        );
+
+        // `wrap(bytes, max_width, opts)`: font-encoded `bytes` broken at
+        // spaces into rows no wider than `max_width` pixels (`opts.tight`
+        // picks the metrics). Without a font the text is one row.
+        methods.add_method(
+            "wrap",
+            |lua, api, (bytes, max_width, opts): (mlua::String, i32, Option<Table>)| {
+                let opts = options(api.host, opts.as_ref())?;
+                let bytes = bytes.as_bytes();
+                let table = lua.create_table()?;
+                match api.cx.font {
+                    Some(font) => {
+                        for (index, row) in
+                            crate::font::wrap_pixels(&bytes, max_width, font, opts.tight)
+                                .into_iter()
+                                .enumerate()
+                        {
+                            table.set(index + 1, lua.create_string(row)?)?;
+                        }
+                    }
+                    None => table.set(1, lua.create_string(&*bytes)?)?,
+                }
+                Ok(table)
             },
         );
 
