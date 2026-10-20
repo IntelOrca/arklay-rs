@@ -375,8 +375,10 @@ impl FlagEditor {
         for row in (scroll..usize::from(group.count)).take(VISIBLE_ROWS) {
             let y = BODY_Y + 18 + (row - scroll) as i32 * ROW_HEIGHT;
             let sel = group.selector(row);
+            let mut name_tint = Tint::White;
             if row == self.row() {
                 pen.cursor(TEXT_LEFT - 16, y);
+                name_tint = super::SELECTED_TINT;
             }
             let set = game.flag_test(group.bank, sel, false);
             pen.ascii(TEXT_LEFT, y, Tint::Grey, &format!("{sel:02X}"));
@@ -390,7 +392,7 @@ impl FlagEditor {
             let width = PANEL_RIGHT - name_x;
             match flag_name(&group, sel) {
                 FlagName::None => {}
-                FlagName::Static(name) => pen.ascii_fit(name_x, y, Tint::White, name, width),
+                FlagName::Static(name) => pen.ascii_fit(name_x, y, name_tint, name, width),
                 FlagName::Room(label, room3) => {
                     let name = pen.text.room_name(&room3);
                     match name {
@@ -402,18 +404,14 @@ impl FlagEditor {
                                 &mut line,
                             );
                             line.extend_from_slice(name);
-                            pen.fit(name_x, y, Tint::White, &line, width);
+                            pen.fit(name_x, y, name_tint, &line, width);
                         }
-                        None => pen.ascii_fit(
-                            name_x,
-                            y,
-                            Tint::White,
-                            &format!("{label} {room3}"),
-                            width,
-                        ),
+                        None => {
+                            pen.ascii_fit(name_x, y, name_tint, &format!("{label} {room3}"), width)
+                        }
                     }
                 }
-                FlagName::Item(item) => pen.item_name_fit(name_x, y, Tint::White, item, width),
+                FlagName::Item(item) => pen.item_name_fit(name_x, y, name_tint, item, width),
             }
         }
     }
