@@ -21,8 +21,8 @@
 //! BMP, TIM and WAV stay the port's own hand-written decoders with their
 //! budgets. PNG, WebP and OGG Vorbis come from the pure-Rust `png`,
 //! `image-webp` and `lewton` crates behind the default-on `hd` feature, so a
-//! `--no-default-features` build keeps its dependency list to `zstd` (and the
-//! optional `mlua`). A build without `hd` still resolves replacements by stem,
+//! `--no-default-features` build keeps its dependency list to `zstd` and
+//! `mlua`. A build without `hd` still resolves replacements by stem,
 //! but fails to decode a PNG/WebP/OGG entry with a message naming the feature.
 //!
 //! Every decoder is bound by the same [`crate::budget`] caps as the shipped

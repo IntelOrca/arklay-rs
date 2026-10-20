@@ -40,9 +40,9 @@ use crate::model::{Texture8, Tmd, TmdObject};
 use crate::state::{Cut, Image, Light, RoomId, RoomState};
 
 /// Default framebuffer width in pixels.
-const WIDTH: u32 = 320;
+pub const WIDTH: u32 = 320;
 /// Default framebuffer height in pixels.
-const HEIGHT: u32 = 240;
+pub const HEIGHT: u32 = 240;
 /// Fractional bits of the 4.12 fixed-point matrices.
 const FIXED_BITS: u32 = 12;
 /// Horizontal screen centre in pixels.
@@ -254,6 +254,11 @@ impl Framebuffer {
         self.clip = rect;
     }
 
+    /// The clip rect [`Framebuffer::set_clip_rect`] installed.
+    pub fn clip_rect(&self) -> Option<[i32; 4]> {
+        self.clip
+    }
+
     /// Copy `image` to the top-left corner, clipping to both images' bounds.
     pub fn blit(&mut self, image: &Image) {
         let rows = image.height.min(self.height) as usize;
@@ -445,6 +450,30 @@ impl Framebuffer {
             SpriteBlend::Opaque,
             mirror,
         );
+    }
+
+    /// Draw one indexed sprite through a per-index colour table: texel index
+    /// `i` writes the opaque `lut[i]`, or nothing when it is `None`. Unlike
+    /// the CLUT paths index 0 is not implicitly transparent.
+    pub fn draw_indexed_sprite_lut(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        lut: &[Option<[u8; 3]>; 256],
+    ) {
+        if texture.width == 0 || texture.height == 0 {
+            return;
+        }
+        self.draw_sprite(src, dst, [false; 2], SpriteBlend::Opaque, |u, v| {
+            if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
+                return None;
+            }
+            let index = *texture
+                .indices
+                .get(v as usize * texture.width as usize + u as usize)?;
+            lut[usize::from(index)].map(|[r, g, b]| [r, g, b, 255])
+        });
     }
 
     /// [`Framebuffer::draw_indexed_sprite_scaled`] with a blend mode and U/V
@@ -906,6 +935,40 @@ impl Framebuffer {
                 if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
                     pixel.copy_from_slice(&color);
                 }
+            }
+        }
+    }
+
+    /// Rasterize a 1-pixel Bresenham line from `(x0, y0)` to `(x1, y1)`
+    /// inclusive, clipped to the framebuffer (like [`Self::fill_rect`], it
+    /// ignores the sprite clip).
+    pub fn draw_line(&mut self, from: [i32; 2], to: [i32; 2], color: [u8; 3]) {
+        let [x0, y0] = from;
+        let [x1, y1] = to;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
+                let offset = (y as usize * self.width as usize + x as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+                }
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let doubled = 2 * error;
+            if doubled >= dy {
+                error += dy;
+                x += sx;
+            }
+            if doubled <= dx {
+                error += dx;
+                y += sy;
             }
         }
     }
@@ -3218,6 +3281,17 @@ fn channel(texel: u8, shade: f64) -> u8 {
 mod tests {
     use super::*;
     use crate::model::{TmdObject, TmdPrim};
+
+    #[test]
+    fn draw_line_marks_its_endpoints_and_skips_offscreen_pixels() {
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_line([10, 10], [13, 10], [255, 0, 0]);
+        for x in 10..=13 {
+            let offset = (10 * framebuffer.width as usize + x) * 4;
+            assert_eq!(&framebuffer.rgba[offset..offset + 4], &[255, 0, 0, 255]);
+        }
+        framebuffer.draw_line([-5, -5], [-1, -1], [0, 255, 0]);
+    }
 
     fn identity() -> anim::Mat4x3 {
         anim::Mat4x3 {

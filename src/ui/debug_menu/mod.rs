@@ -42,7 +42,7 @@ use crate::render::{Framebuffer, Tint};
 use crate::state::RoomId;
 use crate::text::Text;
 use crate::ui::UiInput;
-use crate::ui::main_menu::{self, MenuAssets};
+use crate::ui::item_icons::ItemIcons;
 use crate::video;
 
 /// One text row's height in pixels (the font's glyph height).
@@ -485,7 +485,7 @@ impl DebugMenu {
         framebuffer: &mut Framebuffer,
         font: Option<&Font>,
         text: &Text,
-        assets: Option<&MenuAssets>,
+        icons: Option<&ItemIcons>,
         game: &GameState,
     ) {
         framebuffer.blend_black_rect(PANEL, 200);
@@ -496,7 +496,7 @@ impl DebugMenu {
             framebuffer,
             font,
             text,
-            assets,
+            icons,
             tight: text.uses_tight_metrics(),
         };
         let (title, hints) = match self.tool {
@@ -687,7 +687,7 @@ struct Pen<'a> {
     framebuffer: &'a mut Framebuffer,
     font: &'a Font,
     text: &'a Text,
-    assets: Option<&'a MenuAssets>,
+    icons: Option<&'a ItemIcons>,
     tight: bool,
 }
 
@@ -730,8 +730,8 @@ impl Pen<'_> {
 
     /// Draw `item`'s 40x30 icon at `[x, y]` (nothing without the menu art).
     fn icon(&mut self, item: u8, [x, y]: [i32; 2]) {
-        if let Some(assets) = self.assets {
-            main_menu::draw_item_icon(self.framebuffer, assets, item, [x as i16, y as i16]);
+        if let Some(icons) = self.icons {
+            icons.draw(self.framebuffer, item, [x, y]);
         }
     }
 

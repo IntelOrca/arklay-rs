@@ -18,12 +18,11 @@ and linked statically, so no separate DLL is needed.
 
 ```sh
 cargo build
-# A lean build with no Lua runtime (every hook is a no-op) and no PNG/WebP/OGG
-# replacement decoders
+# A lean build without the PNG/WebP/OGG replacement decoders
 cargo build --no-default-features
 ```
 
-Lua 5.4 is vendored and compiled from source by the default-on `lua` feature.
+Lua 5.4 is vendored and compiled from source on every build.
 The `hd` feature (also default) pulls the pure-Rust `png`, `image-webp` and
 `lewton` crates that decode a mod's replacement art and audio; without it the
 engine still resolves replacements by stem but refuses to decode those formats.

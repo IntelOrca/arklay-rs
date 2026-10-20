@@ -452,7 +452,14 @@ pub fn convert_game_with_options(
     let (npc_count, npc_bytes) = copy_npc_models(&npc, &mut writer, &mut progress, jobs)?;
     let (enemy_count, enemy_bytes) =
         copy_enemy_models(&enemy_models, &mut writer, &mut progress, jobs)?;
-    let (enemylua_count, enemylua_bytes) = copy_enemy_scripts(&mut writer, &mut progress)?;
+    let (enemylua_count, enemylua_bytes) = copy_scripts(
+        "enemylua",
+        crate::enemy::ENEMY_SCRIPTS,
+        &mut writer,
+        &mut progress,
+    )?;
+    let (uilua_count, uilua_bytes) =
+        copy_scripts("uilua", crate::ui::UI_SCRIPTS, &mut writer, &mut progress)?;
     let (effect_count, effect_bytes) =
         copy_effect_sheets(&effects, &mut writer, &mut progress, jobs)?;
     let (font_count, font_bytes) = copy_font(&fonts, &mut writer, &mut progress)?;
@@ -582,6 +589,7 @@ pub fn convert_game_with_options(
             report,
             "enemylua: {enemylua_count} entries, {enemylua_bytes} bytes"
         )?;
+        writeln!(report, "uilua: {uilua_count} entries, {uilua_bytes} bytes")?;
         writeln!(
             report,
             "effspr: {effect_count} entries, {effect_bytes} bytes"
@@ -933,12 +941,17 @@ fn copy_enemy_models(
     Ok((count, bytes))
 }
 
-/// Add the checked-in enemy scripts to the pack under their `enemy/` entries.
-fn copy_enemy_scripts(writer: &mut PackWriter, progress: &mut Progress) -> Result<(usize, usize)> {
-    progress.begin("enemylua", crate::enemy::ENEMY_SCRIPTS.len() as u64);
+/// Add checked-in scripts (the enemy or screen table) under their entries.
+fn copy_scripts(
+    phase: &str,
+    scripts: &[(&str, &str)],
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+) -> Result<(usize, usize)> {
+    progress.begin(phase, scripts.len() as u64);
     let mut count = 0usize;
     let mut bytes = 0usize;
-    for (entry, source) in crate::enemy::ENEMY_SCRIPTS {
+    for (entry, source) in scripts {
         bytes += source.len();
         count += 1;
         writer
@@ -4498,7 +4511,7 @@ mod tests {
         convert_game(&root.path, &out).unwrap();
         let pack = crate::pack::Pack::open(&out).unwrap();
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
-        assert_eq!(count("ui/"), UI_ASSETS.len());
+        assert_eq!(count("ui/"), UI_ASSETS.len() + crate::ui::UI_SCRIPTS.len());
         assert_eq!(count("item/"), 1);
         assert_eq!(count("data/"), 1);
         assert_eq!(count("shadow/"), 1);
@@ -4746,10 +4759,7 @@ mod tests {
         assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
         assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
         assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
-        assert!(
-            !pack.contains(crate::ui::map::TABLES_ENTRY),
-            "no map tables are packed"
-        );
+        assert!(!pack.contains("map/tables.bin"), "no map tables are packed");
         assert!(
             !pack.contains(crate::combat::COMBAT_ENTRY),
             "no combat tables are packed"
@@ -4852,10 +4862,7 @@ mod tests {
         );
         assert_eq!(count("effspr/"), 33);
         assert_eq!(count("map/"), 16, "15 plans and the backdrop");
-        assert!(
-            !pack.contains(crate::ui::map::TABLES_ENTRY),
-            "no map tables are packed"
-        );
+        assert!(!pack.contains("map/tables.bin"), "no map tables are packed");
         assert!(
             !pack.contains(crate::combat::COMBAT_ENTRY),
             "no combat tables are packed"

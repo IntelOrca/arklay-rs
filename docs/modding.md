@@ -412,9 +412,8 @@ drive the collector, and the state carries a 16 MiB allocation ceiling. An
 instruction-budget hook aborts a script that runs away (the call errors out
 within a few million instructions). Every load or call error is logged once
 with a `[lua]` prefix and disables only the failing hook or chunk; the game
-session always continues. A pack with no `lua/` entries loads no VM, and a
-`--no-default-features` build has no Lua runtime at all: every hook compiles
-to a no-op and runs stay byte-identical.
+session always continues. A pack with no `lua/` entries loads no VM, and runs stay
+byte-identical.
 
 Hooks cannot spawn enemies: the hook API has no such operation by
 construction. Entity behaviour is the separate enemy-script surface below.
@@ -473,7 +472,7 @@ the load screen).
 | `api:string(key)` | A `language/<tag>.txt` string, decoded to characters; `nil` when no language carries the key. |
 | `api:character_name(index)` | The save screen's name for character `0`/`1`, decoded. |
 | `api:text_width(text[, tight])` | The pixel width `text` draws at (the session's tight metrics unless `tight` is given). |
-| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open` and `update` and play after the call; the engine drops them in a capture run, which stays silent. |
+| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open`, `update` and the engine's hooks and play after the call (a cue raised while drawing is dropped); the engine drops them in a capture run, which stays silent. |
 | `api:save(name)` | Write the pending block to `<save_dir>/<name>` and return `ok, err`. `name` is one plain file name (no directory part); the extension is the script's choice. Save mode only. |
 | `api:remove(name)` | Delete `<save_dir>/<name>`, ignoring a missing file. Returns `ok, err`. |
 | `api:load(name)` | Load `<save_dir>/<name>`: the engine continues from that save on the next tick. Returns `ok, err`. Load mode only. |
@@ -511,11 +510,107 @@ scale, `clut` the indexed palette row and `blend` the sprite blend mode.
 ### The input table
 
 `update(api, input)` receives the tick's edges: `up`, `down`, `left`, `right`,
-`confirm`, `cancel`, `page_left`, `page_right`, `start`, `any`, plus the
+`confirm`, `cancel`, `page_left`, `page_right`, `start`, `return_title` (F9),
+`any`, plus the
 original pad words `pad` (the edge word) and `held` (the held directions).
 The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 `0x0008`, up `0x0010`, down `0x0020`, left `0x0040`, right `0x0080`, L1
 `0x0400`, R1 `0x0800`.
+
+### Engine screens
+
+The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
+`char_select`, `save_load`, `ending_result`, `ending_epilogue`,
+`return_title`, `death`, `computer_lab`, `main_menu`, `map`, `file`, `item_view`, `item_box`, …), with shared code under `ui/lib/`. A pack or mod entry
+replaces the engine's built-in copy. An engine screen is a module rather than a
+set of globals:
+
+```lua
+local M = {}
+function M.open(api, args) end    -- once; `args` is the opener's table
+function M.update(api, input) end -- once per fixed tick
+function M.draw(api) end          -- once per frame
+return M
+```
+
+It gets every method above plus the ones below. The layout space is
+`api:width()` x `api:height()`; a screen should centre its 320x240 art on
+`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size
+(the shipped item viewer still draws at fixed coordinates).
+A screen that fails to open or errors leaves through the opener's fallback.
+The engine may also call a named module function, `M.<name>(api)`, to tell a
+running screen something happened (the pick-up viewer's `begin_exit`), or
+`M.<name>(api, value)` to hand it one value (the item box's `cursor_shown`
+before each draw); a screen without that function ignores it.
+
+The pause menu (`main_menu`) changes the game: the engine lends it the
+session's state for `open`, `update` and its hooks, so the methods marked
+*lent* below work there and raise an error from any other screen (or from
+`draw`).
+
+| Method | Effect |
+| --- | --- |
+| `api:width()`, `api:height()` | The layout size. |
+| `api:exit([action[, arg]])` | Leave the screen, reporting `action`: `title`, `char_select`, `save_load`, `attract`, `resume`, `quit`, `ending_result`, `ending_epilogue`, `ending_save`, `new_game` (`arg` the character) or `load_game` (`arg` the slot `0..=7`). |
+| `api:set(key, value)` | Publish an integer/boolean the engine reads back (`nil` clears it); up to 64 keys. |
+| `api:overlay(colour, alpha)` | A `"black"`/`"white"` full-screen overlay at `alpha`, or `nil` for none. |
+| `api:has_font()`, `api:has_text()` | Whether the pack has a game font / text table. |
+| `api:pack_bytes(entry)` | A pack entry's raw bytes as a string; `nil` when absent. |
+| `api:ui_bytes(key)` | The text table's font-encoded bytes for `key`; `nil` without a text table. |
+| `api:location_bytes(stage, room)` | The font-encoded location label of a save's room. |
+| `api:wrap(bytes, max_width[, opts])` | Font-encoded `bytes` broken at spaces into a table of rows no wider than `max_width` pixels; one row without a font. |
+| `api:glyphs(x, y, bytes[, opts])` | Draw font-encoded bytes (white, brightness 2, the session's metrics; `{tight = false}` draws on the fixed grid). `{fit = width}` condenses a row wider than `width` pixels. |
+| `api:text_8x14(x, y, bytes[, opts])` | Draw raw bytes through the original's unshadowed 8x14 grid in `opts.colour`. |
+| `api:grid_text(x, y, scale, bytes)` | Draw raw font-sheet cells. |
+| `api:save_slots()` | Eight booleans: which numbered slots hold a save. |
+| `api:slot_info()` | Eight entries: `false` for an empty slot, else `{character, saves, stage, room}`. |
+| `api:save_slot(slot)` | Save mode: write the pending block to numbered slot `0..=7` (consuming an ink ribbon when the opener asked) and return `true, info` or `false, err`. |
+| `api:has_image(stem)` | Whether the pack has the image. |
+| `api:picture(stem[, key[, geometry]])` | Load a full-colour image and return a handle; `key` is a transparent colour, `geometry` `"free"` (default) or `"shipped"` (pinned to the original sheet's size). |
+| `api:page(stem)` | Load an indexed UI sheet and return a handle. |
+| `api:indexed_page(stem)` | Like `api:page`, but always indexed: a true-colour replacement is re-indexed colour for colour, for screens that composite by texel index (`api:page_lut`). |
+| `api:page_palette(page[, row])` | An indexed page's CLUT row (default 0) as a table of `0xRRGGBB` colours keyed by texel index `0..=255`; `nil` for a full-colour page. |
+| `api:ivm(entry)` | Load a model and return a handle. |
+| `api:art_size(handle)` | A handle's width and height. |
+| `api:clear()` | Clear the frame to black. |
+| `api:fill_rect(x, y, w, h, r, g, b[, a])` | A filled rectangle. |
+| `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line, both ends included. |
+| `api:blend_black_rect(x, y, w, h, alpha)` | Darken a rectangle. |
+| `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
+| `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
+| `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
+| `api:page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v)` | A sheet region flipped per axis. |
+| `api:page_lut(page, sx, sy, w, h, dx, dy, lut)` | An unscaled rect of an indexed page drawn through `lut`, a table of opaque `0xRRGGBB` colours keyed by texel index; an index without an entry (index 0 included) is transparent. |
+| `api:draw_ivm(model, {joints, objects, camera = {from, to, fov, screen}, light})` | Draw a model: object `i` takes joint chain `objects[i]`, the rest the one `joints` chain; `screen = {x, y}` offsets the projection centre. |
+| `api:item_model(item)` | Load the item viewer's model for `item` and return a handle, or `nil, err`. |
+| `api:model_objects(model)` | The number of objects in a model. |
+| `api:clip([x, y, w, h])` | Clip this draw's later primitives to a rectangle; no arguments clears it. |
+| `api:darken(alpha)` | Fade the whole frame toward black by `alpha`. |
+| `api:page_ramp(page, sx, sy, w, h, dx, dy, ramp)` | An unscaled sheet region modulated by `2 * ramp`, half-blended. |
+| `api:flag(bank, bit)` | One bit of the paused session's flag banks; `false` outside a session. |
+| `api:room()` | The paused session's stage, room, camera cut and player (0 Chris, 1 Jill). |
+| `api:item_name_bytes(id[, examined])` | The font-encoded item name; with `examined`, the menu's name, which stays the unchecked one until the item's class is examined. |
+| `api:font_margin()` | The session font's left text margin. |
+| `api:message_active()` | Whether the game's message window is up. |
+| `api:examine_spin(pitch, yaw, roll, sx, sy, sz)` | The item viewer's pose after pre-multiplying a spin, re-extracted the reference way. |
+| `api:examine_check(item, pitch, yaw, roll, zoom_spin, quantity)` | The examine check: `"description"`, `"zoom"` or `"message", id, mark, select`. |
+| `api:class_message(item)` | The global message the item's examine class shows, or `nil`. |
+| `api:inventory(slot)` | The id and quantity of inventory slot `slot` (`0, 0` past the held run). |
+| `api:inventory_capacity()` | The current character's inventory slots. |
+| `api:item_box(slot)` | The id and quantity of item-box slot `slot`. |
+| `api:player_health()` | The player's health, maximum health and status byte (poison bits `0x22`). |
+| `api:character()` | The portrait's character index (`0` Chris, `1` Jill, `2`/`3` the alternates). |
+| `api:has_radio()` | Whether the radio tab is live. |
+| `api:equipped()` | The equipped item, `0` for none. |
+| `api:item_count(item)` | How many of `item` the inventory holds. |
+| `api:rand()` | *Lent.* The next draw of the game's shared `rand()` stream, `0..=0x7FFF`. |
+| `api:select_item(item)` | *Lent.* Mirror the item under the cursor into the state byte the scripts test (`0` for none). |
+| `api:equip(item)` | *Lent.* Equip `item`, or unequip with `0`. |
+| `api:use_item(slot)` | *Lent.* USE the item in `slot`: `true, healed, cured, closes` (the item is consumed; `closes` exits the whole menu), `false, category` for a refusal, nothing for an empty slot. |
+| `api:combine(slot, target)` | *Lent.* MOVE `slot` onto `target`: `"applied", herb`, `"drug_store"`, `"herb_no_recipe"` or `"none"`. |
+| `api:show_message(id)` | *Lent.* Open the game's message window on global message `id`. |
+| `api:item_icon_row(item)` | The item's 40x30 row in `item/item_all`, or `nil`. |
+| `api:draw_actor(name, {from, to, fov})` | Draw an engine-owned actor through the camera and return whether it drew; the DIED screen offers `"player"`, the posed corpse. |
 
 ## Enemy scripts
 

@@ -179,6 +179,18 @@ pub fn item_name_bytes(text: &Text, item: u8, examined: &[u8; 4]) -> Vec<u8> {
     text.item_name(u16::from(item)).unwrap_or(&[]).to_vec()
 }
 
+/// The name the menus (inventory, item box, viewer) draw for `item`: the
+/// same unexamined-name rule as [`item_name_bytes`], applied to every item
+/// id, and `None` when the item has no name at all.
+pub fn menu_item_name<'a>(text: &'a Text, item: u8, examined: &[u8; 4]) -> Option<&'a [u8]> {
+    match items::record(item) {
+        Some(record) if !record.name_valid() && !examined_bit(examined, record.name_class) => text
+            .item_name_unchecked(u16::from(item))
+            .or_else(|| text.item_name(u16::from(item))),
+        _ => text.item_name(u16::from(item)),
+    }
+}
+
 /// Whether `class` is set in the four-byte examined-item flag bank, using the
 /// original's most-significant-bit-first selector.
 pub fn examined_bit(examined: &[u8; 4], class: u8) -> bool {
@@ -1192,11 +1204,11 @@ mod tests {
         // The direct item-name lookup (menu, item box, viewer) reads the same
         // bank: generic before, real after.
         assert_eq!(
-            crate::ui::main_menu::item_name_bytes(&text, item, &[0; 4]),
+            menu_item_name(&text, item, &[0; 4]),
             Some([0xCC, 0x07].as_slice())
         );
         assert_eq!(
-            crate::ui::main_menu::item_name_bytes(&text, item, &examined_flags),
+            menu_item_name(&text, item, &examined_flags),
             Some([0xAA, 0x07].as_slice())
         );
     }

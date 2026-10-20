@@ -836,7 +836,6 @@ fn the_config_file_is_read_and_a_bad_value_is_a_warning() {
 
 /// A pack whose Lua hook registers a probe save screen: the screen logs
 /// `saves=<count>`, the number of files in the save directory it was given.
-#[cfg(feature = "lua")]
 fn write_lua_screen_pack(path: &Path) {
     let id = RoomId::parse("1000").unwrap();
     let rdt_entry = id.rdt_entry();
@@ -874,7 +873,6 @@ end
 /// The config's `save_dir` is the directory the screen lists: the probe screen
 /// logs the number of files it sees, so the count proves which directory was
 /// read.
-#[cfg(feature = "lua")]
 #[test]
 fn the_config_save_dir_drives_a_registered_lua_screen() {
     let dir = TempDir::new("config-save-dir");

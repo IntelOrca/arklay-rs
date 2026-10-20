@@ -9419,6 +9419,32 @@ mod tests {
         GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default())
     }
 
+    #[test]
+    fn two_stacks_of_one_item_merge_through_the_combine_tables() {
+        // Two ink-ribbon slots merge up to the 0xFA cap. They cannot be built
+        // through `add_item` (that already merges stacks), so push both.
+        let mut state = game();
+        for _ in 0..2 {
+            state.inventory.push(InventoryItem {
+                id: 0x2F,
+                quantity: 3,
+            });
+        }
+        let result = state.combine_slots(0, 1);
+        assert!(matches!(result, CombineResult::Applied { .. }));
+        assert_eq!(state.inventory.len(), 1);
+        assert_eq!(state.inventory[0].quantity, 3 + 3);
+    }
+
+    #[test]
+    fn two_herbs_without_a_recipe_are_their_own_result() {
+        let mut state = game();
+        state.add_item(0x43, 1); // red herb
+        state.add_item(0x45, 1); // blue herb
+        assert_eq!(state.combine_slots(0, 1), CombineResult::HerbNoRecipe);
+        assert_eq!(state.inventory.len(), 2);
+    }
+
     fn insn(offset: usize, op: &'static Op, decoded: Decoded, len: usize, values: &[i64]) -> Insn {
         Insn {
             offset,

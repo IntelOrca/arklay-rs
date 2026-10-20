@@ -21,6 +21,7 @@ pub mod emd;
 pub mod ending;
 pub mod enemy;
 pub mod engine;
+pub mod examine;
 pub mod font;
 pub mod game;
 pub mod gpu;

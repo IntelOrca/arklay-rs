@@ -759,13 +759,26 @@ fn main() -> Result<()> {
             renderer.render_scale = cli.render_scale.unwrap_or(renderer.render_scale);
             renderer.msaa = cli.msaa.unwrap_or(renderer.msaa);
             renderer.frame_rate = cli.frame_rate.unwrap_or(renderer.frame_rate);
+            // An app-level `--ui` boot plays a scripted `--input` without a
+            // trace: its frames are the screens' regression captures.
+            let app_script = cli.input.is_some()
+                && !tracing
+                && cli.capture_dir.is_some()
+                && cli
+                    .ui
+                    .as_deref()
+                    .is_some_and(|screen| !matches!(screen, "game" | "demo" | "font"));
             if let Some(screen) = &cli.ui
                 && cli.ticks > 0
                 && ((screen != "game" && screen != "demo") || !tracing)
+                && !app_script
             {
-                bail!("--ticks with --ui is only supported for `--ui game` with --trace");
+                bail!(
+                    "--ticks with --ui is only supported for `--ui game` with --trace, or an \
+                     app screen with --input and --capture-dir"
+                );
             }
-            if cli.ticks > 0 && cli.capture.is_none() && !cli.stats && !tracing {
+            if cli.ticks > 0 && cli.capture.is_none() && !cli.stats && !tracing && !app_script {
                 bail!("--ticks requires --capture (or --stats)");
             }
             if cli.stats && cli.room.is_none() {
@@ -774,7 +787,7 @@ fn main() -> Result<()> {
             if cli.capture_every.is_some() && cli.capture_dir.is_none() {
                 bail!("--capture-every requires --capture-dir");
             }
-            if cli.capture_every.is_some() && !tracing {
+            if cli.capture_every.is_some() && !tracing && !app_script {
                 bail!("--capture-every requires --trace");
             }
             if cli.capture_every.is_some() && cli.ticks == 0 {
@@ -792,8 +805,8 @@ fn main() -> Result<()> {
             {
                 bail!("--trace is only supported for --room or --ui game/demo");
             }
-            if cli.input.is_some() && !tracing {
-                bail!("--input requires --trace");
+            if cli.input.is_some() && !tracing && !app_script {
+                bail!("--input requires --trace (or an app --ui screen with --capture-dir)");
             }
             if (cli.setup_script.is_some() || cli.save_out.is_some())
                 && cli.ui.is_none()

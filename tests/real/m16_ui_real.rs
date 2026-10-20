@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 
 use arklay::bmp;
 use arklay::pack::Pack;
-use arklay::state::RoomId;
-use arklay::ui::map::MapTables;
 
 /// Self-deleting temporary directory unique to this process and label.
 struct TempDir(PathBuf);
@@ -105,103 +103,43 @@ fn real_ui_captures_are_deterministic_and_the_map_draws() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn builtin_map_tables_match_sampled_rooms() {
+fn converted_packs_carry_no_map_tables() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
     assert!(
-        !pack.contains(arklay::ui::map::TABLES_ENTRY),
+        !pack.contains("map/tables.bin"),
         "a converted pack carries no map/tables.bin; the map tab uses the built-ins"
     );
-    let tables = MapTables::default();
-
-    // Sampled rooms and the area/layout their first camera maps to. The room
-    // digit is the RDT room number; the group is `(stage - 1) % 5`.
-    let cases: [(&str, u8, u8); 5] = [
-        ("100", 0, 0), // Mansion 1F
-        ("200", 1, 0), // Mansion 2F
-        ("300", 3, 1), // Courtyard
-        ("406", 5, 2), // Guardhouse
-        ("506", 9, 3), // Laboratory B2
-    ];
-    for (text, area, layout) in cases {
-        let id = RoomId::parse(text).unwrap();
-        let group = usize::from(id.stage.wrapping_sub(1) % 5);
-        let (found_area, found_layout, _) = tables.initial_view(group, id.room, 0);
-        assert_eq!(found_area, area, "ROOM{text} area");
-        assert_eq!(found_layout, layout, "ROOM{text} layout");
-    }
-
-    // The area table's own values are the documented layout paths.
-    assert_eq!(tables.area_at(0, 1), 0);
-    assert_eq!(tables.area_at(3, 1), 9);
-    assert_eq!(tables.group_for_area(9), 4);
 }
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
 fn real_item_examine_combos_gate_the_description() {
-    use arklay::text::Text;
-    use arklay::ui::item_view::{
-        ConfirmOutcome, ExamineContext, ExamineEvent, ExamineInput, ItemViewScreen,
-    };
+    use arklay::examine::{self, ConfirmOutcome, ExamineContext};
 
-    let Some((_root, pack_path)) = common::asset_env() else {
+    if common::asset_env().is_none() {
         return;
-    };
-    let pack = Pack::open(&pack_path).unwrap();
-    let text = Text::load(&pack, Some("en-US"));
-    let open = |item| {
-        let mut view = ItemViewScreen::new(item);
-        view.open_with(&pack, &text);
-        for _ in 0..0x100 {
-            view.step_examine(ExamineInput::default());
-            if view.turntable_ready() {
-                return view;
-            }
-        }
-        panic!("the viewer intro never settled");
-    };
+    }
+    let check = |item, angles| examine::examine_check(item, angles, 0, ExamineContext::default());
 
     // The sword key (0x33) is one of the rotation-gated items: record 1 wants
     // yaw near 0 and the roll window at 0x5D0..0xA30. Aligned, it shows its
     // class message and marks the class examined.
-    let mut view = open(0x33);
-    view.pitch = 0x0F00;
-    view.roll = 0x800;
     assert!(matches!(
-        view.confirm(ExamineContext::default()),
+        check(0x33, [0x0F00, 0, 0x800]),
         ConfirmOutcome::Message {
             mark_examined: true,
             ..
         }
     ));
-
     // The resting pose is outside the window: the plain description.
-    let mut view = open(0x33);
-    assert_eq!(
-        view.confirm(ExamineContext::default()),
-        ConfirmOutcome::Description
-    );
-
-    // The red book's matched pose takes the zoom, which ends on its message.
-    let mut view = open(0x3E);
-    view.yaw = 0x400;
-    assert_eq!(
-        view.confirm(ExamineContext::default()),
-        ConfirmOutcome::Zoom
-    );
-    let mut ticks = 0;
-    let event = loop {
-        ticks += 1;
-        assert!(ticks < 200, "the red book zoom never finished");
-        match view.step_examine(ExamineInput::default()) {
-            ExamineEvent::None => {}
-            event => break event,
-        }
-    };
-    assert!(matches!(event, ExamineEvent::Message(_)));
+    assert_eq!(check(0x33, [0, 0, 0]), ConfirmOutcome::Description);
+    // The red book's matched pose takes the zoom, which ends on its class
+    // message.
+    assert_eq!(check(0x3E, [0, 0x400, 0]), ConfirmOutcome::Zoom);
+    assert!(examine::class_message(0x3E).is_some());
 }
 
 /// The sampled golden-frame scenarios, in `hashes_fnv.txt` order.

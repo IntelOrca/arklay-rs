@@ -9,20 +9,21 @@
 //! slice-5 UI art; a stale pack fails the test rather than silently skipping.
 //!
 //! The tests cover the four slice-7 acceptance paths: every shipped `.ivm`
-//! parses, the combat knife renders a non-empty model (stable across two
-//! draws, and different after a rotation), the knife's confirm asks for its
-//! description, and the `--ui view` capture is deterministic.
+//! parses, the shipped `ui/item_view.lua` renders the combat knife as a
+//! non-empty model (stable across two draws, and different after a
+//! rotation), the knife's confirm asks for its description, and the
+//! `--ui view` capture is deterministic.
 
 use crate::common;
 
 use arklay::engine;
+use arklay::examine::{self, ConfirmOutcome, ExamineContext};
 use arklay::ivm;
 use arklay::pack::Pack;
 use arklay::render::Framebuffer;
 use arklay::text::Text;
-use arklay::ui::item_view::{
-    ConfirmOutcome, ExamineContext, ExamineEvent, ExamineInput, ItemViewScreen,
-};
+use arklay::ui::lua_screen::{LuaScreen, ScreenArg};
+use arklay::ui::{Screen, ScreenAction, UiContext, UiInput};
 
 fn pack() -> Option<Pack> {
     let (_, path) = common::asset_env()?;
@@ -64,15 +65,70 @@ fn every_shipped_item_model_parses_from_the_pack() {
     }
 }
 
-/// Steps the examine viewer with no input until its turntable is up.
-fn settle(screen: &mut ItemViewScreen) {
-    for _ in 0..0x100 {
-        screen.step_examine(ExamineInput::default());
-        if screen.turntable_ready() {
-            return;
+/// The shipped `ui/item_view.lua` examine viewer on the real pack.
+struct Viewer<'a> {
+    pack: &'a Pack,
+    text: Text,
+    saves: std::path::PathBuf,
+    screen: LuaScreen,
+}
+
+impl<'a> Viewer<'a> {
+    fn open(pack: &'a Pack, item: u8) -> Self {
+        let text = Text::load(pack, Some("en-US"));
+        let saves = std::env::temp_dir().join(format!("arklay-view-saves-{}", std::process::id()));
+        let screen = {
+            let mut cx = Self::context(pack, &text, &saves);
+            LuaScreen::open_screen(
+                "item_view",
+                &[("item", ScreenArg::Int(i64::from(item)))],
+                ScreenAction::Resume,
+                &mut cx,
+            )
+            .unwrap()
+        };
+        Self {
+            pack,
+            text,
+            saves,
+            screen,
         }
     }
-    panic!("the viewer intro never settled");
+
+    fn context<'b>(pack: &'b Pack, text: &'b Text, saves: &'b std::path::Path) -> UiContext<'b> {
+        UiContext {
+            pack,
+            save_dir: saves,
+            font: None,
+            text: Some(text),
+            ticks: 0,
+            cues: std::cell::RefCell::new(Vec::new()),
+            game: None,
+        }
+    }
+
+    fn step(&mut self, input: UiInput) {
+        let cx = Self::context(self.pack, &self.text, &self.saves);
+        self.screen.update(&cx, input);
+    }
+
+    fn draw(&mut self) -> Framebuffer {
+        let mut framebuffer = Framebuffer::new();
+        let cx = Self::context(self.pack, &self.text, &self.saves);
+        self.screen.draw(&cx, &mut framebuffer);
+        framebuffer
+    }
+
+    /// Step with no input until the turntable is up.
+    fn settle(&mut self) {
+        for _ in 0..0x100 {
+            self.step(UiInput::default());
+            if self.screen.value("ready") != 0 {
+                return;
+            }
+        }
+        panic!("the viewer intro never settled");
+    }
 }
 
 #[test]
@@ -81,35 +137,26 @@ fn the_combat_knife_renders_a_non_empty_model() {
     let Some(pack) = pack() else {
         return;
     };
-    let text = Text::load(&pack, Some("en-US"));
+    let mut viewer = Viewer::open(&pack, 1);
+    viewer.settle();
 
-    let mut screen = ItemViewScreen::new(1);
-    screen.open_with(&pack, &text);
-    assert!(screen.model().is_some(), "the knife's model loaded");
-    settle(&mut screen);
-
-    let mut first = Framebuffer::new();
-    screen.draw_model(&mut first);
+    let first = viewer.draw();
     let first_painted = painted(&first);
     assert!(
         first_painted > 500,
         "the knife drew only {first_painted} pixels"
     );
-
-    let mut second = Framebuffer::new();
-    screen.draw_model(&mut second);
+    let second = viewer.draw();
     assert_eq!(first.rgba, second.rgba, "two knife renders differ");
 
     // Holding right turns the turntable.
     for _ in 0..0x40 {
-        screen.step_examine(ExamineInput {
-            right: true,
-            ..ExamineInput::default()
+        viewer.step(UiInput {
+            held_right: true,
+            ..UiInput::default()
         });
     }
-    assert_ne!(screen.yaw, 0);
-    let mut turned = Framebuffer::new();
-    screen.draw_model(&mut turned);
+    let turned = viewer.draw();
     assert_ne!(first.rgba, turned.rgba, "the turntable angle is ignored");
 }
 
@@ -120,32 +167,24 @@ fn the_knife_confirm_shows_its_description() {
         return;
     };
     let text = Text::load(&pack, Some("en-US"));
-
-    let mut screen = ItemViewScreen::new(1);
-    screen.open_with(&pack, &text);
     assert!(
-        screen.description().is_some_and(|bytes| !bytes.is_empty()),
+        examine::description_bytes(&text, 1).is_some_and(|bytes| !bytes.is_empty()),
         "the knife has a description"
     );
-    settle(&mut screen);
+    // The knife is not examinable: the viewer asks the engine for its
+    // description in the game's message window and waits for it.
     assert_eq!(
-        screen.step_examine(ExamineInput {
-            confirm: true,
-            ..ExamineInput::default()
-        }),
-        ExamineEvent::Confirm
-    );
-    // The knife is not examinable: the engine shows its description in the
-    // game's message window and the viewer waits for it.
-    assert_eq!(
-        screen.confirm(ExamineContext::default()),
+        examine::examine_check(1, [0, 0, 0], 0, ExamineContext::default()),
         ConfirmOutcome::Description
     );
-    screen.step_examine(ExamineInput {
-        message_active: true,
-        ..ExamineInput::default()
+    let mut viewer = Viewer::open(&pack, 1);
+    viewer.settle();
+    viewer.step(UiInput {
+        confirm: true,
+        ..UiInput::default()
     });
-    assert!(!screen.turntable_ready());
+    assert_eq!(viewer.screen.value("event"), 1);
+    assert_eq!(viewer.screen.value("ready"), 0);
 }
 
 #[test]

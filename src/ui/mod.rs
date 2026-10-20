@@ -13,24 +13,21 @@
 //! not [`Screen`]s: they share [`crate::game::GameState`] and are driven
 //! explicitly by the session.
 
-pub mod char_select;
-pub mod computer_lab;
 pub mod death;
 pub mod debug_menu;
-pub mod ending;
-pub mod file;
-pub mod item_box;
-pub mod item_view;
-pub mod layout;
+pub mod item_icons;
 pub mod lua_screen;
-pub mod main_menu;
-pub mod map;
-pub mod return_title;
 pub mod save_load;
-pub mod status;
-pub mod title;
 
 use std::path::Path;
+
+mod scripts {
+    include!(concat!(env!("OUT_DIR"), "/ui_scripts.rs"));
+}
+/// The checked-in screen scripts (`games/re1/ui/**.lua`) as `(entry, source)`
+/// pairs. `convert-game` packs them; a pack that predates them (or a test
+/// pack) falls back to these copies, so every pack has its screens.
+pub use scripts::UI_SCRIPTS;
 
 use anyhow::{Context, Result};
 
@@ -223,6 +220,9 @@ pub struct UiContext<'a> {
     /// [`Screen::update`]. Interior mutability keeps `update`'s `&UiContext`
     /// borrow (screens only ever push).
     pub cues: std::cell::RefCell<Vec<UiCue>>,
+    /// The paused session's game state, for the in-game screens' rule
+    /// queries; `None` outside a session.
+    pub game: Option<&'a crate::game::GameState>,
 }
 
 impl UiContext<'_> {

@@ -26,6 +26,9 @@ use anyhow::{Context, Result, bail};
 use crate::pack::Pack;
 use crate::state::RoomId;
 
+/// Bytes of a `map/tables.bin` blob: the magic plus the seven tables.
+const MAP_TABLES_BYTES: usize = 4 + 6 + 6 + 16 + 16 + 16 + 4 + 4;
+
 /// The parser family a pack entry is validated with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Format {
@@ -413,7 +416,12 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
             crate::language::Language::parse(source)?;
         }
         Format::MapTables => {
-            crate::ui::map::MapTables::parse(data)?;
+            // The map tab (`ui/map.lua`) reads the magic and the seven
+            // tables.
+            anyhow::ensure!(
+                data.len() >= MAP_TABLES_BYTES && data.starts_with(b"MAP1"),
+                "map table blob needs the MAP1 magic and {MAP_TABLES_BYTES} bytes"
+            );
         }
         Format::Combat => {
             crate::combat::CombatTables::parse(data)?;
