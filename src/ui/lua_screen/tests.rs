@@ -158,6 +158,7 @@ impl Fixture {
             text: Some(&self.text),
             ticks: 0,
             cues: std::cell::RefCell::new(Vec::new()),
+            game: None,
         }
     }
 

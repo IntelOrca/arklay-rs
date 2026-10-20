@@ -60,6 +60,7 @@ impl Harness {
             text: None,
             ticks: 0,
             cues: Default::default(),
+            game: None,
         }
     }
 
@@ -1493,4 +1494,265 @@ fn cancel_leaves_the_lab_terminal_from_the_menu() {
         ScreenResult::Done(ScreenAction::Quit)
     );
     assert_eq!(lab.screen.value("released_door"), 0);
+}
+
+// ---- map -----------------------------------------------------------------
+
+/// An 8bpp TIM of one row: `palette` maps index to a BGR555 colour.
+fn map_tim(pixels: &[u8], palette: impl Fn(u16) -> u16) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&0x10u32.to_le_bytes());
+    data.extend_from_slice(&9u32.to_le_bytes());
+    data.extend_from_slice(&524u32.to_le_bytes());
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    data.extend_from_slice(&256u16.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    for index in 0..256u16 {
+        data.extend_from_slice(&palette(index).to_le_bytes());
+    }
+    data.extend_from_slice(&(12u32 + pixels.len() as u32).to_le_bytes());
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    data.extend_from_slice(&(pixels.len() as u16 / 2).to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(pixels);
+    data
+}
+
+/// The map tab over a game whose room-flags bank has `bits` set.
+struct MapTab {
+    harness: Harness,
+    pack: Pack,
+    game: crate::game::GameState,
+    screen: LuaScreen,
+}
+
+impl MapTab {
+    fn new(label: &str, pack: Pack, (stage, room, cut): (u8, u8, usize), bits: &[u8]) -> Self {
+        let harness = Harness::new(label);
+        let mut game = crate::game::GameState::default();
+        game.id.stage = stage;
+        game.id.room = room;
+        game.camera.current_cut = cut;
+        for &bit in bits {
+            game.flags[usize::from(crate::game::BANK_ROOM_FLAGS)].apply(bit, 0);
+        }
+        let screen = {
+            let mut cx = UiContext {
+                pack: &pack,
+                game: Some(&game),
+                ..harness.context()
+            };
+            LuaScreen::open_screen("map", &[], ScreenAction::Quit, &mut cx).unwrap()
+        };
+        Self {
+            harness,
+            pack,
+            game,
+            screen,
+        }
+    }
+
+    fn step(&mut self, input: UiInput) -> ScreenResult {
+        let cx = UiContext {
+            pack: &self.pack,
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        self.screen.update(&cx, input)
+    }
+
+    fn draw(&mut self) -> crate::render::Framebuffer {
+        let cx = UiContext {
+            pack: &self.pack,
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        let mut framebuffer = crate::render::Framebuffer::new();
+        self.screen.draw(&cx, &mut framebuffer);
+        framebuffer
+    }
+
+    fn state(&self, expr: &str) -> i64 {
+        self.screen.test_eval(&format!("return {expr}"))
+    }
+}
+
+fn no_map_pack() -> Pack {
+    let mut writer = crate::pack::PackWriter::new();
+    writer.add("unused", Vec::new()).unwrap();
+    Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+}
+
+#[test]
+fn map_tables_blob_overrides_need_the_magic_and_size() {
+    let tab = MapTab::new("map-tables", no_map_pack(), (1, 1, 0), &[]);
+    let parsed: i64 = tab.state(r#"M.parse_tables("MAP1" .. string.rep("\7", 68)).area[15]"#);
+    assert_eq!(parsed, 7);
+    let short: bool = tab
+        .screen
+        .test_eval(r#"return M.parse_tables("MAP1" .. string.rep("\7", 67)) == nil"#);
+    assert!(short);
+    let magic: bool = tab
+        .screen
+        .test_eval(r#"return M.parse_tables("MAP2" .. string.rep("\7", 68)) == nil"#);
+    assert!(magic);
+}
+
+#[test]
+fn map_area_table_and_initial_view_follow_the_reference() {
+    let tab = MapTab::new("map-initial", no_map_pack(), (1, 1, 0), &[]);
+    for (layout, room, area) in [
+        (0, 0, 2),
+        (0, 1, 0),
+        (0, 2, 1),
+        (0, 3, 0xFF),
+        (3, 0, 10),
+        (3, 3, 7),
+    ] {
+        assert_eq!(tab.state(&format!("M.area_at({layout}, {room})")), area);
+    }
+    for ((group, room, cut), area) in [
+        ((0, 0x01, 0), 0),
+        ((0, 0x07, 4), 0),
+        ((0, 0x10, 0), 2),
+        ((1, 0x0C, 5), 0),
+        ((1, 0x0F, 2), 1),
+        ((2, 0x0B, 5), 4),
+        ((3, 0x0C, 0), 5),
+        ((3, 0x0D, 0), 6),
+        ((4, 0x13, 0), 10),
+        ((4, 0x07, 0), 9),
+        ((4, 0x01, 0), 7),
+        ((4, 0x03, 0), 8),
+    ] {
+        assert_eq!(
+            tab.state(&format!("M.initial_area({group}, {room}, {cut})")),
+            area,
+            "group {group} room {room:#x} cut {cut}"
+        );
+    }
+    // Room 1001 opens on Mansion 1F, layout 0's room slot 1.
+    assert_eq!(tab.state("M.state.area"), 0);
+    assert_eq!(tab.state("M.state.layout"), 0);
+    assert_eq!(tab.state("M.state.room[0]"), 1);
+}
+
+#[test]
+fn map_navigation_steps_rooms_and_zooms() {
+    // Room 1 of group 0 (area 0) and a group-1 room in area 1 make the
+    // layout-0 up step reachable; room 0 (area 2) is not.
+    let mut tab = MapTab::new("map-nav", no_map_pack(), (1, 1, 0), &[1, 32]);
+    assert_eq!(tab.step(neutral()), ScreenResult::Continue);
+    tab.step(press(|i| i.down = true));
+    assert_eq!(tab.state("M.state.room[0]"), 1, "area 2 is not reachable");
+    tab.step(press(|i| i.up = true));
+    assert_eq!(tab.state("M.state.room[0]"), 2);
+    assert_eq!(tab.state("M.state.area"), 1);
+    tab.step(press(|i| i.up = true));
+    assert_eq!(
+        tab.state("M.state.room[0]"),
+        2,
+        "room 2 is the last real room"
+    );
+    tab.step(press(|i| i.down = true));
+    assert_eq!(tab.state("M.state.room[0]"), 1);
+    // Confirm enters the full display; cancel leaves it, then closes.
+    tab.step(press(|i| i.confirm = true));
+    assert_eq!(tab.screen.value("zoomed"), 1);
+    tab.step(press(|i| i.up = true));
+    assert_eq!(tab.state("M.state.room[0]"), 1, "the display ignores steps");
+    tab.step(press(|i| i.cancel = true));
+    assert_eq!(tab.screen.value("zoomed"), 0);
+    assert_eq!(
+        tab.step(press(|i| i.cancel = true)),
+        ScreenResult::Done(ScreenAction::Quit)
+    );
+}
+
+#[test]
+fn map_owned_maps_unlock_the_layout_steps() {
+    let base = crate::game::ROOM_FLAG_MAP_BASE;
+    // Only Mansion 1F is known: there is no other layout to step to.
+    let mut tab = MapTab::new("map-layout-1f", no_map_pack(), (1, 1, 0), &[base]);
+    tab.step(neutral());
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.state("M.state.layout"), 0);
+    // The laboratory map (areas 8/9, layout 3) makes all four layouts wrap in
+    // pairs: left from layout 0 lands on layout 3 and right returns.
+    let mut tab = MapTab::new(
+        "map-layout-lab",
+        no_map_pack(),
+        (1, 1, 0),
+        &[base, base + 5],
+    );
+    tab.step(neutral());
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.state("M.state.layout"), 3);
+    assert_eq!(tab.state("M.state.area"), 7, "layout 3's untouched slot 3");
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.state("M.state.layout"), 0);
+}
+
+#[test]
+fn map_display_reddens_the_current_room_over_the_grid() {
+    const WHITE: u16 = 0x7FFF;
+    const GREEN: u16 = 0x03E0;
+    const BLUE: u16 = 0x7C00;
+    let mut writer = crate::pack::PackWriter::new();
+    // The grid's index 0 is a solid colour; index 1 is the grid line.
+    writer
+        .add(
+            "map/blue.tim",
+            map_tim(&[0, 1, 0, 1], |index| match index {
+                0 => BLUE,
+                1 => GREEN,
+                _ => 0,
+            }),
+        )
+        .unwrap();
+    // The 2F plan: the keyed index 0, room 0's marker (13), an ordinary
+    // index (200) and room 1's marker (19).
+    writer
+        .add("map/map03.tim", map_tim(&[0, 13, 200, 19], |_| WHITE))
+        .unwrap();
+    let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+    // Room 1110's first camera opens on area 2 (layout 0's room slot 0).
+    let mut tab = MapTab::new("map-display", pack, (1, 0x10, 0), &[]);
+    assert_eq!(tab.state("M.state.area"), 2);
+    tab.step(neutral());
+    tab.step(press(|i| i.confirm = true));
+    let framebuffer = tab.draw();
+    let pixel = |x: u32| {
+        let offset = ((28 * framebuffer.width + 48 + x) * 4) as usize;
+        [
+            framebuffer.rgba[offset],
+            framebuffer.rgba[offset + 1],
+            framebuffer.rgba[offset + 2],
+        ]
+    };
+    let blue = pixel(0);
+    assert!(
+        blue[2] > 0 && blue[0] == 0 && blue[1] == 0,
+        "the keyed texel shows the dimmed grid: {blue:?}"
+    );
+    let red = (0xF8u16 * 0x80 / 0xFF) as u8;
+    assert_eq!(pixel(1), [red, 0, 0], "the current room's marker");
+    let grey = pixel(2);
+    assert!(grey[0] > 0 && grey[0] < 0xC0 && grey[0] == grey[1] && grey[1] == grey[2]);
+    let green = pixel(3);
+    assert!(
+        green[1] > 0 && green[0] == 0 && green[2] == 0,
+        "unvisited markers show the grid: {green:?}"
+    );
+}
+
+#[test]
+fn map_without_art_stays_blank() {
+    let mut tab = MapTab::new("map-blank", no_map_pack(), (1, 1, 0), &[1]);
+    tab.step(neutral());
+    let framebuffer = tab.draw();
+    assert!(framebuffer.rgba.iter().all(|&c| c == 0));
+    tab.step(press(|i| i.confirm = true));
+    let framebuffer = tab.draw();
+    assert!(framebuffer.rgba.iter().all(|&c| c == 0));
 }

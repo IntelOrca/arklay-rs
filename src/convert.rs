@@ -4759,10 +4759,7 @@ mod tests {
         assert_eq!(pack.read("file/textm_42.tim").unwrap().as_ref(), b"page42");
         assert_eq!(pack.read("map/map0e.tim").unwrap().as_ref(), b"plan14");
         assert_eq!(pack.read("map/blue.tim").unwrap().as_ref(), b"blue");
-        assert!(
-            !pack.contains(crate::ui::map::TABLES_ENTRY),
-            "no map tables are packed"
-        );
+        assert!(!pack.contains("map/tables.bin"), "no map tables are packed");
         assert!(
             !pack.contains(crate::combat::COMBAT_ENTRY),
             "no combat tables are packed"
@@ -4865,10 +4862,7 @@ mod tests {
         );
         assert_eq!(count("effspr/"), 33);
         assert_eq!(count("map/"), 16, "15 plans and the backdrop");
-        assert!(
-            !pack.contains(crate::ui::map::TABLES_ENTRY),
-            "no map tables are packed"
-        );
+        assert!(!pack.contains("map/tables.bin"), "no map tables are packed");
         assert!(
             !pack.contains(crate::combat::COMBAT_ENTRY),
             "no combat tables are packed"

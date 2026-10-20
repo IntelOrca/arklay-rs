@@ -447,6 +447,30 @@ impl Framebuffer {
         );
     }
 
+    /// Draw one indexed sprite through a per-index colour table: texel index
+    /// `i` writes the opaque `lut[i]`, or nothing when it is `None`. Unlike
+    /// the CLUT paths index 0 is not implicitly transparent.
+    pub fn draw_indexed_sprite_lut(
+        &mut self,
+        texture: &Texture8,
+        src: [i32; 4],
+        dst: [i32; 4],
+        lut: &[Option<[u8; 3]>; 256],
+    ) {
+        if texture.width == 0 || texture.height == 0 {
+            return;
+        }
+        self.draw_sprite(src, dst, [false; 2], SpriteBlend::Opaque, |u, v| {
+            if u < 0 || v < 0 || u >= texture.width as i32 || v >= texture.height as i32 {
+                return None;
+            }
+            let index = *texture
+                .indices
+                .get(v as usize * texture.width as usize + u as usize)?;
+            lut[usize::from(index)].map(|[r, g, b]| [r, g, b, 255])
+        });
+    }
+
     /// [`Framebuffer::draw_indexed_sprite_scaled`] with a blend mode and U/V
     /// mirror flags.
     #[allow(clippy::too_many_arguments)]

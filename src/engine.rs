@@ -1505,9 +1505,8 @@ struct GameSession {
     file: Option<FileScreen>,
     /// FILE tab art, loaded on the first open.
     file_assets: Option<FileAssets>,
-    /// The map tab; the room stays frozen while it is up. It is gated by the
-    /// radio scenario flag, exactly like the radio tab.
-    map: Option<ui::map::MapScreen>,
+    /// The map tab (`ui/map.lua`); the room stays frozen while it is up.
+    map: Option<Box<ui::lua_screen::LuaScreen>>,
     /// The typewriter save screen; the room stays frozen while it is up.
     save_screen: Option<Box<dyn ui::save_load::SaveScreen>>,
     /// Where save files live for this session.
@@ -1649,6 +1648,19 @@ const DOOR_LOCK_BITS: [u8; 2] = [0x25, 0x26];
 
 /// The lab map's room-flag bit (`ROOM_FLAG_MAP_BASE + MAP_INDEX_LABORATORY`).
 const LAB_MAP_FLAG: u8 = 0x81;
+
+/// The screen rect the map browser's composite covers (the base window's
+/// 160x72 plus the name and glyph rows below it) and the full display's plan
+/// rect. The engine re-draws the panel decorations the original paints over
+/// them (`MainMenu::draw_frames_over`).
+const MAP_BROWSER_RECT: ui::layout::Rect = ui::layout::Rect {
+    pos: [33, 32],
+    size: [160, 96],
+};
+const MAP_DISPLAY_RECT: ui::layout::Rect = ui::layout::Rect {
+    pos: [48, 28],
+    size: [128, 100],
+};
 
 /// The state `computer_lab_init` (0x004123d0) swaps out for the terminal and
 /// restores on exit.
@@ -3793,6 +3805,7 @@ impl GameSession {
             text: Some(&self.text),
             ticks: self.game.frame,
             cues: std::cell::RefCell::new(Vec::new()),
+            game: Some(&self.game),
         }
     }
 
@@ -3819,6 +3832,7 @@ impl GameSession {
                 text: Some(text),
                 ticks: game.frame,
                 cues: std::cell::RefCell::new(Vec::new()),
+                game: Some(game),
             };
             let result = screen.update(&cx, ui);
             (result, cx.cues.into_inner())
@@ -3958,22 +3972,21 @@ impl GameSession {
             if let Some(menu) = self.menu.as_mut() {
                 menu.tick(&mut self.game);
             }
-            if let Some(map) = self.map.as_mut() {
-                map.tick();
-            }
-            let Some(event_input) = menu_input(ui) else {
+            // The screen takes the frame's one menu input, like the Rust
+            // tabs; the engine plays its cue.
+            let event_input = menu_input(ui);
+            let Some(mut map) = self.map.take() else {
                 return;
             };
-            let cue = menu_cue(event_input);
-            let event = self
-                .map
-                .as_mut()
-                .map(|map| map.handle_input(&self.game, event_input));
-            if let Some(cue) = cue {
+            let result = {
+                let cx = self.ui_context(pack);
+                map.update(&cx, event_input.map_or_else(UiInput::default, single_input))
+            };
+            if let Some(cue) = event_input.and_then(menu_cue) {
                 self.play_ui_cue_names(pack, vec![cue]);
             }
-            if event == Some(ui::map::MapEvent::Close) {
-                self.map = None;
+            if let ScreenResult::Continue = result {
+                self.map = Some(map);
             }
             return;
         }
@@ -4175,7 +4188,14 @@ impl GameSession {
             return;
         }
         self.open_menu(pack);
-        self.map = Some(ui::map::MapScreen::open(pack, &self.game));
+        let screen = {
+            let mut cx = self.ui_context(pack);
+            ui::lua_screen::LuaScreen::open_screen("map", &[], ScreenAction::Resume, &mut cx)
+        };
+        match screen {
+            Ok(screen) => self.map = Some(Box::new(screen)),
+            Err(err) => eprintln!("warning: map tab unavailable: {err:#}"),
+        }
     }
 
     /// Advance an active transition one `main_loop` frame and run the parts
@@ -4440,6 +4460,7 @@ impl GameSession {
             text: Some(text),
             ticks: game.frame,
             cues: std::cell::RefCell::new(Vec::new()),
+            game: Some(game),
         };
         let mut draw_actor = |name: &str, camera: &Camera, framebuffer: &mut Framebuffer| {
             if name != "player" {
@@ -4798,6 +4819,7 @@ impl GameSession {
                     text: Some(text),
                     ticks: game.frame,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
                 };
                 screen.draw(&cx, framebuffer);
             }
@@ -4892,15 +4914,39 @@ impl GameSession {
                 );
             }
         }
-        if let Some(map) = self.map.as_mut() {
-            map.draw(&mut self.framebuffer, pack, &self.game);
+        if self.map.is_some() {
+            let Self {
+                map,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = map.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
+                screen.draw(&cx, framebuffer);
+            }
         }
         if let Some(map) = self.map.as_ref() {
             // The original's depth puts the status screen's frame decorations
             // in front of the map tab's sprites, so the panel's dithered
             // right-hand edge shows over the composite (see
             // `MainMenu::draw_frames_over`).
-            let rect = map.content_rect();
+            let rect = if map.value("zoomed") != 0 {
+                MAP_DISPLAY_RECT
+            } else {
+                MAP_BROWSER_RECT
+            };
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw_frames_over(&mut self.framebuffer, assets, rect);
             }
@@ -4923,6 +4969,7 @@ impl GameSession {
                     text: Some(text),
                     ticks: game.frame,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -4953,6 +5000,7 @@ impl GameSession {
                         text: Some(text),
                         ticks: game.frame,
                         cues: std::cell::RefCell::new(Vec::new()),
+                        game: Some(game),
                     };
                     screen.draw(&cx, framebuffer);
                     framebuffer.fade_overlay(screen.overlay());
@@ -5003,6 +5051,7 @@ impl GameSession {
                     text: Some(text),
                     ticks: game.frame,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
                 };
                 screen.draw(&cx, framebuffer);
             }
@@ -5886,6 +5935,7 @@ impl App {
             text: Some(&self.text),
             ticks: self.ticks,
             cues: std::cell::RefCell::new(Vec::new()),
+            game: None,
         }
     }
 
@@ -6458,6 +6508,7 @@ impl App {
                 text: Some(text),
                 ticks: *ticks,
                 cues: std::cell::RefCell::new(Vec::new()),
+                game: None,
             };
             let result = match mode {
                 Mode::Title(screen) => screen.update(&cx, ui),
@@ -6554,6 +6605,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -6566,6 +6618,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -6578,6 +6631,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -6590,6 +6644,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -6602,6 +6657,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -6614,6 +6670,7 @@ impl App {
                     text: Some(text),
                     ticks: *ticks,
                     cues: std::cell::RefCell::new(Vec::new()),
+                    game: None,
                 };
                 screen.draw(&cx, framebuffer);
                 framebuffer.fade_overlay(screen.overlay());
@@ -11051,6 +11108,23 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
 /// blip on a D-pad move, slot 6 the decide chime on confirm and slot 5 the
 /// cancel cue. Those slots are the `cursor`/`decide`/`cancel` samples the
 /// character tables share, so the port's UI cues resolve to the same wavs.
+/// A [`UiInput`] carrying only `input`, for the Lua tabs that take the menu's
+/// one-input-per-frame priority.
+fn single_input(input: MenuInput) -> UiInput {
+    let mut ui = UiInput::default();
+    match input {
+        MenuInput::Up => ui.up = true,
+        MenuInput::Down => ui.down = true,
+        MenuInput::Left => ui.left = true,
+        MenuInput::Right => ui.right = true,
+        MenuInput::Confirm => ui.confirm = true,
+        MenuInput::Cancel => ui.cancel = true,
+        MenuInput::PageLeft => ui.page_left = true,
+        MenuInput::PageRight => ui.page_right = true,
+    }
+    ui
+}
+
 fn menu_cue(input: MenuInput) -> Option<ui::UiCue> {
     match input {
         MenuInput::Up | MenuInput::Down | MenuInput::Left | MenuInput::Right => {
@@ -17262,16 +17336,8 @@ mod tests {
         writer
             .add(&id.cut_entry(0), bmp::encode_to_vec(&test_image()).unwrap())
             .unwrap();
-        writer
-            .add(
-                ui::map::TABLES_ENTRY,
-                ui::map::MapTables::default().encode(),
-            )
-            .unwrap();
         writer.add("map/map0d.tim", synthetic_map_tim()).unwrap();
-        writer
-            .add(ui::map::BLUE_ENTRY, synthetic_map_tim())
-            .unwrap();
+        writer.add("map/blue.tim", synthetic_map_tim()).unwrap();
         writer.write(&pack_path).unwrap();
 
         let pack = Pack::open(&pack_path).unwrap();

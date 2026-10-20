@@ -21,7 +21,6 @@ pub mod item_view;
 pub mod layout;
 pub mod lua_screen;
 pub mod main_menu;
-pub mod map;
 pub mod save_load;
 pub mod status;
 
@@ -226,6 +225,9 @@ pub struct UiContext<'a> {
     /// [`Screen::update`]. Interior mutability keeps `update`'s `&UiContext`
     /// borrow (screens only ever push).
     pub cues: std::cell::RefCell<Vec<UiCue>>,
+    /// The paused session's game state, for the in-game screens' rule
+    /// queries; `None` outside a session.
+    pub game: Option<&'a crate::game::GameState>,
 }
 
 impl UiContext<'_> {

@@ -303,6 +303,22 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         })))
     });
 
+    // `indexed_page(stem)`: a page that is always indexed - a true-colour
+    // replacement is re-indexed colour for colour - for the screens that
+    // composite by texel index (`page_lut`).
+    methods.add_method_mut("indexed_page", |_lua, api, stem: String| {
+        let pack: &Pack = api.cx.pack;
+        let cache_key = format!("indexed:{stem}");
+        Ok(loaded(api.host.assets.load(cache_key, || {
+            let asset = pack
+                .read_asset(&stem, AssetClass::Image)?
+                .ok_or_else(|| anyhow::anyhow!("missing {stem}"))?;
+            crate::assets::decode_texture(&asset, Geometry::Shipped)
+                .map(|texture| Asset::Page(Artwork::Indexed(texture)))
+                .map_err(|err| err.context(format!("invalid {}", asset.path())))
+        })))
+    });
+
     methods.add_method_mut("ivm", |_lua, api, entry: String| {
         let pack: &Pack = api.cx.pack;
         let cache_key = format!("ivm:{entry}");
@@ -316,6 +332,28 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     methods.add_method("art_size", |_lua, api, handle: usize| {
         Ok(api.host.assets.get(handle)?.size())
     });
+
+    // `page_palette(page, row)`: an indexed page's CLUT row as a table of
+    // `0xRRGGBB` colours keyed by texel index (`0..=255`); nil for an RGBA
+    // page.
+    methods.add_method(
+        "page_palette",
+        |lua, api, (handle, row): (usize, Option<usize>)| {
+            let Artwork::Indexed(texture) = api.host.assets.page(handle)? else {
+                return Ok(None);
+            };
+            let row = row.unwrap_or(0);
+            let table = lua.create_table()?;
+            for index in 0..=255u8 {
+                let [r, g, b, _] = texture.palette(row, index);
+                table.set(
+                    index,
+                    (i64::from(r) << 16) | (i64::from(g) << 8) | i64::from(b),
+                )?;
+            }
+            Ok(Some(table))
+        },
+    );
 
     // ---- primitives ----------------------------------------------------
     methods.add_method_mut("clear", |_lua, api, ()| {
@@ -456,6 +494,36 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 byte(b.unwrap_or(255)),
             ];
             framebuffer.draw_background(image, [coord(x), coord(y)], colour);
+            Ok(())
+        },
+    );
+
+    // `page_lut(page, sx, sy, w, h, dx, dy, lut)`: an unscaled indexed-page
+    // rect drawn through `lut`, a table of opaque `0xRRGGBB` colours keyed by
+    // texel index; an index without an entry is transparent,
+    // index 0 included. The screens composite remapped palettes with it (the
+    // map's tinted and room-highlighted plans).
+    methods.add_method_mut(
+        "page_lut",
+        |_lua, api, (handle, sx, sy, w, h, dx, dy, lut): (usize, i32, i32, i32, i32, i32, i32, Table)| {
+            let Artwork::Indexed(texture) = api.host.assets.page(handle)? else {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "art handle {handle} is not an indexed page"
+                )));
+            };
+            let mut colours = [None; 256];
+            for (index, colour) in colours.iter_mut().enumerate() {
+                if let Some(rgb) = lut.get::<Option<i64>>(index)? {
+                    *colour = Some([(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8]);
+                }
+            }
+            let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            framebuffer.draw_indexed_sprite_lut(
+                texture,
+                rect(sx, sy, w, h),
+                rect(dx, dy, w, h),
+                &colours,
+            );
             Ok(())
         },
     );

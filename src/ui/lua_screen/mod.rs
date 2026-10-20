@@ -845,6 +845,41 @@ impl UserData for Api<'_> {
             Ok(table)
         });
 
+        // `flag(bank, bit)`: one bit of the paused session's flag banks;
+        // false outside a session.
+        methods.add_method("flag", |_lua, api, (bank, bit): (usize, u8)| {
+            Ok(api
+                .cx
+                .game
+                .and_then(|game| game.flags.get(bank))
+                .is_some_and(|flags| flags.bit(bit)))
+        });
+
+        // `room()`: the paused session's stage, room and camera cut; nil
+        // outside a session.
+        methods.add_method("room", |_lua, api, ()| {
+            Ok(match api.cx.game {
+                Some(game) => (
+                    Some(game.id.stage),
+                    Some(game.id.room),
+                    Some(game.camera.current_cut as i64),
+                ),
+                None => (None, None, None),
+            })
+        });
+
+        // `pack_bytes(entry)`: a pack entry's raw bytes, nil when absent.
+        methods.add_method("pack_bytes", |lua, api, entry: String| {
+            match api.cx.pack.read(&entry) {
+                Ok(bytes) => {
+                    budget::check_len(bytes.len(), budget::MAX_SCREEN_IMAGE_BYTES, "pack entry")
+                        .map_err(mlua::Error::external)?;
+                    Ok(Some(lua.create_string(&bytes)?))
+                }
+                Err(_) => Ok(None),
+            }
+        });
+
         methods.add_method("has_font", |_lua, api, ()| Ok(api.cx.font.is_some()));
         methods.add_method("has_text", |_lua, api, ()| Ok(api.cx.text.is_some()));
 

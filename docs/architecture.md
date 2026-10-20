@@ -315,7 +315,7 @@ claims about the original.
 | Mask table | `mask::parse` | sprite/group counts | `mask` unit tests, `tests/real/mask_render_real.rs`, `fuzz/mask` |
 | WAV | `audio::parse_wav` | sample count bounded by the `data` chunk | `audio` unit tests, `fuzz/wav`, `tests/real/m13_real.rs` |
 | Lua source | `lua::LuaVm::load`, `lua::verify_source` | 16 MiB VM, source-size cap | `lua` unit tests, `fuzz/lua`, `arklay verify` |
-| Map tables | `ui::map::MapTables::parse` | fixed blob size/magic | `ui::map` unit tests, `tests/real/m16_ui_real.rs` |
+| Map tables | `ui/map.lua` `parse_tables` (size/magic also checked by `arklay verify`) | fixed blob size/magic | `ui::lua_screen` screen tests |
 | Combat tables | `combat::CombatTables::parse` | fixed blob size/magic/version, `MAX_COMBAT_TABLE_BYTES` (64 KiB) | `combat` unit tests, `tests/real/combat_real.rs`, `tests/torture`, `fuzz/combat` |
 | BioCard prefix | `data/bio_card.dat` | 0x200 required | `save` unit tests, `arklay verify` |
 | `roomcut`/`roommask` image | `assets::decode_picture` (`bmp`/`png`/`webp`/`tim`/`pix`) | BMP/TIM/PNG/WebP caps, `MAX_PIXELS` | `arklay verify`, `tests/soak_real.rs`, `tests/real/hd_real.rs` |

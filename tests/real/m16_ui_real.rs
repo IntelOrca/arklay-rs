@@ -27,8 +27,6 @@ use std::path::{Path, PathBuf};
 
 use arklay::bmp;
 use arklay::pack::Pack;
-use arklay::state::RoomId;
-use arklay::ui::map::MapTables;
 
 /// Self-deleting temporary directory unique to this process and label.
 struct TempDir(PathBuf);
@@ -105,38 +103,15 @@ fn real_ui_captures_are_deterministic_and_the_map_draws() {
 
 #[test]
 #[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
-fn builtin_map_tables_match_sampled_rooms() {
+fn converted_packs_carry_no_map_tables() {
     let Some((_root, pack_path)) = common::asset_env() else {
         return;
     };
     let pack = Pack::open(&pack_path).unwrap();
     assert!(
-        !pack.contains(arklay::ui::map::TABLES_ENTRY),
+        !pack.contains("map/tables.bin"),
         "a converted pack carries no map/tables.bin; the map tab uses the built-ins"
     );
-    let tables = MapTables::default();
-
-    // Sampled rooms and the area/layout their first camera maps to. The room
-    // digit is the RDT room number; the group is `(stage - 1) % 5`.
-    let cases: [(&str, u8, u8); 5] = [
-        ("100", 0, 0), // Mansion 1F
-        ("200", 1, 0), // Mansion 2F
-        ("300", 3, 1), // Courtyard
-        ("406", 5, 2), // Guardhouse
-        ("506", 9, 3), // Laboratory B2
-    ];
-    for (text, area, layout) in cases {
-        let id = RoomId::parse(text).unwrap();
-        let group = usize::from(id.stage.wrapping_sub(1) % 5);
-        let (found_area, found_layout, _) = tables.initial_view(group, id.room, 0);
-        assert_eq!(found_area, area, "ROOM{text} area");
-        assert_eq!(found_layout, layout, "ROOM{text} layout");
-    }
-
-    // The area table's own values are the documented layout paths.
-    assert_eq!(tables.area_at(0, 1), 0);
-    assert_eq!(tables.area_at(3, 1), 9);
-    assert_eq!(tables.group_for_area(9), 4);
 }
 
 #[test]
