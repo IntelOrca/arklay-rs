@@ -456,7 +456,8 @@ function draw(api) end           -- once per frame
 ```
 
 The screen runs in the hooks' sandbox — base/`string`/`table` only, 16 MiB, the
-instruction budget — in its own VM and draws in the 320x240 layout space. A
+instruction budget — in its own VM and draws in the 320x240 layout space (the band or canvas
+described below at a wider aspect). A
 screen that fails to load, or a missing `update`, leaves the engine on the
 ported original screen; a script that errors while running is logged once and
 the screen leaves (back to gameplay from a save screen, back to the title from
@@ -535,8 +536,27 @@ return M
 
 It gets every method above plus the ones below. The layout space is
 `api:width()` x `api:height()`; a screen should centre its 320x240 art on
-`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size
-(the shipped item viewer still draws at fixed coordinates).
+`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size.
+At the default 4:3 aspect the space is 320x240. A wider `aspect` (see
+`arklay.toml`) changes it in one of two ways:
+
+- **The band.** By default a screen draws in the cropped band the window
+  shows: 320 wide and `320 * h / w` rows (180 at 16:9, 200 at 16:10). A screen
+  whose content is taller than that has to lay it out again: the shipped title
+  shows the bottom of its art, the save screen stacks its rows tighter, and the
+  ending captions are pulled inside the band. `api:background` keeps
+  stretching over the logical 320x240 quad centred in the space, so the band
+  crops a full-screen picture rather than squashing it.
+- **The canvas.** A screen drawn on black can call `api:set("canvas", 1)`. The
+  frame then becomes a full-height canvas of the aspect's width (427x240 at
+  16:9, 384x240 at 16:10) with no room under it, so the screen keeps every row
+  and gains columns at its sides. The pause menu, the item box, the file and
+  map screens and the examine viewer use it; the status panel runs its bottom
+  strip out to the canvas edges.
+
+Model draws (`api:draw_ivm`, actors) project about the centre of the layout
+space, so a screen camera's `screen` offset stays relative to the 320x240
+layout's centre.
 A screen that fails to open or errors leaves through the opener's fallback.
 The engine may also call a named module function, `M.<name>(api)`, to tell a
 running screen something happened (the pick-up viewer's `begin_exit`), or

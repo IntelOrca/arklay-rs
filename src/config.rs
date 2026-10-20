@@ -33,6 +33,7 @@
 //! msaa = 1               # GPU: the 3D scene's samples per pixel (1, 2, 4, 8)
 //! frame_rate = 30        # presented frames per second (30..1000); the game
 //!                        # still runs at 30 Hz and higher rates tween
+//! aspect = "4:3"         # or "16:9": crops the 4:3 frame to the wider shape
 //!
 //! # Discovered mods (the game pack's sibling `mods/` and `<config dir>/mods`).
 //! # `enabled` narrows the discovered set when present; `disabled` always
@@ -348,6 +349,12 @@ impl Config {
         Self::update(path, |config| config.graphics.frame_rate = frame_rate)
     }
 
+    /// Persist `[graphics] aspect` into the file at `path`, keeping its other
+    /// keys. Rewritten like [`Config::save_bindings`].
+    pub fn save_aspect(path: &Path, aspect: video::Aspect) -> Result<()> {
+        Self::update(path, |config| config.graphics.aspect = aspect)
+    }
+
     /// Read the file at `path` (a missing one is empty), apply `change` and
     /// write it back in its canonical form. A file that does not parse is
     /// left alone and reported.
@@ -515,6 +522,11 @@ fn parse_graphics_key(graphics: &mut Graphics, key: &str, value: &str, line: usi
         "frame_rate" => {
             graphics.frame_rate = integer(video::MIN_FRAME_RATE..=video::MAX_FRAME_RATE)?
         }
+        "aspect" => {
+            let name = parse_quoted(value, line)?;
+            graphics.aspect = video::Aspect::parse(&name)
+                .with_context(|| format!("line {line}: invalid `aspect`"))?;
+        }
         other => bail!("line {line}: unknown key `{other}`"),
     }
     Ok(())
@@ -545,6 +557,9 @@ fn render_graphics(graphics: &Graphics) -> String {
     }
     if graphics.fullscreen != defaults.fullscreen {
         out.push_str(&format!("fullscreen = {}\n", graphics.fullscreen));
+    }
+    if graphics.aspect != defaults.aspect {
+        out.push_str(&format!("aspect = {}\n", quote(&graphics.aspect.name())));
     }
     for (key, value, default) in [
         ("window_width", graphics.window_width, defaults.window_width),
@@ -894,7 +909,8 @@ mod tests {
              display = 2\n\
              render_scale = 150\n\
              msaa = 4\n\
-             frame_rate = 75\n",
+             frame_rate = 75\n\
+             aspect = \"16:9\"\n",
         )
         .unwrap();
         assert_eq!(
@@ -908,6 +924,7 @@ mod tests {
                 render_scale: 150,
                 msaa: 4,
                 frame_rate: 75,
+                aspect: video::Aspect::WIDE,
             }
         );
         let text = config.render();
@@ -1045,6 +1062,7 @@ mod tests {
             render_scale: 200,
             msaa: 8,
             frame_rate: 120,
+            aspect: video::Aspect::WIDE,
         };
         Config::save_window(&path, &run).unwrap();
         let (saved, warnings) = Config::load(&path);
@@ -1080,6 +1098,43 @@ mod tests {
         Config::save_frame_rate(&path, 30).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "[graphics]\nmsaa = 4\n");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_the_aspect_keeps_the_other_keys() {
+        let dir = std::env::temp_dir().join(format!("arklay-config-{}-aspect", std::process::id()));
+        let path = dir.join("arklay.toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(&path, "[graphics]\nmsaa = 4\n").unwrap();
+        Config::save_aspect(&path, video::Aspect::WIDE).unwrap();
+        let (saved, warnings) = Config::load(&path);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            (saved.graphics.msaa, saved.graphics.aspect),
+            (4, video::Aspect::WIDE)
+        );
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("aspect = \"16:9\"\n")
+        );
+        // The default 4:3 is not written.
+        Config::save_aspect(&path, video::Aspect::STANDARD).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "[graphics]\nmsaa = 4\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_any_aspect_and_rejects_a_bad_one() {
+        let config = Config::parse("[graphics]\naspect = \"16:10\"\n").unwrap();
+        assert_eq!(config.graphics.aspect.name(), "16:10");
+        for text in [
+            "[graphics]\naspect = \"wide\"\n",
+            "[graphics]\naspect = \"0:9\"\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
+        }
     }
 
     #[test]

@@ -140,8 +140,9 @@ const WIDTH: i32 = 320;
 const HEIGHT: i32 = 240;
 const SCALE: i32 = 3;
 const WINDOW_WIDTH: i32 = WIDTH * SCALE;
-const WINDOW_HEIGHT: i32 = HEIGHT * SCALE;
-const PIXEL_PITCH: i32 = WIDTH * 4;
+/// How far above the player's feet a wider aspect's band aims: about the
+/// middle of the body (world y grows downward).
+const FOLLOW_BODY_HEIGHT: i32 = 900;
 /// Fixed simulation step in milliseconds (30 Hz, the original frame rate).
 const TICK_MS: f64 = 1000.0 / 30.0;
 /// The original's non-gameplay frame-limiter period in milliseconds.
@@ -238,6 +239,55 @@ struct TextureHandle(*mut SDL_Texture);
 impl Drop for TextureHandle {
     fn drop(&mut self) {
         unsafe { SDL_DestroyTexture(self.0) };
+    }
+}
+
+/// The software presenter's streaming texture and its size.
+struct FrameTexture {
+    handle: TextureHandle,
+    size: (u32, u32),
+}
+
+impl FrameTexture {
+    /// A `width` x `height` streaming texture, copied without blending.
+    fn new(renderer: *mut SDL_Renderer, width: u32, height: u32) -> Result<Self> {
+        let texture = unsafe {
+            SDL_CreateTexture(
+                renderer,
+                SDL_PIXELFORMAT_ABGR8888,
+                SDL_TEXTUREACCESS_STREAMING,
+                width as i32,
+                height as i32,
+            )
+        };
+        if texture.is_null() {
+            bail!("SDL_CreateTexture failed: {}", sdl_error());
+        }
+        let handle = TextureHandle(texture);
+        if !unsafe { SDL_SetTextureBlendMode(handle.0, SDL_BLENDMODE_NONE) } {
+            bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
+        }
+        if !unsafe { SDL_SetTextureScaleMode(handle.0, SDL_SCALEMODE_NEAREST) } {
+            bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
+        }
+        Ok(Self {
+            handle,
+            size: (width, height),
+        })
+    }
+
+    /// The texture for a `width` x `height` frame, recreated on a size
+    /// change (a wider aspect's canvas opening or closing).
+    fn fit(
+        &mut self,
+        renderer: *mut SDL_Renderer,
+        width: u32,
+        height: u32,
+    ) -> Result<*mut SDL_Texture> {
+        if self.size != (width, height) {
+            *self = Self::new(renderer, width, height)?;
+        }
+        Ok(self.handle.0)
     }
 }
 
@@ -524,11 +574,7 @@ pub fn run_with_options(
                         && let Some(dir) = trace.capture_dir
                     {
                         capture_bmp(
-                            &Image {
-                                width: framebuffer.width,
-                                height: framebuffer.height,
-                                rgba: framebuffer.rgba.clone(),
-                            },
+                            &presented_image(&framebuffer),
                             &dir.join(format!("f{index:05}.bmp")),
                         )?;
                     }
@@ -556,6 +602,12 @@ pub fn run_with_options(
         timings.phases.render += render_start.elapsed();
 
         if let Some(capture_path) = capture {
+            // The capture frames the band on the player like the game's
+            // snap on entering a room.
+            let height = video::aspect().height();
+            let target = band_target(&loaded.room, player_state.pos);
+            framebuffer.view =
+                video::View::at(video::follow(0, height, target, true) as i32, height);
             let title = window_title(
                 &loaded.id.room3(),
                 loaded.room.current_cut,
@@ -980,6 +1032,9 @@ fn run_session_loop(
             display.set_frame_rate(rate);
             clock.set_rate(rate);
         }
+        if let Some(aspect) = session.take_aspect_change() {
+            display.set_aspect(aspect);
+        }
         session.set_frame_rate(display.frame_rate());
         session.update_window_title(display.window)?;
 
@@ -1043,10 +1098,11 @@ fn run_session_loop(
 
 /// How a [`Display`] puts frames on screen.
 enum Backend {
-    /// An SDL renderer scaling a streaming 320x240 texture. The texture is
-    /// declared first so it is destroyed before its renderer.
+    /// An SDL renderer scaling a streaming texture of the frame's size
+    /// (320x240, or a wider aspect's canvas). The texture is declared first
+    /// so it is destroyed before its renderer.
     Software {
-        texture: TextureHandle,
+        texture: FrameTexture,
         renderer: RendererHandle,
     },
     /// The SDL_GPU device, which owns the window's swapchain.
@@ -1095,7 +1151,10 @@ impl Display {
         // An interactive window starts hidden at 1x so it can be sized and
         // placed on its display before it is first shown.
         let (size, flags) = if capture {
-            ((WINDOW_WIDTH, WINDOW_HEIGHT), SDL_WindowFlags::default())
+            (
+                (WINDOW_WIDTH, capture_rows() * SCALE),
+                SDL_WindowFlags::default(),
+            )
         } else {
             ((WIDTH, HEIGHT), SDL_WINDOW_HIDDEN)
         };
@@ -1198,6 +1257,30 @@ impl Display {
             .map_or(video::TICK_RATE, |graphics| graphics.frame_rate)
     }
 
+    /// Change the aspect ratio from the options screen: the frame shape
+    /// switches at once, the window keeps its zoom at the new shape and the
+    /// choice is persisted.
+    fn set_aspect(&mut self, aspect: video::Aspect) {
+        video::set_aspect(aspect);
+        let window = self.window;
+        let Some(graphics) = self.graphics.as_mut() else {
+            return;
+        };
+        graphics.aspect = aspect;
+        if !graphics.fullscreen {
+            let times = (graphics.window_width / WIDTH as u32).max(1);
+            (graphics.window_width, graphics.window_height) =
+                (WIDTH as u32 * times, aspect.height() * times);
+        }
+        let display = unsafe { SDL_GetDisplayForWindow(window) };
+        place_window(window, graphics, display);
+        self.save_window();
+        let path = crate::config::Config::default_path();
+        if let Err(err) = crate::config::Config::save_aspect(&path, aspect) {
+            eprintln!("warning: aspect ratio not saved: {err:#}");
+        }
+    }
+
     /// Change the frame rate from the options screen and persist it.
     fn set_frame_rate(&mut self, rate: u32) {
         let Some(graphics) = self.graphics.as_mut() else {
@@ -1219,26 +1302,7 @@ impl Display {
         let renderer = RendererHandle(renderer);
         let _ = unsafe { SDL_SetRenderVSync(renderer.0, 1) };
 
-        let texture = unsafe {
-            SDL_CreateTexture(
-                renderer.0,
-                SDL_PIXELFORMAT_ABGR8888,
-                SDL_TEXTUREACCESS_STREAMING,
-                WIDTH,
-                HEIGHT,
-            )
-        };
-        if texture.is_null() {
-            bail!("SDL_CreateTexture failed: {}", sdl_error());
-        }
-        let texture = TextureHandle(texture);
-
-        if !unsafe { SDL_SetTextureBlendMode(texture.0, SDL_BLENDMODE_NONE) } {
-            bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
-        }
-        if !unsafe { SDL_SetTextureScaleMode(texture.0, SDL_SCALEMODE_NEAREST) } {
-            bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
-        }
+        let texture = FrameTexture::new(renderer.0, WIDTH as u32, HEIGHT as u32)?;
         if !unsafe { SDL_SetRenderDrawColor(renderer.0, 0, 0, 0, 255) } {
             bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
         }
@@ -1264,7 +1328,7 @@ impl Display {
     /// A GPU failure here drops this frame and continues in software.
     fn present_layers(&mut self, black: &Framebuffer, white: Option<&Framebuffer>) -> Result<()> {
         match &mut self.backend {
-            Backend::Software { texture, renderer } => present(renderer.0, texture.0, black),
+            Backend::Software { texture, renderer } => present(renderer.0, texture, black),
             Backend::Gpu(gpu) => match gpu.present(black, white) {
                 Ok(()) => Ok(()),
                 Err(err) => self.fall_back_to_software(&err),
@@ -1523,6 +1587,12 @@ struct GameSession {
     /// scene (see [`GameSession::render_layers`]). Like `framebuffer`, it
     /// persists so a frozen frame keeps drawing over the last one.
     framebuffer_white: Option<Framebuffer>,
+    /// The band a wider aspect presents (see [`GameSession::follow_view`]);
+    /// the whole frame at 4:3.
+    view: video::View,
+    /// The room and camera cut `view` last followed, so a cut or a room
+    /// change snaps the band instead of panning to it.
+    view_cut: Option<(RoomId, usize)>,
     /// Whether the persisted framebuffers show the GPU scene: set by a frame
     /// that recorded one and cleared by any frame that covered it.
     gpu_scene_visible: bool,
@@ -1605,6 +1675,8 @@ struct GameSession {
     frame_rate: u32,
     /// The DISPLAY tool changed [`GameSession::frame_rate`].
     frame_rate_changed: bool,
+    /// The aspect ratio the DISPLAY tool picked, until the window takes it.
+    aspect_changed: Option<video::Aspect>,
     /// The open F9 return-to-title prompt; the room stays frozen and the game
     /// sounds are paused while it is up.
     return_title: Option<Box<ui::lua_screen::LuaScreen>>,
@@ -1950,6 +2022,8 @@ impl GameSession {
             lua,
             framebuffer: Framebuffer::new(),
             framebuffer_white: None,
+            view: video::aspect().centred(),
+            view_cut: None,
             gpu_scene_visible: false,
             gpu_room: None,
             titled_cut: usize::MAX,
@@ -1990,6 +2064,7 @@ impl GameSession {
             bindings_changed: false,
             frame_rate: video::TICK_RATE,
             frame_rate_changed: false,
+            aspect_changed: None,
             return_title: None,
             return_title_requested: false,
             load_slot_requested: None,
@@ -2142,7 +2217,29 @@ impl GameSession {
         // screen's own loop, the computer terminal, the typewriter hand-off)
         // still step once per platform frame, exactly like the original's.
         self.tick_screen_intensity();
+        self.follow_view();
         result
+    }
+
+    /// Move the presented band one tick toward the player.
+    ///
+    /// A wider aspect shows fewer rows than the 4:3 frame, so the band
+    /// follows the player's projected body ([`video::follow`]): it snaps on a
+    /// camera cut or a room change and otherwise pans gently, so a fixed
+    /// camera keeps the player in view. The scene itself, its masks and the
+    /// camera stay in 4:3 space.
+    fn follow_view(&mut self) {
+        let aspect = video::aspect();
+        if aspect.is_standard() {
+            self.view = video::View::default();
+            return;
+        }
+        let cut_key = (self.loaded.id, self.loaded.room.current_cut);
+        let snap = self.view_cut != Some(cut_key) || self.view.height != aspect.height();
+        self.view_cut = Some(cut_key);
+        let target = band_target(&self.loaded.room, self.player.pos);
+        let top = video::follow(self.view.top, aspect.height(), target, snap);
+        self.view = video::View::at(top as i32, aspect.height());
     }
 
     fn tick_inner(
@@ -3242,6 +3339,11 @@ impl GameSession {
         std::mem::take(&mut self.frame_rate_changed).then_some(self.frame_rate)
     }
 
+    /// Take the aspect ratio the DISPLAY tool picked, once.
+    fn take_aspect_change(&mut self) -> Option<video::Aspect> {
+        self.aspect_changed.take()
+    }
+
     /// Take the bindings the CONTROLS tool changed, once.
     fn take_bindings_change(&mut self) -> Option<controls::Bindings> {
         std::mem::take(&mut self.bindings_changed).then(|| self.bindings.clone())
@@ -3389,6 +3491,10 @@ impl GameSession {
             self.frame_rate_changed = true;
             return;
         }
+        if let DebugMenuEvent::AspectChanged(aspect) = event {
+            self.aspect_changed = Some(aspect);
+            return;
+        }
         if event != DebugMenuEvent::None {
             self.debug_menu_memory = self.debug_menu.take();
         }
@@ -3396,7 +3502,8 @@ impl GameSession {
             DebugMenuEvent::None
             | DebugMenuEvent::Close
             | DebugMenuEvent::BindingsChanged
-            | DebugMenuEvent::FrameRateChanged(_) => {}
+            | DebugMenuEvent::FrameRateChanged(_)
+            | DebugMenuEvent::AspectChanged(_) => {}
             DebugMenuEvent::Jump(target) => {
                 if let Err(err) = self.debug_jump(pack, target)
                     && self.debug_failed.insert(target.rdt_number())
@@ -4756,6 +4863,26 @@ impl GameSession {
     }
 
     fn render_pass(&mut self, pack: &Pack, pass: ScenePass<'_>) {
+        // A wider aspect's canvas replaces the 320x240 frame while a screen
+        // that asks for one is up; everything else draws in 4:3 space.
+        let canvas = self.canvas_width();
+        match canvas {
+            Some(width) => self.framebuffer.resize(width, HEIGHT as u32),
+            None => self.framebuffer.resize(WIDTH as u32, HEIGHT as u32),
+        }
+        // The loading narration and the films present the centred band; the
+        // room and its overlays the band following the player. The F1 debug
+        // menu is laid out for 240 rows, so while it is up the whole 4:3
+        // frame is presented, pillarboxed, instead.
+        if canvas.is_none() {
+            self.framebuffer.view = if self.debug_menu.is_some() {
+                video::View::default()
+            } else if self.boot_message.is_some() || self.movie.is_some() {
+                video::aspect().centred()
+            } else {
+                self.view
+            };
+        }
         // The screens below replace the whole frame, scene included.
         if self.boot_message.is_some()
             || self.movie.is_some()
@@ -4778,9 +4905,13 @@ impl GameSession {
                 [0, 0, 0, 255],
             );
             if let Some(font) = &self.font {
-                self.game
-                    .message
-                    .draw(&mut self.framebuffer, font, &self.text);
+                let Self {
+                    game,
+                    framebuffer,
+                    text,
+                    ..
+                } = self;
+                framebuffer.with_screen(|screen| game.message.draw(screen, font, text));
             }
             return;
         }
@@ -4801,8 +4932,11 @@ impl GameSession {
         }
         // While the menu is up the room is frozen: keep the frame it was
         // opened over instead of re-rendering the scene, then draw the menu
-        // and the window over it.
-        if self.menu.is_none() {
+        // and the window over it. A canvas shows no room at all.
+        if canvas.is_some() {
+            self.framebuffer.clear();
+            self.gpu_scene_visible = false;
+        } else if self.menu.is_none() {
             match pass {
                 // The scene was recorded by the black pass; this pass only
                 // redraws what lies over it.
@@ -5099,20 +5233,28 @@ impl GameSession {
         // The pause-menu open/close fade sits over the menu and its overlays.
         self.draw_menu_fade();
         if let Some(font) = &self.font {
-            self.game
-                .message
-                .draw(&mut self.framebuffer, font, &self.text);
+            let Self {
+                game,
+                framebuffer,
+                text,
+                ..
+            } = self;
+            framebuffer.with_screen(|screen| game.message.draw(screen, font, text));
         }
         // The debug overlay is drawn last so it stays legible over the frozen
         // frame and any message the room raised before it opened.
         if let Some(debug_menu) = self.debug_menu.as_mut() {
-            debug_menu.draw(
-                &mut self.framebuffer,
-                self.font.as_ref(),
-                &self.text,
-                self.item_icons.as_ref(),
-                &self.game,
-            );
+            let Self {
+                framebuffer,
+                font,
+                text,
+                item_icons,
+                game,
+                ..
+            } = self;
+            framebuffer.with_screen(|screen| {
+                debug_menu.draw(screen, font.as_ref(), text, item_icons.as_ref(), game)
+            });
         }
         // The return-to-title prompt draws over everything, including the
         // debug overlay, with its own full-screen dim.
@@ -5139,6 +5281,39 @@ impl GameSession {
                 screen.draw(&cx, framebuffer);
             }
         }
+    }
+
+    /// The canvas width a wider aspect gives the frame while a visible
+    /// screen drawn on black asks for one (`api:set("canvas", 1)`: the
+    /// pause-menu panel and its sub-screens). Such a screen keeps all 240
+    /// rows and gains columns instead of losing rows to the crop. `None` at
+    /// 4:3 and while a screen that owns the whole frame (a film, the
+    /// loading narration, a door, the death screen) is up.
+    fn canvas_width(&self) -> Option<u32> {
+        let aspect = video::aspect();
+        if aspect.is_standard()
+            || self.boot_message.is_some()
+            || self.movie.is_some()
+            || self.transition.is_some()
+            || self.death_screen.is_some()
+            || self.computer.is_some()
+        {
+            return None;
+        }
+        let wants = |screen: Option<&ui::lua_screen::LuaScreen>| {
+            screen.is_some_and(|screen| screen.value("canvas") != 0)
+        };
+        let hidden = self.menu_fade_hides();
+        let pickup = self.pickup_view.as_ref();
+        let menu_stack = !hidden
+            && (wants(self.menu.as_deref())
+                || wants(self.examine.as_deref())
+                || wants(self.item_box.as_deref()));
+        let owned = wants(self.file.as_deref())
+            || wants(self.map.as_deref())
+            || wants(pickup.and_then(|pickup| pickup.reader.as_deref()))
+            || wants(pickup.and_then(|pickup| pickup.screen.as_deref()));
+        (menu_stack || owned).then(|| aspect.canvas_width())
     }
 
     /// The last rendered frame.
@@ -6678,6 +6853,9 @@ impl App {
             ticks,
             ..
         } = self;
+        // A full-screen app screen presents the centred band; a session
+        // brings its own band with its frame.
+        framebuffer.view = crate::video::aspect().centred();
         match mode {
             Mode::Boot => {}
             Mode::Title(screen) => {
@@ -6867,6 +7045,14 @@ impl App {
         }
     }
 
+    /// An aspect-ratio change from the playing session's options screen.
+    fn take_aspect_change(&mut self) -> Option<video::Aspect> {
+        match &mut self.mode {
+            Mode::Play(session) => session.take_aspect_change(),
+            _ => None,
+        }
+    }
+
     /// Feed the mixers.
     fn update_audio(&mut self) {
         if let Mode::Play(session) = &mut self.mode {
@@ -6892,14 +7078,7 @@ impl App {
 
     /// Write the current app frame as a BMP.
     fn capture(&self, path: &Path) -> Result<()> {
-        capture_bmp(
-            &Image {
-                width: self.framebuffer.width,
-                height: self.framebuffer.height,
-                rgba: self.framebuffer.rgba.clone(),
-            },
-            path,
-        )
+        capture_bmp(&presented_image(&self.framebuffer), path)
     }
 }
 
@@ -7444,11 +7623,7 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
         return Ok(());
     };
     capture_bmp(
-        &Image {
-            width: app.framebuffer.width,
-            height: app.framebuffer.height,
-            rgba: app.framebuffer.rgba.clone(),
-        },
+        &presented_image(&app.framebuffer),
         &dir.join(format!("f{index:05}.bmp")),
     )
 }
@@ -7475,6 +7650,9 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
         if let Some(rate) = app.take_frame_rate_change() {
             display.set_frame_rate(rate);
             clock.set_rate(rate);
+        }
+        if let Some(aspect) = app.take_aspect_change() {
+            display.set_aspect(aspect);
         }
         app.set_frame_rate(display.frame_rate());
         app.update_window_title(display.window)?;
@@ -7635,7 +7813,7 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> R
         SDL_CreateWindow(
             title.as_ptr(),
             WINDOW_WIDTH,
-            WINDOW_HEIGHT,
+            capture_rows() * SCALE,
             SDL_WindowFlags::default(),
         )
     };
@@ -7651,26 +7829,7 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> R
     let _renderer = RendererHandle(renderer);
     let _ = unsafe { SDL_SetRenderVSync(renderer, 1) };
 
-    let texture = unsafe {
-        SDL_CreateTexture(
-            renderer,
-            SDL_PIXELFORMAT_ABGR8888,
-            SDL_TEXTUREACCESS_STREAMING,
-            WIDTH,
-            HEIGHT,
-        )
-    };
-    if texture.is_null() {
-        bail!("SDL_CreateTexture failed: {}", sdl_error());
-    }
-    let _texture = TextureHandle(texture);
-
-    if !unsafe { SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE) } {
-        bail!("SDL_SetTextureBlendMode failed: {}", sdl_error());
-    }
-    if !unsafe { SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST) } {
-        bail!("SDL_SetTextureScaleMode failed: {}", sdl_error());
-    }
+    let mut texture = FrameTexture::new(renderer, WIDTH as u32, HEIGHT as u32)?;
     if !unsafe { SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255) } {
         bail!("SDL_SetRenderDrawColor failed: {}", sdl_error());
     }
@@ -7679,7 +7838,7 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> R
     draw_font_screen(&mut framebuffer, &font);
 
     if let Some(capture_path) = capture {
-        present(renderer, texture, &framebuffer)?;
+        present(renderer, &mut texture, &framebuffer)?;
         return capture_frame(renderer, capture_path);
     }
 
@@ -7690,7 +7849,7 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> R
         if poll_events(&mut event, &mut input, &mut cut_delta, None) {
             return Ok(());
         }
-        present(renderer, texture, &framebuffer)?;
+        present(renderer, &mut texture, &framebuffer)?;
         if !unsafe { SDL_RenderPresent(renderer) } {
             bail!("SDL_RenderPresent failed: {}", sdl_error());
         }
@@ -12371,12 +12530,13 @@ fn draw_special_light(
 /// Upload the framebuffer and draw it scaled to the window.
 fn present(
     renderer: *mut SDL_Renderer,
-    texture: *mut SDL_Texture,
+    texture: &mut FrameTexture,
     framebuffer: &Framebuffer,
 ) -> Result<()> {
-    if framebuffer.width != WIDTH as u32
+    if framebuffer.width < WIDTH as u32
+        || framebuffer.width > video::MAX_CANVAS_WIDTH
         || framebuffer.height != HEIGHT as u32
-        || framebuffer.rgba.len() != (WIDTH * HEIGHT * 4) as usize
+        || framebuffer.rgba.len() != framebuffer.width as usize * HEIGHT as usize * 4
     {
         bail!(
             "expected a {WIDTH}x{HEIGHT} framebuffer, got {}x{} with {} bytes",
@@ -12385,12 +12545,13 @@ fn present(
             framebuffer.rgba.len()
         );
     }
+    let texture = texture.fit(renderer, framebuffer.width, framebuffer.height)?;
     if !unsafe {
         SDL_UpdateTexture(
             texture,
             std::ptr::null(),
             framebuffer.rgba.as_ptr().cast::<c_void>(),
-            PIXEL_PITCH,
+            framebuffer.width as i32 * 4,
         )
     } {
         bail!("SDL_UpdateTexture failed: {}", sdl_error());
@@ -12398,14 +12559,21 @@ fn present(
     if !unsafe { SDL_RenderClear(renderer) } {
         bail!("SDL_RenderClear failed: {}", sdl_error());
     }
-    // The frame fills the largest centred 4:3 viewport: nearest at a whole
-    // zoom (the exact 3x a capture reads back), pixel-art sampling between.
+    // The frame's visible band fills the largest centred viewport of its
+    // shape (4:3, or the wider aspect's crop): nearest at a whole zoom (the
+    // exact 3x a capture reads back), pixel-art sampling between.
     let (mut width, mut height) = (0, 0);
     if !unsafe { SDL_GetCurrentRenderOutputSize(renderer, &mut width, &mut height) } {
         bail!("SDL_GetCurrentRenderOutputSize failed: {}", sdl_error());
     }
-    let viewport = video::fit(width.max(1) as u32, height.max(1) as u32);
-    let mode = if viewport.is_whole_zoom() {
+    let shown = video::shown(framebuffer.width, framebuffer.height, framebuffer.view);
+    let viewport = video::fit_size(
+        width.max(1) as u32,
+        height.max(1) as u32,
+        shown.width,
+        shown.height,
+    );
+    let mode = if viewport.is_whole_zoom_of_size(shown.width, shown.height) {
         SDL_SCALEMODE_NEAREST
     } else {
         SDL_SCALEMODE_PIXELART
@@ -12419,7 +12587,13 @@ fn present(
         w: viewport.width as f32,
         h: viewport.height as f32,
     };
-    if !unsafe { SDL_RenderTexture(renderer, texture, std::ptr::null(), &destination) } {
+    let source = SDL_FRect {
+        x: 0.0,
+        y: shown.top as f32,
+        w: shown.width as f32,
+        h: shown.height as f32,
+    };
+    if !unsafe { SDL_RenderTexture(renderer, texture, &source, &destination) } {
         bail!("SDL_RenderTexture failed: {}", sdl_error());
     }
     Ok(())
@@ -12448,12 +12622,12 @@ fn place_window(window: *mut SDL_Window, graphics: &mut Graphics, display: SDL_D
         SDL_SetWindowFullscreen(window, false);
     }
     // A window that does not fit its display shrinks to the largest whole
-    // multiple of 320x240 that does.
+    // multiple of the frame (320x240, or the wider aspect's band) that does.
     if let Some((room_width, room_height)) = window_room(window, display)
         && (graphics.window_width > room_width || graphics.window_height > room_height)
     {
         (graphics.window_width, graphics.window_height) =
-            video::largest_window((room_width, room_height));
+            video::largest_window_rows((room_width, room_height), graphics.aspect.height());
     }
     // The size is in window coordinates; the client area is to be exactly
     // `window_width` x `window_height` pixels.
@@ -12628,9 +12802,11 @@ fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
     let _converted = SurfaceHandle(converted);
 
     let frame = unsafe { &*converted };
-    if frame.w != WINDOW_WIDTH || frame.h != WINDOW_HEIGHT {
+    let rows = capture_rows();
+    let window_height = rows * SCALE;
+    if frame.w != WINDOW_WIDTH || frame.h != window_height {
         bail!(
-            "capture returned a {}x{} frame, expected {WINDOW_WIDTH}x{WINDOW_HEIGHT}",
+            "capture returned a {}x{} frame, expected {WINDOW_WIDTH}x{window_height}",
             frame.w,
             frame.h
         );
@@ -12641,10 +12817,10 @@ fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
     }
 
     let pixels = unsafe {
-        std::slice::from_raw_parts(frame.pixels.cast::<u8>(), pitch * WINDOW_HEIGHT as usize)
+        std::slice::from_raw_parts(frame.pixels.cast::<u8>(), pitch * window_height as usize)
     };
-    let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
-    for y in 0..HEIGHT as usize {
+    let mut rgba = Vec::with_capacity((WIDTH * rows * 4) as usize);
+    for y in 0..rows as usize {
         let row = &pixels[y * SCALE as usize * pitch..];
         for x in 0..WIDTH as usize {
             let start = x * SCALE as usize * 4;
@@ -12655,11 +12831,42 @@ fn capture_frame(renderer: *mut SDL_Renderer, path: &Path) -> Result<()> {
     capture_bmp(
         &Image {
             width: WIDTH as u32,
-            height: HEIGHT as u32,
+            height: rows as u32,
             rgba,
         },
         path,
     )
+}
+
+/// The rows a capture holds: the frame's visible band at this thread's
+/// aspect (240 at 4:3).
+/// The frame row the band follows in `room`: the player's projected body at
+/// `pos` through the current cut's camera, or `None` off camera.
+fn band_target(room: &RoomState, pos: [i32; 3]) -> Option<i32> {
+    let [x, y, z] = pos;
+    room.cuts.get(room.current_cut).and_then(|cut| {
+        Camera::from_cut(cut)
+            .project([x, y - FOLLOW_BODY_HEIGHT, z])
+            .map(|[_, row]| row)
+    })
+}
+
+fn capture_rows() -> i32 {
+    video::aspect().height() as i32
+}
+
+/// The rows of `framebuffer` its aspect presents, as a capture image: the
+/// whole frame at 4:3.
+fn presented_image(framebuffer: &Framebuffer) -> Image {
+    let shown = video::shown(framebuffer.width, framebuffer.height, framebuffer.view);
+    let stride = framebuffer.width as usize * 4;
+    let start = shown.top as usize * stride;
+    let rows = (shown.height as usize).min(framebuffer.height as usize - shown.top as usize);
+    Image {
+        width: framebuffer.width,
+        height: rows as u32,
+        rgba: framebuffer.rgba[start..start + rows * stride].to_vec(),
+    }
 }
 
 /// Write one capture BMP through a sibling temporary file, so a failed

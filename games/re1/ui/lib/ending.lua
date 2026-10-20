@@ -67,6 +67,23 @@ function E.origin(api)
     return api:width() // 2 - 0xA0, api:height() // 2 - 0x78
 end
 
+-- The rows kept clear at a short frame's edges.
+local FIT_MARGIN = 2
+
+--- Pull a `height`-row slot at screen row `y` back inside a frame shorter
+--- than the layout (a wider aspect's band); on a 240-row frame every slot
+--- already fits and keeps its row.
+function E.fit_row(api, y, height)
+    local bottom = api:height() - FIT_MARGIN - height
+    if y > bottom then
+        y = bottom
+    end
+    if y < FIT_MARGIN then
+        y = FIT_MARGIN
+    end
+    return y
+end
+
 local Slot = {}
 Slot.__index = Slot
 
@@ -112,7 +129,7 @@ function Slot:draw(api, plate, text)
         return
     end
     local ox, oy = E.origin(api)
-    local x, y = self.x + ox, self.y + oy
+    local x, y = self.x + ox, E.fit_row(api, self.y + oy, self.height)
     local scale = E.shade_scale(self:shade())
     if self.kind == "sprite" then
         if plate then

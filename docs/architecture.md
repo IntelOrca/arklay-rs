@@ -340,16 +340,33 @@ a failure while drawing or presenting does the same mid-game.
 
 - **Resolutions.** Every frame is the 320x240 one; only its presentation
   varies. The window's client area is `window_width` x `window_height`
-  (F8 sets whole multiples of 320x240), or the
+  (F8 sets whole multiples of the presented frame), or the
   whole display in borderless fullscreen, and the frame fills the largest
-  centred 4:3 viewport in it (`video::fit`). The table below is what each
-  stage draws at for a viewport of `W`x`H`:
+  centred viewport of its shape in it (`video::fit`). The table below is
+  what each stage draws at for a viewport of `W`x`H`:
 
   | Stage | Software | GPU |
   |---|---|---|
   | Backgrounds, masks, models, shadows, effects | 320x240 | `W`x`H` times `render_scale`%, `msaa` samples, resolved and filtered bilinearly to `W`x`H` |
   | Sprites, UI, messages, fades | 320x240 | 320x240 (the two software layers) |
   | To the screen | the 320x240 frame scaled to `W`x`H` | the layers scaled to `W`x`H`, composited over the scene |
+
+  **Aspect.** `[graphics] aspect` (`--aspect`, F1 DISPLAY) picks the
+  presented shape; `"4:3"` is the default and the only one traces, the oracle
+  and goldens use. A wider aspect crops at presentation and changes nothing
+  that runs: the room, its masks, collision and cameras stay in the 320x240
+  frame, and the window shows a 320-wide band of it (`video::View`, 180 rows at
+  16:9). In a room the band follows the player's projected chest row with a
+  dead zone and a few rows per tick, and snaps on a cut or room change
+  (`video::follow`). Films and the loading narration show the centred band.
+  The message window and the other overlays draw in the band
+  (`Framebuffer::with_screen`), keeping their distance from its bottom. Lua
+  screens lay out in the band, or ask for a full-height canvas of the aspect's
+  width (427x240 at 16:9) that replaces the frame while they are up (the pause
+  menu and its sub-screens). The F1 debug menu presents the whole 4:3 frame,
+  pillarboxed. Both backends accept the canvas. The GPU path resizes its
+  overlay layers to match, while the scene targets keep covering the 4:3
+  frame.
 
   A 320x240 layer reaches the viewport with nearest sampling at a whole
   zoom (always, windowed) and with sharp (pixel-art) sampling at a fractional

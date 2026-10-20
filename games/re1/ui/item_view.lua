@@ -332,6 +332,9 @@ function M.open(api, args)
     s.item = args.item or 0
     s.quantity = args.quantity or 0
     s.pickup = args.pickup or false
+    -- The examine viewer draws on black, so a wider aspect gives it a wider
+    -- canvas; the pickup viewer draws over the room and keeps its band.
+    api:set("canvas", s.pickup and 0 or 1)
     s.pitch, s.yaw, s.roll = 0, 0, 0
     s.model_x = MODEL_REST_X
     s.stage = "setup"
@@ -410,6 +413,7 @@ function M.draw(api)
     if s.pickup then
         return
     end
+    local ox, oy = api:width() // 2 - 160, api:height() // 2 - 120
     if s.arrows then
         if s.status == nil then
             s.status = api:page("ui/status") or false
@@ -418,14 +422,14 @@ function M.draw(api)
             for _, arrow in ipairs(ARROWS) do
                 local u = s.held[arrow[4]] and ARROW_LIT_U or ARROW_IDLE_U
                 api:page_sprite_mirrored(s.status, u, arrow[3], ARROW_SIZE, ARROW_SIZE,
-                    arrow[1], arrow[2], ARROW_SIZE, ARROW_SIZE, 0, 0, false, false)
+                    ox + arrow[1], oy + arrow[2], ARROW_SIZE, ARROW_SIZE, 0, 0, false, false)
             end
         end
     end
     if s.show_name then
         local name = api:item_name_bytes(s.item, true)
         if name then
-            api:glyphs(api:font_margin(), ITEM_NAME_Y, name, { brightness = 0 })
+            api:glyphs(ox + api:font_margin(), oy + ITEM_NAME_Y, name, { brightness = 0 })
         end
     end
 end

@@ -13,7 +13,10 @@
 //!
 //! `api` is the general screen surface a mod can use for any full-screen
 //! menu: the save list, save/load/remove actions, the pad edges, the screen
-//! sounds, and immediate-mode drawing in the 320x240 layout space. The full
+//! sounds, and immediate-mode drawing in the layout space: 320x240 at 4:3,
+//! the presented band (320x180 at 16:9) at a wider aspect, or the full-height
+//! canvas (427x240 at 16:9) a screen drawn on black asks for with
+//! `api:set("canvas", 1)`. The full
 //! method table is in `docs/modding.md`.
 //!
 //! There is no Rust fallback: a script that fails to load is an error the
@@ -259,7 +262,7 @@ impl LuaScreen {
             exited: false,
             failed: false,
             images: HashMap::new(),
-            layout: (crate::render::WIDTH, crate::render::HEIGHT),
+            layout: (crate::render::WIDTH, crate::video::aspect().height()),
             action: None,
             overlay: None,
             values: HashMap::new(),
@@ -367,13 +370,19 @@ impl LuaScreen {
         actors: Option<&mut ActorDraw<'_>>,
     ) {
         let Self { host, vm, entry } = self;
-        // `api:clip` lasts for this draw only.
-        let clip = framebuffer.clip_rect();
-        if let Err(err) = vm.call_draw(host, cx, framebuffer, actors) {
-            eprintln!("[lua] screen {entry} draw failed: {err}");
-            host.failed = true;
-        }
-        framebuffer.set_clip_rect(clip);
+        // The script lays itself out in the presented band: the whole frame
+        // at 4:3 or on a canvas, the shorter rows a wider aspect shows
+        // otherwise.
+        framebuffer.with_view(|framebuffer| {
+            host.layout = (framebuffer.width, framebuffer.height);
+            // `api:clip` lasts for this draw only.
+            let clip = framebuffer.clip_rect();
+            if let Err(err) = vm.call_draw(host, cx, framebuffer, actors) {
+                eprintln!("[lua] screen {entry} draw failed: {err}");
+                host.failed = true;
+            }
+            framebuffer.set_clip_rect(clip);
+        });
     }
 
     /// The action an exit reports: the one the script named, else back to

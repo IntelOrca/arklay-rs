@@ -45,6 +45,7 @@ use anyhow::{Result, bail};
 use sdl3_sys::error::SDL_GetError;
 use sdl3_sys::gpu::*;
 use sdl3_sys::pixels::SDL_FColor;
+use sdl3_sys::rect::SDL_Rect;
 use sdl3_sys::video::{SDL_GetWindowSizeInPixels, SDL_Window};
 
 use crate::model::{Texture8, Tmd};
@@ -80,9 +81,6 @@ fn sdl_error() -> String {
         .to_string_lossy()
         .into_owned()
 }
-
-/// The size of one overlay layer upload.
-const LAYER_BYTES: u32 = LAYER_WIDTH * LAYER_HEIGHT * 4;
 
 /// A compiled shader, released when dropped; a pipeline keeps what it needs.
 struct Shader {
@@ -169,6 +167,9 @@ pub struct GpuRenderer {
     /// The persistent staging buffer of both overlay layers, cycled per
     /// present.
     layer_transfer: *mut SDL_GPUTransferBuffer,
+    /// The layers' size: 320x240, or a wider aspect's canvas while a screen
+    /// presents one ([`GpuRenderer::ensure_layers`]).
+    layer_size: (u32, u32),
     sprite_buffer: *mut SDL_GPUBuffer,
     sprite_capacity: u32,
     meshes: HashMap<usize, Resident<MeshBuffer>>,
@@ -282,6 +283,7 @@ impl GpuRenderer {
             layer_black: std::ptr::null_mut(),
             layer_white: std::ptr::null_mut(),
             layer_transfer: std::ptr::null_mut(),
+            layer_size: (0, 0),
             sprite_buffer: std::ptr::null_mut(),
             sprite_capacity: 0,
             meshes: HashMap::new(),
@@ -308,32 +310,58 @@ impl GpuRenderer {
         };
         renderer.samples = renderer.sample_count(msaa);
         renderer.create_scene_targets()?;
-        renderer.layer_black = renderer.texture(
-            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            LAYER_WIDTH,
-            LAYER_HEIGHT,
-            SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        )?;
-        renderer.layer_white = renderer.texture(
-            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            LAYER_WIDTH,
-            LAYER_HEIGHT,
-            SDL_GPU_TEXTUREUSAGE_SAMPLER,
-        )?;
-        let transfer_info = SDL_GPUTransferBufferCreateInfo {
-            usage: SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
-            size: LAYER_BYTES * 2,
-            ..Default::default()
-        };
-        renderer.layer_transfer = unsafe { SDL_CreateGPUTransferBuffer(device, &transfer_info) };
-        if renderer.layer_transfer.is_null() {
-            bail!("SDL_CreateGPUTransferBuffer failed: {}", sdl_error());
-        }
+        renderer.ensure_layers(LAYER_WIDTH, LAYER_HEIGHT)?;
         renderer.sampler = renderer.create_sampler(SDL_GPU_FILTER_NEAREST)?;
         renderer.linear = renderer.create_sampler(SDL_GPU_FILTER_LINEAR)?;
         renderer.build_scene_pipelines()?;
         renderer.clear_scene()?;
         Ok(renderer)
+    }
+
+    /// (Re)create both overlay layers and their staging buffer at `width` x
+    /// `height` unless they already have that size. The released ones stay
+    /// alive until the presents still reading them finish.
+    fn ensure_layers(&mut self, width: u32, height: u32) -> Result<()> {
+        if self.layer_size == (width, height) && !self.layer_transfer.is_null() {
+            return Ok(());
+        }
+        unsafe {
+            for texture in [self.layer_black, self.layer_white] {
+                if !texture.is_null() {
+                    SDL_ReleaseGPUTexture(self.device, texture);
+                }
+            }
+            if !self.layer_transfer.is_null() {
+                SDL_ReleaseGPUTransferBuffer(self.device, self.layer_transfer);
+            }
+        }
+        self.layer_black = std::ptr::null_mut();
+        self.layer_white = std::ptr::null_mut();
+        self.layer_transfer = std::ptr::null_mut();
+        self.layer_size = (0, 0);
+        self.layer_black = self.texture(
+            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            width,
+            height,
+            SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        )?;
+        self.layer_white = self.texture(
+            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            width,
+            height,
+            SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        )?;
+        let transfer_info = SDL_GPUTransferBufferCreateInfo {
+            usage: SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD,
+            size: width * height * 4 * 2,
+            ..Default::default()
+        };
+        self.layer_transfer = unsafe { SDL_CreateGPUTransferBuffer(self.device, &transfer_info) };
+        if self.layer_transfer.is_null() {
+            bail!("SDL_CreateGPUTransferBuffer failed: {}", sdl_error());
+        }
+        self.layer_size = (width, height);
+        Ok(())
     }
 
     /// The most samples up to `msaa` both scene formats support.
@@ -432,7 +460,17 @@ impl GpuRenderer {
         if !unsafe { SDL_GetWindowSizeInPixels(self.window, &mut width, &mut height) } {
             bail!("SDL_GetWindowSizeInPixels failed: {}", sdl_error());
         }
-        let viewport = video::fit(width.max(1) as u32, height.max(1) as u32);
+        // The scene covers the whole 4:3 frame a wider aspect's band is
+        // cropped from.
+        let band = video::shown(LAYER_WIDTH, LAYER_HEIGHT, video::aspect().centred());
+        let fit = video::fit_rows(width.max(1) as u32, height.max(1) as u32, band.height);
+        let (_, _, frame_w, frame_h) = video::frame_viewport(fit, band, LAYER_HEIGHT);
+        let viewport = video::Viewport {
+            x: 0,
+            y: 0,
+            width: frame_w.round().max(1.0) as u32,
+            height: frame_h.round().max(1.0) as u32,
+        };
         let (width, height) = video::scene_size(viewport, self.render_scale);
         let size = (width.min(MAX_SCENE_SIDE), height.min(MAX_SCENE_SIDE));
         if size == self.scene_size && !self.scene_colour.is_null() {
@@ -1333,10 +1371,16 @@ impl GpuRenderer {
         if self.window.is_null() || self.pipelines.composite.is_null() {
             bail!("the GPU renderer has no window to present to");
         }
+        // A 320x240 frame, or a wider aspect's full-height canvas (which
+        // never shows the scene, so it has no white layer).
+        let (layer_w, layer_h) = (black.width, black.height);
+        let layer_bytes = layer_w * layer_h * 4;
+        let canvas = layer_h == LAYER_HEIGHT && layer_w > LAYER_WIDTH && white.is_none();
         for layer in std::iter::once(black).chain(white) {
-            if layer.width != LAYER_WIDTH
-                || layer.height != LAYER_HEIGHT
-                || layer.rgba.len() != LAYER_BYTES as usize
+            if !(canvas || (layer.width == LAYER_WIDTH && layer.height == LAYER_HEIGHT))
+                || layer.width != layer_w
+                || layer.height != layer_h
+                || layer.rgba.len() != layer_bytes as usize
             {
                 bail!(
                     "expected a {LAYER_WIDTH}x{LAYER_HEIGHT} framebuffer, got {}x{}",
@@ -1345,6 +1389,7 @@ impl GpuRenderer {
                 );
             }
         }
+        self.ensure_layers(layer_w, layer_h)?;
         // Cycling the staging buffer and the layer textures lets this
         // upload proceed while the previous present may still read them.
         let mapped = unsafe { SDL_MapGPUTransferBuffer(self.device, self.layer_transfer, true) };
@@ -1356,8 +1401,8 @@ impl GpuRenderer {
             for (index, layer) in layers.iter().enumerate() {
                 std::ptr::copy_nonoverlapping(
                     layer.rgba.as_ptr(),
-                    mapped.cast::<u8>().add(index * LAYER_BYTES as usize),
-                    LAYER_BYTES as usize,
+                    mapped.cast::<u8>().add(index * layer_bytes as usize),
+                    layer_bytes as usize,
                 );
             }
             SDL_UnmapGPUTransferBuffer(self.device, self.layer_transfer);
@@ -1371,14 +1416,14 @@ impl GpuRenderer {
         for (index, texture) in [self.layer_black, self.layer_white].into_iter().enumerate() {
             let source = SDL_GPUTextureTransferInfo {
                 transfer_buffer: self.layer_transfer,
-                offset: index as u32 * LAYER_BYTES,
-                pixels_per_row: LAYER_WIDTH,
-                rows_per_layer: LAYER_HEIGHT,
+                offset: index as u32 * layer_bytes,
+                pixels_per_row: layer_w,
+                rows_per_layer: layer_h,
             };
             let destination = SDL_GPUTextureRegion {
                 texture,
-                w: LAYER_WIDTH,
-                h: LAYER_HEIGHT,
+                w: layer_w,
+                h: layer_h,
                 d: 1,
                 ..Default::default()
             };
@@ -1429,18 +1474,30 @@ impl GpuRenderer {
                             sampler: self.linear,
                         }
                     });
-                let fit = video::fit(width, height);
+                // The whole 4:3 frame is composited into the viewport that
+                // puts its visible band on the fitted rectangle, and the
+                // scissor crops the rest (the band is the whole frame at 4:3).
+                let shown = video::shown(black.width, black.height, black.view);
+                let fit = video::fit_size(width, height, shown.width, shown.height);
+                let (x, y, w, h) = video::frame_viewport(fit, shown, black.height);
                 let viewport = SDL_GPUViewport {
-                    x: fit.x as f32,
-                    y: fit.y as f32,
-                    w: fit.width as f32,
-                    h: fit.height as f32,
+                    x,
+                    y,
+                    w,
+                    h,
                     min_depth: 0.0,
                     max_depth: 1.0,
+                };
+                let scissor = SDL_Rect {
+                    x: fit.x as i32,
+                    y: fit.y as i32,
+                    w: fit.width as i32,
+                    h: fit.height as i32,
                 };
                 unsafe {
                     SDL_BindGPUGraphicsPipeline(pass, self.pipelines.composite);
                     SDL_SetGPUViewport(pass, &viewport);
+                    SDL_SetGPUScissor(pass, &scissor);
                     SDL_BindGPUFragmentSamplers(pass, 0, samplers.as_ptr(), 3);
                     SDL_DrawGPUPrimitives(pass, 3, 1, 0, 0);
                     SDL_EndGPURenderPass(pass);

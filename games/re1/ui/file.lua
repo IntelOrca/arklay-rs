@@ -231,6 +231,8 @@ local function reader_reset()
 end
 
 function M.open(api, args)
+    -- Drawn on black: a wider aspect gives the panel a wider canvas.
+    api:set("canvas", 1)
     local _, _, _, player = api:room()
     s = {
         -- "list" or "reader".

@@ -86,6 +86,8 @@ pub enum DebugMenuEvent {
     /// The DISPLAY tool picked this presented frame rate; the menu stays
     /// open.
     FrameRateChanged(u32),
+    /// The DISPLAY tool picked this aspect ratio; the menu stays open.
+    AspectChanged(video::Aspect),
 }
 
 /// The main list's tools, in order.
@@ -109,7 +111,7 @@ pub enum Tool {
     ClearGame,
     /// The input rebind screen.
     Controls,
-    /// The display options (the presented frame rate).
+    /// The display options (the presented frame rate and aspect ratio).
     Display,
 }
 
@@ -240,6 +242,10 @@ pub struct DebugMenu {
     controls: ControlsEditor,
     /// The presented frame rate the DISPLAY tool shows and steps.
     frame_rate: u32,
+    /// The aspect ratio the DISPLAY tool shows and steps.
+    aspect: video::Aspect,
+    /// The DISPLAY tool's row: 0 frame rate, 1 aspect ratio.
+    display_row: usize,
 }
 
 impl DebugMenu {
@@ -258,6 +264,8 @@ impl DebugMenu {
             ending_row: usize::from(default_ending(game).clamp(1, 7) - 1),
             controls: ControlsEditor::new(bindings),
             frame_rate: video::TICK_RATE,
+            aspect: video::aspect(),
+            display_row: 0,
         }
     }
 
@@ -269,6 +277,11 @@ impl DebugMenu {
     /// The DISPLAY tool's frame rate.
     pub fn frame_rate(&self) -> u32 {
         self.frame_rate
+    }
+
+    /// The DISPLAY tool's aspect ratio.
+    pub fn aspect(&self) -> video::Aspect {
+        self.aspect
     }
 
     /// Reattach the menu to the live session after it was closed: the open
@@ -398,12 +411,17 @@ impl DebugMenu {
         Step::Stay
     }
 
-    /// DISPLAY: left/right step the frame rate through
-    /// [`video::FRAME_RATE_PRESETS`] (confirm steps up); each change applies
-    /// at once and is saved to `arklay.toml` by the engine.
+    /// DISPLAY: up/down pick the row; left/right step the frame rate
+    /// through [`video::FRAME_RATE_PRESETS`] or the aspect ratio through
+    /// [`video::Aspect::PRESETS`] (confirm steps up). Each change applies at
+    /// once and is saved to `arklay.toml` by the engine.
     fn handle_display(&mut self, input: UiInput) -> Step {
         if input.cancel {
             return Step::Back;
+        }
+        if input.up || input.down {
+            self.display_row ^= 1;
+            return Step::Stay;
         }
         let delta = if input.left {
             -1
@@ -412,6 +430,10 @@ impl DebugMenu {
         } else {
             return Step::Stay;
         };
+        if self.display_row == 1 {
+            self.aspect = self.aspect.step(delta);
+            return Step::Event(DebugMenuEvent::AspectChanged(self.aspect));
+        }
         self.frame_rate = video::step_frame_rate(self.frame_rate, delta);
         Step::Event(DebugMenuEvent::FrameRateChanged(self.frame_rate))
     }
@@ -584,20 +606,27 @@ impl DebugMenu {
 
     fn draw_display(&self, pen: &mut Pen) {
         let value_x = TEXT_LEFT + 12 * pen.font.metrics.glyph_w;
-        pen.cursor(TEXT_LEFT - 16, BODY_Y);
-        pen.bytes(
-            TEXT_LEFT,
-            BODY_Y,
-            SELECTED_TINT,
-            pen.text.ui("UI_DEBUG_DISPLAY_FRAME_RATE"),
-        );
-        pen.ascii(
-            value_x,
-            BODY_Y,
-            Tint::Yellow,
-            &format!("{}", self.frame_rate),
-        );
-        let note = if self.frame_rate > video::TICK_RATE {
+        let rows = [
+            (
+                "UI_DEBUG_DISPLAY_FRAME_RATE",
+                format!("{}", self.frame_rate),
+            ),
+            ("UI_DEBUG_DISPLAY_ASPECT", self.aspect.name()),
+        ];
+        for (index, (label, value)) in rows.iter().enumerate() {
+            let y = BODY_Y + index as i32 * ROW_HEIGHT;
+            let tint = if index == self.display_row {
+                pen.cursor(TEXT_LEFT - 16, y);
+                SELECTED_TINT
+            } else {
+                Tint::White
+            };
+            pen.bytes(TEXT_LEFT, y, tint, pen.text.ui(label));
+            pen.ascii(value_x, y, Tint::Yellow, value);
+        }
+        let note = if self.display_row == 1 {
+            "UI_DEBUG_DISPLAY_ASPECT_NOTE"
+        } else if self.frame_rate > video::TICK_RATE {
             "UI_DEBUG_DISPLAY_TWEENED"
         } else {
             "UI_DEBUG_DISPLAY_NATIVE"
@@ -605,7 +634,7 @@ impl DebugMenu {
         let note = pen.text.ui(note);
         pen.fit(
             TEXT_LEFT,
-            BODY_Y + 2 * ROW_HEIGHT,
+            BODY_Y + 3 * ROW_HEIGHT,
             Tint::Grey,
             note,
             PANEL_RIGHT - TEXT_LEFT,

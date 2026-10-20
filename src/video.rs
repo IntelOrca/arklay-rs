@@ -36,6 +36,18 @@
 //! the exact 320x240 frame in software through a fixed 3x window. A headless
 //! `--stats` run times presentation frames only at an explicit
 //! `--frame-rate`.
+//!
+//! # Aspect ratio
+//!
+//! `aspect` (default `4:3`) is the one option a capture also honours
+//! (`--aspect`). A wider aspect is a presentation crop: the frame keeps the
+//! full 320 pixel width and shows a [`View`] band of [`Aspect::height`]
+//! rows (180 at 16:9, 200 at 16:10) of the 4:3 scene. Gameplay, masks,
+//! collision and cameras stay in 4:3 space; the band follows the player
+//! ([`follow`]), and the screens lay themselves out in the 320 x
+//! [`Aspect::height`] space `api:width()` x `api:height()` report. The
+//! aspect is a run-wide setting held per thread ([`aspect`], [`set_aspect`])
+//! so tests that pick one do not leak it into each other.
 
 /// The engine's frame size.
 pub const NATIVE_WIDTH: u32 = 320;
@@ -80,6 +92,233 @@ pub fn step_frame_rate(rate: u32, delta: i32) -> u32 {
             .find(|&preset| preset < rate)
             .unwrap_or(presets[presets.len() - 1])
     }
+}
+
+/// The widest canvas a frame may be: 32:9 at the native 240 rows.
+pub const MAX_CANVAS_WIDTH: u32 = 854;
+
+/// A display aspect ratio, `width:height`, no narrower than 4:3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Aspect {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for Aspect {
+    fn default() -> Self {
+        Self::STANDARD
+    }
+}
+
+impl Aspect {
+    /// The original 4:3 frame.
+    pub const STANDARD: Self = Self {
+        width: 4,
+        height: 3,
+    };
+    /// 16:9 widescreen.
+    pub const WIDE: Self = Self {
+        width: 16,
+        height: 9,
+    };
+    /// The aspects the options screen steps through.
+    pub const PRESETS: [Self; 2] = [Self::STANDARD, Self::WIDE];
+    /// The shortest band an aspect may show (an aspect wider than 32:9 is
+    /// refused rather than cropped to a sliver).
+    pub const MIN_HEIGHT: u32 = 90;
+
+    /// Parse `W:H` (`4:3`, `16:9`, `16:10`, ...). An aspect narrower than
+    /// 4:3 or wider than 32:9 is refused.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (width, height) = text.trim().split_once(':')?;
+        let aspect = Self {
+            width: width.trim().parse().ok()?,
+            height: height.trim().parse().ok()?,
+        };
+        let valid = aspect.width > 0
+            && aspect.height > 0
+            && u64::from(aspect.width) * 3 >= u64::from(aspect.height) * 4
+            && aspect.band_height() >= Self::MIN_HEIGHT;
+        valid.then_some(aspect)
+    }
+
+    /// The config spelling.
+    pub fn name(self) -> String {
+        format!("{}:{}", self.width, self.height)
+    }
+
+    /// The visible rows of the 320 pixel wide frame, rounded to even.
+    fn band_height(self) -> u32 {
+        let rows = u64::from(NATIVE_WIDTH) * u64::from(self.height) / u64::from(self.width.max(1));
+        ((rows as u32) & !1).min(NATIVE_HEIGHT)
+    }
+
+    /// The visible rows of the frame: 240 at 4:3, 180 at 16:9.
+    pub fn height(self) -> u32 {
+        self.band_height().max(Self::MIN_HEIGHT.min(NATIVE_HEIGHT))
+    }
+
+    /// Whether this is the full 4:3 frame.
+    pub fn is_standard(self) -> bool {
+        self.height() == NATIVE_HEIGHT
+    }
+
+    /// The preset after (`delta > 0`) or before this aspect, wrapping; an
+    /// aspect that is not a preset steps to the first.
+    pub fn step(self, delta: i32) -> Self {
+        let presets = &Self::PRESETS;
+        let Some(index) = presets.iter().position(|&preset| preset == self) else {
+            return presets[0];
+        };
+        let len = presets.len() as i32;
+        presets[(index as i32 + delta.signum()).rem_euclid(len) as usize]
+    }
+
+    /// The width of a full-height canvas of this shape: 320 at 4:3, 427 at
+    /// 16:9. Screens drawn on black (the pause-menu panel) take a canvas
+    /// this wide instead of the cropped band, so they keep every row.
+    pub fn canvas_width(self) -> u32 {
+        let width = (u64::from(NATIVE_HEIGHT) * u64::from(self.width)
+            + u64::from(self.height.max(1)) / 2)
+            / u64::from(self.height.max(1));
+        (width as u32).clamp(NATIVE_WIDTH, MAX_CANVAS_WIDTH)
+    }
+
+    /// The band centred on the 4:3 frame.
+    pub fn centred(self) -> View {
+        let height = self.height();
+        View {
+            top: (NATIVE_HEIGHT - height) / 2,
+            height,
+        }
+    }
+}
+
+thread_local! {
+    static ASPECT: std::cell::Cell<Aspect> = const { std::cell::Cell::new(Aspect::STANDARD) };
+}
+
+/// The aspect this thread presents at.
+pub fn aspect() -> Aspect {
+    ASPECT.with(std::cell::Cell::get)
+}
+
+/// Present this thread's frames at `aspect` from now on.
+pub fn set_aspect(aspect: Aspect) {
+    ASPECT.with(|cell| cell.set(aspect));
+}
+
+/// The band a frame whose own view is `view` presents at this thread's
+/// aspect: `view` when it has the aspect's height or is the whole frame
+/// (presented pillarboxed: the F1 debug menu), else the centred band (a
+/// band of another aspect's height, from before a change).
+pub fn presented(view: View) -> View {
+    let aspect = aspect();
+    if view.height == aspect.height() || view.is_full() {
+        view
+    } else {
+        aspect.centred()
+    }
+}
+
+/// The part of a `width` x `height` frame the window shows: a 320x240
+/// frame's [`presented`] band, or the whole of any other frame (a wider
+/// aspect's canvas).
+pub fn shown(width: u32, height: u32, view: View) -> Shown {
+    if width == NATIVE_WIDTH && height == NATIVE_HEIGHT {
+        let band = presented(view);
+        Shown {
+            top: band.top,
+            width,
+            height: band.height,
+        }
+    } else {
+        Shown {
+            top: 0,
+            width,
+            height,
+        }
+    }
+}
+
+/// The rows `top..top + height` of a frame, all `width` columns: what the
+/// window shows of it ([`shown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shown {
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The visible band of a 320x240 frame: rows `top..top + height`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub top: u32,
+    pub height: u32,
+}
+
+impl Default for View {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            height: NATIVE_HEIGHT,
+        }
+    }
+}
+
+impl View {
+    /// Whether the band is the whole frame.
+    pub fn is_full(self) -> bool {
+        self.top == 0 && self.height == NATIVE_HEIGHT
+    }
+
+    /// The band of `height` rows whose top is `top`, kept inside the frame.
+    pub fn at(top: i32, height: u32) -> Self {
+        let height = height.min(NATIVE_HEIGHT);
+        let max = (NATIVE_HEIGHT - height) as i32;
+        Self {
+            top: top.clamp(0, max) as u32,
+            height,
+        }
+    }
+}
+
+/// How far the gameplay band moves towards its target per tick, at most.
+pub const FOLLOW_STEP: i32 = 4;
+/// Rows of the band's middle the player may move in without it following.
+pub const FOLLOW_DEAD_ZONE: i32 = 24;
+
+/// The band's top after one tick of following a point at screen row
+/// `target` (the player's projected body, `None` off screen) from `top`.
+/// `snap` (a camera cut, a room entry) jumps straight to the target;
+/// otherwise the band only moves once the point leaves the dead zone around
+/// its centre, and then by at most [`FOLLOW_STEP`] rows.
+pub fn follow(top: u32, height: u32, target: Option<i32>, snap: bool) -> u32 {
+    let height = height.min(NATIVE_HEIGHT);
+    let max = (NATIVE_HEIGHT - height) as i32;
+    let Some(target) = target else {
+        return if snap {
+            (max / 2) as u32
+        } else {
+            top.min(max as u32)
+        };
+    };
+    let half = height as i32 / 2;
+    let wanted = (target - half).clamp(0, max);
+    let top = top as i32;
+    if snap {
+        return wanted as u32;
+    }
+    let centre = top + half;
+    let slack = FOLLOW_DEAD_ZONE.min(half);
+    let wanted = if (target - centre).abs() <= slack {
+        top
+    } else if target > centre {
+        (target - slack - half).clamp(0, max)
+    } else {
+        (target + slack - half).clamp(0, max)
+    };
+    (top + (wanted - top).clamp(-FOLLOW_STEP, FOLLOW_STEP)).clamp(0, max) as u32
 }
 
 /// Which renderer an interactive window draws the gameplay scene with.
@@ -130,6 +369,8 @@ pub struct Graphics {
     pub msaa: u32,
     /// Presented frames per second; the simulation stays at [`TICK_RATE`].
     pub frame_rate: u32,
+    /// The display aspect ratio: 4:3 or a wider crop.
+    pub aspect: Aspect,
 }
 
 impl Default for Graphics {
@@ -143,6 +384,7 @@ impl Default for Graphics {
             render_scale: 100,
             msaa: 1,
             frame_rate: TICK_RATE,
+            aspect: Aspect::STANDARD,
         }
     }
 }
@@ -159,19 +401,51 @@ pub struct Viewport {
 impl Viewport {
     /// Whether the viewport is an exact whole multiple of 320x240.
     pub fn is_whole_zoom(&self) -> bool {
-        self.width.is_multiple_of(NATIVE_WIDTH)
-            && self.height.is_multiple_of(NATIVE_HEIGHT)
-            && self.width / NATIVE_WIDTH == self.height / NATIVE_HEIGHT
+        self.is_whole_zoom_of(NATIVE_HEIGHT)
+    }
+
+    /// Whether the viewport is an exact whole multiple of a 320 x `rows`
+    /// frame.
+    pub fn is_whole_zoom_of(&self, rows: u32) -> bool {
+        self.is_whole_zoom_of_size(NATIVE_WIDTH, rows)
+    }
+
+    /// Whether the viewport is an exact whole multiple of a `width` x
+    /// `height` frame.
+    pub fn is_whole_zoom_of_size(&self, width: u32, height: u32) -> bool {
+        let (width, height) = (width.max(1), height.max(1));
+        self.width.is_multiple_of(width)
+            && self.height.is_multiple_of(height)
+            && self.width / width == self.height / height
     }
 }
 
 /// The largest 4:3 rectangle centred in a `width` x `height` client area.
 pub fn fit(width: u32, height: u32) -> Viewport {
+    fit_rows(width, height, NATIVE_HEIGHT)
+}
+
+/// The largest rectangle with a 320 x `rows` frame's shape centred in a
+/// `width` x `height` client area.
+pub fn fit_rows(width: u32, height: u32, rows: u32) -> Viewport {
+    fit_size(width, height, NATIVE_WIDTH, rows)
+}
+
+/// The largest rectangle with a `frame_w` x `frame_h` frame's shape centred
+/// in a `width` x `height` client area.
+pub fn fit_size(width: u32, height: u32, frame_w: u32, frame_h: u32) -> Viewport {
     let (width, height) = (width.max(1), height.max(1));
-    let (w, h) = if u64::from(width) * 3 >= u64::from(height) * 4 {
-        ((height * 4 + 1) / 3, height)
+    let (frame_w, frame_h) = (u64::from(frame_w.max(1)), u64::from(frame_h.max(1)));
+    let (w, h) = if u64::from(width) * frame_h >= u64::from(height) * frame_w {
+        (
+            ((u64::from(height) * frame_w + frame_h / 2) / frame_h) as u32,
+            height,
+        )
     } else {
-        (width, (width * 3 + 2) / 4)
+        (
+            width,
+            ((u64::from(width) * frame_h + frame_w / 2) / frame_w) as u32,
+        )
     };
     let (w, h) = (w.clamp(1, width), h.clamp(1, height));
     Viewport {
@@ -180,6 +454,19 @@ pub fn fit(width: u32, height: u32) -> Viewport {
         width: w,
         height: h,
     }
+}
+
+/// The viewport the whole `frame_height` rows tall frame would take so that
+/// its `shown` rows land exactly on `band` (the [`fit_size`] rectangle): the
+/// GPU scene and the layers are drawn into it and clipped to `band`.
+pub fn frame_viewport(band: Viewport, shown: Shown, frame_height: u32) -> (f32, f32, f32, f32) {
+    let scale = band.height as f32 / shown.height.max(1) as f32;
+    (
+        band.x as f32,
+        band.y as f32 - shown.top as f32 * scale,
+        band.width as f32,
+        frame_height as f32 * scale,
+    )
 }
 
 /// The GPU scene target for `viewport` at `render_scale` percent.
@@ -191,27 +478,37 @@ pub fn scene_size(viewport: Viewport, render_scale: u32) -> (u32, u32) {
 /// The largest whole multiple of 320x240 that fits in `room` (a client
 /// area, in pixels); at least 320x240.
 pub fn largest_window(room: (u32, u32)) -> (u32, u32) {
-    let times = (room.0 / NATIVE_WIDTH).min(room.1 / NATIVE_HEIGHT).max(1);
-    (NATIVE_WIDTH * times, NATIVE_HEIGHT * times)
+    largest_window_rows(room, NATIVE_HEIGHT)
 }
 
-/// The smallest whole multiple of 320x240 larger than every one a `width` x
-/// `height` window holds.
-fn next_window(width: u32, height: u32) -> (u32, u32) {
-    let times = (width / NATIVE_WIDTH).min(height / NATIVE_HEIGHT) + 1;
-    (NATIVE_WIDTH * times, NATIVE_HEIGHT * times)
+/// The largest whole multiple of a 320 x `rows` frame that fits in `room`;
+/// at least one.
+pub fn largest_window_rows(room: (u32, u32), rows: u32) -> (u32, u32) {
+    let rows = rows.max(1);
+    let times = (room.0 / NATIVE_WIDTH).min(room.1 / rows).max(1);
+    (NATIVE_WIDTH * times, rows * times)
 }
 
-/// The window state F8 steps to: the next whole multiple of 320x240 above
+/// The smallest whole multiple of a 320 x `rows` frame larger than every
+/// one a `width` x `height` window holds.
+fn next_window(width: u32, height: u32, rows: u32) -> (u32, u32) {
+    let rows = rows.max(1);
+    let times = (width / NATIVE_WIDTH).min(height / rows) + 1;
+    (NATIVE_WIDTH * times, rows * times)
+}
+
+/// The window state F8 steps to: the next whole multiple of the frame (320 x
+/// [`Aspect::height`]) above
 /// the window's current size, borderless fullscreen once that would not fit
 /// in `room` (the client area the display allows, in pixels), then back to
 /// 320x240. Going fullscreen keeps the window size, so Alt+Enter returns to
 /// that window.
 pub fn step_window(graphics: &mut Graphics, room: (u32, u32)) {
-    let (width, height) = next_window(graphics.window_width, graphics.window_height);
+    let rows = graphics.aspect.height();
+    let (width, height) = next_window(graphics.window_width, graphics.window_height, rows);
     if graphics.fullscreen {
         graphics.fullscreen = false;
-        (graphics.window_width, graphics.window_height) = (NATIVE_WIDTH, NATIVE_HEIGHT);
+        (graphics.window_width, graphics.window_height) = (NATIVE_WIDTH, rows);
     } else if width <= room.0 && height <= room.1 {
         (graphics.window_width, graphics.window_height) = (width, height);
     } else {

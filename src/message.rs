@@ -660,7 +660,9 @@ impl MessageWindow {
     /// paint their contents and item names paint in the colour `0x05` selected
     /// (the item-name sequence is always bracketed with the green operand).
     ///
-    /// The engine calls this after the gameplay scene and before fades.
+    /// The engine calls this after the gameplay scene and before fades. The
+    /// line keeps its distance from the bottom when `framebuffer` is a
+    /// wider aspect's shorter band.
     pub fn draw(&self, framebuffer: &mut Framebuffer, font: &Font, text: &Text) {
         if !self.active || !self.source_ready {
             return;
@@ -668,11 +670,12 @@ impl MessageWindow {
         let metrics = font.metrics;
         let glyph_w = metrics.glyph_w;
         let tight = text.uses_tight_metrics();
-        let base_y = if self.menu {
+        let row = if self.menu {
             metrics.menu_y
         } else {
             metrics.text_y
         };
+        let base_y = row + framebuffer.height as i32 - crate::render::HEIGHT as i32;
         let mut x = metrics.left_margin;
         let mut y = base_y;
         let mut tint = Tint::from_clut_row(i32::from(self.clut_base));
