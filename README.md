@@ -156,6 +156,9 @@ Vorbis audio — and the engine resolves them by entry stem with a fixed
 extension priority (`webp > png > bmp > tim > pix`, `ogg > wav`):
 
 ```sh
+# Print the HD texture-pack file names for an original file's textures
+cargo run -- hash /path/to/JPN/STAGE1/RC1000.pak   # bgd/DD17F52F.webp
+
 # Build the checked-in demo sources into a pack (no game assets included)
 cargo run -- mod build mods/demo --out demo.akpak
 

@@ -279,6 +279,20 @@ enum Command {
         mods: Vec<PathBuf>,
     },
 
+    /// Print the HD texture-pack file names (`<class>/<hash>.webp`) that
+    /// replace the textures in an original game file
+    Hash {
+        /// Original file: TIM, PIX, PAK, a model or room file with embedded
+        /// TIMs (EMD, EMW, IVM, RDT, ...), or BMP/PNG/WebP artwork
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Hash as this class instead of the one the file type implies:
+        /// bgd, mask, misc, skin or skin2
+        #[arg(long, value_name = "CLASS")]
+        class: Option<String>,
+    },
+
     /// List every entry of a game pack with its stored size
     List {
         /// Game pack to read
@@ -497,6 +511,106 @@ fn extract_pack(pack_path: &Path, out_dir: &Path, mods: &[PathBuf]) -> Result<()
     Ok(())
 }
 
+/// Print the HD texture-pack file name of every texture in an original file,
+/// e.g. `arklay hash STAGE1/RC1000.pak` -> `bgd/DD17F52F.webp`.
+///
+/// The hash is taken over the texels as the game uploads them, so the file is
+/// decoded the way its loader decodes it: room backgrounds and masks are
+/// bit-replicated, everything else is shifted, and a container is scanned for
+/// every embedded TIM and CLUT row. See [`arklay::hash`].
+fn hash_file(path: &Path, class: Option<&str>) -> Result<()> {
+    use arklay::hash::{Class, Expand, Found, Surface};
+
+    let data = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let forced = class.map(Class::parse).transpose()?;
+    let whole = |surface: Surface| {
+        vec![Found {
+            offset: 0,
+            clut: None,
+            surface,
+        }]
+    };
+    // A full-screen 16bpp image is a background; other textures default by
+    // the kind of file that carries them.
+    let screen = |surface: &Surface| surface.width >= 320 && surface.height >= 240;
+    let (found, implied) = match extension.as_str() {
+        "pak" => {
+            let tim = arklay::lzw::decode(&data)
+                .with_context(|| format!("failed to LZW-decode {}", path.display()))?;
+            let mask = name.starts_with("OSP");
+            let mut found = arklay::hash::scan_tims(&tim, Expand::Replicate, mask);
+            found.retain(|found| found.offset == 0);
+            (found, if mask { Class::Mask } else { Class::Bgd })
+        }
+        "pix" => {
+            // `DATA/RC1121.PIX` is a room camera and loads like one.
+            let expand = if name.starts_with("RC") {
+                Expand::Replicate
+            } else {
+                Expand::Shift
+            };
+            (whole(arklay::hash::pix_surface(&data, expand)?), Class::Bgd)
+        }
+        "bmp" | "png" | "webp" => {
+            let image = arklay::assets::decode_image_bytes(&extension, &data)
+                .with_context(|| format!("failed to decode {}", path.display()))?;
+            let surface = Surface::from_rgba(&image);
+            let implied = if screen(&surface) {
+                Class::Bgd
+            } else {
+                Class::Misc
+            };
+            (whole(surface), implied)
+        }
+        "emd" | "emw" | "ivm" | "plw" | "tmd" => (
+            arklay::hash::scan_tims(&data, Expand::Shift, false),
+            Class::Skin,
+        ),
+        "rdt" => (
+            arklay::hash::scan_tims(&data, Expand::Shift, false),
+            Class::Skin2,
+        ),
+        _ => (
+            arklay::hash::scan_tims(&data, Expand::Shift, false),
+            Class::Misc,
+        ),
+    };
+    if found.is_empty() {
+        bail!("{} contains no texture", path.display());
+    }
+    let several = found.len() > 1;
+    for texture in &found {
+        let class = forced.unwrap_or(if implied == Class::Misc && screen(&texture.surface) {
+            Class::Bgd
+        } else {
+            implied
+        });
+        let hash = arklay::hash::format_hash(texture.surface.hash(class));
+        let mut line = format!("{}/{hash}.webp", class.name());
+        if several {
+            line.push_str(&format!(
+                "  # TIM at 0x{:X}, {}x{}",
+                texture.offset, texture.surface.width, texture.surface.height
+            ));
+            if let Some(clut) = texture.clut {
+                line.push_str(&format!(", CLUT {clut}"));
+            }
+        }
+        println!("{line}");
+    }
+    Ok(())
+}
+
 /// Write one deterministic `list` line per entry: right-aligned size, path.
 ///
 /// Returns the entry count and the total bytes listed.
@@ -613,6 +727,7 @@ fn main() -> Result<()> {
             verbose,
         ),
         Some(Command::Extract { pack, out, mods }) => extract_pack(&pack, &out, &mods),
+        Some(Command::Hash { file, class }) => hash_file(&file, class.as_deref()),
         Some(Command::List { pack, mods }) => list_pack(&pack, &mods),
         Some(Command::Verify { pack, mods, strict }) => verify_pack(&pack, &mods, strict),
         Some(Command::Scd { action }) => match action {
@@ -1126,6 +1241,16 @@ entries:
             Cli::try_parse_from(["arklay", "game.akpak", "--load", "s.dat", "--room", "101"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_cli_accepts_the_hash_subcommand() {
+        let cli = Cli::try_parse_from(["arklay", "hash", "RC1000.pak", "--class", "bgd"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Hash { file, class: Some(class) })
+                if file.as_path() == Path::new("RC1000.pak") && class == "bgd"
+        ));
     }
 
     #[test]

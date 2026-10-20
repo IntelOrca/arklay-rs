@@ -202,6 +202,46 @@ arklay re1.akpak --mod hd.akpak --ui box --capture hd-box.bmp
 `arklay mod build --base <base.akpak>` counts a format override as an override:
 `roomcut/100_000.png` over the base's `.bmp` is not reported as a new file.
 
+### HD texture-pack names
+
+The RE1 HD texture pack (`bio1hd.asi`, run by Classic REbirth) names every
+replacement `hires/<class>/<hash>.webp`. `<hash>` is the CRC-32 (IEEE / zlib) of the
+texture's texels as the game uploads them, in 32-bit BGRA, written as 8 uppercase hex
+digits. `arklay hash FILE` reproduces the conversion and prints the name for every
+texture in an original file:
+
+```sh
+arklay hash JPN/STAGE1/RC1000.pak        # bgd/DD17F52F.webp
+arklay hash JPN/objspr/OSP00001.pak      # mask/C5157461.webp
+arklay hash JPN/ENEMY/EM1002.EMD         # skin/474AD7E1.webp, one line per TIM and CLUT row
+arklay hash JPN/DATA/SEL_BACK.PIX        # bgd/B87E761B.webp
+arklay hash JPN/DATA/BLUE.TIM            # misc/4F8DC05B.webp
+```
+
+The game's conversion, which the hash depends on:
+
+- A 15-bit texel widens each channel to 8 bits. Room backgrounds (`RC*.pak`) and
+  masks (`OSP*.pak`) bit-replicate (`v << 3 | v >> 2`). Model, menu and `DATA/*.PIX`
+  textures shift (`v << 3`).
+- Pure black becomes `0x000001` (blue 1) so it stays distinct from transparent `0`. A
+  mask's colour 0 is transparent.
+- `bgd` hashes the left 256 x 240 texels with alpha forced to `0xFF`. `mask` hashes
+  the left 256 x 256 texels, with opaque texels at alpha `0xFF`. `misc`, `skin` and
+  `skin2` hash the whole texture, with every texel but `0` and `1` at alpha `0xFF`. A
+  window larger than the texture is padded with zero texels.
+
+The class comes from how the game uses the texture, so `arklay hash` infers it from
+the file: a `.pak` is `bgd` or `mask`, models (`EMD`, `EMW`, `IVM`, ...) are `skin`,
+rooms (`RDT`) are `skin2`, and other 320x240 images are `bgd`; anything else is
+`misc`. `misc`, `skin` and `skin2` share one hash rule, so `--class` only changes the
+directory for those.
+
+The hash covers the texture the game builds at runtime, so a screen composited from
+several sources has no single source file. Classic REbirth's save screen is its own
+`type.png` with the menu panel baked in, which hashes to `bgd/D1D144A8.webp`. The raw
+`JPN/DATA/TYPE00.TIM` does not. PNG/BMP/WebP input is treated as that kind of
+artwork: alpha 0 is transparent, and every other pixel keeps its colour, with black
+remapped to `0x000001`.
 
 ## Language files
 
