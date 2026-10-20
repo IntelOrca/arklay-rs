@@ -329,6 +329,27 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         })))
     });
 
+    // `item_model(item)`: the item viewer's model for `item`; nil and a
+    // message when the item has none or its file is missing.
+    methods.add_method_mut("item_model", |_lua, api, item: u8| {
+        let Some(entry) = crate::examine::model_entry(item) else {
+            return Ok((None, Some(format!("item {item:#04x} has no model"))));
+        };
+        let pack: &Pack = api.cx.pack;
+        let cache_key = format!("ivm:{entry}");
+        Ok(loaded(api.host.assets.load(cache_key, || {
+            let bytes = pack.read(&entry)?;
+            let model =
+                ivm::parse(&bytes).map_err(|err| err.context(format!("invalid {entry}")))?;
+            Ok(Asset::Model(Box::new(model), bytes.len()))
+        })))
+    });
+
+    // `model_objects(model)`: the number of objects a model carries.
+    methods.add_method("model_objects", |_lua, api, handle: usize| {
+        Ok(api.host.assets.model(handle)?.objects.len())
+    });
+
     methods.add_method("art_size", |_lua, api, handle: usize| {
         Ok(api.host.assets.get(handle)?.size())
     });
@@ -373,8 +394,10 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         },
     );
 
-    // `draw_ivm(model, {joints = {...}, camera = {from, to, fov}, light})`:
-    // every object of the model takes the one composed joint matrix.
+    // `draw_ivm(model, {joints = {...}, objects = {{...}, ...}, camera =
+    // {from, to, fov, screen = {x, y}}, light})`: object `i` takes the
+    // joint chain `objects[i]`, and every object past the list the one
+    // composed `joints` chain. `screen` offsets the projection centre.
     methods.add_method_mut("draw_ivm", |_lua, api, (handle, spec): (usize, Table)| {
         let Api {
             host, framebuffer, ..
@@ -383,16 +406,26 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         let model = host.assets.model(handle)?;
         let joint = joint_matrix(spec.get("joints")?)?;
         let camera: Table = spec.get("camera")?;
-        let camera = Camera::from_points(
+        let screen = match camera.get::<Option<Table>>("screen")? {
+            Some(offset) => [offset.get(1)?, offset.get(2)?],
+            None => [0, 0],
+        };
+        let mut camera = Camera::from_points(
             triple(&camera, "from")?,
             triple(&camera, "to")?,
             field(&camera, "fov")?,
         );
+        camera.screen = screen;
         let light = match spec.get::<Option<Table>>("light")? {
             Some(table) => Some(light(&table)?),
             None => None,
         };
-        let joints = vec![joint; model.objects.len()];
+        let mut joints = vec![joint; model.objects.len()];
+        if let Some(objects) = spec.get::<Option<Table>>("objects")? {
+            for (slot, chain) in joints.iter_mut().zip(objects.sequence_values::<Table>()) {
+                *slot = joint_matrix(Some(chain?))?;
+            }
+        }
         framebuffer.draw_ivm(model, &joints, &camera, light.as_ref());
         Ok(())
     });

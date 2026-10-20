@@ -1335,6 +1335,12 @@ enum PickupPhase {
 /// The item-viewer flow the engine drives itself (the original's main-menu
 /// modes 3, 4 and 8).
 ///
+/// The `event` codes `ui/item_view.lua` publishes to the examine tick.
+const EXAMINE_DESCRIPTION: i64 = 1;
+const EXAMINE_MESSAGE: i64 = 2;
+const EXAMINE_MARK_BIT: i64 = 3;
+const EXAMINE_MEDAL: i64 = 4;
+
 /// Like the examine viewer, a pick-up shares the game's message window and
 /// the inventory panel, so the engine owns its state machine: the viewer's intro/exit
 /// animation steps in [`GameSession::tick_pickup_view`] and the message is
@@ -1347,7 +1353,7 @@ struct PickupView {
     /// Which prompt the flow runs.
     kind: PickupKind,
     /// The model viewer; `None` for the document reader flow.
-    screen: Option<ui::item_view::ItemViewScreen>,
+    screen: Option<Box<ui::lua_screen::LuaScreen>>,
     /// The document reader (`ui/file.lua` opened with `pickup`); `None` for
     /// the model-viewer flows.
     reader: Option<Box<ui::lua_screen::LuaScreen>>,
@@ -1535,7 +1541,7 @@ struct GameSession {
     /// transmission). It runs inside the live menu: the menu keeps ticking
     /// and drawing underneath, and the viewer's messages go through the
     /// game's message window.
-    examine: Option<ui::item_view::ItemViewScreen>,
+    examine: Option<Box<ui::lua_screen::LuaScreen>>,
     /// A message dismissal consumed the action key while it was still held;
     /// the room tick keeps ignoring the action until the key is released,
     /// matching the original's cleared held/previous-held pad bits.
@@ -3401,13 +3407,38 @@ impl GameSession {
         Ok(())
     }
 
-    /// Open the examine viewer on `item` inside the open menu. It starts on
-    /// its setup state: the first [`GameSession::tick_examine`] runs the
-    /// setup and the first intro frame together.
+    /// Open the examine viewer (`ui/item_view.lua`) on `item` inside the open
+    /// menu. It starts on its setup state: the first
+    /// [`GameSession::tick_examine`] runs the setup and the first intro frame
+    /// together. A viewer that cannot open hands the menu straight back.
     fn open_item_view(&mut self, pack: &Pack, item: u8) {
-        let mut screen = ui::item_view::ItemViewScreen::new(item);
-        screen.open_with(pack, &self.text);
-        self.examine = Some(screen);
+        let quantity = self
+            .menu
+            .as_ref()
+            .and_then(|menu| ui::layout::slot_of_cursor(menu.cursor))
+            .and_then(|slot| self.game.inventory.get(slot))
+            .map_or(0, |stack| stack.quantity);
+        let screen = {
+            let mut cx = self.ui_context(pack);
+            ui::lua_screen::LuaScreen::open_screen(
+                "item_view",
+                &[
+                    ("item", ScreenArg::Int(i64::from(item))),
+                    ("quantity", ScreenArg::Int(i64::from(quantity))),
+                ],
+                ScreenAction::Resume,
+                &mut cx,
+            )
+        };
+        match screen {
+            Ok(screen) => self.examine = Some(Box::new(screen)),
+            Err(err) => {
+                eprintln!("warning: item viewer unavailable: {err:#}");
+                if let Some(menu) = self.menu.as_mut() {
+                    menu.view_closed();
+                }
+            }
+        }
     }
 
     /// One frame of the examine viewer and the CHECK slide around it
@@ -3415,9 +3446,11 @@ impl GameSession {
     ///
     /// The menu ticks first (its health monitor, and the slide); the frame
     /// the slide-out finishes starts the viewer and runs its first frame. The
-    /// viewer's confirm runs the examine check against the game state and
-    /// shows its message or the item description in the game's window; the
-    /// frame its closing animation finishes the options start sliding back.
+    /// viewer runs the examine check itself and publishes what the game
+    /// should do: the engine shows its message or the item description in
+    /// the game's window, marks the examined bits and rewrites the slot of a
+    /// doom book turned medal. The frame its closing animation finishes the
+    /// options start sliding back.
     fn tick_examine(&mut self, pack: &Pack, ui: UiInput) {
         let Some(menu) = self.menu.as_mut() else {
             self.examine = None;
@@ -3426,74 +3459,52 @@ impl GameSession {
         if let Some(MenuEvent::ViewItem(item)) = menu.tick(&mut self.game) {
             self.open_item_view(pack, item);
         }
-        let Self {
-            examine,
-            menu,
-            game,
-            text,
-            ..
-        } = self;
-        let (Some(viewer), Some(menu)) = (examine.as_mut(), menu.as_mut()) else {
+        let Some(mut viewer) = self.examine.take() else {
             return;
         };
-        let input = ui::item_view::ExamineInput {
-            confirm: ui.confirm,
-            cancel: ui.cancel,
-            up: ui.up || ui.held_up,
-            down: ui.down || ui.held_down,
-            left: ui.left || ui.held_left,
-            right: ui.right || ui.held_right,
-            message_active: game.message.active,
+        let result = {
+            let cx = self.ui_context(pack);
+            viewer.update(&cx, ui)
         };
-        let slot = ui::layout::slot_of_cursor(menu.cursor);
-        match viewer.step_examine(input) {
-            ui::item_view::ExamineEvent::None => {}
-            ui::item_view::ExamineEvent::Confirm => {
-                let context = ui::item_view::ExamineContext {
-                    slot_quantity: slot
-                        .and_then(|slot| game.inventory.get(slot))
-                        .map_or(0, |stack| stack.quantity),
-                    item13_message: game.flag_test(game::BANK_SCENARIO, 0x13, false)
-                        || game.flag_test(game::BANK_SCENARIO, 0x00, false),
-                };
-                match viewer.confirm(context) {
-                    ui::item_view::ConfirmOutcome::Description => {
-                        if let Some(bytes) = viewer.description() {
-                            game.show_item_description(viewer.item().wrapping_sub(1), bytes);
-                        }
-                    }
-                    ui::item_view::ConfirmOutcome::Zoom => {}
-                    ui::item_view::ConfirmOutcome::Message {
-                        id,
-                        mark_examined,
-                        select,
-                    } => {
-                        if mark_examined {
-                            game.mark_examined(viewer.item());
-                        }
-                        if let Some(item) = select {
-                            game.select_item(Some(item));
-                        }
-                        game.show_message(id, 0);
-                    }
+        let Self {
+            menu, game, text, ..
+        } = self;
+        let Some(menu) = menu.as_mut() else {
+            return;
+        };
+        let id = viewer.value("event_id") as u8;
+        match viewer.value("event") {
+            EXAMINE_DESCRIPTION => {
+                let item = viewer.value("item") as u8;
+                if let Some(bytes) = crate::examine::description_bytes(text, item) {
+                    game.show_item_description(item.wrapping_sub(1), bytes);
                 }
             }
-            ui::item_view::ExamineEvent::Message(id) => game.show_message(id, 0),
-            ui::item_view::ExamineEvent::MarkExaminedBit(bit) => game.mark_examined_bit(bit),
-            ui::item_view::ExamineEvent::Medal(item) => {
+            EXAMINE_MESSAGE => {
+                match viewer.value("event_mark") as u8 {
+                    0 => {}
+                    item => game.mark_examined(item),
+                }
+                match viewer.value("event_select") as u8 {
+                    0 => {}
+                    item => game.select_item(Some(item)),
+                }
+                game.show_message(id, 0);
+            }
+            EXAMINE_MARK_BIT => game.mark_examined_bit(id),
+            EXAMINE_MEDAL => {
+                let slot = ui::layout::slot_of_cursor(menu.cursor);
                 if let Some(stack) = slot.and_then(|slot| game.inventory.get_mut(slot)) {
-                    *stack = game::InventoryItem {
-                        id: item,
-                        quantity: 1,
-                    };
+                    *stack = game::InventoryItem { id, quantity: 1 };
                 }
                 menu.reselect(game);
-                viewer.open_with(pack, text);
             }
-            ui::item_view::ExamineEvent::Closed => {
-                *examine = None;
-                menu.view_closed();
-            }
+            _ => {}
+        }
+        if matches!(result, ScreenResult::Continue) {
+            self.examine = Some(viewer);
+        } else {
+            menu.view_closed();
         }
     }
 
@@ -3529,13 +3540,23 @@ impl GameSession {
         self.game.select_item(Some(item));
         let (screen, reader, phase) = match kind {
             PickupKind::Take | PickupKind::GotItem => {
-                let mut screen = if kind == PickupKind::Take {
-                    ui::item_view::ItemViewScreen::new_take(item)
-                } else {
-                    ui::item_view::ItemViewScreen::new_got_item(item)
+                let screen = {
+                    let mut cx = self.ui_context(pack);
+                    ui::lua_screen::LuaScreen::open_screen(
+                        "item_view",
+                        &[
+                            ("item", ScreenArg::Int(i64::from(item))),
+                            ("pickup", ScreenArg::Bool(true)),
+                        ],
+                        ScreenAction::Resume,
+                        &mut cx,
+                    )
                 };
-                screen.open_with(pack, &self.text);
-                (Some(screen), None, PickupPhase::Intro)
+                let screen = screen
+                    .map_err(|err| eprintln!("warning: item viewer unavailable: {err:#}"))
+                    .ok()
+                    .map(Box::new);
+                (screen, None, PickupPhase::Intro)
             }
             PickupKind::Document => {
                 // The original's state-8 screen files the entry as it opens
@@ -3602,8 +3623,19 @@ impl GameSession {
         };
         match phase {
             PickupPhase::Intro => {
-                let settled = match self.pickup_view.as_mut().and_then(|p| p.screen.as_mut()) {
-                    Some(screen) => screen.step_intro(),
+                let settled = match self.pickup_view.as_mut().and_then(|p| p.screen.take()) {
+                    Some(mut screen) => {
+                        let result = {
+                            let cx = self.ui_context(pack);
+                            screen.update(&cx, UiInput::default())
+                        };
+                        let settled = screen.value("settled") != 0
+                            || !matches!(result, ScreenResult::Continue);
+                        if let Some(pickup) = self.pickup_view.as_mut() {
+                            pickup.screen = Some(screen);
+                        }
+                        settled
+                    }
                     None => true,
                 };
                 if settled {
@@ -3678,16 +3710,32 @@ impl GameSession {
                     }
                     _ => {}
                 }
-                if let Some(pickup) = self.pickup_view.as_mut() {
-                    if let Some(screen) = pickup.screen.as_mut() {
-                        screen.begin_exit();
+                if let Some(mut screen) = self.pickup_view.as_mut().and_then(|p| p.screen.take()) {
+                    {
+                        let cx = self.ui_context(pack);
+                        screen.signal("begin_exit", &cx);
                     }
+                    if let Some(pickup) = self.pickup_view.as_mut() {
+                        pickup.screen = Some(screen);
+                    }
+                }
+                if let Some(pickup) = self.pickup_view.as_mut() {
                     pickup.phase = PickupPhase::Exit;
                 }
             }
             PickupPhase::Exit => {
-                let finished = match self.pickup_view.as_mut().and_then(|p| p.screen.as_mut()) {
-                    Some(screen) => screen.step_exit(),
+                let finished = match self.pickup_view.as_mut().and_then(|p| p.screen.take()) {
+                    Some(mut screen) => {
+                        let result = {
+                            let cx = self.ui_context(pack);
+                            screen.update(&cx, UiInput::default())
+                        };
+                        let finished = !matches!(result, ScreenResult::Continue);
+                        if let Some(pickup) = self.pickup_view.as_mut() {
+                            pickup.screen = Some(screen);
+                        }
+                        finished
+                    }
                     None => true,
                 };
                 if finished {
@@ -4866,16 +4914,28 @@ impl GameSession {
         }
         // The examine viewer draws over the live menu: the model, its
         // rotation arrows and the item name.
-        if let Some(viewer) = &self.examine
-            && !self.menu_fade_hides()
-        {
-            viewer.draw_examine(
-                &mut self.framebuffer,
-                self.menu_assets.as_ref().map(|assets| &assets.status),
-                self.font.as_ref(),
-                &self.text,
-                &self.game.examined_flags(),
-            );
+        if self.examine.is_some() && !self.menu_fade_hides() {
+            let Self {
+                examine,
+                framebuffer,
+                font,
+                text,
+                game,
+                save_dir,
+                ..
+            } = self;
+            if let Some(viewer) = examine.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
+                viewer.draw(&cx, framebuffer);
+            }
         }
         if self.item_box.is_some() && !self.menu_fade_hides() {
             self.ensure_item_box_assets(pack);
@@ -20419,14 +20479,14 @@ off_0010:
             session
                 .examine
                 .as_ref()
-                .map(ui::item_view::ItemViewScreen::item),
+                .map(|viewer| viewer.value("item") as u8),
             Some(ITEM_KNIFE)
         );
         idle_until(&mut session, &pack, 0x80, |session| {
             session
                 .examine
                 .as_ref()
-                .is_some_and(ui::item_view::ItemViewScreen::turntable_ready)
+                .is_some_and(|viewer| viewer.value("ready") != 0)
         });
         assert_eq!(session.game.frame, frozen, "the room stays frozen");
 
@@ -20482,7 +20542,7 @@ off_0010:
             session
                 .examine
                 .as_ref()
-                .is_some_and(ui::item_view::ItemViewScreen::turntable_ready)
+                .is_some_and(|viewer| viewer.value("ready") != 0)
         });
         assert!(!crate::message::examined_bit(
             &session.game.examined_flags(),
@@ -20655,7 +20715,7 @@ off_0010:
                 .pickup_view
                 .as_ref()
                 .and_then(|pickup| pickup.screen.as_ref())
-                .map(|screen| screen.item()),
+                .map(|screen| screen.value("item") as u8),
             Some(ITEM_FIRST_AID_SPRAY),
             "the viewer loaded the picked item's model"
         );

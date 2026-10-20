@@ -263,6 +263,17 @@ impl LuaScreen {
         self.host.values.get(key).copied().unwrap_or(0)
     }
 
+    /// Run the script's `M.<name>(api)` hook, if it defines one: the engine's
+    /// way to tell a running screen something happened (the pick-up viewer's
+    /// `begin_exit`). A failing hook is logged and fails the screen.
+    pub fn signal(&mut self, name: &str, cx: &UiContext<'_>) {
+        let Self { host, vm, entry } = self;
+        if let Err(err) = vm.call_hook(name, host, cx) {
+            eprintln!("[lua] screen {entry} {name} failed: {err}");
+            host.failed = true;
+        }
+    }
+
     /// [`Screen::draw`] with the engine's actors available to
     /// `api:draw_actor`.
     pub fn draw_with_actors(
@@ -377,7 +388,6 @@ struct ScreenVm {
     #[cfg_attr(not(test), allow(dead_code))]
     env: Table,
     /// The table the entry chunk returned (the env for a legacy script).
-    #[cfg_attr(not(test), allow(dead_code))]
     module: Table,
     on_open: Option<Function>,
     update: Option<Function>,
@@ -468,6 +478,26 @@ impl ScreenVm {
                     actors: None,
                 })?;
                 function.call::<()>((api, table))
+            })
+            .map_err(|err| anyhow::anyhow!("{err}"))?;
+        Ok(())
+    }
+
+    /// Run the module's `name(api)`, when it is a function.
+    fn call_hook(&self, name: &str, host: &mut Host, cx: &UiContext<'_>) -> Result<()> {
+        let Ok(Value::Function(function)) = self.module.get::<Value>(name) else {
+            return Ok(());
+        };
+        self.budget.begin();
+        self.lua
+            .scope(|scope| {
+                let api = scope.create_userdata(Api {
+                    host: &mut *host,
+                    cx,
+                    framebuffer: None,
+                    actors: None,
+                })?;
+                function.call::<()>(api)
             })
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(())
@@ -898,12 +928,80 @@ impl UserData for Api<'_> {
 
         // The font-encoded name of item `id`; nil without a text table or
         // a name.
-        methods.add_method("item_name_bytes", |lua, api, id: u16| {
-            api.cx
-                .text
-                .and_then(|text| text.item_name(id))
-                .map(|name| lua.create_string(name))
-                .transpose()
+        // `item_name_bytes(id, examined)`: with `examined`, the menu's name:
+        // an unchecked item whose class the session has not examined yet
+        // keeps its unchecked name.
+        methods.add_method(
+            "item_name_bytes",
+            |lua, api, (id, examined): (u16, Option<bool>)| {
+                let Some(text) = api.cx.text else {
+                    return Ok(None);
+                };
+                let name = match (examined.unwrap_or(false), u8::try_from(id), api.cx.game) {
+                    (true, Ok(item), Some(game)) => {
+                        crate::ui::main_menu::item_name_bytes(text, item, &game.examined_flags())
+                    }
+                    _ => text.item_name(id),
+                };
+                name.map(|name| lua.create_string(name)).transpose()
+            },
+        );
+
+        // `font_margin()`: the session font's left text margin.
+        methods.add_method("font_margin", |_lua, api, ()| {
+            Ok(api.cx.font.map_or(0, |font| font.metrics.left_margin))
+        });
+
+        // `message_active()`: whether the game's message window is up.
+        methods.add_method("message_active", |_lua, api, ()| {
+            Ok(api.cx.game.is_some_and(|game| game.message.active))
+        });
+
+        // `examine_spin(pitch, yaw, roll, sx, sy, sz)`: the turntable pose
+        // after pre-multiplying the spin, re-extracted the reference way.
+        methods.add_method(
+            "examine_spin",
+            |_lua, _api, (pitch, yaw, roll, sx, sy, sz): (i32, i32, i32, i32, i32, i32)| {
+                let [pitch, yaw, roll] = crate::examine::spin([pitch, yaw, roll], [sx, sy, sz]);
+                Ok((pitch, yaw, roll))
+            },
+        );
+
+        // `examine_check(item, pitch, yaw, roll, zoom_spin, quantity)`: the
+        // examine check, as `kind, id, mark, select`: `"description"`,
+        // `"zoom"` or `"message"` with its global message id, whether it
+        // marks the item examined and the item `\i` names.
+        methods.add_method(
+            "examine_check",
+            |_lua, api, (item, pitch, yaw, roll, zoom_spin, quantity): (u8, i32, i32, i32, i32, u8)| {
+                let item13_message = api.cx.game.is_some_and(|game| {
+                    game.flag_test(crate::game::BANK_SCENARIO, 0x13, false)
+                        || game.flag_test(crate::game::BANK_SCENARIO, 0x00, false)
+                });
+                let context = crate::examine::ExamineContext {
+                    slot_quantity: quantity,
+                    item13_message,
+                };
+                Ok(
+                    match crate::examine::examine_check(item, [pitch, yaw, roll], zoom_spin, context) {
+                        crate::examine::ConfirmOutcome::Description => {
+                            ("description", None, false, None)
+                        }
+                        crate::examine::ConfirmOutcome::Zoom => ("zoom", None, false, None),
+                        crate::examine::ConfirmOutcome::Message {
+                            id,
+                            mark_examined,
+                            select,
+                        } => ("message", Some(id), mark_examined, select),
+                    },
+                )
+            },
+        );
+
+        // `class_message(item)`: the global message the item's examine
+        // class shows; nil when it has none.
+        methods.add_method("class_message", |_lua, _api, item: u8| {
+            Ok(crate::examine::class_message(item))
         });
 
         // The font-encoded shorthand location label of a save's room.

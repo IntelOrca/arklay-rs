@@ -2275,3 +2275,267 @@ fn file_reader_blacks_out_the_screen_and_the_first_list_frame_draws_nothing() {
     let framebuffer = tab.draw();
     assert!(framebuffer.rgba.chunks(4).all(|px| px == [0, 0, 0, 255]));
 }
+
+/// `ui/item_view.lua` against a game state the test drives (the message
+/// window flag and the examined bank).
+struct ItemView {
+    harness: Harness,
+    game: crate::game::GameState,
+    screen: LuaScreen,
+}
+
+impl ItemView {
+    fn new(label: &str, item: u8, args: &[(&str, ScreenArg)]) -> Self {
+        let harness = Harness::new(label);
+        let game = crate::game::GameState::default();
+        let mut all = vec![("item", ScreenArg::Int(i64::from(item)))];
+        all.extend(args.iter().cloned());
+        let screen = {
+            let mut cx = UiContext {
+                game: Some(&game),
+                ..harness.context()
+            };
+            LuaScreen::open_screen("item_view", &all, ScreenAction::Quit, &mut cx).unwrap()
+        };
+        Self {
+            harness,
+            game,
+            screen,
+        }
+    }
+
+    fn step(&mut self, input: UiInput) -> ScreenResult {
+        let cx = UiContext {
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        self.screen.update(&cx, input)
+    }
+
+    /// One frame; the published event as `(event, id, mark, select)`.
+    fn event(&mut self, input: UiInput) -> (i64, i64, i64, i64) {
+        assert!(matches!(self.step(input), ScreenResult::Continue));
+        (
+            self.screen.value("event"),
+            self.screen.value("event_id"),
+            self.screen.value("event_mark"),
+            self.screen.value("event_select"),
+        )
+    }
+
+    fn int(&self, expr: &str) -> i64 {
+        self.screen.test_eval(&format!("return {expr}"))
+    }
+
+    fn pose(&self) -> [i64; 3] {
+        [
+            self.int("M.state.pitch"),
+            self.int("M.state.yaw"),
+            self.int("M.state.roll"),
+        ]
+    }
+
+    fn ready(&self) -> bool {
+        self.screen.value("ready") != 0
+    }
+
+    /// Run with no input until the turntable is up; the frames it took.
+    fn settle(&mut self) -> u32 {
+        for frame in 1..=0x100 {
+            self.event(neutral());
+            if self.ready() {
+                return frame;
+            }
+        }
+        panic!("the intro never settled");
+    }
+}
+
+fn held(left: bool, right: bool, up: bool, down: bool) -> UiInput {
+    UiInput {
+        held_left: left,
+        held_right: right,
+        held_up: up,
+        held_down: down,
+        ..UiInput::default()
+    }
+}
+
+#[test]
+fn item_view_setup_frame_and_intro_take_0x40_frames_and_ramp_the_lights() {
+    let mut view = ItemView::new("view-intro", 0x01, &[]);
+    // The setup runs on the first frame together with the first intro step,
+    // so the turntable is up on frame 0x40.
+    view.event(neutral());
+    assert_eq!(view.int("M.state.light"), 0xFF - (0x3F << 2));
+    assert_eq!(view.settle(), 0x3F);
+    assert_eq!(view.int("M.state.light"), 0xFF);
+    // The intro's yaw and roll wrap back to the resting pose.
+    assert_eq!(view.pose(), [0, 0, 0]);
+    assert_eq!(view.int("M.state.model_x"), 0x1980);
+}
+
+#[test]
+fn item_view_left_and_up_spin_the_turntable_the_reference_way() {
+    let mut view = ItemView::new("view-spin", 0x01, &[]);
+    view.settle();
+    let mut poses = Vec::new();
+    for input in [
+        held(true, false, false, false),
+        held(false, true, false, false),
+        held(false, false, true, false),
+        held(false, false, false, true),
+    ] {
+        view.event(input);
+        poses.push(view.pose());
+    }
+    assert_eq!(poses, [[0, 0x1F, 0], [0, 0, 0], [0, 0, 0x0FE1], [0, 0, 0]]);
+}
+
+#[test]
+fn item_view_cancel_runs_the_exit_and_closes_after_0x40_frames() {
+    let mut view = ItemView::new("view-cancel", 0x01, &[]);
+    view.settle();
+    view.event(UiInput {
+        cancel: true,
+        ..UiInput::default()
+    });
+    assert!(!view.ready());
+    for frame in 1..0x40 {
+        view.event(neutral());
+        assert_eq!(view.int("M.state.light"), ((0x40 - frame) << 2) - 1);
+    }
+    assert!(!matches!(view.step(neutral()), ScreenResult::Continue));
+}
+
+#[test]
+fn item_view_confirm_shows_the_description_and_waits_for_the_window() {
+    let mut view = ItemView::new("view-confirm", 0x01, &[]);
+    view.settle();
+    assert_eq!(
+        view.event(UiInput {
+            confirm: true,
+            ..UiInput::default()
+        }),
+        (1, 0, 0, 0)
+    );
+    // Cancel and the arrows are ignored while the description is up.
+    view.game.message.active = true;
+    view.event(UiInput {
+        cancel: true,
+        held_left: true,
+        ..UiInput::default()
+    });
+    assert!(!view.ready());
+    assert_eq!(view.pose()[1], 0);
+    view.game.message.active = false;
+    view.event(neutral());
+    assert!(view.ready());
+}
+
+#[test]
+fn item_view_loaded_weapons_name_their_rounds() {
+    let mut view = ItemView::new("view-weapon", 0x04, &[("quantity", ScreenArg::Int(6))]);
+    view.settle();
+    assert_eq!(
+        view.event(UiInput {
+            confirm: true,
+            ..UiInput::default()
+        }),
+        (
+            2,
+            i64::from(crate::examine::MESSAGE_WEAPON_LOADED),
+            0,
+            i64::from(crate::weapons::weapon_ammo_item_id(0x04)),
+        )
+    );
+}
+
+#[test]
+fn item_view_red_book_zooms_then_marks_the_read_bit() {
+    let mut view = ItemView::new("view-red-book", items::ITEM_RED_BOOK, &[]);
+    view.settle();
+    view.screen.test_eval::<()>("M.state.yaw = 0x400");
+    let confirm = UiInput {
+        confirm: true,
+        ..UiInput::default()
+    };
+    assert_eq!(view.event(confirm), (0, 0, 0, 0), "the zoom starts");
+    let mut frames = 0;
+    let message = loop {
+        frames += 1;
+        match view.event(neutral()) {
+            (0, ..) => {}
+            event => break event,
+        }
+    };
+    let class = crate::examine::class_message(items::ITEM_RED_BOOK).unwrap();
+    assert_eq!(message, (2, i64::from(class), 0, 0));
+    // The step ramps by four up to 0x20: 4+8+..+32 = 144 after eight
+    // frames, then 0x20 a frame until object 1 passes 0x300.
+    assert_eq!(frames, 8 + (0x300 - 144) / 0x20 + 1);
+    view.game.message.active = true;
+    view.event(neutral());
+    view.game.message.active = false;
+    assert_eq!(view.event(neutral()), (3, 0x0D, 0, 0));
+    // The spin has run: a second confirm goes straight to the message and
+    // marks the book examined.
+    assert_eq!(
+        view.event(confirm),
+        (2, i64::from(class), i64::from(items::ITEM_RED_BOOK), 0)
+    );
+}
+
+#[test]
+fn item_view_doom_book_turns_into_its_medal() {
+    let mut view = ItemView::new("view-doom-book", 0x3F, &[]);
+    view.settle();
+    view.screen.test_eval::<()>("M.state.yaw = 0x400");
+    view.event(UiInput {
+        confirm: true,
+        ..UiInput::default()
+    });
+    while let (0, ..) = view.event(neutral()) {}
+    // The message closes, then the book zooms back out for 0x40 frames.
+    assert_eq!(view.event(neutral()), (0, 0, 0, 0));
+    for frame in 1..=0x40 {
+        let event = view.event(neutral());
+        if frame < 0x40 {
+            assert_eq!(event, (0, 0, 0, 0), "frame {frame}");
+        } else {
+            assert_eq!(event, (4, 0x24, 0, 0));
+        }
+    }
+    assert_eq!(view.screen.value("item"), 0x24);
+    assert_eq!(view.settle(), 0x40, "the medal plays the intro again");
+}
+
+#[test]
+fn item_view_pickup_spins_in_and_closes_on_begin_exit() {
+    let mut view = ItemView::new("view-pickup", 0x01, &[("pickup", ScreenArg::Bool(true))]);
+    for frame in 1..=0x40 {
+        view.event(UiInput {
+            confirm: true,
+            cancel: true,
+            ..UiInput::default()
+        });
+        assert_eq!(view.screen.value("settled") != 0, frame == 0x40);
+    }
+    // Settled, it waits for the engine without reading the pad.
+    view.event(UiInput {
+        cancel: true,
+        ..UiInput::default()
+    });
+    assert!(view.screen.value("settled") != 0);
+    {
+        let cx = UiContext {
+            game: Some(&view.game),
+            ..view.harness.context()
+        };
+        view.screen.signal("begin_exit", &cx);
+    }
+    for _ in 1..0x40 {
+        view.event(neutral());
+    }
+    assert!(!matches!(view.step(neutral()), ScreenResult::Continue));
+}

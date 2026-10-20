@@ -521,7 +521,7 @@ The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 
 The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
 `char_select`, `save_load`, `ending_result`, `ending_epilogue`,
-`return_title`, `death`, `computer_lab`, `map`, `file`, …), with shared code under `ui/lib/`. A pack or mod entry
+`return_title`, `death`, `computer_lab`, `map`, `file`, `item_view`, …), with shared code under `ui/lib/`. A pack or mod entry
 replaces the engine's built-in copy. An engine screen is a module rather than a
 set of globals:
 
@@ -537,6 +537,9 @@ It gets every method above plus the ones below. The layout space is
 `api:width()` x `api:height()`; a screen centres its 320x240 art on
 `(width // 2 - 160, height // 2 - 120)` rather than assuming the original size.
 A screen that fails to open or errors leaves through the opener's fallback.
+The engine may also call a named module function, `M.<name>(api)`, to tell a
+running screen something happened (the pick-up viewer's `begin_exit`); a
+screen without that function ignores it.
 
 | Method | Effect |
 | --- | --- |
@@ -565,7 +568,20 @@ A screen that fails to open or errors leaves through the opener's fallback.
 | `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
 | `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
 | `api:page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v)` | A sheet region flipped per axis. |
-| `api:draw_ivm(model, {joints, camera = {from, to, fov}, light})` | Draw a model through one composed joint chain. |
+| `api:draw_ivm(model, {joints, objects, camera = {from, to, fov, screen}, light})` | Draw a model: object `i` takes joint chain `objects[i]`, the rest the one `joints` chain; `screen = {x, y}` offsets the projection centre. |
+| `api:item_model(item)` | Load the item viewer's model for `item` and return a handle, or `nil, err`. |
+| `api:model_objects(model)` | The number of objects in a model. |
+| `api:clip([x, y, w, h])` | Clip this draw's later primitives to a rectangle; no arguments clears it. |
+| `api:darken(alpha)` | Fade the whole frame toward black by `alpha`. |
+| `api:page_ramp(page, sx, sy, w, h, dx, dy, ramp)` | An unscaled sheet region modulated by `2 * ramp`, half-blended. |
+| `api:flag(bank, bit)` | One bit of the paused session's flag banks; `false` outside a session. |
+| `api:room()` | The paused session's stage, room, camera cut and player (0 Chris, 1 Jill). |
+| `api:item_name_bytes(id[, examined])` | The font-encoded item name; with `examined`, the menu's name, which stays the unchecked one until the item's class is examined. |
+| `api:font_margin()` | The session font's left text margin. |
+| `api:message_active()` | Whether the game's message window is up. |
+| `api:examine_spin(pitch, yaw, roll, sx, sy, sz)` | The item viewer's pose after pre-multiplying a spin, re-extracted the reference way. |
+| `api:examine_check(item, pitch, yaw, roll, zoom_spin, quantity)` | The examine check: `"description"`, `"zoom"` or `"message", id, mark, select`. |
+| `api:class_message(item)` | The global message the item's examine class shows, or `nil`. |
 | `api:draw_actor(name, {from, to, fov})` | Draw an engine-owned actor through the camera and return whether it drew; the DIED screen offers `"player"`, the posed corpse. |
 
 ## Enemy scripts

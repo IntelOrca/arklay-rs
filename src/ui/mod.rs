@@ -16,7 +16,6 @@
 pub mod death;
 pub mod debug_menu;
 pub mod item_box;
-pub mod item_view;
 pub mod layout;
 pub mod lua_screen;
 pub mod main_menu;
