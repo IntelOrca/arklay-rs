@@ -1186,7 +1186,8 @@ zombie_walk1 = function(e)
         e:wander_turn(e.zombie_wander_word, e.turn_speed, 60)
     end
 
-    if e.player_distance < 3000 then
+    -- Port-only: a hidden player is never close enough to turn toward.
+    if e.player_distance < 3000 and not e:player_hidden() then
         local step = e:turn_toward_target(px, pz, 1024)
         if s16(step) ~= 0 then
             e.ignore = 1
@@ -1218,7 +1219,7 @@ zombie_walk1 = function(e)
             e.action_behavior = 2
             e.ignore = 0
         end
-        if e.player_distance < 1200 then
+        if e.player_distance < 1200 and not e:player_hidden() then
             local step = e:turn_toward_target(px, pz, 712)
             if s16(step) == 0 then
                 e.ignore = 1
@@ -1579,20 +1580,29 @@ zombie_chase_walk = function(e)
 end
 
 fast_player_facing = function(e)
+    -- Port-only: no one to face while the player is hidden, so the turn ends
+    -- at once and the latched position is left alone.
+    local hidden = e:player_hidden()
     if e.action_state == 0 then
         e.animation_frame_id = 0
         e.timing_control = 0
         e.blend_counter = 3
         e.hit_state = 0
-        local px, _, pz = e:player_pos()
-        e:turn_toward_target(px, pz, 0x400)
+        if not hidden then
+            local px, _, pz = e:player_pos()
+            e:turn_toward_target(px, pz, 0x400)
+        end
         e.animation_id = 3
         e.action_state = 1
         e.action_ticks_counter = (e.rand_seed & 0x3F) + 0x1E
     end
 
-    local px, _, pz = e:player_pos()
-    local step = e:turn_toward_target(px, pz, 0x54)
+    local px, pz, step = 0, 0, 0
+    if not hidden then
+        local _
+        px, _, pz = e:player_pos()
+        step = e:turn_toward_target(px, pz, 0x54)
+    end
 
     local ticks = s16(e.action_ticks_counter)
     e.action_ticks_counter = ticks - 1
@@ -1607,8 +1617,10 @@ fast_player_facing = function(e)
     e.ignore = 0
     e.action_behavior = 2
     e.action_state = 2
-    e.player_pos_x = px & 0xFFFF
-    e.player_pos_z = pz & 0xFFFF
+    if not hidden then
+        e.player_pos_x = px & 0xFFFF
+        e.player_pos_z = pz & 0xFFFF
+    end
 end
 
 benddown_and_eat = function(e)

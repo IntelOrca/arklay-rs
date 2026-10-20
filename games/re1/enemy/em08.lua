@@ -101,6 +101,15 @@ local function joint_sound(e, bank, id, joint)
     )
 end
 
+-- Port-only: the yaw step toward the player; none while the player is hidden.
+local function turn_toward_player(e, step)
+    if e:player_hidden() then
+        return 0
+    end
+    local px, _, pz = e:player_pos()
+    return e:turn_toward_target(px, pz, step)
+end
+
 -- Queue a `Play3DSnd` cue at the player.
 local function player_sound(e, bank, id)
     local x, y, z = e:player_pos()
@@ -169,8 +178,10 @@ idle = function(e)
 
     if (e.behavior_flags & 0x40) == 0 then
         e.angle = (e.p42_yaw_jitter + e.angle) & 0xFFF
-        local px, _, pz = e:player_pos()
-        e:rotate_toward_target(px, pz, 8)
+        if not e:player_hidden() then
+            local px, _, pz = e:player_pos()
+            e:rotate_toward_target(px, pz, 8)
+        end
     end
 
     local saved_roll = e.roll
@@ -205,9 +216,16 @@ end
 
 -- The sweep contact test, called from states 5 and 6.
 local function sweep_hit(e)
-    local reach = (as_s16(e.p42_dist) - 2000) & 0xFFFF
+    local dist = as_s16(e.p42_dist)
+    if e:player_hidden() then
+        -- Port-only: p42_dist reads far while hidden, but a swing in progress
+        -- still connects with a body in its path.
+        local px, _, pz = e:player_pos()
+        dist = as_s16(e:xz_distance_to(px, pz))
+    end
+    local reach = (dist - 2000) & 0xFFFF
     if e.behavior_flags == 5 then
-        reach = (as_s16(e.p42_dist) - 0xDAC) & 0xFFFF
+        reach = (dist - 0xDAC) & 0xFFFF
     end
     if reach > 0x157B then
         return
@@ -268,8 +286,7 @@ sweep = function(e)
         e.animation_id = 0x0C
         e.p42_ticks = 0x32
         e.p42_sweep_dir = 1
-        local px, _, pz = e:player_pos()
-        if as_s16(e:turn_toward_target(px, pz, 1)) < 0 then
+        if as_s16(turn_toward_player(e, 1)) < 0 then
             e.p42_sweep_dir = 0
         end
     end
@@ -379,8 +396,7 @@ spit = function(e)
         end
         local body_hit = e:plant42_body_hit() or 0
         local step = as_s16(body_hit * 0x20 + 0x10)
-        local px, _, pz = e:player_pos()
-        e:turn_toward_target(px, pz, step)
+        turn_toward_player(e, step)
         if e.animation_frame_id < 8 then
             e.roll = e.roll + 0x40
             return
@@ -493,8 +509,7 @@ move = function(e)
             e.action_state = 5
         end
         e.angle = e.angle - 0x28
-        local px, _, pz = e:player_pos()
-        e.angle = e.angle + as_s16(e:turn_toward_target(px, pz, 0x10))
+        e.angle = e.angle + as_s16(turn_toward_player(e, 0x10))
         e.angle = e.angle + 0x28
         e:plant42_advance(true, 0x40)
         local head_y = e:joint_world_y(14)
@@ -515,13 +530,12 @@ move = function(e)
             e.action_state = 5
         end
         e.angle = e.angle - 0x30
-        local px, _, pz = e:player_pos()
-        e.angle = e.angle + as_s16(e:turn_toward_target(px, pz, 0x10))
+        e.angle = e.angle + as_s16(turn_toward_player(e, 0x10))
         e.angle = e.angle + 0x30
 
-        local pxx, _, pzz = e:player_pos()
-        e.player_displacement = abs(pxx - e:joint_world_x(14)) + abs(pzz - e:joint_world_z(14))
-        e.player_distance_z = abs(pzz - e:joint_world_z(12)) + abs(pxx - e:joint_world_x(12))
+        local px, _, pz = e:player_pos()
+        e.player_displacement = abs(px - e:joint_world_x(14)) + abs(pz - e:joint_world_z(14))
+        e.player_distance_z = abs(pz - e:joint_world_z(12)) + abs(px - e:joint_world_x(12))
 
         if (e.player_displacement > 799 and e.player_distance_z > 499)
             or (e.player_health_status & 8) ~= 0
@@ -1099,6 +1113,10 @@ action_select = function(e)
     if e.player_attacked ~= 0 then
         return
     end
+    -- Port-only: a hidden player is never in range, so nothing is selected.
+    if e:player_hidden() then
+        return
+    end
     if e.player_displacement < 11000 then
         local px, _, pz = e:player_pos()
         e.angle = e.angle + as_s16(e:turn_toward_target(px, pz, 4))
@@ -1129,6 +1147,9 @@ local function action_dispatch(e)
     end
     local table = (kind == 5) and ACTIONS_FLAGS5 or ACTIONS_DEFAULT
     if e.player_attacked ~= 0 then
+        return
+    end
+    if e:player_hidden() then
         return
     end
     if e.player_displacement < 11000 then
@@ -1400,7 +1421,8 @@ ambient_effects = function(e)
         e.p42_life = (e:random() & 0x3F) + 0x32
     end
 
-    if (e.behavior_flags & 1) == 0 then
+    -- Port-only: the drips that rain around the player are skipped while hidden.
+    if (e.behavior_flags & 1) == 0 and not e:player_hidden() then
         if e.p42_life == 1 and e.p42_dist > 0x1964 then
             local px, _, pz = e:player_pos()
             local x = (e:random() & 0x1FF) + px - 0x100
@@ -1493,8 +1515,13 @@ end
 -- State 1: the decision layer.
 local function state_check(e)
     e.status_flags = (e.status_flags & 0x1F) | 0x40
-    local px, _, pz = e:player_pos()
-    e.p42_dist = e:xz_distance_to(px, pz)
+    if e:player_hidden() then
+        -- Port-only: a hidden player is never close enough to matter.
+        e.p42_dist = 0x7FFF
+    else
+        local px, _, pz = e:player_pos()
+        e.p42_dist = e:xz_distance_to(px, pz)
+    end
     if e.p42_dist < 10000 then
         e.status_flags = e.status_flags | 0x80
     end

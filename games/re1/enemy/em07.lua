@@ -68,6 +68,12 @@ end
 -- truncates to 16 bits, the two terms add as words and the sum truncates
 -- again.
 local function refresh_distance(e, px, pz)
+    -- Port-only: a hidden player reads as far away, as `check_visual_range`
+    -- reports it.
+    if e:player_hidden() then
+        e.wasp_distance = 0x7FFF
+        return
+    end
     local dx = px - e.pos_x
     local dz = pz - e.pos_z
     if dx < 0 then
@@ -77,6 +83,15 @@ local function refresh_distance(e, px, pz)
         dz = -dz
     end
     e.wasp_distance = ((dx & 0xFFFF) + (dz & 0xFFFF)) & 0xFFFF
+end
+
+-- Port-only: `turn_toward_target` at the player, reporting "already aligned"
+-- while the player is hidden so no heading follows them.
+local function turn_toward_player(e, px, pz, step)
+    if e:player_hidden() then
+        return 0
+    end
+    return e:turn_toward_target(px, pz, step)
 end
 
 -- The 16-bit signed view of a wrapped sum.
@@ -219,7 +234,7 @@ local function hover(e, px, py, pz)
     -- The band test is the unsigned `-2300 - y < 600`, i.e.
     -- -2900 < y <= -2300.
     if e.wasp_touch == 0 or e.wasp_distance >= 1000
-        or e:turn_toward_target(px, pz, 0x100) ~= 0 then
+        or turn_toward_player(e, px, pz, 0x100) ~= 0 then
         return
     end
     local band = -2300 - e.pos_y
@@ -241,7 +256,7 @@ local function hover(e, px, py, pz)
     set_behavior(e, 3)
 
     if not e:player_facing_entity()
-        and e:turn_toward_target(px, pz, 0xC0) == 0
+        and turn_toward_player(e, px, pz, 0xC0) == 0
         and e.wasp_big == 0 then
         set_behavior(e, 5)
         e.angle = e:angle_to(px, pz)
@@ -256,7 +271,7 @@ end
 -- kill and drive the player's death pose itself.
 local function sting(e, px, py, pz)
     e.animation_id = 3
-    e.angle = e.angle + e:turn_toward_target(px, pz, 0x30)
+    e.angle = e.angle + turn_toward_player(e, px, pz, 0x30)
     wasp_animate(e)
 
     if e.wasp_anim_done == 0 then
@@ -264,7 +279,7 @@ local function sting(e, px, py, pz)
     end
 
     if e.player_attacked == 0 and e.wasp_distance < 0x5DC
-        and e:turn_toward_target(px, pz, 0x100) == 0 and e.wasp_path_bit ~= 0 then
+        and turn_toward_player(e, px, pz, 0x100) == 0 and e.wasp_path_bit ~= 0 then
         e.player_attacked = 1
         e.player_action_behavior = 100
 
@@ -290,7 +305,7 @@ end
 local function victory(e, px, py, pz)
     set_wings(e, false)
     e.animation_id = 2
-    e.angle = e.angle + e:turn_toward_target(px, pz, 0x10) * e.wasp_path_bit * 2
+    e.angle = e.angle + turn_toward_player(e, px, pz, 0x10) * e.wasp_path_bit * 2
     wasp_animate(e)
 
     if e.animation_frame_id % 7 == 0 then
@@ -468,7 +483,11 @@ end
 -- swings the heading back, the drift layer owns the cruise while ignore is 0,
 -- and the shadow tracks the root joint's world height with a per-size floor.
 local function run(e)
-    local px, py, pz = e:player_pos()
+    -- Port-only: a hidden player's position is never read.
+    local px, py, pz = 0, 0, 0
+    if not e:player_hidden() then
+        px, py, pz = e:player_pos()
+    end
 
     if e.player_health < 0 and e.action_behavior ~= 4 then
         e.wasp_bob = 0x23
@@ -479,7 +498,7 @@ local function run(e)
     end
 
     if e.wasp_collision ~= 0 then
-        e.angle = e.angle + e:turn_toward_target(px, pz, 0x80)
+        e.angle = e.angle + turn_toward_player(e, px, pz, 0x80)
     end
 
     refresh_distance(e, px, pz)
@@ -490,15 +509,15 @@ local function run(e)
 
         -- Past frame 0x1C, an off-axis wasp pays 8 units of speed to swing
         -- at the player.
-        if e.wasp_drift > 0x1C and e:turn_toward_target(px, pz, 0x100) ~= 0 then
-            e.angle = e.angle + e:turn_toward_target(px, pz, 0x80)
+        if e.wasp_drift > 0x1C and turn_toward_player(e, px, pz, 0x100) ~= 0 then
+            e.angle = e.angle + turn_toward_player(e, px, pz, 0x80)
             e.wasp_speed = e.wasp_speed - 8
         end
 
         -- Stalled: re-roll the cruise speed and steer away.
         if e.wasp_speed < 0x1E then
             e.wasp_speed = hover_speed(e)
-            e.angle = e.angle - e:turn_toward_target(px, pz, 0x200)
+            e.angle = e.angle - turn_toward_player(e, px, pz, 0x200)
         end
 
         if e.wasp_speed > 400 then
@@ -587,7 +606,10 @@ local function damaged(e)
         e.status_flags = e.status_flags & 0x1F
         e:check_visual_range(4000)
 
-        local px, _, pz = e:player_pos()
+        local px, pz = 0, 0
+        if not e:player_hidden() then
+            px, _, pz = e:player_pos()
+        end
         refresh_distance(e, px, pz)
 
         if e.wasp_distance < 400 and e.player_move_speed ~= 0 then

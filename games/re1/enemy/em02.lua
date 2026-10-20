@@ -135,8 +135,61 @@ local function player_anim_word(e)
 end
 
 local function player_unreachable(e)
+    -- Port-only: a hidden player's pose is never read.
+    if e:player_hidden() then
+        return false
+    end
     local word = player_anim_word(e)
     return word == UNREACHABLE_A or word == UNREACHABLE_B
+end
+
+-- Port-only: while the player is hidden there is nothing to steer at, so the
+-- turn helpers report "already aligned" and the rotates and head tracking are
+-- skipped. Visible, they are plain pass-throughs.
+local function turn_toward_player(e, step)
+    if e:player_hidden() then
+        return 0
+    end
+    local px, _, pz = e:player_pos()
+    return e:turn_toward_target(px, pz, step)
+end
+
+local function rotate_toward_player(e, step)
+    if e:player_hidden() then
+        return
+    end
+    local px, _, pz = e:player_pos()
+    e:rotate_toward_target(px, pz, step)
+end
+
+-- The same two aimed at the chase waypoint, which is latched from the player.
+local function turn_toward_waypoint(e, step)
+    if e:player_hidden() then
+        return 0
+    end
+    return e:turn_toward_target(e.player_pos_x, e.player_pos_z, step)
+end
+
+local function rotate_toward_waypoint(e, step)
+    if e:player_hidden() then
+        return
+    end
+    e:rotate_toward_target(e.player_pos_x, e.player_pos_z, step)
+end
+
+local function latch_player_waypoint(e)
+    if e:player_hidden() then
+        return
+    end
+    local px, _, pz = e:player_pos()
+    e.player_pos_x = px
+    e.player_pos_z = pz
+end
+
+local function head_track(e)
+    if not e:player_hidden() then
+        e:head_track()
+    end
 end
 
 -- Probe a hard left and a hard right turn. Returns +1 "only left blocked",
@@ -153,6 +206,10 @@ end
 
 -- The same probe aimed at the player.
 local function probe_toward_player(e, mul)
+    -- Port-only: no bearing to probe along, so the way is never "blocked".
+    if e:player_hidden() then
+        return false
+    end
     local px, _, pz = e:player_pos()
     local to_player = e:angle_to(px, pz)
     return e:probe_turn(to_player - e.angle, mul)
@@ -229,9 +286,7 @@ local function select_chase(e)
         e.cb_swerve = (e:random() & 0xF) + 0x14
     end
     e.ignore = 2
-    local px, _, pz = e:player_pos()
-    e.player_pos_x = px
-    e.player_pos_z = pz
+    latch_player_waypoint(e)
     e.cb_aiflags = (e.cb_aiflags & ~(AI_SKID | AI_SKID2)) | AI_ACTIVE
 end
 
@@ -493,7 +548,8 @@ local function patrol_pick_turn(e)
 
     -- A walking dog that would be turning away from the player cuts the turn
     -- short so it drifts back toward them.
-    if e.cb_behflags == 0 then
+    -- Port-only: no drift toward a hidden player.
+    if e.cb_behflags == 0 and not e:player_hidden() then
         local px, _, pz = e:player_pos()
         local to_player = e:turn_toward_target(px, pz, 0x200)
         if to_player * dir < 0 then
@@ -1086,8 +1142,7 @@ local function strafe_spring(e)
         if e.animation_frame_id > 7 then
             slow_down(e, 0x20, 0x28)
         end
-        local px, _, pz = e:player_pos()
-        e:rotate_toward_target(px, pz, 0x40)
+        rotate_toward_player(e, 0x40)
     else
         e.move_speed_current = 0
         e.cb_turn_step = 0
@@ -1131,7 +1186,7 @@ local function alert_wait(e)
 end
 
 local function alert_track(e)
-    e:head_track()
+    head_track(e)
     e.action_ticks_counter = e.action_ticks_counter - 1
     if e.action_ticks_counter == 0 then
         e.ignore = 0
@@ -1233,7 +1288,7 @@ local function beh_bite(e)
         end
         return
     end
-    e:head_track()
+    head_track(e)
     if e.animation_frame_id == 0x21 then
         e.ignore = 0
         e.behavior_flags = 4
@@ -1280,8 +1335,7 @@ local function stalk_reface(e)
     if e.action_ticks_counter ~= 0 and (e.cb_probe & 1) == 0 then
         return
     end
-    local px, _, pz = e:player_pos()
-    e.tint_flashes = e:turn_toward_target(px, pz, (e:random() & 7) + 0x10)
+    e.tint_flashes = turn_toward_player(e, (e:random() & 7) + 0x10)
     e.action_ticks_counter = 2
     e.action_behavior = 1
     e.action_ticks_counter = (e:random() & 0x1F) + 0x2D
@@ -1310,14 +1364,17 @@ local function beh_stalk(e)
     end
     e:advance_anim(0x100)
     footstep(e)
-    e:head_track()
+    head_track(e)
 
     if probe_toward_player(e, 8) and e.action_behavior ~= 3 then
         e.action_behavior = 3
         e.action_state = 0
     end
 
-    local px, _, pz = e:player_pos()
+    local px, _, pz = 0, 0, 0
+    if not e:player_hidden() then
+        px, _, pz = e:player_pos()
+    end
     if e.cb_dist < 0x9C4 then
         e.groan_timer = e.groan_timer + 1
         if e.cb_behflags_byte & 4 ~= 0 then
@@ -1335,7 +1392,9 @@ local function beh_stalk(e)
         if e.groan_timer > 0 then
             e.groan_timer = e.groan_timer - 1
         end
-        if e:turn_toward_target(px, pz, 0x80) == 0 and e.player_move_speed > 200 then
+        -- Port-only: a hidden player is never lined up to be heard.
+        if not e:player_hidden() and e:turn_toward_target(px, pz, 0x80) == 0
+            and e.player_move_speed > 200 then
             e.groan_timer = e.groan_timer + 6
         end
     end

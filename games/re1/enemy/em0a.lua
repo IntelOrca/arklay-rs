@@ -71,7 +71,10 @@ local function chase(e, px, _, pz)
         return
     end
 
-    if e.player_distance < 8000 then
+    if e:player_hidden() then
+        -- Port-only: nothing to steer toward; the heading holds, as for a
+        -- snake with no route.
+    elseif e.player_distance < 8000 then
         local turn = e:turn_toward_target(px, pz, signed_word(e.action_ticks_counter))
         e.angle = e.angle + turn * e.path_bit
     else
@@ -277,7 +280,7 @@ local function decide_ground(e, turn_slow)
             set_behavior(e, 2)
             e.stuck_frames = 0
         end
-        if e.player_health < 0 then
+        if e.player_health < 0 and not e:player_hidden() then
             e.ignore = 1
             set_behavior(e, 4)
         end
@@ -301,8 +304,8 @@ local function decide_ceiling_ambush(e, _, px, pz)
     set_behavior(e, 5)
 
     local drop
-    if e.player_action_behavior == 0x14 and e.player_action_state == 0
-        and e.player_distance < 5000 then
+    if e.player_distance < 5000 and e.player_action_behavior == 0x14
+        and e.player_action_state == 0 then
         drop = true
     else
         local ticks = signed_word(e.action_ticks_counter)
@@ -311,8 +314,11 @@ local function decide_ceiling_ambush(e, _, px, pz)
     end
 
     if drop then
-        e.pos_x = (e:random() & 1) * 100 + px
-        e.pos_z = (e:random() & 1) * 100 + pz
+        -- Port-only: a hidden player's position is unknown; drop in place.
+        if not e:player_hidden() then
+            e.pos_x = (e:random() & 1) * 100 + px
+            e.pos_z = (e:random() & 1) * 100 + pz
+        end
         e.ignore = 1
         set_behavior(e, 1)
     end
@@ -335,7 +341,10 @@ local DECIDES = { decide_ground, decide_ceiling_near, decide_ceiling_ambush, dec
 -- sum truncates to 16 bits; a player on another floor reports a flat 4999,
 -- which sits between the bite range and the notice ranges.
 local function decide_action(e, turn_slow, px, py, pz)
-    if py == 0 then
+    if e:player_hidden() then
+        -- Port-only: as far away as `check_visual_range` reports it.
+        e.player_distance = 0x7FFF
+    elseif py == 0 then
         local dz = pz - e.pos_z
         if dz < 0 then
             dz = -dz
@@ -425,9 +434,15 @@ end
 
 -- State 1: the main driver.
 local function run(e)
-    local px, py, pz = e:player_pos()
-    local turn_slow = e:turn_toward_target(px, pz, 0x100)
-    local fast = e:turn_toward_target(px, pz, 0x200)
+    -- Port-only: a hidden player has no position to read and neither turn
+    -- probe reports the snake as lined up.
+    local px, py, pz = 0, 0, 0
+    local turn_slow, fast = 1, 1
+    if not e:player_hidden() then
+        px, py, pz = e:player_pos()
+        turn_slow = e:turn_toward_target(px, pz, 0x100)
+        fast = e:turn_toward_target(px, pz, 0x200)
+    end
 
     if e.ignore == 0 then
         decide_action(e, turn_slow, px, py, pz)
