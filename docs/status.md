@@ -823,8 +823,11 @@ Still open, by design:
   damage. Each is catalogued in the module docs and
   `docs/m18-deviations.md`.
 
-No RE2/RE3 runtime, format, pack or migration work is planned until those
-RE1 gaps close: there is no RE2 corpus in the workspace, and the canonical
-re-base cannot be validated without the full roster. The M17 harnesses
+No RE2/RE3 runtime work is planned until those RE1 gaps close. The RE2
+conversion tooling is specified separately in issue #15 (the pack inventory,
+the ADT roomcut decoder and the converter's game detection); it produces a
+base pack only and adds no runtime dialect. There is no RE2 corpus in the
+workspace yet, and the canonical re-base cannot be validated without the full
+roster. The M17 harnesses
 already key off the manifest's `rdt_version`/`scd_version` and per-entry path
 prefixes, so a second dialect adds parser rows rather than rewriting them.

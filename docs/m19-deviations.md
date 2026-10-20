@@ -97,9 +97,11 @@ unchanged, so both directions work.
 ## Not ported: the PNG background override
 
 CR looks for `type.png` before the original TIM. Format-level asset overrides
-are a general feature tracked separately (issue #53), so the screen draws
-whatever the pack carries under `ui/type00.bmp` (or a mod's replacement) and
-falls back to a black frame when the entry is missing.
+landed as a general feature (#53): a layer resolves a replacement by entry
+stem with the fixed extension priority `webp > png > bmp > tim > pix`, so a
+mod can ship `ui/type00.png` (or `.webp`) and it wins over the pack's
+`ui/type00.bmp`. Without a replacement the screen draws the pack's entry and
+falls back to a black frame when it is missing.
 
 ## Not ported: ModSDK text overrides
 

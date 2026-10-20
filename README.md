@@ -67,7 +67,8 @@ cargo run -- extracted/ --room 100 --player 0
 # Pick the displayed language; the default is the OS locale, then en-US
 cargo run -- re1.akpak --room 100 --language ja-JP
 
-# Boot the title screen (or --ui title|select|game|menu|box|file|map|view|load|death|font|debug)
+# Boot a screen directly (--ui title|select|game|demo|menu|box|file|map|view|save|load|
+# death|result|epilogue|font|debug)
 cargo run -- re1.akpak
 
 # Play one attract reel directly (the reference's --test-demo oracle anchor):
