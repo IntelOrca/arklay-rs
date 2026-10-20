@@ -60,7 +60,9 @@ const TEXT_LEFT: i32 = 52;
 /// The first of the two key-hint lines.
 const HINT_Y: i32 = 196;
 /// Cursor glyph from the shared font sheet.
-const CURSOR_GLYPH: u8 = 0x26;
+const CURSOR_GLYPH: u8 = 0x0B;
+/// Cursor tint (orange).
+const CURSOR_TINT: Tint = Tint::Rgb(255, 160, 0);
 
 /// What one tick of the menu decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -713,7 +715,7 @@ impl Pen<'_> {
             self.framebuffer,
             x,
             y,
-            Tint::White,
+            CURSOR_TINT,
             2,
             &[CURSOR_GLYPH],
             false,
