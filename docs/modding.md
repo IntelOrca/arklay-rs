@@ -472,7 +472,7 @@ the load screen).
 | `api:string(key)` | A `language/<tag>.txt` string, decoded to characters; `nil` when no language carries the key. |
 | `api:character_name(index)` | The save screen's name for character `0`/`1`, decoded. |
 | `api:text_width(text[, tight])` | The pixel width `text` draws at (the session's tight metrics unless `tight` is given). |
-| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open` and `update` and play after the call; the engine drops them in a capture run, which stays silent. |
+| `api:sound(name)` | Queue a screen sound: `cursor`, `decide`, `cancel`, `error` (the cancel cue), `title`, `select_cursor`, `select_confirm`, `save_cursor` (the save screen's cursor move) or `save_confirm`. Cues queue from `on_open`, `update` and the engine's hooks and play after the call (a cue raised while drawing is dropped); the engine drops them in a capture run, which stays silent. |
 | `api:save(name)` | Write the pending block to `<save_dir>/<name>` and return `ok, err`. `name` is one plain file name (no directory part); the extension is the script's choice. Save mode only. |
 | `api:remove(name)` | Delete `<save_dir>/<name>`, ignoring a missing file. Returns `ok, err`. |
 | `api:load(name)` | Load `<save_dir>/<name>`: the engine continues from that save on the next tick. Returns `ok, err`. Load mode only. |
@@ -534,8 +534,9 @@ return M
 ```
 
 It gets every method above plus the ones below. The layout space is
-`api:width()` x `api:height()`; a screen centres its 320x240 art on
-`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size.
+`api:width()` x `api:height()`; a screen should centre its 320x240 art on
+`(width // 2 - 160, height // 2 - 120)` rather than assuming the original size
+(the shipped item viewer still draws at fixed coordinates).
 A screen that fails to open or errors leaves through the opener's fallback.
 The engine may also call a named module function, `M.<name>(api)`, to tell a
 running screen something happened (the pick-up viewer's `begin_exit`), or
@@ -554,6 +555,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:set(key, value)` | Publish an integer/boolean the engine reads back (`nil` clears it); up to 64 keys. |
 | `api:overlay(colour, alpha)` | A `"black"`/`"white"` full-screen overlay at `alpha`, or `nil` for none. |
 | `api:has_font()`, `api:has_text()` | Whether the pack has a game font / text table. |
+| `api:pack_bytes(entry)` | A pack entry's raw bytes as a string; `nil` when absent. |
 | `api:ui_bytes(key)` | The text table's font-encoded bytes for `key`; `nil` without a text table. |
 | `api:location_bytes(stage, room)` | The font-encoded location label of a save's room. |
 | `api:wrap(bytes, max_width[, opts])` | Font-encoded `bytes` broken at spaces into a table of rows no wider than `max_width` pixels; one row without a font. |
@@ -566,6 +568,8 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:has_image(stem)` | Whether the pack has the image. |
 | `api:picture(stem[, key[, geometry]])` | Load a full-colour image and return a handle; `key` is a transparent colour, `geometry` `"free"` (default) or `"shipped"` (pinned to the original sheet's size). |
 | `api:page(stem)` | Load an indexed UI sheet and return a handle. |
+| `api:indexed_page(stem)` | Like `api:page`, but always indexed: a true-colour replacement is re-indexed colour for colour, for screens that composite by texel index (`api:page_lut`). |
+| `api:page_palette(page[, row])` | An indexed page's CLUT row (default 0) as a table of `0xRRGGBB` colours keyed by texel index `0..=255`; `nil` for a full-colour page. |
 | `api:ivm(entry)` | Load a model and return a handle. |
 | `api:art_size(handle)` | A handle's width and height. |
 | `api:clear()` | Clear the frame to black. |
@@ -576,6 +580,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
 | `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
 | `api:page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v)` | A sheet region flipped per axis. |
+| `api:page_lut(page, sx, sy, w, h, dx, dy, lut)` | An unscaled rect of an indexed page drawn through `lut`, a table of opaque `0xRRGGBB` colours keyed by texel index; an index without an entry (index 0 included) is transparent. |
 | `api:draw_ivm(model, {joints, objects, camera = {from, to, fov, screen}, light})` | Draw a model: object `i` takes joint chain `objects[i]`, the rest the one `joints` chain; `screen = {x, y}` offsets the projection centre. |
 | `api:item_model(item)` | Load the item viewer's model for `item` and return a handle, or `nil, err`. |
 | `api:model_objects(model)` | The number of objects in a model. |

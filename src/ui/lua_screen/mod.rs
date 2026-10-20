@@ -16,10 +16,11 @@
 //! sounds, and immediate-mode drawing in the 320x240 layout space. The full
 //! method table is in `docs/modding.md`.
 //!
-//! A script that fails to load leaves the engine on the ported original
-//! screen; a script that errors while running is logged once and the screen
-//! leaves (returning to gameplay or the title) instead of trapping the
-//! player.
+//! There is no Rust fallback: a script that fails to load is an error the
+//! opener handles (a registered mod save screen falls back to the shipped
+//! script; any other screen takes its fail action, or never opens), and a
+//! script that errors while running is logged once and the screen leaves
+//! (returning to gameplay or the title) instead of trapping the player.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -397,6 +398,14 @@ impl LuaScreen {
         self.vm
             .global(name)
             .unwrap_or_else(|err| panic!("global {name}: {err}"))
+    }
+}
+
+impl LuaScreen {
+    /// Whether the script raised an error: a failed screen ignores every
+    /// later call, so its owner must close it.
+    pub fn failed(&self) -> bool {
+        self.host.failed
     }
 }
 
@@ -1217,7 +1226,7 @@ impl UserData for Api<'_> {
         // ---- actions -------------------------------------------------
         methods.add_method("sound", |_lua, api, name: String| {
             let Some(cue) = cue_of(&name) else {
-                eprintln!("[lua] save screen: unknown sound `{name}`");
+                eprintln!("[lua] screen: unknown sound `{name}`");
                 return Ok(());
             };
             api.cx.play_cue(cue);
@@ -1344,8 +1353,11 @@ impl UserData for Api<'_> {
                     )));
                 }
             };
-            budget::check_len(api.host.values.len() + 1, 64, "screen values")
-                .map_err(|err| mlua::Error::RuntimeError(format!("{err:#}")))?;
+            // Overwriting a published key never grows the table.
+            if !api.host.values.contains_key(&key) {
+                budget::check_len(api.host.values.len() + 1, 64, "screen values")
+                    .map_err(|err| mlua::Error::RuntimeError(format!("{err:#}")))?;
+            }
             api.host.values.insert(key, value);
             Ok(())
         });

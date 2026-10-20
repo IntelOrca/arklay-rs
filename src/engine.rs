@@ -3984,6 +3984,14 @@ impl GameSession {
             self.tick_pickup_view(pack, ui, input, action);
             return;
         }
+        // A menu script that raised an error ignores every later call, so
+        // nothing it published (a latched CHECK slide, a sub-screen's cursor)
+        // would ever move again: hand the room back instead of freezing it.
+        // The examine viewer is its own screen and finishes first.
+        if self.examine.is_none() && self.menu.as_ref().is_some_and(|menu| menu.failed()) {
+            self.begin_menu_close(pack);
+            return;
+        }
         let message_input = MessageInput {
             action,
             left: input.left,
@@ -11153,8 +11161,6 @@ impl InputState {
     }
 }
 
-/// Map one frame of edge-triggered pad input to the single inventory menu
-/// input it represents; the original pad reports one new button per frame.
 /// What the pause-menu script asked the engine to do this frame
 /// (`ui/main_menu.lua`'s `event` and `event_id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11199,6 +11205,8 @@ enum MenuInput {
     Cancel,
 }
 
+/// Map one frame of edge-triggered pad input to the single inventory menu
+/// input it represents; the original pad reports one new button per frame.
 fn menu_input(ui: UiInput) -> Option<MenuInput> {
     if ui.up {
         Some(MenuInput::Up)
@@ -11221,12 +11229,6 @@ fn menu_input(ui: UiInput) -> Option<MenuInput> {
     }
 }
 
-/// The cue a menu pad input plays.
-///
-/// The original's menu handlers call `play_sfx(3, ...)`: slot 4 is the cursor
-/// blip on a D-pad move, slot 6 the decide chime on confirm and slot 5 the
-/// cancel cue. Those slots are the `cursor`/`decide`/`cancel` samples the
-/// character tables share, so the port's UI cues resolve to the same wavs.
 /// A [`UiInput`] carrying only `input`, for the Lua tabs that take the menu's
 /// one-input-per-frame priority.
 fn single_input(input: MenuInput) -> UiInput {
@@ -11244,6 +11246,12 @@ fn single_input(input: MenuInput) -> UiInput {
     ui
 }
 
+/// The cue a menu pad input plays.
+///
+/// The original's menu handlers call `play_sfx(3, ...)`: slot 4 is the cursor
+/// blip on a D-pad move, slot 6 the decide chime on confirm and slot 5 the
+/// cancel cue. Those slots are the `cursor`/`decide`/`cancel` samples the
+/// character tables share, so the port's UI cues resolve to the same wavs.
 fn menu_cue(input: MenuInput) -> Option<ui::UiCue> {
     match input {
         MenuInput::Up | MenuInput::Down | MenuInput::Left | MenuInput::Right => {
@@ -19552,6 +19560,40 @@ off_0010:
             1,
             "the cancel close played the exit cue more than once"
         );
+    }
+
+    #[test]
+    fn a_failed_menu_script_closes_the_menu_instead_of_freezing() {
+        // A menu script that raises an error mid-CHECK leaves `viewing`
+        // latched; the session must still hand the room back.
+        let dir = TempDir::new();
+        let pack_path = menu_cue_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    start: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        settle_menu_fade(&mut session, &pack);
+        let menu = session.menu.as_mut().unwrap();
+        menu.test_set_value("viewing", 1);
+        menu.test_eval::<()>("M.tick = function() error('boom') end");
+        for _ in 0..2 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert!(session.menu.as_ref().unwrap().failed());
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
     }
 
     #[test]
