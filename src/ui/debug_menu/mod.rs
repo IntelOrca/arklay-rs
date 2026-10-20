@@ -59,10 +59,8 @@ const BODY_Y: i32 = 44;
 const TEXT_LEFT: i32 = 52;
 /// The first of the two key-hint lines.
 const HINT_Y: i32 = 196;
-/// Cursor glyph from the shared font sheet.
-const CURSOR_GLYPH: u8 = 0x0B;
-/// Cursor tint (orange).
-const CURSOR_TINT: Tint = Tint::Rgb(255, 160, 0);
+/// Cursor colour (orange).
+const CURSOR_COLOR: [u8; 4] = [255, 160, 0, 255];
 
 /// What one tick of the menu decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -709,17 +707,14 @@ impl Pen<'_> {
         self.fit(x, y, tint, &bytes, max_width);
     }
 
-    /// Draw the list cursor.
+    /// Draw the list cursor: an orange right-pointing arrow (the font sheet
+    /// only has a down-pointing one).
     fn cursor(&mut self, x: i32, y: i32) {
-        self.font.draw_text(
-            self.framebuffer,
-            x,
-            y,
-            CURSOR_TINT,
-            2,
-            &[CURSOR_GLYPH],
-            false,
-        );
+        for column in 0..6 {
+            let height = 11 - column * 2;
+            self.framebuffer
+                .fill_rect([x + 4 + column, y + 1 + column, 1, height], CURSOR_COLOR);
+        }
     }
 
     /// Draw `item`'s 40x30 icon at `[x, y]` (nothing without the menu art).
