@@ -234,15 +234,17 @@ impl InventoryEditor {
         let capacity = game.inventory_capacity();
         for slot in (self.scroll..capacity).take(VISIBLE_SLOTS) {
             let y = BODY_Y + (slot - self.scroll) as i32 * SLOT_HEIGHT;
+            let mut name_tint = Tint::White;
             if slot == self.slot {
                 pen.cursor(TEXT_LEFT - 16, y + 8);
+                name_tint = super::SELECTED_TINT;
             }
             pen.ascii(TEXT_LEFT, y + 8, Tint::Grey, &format!("{}", slot + 1));
             let name_x = TEXT_LEFT + 62;
             match game.inventory.get(slot) {
                 Some(stack) => {
                     pen.icon(stack.id, [TEXT_LEFT + 14, y]);
-                    pen.item_name(name_x, y + 1, Tint::White, stack.id);
+                    pen.item_name(name_x, y + 1, name_tint, stack.id);
                     let limit = quantity_limit(stack.id);
                     let quantity = if limit == 0 {
                         format!("{:02X}", stack.id)

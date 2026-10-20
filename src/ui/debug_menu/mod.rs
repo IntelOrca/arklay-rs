@@ -59,8 +59,10 @@ const BODY_Y: i32 = 44;
 const TEXT_LEFT: i32 = 52;
 /// The first of the two key-hint lines.
 const HINT_Y: i32 = 196;
-/// Cursor glyph from the shared font sheet.
-const CURSOR_GLYPH: u8 = 0x26;
+/// Cursor colour (orange).
+const CURSOR_COLOR: [u8; 4] = [255, 160, 0, 255];
+/// Tint of the selected row's text (orange, matching the cursor).
+const SELECTED_TINT: Tint = Tint::Rgb(255, 160, 0);
 
 /// What one tick of the menu decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -557,10 +559,12 @@ impl DebugMenu {
         let value_x = TEXT_LEFT + 12 * pen.font.metrics.glyph_w;
         for (index, (label, value)) in rows.iter().enumerate() {
             let y = BODY_Y + index as i32 * ROW_HEIGHT;
+            let mut tint = Tint::White;
             if index == self.player_row {
                 pen.cursor(TEXT_LEFT - 16, y);
+                tint = SELECTED_TINT;
             }
-            pen.bytes(TEXT_LEFT, y, Tint::White, pen.text.ui(label));
+            pen.bytes(TEXT_LEFT, y, tint, pen.text.ui(label));
             pen.bytes(value_x, y, Tint::Yellow, pen.text.ui(value));
         }
         let note = if game.debug.pending_player.is_some() {
@@ -584,7 +588,7 @@ impl DebugMenu {
         pen.bytes(
             TEXT_LEFT,
             BODY_Y,
-            Tint::White,
+            SELECTED_TINT,
             pen.text.ui("UI_DEBUG_DISPLAY_FRAME_RATE"),
         );
         pen.ascii(
@@ -628,10 +632,12 @@ impl DebugMenu {
         ];
         for (index, (label, (value, tint))) in CHEAT_NAMES.iter().zip(states).enumerate() {
             let y = BODY_Y + index as i32 * ROW_HEIGHT;
+            let mut label_tint = Tint::White;
             if index == self.cheat_row {
                 pen.cursor(TEXT_LEFT - 16, y);
+                label_tint = SELECTED_TINT;
             }
-            pen.bytes(TEXT_LEFT, y, Tint::White, pen.text.ui(label));
+            pen.bytes(TEXT_LEFT, y, label_tint, pen.text.ui(label));
             // Place each value after its own label: the tri-state values are
             // much wider than ON/OFF, and a fixed column overflows the panel
             // with the wide Japanese glyphs.
@@ -644,11 +650,14 @@ impl DebugMenu {
         let default = default_ending(game);
         for (index, key) in ENDING_HINTS.iter().enumerate() {
             let y = BODY_Y + index as i32 * ROW_HEIGHT;
-            if index == self.ending_row {
+            let selected = index == self.ending_row;
+            if selected {
                 pen.cursor(TEXT_LEFT - 16, y);
             }
             let id = index as u8 + 1;
-            let tint = if id == default {
+            let tint = if selected {
+                SELECTED_TINT
+            } else if id == default {
                 Tint::Green
             } else {
                 Tint::White
@@ -664,10 +673,12 @@ impl DebugMenu {
 fn draw_list(pen: &mut Pen, keys: &[&str], cursor: usize) {
     for (index, key) in keys.iter().enumerate() {
         let y = BODY_Y + index as i32 * ROW_HEIGHT;
+        let mut tint = Tint::White;
         if index == cursor {
             pen.cursor(TEXT_LEFT - 16, y);
+            tint = SELECTED_TINT;
         }
-        pen.bytes(TEXT_LEFT, y, Tint::White, pen.text.ui(key));
+        pen.bytes(TEXT_LEFT, y, tint, pen.text.ui(key));
     }
 }
 
@@ -707,17 +718,14 @@ impl Pen<'_> {
         self.fit(x, y, tint, &bytes, max_width);
     }
 
-    /// Draw the list cursor.
+    /// Draw the list cursor: an orange right-pointing arrow (the font sheet
+    /// only has a down-pointing one).
     fn cursor(&mut self, x: i32, y: i32) {
-        self.font.draw_text(
-            self.framebuffer,
-            x,
-            y,
-            Tint::White,
-            2,
-            &[CURSOR_GLYPH],
-            false,
-        );
+        for column in 0..6 {
+            let height = 11 - column * 2;
+            self.framebuffer
+                .fill_rect([x + 4 + column, y + 1 + column, 1, height], CURSOR_COLOR);
+        }
     }
 
     /// Draw `item`'s 40x30 icon at `[x, y]` (nothing without the menu art).

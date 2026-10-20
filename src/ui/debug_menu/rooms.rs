@@ -263,15 +263,28 @@ impl RoomSelect {
             let scroll = self.scroll_rows[column];
             for (index, room) in rooms.iter().enumerate().skip(scroll).take(VISIBLE_ROWS) {
                 let y = BODY_Y + 16 + (index - scroll) as i32 * ROW_HEIGHT;
-                if column == self.column && index == self.rows[column] {
+                let selected = column == self.column && index == self.rows[column];
+                if selected {
                     pen.cursor(x, y);
                 }
                 let current = (room.stage, room.room) == self.current;
-                let tint = if current { Tint::Green } else { Tint::White };
+                let tint = if selected {
+                    super::SELECTED_TINT
+                } else if current {
+                    Tint::Green
+                } else {
+                    Tint::White
+                };
                 pen.ascii(x + 10, y, tint, &format!("{:02X}", room.room));
                 let name_x = x + 10 + 2 * glyph_w + 4;
                 if let Some(name) = pen.text.room_name(&room3(room)) {
-                    let tint = if current { Tint::Green } else { Tint::Grey };
+                    let tint = if selected {
+                        super::SELECTED_TINT
+                    } else if current {
+                        Tint::Green
+                    } else {
+                        Tint::Grey
+                    };
                     pen.fit(name_x, y, tint, name, x + COLUMN_WIDTH - 2 - name_x);
                 }
             }
