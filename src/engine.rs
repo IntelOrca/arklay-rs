@@ -8830,7 +8830,7 @@ pub struct SimulatedTypewriter {
 /// completion and rebuild a gameplay session from the written slot.
 ///
 /// This is the deterministic seam the real-asset tests use; it writes the slot
-/// through the same [`ui::save_load::SaveLoadScreen`] path the engine uses.
+/// through the same [`ui::save_load::open_save_screen`] path the engine uses.
 ///
 /// The seam drives the ported slot screen, so it reads slot 0 back by its
 /// fixed name. A pack that registers a Lua save screen names its own file, so

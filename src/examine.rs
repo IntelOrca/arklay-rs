@@ -29,7 +29,7 @@ pub const VIEWER_FOV: i32 = 0xC0;
 const INGRAM_DESCRIPTION: u16 = 0x4E;
 /// The description table index the Minimi maps to (1-based).
 const MINIMI_DESCRIPTION: u16 = 0x4F;
-/// Global message: "<ammo> loaded." for a weapon holding rounds.
+/// Global message: "`<ammo>` loaded." for a weapon holding rounds.
 pub const MESSAGE_WEAPON_LOADED: u8 = 0xF0;
 /// Global message for item 0x13 once its scenario flags are up.
 pub const MESSAGE_ITEM13: u8 = 0xF1;

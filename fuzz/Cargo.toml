@@ -9,7 +9,7 @@ rust-version = "1.88"
 cargo-fuzz = true
 
 [dependencies]
-arklay = { path = "..", features = ["lua"] }
+arklay = { path = ".." }
 libfuzzer-sys = "0.4"
 # The fuzzers only exercise arklay's parsers, but linking the library needs
 # SDL3. A machine with a system SDL3 needs nothing here; CI has none, so its
