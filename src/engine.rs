@@ -129,7 +129,6 @@ use crate::trace;
 use crate::transition::{self, DoorStepper};
 use crate::tween::{self, Tween};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
-use crate::ui::item_box::{ItemBox, ItemBoxAssets, ItemBoxEvent};
 use crate::ui::lua_screen::ScreenArg;
 use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
@@ -1501,12 +1500,11 @@ struct GameSession {
     /// before game_loop resumes and the room-entry fade arms (the original's
     /// menu task teardown takes two frames).
     menu_close_wait: u8,
-    /// The item-box overlay opened by a room `item_box` action. It shares the
-    /// session's state and draws over the inventory panel the menu underneath
-    /// provides; the room stays frozen while it is up.
-    item_box: Option<ItemBox>,
-    /// Item-box art, loaded on the first open.
-    item_box_assets: Option<ItemBoxAssets>,
+    /// The item-box overlay (`ui/item_box.lua`) opened by a room `item_box`
+    /// action. It draws over the inventory panel the menu underneath
+    /// provides; the room stays frozen while it is up. It stays drawn through
+    /// the closing fade after it exits and drops with the panel.
+    item_box: Option<Box<ui::lua_screen::LuaScreen>>,
     /// The FILE tab selector/reader (`ui/file.lua`); the room stays frozen
     /// while it is up.
     file: Option<Box<ui::lua_screen::LuaScreen>>,
@@ -1957,7 +1955,6 @@ impl GameSession {
             menu_assets_loaded: false,
             menu: None,
             item_box: None,
-            item_box_assets: None,
             file: None,
             map: None,
             save_screen: None,
@@ -3986,37 +3983,40 @@ impl GameSession {
             if let Some(menu) = self.menu.as_mut() {
                 menu.tick(&mut self.game);
             }
-            if let Some(item_box) = self.item_box.as_mut() {
-                item_box.tick();
+            // The screen takes the frame's one menu input, like the Lua tabs;
+            // the engine plays its cue and performs a confirmed swap.
+            let event_input = menu_input(ui);
+            let Some(mut item_box) = self.item_box.take() else {
+                return;
+            };
+            let result = {
+                let cx = self.ui_context(pack);
+                item_box.update(&cx, event_input.map_or_else(UiInput::default, single_input))
+            };
+            if let Some(cue) = event_input.and_then(menu_cue) {
+                self.play_ui_cue_names(pack, vec![cue]);
             }
-            if let Some(event_input) = menu_input(ui) {
-                let cue = menu_cue(event_input);
-                let event = self
-                    .item_box
-                    .as_mut()
-                    .map(|item_box| item_box.handle_input(&mut self.game, event_input));
-                if let Some(cue) = cue {
-                    self.play_ui_cue_names(pack, vec![cue]);
-                }
-                if event == Some(ItemBoxEvent::Close) {
-                    // `menu_itembox_interaction` returns 1 for a browse cancel
-                    // and for a confirm on a cursor without a slot; the menu
-                    // driver turns that into `menu_exit_cleanup`, so the whole
-                    // pause menu fades out and the room resumes - the box never
-                    // drops back to the inventory panel. The overlay stays drawn
-                    // through the closing fade (`close_menu` drops it with the
-                    // panel) and the interaction already played the cancel cue,
-                    // so the close is silent.
-                    self.game.reset_itembox();
-                    self.begin_menu_close_silent();
-                }
+            if item_box.value("swap") != 0 {
+                self.game.item_box_swap(
+                    item_box.value("swap_box") as usize,
+                    item_box.value("swap_slot") as usize,
+                );
             }
-            if let Some(cursor) = self
-                .item_box
-                .as_ref()
-                .map(|item_box| item_box.player_cursor)
-                && let Some(menu) = self.menu.as_mut()
-            {
+            if !matches!(result, ScreenResult::Continue) {
+                // `menu_itembox_interaction` returns 1 for a browse cancel and
+                // for a confirm on a cursor without a slot; the menu driver
+                // turns that into `menu_exit_cleanup`, so the whole pause menu
+                // fades out and the room resumes - the box never drops back to
+                // the inventory panel. The overlay stays drawn through the
+                // closing fade (`close_menu` drops it with the panel) and the
+                // interaction already played the cancel cue, so the close is
+                // silent.
+                self.game.reset_itembox();
+                self.begin_menu_close_silent();
+            }
+            let cursor = item_box.value("cursor") as u8;
+            self.item_box = Some(item_box);
+            if let Some(menu) = self.menu.as_mut() {
                 menu.move_cursor_to(&mut self.game, cursor);
             }
             return;
@@ -4184,24 +4184,12 @@ impl GameSession {
         }
     }
 
-    /// Load the item-box art once; a missing sheet is logged and leaves the
-    /// overlay frame blank.
-    fn ensure_item_box_assets(&mut self, pack: &Pack) {
-        if self.item_box_assets.is_some() {
-            return;
-        }
-        match ItemBoxAssets::load(pack) {
-            Ok(assets) => self.item_box_assets = Some(assets),
-            Err(err) => eprintln!("warning: item-box art unavailable: {err:#}"),
-        }
-    }
-
-    /// Open the item box over the frozen inventory panel.
+    /// Open the item box (`ui/item_box.lua`) over the frozen inventory panel.
+    /// A box that cannot open leaves the panel up on its own.
     fn open_item_box(&mut self, pack: &Pack) {
         if self.item_box.is_some() {
             return;
         }
-        self.ensure_item_box_assets(pack);
         self.open_menu(pack);
         // The box shares the inventory panel's cursor: it opens on whatever
         // slot the menu is showing, and `tick_menu` keeps the two in step.
@@ -4209,9 +4197,19 @@ impl GameSession {
             .menu
             .as_ref()
             .map_or(ui::layout::FIRST_SLOT_CURSOR, |menu| menu.cursor);
-        let mut item_box = ItemBox::default();
-        item_box.open(&self.game, cursor);
-        self.item_box = Some(item_box);
+        let screen = {
+            let mut cx = self.ui_context(pack);
+            ui::lua_screen::LuaScreen::open_screen(
+                "item_box",
+                &[("cursor", ScreenArg::Int(i64::from(cursor)))],
+                ScreenAction::Resume,
+                &mut cx,
+            )
+        };
+        match screen {
+            Ok(screen) => self.item_box = Some(Box::new(screen)),
+            Err(err) => eprintln!("warning: item box unavailable: {err:#}"),
+        }
     }
 
     /// Open the FILE tab selector over the frozen inventory panel.
@@ -4900,7 +4898,7 @@ impl GameSession {
             let box_owns_cursor = self
                 .item_box
                 .as_ref()
-                .is_some_and(|item_box| !item_box.cursor_on_tab());
+                .is_some_and(|item_box| !ui::layout::is_tab(item_box.value("cursor") as u8));
             if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
                 menu.draw_with_name(
                     &mut self.framebuffer,
@@ -4938,27 +4936,31 @@ impl GameSession {
             }
         }
         if self.item_box.is_some() && !self.menu_fade_hides() {
-            self.ensure_item_box_assets(pack);
             // The box's cursor comes from the interaction itself, so it is
             // withheld until the menu's first input frame like the menu's own.
             let reveal_cursor =
                 self.menu_fade_phase == MenuFadePhase::None && self.menu_reveal_delay == 0;
-            if let (Some(item_box), Some(item_box_assets), Some(menu_assets)) =
-                (&self.item_box, &self.item_box_assets, &self.menu_assets)
-            {
-                item_box.draw(
-                    &mut self.framebuffer,
-                    item_box_assets,
-                    menu_assets,
-                    &self.text,
-                    &self.game,
-                );
-                // The box interaction draws the cursor after its own overlay
-                // (`itembox_draw_cursor`, pending depth 5 -> nearer than the
-                // frame pieces but behind the masks).
-                if reveal_cursor {
-                    item_box.draw_cursor(&mut self.framebuffer, menu_assets);
-                }
+            let Self {
+                item_box,
+                framebuffer,
+                font,
+                text,
+                game,
+                save_dir,
+                ..
+            } = self;
+            if let Some(screen) = item_box.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
+                screen.signal_with("cursor_shown", reveal_cursor, &cx);
+                screen.draw(&cx, framebuffer);
             }
         }
         if self.file.is_some() {
@@ -21297,7 +21299,7 @@ off_0010:
             session
                 .item_box
                 .as_ref()
-                .map(|item_box| item_box.player_cursor),
+                .map(|item_box| item_box.value("cursor")),
             Some(10)
         );
         let menu = session.menu.as_ref().expect("the panel stays open");

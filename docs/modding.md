@@ -521,7 +521,7 @@ The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 
 The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
 `char_select`, `save_load`, `ending_result`, `ending_epilogue`,
-`return_title`, `death`, `computer_lab`, `map`, `file`, `item_view`, …), with shared code under `ui/lib/`. A pack or mod entry
+`return_title`, `death`, `computer_lab`, `map`, `file`, `item_view`, `item_box`, …), with shared code under `ui/lib/`. A pack or mod entry
 replaces the engine's built-in copy. An engine screen is a module rather than a
 set of globals:
 
@@ -538,8 +538,9 @@ It gets every method above plus the ones below. The layout space is
 `(width // 2 - 160, height // 2 - 120)` rather than assuming the original size.
 A screen that fails to open or errors leaves through the opener's fallback.
 The engine may also call a named module function, `M.<name>(api)`, to tell a
-running screen something happened (the pick-up viewer's `begin_exit`); a
-screen without that function ignores it.
+running screen something happened (the pick-up viewer's `begin_exit`), or
+`M.<name>(api, value)` to hand it one value (the item box's `cursor_shown`
+before each draw); a screen without that function ignores it.
 
 | Method | Effect |
 | --- | --- |
@@ -551,7 +552,8 @@ screen without that function ignores it.
 | `api:ui_bytes(key)` | The text table's font-encoded bytes for `key`; `nil` without a text table. |
 | `api:location_bytes(stage, room)` | The font-encoded location label of a save's room. |
 | `api:wrap(bytes, max_width[, opts])` | Font-encoded `bytes` broken at spaces into a table of rows no wider than `max_width` pixels; one row without a font. |
-| `api:glyphs(x, y, bytes[, opts])` | Draw font-encoded bytes (white, brightness 2, the session's metrics; `{tight = false}` draws on the fixed grid). |
+| `api:glyphs(x, y, bytes[, opts])` | Draw font-encoded bytes (white, brightness 2, the session's metrics; `{tight = false}` draws on the fixed grid). `{fit = width}` condenses a row wider than `width` pixels. |
+| `api:text_8x14(x, y, bytes[, opts])` | Draw raw bytes through the original's unshadowed 8x14 grid in `opts.colour`. |
 | `api:grid_text(x, y, scale, bytes)` | Draw raw font-sheet cells. |
 | `api:save_slots()` | Eight booleans: which numbered slots hold a save. |
 | `api:slot_info()` | Eight entries: `false` for an empty slot, else `{character, saves, stage, room}`. |
@@ -582,6 +584,10 @@ screen without that function ignores it.
 | `api:examine_spin(pitch, yaw, roll, sx, sy, sz)` | The item viewer's pose after pre-multiplying a spin, re-extracted the reference way. |
 | `api:examine_check(item, pitch, yaw, roll, zoom_spin, quantity)` | The examine check: `"description"`, `"zoom"` or `"message", id, mark, select`. |
 | `api:class_message(item)` | The global message the item's examine class shows, or `nil`. |
+| `api:inventory(slot)` | The id and quantity of inventory slot `slot` (`0, 0` past the held run). |
+| `api:inventory_capacity()` | The current character's inventory slots. |
+| `api:item_box(slot)` | The id and quantity of item-box slot `slot`. |
+| `api:item_icon_row(item)` | The item's 40x30 row in `item/item_all`, or `nil`. |
 | `api:draw_actor(name, {from, to, fov})` | Draw an engine-owned actor through the camera and return whether it drew; the DIED screen offers `"player"`, the posed corpse. |
 
 ## Enemy scripts

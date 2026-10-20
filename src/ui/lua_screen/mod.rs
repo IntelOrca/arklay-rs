@@ -267,8 +267,14 @@ impl LuaScreen {
     /// way to tell a running screen something happened (the pick-up viewer's
     /// `begin_exit`). A failing hook is logged and fails the screen.
     pub fn signal(&mut self, name: &str, cx: &UiContext<'_>) {
+        self.signal_with(name, (), cx);
+    }
+
+    /// [`LuaScreen::signal`] with one argument after `api`: `M.<name>(api,
+    /// value)` (the item box's `cursor_shown`).
+    pub fn signal_with(&mut self, name: &str, value: impl mlua::IntoLuaMulti, cx: &UiContext<'_>) {
         let Self { host, vm, entry } = self;
-        if let Err(err) = vm.call_hook(name, host, cx) {
+        if let Err(err) = vm.call_hook(name, host, cx, value) {
             eprintln!("[lua] screen {entry} {name} failed: {err}");
             host.failed = true;
         }
@@ -484,7 +490,13 @@ impl ScreenVm {
     }
 
     /// Run the module's `name(api)`, when it is a function.
-    fn call_hook(&self, name: &str, host: &mut Host, cx: &UiContext<'_>) -> Result<()> {
+    fn call_hook(
+        &self,
+        name: &str,
+        host: &mut Host,
+        cx: &UiContext<'_>,
+        value: impl mlua::IntoLuaMulti,
+    ) -> Result<()> {
         let Ok(Value::Function(function)) = self.module.get::<Value>(name) else {
             return Ok(());
         };
@@ -497,7 +509,9 @@ impl ScreenVm {
                     framebuffer: None,
                     actors: None,
                 })?;
-                function.call::<()>(api)
+                let mut args = mlua::IntoLuaMulti::into_lua_multi(value, &self.lua)?;
+                args.push_front(Value::UserData(api));
+                function.call::<()>(args)
             })
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         Ok(())
@@ -1004,6 +1018,47 @@ impl UserData for Api<'_> {
             Ok(crate::examine::class_message(item))
         });
 
+        // `inventory(slot)`: the id and quantity of inventory slot `slot`;
+        // `0, 0` past the held run or outside a session.
+        methods.add_method("inventory", |_lua, api, slot: usize| {
+            let stack = api
+                .cx
+                .game
+                .and_then(|game| game.inventory.get(slot).copied())
+                .unwrap_or_default();
+            Ok((stack.id, stack.quantity))
+        });
+
+        // `inventory_capacity()`: the current character's inventory slots;
+        // Chris's six outside a session.
+        methods.add_method("inventory_capacity", |_lua, api, ()| {
+            Ok(api
+                .cx
+                .game
+                .map_or(crate::game::INVENTORY_SLOTS_CHRIS, |game| {
+                    game.inventory_capacity()
+                }))
+        });
+
+        // `item_box(slot)`: the id and quantity of item-box slot `slot`;
+        // `0, 0` for an out-of-range slot or outside a session.
+        methods.add_method("item_box", |_lua, api, slot: usize| {
+            let stack = api
+                .cx
+                .game
+                .and_then(|game| game.item_box.get(slot).copied())
+                .unwrap_or_default();
+            Ok((stack.id, stack.quantity))
+        });
+
+        // `item_icon_row(item)`: the item's 40x30 row in `item/item_all`, or
+        // nil when it has no icon there.
+        methods.add_method("item_icon_row", |_lua, _api, item: u8| {
+            let class = crate::items::image_class(item);
+            let row = usize::from(class.wrapping_sub(1));
+            Ok((class != 0 && row < crate::items::ITEM_ALL_ROWS).then_some(row))
+        });
+
         // The font-encoded shorthand location label of a save's room.
         methods.add_method("location_bytes", |lua, api, (stage, room): (u8, u8)| {
             api.cx
@@ -1403,6 +1458,37 @@ impl UserData for Api<'_> {
         // `api:ui_bytes`, `api:location_bytes` or assembled by the script).
         methods.add_method_mut(
             "glyphs",
+            |_lua, api, (x, y, bytes, opts_table): (i32, i32, mlua::String, Option<Table>)| {
+                let (x, y) = (coord(x), coord(y));
+                let opts = options(api.host, opts_table.as_ref())?;
+                let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+                let Some(font) = api.cx.font else {
+                    api.host.note_missing_font();
+                    return Ok(());
+                };
+                // `fit` condenses a row wider than that many pixels.
+                let fit = match &opts_table {
+                    Some(table) => table.get::<Option<i32>>("fit")?.unwrap_or(0),
+                    None => 0,
+                };
+                font.draw_text_fit(
+                    framebuffer,
+                    x,
+                    y,
+                    opts.tint,
+                    opts.brightness,
+                    &bytes.as_bytes(),
+                    opts.tight,
+                    fit,
+                );
+                Ok(())
+            },
+        );
+
+        // `text_8x14(x, y, bytes[, opts])`: raw bytes through the original's
+        // unshadowed `PrintText8x14` grid, in `opts.colour`.
+        methods.add_method_mut(
+            "text_8x14",
             |_lua, api, (x, y, bytes, opts): (i32, i32, mlua::String, Option<Table>)| {
                 let (x, y) = (coord(x), coord(y));
                 let opts = options(api.host, opts.as_ref())?;
@@ -1411,15 +1497,7 @@ impl UserData for Api<'_> {
                     api.host.note_missing_font();
                     return Ok(());
                 };
-                font.draw_text(
-                    framebuffer,
-                    x,
-                    y,
-                    opts.tint,
-                    opts.brightness,
-                    &bytes.as_bytes(),
-                    opts.tight,
-                );
+                font.draw_text_8x14(framebuffer, x, y, opts.tint, &bytes.as_bytes());
                 Ok(())
             },
         );

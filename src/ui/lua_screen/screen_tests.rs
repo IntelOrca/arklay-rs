@@ -2539,3 +2539,292 @@ fn item_view_pickup_spins_in_and_closes_on_begin_exit() {
     }
     assert!(!matches!(view.step(neutral()), ScreenResult::Continue));
 }
+
+/// `ui/item_box.lua` against a game state the harness owns; a published swap
+/// is applied the way the engine applies it.
+struct ItemBoxScreen {
+    harness: Harness,
+    game: crate::game::GameState,
+    screen: LuaScreen,
+}
+
+impl ItemBoxScreen {
+    fn new(label: &str, game: crate::game::GameState, cursor: u8) -> Self {
+        let harness = Harness::new(label);
+        let screen = {
+            let mut cx = UiContext {
+                game: Some(&game),
+                ..harness.context()
+            };
+            LuaScreen::open_screen(
+                "item_box",
+                &[("cursor", ScreenArg::Int(i64::from(cursor)))],
+                ScreenAction::Quit,
+                &mut cx,
+            )
+            .unwrap()
+        };
+        Self {
+            harness,
+            game,
+            screen,
+        }
+    }
+
+    /// One frame; whether it swapped, panicking if it closed.
+    fn step(&mut self, input: UiInput) -> bool {
+        assert!(!self.closes(input), "the box closed");
+        self.screen.value("swap") != 0
+    }
+
+    /// One frame; whether the box closed.
+    fn closes(&mut self, input: UiInput) -> bool {
+        let cx = UiContext {
+            game: Some(&self.game),
+            ..self.harness.context()
+        };
+        let result = self.screen.update(&cx, input);
+        if self.screen.value("swap") != 0 {
+            self.game.item_box_swap(
+                self.screen.value("swap_box") as usize,
+                self.screen.value("swap_slot") as usize,
+            );
+        }
+        !matches!(result, ScreenResult::Continue)
+    }
+
+    fn int(&self, expr: &str) -> i64 {
+        self.screen.test_eval(&format!("return {expr}"))
+    }
+
+    fn armed(&self) -> bool {
+        self.int("M.state.mode == 'armed' and 1 or 0") != 0
+    }
+
+    fn box_cursor(&self) -> i64 {
+        self.int("M.state.box_cursor")
+    }
+
+    fn dim(&self) -> bool {
+        self.int("M.state.cursor_blink & 0x20") == 0
+    }
+
+    /// Run idle frames until the page slide ends.
+    fn settle_slide(&mut self) {
+        for _ in 0..0x20 {
+            if self.int("M.state.slide_dir") == 0 {
+                return;
+            }
+            self.step(neutral());
+        }
+        panic!("the slide never ended");
+    }
+}
+
+fn box_game() -> crate::game::GameState {
+    let mut game = crate::game::GameState::new(
+        crate::state::RoomId::parse("1001").unwrap(),
+        &crate::state::RoomState::default(),
+    );
+    game.max_health = 96;
+    game
+}
+
+#[test]
+fn item_box_confirm_arms_and_a_paged_confirm_swaps() {
+    let mut game = box_game();
+    game.add_item(0x41, 1); // spray in slot 0
+    game.item_box[2] = InventoryItem {
+        id: 0x0B,
+        quantity: 12,
+    };
+    let mut item_box = ItemBoxScreen::new("box-swap", game, 8);
+    assert!(!item_box.step(confirm()));
+    assert!(item_box.armed());
+    // Cancel disarms without moving anything or closing.
+    assert!(!item_box.step(press(|input| input.cancel = true)));
+    assert!(!item_box.armed());
+    assert_eq!(item_box.game.inventory[0].id, 0x41);
+
+    // Arm, page to the ammo slot and confirm: deposit the spray and take the
+    // ammo.
+    item_box.step(confirm());
+    for _ in 0..2 {
+        item_box.step(press(|input| input.page_right = true));
+        item_box.settle_slide();
+    }
+    assert_eq!(item_box.box_cursor(), 2);
+    assert!(item_box.step(confirm()));
+    assert!(!item_box.armed());
+    assert_eq!(item_box.game.item_box[2].id, 0x41);
+    assert_eq!(item_box.game.inventory[0].id, 0x0B);
+    assert_eq!(item_box.game.inventory[0].quantity, 12);
+}
+
+#[test]
+fn item_box_drops_a_confirm_during_the_slide() {
+    let mut game = box_game();
+    game.add_item(0x41, 1);
+    game.item_box[1] = InventoryItem {
+        id: 0x0B,
+        quantity: 12,
+    };
+    let mut item_box = ItemBoxScreen::new("box-slide", game, 8);
+    item_box.step(confirm());
+    // Page forward, then confirm with the slide still running: the
+    // original's state 3 reads no buttons.
+    item_box.step(press(|input| input.down = true));
+    assert!(!item_box.step(confirm()));
+    assert!(item_box.armed());
+    assert_eq!(item_box.game.item_box[1].id, 0x0B);
+    // The same confirm after the slide swaps the slot it landed on.
+    item_box.settle_slide();
+    assert_eq!(item_box.box_cursor(), 1);
+    assert!(item_box.step(confirm()));
+    assert_eq!(item_box.game.item_box[1].id, 0x41);
+    assert_eq!(item_box.game.inventory[0].id, 0x0B);
+}
+
+#[test]
+fn item_box_armed_up_and_down_page_and_wrap_the_box_cursor() {
+    let mut game = box_game();
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-page", game, 8);
+    item_box.step(confirm());
+    for expected in [1, 2] {
+        item_box.step(press(|input| input.down = true));
+        item_box.settle_slide();
+        assert_eq!(item_box.box_cursor(), expected);
+    }
+    assert_eq!(
+        item_box.screen.value("cursor"),
+        8,
+        "the inventory cursor is fixed"
+    );
+    // Up moves the box cursor back at once and wraps past the first slot.
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.box_cursor(), 1);
+    item_box.settle_slide();
+    for _ in 0..2 {
+        item_box.step(press(|input| input.up = true));
+        item_box.settle_slide();
+    }
+    assert_eq!(item_box.box_cursor(), 47, "past the first slot wraps");
+    assert!(item_box.armed(), "paging keeps the arm");
+    item_box.step(press(|input| input.down = true));
+    item_box.settle_slide();
+    assert_eq!(item_box.box_cursor(), 0, "past the last slot wraps");
+}
+
+#[test]
+fn item_box_cursor_blinks_in_step_with_the_box_state() {
+    let mut game = box_game();
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-blink", game, 8);
+    // The counter starts at 0; the first browse frame's count-down lands on
+    // 0xFF, the bright frame.
+    assert!(item_box.dim());
+    item_box.step(neutral());
+    assert!(!item_box.dim());
+    // The arm resets the counter and the armed and sliding states leave it
+    // alone.
+    item_box.step(confirm());
+    assert!(item_box.dim());
+    item_box.step(press(|input| input.down = true));
+    for _ in 0..0x40 {
+        item_box.step(neutral());
+    }
+    assert!(item_box.dim());
+    // Back in browse the count-down resumes; a D-pad move resets it.
+    item_box.step(press(|input| input.cancel = true));
+    item_box.step(neutral());
+    assert!(!item_box.dim());
+    item_box.step(press(|input| input.down = true));
+    assert!(item_box.dim());
+}
+
+#[test]
+fn item_box_swap_clears_the_equipped_marker_when_the_item_leaves() {
+    let mut game = box_game();
+    game.add_item(0x02, 15); // Beretta
+    game.add_item(0x41, 1);
+    game.set_equipped(Some(0x02));
+    let mut item_box = ItemBoxScreen::new("box-equipped", game, 8);
+    item_box.step(confirm());
+    assert!(item_box.step(confirm()));
+    assert_eq!(item_box.game.item_box[0].id, 0x02);
+    assert_eq!(item_box.game.inventory[0].id, 0x41);
+    assert_eq!(item_box.game.equipped, None);
+}
+
+#[test]
+fn item_box_cancel_and_a_tab_confirm_close_the_box() {
+    let mut game = box_game();
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-cancel", game.clone(), 8);
+    assert!(item_box.closes(press(|input| input.cancel = true)));
+
+    // A cursor on the tab row closes on confirm, as the original's
+    // `(cursor & 0xf8) == 0` check does.
+    let mut item_box = ItemBoxScreen::new("box-tab", game, 6);
+    assert!(item_box.closes(confirm()));
+}
+
+#[test]
+fn item_box_an_empty_armed_slot_stays_armed() {
+    let mut item_box = ItemBoxScreen::new("box-empty", box_game(), 8);
+    item_box.step(confirm());
+    assert!(!item_box.step(confirm()));
+    assert!(item_box.armed());
+    assert!(item_box.game.item_box.iter().all(|slot| slot.id == 0));
+}
+
+#[test]
+fn item_box_walks_the_shared_cursor_and_swaps_under_it() {
+    let mut game = box_game();
+    game.add_item(0x41, 1); // slot 0
+    game.add_item(0x44, 1); // slot 1
+    game.add_item(0x02, 15); // slot 2
+    let mut item_box = ItemBoxScreen::new("box-walk", game, 10);
+    assert_eq!(
+        item_box.screen.value("cursor"),
+        10,
+        "open adopts the cursor"
+    );
+    let mut cursors = Vec::new();
+    for input in [
+        press(|input| input.left = true),
+        press(|input| input.down = true),
+        press(|input| input.right = true),
+        press(|input| input.up = true),
+    ] {
+        item_box.step(input);
+        cursors.push(item_box.screen.value("cursor"));
+    }
+    assert_eq!(cursors, [8, 12, 14, 10]);
+    item_box.step(confirm());
+    assert!(item_box.step(confirm()));
+    assert_eq!(
+        item_box.game.item_box[0].id, 0x44,
+        "the slot under the cursor moved"
+    );
+    assert!(!item_box.game.has_item(0x44));
+    assert_eq!(
+        item_box.screen.value("cursor"),
+        10,
+        "a swap does not move the cursor"
+    );
+}
+
+#[test]
+fn item_box_without_art_draws_nothing() {
+    let mut item_box = ItemBoxScreen::new("box-draw", box_game(), 8);
+    let cx = UiContext {
+        game: Some(&item_box.game),
+        ..item_box.harness.context()
+    };
+    item_box.screen.signal_with("cursor_shown", true, &cx);
+    let mut framebuffer = Framebuffer::new();
+    item_box.screen.draw(&cx, &mut framebuffer);
+    assert!(framebuffer.rgba == Framebuffer::new().rgba);
+}
