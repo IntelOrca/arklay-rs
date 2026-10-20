@@ -432,6 +432,10 @@ local function behavior_run(e)
     local dx = px - e.pos_x
     local dz = pz - e.pos_z
     e.cb_dist = (dx < 0 and -dx or dx) + (dz < 0 and -dz or dz)
+    -- Port-only: a hidden player is never close enough to matter.
+    if e:player_hidden() then
+        e.cb_dist = 0x7FFF
+    end
 
     e.cb_path = e:pathfind_update(px, pz)
     e.status_flags = (e.status_flags & 0x1F) | 0x40

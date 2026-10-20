@@ -1296,6 +1296,10 @@ pub struct Entity {
     pub roll: u16,
     /// Entity status flags; bit 0 is active/visible.
     pub status_flags: u8,
+    /// Port-only: hostile enemies cannot perceive this entity (the GHOST
+    /// cheat sets it on the player). Per entity, so another player or an NPC
+    /// can be hidden independently.
+    pub hidden_from_enemies: bool,
     /// The spawn record's behaviour/weapon selector.
     pub behavior_flags: u8,
     /// Animation behavior byte (`action_behavior`).
@@ -5626,6 +5630,7 @@ impl GameState {
     /// (`0x02`/`0x20`/`0x40`) and countdown cleared. The `0x80` reach lock is
     /// left alone.
     pub fn apply_invincible(&mut self) {
+        self.entities[0].hidden_from_enemies = self.debug.ghost;
         if !self.debug.invincible {
             return;
         }
@@ -5635,11 +5640,11 @@ impl GameState {
         self.poison_timer = 0;
     }
 
-    /// Whether the GHOST cheat hides the player from entity `slot`: only
-    /// hostile characters (ids below the `0x20` NPC range) lose track, so
-    /// partners still follow.
+    /// Whether the player is hidden from entity `slot`: only hostile
+    /// characters (ids below the `0x20` NPC range) lose track, so partners
+    /// still follow.
     pub fn ghost_hides_player_from(&self, slot: usize) -> bool {
-        self.debug.ghost && self.entities[slot].id < 0x20
+        self.entities[0].hidden_from_enemies && self.entities[slot].id < 0x20
     }
 
     /// Clear the per-frame item-use flag bank. The original zeroes both
