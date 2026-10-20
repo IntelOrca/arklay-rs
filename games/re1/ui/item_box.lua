@@ -22,14 +22,12 @@
 -- listed in the order the original's backwards walk draws them.
 
 local Grid = require("lib/menu_grid")
+local Slot = require("lib/item_slot")
 
 local M = {}
 
 local ITEMBOX_STEM = "ui/itemboxn"
 local STATUS_STEM = "ui/status"
-local BLUE_STEM = "ui/blue"
-local STAITEM_STEM = "ui/staitem"
-local ITEM_ALL_STEM = "item/item_all"
 
 -- Number of box slots (8bpp sheet and save block agree on 48).
 local SLOTS_TOTAL = 48
@@ -40,8 +38,6 @@ local SLIDE_WRAP = 0x0F
 -- The cursor blink counter's dim phase: while bit `0x20` of `DAT_00ae9f18` is
 -- clear the original draws the slot cursor's dim cell (`texU 0xA8`).
 local CURSOR_DIM_BIT = 0x20
--- The highest regular item id; higher ids are the Ingram/Minimi specials.
-local MAX_ITEM = 0x6E
 
 -- Frame textures, in the original's draw order: the preview border, the two
 -- box arrows, the item-list bottom and top edge lines (both sampling the
@@ -103,7 +99,7 @@ local NAME_MAX_WIDTH = 128
 
 -- The box preview slot and its icon size.
 local SLOT_X, SLOT_Y = 0x5C, 0x58
-local SLOT_W, SLOT_H = 40, 30
+local SLOT_H = Slot.H
 -- Page-position ticks.
 local TICK_X, TICK_Y = 0xB0, 0x21
 -- The preview column's bottom drawable row (exclusive). The right half of a
@@ -180,6 +176,8 @@ function M.open(api, args)
     s.cursor_blink = 0
     s.cursor_shown = false
     api:set("cursor", s.player_cursor)
+    -- On a slot the box draws the shared cursor itself; on a tab the menu does.
+    api:set("on_slot", not Grid.is_tab(s.player_cursor))
 end
 
 function M.cursor_shown(_api, shown)
@@ -290,6 +288,7 @@ function M.update(api, input)
         armed_input(api, input)
     end
     api:set("cursor", s.player_cursor)
+    api:set("on_slot", not Grid.is_tab(s.player_cursor))
 end
 
 -- Drawing ---------------------------------------------------------------
@@ -305,75 +304,6 @@ end
 
 local function shadow(api, ox, oy, rect)
     api:blend_black_rect(ox + rect[1], oy + rect[2], rect[3], rect[4], SHADOW_ALPHA)
-end
-
--- One 40-wide slice of an item's icon: `height` rows from `source_v` rows
--- into its 40x30 cell.
-local function draw_icon_slice(api, ox, oy, item, x, y, source_v, height)
-    if height <= 0 then
-        return
-    end
-    if item <= MAX_ITEM then
-        local row = api:item_icon_row(item)
-        if row == nil then
-            return
-        end
-        local atlas = api:picture(ITEM_ALL_STEM, 0x000000, "shipped")
-        api:picture_sprite_scaled(atlas, 0, row * SLOT_H + source_v, 40, height,
-            ox + x, oy + y, 40, height, 255)
-    else
-        local staitem = api:page(STAITEM_STEM)
-        api:page_sprite_mirrored(staitem, 0, (item - 0x6F) * 30 + source_v, 40, height,
-            ox + x, oy + y, 40, height, 0, 0, false, false)
-    end
-end
-
--- A stack's quantity digits under its icon at `(x, y)`, clipped above
--- `clip_bottom`: ammunition-like items only, the infinite mark for the
--- specials and the unlimited-ammo rocket launcher.
-local function draw_quantity(api, ox, oy, item, quantity, x, y, clip_bottom)
-    local quantifiable = (item < 0x13 and item ~= 0x01) or item == 0x2F or item > MAX_ITEM
-    if not quantifiable then
-        return
-    end
-    local infinite = item > MAX_ITEM or (item == 0x0A and api:flag(0, 0x7E))
-    y = y + 0x14
-    local height = clip_bottom - y
-    if height > 8 then
-        height = 8
-    end
-    if height <= 0 then
-        return
-    end
-    local status = api:page(STATUS_STEM)
-    if infinite then
-        api:page_sprite_mirrored(status, 152, 112, 10, height, ox + x + 6, oy + y, 10, height,
-            0, 0, false, false)
-        return
-    end
-    if item ~= 0x06 and item < 0x0B then
-        quantity = quantity & 0x7F
-    end
-    local digits = { quantity // 100, (quantity // 10) % 10, quantity % 10 }
-    local column = 0x80
-    if item == 4 or item == 8 or item == 0x0D or item == 0x11 then
-        column = 0x88
-    elseif item == 7 or item == 0x12 then
-        column = 0xC0
-    end
-    local cursor = x + ((item < 0x0B) and 4 or 0x0E)
-    local drawn = false
-    for index = 1, 3 do
-        local digit = digits[index]
-        if digit ~= 0 or drawn or index == 3 then
-            api:page_sprite_mirrored(status, column, digit * 8, 8, height, ox + cursor, oy + y,
-                8, height, 0, 0, false, false)
-            drawn = true
-        end
-        if drawn or item > 0x0A then
-            cursor = cursor + 8
-        end
-    end
 end
 
 -- The item name list ending at the box cursor: three rows normally, four
@@ -420,16 +350,16 @@ local function draw_slot(api, ox, oy)
         local id, quantity = api:item_box(slot)
         if visible > 0 then
             if id == 0 then
-                api:page_sprite_mirrored(api:page(BLUE_STEM), 0, 0, SLOT_W, visible,
-                    ox + SLOT_X, oy + y, SLOT_W, visible, 0, 0, false, false)
+                Slot.draw_empty(api, ox + SLOT_X, oy + y, visible)
             else
-                draw_icon_slice(api, ox, oy, id, SLOT_X, y, source_v, visible)
+                Slot.draw_icon(api, id, ox + SLOT_X, oy + y, source_v, visible)
             end
         end
         if id ~= 0 then
             -- The box's quantity is drawn from `screenX - 2`, two pixels left
             -- of the inventory panel's own quantity.
-            draw_quantity(api, ox, oy, id, quantity, SLOT_X - 2, qty_y, SLOT_CLIP_BOTTOM)
+            Slot.draw_quantity(api, id, quantity, ox + SLOT_X - 2, oy + qty_y,
+                oy + SLOT_CLIP_BOTTOM)
         end
         source_v = 0
         y = qty_y + SLOT_H
@@ -500,8 +430,7 @@ function M.draw(api)
     local ox, oy = origin(api)
     -- A pack missing the box or menu art leaves the overlay undrawn.
     local page = api:page(ITEMBOX_STEM)
-    if page == nil or api:page(STATUS_STEM) == nil or api:page(BLUE_STEM) == nil
-        or api:page(STAITEM_STEM) == nil or api:picture(ITEM_ALL_STEM, 0x000000, "shipped") == nil then
+    if page == nil or not Slot.art_present(api) then
         return
     end
     for _, part in ipairs(FRAME_PARTS_C) do

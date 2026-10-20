@@ -521,7 +521,7 @@ The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 
 The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
 `char_select`, `save_load`, `ending_result`, `ending_epilogue`,
-`return_title`, `death`, `computer_lab`, `map`, `file`, `item_view`, `item_box`, …), with shared code under `ui/lib/`. A pack or mod entry
+`return_title`, `death`, `computer_lab`, `main_menu`, `map`, `file`, `item_view`, `item_box`, …), with shared code under `ui/lib/`. A pack or mod entry
 replaces the engine's built-in copy. An engine screen is a module rather than a
 set of globals:
 
@@ -541,6 +541,11 @@ The engine may also call a named module function, `M.<name>(api)`, to tell a
 running screen something happened (the pick-up viewer's `begin_exit`), or
 `M.<name>(api, value)` to hand it one value (the item box's `cursor_shown`
 before each draw); a screen without that function ignores it.
+
+The pause menu (`main_menu`) changes the game: the engine lends it the
+session's state for `open`, `update` and its hooks, so the methods marked
+*lent* below work there and raise an error from any other screen (or from
+`draw`).
 
 | Method | Effect |
 | --- | --- |
@@ -565,6 +570,7 @@ before each draw); a screen without that function ignores it.
 | `api:art_size(handle)` | A handle's width and height. |
 | `api:clear()` | Clear the frame to black. |
 | `api:fill_rect(x, y, w, h, r, g, b[, a])` | A filled rectangle. |
+| `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line, both ends included. |
 | `api:blend_black_rect(x, y, w, h, alpha)` | Darken a rectangle. |
 | `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
 | `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
@@ -587,6 +593,17 @@ before each draw); a screen without that function ignores it.
 | `api:inventory(slot)` | The id and quantity of inventory slot `slot` (`0, 0` past the held run). |
 | `api:inventory_capacity()` | The current character's inventory slots. |
 | `api:item_box(slot)` | The id and quantity of item-box slot `slot`. |
+| `api:player_health()` | The player's health, maximum health and status byte (poison bits `0x22`). |
+| `api:character()` | The portrait's character index (`0` Chris, `1` Jill, `2`/`3` the alternates). |
+| `api:has_radio()` | Whether the radio tab is live. |
+| `api:equipped()` | The equipped item, `0` for none. |
+| `api:item_count(item)` | How many of `item` the inventory holds. |
+| `api:rand()` | *Lent.* The next draw of the game's shared `rand()` stream, `0..=0x7FFF`. |
+| `api:select_item(item)` | *Lent.* Mirror the item under the cursor into the state byte the scripts test (`0` for none). |
+| `api:equip(item)` | *Lent.* Equip `item`, or unequip with `0`. |
+| `api:use_item(slot)` | *Lent.* USE the item in `slot`: `true, healed, cured, closes` (the item is consumed; `closes` exits the whole menu), `false, category` for a refusal, nothing for an empty slot. |
+| `api:combine(slot, target)` | *Lent.* MOVE `slot` onto `target`: `"applied", herb`, `"drug_store"`, `"herb_no_recipe"` or `"none"`. |
+| `api:show_message(id)` | *Lent.* Open the game's message window on global message `id`. |
 | `api:item_icon_row(item)` | The item's 40x30 row in `item/item_all`, or `nil`. |
 | `api:draw_actor(name, {from, to, fov})` | Draw an engine-owned actor through the camera and return whether it drew; the DIED screen offers `"player"`, the posed corpse. |
 

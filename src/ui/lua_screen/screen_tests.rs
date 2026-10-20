@@ -2828,3 +2828,569 @@ fn item_box_without_art_draws_nothing() {
     item_box.screen.draw(&cx, &mut framebuffer);
     assert!(framebuffer.rgba == Framebuffer::new().rgba);
 }
+
+// ---- main menu -------------------------------------------------------------
+
+const MENU_NONE: (i64, i64) = (0, 0);
+const MENU_CLOSE: (i64, i64) = (1, 0);
+const MENU_CLOSE_SILENT: (i64, i64) = (2, 0);
+
+/// The pause menu over a lent game state, like the engine drives it.
+struct Menu {
+    harness: Harness,
+    game: crate::game::GameState,
+    screen: LuaScreen,
+    /// The cues the last [`Menu::input`] queued.
+    cues: Vec<UiCue>,
+}
+
+/// A session with a 96-health player and nothing held.
+fn menu_game() -> crate::game::GameState {
+    use crate::state::{RoomId, RoomState};
+    let mut game =
+        crate::game::GameState::new(RoomId::parse("1001").unwrap(), &RoomState::default());
+    game.max_health = 96;
+    game.entities[0].health = 96;
+    game
+}
+
+impl Menu {
+    fn open(mut game: crate::game::GameState) -> Self {
+        let harness = Harness::new("main-menu");
+        let screen = {
+            let mut cx = harness.context();
+            LuaScreen::open_screen_with_game(
+                "main_menu",
+                &[],
+                ScreenAction::Quit,
+                &mut cx,
+                &mut game,
+            )
+            .unwrap()
+        };
+        Self {
+            harness,
+            game,
+            screen,
+            cues: Vec::new(),
+        }
+    }
+
+    /// Open the menu again over the current game (the original re-runs its
+    /// state 0 on every START).
+    fn reopen(&mut self) {
+        self.game.cancel_message();
+        let mut cx = self.harness.context();
+        self.screen = LuaScreen::open_screen_with_game(
+            "main_menu",
+            &[],
+            ScreenAction::Quit,
+            &mut cx,
+            &mut self.game,
+        )
+        .unwrap();
+    }
+
+    fn event(&self) -> (i64, i64) {
+        (self.screen.value("event"), self.screen.value("event_id"))
+    }
+
+    fn value(&self, key: &str) -> i64 {
+        self.screen.value(key)
+    }
+
+    fn tick(&mut self) -> (i64, i64) {
+        let cx = self.harness.context();
+        self.screen
+            .signal_with_game("tick", (), &cx, &mut self.game);
+        self.event()
+    }
+
+    /// One frame's input, once the action submenu accepts it: the engine
+    /// keeps ticking the menu while the box grows.
+    fn input(&mut self, build: impl FnOnce(&mut UiInput)) -> (i64, i64) {
+        for _ in 0..20 {
+            if self.mode() != MODE_ACTIONS || self.value("ready") != 0 && self.value("closing") == 0
+            {
+                break;
+            }
+            self.tick();
+        }
+        let cx = self.harness.context();
+        let result = self
+            .screen
+            .update_with_game(&cx, press(build), &mut self.game);
+        assert_eq!(result, ScreenResult::Continue);
+        self.cues = cx.cues.borrow().clone();
+        self.event()
+    }
+
+    fn up(&mut self) -> (i64, i64) {
+        self.input(|i| i.up = true)
+    }
+
+    fn down(&mut self) -> (i64, i64) {
+        self.input(|i| i.down = true)
+    }
+
+    fn right(&mut self) -> (i64, i64) {
+        self.input(|i| i.right = true)
+    }
+
+    fn confirm(&mut self) -> (i64, i64) {
+        self.input(|i| i.confirm = true)
+    }
+
+    fn cancel(&mut self) -> (i64, i64) {
+        self.input(|i| i.cancel = true)
+    }
+
+    /// Tick until the action submenu's close animation ends; the last
+    /// event it published.
+    fn finish_close(&mut self) -> (i64, i64) {
+        let mut event = MENU_NONE;
+        for _ in 0..20 {
+            if self.value("closing") == 0 {
+                return event;
+            }
+            let next = self.tick();
+            if next != MENU_NONE {
+                event = next;
+            }
+        }
+        panic!("the submenu never closed");
+    }
+
+    /// Confirm the selected action, then run its one-frame hand-off and
+    /// the submenu's close animation; the last event published.
+    fn confirm_action(&mut self) -> (i64, i64) {
+        self.confirm();
+        let event = self.tick();
+        let after = self.finish_close();
+        if after != MENU_NONE { after } else { event }
+    }
+
+    fn mode(&self) -> i64 {
+        self.value("mode")
+    }
+
+    fn eval<T: mlua::FromLuaMulti>(&self, body: &str) -> T {
+        self.screen.test_eval(body)
+    }
+}
+
+const MODE_NAVIGATION: i64 = 0;
+const MODE_ACTIONS: i64 = 1;
+const MODE_MOVE: i64 = 2;
+
+#[test]
+fn main_menu_cursor_navigation_uses_the_layout_rules() {
+    use crate::game::STATE_BYTE_SELECTED_ITEM;
+    let mut game = menu_game();
+    game.add_item(0x44, 1);
+    game.add_item(0x43, 1);
+    let mut menu = Menu::open(game);
+    assert_eq!(menu.value("cursor"), 8);
+    assert_eq!(menu.value("slot"), 0);
+    assert_eq!(menu.value("selected_item"), 0x44);
+    assert_eq!(menu.game.selected_item, Some(0x44));
+    assert_eq!(
+        menu.game.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
+        0x44
+    );
+
+    menu.right();
+    assert_eq!(menu.value("cursor"), 10);
+    assert_eq!(menu.value("selected_item"), 0x43);
+    menu.up();
+    assert_eq!(
+        menu.value("cursor"),
+        6,
+        "up from the top slot row reaches the tabs"
+    );
+    assert_eq!(menu.value("slot"), -1);
+    assert_eq!(menu.value("selected_item"), 0);
+    assert_eq!(menu.game.selected_item, None);
+    menu.up();
+    assert_eq!(menu.value("cursor"), 2);
+    menu.up();
+    assert_eq!(
+        menu.value("cursor"),
+        22,
+        "up from the top tab row wraps to the bottom"
+    );
+
+    // Chris carries six slots.
+    let mut game = menu_game();
+    game.id.player_flag = 0;
+    assert_eq!(game.inventory_capacity(), 6);
+    let mut chris = Menu::open(game);
+    chris.down();
+    chris.down();
+    assert_eq!(chris.value("cursor"), 16);
+    chris.down();
+    assert_eq!(
+        chris.value("cursor"),
+        0,
+        "past the sixth slot wraps to the tab row"
+    );
+}
+
+#[test]
+fn main_menu_submenu_transitions_and_check_return() {
+    let mut game = menu_game();
+    game.add_item(0x44, 1);
+    let mut menu = Menu::open(game);
+
+    // Confirm on the item opens the action submenu.
+    assert_eq!(menu.confirm(), MENU_NONE);
+    assert_eq!(menu.mode(), MODE_ACTIONS);
+    assert!(!menu.eval::<bool>("return M.state.equippable"));
+    // Down twice selects MOVE, then cancel walks back.
+    menu.down();
+    menu.down();
+    assert_eq!(menu.eval::<i64>("return M.state.action"), 2);
+    menu.cancel();
+    assert_eq!(menu.value("closing"), 1, "cancel shrinks the submenu away");
+    menu.finish_close();
+    assert_eq!(menu.mode(), MODE_NAVIGATION);
+
+    // CHECK slides the options out, then starts the viewer.
+    menu.confirm();
+    while menu.value("ready") == 0 {
+        menu.tick();
+    }
+    menu.down();
+    assert_eq!(menu.eval::<i64>("return M.state.action"), 1);
+    menu.confirm();
+    let mut frames = 0;
+    let event = loop {
+        frames += 1;
+        assert!(frames < 20, "the slide never finished");
+        let event = menu.tick();
+        if event != MENU_NONE {
+            break event;
+        }
+    };
+    assert_eq!(event, (3, 0x44));
+    assert_eq!(menu.value("viewing"), 1);
+    // The viewer closing slides the options back in.
+    let cx = menu.harness.context();
+    menu.screen
+        .signal_with_game("view_closed", (), &cx, &mut menu.game);
+    while menu.value("viewing") != 0 {
+        menu.tick();
+    }
+    assert_eq!(menu.mode(), MODE_ACTIONS);
+
+    // An empty slot refuses to open the submenu, silently.
+    let mut empty = Menu::open(menu_game());
+    let cx = empty.harness.context();
+    let result = empty
+        .screen
+        .update_with_game(&cx, confirm(), &mut empty.game);
+    assert_eq!(result, ScreenResult::Continue);
+    assert!(
+        cx.cues.borrow().is_empty(),
+        "an empty-slot confirm is silent"
+    );
+    assert_eq!(empty.event(), MENU_NONE);
+    assert_eq!(empty.mode(), MODE_NAVIGATION);
+}
+
+#[test]
+fn main_menu_tab_and_exit_confirmations() {
+    let mut menu = Menu::open(menu_game());
+    menu.eval::<()>("M.state.cursor = 4");
+    assert_eq!(menu.confirm(), (4, 4));
+    // The exit tab closes without the exit cue after its decide
+    // (`menu_tab_exit`); the cancel's only cue is the one the engine's close
+    // plays.
+    menu.eval::<()>("M.state.cursor = 6");
+    assert_eq!(menu.confirm(), MENU_CLOSE_SILENT);
+    assert_eq!(menu.cues, [UiCue::Decide]);
+    assert_eq!(menu.cancel(), MENU_CLOSE);
+    assert!(menu.cues.is_empty(), "the cancel queued its own cue");
+    // START cycles the tabs: the map, the file, then the exit without the
+    // radio.
+    assert_eq!(menu.input(|i| i.start = true), (4, 0));
+    assert_eq!(menu.input(|i| i.start = true), (4, 2));
+    assert_eq!(menu.input(|i| i.start = true), (4, 6));
+}
+
+#[test]
+fn main_menu_a_herb_heal_updates_health_and_state() {
+    use crate::game::{STATE_BYTE_SELECTED_ITEM, STATE_BYTE_USED_ITEM};
+    let mut game = menu_game();
+    game.entities[0].health = 20;
+    game.add_item(0x44, 1);
+    let mut menu = Menu::open(game);
+
+    menu.confirm();
+    // The action runs one frame after the confirm; check the flush's first
+    // frame before the submenu's close animation advances it.
+    menu.confirm();
+    assert_eq!(menu.tick(), MENU_NONE);
+    // A green herb restores exactly one third of the maximum.
+    assert_eq!(menu.game.entities[0].health, 20 + 96 / 3);
+    assert!(menu.game.inventory.is_empty(), "the herb was consumed");
+    assert_eq!(menu.game.last_used_item, Some(0x44));
+    assert_eq!(
+        menu.game.state_bytes[usize::from(STATE_BYTE_USED_ITEM)],
+        0x44
+    );
+    assert_eq!(
+        menu.game.state_bytes[usize::from(STATE_BYTE_SELECTED_ITEM)],
+        0
+    );
+    let flush: Vec<i64> = menu.eval("local f = M.state.bar.flush return {f[1], f[2], f[3]}");
+    assert_eq!(flush, [0, 0xFF, 0], "the green flush");
+    // The heal's draw is the same frame's monitor update, so the flush has
+    // already advanced its first step.
+    assert_eq!(menu.value("monitor"), 3);
+    menu.finish_close();
+    assert_eq!(menu.mode(), MODE_NAVIGATION);
+}
+
+#[test]
+fn main_menu_heal_refusals_do_not_consume() {
+    let mut game = menu_game();
+    game.add_item(0x44, 1);
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    menu.confirm_action();
+    assert_eq!(menu.game.message.id, Some(0xF7 + 7), "the heal refusal");
+    assert_eq!(menu.game.inventory.len(), 1, "the herb was not consumed");
+    assert_eq!(menu.game.last_used_item, None);
+}
+
+#[test]
+fn main_menu_poison_cures_clear_the_status_bits() {
+    let mut game = menu_game();
+    game.set_health_status(0x22);
+    game.add_item(0x45, 1); // blue herb cures poison 0x02
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    assert_eq!(menu.confirm_action(), MENU_NONE);
+    assert_eq!(menu.game.health_status, 0x20);
+    assert_eq!(
+        menu.game.state_bytes[usize::from(crate::game::STATE_BYTE_HEALTH_STATUS)],
+        0x20
+    );
+
+    // Serum cures the 0x20 poison and clears the scenario-2 marker.
+    menu.game.set_health_status(0x22);
+    menu.game
+        .apply_flag(1, crate::game::SCENARIO2_FLAG_YAWN_POISONED, 0);
+    menu.game.add_item(0x42, 1);
+    menu.reopen();
+    menu.confirm();
+    assert_eq!(menu.confirm_action(), MENU_NONE);
+    assert_eq!(menu.game.health_status, 0x02);
+    assert!(
+        !menu
+            .game
+            .flag_test(1, crate::game::SCENARIO2_FLAG_YAWN_POISONED, false)
+    );
+}
+
+#[test]
+fn main_menu_keys_need_their_use_flag_and_are_consumed() {
+    let mut game = menu_game();
+    game.add_item(0x33, 1); // sword key
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    assert_eq!(menu.confirm_action(), MENU_NONE);
+    assert_eq!(menu.game.message.id, Some(0xF7 + 5), "the key refusal");
+    assert_eq!(menu.game.inventory.len(), 1);
+
+    menu.game.set_item_use_flag(0x33, true);
+    menu.reopen();
+    menu.confirm();
+    assert_eq!(
+        menu.confirm_action(),
+        MENU_CLOSE,
+        "a key use closes the inventory"
+    );
+    assert!(menu.game.inventory.is_empty());
+    assert_eq!(menu.game.last_used_item, Some(0x33));
+}
+
+#[test]
+fn main_menu_the_red_book_needs_its_own_flag() {
+    let mut game = menu_game();
+    game.add_item(0x3E, 1);
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    menu.confirm_action();
+    assert_eq!(menu.game.message.id, Some(0xF7 + 6), "the book refusal");
+    menu.game.set_item_use_flag(0x3E, true);
+    menu.reopen();
+    menu.confirm();
+    assert_eq!(
+        menu.confirm_action(),
+        MENU_CLOSE,
+        "a book use closes the inventory"
+    );
+    assert!(menu.game.inventory.is_empty());
+}
+
+#[test]
+fn main_menu_equipping_a_weapon_toggles_the_state_byte() {
+    use crate::game::STATE_BYTE_EQUIPPED;
+    let mut game = menu_game();
+    game.add_item(0x02, 15);
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    assert!(menu.eval::<bool>("return M.state.equippable"));
+    menu.confirm();
+    assert_eq!(menu.game.equipped, Some(0x02));
+    assert_eq!(
+        menu.game.state_bytes[usize::from(STATE_BYTE_EQUIPPED)],
+        0x02
+    );
+    // The equip runs the submenu's close animation; a second confirm once
+    // it is back on the inventory removes it again. The ammo is not
+    // consumed by an equip.
+    menu.finish_close();
+    assert_eq!(menu.mode(), MODE_NAVIGATION);
+    menu.confirm();
+    menu.confirm();
+    assert_eq!(menu.game.equipped, None);
+    assert_eq!(menu.game.inventory[0].quantity, 15);
+}
+
+#[test]
+fn main_menu_two_herbs_combine_through_the_move_action() {
+    let mut game = menu_game();
+    game.add_item(0x44, 1); // green
+    game.add_item(0x43, 1); // red
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    menu.down();
+    menu.down();
+    assert_eq!(menu.confirm(), MENU_NONE);
+    assert_eq!(menu.mode(), MODE_MOVE);
+    menu.right();
+    assert_eq!(menu.eval::<i64>("return M.state.move_cursor"), 10);
+    menu.confirm();
+    assert_eq!(menu.game.message.id, Some(0xF5), "the herb-mix message");
+    assert_eq!(menu.game.inventory.len(), 1);
+    assert_eq!(menu.game.inventory[0].id, 0x46, "green+red mixed herb");
+    assert_eq!(menu.mode(), MODE_NAVIGATION);
+}
+
+#[test]
+fn main_menu_two_herbs_without_a_recipe_show_the_cannot_combine_message() {
+    // Red + blue has no recipe, but both are herbs: the original's distinct
+    // result 3, which shows `0xF6` rather than refusing silently.
+    let mut game = menu_game();
+    game.add_item(0x43, 1); // red herb
+    game.add_item(0x45, 1); // blue herb
+    let mut menu = Menu::open(game);
+    menu.confirm();
+    menu.down();
+    menu.down();
+    menu.confirm();
+    assert_eq!(menu.mode(), MODE_MOVE);
+    menu.right();
+    menu.confirm();
+    assert_eq!(menu.game.message.id, Some(0xF6));
+    assert_eq!(menu.game.inventory.len(), 2, "nothing was consumed");
+}
+
+#[test]
+fn main_menu_actions_are_visible_to_cmpb() {
+    let mut game = menu_game();
+    game.entities[0].health = 20;
+    game.add_item(0x44, 1);
+    game.add_item(0x0B, 30);
+    let mut menu = Menu::open(game);
+    assert!(menu.game.compare_byte(6, 0, 0x44), "selected item byte");
+    assert!(menu.game.compare_byte(7, 0, 2), "two held slots");
+    assert!(menu.game.compare_byte(18, 0, 0));
+    menu.confirm();
+    menu.confirm_action();
+    assert!(menu.game.compare_byte(18, 0, 0x44), "used item byte");
+    assert!(
+        menu.game.compare_byte(7, 0, 1),
+        "the green herb was consumed"
+    );
+    assert!(
+        menu.game.compare_byte(6, 0, 0x0B),
+        "cursor follows the pack"
+    );
+}
+
+// ---- the health monitor ------------------------------------------------------
+
+#[test]
+fn health_monitor_states_follow_the_thirds_and_clamp() {
+    let menu = Menu::open(menu_game());
+    let state = |health: i64, max: i64| -> i64 {
+        menu.eval(&format!(
+            "return require('lib/health_bar').health_state({health}, {max})"
+        ))
+    };
+    assert_eq!(state(140, 140), 3);
+    assert_eq!(state(106, 140), 3);
+    assert_eq!(state(105, 140), 2);
+    assert_eq!(state(71, 140), 2);
+    assert_eq!(state(70, 140), 1);
+    assert_eq!(state(36, 140), 1);
+    assert_eq!(state(35, 140), 0);
+    assert_eq!(state(1, 140), 0);
+    assert_eq!(state(0, 140), 0);
+    // A maximum that is not a multiple of four cannot divide out to 4.
+    assert_eq!(state(96, 96), 3);
+    assert_eq!(state(150, 150), 3);
+    assert_eq!(state(10, 2), 3);
+    assert_eq!(state(10, 0), 0);
+}
+
+#[test]
+fn health_monitor_a_heal_flush_runs_and_ends() {
+    let mut game = menu_game();
+    game.entities[0].health = 20;
+    game.set_health_status(0x22);
+    let mut menu = Menu::open(game);
+    menu.tick();
+    assert_eq!(menu.eval::<i64>("return M.state.bar.health_state"), 0);
+    assert!(menu.eval::<bool>("return M.state.bar.poisoned"));
+    menu.eval::<()>("require('lib/health_bar').start_flush(M.state.bar, true, true)");
+    assert_eq!(menu.eval::<i64>("return M.state.bar.state"), 2);
+    menu.game.entities[0].health = 96;
+    menu.game.set_health_status(0);
+    menu.tick();
+    assert_eq!(menu.value("monitor"), 3);
+    assert_eq!(menu.eval::<i64>("return M.state.bar.head"), 0xAF);
+    for _ in 0..100 {
+        if menu.value("monitor") != 3 {
+            break;
+        }
+        menu.tick();
+    }
+    assert!(
+        menu.eval::<bool>("return M.state.bar.flush == nil"),
+        "the flush ended"
+    );
+}
+
+#[test]
+fn health_monitor_poison_selects_the_poisoned_waves() {
+    let mut game = menu_game();
+    game.max_health = 140;
+    game.entities[0].health = 140;
+    game.set_health_status(0x20);
+    let mut menu = Menu::open(game);
+    let mut poisoned_group = false;
+    for _ in 0..200 {
+        menu.tick();
+        if menu.eval::<i64>("return M.state.bar.wave") >= 16 {
+            poisoned_group = true;
+            break;
+        }
+    }
+    assert!(poisoned_group, "poison never selected the poisoned waves");
+    assert_eq!(menu.eval::<i64>("return M.state.bar.health_state"), 3);
+}

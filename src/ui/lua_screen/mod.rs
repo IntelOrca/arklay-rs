@@ -31,6 +31,7 @@ use mlua::{Function, Lua, Table, UserData, UserDataMethods, Value};
 use crate::budget;
 use crate::charset::{self, Script};
 use crate::font::Tint;
+use crate::game::GameState;
 use crate::lua::{Budget, new_sandboxed_state};
 use crate::model::Texture8;
 use crate::pack::Pack;
@@ -45,6 +46,7 @@ use crate::ui::{Screen, ScreenAction, ScreenResult, UiContext, UiCue, UiInput};
 use sources::{Loader, Sources};
 
 mod draw;
+mod game_api;
 mod sources;
 
 /// The coordinate range the drawing API accepts; wider values are clamped
@@ -178,7 +180,7 @@ pub struct LuaScreen {
 impl LuaScreen {
     /// Load the `entry` script as the title's load screen.
     pub fn open_load(entry: &str, cx: &mut UiContext<'_>) -> Result<Self> {
-        Self::open(entry, Mode::Load, &[], cx)
+        Self::open(entry, Mode::Load, &[], cx, None)
     }
 
     /// Open the engine screen `id`: the pack's `ui/<id>.lua`, or the
@@ -190,7 +192,26 @@ impl LuaScreen {
         fail: ScreenAction,
         cx: &mut UiContext<'_>,
     ) -> Result<Self> {
-        Self::open(&screen_entry(id), Mode::Screen { fail }, args, cx)
+        Self::open(&screen_entry(id), Mode::Screen { fail }, args, cx, None)
+    }
+
+    /// [`LuaScreen::open_screen`] lending the script the session's game
+    /// state, which its `open` may change (the pause menu). `cx.game` is
+    /// unused while `game` is lent.
+    pub fn open_screen_with_game(
+        id: &str,
+        args: &[(&str, ScreenArg)],
+        fail: ScreenAction,
+        cx: &mut UiContext<'_>,
+        game: &mut GameState,
+    ) -> Result<Self> {
+        Self::open(
+            &screen_entry(id),
+            Mode::Screen { fail },
+            args,
+            cx,
+            Some(game),
+        )
     }
 
     /// Load the `entry` script as a save screen writing `file`;
@@ -209,6 +230,7 @@ impl LuaScreen {
             },
             &[],
             cx,
+            None,
         )
     }
 
@@ -217,6 +239,7 @@ impl LuaScreen {
         mode: Mode,
         args: &[(&str, ScreenArg)],
         cx: &mut UiContext<'_>,
+        game: Option<&mut GameState>,
     ) -> Result<Self> {
         let sources = Sources::collect(cx.pack, entry)?;
         let text = cx.text;
@@ -243,7 +266,7 @@ impl LuaScreen {
         };
         let vm = ScreenVm::load(entry, Loader::new(sources))?;
         host.rescan();
-        vm.call_open(&mut host, cx, args)
+        vm.call_open(&mut host, cx, game, args)
             .with_context(|| format!("screen script {entry} open failed"))?;
         Ok(Self {
             entry: entry.to_string(),
@@ -273,11 +296,65 @@ impl LuaScreen {
     /// [`LuaScreen::signal`] with one argument after `api`: `M.<name>(api,
     /// value)` (the item box's `cursor_shown`).
     pub fn signal_with(&mut self, name: &str, value: impl mlua::IntoLuaMulti, cx: &UiContext<'_>) {
+        self.hook(name, value, cx, None);
+    }
+
+    /// [`LuaScreen::signal_with`] lending the hook the session's game
+    /// state, which it may change (the pause menu's per-frame `tick`).
+    pub fn signal_with_game(
+        &mut self,
+        name: &str,
+        value: impl mlua::IntoLuaMulti,
+        cx: &UiContext<'_>,
+        game: &mut GameState,
+    ) {
+        self.hook(name, value, cx, Some(game));
+    }
+
+    fn hook(
+        &mut self,
+        name: &str,
+        value: impl mlua::IntoLuaMulti,
+        cx: &UiContext<'_>,
+        game: Option<&mut GameState>,
+    ) {
         let Self { host, vm, entry } = self;
-        if let Err(err) = vm.call_hook(name, host, cx, value) {
+        if let Err(err) = vm.call_hook(name, host, cx, game, value) {
             eprintln!("[lua] screen {entry} {name} failed: {err}");
             host.failed = true;
         }
+    }
+
+    /// [`Screen::update`] lending the script the session's game state,
+    /// which it may change (the pause menu's use, equip and combine).
+    pub fn update_with_game(
+        &mut self,
+        cx: &UiContext<'_>,
+        input: UiInput,
+        game: &mut GameState,
+    ) -> ScreenResult {
+        self.step(cx, input, Some(game))
+    }
+
+    fn step(
+        &mut self,
+        cx: &UiContext<'_>,
+        input: UiInput,
+        game: Option<&mut GameState>,
+    ) -> ScreenResult {
+        let Self { host, vm, entry } = self;
+        if let Err(err) = vm.call_update(host, cx, game, input) {
+            eprintln!("[lua] screen {entry} update failed: {err}");
+            host.failed = true;
+        }
+        self.host.ticks = self.host.ticks.saturating_add(1);
+        if let Some(path) = self.host.load.take() {
+            return ScreenResult::Done(ScreenAction::LoadFile(path));
+        }
+        if self.host.exited || self.host.failed {
+            return ScreenResult::Done(self.exit_action());
+        }
+        ScreenResult::Continue
     }
 
     /// [`Screen::draw`] with the engine's actors available to
@@ -346,19 +423,7 @@ impl Screen for LuaScreen {
     }
 
     fn update(&mut self, cx: &UiContext<'_>, input: UiInput) -> ScreenResult {
-        let Self { host, vm, entry } = self;
-        if let Err(err) = vm.call_update(host, cx, input) {
-            eprintln!("[lua] screen {entry} update failed: {err}");
-            host.failed = true;
-        }
-        self.host.ticks = self.host.ticks.saturating_add(1);
-        if let Some(path) = self.host.load.take() {
-            return ScreenResult::Done(ScreenAction::LoadFile(path));
-        }
-        if self.host.exited || self.host.failed {
-            return ScreenResult::Done(self.exit_action());
-        }
-        ScreenResult::Continue
+        self.step(cx, input, None)
     }
 
     fn draw(&mut self, cx: &UiContext<'_>, framebuffer: &mut Framebuffer) {
@@ -447,6 +512,7 @@ impl ScreenVm {
         &self,
         host: &mut Host,
         cx: &UiContext<'_>,
+        game: Option<&mut GameState>,
         args: &[(&str, ScreenArg)],
     ) -> Result<()> {
         let Some(function) = &self.on_open else {
@@ -459,6 +525,7 @@ impl ScreenVm {
                 let api = scope.create_userdata(Api {
                     host: &mut *host,
                     cx,
+                    game_mut: game,
                     framebuffer: None,
                     actors: None,
                 })?;
@@ -469,7 +536,13 @@ impl ScreenVm {
     }
 
     /// Run `update(api, input)`.
-    fn call_update(&self, host: &mut Host, cx: &UiContext<'_>, input: UiInput) -> Result<()> {
+    fn call_update(
+        &self,
+        host: &mut Host,
+        cx: &UiContext<'_>,
+        game: Option<&mut GameState>,
+        input: UiInput,
+    ) -> Result<()> {
         let Some(function) = &self.update else {
             return Ok(());
         };
@@ -480,6 +553,7 @@ impl ScreenVm {
                 let api = scope.create_userdata(Api {
                     host: &mut *host,
                     cx,
+                    game_mut: game,
                     framebuffer: None,
                     actors: None,
                 })?;
@@ -495,6 +569,7 @@ impl ScreenVm {
         name: &str,
         host: &mut Host,
         cx: &UiContext<'_>,
+        game: Option<&mut GameState>,
         value: impl mlua::IntoLuaMulti,
     ) -> Result<()> {
         let Ok(Value::Function(function)) = self.module.get::<Value>(name) else {
@@ -506,6 +581,7 @@ impl ScreenVm {
                 let api = scope.create_userdata(Api {
                     host: &mut *host,
                     cx,
+                    game_mut: game,
                     framebuffer: None,
                     actors: None,
                 })?;
@@ -534,6 +610,7 @@ impl ScreenVm {
                 let api = scope.create_userdata(Api {
                     host: &mut *host,
                     cx,
+                    game_mut: None,
                     framebuffer: Some(&mut *framebuffer),
                     // Shorten the closure's bound to the scope's lifetime.
                     actors: actors.map(|draw| draw as &mut ActorDraw<'_>),
@@ -608,8 +685,27 @@ fn input_table(lua: &Lua, input: UiInput) -> mlua::Result<Table> {
 struct Api<'a> {
     host: &'a mut Host,
     cx: &'a UiContext<'a>,
+    /// The session's game state when the engine lends it mutably (the
+    /// pause menu); `cx.game` is the read-only view otherwise.
+    game_mut: Option<&'a mut GameState>,
     framebuffer: Option<&'a mut Framebuffer>,
     actors: Option<&'a mut ActorDraw<'a>>,
+}
+
+impl Api<'_> {
+    /// The paused session's game state, mutable loan or shared view.
+    fn game(&self) -> Option<&GameState> {
+        self.game_mut.as_deref().or(self.cx.game)
+    }
+
+    /// The mutable game state, or an error outside a lending call.
+    fn game_mut(&mut self, method: &str) -> mlua::Result<&mut GameState> {
+        self.game_mut.as_deref_mut().ok_or_else(|| {
+            mlua::Error::RuntimeError(format!(
+                "api:{method} needs the game state, which this screen cannot change"
+            ))
+        })
+    }
 }
 
 /// Draws an engine-owned actor (the DIED screen's corpse) named by
@@ -896,8 +992,7 @@ impl UserData for Api<'_> {
         // false outside a session.
         methods.add_method("flag", |_lua, api, (bank, bit): (usize, u8)| {
             Ok(api
-                .cx
-                .game
+                .game()
                 .and_then(|game| game.flags.get(bank))
                 .is_some_and(|flags| flags.bit(bit)))
         });
@@ -905,7 +1000,7 @@ impl UserData for Api<'_> {
         // `room()`: the paused session's stage, room, camera cut and player
         // digit (0 Chris, 1 Jill); nil outside a session.
         methods.add_method("room", |_lua, api, ()| {
-            Ok(match api.cx.game {
+            Ok(match api.game() {
                 Some(game) => (
                     Some(game.id.stage),
                     Some(game.id.room),
@@ -951,9 +1046,9 @@ impl UserData for Api<'_> {
                 let Some(text) = api.cx.text else {
                     return Ok(None);
                 };
-                let name = match (examined.unwrap_or(false), u8::try_from(id), api.cx.game) {
+                let name = match (examined.unwrap_or(false), u8::try_from(id), api.game()) {
                     (true, Ok(item), Some(game)) => {
-                        crate::ui::main_menu::item_name_bytes(text, item, &game.examined_flags())
+                        crate::message::menu_item_name(text, item, &game.examined_flags())
                     }
                     _ => text.item_name(id),
                 };
@@ -968,7 +1063,7 @@ impl UserData for Api<'_> {
 
         // `message_active()`: whether the game's message window is up.
         methods.add_method("message_active", |_lua, api, ()| {
-            Ok(api.cx.game.is_some_and(|game| game.message.active))
+            Ok(api.game().is_some_and(|game| game.message.active))
         });
 
         // `examine_spin(pitch, yaw, roll, sx, sy, sz)`: the turntable pose
@@ -988,7 +1083,7 @@ impl UserData for Api<'_> {
         methods.add_method(
             "examine_check",
             |_lua, api, (item, pitch, yaw, roll, zoom_spin, quantity): (u8, i32, i32, i32, i32, u8)| {
-                let item13_message = api.cx.game.is_some_and(|game| {
+                let item13_message = api.game().is_some_and(|game| {
                     game.flag_test(crate::game::BANK_SCENARIO, 0x13, false)
                         || game.flag_test(crate::game::BANK_SCENARIO, 0x00, false)
                 });
@@ -1022,8 +1117,7 @@ impl UserData for Api<'_> {
         // `0, 0` past the held run or outside a session.
         methods.add_method("inventory", |_lua, api, slot: usize| {
             let stack = api
-                .cx
-                .game
+                .game()
                 .and_then(|game| game.inventory.get(slot).copied())
                 .unwrap_or_default();
             Ok((stack.id, stack.quantity))
@@ -1033,8 +1127,7 @@ impl UserData for Api<'_> {
         // Chris's six outside a session.
         methods.add_method("inventory_capacity", |_lua, api, ()| {
             Ok(api
-                .cx
-                .game
+                .game()
                 .map_or(crate::game::INVENTORY_SLOTS_CHRIS, |game| {
                     game.inventory_capacity()
                 }))
@@ -1044,8 +1137,7 @@ impl UserData for Api<'_> {
         // `0, 0` for an out-of-range slot or outside a session.
         methods.add_method("item_box", |_lua, api, slot: usize| {
             let stack = api
-                .cx
-                .game
+                .game()
                 .and_then(|game| game.item_box.get(slot).copied())
                 .unwrap_or_default();
             Ok((stack.id, stack.quantity))
@@ -1517,6 +1609,7 @@ impl UserData for Api<'_> {
         });
 
         draw::add_methods(methods);
+        game_api::add_methods(methods);
     }
 }
 

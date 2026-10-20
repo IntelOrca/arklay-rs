@@ -394,6 +394,20 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         },
     );
 
+    // `line(x0, y0, x1, y1, r, g, b)`: a one-pixel line, both ends drawn.
+    methods.add_method_mut(
+        "line",
+        |_lua, api, (x0, y0, x1, y1, r, g, b): (i32, i32, i32, i32, i64, i64, i64)| {
+            let framebuffer = api.framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            framebuffer.draw_line(
+                [coord(x0), coord(y0)],
+                [coord(x1), coord(y1)],
+                [byte(r), byte(g), byte(b)],
+            );
+            Ok(())
+        },
+    );
+
     // `draw_ivm(model, {joints = {...}, objects = {{...}, ...}, camera =
     // {from, to, fov, screen = {x, y}}, light})`: object `i` takes the
     // joint chain `objects[i]`, and every object past the list the one

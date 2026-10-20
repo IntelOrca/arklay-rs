@@ -939,6 +939,40 @@ impl Framebuffer {
         }
     }
 
+    /// Rasterize a 1-pixel Bresenham line from `(x0, y0)` to `(x1, y1)`
+    /// inclusive, clipped to the framebuffer (like [`Self::fill_rect`], it
+    /// ignores the sprite clip).
+    pub fn draw_line(&mut self, from: [i32; 2], to: [i32; 2], color: [u8; 3]) {
+        let [x0, y0] = from;
+        let [x1, y1] = to;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut error = dx + dy;
+        let (mut x, mut y) = (x0, y0);
+        loop {
+            if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
+                let offset = (y as usize * self.width as usize + x as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+                    pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+                }
+            }
+            if x == x1 && y == y1 {
+                break;
+            }
+            let doubled = 2 * error;
+            if doubled >= dy {
+                error += dy;
+                x += sx;
+            }
+            if doubled <= dx {
+                error += dx;
+                y += sy;
+            }
+        }
+    }
+
     /// Alpha-blend a solid rectangle over the framebuffer.
     ///
     /// `alpha` is the source weight: 0 leaves the destination untouched and
@@ -3247,6 +3281,17 @@ fn channel(texel: u8, shade: f64) -> u8 {
 mod tests {
     use super::*;
     use crate::model::{TmdObject, TmdPrim};
+
+    #[test]
+    fn draw_line_marks_its_endpoints_and_skips_offscreen_pixels() {
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.draw_line([10, 10], [13, 10], [255, 0, 0]);
+        for x in 10..=13 {
+            let offset = (10 * framebuffer.width as usize + x) * 4;
+            assert_eq!(&framebuffer.rgba[offset..offset + 4], &[255, 0, 0, 255]);
+        }
+        framebuffer.draw_line([-5, -5], [-1, -1], [0, 255, 0]);
+    }
 
     fn identity() -> anim::Mat4x3 {
         anim::Mat4x3 {

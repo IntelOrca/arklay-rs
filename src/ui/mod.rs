@@ -15,11 +15,9 @@
 
 pub mod death;
 pub mod debug_menu;
-pub mod layout;
+pub mod item_icons;
 pub mod lua_screen;
-pub mod main_menu;
 pub mod save_load;
-pub mod status;
 
 use std::path::Path;
 

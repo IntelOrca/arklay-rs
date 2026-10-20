@@ -22,11 +22,18 @@
 -- transcribed from the scenario flags rather than extracted. A pack without
 -- the map art leaves the tab blank with a warning.
 --
--- The screen publishes `zoomed` (0/1) so the engine can re-draw the panel
--- decorations the original paints over the current view. The room-flags/SCD
+-- The screen publishes `zoomed` (0/1) for the engine's tests. The room-flags/SCD
 -- bit that records a map pick-up is raised by the engine's pick-up rule.
 
+local Panel = require("lib/status_panel")
+
 local M = {}
+
+-- The screen rects the browser's composite covers (the base window's 160x72
+-- plus the name and glyph rows below it) and the full display's plan: the
+-- status panel's decorations that overlap them are re-drawn on top.
+local BROWSER_RECT = { 33, 32, 160, 96 }
+local DISPLAY_RECT = { 48, 28, 128, 100 }
 
 local TABLES_ENTRY = "map/tables.bin"
 local BLUE_STEM = "map/blue"
@@ -588,6 +595,11 @@ function M.draw(api)
     elseif s.started then
         draw_browser(api, ox, oy)
     end
+    -- The original's depth puts the status screen's frame decorations in
+    -- front of the map's sprites, so the panel's dithered right-hand edge
+    -- shows over the composite.
+    local rect = s.zoomed and DISPLAY_RECT or BROWSER_RECT
+    Panel.draw_frames_over(api, ox, oy, api:inventory_capacity(), rect)
 end
 
 return M

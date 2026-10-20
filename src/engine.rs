@@ -129,8 +129,9 @@ use crate::trace;
 use crate::transition::{self, DoorStepper};
 use crate::tween::{self, Tween};
 use crate::ui::debug_menu::{DebugMenu, DebugMenuEvent};
+use crate::ui::item_icons::ItemIcons;
+use crate::ui::lua_screen::LuaScreen;
 use crate::ui::lua_screen::ScreenArg;
-use crate::ui::main_menu::{MainMenu, MenuAssets, MenuEvent, MenuInput, MenuMode};
 use crate::ui::{self, Screen, ScreenAction, ScreenResult, UiContext, UiInput};
 use crate::video::{self, Graphics, RendererKind};
 use crate::weapons;
@@ -1434,13 +1435,13 @@ struct GameSession {
     /// Decoded glyph sheet for the message window; absent packs cannot draw
     /// messages but still run their state machine.
     font: Option<font::Font>,
-    /// Pause-menu art, loaded once on the first START.
-    menu_assets: Option<MenuAssets>,
-    /// Whether the one-time menu-asset load has been attempted.
-    menu_assets_loaded: bool,
-    /// The paused inventory/status menu; the room tick is frozen while it is
-    /// up and the last gameplay frame stays under it.
-    menu: Option<MainMenu>,
+    /// The debug overlay's item icons, loaded once when it first opens.
+    item_icons: Option<ItemIcons>,
+    /// Whether the one-time item-icon load has been attempted.
+    item_icons_loaded: bool,
+    /// The paused inventory/status menu (`ui/main_menu.lua`); the room tick
+    /// is frozen while it is up and the last gameplay frame stays under it.
+    menu: Option<Box<LuaScreen>>,
     /// The pause menu's open/close fade and which phase it is in.
     menu_fade: transition::Fade,
     /// The pause-menu fade phase; `None` means the menu accepts input.
@@ -1651,19 +1652,6 @@ const DOOR_LOCK_BITS: [u8; 2] = [0x25, 0x26];
 
 /// The lab map's room-flag bit (`ROOM_FLAG_MAP_BASE + MAP_INDEX_LABORATORY`).
 const LAB_MAP_FLAG: u8 = 0x81;
-
-/// The screen rect the map browser's composite covers (the base window's
-/// 160x72 plus the name and glyph rows below it) and the full display's plan
-/// rect. The engine re-draws the panel decorations the original paints over
-/// them (`MainMenu::draw_frames_over`).
-const MAP_BROWSER_RECT: ui::layout::Rect = ui::layout::Rect {
-    pos: [33, 32],
-    size: [160, 96],
-};
-const MAP_DISPLAY_RECT: ui::layout::Rect = ui::layout::Rect {
-    pos: [48, 28],
-    size: [128, 100],
-};
 
 /// The state `computer_lab_init` (0x004123d0) swaps out for the terminal and
 /// restores on exit.
@@ -1951,8 +1939,8 @@ impl GameSession {
             music: None,
             text,
             font,
-            menu_assets: None,
-            menu_assets_loaded: false,
+            item_icons: None,
+            item_icons_loaded: false,
             menu: None,
             item_box: None,
             file: None,
@@ -2895,17 +2883,16 @@ impl GameSession {
         Ok(())
     }
 
-    /// The lazily loaded pause-menu art; a missing or invalid sheet is logged
-    /// once and leaves the menu blank but functional.
-    fn ensure_menu_assets(&mut self, pack: &Pack) {
-        if self.menu_assets_loaded {
+    /// The debug overlay's lazily loaded item icons; a missing or invalid
+    /// sheet is logged once and leaves the overlay without icons.
+    fn ensure_item_icons(&mut self, pack: &Pack) {
+        if self.item_icons_loaded {
             return;
         }
-        self.menu_assets_loaded = true;
-        let font = self.font.as_ref();
-        match MenuAssets::load(pack, font) {
-            Ok(assets) => self.menu_assets = Some(assets),
-            Err(err) => eprintln!("warning: pause-menu art unavailable: {err:#}"),
+        self.item_icons_loaded = true;
+        match ItemIcons::load(pack) {
+            Ok(icons) => self.item_icons = Some(icons),
+            Err(err) => eprintln!("warning: item icons unavailable: {err:#}"),
         }
     }
 
@@ -2947,12 +2934,76 @@ impl GameSession {
         if self.menu.is_some() {
             return;
         }
-        self.ensure_menu_assets(pack);
         self.render(pack);
-        let mut menu = MainMenu::new(self.game.inventory_capacity());
-        menu.open(&mut self.game);
+        let opened = self.with_menu(pack, |menu, cx, game| {
+            let screen =
+                LuaScreen::open_screen_with_game("main_menu", &[], ScreenAction::Resume, cx, game)?;
+            *menu = Some(Box::new(screen));
+            anyhow::Ok(())
+        });
+        if let Err(err) = opened {
+            eprintln!("warning: pause menu unavailable: {err:#}");
+            return;
+        }
         self.game.message_menu = true;
-        self.menu = Some(menu);
+    }
+
+    /// Run `f` on the pause-menu slot with the session's game state lent to
+    /// it (the menu script's use, equip and combine change it), then play the
+    /// cues the script raised.
+    fn with_menu<R>(
+        &mut self,
+        pack: &Pack,
+        f: impl FnOnce(&mut Option<Box<LuaScreen>>, &mut UiContext<'_>, &mut game::GameState) -> R,
+    ) -> R {
+        let (result, cues) = {
+            let Self {
+                menu,
+                save_dir,
+                font,
+                text,
+                game,
+                ..
+            } = self;
+            let mut cx = UiContext {
+                pack,
+                save_dir,
+                font: font.as_ref(),
+                text: Some(text),
+                ticks: game.frame,
+                cues: std::cell::RefCell::new(Vec::new()),
+                game: None,
+            };
+            let result = f(menu, &mut cx, game);
+            (result, cx.cues.into_inner())
+        };
+        self.play_ui_cue_names(pack, cues);
+        result
+    }
+
+    /// Run the pause menu's `M.<name>(api, value)` hook and return the event
+    /// it published.
+    fn menu_signal(
+        &mut self,
+        pack: &Pack,
+        name: &str,
+        value: impl mlua::IntoLuaMulti,
+    ) -> MenuEvent {
+        self.with_menu(pack, |menu, cx, game| {
+            let Some(menu) = menu.as_mut() else {
+                return MenuEvent::None;
+            };
+            menu.signal_with_game(name, value, cx, game);
+            MenuEvent::published(menu)
+        })
+    }
+
+    /// One frame of the pause menu's own animation: a use confirmed on the
+    /// previous frame, the CHECK slide, the submenu box and the health
+    /// monitor (`menu_draw_health_bar`, which draws from the shared
+    /// `rand()`).
+    fn tick_menu_screen(&mut self, pack: &Pack) -> MenuEvent {
+        self.menu_signal(pack, "tick", ())
     }
 
     /// Close the pause menu and unfreeze the room. Any item-box overlay is
@@ -2981,6 +3032,9 @@ impl GameSession {
             return;
         }
         self.open_menu(pack);
+        if self.menu.is_none() {
+            return;
+        }
         // The original's `set_fading` only sets the counter: the accumulator is
         // left at the room-entry fade's negative leftover, and the first step
         // resets it to 0 before adding. Seed it from the room fade so the
@@ -3275,7 +3329,7 @@ impl GameSession {
     /// state from the last time it was open is reused, so F1 returns to the
     /// tool and cursors it was left on.
     fn open_debug_menu(&mut self, pack: &Pack) {
-        self.ensure_menu_assets(pack);
+        self.ensure_item_icons(pack);
         let mut menu = match self.debug_menu_memory.take() {
             Some(mut menu) => {
                 menu.reopen(self.loaded.id, &self.game, &self.bindings);
@@ -3410,9 +3464,7 @@ impl GameSession {
     /// together. A viewer that cannot open hands the menu straight back.
     fn open_item_view(&mut self, pack: &Pack, item: u8) {
         let quantity = self
-            .menu
-            .as_ref()
-            .and_then(|menu| ui::layout::slot_of_cursor(menu.cursor))
+            .menu_slot()
             .and_then(|slot| self.game.inventory.get(slot))
             .map_or(0, |stack| stack.quantity);
         let screen = {
@@ -3431,9 +3483,7 @@ impl GameSession {
             Ok(screen) => self.examine = Some(Box::new(screen)),
             Err(err) => {
                 eprintln!("warning: item viewer unavailable: {err:#}");
-                if let Some(menu) = self.menu.as_mut() {
-                    menu.view_closed();
-                }
+                self.menu_signal(pack, "view_closed", ());
             }
         }
     }
@@ -3449,11 +3499,11 @@ impl GameSession {
     /// doom book turned medal. The frame its closing animation finishes the
     /// options start sliding back.
     fn tick_examine(&mut self, pack: &Pack, ui: UiInput) {
-        let Some(menu) = self.menu.as_mut() else {
+        if self.menu.is_none() {
             self.examine = None;
             return;
-        };
-        if let Some(MenuEvent::ViewItem(item)) = menu.tick(&mut self.game) {
+        }
+        if let MenuEvent::ViewItem(item) = self.tick_menu_screen(pack) {
             self.open_item_view(pack, item);
         }
         let Some(mut viewer) = self.examine.take() else {
@@ -3463,12 +3513,11 @@ impl GameSession {
             let cx = self.ui_context(pack);
             viewer.update(&cx, ui)
         };
-        let Self {
-            menu, game, text, ..
-        } = self;
-        let Some(menu) = menu.as_mut() else {
+        if self.menu.is_none() {
             return;
-        };
+        }
+        let medal_slot = self.menu_slot();
+        let Self { game, text, .. } = self;
         let id = viewer.value("event_id") as u8;
         match viewer.value("event") {
             EXAMINE_DESCRIPTION => {
@@ -3490,18 +3539,17 @@ impl GameSession {
             }
             EXAMINE_MARK_BIT => game.mark_examined_bit(id),
             EXAMINE_MEDAL => {
-                let slot = ui::layout::slot_of_cursor(menu.cursor);
-                if let Some(stack) = slot.and_then(|slot| game.inventory.get_mut(slot)) {
+                if let Some(stack) = medal_slot.and_then(|slot| game.inventory.get_mut(slot)) {
                     *stack = game::InventoryItem { id, quantity: 1 };
                 }
-                menu.reselect(game);
+                self.menu_signal(pack, "reselect", ());
             }
             _ => {}
         }
         if matches!(result, ScreenResult::Continue) {
             self.examine = Some(viewer);
         } else {
-            menu.view_closed();
+            self.menu_signal(pack, "view_closed", ());
         }
     }
 
@@ -3947,7 +3995,12 @@ impl GameSession {
         // task runs before the message task, so a description the viewer asks
         // for starts revealing this frame and a dismissal reaches the viewer
         // on the next one.
-        if self.examine.is_some() || self.menu.as_ref().is_some_and(MainMenu::viewing) {
+        if self.examine.is_some()
+            || self
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.value("viewing") != 0)
+        {
             self.tick_examine(pack, ui);
             self.game
                 .update_message(message_input, &self.loaded.room, &self.text);
@@ -3961,13 +4014,8 @@ impl GameSession {
             // runs `menu_draw_health_bar` under it (the status-screen message
             // wait and the submenu's message states), so the health monitor
             // and its shared `rand()` draws keep advancing.
-            let deferred = match &mut self.menu {
-                Some(menu) => menu.tick(&mut self.game),
-                None => None,
-            };
-            if let Some(event) = deferred {
-                self.apply_menu_event(pack, event);
-            }
+            let event = self.tick_menu_screen(pack);
+            self.apply_menu_event(pack, event);
             return;
         }
 
@@ -3980,9 +4028,7 @@ impl GameSession {
             // The original's item-box state 3 calls `menu_draw_health_bar`
             // every frame, which keeps the face and the EKG heartbeat sweeping
             // while the box is up.
-            if let Some(menu) = self.menu.as_mut() {
-                menu.tick(&mut self.game);
-            }
+            self.tick_menu_screen(pack);
             // The screen takes the frame's one menu input, like the Lua tabs;
             // the engine plays its cue and performs a confirmed swap.
             let event_input = menu_input(ui);
@@ -4014,11 +4060,9 @@ impl GameSession {
                 self.game.reset_itembox();
                 self.begin_menu_close_silent();
             }
-            let cursor = item_box.value("cursor") as u8;
+            let cursor = item_box.value("cursor");
             self.item_box = Some(item_box);
-            if let Some(menu) = self.menu.as_mut() {
-                menu.move_cursor_to(&mut self.game, cursor);
-            }
+            self.menu_signal(pack, "move_cursor", cursor);
             return;
         }
 
@@ -4027,9 +4071,7 @@ impl GameSession {
             // The original's menu task keeps running `menu_update_status_screen`
             // (the health monitor and its shared `rand()` draws) while the map
             // browser is up, exactly like the item box below.
-            if let Some(menu) = self.menu.as_mut() {
-                menu.tick(&mut self.game);
-            }
+            self.tick_menu_screen(pack);
             // The screen takes the frame's one menu input, like the Rust
             // tabs; the engine plays its cue.
             let event_input = menu_input(ui);
@@ -4054,9 +4096,7 @@ impl GameSession {
             // The original's menu task keeps running `menu_update_status_screen`
             // (the health monitor and its shared `rand()` draws) while the
             // document selector/reader is up.
-            if let Some(menu) = self.menu.as_mut() {
-                menu.tick(&mut self.game);
-            }
+            self.tick_menu_screen(pack);
             // The screen takes the frame's one menu input; the engine plays
             // its cue.
             let event_input = menu_input(ui);
@@ -4076,60 +4116,28 @@ impl GameSession {
             return;
         }
 
-        let has_radio = self.game.has_radio();
         // A use/view confirmed on the previous frame runs now, before this
         // frame's health-bar draw, exactly like the original's submenu state 4.
-        let deferred = match &mut self.menu {
-            Some(menu) => menu.tick(&mut self.game),
-            None => return,
-        };
-        if let Some(event) = deferred {
-            self.apply_menu_event(pack, event);
-        }
-        let Some(menu) = self.menu.as_mut() else {
-            return;
-        };
-        // The action submenu ignores all input while its 8-frame open or
-        // close animation runs (main_menu's states 1 and 3).
-        if menu.mode == MenuMode::Actions && (!menu.submenu_ready() || menu.submenu_closing) {
+        if self.menu.is_none() {
             return;
         }
-        // START (Tab) cycles the top tabs while the menu is open; the file
-        // tab opens the document selector.
-        if ui.start {
-            let cursor = menu.cycle_tab(&mut self.game, has_radio);
-            self.handle_tab(pack, cursor);
-            return;
-        }
-        let Some(event_input) = menu_input(ui) else {
-            // An idle navigation frame counts the cursor blink down.
-            if menu.mode == MenuMode::Navigation {
-                menu.blink();
-            }
+        let event = self.tick_menu_screen(pack);
+        self.apply_menu_event(pack, event);
+        // START cycles the top tabs; otherwise one pad edge reaches the menu.
+        let mut input = menu_input(ui).map_or_else(UiInput::default, single_input);
+        input.start = ui.start;
+        let stepped = self.with_menu(pack, |menu, cx, game| {
+            let menu = menu.as_mut()?;
+            let result = menu.update_with_game(cx, input, game);
+            Some((result, MenuEvent::published(menu)))
+        });
+        let Some((result, event)) = stepped else {
             return;
         };
-        let was_navigation = menu.mode == MenuMode::Navigation;
-        let event = menu.handle_input(&mut self.game, event_input);
-        let mode = menu.mode;
-        // A confirm that did nothing (an empty slot) stays silent, exactly like
-        // the original's `goto input_blink` path.
-        //
-        // The navigation cancel is silent here too: its `play_sfx(3, 5)` is the
-        // state-1 exit cue [`Self::begin_menu_close`] plays, and the reference
-        // reaches that exit without ever running `menu_handle_input`'s
-        // navigation path (the cancel bit fails `cond1`), which owns no cue of
-        // its own.
-        let cue = match event_input {
-            MenuInput::Confirm
-                if event == MenuEvent::None && was_navigation && mode == MenuMode::Navigation =>
-            {
-                None
-            }
-            MenuInput::Cancel if event == MenuEvent::Close => None,
-            _ => menu_cue(event_input),
-        };
-        if let Some(cue) = cue {
-            self.play_ui_cue_names(pack, vec![cue]);
+        if result != ScreenResult::Continue {
+            // A failing script hands the room back rather than freezing it.
+            self.begin_menu_close(pack);
+            return;
         }
         self.apply_menu_event(pack, event);
     }
@@ -4140,13 +4148,17 @@ impl GameSession {
             MenuEvent::None => {}
             MenuEvent::Close => self.begin_menu_close(pack),
             MenuEvent::CloseSilent => self.begin_menu_close_silent(),
-            MenuEvent::Message(id) => self.game.show_message(id as u8, 0),
             // CHECK's slide-out finished: the viewer starts. The slide's own
             // frames run through `tick_examine`, which handles this itself.
             MenuEvent::ViewItem(item) => self.open_item_view(pack, item),
             MenuEvent::Tab(cursor) => self.handle_tab(pack, cursor),
-            MenuEvent::Changed => {}
         }
+    }
+
+    /// The inventory slot under the pause menu's cursor, if it is on one.
+    fn menu_slot(&self) -> Option<usize> {
+        let slot = self.menu.as_ref()?.value("slot");
+        usize::try_from(slot).ok()
     }
 
     /// Run the action of a selected top tab.
@@ -4193,15 +4205,14 @@ impl GameSession {
         self.open_menu(pack);
         // The box shares the inventory panel's cursor: it opens on whatever
         // slot the menu is showing, and `tick_menu` keeps the two in step.
-        let cursor = self
-            .menu
-            .as_ref()
-            .map_or(ui::layout::FIRST_SLOT_CURSOR, |menu| menu.cursor);
+        let Some(cursor) = self.menu.as_ref().map(|menu| menu.value("cursor")) else {
+            return;
+        };
         let screen = {
             let mut cx = self.ui_context(pack);
             ui::lua_screen::LuaScreen::open_screen(
                 "item_box",
-                &[("cursor", ScreenArg::Int(i64::from(cursor)))],
+                &[("cursor", ScreenArg::Int(cursor))],
                 ScreenAction::Resume,
                 &mut cx,
             )
@@ -4876,7 +4887,6 @@ impl GameSession {
         // frame and while the closing fade runs; it is revealed for the
         // fade-in.
         if self.menu.is_some() && !self.menu_fade_hides() {
-            self.ensure_menu_assets(pack);
             // The cursor and the 0xBA item-name line are drawn from
             // menu_handle_input (state 1), which only runs once the opening
             // fade has finished *and* the state-0 transition frame has passed;
@@ -4898,16 +4908,29 @@ impl GameSession {
             let box_owns_cursor = self
                 .item_box
                 .as_ref()
-                .is_some_and(|item_box| !ui::layout::is_tab(item_box.value("cursor") as u8));
-            if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
-                menu.draw_with_name(
-                    &mut self.framebuffer,
-                    assets,
-                    &self.text,
-                    &self.game,
-                    menu_ready && !box_owns_cursor,
-                    show_item_name,
-                );
+                .is_some_and(|item_box| item_box.value("on_slot") != 0);
+            let show_cursor = menu_ready && !box_owns_cursor;
+            let Self {
+                menu,
+                save_dir,
+                font,
+                text,
+                game,
+                framebuffer,
+                ..
+            } = self;
+            if let Some(screen) = menu.as_mut() {
+                let cx = UiContext {
+                    pack,
+                    save_dir,
+                    font: font.as_ref(),
+                    text: Some(text),
+                    ticks: game.frame,
+                    cues: std::cell::RefCell::new(Vec::new()),
+                    game: Some(game),
+                };
+                screen.signal_with("present", (show_cursor, show_item_name), &cx);
+                screen.draw(&cx, framebuffer);
             }
         }
         // The examine viewer draws over the live menu: the model, its
@@ -5009,20 +5032,6 @@ impl GameSession {
                 screen.draw(&cx, framebuffer);
             }
         }
-        if let Some(map) = self.map.as_ref() {
-            // The original's depth puts the status screen's frame decorations
-            // in front of the map tab's sprites, so the panel's dithered
-            // right-hand edge shows over the composite (see
-            // `MainMenu::draw_frames_over`).
-            let rect = if map.value("zoomed") != 0 {
-                MAP_DISPLAY_RECT
-            } else {
-                MAP_BROWSER_RECT
-            };
-            if let (Some(menu), Some(assets)) = (&self.menu, &self.menu_assets) {
-                menu.draw_frames_over(&mut self.framebuffer, assets, rect);
-            }
-        }
         if self.save_screen.is_some() {
             let Self {
                 save_screen,
@@ -5093,7 +5102,7 @@ impl GameSession {
                 &mut self.framebuffer,
                 self.font.as_ref(),
                 &self.text,
-                self.menu_assets.as_ref(),
+                self.item_icons.as_ref(),
                 &self.game,
             );
         }
@@ -11146,6 +11155,50 @@ impl InputState {
 
 /// Map one frame of edge-triggered pad input to the single inventory menu
 /// input it represents; the original pad reports one new button per frame.
+/// What the pause-menu script asked the engine to do this frame
+/// (`ui/main_menu.lua`'s `event` and `event_id`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuEvent {
+    None,
+    /// Leave the menu through the closing fade, with the state-1 exit's
+    /// cancel cue.
+    Close,
+    /// Leave through the same fade without the exit cue: the exit tab, whose
+    /// confirm already played the decide cue (`menu_tab_exit`).
+    CloseSilent,
+    /// CHECK's slide-out finished: open the examine viewer on the item.
+    ViewItem(u8),
+    /// A top tab was confirmed (the cursor `0..=6`).
+    Tab(u8),
+}
+
+impl MenuEvent {
+    /// The event the menu screen published on its last call.
+    fn published(menu: &LuaScreen) -> Self {
+        let id = menu.value("event_id") as u8;
+        match menu.value("event") {
+            1 => Self::Close,
+            2 => Self::CloseSilent,
+            3 => Self::ViewItem(id),
+            4 => Self::Tab(id),
+            _ => Self::None,
+        }
+    }
+}
+
+/// One pad edge the menus react to, in the original's priority order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MenuInput {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageLeft,
+    PageRight,
+    Confirm,
+    Cancel,
+}
+
 fn menu_input(ui: UiInput) -> Option<MenuInput> {
     if ui.up {
         Some(MenuInput::Up)
@@ -19533,7 +19586,11 @@ off_0010:
             )
             .unwrap();
         settle_menu_fade(&mut session, &pack);
-        session.menu.as_mut().unwrap().cursor = 6;
+        session
+            .menu
+            .as_ref()
+            .unwrap()
+            .test_eval::<()>("M.state.cursor = 6");
 
         session
             .tick(
@@ -19623,6 +19680,12 @@ off_0010:
         panic!("the pause-menu fade did not settle");
     }
 
+    /// The pause menu's EKG head span (the monitor's primary trail).
+    fn menu_monitor_span(session: &GameSession) -> (i64, i64) {
+        let menu = session.menu.as_ref().unwrap();
+        (menu.value("monitor_left"), menu.value("monitor_right"))
+    }
+
     /// Advance the pause menu until its action submenu's 8-frame open
     /// animation has finished and it accepts input again.
     fn settle_submenu_open(session: &mut GameSession, pack: &Pack) {
@@ -19630,7 +19693,7 @@ off_0010:
             if session
                 .menu
                 .as_ref()
-                .is_none_or(|menu| menu.submenu_ready())
+                .is_none_or(|menu| menu.value("ready") != 0)
             {
                 return;
             }
@@ -19648,7 +19711,7 @@ off_0010:
             let closing = session
                 .menu
                 .as_ref()
-                .is_some_and(|menu| menu.submenu_closing);
+                .is_some_and(|menu| menu.value("closing") != 0);
             if !closing {
                 return;
             }
@@ -20472,7 +20535,12 @@ off_0010:
                 .tick(&pack, ui, player::Input::default(), false)
                 .unwrap();
         }
-        assert!(session.menu.as_ref().is_some_and(MainMenu::viewing));
+        assert!(
+            session
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.value("viewing") != 0)
+        );
         let frozen = session.game.frame;
         // The submenu slides out for eight frames before the viewer starts.
         let slide = idle_until(&mut session, &pack, 20, |session| session.examine.is_some());
@@ -20502,7 +20570,10 @@ off_0010:
             session.examine.is_none()
         });
         idle_until(&mut session, &pack, 20, |session| {
-            !session.menu.as_ref().is_some_and(MainMenu::viewing)
+            !session
+                .menu
+                .as_ref()
+                .is_some_and(|menu| menu.value("viewing") != 0)
         });
         assert!(
             session.menu.is_some(),
@@ -21303,9 +21374,10 @@ off_0010:
             Some(10)
         );
         let menu = session.menu.as_ref().expect("the panel stays open");
-        assert_eq!(menu.cursor, 10, "the drawn cursor follows the box");
+        assert_eq!(menu.value("cursor"), 10, "the drawn cursor follows the box");
         assert_eq!(
-            menu.selected_item, ITEM_HANDGUN_AMMO,
+            menu.value("selected_item"),
+            i64::from(ITEM_HANDGUN_AMMO),
             "the drawn name follows"
         );
 
@@ -21326,7 +21398,7 @@ off_0010:
         }
         assert_eq!(session.game.item_box[0].id, ITEM_HANDGUN_AMMO);
         assert!(!session.game.has_item(ITEM_HANDGUN_AMMO));
-        assert_eq!(session.menu.as_ref().unwrap().cursor, 10);
+        assert_eq!(session.menu.as_ref().unwrap().value("cursor"), 10);
     }
 
     #[test]
@@ -21346,12 +21418,12 @@ off_0010:
         // head steps to 0x85 and immediately wraps to 0x35 (off the window's
         // left edge); the sweep then fills the window over the next ~0x50
         // ticks.
-        assert_eq!(session.menu.as_ref().unwrap().health_bar.state, 0);
+        assert_eq!(session.menu.as_ref().unwrap().value("monitor"), 0);
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
         assert_eq!(
-            session.menu.as_ref().unwrap().health_bar.state,
+            session.menu.as_ref().unwrap().value("monitor"),
             1,
             "the item box starts the EKG sweep"
         );
@@ -21360,11 +21432,11 @@ off_0010:
                 .tick(&pack, UiInput::default(), player::Input::default(), false)
                 .unwrap();
         }
-        let first = session.menu.as_ref().unwrap().health_bar.primary_span();
+        let first = menu_monitor_span(&session);
         session
             .tick(&pack, UiInput::default(), player::Input::default(), false)
             .unwrap();
-        let second = session.menu.as_ref().unwrap().health_bar.primary_span();
+        let second = menu_monitor_span(&session);
         assert_ne!(first, second, "the EKG head advances while the box is up");
     }
 
