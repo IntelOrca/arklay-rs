@@ -521,7 +521,7 @@ The bit layout is the original's: confirm `0x0001`, cancel `0x0002`, start
 
 The game's own screens are pack scripts too: `ui/<id>.lua` (`title`,
 `char_select`, `save_load`, `ending_result`, `ending_epilogue`,
-`return_title`, `death`, …), with shared code under `ui/lib/`. A pack or mod entry
+`return_title`, `death`, `computer_lab`, …), with shared code under `ui/lib/`. A pack or mod entry
 replaces the engine's built-in copy. An engine screen is a module rather than a
 set of globals:
 

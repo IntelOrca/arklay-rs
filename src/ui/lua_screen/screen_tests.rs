@@ -1337,3 +1337,160 @@ fn death_the_strip_math_matches_the_original() {
         assert_eq!(wave(59, column), i64::from(expected), "column {column}");
     }
 }
+
+// ---- computer_lab ----------------------------------------------------------
+
+/// The lab terminal over the embedded language file (its credentials).
+struct Lab {
+    harness: Harness,
+    text: crate::text::Text,
+    screen: LuaScreen,
+}
+
+impl Lab {
+    fn new(label: &str) -> Self {
+        let harness = Harness::new(label);
+        let text = crate::text::Text::embedded();
+        let mut cx = UiContext {
+            text: Some(&text),
+            ..harness.context()
+        };
+        let screen =
+            LuaScreen::open_screen("computer_lab", &[], ScreenAction::Quit, &mut cx).unwrap();
+        Self {
+            harness,
+            text,
+            screen,
+        }
+    }
+
+    fn step(&mut self, input: UiInput) -> ScreenResult {
+        let cx = UiContext {
+            text: Some(&self.text),
+            ..self.harness.context()
+        };
+        self.screen.update(&cx, input)
+    }
+
+    fn state(&self, field: &str) -> String {
+        self.screen
+            .test_eval(&format!("return tostring(M.state.{field})"))
+    }
+
+    fn cell(&self) -> u8 {
+        self.state("cell").parse().unwrap()
+    }
+
+    /// Navigate to `cell` (rows first, like the covered cells need) and
+    /// commit it.
+    fn press_cell(&mut self, cell: u8) {
+        for _ in 0..64 {
+            let current = self.cell();
+            if current == cell {
+                break;
+            }
+            let (row, col) = (current / 8, current % 8);
+            self.step(press(|i| {
+                if row < cell / 8 {
+                    i.down = true;
+                } else if row > cell / 8 {
+                    i.up = true;
+                } else if col < cell % 8 {
+                    i.right = true;
+                } else {
+                    i.left = true;
+                }
+            }));
+        }
+        assert_eq!(self.cell(), cell, "cursor reached cell {cell:#x}");
+        self.step(press(|i| i.confirm = true));
+    }
+
+    /// Type char codes (`1` = `A`) and submit them with ENTER.
+    fn type_codes(&mut self, codes: &[u8]) {
+        for &code in codes {
+            self.press_cell(if code <= 0x16 { code } else { code + 1 });
+        }
+        self.press_cell(0x17);
+    }
+
+    fn hold(&mut self) {
+        for _ in 0..90 {
+            assert_eq!(self.step(neutral()), ScreenResult::Continue);
+        }
+    }
+}
+
+#[test]
+fn the_lab_login_accepts_john_and_ada_then_opens_the_menu() {
+    let mut lab = Lab::new("lab-login");
+    lab.type_codes(&[10, 15, 8, 14]);
+    assert_eq!(lab.state("sub"), "secret");
+    lab.type_codes(&[1, 4, 1]);
+    assert_eq!(lab.state("sub"), "accepted");
+    lab.hold();
+    assert_eq!(lab.state("stage"), "menu");
+}
+
+#[test]
+fn the_lab_rejects_a_wrong_password_and_restarts_the_login() {
+    let mut lab = Lab::new("lab-reject");
+    lab.type_codes(&[10, 15, 8, 14]);
+    lab.type_codes(&[1, 4, 2]);
+    assert_eq!(lab.state("sub"), "rejected");
+    lab.hold();
+    assert_eq!(lab.state("stage"), "login");
+    assert_eq!(lab.state("sub"), "user");
+    assert_eq!(lab.cell(), 1);
+}
+
+#[test]
+fn mole_releases_the_selected_lab_door() {
+    let mut lab = Lab::new("lab-mole");
+    lab.type_codes(&[10, 15, 8, 14]);
+    lab.type_codes(&[1, 4, 1]);
+    lab.hold();
+    lab.step(press(|i| i.down = true));
+    lab.step(press(|i| i.confirm = true));
+    assert_eq!(lab.state("stage"), "command");
+    lab.type_codes(&[13, 15, 12, 5]);
+    assert_eq!(lab.state("sub"), "accepted");
+    assert_eq!(lab.screen.value("released_door"), 0);
+    lab.hold();
+    assert_eq!(lab.state("stage"), "unlocked");
+    assert_eq!(lab.screen.value("released_door"), 2);
+    // The unlock hold then closes the terminal.
+    for _ in 0..89 {
+        assert_eq!(lab.step(neutral()), ScreenResult::Continue);
+    }
+    assert_eq!(lab.step(neutral()), ScreenResult::Done(ScreenAction::Quit));
+}
+
+#[test]
+fn the_lab_keyboard_skips_the_covered_cells() {
+    let mut lab = Lab::new("lab-cursor");
+    // Row 3 right of BACKSPACE (0x1d) is covered: the cursor steps back.
+    lab.press_cell(0x1d);
+    lab.step(press(|i| i.right = true));
+    assert_eq!(lab.cell(), 0x1d);
+    // Down from row 2's last column steps back up out of 0x1f.
+    lab.step(press(|i| i.up = true));
+    lab.step(press(|i| i.right = true));
+    lab.step(press(|i| i.right = true));
+    assert_eq!(lab.cell(), 0x17);
+    lab.step(press(|i| i.down = true));
+    assert_eq!(lab.cell(), 0x17);
+}
+
+#[test]
+fn cancel_leaves_the_lab_terminal_from_the_menu() {
+    let mut lab = Lab::new("lab-cancel");
+    lab.type_codes(&[10, 15, 8, 14]);
+    lab.type_codes(&[1, 4, 1]);
+    lab.hold();
+    assert_eq!(
+        lab.step(press(|i| i.cancel = true)),
+        ScreenResult::Done(ScreenAction::Quit)
+    );
+    assert_eq!(lab.screen.value("released_door"), 0);
+}

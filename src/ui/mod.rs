@@ -13,7 +13,6 @@
 //! not [`Screen`]s: they share [`crate::game::GameState`] and are driven
 //! explicitly by the session.
 
-pub mod computer_lab;
 pub mod death;
 pub mod debug_menu;
 pub mod file;

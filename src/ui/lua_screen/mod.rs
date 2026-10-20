@@ -311,6 +311,11 @@ impl LuaScreen {
             .eval(body)
             .unwrap_or_else(|err| panic!("eval {body}: {err}"))
     }
+
+    /// Publish `key` as if the script had called `api:set`.
+    pub(crate) fn test_set_value(&mut self, key: &str, value: i64) {
+        self.host.values.insert(key.to_owned(), value);
+    }
 }
 
 impl Screen for LuaScreen {
