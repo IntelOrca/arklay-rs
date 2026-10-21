@@ -32,7 +32,9 @@ mlua = { version = "0.10", default-features = false, features = [
     "lua54",
     "vendored",
 ] }
-openh264 = { version = "0.9", optional = true }
+# 0.9.5 and later depend on `wide` 1.x, which needs a newer rustc than our
+# MSRV.
+openh264 = { version = "=0.9.3", optional = true }
 png = { version = "0.18", optional = true }
 sdl3-sys = { version = "0.7", default-features = false }
 symphonia-codec-aac = { version = "0.6", optional = true }
