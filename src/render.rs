@@ -3489,17 +3489,16 @@ pub(crate) fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3]
 }
 
 /// `ApplyMatrixSV`: the PS1 GTE convention, Y negated on input and output,
-/// 4.12 in and out with the reference's rounding.
+/// 4.12 in and out. Unlike `MulMatrix0` and `ApplyMatrixLV`, which round each
+/// product, it sums the three products and rounds the sum toward zero once.
 pub(crate) fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
     let source = [v[0], -v[1], v[2]];
     let mut out = [0i32; 3];
     for row in 0..3 {
-        let mut sum = 0i64;
-        for k in 0..3 {
-            let value = i64::from(m[row][k]) * i64::from(source[k]);
-            sum += (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS;
-        }
-        out[row] = sum as i32;
+        let sum: i64 = (0..3)
+            .map(|k| i64::from(m[row][k]) * i64::from(source[k]))
+            .sum();
+        out[row] = ((sum + ((sum >> 63) & 0xFFF)) >> FIXED_BITS) as i32;
     }
     [out[0], -out[1], out[2]]
 }
@@ -4097,6 +4096,14 @@ mod tests {
         assert_eq!(&framebuffer.rgba[0..4], &[9, 9, 9, 9]);
         let second_row = 320 * 4;
         assert_eq!(&framebuffer.rgba[second_row..second_row + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn apply_matrix_sv_rounds_the_summed_products_once() {
+        // Each half-unit product truncates to zero on its own; their sum is a
+        // whole unit. Y is negated on the way in and out.
+        let m = [[1, 1, 0], [0, 1, 1], [-1, 0, -1]];
+        assert_eq!(apply_matrix_sv(&m, [2048, -2048, 2048]), [1, -1, -1]);
     }
 
     #[test]
