@@ -149,6 +149,8 @@ pub enum UiCue {
     /// The save/load confirm (`type02`, title bank slot 15). The typed
     /// reveal's "typewriter" tick plays the same slot per revealed character.
     SaveConfirm,
+    /// A FILE reader page turn (`Chris10`, character-table slot 8).
+    PageTurn,
 }
 
 impl UiCue {
@@ -164,6 +166,7 @@ impl UiCue {
             UiCue::SelectConfirm => crate::sfx::global_sfx(13, 1),
             UiCue::SaveCursor => crate::sfx::global_sfx(12, 14),
             UiCue::SaveConfirm => crate::sfx::global_sfx(12, 15),
+            UiCue::PageTurn => Some(crate::sfx::UI_PAGE_TURN),
         }
     }
 }
@@ -279,6 +282,7 @@ mod tests {
         assert_eq!(UiCue::SelectConfirm.name(), Some("Select05"));
         assert_eq!(UiCue::SaveCursor.name(), Some("type01"));
         assert_eq!(UiCue::SaveConfirm.name(), Some("type02"));
+        assert_eq!(UiCue::PageTurn.name(), Some("Chris10"));
     }
 
     #[test]

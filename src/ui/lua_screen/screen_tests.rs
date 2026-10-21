@@ -1762,6 +1762,8 @@ struct FileTab {
     harness: Harness,
     game: crate::game::GameState,
     screen: LuaScreen,
+    /// The cues the last [`FileTab::step`] queued.
+    cues: Vec<UiCue>,
 }
 
 impl FileTab {
@@ -1783,6 +1785,7 @@ impl FileTab {
             harness,
             game,
             screen,
+            cues: Vec::new(),
         }
     }
 
@@ -1791,7 +1794,9 @@ impl FileTab {
             game: Some(&self.game),
             ..self.harness.context()
         };
-        self.screen.update(&cx, input)
+        let result = self.screen.update(&cx, input);
+        self.cues = cx.cues.borrow().clone();
+        result
     }
 
     fn tick(&mut self) {
@@ -2057,6 +2062,90 @@ fn file_reader_pages_through_and_closes_on_the_last_page() {
 }
 
 #[test]
+fn file_pages_turn_with_the_character_bank_page_turn_cue() {
+    // The reference's `jpn_file_list_input` plays `play_sfx(3, 8)` (the
+    // character table's "Chris10") on each half-page turn and `play_sfx(3, 4)`
+    // (the shared "cursor") when the last-page acknowledgement is raised or
+    // withdrawn; the selector's moves blip and its confirm chimes.
+    let mut tab = FileTab::new("file-cues", 0, &[0x0F, 0x03], &[]);
+    tab.settle_list();
+    assert!(tab.cues.is_empty(), "the entry slide is silent");
+
+    // A move that lands blips; the ends of the list and the empty second book
+    // play nothing.
+    tab.step(press(|i| i.down = true));
+    assert_eq!(tab.cues, [UiCue::Cursor]);
+    tab.step(press(|i| i.down = true));
+    assert!(tab.cues.is_empty(), "nowhere left to move");
+    tab.step(press(|i| i.up = true));
+    assert_eq!(tab.cues, [UiCue::Cursor]);
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.cues, [UiCue::Cursor], "the book change blips");
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.cues, [UiCue::Cursor]);
+
+    // Confirm opens the reader with the decide chime; the fade and the
+    // reader's entry ramp are silent.
+    let count = tab.int("M.tables.page_count[0x0F]");
+    assert_eq!(count, 5);
+    tab.step(press(|i| i.confirm = true));
+    assert_eq!(tab.cues, [UiCue::Decide]);
+    tab.settle_reader();
+    assert!(tab.cues.is_empty());
+
+    // Page down turns the half-page with the page-turn sample. The reader's
+    // busy lock drops the next press without a cue.
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.cues, [UiCue::PageTurn]);
+    tab.step(press(|i| i.right = true));
+    assert!(tab.cues.is_empty(), "the busy lock swallows the input");
+    tab.settle_reader();
+    assert_eq!(tab.int("M.state.page"), 1);
+
+    for _ in 1..count - 1 {
+        tab.step(press(|i| i.right = true));
+        assert_eq!(tab.cues, [UiCue::PageTurn]);
+        tab.settle_reader();
+    }
+    assert_eq!(tab.int("M.state.page"), count - 1);
+
+    // The last half-page is acknowledged and withdrawn with the cursor blip,
+    // not the page-turn sample; an acknowledged last page holds silently.
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.cues, [UiCue::Cursor]);
+    assert!(tab.flag("M.state.reader_last_page"));
+    tab.step(press(|i| i.right = true));
+    assert!(tab.cues.is_empty());
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.cues, [UiCue::Cursor]);
+    assert!(!tab.flag("M.state.reader_last_page"));
+
+    // A page up and the follow-up page down turn pages with the page-turn
+    // sample again.
+    tab.step(press(|i| i.left = true));
+    assert_eq!(tab.cues, [UiCue::PageTurn]);
+    tab.settle_reader();
+    assert_eq!(tab.int("M.state.page"), count - 2);
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.cues, [UiCue::PageTurn]);
+    tab.settle_reader();
+    tab.step(press(|i| i.right = true));
+    assert_eq!(tab.cues, [UiCue::Cursor], "re-acknowledge the last page");
+
+    // Confirm on the last page and the selector's cancel both play the cancel
+    // cue; the exit slides and return to the list in silence.
+    tab.step(press(|i| i.confirm = true));
+    assert_eq!(tab.cues, [UiCue::Cancel]);
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "list");
+    assert!(matches!(
+        tab.step(press(|i| i.cancel = true)),
+        ScreenResult::Done(_)
+    ));
+    assert_eq!(tab.cues, [UiCue::Cancel]);
+}
+
+#[test]
 fn file_reader_slides_the_page_on_and_off() {
     let mut tab = FileTab::new("file-slides", 0, &[0x0F], &[]);
     tab.settle_list();
@@ -2241,6 +2330,7 @@ fn file_pickup_reader_exits_instead_of_returning_to_the_list() {
     let count = tab.int("M.tables.page_count[0]");
     for _ in 1..count {
         tab.step(press(|i| i.right = true));
+        assert_eq!(tab.cues, [UiCue::PageTurn]);
         tab.settle_reader();
     }
     assert_eq!(tab.int("M.state.page"), count - 1);

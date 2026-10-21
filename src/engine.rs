@@ -3810,23 +3810,26 @@ impl GameSession {
                 }
             }
             PickupPhase::Reader => {
-                let (exit_done, missing) = {
+                let (exit_done, missing, cues) = {
                     let input = menu_input(ui).map_or_else(UiInput::default, single_input);
                     match self.pickup_view.as_mut().and_then(|p| p.reader.take()) {
                         Some(mut reader) => {
-                            let result = {
+                            let (result, cues) = {
                                 let cx = self.ui_context(pack);
-                                reader.update(&cx, input)
+                                let result = reader.update(&cx, input);
+                                (result, cx.cues.into_inner())
                             };
                             let done = !matches!(result, ScreenResult::Continue);
                             if let Some(pickup) = self.pickup_view.as_mut() {
                                 pickup.reader = Some(reader);
                             }
-                            (done, false)
+                            (done, false, cues)
                         }
-                        None => (false, true),
+                        None => (false, true, Vec::new()),
                     }
                 };
+                // The reader's own cues: page turns and the exit's cancel.
+                self.play_ui_cue_names(pack, cues);
                 if missing {
                     self.close_pickup_view();
                     return;
@@ -4227,19 +4230,20 @@ impl GameSession {
             // (the health monitor and its shared `rand()` draws) while the
             // document selector/reader is up.
             self.tick_menu_screen(pack);
-            // The screen takes the frame's one menu input; the engine plays
-            // its cue.
+            // The screen takes the frame's one menu input and owns its own
+            // cues: the selector's cursor blip, the reader's page turn and
+            // the cancel/decide slots the reference's file handlers play.
             let event_input = menu_input(ui);
             let Some(mut file) = self.file.take() else {
                 return;
             };
-            let result = {
+            let (result, cues) = {
                 let cx = self.ui_context(pack);
-                file.update(&cx, event_input.map_or_else(UiInput::default, single_input))
+                let result =
+                    file.update(&cx, event_input.map_or_else(UiInput::default, single_input));
+                (result, cx.cues.into_inner())
             };
-            if let Some(cue) = event_input.and_then(menu_cue) {
-                self.play_ui_cue_names(pack, vec![cue]);
-            }
+            self.play_ui_cue_names(pack, cues);
             if let ScreenResult::Continue = result {
                 self.file = Some(file);
             }
@@ -18353,8 +18357,77 @@ end
         writer
             .add("se/decide.wav", voice_wav_bytes(&[1000; 6000]))
             .unwrap();
+        writer
+            .add("se/cursor.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
+        writer
+            .add("se/Chris10.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
         writer.write(&pack_path).unwrap();
         pack_path
+    }
+
+    #[test]
+    fn a_file_page_turn_plays_the_page_turn_cue_once() {
+        // The reference's reader plays one `play_sfx(3, 8)` per turn (the
+        // character table's "Chris10"); the port's generic menu cue must not
+        // layer a cursor blip on top of it.
+        let _sdl = crate::audio::test_lock::sdl();
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping page-turn-cue test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let pack_path = menu_cue_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        // Document 15 is the Chris list's slot 0, five half-pages long.
+        session.game.set_file_collected(15, true);
+        session.music = Some(mixer);
+        session.open_file(&pack);
+
+        tick_until(&mut session, &pack, 32, "the FILE entry slide", |s| {
+            s.file
+                .as_ref()
+                .is_some_and(|file| file.value("locked") == 0)
+        });
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        tick_until(&mut session, &pack, 64, "the reader entry slide", |s| {
+            s.file.as_ref().is_some_and(|file| {
+                file.value("reader") != 0 && file.value("idle") != 0 && file.value("locked") == 0
+            })
+        });
+        // The test mixer does not advance its voices (the app's `update_audio`
+        // does), so count the cue the turn adds.
+        let before = session.music.as_ref().unwrap().active_sfx();
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    right: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            session.music.as_ref().unwrap().active_sfx(),
+            before + 1,
+            "the page turn played more than the page-turn cue"
+        );
     }
 
     #[test]

@@ -150,6 +150,18 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   off-screen (only the fixed-position book indicators, scroll arrows and title
   draw, dimmed) through the mode-2 fade, and `pickup_fade_update(1)` clears the
   pair when the ramp completes (t=286 after a 250 cancel).
+- **FILE reader page-turn cue.** The original's `jpn_file_list_input`
+  (0x0042bf90) plays `play_sfx(3, 8)` - the character table's slot 8,
+  `Chris10` - on each accepted half-page turn, and `play_sfx(3, 4)` (the
+  shared `cursor` blip) when the last-page acknowledgement is raised or
+  withdrawn. The selector's moves and book changes blip slot 4, its confirm
+  opens the reader with slot 6, and the reader's cancel / last-page confirm
+  plays slot 5. arklay's file screen queued no cues of its own: the engine's
+  generic `menu_cue` supplied a cursor/decide/cancel blip for every edge,
+  including presses the reader's busy lock swallowed, and the page-turn
+  sample never played. The Lua screen now owns its cues (sending
+  `page_turn` for slot 8) and the FILE tab and room document reader drain
+  them, so a page turn is one `Chris10` voice and a locked press is silent.
 - **FILE selector art and masks.** The scroll arrows, book indicators, slot
   icons and cursor are `(texU, 0)` rectangles of the cover page (`DAT_004d27d0`
   0x004d27d0, `0x004d27f4`/`0x004d2818`, `0x004d283c`/`0x004d2860`; only texU
