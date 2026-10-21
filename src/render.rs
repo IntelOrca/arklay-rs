@@ -255,7 +255,11 @@ impl Framebuffer {
             height,
             rgba: vec![0; width as usize * height as usize * 4],
             clip: None,
-            view: crate::video::View { top: 0, height },
+            view: crate::video::View {
+                top: 0,
+                height,
+                pan: 0,
+            },
         }
     }
 

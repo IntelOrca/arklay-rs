@@ -1593,6 +1593,9 @@ struct GameSession {
     /// The room and camera cut `view` last followed, so a cut or a room
     /// change snaps the band instead of panning to it.
     view_cut: Option<(RoomId, usize)>,
+    /// The band at the previous tick, which a frame drawn between ticks
+    /// blends from.
+    view_prev: video::View,
     /// Whether the persisted framebuffers show the GPU scene: set by a frame
     /// that recorded one and cleared by any frame that covered it.
     gpu_scene_visible: bool,
@@ -2024,6 +2027,7 @@ impl GameSession {
             framebuffer_white: None,
             view: video::aspect().centred(),
             view_cut: None,
+            view_prev: video::View::default(),
             gpu_scene_visible: false,
             gpu_room: None,
             titled_cut: usize::MAX,
@@ -2232,6 +2236,7 @@ impl GameSession {
         let aspect = video::aspect();
         if aspect.is_standard() {
             self.view = video::View::default();
+            self.view_prev = self.view;
             return;
         }
         let cut_key = (self.loaded.id, self.loaded.room.current_cut);
@@ -2247,7 +2252,9 @@ impl GameSession {
             let target = band_target(&self.loaded.room, self.player.pos);
             video::follow(self.view.top, aspect.height(), target, snap)
         };
-        self.view = video::View::at(top as i32, aspect.height());
+        let view = video::View::at(top as i32, aspect.height());
+        self.view_prev = if snap { view } else { self.view };
+        self.view = view;
     }
 
     fn tick_inner(
@@ -4889,7 +4896,11 @@ impl GameSession {
             } else if self.boot_message.is_some() || self.movie.is_some() {
                 video::aspect().centred()
             } else {
-                self.view
+                // A frame drawn between ticks blends the band's pan too.
+                match self.tween.alpha() {
+                    Some(alpha) => self.view.between(self.view_prev, alpha),
+                    None => self.view,
+                }
             };
         }
         // The screens below replace the whole frame, scene included.
@@ -12602,7 +12613,7 @@ fn present(
     };
     let source = SDL_FRect {
         x: 0.0,
-        y: shown.top as f32,
+        y: shown.top as f32 + shown.pan,
         w: shown.width as f32,
         h: shown.height as f32,
     };
@@ -21190,6 +21201,37 @@ off_0010:
         let frame = session.frame();
         assert_eq!((frame.width, frame.height), (320, 240));
         assert_eq!(frame.view, video::View::default());
+        video::set_aspect(video::Aspect::default());
+    }
+
+    /// A frame drawn between two ticks at a higher frame rate presents the
+    /// band part of the way along its pan, to a fraction of a row, so the
+    /// background pans at the frame rate rather than the 30 Hz tick rate.
+    #[test]
+    fn a_frame_between_ticks_presents_the_band_part_way_along_its_pan() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        video::set_aspect(video::Aspect::parse("16:9").unwrap());
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        settle_control(&mut session, &pack);
+        session.view_prev = video::View::at(30, 180);
+        session.view = video::View::at(34, 180);
+
+        session.tween.set_alpha(Some(0.125));
+        session.render(&pack);
+        let view = session.frame().view;
+        assert_eq!((view.top, view.pan), (30, 128));
+        let shown = video::shown(320, 240, view);
+        assert_eq!(shown.top as f32 + shown.pan, 30.5);
+
+        // Without tweening (30 fps, captures) the band stays on whole rows.
+        session.tween.set_alpha(None);
+        session.render(&pack);
+        assert_eq!(session.frame().view, video::View::at(34, 180));
         video::set_aspect(video::Aspect::default());
     }
 

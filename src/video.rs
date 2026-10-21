@@ -190,6 +190,7 @@ impl Aspect {
         View {
             top: (NATIVE_HEIGHT - height) / 2,
             height,
+            pan: 0,
         }
     }
 }
@@ -229,12 +230,14 @@ pub fn shown(width: u32, height: u32, view: View) -> Shown {
         let band = presented(view);
         Shown {
             top: band.top,
+            pan: f32::from(band.pan) / 256.0,
             width,
             height: band.height,
         }
     } else {
         Shown {
             top: 0,
+            pan: 0.0,
             width,
             height,
         }
@@ -242,19 +245,23 @@ pub fn shown(width: u32, height: u32, view: View) -> Shown {
 }
 
 /// The rows `top..top + height` of a frame, all `width` columns: what the
-/// window shows of it ([`shown`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// window shows of it ([`shown`]), moved down `pan` (under one) rows more.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Shown {
     pub top: u32,
+    pub pan: f32,
     pub width: u32,
     pub height: u32,
 }
 
-/// The visible band of a 320x240 frame: rows `top..top + height`.
+/// The visible band of a 320x240 frame: rows `top..top + height`,
+/// presented `pan` 256ths of a row lower still. Drawing ignores the pan: it
+/// is the presenter's sub-row offset that smooths a pan between ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct View {
     pub top: u32,
     pub height: u32,
+    pub pan: u8,
 }
 
 impl Default for View {
@@ -262,6 +269,7 @@ impl Default for View {
         Self {
             top: 0,
             height: NATIVE_HEIGHT,
+            pan: 0,
         }
     }
 }
@@ -279,7 +287,27 @@ impl View {
         Self {
             top: top.clamp(0, max) as u32,
             height,
+            pan: 0,
         }
+    }
+
+    /// The band `alpha` of the way from `prev` (the previous tick's) to
+    /// `self`, to the 256th of a row: a frame drawn between two ticks pans
+    /// smoothly instead of stepping at the tick rate. A band of another
+    /// height (an aspect change) does not blend.
+    pub fn between(self, prev: View, alpha: f32) -> View {
+        if prev.height != self.height || prev.top == self.top {
+            return self;
+        }
+        let (from, to) = (prev.top as f32, self.top as f32);
+        let fine = ((from + (to - from) * alpha.clamp(0.0, 1.0)) * 256.0).round() as u32;
+        let (top, pan) = (fine / 256, (fine % 256) as u8);
+        // The pan shows part of the row below the band, which must exist.
+        let mut view = View::at(top as i32, self.height);
+        if pan != 0 && view.top == top && top + self.height < NATIVE_HEIGHT {
+            view.pan = pan;
+        }
+        view
     }
 }
 
@@ -477,7 +505,7 @@ pub fn frame_viewport(band: Viewport, shown: Shown, frame_height: u32) -> (f32, 
     let scale = band.height as f32 / shown.height.max(1) as f32;
     (
         band.x as f32,
-        band.y as f32 - shown.top as f32 * scale,
+        band.y as f32 - (shown.top as f32 + shown.pan) * scale,
         band.width as f32,
         frame_height as f32 * scale,
     )
@@ -544,6 +572,23 @@ mod tests {
         assert_eq!(step_frame_rate(75, 1), 120);
         assert_eq!(step_frame_rate(75, -1), 60);
         assert_eq!(step_frame_rate(1000, 1), 30);
+    }
+
+    #[test]
+    fn a_band_between_ticks_pans_by_fractions_of_a_row() {
+        let prev = View::at(30, 180);
+        let cur = View::at(34, 180);
+        assert_eq!(cur.between(prev, 0.0), prev);
+        assert_eq!(cur.between(prev, 1.0), cur);
+        let half = cur.between(prev, 0.5);
+        assert_eq!((half.top, half.pan), (32, 0));
+        let eighth = cur.between(prev, 0.125);
+        assert_eq!((eighth.top, eighth.pan), (30, 128));
+        // Panning up blends the same way.
+        let up = prev.between(cur, 0.125);
+        assert_eq!((up.top, up.pan), (33, 128));
+        // A band of another height snaps.
+        assert_eq!(View::at(20, 200).between(prev, 0.5), View::at(20, 200));
     }
 
     #[test]

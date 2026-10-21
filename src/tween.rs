@@ -123,6 +123,12 @@ impl Tween {
         self.alpha = alpha.map(|alpha| alpha.clamp(0.0, 1.0));
     }
 
+    /// The draw's position between the previous and the current tick, while
+    /// tweening is on.
+    pub fn alpha(&self) -> Option<f32> {
+        self.alpha
+    }
+
     /// Whether tweening is on.
     pub fn enabled(&self) -> bool {
         self.alpha.is_some()
