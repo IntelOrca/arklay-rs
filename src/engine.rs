@@ -22149,10 +22149,10 @@ off_0010:
             session.examine.is_none()
         });
         idle_until(&mut session, &pack, 20, |session| {
-            !session
+            session
                 .menu
                 .as_ref()
-                .is_some_and(|menu| menu.value("viewing") != 0)
+                .is_none_or(|menu| menu.value("viewing") == 0)
         });
         assert!(
             session.menu.is_some(),
@@ -24776,7 +24776,7 @@ end
         assert_eq!(screen_open_at, 217);
         let title_at = title_at.expect("the title returned");
         assert!(title_at > screen_open_at, "the screen ran before the title");
-        assert!(!session.death_screen.is_some());
+        assert!(session.death_screen.is_none());
         assert!(session.game.flags[5].bit(game::MSF_PLAYER_DEAD));
     }
 
