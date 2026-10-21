@@ -3110,37 +3110,41 @@ fn collect_triangles(
         ];
         let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
             let (position, depth, uv, normal) = corners[corner];
-            let shade = match (lighting, light) {
-                _ if let Some(colour) = colour => colour
+            // A `JointSetColorTint` colour replaces the lighting outright, so
+            // it is tested before the lighting arms.
+            let shade = match colour {
+                Some(colour) => colour
                     .map(|channel| (f64::from(channel) / 128.0 * CHANNEL_MAX).min(CHANNEL_MAX)),
-                // The gameplay path evaluates each corner normal against the
-                // latched light directions, clamps the accumulated light, then
-                // folds in the vertex colour and the mesh tint.
-                (Some(_), Some(light)) if !full_bright => {
-                    let mut shade = match normal {
-                        Some(normal) => reference_vertex_shade(
-                            &light_camera,
-                            &normal_matrix,
-                            normal,
-                            &light,
-                            room_object.then_some(&joint.r),
-                        ),
-                        None => light.ambient,
-                    };
-                    for (channel, &scale) in shade.iter_mut().zip(&tint) {
-                        *channel = channel.min(CHANNEL_MAX) * f64::from(scale) / CHANNEL_MAX;
-                    }
-                    if let Some(scale) = vertex_scale {
-                        for (channel, &scale) in shade.iter_mut().zip(&scale) {
-                            *channel *= scale;
+                None => match (lighting, light) {
+                    // The gameplay path evaluates each corner normal against
+                    // the latched light directions, clamps the accumulated
+                    // light, then folds in the vertex colour and the mesh tint.
+                    (Some(_), Some(light)) if !full_bright => {
+                        let mut shade = match normal {
+                            Some(normal) => reference_vertex_shade(
+                                &light_camera,
+                                &normal_matrix,
+                                normal,
+                                &light,
+                                room_object.then_some(&joint.r),
+                            ),
+                            None => light.ambient,
+                        };
+                        for (channel, &scale) in shade.iter_mut().zip(&tint) {
+                            *channel = channel.min(CHANNEL_MAX) * f64::from(scale) / CHANNEL_MAX;
                         }
+                        if let Some(scale) = vertex_scale {
+                            for (channel, &scale) in shade.iter_mut().zip(&scale) {
+                                *channel *= scale;
+                            }
+                        }
+                        shade
                     }
-                    shade
-                }
-                // A blended packet on a lit mesh and every door/item polygon
-                // are full-bright: the mesh tint alone.
-                (Some(_), _) => tint.map(f64::from),
-                (None, _) => [CHANNEL_MAX; 3],
+                    // A blended packet on a lit mesh and every door/item
+                    // polygon are full-bright: the mesh tint alone.
+                    (Some(_), _) => tint.map(f64::from),
+                    (None, _) => [CHANNEL_MAX; 3],
+                },
             };
             RasterVertex {
                 position,
