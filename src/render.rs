@@ -1813,7 +1813,7 @@ pub struct EntityMesh<'a> {
     pub per_joint_light: bool,
     /// The mesh object the reference draws through its complex pool
     /// (`ComplexTmdObjectSetup` / `FUN_00486df0`) instead of the TMD path:
-    /// Plant 42's root ball. See [`collect_complex_pool`].
+    /// Plant 42's root ball. See `collect_complex_pool`.
     pub complex_object: Option<usize>,
     /// The Plant 42 body's light matrix: `MulMatrix0(g_lightMatrix, &m, &m)`
     /// with `m` the identity, run in place. See
