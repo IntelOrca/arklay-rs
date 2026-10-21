@@ -22,6 +22,8 @@
 #   RE1_ASSETS      game install root (default /usr/share/games/re1)
 #   ARKLAY_BIN      arklay binary (default target/release/arklay)
 #   ARKLAY_RE1_PACK game pack (default games/re1.akpak)
+#   ARKLAY_LANGUAGE display language tag (default ja-JP, matching the
+#                   reference's JPN assets)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +33,7 @@ SYSROOT="${RE1_REF_SYSROOT:-$REF_REPO/build/sysroot32}"
 ASSETS="${RE1_ASSETS:-/usr/share/games/re1}"
 ARK_BIN="${ARKLAY_BIN:-$REPO_ROOT/target/release/arklay}"
 PACK="${ARKLAY_RE1_PACK:-$REPO_ROOT/games/re1.akpak}"
+LANGUAGE="${ARKLAY_LANGUAGE:-ja-JP}"
 
 ROOM="${1:?usage: oracle-room.sh ROOM PLAYER [TICKS] [OUTDIR]}"
 PLAYER="${2:?usage: oracle-room.sh ROOM PLAYER [TICKS] [OUTDIR]}"
@@ -107,7 +110,7 @@ LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe MESA_LOADER_DRIVER_OVERRIDE=llvm
 echo "== arklay: room $ROOM player $PLAYER, $TICKS ticks"
 "$ARK_BIN" "$PACK" --ui game --room "$ROOM" --player "$PLAYER" \
     --character "$PLAYER" --ticks "$TICKS" --no-mods \
-    --trace "$OUT/ark.trace" \
+    --language "$LANGUAGE" --trace "$OUT/ark.trace" \
     --capture-every 30 --capture-dir "$OUT/arkcaps"
 
 echo "== compare"

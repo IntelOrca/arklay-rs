@@ -10453,16 +10453,31 @@ fn build_effect_quads(
             continue;
         };
         let room_sprite = game.room_effects.sprite(sprite_type);
-        let (sprite, page, region_v, room_art) = if let Some(sprite) = room_sprite {
-            (sprite, usize::from(sprite.info.page_index()), 0u32, true)
+        let (sprite, page, region_v, room_art, sheet_rows) = if let Some(sprite) = room_sprite {
+            (
+                sprite,
+                usize::from(sprite.info.page_index()),
+                0u32,
+                true,
+                [0, 256],
+            )
         } else if let Some(sprite) = game.weapon_effects.sprite(sprite_type) {
             let Some(slot) = game.weapon_effects.slot_of(sprite_type) else {
                 continue;
             };
-            let Some((page, region_v)) = effects::pages::weapon_sheet_region(slot) else {
+            let (Some((page, region_v)), Some(height)) = (
+                effects::pages::weapon_sheet_region(slot),
+                effects::pages::weapon_sheet_height(slot),
+            ) else {
                 continue;
             };
-            (sprite, usize::from(page), u32::from(region_v), false)
+            (
+                sprite,
+                usize::from(page),
+                u32::from(region_v),
+                false,
+                [region_v, height],
+            )
         } else {
             continue;
         };
@@ -10571,6 +10586,7 @@ fn build_effect_quads(
             size,
             tint,
             blend,
+            sheet: sheet_rows,
         });
     }
     quads
@@ -11060,7 +11076,7 @@ fn tick_room_timed(
         context.game.entities[0].target = target;
     }
     let look_at_origin = enemy::look_at_joint_origin(context.game, 0);
-    context.game.entity_anims[0].slew_look_at(&context.game.entities[0], look_at_origin);
+    context.game.entity_anims[0].slew_look_at(&mut context.game.entities[0], look_at_origin);
     // `update_player_anim`'s tail: the moved player is mirrored onto entity 0,
     // then `HandleEnemyPlayerCollisions` pushes the player out of every active
     // entity's SCA volume and the room collision resolves the result with the
@@ -11912,6 +11928,7 @@ fn visible_objects<'a>(
     anim::Mat4x3,
     usize,
 )> {
+    let view = room.cuts.get(camera).map(Camera::from_cut);
     let mut visible = Vec::new();
     for (slot, record) in objects.records.iter().enumerate() {
         if !record.active() {
@@ -11938,6 +11955,16 @@ fn visible_objects<'a>(
         // Z before submission; the cull above used the unshifted position).
         if room.stage == 3 && room.room == 0x03 && (1..5).contains(&(record.model & 0x3F)) {
             world.t[2] += 1000;
+        }
+        // `FUN_00483270` drops the whole object when its origin sits behind
+        // the eye (GTE `t[2] < 0`), unless the room pins it to the fixed
+        // ordering-table slot instead of sorting by depth.
+        if !object_fixed_depth(room, record)
+            && view
+                .as_ref()
+                .is_some_and(|view| view.view_position(world.t)[2] < 0)
+        {
+            continue;
         }
         visible.push((asset, record, world, slot));
     }
@@ -11993,6 +12020,18 @@ fn visible_items<'a>(
 /// visible model lives elsewhere (mirror/door frames), plus the boulder that
 /// is dropped once it rolls within ~3600 units of the camera. The stage
 /// folding uses the port's 1-based stage digit.
+/// Whether `RoomObjectRender` pins an omodel to the fixed ordering-table slot
+/// (`DAT_00ae9ef8`) instead of sorting it by GTE depth: the flooded guardhouse
+/// rooms, the courtyard water gate and objects 0-1 of room 20B.
+fn object_fixed_depth(room: &RoomState, record: &objects::ObjectRecord) -> bool {
+    match room.stage % 5 {
+        4 => matches!(room.room, 0x0D..=0x11),
+        3 => room.room == 0x01,
+        2 => room.room == 0x0B && record.model & 0x3F < 2,
+        _ => false,
+    }
+}
+
 fn object_render_skipped(room: &RoomState, camera: usize, record: &objects::ObjectRecord) -> bool {
     let model = record.model & 0x3F;
     // Guardhouse 002's mirror stand-in on camera 4.
@@ -12170,11 +12209,12 @@ fn render_frame_on(
     // previous tick and this one (a no-op unless the render rate tweens).
     tween.begin(id, room.current_cut);
     // The frame's screen shake, rolled by `roll_screen_shake` at the top of the
-    // gameplay tick. It shifts the camera projection and the background's
-    // display origin; the room's view matrix stays untouched.
+    // gameplay tick. The screen offset shifts the camera projection and the
+    // live shake the background's display origin; the room's view matrix
+    // stays untouched.
     let shake = game.screen_shake();
     let mut camera = Camera::from_cut(cut);
-    camera.screen = shake;
+    camera.screen = game.screen_offset();
     let lighting = Lighting::from_room(room);
 
     let page = if cut.masks.is_empty() || cut.mask_active == 0 {
@@ -12191,12 +12231,14 @@ fn render_frame_on(
     });
 
     // Every ground shadow is submitted through the same fade-sprite path: the
-    // player's when its camera-zone test passes (or the room forces it on),
+    // player's when its quad has been built and its camera-zone test passes
+    // (or the room forces it on),
     // and one per active character that has entered the camera's switch zone,
     // using `character_init`'s tint, half extents and local offset.
     let shadow_texture = shadows.page_for(pack);
     let mut shadow_list: Vec<render::Shadow<'_>> = Vec::new();
     if let Some(texture) = shadow_texture
+        && game.entities[0].shadow_quad
         && shadow::visible(
             id,
             room,
@@ -12302,8 +12344,12 @@ fn render_frame_on(
     let mut npc_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut npc_hidden: Vec<u32> = Vec::new();
     let mut npc_tints: Vec<[u8; 3]> = Vec::new();
+    let mut npc_joint_colours: Vec<[[u8; 3]; 32]> = Vec::new();
     let mut npc_weapon_ids: Vec<Option<u16>> = Vec::new();
     let mut npc_zone_gate: Vec<bool> = Vec::new();
+    // Each character's light latch point (its own matrix translation) and
+    // whether it re-latches per joint (Yawn, ids 0x0D/0x12).
+    let mut npc_lights: Vec<([i32; 3], bool)> = Vec::new();
     for slot in 1..game::ENTITY_COUNT {
         let entity = &game.entities[slot];
         if !entity.active() {
@@ -12340,11 +12386,14 @@ fn render_frame_on(
             } else if !entity.shadow_suppressed
                 && (entity.shadow_half_x != 0 || entity.shadow_half_z != 0)
             {
+                // Every monster's `entity_add_fade_sprite` call passes a zero
+                // height, and the draw places the quad at that height alone:
+                // a flying or hanging monster still shadows the floor.
                 Some(render::Shadow {
                     texture,
                     pos: [
                         entity.pos[0] + i32::from(entity.shadow_offset[0]),
-                        entity.pos[1] + i32::from(entity.shadow_offset[1]),
+                        0,
                         entity.pos[2] + i32::from(entity.shadow_offset[2]),
                     ],
                     angle: entity.angle,
@@ -12382,8 +12431,16 @@ fn render_frame_on(
             else {
                 continue;
             };
-            let entity_matrix =
-                anim::entity_matrix_scaled(entity.pos, entity.angle, entity.joint_scale);
+            // `EntityComputeJointWorldMatrices` rebuilds the entity matrix
+            // from the whole rotation vector, so a pitched or rolled monster
+            // (Plant 42's swaying vines) draws tilted.
+            let entity_matrix = anim::entity_matrix_rotated_scaled(
+                entity.pos,
+                entity.pitch,
+                entity.angle,
+                entity.roll,
+                entity.joint_scale,
+            );
             let mut joints = anim::joint_matrices(&model.skeleton, &keyframe, &entity_matrix);
             apply_look_at(&mut joints, entity, &game.entity_anims[slot]);
             joints
@@ -12401,11 +12458,13 @@ fn render_frame_on(
         npc_joints.push(std::mem::take(&mut joints));
         npc_hidden.push(hidden);
         npc_tints.push(entity.model_tint_rgb());
+        npc_joint_colours.push(entity.joint_colours);
         npc_weapon_ids.push(crate::weapons::character_weapon_id(
             entity.id,
             entity.behavior_flags,
         ));
         npc_zone_gate.push(entity.has_enter_switch_zone & 0x7F != 0);
+        npc_lights.push((entity.pos, matches!(entity.id, 0x0D | 0x12)));
     }
 
     // The room's object and item models are submitted before the NPC and
@@ -12456,6 +12515,15 @@ fn render_frame_on(
             // creator's remap lives in `record_blend_weight`.
             blend_weight: render::record_blend_weight(&asset.model, record.blend_override),
             hidden_joints: 0,
+            // `update_entity_lighting(record + 0x34)`: the record's own
+            // position, not the composed one, so a parented object lights
+            // from its local offset.
+            light_pos: Some(record.pos),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     for ((asset, _, _, _), joints) in visible_item_models.iter().zip(&item_joints) {
@@ -12466,24 +12534,50 @@ fn render_frame_on(
             tint: [255; 3],
             blend_weight: render::record_blend_weight(&asset.model, None),
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for (((model, joints), hidden), tint) in models
+    for (
+        (((((model, joints), hidden), tint), &(light_pos, per_joint_light)), joint_colours),
+        weapon_id,
+    ) in models
         .iter()
         .zip(&npc_joints)
         .zip(&npc_hidden)
         .zip(&npc_tints)
+        .zip(&npc_lights)
+        .zip(&npc_joint_colours)
+        .zip(&npc_weapon_ids)
     {
+        // The original loads the held weapon's TMD into the weapon joint's
+        // own slot, so it replaces the character's object there rather than
+        // drawing beside it.
+        let weapon_slot = if weapon_id.is_some() {
+            1 << crate::weapons::WEAPON_JOINT
+        } else {
+            0
+        };
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
             tint: *tint,
             blend_weight: None,
-            hidden_joints: *hidden,
+            hidden_joints: *hidden | weapon_slot,
+            light_pos: Some(light_pos),
+            per_joint_light,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: *joint_colours,
         });
     }
     // The held-weapon meshes of the scripted characters draw with the
@@ -12517,6 +12611,14 @@ fn render_frame_on(
             tint: npc_tints[*index],
             blend_weight: None,
             hidden_joints: 0,
+            // The weapon slot is one of the character's joints: it shares
+            // the character's latch.
+            light_pos: Some(npc_lights[*index].0),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
@@ -12538,6 +12640,12 @@ fn render_frame_on(
             tint: game.player_tint,
             blend_weight: None,
             hidden_joints: hidden,
+            light_pos: Some(game.entities[0].pos),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
     // The held weapon's mesh draws at the hand joint while the weapon bank
@@ -12565,6 +12673,12 @@ fn render_frame_on(
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: Some(game.entities[0].pos),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12577,6 +12691,7 @@ fn render_frame_on(
     let mut web_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut web_hidden: Vec<u32> = Vec::new();
     let mut web_tints: Vec<[u8; 3]> = Vec::new();
+    let mut web_lights: Vec<[i32; 3]> = Vec::new();
     for (clone_index, clone) in game.web_clones.iter().enumerate() {
         let Some(clone) = clone else {
             continue;
@@ -12626,12 +12741,14 @@ fn render_frame_on(
         web_joints.push(joints);
         web_hidden.push(hidden);
         web_tints.push(clone.entity.model_tint_rgb());
+        web_lights.push(clone.entity.pos);
     }
-    for (((model, joints), hidden), tint) in web_models
+    for ((((model, joints), hidden), tint), &light_pos) in web_models
         .iter()
         .zip(&web_joints)
         .zip(&web_hidden)
         .zip(&web_tints)
+        .zip(&web_lights)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12640,6 +12757,12 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: Some(light_pos),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12652,6 +12775,11 @@ fn render_frame_on(
     let mut companion_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
     let mut companion_hidden: Vec<u32> = Vec::new();
     let mut companion_tints: Vec<[u8; 3]> = Vec::new();
+    let mut companion_complex: Vec<Option<usize>> = Vec::new();
+    // Per companion: the light latch position, whether the light matrix is
+    // the aliased identity product, and the light matrix's rotation operand.
+    type CompanionLight = ([i32; 3], bool, Option<[[i32; 3]; 3]>);
+    let mut companion_light_pos: Vec<CompanionLight> = Vec::new();
     for (companion_index, companion) in game.companions.iter().enumerate() {
         let Some(companion) = companion else {
             continue;
@@ -12673,12 +12801,14 @@ fn render_frame_on(
             && (companion.entity.shadow_half_x != 0 || companion.entity.shadow_half_z != 0)
             && let Some(texture) = shadow_texture
         {
+            // `entity_add_fade_sprite(&body.t, quad, 0, 0)`: floor height
+            // and no yaw.
             let mut pos = [
                 companion.entity.pos[0] + i32::from(companion.entity.shadow_offset[0]),
-                companion.entity.pos[1] + i32::from(companion.entity.shadow_offset[1]),
+                0,
                 companion.entity.pos[2] + i32::from(companion.entity.shadow_offset[2]),
             ];
-            let mut angle = companion.entity.angle;
+            let mut angle = 0;
             tween.shadow(tween::Key::Companion(companion_index), &mut pos, &mut angle);
             shadow_list.push(render::Shadow {
                 texture,
@@ -12696,12 +12826,8 @@ fn render_frame_on(
         };
         let object = companion.mesh_object();
         let mut matrix = companion.matrix.unwrap_or_else(|| {
-            anim::entity_matrix_rotated(
-                companion.entity.pos,
-                companion.entity.pitch,
-                companion.entity.angle,
-                companion.entity.roll,
-            )
+            let [pitch, angle, roll] = companion.render_rotation();
+            anim::entity_matrix_rotated(companion.entity.pos, pitch, angle, roll)
         });
         enemy::custom_anim::scale_columns_xyz(&mut matrix, companion.render_scale());
         // One identity matrix per joint, with the companion's transform at
@@ -12720,12 +12846,31 @@ fn render_frame_on(
         companion_joints.push(joints);
         companion_hidden.push(!(1u32 << object));
         companion_tints.push(companion.entity.model_tint_rgb());
+        // The root ball's clone is built with `DAT_004d2bd8` set, which
+        // routes its object through the reference's complex pool.
+        companion_complex
+            .push((companion.kind == enemy::companion::CompanionKind::Roots).then_some(object));
+        // The plant companions latch the room lights at their own
+        // translation (`update_entity_lighting(&local.t)`), not at the
+        // placeholder first joint, and light through the aliased identity
+        // product. The heart latches them at its owner's position
+        // (`update_entity_lighting(&owner->localMatrix.t)`) and its light
+        // matrix is a plain product.
+        let light_pos = if heart {
+            game.entities[usize::from(companion.owner)].pos
+        } else {
+            companion.entity.pos
+        };
+        companion_light_pos.push((light_pos, !heart, companion.anchor_rotation));
     }
-    for (((model, joints), hidden), tint) in companion_models
-        .iter()
-        .zip(&companion_joints)
-        .zip(&companion_hidden)
-        .zip(&companion_tints)
+    for (((((model, joints), hidden), tint), complex), &(light_pos, aliased, light_rotation)) in
+        companion_models
+            .iter()
+            .zip(&companion_joints)
+            .zip(&companion_hidden)
+            .zip(&companion_tints)
+            .zip(&companion_complex)
+            .zip(&companion_light_pos)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12734,6 +12879,12 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: Some(light_pos),
+            per_joint_light: false,
+            complex_object: *complex,
+            aliased_light: complex.is_none() && aliased,
+            light_rotation,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -12803,6 +12954,12 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
 
@@ -13292,6 +13449,60 @@ mod tests {
             height: HEIGHT as u32,
             rgba,
         }
+    }
+
+    #[test]
+    fn visible_objects_drop_a_record_whose_origin_is_behind_the_eye() {
+        use crate::objects::{OBJECT_FLAG_ACTIVE, ObjectAsset, ObjectTable};
+
+        let room = RoomState {
+            stage: 3,
+            room: 0x07,
+            object_models: vec![ObjectAsset {
+                pair_index: 0,
+                model: crate::model::Tmd::default(),
+                texture: crate::model::Texture8 {
+                    width: 0,
+                    height: 0,
+                    indices: Vec::new(),
+                    palettes: Vec::new(),
+                    stp: Vec::new(),
+                },
+            }],
+            cuts: vec![crate::state::Cut {
+                pos: [2000, 0, 2000],
+                look_at: [2000, 0, 3000],
+                fov: 500,
+                ..crate::state::Cut::default()
+            }],
+            zones: vec![crate::state::Zone {
+                cam_to: 0,
+                cam_from: 0,
+                corners: [[0, 0], [0, 5000], [5000, 5000], [5000, 0]],
+            }],
+            ..RoomState::default()
+        };
+        let mut objects = ObjectTable::new(1);
+        {
+            let record = objects.record_mut(0).unwrap();
+            record.flag = OBJECT_FLAG_ACTIVE;
+            record.asset = Some(0);
+            record.pos = [2000, 0, 2300];
+        }
+        assert_eq!(visible_objects(&room, &objects, 0, [0, 0, 0], 0).len(), 1);
+
+        // Inside the zone but behind the camera: `FUN_00483270` returns on a
+        // negative GTE depth before queueing any triangle.
+        objects.record_mut(0).unwrap().pos = [2000, 0, 1700];
+        assert!(visible_objects(&room, &objects, 0, [0, 0, 0], 0).is_empty());
+
+        // A room pinned to the fixed ordering-table slot keeps it.
+        let pinned = RoomState {
+            stage: 4,
+            room: 0x0E,
+            ..room
+        };
+        assert_eq!(visible_objects(&pinned, &objects, 0, [0, 0, 0], 0).len(), 1);
     }
 
     #[test]
@@ -16193,6 +16404,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
         }];
         let camera = Camera::from_cut(cut);
         let lighting = Lighting::from_room(&loaded.room);
@@ -23887,7 +24104,7 @@ off_0010:
         assert_eq!(quad.key, 960);
         // scale = 200 * 1 * 128 * 256 / (1000 + 1) = 6548 -> 204 px wide.
         assert_eq!(quad.size, [204, 204]);
-        assert_eq!(quad.pos, [77, 18]);
+        assert_eq!(quad.pos, [78, 18]);
         // depth_group 8 -> tint level 1 of colour record 1.
         assert_eq!(quad.tint, [0xB2, 0xB2, 0xB2]);
 
@@ -23895,7 +24112,7 @@ off_0010:
         let mut shaken = camera;
         shaken.screen = [5, -4];
         let quads = build_effect_quads(&game, &room, id, &shaken, &pages, &mut Tween::default());
-        assert_eq!(quads[0].pos, [82, 14]);
+        assert_eq!(quads[0].pos, [83, 14]);
     }
 
     #[test]
@@ -24329,6 +24546,7 @@ end
                         raw_y: false,
                         flat_color: None,
                         quad: None,
+                        uv_nudge: [0; 3],
                     }],
                 }],
             },

@@ -1247,6 +1247,7 @@ impl Framebuffer {
                 0,
                 [255; 3],
                 None,
+                None,
                 false,
                 &mut triangles,
             );
@@ -1281,6 +1282,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 None,
                 false,
                 &mut triangles,
@@ -1328,6 +1330,7 @@ impl Framebuffer {
                 true,
                 0,
                 [255; 3],
+                None,
                 None,
                 false,
                 &mut triangles,
@@ -1379,127 +1382,129 @@ impl Framebuffer {
 
     fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
         triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        let mut depth = self.depth_buffer();
+        let mut twins = KnockoutTwins::default();
         for triangle in &triangles {
-            self.rasterize(texture, triangle);
+            let twin = twins.get(texture, triangle);
+            self.rasterize(texture, triangle, twin, &mut depth);
         }
     }
 
-    fn rasterize(&mut self, texture: &Texture8, triangle: &Triangle) {
+    /// A cleared 24-bit depth buffer covering the framebuffer.
+    fn depth_buffer(&self) -> Vec<u32> {
+        vec![crate::raster::DEPTH_CLEAR; self.width as usize * self.height as usize]
+    }
+
+    /// Draw one model triangle the way the reference's GL path does on
+    /// llvmpipe: `DrawTriangles3D` under `GL_SRC_ALPHA` blending, a
+    /// `GL_LEQUAL` test against the 24-bit depth buffer and a depth write for
+    /// opaque triangles only.
+    ///
+    /// A blending triangle blends every texel at its alpha. When the page has
+    /// a knock-out twin (`twin`), the reference draws the same triangle again
+    /// through it at full alpha, so the non-STP texels come out opaque.
+    fn rasterize(
+        &mut self,
+        texture: &Texture8,
+        triangle: &Triangle,
+        twin: bool,
+        depth: &mut [u32],
+    ) {
         if texture.width == 0 || texture.height == 0 {
             return;
         }
-        let [a, b, c] = &triangle.raster;
-        let area = (b.position[0] - a.position[0]) * (c.position[1] - a.position[1])
-            - (c.position[0] - a.position[0]) * (b.position[1] - a.position[1]);
-        if triangle.cull && !faces_camera(area) {
-            return;
-        }
-
-        let min_x = a.position[0].min(b.position[0]).min(c.position[0]).floor() as i64;
-        let max_x = a.position[0].max(b.position[0]).max(c.position[0]).ceil() as i64;
-        let min_y = a.position[1].min(b.position[1]).min(c.position[1]).floor() as i64;
-        let max_y = a.position[1].max(b.position[1]).max(c.position[1]).ceil() as i64;
-        let min_x = min_x.max(0);
-        let min_y = min_y.max(0);
-        let max_x = max_x.min(i64::from(self.width) - 1);
-        let max_y = max_y.min(i64::from(self.height) - 1);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
-        let width = self.width as usize;
-        for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let weight0 = ((b.position[0] - px) * (c.position[1] - py)
-                    - (c.position[0] - px) * (b.position[1] - py))
-                    / area;
-                let weight1 = ((c.position[0] - px) * (a.position[1] - py)
-                    - (a.position[0] - px) * (c.position[1] - py))
-                    / area;
-                let weight2 = 1.0 - weight0 - weight1;
-                if weight0 < 0.0 || weight1 < 0.0 || weight2 < 0.0 {
-                    continue;
-                }
-
-                let inv_z = weight0 * a.inv_z + weight1 * b.inv_z + weight2 * c.inv_z;
-                if inv_z.is_nan() || inv_z <= 0.0 {
-                    continue;
-                }
-                let u =
-                    (weight0 * a.u * a.inv_z + weight1 * b.u * b.inv_z + weight2 * c.u * c.inv_z)
-                        / inv_z;
-                let v =
-                    (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
-                        / inv_z;
-                // An untextured gouraud polygon keeps its packet colour; every
-                // other polygon samples the texture page through its row. The
-                // sampled palette index also selects per-texel STP blending.
-                let (color, palette_index) = match triangle.flat {
-                    Some(flat) => ([flat[0], flat[1], flat[2], 255], None),
-                    None => {
-                        let Some(texel_u) = wrap_texel(u, texture.width) else {
-                            continue;
-                        };
-                        let Some(texel_v) = wrap_texel(v, texture.height) else {
-                            continue;
-                        };
-                        let index = texel_v as usize * texture.width as usize + texel_u as usize;
-                        let Some(&palette_index) = texture.indices.get(index) else {
-                            continue;
-                        };
-                        // Palette entry zero is the PSX colour key: the PC's
-                        // model-texture conversion maps an indexed page's
-                        // entry 0 to alpha 0, so the texel is skipped instead
-                        // of painted (the room-105 blood decals' black
-                        // background). The untextured path has no index and
-                        // stays opaque.
-                        if palette_index == 0 {
-                            continue;
-                        }
-                        (
-                            texture.palette(triangle.palette_row, palette_index),
-                            Some(palette_index),
-                        )
-                    }
-                };
-
-                let shade = [
-                    weight0 * a.shade[0] + weight1 * b.shade[0] + weight2 * c.shade[0],
-                    weight0 * a.shade[1] + weight1 * b.shade[1] + weight2 * c.shade[1],
-                    weight0 * a.shade[2] + weight1 * b.shade[2] + weight2 * c.shade[2],
-                ];
-                let mut pixel = [
-                    channel(color[0], shade[0]),
-                    channel(color[1], shade[1]),
-                    channel(color[2], shade[2]),
-                    255,
-                ];
-                let offset = (y as usize * width + x as usize) * 4;
-                // A packet carrying the ABE bit blends only where the sampled
-                // palette entry carries the STP bit. A palette row with no STP
-                // entries has no blend texels at all, so the packet is fully
-                // opaque there; the STP selector is the whole story.
-                let blend = triangle.blend
-                    && palette_index
-                        .is_some_and(|index| texture.palette_stp(triangle.palette_row, index));
-                if blend && let Some(dst) = self.rgba.get(offset..offset + 4) {
-                    // The record's background weight in 256ths; `None` keeps
-                    // the M16 per-packet half blend.
-                    let background = u32::from(triangle.blend_weight.unwrap_or(0x80));
-                    let source = 256 - background;
-                    for (channel, &destination) in pixel[..3].iter_mut().zip(dst) {
-                        *channel = ((u32::from(*channel) * source
-                            + u32::from(destination) * background)
-                            / 256) as u8;
-                    }
-                }
-                if let Some(slot) = self.rgba.get_mut(offset..offset + 4) {
-                    slot.copy_from_slice(&pixel);
-                }
+        let texture_width = f64::from(texture.width);
+        let texture_height = f64::from(texture.height);
+        // A blending packet's vertex alpha is the record's foreground weight;
+        // `None` keeps the M16 per-packet half blend.
+        let alpha = if triangle.blend {
+            match triangle.blend_weight {
+                // `CreateTmdObjectInternal`'s 0.2f background weight.
+                Some(0x33) => 1.0 - 0.2f32,
+                weight => 1.0 - f32::from(weight.unwrap_or(0x80)) / 256.0,
             }
-        }
+        } else {
+            1.0
+        };
+        let vertices = std::array::from_fn(|corner| {
+            let vertex = &triangle.raster[corner];
+            let nudge = triangle.uv_nudge[corner];
+            // `PSXObject_Store` stores normalised coordinates and nudges a
+            // degenerate corner by 0.003 on the stored float.
+            let mut u = (f64::from(vertex.u) / texture_width) as f32;
+            let mut v = (f64::from(vertex.v) / texture_height) as f32;
+            let step = f64::from(if nudge & 4 != 0 { 0.0001f32 } else { 0.003f32 });
+            if nudge & 1 != 0 {
+                u = (f64::from(u) + step) as f32;
+            }
+            if nudge & 2 != 0 {
+                v = (f64::from(v) + step) as f32;
+            }
+            crate::raster::GlVertex {
+                x: vertex.position[0],
+                y: vertex.position[1],
+                depth: depth_ndc(vertex.w),
+                w: vertex.w,
+                u,
+                v,
+                color: [vertex.shade[0], vertex.shade[1], vertex.shade[2], alpha],
+            }
+        });
+        let width = self.width as usize;
+        let rgba = &mut self.rgba;
+        crate::raster::draw_triangle(&vertices, self.width, self.height, |fragment| {
+            let pixel = fragment.y * width + fragment.x;
+            let Some(stored) = depth.get_mut(pixel) else {
+                return;
+            };
+            if fragment.depth > *stored {
+                return;
+            }
+            // The blended pass and its knockout twin leave depth alone; an
+            // opaque triangle writes it even where its texel is transparent,
+            // since the shader never discards.
+            if !triangle.blend {
+                *stored = fragment.depth;
+            }
+            // An untextured packet samples the white texture; every other
+            // packet samples its page through the palette row. Palette entry
+            // zero is the PSX colour key (alpha 0), which leaves the pixel.
+            let (texel, blend) = match triangle.flat {
+                Some(_) => ([255, 255, 255], false),
+                None => {
+                    let texel_u = clamp_texel(fragment.u, texture.width);
+                    let texel_v = clamp_texel(fragment.v, texture.height);
+                    let index = texel_v * texture.width as usize + texel_u;
+                    let Some(&palette_index) = texture.indices.get(index) else {
+                        return;
+                    };
+                    if palette_index == 0 {
+                        return;
+                    }
+                    let color = texture.palette(triangle.palette_row, palette_index);
+                    // A blending triangle blends every texel unless the
+                    // knock-out twin paints its non-STP texels back opaque.
+                    let blend = triangle.blend
+                        && (!twin || texture.palette_stp(triangle.palette_row, palette_index));
+                    ([color[0], color[1], color[2]], blend)
+                }
+            };
+            let offset = pixel * 4;
+            let Some(slot) = rgba.get_mut(offset..offset + 4) else {
+                return;
+            };
+            let source_alpha = if blend {
+                unorm8(fragment.color[3])
+            } else {
+                255
+            };
+            for (index, destination) in slot[..3].iter_mut().enumerate() {
+                let source =
+                    unorm8(f32::from(texel[index]) * (1.0 / 255.0) * fragment.color[index]);
+                *destination = blend_unorm8(source, *destination, source_alpha);
+            }
+            slot[3] = 255;
+        });
     }
 
     /// Paint a sorted scene list: each triangle selects its own texture page,
@@ -1512,14 +1517,17 @@ impl Framebuffer {
         effect_pages: &[Option<&Image>],
         items: &[SceneItem<'_>],
     ) {
+        let mut depth = self.depth_buffer();
+        let mut twins = KnockoutTwins::default();
         for item in items {
             match item {
                 SceneItem::Shadow(poly) => {
-                    self.rasterize_shadow(poly.texture, poly);
+                    self.rasterize_shadow(poly, &depth);
                 }
                 SceneItem::Triangle(triangle) => {
                     if let Some(texture) = textures.get(triangle.texture) {
-                        self.rasterize(texture, triangle);
+                        let twin = twins.get(texture, triangle);
+                        self.rasterize(texture, triangle, twin, &mut depth);
                     }
                 }
                 SceneItem::Mask(quad) => {
@@ -1536,119 +1544,37 @@ impl Framebuffer {
         }
     }
 
-    /// Rasterize one clipped ground-shadow polygon.
-    ///
-    /// The convex ring is fanned into triangles and sampled nearest with
-    /// perspective-correct UVs, exactly like the model path. A texel's alpha
-    /// multiplies the destination towards the polygon's tint; a zero-alpha
-    /// texel is a hole and leaves the framebuffer untouched.
-    fn rasterize_shadow(&mut self, texture: &Image, poly: &ShadowPoly) {
-        if texture.width == 0 || texture.height == 0 || poly.corners.len() < 3 {
+    /// Rasterize one ground shadow (`MarniDrawTrianglesPersp`): the model
+    /// pipeline with bilinear sampling, depth tested but never written, and
+    /// alpha-blended by the texel's coverage times the vertex colour.
+    fn rasterize_shadow(&mut self, poly: &ShadowPoly, depth: &[u32]) {
+        let texture = poly.texture;
+        if texture.width == 0 || texture.height == 0 {
             return;
         }
-        for corner in 1..poly.corners.len() - 1 {
-            self.rasterize_shadow_triangle(texture, poly, [0, corner, corner + 1]);
-        }
-    }
-
-    fn rasterize_shadow_triangle(
-        &mut self,
-        texture: &Image,
-        poly: &ShadowPoly,
-        indices: [usize; 3],
-    ) {
-        let (a, b, c) = (
-            &poly.corners[indices[0]],
-            &poly.corners[indices[1]],
-            &poly.corners[indices[2]],
-        );
-        let area = (b.position[0] - a.position[0]) * (c.position[1] - a.position[1])
-            - (c.position[0] - a.position[0]) * (b.position[1] - a.position[1]);
-        if area == 0.0 {
-            return;
-        }
-
-        let min_x = a.position[0].min(b.position[0]).min(c.position[0]).floor() as i64;
-        let max_x = a.position[0].max(b.position[0]).max(c.position[0]).ceil() as i64;
-        let min_y = a.position[1].min(b.position[1]).min(c.position[1]).floor() as i64;
-        let max_y = a.position[1].max(b.position[1]).max(c.position[1]).ceil() as i64;
-        let min_x = min_x.max(0);
-        let min_y = min_y.max(0);
-        let max_x = max_x.min(i64::from(self.width) - 1);
-        let max_y = max_y.min(i64::from(self.height) - 1);
-        if min_x > max_x || min_y > max_y {
-            return;
-        }
-
         let width = self.width as usize;
-        for y in min_y..=max_y {
-            let py = y as f64 + 0.5;
-            for x in min_x..=max_x {
-                let px = x as f64 + 0.5;
-                let weight0 = ((b.position[0] - px) * (c.position[1] - py)
-                    - (c.position[0] - px) * (b.position[1] - py))
-                    / area;
-                let weight1 = ((c.position[0] - px) * (a.position[1] - py)
-                    - (a.position[0] - px) * (c.position[1] - py))
-                    / area;
-                let weight2 = 1.0 - weight0 - weight1;
-                // The fan's triangles share their diagonals; the top-left
-                // rule assigns a sample exactly on a shared edge to one of
-                // them, so the translucent quad is not blended twice along
-                // the seam.
-                let positive = area > 0.0;
-                let inside = |weight: f64, from: [f64; 2], to: [f64; 2]| {
-                    if weight > 1e-9 {
-                        true
-                    } else if weight < -1e-9 {
-                        false
-                    } else {
-                        top_left(from, to, positive)
-                    }
-                };
-                if !inside(weight0, b.position, c.position)
-                    || !inside(weight1, c.position, a.position)
-                    || !inside(weight2, a.position, b.position)
+        let rgba = &mut self.rgba;
+        for triangle in &poly.triangles {
+            crate::raster::draw_triangle(triangle, self.width, self.height, |fragment| {
+                let pixel = fragment.y * width + fragment.x;
+                if depth
+                    .get(pixel)
+                    .is_none_or(|&stored| fragment.depth > stored)
                 {
-                    continue;
+                    return;
                 }
-
-                let inv_z = weight0 * a.inv_z + weight1 * b.inv_z + weight2 * c.inv_z;
-                if inv_z.is_nan() || inv_z <= 0.0 {
-                    continue;
+                let texel = sample_bilinear(texture, fragment.u, fragment.v);
+                let Some(slot) = rgba.get_mut(pixel * 4..pixel * 4 + 4) else {
+                    return;
+                };
+                let alpha = unorm8(f32::from(texel[3]) * (1.0 / 255.0) * fragment.color[3]);
+                for (index, destination) in slot[..3].iter_mut().enumerate() {
+                    let source =
+                        unorm8(f32::from(texel[index]) * (1.0 / 255.0) * fragment.color[index]);
+                    *destination = blend_unorm8(source, *destination, alpha);
                 }
-                let u =
-                    (weight0 * a.u * a.inv_z + weight1 * b.u * b.inv_z + weight2 * c.u * c.inv_z)
-                        / inv_z;
-                let v =
-                    (weight0 * a.v * a.inv_z + weight1 * b.v * b.inv_z + weight2 * c.v * c.inv_z)
-                        / inv_z;
-                let Some(texel_u) = wrap_texel(u * f64::from(texture.width), texture.width) else {
-                    continue;
-                };
-                let Some(texel_v) = wrap_texel(v * f64::from(texture.height), texture.height)
-                else {
-                    continue;
-                };
-                let texel = (texel_v as usize * texture.width as usize + texel_u as usize) * 4;
-                let Some(texel) = texture.rgba.get(texel..texel + 4) else {
-                    continue;
-                };
-                let alpha = i64::from(texel[3]);
-                if alpha == 0 {
-                    continue;
-                }
-                let offset = (y as usize * width + x as usize) * 4;
-                let Some(pixel) = self.rgba.get_mut(offset..offset + 4) else {
-                    continue;
-                };
-                for (channel, &tint) in pixel[..3].iter_mut().zip(&poly.tint) {
-                    *channel =
-                        ((i64::from(*channel) * (255 - alpha) + i64::from(tint) * alpha + 127)
-                            / 255) as u8;
-                }
-                pixel[3] = 255;
-            }
+                slot[3] = 255;
+            });
         }
     }
 
@@ -1716,63 +1642,96 @@ impl Framebuffer {
             return;
         }
 
-        let x0 = i64::from(quad.pos[0]);
-        let y0 = i64::from(quad.pos[1]);
-        let start_x = x0.max(0);
-        let start_y = y0.max(0);
-        let end_x = (x0 + i64::from(quad.size[0])).min(i64::from(self.width));
-        let end_y = (y0 + i64::from(quad.size[1])).min(i64::from(self.height));
-        if start_x >= end_x || start_y >= end_y {
-            return;
-        }
-
         let page_width = page.width as usize;
-        let u0 = i64::from(quad.uv[0]);
-        let v0 = i64::from(quad.uv[1]);
-        let source_w = i64::from(quad.source[0].max(1));
-        let source_h = i64::from(quad.source[1].max(1));
-        let target_w = i64::from(quad.size[0]);
-        let target_h = i64::from(quad.size[1]);
-        let half = quad.blend & 0x80 != 0;
+        // `SubmitEffectSprite`: the tint is scaled by 0x80 and
+        // `g_ColorScaleFactor / 255` and truncated to a byte, and the blend
+        // level becomes `blend / 256` (opaque when zero), truncated to a byte.
+        let tint_scale = (2.0f32 / 255.0) * (1.0f32 / 255.0);
+        let color = quad.tint.map(|channel| {
+            let value = (f32::from(channel) * 128.0 * tint_scale * 255.0) as i32;
+            value.clamp(0, 255) as f32 / 255.0
+        });
+        let level = f32::from(quad.blend) * 0.003_906_25;
+        let level = if level == 0.0 { 1.0 } else { level };
+        let alpha = ((level * 255.0) as i32).clamp(0, 255) as f32 / 255.0;
         let target_stride = self.width as usize;
 
-        for y in start_y..end_y {
-            let texel_y = v0 + (y - y0) * source_h / target_h;
-            if !(0..i64::from(page.height)).contains(&texel_y) {
-                continue;
-            }
-            for x in start_x..end_x {
-                let texel_x = u0 + (x - x0) * source_w / target_w;
-                if !(0..i64::from(page.width)).contains(&texel_x) {
-                    continue;
-                }
-                let source = texel_y as usize * page_width * 4 + texel_x as usize * 4;
-                let target = y as usize * target_stride * 4 + x as usize * 4;
+        // `MarniDX::DrawSprite`: two unprojected triangles, `(x, y) (x1, y)
+        // (x, y1)` and `(x, y1) (x1, y) (x1, y1)`, through the same llvmpipe
+        // setup as the models. The vertex order fixes the plane rounding that
+        // decides which texel a pixel centre on a texel edge lands on.
+        let [x, y, w, h] = [quad.pos[0], quad.pos[1], quad.size[0], quad.size[1]].map(|v| v as f32);
+        let (x1, y1) = (x + w, y + h);
+        let [top, sheet_height] = quad.sheet.map(u32::from);
+        let sheet_height = sheet_height.clamp(1, page.height.saturating_sub(top).max(1));
+        let page_w = page.width as f32;
+        let sheet_v = f32::from(quad.uv[1]) - top as f32;
+        let u0 = f32::from(quad.uv[0]) / page_w;
+        let v0 = sheet_v / sheet_height as f32;
+        let u1 = (f32::from(quad.uv[0]) + f32::from(quad.source[0].max(1))) / page_w;
+        let v1 = (sheet_v + f32::from(quad.source[1].max(1))) / sheet_height as f32;
+        let corner = |x: f32, y: f32, u: f32, v: f32| crate::raster::GlVertex {
+            x,
+            y,
+            depth: 0.0,
+            w: 1.0,
+            u,
+            v,
+            color: [1.0; 4],
+        };
+        let triangles = [
+            [
+                corner(x, y, u0, v0),
+                corner(x1, y, u1, v0),
+                corner(x, y1, u0, v1),
+            ],
+            [
+                corner(x, y1, u0, v1),
+                corner(x1, y, u1, v0),
+                corner(x1, y1, u1, v1),
+            ],
+        ];
+        let rgba = &mut self.rgba;
+        for triangle in &triangles {
+            crate::raster::draw_triangle(triangle, self.width, self.height, |fragment| {
+                let texel_x = clamp_texel(fragment.u, page.width);
+                let texel_y = top as usize + clamp_texel(fragment.v, sheet_height);
+                let source = texel_y * page_width * 4 + texel_x * 4;
+                let target = fragment.y * target_stride * 4 + fragment.x * 4;
                 let (Some(texel), Some(slot)) = (
                     page.rgba.get(source..source + 4),
-                    self.rgba.get_mut(target..target + 4),
+                    rgba.get_mut(target..target + 4),
                 ) else {
-                    continue;
+                    return;
                 };
                 if texel[3] == 0 {
-                    continue;
+                    return;
                 }
-                let tinted = [
-                    (u32::from(texel[0]) * u32::from(quad.tint[0]) / 255) as u8,
-                    (u32::from(texel[1]) * u32::from(quad.tint[1]) / 255) as u8,
-                    (u32::from(texel[2]) * u32::from(quad.tint[2]) / 255) as u8,
-                ];
-                if half {
-                    for (channel, &source) in slot[..3].iter_mut().zip(&tinted) {
-                        *channel = ((u32::from(*channel) + u32::from(source)) / 2) as u8;
-                    }
-                } else {
-                    slot[..3].copy_from_slice(&tinted);
+                // `FlushSpriteCommands` hands the GPU an 8-bit vertex colour
+                // and alpha. llvmpipe stores the fragment's texel-times-colour
+                // as bytes and blends them in 8-bit fixed point, rounding
+                // each `x * y / 255` product.
+                let unorm = |value: f32| (value * 255.0).round().clamp(0.0, 255.0) as u32;
+                let alpha = unorm(f32::from(texel[3]) / 255.0 * alpha);
+                for ((channel, &source), &color) in
+                    slot[..3].iter_mut().zip(&texel[..3]).zip(&color)
+                {
+                    let source = unorm(f32::from(source) / 255.0 * color);
+                    let blended =
+                        unorm_mul(source, alpha) + unorm_mul(u32::from(*channel), 255 - alpha);
+                    *channel = blended.min(255) as u8;
                 }
                 slot[3] = 255;
-            }
+            });
         }
     }
+}
+
+/// llvmpipe's `lp_build_mul` on 8-bit normalised values: `a * b / 255`,
+/// rounded to nearest.
+fn unorm_mul(a: u32, b: u32) -> u32 {
+    let product = a * b + 0x80;
+    (product + (product >> 8)) >> 8
 }
 
 /// Draw one frame of a parsed door animation over black.
@@ -1844,7 +1803,33 @@ pub struct EntityMesh<'a> {
     /// (not even in the mirror copy), the port's stand-in for the joint flag
     /// byte's bit 0.
     pub hidden_joints: u32,
+    /// Where the room lights latch (`update_entity_lighting`): an entity's
+    /// own matrix translation (`ent + 0x34`, its feet), not its root joint.
+    /// `None` latches at the first joint, which for a room object or item
+    /// record is the record position the original passes (`obj + 0x34`).
+    pub light_pos: Option<[i32; 3]>,
+    /// Yawn (ids `0x0D`/`0x12`): `render_entity` re-latches the lights at
+    /// every joint's world translation before drawing it.
+    pub per_joint_light: bool,
+    /// The mesh object the reference draws through its complex pool
+    /// (`ComplexTmdObjectSetup` / `FUN_00486df0`) instead of the TMD path:
+    /// Plant 42's root ball. See `collect_complex_pool`.
+    pub complex_object: Option<usize>,
+    /// The Plant 42 body's light matrix: `MulMatrix0(g_lightMatrix, &m, &m)`
+    /// with `m` the identity, run in place. See
+    /// [`EntityLight::aliased_identity_product`].
+    pub aliased_light: bool,
+    /// The light matrix's right operand when it is not the identity:
+    /// `SetLightMatrix(MulMatrix0(g_lightMatrix, rotation))`. The Tyrant's
+    /// heart passes its anchor joint's world rotation.
+    pub light_rotation: Option<[[i32; 3]; 3]>,
+    /// Per-joint `JointSetColorTint` colours (1/128 multipliers); a non-zero
+    /// entry draws the joint unlit in that colour.
+    pub joint_colours: [[u8; 3]; 32],
 }
+
+/// No joint carries a `JointSetColorTint` colour.
+pub const NO_JOINT_COLOURS: [[u8; 3]; 32] = [[0; 3]; 32];
 
 /// The original's `GetTmdBlendMode` plus `CreateTmdObjectInternal`'s remap:
 /// the background weight of the first semi-transparent primitive of `model`,
@@ -2060,13 +2045,15 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     // The shadows are submitted before the models, so a mask or triangle whose
     // rounded key ties one wins the tie the way the original's later
     // submission into the shared ordering table does.
-    for shadow in shadows {
-        collect_shadow(shadow, camera, &mut items);
-    }
+    items.extend(
+        shadow_polys(shadows, camera)
+            .into_iter()
+            .map(SceneItem::Shadow),
+    );
 
     let mut triangles = Vec::new();
     for (texture, mesh) in meshes.iter().enumerate() {
-        let light = lighting.latched(root_position(mesh.joints));
+        let light = lighting.latched(mesh.light_pos.unwrap_or(root_position(mesh.joints)));
         // The room's own object and item models come first in the list (the
         // original's room pass, which uses its own D3D light setup); every
         // later mesh is an entity and uses the world-space dot.
@@ -2075,6 +2062,24 @@ pub fn draw_gameplay_scene_with_effects<'a>(
             if !mesh.joint_visible(index) {
                 continue;
             }
+            if mesh.complex_object == Some(index) {
+                collect_complex_pool(object, joint, camera, texture, &mut triangles);
+                continue;
+            }
+            let light = if mesh.per_joint_light {
+                lighting.latched(joint.t)
+            } else {
+                light
+            };
+            let light = if mesh.aliased_light {
+                light.aliased_identity_product()
+            } else {
+                light
+            };
+            let light = match &mesh.light_rotation {
+                Some(rotation) => light.rotated(rotation),
+                None => light,
+            };
             collect_triangles(
                 object,
                 joint,
@@ -2084,6 +2089,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                 true,
                 texture,
                 mesh.tint,
+                mesh.joint_colours.get(index).copied(),
                 mesh.blend_weight,
                 room_object,
                 &mut triangles,
@@ -2096,11 +2102,16 @@ pub fn draw_gameplay_scene_with_effects<'a>(
     // pass re-runs the character joints, never the room's own objects.
     if let Some(mirror) = mirror {
         for (texture, mesh) in meshes.iter().enumerate().skip(mirror_from) {
-            let light = lighting.latched(root_position(mesh.joints));
+            let light = lighting.latched(mesh.light_pos.unwrap_or(root_position(mesh.joints)));
             for (index, (object, joint)) in mesh.mesh.objects.iter().zip(mesh.joints).enumerate() {
                 if !mesh.joint_visible(index) || !mirror.joint_visible(joint.t) {
                     continue;
                 }
+                let light = if mesh.per_joint_light {
+                    lighting.latched(joint.t)
+                } else {
+                    light
+                };
                 // The mirrored X scale reverses screen-space winding, so the
                 // usual back-face test would drop every front face; the
                 // reflection is submitted unculled (the original culls with
@@ -2114,6 +2125,7 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                     false,
                     texture,
                     mesh.tint,
+                    mesh.joint_colours.get(index).copied(),
                     mesh.blend_weight,
                     false,
                     &mut triangles,
@@ -2190,113 +2202,190 @@ pub(crate) fn mask_quads(layer: &MaskLayer<'_>, offset: [i32; 2]) -> Vec<MaskQua
     quads
 }
 
-/// Project and clip one ground shadow into the scene list.
-///
-/// The four corners are yawed into world space exactly like the model's root
-/// joint, clipped against the camera's near plane and projected. The painter's
-/// key is the truncating integer mean of the four *unclipped* corner view Zs,
-/// the same quantity and units a triangle's [`Triangle::depth`] uses, so it
-/// goes through [`triangle_depth_key`] like every other scene key.
-fn collect_shadow<'a>(shadow: &Shadow<'a>, camera: &Camera, items: &mut Vec<SceneItem<'a>>) {
-    if let Some(poly) = shadow_polygon(shadow, camera) {
-        items.push(SceneItem::Shadow(poly));
+/// Every ground shadow's projected commands in `DrawFadeSpr`'s queue order,
+/// the items [`collect_shadow`] submits to the painter's sort.
+pub(crate) fn shadow_polys<'a>(shadows: &[Shadow<'a>], camera: &Camera) -> Vec<ShadowPoly<'a>> {
+    let mut items = Vec::new();
+    for (layer, &index) in shadow_order(shadows, camera).iter().enumerate() {
+        collect_shadow(&shadows[index], layer as i32, camera, &mut items);
     }
+    items
+        .into_iter()
+        .filter_map(|item| match item {
+            SceneItem::Shadow(poly) => Some(poly),
+            _ => None,
+        })
+        .collect()
 }
 
-/// One ground shadow's near-clipped, projected polygon and painter's key, the
-/// item [`collect_shadow`] submits; `None` when nothing survives the clip.
-pub(crate) fn shadow_polygon<'a>(shadow: &Shadow<'a>, camera: &Camera) -> Option<ShadowPoly<'a>> {
+/// `DrawFadeSpr`'s queue order: a selection pass over the shadows' mean
+/// entity-corner depths (`RotAverage4`, clamped like the queue's sort key),
+/// swapping whole records.
+fn shadow_order(shadows: &[Shadow<'_>], camera: &Camera) -> Vec<usize> {
+    let keys: Vec<u32> = shadows
+        .iter()
+        .map(|shadow| {
+            let (rotation, t) = shadow_matrix(shadow, 0, camera);
+            let (left, right) = (
+                shadow.shift[0] - shadow.half_x,
+                shadow.shift[0] + shadow.half_x,
+            );
+            let (back, front) = (
+                shadow.shift[1] - shadow.half_z,
+                shadow.shift[1] + shadow.half_z,
+            );
+            let sum: i32 = [(left, front), (right, front), (left, back), (right, back)]
+                .iter()
+                .map(|&(x, z)| {
+                    let r = i32::from(rotation[2][0]) * x + i32::from(rotation[2][2]) * z;
+                    (((r + ((r >> 31) & 0xFFF)) >> 12) + t[2]) >> 2
+                })
+                .sum();
+            let depth = ((sum + ((sum >> 31) & 3)) >> 2) as u32;
+            if depth > 0xFEF { 0xFF0 } else { depth }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..shadows.len()).collect();
+    for a in 0..order.len() {
+        for b in a + 1..order.len() {
+            if keys[order[b]] < keys[order[a]] {
+                order.swap(a, b);
+            }
+        }
+    }
+    order
+}
+
+/// The shadow's composed matrix: `CompMatrix(g_RoomCameraData, local)` with
+/// `local` the identity yawed by the entity angle and translated to the
+/// ground point, lifted by `layer` steps of 2 so queued shadows never share a
+/// plane.
+fn shadow_matrix(shadow: &Shadow<'_>, layer: i32, camera: &Camera) -> ([[i16; 3]; 3], [i32; 3]) {
+    let local = anim::Mat4x3 {
+        r: crate::player::rot_matrix_y(shadow.angle),
+        t: [shadow.pos[0], shadow.pos[1] + 2 * layer, shadow.pos[2]],
+    };
+    ref_composed(camera, &local)
+}
+
+/// Project and clip one ground shadow into the scene list (`DrawFadeSpr`
+/// and `AddFadePoly`).
+///
+/// The drawn quad spans `+-halfW x +-halfH` from the record's corner 1, in
+/// the composed matrix's integer 4.12 arithmetic. It is clipped against view
+/// Z 128 along the edge ring 0->1->3->2 and projected with truncating integer
+/// divides. A pentagon becomes two four-corner commands, each drawn as the
+/// fan (0,1,2) + (0,2,3). The painter's key is the truncating mean of the four
+/// *unclipped* corner view Zs.
+fn collect_shadow<'a>(
+    shadow: &Shadow<'a>,
+    layer: i32,
+    camera: &Camera,
+    items: &mut Vec<SceneItem<'a>>,
+) {
+    const FADE_NEAR: i32 = 128;
     if shadow.texture.width == 0 || shadow.texture.height == 0 {
-        return None;
+        return;
     }
-    let entity = anim::entity_matrix(shadow.pos, shadow.angle);
-    let (left, right) = (
-        (shadow.shift[0] - shadow.half_x) as i16,
-        (shadow.shift[0] + shadow.half_x) as i16,
-    );
-    let (back, front) = (
-        (shadow.shift[1] - shadow.half_z) as i16,
-        (shadow.shift[1] + shadow.half_z) as i16,
-    );
-    let local = [
-        [left, 0, front],
-        [right, 0, front],
-        [left, 0, back],
-        [right, 0, back],
-    ];
-    let view: [[i32; 3]; 4] = local.map(|corner| camera.view_position(fixed_mul(&entity, corner)));
-
-    let mean_depth = view.iter().map(|vertex| i64::from(vertex[2])).sum::<i64>() / 4;
-
-    // The texture's v axis runs towards the entity's local -Z and u along +X,
-    // matching the viewport quad's UV orientation.
-    let uv = [[0.0, 0.0], [4096.0, 0.0], [0.0, 4096.0], [4096.0, 4096.0]];
-    // The corners are laid out (-x,+z) (+x,+z) (-x,-z) (+x,-z), so the quad's
-    // edges are 0->1->3->2. Walking 0->1->2->3 would be a bowtie whose
-    // diagonals clip at the wrong places.
-    let edge = [0usize, 1, 3, 2];
-    let mut polygon: Vec<ShadowVertex> = Vec::with_capacity(5);
-    let near = 2.0 * f64::from(camera.fov);
+    let half_w = shadow.shift[0] + shadow.half_x;
+    let half_h = shadow.shift[1] + shadow.half_z;
+    if half_w <= 0 || half_h <= 0 {
+        return;
+    }
+    let (rotation, t) = shadow_matrix(shadow, layer, camera);
+    let mut cvx = [0i32; 4];
+    let mut cvy = [0i32; 4];
+    let mut cvz = [0i32; 4];
+    let mut cu = [0i32; 4];
+    let mut cv = [0i32; 4];
     for corner in 0..4 {
-        let index = edge[corner];
-        let next = edge[(corner + 1) & 3];
-        let a = view[index];
-        let b = view[next];
-        let a_in = f64::from(a[2]) >= near;
-        let b_in = f64::from(b[2]) >= near;
+        let cx = if corner == 0 || corner == 2 {
+            -half_w
+        } else {
+            half_w
+        };
+        let cz = if corner == 0 || corner == 1 {
+            half_h
+        } else {
+            -half_h
+        };
+        let rotate = |row: usize| {
+            let r = i32::from(rotation[row][0]) * cx + i32::from(rotation[row][2]) * cz;
+            ((r + ((r >> 31) & 0xFFF)) >> 12) + t[row]
+        };
+        cvx[corner] = rotate(0);
+        cvy[corner] = rotate(1);
+        cvz[corner] = rotate(2);
+        cu[corner] = ((cx + half_w) << 12) / (2 * half_w);
+        cv[corner] = ((half_h - cz) << 12) / (2 * half_h);
+    }
+
+    let edge = [0usize, 1, 3, 2];
+    // (x, y, z, u, v) per clipped corner.
+    let mut ring: Vec<[i32; 5]> = Vec::with_capacity(5);
+    for step in 0..4 {
+        let (a, b) = (edge[step], edge[(step + 1) & 3]);
+        let (za, zb) = (cvz[a], cvz[b]);
+        let a_in = za >= FADE_NEAR;
         if a_in {
-            polygon.push(project_shadow_vertex(a, uv[index], shadow.lift, camera));
+            ring.push([cvx[a], cvy[a], za, cu[a], cv[a]]);
         }
-        if a_in != b_in {
-            let t = (near - f64::from(a[2])) / f64::from(b[2] - a[2]);
-            let lerp =
-                |axis: usize| f64::from(a[axis]) + (f64::from(b[axis]) - f64::from(a[axis])) * t;
-            let clipped = [lerp(0) as i32, lerp(1) as i32, lerp(2) as i32];
-            let uv_clipped = [
-                uv[index][0] + (uv[next][0] - uv[index][0]) * t,
-                uv[index][1] + (uv[next][1] - uv[index][1]) * t,
-            ];
-            polygon.push(project_shadow_vertex(
-                clipped,
-                uv_clipped,
-                shadow.lift,
-                camera,
-            ));
+        if a_in != (zb >= FADE_NEAR) {
+            let t = ((FADE_NEAR - za) << 12) / (zb - za);
+            let lerp = |from: i32, to: i32| from + (((to - from) * t) >> 12);
+            ring.push([
+                lerp(cvx[a], cvx[b]),
+                lerp(cvy[a], cvy[b]),
+                FADE_NEAR,
+                lerp(cu[a], cu[b]),
+                lerp(cv[a], cv[b]),
+            ]);
         }
     }
-    if polygon.len() < 3 {
-        return None;
+    if ring.is_empty() {
+        return;
     }
 
-    Some(ShadowPoly {
-        key: triangle_depth_key(mean_depth as f64),
-        corners: polygon,
+    let focal = camera.fov;
+    let lift = shadow.lift;
+    let t1 = t[1];
+    let color = shadow.tint.map(|byte| f32::from(byte) * (1.0 / 255.0));
+    let corner = |k: usize| {
+        let [vx, vy, vz, u, v] = ring[k];
+        // `DrawFadeSpr` projects about the fixed 160/120 centre: the shadow
+        // never follows the screen offset or shake the models and masks do.
+        let px = (vx * focal) / vz + CENTER_X;
+        let py = ((t1 + lift - (vy - t1)) * focal) / vz + CENTER_Y;
+        let wz = f32::from(vz.min(30000) as i16);
+        crate::raster::GlVertex {
+            x: f32::from(px as i16),
+            y: f32::from(py as i16),
+            depth: depth_ndc(wz),
+            w: wz,
+            u: f32::from(u as i16) * (1.0 / 4096.0),
+            v: f32::from(v as i16) * (1.0 / 4096.0),
+            color: [color[0], color[1], color[2], 1.0],
+        }
+    };
+    let last = ring.len() - 1;
+    let commands: &[[usize; 4]] = if ring.len() > 4 {
+        &[[0, 1, 2, 3], [0, 3, 4, 4]]
+    } else {
+        &[[0, 1, 2, 3]]
+    };
+    let mut triangles = Vec::with_capacity(4);
+    for command in commands {
+        let quad = command.map(|k| corner(k.min(last)));
+        triangles.push([quad[0], quad[1], quad[2]]);
+        triangles.push([quad[0], quad[2], quad[3]]);
+    }
+
+    let sort_z = (cvz[0] + cvz[1] + cvz[2] + cvz[3]) / 4;
+    items.push(SceneItem::Shadow(ShadowPoly {
+        key: triangle_depth_key(f64::from(sort_z.max(0))),
+        triangles,
         texture: shadow.texture,
-        tint: shadow.tint,
-    })
-}
-
-/// Project one view-space shadow vertex to screen space.
-///
-/// `lift` joins the primitive's translation row, the same displacement the
-/// original applies to the quad origin: the translation grows downwards, so a
-/// positive lift drops the vertex down the screen. u/v stay in the texture's
-/// 0..4096 space and are scaled to texels by the rasterizer. The frame's screen
-/// offset (the shake) shifts the projected vertex like every other scene
-/// primitive.
-fn project_shadow_vertex(view: [i32; 3], uv: [f64; 2], lift: i32, camera: &Camera) -> ShadowVertex {
-    let focal = f64::from(camera.fov);
-    let inv_z = 1.0 / f64::from(view[2]);
-    ShadowVertex {
-        position: [
-            f64::from(CENTER_X) + f64::from(view[0]) * focal * inv_z + f64::from(camera.screen[0]),
-            f64::from(CENTER_Y) - (f64::from(view[1]) - f64::from(lift)) * focal * inv_z
-                + f64::from(camera.screen[1]),
-        ],
-        inv_z,
-        u: uv[0] / 4096.0,
-        v: uv[1] / 4096.0,
-    }
+    }));
 }
 
 /// A cut camera: a 4.12 view rotation, a world-unit translation and the cut's
@@ -2323,6 +2412,9 @@ pub struct Camera {
     pub screen: [i32; 2],
     pub from: [i32; 3],
     pub look_at: [i32; 3],
+    /// The camera was reflected about a mirror plane ([`Camera::mirrored`]);
+    /// the reference negates `g_RoomCameraData`'s X row to match.
+    pub mirrored: bool,
 }
 
 /// `a * b` for two 4.12 rotation matrices, each product truncated toward zero
@@ -2415,6 +2507,7 @@ impl Camera {
             screen: [0, 0],
             from,
             look_at: to,
+            mirrored: false,
         }
     }
 
@@ -2449,6 +2542,7 @@ impl Camera {
         camera.screen = self.screen;
         camera.view[0] = camera.view[0].map(|entry| -entry);
         camera.trans[0] = -camera.trans[0];
+        camera.mirrored = true;
         camera
     }
 
@@ -2651,6 +2745,46 @@ pub struct EntityLight {
     pub sources: [EntityLightSource; 3],
 }
 
+impl EntityLight {
+    /// The light rows after the Plant 42 body's
+    /// `MulMatrix0(g_lightMatrix, &m, &m)` over an identity `m`. The product
+    /// is written element by element into its own right operand, so every
+    /// row after the first reads columns the earlier rows already
+    /// overwrote; only the first light keeps its direction.
+    pub fn aliased_identity_product(mut self) -> Self {
+        let rows = self.sources.map(|source| source.dir);
+        let mut product = [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]];
+        for (i, row) in rows.iter().enumerate() {
+            // Indexed on purpose: each store must be visible to the next read.
+            #[allow(clippy::needless_range_loop)]
+            for j in 0..3 {
+                let sum: i64 = (0..3)
+                    .map(|k| {
+                        let value = i64::from(row[k]) * i64::from(product[k][j]);
+                        (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS
+                    })
+                    .sum();
+                // `MulMatrix0` stores shorts.
+                product[i][j] = i32::from(sum as i16);
+            }
+        }
+        for (source, row) in self.sources.iter_mut().zip(product) {
+            source.dir = row;
+        }
+        self
+    }
+
+    /// The light rows after `MulMatrix0(g_lightMatrix, rotation, &out)` into
+    /// a separate output: each light row times `rotation`, the same product
+    /// the room-object pass applies per vertex.
+    pub fn rotated(mut self, rotation: &[[i32; 3]; 3]) -> Self {
+        for source in &mut self.sources {
+            source.dir = mul_matrix0(&[source.dir, [0; 3], [0; 3]], rotation)[0];
+        }
+        self
+    }
+}
+
 /// One latched light in the reference's stored form: the 4.12 direction
 /// `F * normalize(entity - light)` (`FUN_0040ac80`) and its attenuated,
 /// `0x80`-capped colour byte.
@@ -2678,13 +2812,36 @@ fn integer_sqrt(value: i64) -> i64 {
     root
 }
 
-/// One projected vertex ready for rasterization.
+/// One projected vertex ready for rasterization, in the reference's GL
+/// vertex terms ([`crate::raster::GlVertex`]).
 struct RasterVertex {
-    position: [f64; 2],
-    inv_z: f64,
-    u: f64,
-    v: f64,
-    shade: [f64; 3],
+    /// Screen position (game pixels, Y down).
+    position: [f32; 2],
+    /// View-space Z.
+    w: f32,
+    /// Texture coordinates in texels; the rasterizer normalises them.
+    u: f32,
+    v: f32,
+    /// Vertex colour, `1.0` = the texel as stored.
+    shade: [f32; 3],
+}
+
+/// Per draw, which (page, palette row) pairs have an STP knock-out twin.
+#[derive(Default)]
+struct KnockoutTwins(std::collections::HashMap<(usize, usize), bool>);
+
+impl KnockoutTwins {
+    /// Whether `triangle` blends through a page with a knock-out twin.
+    fn get(&mut self, texture: &Texture8, triangle: &Triangle) -> bool {
+        if !triangle.blend || triangle.flat.is_some() {
+            return false;
+        }
+        let key = (texture.indices.as_ptr() as usize, triangle.palette_row);
+        *self
+            .0
+            .entry(key)
+            .or_insert_with(|| texture.has_knockout_twin(triangle.palette_row))
+    }
 }
 
 /// One triangle ready for rasterization.
@@ -2696,7 +2853,6 @@ struct Triangle {
     /// Index of the mesh's texture page in the frame's texture list.
     texture: usize,
     palette_row: usize,
-    cull: bool,
     /// A solid gouraud colour; `None` samples the texture instead.
     flat: Option<[u8; 3]>,
     /// The packet's semi-transparency bit: rasterize with a per-texel blend
@@ -2705,31 +2861,20 @@ struct Triangle {
     /// The record's background blend weight in 256ths. `None` is the M16
     /// per-packet half blend; see [`EntityMesh::blend_weight`].
     blend_weight: Option<u8>,
+    /// Per corner, `PSXObject_Store`'s degenerate-UV nudge: bit 0 adds
+    /// `0.003` to the normalised u, bit 1 to v.
+    uv_nudge: [u8; 3],
 }
 
-/// One projected shadow vertex: screen position, inverse view Z and the
-/// normalized texture coordinates.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ShadowVertex {
-    pub(crate) position: [f64; 2],
-    pub(crate) inv_z: f64,
-    /// Texture u over `0..=1`; the rasterizer scales by the page width.
-    pub(crate) u: f64,
-    /// Texture v over `0..=1`; the rasterizer scales by the page height.
-    pub(crate) v: f64,
-}
-
-/// A ground shadow's clipped convex polygon, ready for rasterization.
+/// A ground shadow's projected commands, ready for rasterization.
 #[derive(Debug, Clone)]
 pub(crate) struct ShadowPoly<'a> {
     /// Painter's key from [`triangle_depth_key`].
     pub(crate) key: u32,
-    /// Convex ring of three to five vertices in edge order.
-    pub(crate) corners: Vec<ShadowVertex>,
+    /// The commands' triangles in draw order.
+    pub(crate) triangles: Vec<[crate::raster::GlVertex; 3]>,
     /// The baked coverage page this polygon samples.
     pub(crate) texture: &'a Image,
-    /// The colour the quad blends towards.
-    pub(crate) tint: [u8; 3],
 }
 
 /// One mask sprite of a camera's page, ready for rasterization.
@@ -2768,6 +2913,11 @@ pub struct EffectQuad {
     pub tint: [u8; 3],
     /// `0x00` opaque or `0x80` half blend.
     pub blend: u8,
+    /// `[top, height]` of the texture the original samples, in page rows: a
+    /// weapon sheet is its own `256 x height` texture cut from the page at
+    /// `top`, so its UVs normalise against that height; anything else samples
+    /// the whole page.
+    pub sheet: [u16; 2],
 }
 
 /// The effect pages of one frame plus the billboards that sample them.
@@ -2841,77 +2991,89 @@ fn collect_triangles(
     cull: bool,
     texture: usize,
     tint: [u8; 3],
+    colour: Option<[u8; 3]>,
     blend_weight: Option<u8>,
     room_object: bool,
     triangles: &mut Vec<Triangle>,
 ) {
-    let vertices: Vec<[i32; 3]> = object
-        .vertices
-        .iter()
-        .map(|vertex| fixed_mul(joint, *vertex))
-        .collect();
-    // The raw-Y form's vertices skip the standard input Y negation; the pool
-    // is built lazily so the common path pays nothing.
-    let mut raw_vertices: Option<Vec<[i32; 3]>> = None;
-    // The reference lights the raw TMD normal through `camera * joint`, so the
-    // stored camera matrix and the joint's 4.12 rotation are all it needs.
-    let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
+    // A `JointSetColorTint` colour turns the reference's unlit path on: the
+    // colour (1/128 scale) replaces the lighting outright. An all-zero colour
+    // is untinted.
+    let colour = colour.filter(|colour| *colour != [0; 3]);
+    // The reference transforms and projects every vertex in floating point
+    // through `camera * joint` (see [`RefProjection`]). The vertex buffer
+    // holds `(x, -y, z)`; the raw-Y form skips the negation, and its pool is
+    // built lazily so the common path pays nothing.
+    let projection = RefProjection::new(camera, joint);
+    let project_pool = |sign: f64| -> Vec<Option<([f32; 2], f32)>> {
+        object
+            .vertices
+            .iter()
+            .map(|vertex| {
+                projection.project([
+                    f64::from(vertex[0]),
+                    sign * f64::from(vertex[1]),
+                    f64::from(vertex[2]),
+                ])
+            })
+            .collect()
+    };
+    let vertices = project_pool(-1.0);
+    let mut raw_vertices: Option<Vec<Option<Projected>>> = None;
+    // The reference lights the normal through the object's draw matrix and
+    // the light rows through `g_RoomCameraData`.
+    let light_camera = ref_camera(camera).0;
+    let normal_matrix = projection.rotation.map(|row| row.map(|entry| entry as f32));
 
     for prim in &object.prims {
         let pool = if prim.raw_y {
-            raw_vertices.get_or_insert_with(|| {
-                object
-                    .vertices
-                    .iter()
-                    .map(|vertex| fixed_mul_raw_y(joint, *vertex))
-                    .collect()
-            })
+            raw_vertices.get_or_insert_with(|| project_pool(1.0))
         } else {
             &vertices
         };
-        // The whole packet is dropped when any corner is inside the near plane;
-        // a plain triangle gets the same test through its three projections
-        // below, while a quad must check its fourth corner too.
-        if let Some(quad) = prim.quad
-            && quad.iter().any(|&index| {
-                pool.get(usize::from(index))
-                    .is_none_or(|vertex| camera.project(*vertex).is_none())
-            })
-        {
+        let corner = |index: u16| pool.get(usize::from(index)).copied().flatten();
+        // The whole packet is dropped when any corner is inside the near
+        // plane, and culled on its first three corners in index order - for a
+        // quad, its first fan triangle - so a quad never loses only one half.
+        let packet = match prim.quad {
+            Some(quad) => {
+                if quad.iter().any(|&index| corner(index).is_none()) {
+                    continue;
+                }
+                [quad[0], quad[1], quad[3]]
+            }
+            None => prim.vertices,
+        };
+        let (Some(first), Some(second), Some(third)) =
+            (corner(packet[0]), corner(packet[1]), corner(packet[2]))
+        else {
+            continue;
+        };
+        let [x0, y0] = first.0.map(f64::from);
+        let [x1, y1] = second.0.map(f64::from);
+        let [x2, y2] = third.0.map(f64::from);
+        if cull && !faces_camera((x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)) {
             continue;
         }
-        let (Some(vertex0), Some(vertex1), Some(vertex2)) = (
-            pool.get(usize::from(prim.vertices[0])),
-            pool.get(usize::from(prim.vertices[1])),
-            pool.get(usize::from(prim.vertices[2])),
+        let (Some((position0, depth0)), Some((position1, depth1)), Some((position2, depth2))) = (
+            corner(prim.vertices[0]),
+            corner(prim.vertices[1]),
+            corner(prim.vertices[2]),
         ) else {
             continue;
         };
-        let (Some(screen0), Some(screen1), Some(screen2)) = (
-            camera.project(*vertex0),
-            camera.project(*vertex1),
-            camera.project(*vertex2),
-        ) else {
-            continue;
-        };
-
-        let position0 = [screen0[0] as f64, screen0[1] as f64];
-        let position1 = [screen1[0] as f64, screen1[1] as f64];
-        let position2 = [screen2[0] as f64, screen2[1] as f64];
-        let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
-            - (position2[0] - position0[0]) * (position1[1] - position0[1]);
-        if cull && !faces_camera(area) {
-            continue;
-        }
-
-        let depth0 = f64::from(camera.view_position(*vertex0)[2]);
-        let depth1 = f64::from(camera.view_position(*vertex1)[2]);
-        let depth2 = f64::from(camera.view_position(*vertex2)[2]);
 
         // The packet's CLUT word carries the ABE bit; a packet with it blends
         // and is drawn full-bright, so the room lights do not apply. The TIM
         // decoder keeps each palette entry's STP flag for the per-texel blend.
-        let blend = prim.blend || prim.clut & ABE_BIT != 0;
+        // A record with a blend weight is the reference's transparent TMD:
+        // every primitive blends at the record weight (none at weight 0) and
+        // draws full-bright.
+        let blend = match blend_weight {
+            Some(weight) => weight != 0,
+            None => prim.blend || prim.clut & ABE_BIT != 0,
+        };
+        let full_bright = blend_weight.is_some() || blend;
         let (page_x, page_y, palette_row) = match lighting {
             Some(_) => (
                 f64::from(u32::from(prim.tsb & 0xF) * 128),
@@ -2924,29 +3086,15 @@ fn collect_triangles(
             None => (0.0, 0.0, 0),
         };
 
-        // Corner normals; a zero-length normal borrows the packet's first real
-        // one (the original substitutes and still draws the packet), and a
-        // packet with no usable normal at all is dropped on the lit path.
-        let mut corner_normals = [
+        // Corner normals. `tmd::parse` already pointed every missing corner
+        // (a flat packet's corners 1 and 2, a zero-length normal) at its
+        // kind's first normal, the one the original substitutes; a zero
+        // normal that remains lights at the ambient level.
+        let corner_normals = [
             object.normals.get(usize::from(prim.normals[0])).copied(),
             object.normals.get(usize::from(prim.normals[1])).copied(),
             object.normals.get(usize::from(prim.normals[2])).copied(),
         ];
-        if lighting.is_some() {
-            let Some(substitute) = corner_normals
-                .iter()
-                .flatten()
-                .copied()
-                .find(|normal| normal != &[0; 3])
-            else {
-                continue;
-            };
-            for normal in &mut corner_normals {
-                if normal.is_none() || normal == &Some([0; 3]) {
-                    *normal = Some(substitute);
-                }
-            }
-        }
 
         // An untextured packet's colour word is a per-corner vertex colour in
         // the original's 1/1024 scale; the sampled flat colour is white and the
@@ -2963,14 +3111,16 @@ fn collect_triangles(
         let raster: [RasterVertex; 3] = std::array::from_fn(|corner| {
             let (position, depth, uv, normal) = corners[corner];
             let shade = match (lighting, light) {
+                _ if let Some(colour) = colour => colour
+                    .map(|channel| (f64::from(channel) / 128.0 * CHANNEL_MAX).min(CHANNEL_MAX)),
                 // The gameplay path evaluates each corner normal against the
                 // latched light directions, clamps the accumulated light, then
                 // folds in the vertex colour and the mesh tint.
-                (Some(_), Some(light)) if !blend => {
+                (Some(_), Some(light)) if !full_bright => {
                     let mut shade = match normal {
                         Some(normal) => reference_vertex_shade(
-                            &stored_camera,
-                            &joint.r,
+                            &light_camera,
+                            &normal_matrix,
                             normal,
                             &light,
                             room_object.then_some(&joint.r),
@@ -2994,26 +3144,145 @@ fn collect_triangles(
             };
             RasterVertex {
                 position,
-                inv_z: 1.0 / depth,
-                u: f64::from(uv[0]) + page_x,
-                v: f64::from(uv[1]) + page_y,
-                shade,
+                w: depth,
+                u: (f64::from(uv[0]) + page_x) as f32,
+                v: (f64::from(uv[1]) + page_y) as f32,
+                shade: shade.map(|channel| (channel / CHANNEL_MAX) as f32),
             }
         });
 
-        let depth = (depth0 + depth1 + depth2) / 3.0;
+        // The sort key is the mean view Z, stored as a float.
+        let depth = f64::from(
+            ((f64::from(depth0) + f64::from(depth1) + f64::from(depth2)) * f64::from(1.0f32 / 3.0))
+                as f32,
+        );
         triangles.push(Triangle {
             raster,
             depth,
             key: triangle_depth_key(depth),
             texture,
             palette_row,
-            cull,
             // An untextured packet paints its per-corner colour through the
             // shade; the sampled colour is white.
             flat: prim.flat_color.map(|_| [255, 255, 255]),
             blend,
             blend_weight,
+            uv_nudge: prim.uv_nudge,
+        });
+    }
+}
+
+/// Project one object the way the reference's complex pool draws it.
+///
+/// `ComplexTmdObjectSetup` turns every textured triangle packet of the object
+/// into its own double-sided, unlit object (vertex colour 1.0), keyed by the
+/// view Z of its vertex centroid (`ApplyMatrixSV`). `FUN_00486df0` then
+/// selection-sorts the keys near to far and writes each object the raw GTE
+/// matrix - no `FUN_00486190` shake tilt - with its view Z pushed back by its
+/// sorted rank, so the `i`-th nearest triangle projects through `t[2] + i`.
+fn collect_complex_pool(
+    object: &TmdObject,
+    joint: &anim::Mat4x3,
+    camera: &Camera,
+    texture: usize,
+    triangles: &mut Vec<Triangle>,
+) {
+    let (rotation, _) = ref_composed(camera, joint);
+    let rotation = rotation.map(|row| row.map(i32::from));
+    let prims: Vec<&crate::model::TmdPrim> = object
+        .prims
+        .iter()
+        .filter(|prim| prim.textured && prim.quad.is_none() && !prim.raw_y)
+        .collect();
+    let mut keys: Vec<i32> = prims
+        .iter()
+        .map(|prim| {
+            let positions = prim.vertices.map(|index| {
+                object
+                    .vertices
+                    .get(usize::from(index))
+                    .copied()
+                    .unwrap_or_default()
+            });
+            // `(short)(a + b + c) / 3` per axis.
+            let centroid: [i32; 3] = std::array::from_fn(|axis| {
+                let sum: i32 = positions.iter().map(|p| i32::from(p[axis])).sum();
+                i32::from(sum as i16) / 3
+            });
+            apply_matrix_sv(&rotation, centroid)[2] as i16 as i32
+        })
+        .collect();
+    let mut ids: Vec<usize> = (0..prims.len()).collect();
+    // The original's selection sort, verbatim (it is not stable).
+    for i in 0..prims.len().saturating_sub(1) {
+        for j in i..prims.len() {
+            if keys[j] < keys[i] {
+                keys.swap(i, j);
+                ids.swap(i, j);
+            }
+        }
+    }
+    for (rank, &id) in ids.iter().enumerate() {
+        let prim = prims[id];
+        let projection = RefProjection::new_complex(camera, joint, rank);
+        let corner = |index: u16| {
+            object.vertices.get(usize::from(index)).and_then(|vertex| {
+                projection.project([
+                    f64::from(vertex[0]),
+                    -f64::from(vertex[1]),
+                    f64::from(vertex[2]),
+                ])
+            })
+        };
+        let (Some(first), Some(second), Some(third)) = (
+            corner(prim.vertices[0]),
+            corner(prim.vertices[1]),
+            corner(prim.vertices[2]),
+        ) else {
+            continue;
+        };
+        let [x0, y0] = first.0.map(f64::from);
+        let [x1, y1] = second.0.map(f64::from);
+        let [x2, y2] = third.0.map(f64::from);
+        // Both windings are listed, so exactly one survives the backface
+        // test unless the triangle is edge-on.
+        let area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
+        if area == 0.0 || area.is_nan() {
+            continue;
+        }
+        let order = if faces_camera(area) {
+            [0, 1, 2]
+        } else {
+            [0, 2, 1]
+        };
+        let corners = [first, second, third];
+        let page_x = f64::from(u32::from(prim.tsb & 0xF) * 128);
+        let page_y = f64::from(u32::from((prim.tsb >> 4) & 1) * 256);
+        let raster: [RasterVertex; 3] = order.map(|corner| {
+            let (position, depth) = corners[corner];
+            let uv = prim.uv[corner];
+            RasterVertex {
+                position,
+                w: depth,
+                u: (f64::from(uv[0]) + page_x) as f32,
+                v: (f64::from(uv[1]) + page_y) as f32,
+                shade: [1.0; 3],
+            }
+        });
+        let depth = f64::from(
+            ((f64::from(first.1) + f64::from(second.1) + f64::from(third.1))
+                * f64::from(1.0f32 / 3.0)) as f32,
+        );
+        triangles.push(Triangle {
+            raster,
+            depth,
+            key: triangle_depth_key(depth),
+            texture,
+            palette_row: usize::from(((prim.clut >> 6) & 0x01FF).saturating_sub(480)),
+            flat: None,
+            blend: false,
+            blend_weight: None,
+            uv_nudge: [0; 3],
         });
     }
 }
@@ -3045,6 +3314,183 @@ pub(crate) fn stored_camera_matrix(from: [i32; 3], to: [i32; 3]) -> [[i32; 3]; 3
     ]
 }
 
+/// `ApplyMatrixLV`: rotate a long vector by a 4.12 matrix with the GTE's Y
+/// negation on input and output and per-product rounding toward zero.
+fn apply_matrix_lv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
+    let source = [i64::from(v[0]), -i64::from(v[1]), i64::from(v[2])];
+    let row = |row: usize| -> i64 {
+        (0..3)
+            .map(|k| {
+                let value = i64::from(m[row][k]) * source[k];
+                (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS
+            })
+            .sum()
+    };
+    [row(0) as i32, -row(1) as i32, row(2) as i32]
+}
+
+/// The reference's float projection of one object (`FlushTmdObjects`).
+///
+/// The object's matrix is `CompMatrix(g_RoomCameraData, joint)` pushed
+/// through `SetRotAndTransMatrix` (translation Y negated), and every vertex
+/// is transformed and projected in floating point without ever rounding to
+/// whole pixels: `sx = cx + vx * (f / vz)`, `sy = cy - vy * (f / vz)`. The
+/// x87 build keeps the intermediates in extended precision, which doubles
+/// stand in for; only the stored screen position and view Z round to `f32`.
+struct RefProjection {
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    center: [f64; 2],
+    focal: f64,
+    near: f64,
+}
+
+impl RefProjection {
+    fn new(camera: &Camera, joint: &anim::Mat4x3) -> Self {
+        let (rotation, mut translation) = ref_composed(camera, joint);
+        // `SetRotAndTransMatrix` negates the translation's Y.
+        translation[1] = translation[1].wrapping_neg();
+        let focal = f64::from(camera.fov);
+        let mut rotation = rotation.map(|row| row.map(|entry| f32::from(entry) / 4096.0));
+        let mut translation = translation.map(|entry| entry as f32);
+        if let Some(tilt) = shake_tilt(camera) {
+            // `FUN_0048c730` then `FUN_0048c820`: the tilt rotates the
+            // object's rotation and translation alike.
+            rotation = std::array::from_fn(|row| {
+                std::array::from_fn(|column| {
+                    rotation[0][column] * tilt[row][0]
+                        + rotation[1][column] * tilt[row][1]
+                        + rotation[2][column] * tilt[row][2]
+                })
+            });
+            translation = std::array::from_fn(|row| {
+                tilt[row][0] * translation[0]
+                    + tilt[row][1] * translation[1]
+                    + tilt[row][2] * translation[2]
+            });
+        }
+        Self {
+            rotation: rotation.map(|row| row.map(f64::from)),
+            translation: translation.map(f64::from),
+            center: [
+                f64::from(CENTER_X + camera.screen[0]),
+                f64::from(CENTER_Y + camera.screen[1]),
+            ],
+            focal,
+            near: (2.0 * focal).max(1.0),
+        }
+    }
+
+    /// The complex pool's projection ([`collect_complex_pool`]): the raw GTE
+    /// matrix with no shake tilt and the view Z pushed back by `rank` (the
+    /// original's `M[14] = (float)i + (float)t[2]`).
+    fn new_complex(camera: &Camera, joint: &anim::Mat4x3, rank: usize) -> Self {
+        let (rotation, mut translation) = ref_composed(camera, joint);
+        translation[1] = translation[1].wrapping_neg();
+        let focal = f64::from(camera.fov);
+        let rotation = rotation.map(|row| row.map(|entry| f32::from(entry) / 4096.0));
+        let translation = [
+            translation[0] as f32,
+            translation[1] as f32,
+            rank as f32 + translation[2] as f32,
+        ];
+        Self {
+            rotation: rotation.map(|row| row.map(f64::from)),
+            translation: translation.map(f64::from),
+            center: [
+                f64::from(CENTER_X + camera.screen[0]),
+                f64::from(CENTER_Y + camera.screen[1]),
+            ],
+            focal,
+            near: (2.0 * focal).max(1.0),
+        }
+    }
+
+    /// Project one vertex-buffer position (`x, -y, z`, or the raw Y form):
+    /// the screen position and view Z, or `None` inside the near plane.
+    fn project(&self, vertex: [f64; 3]) -> Option<([f32; 2], f32)> {
+        let [vx, vy, vz] = std::array::from_fn(|row| {
+            let m = self.rotation[row];
+            m[0] * vertex[0] + m[1] * vertex[1] + m[2] * vertex[2] + self.translation[row]
+        });
+        if vz.is_nan() || vz < self.near {
+            return None;
+        }
+        let iz = self.focal / vz;
+        Some((
+            [
+                (self.center[0] + vx * iz) as f32,
+                (self.center[1] - vy * iz) as f32,
+            ],
+            vz as f32,
+        ))
+    }
+}
+
+/// `FUN_00486190`'s view rotation while the screen is shaken: the look-at from
+/// `(0, 0, -f)` towards `(-shake_x, shake_y, 0)` (`FUN_0048cc50`), which the
+/// reference folds into every TMD object's matrix on top of the shifted
+/// projection centre. At rest it is the identity and is skipped.
+fn shake_tilt(camera: &Camera) -> Option<[[f32; 3]; 3]> {
+    if camera.screen == [0, 0] {
+        return None;
+    }
+    let dx = -camera.screen[0] as f32;
+    let dy = camera.screen[1] as f32;
+    let dz = camera.fov as f32;
+    let mut length = (dx * dx + dy * dy + dz * dz).sqrt();
+    if length == 0.0 {
+        length = 1.0;
+    }
+    let inverse = 1.0 / length;
+    let ny = -(dy * inverse);
+    let horizontal = (1.0 - ny * ny).sqrt();
+    let (nx, nz) = if horizontal == 0.0 {
+        (0.0, 1.0)
+    } else {
+        (-((dx * inverse) / horizontal), (dz * inverse) / horizontal)
+    };
+    Some([
+        [nz, 0.0, nx],
+        [-(nx * ny), horizontal, nz * ny],
+        [-(nx * horizontal), -ny, nz * horizontal],
+    ])
+}
+
+/// `g_RoomCameraData`: the stored camera rotation and translation.
+pub(crate) fn ref_camera(camera: &Camera) -> ([[i32; 3]; 3], [i32; 3]) {
+    let mut view = stored_camera_matrix(camera.from, camera.look_at);
+    let mut view_t = apply_matrix_lv(&view, camera.from.map(i32::wrapping_neg));
+    if camera.mirrored {
+        // `entity_draw_mirror_reflection` composes a negated-X identity
+        // into the reflected camera, rotation and translation alike.
+        view[0] = view[0].map(|entry| -entry);
+        view_t[0] = -view_t[0];
+    }
+    (view, view_t)
+}
+
+/// `CompMatrix(g_RoomCameraData, joint)`: the camera composed onto `joint`,
+/// as the 4.12 short rotation and the integer translation.
+fn ref_composed(camera: &Camera, joint: &anim::Mat4x3) -> ([[i16; 3]; 3], [i32; 3]) {
+    let (view, view_t) = ref_camera(camera);
+    // `MulMatrix0` stores shorts.
+    let rotation = mul_matrix0(&view, &joint.r).map(|row| row.map(|entry| entry as i16));
+    let moved = apply_matrix_lv(&view, joint.t);
+    let translation = std::array::from_fn(|axis| moved[axis].wrapping_add(view_t[axis]));
+    (rotation, translation)
+}
+
+/// A projected corner: screen position and view Z.
+type Projected = ([f32; 2], f32);
+
+/// `TmdDepthNdc`: view Z on the linear `[0, 1]` depth-buffer ramp.
+fn depth_ndc(view_z: f32) -> f32 {
+    const NEAR: f32 = 1.0;
+    const FAR: f32 = 131_072.0;
+    ((view_z - NEAR) * (1.0 / (FAR - NEAR))).clamp(0.0, 1.0)
+}
+
 /// `MulMatrix0`: `m2 = m0 * m1` over 4.12 matrices with the reference's
 /// per-product rounding.
 pub(crate) fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3] {
@@ -3061,55 +3507,51 @@ pub(crate) fn mul_matrix0(a: &[[i32; 3]; 3], b: &[[i32; 3]; 3]) -> [[i32; 3]; 3]
 }
 
 /// `ApplyMatrixSV`: the PS1 GTE convention, Y negated on input and output,
-/// 4.12 in and out with the reference's rounding.
+/// 4.12 in and out. Unlike `MulMatrix0` and `ApplyMatrixLV`, which round each
+/// product, it sums the three products and rounds the sum toward zero once.
 pub(crate) fn apply_matrix_sv(m: &[[i32; 3]; 3], v: [i32; 3]) -> [i32; 3] {
     let source = [v[0], -v[1], v[2]];
     let mut out = [0i32; 3];
     for row in 0..3 {
-        let mut sum = 0i64;
-        for k in 0..3 {
-            let value = i64::from(m[row][k]) * i64::from(source[k]);
-            sum += (value + ((value >> 63) & 0xFFF)) >> FIXED_BITS;
-        }
-        out[row] = sum as i32;
+        let sum: i64 = (0..3)
+            .map(|k| i64::from(m[row][k]) * i64::from(source[k]))
+            .sum();
+        out[row] = ((sum + ((sum >> 63) & 0xFFF)) >> FIXED_BITS) as i32;
     }
     [out[0], -out[1], out[2]]
 }
 
 /// The reference's `TmdComputeLight` (TmdRenderer.cpp) for one vertex.
 ///
-/// `camera` is `g_RoomCameraData`; `rot` is the object's or joint's 4.12 world
-/// matrix; `normal` is the raw TMD normal. Room objects multiply the stored
-/// light row by the object's rotation before the camera transform
+/// `camera` is `g_RoomCameraData`; `matrix` is the object's float draw matrix
+/// ([`RefProjection`]'s rotation: `camera * rot` as 4.12 shorts, turned by the
+/// shake tilt when the screen is shaken); `normal` is the raw TMD normal. Room objects multiply
+/// the stored light row by the object's rotation before the camera transform
 /// (`RoomObjectRender`), the item viewer by the camera itself
 /// (`MulMatrix0(&g_lightMatrix, &g_RoomCameraData)`), both through
 /// `light_rot`; entities use the stored row as-is. Every path then
 /// rotate the normal (Y-negated and scaled like the vertex buffer's
-/// `PSXObjVtx`) by `camera * rot`, negate the transformed light direction, and
-/// accumulate `max(0, -(n_view . l)) * colour` over the ambient. The scale of
-/// the dot is 4.12 (the light vectors) against unit (the normal).
+/// `PSXObjVtx`) by the draw matrix, negate the transformed light direction,
+/// and accumulate `max(0, -(n_view . l)) * colour` over the ambient. The light
+/// rows never see the shake tilt. The scale of the dot is 4.12 (the light
+/// vectors) against unit (the normal).
 pub(crate) fn reference_vertex_shade(
     camera: &[[i32; 3]; 3],
-    rot: &[[i32; 3]; 3],
+    matrix: &[[f32; 3]; 3],
     normal: [i16; 3],
     light: &EntityLight,
     light_rot: Option<&[[i32; 3]; 3]>,
 ) -> [f64; 3] {
     // The reference accumulates in 32-bit floats (`TmdComputeLight`), so the
     // port matches its rounding exactly rather than using doubles.
-    let normal = [normal[0] as f32, -(normal[1] as f32), normal[2] as f32];
-    let mut n_view = [0.0f32; 3];
-    for row in 0..3 {
-        let mut sum = 0.0f32;
-        for k in 0..3 {
-            let mut inner = 0.0f32;
-            for j in 0..3 {
-                inner += camera[row][j] as f32 * rot[j][k] as f32;
-            }
-            sum += inner * normal[k];
-        }
-        n_view[row] = sum / (4096.0 * 4096.0 * 4096.0);
-    }
+    let normal = [
+        f32::from(normal[0]) / 4096.0,
+        -f32::from(normal[1]) / 4096.0,
+        f32::from(normal[2]) / 4096.0,
+    ];
+    let n_view: [f32; 3] = std::array::from_fn(|row| {
+        matrix[row][0] * normal[0] + matrix[row][1] * normal[1] + matrix[row][2] * normal[2]
+    });
     let mut shade = light.ambient.map(|value| value as f32);
     for source in &light.sources {
         let vec = match light_rot {
@@ -3145,6 +3587,15 @@ fn collect_ivm_triangles(
     triangles: &mut Vec<Triangle>,
 ) {
     let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
+    // The viewer's normal transform: `camera * rot` in floats, unrounded.
+    let draw_matrix: [[f32; 3]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            (0..3)
+                .map(|k| stored_camera[row][k] as f32 * joint.r[k][column] as f32)
+                .sum::<f32>()
+                / (4096.0 * 4096.0)
+        })
+    });
     let vertices: Vec<[i32; 3]> = object
         .vertices
         .iter()
@@ -3239,7 +3690,7 @@ fn collect_ivm_triangles(
                         let mut shade = match normal {
                             Some(normal) => reference_vertex_shade(
                                 &stored_camera,
-                                &joint.r,
+                                &draw_matrix,
                                 normal,
                                 light,
                                 Some(&stored_camera),
@@ -3254,11 +3705,11 @@ fn collect_ivm_triangles(
                     None => colour,
                 };
                 RasterVertex {
-                    position,
-                    inv_z: 1.0 / depth,
-                    u: f64::from(prim.uv[index][0]),
-                    v: f64::from(prim.uv[index][1]),
-                    shade,
+                    position: position.map(|axis| axis as f32),
+                    w: depth as f32,
+                    u: f32::from(prim.uv[index][0]),
+                    v: f32::from(prim.uv[index][1]),
+                    shade: shade.map(|channel| (channel / CHANNEL_MAX) as f32),
                 }
             });
 
@@ -3269,10 +3720,10 @@ fn collect_ivm_triangles(
                 key: triangle_depth_key(depth),
                 texture: 0,
                 palette_row: 0,
-                cull: true,
                 flat,
                 blend: prim.blend,
                 blend_weight: None,
+                uv_nudge: [0; 3],
             });
         }
     }
@@ -3299,25 +3750,6 @@ fn fixed_mul(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
     })
 }
 
-/// [`fixed_mul`] for a `0x25010607` raw-Y packet: the PSX vertex reader for
-/// that form does not negate the stored Y, so neither does this.
-fn fixed_mul_raw_y(joint: &anim::Mat4x3, vertex: [i16; 3]) -> [i32; 3] {
-    let v = [
-        i128::from(vertex[0]),
-        i128::from(vertex[1]),
-        i128::from(vertex[2]),
-    ];
-    std::array::from_fn(|row| {
-        let r = joint.r[row];
-        let sum = i128::from(r[0]) * v[0] + i128::from(r[1]) * v[1] + i128::from(r[2]) * v[2];
-        let mut scaled = (sum + ((sum >> 127) & i128::from(0xFFF))) >> FIXED_BITS;
-        if row == 1 {
-            scaled = -scaled;
-        }
-        clamp_i32(scaled + i128::from(joint.t[row]))
-    })
-}
-
 /// Clamp an intermediate to the `i32` range.
 fn clamp_i32(value: i128) -> i32 {
     value.clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
@@ -3331,38 +3763,73 @@ fn faces_camera(area: f64) -> bool {
     area > 0.0
 }
 
-/// Whether a boundary sample on the directed edge `from -> to` belongs to the
-/// triangle under the top-left fill rule.
-///
-/// `positive` is the winding of the triangle's screen-space area. Two
-/// triangles sharing an edge see it in opposite directions, so exactly one of
-/// them keeps the samples lying on it.
-fn top_left(from: [f64; 2], to: [f64; 2], positive: bool) -> bool {
-    let dx = to[0] - from[0];
-    let dy = to[1] - from[1];
-    if positive {
-        dy < 0.0 || (dy == 0.0 && dx > 0.0)
-    } else {
-        dy > 0.0 || (dy == 0.0 && dx < 0.0)
-    }
+/// GL_NEAREST under CLAMP_TO_EDGE: the texel under a normalised coordinate.
+fn clamp_texel(coordinate: f32, size: u32) -> usize {
+    ((coordinate * size as f32).floor().max(0.0) as usize).min(size as usize - 1)
 }
 
-/// Wrap a texture coordinate around one dimension.
-fn wrap_texel(coordinate: f64, size: u32) -> Option<u32> {
-    if size == 0 {
-        return None;
-    }
-    Some(coordinate.rem_euclid(f64::from(size)) as u32)
+/// llvmpipe's float to unorm8 conversion: clamp, scale by 255 and round to
+/// nearest even.
+fn unorm8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8
 }
 
-/// Multiply a texture channel by a 0..255 shade.
+/// llvmpipe's AoS bilinear fetch of an RGBA8 clamp-to-edge texture.
 ///
-/// The reference multiplies through the GL pipeline in normalized floats, so
-/// the result rounds to nearest rather than truncating.
-fn channel(texel: u8, shade: f64) -> u8 {
-    (f32::from(texel) * shade as f32 / 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8
+/// Each coordinate becomes 8.8 fixed point centred on the texels,
+/// `round(c * size * 256) - 128`; the integer part picks the two clamped
+/// neighbours and the low byte weights them. The lerps run in 16-bit lanes
+/// with llvmpipe's rounding (`lp_build_lerp` on normalised 8-bit values).
+fn sample_bilinear(texture: &Image, u: f32, v: f32) -> [u8; 4] {
+    let axis = |coordinate: f32, size: u32| {
+        let scaled = (coordinate * (size as f32 * 256.0)).round_ties_even();
+        let fixed = scaled.clamp(-(1 << 24) as f32, (1 << 24) as f32) as i32 - 128;
+        let whole = fixed >> 8;
+        let last = size as i32 - 1;
+        (
+            whole.clamp(0, last) as usize,
+            (whole + 1).clamp(0, last) as usize,
+            (fixed & 0xFF) as u16,
+        )
+    };
+    let (x0, x1, fx) = axis(u, texture.width);
+    let (y0, y1, fy) = axis(v, texture.height);
+    let width = texture.width as usize;
+    let fetch = |x: usize, y: usize, channel: usize| {
+        texture
+            .rgba
+            .get((y * width + x) * 4 + channel)
+            .copied()
+            .unwrap_or(0)
+    };
+    std::array::from_fn(|channel| {
+        let top = lerp_unorm8(fx, fetch(x0, y0, channel), fetch(x1, y0, channel));
+        let bottom = lerp_unorm8(fx, fetch(x0, y1, channel), fetch(x1, y1, channel));
+        lerp_unorm8(fy, top, bottom)
+    })
+}
+
+/// `lp_build_lerp` for normalised 8-bit values in 16-bit lanes: the weight
+/// times the wrapped difference, rounded by `0x7F` plus the product's bit 8,
+/// shifted down and added back modulo 256.
+fn lerp_unorm8(weight: u16, from: u8, to: u8) -> u8 {
+    let delta = u16::from(to).wrapping_sub(u16::from(from));
+    let mut product = weight.wrapping_mul(delta);
+    product = product.wrapping_add(0x7F + ((product & 0x100) >> 8));
+    u16::from(from).wrapping_add(product >> 8) as u8
+}
+
+/// llvmpipe's 8-bit normalised multiply, `round(a * b / 255)` (the
+/// `lp_build_mul_norm` double-blend trick).
+fn mul_unorm8(a: u8, b: u8) -> u32 {
+    let product = u32::from(a) * u32::from(b) + 128;
+    (product + (product >> 8)) >> 8
+}
+
+/// The reference's `GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA` blend as llvmpipe
+/// runs it on an RGBA8 target: both terms in unorm8, added with saturation.
+fn blend_unorm8(source: u8, destination: u8, alpha: u8) -> u8 {
+    (mul_unorm8(source, alpha) + mul_unorm8(destination, 255 - alpha)).min(255) as u8
 }
 
 #[cfg(test)]
@@ -3408,7 +3875,8 @@ mod tests {
             roll: 0,
             screen: [0, 0],
             from: [0, 0, 0],
-            look_at: [100, 0, 0],
+            look_at: [0, 0, 100],
+            mirrored: false,
         }
     }
 
@@ -3425,7 +3893,7 @@ mod tests {
 
     /// The standard screen-facing triangle, its plane at view-space Z `z`.
     fn mesh_at(z: i16, reversed: bool) -> Tmd {
-        let mut vertices = vec![[0i16, 0, z], [0, 1000, z], [1000, 0, z]];
+        let mut vertices = vec![[0i16, 0, z], [0, -1000, z], [1000, 0, z]];
         if reversed {
             vertices.swap(1, 2);
         }
@@ -3444,6 +3912,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: None,
+                    uv_nudge: [0; 3],
                 }],
             }],
         }
@@ -3498,7 +3967,7 @@ mod tests {
     #[test]
     fn synthetic_triangle_render_matches_golden_hash() {
         let framebuffer = render_triangle(false);
-        assert_eq!(fnv1a(&framebuffer.rgba), 12_035_862_220_174_893_125);
+        assert_eq!(fnv1a(&framebuffer.rgba), 9_570_522_492_068_598_149);
     }
 
     #[test]
@@ -3648,6 +4117,14 @@ mod tests {
     }
 
     #[test]
+    fn apply_matrix_sv_rounds_the_summed_products_once() {
+        // Each half-unit product truncates to zero on its own; their sum is a
+        // whole unit. Y is negated on the way in and out.
+        let m = [[1, 1, 0], [0, 1, 1], [-1, 0, -1]];
+        assert_eq!(apply_matrix_sv(&m, [2048, -2048, 2048]), [1, -1, -1]);
+    }
+
+    #[test]
     fn lighting_copies_the_room_state() {
         let room = RoomState {
             ambient: [1, 2, 3],
@@ -3722,16 +4199,6 @@ mod tests {
         // negated again before the translation is added, so the pitched joint
         // maps +Z to -Y (a plain product would map it to +Y).
         assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
-
-        // The raw-Y form reads the stored Y as-is; for the same pitched joint
-        // a positive Y maps to -Z through the first row of the rotation.
-        assert_eq!(fixed_mul_raw_y(&joint, [0, 100, 0]), [10, 20, -69]);
-        // Zero Y is unaffected, so both forms agree on the rotation plane.
-        assert_eq!(fixed_mul(&joint, [0, 0, 100]), [10, -79, 30]);
-        assert_eq!(
-            fixed_mul_raw_y(&joint, [0, 0, 100]),
-            fixed_mul(&joint, [0, 0, 100])
-        );
     }
 
     #[test]
@@ -3809,7 +4276,7 @@ mod tests {
         SceneItem::Triangle(Triangle {
             raster: std::array::from_fn(|_| RasterVertex {
                 position: [0.0; 2],
-                inv_z: 1.0,
+                w: 1.0,
                 u: 0.0,
                 v: 0.0,
                 shade: [0.0; 3],
@@ -3818,11 +4285,18 @@ mod tests {
             key,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: false,
             blend_weight: None,
+            uv_nudge: [0; 3],
         })
+    }
+
+    /// Draw one triangle against a freshly cleared depth buffer.
+    fn rasterize_alone(framebuffer: &mut Framebuffer, texture: &Texture8, triangle: &Triangle) {
+        let mut depth = framebuffer.depth_buffer();
+        let twin = texture.has_knockout_twin(triangle.palette_row);
+        framebuffer.rasterize(texture, triangle, twin, &mut depth);
     }
 
     fn framebuffer_pixel(framebuffer: &Framebuffer, x: usize, y: usize) -> [u8; 4] {
@@ -3861,6 +4335,12 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
+                light_rotation: None,
+                joint_colours: NO_JOINT_COLOURS,
             },
             EntityMesh {
                 mesh: &mesh1,
@@ -3869,6 +4349,12 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
+                light_rotation: None,
+                joint_colours: NO_JOINT_COLOURS,
             },
         ];
         let lighting = Lighting {
@@ -3940,6 +4426,12 @@ mod tests {
                 tint: [255; 3],
                 blend_weight: None,
                 hidden_joints: 0,
+                light_pos: None,
+                per_joint_light: false,
+                complex_object: None,
+                aliased_light: false,
+                light_rotation: None,
+                joint_colours: NO_JOINT_COLOURS,
             }
         }
         let lighting = Lighting {
@@ -3984,24 +4476,43 @@ mod tests {
     }
 
     #[test]
-    fn screen_shake_shifts_shadows_and_masks() {
+    fn screen_shake_tilts_the_object_matrix() {
+        let mut camera = straight_camera();
+        camera.fov = 207;
+        assert_eq!(shake_tilt(&camera), None);
+        // Offset (161, 121) with f = 207, as `FUN_0048cc50` builds it.
+        camera.screen = [1, 1];
+        let tilt = shake_tilt(&camera).expect("a shaken screen tilts");
+        let expected = [
+            [0.999_988, 0.0, 0.004_830_86],
+            [0.000_023_337, 0.999_988, -0.004_830_75],
+            [-0.004_830_81, 0.004_830_81, 0.999_977],
+        ];
+        for (row, expected) in tilt.iter().zip(&expected) {
+            for (&value, &expected) in row.iter().zip(expected) {
+                assert!((value - expected).abs() < 1e-6, "{tilt:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn screen_shake_shifts_masks_but_not_shadows() {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
         let mut plain = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut plain);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut plain);
         let mut camera = straight_camera();
         camera.screen = [4, -3];
         let mut shaken = Vec::new();
-        collect_shadow(&shadow, &camera, &mut shaken);
+        collect_shadow(&shadow, 0, &camera, &mut shaken);
         let [SceneItem::Shadow(plain)] = &plain[..] else {
             panic!("expected one plain shadow");
         };
         let [SceneItem::Shadow(shifted)] = &shaken[..] else {
             panic!("expected one shaken shadow");
         };
-        for (plain, shifted) in plain.corners.iter().zip(&shifted.corners) {
-            assert_eq!(shifted.position[0], plain.position[0] + 4.0);
-            assert_eq!(shifted.position[1], plain.position[1] - 3.0);
+        for (plain, shifted) in shadow_corners(plain).iter().zip(&shadow_corners(shifted)) {
+            assert_eq!((shifted.x, shifted.y), (plain.x, plain.y));
         }
 
         let cut = Cut {
@@ -4133,6 +4644,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let lighting = Lighting {
             ambient: [4095; 3],
@@ -4494,43 +5011,42 @@ mod tests {
         }
     }
 
+    /// The ring corners of a single-command shadow: the fan (0,1,2) + (0,2,3).
+    fn shadow_corners(poly: &ShadowPoly) -> Vec<crate::raster::GlVertex> {
+        assert_eq!(poly.triangles.len(), 2);
+        let [first, second] = [poly.triangles[0], poly.triangles[1]];
+        assert_eq!(first[0], second[0]);
+        assert_eq!(first[2], second[1]);
+        vec![first[0], first[1], first[2], second[2]]
+    }
+
     #[test]
     fn shadow_projection_keeps_the_quad_edge_order_and_uvs() {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
-        // Half the depth keeps every corner in front of the near plane
-        // (z = 2 * fov = 400).
         let shadow = shadow_at([0, 0, 1000], 500, 300, &texture);
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
 
         let [SceneItem::Shadow(poly)] = &items[..] else {
             panic!("expected one shadow item, got {}", items.len());
         };
         assert_eq!(poly.key, 1000);
-        assert_eq!(poly.corners.len(), 4);
         // Edge order 0->1->3->2, so the corners come out
         // (-x,+z) (+x,+z) (+x,-z) (-x,-z) with v running towards local -Z.
         // The near edge is wider than the far edge and every corner sits on
-        // the horizon line of the unpitched camera.
+        // the horizon line of the unpitched camera, at truncated integer
+        // screen positions.
+        let corners = shadow_corners(poly);
         let expected = [
-            (83.07692307692308, 0.0, 0.0),
-            (236.92307692307693, 1.0, 0.0),
-            (302.85714285714283, 1.0, 1.0),
-            (17.142857142857142, 0.0, 1.0),
+            (84.0, 0.0, 0.0),
+            (236.0, 1.0, 0.0),
+            (302.0, 1.0, 1.0),
+            (18.0, 0.0, 1.0),
         ];
-        for (corner, (x, u, v)) in poly.corners.iter().zip(expected) {
-            assert!(
-                (corner.position[0] - x).abs() < 1.0,
-                "x {} != {x}",
-                corner.position[0]
-            );
-            assert!((corner.position[1] - 120.0).abs() < 1e-9);
-            assert!((corner.u - u).abs() < 1e-9, "u {} != {u}", corner.u);
-            assert!((corner.v - v).abs() < 1e-9, "v {} != {v}", corner.v);
+        for (corner, (x, u, v)) in corners.iter().zip(expected) {
+            assert_eq!((corner.x, corner.y, corner.u, corner.v), (x, 120.0, u, v));
+            assert_eq!(corner.color, [0.0, 0.0, 1.0 / 255.0, 1.0]);
         }
-        let far_width = poly.corners[1].position[0] - poly.corners[0].position[0];
-        let near_width = poly.corners[2].position[0] - poly.corners[3].position[0];
-        assert!(near_width > far_width, "{near_width} <= {far_width}");
     }
 
     #[test]
@@ -4538,13 +5054,14 @@ mod tests {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 1000], 500, 700, &texture);
         let mut unlifted = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut unlifted);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut unlifted);
         let mut lifted = Vec::new();
         collect_shadow(
             &Shadow {
                 lift: 100,
                 ..shadow
             },
+            0,
             &straight_camera(),
             &mut lifted,
         );
@@ -4553,12 +5070,12 @@ mod tests {
         else {
             panic!("expected shadow items");
         };
-        // A positive placement lift drops the quad down the screen:
-        // screen y = 120 - (view_y - lift) * f / z.
-        let expected = base.corners[0].position[1]
-            + 100.0 * f64::from(straight_camera().fov) * base.corners[0].inv_z;
-        assert!((raised.corners[0].position[1] - expected).abs() < 1e-9);
-        assert!(raised.corners[0].position[1] > base.corners[0].position[1]);
+        // A positive placement lift drops the quad down the screen by
+        // lift * f / z: 100 * 200 / 1699 at the far corner (the yaw matrix's
+        // 4095 diagonal truncates 700 to 699).
+        let (base, raised) = (shadow_corners(base)[0], shadow_corners(raised)[0]);
+        assert_eq!(base.w, 1699.0);
+        assert_eq!(raised.y - base.y, 11.0);
     }
 
     #[test]
@@ -4566,22 +5083,19 @@ mod tests {
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         let shadow = shadow_at([0, 0, 0], 500, 700, &texture);
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
 
         let [SceneItem::Shadow(poly)] = &items[..] else {
             panic!("expected one shadow item, got {}", items.len());
         };
-        // Corners 1 and 3 are behind the near plane (z = 2 * fov = 400); each
-        // clipped edge contributes one vertex on the plane.
-        assert_eq!(poly.corners.len(), 4);
-        for corner in &poly.corners {
-            assert!(corner.inv_z > 0.0);
-        }
-        // The clipped vertices land on the plane at screen x = 160 +/- 250.
-        assert!((poly.corners[2].position[0] - 410.0).abs() < 1.0);
-        assert!((poly.corners[2].inv_z - 1.0 / 400.0).abs() < 1e-9);
-        assert!((poly.corners[3].position[0] + 90.0).abs() < 1.0);
-        assert!((poly.corners[3].inv_z - 1.0 / 400.0).abs() < 1e-9);
+        // Corners 2 and 3 are behind the near plane (view z 128); each
+        // clipped edge contributes one vertex on the plane, at screen
+        // x = 160 +/- 499 * 200 / 128 and v = (699 - 128) / 1398, all
+        // truncated.
+        let corners = shadow_corners(poly);
+        assert_eq!([corners[2].x, corners[2].w], [939.0, 128.0]);
+        assert_eq!([corners[3].x, corners[3].w], [-619.0, 128.0]);
+        assert_eq!(corners[2].v, 1672.0 / 4096.0);
     }
 
     #[test]
@@ -4590,6 +5104,7 @@ mod tests {
         let mut items = Vec::new();
         collect_shadow(
             &shadow_at([0, 0, -5000], 500, 700, &texture),
+            0,
             &straight_camera(),
             &mut items,
         );
@@ -4602,6 +5117,7 @@ mod tests {
         };
         collect_shadow(
             &shadow_at([0, 0, 1000], 500, 700, &empty),
+            0,
             &straight_camera(),
             &mut items,
         );
@@ -4610,37 +5126,31 @@ mod tests {
 
     /// A shadow polygon covering screen (10,10)..(20,20), sampling `texture`.
     fn shadow_poly(texture: &Image) -> ShadowPoly<'_> {
+        let corner = |x: f32, y: f32, u: f32, v: f32| crate::raster::GlVertex {
+            x,
+            y,
+            depth: depth_ndc(1000.0),
+            w: 1000.0,
+            u,
+            v,
+            color: [0.0, 0.0, 1.0 / 255.0, 1.0],
+        };
+        let quad = [
+            corner(10.0, 10.0, 0.0, 0.0),
+            corner(20.0, 10.0, 1.0, 0.0),
+            corner(20.0, 20.0, 1.0, 1.0),
+            corner(10.0, 20.0, 0.0, 1.0),
+        ];
         ShadowPoly {
             key: 1000,
-            corners: vec![
-                ShadowVertex {
-                    position: [10.0, 10.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 0.0,
-                    v: 0.0,
-                },
-                ShadowVertex {
-                    position: [20.0, 10.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 1.0,
-                    v: 0.0,
-                },
-                ShadowVertex {
-                    position: [20.0, 20.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 1.0,
-                    v: 1.0,
-                },
-                ShadowVertex {
-                    position: [10.0, 20.0],
-                    inv_z: 1.0 / 1000.0,
-                    u: 0.0,
-                    v: 1.0,
-                },
-            ],
+            triangles: vec![[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]],
             texture,
-            tint: [0, 0, 1],
         }
+    }
+
+    fn draw_shadow(framebuffer: &mut Framebuffer, poly: &ShadowPoly) {
+        let depth = framebuffer.depth_buffer();
+        framebuffer.rasterize_shadow(poly, &depth);
     }
 
     #[test]
@@ -4649,11 +5159,11 @@ mod tests {
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
-        // 200 * 127 / 255 + 1 * 128 / 255 rounds to 100 on every channel.
+        draw_shadow(&mut framebuffer, &poly);
+        // 200 * 127 / 255 rounds to 100; the tint's 1/255 blue adds one.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 15, 15),
-            [100, 100, 100, 255]
+            [100, 100, 101, 255]
         );
         assert_eq!(framebuffer_pixel(&framebuffer, 5, 5), [200, 200, 200, 255]);
 
@@ -4662,7 +5172,7 @@ mod tests {
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
+        draw_shadow(&mut framebuffer, &poly);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 15, 15),
             [200, 200, 200, 255]
@@ -4671,45 +5181,56 @@ mod tests {
 
     #[test]
     fn shadow_seam_blends_once_for_both_windings() {
-        // The fan's shared diagonal passes through (15, 15); a camera on the
-        // other side of the quad reverses the ring and must not double-blend
-        // the seam either.
+        // The fan's shared diagonal passes through (15, 15); the reversed
+        // winding must not double-blend the seam either.
         let texture = solid_image(1, 1, [255, 255, 255, 128]);
         for reversed in [false, true] {
             let mut poly = shadow_poly(&texture);
             if reversed {
-                poly.corners.reverse();
+                for triangle in &mut poly.triangles {
+                    triangle.reverse();
+                }
             }
             let mut framebuffer = Framebuffer::new();
             framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-            framebuffer.rasterize_shadow(&texture, &poly);
+            draw_shadow(&mut framebuffer, &poly);
             assert_eq!(
                 framebuffer_pixel(&framebuffer, 15, 15),
-                [100, 100, 100, 255],
+                [100, 100, 101, 255],
                 "reversed {reversed}"
             );
         }
     }
 
     #[test]
-    fn shadow_samples_the_page_at_its_texel_size() {
+    fn shadow_samples_the_page_bilinearly_with_clamped_edges() {
         // A 2x1 page: the left texel is transparent, the right one darkens.
-        // The quad's normalized u must scale by the page width, so each half
-        // of the quad samples its own texel.
+        // Near either edge both bilinear taps clamp onto the same texel; the
+        // middle column weights the two halves.
         let mut texture = solid_image(2, 1, [255, 255, 255, 128]);
         texture.rgba[3] = 0;
         let poly = shadow_poly(&texture);
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [200, 200, 200, 255]));
-        framebuffer.rasterize_shadow(&texture, &poly);
+        draw_shadow(&mut framebuffer, &poly);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 15),
             [200, 200, 200, 255]
         );
         assert_eq!(
             framebuffer_pixel(&framebuffer, 18, 15),
-            [100, 100, 100, 255]
+            [100, 100, 101, 255]
         );
+        let middle = framebuffer_pixel(&framebuffer, 15, 15);
+        assert!(middle[0] > 100 && middle[0] < 200, "{middle:?}");
+    }
+
+    #[test]
+    fn bilinear_lerp_matches_llvmpipe_rounding() {
+        assert_eq!(lerp_unorm8(0, 10, 200), 10);
+        assert_eq!(lerp_unorm8(128, 0, 255), 128);
+        assert_eq!(lerp_unorm8(128, 255, 0), 127);
+        assert_eq!(lerp_unorm8(255, 0, 255), 254);
     }
 
     #[test]
@@ -4728,7 +5249,7 @@ mod tests {
         let shadow = shadow_at([0, 0, 1024], 500, 300, &texture);
 
         let mut items = Vec::new();
-        collect_shadow(&shadow, &straight_camera(), &mut items);
+        collect_shadow(&shadow, 0, &straight_camera(), &mut items);
         collect_masks(&layer, [0, 0], &mut items);
         mask::order_far_to_near(&mut items, SceneItem::key);
         assert!(matches!(items[0], SceneItem::Shadow(_)));
@@ -4783,7 +5304,7 @@ mod tests {
         assert!(changed > 1000, "the shadow only repainted {changed} pixels");
         let center = camera.project([0, 0, 1000]).unwrap();
         let pixel = framebuffer_pixel(&with, center[0] as usize, center[1] as usize);
-        assert_eq!(pixel, [100, 100, 100, 255]);
+        assert_eq!(pixel, [100, 100, 101, 255]);
     }
     fn effect_image(pixels: &[[u8; 4]]) -> Image {
         Image {
@@ -4809,6 +5330,7 @@ mod tests {
             size,
             tint,
             blend,
+            sheet: [0, 256],
         }
     }
 
@@ -4921,6 +5443,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let camera = straight_camera();
         let lighting = Lighting {
@@ -5027,6 +5555,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0b1,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5056,6 +5590,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5114,6 +5654,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
 
         let render = |mirror_from: usize, mirror: Option<&MirrorPass>| {
@@ -5159,6 +5705,12 @@ mod tests {
             tint: [128, 128, 128],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
         draw_gameplay_scene(
@@ -5173,6 +5725,48 @@ mod tests {
         // (200, 40) lies inside mesh_at's screen triangle.
         let pixel = framebuffer_pixel(&framebuffer, 200, 40);
         assert!(pixel[0] > 100 && pixel[0] < 160, "{pixel:?}");
+    }
+
+    #[test]
+    fn a_joint_colour_draws_the_joint_unlit_in_that_colour() {
+        // Zero light would paint black; the 0x30 red joint colour (0.375)
+        // replaces the lighting outright.
+        let texture = solid_texture([255, 255, 255, 255]);
+        let mesh = mesh_at(1000, false);
+        let joints = [identity()];
+        let lighting = Lighting {
+            ambient: [0; 3],
+            lights: [Light::default(); 3],
+        };
+        let mut joint_colours = NO_JOINT_COLOURS;
+        joint_colours[0] = [0x30, 0, 0];
+        let tinted = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            blend_weight: None,
+            hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours,
+        }];
+        let mut framebuffer = Framebuffer::new();
+        draw_gameplay_scene(
+            &mut framebuffer,
+            None,
+            &tinted,
+            &[],
+            &straight_camera(),
+            &lighting,
+            None,
+        );
+        let pixel = framebuffer_pixel(&framebuffer, 200, 40);
+        assert!((94..=97).contains(&pixel[0]), "{pixel:?}");
+        assert_eq!(&pixel[1..3], &[0, 0], "{pixel:?}");
     }
 
     #[test]
@@ -5197,13 +5791,14 @@ mod tests {
             0,
             [255; 3],
             None,
+            None,
             false,
             &mut triangles,
         );
         assert_eq!(triangles.len(), 1);
         assert!(triangles[0].blend, "the ABE bit must set the blend flag");
         assert_eq!(
-            triangles[0].raster[0].shade, [CHANNEL_MAX; 3],
+            triangles[0].raster[0].shade, [1.0; 3],
             "a blended packet is full-bright"
         );
 
@@ -5218,6 +5813,7 @@ mod tests {
             true,
             0,
             [255; 3],
+            None,
             None,
             false,
             &mut triangles,
@@ -5240,10 +5836,10 @@ mod tests {
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
         framebuffer.draw_model(&mesh, &texture, &joints, &straight_camera(), &lighting);
-        // (255 + 100) / 2 truncates to 177 where the triangle covers.
+        // llvmpipe's unorm8 blend at alpha 128: 128 + 50 = 178.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 200, 100),
-            [177, 177, 177, 255]
+            [178, 178, 178, 255]
         );
         // Untouched grey outside it.
         assert_eq!(
@@ -5254,62 +5850,71 @@ mod tests {
 
     #[test]
     fn per_texel_stp_selects_which_texels_blend() {
-        // A two-texel page: entry 1 is opaque, entry 2 carries the STP bit.
+        // A three-texel page: entry 1 is opaque, entry 2 carries the STP bit.
+        // Opaque texels outnumber STP ones, so the page gets a knock-out twin.
         let mut texture = Texture8 {
-            width: 2,
+            width: 3,
             height: 1,
-            indices: vec![1, 2],
+            indices: vec![1, 1, 2],
             palettes: vec![[0u8; 4]; 2 * crate::model::PALETTE_ROW_LEN],
             stp: vec![false; 2 * crate::model::PALETTE_ROW_LEN],
         };
         texture.palettes[1] = [255, 255, 255, 255];
         texture.palettes[2] = [255, 255, 255, 255];
         texture.stp[2] = true;
-        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+        let raster_vertex = |position: [f32; 2], u: f32, v: f32| RasterVertex {
             position,
-            inv_z: 1.0 / 1000.0,
+            w: 1000.0,
             u,
             v,
-            shade: [CHANNEL_MAX; 3],
+            shade: [1.0; 3],
         };
         let triangle = Triangle {
             raster: [
                 raster_vertex([10.0, 10.0], 0.0, 0.0),
-                raster_vertex([20.0, 10.0], 2.0, 0.0),
+                raster_vertex([20.0, 10.0], 3.0, 0.0),
                 raster_vertex([10.0, 20.0], 0.0, 0.0),
             ],
             depth: 1000.0,
             key: 1000,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: true,
             blend_weight: None,
+            uv_nudge: [0; 3],
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle);
-        // The opaque texel overwrites; the STP texel halves with the grey.
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
+        // The twin paints the opaque texel back; the STP texel stays blended.
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
         );
         assert_eq!(
-            framebuffer_pixel(&framebuffer, 18, 11),
-            [177, 177, 177, 255]
+            framebuffer_pixel(&framebuffer, 17, 11),
+            [178, 178, 178, 255]
         );
 
-        // With no STP entries there are no blend texels: the packet is fully
-        // opaque, exactly the original's per-texel selector with an all-clear
-        // mask.
+        // With no STP texels there is no twin, so every texel blends.
         texture.stp = vec![false; 2 * crate::model::PALETTE_ROW_LEN];
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle);
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [255, 255, 255, 255]
+            [178, 178, 178, 255]
+        );
+
+        // Nor when STP texels are the majority.
+        texture.stp[1] = true;
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
+        rasterize_alone(&mut framebuffer, &texture, &triangle);
+        assert_eq!(
+            framebuffer_pixel(&framebuffer, 17, 11),
+            [178, 178, 178, 255]
         );
     }
 
@@ -5330,6 +5935,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: None,
+                    uv_nudge: [0; 3],
                 }],
             }],
         };
@@ -5370,12 +5976,12 @@ mod tests {
     fn a_record_blend_weight_scales_the_per_texel_mix() {
         let mut texture = solid_texture([255, 255, 255, 255]);
         texture.stp = vec![false, true];
-        let raster_vertex = |position: [f64; 2], u: f64, v: f64| RasterVertex {
+        let raster_vertex = |position: [f32; 2], u: f32, v: f32| RasterVertex {
             position,
-            inv_z: 1.0 / 1000.0,
+            w: 1000.0,
             u,
             v,
-            shade: [CHANNEL_MAX; 3],
+            shade: [1.0; 3],
         };
         let triangle = |blend_weight| Triangle {
             raster: [
@@ -5387,33 +5993,33 @@ mod tests {
             key: 1000,
             texture: 0,
             palette_row: 0,
-            cull: false,
             flat: None,
             blend: true,
             blend_weight,
+            uv_nudge: [0; 3],
         };
         let mut framebuffer = Framebuffer::new();
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
 
         // The 0x33 override weight (0.2 background): (255 * 205 + 100 * 51) /
         // 256 = 224.
-        framebuffer.rasterize(&texture, &triangle(Some(0x33)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0x33)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [224, 224, 224, 255]
         );
 
-        // The 0x80 half blend: (255 * 128 + 100 * 128) / 256 = 177.
+        // The 0x80 half blend in unorm8: alpha 128 gives 128 + 50 = 178.
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle(Some(0x80)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0x80)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
-            [177, 177, 177, 255]
+            [178, 178, 178, 255]
         );
 
         // A zero background weight is opaque, the ABR 1 `B + F` rule.
         framebuffer.blit(&solid_image(320, 240, [100, 100, 100, 255]));
-        framebuffer.rasterize(&texture, &triangle(Some(0)));
+        rasterize_alone(&mut framebuffer, &texture, &triangle(Some(0)));
         assert_eq!(
             framebuffer_pixel(&framebuffer, 11, 11),
             [255, 255, 255, 255]
@@ -5448,9 +6054,9 @@ mod tests {
             objects: vec![TmdObject {
                 vertices: vec![
                     [0, 0, 1000],
-                    [0, 0, if behind { 0 } else { 1000 }],
+                    [1000, -1000, if behind { 0 } else { 1000 }],
                     [1000, 0, 1000],
-                    [0, 1000, 1000],
+                    [0, -1000, 1000],
                 ],
                 normals: vec![[0, 0, 4096]],
                 prims: vec![TmdPrim {
@@ -5464,6 +6070,7 @@ mod tests {
                     raw_y: false,
                     flat_color: None,
                     quad: Some([0, 1, 3, 2]),
+                    uv_nudge: [0; 3],
                 }],
             }],
         };
@@ -5907,60 +6514,6 @@ mod tests {
         ];
         framebuffer.draw_sprites(&mut sprites);
         assert_eq!(framebuffer_pixel(&framebuffer, 0, 0), [99, 99, 99, 255]);
-    }
-
-    #[test]
-    fn shadow_depth_key_truncates_the_corner_mean() {
-        // The key is the truncating integer mean of the four unclipped corner
-        // Zs, not a rounded f64 mean. Search yaws, sizes and a pitched camera
-        // until a fixture's mean is not an exact integer, then pin it.
-        let texture = solid_image(1, 1, [255, 255, 255, 128]);
-        let cameras = [
-            straight_camera(),
-            Camera::from_cut(&Cut {
-                pos: [0, -1500, -1500],
-                look_at: [0, 0, 1000],
-                fov: 200,
-                ..Cut::default()
-            }),
-        ];
-        let mut exercised = false;
-        'search: for camera in &cameras {
-            for (half_x, half_z) in [(1234, 777), (500, 300), (61, 919), (1500, 1400)] {
-                for angle in (0x40..0x1000).step_by(0x40) {
-                    let shadow = Shadow {
-                        angle,
-                        ..shadow_at([0, 0, 1000], half_x, half_z, &texture)
-                    };
-                    let mut items = Vec::new();
-                    collect_shadow(&shadow, camera, &mut items);
-                    let [SceneItem::Shadow(poly)] = &items[..] else {
-                        panic!("expected one shadow");
-                    };
-                    let entity = anim::entity_matrix(shadow.pos, shadow.angle);
-                    let corners = [
-                        [-shadow.half_x as i16, 0, shadow.half_z as i16],
-                        [shadow.half_x as i16, 0, shadow.half_z as i16],
-                        [-shadow.half_x as i16, 0, -shadow.half_z as i16],
-                        [shadow.half_x as i16, 0, -shadow.half_z as i16],
-                    ];
-                    let sum: i64 = corners
-                        .iter()
-                        .map(|corner| {
-                            i64::from(camera.view_position(fixed_mul(&entity, *corner))[2])
-                        })
-                        .sum();
-                    let truncating = sum / 4;
-                    let rounded = (sum as f64 / 4.0).round() as i64;
-                    assert_eq!(i64::from(poly.key), truncating, "angle {angle:#x}");
-                    if truncating != rounded {
-                        exercised = true;
-                        break 'search;
-                    }
-                }
-            }
-        }
-        assert!(exercised, "no fixture made the corner mean non-integral");
     }
 
     #[test]

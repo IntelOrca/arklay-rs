@@ -101,26 +101,29 @@ fn coverage_alpha(red: u8) -> u8 {
     (coverage * 16 / 31) as u8
 }
 
-/// The tint the fade-sprite primitive blends towards.
+/// The tint the fade-sprite primitive blends towards, as the vertex colour
+/// bytes the reference's sprite flush hands the GPU.
 ///
 /// The original converts each tint byte with `b / 256` below `0x80` and
 /// `(256 - b) / 256` above it, with an all-equal special case that collapses
-/// the shadow grey `0x808080` to near-black.
+/// the shadow grey `0x808080` to near-black `0.004`. The flush then truncates
+/// each float times 255 to a byte.
 pub fn billboard_tint(rgb: u32) -> [u8; 3] {
     // The packed tint sits in a little-endian dword, so the low byte is red.
     let bytes = [rgb as u8, (rgb >> 8) as u8, (rgb >> 16) as u8];
-    if bytes[0] == bytes[1] && bytes[1] == bytes[2] {
-        [0, 0, 1]
+    let floats = if bytes[0] == bytes[1] && bytes[1] == bytes[2] {
+        [0.0, 0.0, 0.004f32]
     } else {
-        // `256 - byte` as an 8-bit wrap: 0x80 stays 128, 0xFF folds to 1.
         bytes.map(|byte| {
-            if byte < 0x80 {
-                byte
+            let folded = if byte < 0x80 {
+                i32::from(byte)
             } else {
-                byte.wrapping_neg()
-            }
+                256 - i32::from(byte)
+            };
+            folded as f32 * 0.00390625
         })
-    }
+    };
+    floats.map(|value| ((value * 255.0) as i32).clamp(0, 255) as u8)
 }
 
 /// The view-space Y offset of the (stage, room, camera) placement record.
@@ -289,9 +292,9 @@ mod tests {
         assert_eq!(billboard_tint(0x0080_8080), [0, 0, 1]);
         // The death blood pool's 0x00FFFF50 stores (0x50, 0xFF, 0xFF) in
         // memory and comes out dark red.
-        assert_eq!(billboard_tint(0x00FF_FF50), [0x50, 1, 1]);
+        assert_eq!(billboard_tint(0x00FF_FF50), [79, 0, 0]);
         // Low bytes pass through; high bytes fold back.
-        assert_eq!(billboard_tint(0x0040_FF20), [0x20, 1, 0x40]);
+        assert_eq!(billboard_tint(0x0040_FF20), [31, 0, 63]);
     }
 
     #[test]

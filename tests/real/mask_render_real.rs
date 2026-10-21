@@ -93,6 +93,7 @@ fn player_triangle(camera: &Camera, corners: [(f64, f64); 3], depth: f64) -> Tmd
                 raw_y: false,
                 flat_color: None,
                 quad: None,
+                uv_nudge: [0; 3],
             }],
         }],
     }
@@ -166,6 +167,12 @@ fn player_occluded_by_a_group_1_pillar_until_the_group_is_disabled() {
         tint: [255; 3],
         blend_weight: None,
         hidden_joints: 0,
+        light_pos: None,
+        per_joint_light: false,
+        complex_object: None,
+        aliased_light: false,
+        light_rotation: None,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 
     // Only group 1 is active, so no other overlay interferes.
@@ -264,6 +271,12 @@ fn room1000_player_frame_is_deterministic_and_mask_aware() {
         tint: [255; 3],
         blend_weight: None,
         hidden_joints: 0,
+        light_pos: None,
+        per_joint_light: false,
+        complex_object: None,
+        aliased_light: false,
+        light_rotation: None,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 
     let camera = Camera::from_cut(cut);

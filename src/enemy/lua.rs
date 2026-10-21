@@ -2199,6 +2199,7 @@ mod imp {
                 game.entities[slot].joint_armed = 0;
                 game.entities[slot].joint_flags_hi = [0; 32];
                 game.entities[slot].joint_blood = [crate::game::JointBlood::default(); 32];
+                game.entities[slot].joint_colours = [[0; 3]; 32];
                 Ok(())
             });
 
@@ -3766,13 +3767,22 @@ mod imp {
                 },
             );
 
-            // The soft body-tint writer (`JointApplyColorTint`): the port has
-            // no per-joint colour pipeline, so the call is recorded as the
-            // joint's gore state only. The state contract stays observable
-            // through `joint_flag`.
+            // The soft body-tint writer (`JointApplyColorTint`): only its
+            // second argument reaches `JointSetColorTint`, as the packed
+            // `r | g << 8 | b << 16` colour the joint then draws unlit in.
+            // The joint flag's bit 7 it also raises is render-only state.
             methods.add_method_mut(
                 "tint_joint",
-                |_lua, _api, (_joint, _a, _b, _rgb): (i64, i64, i64, i64)| Ok(()),
+                |_lua, api, (joint, colour, _b, _rgb): (i64, i64, i64, i64)| {
+                    let slot = api.slot;
+                    if let Some(entry) = api.game().entities[slot]
+                        .joint_colours
+                        .get_mut(joint as usize)
+                    {
+                        *entry = [colour as u8, (colour >> 8) as u8, (colour >> 16) as u8];
+                    }
+                    Ok(())
+                },
             );
 
             // The posed skeleton's joint world translation (the original's
@@ -3924,8 +3934,7 @@ mod imp {
                     game.entities[slot].target = target;
                 }
                 let origin = crate::enemy::look_at_joint_origin(game, slot);
-                let target = game.entities[slot];
-                game.entity_anims[slot].slew_look_at(&target, origin);
+                game.entity_anims[slot].slew_look_at(&mut game.entities[slot], origin);
                 Ok(())
             });
 

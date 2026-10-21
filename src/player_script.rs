@@ -191,6 +191,7 @@ pub fn update_banks(
             let entity = &mut game.entities[0];
             entity.set_state(1);
             entity.set_ignore(0);
+            entity.shadow_quad = true;
             entity.action_behavior = 0;
             entity.action_state = 0;
             entity.animation_frame_id = 0;
@@ -3313,6 +3314,22 @@ mod tests {
         room: &[Clip],
     ) {
         update(game, player, &RoomState::default(), emd, emw, room);
+    }
+
+    /// Only the state-0 init builds the shadow quad: a player a room's init
+    /// script parks in state 8 before its first update never gets one.
+    #[test]
+    fn only_the_state_zero_init_builds_the_shadow_quad() {
+        let emd = vec![clip(3, 1); 0x10];
+        let mut game = test_game(8, 1, 0);
+        let mut player = test_player();
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert!(!game.entities[0].shadow_quad);
+
+        let mut game = test_game(0, 0, 0);
+        run(&mut game, &mut player, &emd, &[], &[]);
+        assert_eq!(game.entities[0].state(), 1);
+        assert!(game.entities[0].shadow_quad);
     }
 
     /// `act_anim_flags`/`act_anim_set` can pass animation ids in `0x0A..0x0F`.

@@ -175,11 +175,11 @@ pub(super) const TWEEN_SIG: [&str; 12] = [
     "tw_pos_rot_add",
     "tw_set_pos:uuu",
     "tw_set_rot:uuu",
-    "tw_abs_pos:UUUu",
+    "tw_abs_pos:uIII",
     "tw_set_field:ub",
     "tw_set_8a:u",
-    "tw_set_sel:uuu",
-    "tw_abs_rot:UUUu",
+    "tw_set_sel:uU",
+    "tw_abs_rot:uUUU",
 ];
 
 /// Which event sub-ISA the renderer is currently inside.

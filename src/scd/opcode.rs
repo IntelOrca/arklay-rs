@@ -192,11 +192,11 @@ pub const TWEEN_OPS: &[Op] = &[
     op(0x04, "tw_pos_rot_add", "", false, Some(1)),
     op(0x05, "tw_set_pos", "uuu", false, Some(4)),
     op(0x06, "tw_set_rot", "uuu", false, Some(4)),
-    op(0x07, "tw_abs_pos", "UUUu", false, Some(8)),
+    op(0x07, "tw_abs_pos", "uIII", false, Some(8)),
     op(0x08, "tw_set_field", "ub", false, Some(3)),
     op(0x09, "tw_set_8a", "u", false, Some(2)),
-    op(0x0A, "tw_set_sel", "uuu", false, Some(4)),
-    op(0x0B, "tw_abs_rot", "UUUu", false, Some(8)),
+    op(0x0A, "tw_set_sel", "uU", false, Some(4)),
+    op(0x0B, "tw_abs_rot", "uUUU", false, Some(8)),
 ];
 
 /// Look up a command-VM opcode.

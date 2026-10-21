@@ -774,14 +774,25 @@ fn yaw_rotate(yaw: i16, v: [i16; 3]) -> [i16; 3] {
     apply_matrix_sv(&matrix, v)
 }
 
-/// Project a world point to screen pixels and a quarter-depth.
+/// Project a world point to screen pixels and a quarter-depth, the original's
+/// `ProjectEffectSprite` (0x0040aa50): the stored camera (`g_RoomCameraData`,
+/// pre-scaled by 4) rotates `(x, -y, z)` with 32-bit sums truncated toward
+/// zero (`MulMatrixVec3`) before the camera translation joins them.
 fn project(camera: &Camera, fov: i32, world: [i32; 3]) -> (i16, i16, i32) {
-    let view = camera.view_position(world);
-    let depth = if view[2] == 0 { 1 } else { view[2] };
-    let focal = i64::from(fov);
-    let z = i64::from(depth);
-    let screen_x = i64::from(view[0]) * focal / z + 160;
-    let screen_y = 120 - i64::from(view[1]) * focal / z;
+    let (matrix, translation) = crate::render::ref_camera(camera);
+    let point = [world[0], world[1].wrapping_neg(), world[2]];
+    let out: [i32; 3] = std::array::from_fn(|row| {
+        let sum = (0..3).fold(0i32, |sum, axis| {
+            sum.wrapping_add((matrix[row][axis] << 2).wrapping_mul(point[axis]))
+        });
+        sum.wrapping_add((sum >> 31) & 0x3FFF) >> 14
+    });
+    let depth = match out[2].wrapping_add(translation[2]) {
+        0 => 1,
+        depth => depth,
+    };
+    let screen_x = out[0].wrapping_add(translation[0]).wrapping_mul(fov) / depth + 160;
+    let screen_y = translation[1].wrapping_sub(out[1]).wrapping_mul(fov) / depth + 120;
     (screen_x as i16, screen_y as i16, depth >> 2)
 }
 

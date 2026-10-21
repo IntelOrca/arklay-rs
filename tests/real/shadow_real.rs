@@ -105,6 +105,12 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         tint: [255; 3],
         blend_weight: None,
         hidden_joints: 0,
+        light_pos: None,
+        per_joint_light: false,
+        complex_object: None,
+        aliased_light: false,
+        light_rotation: None,
+        joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 
     let background = bmp::decode(&pack.read(&id.cut_entry(camera_index)).unwrap()).unwrap();

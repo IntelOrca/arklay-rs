@@ -674,12 +674,19 @@ pub fn nudge_spawn(game: &mut GameState, slot: usize, distance: i16) {
 ///
 /// The head world anchor is joint 3's previous-tick world translation plus its
 /// local transform offset (the original reads the posed joint block before the
-/// render pass recomposes it). The visible joint rotations are not offset in
-/// the port's render pass, a documented deviation; the swerve arithmetic and
-/// the clamp are exact.
+/// render pass recomposes it). The neck turn (`cerberus_rotate_spine`) adds
+/// the swerve before this tick's update to the posed joints, so it shows in
+/// the render and feeds the next blend.
 pub fn head_track(game: &mut GameState, slot: usize, _clips: &[Clip]) -> bool {
     let entity = &game.entities[slot];
     let swerve = entity.cb_swerve();
+    let turn = |share: i32| [0, (share + i32::from(swerve)) as i16, 0];
+    game.entity_anims[slot].player.rotate_joints(vec![
+        (1, turn(0)),
+        (2, turn(i32::from(swerve) >> 2)),
+        (3, turn(i32::from(swerve) >> 1)),
+    ]);
+    let entity = &game.entities[slot];
     let world = game
         .joint_worlds
         .get(slot)

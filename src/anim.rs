@@ -299,20 +299,42 @@ pub(crate) fn rotation_matrix(x: i32, y: i32, z: i32) -> [[i32; 3]; 3] {
     matrix
 }
 
-/// The look-at tracking joint's local rotation: a Y-X-Z Euler rotation with
-/// the given yaw and pitch, composed from the existing trig tables. The
-/// original builds it with `RotMatrixYXZ(0, yaw, pitch)` and composes it onto
-/// the joint's world matrix.
+/// The look-at tracking joint's local rotation, `RotMatrixYXZ(0, yaw, pitch)`
+/// (0x00409ed0): the yaw turns about Y and the pitch about Z, the angles
+/// handed to the component math are `(0x1000 - x, y, 0x1000 - z)`, and the
+/// nine 14-bit components are scaled to 4.12 with a truncating `>> 2`. The
+/// original composes it onto the joint's world matrix.
 pub fn look_at_matrix(yaw: i16, pitch: i16) -> Mat4x3 {
-    let yaw = Mat4x3 {
-        r: rotation_matrix(0, i32::from(yaw), 0),
-        t: [0; 3],
-    };
-    let pitch = Mat4x3 {
-        r: rotation_matrix(i32::from(pitch), 0, 0),
-        t: [0; 3],
-    };
-    compose(&yaw, &pitch)
+    let components = rotation_components_yxz(0x1000, i32::from(yaw), 0x1000 - i32::from(pitch));
+    let mut r = [[0i32; 3]; 3];
+    for (slot, component) in components.iter().enumerate() {
+        r[slot / 3][slot % 3] = (*component + ((*component >> 31) & 3)) >> 2;
+    }
+    Mat4x3 { r, t: [0; 3] }
+}
+
+/// `GteRotationMatrixYXZ` (0x00440b70): the nine 14-bit Y-X-Z components,
+/// built from sum and difference angles exactly like the original, each
+/// halving a truncating `/ 2` and each product a `>> 14` corrected toward
+/// zero.
+fn rotation_components_yxz(x: i32, y: i32, z: i32) -> [i32; 9] {
+    let shift = |temp: i32| (temp + ((temp >> 31) & 0x3FFF)) >> 14;
+    let (x_minus_y, x_plus_y, z_plus_y, y_minus_z) = (x - y, x + y, z + y, y - z);
+    [
+        shift((cos14(x_minus_y) - cos14(x_plus_y)) / 2 * sin14(z))
+            + (cos14(y_minus_z) + cos14(z_plus_y)) / 2,
+        shift((cos14(x_minus_y) - cos14(x_plus_y)) / 2 * cos14(z))
+            + (sin14(y_minus_z) - sin14(z_plus_y)) / 2,
+        (sin14(x_plus_y) - sin14(x_minus_y)) / 2,
+        (sin14(z + x) - sin14(x - z)) / 2,
+        (cos14(x - z) + cos14(z + x)) / 2,
+        -sin14(x),
+        shift((sin14(x_plus_y) + sin14(x_minus_y)) / 2 * sin14(z))
+            - (sin14(z_plus_y) + sin14(y_minus_z)) / 2,
+        shift((sin14(x_plus_y) + sin14(x_minus_y)) / 2 * cos14(z))
+            + (cos14(y_minus_z) - cos14(z_plus_y)) / 2,
+        (cos14(x_minus_y) + cos14(x_plus_y)) / 2,
+    ]
 }
 
 /// `a * b` for two [`Mat4x3`] values: rotation matrix product and the game's
@@ -354,13 +376,19 @@ pub(crate) fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
     Mat4x3 { r, t }
 }
 
-/// One consuming tick whose blended pose has not been materialized yet: the
-/// keyframe the tick blended toward and the weights it applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PoseStep {
-    keyframe: usize,
-    blend: u16,
-    step: u16,
+/// One write to the joint structs that has not been materialized yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PoseStep {
+    /// A consuming tick: the keyframe it blended toward and the weights it
+    /// applied.
+    Keyframe {
+        keyframe: usize,
+        blend: u16,
+        step: u16,
+    },
+    /// A behaviour adding to joint rotations on top of the posed joints
+    /// (the hound's neck turn), as `(joint, delta)` pairs.
+    Rotate(Vec<(usize, [i16; 3])>),
 }
 
 /// Clip playback state. One `update` is one 30 Hz tick.
@@ -433,8 +461,19 @@ impl AnimPlayer {
         self.timing = 0;
         self.blend_counter = self.full_blend_counter();
         // Pending steps name keyframes of the clip that was playing; they
-        // cannot be resolved against the new clip's table.
-        self.pending_pose.get_mut().clear();
+        // cannot be resolved against the new clip's table. Rotations already
+        // added to the joints stay.
+        self.pending_pose
+            .get_mut()
+            .retain(|step| matches!(step, PoseStep::Rotate(_)));
+    }
+
+    /// Add `deltas` to the rotations of the posed joints, on top of whatever
+    /// this tick's consume wrote (the original adds straight into the joint
+    /// structs, so a held tick keeps accumulating and the next blend eases
+    /// out of the turned pose).
+    pub fn rotate_joints(&mut self, deltas: Vec<(usize, [i16; 3])>) {
+        self.pending_pose.get_mut().push(PoseStep::Rotate(deltas));
     }
 
     /// The blend counter a clip change arms for the configured step.
@@ -526,7 +565,7 @@ impl AnimPlayer {
         if self.blend_used == 0 {
             pending.clear();
         }
-        pending.push(PoseStep {
+        pending.push(PoseStep::Keyframe {
             keyframe,
             blend: self.blend_used,
             step: self.blend_step,
@@ -568,12 +607,30 @@ impl AnimPlayer {
         }
         let mut pose = self.applied.borrow().clone();
         for step in steps {
-            let Some(target) = keyframes.get(step.keyframe) else {
+            let (keyframe, blend, step) = match step {
+                PoseStep::Keyframe {
+                    keyframe,
+                    blend,
+                    step,
+                } => (keyframe, blend, step),
+                PoseStep::Rotate(deltas) => {
+                    let posed = pose.get_or_insert_with(|| current.clone());
+                    for (joint, delta) in deltas {
+                        if let Some(rotation) = posed.rotations.get_mut(joint) {
+                            for (axis, delta) in rotation.iter_mut().zip(delta) {
+                                *axis = axis.wrapping_add(delta);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Some(target) = keyframes.get(keyframe) else {
                 continue;
             };
             pose = match pose.take() {
-                Some(source) if step.blend != 0 && step.step != 0 => {
-                    Some(blend_keyframes(&source, target, step.blend, step.step))
+                Some(source) if blend != 0 && step != 0 => {
+                    Some(blend_keyframes(&source, target, blend, step))
                 }
                 // A direct step needs no source; a blend with no pose on
                 // screen (a fresh spawn) starts from the target instead of
@@ -1162,6 +1219,31 @@ mod tests {
         let first = player.pose_keyframe(&clips, &keyframes).unwrap();
         let second = player.pose_keyframe(&clips, &keyframes).unwrap();
         assert_eq!(first, second, "a second read must not blend again");
+    }
+
+    #[test]
+    fn joint_rotations_add_on_the_posed_joints_until_a_direct_step() {
+        let clips = vec![timing_clip(&[1])];
+        let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
+            offset: [0, 0, 0],
+            rotations: vec![[0x10, 0, 0], [0, 0x20, 0]],
+        }];
+        let mut player = AnimPlayer::new(0);
+        player.update(&clips);
+        player.rotate_joints(vec![(1, [0, 5, 0])]);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations, [[0x10, 0, 0], [0, 0x25, 0]]);
+
+        // Without a consume in between the turns accumulate on the joints.
+        player.rotate_joints(vec![(1, [0, 5, 0]), (9, [1, 1, 1])]);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations[1], [0, 0x2A, 0]);
+
+        // A direct consume rewrites the joints from the keyframe.
+        player.update(&clips);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations[1], [0, 0x20, 0]);
     }
 
     #[test]

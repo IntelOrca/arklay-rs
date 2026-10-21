@@ -226,14 +226,13 @@ fn light_vector(
         dir
     };
     let l = apply_matrix_sv(stored, vec);
+    // The draw matrix is `MulMatrix0`'s rounded 4.12 short product.
+    let draw = mul_matrix0(stored, &joint.r).map(|row| row.map(|entry| entry as i16));
     let mut out = [0.0f32; 4];
     for (k, slot) in out.iter_mut().take(3).enumerate() {
         let mut sum = 0.0f64;
         for (row, &l_row) in l.iter().enumerate() {
-            let m: f64 = (0..3)
-                .map(|j| f64::from(stored[row][j]) * f64::from(joint.r[j][k]))
-                .sum();
-            sum += m * f64::from(l_row);
+            sum += f64::from(draw[row][k]) * 4096.0 * f64::from(l_row);
         }
         *slot = (sum / 4096f64.powi(4)) as f32;
     }
@@ -461,31 +460,23 @@ pub fn scene_sprites<'a>(scene: &GameplayScene<'a>) -> Sprites<'a> {
     // The shadows keep their perspective-correct UVs: each projected corner
     // goes back to clip space with `w` = its view Z. They blend towards the
     // tint by the page's coverage alpha, far to near.
-    let mut shadows: Vec<_> = scene
-        .shadows
-        .iter()
-        .filter_map(|shadow| render::shadow_polygon(shadow, camera))
-        .collect();
+    let mut shadows = render::shadow_polys(scene.shadows, camera);
     shadows.sort_by_key(|poly| std::cmp::Reverse(poly.key));
     for poly in &shadows {
         let first = sprites.vertices.len();
         let depth = key_depth(poly.key, camera.fov);
-        let colour = poly.tint.map(|channel| f32::from(channel) / 255.0);
-        let corner = |index: usize| {
-            let vertex = &poly.corners[index];
-            let w = (1.0 / vertex.inv_z) as f32;
-            let [nx, ny] = ndc(vertex.position[0] as f32, vertex.position[1] as f32);
+        let corner = |vertex: &crate::raster::GlVertex| {
+            let w = vertex.w;
+            let [nx, ny] = ndc(vertex.x, vertex.y);
             SpriteVertex {
                 clip: [nx * w, ny * w, depth * w, w],
-                uv: [vertex.u as f32, vertex.v as f32],
-                colour: [colour[0], colour[1], colour[2], 1.0],
+                uv: [vertex.u, vertex.v],
+                colour: vertex.color,
                 mode: SPRITE_SHADOW,
             }
         };
-        for index in 1..poly.corners.len() - 1 {
-            sprites
-                .vertices
-                .extend([corner(0), corner(index), corner(index + 1)]);
+        for triangle in &poly.triangles {
+            sprites.vertices.extend(triangle.iter().map(corner));
         }
         sprites
             .before
@@ -668,6 +659,7 @@ mod tests {
             textured: true,
             blend: false,
             raw_y: false,
+            uv_nudge: [0; 3],
             flat_color: None,
             quad: None,
         }
@@ -771,14 +763,22 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
+            complex_object: None,
+            aliased_light: false,
         };
         let stored = stored_camera_matrix(camera.from, camera.look_at);
+        let draw_matrix = mul_matrix0(&stored, &joint.r)
+            .map(|row| row.map(|entry| f32::from(entry as i16) / 4096.0));
         for room_object in [false, true] {
             let uniforms = draw_uniforms(&camera, &entity, &light, room_object, None);
             for normal in [[0i16, -4096, 0], [2896, 0, 2896], [-1000, 3000, -2000]] {
                 let reference = render::reference_vertex_shade(
                     &stored,
-                    &joint.r,
+                    &draw_matrix,
                     normal,
                     &light,
                     room_object.then_some(&joint.r),
@@ -828,6 +828,12 @@ mod tests {
             tint: [255; 3],
             blend_weight: None,
             hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
+            complex_object: None,
+            aliased_light: false,
         };
         let camera = Camera::from_points([0, 0, -5000], [0, 0, 0], 500);
         let light = Lighting {

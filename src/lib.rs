@@ -44,6 +44,7 @@ pub mod pack;
 pub mod player;
 pub mod player_script;
 pub mod progress;
+pub mod raster;
 pub mod rdt;
 pub mod render;
 pub mod save;

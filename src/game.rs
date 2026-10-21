@@ -1349,6 +1349,13 @@ pub struct Entity {
     pub is_being_attacked: u8,
     /// `unk_e0` scratch word (0x33 sub-command 10 toggles bit 0x40).
     pub unk_e0: u16,
+    /// Whether the player's ground-shadow quad (`pushVelocity`, entity
+    /// +0xE4) has been built. Only the player's state-0 init builds it (500 x
+    /// 700) and only the new-game memset clears it, so it survives doors; a
+    /// session that opens straight into a room whose init script holds the
+    /// player in state 8 (`plw_anim`) keeps the zero-sized quad, which
+    /// `DrawFadeSpr` skips.
+    pub shadow_quad: bool,
     /// Animation position offsets (`unk_c6`/`unk_c8`); the state-8 walk
     /// handlers steer at this pair.
     pub unk_c6: u16,
@@ -1483,6 +1490,10 @@ pub struct Entity {
     /// The per-joint blood-scratch block `blood_splatter_physics` drives:
     /// counter, flags, X velocity and Y acceleration of the bleeding joint.
     pub joint_blood: [JointBlood; 32],
+    /// Per-joint `JointSetColorTint` colours (`r | g << 8 | b << 16`, each a
+    /// 1/128 multiplier): a non-zero entry draws that joint unlit in the
+    /// colour, the Hunter's blood-red claws after a lunge. Zero is untinted.
+    pub joint_colours: [[u8; 3]; 32],
     /// Joint visibility bits XORed by `eml_state` sub-command 9: bit `i` is
     /// joint `i`'s flag bit. Scripted enemies set or clear the same bits
     /// through the `set_joint_visible` script helper. The spiders carry 20
@@ -3617,6 +3628,12 @@ pub struct GameState {
     /// rolled at the top of the gameplay tick while `MSF2_SCREEN_SHAKE` is set
     /// and read by the renderer. See [`GameState::roll_screen_shake`].
     pub screen_shake: [i32; 2],
+    /// The last rolled shake offset as the original's `g_ScreenOffsetX/Y` and
+    /// `g_SubpixelOffsetX/Y` hold it, relative to the screen centre. A
+    /// screen-border room (`MSF2_SCREEN_BORDER`) never re-centres them, so
+    /// once its shake stops the projection keeps the final roll until the
+    /// next room load. See [`GameState::screen_offset`].
+    pub screen_offset: [i32; 2],
     /// The effect pool (64 slots).
     pub effects: Box<effects::EffectPool>,
     /// The room's runtime object-model records, one per declared omodel slot;
@@ -3629,6 +3646,9 @@ pub struct GameState {
     /// pair. The host has no room borrow, so the engine applies them with the
     /// other room edits.
     pub item_palette_edits: Vec<u8>,
+    /// Queued `obj` palette fix-ups by object pair, applied like
+    /// [`Self::item_palette_edits`].
+    pub object_palette_edits: Vec<(u8, crate::objects::PaletteFixup)>,
     /// Queued `inst_cfg` collision-boundary rewrites, applied by the engine's
     /// room tick before physics and cleared with it.
     pub collision_edits: Vec<CollisionEdit>,
@@ -3811,10 +3831,12 @@ impl Default for GameState {
             rand_state: 1,
             rand_seed: 0,
             screen_shake: [0, 0],
+            screen_offset: [0, 0],
             effects: Box::new(effects::EffectPool::new()),
             objects: ObjectTable::default(),
             items: crate::objects::ItemTable::default(),
             item_palette_edits: Vec::new(),
+            object_palette_edits: Vec::new(),
             collision_edits: Vec::new(),
             light_edits: Vec::new(),
             object_push: false,
@@ -4483,13 +4505,28 @@ impl GameState {
             let x = i32::from(platform_rand(&mut self.rand_state) & 1);
             let y = i32::from(platform_rand(&mut self.rand_state) & 1);
             let direction = platform_rand(&mut self.rand_state) & 3;
-            match direction {
+            let roll = match direction {
                 1 => [x, -y],
                 2 => [-x, y],
                 3 => [-x, -y],
                 _ => [x, y],
-            }
+            };
+            self.screen_offset = roll;
+            roll
         };
+    }
+
+    /// The frame's screen offset, which shifts the 3D projection, the masks
+    /// and the sprites. `main_loop` re-centres it every frame through
+    /// `ResetScreenAndRebuildSprites`, re-applying a live roll, except in a
+    /// screen-border room: `ApplyShakeAndRebuildSprites` moves only the
+    /// background there, so the last roll persists after the shake stops.
+    pub fn screen_offset(&self) -> [i32; 2] {
+        if self.flags[5].bit(MSF2_SCREEN_BORDER) {
+            self.screen_offset
+        } else {
+            self.screen_shake
+        }
     }
 
     /// The screen-shake offset rolled for this frame by
@@ -4864,10 +4901,11 @@ impl GameState {
             }
             "tw_abs_pos" => {
                 if let Some(mut fields) = self.tween_fields() {
+                    // A pad byte, then the three shorts at +2/+4/+6.
                     fields.pos = [
-                        i32::from(operand_i16(operands, 0)),
                         i32::from(operand_i16(operands, 1)),
                         i32::from(operand_i16(operands, 2)),
+                        i32::from(operand_i16(operands, 3)),
                     ];
                     self.write_tween_fields(fields);
                 }
@@ -4906,9 +4944,9 @@ impl GameState {
             "tw_abs_rot" => {
                 if let Some(mut fields) = self.tween_fields() {
                     fields.rotation = [
-                        operand_u16(operands, 0) as i16,
                         operand_u16(operands, 1) as i16,
                         operand_u16(operands, 2) as i16,
+                        operand_u16(operands, 3) as i16,
                     ];
                     self.write_tween_fields(fields);
                 }
@@ -4993,6 +5031,8 @@ impl GameState {
         self.special_light_masks = [0; 3];
         self.got_item_slot = None;
         self.pending_reach = None;
+        // The load re-centres the screen offset (`CenterScreenOrigin`).
+        self.screen_offset = [0, 0];
         // The original's door-animation window clears the 0x80 reach lock when
         // a transition runs, so an abandoned reach cannot freeze the
         // destination's scripted walks.
@@ -5006,6 +5046,7 @@ impl GameState {
         self.objects.reset(usize::from(room.omodel_slot_count));
         self.items.reset(usize::from(room.item_count));
         self.item_palette_edits.clear();
+        self.object_palette_edits.clear();
         self.collision_edits.clear();
         self.light_edits.clear();
         self.zone_edits.clear();
@@ -5145,6 +5186,15 @@ impl GameState {
                 .find(|asset| asset.pair_index == usize::from(pair))
             {
                 crate::objects::darken_map_palette(&mut asset.texture);
+            }
+        }
+        for (pair, fixup) in self.object_palette_edits.drain(..) {
+            if let Some(asset) = room
+                .object_models
+                .iter_mut()
+                .find(|asset| asset.pair_index == usize::from(pair))
+            {
+                crate::objects::apply_palette_fixup(&mut asset.texture, fixup);
             }
         }
     }
@@ -9012,7 +9062,12 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_model(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         match op.op {
             0x1F => {
-                self.state.objects.build(operands, self.state.id);
+                let fixup = self.state.objects.palette_fixup(operands, self.state.id);
+                if self.state.objects.build(operands, self.state.id)
+                    && let Some(fixup) = fixup
+                {
+                    self.state.object_palette_edits.push((0, fixup));
+                }
                 StepResult::Continue
             }
             // `inst_cfg` (0x30): queue the collision-boundary rewrite; the
@@ -9297,10 +9352,10 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_misc(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         // `room_sprite_hide` (0x49): queue a room-sprite group id for hiding.
         // Operand 0xFF clears the pending mask instead of adding to it; the
-        // engine's mask pass clears the selected groups.
+        // engine's mask pass clears the selected groups. The original reads
+        // the opcode word and keeps its high byte, which is this operand byte.
         if op.op == 0x49 {
-            let value = operand_u16(operands, 0);
-            let selector = (value >> 8) as u8;
+            let selector = operand_u8(operands, 0);
             if selector == 0xFF {
                 self.state.sprite_hide = 0;
             } else {
@@ -10935,19 +10990,19 @@ mod tests {
     fn room_sprite_hide_queues_and_wipes_the_mask() {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
-        // The operand's high byte names the bit; 0xFF00 wipes the queue.
+        // The operand byte names the bit (mod 32); 0xFF wipes the queue.
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0x0200])),
+            host.on_misc(op(0x49), &operands(&[0x02])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, 1 << 2);
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0x2500])),
+            host.on_misc(op(0x49), &operands(&[0x25])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, (1 << 2) | (1 << 5));
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0xFF00])),
+            host.on_misc(op(0x49), &operands(&[0xFF])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, 0);
@@ -12064,6 +12119,22 @@ mod tests {
     }
 
     #[test]
+    fn a_screen_border_room_keeps_the_last_shake_offset() {
+        let mut state = game();
+        state.flags[5].apply(MSF2_SCREEN_SHAKE, 0);
+        state.roll_screen_shake();
+        assert_eq!(state.screen_offset(), [-1, 1]);
+        state.flags[5].apply(MSF2_SCREEN_SHAKE, 1);
+        state.roll_screen_shake();
+        // An ordinary room re-centres as soon as the shake stops ...
+        assert_eq!(state.screen_shake(), [0, 0]);
+        assert_eq!(state.screen_offset(), [0, 0]);
+        // ... a screen-border room keeps the final roll.
+        state.flags[5].apply(MSF2_SCREEN_BORDER, 0);
+        assert_eq!(state.screen_offset(), [-1, 1]);
+    }
+
+    #[test]
     fn get_eml_state_reads_the_behavior_flags() {
         let mut state = game();
         state.entities[2].behavior_flags = 0x5A;
@@ -12455,15 +12526,15 @@ mod tests {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
         assert_eq!(
-            host.on_misc(tween_op(0x07).unwrap(), &operands(&[10, 20, 30, 0])),
+            host.on_misc(tween_op(0x07).unwrap(), &operands(&[0, 10, 20, 30])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_misc(tween_op(0x0B).unwrap(), &operands(&[1, 2, 3, 0])),
+            host.on_misc(tween_op(0x0B).unwrap(), &operands(&[0, 1, 2, 3])),
             StepResult::Continue
         );
         assert_eq!(
-            host.on_misc(tween_op(0x0A).unwrap(), &operands(&[3, 96, 0])),
+            host.on_misc(tween_op(0x0A).unwrap(), &operands(&[3, 96])),
             StepResult::Continue
         );
         assert_eq!(
