@@ -9347,10 +9347,10 @@ impl ScdHost for ScdGameHost<'_> {
     fn on_misc(&mut self, op: &Op, operands: &[Operand]) -> StepResult {
         // `room_sprite_hide` (0x49): queue a room-sprite group id for hiding.
         // Operand 0xFF clears the pending mask instead of adding to it; the
-        // engine's mask pass clears the selected groups.
+        // engine's mask pass clears the selected groups. The original reads
+        // the opcode word and keeps its high byte, which is this operand byte.
         if op.op == 0x49 {
-            let value = operand_u16(operands, 0);
-            let selector = (value >> 8) as u8;
+            let selector = operand_u8(operands, 0);
             if selector == 0xFF {
                 self.state.sprite_hide = 0;
             } else {
@@ -10985,19 +10985,19 @@ mod tests {
     fn room_sprite_hide_queues_and_wipes_the_mask() {
         let mut state = game();
         let mut host = ScdGameHost::new(&mut state);
-        // The operand's high byte names the bit; 0xFF00 wipes the queue.
+        // The operand byte names the bit (mod 32); 0xFF wipes the queue.
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0x0200])),
+            host.on_misc(op(0x49), &operands(&[0x02])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, 1 << 2);
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0x2500])),
+            host.on_misc(op(0x49), &operands(&[0x25])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, (1 << 2) | (1 << 5));
         assert_eq!(
-            host.on_misc(op(0x49), &operands(&[0xFF00])),
+            host.on_misc(op(0x49), &operands(&[0xFF])),
             StepResult::Continue
         );
         assert_eq!(host.state().sprite_hide, 0);
