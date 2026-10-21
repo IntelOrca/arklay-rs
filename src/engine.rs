@@ -13048,7 +13048,7 @@ fn render_frame_on(
         mirror: mirror.as_ref(),
     };
     let on_gpu = match gpu {
-        Some(gpu) => match gpu.record_scene(&scene) {
+        Some(gpu) => match gpu.record_scene(&scene, Some(pack)) {
             Ok(()) => {
                 framebuffer.clear();
                 true
@@ -15915,7 +15915,11 @@ mod tests {
         };
         let (gpu_width, gpu_height) = gpu.scene_size();
         let scale = gpu_width / WIDTH as u32;
-        let pack = Pack::open(Path::new(&path)).unwrap();
+        // Mod packs to layer, `:`-separated (an HD texture pack, say).
+        let mods: Vec<std::path::PathBuf> = std::env::var("ARKLAY_GPU_TEST_MODS")
+            .map(|mods| std::env::split_paths(&mods).collect())
+            .unwrap_or_default();
+        let pack = Pack::open_layered(Path::new(&path), &mods).unwrap();
         let save_dir = TempDir::new();
         let mut drawn = 0;
         for (room, cut) in ["105", "106", "10B", "10D", "202", "1001"]
