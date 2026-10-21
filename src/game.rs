@@ -6623,11 +6623,12 @@ impl GameState {
     /// # Documented deviation
     ///
     /// The port does not port the state-8 file-list screen (its art, layout and
-    /// navigation are a separate slice); it shows the same observable result
-    /// through global 0xC6 and files the entry through
-    /// [`Self::take_document`]. The reach gate works exactly as in
-    /// [`Self::arm_item_pickup`], with the completion raising
-    /// `MSF_PICKUP_SCREEN`.
+    /// navigation are a separate slice); it opens the FILE reader on the
+    /// picked entry and shows the same observable result through global 0xC6,
+    /// with the state-8 decide cue and the black surround of the original's
+    /// panel-less screen. It files the entry through [`Self::take_document`].
+    /// The reach gate works exactly as in [`Self::arm_item_pickup`], with the
+    /// completion raising `MSF_PICKUP_SCREEN`.
     pub fn arm_document(&mut self, slot: u8) -> bool {
         let Some(action) = self.room_actions.get(usize::from(slot)).copied().flatten() else {
             return false;
