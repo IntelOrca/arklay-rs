@@ -2160,13 +2160,7 @@ impl GameSession {
     /// loads the background, after the init script and the room_set event
     /// pass, so this runs at both points; a second call is a no-op.
     fn apply_screen_border(&mut self) {
-        if self.game.flag_test(5, game::MSF2_SCREEN_BORDER, false) {
-            for cut in &mut self.loaded.room.cuts {
-                if let Some(background) = cut.background.as_mut() {
-                    background.reslice(316, 236);
-                }
-            }
-        }
+        apply_screen_border(&self.game, &mut self.loaded.room);
     }
 
     /// Place the player for an arbitrary room start: the room's paired-door
@@ -10368,12 +10362,14 @@ fn new_game_state(pack: &Pack, id: RoomId, room: &RoomState) -> game::GameState 
 }
 
 /// Run a room's init script against `game`, then apply the room edits it
-/// queued (`inst_cfg`/`obj_xfm`) before anything reads the room.
+/// queued (`inst_cfg`/`obj_xfm`) and the screen-border geometry it selected
+/// before anything reads the room.
 fn run_room_init(loaded: &mut LoadedRoom, game: &mut game::GameState) {
     let mut command_vm = scd::vm::CommandVm::new(&loaded.scripts);
     let mut host = game::ScdGameHost::new(game);
     command_vm.run_init(&mut host);
     game.apply_room_edits(&mut loaded.room);
+    apply_screen_border(game, &mut loaded.room);
 }
 
 /// Apply the command pass's `evt_exec` starts and `task_kill` kills in
@@ -10491,6 +10487,22 @@ fn run_player_machine(context: &mut RoomContext<'_>, assets: &PlayerAssets, pad:
     crate::weapons::update(context.game, context.player, context.room, &clips, pad);
 }
 
+/// Re-slice the room's backgrounds to 316x236 while the screen-border flag
+/// (msf2 bit 2, the caves) is set: those paks store their artwork 316 pixels
+/// wide while the TIM header claims 320, so the same linear pixels are
+/// re-wrapped. Already re-sliced backgrounds are left alone.
+fn apply_screen_border(game: &game::GameState, room: &mut RoomState) {
+    if game.flag_test(5, game::MSF2_SCREEN_BORDER, false) {
+        for cut in &mut room.cuts {
+            if let Some(background) = cut.background.as_mut()
+                && (background.width, background.height) != (316, 236)
+            {
+                background.reslice(316, 236);
+            }
+        }
+    }
+}
+
 /// Run one fixed 30 Hz tick: scripts, interaction, player movement and camera.
 /// Returns the door transition the tick requested, if any.
 ///
@@ -10568,6 +10580,11 @@ fn tick_room_timed(
     // become visible here, before the player's physics and before the
     // renderer reads the lighting.
     context.game.apply_room_edits(context.room);
+    // A room event can raise the screen-border flag after the load (room
+    // 306's `event_00` yields before its `set`); the reference decodes each
+    // background at display time with the flag as it stands then, so the
+    // re-slice follows the flag here too, ahead of the camera switch.
+    apply_screen_border(context.game, context.room);
     // The original's `check_camera_switch(0)` runs after the scripts and
     // BEFORE `update_entities`/`update_player_anim`, so it tests the position
     // the scripts left rather than this tick's movement. That is what makes a
@@ -14888,6 +14905,48 @@ mod tests {
             }
         }
         assert_eq!(game.desk.state, 33, "the per-frame desk state machine ran");
+    }
+
+    #[test]
+    fn screen_border_flag_reslices_backgrounds_whenever_it_is_set() {
+        let id = RoomId {
+            stage: 3,
+            room: 6,
+            player_flag: 0,
+        };
+        // Number the pixels so the re-wrap is observable: row 1 of the 316-wide
+        // view starts at linear pixel 316, not 320.
+        let rgba = (0..320u32 * 240)
+            .flat_map(|i| i.to_le_bytes())
+            .collect::<Vec<u8>>();
+        let background = Image {
+            width: 320,
+            height: 240,
+            rgba,
+        };
+        let mut room = RoomState {
+            cuts: vec![crate::state::Cut {
+                background: Some(background),
+                ..Default::default()
+            }],
+            ..RoomState::default()
+        };
+        let mut game = game::GameState::new(id, &room);
+
+        // Without the flag the header geometry stands.
+        apply_screen_border(&game, &mut room);
+        let image = room.cuts[0].background.as_ref().unwrap();
+        assert_eq!((image.width, image.height), (320, 240));
+
+        // A room event raising the flag after the load (room 306's event_00)
+        // still re-wraps the background, and a repeat is a no-op.
+        game.apply_flag(5, game::MSF2_SCREEN_BORDER, 0);
+        apply_screen_border(&game, &mut room);
+        apply_screen_border(&game, &mut room);
+        let image = room.cuts[0].background.as_ref().unwrap();
+        assert_eq!((image.width, image.height), (316, 236));
+        assert_eq!(image.rgba.len(), 316 * 236 * 4);
+        assert_eq!(&image.rgba[316 * 4..316 * 4 + 4], &316u32.to_le_bytes());
     }
 
     #[test]
