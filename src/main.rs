@@ -225,8 +225,21 @@ struct Cli {
     )]
     frame_rate: Option<u32>,
 
+    /// The presented aspect ratio, `4:3` or a wider `W:H` such as `16:9`
+    /// (default: the config's `[graphics] aspect`, except under --trace,
+    /// else 4:3). A wider aspect crops the 4:3 frame's rows; captures take
+    /// the cropped shape
+    #[arg(long, value_name = "W:H", requires = "pack", value_parser = parse_aspect)]
+    aspect: Option<arklay::video::Aspect>,
+
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Parse `--aspect`: `W:H` from 4:3 up to 32:9.
+fn parse_aspect(value: &str) -> Result<arklay::video::Aspect, String> {
+    arklay::video::Aspect::parse(value)
+        .ok_or_else(|| format!("expected W:H from 4:3 to 32:9, got `{value}`"))
 }
 
 /// Parse `--msaa`: one of [`arklay::video::MSAA_COUNTS`].
@@ -759,6 +772,13 @@ fn main() -> Result<()> {
             renderer.render_scale = cli.render_scale.unwrap_or(renderer.render_scale);
             renderer.msaa = cli.msaa.unwrap_or(renderer.msaa);
             renderer.frame_rate = cli.frame_rate.unwrap_or(renderer.frame_rate);
+            // A trace compares against the 4:3 reference, so only an explicit
+            // `--aspect` changes its shape.
+            if tracing {
+                renderer.aspect = arklay::video::Aspect::STANDARD;
+            }
+            renderer.aspect = cli.aspect.unwrap_or(renderer.aspect);
+            arklay::video::set_aspect(renderer.aspect);
             // An app-level `--ui` boot plays a scripted `--input` without a
             // trace: its frames are the screens' regression captures.
             let app_script = cli.input.is_some()

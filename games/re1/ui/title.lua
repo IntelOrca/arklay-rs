@@ -259,10 +259,13 @@ function M.update(api, input)
 end
 
 function M.draw(api)
+    -- A shorter (wider-aspect) frame shows the picture's bottom rows: the
+    -- logo, the menu and the copyright lines, losing the top of the eye.
+    local lift = (api:height() - 240) // 2
     if background then
         -- A full-frame backdrop is stretched, so a replacement may be
         -- authored at any size (an HD title screen, for example).
-        api:draw_background(background, 0, 0)
+        api:draw_background(background, 0, lift)
     else
         api:clear()
         api:fill_rect(0, 0, api:width(), api:height(), 0, 0, 0, 255)
@@ -278,7 +281,7 @@ function M.draw(api)
         scale = 255
     end
     local origin_x = api:width() // 2
-    local origin_y = api:height() // 2
+    local origin_y = api:height() // 2 + lift
     api:page_sprite_scaled(
         prompt,
         0, row.v, 256, row.height,

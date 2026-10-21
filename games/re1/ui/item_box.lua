@@ -167,6 +167,8 @@ local function selected_item(api)
 end
 
 function M.open(api, args)
+    -- Drawn on black: a wider aspect gives the panel a wider canvas.
+    api:set("canvas", 1)
     s.mode = "browse"
     s.box_cursor = 0
     s.player_cursor = args.cursor or Grid.FIRST_SLOT_CURSOR

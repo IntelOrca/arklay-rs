@@ -63,6 +63,10 @@ pub struct Framebuffer {
     /// sliding art is clipped to the panel's screen area instead of spilling
     /// over the chrome.
     pub clip: Option<[i32; 4]>,
+    /// The rows a wider aspect presents ([`crate::video::View`]); the whole
+    /// frame at 4:3. Drawing ignores it: the scene stays in 4:3 space, and
+    /// screen-space layers draw through [`Framebuffer::with_view`].
+    pub view: crate::video::View,
 }
 
 impl Default for Framebuffer {
@@ -240,7 +244,71 @@ impl Framebuffer {
             height: HEIGHT,
             rgba: vec![0; (WIDTH * HEIGHT * 4) as usize],
             clip: None,
+            view: crate::video::View::default(),
         }
+    }
+
+    /// A black `width` x `height` framebuffer.
+    pub fn with_size(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            rgba: vec![0; width as usize * height as usize * 4],
+            clip: None,
+            view: crate::video::View {
+                top: 0,
+                height,
+                pan: 0,
+            },
+        }
+    }
+
+    /// Run `draw` on the visible band as its own frame: a 320 x
+    /// `view.height` framebuffer whose row 0 is the band's top, so a
+    /// screen-space layer (a menu, the message window) lays itself out in
+    /// the space the player sees. The band's pixels are copied in and back,
+    /// and a clip rect `draw` leaves is lifted. A full-frame view draws in
+    /// place, so 4:3 frames are drawn exactly as before.
+    pub fn with_view<R>(&mut self, draw: impl FnOnce(&mut Framebuffer) -> R) -> R {
+        let view = self.view;
+        if view.is_full() || self.width != WIDTH || self.height != HEIGHT {
+            return draw(self);
+        }
+        let stride = self.width as usize * 4;
+        let start = view.top as usize * stride;
+        let end = start + view.height as usize * stride;
+        let mut band = Framebuffer::with_size(self.width, view.height);
+        band.rgba.copy_from_slice(&self.rgba[start..end]);
+        let result = draw(&mut band);
+        self.rgba[start..end].copy_from_slice(&band.rgba);
+        result
+    }
+
+    /// Run `draw` on the 320 x `rows` frame a fixed 4:3 layout draws in:
+    /// [`Framebuffer::with_view`]'s band on a 320x240 frame, the centred
+    /// 320x240 columns of a wider aspect's canvas. Rust's screen-space
+    /// overlays (the message window, the debug menu) draw through this.
+    pub fn with_screen<R>(&mut self, draw: impl FnOnce(&mut Framebuffer) -> R) -> R {
+        if self.width <= WIDTH {
+            return self.with_view(draw);
+        }
+        let left = (self.width - WIDTH) as usize / 2;
+        let stride = self.width as usize * 4;
+        let rows = self.height as usize;
+        let mut screen = Framebuffer::with_size(WIDTH, self.height);
+        let span = WIDTH as usize * 4;
+        for row in 0..rows {
+            let start = row * stride + left * 4;
+            screen.rgba[row * span..(row + 1) * span]
+                .copy_from_slice(&self.rgba[start..start + span]);
+        }
+        let result = draw(&mut screen);
+        for row in 0..rows {
+            let start = row * stride + left * 4;
+            self.rgba[start..start + span]
+                .copy_from_slice(&screen.rgba[row * span..(row + 1) * span]);
+        }
+        result
     }
 
     /// Fill the whole framebuffer black.
@@ -289,11 +357,19 @@ impl Framebuffer {
     /// left, and the edge row/column repeats. `colour` is the global colour
     /// multiplier (`255` per channel is identity), applied with a truncating
     /// integer scale. The destination is always opaque.
+    ///
+    /// The image stretches over the logical 320x240 quad centred in the
+    /// frame, so a wider aspect's shorter band crops the picture rather than
+    /// squashing it; a wider canvas repeats the edge columns.
     pub fn draw_background(&mut self, image: &Image, origin: [i32; 2], colour: [u8; 3]) {
         if image.width == 0 || image.height == 0 {
             return;
         }
         let width = self.width as usize;
+        let origin = [
+            origin[0] + (self.width as i32 - WIDTH as i32) / 2,
+            origin[1] + (self.height as i32 - HEIGHT as i32) / 2,
+        ];
         // The reference uploads the background as a texture and stretches it
         // over the full logical 320x240 quad (see the display-image pass in
         // `OT_InsertPrimitive`), so a 316x236 screen-border background covers
@@ -302,8 +378,8 @@ impl Framebuffer {
         // (`(2x + 1) / 2`) is the reference's GL rasterisation.
         let scale_x = i64::from(image.width);
         let scale_y = i64::from(image.height);
-        let frame_w = i64::from(self.width);
-        let frame_h = i64::from(self.height);
+        let frame_w = WIDTH as i64;
+        let frame_h = HEIGHT as i64;
         for y in 0..self.height {
             let source_y = (((i64::from(y) - i64::from(origin[1])) * 2 + 1) * scale_y
                 / (2 * frame_h))
@@ -783,12 +859,24 @@ impl Framebuffer {
 
     /// Copy another 320x240 framebuffer over this one.
     pub fn copy_from(&mut self, other: &Framebuffer) {
-        if self.width == other.width
-            && self.height == other.height
-            && self.rgba.len() == other.rgba.len()
-        {
-            self.rgba.copy_from_slice(&other.rgba);
+        // A wider aspect's canvas and the 320x240 frame trade places as
+        // screens open and close.
+        if (self.width, self.height) != (other.width, other.height) {
+            self.resize(other.width, other.height);
         }
+        if self.rgba.len() == other.rgba.len() {
+            self.rgba.copy_from_slice(&other.rgba);
+            self.view = other.view;
+        }
+    }
+
+    /// Make this a black `width` x `height` frame unless it already has that
+    /// size; its view becomes the whole frame either way.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        if (self.width, self.height) != (width, height) {
+            *self = Self::with_size(width, height);
+        }
+        self.view = crate::video::View::default();
     }
 
     /// Blend the whole frame towards `color` by `alpha`/255.

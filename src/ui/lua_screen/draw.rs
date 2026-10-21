@@ -411,7 +411,8 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     // `draw_ivm(model, {joints = {...}, objects = {{...}, ...}, camera =
     // {from, to, fov, screen = {x, y}}, light})`: object `i` takes the
     // joint chain `objects[i]`, and every object past the list the one
-    // composed `joints` chain. `screen` offsets the projection centre.
+    // composed `joints` chain. `screen` offsets the projection centre,
+    // which sits at the layout's centre (see [`band_centre`]).
     methods.add_method_mut("draw_ivm", |_lua, api, (handle, spec): (usize, Table)| {
         let Api {
             host, framebuffer, ..
@@ -429,7 +430,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             triple(&camera, "to")?,
             field(&camera, "fov")?,
         );
-        camera.screen = screen;
+        camera.screen = band_centre(framebuffer, screen);
         let light = match spec.get::<Option<Table>>("light")? {
             Some(table) => Some(light(&table)?),
             None => None,
@@ -449,7 +450,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     methods.add_method_mut(
         "draw_actor",
         |_lua, api, (name, camera): (String, Table)| {
-            let camera = Camera::from_points(
+            let mut camera = Camera::from_points(
                 triple(&camera, "from")?,
                 triple(&camera, "to")?,
                 field(&camera, "fov")?,
@@ -460,6 +461,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 ..
             } = api;
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
+            camera.screen = band_centre(framebuffer, [0, 0]);
             Ok(actors
                 .as_deref_mut()
                 .is_some_and(|draw| draw(&name, &camera, framebuffer)))
@@ -700,6 +702,16 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             Ok(())
         },
     );
+}
+
+/// A screen camera's projection offset: the rasterizer projects about the
+/// 4:3 frame's centre, so a shorter layout band (a wider aspect) moves the
+/// centre up by half the rows it lost, and a wider canvas moves it right by
+/// half the columns it gained, keeping the model centred in the layout.
+fn band_centre(framebuffer: &Framebuffer, screen: [i32; 2]) -> [i32; 2] {
+    let gained = framebuffer.width as i32 - crate::render::WIDTH as i32;
+    let lost = crate::render::HEIGHT as i32 - framebuffer.height as i32;
+    [screen[0] + gained / 2, screen[1] - lost / 2]
 }
 
 #[cfg(test)]

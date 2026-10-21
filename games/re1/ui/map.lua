@@ -339,6 +339,8 @@ local function page(api, stem, warning)
 end
 
 function M.open(api)
+    -- Drawn on black: a wider aspect gives the panel a wider canvas.
+    api:set("canvas", 1)
     s = {
         tables = load_tables(api),
         -- The current layout (0..3) and the selected room index per layout.

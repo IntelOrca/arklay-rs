@@ -304,6 +304,31 @@ local function origin(api)
     return api:width() // 2 - 160, api:height() // 2 - 120
 end
 
+-- The rows a frame shorter than 240 (a wider aspect's band) stacks the
+-- screen on: the header, the slot rows at a tighter pitch, the exit row and
+-- the prompt/confirm lines, measured from the band's top.
+local COMPACT = {
+    header = 4, row = 20, pitch = 14,
+    prompt = 148, confirm = 164, error = 148, error2 = 164,
+}
+
+--- The vertical layout in the origin's coordinates: the original's rows
+--- on a 240-row frame, the compact rows on a shorter one.
+local function layout(api, oy)
+    if api:height() >= 240 then
+        return {
+            header = HEADER_Y, row = ROW_Y, pitch = ROW_HEIGHT, exit = EXIT_Y,
+            prompt = PROMPT_Y, confirm = CONFIRM_Y, error = ERROR_Y, error2 = ERROR_Y2,
+        }
+    end
+    local rows = {}
+    for key, y in pairs(COMPACT) do
+        rows[key] = key == "pitch" and y or y - oy
+    end
+    rows.exit = rows.row + SLOT_COUNT * rows.pitch
+    return rows
+end
+
 local function cursor(api, x, y)
     if api:has_font() then
         api:glyphs(x, y, CURSOR_GLYPH, { tight = false })
@@ -314,6 +339,7 @@ end
 
 function M.draw(api)
     local ox, oy = origin(api)
+    local rows = layout(api, oy)
     if background then
         -- A full-frame backdrop is stretched, so a replacement may be
         -- authored at any size.
@@ -322,7 +348,7 @@ function M.draw(api)
         api:clear()
         api:fill_rect(0, 0, api:width(), api:height(), 0, 0, 0, 255)
     end
-    local row_y = oy + ROW_Y + s.cursor * ROW_HEIGHT
+    local row_y = oy + rows.row + s.cursor * rows.pitch
     if not (api:has_font() and api:has_text()) then
         cursor(api, ox + CURSOR_X, row_y)
         return
@@ -334,11 +360,11 @@ function M.draw(api)
 
     -- The header is the original's formatted path, so the suffix's M is
     -- the sheet's letter M.
-    text(HEADER_X, HEADER_Y, "UI_SAVE_HEADER_" .. mode)
-    text(HEADER_X, HEADER_Y, "UI_SAVE_HEADER_SUFFIX")
+    text(HEADER_X, rows.header, "UI_SAVE_HEADER_" .. mode)
+    text(HEADER_X, rows.header, "UI_SAVE_HEADER_SUFFIX")
 
     for index = 0, SLOT_COUNT - 1 do
-        local y = ROW_Y + index * ROW_HEIGHT
+        local y = rows.row + index * rows.pitch
         local info = s.slots[index + 1]
         if s.stage == "save_anim" and s.cursor == index then
             -- The reveal draws this row.
@@ -356,8 +382,8 @@ function M.draw(api)
         end
     end
 
-    text(ROW_X, EXIT_Y, "UI_SAVE_EXIT_" .. mode)
-    text(ROW_X, EXIT_Y, "UI_SAVE_EXIT_SUFFIX")
+    text(ROW_X, rows.exit, "UI_SAVE_EXIT_" .. mode)
+    text(ROW_X, rows.exit, "UI_SAVE_EXIT_SUFFIX")
 
     if s.reveal then
         -- The reveal is assembled on the fixed 14px grid to line up with
@@ -366,18 +392,18 @@ function M.draw(api)
     end
 
     if s.stage == "confirm_overwrite" then
-        text(PROMPT_X, PROMPT_Y, "UI_SAVE_OVERWRITE_PROMPT")
-        text(CONFIRM_X, CONFIRM_Y, "UI_SAVE_YES_NO")
+        text(PROMPT_X, rows.prompt, "UI_SAVE_OVERWRITE_PROMPT")
+        text(CONFIRM_X, rows.confirm, "UI_SAVE_YES_NO")
     elseif s.stage == "error" then
-        text(PROMPT_X, ERROR_Y, "UI_SAVE_ERROR_0")
-        text(PROMPT_X, ERROR_Y2, "UI_SAVE_ERROR_1")
+        text(PROMPT_X, rows.error, "UI_SAVE_ERROR_0")
+        text(PROMPT_X, rows.error2, "UI_SAVE_ERROR_1")
     end
 
     if s.stage == "confirm_overwrite" then
         -- The slot cursor stays visible while the confirm cursor blinks.
         cursor(api, ox + CURSOR_X, row_y)
         if not s.blink_state then
-            cursor(api, ox + CONFIRM_X + s.confirm_choice * CONFIRM_STRIDE, oy + CONFIRM_Y)
+            cursor(api, ox + CONFIRM_X + s.confirm_choice * CONFIRM_STRIDE, oy + rows.confirm)
         end
     elseif not s.blink_state then
         cursor(api, ox + CURSOR_X, row_y)

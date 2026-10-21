@@ -122,9 +122,43 @@ function Panel.draw_masks(api, ox, oy)
     end
 end
 
+-- The bottom strip's repeatable slices, `{y, h, u, v}` at an 8-column
+-- stretch of the line (y 182) and the two strip halves (y 216): what a
+-- wider canvas tiles across the margins either side of the panel.
+local STRIP_LEFT = {
+    { 182, 2, 0x08, 0xA6 },
+    { 216, 16, 0x08, 0x88 },
+}
+local STRIP_RIGHT = {
+    { 182, 2, 0xB0, 0xA6 },
+    { 216, 16, 0xB8, 0xA8 },
+}
+local STRIP_SLICE = 8
+
+local function draw_strip_margins(api, page, ox, oy)
+    if ox <= 0 then
+        return
+    end
+    local right = ox + 320
+    for _, slice in ipairs(STRIP_LEFT) do
+        for x = ox - STRIP_SLICE, -STRIP_SLICE + 1, -STRIP_SLICE do
+            api:page_sprite_mirrored(page, slice[3], slice[4], STRIP_SLICE, slice[2],
+                x, oy + slice[1], STRIP_SLICE, slice[2], 0, 0, false, false)
+        end
+    end
+    for _, slice in ipairs(STRIP_RIGHT) do
+        for x = right, api:width() - 1, STRIP_SLICE do
+            api:page_sprite_mirrored(page, slice[3], slice[4], STRIP_SLICE, slice[2],
+                x, oy + slice[1], STRIP_SLICE, slice[2], 0, 0, false, false)
+        end
+    end
+end
+
 --- Every frame part, then the common tiles, then the character's border.
+--- On a canvas wider than the panel the bottom strip runs on to its edges.
 function Panel.draw_frames(api, ox, oy, slots)
     local page = api:page(Panel.STATUS_STEM)
+    draw_strip_margins(api, page, ox, oy)
     for _, part in ipairs(FRAME_PARTS) do
         draw_part(api, page, ox, oy, part)
     end

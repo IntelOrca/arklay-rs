@@ -97,6 +97,8 @@ local function blink()
 end
 
 function M.open(api, _args)
+    -- Drawn on black: a wider aspect gives the panel a wider canvas.
+    api:set("canvas", 1)
     s.slots = api:inventory_capacity()
     s.cursor = Grid.FIRST_SLOT_CURSOR
     s.mode = NAVIGATION
