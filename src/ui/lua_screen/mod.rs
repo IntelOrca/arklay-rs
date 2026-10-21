@@ -290,6 +290,12 @@ impl LuaScreen {
         self.host.values.get(key).copied().unwrap_or(0)
     }
 
+    /// Overwrite a published value, as the script's `api:set` would.
+    #[cfg(test)]
+    pub fn set_value(&mut self, key: &str, value: i64) {
+        self.host.values.insert(key.to_owned(), value);
+    }
+
     /// Run the script's `M.<name>(api)` hook, if it defines one: the engine's
     /// way to tell a running screen something happened (the pick-up viewer's
     /// `begin_exit`). A failing hook is logged and fails the screen.

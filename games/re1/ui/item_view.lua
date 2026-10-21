@@ -333,7 +333,8 @@ function M.open(api, args)
     s.quantity = args.quantity or 0
     s.pickup = args.pickup or false
     -- The examine viewer draws on black, so a wider aspect gives it a wider
-    -- canvas; the pickup viewer draws over the room and keeps its band.
+    -- canvas; the pickup viewer draws in the inventory panel, which asks for
+    -- the canvas itself.
     api:set("canvas", s.pickup and 0 or 1)
     s.pitch, s.yaw, s.roll = 0, 0, 0
     s.model_x = MODEL_REST_X

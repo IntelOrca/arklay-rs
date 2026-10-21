@@ -321,6 +321,20 @@ pub fn follow(top: u32, height: u32, target: Option<i32>, snap: bool) -> u32 {
     (top + (wanted - top).clamp(-FOLLOW_STEP, FOLLOW_STEP)).clamp(0, max) as u32
 }
 
+/// The band's top after one tick of moving from `top` towards the centred
+/// band, at most [`FOLLOW_STEP`] rows (`snap` jumps straight there). The
+/// cutscene letterbox bars cover the frame's top and bottom 28 rows, so a
+/// centred band crops them evenly.
+pub fn centre(top: u32, height: u32, snap: bool) -> u32 {
+    let height = height.min(NATIVE_HEIGHT);
+    let wanted = ((NATIVE_HEIGHT - height) / 2) as i32;
+    if snap {
+        return wanted as u32;
+    }
+    let top = top as i32;
+    (top + (wanted - top).clamp(-FOLLOW_STEP, FOLLOW_STEP)) as u32
+}
+
 /// Which renderer an interactive window draws the gameplay scene with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RendererKind {
@@ -530,6 +544,18 @@ mod tests {
         assert_eq!(step_frame_rate(75, 1), 120);
         assert_eq!(step_frame_rate(75, -1), 60);
         assert_eq!(step_frame_rate(1000, 1), 30);
+    }
+
+    #[test]
+    fn the_letterboxed_band_steps_to_the_centre() {
+        // 16:9's 180-row band centres at row 30, cropping both 28-row bars.
+        assert_eq!(centre(60, 180, true), 30);
+        assert_eq!(centre(0, 180, false), 4);
+        assert_eq!(centre(60, 180, false), 56);
+        assert_eq!(centre(32, 180, false), 30);
+        assert_eq!(centre(30, 180, false), 30);
+        // 16:10's 200-row band centres at row 20.
+        assert_eq!(centre(40, 200, true), 20);
     }
 
     #[test]

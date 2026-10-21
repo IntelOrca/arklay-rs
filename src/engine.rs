@@ -2237,8 +2237,16 @@ impl GameSession {
         let cut_key = (self.loaded.id, self.loaded.room.current_cut);
         let snap = self.view_cut != Some(cut_key) || self.view.height != aspect.height();
         self.view_cut = Some(cut_key);
-        let target = band_target(&self.loaded.room, self.player.pos);
-        let top = video::follow(self.view.top, aspect.height(), target, snap);
+        // While the cutscene letterbox is up (or ramping in) the band centres
+        // instead, so the two bars are cropped evenly.
+        let letterbox = self.sprite_anim_intensity as u8 != 0
+            || self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY);
+        let top = if letterbox {
+            video::centre(self.view.top, aspect.height(), snap)
+        } else {
+            let target = band_target(&self.loaded.room, self.player.pos);
+            video::follow(self.view.top, aspect.height(), target, snap)
+        };
         self.view = video::View::at(top as i32, aspect.height());
     }
 
@@ -4872,10 +4880,11 @@ impl GameSession {
         }
         // The loading narration and the films present the centred band; the
         // room and its overlays the band following the player. The F1 debug
-        // menu is laid out for 240 rows, so while it is up the whole 4:3
-        // frame is presented, pillarboxed, instead.
+        // menu and a screen on black without a canvas (a mod's screen that
+        // predates `canvas`) are laid out for 240 rows, so while one is up
+        // the whole 4:3 frame is presented, pillarboxed, instead.
         if canvas.is_none() {
-            self.framebuffer.view = if self.debug_menu.is_some() {
+            self.framebuffer.view = if self.debug_menu.is_some() || self.screen_on_black(|_| true) {
                 video::View::default()
             } else if self.boot_message.is_some() || self.movie.is_some() {
                 video::aspect().centred()
@@ -5290,30 +5299,34 @@ impl GameSession {
     /// 4:3 and while a screen that owns the whole frame (a film, the
     /// loading narration, a door, the death screen) is up.
     fn canvas_width(&self) -> Option<u32> {
-        let aspect = video::aspect();
-        if aspect.is_standard()
+        self.screen_on_black(|screen| screen.value("canvas") != 0)
+            .then(|| video::aspect().canvas_width())
+    }
+
+    /// Whether a visible screen drawn on black matching `wants` is up at a
+    /// wider aspect: the pause-menu stack (unless its fade hides it), the
+    /// FILE and MAP screens and the pick-up viewer.
+    fn screen_on_black(&self, wants: impl Fn(&ui::lua_screen::LuaScreen) -> bool) -> bool {
+        if video::aspect().is_standard()
             || self.boot_message.is_some()
             || self.movie.is_some()
             || self.transition.is_some()
             || self.death_screen.is_some()
             || self.computer.is_some()
         {
-            return None;
+            return false;
         }
-        let wants = |screen: Option<&ui::lua_screen::LuaScreen>| {
-            screen.is_some_and(|screen| screen.value("canvas") != 0)
-        };
-        let hidden = self.menu_fade_hides();
+        let wants = |screen: Option<&ui::lua_screen::LuaScreen>| screen.is_some_and(&wants);
         let pickup = self.pickup_view.as_ref();
-        let menu_stack = !hidden
+        let menu_stack = !self.menu_fade_hides()
             && (wants(self.menu.as_deref())
                 || wants(self.examine.as_deref())
                 || wants(self.item_box.as_deref()));
-        let owned = wants(self.file.as_deref())
+        menu_stack
+            || wants(self.file.as_deref())
             || wants(self.map.as_deref())
             || wants(pickup.and_then(|pickup| pickup.reader.as_deref()))
-            || wants(pickup.and_then(|pickup| pickup.screen.as_deref()));
-        (menu_stack || owned).then(|| aspect.canvas_width())
+            || wants(pickup.and_then(|pickup| pickup.screen.as_deref()))
     }
 
     /// The last rendered frame.
@@ -21142,6 +21155,42 @@ off_0010:
             session.player.anim.frame, 1,
             "the exit restore ran the first body Joint_move"
         );
+    }
+
+    /// At a wider aspect the pick-up panel takes the menu's wider canvas,
+    /// and a panel that does not ask for one (a mod's screen that predates
+    /// `canvas`) presents the whole 4:3 frame, pillarboxed, instead of the
+    /// gameplay band cropping its top and pulling the prompt over it.
+    #[test]
+    fn a_wide_pickup_panel_keeps_all_240_rows() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        video::set_aspect(video::Aspect::parse("16:9").unwrap());
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        settle_control(&mut session, &pack);
+        session.game.room_actions[1] = Some(item_room_action(1, ITEM_FIRST_AID_SPRAY, 1, 4));
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        tick_until(&mut session, &pack, 300, "the yes/no phase", |session| {
+            session.game.message.phase() == crate::message::MessagePhase::YesNo
+        });
+
+        session.render(&pack);
+        let frame = session.frame();
+        assert_eq!((frame.width, frame.height), (427, 240));
+        assert_eq!(frame.view, video::View::default());
+
+        session.menu.as_mut().unwrap().set_value("canvas", 0);
+        session.render(&pack);
+        let frame = session.frame();
+        assert_eq!((frame.width, frame.height), (320, 240));
+        assert_eq!(frame.view, video::View::default());
+        video::set_aspect(video::Aspect::default());
     }
 
     #[test]
