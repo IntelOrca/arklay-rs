@@ -596,7 +596,8 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
   INFINITE pins the clip at capacity and never decrements it. Session-only,
   never saved.
 - SAVE: save opens the typewriter save screen; load opens the load screen and
-  continues from the picked slot.
+  continues from the picked save (a numbered slot, or the file a registered
+  screen chose with `api:load`).
 - ITEM BOX: opens the item box anywhere.
 - CLEAR GAME: plays ending 1-7 (defaulting to the one the current flags
   select) and the result screen.
