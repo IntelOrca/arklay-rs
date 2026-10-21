@@ -356,6 +356,35 @@ fn finish_mask(texel: u32) -> u32 {
     if texel == 0 { 0 } else { texel | 0xff00_0000 }
 }
 
+/// Japanese pages Classic REbirth swaps for their English versions before the
+/// game uploads them (`DATA/STATUS.TIM`, `DATA/TITLE.PIX`), as the hash of
+/// the Japanese page and of the English one. A pack made under CR names the
+/// English page, so a Japanese install also looks that hash up.
+const TRANSLATED: [(u32, u32); 2] = [
+    // The status screen's menu page, CLUT row 0.
+    (0x440c_318f, 0x97de_3e43),
+    // The title screen.
+    (0xe0c7_ae8b, 0x3c52_c827),
+];
+
+/// Append the English page's hash, with the same frame, after each candidate
+/// that names a Japanese page in [`TRANSLATED`].
+fn add_translations(candidates: &mut Vec<Candidate>) {
+    let english: Vec<Candidate> = candidates
+        .iter()
+        .filter_map(|candidate| {
+            TRANSLATED
+                .iter()
+                .find(|&&(japanese, _)| japanese == candidate.hash)
+                .map(|&(_, hash)| Candidate {
+                    hash,
+                    frame: candidate.frame,
+                })
+        })
+        .collect();
+    candidates.extend(english);
+}
+
 /// The hashes an RGBA image (background, mask page, effect sheet) may carry,
 /// most specific first.
 pub fn image_candidates(image: &Image) -> Vec<Candidate> {
@@ -412,6 +441,7 @@ pub fn image_candidates(image: &Image) -> Vec<Candidate> {
             });
         }
     }
+    add_translations(&mut candidates);
     candidates
 }
 
@@ -500,6 +530,7 @@ pub fn page_candidates(texture: &Texture8, row: usize) -> Vec<Candidate> {
             frame: [texture.width, texture.height],
         });
     }
+    add_translations(&mut candidates);
     candidates
 }
 
@@ -678,6 +709,38 @@ mod tests {
                 hash: shifted,
                 frame: [320, 240]
             }
+        );
+    }
+
+    #[test]
+    fn a_page_cr_translates_also_carries_the_english_hash() {
+        let mut candidates = vec![
+            Candidate {
+                hash: 0x440c_318f,
+                frame: [256, 256],
+            },
+            Candidate {
+                hash: 5,
+                frame: [1, 1],
+            },
+        ];
+        add_translations(&mut candidates);
+        assert_eq!(
+            candidates,
+            [
+                Candidate {
+                    hash: 0x440c_318f,
+                    frame: [256, 256]
+                },
+                Candidate {
+                    hash: 5,
+                    frame: [1, 1]
+                },
+                Candidate {
+                    hash: 0x97de_3e43,
+                    frame: [256, 256]
+                },
+            ]
         );
     }
 
