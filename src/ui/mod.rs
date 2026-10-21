@@ -69,7 +69,8 @@ pub struct UiInput {
     pub page_left: bool,
     /// R1 (`]` by default): pages the item box forward.
     pub page_right: bool,
-    /// START (Tab by default): opens the gameplay pause menu.
+    /// START (Tab by default): opens the gameplay pause menu; the debug
+    /// menu's INVENTORY tool uses it to clear a slot.
     pub start: bool,
     /// F1: the port-only debug room overlay's edge. The overlay is always
     /// available; `--debug-menu` is accepted for compatibility only.

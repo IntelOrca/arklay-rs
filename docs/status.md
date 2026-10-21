@@ -578,7 +578,9 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
 
 - ROOM SELECT: the pack's rooms in seven stage columns, the current room in
   green; a jump uses the pending character's room variant when it is packed.
-- INVENTORY: edit each slot's item and quantity, with an icon picker.
+- INVENTORY: edit each slot's item and quantity, with an icon picker. Left
+  and right step the quantity down to zero (the item stays), and START
+  clears the slot.
 - PLAYER: character and outfit (normal, alt 1, alt 2) are pending and apply at
   the next room load, like the wardrobe; the alternate outfits load
   `em1030 + character + 2 * variant` as the original's `LoadEntityEMD` does.
