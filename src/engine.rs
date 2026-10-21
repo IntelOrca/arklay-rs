@@ -7386,28 +7386,34 @@ impl App {
         } else {
             // Gameplay has ended (or yielded to a film): its uploads go.
             gpu.release_residency();
-            // A screen drawing art the pack replaces in HD is drawn again
-            // over white, like a session's overlays, and the GPU draws the
-            // replacements under both layers.
-            let hd = !self.pack.htexture().is_empty();
-            if hd {
-                self.framebuffer.capture_hd(0);
-            } else {
-                self.framebuffer.hd = None;
-            }
-            self.draw_frame();
-            if self.framebuffer.hd_quads().is_empty() {
-                self.framebuffer_white = None;
-                return;
-            }
-            let mut white = self.framebuffer_white.take().unwrap_or_default();
-            white.resize(self.framebuffer.width, self.framebuffer.height);
-            std::mem::swap(&mut self.framebuffer, &mut white);
-            self.framebuffer.capture_hd(255);
-            self.draw_frame();
-            std::mem::swap(&mut self.framebuffer, &mut white);
-            self.framebuffer_white = Some(white);
+            self.draw_app_layers();
         }
+    }
+
+    /// Draw an app screen's frame, and draw it again over white when it
+    /// shows HD 2D art (see [`App::white_frame`]).
+    fn draw_app_layers(&mut self) {
+        // A screen drawing art the pack replaces in HD is drawn again
+        // over white, like a session's overlays, and the GPU draws the
+        // replacements under both layers.
+        let hd = !self.pack.htexture().is_empty();
+        if hd {
+            self.framebuffer.capture_hd(0);
+        } else {
+            self.framebuffer.hd = None;
+        }
+        self.draw_frame();
+        if self.framebuffer.hd_quads().is_empty() {
+            self.framebuffer_white = None;
+            return;
+        }
+        let mut white = self.framebuffer_white.take().unwrap_or_default();
+        white.resize(self.framebuffer.width, self.framebuffer.height);
+        std::mem::swap(&mut self.framebuffer, &mut white);
+        self.framebuffer.capture_hd(255);
+        self.draw_frame();
+        std::mem::swap(&mut self.framebuffer, &mut white);
+        self.framebuffer_white = Some(white);
     }
 
     /// The frame drawn over a white GPU scene, when the session shows one or
@@ -18554,6 +18560,53 @@ mod tests {
         };
         assert_eq!(screen.test_eval::<String>("return M.state.stage"), "idle");
         assert_eq!(screen.test_eval::<u8>("return M.state.selected"), 1);
+    }
+
+    #[test]
+    fn an_app_screen_with_hd_art_is_drawn_over_black_and_white() {
+        let dir = TempDir::new();
+        let back = solid_image([0, 0, 40, 255]);
+        let hd = bmp::encode_to_vec(&solid_image([0, 0, 200, 255])).unwrap();
+        let mut writer = PackWriter::new();
+        writer
+            .add("ui/sel_back.bmp", bmp::encode_to_vec(&back).unwrap())
+            .unwrap();
+        writer
+            .add(
+                "ui/select_b.bmp",
+                bmp::encode_to_vec(&test_image()).unwrap(),
+            )
+            .unwrap();
+        let mut hashes: Vec<u32> = crate::htexture::image_candidates(&back)
+            .iter()
+            .map(|candidate| candidate.hash)
+            .collect();
+        hashes.sort_unstable();
+        hashes.dedup();
+        for hash in hashes {
+            writer
+                .add(&format!("htexture/bgd/{hash:08X}.bmp"), hd.clone())
+                .unwrap();
+        }
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        app.boot(AppBoot::CharSelect).unwrap();
+        app.settle(40).unwrap();
+
+        app.draw_app_layers();
+        let overlay = app.frame().hd.as_deref().expect("a capture");
+        assert!(!overlay.scene, "an app screen has no scene under it");
+        assert!(!overlay.quads.is_empty());
+        let white = app.white_frame().expect("a white layer");
+        assert_eq!(white.hd.as_ref().map(|hd| hd.hole), Some(255));
+        // A pixel of the background left to the GPU is a hole in both.
+        assert_eq!(&app.frame().rgba[..3], &[0, 0, 0]);
+        assert_eq!(&white.rgba[..3], &[255, 255, 255]);
+
+        // The plain software frame has no capture and the original art.
+        app.draw();
+        assert!(app.frame().hd.is_none());
+        assert_eq!(&app.frame().rgba[..3], &[0, 0, 40]);
     }
 
     /// A minimal 8bpp TIM with four pixels and a 256-entry palette, enough for

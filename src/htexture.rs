@@ -22,13 +22,13 @@
 //! 128 x 128 page draws its top-left quarter.
 //!
 //! Only the GPU renderer draws replacements; the software rasterizer stays
-//! the 320 x 240 reference. The 2D screens (title, files, item pictures, the
-//! status screen, the epilogue) are software overlays, so a replaced piece of
+//! the 320 x 240 reference. The 2D screens (files, item pictures, the status
+//! screen, maps, the select and epilogue backgrounds) are software overlays, so a replaced piece of
 //! their art is drawn on the GPU as an [`Overlay`] quad while the overlay
 //! leaves a hole for it (see [`Overlay`]).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
 
@@ -57,12 +57,20 @@ pub struct Found {
     pub frame: [u32; 2],
 }
 
+/// A decoded replacement's file and frame.
+type DecodedKey = (String, [u32; 2]);
+
 /// The `htexture/` replacements of a pack and its mod layers, by hash.
 #[derive(Debug, Default)]
 pub struct HdTable {
     files: HashMap<u32, String>,
     /// Textures already reported as having no replacement.
     reported: Mutex<HashSet<u32>>,
+    /// Decoded 2D replacements by path and frame, held weakly: while any
+    /// screen or the GPU's texture cache keeps one alive, every lookup gets
+    /// that same [`Replacement`], so a reopened screen is neither decoded
+    /// nor uploaded again.
+    decoded: Mutex<HashMap<DecodedKey, Weak<Replacement>>>,
 }
 
 impl HdTable {
@@ -102,6 +110,7 @@ impl HdTable {
         HdTable {
             files,
             reported: Mutex::new(HashSet::new()),
+            decoded: Mutex::new(HashMap::new()),
         }
     }
 
@@ -176,17 +185,30 @@ pub fn replacement(
     candidates: &[Candidate],
     what: impl FnOnce() -> String,
 ) -> Option<Arc<Replacement>> {
-    let found = pack.htexture().find(candidates, what)?;
-    match load(pack, &found.path) {
+    let table = pack.htexture();
+    let found = table.find(candidates, what)?;
+    let frame = [found.frame[0].max(1), found.frame[1].max(1)];
+    let key = (found.path, frame);
+    if let Some(kept) = table
+        .decoded
+        .lock()
+        .ok()
+        .and_then(|decoded| decoded.get(&key).and_then(Weak::upgrade))
+    {
+        return Some(kept);
+    }
+    match load(pack, &key.0) {
         Ok(image)
             if image.width > 0
                 && image.height > 0
                 && image.rgba.len() >= (image.width * image.height * 4) as usize =>
         {
-            Some(Arc::new(Replacement {
-                image,
-                frame: [found.frame[0].max(1), found.frame[1].max(1)],
-            }))
+            let replacement = Arc::new(Replacement { image, frame });
+            if let Ok(mut decoded) = table.decoded.lock() {
+                decoded.retain(|_, kept| kept.strong_count() > 0);
+                decoded.insert(key, Arc::downgrade(&replacement));
+            }
+            Some(replacement)
         }
         Ok(_) => None,
         Err(err) => {
@@ -221,7 +243,11 @@ pub struct Quad {
 /// whatever the overlay draws later (text, fades) still lands over it. A
 /// blended draw (the FILE backdrop's half alpha) blends the hole grey, which
 /// is exact over art the scene does not show through.
-#[derive(Clone, Debug, Default)]
+///
+/// Each punched texel also records its quad in `coverage`, and the GPU
+/// keeps a quad's pixels only where it wrote last, so the HD art covers
+/// exactly what the original did even where replaced draws overlap.
+#[derive(Debug, Default)]
 pub struct Overlay {
     pub quads: Vec<Quad>,
     /// The hole grey of the pass being drawn.
@@ -234,15 +260,67 @@ pub struct Overlay {
     /// Whether the gameplay scene lies under the overlay; without it the
     /// quads are drawn over black.
     pub scene: bool,
+    /// The `[width, height]` of the frame captured.
+    pub size: [u32; 2],
+    /// Per frame pixel, row-major: one more than the index of the quad that
+    /// punched it last, or `0`.
+    pub coverage: Vec<u16>,
 }
 
 impl Overlay {
-    /// A frame's capture for the pass whose hole grey is `hole`.
-    pub fn new(hole: u8) -> Self {
-        Self {
-            hole,
-            ..Self::default()
+    /// A `size` frame's capture for the pass whose hole grey is `hole`.
+    pub fn new(hole: u8, size: [u32; 2]) -> Self {
+        let mut overlay = Self::default();
+        overlay.reset(hole, size);
+        overlay
+    }
+
+    /// Start over as [`Overlay::new`], keeping the allocations.
+    pub fn reset(&mut self, hole: u8, size: [u32; 2]) {
+        self.quads.clear();
+        self.hole = hole;
+        self.punching = false;
+        self.offset = [0, 0];
+        self.scene = false;
+        self.resize(size);
+    }
+
+    /// Clear the coverage for a `size` frame.
+    pub fn resize(&mut self, size: [u32; 2]) {
+        self.size = size;
+        self.coverage.clear();
+        self.coverage.resize(size[0] as usize * size[1] as usize, 0);
+    }
+
+    /// Record that the draw being punched wrote pixel `(x, y)` of the
+    /// framebuffer at `offset`.
+    pub fn cover(&mut self, x: i32, y: i32) {
+        let (x, y) = (x + self.offset[0], y + self.offset[1]);
+        if x < 0 || y < 0 || x as u32 >= self.size[0] || y as u32 >= self.size[1] {
+            return;
         }
+        let quad = self.quads.len().min(usize::from(u16::MAX)) as u16;
+        self.coverage[y as usize * self.size[0] as usize + x as usize] = quad;
+    }
+}
+
+impl Clone for Overlay {
+    fn clone(&self) -> Self {
+        let mut overlay = Self::default();
+        overlay.clone_from(self);
+        overlay
+    }
+
+    /// Copies into the existing buffers, as the session's frame is copied
+    /// to the app's every frame.
+    fn clone_from(&mut self, source: &Self) {
+        self.quads.clone_from(&source.quads);
+        self.hole = source.hole;
+        self.punching = source.punching;
+        self.offset = source.offset;
+        self.scene = source.scene;
+        self.size = source.size;
+        self.coverage.clone_from(&source.coverage);
     }
 }
 
@@ -499,6 +577,31 @@ mod tests {
         let found = table.find(&candidates, String::new).unwrap();
         assert_eq!(found.path, "htexture/00000003.webp");
         assert_eq!(found.frame, [3, 3]);
+    }
+
+    #[test]
+    fn a_replacement_is_shared_while_any_holder_keeps_it() {
+        let bmp = crate::bmp::encode_to_vec(&Image {
+            width: 2,
+            height: 2,
+            rgba: vec![255; 16],
+        })
+        .unwrap();
+        let mut writer = crate::pack::PackWriter::new();
+        writer.add("htexture/misc/00000007.bmp", bmp).unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let candidates = [Candidate {
+            hash: 7,
+            frame: [4, 4],
+        }];
+        let first = replacement(&pack, &candidates, String::new).unwrap();
+        let again = replacement(&pack, &candidates, String::new).unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        drop((first, again));
+        // Once dropped, the next lookup decodes afresh.
+        let decoded = replacement(&pack, &candidates, String::new).unwrap();
+        assert_eq!(decoded.frame, [4, 4]);
+        assert_eq!(decoded.image.width, 2);
     }
 
     #[test]

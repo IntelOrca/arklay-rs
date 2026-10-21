@@ -51,6 +51,8 @@ pub unsafe trait Plain: Copy {}
 // SAFETY: both vertex types are `repr(C)` runs of `f32`/`u32` fields.
 unsafe impl Plain for MeshVertex {}
 unsafe impl Plain for SpriteVertex {}
+// SAFETY: a bare integer.
+unsafe impl Plain for u16 {}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]

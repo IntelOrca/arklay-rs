@@ -341,7 +341,11 @@ impl Framebuffer {
     /// grey is `hole` (see [`crate::htexture::Overlay`]); the previous
     /// frame's are dropped.
     pub fn capture_hd(&mut self, hole: u8) {
-        self.hd = Some(Box::new(crate::htexture::Overlay::new(hole)));
+        let size = [self.width, self.height];
+        match self.hd.as_mut() {
+            Some(overlay) => overlay.reset(hole, size),
+            None => self.hd = Some(Box::new(crate::htexture::Overlay::new(hole, size))),
+        }
     }
 
     /// Whether 2D replacements are being captured.
@@ -397,13 +401,12 @@ impl Framebuffer {
         }
     }
 
-    /// The hole grey a draw writes in place of its texels, while one is
-    /// replaced.
-    fn hole(&self) -> Option<u8> {
-        self.hd
-            .as_ref()
-            .filter(|overlay| overlay.punching)
-            .map(|overlay| overlay.hole)
+    /// The capture of the draw being replaced, which writes its hole grey
+    /// in place of its texels and [`crate::htexture::Overlay::cover`]s them.
+    fn punching(
+        hd: &mut Option<Box<crate::htexture::Overlay>>,
+    ) -> Option<&mut crate::htexture::Overlay> {
+        hd.as_deref_mut().filter(|overlay| overlay.punching)
     }
 
     /// Fill the whole framebuffer black.
@@ -471,7 +474,7 @@ impl Framebuffer {
         // the frame. The origin is the display-image origin in logical pixels,
         // applied before the texture-space sampling, and the fragment centre
         // (`(2x + 1) / 2`) is the reference's GL rasterisation.
-        let hole = self.hole();
+        let mut punch = Self::punching(&mut self.hd);
         let scale_x = i64::from(image.width);
         let scale_y = i64::from(image.height);
         let frame_w = WIDTH as i64;
@@ -492,8 +495,11 @@ impl Framebuffer {
                 let Some(slot) = self.rgba.get_mut(offset..offset + 4) else {
                     continue;
                 };
+                if let Some(overlay) = punch.as_deref_mut() {
+                    overlay.cover(x as i32, y as i32);
+                }
                 for channel in 0..3 {
-                    slot[channel] = match hole {
+                    slot[channel] = match punch.as_ref().map(|overlay| overlay.hole) {
                         Some(grey) => grey,
                         None => {
                             (u32::from(texel[channel]) * u32::from(colour[channel]) / 255) as u8
@@ -975,8 +981,11 @@ impl Framebuffer {
     /// size; its view becomes the whole frame either way.
     pub fn resize(&mut self, width: u32, height: u32) {
         if (self.width, self.height) != (width, height) {
-            let hd = self.hd.take();
+            let mut hd = self.hd.take();
             *self = Self::with_size(width, height);
+            if let Some(overlay) = hd.as_mut() {
+                overlay.resize([width, height]);
+            }
             self.hd = hd;
         }
         self.view = crate::video::View::default();
@@ -1269,7 +1278,7 @@ impl Framebuffer {
             return;
         }
         let width = self.width as usize;
-        let hole = self.hole();
+        let mut punch = Self::punching(&mut self.hd);
         for y in start_y..end_y {
             let Ok(offset_y) = i32::try_from(
                 (i64::from(y) - i64::from(dst_y)) * i64::from(src_h) / i64::from(dst_h),
@@ -1295,8 +1304,9 @@ impl Framebuffer {
                 let Some(mut pixel) = sample(tex_x, tex_y) else {
                     continue;
                 };
-                if let Some(grey) = hole {
-                    pixel[..3].fill(grey);
+                if let Some(overlay) = punch.as_deref_mut() {
+                    pixel[..3].fill(overlay.hole);
+                    overlay.cover(x, y);
                 }
                 let offset = (y as usize * width + x as usize) * 4;
                 let Some(slot) = self.rgba.get_mut(offset..offset + 4) else {
@@ -4014,6 +4024,12 @@ mod tests {
         let overlay = canvas.hd.as_ref().unwrap();
         assert_eq!(overlay.offset, [0, 0]);
         assert!(!overlay.punching);
+        // The background's texels are marked as the first quad's.
+        assert_eq!(overlay.size, [426, 240]);
+        assert_eq!(overlay.coverage[52], 0);
+        assert_eq!(overlay.coverage[53], 1);
+        assert_eq!(overlay.coverage[239 * 426 + 372], 1);
+        assert_eq!(overlay.coverage[239 * 426 + 373], 0);
         let quads = canvas.hd_quads();
         assert_eq!(quads.len(), 2);
         assert_eq!(quads[0].dst, [53.0, 0.0, 373.0, 240.0]);

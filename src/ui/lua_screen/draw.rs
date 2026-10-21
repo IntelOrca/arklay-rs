@@ -693,7 +693,10 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 Some(hd) => {
                     let (corners, uv) = background_quad(&hd, image, framebuffer, origin);
                     let colour = colour.map(|channel| f32::from(channel) / 255.0);
+                    // A background ignores the clip, so its quad must too.
+                    let clip = framebuffer.clip.take();
                     framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                    framebuffer.clip = clip;
                 }
                 None => draw(framebuffer),
             }
@@ -842,8 +845,9 @@ fn background_quad(
     origin: [i32; 2],
 ) -> ([f32; 4], [f32; 4]) {
     let (width, height) = (framebuffer.width as f32, framebuffer.height as f32);
-    let left = origin[0] as f32 + (width - crate::render::WIDTH as f32) / 2.0;
-    let top = origin[1] as f32 + (height - crate::render::HEIGHT as f32) / 2.0;
+    // Centred as `draw_background` centres it, in whole pixels.
+    let left = (origin[0] + (framebuffer.width as i32 - crate::render::WIDTH as i32) / 2) as f32;
+    let top = (origin[1] + (framebuffer.height as i32 - crate::render::HEIGHT as i32) / 2) as f32;
     // Logical-quad position to source texels, then to the replacement's frame.
     let u =
         |x: f32| (x - left) / crate::render::WIDTH as f32 * image.width as f32 / hd.frame[0] as f32;
@@ -910,5 +914,48 @@ mod tests {
         let expected = anim::compose(&root, &spin);
         let actual = joint_matrix(Some(joints)).unwrap();
         assert_eq!((actual.r, actual.t), (expected.r, expected.t));
+    }
+
+    #[test]
+    fn a_mirrored_sprite_quad_swaps_its_texture_coordinates() {
+        let hd = Replacement {
+            image: Image {
+                width: 4,
+                height: 4,
+                rgba: vec![0; 64],
+            },
+            frame: [256, 128],
+        };
+        let (dst, uv) = sprite_quad(&hd, [64, 32, 64, 32], [10, 20, 128, 64], [false; 2]);
+        assert_eq!(dst, [10.0, 20.0, 138.0, 84.0]);
+        assert_eq!(uv, [0.25, 0.25, 0.5, 0.5]);
+        let (_, uv) = sprite_quad(&hd, [64, 32, 64, 32], [10, 20, 128, 64], [true, false]);
+        assert_eq!(uv, [0.5, 0.25, 0.25, 0.5]);
+        let (_, uv) = sprite_quad(&hd, [64, 32, 64, 32], [10, 20, 128, 64], [false, true]);
+        assert_eq!(uv, [0.25, 0.5, 0.5, 0.25]);
+    }
+
+    #[test]
+    fn a_background_quad_centres_in_whole_pixels_like_the_software() {
+        let hd = Replacement {
+            image: Image {
+                width: 4,
+                height: 4,
+                rgba: vec![0; 64],
+            },
+            frame: [320, 240],
+        };
+        let image = Image {
+            width: 320,
+            height: 240,
+            rgba: Vec::new(),
+        };
+        // A 427-wide canvas centres the 320 columns 53 in, not 53.5.
+        let framebuffer = Framebuffer::with_size(427, 240);
+        let (dst, uv) = background_quad(&hd, &image, &framebuffer, [0, 0]);
+        assert_eq!(dst, [0.0, 0.0, 427.0, 240.0]);
+        assert_eq!(uv[0], -53.0 / 320.0);
+        assert_eq!(uv[2], 374.0 / 320.0);
+        assert_eq!((uv[1], uv[3]), (0.0, 1.0));
     }
 }
