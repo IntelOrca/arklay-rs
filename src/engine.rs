@@ -12196,12 +12196,14 @@ fn render_frame_on(
     });
 
     // Every ground shadow is submitted through the same fade-sprite path: the
-    // player's when its camera-zone test passes (or the room forces it on),
+    // player's when its quad has been built and its camera-zone test passes
+    // (or the room forces it on),
     // and one per active character that has entered the camera's switch zone,
     // using `character_init`'s tint, half extents and local offset.
     let shadow_texture = shadows.page_for(pack);
     let mut shadow_list: Vec<render::Shadow<'_>> = Vec::new();
     if let Some(texture) = shadow_texture
+        && game.entities[0].shadow_quad
         && shadow::visible(
             id,
             room,

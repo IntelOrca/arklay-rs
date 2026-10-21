@@ -1349,6 +1349,13 @@ pub struct Entity {
     pub is_being_attacked: u8,
     /// `unk_e0` scratch word (0x33 sub-command 10 toggles bit 0x40).
     pub unk_e0: u16,
+    /// Whether the player's ground-shadow quad (`pushVelocity`, entity
+    /// +0xE4) has been built. Only the player's state-0 init builds it (500 x
+    /// 700) and only the new-game memset clears it, so it survives doors; a
+    /// session that opens straight into a room whose init script holds the
+    /// player in state 8 (`plw_anim`) keeps the zero-sized quad, which
+    /// `DrawFadeSpr` skips.
+    pub shadow_quad: bool,
     /// Animation position offsets (`unk_c6`/`unk_c8`); the state-8 walk
     /// handlers steer at this pair.
     pub unk_c6: u16,
