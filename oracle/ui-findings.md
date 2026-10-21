@@ -371,6 +371,20 @@ from camera 0 with no input at all (state and pixels match for 200 ticks).
   fill, which matches every other ramp frame (and the fully ramped backdrop)
   byte-for-byte, so those five pixels are a residual GPU rounding difference
   (max channel delta 1, mean 0.000/255).
+- **Room document pick-up (state 8) pacing.** The filed line now matches: the
+  reader and the 0xC6 line sit on the original's black surround (no inventory
+  panel), the state-8 decide cue plays, and the filed frames are byte-identical
+  in a room-206 scenario (document `0x6E`, zone `[4190, 9110, 1800, 1800]`).
+  The open and close still use the port's direct viewer instead of the
+  reference's state-8 task: the reference spends one gameplay frame before the
+  menu takes over, fades the room to black (`set_fading(2, 0xC00)`), and leaves
+  the state-8 loop directly when the line clears, while arklay opens at the
+  action's tick and closes through the pause menu's `0xC00` fade. An oracle
+  scenario over the whole flow therefore still diverges on `fade` (32), the
+  frozen player's `as`/`ticks` (~80/113) and the post-close `rng`/`rseed`
+  follow-on (162, the extra ~10 frozen frames). Add
+  `oracle/inputs/document_pickup.txt` and a room-206 save once that pacing is
+  ported.
 - **FILE selector animation.** The reader is matched, but the *selector's* own
   animation states (`FUN_00481d00` cases 2-12) are still the port's simplified
   slide: the reference slides the current cover out (to `-0x78` at doubling

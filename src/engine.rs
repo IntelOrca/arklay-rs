@@ -1341,12 +1341,13 @@ const EXAMINE_MESSAGE: i64 = 2;
 const EXAMINE_MARK_BIT: i64 = 3;
 const EXAMINE_MEDAL: i64 = 4;
 
-/// Like the examine viewer, a pick-up shares the game's message window and
-/// the inventory panel, so the engine owns its state machine: the viewer's intro/exit
-/// animation steps in [`GameSession::tick_pickup_view`] and the message is
-/// resolved by [`game::GameState::update_message`] exactly like a menu
-/// message. A document pick-up runs the FILE reader on the picked entry
-/// instead of the model viewer.
+/// Like the examine viewer, a pick-up shares the game's message window, so
+/// the engine owns its state machine: the viewer's intro/exit animation steps
+/// in [`GameSession::tick_pickup_view`] and the message is resolved by
+/// [`game::GameState::update_message`] exactly like a menu message. The ground
+/// and scripted modes draw the inventory panel underneath; a document pick-up
+/// runs the FILE reader on the picked entry instead of the model viewer and
+/// owns a black frame (the original's panel-less state-8 screen).
 struct PickupView {
     /// The room action slot being awarded or filed.
     slot: u8,
@@ -1359,6 +1360,9 @@ struct PickupView {
     reader: Option<Box<ui::lua_screen::LuaScreen>>,
     /// Where the flow is.
     phase: PickupPhase,
+    /// The viewer has yet to draw the reference's menu-entry random seed
+    /// (`g_RandSeed = rand()` at the top of the menu task's first frame).
+    entry_rand_pending: bool,
 }
 
 /// One gameplay session: the loaded room, game state, player and VMs.
@@ -1585,8 +1589,8 @@ struct GameSession {
     transition: Option<TransitionMode>,
     transition_finished: bool,
     /// The ground/scripted item pick-up viewer. It is engine-driven because
-    /// it shares the game's message window and the pause menu's inventory
-    /// panel; see [`PickupView`].
+    /// it shares the game's message window (and, for those modes, the pause
+    /// menu's inventory panel); see [`PickupView`].
     pickup_view: Option<PickupView>,
     /// The pause menu's examine viewer (CHECK, or the radio tab without a
     /// transmission). It runs inside the live menu: the menu keeps ticking
@@ -3935,8 +3939,10 @@ impl GameSession {
     ///
     /// The inventory panel (the original's main-menu background) opens under
     /// the viewer. The ground and got-item modes add the model viewer with its
-    /// spin-in intro; the document fallback files the entry and shows global
-    /// 0xC6 directly.
+    /// spin-in intro. The document fallback files the entry, plays the state-8
+    /// decide cue and shows global 0xC6 on black: the original's file screen
+    /// has no inventory panel, so [`Self::document_pickup_hides_menu`] keeps
+    /// one from being drawn under the reader or the filed line.
     fn open_pickup_view(&mut self, pack: &Pack, request: game::ItemViewRequest) {
         if self.pickup_view.is_some() {
             return;
@@ -3987,6 +3993,10 @@ impl GameSession {
                 // it (`menu_update_status_screen`'s key-item scan); global
                 // 0xC6 arrives once the reader's exit slide has finished.
                 self.game.mark_file_collected(item);
+                // The same state-8 entry plays the character bank's decide
+                // chime (`play_sfx(3, 6)`) as its fade settles. The port opens
+                // the reader directly, so the cue plays with the open.
+                self.play_character_bank_cue(pack, sfx::UI_DECIDE, 6);
                 let reader = {
                     let mut cx = self.ui_context(pack);
                     ui::lua_screen::LuaScreen::open_screen(
@@ -4009,6 +4019,7 @@ impl GameSession {
             screen,
             reader,
             phase,
+            entry_rand_pending: true,
         });
     }
 
@@ -4024,6 +4035,18 @@ impl GameSession {
     /// character bank's confirm/cancel cue as it resolves, exactly like the
     /// original's viewer.
     fn tick_pickup_view(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) {
+        // The reference's pickup screen is main-menu state 8. The menu task's
+        // first frame is a `game_loop` iteration, which draws `g_RandSeed =
+        // rand()` before the request hands over to the menu; arklay opens the
+        // viewer at the end of the action's tick, so the draw belongs to this
+        // first frozen tick to keep the shared stream in step.
+        let entry_draw = self
+            .pickup_view
+            .as_mut()
+            .is_some_and(|pickup| std::mem::take(&mut pickup.entry_rand_pending));
+        if entry_draw {
+            self.game.draw_frame_rand();
+        }
         let was_active = self.game.message.active;
         let was_yes_no = self.game.message.phase() == crate::message::MessagePhase::YesNo;
         self.game.update_message(
@@ -4094,8 +4117,9 @@ impl GameSession {
                     // The reader's slide-out completed: the original fades its
                     // black overlay and raises 0xC6 while the entry is still
                     // pending, then consumes it once the message clears. The
-                    // reader layer drops with the slide, revealing the panel
-                    // the 0xC6 line belongs to.
+                    // reader layer drops with the slide; the filed line stays
+                    // on the site's black surround (the state-8 screen has no
+                    // inventory panel).
                     self.game.show_message(game::MESSAGE_FILE_FILED, 0);
                     if let Some(pickup) = self.pickup_view.as_mut() {
                         pickup.reader = None;
@@ -4202,7 +4226,8 @@ impl GameSession {
     }
 
     /// Close the pick-up viewer: clear the pending menu bits, drop the flow
-    /// and darken the inventory panel through the pause menu's closing fade.
+    /// and run the pause menu's closing fade (black for a document pick-up,
+    /// whose menu is never drawn; the panel darkens for the item modes).
     /// The original's menu cleanup fades the whole menu to black, restores the
     /// game state and only then unfreezes; [`Self::tick_menu_fade`] runs that
     /// completion and arms the room-entry fade. No cue plays here: the prompt
@@ -5049,6 +5074,17 @@ impl GameSession {
         )
     }
 
+    /// Whether a document pick-up owns the whole frame: the original's state-8
+    /// file screen draws no inventory panel, so the menu under it is
+    /// suppressed and the frame stays black around the reader and the filed
+    /// line. The other pick-up modes (the ground take and the scripted got-item
+    /// viewer) belong to the inventory panel and keep drawing it.
+    fn document_pickup_hides_menu(&self) -> bool {
+        self.pickup_view
+            .as_ref()
+            .is_some_and(|pickup| pickup.kind == PickupKind::Document)
+    }
+
     /// The pause-menu fade's current alpha, for the deterministic tests.
     #[cfg(test)]
     fn menu_fade_alpha(&self) -> Option<u8> {
@@ -5249,6 +5285,13 @@ impl GameSession {
         if canvas.is_some() {
             self.framebuffer.clear();
             self.gpu_scene_visible = false;
+        } else if self.document_pickup_hides_menu() {
+            // The original's state-8 file screen draws no inventory panel, so
+            // the document reader and the filed line sit on black. Clear the
+            // frozen frame (or the previous frame's panel) so nothing of the
+            // menu shows through.
+            self.framebuffer.clear();
+            self.gpu_scene_visible = false;
         } else if self.menu.is_none() {
             match pass {
                 // The scene was recorded by the black pass; this pass only
@@ -5340,8 +5383,9 @@ impl GameSession {
         }
         // The menu is hidden while the opening fade-out darkens the frozen
         // frame and while the closing fade runs; it is revealed for the
-        // fade-in.
-        if self.menu.is_some() && !self.menu_fade_hides() {
+        // fade-in. A document pick-up suppresses it for the whole flow: the
+        // original's state-8 file screen draws no inventory panel.
+        if self.menu.is_some() && !self.menu_fade_hides() && !self.document_pickup_hides_menu() {
             // The cursor and the 0xBA item-name line are drawn from
             // menu_handle_input (state 1), which only runs once the opening
             // fade has finished *and* the state-0 transition frame has passed;
@@ -19604,6 +19648,61 @@ end
         pack_path
     }
 
+    /// The test double whose draw covers the frame: a document pick-up that
+    /// leaves the pause menu visible paints the filed line's background
+    /// magenta instead of black.
+    const DOCUMENT_PICKUP_MENU: &str = r#"
+local M = {}
+function M.open(api)
+    api:set("canvas", 1)
+end
+function M.update(api, input)
+end
+function M.draw(api)
+    api:fill_rect(0, 0, api:width(), api:height(), 255, 0, 255)
+end
+return M
+"#;
+
+    /// A pack for the document pick-up tests: [`message_pack`]'s room and
+    /// language table, the decide cue as the only sound effect, and the
+    /// [`DOCUMENT_PICKUP_MENU`] stub in place of the pause menu.
+    fn document_pickup_pack(dir: &TempDir) -> PathBuf {
+        let pack_path = dir.0.join("document-pickup.akpak");
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let id = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        let mut language = String::new();
+        for index in 0..64 {
+            let value = if index == 0x00 || index == 0x3F {
+                "0{branch 2 10 0}"
+            } else {
+                "0"
+            };
+            language.push_str(&format!("MESSAGE_{index:02X} = \"{value}\"\n"));
+        }
+        let mut writer = PackWriter::new();
+        writer
+            .add(&id.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&id.cut_entry(0), bmp_bytes).unwrap();
+        writer
+            .add("language/en-US.txt", language.as_bytes().to_vec())
+            .unwrap();
+        writer
+            .add("ui/main_menu.lua", DOCUMENT_PICKUP_MENU.as_bytes().to_vec())
+            .unwrap();
+        // Long enough to outlive the tick: the count reads the live voices.
+        writer
+            .add("se/decide.wav", voice_wav_bytes(&[1000; 6000]))
+            .unwrap();
+        writer.write(&pack_path).unwrap();
+        pack_path
+    }
+
     #[test]
     fn a_file_page_turn_plays_the_page_turn_cue_once() {
         // The reference's reader plays one `play_sfx(3, 8)` per turn (the
@@ -22366,6 +22465,10 @@ off_0010:
             .unwrap();
         assert!(session.pickup_view.is_some(), "the flag opened the viewer");
         assert!(session.menu.is_some(), "the inventory panel is underneath");
+        assert!(
+            !session.document_pickup_hides_menu(),
+            "a ground take keeps the inventory panel"
+        );
         assert_eq!(
             session
                 .pickup_view
@@ -22804,7 +22907,7 @@ off_0010:
     #[test]
     fn a_document_pickup_opens_the_reader_and_files_the_entry_on_close() {
         let dir = TempDir::new();
-        let pack_path = message_pack(&dir);
+        let pack_path = document_pickup_pack(&dir);
         let pack = Pack::open(&pack_path).unwrap();
         let mut session =
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
@@ -22867,6 +22970,28 @@ off_0010:
                 .is_some_and(|pickup| pickup.reader.is_none()),
             "the reader layer drops with its exit slide"
         );
+        // The filed line belongs to the original's state-8 file screen, which
+        // draws no inventory panel: the line sits on black, not on the status
+        // screen. The frozen room (the synthetic cut background) must not show
+        // through either.
+        assert!(
+            session.document_pickup_hides_menu(),
+            "a document pick-up suppresses the inventory panel"
+        );
+        session.render(&pack);
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * session.framebuffer.width as usize + x) * 4;
+            session.framebuffer.rgba[offset..offset + 4]
+                .try_into()
+                .unwrap()
+        };
+        for (x, y) in [(20, 20), (280, 30), (300, 220)] {
+            assert_eq!(
+                &pixel(x, y)[..3],
+                &[0, 0, 0],
+                "({x},{y}) shows the status screen under the filed line"
+            );
+        }
         assert!(
             session.game.room_actions[1].is_some(),
             "the entry is consumed only once the message clears"
@@ -22888,6 +23013,87 @@ off_0010:
         settle_menu_fade(&mut session, &pack);
         assert!(session.menu.is_none());
         assert!(!session.game.menu_pending());
+    }
+
+    #[test]
+    fn a_document_pickup_plays_the_state_eight_decide_cue() {
+        // The original's state-8 pickup screen plays `play_sfx(3, 6)` (the
+        // character bank's decide chime) as its fade settles. The port opens
+        // the reader directly, so the cue belongs to the open itself. The
+        // pack carries only that wav, so any live voice is the decide cue.
+        let _sdl = crate::audio::test_lock::sdl();
+        let Some(mixer) = dummy_mixer() else {
+            eprintln!("skipping document pickup cue test: no audio device");
+            return;
+        };
+        let dir = TempDir::new();
+        let pack_path = document_pickup_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        settle_control(&mut session, &pack);
+        session.music = Some(mixer);
+        session.game.room_actions[1] = Some(item_room_action(1, 0x60, 1, 0x0D));
+
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(
+            session
+                .pickup_view
+                .as_ref()
+                .is_some_and(|pickup| pickup.kind == PickupKind::Document),
+            "the action opened the document flow"
+        );
+        assert_eq!(
+            session.music.as_ref().unwrap().active_sfx(),
+            1,
+            "the document pick-up plays the decide cue"
+        );
+    }
+
+    #[test]
+    fn a_pickup_view_draws_the_menu_entry_random_seed_once() {
+        // The reference's pickup screen is main-menu state 8: the menu task's
+        // first frame still draws `g_RandSeed = rand()`, then the frozen menu
+        // loop draws none until it closes. The port opens the viewer at the end
+        // of the action's tick, so its first frozen tick must draw exactly one
+        // seed and the later ones none.
+        let dir = TempDir::new();
+        let pack_path = document_pickup_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        place_player(&mut session);
+        settle_control(&mut session, &pack);
+        session.game.room_actions[1] = Some(item_room_action(1, 0x60, 1, 0x0D));
+
+        session
+            .tick(&pack, UiInput::default(), pressed(), true)
+            .unwrap();
+        assert!(session.pickup_view.is_some(), "the action opened the flow");
+        let opened = session.game.rand_state;
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        let mut expected = opened;
+        game::platform_rand(&mut expected);
+        assert_eq!(
+            session.game.rand_state, expected,
+            "the first frozen tick draws the menu-entry seed"
+        );
+
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(
+            session.game.rand_state, expected,
+            "the frozen menu loop draws no further seeds"
+        );
     }
 
     #[test]
