@@ -501,6 +501,11 @@ impl MixState {
         self.voice = (!pcm.is_empty()).then(|| Voice::new(pcm, gain.max(0.0), pan, false, 0));
     }
 
+    /// Drop every sounding one-shot.
+    pub(crate) fn stop_all_sfx(&mut self) {
+        self.sfx.clear();
+    }
+
     /// Stop the voice channel and clear its finished report.
     pub(crate) fn stop_voice(&mut self) {
         self.voice = None;
@@ -938,6 +943,11 @@ impl Mixer {
     /// Stop the voice channel.
     pub fn stop_voice(&mut self) {
         self.state.stop_voice();
+    }
+
+    /// Stop every sounding one-shot.
+    pub fn stop_all_sfx(&mut self) {
+        self.state.stop_all_sfx();
     }
 
     /// Whether the voice channel has a buffer loaded.
@@ -1664,6 +1674,17 @@ mod tests {
         assert!(state.bgm_channel_playing(0));
         assert_eq!(state.active_sfx(), 0);
         assert!(!state.is_silent());
+    }
+
+    #[test]
+    fn stop_all_sfx_drops_only_the_one_shots() {
+        let mut state = MixState::new();
+        state.play_bgm(vec![100i16; 64]);
+        state.play_sfx(vec![1000i16; 8], 1.0, 0.0);
+        state.play_sfx_on_bank(3, vec![1000i16; 8], 1.0, 0.0);
+        state.stop_all_sfx();
+        assert_eq!(state.active_sfx(), 0);
+        assert!(state.bgm_channel_playing(0), "the BGM is left alone");
     }
 
     #[test]

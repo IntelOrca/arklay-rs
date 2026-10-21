@@ -123,9 +123,11 @@ The confirm button skips the loading narration before the first room and,
 like Classic REbirth 1.1.4's hidden `CutSkip`, a letterboxed cutscene (bank-5
 `MSF_SCREEN_INTENSITY`). The cutscene skip never jumps the script: it fades
 to black over ten ticks with the scene still running, then runs the scene's
-ticks back to back under a black frame (a 12 ms burst per presented frame)
-with the mixer parked, every message window pressed through and the play
-timer held, until the letterbox flag drops, and fades back in over ten ticks.
+ticks back to back under a black frame (up to 12 ms of them per 30 Hz
+gameplay tick) with the mixer parked and its sounds stopped, every message
+window pressed through and the play timer held, until the letterbox flag
+drops, and fades back in over ten ticks. A press while a scene's line is up
+pages the line instead, and a line the scene raises on its last tick stays up.
 A door the scene walks through under the letterbox runs with its animation
 skipped; a film, the death sequence, a modal screen or a yes/no prompt ends
 the skip so the player gets them. When the mixer comes back every loaded BGM
