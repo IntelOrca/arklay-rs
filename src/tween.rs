@@ -50,6 +50,9 @@ const MIN_AXIS_COS: f32 = 0.5;
 pub enum Key {
     /// The player model.
     Player,
+    /// The beretta's ejected magazine, drawn as the player EMD's 16th mesh
+    /// object while it falls.
+    Clip,
     /// The NPC in entity slot `n` with entity id `id`, so a slot that a
     /// different enemy took over snaps.
     Npc(usize, u8),

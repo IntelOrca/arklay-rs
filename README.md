@@ -250,7 +250,11 @@ animated (like the original's reload, a partial magazine is replaced by the
 best spare stack, not topped up). Like Classic REbirth, only the handgun,
 shotgun, Python and Magnum (weapon ids 2-5) reload this way: the knife,
 flamethrower, rocket launcher and special machine guns are excluded, and a
-full clip or a missing reserve is a no-op. `--tactical-reload` and
+full clip or a missing reserve is a no-op. The beretta also ejects its empty
+magazine on the reload's tenth motion frame: the clip falls from the hand,
+bounces once off the floor and disappears, driven by the original's joint-15
+fall physics (the shotgun and the two Pythons have no such mesh, and this
+applies to the empty-clip reload too). `--tactical-reload` and
 `--no-tactical-reload` override the setting for one run.
 
 A `--trace` or `--input` run leaves both settings off unless the matching
