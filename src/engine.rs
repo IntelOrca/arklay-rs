@@ -18822,6 +18822,9 @@ mod tests {
             GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
                 .unwrap();
         session.set_skips_enabled(true);
+        // One scene tick per call: the burst's wall-clock budget is machine
+        // dependent, and a fast machine would run the whole scene at once.
+        session.cutscene_skip_burst = std::time::Duration::ZERO;
         session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
         session
             .tick(&pack, UiInput::default(), action_press(), true)
@@ -19050,6 +19053,9 @@ mod tests {
         trigger_test_door(&pack, &mut session);
         let door = session.transition.take();
         session.set_skips_enabled(true);
+        // One scene tick per call, so a fast machine cannot run the whole
+        // scene (and end the skip) before the door assertions below.
+        session.cutscene_skip_burst = std::time::Duration::ZERO;
         session.swallow_action = false;
         session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
         session
@@ -19081,6 +19087,9 @@ mod tests {
         trigger_test_door(&pack, &mut session);
         let door = session.transition.take();
         session.set_skips_enabled(true);
+        // One scene tick per call, so a fast machine cannot run the whole
+        // scene (and end the skip) before the door assertions below.
+        session.cutscene_skip_burst = std::time::Duration::ZERO;
         session.swallow_action = false;
         session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
         session
