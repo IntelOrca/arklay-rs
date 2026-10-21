@@ -2,10 +2,11 @@
 //!
 //! One row per capacity slot shows the slot number, the item icon, its name
 //! and the quantity. Left/right step the quantity inside the item's limit
-//! (dropping below one clears the slot) and confirm opens the picker: a grid
-//! of every item icon, eight to a row, with an EMPTY cell first. Every edit
-//! goes through [`GameState`] and its slot bookkeeping; the equipped and
-//! selected items are dropped when an edit leaves them dangling.
+//! (down to zero, which keeps the item) and START clears the slot. Confirm
+//! opens the picker: a grid of every item icon, eight to a row, with an EMPTY
+//! cell first. Every edit goes through [`GameState`] and its slot bookkeeping;
+//! the equipped and selected items are dropped when an edit leaves them
+//! dangling.
 
 use super::{BODY_Y, Pen, Step, TEXT_LEFT, TITLE_Y};
 use crate::game::{GameState, InventoryItem};
@@ -76,8 +77,8 @@ pub fn assign(game: &mut GameState, slot: usize, item: u8) -> usize {
     landed
 }
 
-/// Step `slot`'s quantity by `delta` inside `1..=quantity_limit`; reaching 0
-/// clears the slot. An item without a quantity is left alone.
+/// Step `slot`'s quantity by `delta` inside `0..=quantity_limit`; zero keeps
+/// the item in its slot. An item without a quantity is left alone.
 pub fn adjust(game: &mut GameState, slot: usize, delta: i32) {
     let Some(stack) = game.inventory.get(slot).copied() else {
         return;
@@ -87,12 +88,7 @@ pub fn adjust(game: &mut GameState, slot: usize, delta: i32) {
         return;
     }
     let quantity = i32::from(stack.quantity).min(limit) + delta;
-    if quantity <= 0 {
-        game.inventory.remove(slot);
-        game.clear_dangling_items();
-    } else {
-        game.inventory[slot].quantity = quantity.min(limit) as u8;
-    }
+    game.inventory[slot].quantity = quantity.clamp(0, limit) as u8;
     game.rebuild_slots();
 }
 
@@ -213,6 +209,8 @@ impl InventoryEditor {
             adjust(game, self.slot, -1);
         } else if input.right {
             adjust(game, self.slot, 1);
+        } else if input.start {
+            self.slot = assign(game, self.slot, 0);
         } else if input.confirm {
             let item = game.inventory.get(self.slot).map_or(0, |stack| stack.id);
             self.picker = Some(Picker::new(item));
@@ -325,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn quantity_steps_clamp_and_clear() {
+    fn quantity_steps_clamp_and_keep_zero() {
         let mut game = game(0);
         game.add_item(0x0B, 249);
         game.add_item(0x02, 15);
@@ -339,14 +337,48 @@ mod tests {
         assert!(limit > 0);
         adjust(&mut game, 1, 1);
         assert_eq!(game.inventory[1].quantity, limit);
-        // Stepping below one clears the slot and compacts the list.
+        // Stepping down to zero keeps the stack in its slot.
         game.inventory[0].quantity = 1;
         adjust(&mut game, 0, -1);
-        assert_eq!(game.inventory.len(), 1);
-        assert_eq!(game.inventory[0].id, 0x02);
+        assert_eq!(
+            game.inventory[0],
+            InventoryItem {
+                id: 0x0B,
+                quantity: 0
+            }
+        );
+        adjust(&mut game, 0, -1);
+        assert_eq!(game.inventory[0].quantity, 0, "floor is zero");
+        assert_eq!(game.inventory.len(), 2);
         assert_eq!(
             game.state_bytes[usize::from(crate::game::STATE_BYTE_TOTAL_HELD)],
-            1
+            2
+        );
+    }
+
+    #[test]
+    fn start_clears_the_slot_and_drops_dangling_items() {
+        let mut game = game(0);
+        game.add_item(0x0B, 1);
+        game.set_equipped(Some(0x0B));
+        let mut editor = InventoryEditor::default();
+        // Zero keeps the item (and the equipped copy) in place.
+        editor.handle_input(press(|i| i.left = true), &mut game);
+        assert_eq!(
+            game.inventory[0],
+            InventoryItem {
+                id: 0x0B,
+                quantity: 0
+            }
+        );
+        assert_eq!(game.equipped, Some(0x0B));
+        // START removes the item instead.
+        editor.handle_input(press(|i| i.start = true), &mut game);
+        assert!(game.inventory.is_empty());
+        assert_eq!(game.equipped, None);
+        assert_eq!(
+            game.state_bytes[usize::from(crate::game::STATE_BYTE_TOTAL_HELD)],
+            0
         );
     }
 
