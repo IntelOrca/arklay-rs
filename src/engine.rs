@@ -12526,22 +12526,33 @@ fn render_frame_on(
     // The NPC joint gates pair with `models`/`npc_joints`/`npc_hidden`, all
     // built together in entity-slot order above; do not re-walk the slots,
     // because a model whose keyframe lookup failed is absent from all three.
-    for (((((model, joints), hidden), tint), &(light_pos, per_joint_light)), joint_colours) in
-        models
-            .iter()
-            .zip(&npc_joints)
-            .zip(&npc_hidden)
-            .zip(&npc_tints)
-            .zip(&npc_lights)
-            .zip(&npc_joint_colours)
+    for (
+        (((((model, joints), hidden), tint), &(light_pos, per_joint_light)), joint_colours),
+        weapon_id,
+    ) in models
+        .iter()
+        .zip(&npc_joints)
+        .zip(&npc_hidden)
+        .zip(&npc_tints)
+        .zip(&npc_lights)
+        .zip(&npc_joint_colours)
+        .zip(&npc_weapon_ids)
     {
+        // The original loads the held weapon's TMD into the weapon joint's
+        // own slot, so it replaces the character's object there rather than
+        // drawing beside it.
+        let weapon_slot = if weapon_id.is_some() {
+            1 << crate::weapons::WEAPON_JOINT
+        } else {
+            0
+        };
         meshes.push(EntityMesh {
             mesh: &model.mesh,
             texture: &model.texture,
             joints,
             tint: *tint,
             blend_weight: None,
-            hidden_joints: *hidden,
+            hidden_joints: *hidden | weapon_slot,
             light_pos: Some(light_pos),
             per_joint_light,
             complex_object: None,
