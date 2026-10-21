@@ -797,3 +797,78 @@ end
     // The stretch path forces opaque alpha; the 320x240 blit keeps it.
     assert_eq!(pixel(100, 100), [0, 0, 255, 128]);
 }
+
+#[test]
+fn replaced_art_leaves_a_hole_and_a_quad_while_capturing() {
+    use crate::pack::PackWriter;
+
+    let source = r#"
+function update(api, input) end
+
+function draw(api)
+local picture = api:picture("art/bg")
+api:picture_sprite_scaled(picture, 0, 0, 4, 4, 10, 20, 40, 40, 255)
+end
+"#;
+    let build = |hd: Option<(u32, Vec<u8>)>| {
+        let mut writer = PackWriter::new();
+        writer
+            .add("screen/save.lua", source.as_bytes().to_vec())
+            .unwrap();
+        writer.add("art/bg.bmp", test_bmp()).unwrap();
+        if let Some((hash, bytes)) = hd {
+            writer
+                .add(&format!("htexture/misc/{hash:08X}.bmp"), bytes)
+                .unwrap();
+        }
+        Pack::from_bytes(writer.to_bytes().unwrap()).unwrap()
+    };
+    let picture =
+        crate::ui::load_picture(&build(None), "art/bg", crate::assets::Geometry::Free, None)
+            .unwrap();
+    let candidate = crate::htexture::image_candidates(&picture)[0];
+    let hd = crate::bmp::encode_to_vec(&crate::state::Image {
+        width: 8,
+        height: 8,
+        rgba: [0, 0, 255, 255].repeat(64),
+    })
+    .unwrap();
+    let pack: &'static Pack = Box::leak(Box::new(build(Some((candidate.hash, hd)))));
+    let fixture = Fixture {
+        pack,
+        text: Text::load(pack, Some("en-US")),
+        font: test_font(),
+        dir: TempDir::new("hd-art"),
+    };
+    let mut screen = fixture.load();
+    let cx = fixture.context();
+    let pixel = |framebuffer: &crate::render::Framebuffer, x: usize, y: usize| {
+        let index = (y * 320 + x) * 4;
+        [
+            framebuffer.rgba[index],
+            framebuffer.rgba[index + 1],
+            framebuffer.rgba[index + 2],
+        ]
+    };
+
+    // Without a capture the original art draws.
+    let plain = draw(&mut screen, &cx);
+    assert_eq!(pixel(&plain, 10, 20), [255, 0, 0]);
+
+    for hole in [0, 255] {
+        let mut framebuffer = crate::render::Framebuffer::new();
+        framebuffer.capture_hd(hole);
+        screen.draw(&cx, &mut framebuffer);
+        assert_eq!(pixel(&framebuffer, 10, 20), [hole; 3]);
+        assert_eq!(pixel(&framebuffer, 49, 59), [hole; 3]);
+        assert_eq!(pixel(&framebuffer, 50, 60), [0; 3]);
+        let quads = framebuffer.hd_quads();
+        assert_eq!(quads.len(), 1);
+        let [fw, fh] = candidate.frame.map(|v| v as f32);
+        assert_eq!(quads[0].dst, [10.0, 20.0, 50.0, 60.0]);
+        assert_eq!(quads[0].uv, [0.0, 0.0, 4.0 / fw, 4.0 / fh]);
+        assert_eq!(quads[0].colour, [1.0; 3]);
+        assert_eq!(quads[0].clip, [0, 0, 320, 240]);
+        assert_eq!(quads[0].image.image.width, 8);
+    }
+}
