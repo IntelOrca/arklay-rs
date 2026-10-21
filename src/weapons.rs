@@ -24,6 +24,12 @@
 //!   original's empty-clip reload behaviour (`0x18`) and its per-weapon cues;
 //!   no new animation or ammo path. Off unless `[game] tactical_reload` or
 //!   `--tactical-reload` enables it.
+//! - The detached magazine ([`DetachedClip`], the original's accessory joint
+//!   15): the beretta's reload arms the empty clip's own TMD at frame `0x0a`
+//!   and [`update_detached_clip`] runs the original's fall/bounce physics and
+//!   floor-hit dust and cue every tick. The clip draws as the player EMD's
+//!   16th mesh object while it is in the air. Both the empty-clip reload and
+//!   the tactical reload share this path.
 //! - The FX spawns: muzzle billboards at the weapon hand joint, the big flash
 //!   on the player matrix and the ejected shell, with the exact per-weapon
 //!   offsets, spawn frames and effect-header weapon tags.
@@ -43,9 +49,6 @@
 //!   previous frame's hand world; the port composes the current pose's joints
 //!   every tick and attaches the FX to joint 14 directly, which subsumes the
 //!   anchor correction.
-//! - **The detached magazine.** The beretta reload arms the accessory joint 15
-//!   (the ejected magazine physics); the port models the ammo transfer, the
-//!   volley latch and the reload cue but not the falling clip mesh.
 //! - **The projectile damage.** Only the weapons the original damages at a
 //!   fire frame run through [`GameState::apply_weapon_damage_with`] here (the
 //!   GL explosive round among them); the flamethrower/acid/flame/rocket
@@ -56,8 +59,9 @@
 
 use std::rc::Rc;
 
+use crate::anim::Mat4x3;
 use crate::effects::{self, Attach};
-use crate::game::{BANK_SCENARIO, EntitySound, GameState, InfiniteAmmo};
+use crate::game::{BANK_SCENARIO, EntitySound, GameState, InfiniteAmmo, MSF2_EFFECT_ZONE};
 use crate::model::{Clip, Keyframe, Skeleton};
 use crate::player::{ClipSource, Input, LockedAction, PlayerState};
 use crate::state::RoomState;
@@ -308,6 +312,104 @@ pub struct WeaponClips<'a> {
     pub weapon_keyframes: &'a [Keyframe],
     /// The active weapon EMW's skeleton.
     pub weapon_skeleton: &'a Skeleton,
+}
+
+/// The beretta's ejected magazine, the original's accessory joint 15.
+///
+/// `LoadEntityModel` bumps the joint count by one around a single
+/// `SetupJointStructures` call, so the player skeleton owns a sixteenth joint
+/// that no animation drives: `SetupJointStructures` hands it the EMD's own
+/// 16th TMD object (the empty clip's mesh) as its animation slot. The
+/// beretta's reload arms it at motion frame `0xa` through
+/// `fire_reset_joint15_recoil` (0x0042a000) and `player_update_detached_joint`
+/// (0x00429d50) then integrates and draws it until it leaves the floor.
+///
+/// The joint's spare shorts are the whole state, reproduced here with the
+/// original's 16-bit wrapping:
+///
+/// | field | original | meaning |
+/// |---|---|---|
+/// | `vel_x` | `velX` (+0x70) | vertical velocity; Y grows downward, so gravity adds |
+/// | `vel_y` | `velY` (+0x72) | the Y tracker the floor and dust tests read |
+/// | `vel_z` | `velZ` (+0x74) | active flag |
+/// | `state` | `rotDeltaX` (+0x76) | state index: 0 spawn, 1 fall, 2 bounce |
+/// | `bounced` | `rotDeltaY` (+0x78) | bounce/dust latch |
+/// | `floor_y` | `rotDeltaZ` (+0x7a) | the player's floor Y at eject time |
+///
+/// `ClearAnimTiming` (0x00429d30) zeroes `velZ`/`state`, which is why a
+/// normally initialised player never enters any of this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DetachedClip {
+    /// `jointsStructs[15].world`: the clip's world matrix, copied from the
+    /// weapon hand at eject and then integrated in place.
+    pub world: Mat4x3,
+    /// `jointsStructs[15].rotation`: the SVECTOR the draw's `RotMatrix` call
+    /// builds the local rotation matrix from.
+    pub rotation: [i16; 3],
+    /// `velX`: vertical velocity, in world units per tick.
+    pub vel_x: i16,
+    /// `velY`: the Y tracker.
+    pub vel_y: i16,
+    /// `velZ`: the active flag.
+    pub vel_z: i16,
+    /// `rotDeltaX`: 0 spawn, 1 fall, 2 bounce.
+    pub state: i16,
+    /// `rotDeltaY`: the bounce/dust latch.
+    pub bounced: i16,
+    /// `rotDeltaZ`: the floor Y at eject time.
+    pub floor_y: i16,
+    /// The hand world pose the spawn copies. The reference's state 0 reads
+    /// `jointsStructs[14].world`, which the *previous* frame's render pass
+    /// composed; the port's weapon tail recomposes the hand for the FX before
+    /// the clip update runs, so the room tick snapshots the pre-machine pose
+    /// here. `None` falls back to the live `joint_worlds[0]` (unit tests).
+    pub spawn_hand: Option<Mat4x3>,
+    /// Whether this tick's draw shows the clip. The reference returns at
+    /// entry when `velZ` is 0, so the tick state 2 clears `velZ` still draws
+    /// the magazine one last time; the port records that entry decision here
+    /// because its physics and draw are separate passes.
+    pub drew: bool,
+}
+
+impl DetachedClip {
+    /// `fire_reset_joint15_recoil` (0x0042a000): arm the clip unless it is
+    /// already in the air. A second reload while the magazine still falls
+    /// leaves the live physics alone, exactly like the reference.
+    pub fn arm(&mut self) {
+        if self.vel_z == 0 {
+            self.vel_z = 1;
+            self.state = 0;
+        }
+    }
+
+    /// Whether the clip is in the air (the original's `velZ != 0`).
+    pub fn active(&self) -> bool {
+        self.vel_z != 0
+    }
+
+    /// Whether this tick's draw shows it, the reference's entry decision:
+    /// `velZ != 0` and the player's whole-entity gate (`zoneFlags & 0x7f`)
+    /// clear. `update_detached_clip` sets it every tick, and the render pass
+    /// reads it, so the tick that clears `velZ` still paints.
+    pub fn visible(&self) -> bool {
+        self.drew
+    }
+
+    /// The matrix the clip's TMD object draws through:
+    /// `RotMatrix(&rotation, &transform)` then `world * transform`. The
+    /// transform's translation stays zero from the spawn state, and the
+    /// original rebuilds its rotation part from the live SVECTOR every draw.
+    pub fn render_matrix(&self) -> Mat4x3 {
+        let transform = Mat4x3 {
+            r: crate::anim::rotation_matrix(
+                i32::from(self.rotation[0]),
+                i32::from(self.rotation[1]),
+                i32::from(self.rotation[2]),
+            ),
+            t: [0; 3],
+        };
+        crate::anim::compose(&self.world, &transform)
+    }
 }
 
 /// The data row index for an item id: normal weapons 2..=11 index 0..=9, the
@@ -1846,9 +1948,14 @@ fn fire_weapon_fx(game: &mut GameState, player: &mut PlayerState, weapon: u8) {
     match weapon {
         2 => {
             if frame == 0x0A && active {
-                // The volley latch arms the beretta's ejected magazine; the
-                // port keeps the latch and the transfer, not the clip mesh.
-                let _ = fire_ammo_volley_gate(game);
+                // The volley latch arms the beretta's ejected magazine: only
+                // the fresh latch fires the joint-15 clip, so a re-entered
+                // frame 0xa with the 0x80 bit already set leaves the live
+                // fall alone (`fire_ammo_volley_gate` then
+                // `fire_reset_joint15_recoil`).
+                if fire_ammo_volley_gate(game) {
+                    player.detached_clip.arm();
+                }
             }
             if frame == 0x11 && active {
                 fire_consume_ammo_stack(game);
@@ -1896,6 +2003,143 @@ fn fire_weapon_fx(game: &mut GameState, player: &mut PlayerState, weapon: u8) {
                 play_weapon_sound(game, weapon, 5);
             }
         }
+    }
+}
+
+/// `player_update_detached_joint` (0x00429d50): one tick of the beretta's
+/// ejected magazine.
+///
+/// The caller integrates the joint's translation before the state routine
+/// runs; the routine only sets velocities and rotations. State 0 seats the
+/// clip on the weapon hand's world pose, state 1 applies gravity and the
+/// dust/floor tests, and state 2 skitters the bounce until it drops back past
+/// the floor, which switches the clip off.
+///
+/// Called from the room tick's tail (before the joint-world store), the
+/// reference's place in `update_player_anim`. The entity's whole-entity gate
+/// pauses the physics *and* the draw while the player is outside the camera
+/// zone, exactly like the reference's early return. The entry state is latched
+/// into [`DetachedClip::drew`] so the render pass still paints the tick state 2
+/// clears `velZ`, exactly like the reference's draw after the state dispatch.
+pub fn update_detached_clip(game: &mut GameState, player: &mut PlayerState, room: &RoomState) {
+    // The reference's entry decision: `velZ != 0` and the player's
+    // whole-entity gate. Recorded before the state routine runs, because the
+    // tick state 2 clears `velZ` still draws (the reference's early return is
+    // at entry, above the state dispatch and the draw).
+    {
+        let clip = &mut player.detached_clip;
+        clip.drew = clip.active() && game.entities[0].zone_flags & 0x7F != 0;
+        if !clip.drew {
+            return;
+        }
+    }
+
+    // 0x00429d7a: `clip->world.t[1] += velX` then the 16-bit
+    // `clip->velY += velX`. Y grows downward, so the fall adds.
+    let clip = &mut player.detached_clip;
+    clip.world.t[1] = clip.world.t[1].wrapping_add(i32::from(clip.vel_x));
+    clip.vel_y = clip.vel_y.wrapping_add(clip.vel_x);
+
+    match clip.state {
+        0 => {
+            // State 0 spawn: seat the clip on the hand's world pose and give
+            // it the fixed 0x400 z-rotation. The copies from the hand's
+            // rotation are immediately overwritten, which the original does
+            // too. The floor reference is the entity matrix's Y at eject time.
+            let hand = clip
+                .spawn_hand
+                .or_else(|| game.joint_worlds[0].get(WEAPON_JOINT).copied());
+            let Some(hand) = hand else {
+                // The reference dereferences the hand's world unchecked. The
+                // port has no pose to seat the clip on (a test fixture without
+                // assets), so switch it off instead of leaving a
+                // half-integrated state behind.
+                clip.drew = false;
+                clip.vel_z = 0;
+                return;
+            };
+            clip.state += 1;
+            clip.world = hand;
+            clip.rotation = [0, 0, 0x400];
+            clip.vel_x = 0x50;
+            clip.vel_y = clip.world.t[1] as i16;
+            clip.bounced = 0;
+            clip.floor_y = game.entities[0].pos[1] as i16;
+        }
+        1 => {
+            // State 1 fall: gravity plus a tumble on X, one dust puff the
+            // first time the clip drops past the room's reference height
+            // (`g_omodel_table[0] + 0x38`, the record-0 Y the knife swing
+            // tests), then the floor hit: bounce the velocity, snap Y to the
+            // floor and play the impact.
+            let bounced = clip.bounced;
+            clip.vel_x = clip
+                .vel_x
+                .wrapping_add((1i16.wrapping_sub(bounced)).wrapping_mul(0x14));
+            clip.rotation[0] =
+                clip.rotation[0].wrapping_add(bounced.wrapping_add(1).wrapping_mul(0x10));
+
+            if bounced == 0 && game.flags[5].bit(MSF2_EFFECT_ZONE) {
+                let object_y = game
+                    .objects
+                    .records
+                    .first()
+                    .map_or(0, |record| record.pos[1]);
+                if object_y < i32::from(clip.vel_y) {
+                    let pos = clip.world.t;
+                    let room_effects = Rc::clone(&game.room_effects);
+                    let _ = effects::create_attached(
+                        game,
+                        &room_effects,
+                        0x17,
+                        8,
+                        Attach::Identity,
+                        pos,
+                        0,
+                        0,
+                    );
+                    clip.bounced = 1;
+                    return;
+                }
+            }
+
+            if clip.vel_y > clip.floor_y {
+                clip.vel_x = -0x50;
+                clip.state += 1;
+                clip.vel_y = clip.floor_y;
+                clip.world.t[1] = i32::from(clip.floor_y);
+                let pos = clip.world.t;
+                if let Some((name, bank, column)) =
+                    crate::sfx::play_3d_cue(room, game.id.player_flag, 2, 0x15)
+                {
+                    game.entity_sounds.push(EntitySound {
+                        name,
+                        bank,
+                        column,
+                        pos,
+                    });
+                }
+            }
+        }
+        2 => {
+            // State 2 bounce: skitter away on X/Z while tumbling on both
+            // axes; once it drops back past the floor the clip switches
+            // itself off.
+            let bounced = clip.bounced;
+            let swing = 2i16.wrapping_sub(bounced);
+            clip.world.t[2] = clip.world.t[2].wrapping_add(0xA);
+            clip.world.t[0] = clip.world.t[0].wrapping_add(0x14);
+            clip.rotation[0] = clip.rotation[0].wrapping_add(swing << 7);
+            let y = clip.vel_y;
+            clip.rotation[1] = clip.rotation[1].wrapping_add(swing << 6);
+            clip.vel_x = clip
+                .vel_x
+                .wrapping_add(bounced.wrapping_add(1).wrapping_mul(0xF));
+            if clip.floor_y < y {
+                clip.vel_z = 0;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3238,6 +3482,332 @@ mod tests {
             let manual = reload_outcome(10, reserve, true);
             assert_eq!(manual, automatic, "reserve {reserve}");
             assert_eq!(automatic, (reserve, 0), "reserve {reserve}");
+        }
+    }
+
+    /// One tick of the weapon machine plus the engine's detached-clip tail:
+    /// the two calls the room tick makes (`weapons::update` then
+    /// [`update_detached_clip`]). The clips mirror [`drive_reload`]'s.
+    fn drive_reload_with_clip(
+        game: &mut GameState,
+        player: &mut PlayerState,
+        input: Input,
+        ticks: usize,
+    ) {
+        let emd = clip_bank(0x24, 8);
+        let weapon_clips = clip_bank(15, 32);
+        let (skeleton, keyframes) = rig(-2400);
+        let room = RoomState::default();
+        for _ in 0..ticks {
+            let clips = WeaponClips {
+                emd: &emd,
+                emw: &emd,
+                room: &[],
+                weapon: &weapon_clips,
+                emd_keyframes: &keyframes,
+                emd_skeleton: &skeleton,
+                weapon_keyframes: &keyframes,
+                weapon_skeleton: &skeleton,
+            };
+            update(game, player, &room, &clips, input);
+            update_detached_clip(game, player, &room);
+        }
+    }
+
+    #[test]
+    fn both_reload_triggers_arm_the_detached_clip() {
+        // The beretta's frame-0xa volley gate arms the joint-15 magazine
+        // whatever entered 0x18: the empty-clip fire press and the Classic
+        // REbirth tactical reload share the handler and its FX routine.
+        for tactical in [false, true] {
+            let (mut game, mut player) = armed(2, if tactical { 10 } else { 0 });
+            game.entities[0].zone_flags = 1;
+            game.player_options.tactical_reload = tactical;
+            game.inventory.push(InventoryItem {
+                id: 0x0B,
+                quantity: 15,
+            });
+            let input = if tactical {
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                }
+            } else {
+                Input {
+                    aim: true,
+                    fire: true,
+                    fire_pressed: true,
+                    ..Input::default()
+                }
+            };
+            let mut reached_reload = false;
+            for _ in 0..240 {
+                drive_reload_with_clip(&mut game, &mut player, input, 1);
+                reached_reload |= player.weapon.behavior == 0x18;
+                if player.detached_clip.active() {
+                    break;
+                }
+            }
+            assert!(reached_reload, "the reload started (tactical={tactical})");
+            assert!(
+                player.detached_clip.active(),
+                "the reload armed the clip (tactical={tactical})"
+            );
+            assert_eq!(
+                player.detached_clip.state, 1,
+                "the spawn ran on the arming tick (tactical={tactical})"
+            );
+            assert_eq!(
+                player.detached_clip.rotation,
+                [0, 0, 0x400],
+                "the spawn seated the clip (tactical={tactical})"
+            );
+            assert_eq!(
+                game.inventory[0].quantity & 0x80,
+                0x80,
+                "the same gate set the volley latch (tactical={tactical})"
+            );
+        }
+    }
+
+    #[test]
+    fn the_detached_clip_spawns_from_the_snapshotted_hand_and_falls_to_the_floor() {
+        let (mut game, mut player) = armed(2, 10);
+        game.entities[0].zone_flags = 1;
+        // The live hand pose (this tick's) and the pre-machine snapshot the
+        // spawn must use: the reference copies the previous render's joint-14
+        // world, not the pose the weapon tail recomposed for this tick's FX.
+        let (skeleton, keyframes) = rig(-2400);
+        let entity = crate::anim::entity_matrix(player.pos, player.angle);
+        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity);
+        let mut snapshot = game.joint_worlds[0][WEAPON_JOINT];
+        snapshot.t[1] = -3000;
+        player.detached_clip.spawn_hand = Some(snapshot);
+        player.detached_clip.arm();
+        let room = RoomState::default();
+
+        // State 0 seats the clip on the snapshotted hand pose.
+        update_detached_clip(&mut game, &mut player, &room);
+        assert_eq!(
+            player.detached_clip.state, 1,
+            "the spawn handed to the fall"
+        );
+        assert_eq!(
+            player.detached_clip.world.t[1], -3000,
+            "the clip spawned on the pre-machine hand snapshot"
+        );
+        assert_ne!(
+            player.detached_clip.world.t[1], game.joint_worlds[0][WEAPON_JOINT].t[1],
+            "not the live hand the weapon tail recomposed"
+        );
+        assert_eq!(player.detached_clip.rotation, [0, 0, 0x400]);
+        assert_eq!(player.detached_clip.vel_x, 0x50);
+        assert_eq!(player.detached_clip.floor_y, 0, "the floor at eject time");
+
+        let mut fall = Vec::new();
+        let mut velocities = Vec::new();
+        let mut hit_floor = false;
+        let mut switched_off_while_drawn = false;
+        for _ in 0..64 {
+            update_detached_clip(&mut game, &mut player, &room);
+            let clip = player.detached_clip;
+            if clip.state == 1 {
+                velocities.push(clip.vel_x);
+                fall.push(clip.world.t[1]);
+            }
+            if clip.state == 2 && clip.vel_x == -0x50 {
+                hit_floor = true;
+            }
+            if !clip.active() {
+                // The reference's early return is at entry, so the state-2
+                // tick that clears `velZ` still draws the magazine.
+                switched_off_while_drawn = clip.drew;
+                break;
+            }
+        }
+        assert_eq!(
+            &velocities[..3],
+            &[0x64, 0x78, 0x8C],
+            "gravity adds 0x14 a tick to the 0x50 spawn velocity"
+        );
+        assert!(
+            fall.windows(2).all(|pair| pair[1] > pair[0]),
+            "the clip fell continuously (Y grows down): {fall:?}"
+        );
+        assert!(hit_floor, "the clip bounced off the floor");
+        assert!(
+            switched_off_while_drawn,
+            "the tick the bounce switched the clip off still drew"
+        );
+        assert!(!player.detached_clip.active(), "the bounce switched it off");
+
+        // The next tick enters with `velZ == 0` and draws nothing.
+        update_detached_clip(&mut game, &mut player, &room);
+        assert!(
+            !player.detached_clip.visible(),
+            "the landed clip stopped drawing"
+        );
+    }
+
+    #[test]
+    fn arming_an_already_falling_clip_leaves_its_physics_alone() {
+        let (mut game, mut player) = armed(2, 10);
+        game.entities[0].zone_flags = 1;
+        let (skeleton, keyframes) = rig(-2400);
+        let entity = crate::anim::entity_matrix(player.pos, player.angle);
+        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity);
+        let room = RoomState::default();
+        player.detached_clip.arm();
+        update_detached_clip(&mut game, &mut player, &room);
+        for _ in 0..4 {
+            update_detached_clip(&mut game, &mut player, &room);
+        }
+        let falling = player.detached_clip;
+        // `fire_reset_joint15_recoil` only arms when `velZ == 0`: a reload
+        // while the magazine is still in the air does not restart the fall.
+        player.detached_clip.arm();
+        assert_eq!(
+            player.detached_clip, falling,
+            "the live fall was left alone"
+        );
+    }
+
+    #[test]
+    fn the_detached_clip_puffs_dust_once_past_the_room_reference_height() {
+        let (mut game, mut player) = armed(2, 10);
+        game.entities[0].zone_flags = 1;
+        // The dust gate is the effect-zone flag plus the room's record-0 Y
+        // (`g_omodel_table[0] + 0x38`, the knife swing's covers-table height).
+        game.flags[5].apply(MSF2_EFFECT_ZONE, 0);
+        game.objects.records = vec![crate::objects::ObjectRecord {
+            pos: [0, -1200, 0],
+            ..crate::objects::ObjectRecord::default()
+        }];
+        game.weapon_effects
+            .sprites
+            .push(crate::effects::fixtures::sprite(
+                0x17,
+                std::array::from_fn(|_| vec![vec![crate::effects::fixtures::block(1, 0, 0)]]),
+            ));
+        let (skeleton, keyframes) = rig(-2400);
+        let entity = crate::anim::entity_matrix(player.pos, player.angle);
+        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity);
+        player.detached_clip.arm();
+        let room = RoomState::default();
+
+        let mut puffs = 0;
+        for _ in 0..64 {
+            update_detached_clip(&mut game, &mut player, &room);
+            puffs = game
+                .effects
+                .active()
+                .filter(|(_, effect)| effect.effect_type == 0x17)
+                .count();
+            if puffs != 0 {
+                break;
+            }
+        }
+        assert_eq!(puffs, 1, "one dust puff spawned past the reference height");
+        assert_eq!(
+            player.detached_clip.bounced, 1,
+            "the dust latch stops it repeating"
+        );
+        // The puff is drawn at the clip's integrated world position.
+        let effect = game
+            .effects
+            .active()
+            .find(|(_, effect)| effect.effect_type == 0x17)
+            .map(|(_, effect)| effect)
+            .unwrap();
+        assert_eq!(effect.spawn_pos, player.detached_clip.world.t);
+    }
+
+    #[test]
+    fn the_detached_clip_pauses_outside_the_camera_zone() {
+        let (mut game, mut player) = armed(2, 10);
+        game.entities[0].zone_flags = 1;
+        let (skeleton, keyframes) = rig(-2400);
+        let entity = crate::anim::entity_matrix(player.pos, player.angle);
+        game.joint_worlds[0] = crate::anim::joint_matrices(&skeleton, &keyframes[0], &entity);
+        player.detached_clip.arm();
+        let room = RoomState::default();
+        update_detached_clip(&mut game, &mut player, &room);
+        let spawned = player.detached_clip;
+        // The whole-entity gate freezes both the physics and the draw.
+        game.entities[0].zone_flags = 0;
+        update_detached_clip(&mut game, &mut player, &room);
+        assert_eq!(
+            player.detached_clip.world, spawned.world,
+            "the clip was frozen"
+        );
+        assert_eq!(player.detached_clip.vel_y, spawned.vel_y);
+        assert!(!player.detached_clip.visible(), "and not drawn");
+        game.entities[0].zone_flags = 1;
+        update_detached_clip(&mut game, &mut player, &room);
+        assert_ne!(
+            player.detached_clip.world, spawned.world,
+            "the fall resumed"
+        );
+        assert!(player.detached_clip.visible(), "and drew again");
+    }
+
+    #[test]
+    fn the_detached_clip_render_matrix_keeps_the_world_translation() {
+        let clip = DetachedClip {
+            world: Mat4x3 {
+                // A true 4.12 identity so the product's rotation is exactly
+                // the clip's own `RotMatrix` output.
+                r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+                t: [100, -2400, 200],
+            },
+            rotation: [0, 0, 0x400],
+            vel_z: 1,
+            ..DetachedClip::default()
+        };
+        let matrix = clip.render_matrix();
+        assert_eq!(matrix.t, [100, -2400, 200], "the world translation is kept");
+        assert_eq!(
+            matrix.r,
+            crate::anim::rotation_matrix(0, 0, 0x400),
+            "the clip's own rotation is composed onto the world"
+        );
+    }
+
+    #[test]
+    fn only_the_beretta_reload_arms_the_detached_clip() {
+        // The original's FX dispatch arms joint 15 only in the beretta's
+        // routine (0x00458ff0); the shotgun and the pythons have no clip mesh.
+        for weapon in [3u8, 4, 5] {
+            let (mut game, mut player) = armed(weapon, 1);
+            game.entities[0].zone_flags = 1;
+            game.player_options.tactical_reload = true;
+            game.inventory.push(InventoryItem {
+                id: weapon_ammo_item_id(weapon),
+                quantity: 15,
+            });
+            let mut reached_reload = false;
+            for _ in 0..240 {
+                drive_reload_with_clip(
+                    &mut game,
+                    &mut player,
+                    Input {
+                        aim: true,
+                        run: true,
+                        ..Input::default()
+                    },
+                    1,
+                );
+                reached_reload |= player.weapon.behavior == 0x18;
+                if player.weapon.behavior == 0 && reached_reload {
+                    break;
+                }
+            }
+            assert!(reached_reload, "weapon {weapon} reloaded");
+            assert!(
+                !player.detached_clip.active(),
+                "weapon {weapon} must not eject a magazine"
+            );
         }
     }
 

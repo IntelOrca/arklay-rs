@@ -606,6 +606,11 @@ pub struct PlayerState {
     /// The player's weapon sub-machine (aim, fire, reload). Inactive while the
     /// locomotion machine owns the tick.
     pub weapon: crate::weapons::WeaponState,
+    /// The beretta's ejected magazine (the original's accessory joint 15):
+    /// armed by the reload's frame `0xa`, integrated every tick by
+    /// [`crate::weapons::update_detached_clip`] and drawn as the player EMD's
+    /// 16th mesh object while it is in the air.
+    pub detached_clip: crate::weapons::DetachedClip,
     /// Slow-motion animation cadence counter (the original's `attackDirection`
     /// reuse): 0 applies the frame and re-arms to 1, 1 skips the frame.
     pub slow_counter: i16,
@@ -695,6 +700,7 @@ pub fn spawn(id: RoomId, room: &RoomState) -> PlayerState {
         interact_finished: None,
         input: Input::default(),
         weapon: crate::weapons::WeaponState::default(),
+        detached_clip: crate::weapons::DetachedClip::default(),
         slow_counter: 0,
         run_stop_ticks: 0,
         fresh_entry: false,
@@ -3191,6 +3197,7 @@ mod tests {
             interact_finished: None,
             input: Input::default(),
             weapon: crate::weapons::WeaponState::default(),
+            detached_clip: crate::weapons::DetachedClip::default(),
             slow_counter: 0,
             run_stop_ticks: 0,
             fresh_entry: false,

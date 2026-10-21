@@ -11159,6 +11159,13 @@ fn tick_room_timed(
     // A movement's free step is consumed by this tick's collision tail; drop
     // any value a skipped tail left behind so it can never leak into this one.
     context.player.collision_pre = None;
+    // The detached magazine's spawn copies the hand world the *previous*
+    // frame's render composed (the reference's `jointsStructs[14].world`).
+    // The weapon tail below recomposes the hand for this tick's FX, so
+    // snapshot the pose before the player machine runs.
+    context.player.detached_clip.spawn_hand = context.game.joint_worlds[0]
+        .get(crate::weapons::WEAPON_JOINT)
+        .copied();
     if state != 1 || frozen {
         // The pad-driven idle did not run this tick, so its reference scratch
         // is stale: the trace mirror must not reapply it.
@@ -11305,6 +11312,12 @@ fn tick_room_timed(
             i32::from((root.t[2] as i16).wrapping_sub(pos[2] as i16)),
         ];
     }
+    // The beretta's ejected magazine: `update_player_anim`'s last call in the
+    // reference, after the collision pass and the zone-flag refresh and before
+    // the render pass composes this frame's joint worlds. Its spawn uses the
+    // hand pose snapshotted before the player machine (`spawn_hand`), the
+    // previous render's `jointsStructs[14].world`.
+    crate::weapons::update_detached_clip(context.game, context.player, context.room);
     // The render loop's `EntityComputeJointWorldMatrices` for the player:
     // composed after the physics so the next tick's held-weapon anchor reads
     // the previous frame's hand, exactly like the original's frame order.
@@ -12766,6 +12779,43 @@ fn render_frame_on(
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
+    // The beretta's ejected magazine draws as the player EMD's own 16th mesh
+    // object while it falls: `player_update_detached_joint` builds its local
+    // matrix from the joint-15 world pose and draws that one object. The body
+    // pass below zips the mesh's 15 objects against the 15 animated joints, so
+    // object 15 never draws there; this pass submits it with the first 15
+    // joints hidden. It is submitted before the body because the reference
+    // draws it during the player's update, so at an exact depth tie the body
+    // paints over the clip.
+    let mut clip_joints: Vec<Vec<anim::Mat4x3>> = Vec::new();
+    if let Some(assets) = assets
+        && assets.emd.mesh.objects.len() > crate::weapons::WEAPON_JOINT + 1
+        && player_state.detached_clip.visible()
+    {
+        let mut matrices = vec![anim::Mat4x3::default(); crate::weapons::WEAPON_JOINT + 2];
+        matrices[crate::weapons::WEAPON_JOINT + 1] = player_state.detached_clip.render_matrix();
+        tween.joints(tween::Key::Clip, &mut matrices);
+        clip_joints.push(matrices);
+        meshes.push(EntityMesh {
+            mesh: &assets.emd.mesh,
+            texture: &assets.emd.texture,
+            joints: &clip_joints[0],
+            // `objs_hide` tints joints 0-13 only, so the clip (joint 15) and
+            // the held weapon (joint 14) stay untinted.
+            tint: [255; 3],
+            blend_weight: None,
+            // Every animated joint is hidden; only the clip's object 15 draws.
+            hidden_joints: (1 << (crate::weapons::WEAPON_JOINT + 1)) - 1,
+            // `update_entity_lighting` latches at the player matrix, then the
+            // light matrix is `MulMatrix0(g_lightMatrix, clip.world)`.
+            light_pos: Some(game.entities[0].pos),
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: Some(player_state.detached_clip.world.r),
+            joint_colours: crate::render::NO_JOINT_COLOURS,
+        });
+    }
     if let (Some(assets), Some(joints)) = (assets, &player_joints) {
         // The player's whole-entity gate reads the live `zoneFlags` low byte
         // (the camera-zone bit plus the interaction bits the scripts raise),
@@ -12793,6 +12843,7 @@ fn render_frame_on(
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
+
     // The held weapon's mesh draws at the hand joint while the weapon bank
     // poses the body: the EMW's single mesh object is authored in joint 14's
     // space, exactly like the original's weapon-slot TMD.
@@ -25034,6 +25085,121 @@ end
                 .all(|pixel| pixel[..3] == [0, 0, 0]),
             "the off-zone NPC still painted"
         );
+    }
+
+    /// A player EMD with the 15 animated body objects left empty and the
+    /// beretta's ejected clip as the 16th object, so a rendered frame can only
+    /// contain the clip.
+    fn synthetic_clip_mesh() -> Tmd {
+        let mut objects: Vec<crate::model::TmdObject> = (0..15)
+            .map(|_| crate::model::TmdObject::default())
+            .collect();
+        objects.push(crate::model::TmdObject {
+            vertices: vec![[0, 0, 0], [200, 0, 0], [0, 200, 0]],
+            normals: vec![[0, 0, 4096]],
+            prims: vec![crate::model::TmdPrim {
+                vertices: [0, 1, 2],
+                normals: [0, 0, 0],
+                uv: [[0, 0]; 3],
+                clut: 0x7800,
+                tsb: 0x80,
+                textured: true,
+                blend: false,
+                raw_y: false,
+                flat_color: None,
+                quad: None,
+                uv_nudge: [0; 3],
+            }],
+        });
+        Tmd { objects }
+    }
+
+    /// Regression for issue #124: the player EMD's 16th mesh object is the
+    /// beretta's ejected magazine, and it must paint while the joint-15
+    /// physics runs and nothing once it is off or outside the camera zone.
+    #[test]
+    fn the_ejected_clip_paints_only_while_it_is_in_the_air() {
+        let id = RoomId::parse("1000").unwrap();
+        let mut room = effect_test_room();
+        room.ambient = [4095; 3];
+        let mut game = game::GameState::new(id, &room);
+        game.entities[0].zone_flags = 1;
+        let pack = Pack::from_bytes(PackWriter::new().to_bytes().unwrap()).unwrap();
+
+        let mut player_state = player::spawn(id, &room);
+        // The clip's own world pose, in front of the cut camera at the origin.
+        player_state.detached_clip.world = anim::entity_matrix([0, 0, 600], 0);
+        player_state.detached_clip.rotation = [0, 0, 0];
+        player_state.detached_clip.vel_z = 1;
+        player_state.detached_clip.drew = true;
+
+        let mut assets = synthetic_player_assets();
+        assets.emd.skeleton = Skeleton {
+            relative: vec![[0, 0, 0]; 15],
+            children: (1..15).map(|index| vec![index as u8]).collect(),
+        };
+        assets.emd.mesh = synthetic_clip_mesh();
+        assets.emd.texture = Texture8 {
+            width: 1,
+            height: 1,
+            indices: vec![1],
+            palettes: vec![[0, 0, 0, 255], [255, 255, 255, 255]],
+            stp: Vec::new(),
+        };
+
+        let mut npc_models = enemy::EntityModelCache::default();
+        let render = |game: &mut game::GameState,
+                      player_state: &player::PlayerState,
+                      npc_models: &mut enemy::EntityModelCache|
+         -> Framebuffer {
+            let mut framebuffer = Framebuffer::new();
+            render_frame(
+                &mut framebuffer,
+                &pack,
+                id,
+                &room,
+                player_state,
+                game,
+                Some(&assets),
+                npc_models,
+                &mut MaskCache::default(),
+                &mut ShadowCache::default(),
+                &mut EffectPageCache::default(),
+            );
+            framebuffer
+        };
+        let painted = |framebuffer: &Framebuffer| {
+            framebuffer
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[..3] != [0, 0, 0])
+                .count()
+        };
+
+        let airborne = render(&mut game, &player_state, &mut npc_models);
+        assert!(painted(&airborne) > 0, "the falling clip painted nothing");
+
+        // The tick state 2 clears `velZ` still draws: the reference's early
+        // return is at entry, so `drew` remains set for that one draw.
+        player_state.detached_clip.vel_z = 0;
+        player_state.detached_clip.drew = true;
+        let last_draw = render(&mut game, &player_state, &mut npc_models);
+        assert!(painted(&last_draw) > 0, "the clip's final draw was dropped");
+
+        // `player_update_detached_joint` stops drawing it once the entry state
+        // is inactive.
+        player_state.detached_clip.drew = false;
+        let grounded = render(&mut game, &player_state, &mut npc_models);
+        assert_eq!(painted(&grounded), 0, "the landed clip still painted");
+
+        // The whole-entity gate (`zoneFlags & 0x7f`) hides it too.
+        player_state.detached_clip.vel_z = 1;
+        game.entities[0].zone_flags = 0;
+        crate::weapons::update_detached_clip(&mut game, &mut player_state, &room);
+        let off_zone = render(&mut game, &player_state, &mut npc_models);
+        assert_eq!(painted(&off_zone), 0, "the off-zone clip painted");
     }
 
     /// A synthetic 8bpp `ui/died.tim`: a 2-pixel-wide, 256-row page whose

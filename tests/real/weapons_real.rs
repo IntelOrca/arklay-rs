@@ -191,6 +191,78 @@ fn a_held_weapon_changes_the_captured_frame() {
     );
 }
 
+/// The beretta's ejected magazine (issue #124): the real player EMD carries
+/// the empty clip as a 16th mesh object, and a real tactical reload arms the
+/// joint-15 physics, which falls to the floor and switches itself off.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn a_real_beretta_reload_ejects_the_clip_mesh() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+
+    // The player EMD is 15 animated joints plus the clip's own 16th object;
+    // the renderer only draws the latter while the physics is live.
+    let emd = arklay::emd::parse(&pack.read("player/00.emd").unwrap()).unwrap();
+    assert_eq!(emd.skeleton.relative.len(), 15, "the animated joints");
+    assert_eq!(emd.mesh.objects.len(), 16, "15 body objects plus the clip");
+    assert!(
+        !emd.mesh.objects[15].prims.is_empty(),
+        "the 16th object is the clip's own mesh"
+    );
+
+    // Room 101's script never latches the controls lock, so the aim + RUN
+    // input reaches the weapon machine.
+    let id = RoomId::parse("1010").unwrap();
+    let reload = |ticks: usize| {
+        arklay::engine::simulate_room_prepared(
+            &pack,
+            id,
+            &[],
+            ticks,
+            |game, _player| {
+                game.player_options.tactical_reload = true;
+                game.inventory.push(arklay::game::InventoryItem {
+                    id: 2,
+                    quantity: 10,
+                });
+                game.inventory.push(arklay::game::InventoryItem {
+                    id: 0x0B,
+                    quantity: 15,
+                });
+                game.set_equipped(Some(2));
+            },
+            |tick| Input {
+                aim: true,
+                run: tick >= 3,
+                ..Input::default()
+            },
+        )
+        .unwrap()
+    };
+
+    // Mid-reload: the clip is in the air and drew this frame's pixels.
+    let airborne = reload(40);
+    let clip = airborne.player.detached_clip;
+    assert!(clip.active(), "the reload left the clip in the air");
+    assert!(
+        i32::from(clip.vel_y) < i32::from(clip.floor_y),
+        "the clip is still above the floor: {clip:?}"
+    );
+    assert!(
+        airborne.player.pos[1] == i32::from(clip.floor_y),
+        "the floor reference is the player's own Y"
+    );
+
+    // Late: the bounce has switched the clip off.
+    let landed = reload(80);
+    assert!(
+        !landed.player.detached_clip.active(),
+        "the clip switched itself off after the bounce"
+    );
+}
+
 /// A handgun trigger cycle through the real packed clips queues the
 /// weapon-bank fire sample (`Gun01`, the reference's sfx id 7), and every
 /// queued name resolves in the pack (which must carry the weapon bank).

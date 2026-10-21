@@ -201,6 +201,11 @@ pub fn update_banks(
             entity.animation_id = 0;
             entity.move_speed_current = 0;
             entity.is_being_attacked = 0;
+            // `ClearAnimTiming`: the spawn init switches the beretta's
+            // detached magazine off (`jointsStructs[15].velZ = 0`), so a clip
+            // still falling when a scripted reset re-runs the state never
+            // carries into the new state.
+            player.detached_clip = crate::weapons::DetachedClip::default();
         }
         8 => scripted_animation(game, player, room, banks),
         // The original's state 4 suppresses every message/input flag.
@@ -3849,6 +3854,9 @@ mod tests {
         let mut game = test_game(0, 7, 9);
         game.entities[0].animation_frame_id = 5;
         let mut player = test_player();
+        // A magazine still in the air from the outgoing state is switched off
+        // by the spawn init (`ClearAnimTiming`).
+        player.detached_clip.arm();
         run(&mut game, &mut player, &[], &[], &[]);
         assert_eq!(game.entities[0].state(), 1);
         assert_eq!(game.entities[0].action_behavior, 0);
@@ -3856,6 +3864,10 @@ mod tests {
         assert_eq!(game.entities[0].animation_id, 0);
         assert_eq!(game.entities[0].animation_frame_id, 0);
         assert_eq!(player.behavior, SCRIPTED_BEHAVIOR);
+        assert!(
+            !player.detached_clip.active(),
+            "the spawn init cleared the detached clip"
+        );
     }
 
     #[test]

@@ -455,10 +455,15 @@ weapon hand and the two flamethrower cues queue through the room's enemy bank.
 The player-side inputs gain port-only aim (`C`) and fire (`Z`) bindings, and
 the engine's tick routes the unfrozen player through `weapons::update` with
 the locomotion machine as the fall-through. Documented deviations: the
-detached beretta magazine mesh, the joint-anchored body correction
+joint-anchored body correction
 (`EntityUpdateWeaponJoint`, subsumed by the port's per-frame pose composition)
 and the projectile effect behaviours' own damage (the flamethrower, acid,
-flame and rocket rounds) remain as before. The synthetic suite covers the
+flame and rocket rounds) remain as before. The beretta's detached magazine
+(the accessory joint 15) landed later with issue #124: the reload's frame-0xa
+volley gate arms the player EMD's own 16th mesh object and
+`weapons::update_detached_clip` runs the original's fall/bounce physics with
+its floor-hit dust and cue, shared by the empty-clip and tactical reloads.
+The synthetic suite covers the
 weapon matrix (each class fires and damages, ammo decrements, the empty clip
 clicks, the reload refills), the aim/holster locomotion hand-off, the
 hand-joint FX attach and the flamethrower cues; the real-asset

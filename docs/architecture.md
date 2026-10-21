@@ -228,6 +228,16 @@ While the machine owns the tick, one 30 Hz step runs:
    `joint_worlds[0]` so the effects pass resolves `Attach::Joint(0, 14)`, and
    the flamethrower refreshes the aim pitch byte the damage cone reads.
 
+The room tick's own tail runs the beretta's detached magazine
+(`weapons::update_detached_clip`, the original's `player_update_detached_joint`)
+after the collision pass and before the render pass's joint-world store. The
+reload's frame-0xa volley gate arms it (`fire_reset_joint15_recoil`); state 0
+seats the clip on joint 14's world pose, state 1 applies gravity with the
+dust/floor tests, and state 2 skitters the bounce until it drops back past the
+floor and switches itself off. The player EMD's own 16th mesh object draws
+through that world pose while `velZ` is set, and the whole-entity gate
+(`zoneFlags & 0x7f`) pauses both the physics and the draw.
+
 The weapon bank's `W*.EMW` clips pose the body (its skeleton is the player
 EMD's) and the EMW's single mesh object draws at joint 14 with the player's
 own texture page, exactly like the original's weapon-slot TMD; the scripted
