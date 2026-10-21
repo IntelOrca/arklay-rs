@@ -42,14 +42,12 @@ fn is_override(base: &Pack, path: &str) -> bool {
     if base.contains(path) {
         return true;
     }
-    let class = if crate::pack::AssetClass::Audio
-        .extensions()
-        .contains(&crate::pack::extension_of(path).as_str())
-    {
-        crate::pack::AssetClass::Audio
-    } else {
-        crate::pack::AssetClass::Image
-    };
+    use crate::pack::AssetClass;
+    let extension = crate::pack::extension_of(path);
+    let class = [AssetClass::Audio, AssetClass::Movie]
+        .into_iter()
+        .find(|class| class.extensions().contains(&extension.as_str()))
+        .unwrap_or(AssetClass::Image);
     base.has_asset(crate::assets::stem(path), class)
 }
 

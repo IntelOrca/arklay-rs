@@ -9,7 +9,8 @@
 // them by its coverage. At a whole zoom no pixel straddles, so the result is
 // exactly nearest sampling; at a fractional zoom every texel still covers the
 // same width. The samplers are bilinear, which also filters the scene target
-// into the viewport when the two sizes differ.
+// into the viewport when the two sizes differ. A layer larger than the
+// viewport (an HD film frame) is minified bilinearly.
 
 layout(location = 0) in vec2 in_uv;
 layout(location = 0) out vec4 out_colour;
@@ -22,7 +23,7 @@ void main() {
     vec2 size = vec2(textureSize(black, 0));
     vec2 texel = in_uv * size;
     // Screen pixels per texel along each axis.
-    vec2 zoom = 1.0 / max(fwidth(texel), vec2(1.0e-6));
+    vec2 zoom = max(1.0 / max(fwidth(texel), vec2(1.0e-6)), vec2(1.0));
     vec2 offset = fract(texel) - 0.5;
     vec2 inner = 0.5 - 0.5 / zoom;
     vec2 blend = (offset - clamp(offset, -inner, inner)) * zoom + 0.5;

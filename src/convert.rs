@@ -63,7 +63,7 @@ const WRITE_CHUNK: usize = 1 << 20;
 /// (68.5%). Expanding the 8-bit files to 16-bit PCM first was strictly worse
 /// (18.2 MB vs 15.5 MB for those 60 files) and recovers no quality, so the
 /// pack stores the shipped samples as they are.
-const PRECOMPRESSED_EXTENSIONS: &[&str] = &["avi", "ogg", "png", "webp"];
+const PRECOMPRESSED_EXTENSIONS: &[&str] = &["avi", "mp4", "ogg", "png", "webp"];
 
 /// Whether an entry's format already carries its own compression, in which
 /// case `convert-game` stores it raw instead of zstd-compressing it.
@@ -2800,6 +2800,7 @@ mod tests {
     fn precompressed_extensions_are_recognised_case_insensitively() {
         for entry in [
             "movie/oj.avi",
+            "movie/OJ.mp4",
             "assets/logo.PNG",
             "bgm/track.ogg",
             "ui/photo.webp",

@@ -1251,6 +1251,27 @@ impl Display {
         }
     }
 
+    /// Present an HD film frame at its own resolution on the GPU backend in
+    /// place of `frame` (see [`GpuRenderer::present_image`]); the software
+    /// backend shows `frame`, the film's 320x240 canvas.
+    #[cfg(feature = "hd")]
+    fn present_film(
+        &mut self,
+        frame: &Framebuffer,
+        film: &crate::hdfilm::VideoFrame,
+    ) -> Result<()> {
+        match &mut self.backend {
+            Backend::Software { texture, renderer } => present(renderer.0, texture, frame),
+            Backend::Gpu(gpu) => {
+                let size = (film.width, film.height);
+                match gpu.present_image(frame, &film.rgba, size, film.serial) {
+                    Ok(()) => Ok(()),
+                    Err(err) => self.fall_back_to_software(&err),
+                }
+            }
+        }
+    }
+
     /// Replace a failed GPU backend with the software one.
     fn fall_back_to_software(&mut self, err: &anyhow::Error) -> Result<()> {
         eprintln!("warning: GPU renderer failed ({err:#}); using software");
@@ -7305,6 +7326,17 @@ impl App {
         &self.framebuffer
     }
 
+    /// The HD film frame on screen, if a film playing now is an HD
+    /// replacement: the GPU backend presents it at its own resolution.
+    #[cfg(feature = "hd")]
+    fn hd_frame(&self) -> Option<&crate::hdfilm::VideoFrame> {
+        match &self.mode {
+            Mode::Movie(session) => session.hd_frame(),
+            Mode::Play(session) => session.movie.as_ref()?.hd_frame(),
+            _ => None,
+        }
+    }
+
     /// Step the camera cut when playing.
     /// The action map the window reads, for every session to start from.
     fn set_bindings(&mut self, bindings: controls::Bindings) {
@@ -8025,6 +8057,13 @@ fn run_app_loop(app: &mut App, display: &mut Display, stats: bool) -> Result<()>
         if let Some(gpu) = display.gpu() {
             app.draw_layers(gpu);
             clock.frame_drawn(draw);
+            #[cfg(feature = "hd")]
+            if let Some(film) = app.hd_frame() {
+                display.present_film(app.frame(), film)?;
+            } else {
+                display.present_layers(app.frame(), app.white_frame())?;
+            }
+            #[cfg(not(feature = "hd"))]
             display.present_layers(app.frame(), app.white_frame())?;
         } else {
             app.draw();
@@ -8122,8 +8161,8 @@ pub fn run_ending(
     // Keep the missing-film diagnostic the pre-sequence entry had: a pack
     // without the films would otherwise warn per film and run the RESULT
     // screen silently.
-    let first = movie::name(films[0]).map(movie::pack_path);
-    if !first.is_some_and(|entry| app.pack.contains(&entry)) {
+    let first = movie::name(films[0]);
+    if !first.is_some_and(|name| movie::exists(&app.pack, name)) {
         bail!("no ending film could be opened; re-run convert-game with the films");
     }
     app.ending = Some(flow);
@@ -15818,6 +15857,23 @@ mod tests {
         for _ in 0..3 {
             display.present_layers(&black, Some(&white)).unwrap();
             display.present_layers(&black, None).unwrap();
+        }
+        // An HD film frame is presented at its own size, and the layers
+        // return to 320x240 after it.
+        #[cfg(feature = "hd")]
+        {
+            let film = crate::hdfilm::VideoFrame {
+                width: 1280,
+                height: 960,
+                rgba: vec![128; 1280 * 960 * 4],
+                canvas: vec![128; 320 * 240 * 4],
+                serial: 1,
+            };
+            // The second present reuses the uploaded frame.
+            display.present_film(&black, &film).unwrap();
+            display.present_film(&black, &film).unwrap();
+            assert!(display.gpu().is_some());
+            display.present_layers(&black, Some(&white)).unwrap();
         }
 
         // A GPU failure hands the window to the software backend, which

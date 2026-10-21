@@ -116,6 +116,7 @@ audio the original shipped. Every loader therefore looks an asset up by *stem*
 | --- | --- |
 | image | `webp` > `png` > `bmp` > `tim` > `pix` |
 | audio | `ogg` > `wav` |
+| movie | `mp4` > `avi` |
 
 **Any entry in a mod whose stem matches a known asset is an override.** The
 winning layer is still decided by `(load_order, id)` exactly as above, and only
@@ -134,6 +135,29 @@ own decoders with the same size budgets as the shipped formats. `mod build`
 packs replacement sources verbatim and stores them raw, and `convert-game`
 needs no change: it reads the install's own BMP/TIM/WAV/PIX sources, which
 never carry a replacement format.
+
+A film replacement is either an MP4 or an AVI holding H.264 video (any
+profile OpenH264 decodes, e.g. High) with optional AAC-LC audio, or a Cinepak
+AVI like the shipped films. The decoder is picked from the container and the
+codec, so an H.264 AVI can sit at the shipped `movie/<name>.avi` path or an MP4
+next to it at `movie/<name>.mp4`; there is no hash lookup. The film plays at
+its own frame rate on the 30 Hz clock and its audio is resampled to the
+mixer's 22050 Hz. The GPU renderer scales the film's own frames to the window
+(letterboxed to their aspect); the software renderer box-filters them onto the
+320x240 frame. Colour follows the stream's signalled matrix (BT.709 or
+BT.601, limited or full range) and assumes BT.601 limited range when there is
+none. The audio track is optional; an MP4 edit list's encoder priming is
+skipped. H.264 is decoded by Cisco's OpenH264 (built from source by the
+`openh264` crate) and AAC by `symphonia`, both behind the `hd` feature. A film
+that does not open logs a warning and the shipped film it shadows plays
+instead; a damaged frame later on holds the previous picture.
+
+Jill's prologue (`movie/pj`) removes 177.8 s to 188.5 s of the film, so
+playback jumps to 188.5 s. Decoding resumes from the keyframe at or before that
+point and catches up from there, so a keyframe exactly at 188.5 s avoids a
+brief freeze at the jump (for example ffmpeg's `-force_key_frames 188.5`, or
+the closest frame boundary). Keep GOPs closed (x264's default) so the restart
+is exact.
 
 ### What each class accepts
 
@@ -154,6 +178,7 @@ never carry a replacement format.
 | BGM | `bgm/013`, `bgm/024_00` | ogg, wav | any |
 | sound effect | `se/a_mcn03`, `se/chain1`, `se/v110_00` | ogg, wav | any |
 | voice | `voice/01_09` | ogg, wav | any |
+| film | `movie/oj`, `movie/capcom`, `movie/ed1` | mp4, avi | any size up to 4096x4096, any frame rate |
 
 The stems are the shipped entries' names without their extensions: `roomcut` and
 `roommask` use `{stage}{room:02X}_{camera:03}` (`RoomId::cut_stem`), `bgm` uses

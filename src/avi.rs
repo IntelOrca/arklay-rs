@@ -1,4 +1,4 @@
-//! AVI demuxer for the shipped Cinepak films.
+//! AVI demuxer for the shipped Cinepak films and H.264 replacements.
 //!
 //! One RIFF/AVI image is parsed into a format description and a frame index.
 //! The corpus is homogeneous: a `LIST hdrl` with one `vids`/`cvid` stream and
@@ -29,6 +29,18 @@ pub struct Avi {
     data: Vec<u8>,
     format: AviFormat,
     frames: Vec<AviFrame>,
+    /// Every audio chunk in stream order, including those past the last
+    /// video frame (a compressed track is not paired one chunk per frame).
+    audio_chunks: Vec<(usize, usize)>,
+    /// The `WAVEFORMATEX` extra bytes after `cbSize` (the AAC
+    /// AudioSpecificConfig of an HD film), empty for PCM.
+    audio_extra: Vec<u8>,
+    /// Whether the file has an audio stream; [`AviFormat::audio`] is zeroed
+    /// without one.
+    has_audio: bool,
+    /// The video `strh` rate as an exact reduced `(rate, scale)`, when it
+    /// declares one.
+    stream_rate: Option<(u32, u32)>,
 }
 
 /// The stream description of an AVI.
@@ -49,7 +61,7 @@ pub struct AviFormat {
 }
 
 /// A PCM audio stream description (a `WAVEFORMATEX`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct AudioFormat {
     /// `wFormatTag`; 1 is PCM.
     pub format_tag: u16,
@@ -83,13 +95,48 @@ struct ChunkRef {
 }
 
 impl Avi {
-    /// Parse one RIFF/AVI image.
+    /// Parse one RIFF/AVI image of the shipped Cinepak corpus.
     ///
     /// The whole file is kept as the backing store; only the chunk index is
     /// built up front. A file that is not RIFF/AVI, has no `cvid` video
     /// stream, is not 320x240 or has a non-PCM audio stream is rejected with
     /// the offending field named.
     pub fn parse(bytes: Vec<u8>) -> Result<Self> {
+        let avi = Self::parse_any(bytes)?;
+        if !avi.has_audio {
+            bail!("AVI has no audio stream");
+        }
+        let format = &avi.format;
+        if !format.video_codec.eq_ignore_ascii_case(b"cvid") {
+            bail!(
+                "unsupported video codec {:?}, expected \"cvid\"",
+                fourcc(&format.video_codec)
+            );
+        }
+        if format.width != 320 || format.height != 240 {
+            bail!(
+                "unsupported video size {}x{}, expected 320x240",
+                format.width,
+                format.height
+            );
+        }
+        if format.audio.format_tag != 1 {
+            bail!(
+                "unsupported audio format tag {}, expected PCM (1)",
+                format.audio.format_tag
+            );
+        }
+        Ok(avi)
+    }
+
+    /// Parse one RIFF/AVI image without checking its codecs or size.
+    ///
+    /// This is the container half of [`Avi::parse`]: an HD replacement film
+    /// carries H.264 video at its own size and AAC audio in the same RIFF
+    /// layout, and the player picks the decoder from
+    /// [`AviFormat::video_codec`] and [`AudioFormat::format_tag`]. The audio
+    /// stream is optional here ([`Avi::has_audio`]).
+    pub fn parse_any(bytes: Vec<u8>) -> Result<Self> {
         let data = bytes;
         if data.len() < 12 {
             bail!("AVI is {} bytes, shorter than a RIFF header", data.len());
@@ -140,7 +187,10 @@ impl Avi {
                                             video_strh = Some(stream.strh);
                                         }
                                         b"auds" if audio.is_none() => {
-                                            audio = Some(parse_audio_format(&data, &stream.strf)?);
+                                            audio = Some((
+                                                parse_audio_format(&data, &stream.strf)?,
+                                                audio_extra(&data, &stream.strf),
+                                            ));
                                         }
                                         _ => {}
                                     }
@@ -165,25 +215,11 @@ impl Avi {
         })?;
 
         let (codec, width, height) = video.context("AVI has no video stream")?;
-        if !codec.eq_ignore_ascii_case(b"cvid") {
-            bail!(
-                "unsupported video codec {:?}, expected \"cvid\"",
-                fourcc(&codec)
-            );
-        }
-        if width != 320 || height != 240 {
-            bail!("unsupported video size {width}x{height}, expected 320x240");
-        }
-        let audio = audio.context("AVI has no audio stream")?;
-        if audio.format_tag != 1 {
-            bail!(
-                "unsupported audio format tag {}, expected PCM (1)",
-                audio.format_tag
-            );
-        }
-        let strh_us = match video_strh {
-            Some(strh) => strh_frame_duration(&data, strh)?,
-            None => None,
+        let has_audio = audio.is_some();
+        let (audio, audio_extra) = audio.unwrap_or_default();
+        let (strh_us, stream_rate) = match video_strh {
+            Some(strh) => strh_frame_rate(&data, strh)?,
+            None => (None, None),
         };
         let frame_rate = frame_rate(avih_us, strh_us)?;
 
@@ -214,7 +250,15 @@ impl Avi {
                 audio: audios.get(index).map(|chunk| (chunk.offset, chunk.len)),
             })
             .collect();
+        let audio_chunks = audios
+            .iter()
+            .map(|chunk| (chunk.offset, chunk.len))
+            .collect();
         Ok(Avi {
+            audio_chunks,
+            audio_extra,
+            has_audio,
+            stream_rate,
             data,
             format: AviFormat {
                 width,
@@ -250,6 +294,39 @@ impl Avi {
     pub fn audio(&self, index: usize) -> Option<&[u8]> {
         let (offset, len) = self.frames.get(index)?.audio?;
         self.data.get(offset..offset + len)
+    }
+
+    /// Whether the file has an audio stream ([`Avi::parse`] requires one).
+    pub fn has_audio(&self) -> bool {
+        self.has_audio
+    }
+
+    /// The video stream's exact frame rate from its `strh` `dwRate /
+    /// dwScale`, reduced, when it declares one. [`AviFormat::frame_rate`]
+    /// rounds to whole frames, which suits the shipped corpus but would run
+    /// a 23.976 fps HD film fast.
+    pub fn stream_rate(&self) -> Option<(u32, u32)> {
+        self.stream_rate
+    }
+
+    /// The `(offset, len)` of every audio chunk body in stream order.
+    pub fn audio_chunks(&self) -> &[(usize, usize)] {
+        &self.audio_chunks
+    }
+
+    /// The `(offset, len)` of every video chunk body in stream order.
+    pub fn video_chunks(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.frames.iter().map(|frame| frame.video)
+    }
+
+    /// The audio format's extra bytes (`WAVEFORMATEX` past `cbSize`).
+    pub fn audio_extra(&self) -> &[u8] {
+        &self.audio_extra
+    }
+
+    /// Give up the file bytes the chunk ranges index into.
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
     }
 
     /// Audio samples one video frame spans: 2205 at 10 fps and 22050 Hz,
@@ -387,12 +464,31 @@ fn parse_audio_format(data: &[u8], strf: &Range<usize>) -> Result<AudioFormat> {
     Ok(format)
 }
 
-/// The `strh` frame duration in microseconds, when `avih` does not carry one.
+/// The `WAVEFORMATEX` extra bytes of an audio `strf`: the `cbSize` bytes
+/// after the 18-byte header, clamped to the chunk. A plain 16-byte
+/// `WAVEFORMAT` has none.
+fn audio_extra(data: &[u8], strf: &Range<usize>) -> Vec<u8> {
+    let Some(bytes) = data.get(strf.clone()) else {
+        return Vec::new();
+    };
+    if bytes.len() < 18 {
+        return Vec::new();
+    }
+    let declared = usize::from(read_u16(bytes, 16));
+    bytes[18..].iter().take(declared).copied().collect()
+}
+
+/// The `strh` frame duration in microseconds (used when `avih` does not
+/// carry one) and its exact reduced `(dwRate, dwScale)`.
 ///
 /// The `dwScale` and `dwRate` fields sit at offsets 20 and 24 of the
 /// `AVISTREAMHEADER`, so a truncated header is an error naming its size rather
 /// than an out-of-bounds read.
-fn strh_frame_duration(data: &[u8], strh: Range<usize>) -> Result<Option<u32>> {
+/// A stream's frame duration in microseconds and its exact rate as a
+/// reduced `(rate, scale)` fraction.
+type StreamTiming = (Option<u32>, Option<(u32, u32)>);
+
+fn strh_frame_rate(data: &[u8], strh: Range<usize>) -> Result<StreamTiming> {
     let header = data.get(strh).context("video strh is out of bounds")?;
     if header.len() < 28 {
         bail!(
@@ -403,10 +499,11 @@ fn strh_frame_duration(data: &[u8], strh: Range<usize>) -> Result<Option<u32>> {
     let scale = read_u32(header, 20);
     let rate = read_u32(header, 24);
     if rate == 0 || scale == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
-    Ok(Some(
-        (u64::from(scale) * u64::from(MICROS_PER_SECOND) / u64::from(rate)) as u32,
+    Ok((
+        Some((u64::from(scale) * u64::from(MICROS_PER_SECOND) / u64::from(rate)) as u32),
+        Some(crate::mp4::reduce(rate, scale)),
     ))
 }
 
@@ -991,6 +1088,27 @@ mod tests {
         fixture.push(b"00dc", &[1]);
         let err = Avi::parse(fixture.build(None)).unwrap_err().to_string();
         assert!(err.contains("frame duration"), "{err}");
+    }
+
+    #[test]
+    fn an_hd_film_may_omit_audio_and_keeps_its_exact_rate() {
+        // 24000/1001 fps H.264 with no audio stream.
+        let mut body = avih(41_708, 1);
+        let video = [
+            strh(b"vids", 1001, 24_000, 1),
+            video_strf(b"H264", 1280, 960),
+        ]
+        .concat();
+        body.extend_from_slice(&list(b"strl", &video));
+        let mut fixture = Fixture::new().with_hdrl(list(b"hdrl", &body));
+        fixture.push(b"00dc", &[1]);
+        let file = fixture.build(None);
+        let avi = Avi::parse_any(file.clone()).unwrap();
+        assert!(!avi.has_audio());
+        assert_eq!(avi.stream_rate(), Some((24_000, 1001)));
+        assert_eq!(avi.format().frame_rate, (24, 1));
+        let err = Avi::parse(file).unwrap_err().to_string();
+        assert!(err.contains("no audio stream"), "{err}");
     }
 
     #[test]
