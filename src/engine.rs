@@ -1470,6 +1470,16 @@ enum ScenePass<'g> {
     White,
 }
 
+/// The save the debug menu's LOAD GAME picked: a numbered slot, or an
+/// explicit file a replacing screen (`api:load`) named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadRequest {
+    /// A vanilla `savedatN.dat` slot.
+    Slot(usize),
+    /// A file the screen's save list chose, e.g. the CR-style folder screen.
+    File(PathBuf),
+}
+
 struct GameSession {
     loaded: LoadedRoom,
     game: game::GameState,
@@ -1685,8 +1695,8 @@ struct GameSession {
     return_title: Option<Box<ui::lua_screen::LuaScreen>>,
     /// A confirmed return to the title screen, taken once by the app.
     return_title_requested: bool,
-    /// A save slot the debug menu's LOAD GAME picked, taken once by the app.
-    load_slot_requested: Option<usize>,
+    /// A save the debug menu's LOAD GAME picked, taken once by the app.
+    load_requested: Option<LoadRequest>,
     /// An ending id the debug menu's CLEAR GAME picked, taken once by the app.
     clear_game_requested: Option<u8>,
     /// The active attract-demo playback, when the session was booted (or
@@ -2071,7 +2081,7 @@ impl GameSession {
             aspect_changed: None,
             return_title: None,
             return_title_requested: false,
-            load_slot_requested: None,
+            load_requested: None,
             clear_game_requested: None,
             attract: None,
             death: ui::death::DeathSequence::idle(),
@@ -3452,9 +3462,9 @@ impl GameSession {
         self.debug_menu = Some(menu);
     }
 
-    /// Take the debug menu's pending LOAD GAME slot.
-    fn take_load_slot_request(&mut self) -> Option<usize> {
-        self.load_slot_requested.take()
+    /// Take the debug menu's pending LOAD GAME choice.
+    fn take_load_request(&mut self) -> Option<LoadRequest> {
+        self.load_requested.take()
     }
 
     /// CLEAR GAME's ending flow from the live state, with the character the
@@ -4063,11 +4073,17 @@ impl GameSession {
         if result == ScreenResult::Continue {
             return;
         }
-        // The debug menu's LOAD GAME: the chosen slot boots a new session,
-        // which the app owns.
-        if let ScreenResult::Done(ScreenAction::LoadGame { slot }) = result {
+        // The debug menu's LOAD GAME: the chosen save boots a new session,
+        // which the app owns. A replacing screen names a file with
+        // `api:load`, the vanilla screen reports a numbered slot.
+        let request = match result {
+            ScreenResult::Done(ScreenAction::LoadGame { slot }) => Some(LoadRequest::Slot(slot)),
+            ScreenResult::Done(ScreenAction::LoadFile(path)) => Some(LoadRequest::File(path)),
+            _ => None,
+        };
+        if let Some(request) = request {
             self.save_screen = None;
-            self.load_slot_requested = Some(slot);
+            self.load_requested = Some(request);
             return;
         }
         if let Some(outcome) = self
@@ -6809,7 +6825,7 @@ impl App {
     fn play_update(&mut self, ui: UiInput, input: player::Input, action: bool) -> Result<AppFlow> {
         let mut return_title = false;
         let mut death_finished = false;
-        let mut load_slot = None;
+        let mut load_request = None;
         let mut clear_game = None;
         {
             let App { pack, mode, .. } = self;
@@ -6829,15 +6845,28 @@ impl App {
                 }
                 return_title = session.take_return_title_request();
                 death_finished = session.death.finished;
-                load_slot = session.take_load_slot_request();
+                load_request = session.take_load_request();
                 clear_game = session
                     .take_clear_game_request()
                     .map(|id| (id, session.ending_flow(id)));
             }
         }
-        if let Some(slot) = load_slot {
-            if let Err(err) = self.continue_from_slot(slot) {
-                eprintln!("warning: save slot {slot} unavailable: {err:#}");
+        if let Some(request) = load_request {
+            let outcome = match &request {
+                LoadRequest::Slot(slot) => self.continue_from_slot(*slot),
+                LoadRequest::File(path) => {
+                    save::load_file(path).and_then(|file| self.continue_from_file(file))
+                }
+            };
+            if let Err(err) = outcome {
+                match &request {
+                    LoadRequest::Slot(slot) => {
+                        eprintln!("warning: save slot {slot} unavailable: {err:#}")
+                    }
+                    LoadRequest::File(path) => {
+                        eprintln!("warning: save file {} unavailable: {err:#}", path.display())
+                    }
+                }
                 // Back to the debug tools rather than silently resuming.
                 let App { pack, mode, .. } = self;
                 if let Mode::Play(session) = mode {
@@ -14338,7 +14367,7 @@ mod tests {
             session.save_screen.is_some(),
             "LOAD GAME opens the load screen"
         );
-        assert_eq!(session.take_load_slot_request(), None, "nothing picked yet");
+        assert_eq!(session.take_load_request(), None, "nothing picked yet");
     }
 
     #[test]
@@ -16587,6 +16616,13 @@ mod tests {
         }
     }
 
+    /// One app update with a single UI edge.
+    fn app_press(app: &mut App, set: impl FnOnce(&mut UiInput)) {
+        let mut ui = UiInput::default();
+        set(&mut ui);
+        app.update(ui, player::Input::default(), false).unwrap();
+    }
+
     /// Drive `app` until `done` is true, feeding one confirm per tick.
     fn run_until(app: &mut App, ticks: u32, done: impl Fn(&App) -> bool) -> bool {
         for _ in 0..ticks {
@@ -17017,7 +17053,7 @@ mod tests {
         let Mode::Play(session) = &mut app.mode else {
             panic!("expected a play mode");
         };
-        session.load_slot_requested = Some(3);
+        session.load_requested = Some(LoadRequest::Slot(3));
         app.update(UiInput::default(), player::Input::default(), false)
             .unwrap();
         let Mode::Play(session) = &mut app.mode else {
@@ -17026,7 +17062,7 @@ mod tests {
         assert!(session.debug_menu.is_some(), "the failure is visible");
         session.debug_menu = None;
 
-        session.load_slot_requested = Some(0);
+        session.load_requested = Some(LoadRequest::Slot(0));
         session.game.entities[0].health = 5;
         app.update(UiInput::default(), player::Input::default(), false)
             .unwrap();
@@ -17035,6 +17071,89 @@ mod tests {
         };
         assert_eq!(session.game.entities[0].health, 77, "slot 0 loaded");
         assert!(session.debug_menu.is_none());
+    }
+
+    #[test]
+    fn app_debug_load_screen_selection_loads_the_slot() {
+        use crate::ui::debug_menu::{TOOLS, Tool};
+        let dir = TempDir::new();
+        let pack_path = new_game_pack(&dir);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let file = save::SaveFile {
+            stage: 0,
+            room: NEW_GAME_ROOM,
+            health: 77,
+            ..save::SaveFile::default()
+        };
+        save::save(&saves, 0, &file).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut app = App::new(pack, saves, false);
+        let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+
+        app_press(&mut app, |ui| ui.debug_menu = true);
+        for _ in 0..TOOLS.iter().position(|tool| *tool == Tool::Save).unwrap() {
+            app_press(&mut app, |ui| ui.down = true);
+        }
+        app_press(&mut app, |ui| ui.confirm = true);
+        app_press(&mut app, |ui| ui.down = true);
+        app_press(&mut app, |ui| ui.confirm = true);
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(session.save_screen.is_some(), "the load screen is up");
+        app_press(&mut app, |ui| ui.confirm = true);
+        for _ in 0..24 {
+            app_press(&mut app, |_| {});
+        }
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(session.save_screen.is_none());
+        assert_eq!(session.game.entities[0].health, 77, "slot 0 loaded");
+    }
+
+    #[test]
+    fn app_debug_load_accepts_a_replacing_screens_chosen_file() {
+        use crate::ui::debug_menu::{TOOLS, Tool};
+        let dir = TempDir::new();
+        let base = new_game_pack(&dir);
+        let (pack_path, mod_path) = pack_with_lua_screen(&dir, &base);
+        let saves = dir.0.join("saves");
+        std::fs::create_dir_all(&saves).unwrap();
+        let file = save::SaveFile {
+            stage: 0,
+            room: NEW_GAME_ROOM,
+            health: 55,
+            ..save::SaveFile::default()
+        };
+        // Not one of the vanilla slots: only the replacing screen's folder
+        // probe lists it.
+        save::save_to_path(&saves.join("a_other.dat"), &file).unwrap();
+        let pack = Pack::open_layered(&pack_path, &[mod_path]).unwrap();
+        let mut app = App::new(pack, saves, false);
+        app.boot(AppBoot::Debug).unwrap();
+
+        for _ in 0..TOOLS.iter().position(|tool| *tool == Tool::Save).unwrap() {
+            app_press(&mut app, |ui| ui.down = true);
+        }
+        app_press(&mut app, |ui| ui.confirm = true);
+        app_press(&mut app, |ui| ui.down = true);
+        app_press(&mut app, |ui| ui.confirm = true);
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(session.save_screen.is_some(), "the load screen is up");
+        app_press(&mut app, |ui| ui.confirm = true);
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(session.save_screen.is_none());
+        assert_eq!(
+            session.game.entities[0].health, 55,
+            "the screen's chosen file loaded"
+        );
     }
 
     #[test]
