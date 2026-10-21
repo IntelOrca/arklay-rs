@@ -1,0 +1,6 @@
+# Stairwell door (room 10B -> 207): hold up into the door, press confirm on
+# tick 10 and keep it held through the transition. The held press must not be
+# read as a skip (issue #107); only a release and a fresh press past frame 10
+# skips the animation (see door_207_skip.txt).
+5 up
+10 up confirm

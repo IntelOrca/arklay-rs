@@ -1,0 +1,9 @@
+# Stairwell door (room 10B -> 207): hold up into the door, press confirm on
+# tick 10 to open it, release it, then press confirm again on tick 32. The
+# fresh press past frame 10 skips the rest of the animation (issue #107: a
+# release and press again is what skips, never the held activation press).
+5 up
+10 up confirm
+11 up
+32 up confirm
+33 up

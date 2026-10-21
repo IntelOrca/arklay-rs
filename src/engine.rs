@@ -1793,6 +1793,30 @@ enum RoomBgmHandoff {
     AtTransitionEnd,
 }
 
+/// How one door-transition frame's skip gate is driven.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionSkip {
+    /// The player's pad: the action or run/cancel button's press edge.
+    Pad(bool),
+    /// The port's cutscene fast-forward: skip the animation without a player
+    /// press.
+    Forced,
+}
+
+/// Whether the player pressed the door-transition skip this tick.
+///
+/// The original's skip gate reads its edge-detected pad word
+/// (`g_PlayerPadHeld` is the rising-edge word) and accepts Cross (`0x80`) or
+/// Circle (`0x40`). The port splits Circle into the Cancel and Run actions,
+/// so both press edges count; the held level never triggers the skip. The
+/// button that activated the door therefore cannot skip the animation while
+/// it stays down; it must be released and pressed again. While an attract
+/// reel owns the pad the reference reads its recorded demo word instead of
+/// the live pad, so `attract` suppresses the live press entirely.
+fn door_skip_pressed(ui: &UiInput, input: &player::Input, attract: bool) -> bool {
+    !attract && (input.action_pressed || input.run_pressed || ui.cancel)
+}
+
 impl GameSession {
     /// A new game as `character` (`0` Chris, `1` Jill): the shipped card's
     /// start room (the main hall), the original's start position, health,
@@ -2451,7 +2475,7 @@ impl GameSession {
     /// skip's fast-forward; returns whether it finished.
     fn skip_transition(&mut self, pack: &Pack) -> bool {
         for _ in 0..MAX_TRANSITION_FRAMES {
-            self.tick_transition(pack, true);
+            self.tick_transition(pack, TransitionSkip::Forced);
             if let Some(skip) = self.cutscene_skip.as_mut() {
                 skip.ticks += 1;
             }
@@ -4686,12 +4710,24 @@ impl GameSession {
         }
     }
 
+    /// The door transition's skip input for one tick.
+    ///
+    /// The player's fresh confirm, run or cancel press is the skip. While an
+    /// attract reel owns the pad the reference reads the recorded demo word
+    /// instead of the live pad, so a live press must not skip a demo's door.
+    /// The port's reel only advances in the gameplay tick, which the
+    /// transition branch bypasses, so the recorded word is not available
+    /// here; a demo's door plays out.
+    fn transition_skip(&self, ui: &UiInput, input: &player::Input) -> TransitionSkip {
+        TransitionSkip::Pad(door_skip_pressed(ui, input, self.attract.is_some()))
+    }
+
     /// Advance an active transition one `main_loop` frame and run the parts
     /// of `room_transition_load` the frame reached: the placement, the
     /// destination's `room_set` and, on the frame it returns, its tail. The
     /// finished flag is held until [`GameSession::finish_transition`] drops
     /// the timeline after the frame was presented.
-    fn tick_transition(&mut self, pack: &Pack, skip: bool) {
+    fn tick_transition(&mut self, pack: &Pack, skip: TransitionSkip) {
         self.tween.advance();
         let Some(mut session) = self.transition.take() else {
             return;
@@ -4709,7 +4745,10 @@ impl GameSession {
             self.tick_screen_intensity();
             return;
         }
-        let frame = session.transition.tick(skip);
+        let frame = match skip {
+            TransitionSkip::Pad(pressed) => session.transition.tick(pressed),
+            TransitionSkip::Forced => session.transition.tick_forced(),
+        };
         session.frame = frame;
         session.door_yield = None;
         for effect in session.transition.stepper_mut().take_sfx() {
@@ -7242,7 +7281,8 @@ impl App {
                     // loaded behind the animation but no gameplay tick happens
                     // until the task finishes, and the first tick after it runs
                     // in the destination. Input stays gated exactly the same.
-                    session.tick_transition(pack, action || input.run);
+                    let skip = session.transition_skip(&ui, &input);
+                    session.tick_transition(pack, skip);
                 } else {
                     session.tick(pack, ui, input, action)?;
                 }
@@ -19030,7 +19070,7 @@ mod tests {
         trigger_test_door(pack, session);
 
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(pack, false);
+            session.tick_transition(pack, TransitionSkip::Pad(false));
             if session.transition_finished {
                 break;
             }
@@ -19102,7 +19142,7 @@ mod tests {
         let mut loaded_during_animation = false;
         let mut bgm_sleep_frames = 0;
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(&pack, false);
+            session.tick_transition(&pack, TransitionSkip::Pad(false));
             let animating = session
                 .transition
                 .as_ref()
@@ -19195,7 +19235,7 @@ mod tests {
 
         let mut held = 0;
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(&pack, false);
+            session.tick_transition(&pack, TransitionSkip::Pad(false));
             let animating = session
                 .transition
                 .as_ref()
@@ -19242,7 +19282,7 @@ mod tests {
 
         trigger_test_door(&pack, &mut session);
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(&pack, false);
+            session.tick_transition(&pack, TransitionSkip::Pad(false));
             if !session.transition_finished {
                 assert_eq!(
                     session.game.bgm.state, 0x08,
@@ -19952,7 +19992,7 @@ end
         }
         assert!(session.transition.is_some(), "the door never opened");
         for _ in 0..MAX_TRANSITION_FRAMES {
-            session.tick_transition(&pack, false);
+            session.tick_transition(&pack, TransitionSkip::Pad(false));
             if session.transition_finished {
                 break;
             }
@@ -22021,6 +22061,63 @@ off_0010:
             movie_buttons_held(input.held_word()),
             0x0001 | 0x0002 | 0x0010
         );
+    }
+
+    /// The door skip is a press edge, never a held button: the confirm press
+    /// that activated the door must be released before it can skip the
+    /// animation (issue #107).
+    #[test]
+    fn the_door_skip_needs_a_fresh_button_press() {
+        let ui = UiInput::default();
+        assert!(
+            !door_skip_pressed(
+                &ui,
+                &player::Input {
+                    action_held: true,
+                    run: true,
+                    ..player::Input::default()
+                },
+                false
+            ),
+            "a held confirm/run must not skip the door transition"
+        );
+        assert!(door_skip_pressed(
+            &ui,
+            &player::Input {
+                action_held: true,
+                action_pressed: true,
+                ..player::Input::default()
+            },
+            false
+        ));
+        assert!(door_skip_pressed(
+            &ui,
+            &player::Input {
+                run: true,
+                run_pressed: true,
+                ..player::Input::default()
+            },
+            false
+        ));
+        // Circle is split into the Cancel and Run actions in the port; both
+        // are press edges of the original's `0x40` bit.
+        let cancel = UiInput {
+            cancel: true,
+            ..UiInput::default()
+        };
+        assert!(door_skip_pressed(&cancel, &player::Input::default(), false));
+        assert!(!door_skip_pressed(&ui, &player::Input::default(), false));
+        // An attract reel's pad is the recorded demo word, so the live press
+        // must not skip a demo's door.
+        assert!(!door_skip_pressed(
+            &cancel,
+            &player::Input {
+                action_pressed: true,
+                run_pressed: true,
+                ..player::Input::default()
+            },
+            true
+        ));
     }
 
     #[test]
@@ -24452,7 +24549,7 @@ off_0010:
     /// animation, otherwise the room ticks with `input`.
     fn app_step(session: &mut GameSession, pack: &Pack, input: player::Input) {
         if session.transition.is_some() {
-            session.tick_transition(pack, false);
+            session.tick_transition(pack, TransitionSkip::Pad(false));
             if session.transition_finished {
                 session.finish_transition(pack);
             }

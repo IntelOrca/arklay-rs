@@ -109,6 +109,9 @@ While a door transition owns the screen the port steps at
 for the transition, which drops the frame limiter from the 33 ms gameplay
 interval to the 16 ms one, and the door interpreter advances one animation
 frame per platform frame. Gameplay pacing resumes when the transition ends.
+The door animation's skip gate reads the confirm or cancel/run button's press
+edge, not its held level, so the press that activated the door must be
+released before another press can skip the animation.
 Film skip input is likewise polled once per platform frame, not once per 30 Hz
 tick. The reference leaves its frame limiter through the film gate while a
 film owns the screen, so its 100-update grace expires within milliseconds; the
