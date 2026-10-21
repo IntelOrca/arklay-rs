@@ -204,6 +204,20 @@ pub fn weapon_sheet_region(slot: usize) -> Option<(u8, u16)> {
     ))
 }
 
+/// The height of weapon sheet `slot`'s own texture (`BakeWeaponSheet`): the
+/// rest of its page, clipped at the next sheet packed below it on that page.
+pub fn weapon_sheet_height(slot: usize) -> Option<u16> {
+    let (page, top) = weapon_sheet_region(slot)?;
+    let next = WEAPON_SHEET_PAGE
+        .iter()
+        .zip(WEAPON_SHEET_PAGE_V)
+        .filter(|&(&other, v)| other == page && v > top)
+        .map(|(_, v)| v)
+        .min()
+        .unwrap_or(256);
+    Some(next - top)
+}
+
 /// The first blend record of `depth_slot` whose band end is above `band_v`, as
 /// `(blend_mode, color_idx, start_v, len)`.
 ///
@@ -978,6 +992,13 @@ mod tests {
     use super::*;
     use crate::effects::fixtures;
     use crate::effects::room::TimGeometry;
+
+    #[test]
+    fn weapon_sheets_stop_at_the_next_sheet_on_their_page() {
+        let heights: Vec<_> = (0..8).filter_map(weapon_sheet_height).collect();
+        assert_eq!(heights, [64, 112, 64, 16, 24, 72, 24, 133]);
+        assert_eq!(weapon_sheet_height(8), None);
+    }
 
     fn empty_rows() -> [Vec<Vec<[u8; 24]>>; 8] {
         std::array::from_fn(|_| Vec::new())

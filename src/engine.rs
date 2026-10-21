@@ -10434,16 +10434,31 @@ fn build_effect_quads(
             continue;
         };
         let room_sprite = game.room_effects.sprite(sprite_type);
-        let (sprite, page, region_v, room_art) = if let Some(sprite) = room_sprite {
-            (sprite, usize::from(sprite.info.page_index()), 0u32, true)
+        let (sprite, page, region_v, room_art, sheet_rows) = if let Some(sprite) = room_sprite {
+            (
+                sprite,
+                usize::from(sprite.info.page_index()),
+                0u32,
+                true,
+                [0, 256],
+            )
         } else if let Some(sprite) = game.weapon_effects.sprite(sprite_type) {
             let Some(slot) = game.weapon_effects.slot_of(sprite_type) else {
                 continue;
             };
-            let Some((page, region_v)) = effects::pages::weapon_sheet_region(slot) else {
+            let (Some((page, region_v)), Some(height)) = (
+                effects::pages::weapon_sheet_region(slot),
+                effects::pages::weapon_sheet_height(slot),
+            ) else {
                 continue;
             };
-            (sprite, usize::from(page), u32::from(region_v), false)
+            (
+                sprite,
+                usize::from(page),
+                u32::from(region_v),
+                false,
+                [region_v, height],
+            )
         } else {
             continue;
         };
@@ -10552,6 +10567,7 @@ fn build_effect_quads(
             size,
             tint,
             blend,
+            sheet: sheet_rows,
         });
     }
     quads

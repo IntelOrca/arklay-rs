@@ -1642,21 +1642,7 @@ impl Framebuffer {
             return;
         }
 
-        let x0 = i64::from(quad.pos[0]);
-        let y0 = i64::from(quad.pos[1]);
-        let start_x = x0.max(0);
-        let start_y = y0.max(0);
-        let end_x = (x0 + i64::from(quad.size[0])).min(i64::from(self.width));
-        let end_y = (y0 + i64::from(quad.size[1])).min(i64::from(self.height));
-        if start_x >= end_x || start_y >= end_y {
-            return;
-        }
-
         let page_width = page.width as usize;
-        let u0 = i64::from(quad.uv[0]);
-        let v0 = i64::from(quad.uv[1]);
-        let source_w = i64::from(quad.source[0].max(1));
-        let source_h = i64::from(quad.source[1].max(1));
         // `SubmitEffectSprite`: the tint is scaled by 0x80 and
         // `g_ColorScaleFactor / 255` and truncated to a byte, and the blend
         // level becomes `blend / 256` (opaque when zero), truncated to a byte.
@@ -1670,30 +1656,56 @@ impl Framebuffer {
         let alpha = ((level * 255.0) as i32).clamp(0, 255) as f32 / 255.0;
         let target_stride = self.width as usize;
 
-        let planes = SpritePlanes::new(
-            [quad.pos[0], quad.pos[1], quad.size[0], quad.size[1]],
-            [u0, v0, source_w, source_h],
-            [page.width, page.height],
-        );
-
-        for y in start_y..end_y {
-            for x in start_x..end_x {
-                let (texel_x, texel_y) = planes.texel(x, y);
-                if !(0..i64::from(page.width)).contains(&texel_x)
-                    || !(0..i64::from(page.height)).contains(&texel_y)
-                {
-                    continue;
-                }
-                let source = texel_y as usize * page_width * 4 + texel_x as usize * 4;
-                let target = y as usize * target_stride * 4 + x as usize * 4;
+        // `MarniDX::DrawSprite`: two unprojected triangles, `(x, y) (x1, y)
+        // (x, y1)` and `(x, y1) (x1, y) (x1, y1)`, through the same llvmpipe
+        // setup as the models. The vertex order fixes the plane rounding that
+        // decides which texel a pixel centre on a texel edge lands on.
+        let [x, y, w, h] = [quad.pos[0], quad.pos[1], quad.size[0], quad.size[1]].map(|v| v as f32);
+        let (x1, y1) = (x + w, y + h);
+        let [top, sheet_height] = quad.sheet.map(u32::from);
+        let sheet_height = sheet_height.clamp(1, page.height.saturating_sub(top).max(1));
+        let page_w = page.width as f32;
+        let sheet_v = f32::from(quad.uv[1]) - top as f32;
+        let u0 = f32::from(quad.uv[0]) / page_w;
+        let v0 = sheet_v / sheet_height as f32;
+        let u1 = (f32::from(quad.uv[0]) + f32::from(quad.source[0].max(1))) / page_w;
+        let v1 = (sheet_v + f32::from(quad.source[1].max(1))) / sheet_height as f32;
+        let corner = |x: f32, y: f32, u: f32, v: f32| crate::raster::GlVertex {
+            x,
+            y,
+            depth: 0.0,
+            w: 1.0,
+            u,
+            v,
+            color: [1.0; 4],
+        };
+        let triangles = [
+            [
+                corner(x, y, u0, v0),
+                corner(x1, y, u1, v0),
+                corner(x, y1, u0, v1),
+            ],
+            [
+                corner(x, y1, u0, v1),
+                corner(x1, y, u1, v0),
+                corner(x1, y1, u1, v1),
+            ],
+        ];
+        let rgba = &mut self.rgba;
+        for triangle in &triangles {
+            crate::raster::draw_triangle(triangle, self.width, self.height, |fragment| {
+                let texel_x = clamp_texel(fragment.u, page.width);
+                let texel_y = top as usize + clamp_texel(fragment.v, sheet_height);
+                let source = texel_y * page_width * 4 + texel_x * 4;
+                let target = fragment.y * target_stride * 4 + fragment.x * 4;
                 let (Some(texel), Some(slot)) = (
                     page.rgba.get(source..source + 4),
-                    self.rgba.get_mut(target..target + 4),
+                    rgba.get_mut(target..target + 4),
                 ) else {
-                    continue;
+                    return;
                 };
                 if texel[3] == 0 {
-                    continue;
+                    return;
                 }
                 // `FlushSpriteCommands` hands the GPU an 8-bit vertex colour
                 // and alpha. llvmpipe stores the fragment's texel-times-colour
@@ -1710,7 +1722,7 @@ impl Framebuffer {
                     *channel = blended.min(255) as u8;
                 }
                 slot[3] = 255;
-            }
+            });
         }
     }
 }
@@ -1720,82 +1732,6 @@ impl Framebuffer {
 fn unorm_mul(a: u32, b: u32) -> u32 {
     let product = a * b + 0x80;
     (product + (product >> 8)) >> 8
-}
-
-/// The texture-coordinate planes llvmpipe sets up for a `MarniDrawSprite`
-/// quad: two triangles, `(x, y) (x1, y) (x, y1)` and `(x1, y) (x, y1)
-/// (x1, y1)`, whose coordinates it interpolates in single precision from the
-/// screen origin. The rounding of those planes decides which texel a pixel
-/// centre lands on when a stretched sprite puts it exactly on a texel edge.
-struct SpritePlanes {
-    rect: [i64; 4],
-    page: [f32; 2],
-    /// Per triangle, the `(origin, d/dx, d/dy)` planes of U and V.
-    planes: [[[f32; 3]; 2]; 2],
-}
-
-impl SpritePlanes {
-    fn new(rect: [i32; 4], source: [i64; 4], page: [u32; 2]) -> Self {
-        let [x, y, w, h] = rect.map(|value| value as f32);
-        let page = page.map(|size| size as f32);
-        // The ortho matrix and viewport round-trip, as the GPU sees them.
-        let window_x = |value: f32| (value * (2.0 / 320.0) + -1.0) * 160.0 + 160.0;
-        let window_y = |value: f32| (value * (-2.0 / 240.0) + 1.0) * -120.0 + 120.0;
-        let u = [
-            source[0] as f32 / page[0],
-            (source[0] + source[2]) as f32 / page[0],
-        ];
-        let v = [
-            source[1] as f32 / page[1],
-            (source[1] + source[3]) as f32 / page[1],
-        ];
-        let (left, right) = (window_x(x), window_x(x + w));
-        let (top, bottom) = (window_y(y), window_y(y + h));
-        let triangles = [
-            [
-                (left, top, u[0], v[0]),
-                (right, top, u[1], v[0]),
-                (left, bottom, u[0], v[1]),
-            ],
-            [
-                (right, top, u[1], v[0]),
-                (left, bottom, u[0], v[1]),
-                (right, bottom, u[1], v[1]),
-            ],
-        ];
-        let planes = triangles.map(|[p0, p1, p2]| {
-            let (dx01, dy01) = (p0.0 - p1.0, p0.1 - p1.1);
-            let (dx20, dy20) = (p2.0 - p0.0, p2.1 - p0.1);
-            let one_over_area = 1.0 / (dx01 * dy20 - dx20 * dy01);
-            let plane = |a0: f32, a1: f32, a2: f32| {
-                let (da01, da20) = (a0 - a1, a2 - a0);
-                let dadx = (da01 * dy20 - dy01 * da20) * one_over_area;
-                let dady = (dx01 * da20 - da01 * dx20) * one_over_area;
-                let origin = a0 - (dadx * (p0.0 - 0.5) + dady * (p0.1 - 0.5));
-                [origin, dadx, dady]
-            };
-            [plane(p0.2, p1.2, p2.2), plane(p0.3, p1.3, p2.3)]
-        });
-        Self {
-            rect: rect.map(i64::from),
-            page,
-            planes,
-        }
-    }
-
-    /// The nearest-sampled texel under pixel `(x, y)`.
-    fn texel(&self, x: i64, y: i64) -> (i64, i64) {
-        let [left, top, w, h] = self.rect;
-        // Pixel centres strictly below the shared diagonal belong to the
-        // first triangle.
-        let first = (2 * (x - left) + 1) * h + (2 * (y - top) + 1) * w < 2 * w * h;
-        let [u, v] = self.planes[usize::from(!first)];
-        let (fx, fy) = (x as f32, y as f32);
-        let sample = |[origin, dadx, dady]: [f32; 3], size: f32| {
-            ((origin + (dadx * fx + dady * fy)) * size).floor() as i64
-        };
-        (sample(u, self.page[0]), sample(v, self.page[1]))
-    }
 }
 
 /// Draw one frame of a parsed door animation over black.
@@ -2959,6 +2895,11 @@ pub struct EffectQuad {
     pub tint: [u8; 3],
     /// `0x00` opaque or `0x80` half blend.
     pub blend: u8,
+    /// `[top, height]` of the texture the original samples, in page rows: a
+    /// weapon sheet is its own `256 x height` texture cut from the page at
+    /// `top`, so its UVs normalise against that height; anything else samples
+    /// the whole page.
+    pub sheet: [u16; 2],
 }
 
 /// The effect pages of one frame plus the billboards that sample them.
@@ -5360,6 +5301,7 @@ mod tests {
             size,
             tint,
             blend,
+            sheet: [0, 256],
         }
     }
 
