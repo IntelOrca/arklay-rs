@@ -77,6 +77,11 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    # `rust-toolchain.toml` pins the checkout to stable, which takes
+    # precedence over the toolchain the action installs, so name the MSRV
+    # through rustup's environment override.
+    env:
+      RUSTUP_TOOLCHAIN: 1.88.0
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
