@@ -213,7 +213,11 @@ While the machine owns the tick, one 30 Hz step runs:
    (`Joint_move`'s blend step 0x400/0x200/0x100 and its wrap-completion flag),
    selects the per-weapon motion id, and runs the reticle/lock-on scan
    (`player_reticle_enemy`, the all-quadrant aim-cone test) where the original
-   does.
+   does. The 0x13 hold-input handler also runs the optional Classic REbirth
+   tactical reload check after the aim-held test and before the fire, empty-clip
+   and lock-on branches: with `[game] tactical_reload`, a held RUN (not the
+   press edge) sends a partial-clip reloadable gun (ids 2..=5, matching
+   ammunition item held) to 0x18.
 2. The fire cycle: the ammo-decrement/muzzle-billboard frame, the damage and
    sound frame (`apply_weapon_damage_with` for the slots the original damages
    at a fire frame), the big muzzle flash on the player matrix, the second

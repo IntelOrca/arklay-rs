@@ -747,6 +747,51 @@ fn the_frame_rate_never_changes_a_trace() {
 }
 
 #[test]
+fn the_tactical_reload_never_changes_a_trace() {
+    let dir = TempDir::new("tactical-reload-trace");
+    let pack = dir.join("game.akpak");
+    write_room_pack(&pack);
+    let config = dir.join("config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("arklay.toml"),
+        "[game]\ntactical_reload = true\n",
+    )
+    .unwrap();
+    let trace = |name: &str, env: &[(&str, &str)]| {
+        let path = dir.join(name);
+        let output = run_env(
+            &[
+                pack.to_str().unwrap(),
+                "--room",
+                "100",
+                "--ticks",
+                "30",
+                "--trace",
+                path.to_str().unwrap(),
+            ],
+            env,
+        );
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        fs::read(&path).unwrap()
+    };
+    let plain = trace("plain.trace", &[]);
+    let configured = trace(
+        "configured.trace",
+        &[("ARKLAY_CONFIG_DIR", config.to_str().unwrap())],
+    );
+    assert!(!plain.is_empty());
+    assert!(
+        plain == configured,
+        "the config's tactical reload changed a trace"
+    );
+    // The synthetic room carries no player weapon bank, so the reload itself
+    // cannot fire here; the flag resolution is unit-tested in `src/main.rs`.
+    // This covers the config table being accepted while a trace stays
+    // byte-identical, the end-to-end half of the trace-invariance guarantee.
+}
+
+#[test]
 fn a_frame_rate_outside_30_to_1000_is_refused() {
     for rate in ["0", "29", "1001"] {
         let output = run(&["game.akpak", "--room", "100", "--frame-rate", rate]);

@@ -304,3 +304,66 @@ fn an_idle_player_paints_the_equipped_weapon() {
         .count();
     assert!(changed > 0, "the idle weapon painted no pixels");
 }
+
+/// The tactical reload through the real packed clips: aim + RUN on a
+/// partially loaded Beretta refills its clip from the 9mm stack and fires no
+/// round.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_tactical_reload_refills_the_beretta_from_its_ammo_stack() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse(WEB_ROOM).unwrap();
+    let mut run = arklay::engine::simulate_room(&pack, id, 4, Input::default()).unwrap();
+
+    run.game.inventory.push(arklay::game::InventoryItem {
+        id: 2,
+        quantity: 10,
+    });
+    run.game.set_equipped(Some(2));
+    run.game.inventory.push(arklay::game::InventoryItem {
+        id: 0x0B,
+        quantity: 15,
+    });
+    run.game.player_options.tactical_reload = true;
+
+    let character = run.game.id.player_flag & 3;
+    let emd =
+        arklay::emd::parse(&pack.read(&format!("player/{character:02}.emd")).unwrap()).unwrap();
+    let emw =
+        arklay::emd::parse_emw(&pack.read(&format!("player/{character:02}.emw")).unwrap()).unwrap();
+    let weapon_entry = weapons::weapon_emw_entry(character, 2).unwrap();
+    let weapon = arklay::emd::parse_emw(&pack.read(&weapon_entry).unwrap()).unwrap();
+    let clips = WeaponClips {
+        emd: &emd.clips,
+        emw: &emw.clips,
+        room: &[],
+        weapon: &weapon.clips,
+        emd_keyframes: &emd.keyframes,
+        emd_skeleton: &emd.skeleton,
+        weapon_keyframes: &weapon.keyframes,
+        weapon_skeleton: &weapon.skeleton,
+    };
+
+    let mut reached_reload = false;
+    let mut lowest = 10;
+    for _ in 0..240 {
+        let input = Input {
+            aim: true,
+            run: true,
+            ..Input::default()
+        };
+        weapons::update(&mut run.game, &mut run.player, &run.room, &clips, input);
+        reached_reload |= run.player.weapon.behavior == 0x18;
+        lowest = lowest.min(run.game.item_count(2) as u8);
+        if run.game.item_count(2) == 15 {
+            break;
+        }
+    }
+    assert!(reached_reload, "aim + RUN started the reload");
+    assert_eq!(lowest, 10, "the tactical reload fired no round");
+    assert_eq!(run.game.item_count(2), 15, "the clip was refilled");
+    assert_eq!(run.game.item_count(0x0B), 0, "the spare was consumed");
+}

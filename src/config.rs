@@ -20,9 +20,10 @@
 //! [bindings]
 //! aim = ["key:C", "mouse:right", "axis:lefttrigger+"]
 //!
-//! # Gameplay options (`--quick-turn` overrides the first one).
+//! # Gameplay options (`--quick-turn` and `--tactical-reload` override them).
 //! [game]
 //! quick_turn = true      # BACKWARD + RUN turns the player 180 degrees
+//! tactical_reload = true # AIM + RUN reloads a partially loaded gun
 //!
 //! # The interactive window (see `crate::video`); a key left out keeps its
 //! # default. F8 and Alt+Enter rewrite `fullscreen` and the window size, and
@@ -112,6 +113,11 @@ pub struct Game {
     /// turns the player 180 degrees in place over eight ticks. Off by
     /// default, like the reference's `[DLL] QuickTurn`.
     pub quick_turn: bool,
+    /// Classic REbirth's tactical reload (`[DLL] TactReload`): with the aim
+    /// held, holding RUN reloads the equipped gun instead of firing when the
+    /// clip is not full and the matching ammunition item is held. Off by
+    /// default.
+    pub tactical_reload: bool,
 }
 
 /// The table the parser is in.
@@ -600,6 +606,13 @@ fn parse_game_line(
                 _ => bail!("line {line}: `quick_turn` expects true or false"),
             };
         }
+        "tactical_reload" => {
+            game.tactical_reload = match value {
+                "true" => true,
+                "false" => false,
+                _ => bail!("line {line}: `tactical_reload` expects true or false"),
+            };
+        }
         other => bail!("line {line}: unknown key `{other}`"),
     }
     Ok(())
@@ -611,6 +624,9 @@ fn render_game(game: &Game) -> String {
     let mut out = String::new();
     if game.quick_turn != defaults.quick_turn {
         out.push_str(&format!("quick_turn = {}\n", game.quick_turn));
+    }
+    if game.tactical_reload != defaults.tactical_reload {
+        out.push_str(&format!("tactical_reload = {}\n", game.tactical_reload));
     }
     out
 }
@@ -1075,6 +1091,24 @@ mod tests {
                 .render(),
             ""
         );
+        // The tactical reload is the second `[game]` behaviour and renders in
+        // the table's key order.
+        let config = Config::parse("[game]\ntactical_reload = true\n").unwrap();
+        assert!(config.game.tactical_reload);
+        assert_eq!(config.render(), "[game]\ntactical_reload = true\n");
+        assert_eq!(Config::parse(&config.render()).unwrap(), config);
+        let config = Config::parse("[game]\nquick_turn = true\ntactical_reload = true\n").unwrap();
+        assert_eq!(
+            config.render(),
+            "[game]\nquick_turn = true\ntactical_reload = true\n"
+        );
+        assert!(!Config::parse("").unwrap().game.tactical_reload);
+        assert_eq!(
+            Config::parse("[game]\ntactical_reload = false\n")
+                .unwrap()
+                .render(),
+            ""
+        );
     }
 
     #[test]
@@ -1082,6 +1116,8 @@ mod tests {
         for text in [
             "[game]\nquick_turn = \"yes\"\n",
             "[game]\nquick_turn = 1\n",
+            "[game]\ntactical_reload = \"yes\"\n",
+            "[game]\ntactical_reload = 1\n",
             "[game]\nunknown = true\n",
             "[game]\n[game]\n",
         ] {
@@ -1089,13 +1125,26 @@ mod tests {
             let (config, warnings) = Config::parse_lenient(text);
             assert!(!warnings.is_empty(), "{text:?} must warn");
             assert!(!config.game.quick_turn, "{text:?}");
+            assert!(!config.game.tactical_reload, "{text:?}");
         }
         // A duplicate key warns and keeps the first value.
-        let text = "[game]\nquick_turn = true\nquick_turn = false\n";
-        assert!(Config::parse(text).is_err());
-        let (config, warnings) = Config::parse_lenient(text);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(config.game.quick_turn);
+        for (key, value) in [
+            ("quick_turn", "quick_turn"),
+            ("tactical_reload", "tactical_reload"),
+        ] {
+            let text = format!("[game]\n{key} = true\n{value} = false\n");
+            assert!(Config::parse(&text).is_err());
+            let (config, warnings) = Config::parse_lenient(&text);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                if key == "quick_turn" {
+                    config.game.quick_turn
+                } else {
+                    config.game.tactical_reload
+                },
+                "the first value is kept"
+            );
+        }
         // Only the bad line falls back; the rest of the file still applies.
         let (config, warnings) = Config::parse_lenient("[game]\nquick_turn = true\n");
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1166,7 +1215,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             &path,
-            "language = \"ja-JP\"\n[graphics]\nrender_scale = 50\n",
+            "language = \"ja-JP\"\n[graphics]\nrender_scale = 50\n[game]\ntactical_reload = true\n",
         )
         .unwrap();
         let run = Graphics {
@@ -1184,6 +1233,7 @@ mod tests {
         let (saved, warnings) = Config::load(&path);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(saved.language.as_deref(), Some("ja-JP"));
+        assert!(saved.game.tactical_reload, "the [game] table is kept");
         assert_eq!(
             saved.graphics,
             Graphics {

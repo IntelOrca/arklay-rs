@@ -146,6 +146,21 @@ struct Cli {
     #[arg(long, requires = "pack", overrides_with = "quick_turn")]
     no_quick_turn: bool,
 
+    /// Enable Classic REbirth's tactical reload for this run: while a gun is
+    /// aimed, holding RUN reloads it when the clip is not full and the
+    /// matching ammunition is held. Overrides `[game] tactical_reload`
+    #[arg(
+        long,
+        requires = "pack",
+        conflicts_with_all = ["no_tactical_reload", "fmv"]
+    )]
+    tactical_reload: bool,
+
+    /// Disable the tactical reload for this run, whatever
+    /// `[game] tactical_reload` says
+    #[arg(long, requires = "pack", conflicts_with = "fmv")]
+    no_tactical_reload: bool,
+
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
@@ -258,6 +273,16 @@ fn parse_aspect(value: &str) -> Result<arklay::video::Aspect, String> {
 /// config's `[game] quick_turn` applies, except to a scripted oracle run
 /// (`--trace`/`--input`), which stays off so its output is unchanged.
 fn quick_turn_enabled(explicit: Option<bool>, configured: bool, scripted: bool) -> bool {
+    explicit.unwrap_or(configured && !scripted)
+}
+
+/// The tactical-reload setting for this run.
+///
+/// An explicit `--tactical-reload` (or `--no-tactical-reload`) wins.
+/// Otherwise the config's `[game] tactical_reload` applies, except to a
+/// scripted oracle run (`--trace`/`--input`), which stays off so its output
+/// is unchanged.
+fn tactical_reload_enabled(explicit: Option<bool>, configured: bool, scripted: bool) -> bool {
     explicit.unwrap_or(configured && !scripted)
 }
 
@@ -788,10 +813,19 @@ fn main() -> Result<()> {
                 .quick_turn
                 .then_some(true)
                 .or_else(|| cli.no_quick_turn.then_some(false));
+            let explicit_tactical_reload = cli
+                .tactical_reload
+                .then_some(true)
+                .or_else(|| cli.no_tactical_reload.then_some(false));
             let player_options = arklay::player::Options {
                 quick_turn: quick_turn_enabled(
                     explicit_quick_turn,
                     config.game.quick_turn,
+                    tracing || cli.input.is_some(),
+                ),
+                tactical_reload: tactical_reload_enabled(
+                    explicit_tactical_reload,
+                    config.game.tactical_reload,
                     tracing || cli.input.is_some(),
                 ),
             };
@@ -911,6 +945,7 @@ fn main() -> Result<()> {
                     cli.ticks,
                     &mods,
                     renderer,
+                    player_options,
                 );
             }
             if let Some(id) = cli.fmv {
@@ -1052,6 +1087,49 @@ mod tests {
         assert!(quick_turn_enabled(Some(true), false, true));
         assert!(!quick_turn_enabled(Some(false), true, false));
         assert!(!quick_turn_enabled(Some(false), true, true));
+    }
+
+    #[test]
+    fn the_cli_accepts_the_tactical_reload_flags() {
+        let cli = Cli::try_parse_from(["arklay", "game.akpak", "--tactical-reload"]).unwrap();
+        assert!(cli.tactical_reload);
+        assert!(!cli.no_tactical_reload);
+        let cli = Cli::try_parse_from(["arklay", "game.akpak", "--no-tactical-reload"]).unwrap();
+        assert!(cli.no_tactical_reload);
+        assert!(!cli.tactical_reload);
+        // The two are exclusive overrides.
+        assert!(
+            Cli::try_parse_from([
+                "arklay",
+                "game.akpak",
+                "--tactical-reload",
+                "--no-tactical-reload"
+            ])
+            .is_err()
+        );
+        // A standalone film has no gameplay to reload.
+        assert!(
+            Cli::try_parse_from(["arklay", "game.akpak", "--fmv", "0", "--tactical-reload"])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["arklay", "game.akpak", "--fmv", "0", "--no-tactical-reload"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_tactical_reload_override_beats_the_config_but_not_a_trace() {
+        // No explicit flag: the config applies to gameplay runs, while a
+        // scripted oracle run keeps the reference default.
+        assert!(!tactical_reload_enabled(None, false, false));
+        assert!(tactical_reload_enabled(None, true, false));
+        assert!(!tactical_reload_enabled(None, true, true));
+        // An explicit flag wins either way, including over a trace.
+        assert!(tactical_reload_enabled(Some(true), false, false));
+        assert!(tactical_reload_enabled(Some(true), false, true));
+        assert!(!tactical_reload_enabled(Some(false), true, false));
+        assert!(!tactical_reload_enabled(Some(false), true, true));
     }
 
     #[test]

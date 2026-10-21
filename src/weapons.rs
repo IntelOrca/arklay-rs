@@ -17,6 +17,13 @@
 //!   from the matching ammunition stack (`fire_consume_ammo_stack`) and the
 //!   once-per-trigger volley latch. The equipped weapon's own quantity byte is
 //!   the clip; the weapon's ammunition item (`weapon + 9`) is the reserve.
+//! - The optional Classic REbirth tactical reload
+//!   ([`crate::player::Options::tactical_reload`]): with the aim held,
+//!   holding RUN reloads a reloadable gun (ids 2..=5) when the clip is not full
+//!   and the matching ammunition item is in the inventory. It uses the
+//!   original's empty-clip reload behaviour (`0x18`) and its per-weapon cues;
+//!   no new animation or ammo path. Off unless `[game] tactical_reload` or
+//!   `--tactical-reload` enables it.
 //! - The FX spawns: muzzle billboards at the weapon hand joint, the big flash
 //!   on the player matrix and the ejected shell, with the exact per-weapon
 //!   offsets, spawn frames and effect-header weapon tags.
@@ -1262,6 +1269,29 @@ fn gun_hold_input(
 
     if !input.aim {
         player.weapon.behavior = 0x17;
+        player.weapon.state = 0;
+        return;
+    }
+
+    // The Classic REbirth tactical reload (`TactReload`, `[game]
+    // tactical_reload`): with the aim held, holding RUN reloads the gun
+    // instead of firing when the clip is not full and the matching ammunition
+    // item is in the inventory. The reference tests the held RUN word, not its
+    // press edge, so holding RUN before pressing AIM reloads on the first
+    // hold-input tick (the raise included); the check sits before the fire,
+    // empty-clip and lock-on paths, so it owns their tick. The raw quantity
+    // byte is compared with the capacity, so the 0x80 volley latch also skips
+    // the reload, exactly like the reference's byte comparison. Like CR's
+    // inserted block, it plays no start click: the 0x18 handler's per-weapon
+    // motion-frame cues are the only sounds.
+    if game.player_options.tactical_reload
+        && input.run
+        && matches!(weapon, 2..=5)
+        && let Some(index) = equipped_index(game, weapon)
+        && game.inventory[index].quantity < clip_capacity(weapon)
+        && game.has_item(weapon_ammo_item_id(weapon))
+    {
+        player.weapon.behavior = 0x18;
         player.weapon.state = 0;
         return;
     }
@@ -2633,6 +2663,16 @@ mod tests {
         (game, player)
     }
 
+    /// Give the equipped weapon a matching ammunition stack and turn the
+    /// tactical reload on.
+    fn tactically_reloadable(game: &mut GameState, weapon: u8, reserve: u8) {
+        game.player_options.tactical_reload = true;
+        game.inventory.push(InventoryItem {
+            id: weapon_ammo_item_id(weapon),
+            quantity: reserve,
+        });
+    }
+
     /// Place one active enemy of `id` at `pos` with the aligned status bit the
     /// aim filter needs.
     fn place_enemy(game: &mut GameState, slot: usize, id: u8, pos: [i32; 3]) {
@@ -3056,6 +3096,495 @@ mod tests {
         fire_consume_ammo_stack(&mut game);
         assert_eq!(game.inventory[0].quantity, 4);
         assert_eq!(game.item_count(0x0C), 0, "the stack was consumed");
+    }
+
+    /// Drive the weapon machine with the longer weapon clips a full reload
+    /// motion needs (the beretta's transfer is at frame 0x11).
+    fn drive_reload(game: &mut GameState, player: &mut PlayerState, input: Input, ticks: usize) {
+        let emd = clip_bank(0x24, 8);
+        let weapon_clips = clip_bank(15, 32);
+        let (skeleton, keyframes) = rig(-2400);
+        let room = RoomState::default();
+        for _ in 0..ticks {
+            let clips = WeaponClips {
+                emd: &emd,
+                emw: &emd,
+                room: &[],
+                weapon: &weapon_clips,
+                emd_keyframes: &keyframes,
+                emd_skeleton: &skeleton,
+                weapon_keyframes: &keyframes,
+                weapon_skeleton: &skeleton,
+            };
+            update(game, player, &room, &clips, input);
+        }
+    }
+
+    #[test]
+    fn the_tactical_reload_refills_a_partial_clip_from_the_reserve() {
+        let (mut game, mut player) = armed(2, 10);
+        // A full spare magazine: the vanilla transfer loads the 15 rounds the
+        // stack holds and empties it.
+        tactically_reloadable(&mut game, 2, 15);
+        let mut reached_reload = false;
+        let mut lowest = 10;
+        for _ in 0..240 {
+            drive_reload(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                },
+                1,
+            );
+            reached_reload |= player.weapon.behavior == 0x18;
+            lowest = lowest.min(game.inventory[0].quantity & 0x7F);
+            if game.inventory[0].quantity & 0x7F == 15 {
+                break;
+            }
+        }
+        assert!(reached_reload, "aim + RUN started the reload");
+        assert_eq!(lowest, 10, "the tactical reload fired no round");
+        assert_eq!(
+            game.inventory[0].quantity & 0x7F,
+            15,
+            "the clip was refilled"
+        );
+        assert_eq!(game.item_count(0x0B), 0, "the spare was consumed");
+    }
+
+    #[test]
+    fn the_tactical_reload_uses_the_vanilla_fresh_magazine_transfer() {
+        // Behaviour 0x18 replaces the clip with the best matching stack, like
+        // the reference's `fire_consume_ammo_stack`: the rounds left in a
+        // partial clip are not topped up (a fresh magazine is loaded). This
+        // is the original's transfer, unchanged by the tactical reload.
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        let mut reached_reload = false;
+        for _ in 0..240 {
+            drive_reload(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                },
+                1,
+            );
+            reached_reload |= player.weapon.behavior == 0x18;
+            if game.inventory[0].quantity & 0x7F == 9 {
+                break;
+            }
+        }
+        assert!(reached_reload, "aim + RUN started the reload");
+        assert_eq!(
+            game.inventory[0].quantity & 0x7F,
+            9,
+            "the spare magazine replaced the partial clip"
+        );
+        assert_eq!(game.item_count(0x0B), 0, "the spare was consumed");
+    }
+
+    /// Drive a beretta reload from `start_clip` with `reserve` rounds in the
+    /// matching stack, returning the final `(clip, reserve)` once the spare is
+    /// consumed. `tactical` picks the AIM + RUN trigger; otherwise it is the
+    /// vanilla empty-clip AIM + FIRE press.
+    fn reload_outcome(start_clip: u8, reserve: u8, tactical: bool) -> (u8, u32) {
+        let (mut game, mut player) = armed(2, start_clip);
+        game.player_options.tactical_reload = tactical;
+        game.inventory.push(InventoryItem {
+            id: 0x0B,
+            quantity: reserve,
+        });
+        let mut started = false;
+        for _ in 0..240 {
+            let input = if tactical {
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                }
+            } else {
+                Input {
+                    aim: true,
+                    fire: true,
+                    fire_pressed: true,
+                    ..Input::default()
+                }
+            };
+            drive_reload(&mut game, &mut player, input, 1);
+            started |= player.weapon.behavior == 0x18;
+            if game.item_count(0x0B) == 0 {
+                break;
+            }
+        }
+        assert!(started, "the reload never started (tactical={tactical})");
+        (game.inventory[0].quantity & 0x7F, game.item_count(0x0B))
+    }
+
+    #[test]
+    fn the_tactical_reload_transfers_ammo_like_the_empty_clip_reload() {
+        // Both triggers enter the same `0x18` handler, so the same spare
+        // stack yields the same clip and reserve whether the old clip was
+        // empty or partial. The shared transfer replaces the magazine, so a
+        // partial clip's rounds are discarded exactly as an empty-clip reload
+        // would leave them behind.
+        for reserve in [9u8, 15] {
+            let automatic = reload_outcome(0, reserve, false);
+            let manual = reload_outcome(10, reserve, true);
+            assert_eq!(manual, automatic, "reserve {reserve}");
+            assert_eq!(automatic, (reserve, 0), "reserve {reserve}");
+        }
+    }
+
+    #[test]
+    fn the_tactical_reload_starts_on_the_first_hold_tick_with_run_held() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        drive(&mut game, &mut player, aiming(false), 40);
+        assert_eq!(player.weapon.behavior, 0x13, "the gun is raised");
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(player.weapon.behavior, 0x18, "the reload owns the tick");
+        assert_eq!(player.weapon.state, 0);
+        assert_eq!(game.inventory[0].quantity, 10, "no round was fired");
+    }
+
+    #[test]
+    fn a_held_run_starts_the_tactical_reload_without_a_press_edge() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        // RUN is already down when AIM goes down: no `run_pressed` edge ever
+        // reaches the machine, and the reload still starts on the first
+        // hold-input tick of the raise.
+        let mut started = None;
+        for tick in 0..40 {
+            let on_hold_tick = player.weapon.behavior == 0x13;
+            drive(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                },
+                1,
+            );
+            if player.weapon.behavior == 0x18 {
+                assert!(on_hold_tick, "the reload starts from the hold input");
+                started = Some(tick);
+                break;
+            }
+        }
+        assert!(started.is_some(), "a held RUN started the reload");
+    }
+
+    #[test]
+    fn the_tactical_reload_takes_priority_over_fire() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        place_enemy(&mut game, 1, 0x00, [800, 0, 0]);
+        drive(&mut game, &mut player, aiming(false), 40);
+        assert_eq!(player.weapon.behavior, 0x13, "the gun is raised");
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                fire: true,
+                fire_pressed: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(
+            player.weapon.behavior, 0x18,
+            "the reload wins over auto-aim fire"
+        );
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                fire: true,
+                ..Input::default()
+            },
+            20,
+        );
+        assert_eq!(game.entities[1].health, 55, "no shot damaged the enemy");
+        assert_eq!(game.inventory[0].quantity, 10, "no round was fired");
+    }
+
+    #[test]
+    fn the_tactical_reload_takes_priority_over_the_run_lock_on() {
+        for (enabled, expected) in [(false, 0x1A), (true, 0x18)] {
+            let (mut game, mut player) = armed(2, 10);
+            game.player_options.tactical_reload = enabled;
+            game.inventory.push(InventoryItem {
+                id: 0x0B,
+                quantity: 9,
+            });
+            place_enemy(&mut game, 1, 0x00, [800, 0, 0]);
+            game.entities[1].has_enter_switch_zone = 1;
+            drive(&mut game, &mut player, aiming(false), 40);
+            assert_eq!(player.weapon.behavior, 0x13, "the gun is raised");
+            drive(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    run_pressed: true,
+                    ..Input::default()
+                },
+                1,
+            );
+            assert_eq!(player.weapon.behavior, expected, "enabled={enabled}");
+        }
+    }
+
+    #[test]
+    fn a_full_clip_skips_the_tactical_reload_and_fire_is_unchanged() {
+        let (mut game, mut player) = armed(2, 15);
+        tactically_reloadable(&mut game, 2, 15);
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                ..Input::default()
+            },
+            20,
+        );
+        assert_eq!(
+            player.weapon.behavior, 0x13,
+            "a full clip has nothing to do"
+        );
+        assert_eq!(game.inventory[0].quantity, 15);
+        // The fire path is untouched.
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                fire: true,
+                fire_pressed: true,
+                ..Input::default()
+            },
+            16,
+        );
+        assert_eq!(player.weapon.behavior, 0x14, "the normal auto-aim fire");
+        assert!(
+            game.inventory[0].quantity < 15,
+            "a round left the clip instead of reloading"
+        );
+        assert_eq!(game.item_count(0x0B), 15, "the reserve was untouched");
+    }
+
+    #[test]
+    fn a_missing_reserve_skips_the_tactical_reload() {
+        let (mut game, mut player) = armed(2, 10);
+        game.player_options.tactical_reload = true;
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                ..Input::default()
+            },
+            20,
+        );
+        assert_eq!(player.weapon.behavior, 0x13, "no matching ammo item");
+        assert_eq!(game.inventory[0].quantity, 10);
+    }
+
+    #[test]
+    fn the_tactical_reload_excludes_the_other_weapons() {
+        for weapon in [ITEM_KNIFE, ITEM_FLAMETHROWER, 10, ITEM_INGRAM, ITEM_MINIMI] {
+            let (mut game, mut player) = armed(weapon, 1);
+            tactically_reloadable(&mut game, weapon, 9);
+            drive(&mut game, &mut player, aiming(false), 40);
+            drive(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                },
+                20,
+            );
+            assert_ne!(
+                player.weapon.behavior, 0x18,
+                "weapon {weapon:#x} must not tactically reload"
+            );
+        }
+    }
+
+    #[test]
+    fn the_volley_latch_skips_the_tactical_reload() {
+        // The comparison is the raw quantity byte, like the reference:
+        // 15 | 0x80 is not below the capacity of 15.
+        let (mut game, mut player) = armed(2, 15 | 0x80);
+        tactically_reloadable(&mut game, 2, 9);
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                ..Input::default()
+            },
+            20,
+        );
+        assert_eq!(player.weapon.behavior, 0x13, "the latch byte blocks it");
+    }
+
+    #[test]
+    fn the_tactical_reload_is_off_by_default() {
+        let (mut game, mut player) = armed(2, 10);
+        game.inventory.push(InventoryItem {
+            id: 0x0B,
+            quantity: 9,
+        });
+        assert!(!game.player_options.tactical_reload);
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                ..Input::default()
+            },
+            20,
+        );
+        assert_eq!(player.weapon.behavior, 0x13, "the aim hold is unchanged");
+        assert_eq!(game.inventory[0].quantity, 10);
+    }
+
+    #[test]
+    fn the_tactical_reload_needs_the_held_run_not_just_its_press_edge() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run_pressed: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(
+            player.weapon.behavior, 0x13,
+            "a press edge without the held bit is not enough"
+        );
+    }
+
+    #[test]
+    fn the_tactical_reload_never_starts_when_the_aim_is_released() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                run: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(player.weapon.behavior, 0x17, "the aim release holsters");
+    }
+
+    #[test]
+    fn the_tactical_reload_overrides_a_direction_quick_fire() {
+        let (mut game, mut player) = armed(2, 10);
+        tactically_reloadable(&mut game, 2, 9);
+        drive(&mut game, &mut player, aiming(false), 40);
+        // The reference's quick-fire block runs first but does not return, so
+        // the inserted tactical block still owns the tick.
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                run: true,
+                up: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(player.weapon.behavior, 0x18);
+    }
+
+    #[test]
+    fn an_empty_clip_fire_still_reloads_with_the_option_on() {
+        let (mut game, mut player) = armed(2, 0);
+        game.player_options.tactical_reload = true;
+        game.inventory.push(InventoryItem {
+            id: 0x0B,
+            quantity: 9,
+        });
+        drive(&mut game, &mut player, aiming(false), 40);
+        drive(
+            &mut game,
+            &mut player,
+            Input {
+                aim: true,
+                fire: true,
+                fire_pressed: true,
+                ..Input::default()
+            },
+            1,
+        );
+        assert_eq!(
+            player.weapon.behavior, 0x18,
+            "the vanilla empty-clip branch is untouched"
+        );
+    }
+
+    #[test]
+    fn every_reloadable_weapon_id_takes_the_tactical_reload() {
+        for weapon in 2..=5 {
+            let (mut game, mut player) = armed(weapon, 1);
+            tactically_reloadable(&mut game, weapon, 9);
+            drive(&mut game, &mut player, aiming(false), 40);
+            drive(
+                &mut game,
+                &mut player,
+                Input {
+                    aim: true,
+                    run: true,
+                    ..Input::default()
+                },
+                1,
+            );
+            assert_eq!(player.weapon.behavior, 0x18, "weapon {weapon}");
+        }
     }
 
     /// Hold the aim with a fire burst of `fire_ticks`, then release the fire

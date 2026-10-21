@@ -140,6 +140,10 @@ cargo run -- re1.akpak --renderer gpu --render-scale 150 --msaa 4
 # `--ui debug` captures the tool list
 cargo run -- re1.akpak --room 100
 cargo run -- re1.akpak --ui debug --capture debug.bmp
+
+# Classic REbirth tactical reload for one run: with a gun aimed, hold RUN to
+# reload instead of firing (or set [game] tactical_reload = true in arklay.toml)
+cargo run -- re1.akpak --room 100 --tactical-reload
 ```
 
 Captures, assembled scripts and converted packs are written to a sibling
@@ -218,6 +222,40 @@ would not shrink also stays raw.
 `extract` rejects packs whose entry paths are absolute, contain
 `..` or backslashes, or are empty, so it never writes outside `--out`.
 
+### Gameplay options
+
+`arklay.toml` also reads a `[game]` table of optional behaviours. Each is off
+unless set, so a default configuration plays, traces and captures exactly as
+before.
+
+```toml
+[game]
+quick_turn = true      # BACKWARD + RUN turns the player 180 degrees
+tactical_reload = true # AIM + RUN reloads the equipped gun
+```
+
+`quick_turn` enables Classic REbirth's quick turn: while walking backward
+(including the back diagonals), pressing RUN turns the player 180 degrees in
+place over eight ticks, plays the no-weapon walk animation and its footsteps,
+and hands control back to normal movement. The player does not move or collide
+during the turn, and the new facing is live for rendering, collision and
+scripts. `--quick-turn` and `--no-quick-turn` override the file for one run.
+
+`tactical_reload` is the Classic REbirth tactical reload: while a gun is
+aimed, holding RUN reloads it instead of firing, provided the clip is not full
+and the matching ammunition item is in the inventory. It plays the normal
+reload animation and its per-weapon cues and loads the matching ammunition
+stack through the original's transfer, so no round is fired and nothing new is
+animated (like the original's reload, a partial magazine is replaced by the
+best spare stack, not topped up). Like Classic REbirth, only the handgun,
+shotgun, Python and Magnum (weapon ids 2-5) reload this way: the knife,
+flamethrower, rocket launcher and special machine guns are excluded, and a
+full clip or a missing reserve is a no-op. `--tactical-reload` and
+`--no-tactical-reload` override the setting for one run.
+
+A `--trace` or `--input` run leaves both settings off unless the matching
+positive flag is passed, so existing traces stay byte-identical.
+
 ### Controls
 
 | Key | Gamepad | Action |
@@ -268,21 +306,6 @@ while it has such a mistake in it, so a change made in game (a rebinding, F8)
 then applies for the run only. Gamepads are picked up when plugged in; extra
 controller mappings can be dropped into `gamecontrollerdb.txt` in the config
 directory (or `SDL_GAMECONTROLLERCONFIG`).
-
-`[game]` holds gameplay options that stay at the original's behaviour unless
-turned on. `quick_turn` enables Classic REbirth's quick turn: while walking
-backward (including the back diagonals), pressing RUN turns the player 180
-degrees in place over eight ticks, plays the no-weapon walk animation and its
-footsteps, and hands control back to normal movement. The player does not
-move or collide during the turn, and the new facing is live for rendering,
-collision and scripts. `--quick-turn` and `--no-quick-turn` override the file
-for one run; scripted `--trace`/`--input` runs force it off unless
-`--quick-turn` is given explicitly, so existing traces are unchanged:
-
-```toml
-[game]
-quick_turn = true # BACKWARD + RUN turns the player 180 degrees
-```
 
 `F8` steps the window up to the next whole multiple of 320x240, switches to
 borderless fullscreen once the next size would not fit the display, and goes

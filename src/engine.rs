@@ -8095,6 +8095,7 @@ pub fn run_ending(
     ticks: u32,
     mods: &ModOptions,
     renderer: Graphics,
+    player_options: player::Options,
 ) -> Result<()> {
     // The debug entry plays a no-save first run: a zero clear time, the
     // shipped card's initial save counter (one, i.e. no saves) and no
@@ -8117,6 +8118,7 @@ pub fn run_ending(
     let save_dir = save::default_save_dir();
     let pack = open_game_pack(pack, mods, None)?;
     let mut app = App::new(pack, save_dir, capture.is_none());
+    app.player_options = player_options;
     // Keep the missing-film diagnostic the pre-sequence entry had: a pack
     // without the films would otherwise warn per film and run the RESULT
     // screen silently.

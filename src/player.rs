@@ -154,6 +154,11 @@ pub struct Options {
     /// backward movement state owns the pad turns the player 180 degrees in
     /// place over eight ticks. Off by default.
     pub quick_turn: bool,
+    /// Classic REbirth's tactical reload (`[DLL] TactReload`): with the aim
+    /// held, holding RUN reloads the equipped gun instead of firing when the
+    /// clip is not full and the matching ammunition item is held. Off by
+    /// default.
+    pub tactical_reload: bool,
 }
 
 /// Keyboard state for one tick.
@@ -5125,7 +5130,10 @@ mod tests {
             emw,
             &[],
             input,
-            Options { quick_turn: true },
+            Options {
+                quick_turn: true,
+                ..Options::default()
+            },
         );
     }
 
@@ -5159,7 +5167,10 @@ mod tests {
             &emw,
             &[],
             backing(),
-            Options { quick_turn: true },
+            Options {
+                quick_turn: true,
+                ..Options::default()
+            },
         );
         assert_eq!(player.behavior, BEHAVIOR_BACK);
         let pos = player.pos;
@@ -5189,7 +5200,10 @@ mod tests {
             &emw,
             &[],
             backing(),
-            Options { quick_turn: true },
+            Options {
+                quick_turn: true,
+                ..Options::default()
+            },
         );
         let angle = player.angle;
         let pos = player.pos;
@@ -5373,7 +5387,10 @@ mod tests {
                 &emw,
                 &[],
                 backing(),
-                Options { quick_turn: true },
+                Options {
+                    quick_turn: true,
+                    ..Options::default()
+                },
             );
         }
         assert_eq!(player.anim.frame, 15);
@@ -5416,7 +5433,10 @@ mod tests {
                     up: true,
                     ..Input::default()
                 },
-                Options { quick_turn: true },
+                Options {
+                    quick_turn: true,
+                    ..Options::default()
+                },
             );
             walk_events.extend(walker.take_footsteps());
         }
@@ -5449,7 +5469,10 @@ mod tests {
             &emw,
             &[],
             run,
-            Options { quick_turn: true },
+            Options {
+                quick_turn: true,
+                ..Options::default()
+            },
         );
         update_with_options(
             &mut player,
@@ -5458,7 +5481,10 @@ mod tests {
             &emw,
             &[],
             run,
-            Options { quick_turn: true },
+            Options {
+                quick_turn: true,
+                ..Options::default()
+            },
         );
         assert_eq!(player.behavior, BEHAVIOR_RUN);
 
