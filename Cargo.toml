@@ -8,11 +8,20 @@ license = "MIT"
 
 [features]
 default = ["hd"]
-# The replacement-format decoders an HD mod pack needs: PNG and WebP art and
-# OGG Vorbis audio. They are pure-Rust crates and optional, so a
-# `--no-default-features` build stays lean; such a build still resolves
+# The replacement-format decoders an HD mod pack needs: PNG and WebP art, OGG
+# Vorbis audio and H.264/AAC films. Art and audio are pure-Rust crates; the
+# H.264 decoder is Cisco's BSD-licensed OpenH264, built from source by its
+# crate (with its SIMD assembly when `nasm` is on the PATH). They are optional,
+# so a `--no-default-features` build stays lean; such a build still resolves
 # replacements by stem, but cannot decode the formats it does not carry.
-hd = ["dep:image-webp", "dep:lewton", "dep:png"]
+hd = [
+    "dep:image-webp",
+    "dep:lewton",
+    "dep:openh264",
+    "dep:png",
+    "dep:symphonia-codec-aac",
+    "dep:symphonia-core",
+]
 
 [dependencies]
 anyhow = "1"
@@ -23,8 +32,11 @@ mlua = { version = "0.10", default-features = false, features = [
     "lua54",
     "vendored",
 ] }
+openh264 = { version = "0.9", optional = true }
 png = { version = "0.18", optional = true }
 sdl3-sys = { version = "0.7", default-features = false }
+symphonia-codec-aac = { version = "0.6", optional = true }
+symphonia-core = { version = "0.6", default-features = false, optional = true }
 zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
@@ -38,6 +50,11 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+# OpenH264 is C++ built by the crate's build script, which follows the
+# profile's opt-level; unoptimised it cannot decode an HD film in real time.
+[profile.dev.package.openh264-sys2]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

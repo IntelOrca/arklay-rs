@@ -486,6 +486,9 @@ pub enum AssetClass {
     Image,
     /// Replacement audio, highest priority first: `ogg > wav`.
     Audio,
+    /// Films, highest priority first: `mp4 > avi`. An AVI is either the
+    /// shipped Cinepak film or an H.264/AAC replacement at the same path.
+    Movie,
 }
 
 impl AssetClass {
@@ -494,6 +497,7 @@ impl AssetClass {
         match self {
             Self::Image => &["webp", "png", "bmp", "tim", "pix"],
             Self::Audio => &["ogg", "wav"],
+            Self::Movie => &["mp4", "avi"],
         }
     }
 }

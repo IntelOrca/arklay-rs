@@ -42,7 +42,9 @@ use anyhow::{Context, Result, bail};
 use crate::audio::SAMPLE_RATE;
 use crate::avi::{AudioFormat, Avi};
 use crate::cinepak::Decoder;
-use crate::pack::Pack;
+#[cfg(feature = "hd")]
+use crate::hdfilm::{HdFilm, VideoFrame};
+use crate::pack::{AssetClass, Pack};
 
 /// Film ids and their lower-case basenames, in id order 0..=28. Id 10 is the
 /// original's null entry and has no file.
@@ -151,6 +153,18 @@ pub fn pack_path(name: &str) -> String {
     format!("movie/{}.avi", name.to_ascii_lowercase())
 }
 
+/// The asset stem of a film basename, `movie/{name}`: the shipped AVI and
+/// an HD replacement (`movie/{name}.mp4`, or an H.264 AVI at the shipped
+/// path) both resolve through it.
+pub fn stem(name: &str) -> String {
+    format!("movie/{}", name.to_ascii_lowercase())
+}
+
+/// Whether any layer of `pack` carries film `name` in any accepted format.
+pub fn exists(pack: &Pack, name: &str) -> bool {
+    pack.has_asset(&stem(name), AssetClass::Movie)
+}
+
 /// The accept/skip button mask of film `id`: `0x0FFF` for every skippable
 /// film and `0x0000` for the unskippable class. Ids past the table default to
 /// unskippable, like the original's bounds check.
@@ -201,25 +215,36 @@ pub enum MovieTick {
     Skipped,
 }
 
-/// One film being played: the demuxed file, the Cinepak canvas, the audio queue
-/// and the skip state.
+/// Where a session's pictures and sound come from.
+enum Source {
+    /// A shipped Cinepak/PCM AVI, decoded on the caller's thread.
+    Cinepak {
+        avi: Box<Avi>,
+        decoder: Decoder,
+        /// The RGBA scratch [`MovieSession::frame_rgba`] hands out.
+        rgba: Vec<u8>,
+    },
+    /// An HD H.264/AAC replacement (MP4 or AVI), decoded on a worker.
+    #[cfg(feature = "hd")]
+    Hd(Box<HdFilm>),
+}
+
+/// One film being played: the decoder source, the audio queue and the skip
+/// state.
 pub struct MovieSession {
     /// The film's table id.
     id: u8,
     /// The character the session opened for (0 Chris, 1 Jill); selects the
     /// prologue cut and travels with the session for chain reporting.
     character: u8,
-    avi: Avi,
-    decoder: Decoder,
-    /// The RGBA scratch [`MovieSession::frame_rgba`] hands out.
-    rgba: Vec<u8>,
+    source: Source,
     /// Output frame index currently presented, counted over the kept frames.
     presented: usize,
-    /// Frames this session presents: the AVI count minus a removed beat.
+    /// Frames this session presents: the film's count minus a removed beat.
     kept_frames: usize,
-    /// The removed beat in AVI frame indices (`start`, `end`), if any.
+    /// The removed beat in source frame indices (`start`, `end`), if any.
     cut: Option<(usize, usize)>,
-    /// Next AVI frame index to decode.
+    /// Next Cinepak frame index to decode.
     decoded_through: usize,
     /// Kept frames whose audio was queued, exclusive.
     audio_queued: usize,
@@ -239,13 +264,14 @@ pub struct MovieSession {
     /// [`Self::tick`] never samples as well; a headless caller that only ticks
     /// leaves it clear and the tick drives the state machine.
     external_poll: bool,
-    /// The AVI frame rate (num/den), the wall-clock film clock's frame length.
+    /// The film frame rate (num/den), the wall-clock film clock's frame length.
     frame_rate: (u32, u32),
     /// Elapsed wall clock for the timed path, in milliseconds.
     wall_ms: f64,
     /// 30 Hz ticks advanced, the no-device clock.
     ticks: u64,
-    /// Output samples one presented frame spans.
+    /// Output samples one presented frame spans, rounded down (the exact
+    /// span is `SAMPLE_RATE * den / num`).
     samples_per_frame: u64,
     /// 30 Hz ticks one presented frame spans.
     ticks_per_frame: u64,
@@ -256,20 +282,84 @@ pub struct MovieSession {
 }
 
 impl MovieSession {
-    /// Resolve `id`, read `movie/{name}.avi` from `pack`, parse it, check the
-    /// format and arm playback at frame 0.
+    /// Resolve `id`, read its film from `pack`, parse it, check the format
+    /// and arm playback at frame 0.
+    ///
+    /// The film resolves by stem (`movie/{name}`) through
+    /// [`AssetClass::Movie`], so an HD mod's `movie/{name}.mp4` or its H.264
+    /// AVI at the shipped path wins over the shipped Cinepak film, and the
+    /// decoder is chosen from the container and codec. A replacement that
+    /// cannot be played (a build without the `hd` decoders, or a corrupt
+    /// file) falls back to the copy it shadows with a warning.
     pub fn open(pack: &Pack, id: u8, character: u8) -> Result<Self> {
         let name = name(id).with_context(|| format!("film id {id} has no file"))?;
-        let entry = pack_path(name);
-        let bytes = pack
-            .read(&entry)
-            .with_context(|| format!("missing film {entry}"))?
-            .to_vec();
-        let avi = Avi::parse(bytes).with_context(|| format!("failed to parse {entry}"))?;
-        Self::from_avi(avi, id, character)
+        let stem = stem(name);
+        let asset = pack
+            .read_asset(&stem, AssetClass::Movie)?
+            .with_context(|| format!("missing film {}", pack_path(name)))?;
+        let path = asset.path().to_owned();
+        let err = match Self::from_bytes(asset.data().to_vec(), id, character)
+            .with_context(|| format!("failed to open film {path}"))
+        {
+            Ok(session) => return Ok(session),
+            Err(err) => err,
+        };
+        let Some(shadowed) = asset.shadowed()? else {
+            return Err(err);
+        };
+        eprintln!("warning: {err:#}; playing {} instead", shadowed.path());
+        let path = shadowed.path().to_owned();
+        Self::from_bytes(shadowed.data().to_vec(), id, character)
+            .with_context(|| format!("failed to open film {path}"))
     }
 
-    /// Build a session over an already parsed AVI.
+    /// Build a session over one film file, picking the decoder from its
+    /// container and codec.
+    fn from_bytes(bytes: Vec<u8>, id: u8, character: u8) -> Result<Self> {
+        if bytes.starts_with(b"RIFF") {
+            let avi = Avi::parse_any(bytes).context("failed to parse AVI")?;
+            if avi.format().video_codec.eq_ignore_ascii_case(b"cvid") {
+                // Re-run the Cinepak checks (size, PCM audio) on the parse.
+                return Self::from_avi(Avi::parse(avi.into_data())?, id, character);
+            }
+            return Self::from_media(crate::media::Media::from_avi(avi)?, id, character);
+        }
+        if crate::mp4::is_mp4(&bytes) {
+            return Self::from_media(crate::mp4::parse(bytes)?, id, character);
+        }
+        bail!("film is neither AVI nor MP4")
+    }
+
+    /// Build a session over an HD film.
+    #[cfg(feature = "hd")]
+    fn from_media(media: crate::media::Media, id: u8, character: u8) -> Result<Self> {
+        media.validate()?;
+        let frame_count = media.video.len();
+        let cut = cut_frames(id, character, media.frame_rate, frame_count);
+        let segments = match cut {
+            Some((start, end)) => vec![0..start, end..frame_count],
+            None => std::iter::once(0..frame_count).collect(),
+        };
+        let frame_rate = media.frame_rate;
+        let film = HdFilm::open(media, segments)?;
+        Self::with_source(
+            Source::Hd(Box::new(film)),
+            id,
+            character,
+            frame_rate,
+            frame_count,
+            cut,
+        )
+    }
+
+    /// Without the `hd` decoders an H.264 film is recognised but unplayable.
+    #[cfg(not(feature = "hd"))]
+    fn from_media(media: crate::media::Media, _id: u8, _character: u8) -> Result<Self> {
+        media.validate()?;
+        bail!("this build has no H.264/AAC decoder (the `hd` feature is off)")
+    }
+
+    /// Build a session over an already parsed Cinepak AVI.
     fn from_avi(avi: Avi, id: u8, character: u8) -> Result<Self> {
         let format = avi.format().clone();
         if format.audio.channels != 2 {
@@ -282,30 +372,40 @@ impl MovieSession {
             (22_050, 16) | (44_100, 8) => {}
             (rate, bits) => bail!("film id {id} has unsupported audio: {rate} Hz {bits}-bit PCM"),
         }
+        let frame_count = avi.frame_count();
+        let cut = cut_frames(id, character, format.frame_rate, frame_count);
+        let source = Source::Cinepak {
+            avi: Box::new(avi),
+            decoder: Decoder::new(320, 240)?,
+            rgba: vec![0u8; 320 * 240 * 4],
+        };
+        Self::with_source(source, id, character, format.frame_rate, frame_count, cut)
+    }
 
-        // A cut past the end of the film is ignored, never fatal: the request
-        // plays the whole film.
-        let cut = prologue_cut_ms(id, character).and_then(|(start, end)| {
-            let start = frame_at_ms(start, format.frame_rate);
-            let end = frame_at_ms(end, format.frame_rate);
-            (end > start && end <= avi.frame_count()).then_some((start, end))
-        });
-        let kept_frames = avi.frame_count() - cut.map_or(0, |(start, end)| end - start);
+    /// Arm a session over a ready source and present its first frame.
+    fn with_source(
+        source: Source,
+        id: u8,
+        character: u8,
+        frame_rate: (u32, u32),
+        frame_count: usize,
+        cut: Option<(usize, usize)>,
+    ) -> Result<Self> {
+        let kept_frames = frame_count - cut.map_or(0, |(start, end)| end - start);
         if kept_frames == 0 {
             bail!("film id {id} has no frames");
         }
-
-        let samples_per_frame = avi.samples_per_frame() as u64 * u64::from(SAMPLE_RATE)
-            / u64::from(format.audio.sample_rate.max(1));
-        let (rate_num, rate_den) = format.frame_rate;
+        let (rate_num, rate_den) = frame_rate;
+        if rate_num == 0 || rate_den == 0 {
+            bail!("film id {id} has a zero frame rate");
+        }
+        let samples_per_frame = u64::from(SAMPLE_RATE) * u64::from(rate_den) / u64::from(rate_num);
         let audio_lead =
-            (AUDIO_LEAD_SECONDS as usize * rate_num as usize / rate_den.max(1) as usize).max(2);
+            (AUDIO_LEAD_SECONDS as usize * rate_num as usize / rate_den as usize).max(2);
         let mut session = MovieSession {
             id,
             character: character & 1,
-            avi,
-            decoder: Decoder::new(320, 240)?,
-            rgba: vec![0u8; 320 * 240 * 4],
+            source,
             presented: 0,
             kept_frames,
             cut,
@@ -317,11 +417,11 @@ impl MovieSession {
             last_buttons: 0,
             audio_lead,
             external_poll: false,
-            frame_rate: format.frame_rate,
+            frame_rate,
             wall_ms: 0.0,
             ticks: 0,
             samples_per_frame,
-            ticks_per_frame: ticks_per_frame(format.frame_rate),
+            ticks_per_frame: ticks_per_frame(frame_rate),
             finished: false,
             skipped: false,
         };
@@ -332,8 +432,8 @@ impl MovieSession {
         Ok(session)
     }
 
-    /// The AVI frame index kept frame `kept` presents, jump-corrected over the
-    /// removed prologue beat.
+    /// The source frame index kept frame `kept` presents, jump-corrected over
+    /// the removed prologue beat.
     fn avi_index(&self, kept: usize) -> usize {
         match self.cut {
             Some((start, end)) if kept >= start => kept + (end - start),
@@ -341,22 +441,27 @@ impl MovieSession {
         }
     }
 
-    /// Decode every AVI frame up to and including kept frame `kept`, then make
-    /// its RGBA canvas current.
+    /// Decode every source frame up to and including kept frame `kept`, then
+    /// make its picture current.
     fn present_kept(&mut self, kept: usize) -> Result<()> {
         let target = self.avi_index(kept);
-        while self.decoded_through <= target {
-            let frame = self
-                .avi
-                .video(self.decoded_through)
-                .with_context(|| format!("AVI frame {} is missing", self.decoded_through))?;
-            self.decoder
-                .decode(frame)
-                .with_context(|| format!("AVI frame {} failed to decode", self.decoded_through))?;
-            self.decoded_through += 1;
+        match &mut self.source {
+            Source::Cinepak { avi, decoder, rgba } => {
+                while self.decoded_through <= target {
+                    let frame = avi.video(self.decoded_through).with_context(|| {
+                        format!("AVI frame {} is missing", self.decoded_through)
+                    })?;
+                    decoder.decode(frame).with_context(|| {
+                        format!("AVI frame {} failed to decode", self.decoded_through)
+                    })?;
+                    self.decoded_through += 1;
+                }
+                decoder.rgba_into(rgba);
+            }
+            #[cfg(feature = "hd")]
+            Source::Hd(film) => film.present(target)?,
         }
         self.presented = kept;
-        self.decoder.rgba_into(&mut self.rgba);
         Ok(())
     }
 
@@ -366,23 +471,34 @@ impl MovieSession {
         let exclusive = exclusive.min(self.kept_frames);
         while self.audio_queued < exclusive {
             let index = self.avi_index(self.audio_queued);
-            let samples = self.frame_audio(index);
-            self.pending_audio.extend_from_slice(&samples);
+            self.queue_frame_audio(index);
             self.audio_queued += 1;
         }
     }
 
-    /// One kept frame's audio as interleaved stereo at [`SAMPLE_RATE`],
-    /// converted from the AVI stream and padded to exactly one frame's worth of
-    /// silence when the track ended early.
-    fn frame_audio(&self, avi_index: usize) -> Vec<i16> {
-        let samples = self.samples_per_frame as usize;
-        let mut out = match self.avi.audio(avi_index) {
-            Some(bytes) => decode_pcm(bytes, &self.avi.format().audio, samples),
-            None => Vec::new(),
-        };
-        out.resize(samples * 2, 0);
-        out
+    /// Queue one source frame's audio as interleaved stereo at
+    /// [`SAMPLE_RATE`]. A Cinepak frame carries its own chunk, converted and
+    /// padded to exactly one frame's worth of silence when the track ended
+    /// early; an HD film's continuous track is cut at the frame's exact
+    /// sample span.
+    fn queue_frame_audio(&mut self, index: usize) {
+        match &mut self.source {
+            Source::Cinepak { avi, .. } => {
+                let samples = self.samples_per_frame as usize;
+                let mut out = match avi.audio(index) {
+                    Some(bytes) => decode_pcm(bytes, &avi.format().audio, samples),
+                    None => Vec::new(),
+                };
+                out.resize(samples * 2, 0);
+                self.pending_audio.extend_from_slice(&out);
+            }
+            #[cfg(feature = "hd")]
+            Source::Hd(film) => {
+                let start = samples_at(index, self.frame_rate);
+                let end = samples_at(index + 1, self.frame_rate);
+                film.audio(start, end, &mut self.pending_audio);
+            }
+        }
     }
 
     /// Poll the skip state with the currently held pad word. Returns `true`
@@ -452,9 +568,10 @@ impl MovieSession {
         }
 
         self.ticks += 1;
+        let (num, den) = (u64::from(self.frame_rate.0), u64::from(self.frame_rate.1));
         let due = match samples_consumed {
-            Some(consumed) => (consumed / self.samples_per_frame.max(1)) as usize,
-            None => (self.ticks / self.ticks_per_frame.max(1)) as usize,
+            Some(consumed) => (consumed * num / (u64::from(SAMPLE_RATE) * den)) as usize,
+            None => (self.ticks * num / (30 * den)) as usize,
         };
         self.advance_due(due)
     }
@@ -544,9 +661,24 @@ impl MovieSession {
         std::mem::take(&mut self.pending_audio)
     }
 
-    /// The presented frame as 320x240 RGBA8, refreshed on every advance.
+    /// The presented frame as 320x240 RGBA8, refreshed on every advance. An
+    /// HD film is box-filtered onto the canvas, letterboxed to its aspect.
     pub fn frame_rgba(&self) -> &[u8] {
-        &self.rgba
+        match &self.source {
+            Source::Cinepak { rgba, .. } => rgba,
+            #[cfg(feature = "hd")]
+            Source::Hd(film) => &film.frame().canvas,
+        }
+    }
+
+    /// The presented HD frame at its own size, for a renderer that scales it
+    /// to the output itself; `None` for a Cinepak film.
+    #[cfg(feature = "hd")]
+    pub fn hd_frame(&self) -> Option<&VideoFrame> {
+        match &self.source {
+            Source::Cinepak { .. } => None,
+            Source::Hd(film) => Some(film.frame()),
+        }
     }
 
     /// The film's table id.
@@ -564,7 +696,7 @@ impl MovieSession {
         self.presented
     }
 
-    /// The presented frame's AVI index (differs after a prologue cut).
+    /// The presented frame's source index (differs after a prologue cut).
     pub fn avi_frame_index(&self) -> usize {
         self.avi_index(self.presented)
     }
@@ -577,12 +709,13 @@ impl MovieSession {
     /// Output samples presented before kept frame `index`, the film's
     /// sample-position reference for the audio cursor. For every 22050 Hz film
     /// this is `avi.samples_before(index)`; the 44100 Hz 8-bit logo is
-    /// converted to the mixer's rate first.
+    /// converted to the mixer's rate first, and an HD film's fractional
+    /// per-frame span accumulates exactly.
     pub fn samples_before(&self, index: usize) -> u64 {
-        index as u64 * self.samples_per_frame
+        samples_at(index, self.frame_rate)
     }
 
-    /// The output samples one presented frame spans.
+    /// The output samples one presented frame spans, rounded down.
     pub fn samples_per_frame(&self) -> u64 {
         self.samples_per_frame
     }
@@ -606,6 +739,29 @@ impl MovieSession {
     pub fn skipped(&self) -> bool {
         self.skipped
     }
+}
+
+/// The removed prologue beat of film `id` for `character` as source frame
+/// indices, when it lies inside the film. A cut past the end of the film is
+/// ignored, never fatal: the request plays the whole film.
+fn cut_frames(
+    id: u8,
+    character: u8,
+    frame_rate: (u32, u32),
+    frame_count: usize,
+) -> Option<(usize, usize)> {
+    prologue_cut_ms(id, character).and_then(|(start, end)| {
+        let start = frame_at_ms(start, frame_rate);
+        let end = frame_at_ms(end, frame_rate);
+        (end > start && end <= frame_count).then_some((start, end))
+    })
+}
+
+/// Output samples at [`SAMPLE_RATE`] before source frame `index`, rounded
+/// down.
+fn samples_at(index: usize, frame_rate: (u32, u32)) -> u64 {
+    let (num, den) = frame_rate;
+    (index as u64 * u64::from(SAMPLE_RATE) * u64::from(den)) / u64::from(num.max(1))
 }
 
 /// Convert one AVI audio chunk to the mixer's 22050 Hz stereo s16, truncated

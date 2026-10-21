@@ -72,8 +72,11 @@ pub enum Format {
     Combat,
     /// `data/bio_card.dat`, the save prefix.
     BioCard,
-    /// `movie/*.avi`, a film.
+    /// `movie/*.avi`, a film: the shipped Cinepak/PCM or an H.264/AAC
+    /// replacement.
     Avi,
+    /// `movie/*.mp4`, an H.264/AAC replacement film.
+    Mp4,
     /// `*.lua`, a sandboxed script source.
     Lua,
     /// Any entry outside the known table.
@@ -105,6 +108,7 @@ impl Format {
             Self::Combat => "combat",
             Self::BioCard => "biocard",
             Self::Avi => "avi",
+            Self::Mp4 => "mp4",
             Self::Lua => "lua",
             Self::Opaque => "opaque",
         }
@@ -169,6 +173,9 @@ pub fn classify(path: &str) -> Format {
     }
     if lower.starts_with("movie/") && lower.ends_with(".avi") {
         return Format::Avi;
+    }
+    if lower.starts_with("movie/") && lower.ends_with(".mp4") {
+        return Format::Mp4;
     }
     match lower.rsplit_once('.') {
         Some((_, "bmp")) => Format::Bmp,
@@ -436,7 +443,15 @@ fn verify_entry(pack: &Pack, path: &str, format: Format) -> Result<()> {
             }
         }
         Format::Avi => {
-            crate::avi::Avi::parse(data.to_vec())?;
+            let avi = crate::avi::Avi::parse_any(data.to_vec())?;
+            if avi.format().video_codec.eq_ignore_ascii_case(b"cvid") {
+                crate::avi::Avi::parse(avi.into_data())?;
+            } else {
+                crate::media::Media::from_avi(avi)?.validate()?;
+            }
+        }
+        Format::Mp4 => {
+            crate::mp4::parse(data.to_vec())?.validate()?;
         }
         Format::Lua => {
             crate::lua::verify_source(data)?;
@@ -522,6 +537,7 @@ mod tests {
         assert_eq!(classify("data/combat.bin"), Format::Combat);
         assert_eq!(classify("data/bio_card.dat"), Format::BioCard);
         assert_eq!(classify("movie/00.avi"), Format::Avi);
+        assert_eq!(classify("movie/OJ.mp4"), Format::Mp4);
         assert_eq!(classify("enemy/em13.lua"), Format::Lua);
         assert_eq!(classify("lua/demo.lua"), Format::Lua);
         assert_eq!(classify("data/core00.esp"), Format::Opaque);

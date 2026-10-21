@@ -73,6 +73,16 @@ const MAX_SCENE_SIDE: u32 = 8192;
 /// back only by vsync does not spin while the window is hidden.
 const HIDDEN_PRESENT_WAIT: std::time::Duration = std::time::Duration::from_millis(4);
 
+/// What [`GpuRenderer::composite`] uploads before drawing.
+enum Layers<'a> {
+    /// The overlay drawn over a black scene and over a white one.
+    Pair([&'a [u8]; 2]),
+    /// One opaque image, composited over itself.
+    Single(&'a [u8]),
+    /// The single image already in `layer_black`.
+    Kept,
+}
+
 const LAYER_WIDTH: u32 = 320;
 const LAYER_HEIGHT: u32 = 240;
 
@@ -170,6 +180,10 @@ pub struct GpuRenderer {
     /// The layers' size: 320x240, or a wider aspect's canvas while a screen
     /// presents one ([`GpuRenderer::ensure_layers`]).
     layer_size: (u32, u32),
+    /// The [`VideoFrame::serial`](crate::hdfilm::VideoFrame::serial) of the
+    /// image `layer_black` holds alone, so a film frame shown across several
+    /// presents is uploaded once.
+    layer_image: Option<u64>,
     sprite_buffer: *mut SDL_GPUBuffer,
     sprite_capacity: u32,
     meshes: HashMap<usize, Resident<MeshBuffer>>,
@@ -284,6 +298,7 @@ impl GpuRenderer {
             layer_white: std::ptr::null_mut(),
             layer_transfer: std::ptr::null_mut(),
             layer_size: (0, 0),
+            layer_image: None,
             sprite_buffer: std::ptr::null_mut(),
             sprite_capacity: 0,
             meshes: HashMap::new(),
@@ -339,6 +354,7 @@ impl GpuRenderer {
         self.layer_white = std::ptr::null_mut();
         self.layer_transfer = std::ptr::null_mut();
         self.layer_size = (0, 0);
+        self.layer_image = None;
         self.layer_black = self.texture(
             SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
             width,
@@ -1389,31 +1405,122 @@ impl GpuRenderer {
                 );
             }
         }
-        self.ensure_layers(layer_w, layer_h)?;
-        // Cycling the staging buffer and the layer textures lets this
-        // upload proceed while the previous present may still read them.
-        let mapped = unsafe { SDL_MapGPUTransferBuffer(self.device, self.layer_transfer, true) };
-        if mapped.is_null() {
-            bail!("SDL_MapGPUTransferBuffer failed: {}", sdl_error());
+        // The whole 4:3 frame is composited into the viewport that puts its
+        // visible band on the fitted rectangle, and the scissor crops the
+        // rest (the band is the whole frame at 4:3).
+        let shown = video::shown(black.width, black.height, black.view);
+        let layers = Layers::Pair([&black.rgba, &white.unwrap_or(black).rgba]);
+        self.composite(layers, (layer_w, layer_h), |width, height| {
+            let fit = video::fit_size(width, height, shown.width, shown.height);
+            (video::frame_viewport(fit, shown, black.height), fit)
+        })
+    }
+
+    /// Present a `width` x `height` RGBA image (an HD film frame) at its own
+    /// resolution where `frame` would be: letterboxed to its aspect inside
+    /// the 4:3 frame's viewport and cropped to the band `frame` shows. An
+    /// image whose `serial` is already uploaded is not uploaded again.
+    pub fn present_image(
+        &mut self,
+        frame: &Framebuffer,
+        rgba: &[u8],
+        (width, height): (u32, u32),
+        serial: u64,
+    ) -> Result<()> {
+        if self.window.is_null() || self.pipelines.composite.is_null() {
+            bail!("the GPU renderer has no window to present to");
         }
-        let layers = [black, white.unwrap_or(black)];
-        unsafe {
-            for (index, layer) in layers.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(
-                    layer.rgba.as_ptr(),
-                    mapped.cast::<u8>().add(index * layer_bytes as usize),
-                    layer_bytes as usize,
-                );
+        if width == 0
+            || height == 0
+            || width > crate::media::MAX_DIMENSION
+            || height > crate::media::MAX_DIMENSION
+            || rgba.len() != width as usize * height as usize * 4
+        {
+            bail!("unexpected {width}x{height} image of {} bytes", rgba.len());
+        }
+        let shown = video::shown(frame.width, frame.height, frame.view);
+        let layers = if self.layer_image == Some(serial) && self.layer_size == (width, height) {
+            Layers::Kept
+        } else {
+            Layers::Single(rgba)
+        };
+        self.composite(layers, (width, height), |target_w, target_h| {
+            let fit = video::fit_size(target_w, target_h, shown.width, shown.height);
+            let frame_viewport = video::frame_viewport(fit, shown, frame.height);
+            (video::image_viewport(frame_viewport, width, height), fit)
+        })?;
+        self.layer_image = Some(serial);
+        Ok(())
+    }
+
+    /// Upload the `size` layers and composite them over the scene into the
+    /// viewport `place` returns for the swapchain size, clipped to its
+    /// rectangle.
+    fn composite(
+        &mut self,
+        layers: Layers<'_>,
+        (layer_w, layer_h): (u32, u32),
+        place: impl FnOnce(u32, u32) -> ((f32, f32, f32, f32), video::Viewport),
+    ) -> Result<()> {
+        let layer_bytes = layer_w * layer_h * 4;
+        self.ensure_layers(layer_w, layer_h)?;
+        let uploads: &[&[u8]] = match &layers {
+            Layers::Pair(pair) => pair,
+            Layers::Single(image) => std::slice::from_ref(image),
+            Layers::Kept => &[],
+        };
+        if !uploads.is_empty() {
+            // A layer pair replaces any single image.
+            self.layer_image = None;
+            // Cycling the staging buffer and the layer textures lets this
+            // upload proceed while the previous present may still read them.
+            let mapped =
+                unsafe { SDL_MapGPUTransferBuffer(self.device, self.layer_transfer, true) };
+            if mapped.is_null() {
+                bail!("SDL_MapGPUTransferBuffer failed: {}", sdl_error());
             }
-            SDL_UnmapGPUTransferBuffer(self.device, self.layer_transfer);
+            unsafe {
+                for (index, layer) in uploads.iter().enumerate() {
+                    std::ptr::copy_nonoverlapping(
+                        layer.as_ptr(),
+                        mapped.cast::<u8>().add(index * layer_bytes as usize),
+                        layer_bytes as usize,
+                    );
+                }
+                SDL_UnmapGPUTransferBuffer(self.device, self.layer_transfer);
+            }
         }
         let command = self.command_buffer()?;
+        if !uploads.is_empty() {
+            self.upload_layers(command, uploads.len(), (layer_w, layer_h))?;
+        }
+        // A single image is composited over itself: `black + scene * 0`.
+        let white = match layers {
+            Layers::Pair(_) => self.layer_white,
+            Layers::Single(_) | Layers::Kept => self.layer_black,
+        };
+        self.composite_pass(command, white, place)?;
+        Self::submit(command)
+    }
+
+    /// Upload `count` staged layers into `layer_black` (then `layer_white`).
+    fn upload_layers(
+        &self,
+        command: *mut SDL_GPUCommandBuffer,
+        count: usize,
+        (layer_w, layer_h): (u32, u32),
+    ) -> Result<()> {
+        let layer_bytes = layer_w * layer_h * 4;
         let copy = unsafe { SDL_BeginGPUCopyPass(command) };
         if copy.is_null() {
             unsafe { SDL_CancelGPUCommandBuffer(command) };
             bail!("SDL_BeginGPUCopyPass failed: {}", sdl_error());
         }
-        for (index, texture) in [self.layer_black, self.layer_white].into_iter().enumerate() {
+        for (index, texture) in [self.layer_black, self.layer_white]
+            .into_iter()
+            .enumerate()
+            .take(count)
+        {
             let source = SDL_GPUTextureTransferInfo {
                 transfer_buffer: self.layer_transfer,
                 offset: index as u32 * layer_bytes,
@@ -1430,7 +1537,18 @@ impl GpuRenderer {
             unsafe { SDL_UploadToGPUTexture(copy, &source, &destination, true) };
         }
         unsafe { SDL_EndGPUCopyPass(copy) };
+        Ok(())
+    }
 
+    /// Record the composite of `layer_black` and `white` over the scene into
+    /// the swapchain, placed by `place`. The command buffer is cancelled on
+    /// failure and left to the caller to submit otherwise.
+    fn composite_pass(
+        &self,
+        command: *mut SDL_GPUCommandBuffer,
+        white: *mut SDL_GPUTexture,
+        place: impl FnOnce(u32, u32) -> ((f32, f32, f32, f32), video::Viewport),
+    ) -> Result<()> {
         // Never wait for an image: with every image in flight (or a hidden
         // window) this frame is skipped and the uploads still run.
         let mut swapchain = std::ptr::null_mut();
@@ -1467,19 +1585,13 @@ impl GpuRenderer {
             };
             let pass = unsafe { SDL_BeginGPURenderPass(command, &target, 1, std::ptr::null()) };
             if !pass.is_null() {
-                let samplers =
-                    [self.layer_black, self.layer_white, self.scene_colour].map(|texture| {
-                        SDL_GPUTextureSamplerBinding {
-                            texture,
-                            sampler: self.linear,
-                        }
-                    });
-                // The whole 4:3 frame is composited into the viewport that
-                // puts its visible band on the fitted rectangle, and the
-                // scissor crops the rest (the band is the whole frame at 4:3).
-                let shown = video::shown(black.width, black.height, black.view);
-                let fit = video::fit_size(width, height, shown.width, shown.height);
-                let (x, y, w, h) = video::frame_viewport(fit, shown, black.height);
+                let samplers = [self.layer_black, white, self.scene_colour].map(|texture| {
+                    SDL_GPUTextureSamplerBinding {
+                        texture,
+                        sampler: self.linear,
+                    }
+                });
+                let ((x, y, w, h), fit) = place(width, height);
                 let viewport = SDL_GPUViewport {
                     x,
                     y,
@@ -1504,7 +1616,7 @@ impl GpuRenderer {
                 }
             }
         }
-        Self::submit(command)
+        Ok(())
     }
 
     /// Read the scene target back as RGBA rows (tests and tools).

@@ -511,6 +511,23 @@ pub fn frame_viewport(band: Viewport, shown: Shown, frame_height: u32) -> (f32, 
     )
 }
 
+/// The viewport a `width` x `height` image takes inside a 4:3 frame's
+/// `frame_viewport`: fitted to its own aspect and centred, so a full-screen
+/// film keeps its shape wherever the frame lands.
+pub fn image_viewport(
+    (x, y, w, h): (f32, f32, f32, f32),
+    width: u32,
+    height: u32,
+) -> (f32, f32, f32, f32) {
+    let inner = fit_size(w.round() as u32, h.round() as u32, width, height);
+    (
+        x + inner.x as f32,
+        y + inner.y as f32,
+        inner.width as f32,
+        inner.height as f32,
+    )
+}
+
 /// The GPU scene target for `viewport` at `render_scale` percent.
 pub fn scene_size(viewport: Viewport, render_scale: u32) -> (u32, u32) {
     let scale = |size: u32| ((u64::from(size) * u64::from(render_scale) + 50) / 100).max(1) as u32;
@@ -561,6 +578,19 @@ pub fn step_window(graphics: &mut Graphics, room: (u32, u32)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_hd_image_fills_the_frame_viewport_at_its_own_aspect() {
+        // A 4:3 film takes the whole 4:3 frame, pillarboxed in a 16:10 window.
+        let frame = (133.0, 0.0, 1333.0, 1000.0);
+        assert_eq!(image_viewport(frame, 1280, 960), frame);
+        // A 16:9 film is letterboxed inside it, the bars split evenly, and
+        // the frame's own offset carries over.
+        assert_eq!(
+            image_viewport((0.0, -60.0, 1280.0, 960.0), 1920, 1080),
+            (0.0, 60.0, 1280.0, 720.0)
+        );
+    }
 
     #[test]
     fn frame_rate_steps_through_the_presets_and_wraps() {
