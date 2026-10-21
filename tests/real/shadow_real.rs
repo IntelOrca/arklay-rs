@@ -109,6 +109,7 @@ fn player_shadow_capture_is_deterministic_and_present_at_spawn() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        light_rotation: None,
         joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
 

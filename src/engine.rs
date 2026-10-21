@@ -12503,6 +12503,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12518,6 +12519,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12544,6 +12546,7 @@ fn render_frame_on(
             per_joint_light,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: *joint_colours,
         });
     }
@@ -12584,6 +12587,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12610,6 +12614,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12642,6 +12647,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12725,6 +12731,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12739,7 +12746,10 @@ fn render_frame_on(
     let mut companion_hidden: Vec<u32> = Vec::new();
     let mut companion_tints: Vec<[u8; 3]> = Vec::new();
     let mut companion_complex: Vec<Option<usize>> = Vec::new();
-    let mut companion_light_pos: Vec<Option<[i32; 3]>> = Vec::new();
+    // Per companion: the light latch position, whether the light matrix is
+    // the aliased identity product, and the light matrix's rotation operand.
+    type CompanionLight = ([i32; 3], bool, Option<[[i32; 3]; 3]>);
+    let mut companion_light_pos: Vec<CompanionLight> = Vec::new();
     for (companion_index, companion) in game.companions.iter().enumerate() {
         let Some(companion) = companion else {
             continue;
@@ -12812,16 +12822,25 @@ fn render_frame_on(
             .push((companion.kind == enemy::companion::CompanionKind::Roots).then_some(object));
         // The plant companions latch the room lights at their own
         // translation (`update_entity_lighting(&local.t)`), not at the
-        // placeholder first joint.
-        companion_light_pos.push((!heart).then_some(companion.entity.pos));
+        // placeholder first joint, and light through the aliased identity
+        // product. The heart latches them at its owner's position
+        // (`update_entity_lighting(&owner->localMatrix.t)`) and its light
+        // matrix is a plain product.
+        let light_pos = if heart {
+            game.entities[usize::from(companion.owner)].pos
+        } else {
+            companion.entity.pos
+        };
+        companion_light_pos.push((light_pos, !heart, companion.anchor_rotation));
     }
-    for (((((model, joints), hidden), tint), complex), light_pos) in companion_models
-        .iter()
-        .zip(&companion_joints)
-        .zip(&companion_hidden)
-        .zip(&companion_tints)
-        .zip(&companion_complex)
-        .zip(&companion_light_pos)
+    for (((((model, joints), hidden), tint), complex), &(light_pos, aliased, light_rotation)) in
+        companion_models
+            .iter()
+            .zip(&companion_joints)
+            .zip(&companion_hidden)
+            .zip(&companion_tints)
+            .zip(&companion_complex)
+            .zip(&companion_light_pos)
     {
         meshes.push(EntityMesh {
             mesh: &model.mesh,
@@ -12830,10 +12849,11 @@ fn render_frame_on(
             tint: *tint,
             blend_weight: None,
             hidden_joints: *hidden,
-            light_pos: *light_pos,
+            light_pos: Some(light_pos),
             per_joint_light: false,
             complex_object: *complex,
-            aliased_light: complex.is_none() && light_pos.is_some(),
+            aliased_light: complex.is_none() && aliased,
+            light_rotation,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -12908,6 +12928,7 @@ fn render_frame_on(
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         });
     }
@@ -16357,6 +16378,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: crate::render::NO_JOINT_COLOURS,
         }];
         let camera = Camera::from_cut(cut);

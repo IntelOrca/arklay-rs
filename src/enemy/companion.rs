@@ -131,6 +131,9 @@ pub struct Companion {
     /// before the machine runs: the original's `RotMatrix` builds the local
     /// matrix ahead of the machine's sway. `None` until the first tick.
     pub latched_rotation: Option<[u16; 3]>,
+    /// The heart's light-matrix operand: the anchor joint's world rotation
+    /// its draw composed under (`MulMatrix0(g_lightMatrix, anchor)`).
+    pub anchor_rotation: Option<[[i32; 3]; 3]>,
 }
 
 impl Companion {
@@ -256,6 +259,7 @@ pub fn plant42_spawn(game: &mut GameState, slot: usize, flags: u8) -> Option<(u1
         local_t: [0; 3],
         latched_scale: None,
         latched_rotation: None,
+        anchor_rotation: None,
     };
     // The clone fans by `remaining * 0x100`, but the field setup that
     // follows zeroes the whole rotation vector (`+0x72..+0x76`).
@@ -314,6 +318,7 @@ pub fn plant42_spawn(game: &mut GameState, slot: usize, flags: u8) -> Option<(u1
         local_t: [0; 3],
         latched_scale: None,
         latched_rotation: None,
+        anchor_rotation: None,
     };
     roots.entity.angle = 0;
     roots.entity.pitch = 0;
@@ -859,6 +864,7 @@ pub fn spawn_heart(game: &mut GameState, slot: usize) -> Option<u16> {
         local_t: [0x138, -760, -287],
         latched_scale: None,
         latched_rotation: None,
+        anchor_rotation: None,
     };
     heart.entity.pitch = 0;
     heart.entity.angle = 0;
@@ -915,6 +921,7 @@ pub fn heart_tick(game: &mut GameState, slot: usize) {
     let anchor = game.joint_worlds[slot].get(1).copied().unwrap_or_default();
     let world = crate::anim::compose(&anchor, &local);
     heart.matrix = Some(world);
+    heart.anchor_rotation = Some(anchor.r);
     heart.entity.pos = world.t;
     if let Some(entry) = game.companions.get_mut(index) {
         *entry = Some(heart);
@@ -1289,11 +1296,22 @@ mod tests {
             15
         ];
         game.joint_worlds[2][1].t = [100, -50, 200];
+        game.joint_worlds[2][1].r = [[0, 0, -4093], [0, 4093, 0], [4093, 0, 0]];
         heart_tick(&mut game, 2);
         let heart = game.companions[usize::from(handle)].as_ref().unwrap();
-        // The local translation rotates through joint 1's identity and adds
+        // The local translation rotates through joint 1's rotation and adds
         // to its translation.
-        assert_eq!(heart.entity.pos, [100 + 0x138, -50 - 760, 200 - 287]);
+        let anchor = game.joint_worlds[2][1];
+        let expected = crate::anim::compose(
+            &anchor,
+            &crate::anim::Mat4x3 {
+                r: [[4096, 0, 0], [0, 4096, 0], [0, 0, 4096]],
+                t: [0x138, -760, -287],
+            },
+        );
+        assert_eq!(heart.entity.pos, expected.t);
+        // The draw's light matrix multiplies by the anchor's rotation alone.
+        assert_eq!(heart.anchor_rotation, Some(anchor.r));
         assert!(heart.live);
         // The beat stepped once from 0x15 and the wobble took the ramp's step.
         assert_eq!(heart.beat, 0x14);

@@ -1819,6 +1819,10 @@ pub struct EntityMesh<'a> {
     /// with `m` the identity, run in place. See
     /// [`EntityLight::aliased_identity_product`].
     pub aliased_light: bool,
+    /// The light matrix's right operand when it is not the identity:
+    /// `SetLightMatrix(MulMatrix0(g_lightMatrix, rotation))`. The Tyrant's
+    /// heart passes its anchor joint's world rotation.
+    pub light_rotation: Option<[[i32; 3]; 3]>,
     /// Per-joint `JointSetColorTint` colours (1/128 multipliers); a non-zero
     /// entry draws the joint unlit in that colour.
     pub joint_colours: [[u8; 3]; 32],
@@ -2071,6 +2075,10 @@ pub fn draw_gameplay_scene_with_effects<'a>(
                 light.aliased_identity_product()
             } else {
                 light
+            };
+            let light = match &mesh.light_rotation {
+                Some(rotation) => light.rotated(rotation),
+                None => light,
             };
             collect_triangles(
                 object,
@@ -2762,6 +2770,16 @@ impl EntityLight {
         }
         for (source, row) in self.sources.iter_mut().zip(product) {
             source.dir = row;
+        }
+        self
+    }
+
+    /// The light rows after `MulMatrix0(g_lightMatrix, rotation, &out)` into
+    /// a separate output: each light row times `rotation`, the same product
+    /// the room-object pass applies per vertex.
+    pub fn rotated(mut self, rotation: &[[i32; 3]; 3]) -> Self {
+        for source in &mut self.sources {
+            source.dir = mul_matrix0(&[source.dir, [0; 3], [0; 3]], rotation)[0];
         }
         self
     }
@@ -4321,6 +4339,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                light_rotation: None,
                 joint_colours: NO_JOINT_COLOURS,
             },
             EntityMesh {
@@ -4334,6 +4353,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                light_rotation: None,
                 joint_colours: NO_JOINT_COLOURS,
             },
         ];
@@ -4410,6 +4430,7 @@ mod tests {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                light_rotation: None,
                 joint_colours: NO_JOINT_COLOURS,
             }
         }
@@ -4627,6 +4648,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
         let lighting = Lighting {
@@ -5425,6 +5447,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
         let camera = straight_camera();
@@ -5536,6 +5559,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -5570,6 +5594,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -5633,6 +5658,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
 
@@ -5683,6 +5709,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: NO_JOINT_COLOURS,
         }];
         let mut framebuffer = Framebuffer::new();
@@ -5724,6 +5751,7 @@ mod tests {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours,
         }];
         let mut framebuffer = Framebuffer::new();

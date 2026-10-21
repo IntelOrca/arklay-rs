@@ -275,6 +275,7 @@ fn room_107_objects_render() {
                 per_joint_light: false,
                 complex_object: None,
                 aliased_light: false,
+                light_rotation: None,
                 joint_colours: arklay::render::NO_JOINT_COLOURS,
             })
             .collect();
@@ -1098,6 +1099,7 @@ fn room_112_mirror_renders_reflection_pixels() {
         per_joint_light: false,
         complex_object: None,
         aliased_light: false,
+        light_rotation: None,
         joint_colours: arklay::render::NO_JOINT_COLOURS,
     }];
     // A stand-in room-object mesh with a flat blue page: it sits before the
@@ -1121,6 +1123,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: arklay::render::NO_JOINT_COLOURS,
         },
         EntityMesh {
@@ -1134,6 +1137,7 @@ fn room_112_mirror_renders_reflection_pixels() {
             per_joint_light: false,
             complex_object: None,
             aliased_light: false,
+            light_rotation: None,
             joint_colours: arklay::render::NO_JOINT_COLOURS,
         },
     ];
