@@ -376,13 +376,19 @@ pub(crate) fn compose(a: &Mat4x3, b: &Mat4x3) -> Mat4x3 {
     Mat4x3 { r, t }
 }
 
-/// One consuming tick whose blended pose has not been materialized yet: the
-/// keyframe the tick blended toward and the weights it applied.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PoseStep {
-    keyframe: usize,
-    blend: u16,
-    step: u16,
+/// One write to the joint structs that has not been materialized yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PoseStep {
+    /// A consuming tick: the keyframe it blended toward and the weights it
+    /// applied.
+    Keyframe {
+        keyframe: usize,
+        blend: u16,
+        step: u16,
+    },
+    /// A behaviour adding to joint rotations on top of the posed joints
+    /// (the hound's neck turn), as `(joint, delta)` pairs.
+    Rotate(Vec<(usize, [i16; 3])>),
 }
 
 /// Clip playback state. One `update` is one 30 Hz tick.
@@ -455,8 +461,19 @@ impl AnimPlayer {
         self.timing = 0;
         self.blend_counter = self.full_blend_counter();
         // Pending steps name keyframes of the clip that was playing; they
-        // cannot be resolved against the new clip's table.
-        self.pending_pose.get_mut().clear();
+        // cannot be resolved against the new clip's table. Rotations already
+        // added to the joints stay.
+        self.pending_pose
+            .get_mut()
+            .retain(|step| matches!(step, PoseStep::Rotate(_)));
+    }
+
+    /// Add `deltas` to the rotations of the posed joints, on top of whatever
+    /// this tick's consume wrote (the original adds straight into the joint
+    /// structs, so a held tick keeps accumulating and the next blend eases
+    /// out of the turned pose).
+    pub fn rotate_joints(&mut self, deltas: Vec<(usize, [i16; 3])>) {
+        self.pending_pose.get_mut().push(PoseStep::Rotate(deltas));
     }
 
     /// The blend counter a clip change arms for the configured step.
@@ -548,7 +565,7 @@ impl AnimPlayer {
         if self.blend_used == 0 {
             pending.clear();
         }
-        pending.push(PoseStep {
+        pending.push(PoseStep::Keyframe {
             keyframe,
             blend: self.blend_used,
             step: self.blend_step,
@@ -590,12 +607,30 @@ impl AnimPlayer {
         }
         let mut pose = self.applied.borrow().clone();
         for step in steps {
-            let Some(target) = keyframes.get(step.keyframe) else {
+            let (keyframe, blend, step) = match step {
+                PoseStep::Keyframe {
+                    keyframe,
+                    blend,
+                    step,
+                } => (keyframe, blend, step),
+                PoseStep::Rotate(deltas) => {
+                    let posed = pose.get_or_insert_with(|| current.clone());
+                    for (joint, delta) in deltas {
+                        if let Some(rotation) = posed.rotations.get_mut(joint) {
+                            for (axis, delta) in rotation.iter_mut().zip(delta) {
+                                *axis = axis.wrapping_add(delta);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            let Some(target) = keyframes.get(keyframe) else {
                 continue;
             };
             pose = match pose.take() {
-                Some(source) if step.blend != 0 && step.step != 0 => {
-                    Some(blend_keyframes(&source, target, step.blend, step.step))
+                Some(source) if blend != 0 && step != 0 => {
+                    Some(blend_keyframes(&source, target, blend, step))
                 }
                 // A direct step needs no source; a blend with no pose on
                 // screen (a fresh spawn) starts from the target instead of
@@ -1184,6 +1219,31 @@ mod tests {
         let first = player.pose_keyframe(&clips, &keyframes).unwrap();
         let second = player.pose_keyframe(&clips, &keyframes).unwrap();
         assert_eq!(first, second, "a second read must not blend again");
+    }
+
+    #[test]
+    fn joint_rotations_add_on_the_posed_joints_until_a_direct_step() {
+        let clips = vec![timing_clip(&[1])];
+        let keyframes = vec![Keyframe {
+            vertex: [0, 0, 0],
+            offset: [0, 0, 0],
+            rotations: vec![[0x10, 0, 0], [0, 0x20, 0]],
+        }];
+        let mut player = AnimPlayer::new(0);
+        player.update(&clips);
+        player.rotate_joints(vec![(1, [0, 5, 0])]);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations, [[0x10, 0, 0], [0, 0x25, 0]]);
+
+        // Without a consume in between the turns accumulate on the joints.
+        player.rotate_joints(vec![(1, [0, 5, 0]), (9, [1, 1, 1])]);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations[1], [0, 0x2A, 0]);
+
+        // A direct consume rewrites the joints from the keyframe.
+        player.update(&clips);
+        let pose = player.pose_keyframe(&clips, &keyframes).unwrap();
+        assert_eq!(pose.rotations[1], [0, 0x20, 0]);
     }
 
     #[test]
