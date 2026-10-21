@@ -634,8 +634,12 @@ pub fn run_with_options(
         session.loaded.room.cuts.len(),
     );
     let mut display = Display::new(&title, false, authoring.renderer)?;
-    session.start_audio(&pack);
-    run_session_loop(&pack, &mut session, &mut display, stats)
+    // The room boot runs on the app's Play mode, not a bare session loop: a
+    // confirmed F9 return and the debug tools' load/clear game requests all
+    // need the mode machine to own the next screen.
+    let mut app = App::new(pack, save_dir, true);
+    app.start_session(session);
+    run_app_loop(&mut app, &mut display, stats)
 }
 
 /// The presentation frames of a headless `--stats` run: after each tick, the
@@ -999,101 +1003,6 @@ impl LoopClock {
             render.report(&mut std::io::stdout().lock())?;
         }
         Ok(())
-    }
-}
-
-/// The interactive gameplay loop shared by `--room` and the app's Play mode:
-/// fixed ticks from the latched input, frames presented at the display's
-/// `frame_rate` (tweened between the last two ticks above the tick rate).
-/// With `stats` the presented frames are reported at exit.
-fn run_session_loop(
-    pack: &Pack,
-    session: &mut GameSession,
-    display: &mut Display,
-    stats: bool,
-) -> Result<()> {
-    let mut framebuffer = Framebuffer::new();
-    let mut input = InputState::interactive();
-    session.set_bindings(input.bindings().clone());
-    session.set_skips_enabled(true);
-    let mut event = SDL_Event::default();
-    let mut clock = LoopClock::new(display.frame_rate(), stats);
-    loop {
-        let mut cut_delta = 0i32;
-        if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
-            return clock.report();
-        }
-        if cut_delta != 0 {
-            session.step_camera_cut(cut_delta);
-        }
-        if let Some(bindings) = session.take_bindings_change() {
-            input.apply_bindings_change(bindings);
-        }
-        if let Some(rate) = session.take_frame_rate_change() {
-            display.set_frame_rate(rate);
-            clock.set_rate(rate);
-        }
-        if let Some(aspect) = session.take_aspect_change() {
-            display.set_aspect(aspect);
-        }
-        session.set_frame_rate(display.frame_rate());
-        session.update_window_title(display.window)?;
-
-        clock.advance();
-        // The film skip state advances on every loop pass, not the gameplay
-        // tick, exactly like the original's platform-driven film update.
-        session.poll_movie_skip(movie_buttons_held(input.held_word()));
-        let tick_ms = session_tick_interval(session.transition.is_some(), session.room_frozen());
-        while clock.accumulator >= tick_ms {
-            if session.transition_finished {
-                clock.accumulator = 0.0;
-                break;
-            }
-            // Each fixed tick consumes its own latched press, so a frame that
-            // catches up several ticks cannot replay one edge and a press that
-            // arrived between two ticks is never dropped.
-            let tick = input.tick();
-            if session.transition.is_some() {
-                session.tick_transition(pack, tick.action || tick.player.run);
-            } else {
-                session.tick(pack, tick.ui, tick.player, tick.action)?;
-                if session.transition.is_some() {
-                    // The original drops the remainder of the frame's time
-                    // when a door hands control to its transition phase.
-                    clock.ticked(tick_ms);
-                    clock.accumulator = 0.0;
-                    break;
-                }
-            }
-            clock.ticked(tick_ms);
-        }
-
-        // The pass that ends a transition is drawn at once, before teardown.
-        let alpha = match clock.pace(tick_ms, session.transition_finished) {
-            Pace::Present { alpha } => alpha,
-            Pace::Wait(ns) => {
-                session.update_audio();
-                unsafe { SDL_DelayNS(ns) };
-                continue;
-            }
-        };
-        session.tween.set_alpha(alpha);
-        let draw = Instant::now();
-        if let Some(gpu) = display.gpu() {
-            session.render_layers(pack, gpu);
-            clock.frame_drawn(draw);
-            display.present_layers(session.frame(), session.white_frame())?;
-        } else {
-            session.render(pack);
-            clock.frame_drawn(draw);
-            framebuffer.copy_from(session.frame());
-            display.present(&framebuffer)?;
-        }
-        display.show()?;
-        if session.transition_finished {
-            session.finish_transition(pack);
-        }
-        session.update_audio();
     }
 }
 
@@ -7872,7 +7781,7 @@ fn run_ui_impl(
         bail!("--setup-script requires a boot that opens a game session");
     }
     let mut display = Display::new("Arklay", false, authoring.renderer)?;
-    run_app_loop(&mut app, &mut display)
+    run_app_loop(&mut app, &mut display, false)
 }
 
 /// Play a scripted `--input` over an app-level `--ui` boot (the title, the
@@ -8041,19 +7950,20 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
     )
 }
 
-/// The interactive app loop shared by `--ui` and the standalone `--fmv`
-/// playback: fixed ticks from the latched input, frames presented at the
-/// display's `frame_rate` like [`run_session_loop`].
-fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
+/// The interactive app loop shared by `--room`, `--ui` and the standalone
+/// `--fmv` playback: fixed ticks from the latched input, frames presented at
+/// the display's `frame_rate` (tweened between the last two ticks above the
+/// tick rate). With `stats` the presented frames are reported at exit.
+fn run_app_loop(app: &mut App, display: &mut Display, stats: bool) -> Result<()> {
     let mut input = InputState::interactive();
     app.enable_skips();
     app.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
-    let mut clock = LoopClock::new(display.frame_rate(), false);
+    let mut clock = LoopClock::new(display.frame_rate(), stats);
     loop {
         let mut cut_delta = 0i32;
         if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
-            return Ok(());
+            return clock.report();
         }
         if cut_delta != 0 {
             app.step_camera_cut(cut_delta);
@@ -8079,7 +7989,7 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
         while clock.accumulator >= tick_ms {
             let tick = input.tick();
             if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
-                return Ok(());
+                return clock.report();
             }
             clock.ticked(tick_ms);
         }
@@ -8092,11 +8002,14 @@ fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
             }
         };
         app.set_tween_alpha(alpha);
+        let draw = Instant::now();
         if let Some(gpu) = display.gpu() {
             app.draw_layers(gpu);
+            clock.frame_drawn(draw);
             display.present_layers(app.frame(), app.white_frame())?;
         } else {
             app.draw();
+            clock.frame_drawn(draw);
             display.present(app.frame())?;
         }
         display.show()?;
@@ -8141,7 +8054,7 @@ pub fn run_fmv(
     let mut app = App::new(pack, save_dir, true);
     app.queue_movie(session, None);
     let mut display = Display::new("Arklay", false, renderer)?;
-    run_app_loop(&mut app, &mut display)
+    run_app_loop(&mut app, &mut display, false)
 }
 
 /// Play one ending chain (`id` 1-7) through the app's film mode, the
@@ -8201,7 +8114,7 @@ pub fn run_ending(
         return app.capture(capture_path);
     }
     let mut display = Display::new("Arklay - ending", false, renderer)?;
-    run_app_loop(&mut app, &mut display)
+    run_app_loop(&mut app, &mut display, false)
 }
 
 /// The `--ui font` screen.
@@ -17547,6 +17460,38 @@ mod tests {
         let pack = Pack::open(&pack_path).unwrap();
         let mut app = App::new(pack, dir.0.join("saves"), false);
         let session = GameSession::new(&app.pack, 0, &app.save_dir).unwrap();
+        app.start_session(session);
+
+        let f9 = UiInput {
+            return_title: true,
+            any: true,
+            ..UiInput::default()
+        };
+        app.update(f9, player::Input::default(), false).unwrap();
+        let Mode::Play(session) = &app.mode else {
+            panic!("expected a play mode");
+        };
+        assert!(
+            session.return_title.is_some(),
+            "the first F9 opens the prompt"
+        );
+
+        app.update(f9, player::Input::default(), false).unwrap();
+        assert!(
+            matches!(app.mode, Mode::Title(_)),
+            "the second F9 returns to the title"
+        );
+    }
+
+    /// The `--room` boot runs its session on the app's mode machine, so the
+    /// F9 prompt's confirmed return reaches the title there too. The bare
+    /// session loop it used to run dropped the request and resumed gameplay.
+    #[test]
+    fn app_f9_twice_from_a_room_boot_returns_to_the_title() {
+        let dir = TempDir::new();
+        let (pack, a, _) = debug_menu_pack(&dir);
+        let mut app = App::new(pack, dir.0.join("saves"), false);
+        let session = GameSession::from_room(&app.pack, a, &app.save_dir).unwrap();
         app.start_session(session);
 
         let f9 = UiInput {
