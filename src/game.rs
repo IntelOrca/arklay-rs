@@ -3550,6 +3550,10 @@ pub struct GameState {
     pub poison_timer: u16,
     /// The typewriter save prompt state (`g_typewriter_state`).
     pub typewriter: TypewriterFlow,
+    /// A cutscene skip is fast-forwarding: [`GameState::advance_frame`] still
+    /// counts `frame` but holds the play timer, so skipped ticks do not add to
+    /// the clear time (Classic REbirth's stage-timer patch).
+    pub play_timer_frozen: bool,
     /// The 48 item-box slots.
     pub item_box: [InventoryItem; ITEM_BOX_SLOTS],
     /// A room change requested by a door.
@@ -3772,6 +3776,7 @@ impl Default for GameState {
             health_status: 0,
             poison_timer: 0,
             typewriter: TypewriterFlow::Idle,
+            play_timer_frozen: false,
             item_box: [InventoryItem::default(); ITEM_BOX_SLOTS],
             transition: None,
             transition_door: None,
@@ -4135,6 +4140,9 @@ impl GameState {
     /// and frozen frames never call this, so they do not count.
     pub fn advance_frame(&mut self) {
         self.frame = self.frame.saturating_add(1);
+        if self.play_timer_frozen {
+            return;
+        }
         let timer = self.play_timer().saturating_add(1);
         self.set_play_timer(timer);
     }
@@ -7982,6 +7990,32 @@ impl GameState {
         self.state_bytes[usize::from(STATE_BYTE_MENU_CHOICE)] = 0;
     }
 
+    /// Run the message window to its end at once, as a cutscene skip's
+    /// fast-forward does: alternating action presses flip every page and
+    /// dismiss the finished text through [`Self::update_message`], so the
+    /// dismissal bookkeeping and any chained message run as if the player had
+    /// pressed through it. A yes/no prompt is left up for the player to
+    /// answer; returns whether one is waiting.
+    pub fn flush_message(&mut self, room: &RoomState, text: &Text) -> bool {
+        for step in 0..8192u32 {
+            if !self.message.active {
+                return false;
+            }
+            if self.message.phase() == crate::message::MessagePhase::YesNo {
+                return true;
+            }
+            let input = MessageInput {
+                action: step % 2 == 1,
+                ..MessageInput::default()
+            };
+            self.update_message(input, room, text);
+        }
+        // A window that never finishes (a malformed stream) is dropped rather
+        // than stalling the skip.
+        self.cancel_message();
+        false
+    }
+
     /// Mirror the window's menu-choice byte into the BioCard state byte the
     /// scripts observe with `cmpb 5`.
     pub fn sync_message_choice(&mut self) {
@@ -10443,6 +10477,19 @@ mod tests {
         );
         assert_eq!(host.state().voice, before);
         assert!(!host.state().voice_playing());
+    }
+
+    #[test]
+    fn a_frozen_play_timer_still_counts_frames() {
+        let mut state = game();
+        state.advance_frame();
+        assert_eq!((state.frame, state.play_timer()), (1, 1));
+        state.play_timer_frozen = true;
+        state.advance_frame();
+        assert_eq!((state.frame, state.play_timer()), (2, 1));
+        state.play_timer_frozen = false;
+        state.advance_frame();
+        assert_eq!((state.frame, state.play_timer()), (3, 2));
     }
 
     #[test]

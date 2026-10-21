@@ -223,7 +223,7 @@ would not shrink also stays raw.
 | Key | Gamepad | Action |
 | --- | --- | --- |
 | Arrow keys | D-pad, left stick | Move / menu selection |
-| `Space`, `Return` | South (A / Cross) | Confirm / action / dismiss a message |
+| `Space`, `Return` | South (A / Cross) | Confirm / action / dismiss a message; skips the loading narration and a letterboxed cutscene |
 | `C` | Left trigger | Aim the equipped weapon (hold) |
 | `Z` | Right trigger | Fire / reload with the weapon aimed |
 | `Tab` | Start | START: open/close the inventory (pause menu), cycle the top tabs |

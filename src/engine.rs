@@ -1015,6 +1015,7 @@ fn run_session_loop(
     let mut framebuffer = Framebuffer::new();
     let mut input = InputState::interactive();
     session.set_bindings(input.bindings().clone());
+    session.set_skips_enabled(true);
     let mut event = SDL_Event::default();
     let mut clock = LoopClock::new(display.frame_rate(), stats);
     loop {
@@ -1453,6 +1454,39 @@ enum MenuFadePhase {
     Closing,
 }
 
+/// A cutscene skip's phase (Classic REbirth 1.1.4's `CutSkip`).
+///
+/// The action button in a letterboxed scene (`MSF_SCREEN_INTENSITY`) fades
+/// the frame to black while the scene plays on (`FadeOut`), then runs the
+/// scene's remaining ticks back to back under the black frame with no sound
+/// and the play timer held (`FastForward`) until the letterbox flag clears,
+/// and fades back in over the post-scene room (`FadeIn`). The script counter
+/// is never jumped: every tick still runs, so the flags, items and positions
+/// end where a watched scene leaves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CutsceneSkipPhase {
+    FadeOut,
+    FastForward,
+    FadeIn,
+}
+
+/// The running cutscene skip: its phase and the ticks spent in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CutsceneSkip {
+    phase: CutsceneSkipPhase,
+    ticks: u32,
+}
+
+/// Ticks the cutscene skip takes to fade to black and back.
+const CUTSCENE_SKIP_FADE_TICKS: u32 = 10;
+
+/// The fast-forward's safety cap: Classic REbirth's five minutes at 30 Hz.
+const CUTSCENE_SKIP_MAX_TICKS: u32 = 9000;
+
+/// Wall time one presented frame may spend fast-forwarding, so the window
+/// stays responsive through a long scene.
+const CUTSCENE_SKIP_BURST: std::time::Duration = std::time::Duration::from_millis(12);
+
 /// Frames the player and entities stay frozen for the room-entry fade after the
 /// menu closes: the original suspends game_loop for the whole fade, but the
 /// first frame after the menu task exits still runs one gameplay tick before
@@ -1633,6 +1667,17 @@ struct GameSession {
     /// room stays frozen and the room-entry fade is not armed until the
     /// message's encoded delay dismisses it.
     boot_message: Option<u8>,
+    /// Whether the action button may skip the loading narration and the
+    /// letterboxed cutscenes. Only the interactive loops turn it on, so a
+    /// scripted `--input`/`--trace` run plays every scene out like the
+    /// reference.
+    skips_enabled: bool,
+    /// The running cutscene skip, if any (see [`CutsceneSkip`]).
+    cutscene_skip: Option<CutsceneSkip>,
+    /// The session's mixer while a cutscene skip runs: the skipped ticks see
+    /// no device, so they play no sound and a voice line or its F7 wait
+    /// clears at once. It goes back to [`Self::music`] when the skip ends.
+    cutscene_skip_music: Option<Mixer>,
     /// The room-entry fade the original arms on every gameplay (re)entry after
     /// a room load: type 2, accumulator `0x7FFF` and a negative counter that
     /// steps the alpha down once per fixed tick.
@@ -2047,6 +2092,9 @@ impl GameSession {
             examine: None,
             swallow_action: false,
             boot_message: None,
+            skips_enabled: false,
+            cutscene_skip: None,
+            cutscene_skip_music: None,
             room_fade: transition::Fade::inactive(),
             room_fade_draw: None,
             tween: Tween::default(),
@@ -2214,7 +2262,23 @@ impl GameSession {
     /// the menu is up the room stays frozen and the same input drives the
     /// menu.
     fn tick(&mut self, pack: &Pack, ui: UiInput, input: player::Input, action: bool) -> Result<()> {
+        if self
+            .cutscene_skip
+            .is_some_and(|skip| skip.phase == CutsceneSkipPhase::FastForward)
+        {
+            return self.tick_cutscene_fast_forward(pack);
+        }
         self.tween.advance();
+        // The scene plays on under the skip's fade-out with a neutral pad, so
+        // the skipping press (or a key mashed after it) acts on nothing else.
+        let fading_out = self
+            .cutscene_skip
+            .is_some_and(|skip| skip.phase == CutsceneSkipPhase::FadeOut);
+        let (ui, input, action) = if fading_out {
+            (UiInput::default(), player::Input::default(), false)
+        } else {
+            (ui, input, action)
+        };
         let result = self.tick_inner(pack, ui, input, action);
         // `main_loop` ramps the cutscene screen intensity in its draw phase,
         // after this frame's scripts, entities and message window have run, so
@@ -2226,7 +2290,224 @@ impl GameSession {
         // still step once per platform frame, exactly like the original's.
         self.tick_screen_intensity();
         self.follow_view();
+        if fading_out
+            && self.transition.is_some()
+            && self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY)
+        {
+            // The scene walked through a door under the fade-out: go black
+            // now and fast-forward through it rather than show the door.
+            self.cutscene_skip = Some(CutsceneSkip {
+                phase: CutsceneSkipPhase::FastForward,
+                ticks: 0,
+            });
+            if !self.skip_transition(pack) {
+                self.end_cutscene_skip(false);
+            }
+            return result;
+        }
+        self.step_cutscene_skip_fade();
         result
+    }
+
+    /// Whether the action button may start a cutscene skip now: a letterboxed
+    /// scene is playing on the plain gameplay path, with no door, film, death,
+    /// modal or yes/no prompt that the press belongs to instead.
+    fn cutscene_skippable(&self) -> bool {
+        self.skips_enabled
+            && self.cutscene_skip.is_none()
+            && self.attract.is_none()
+            && self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY)
+            && !self.game.flags[5].bit(game::MSF2_ATTRACT_DEMO)
+            && !self.game.fmv_requested()
+            && !self.room_boot_gate
+            && !self.cutscene_skip_interrupted()
+    }
+
+    /// Whether something that owns the screen or the pad has taken over, so a
+    /// cutscene skip must hand back control: a door, a film, the death
+    /// sequence, any modal screen, or a yes/no prompt the player has to
+    /// answer.
+    fn cutscene_skip_interrupted(&self) -> bool {
+        self.transition.is_some()
+            || self.movie.is_some()
+            || !self.death.is_idle()
+            || self.death_screen.is_some()
+            || self.boot_message.is_some()
+            || self.room_frozen()
+            || self.examine.is_some()
+            || self.typewriter_arm.is_some()
+            || self.typewriter_fade.is_some()
+            || self.typewriter_open.is_some()
+            || self.itembox_open_delay > 0
+            || (self.game.message.active
+                && self.game.message.phase() == crate::message::MessagePhase::YesNo)
+    }
+
+    /// Start a cutscene skip: silence the game sounds and park the mixer so
+    /// the scene's remaining ticks run without a device.
+    fn begin_cutscene_skip(&mut self) {
+        if let Some(mut mixer) = self.music.take() {
+            mixer.stop_voice();
+            mixer.stop_all_bgm();
+            self.cutscene_skip_music = Some(mixer);
+        }
+        self.cutscene_skip = Some(CutsceneSkip {
+            phase: CutsceneSkipPhase::FadeOut,
+            ticks: 0,
+        });
+    }
+
+    /// Give the parked mixer back after a cutscene skip. The skipped ticks
+    /// moved the scripted BGM state on without a device, so every loaded bank
+    /// reloads on the next reconciliation and the room's music matches the
+    /// scene's end.
+    fn restore_cutscene_skip_music(&mut self) {
+        let Some(mut mixer) = self.cutscene_skip_music.take() else {
+            return;
+        };
+        mixer.stop_voice();
+        mixer.stop_all_bgm();
+        for channel in &mut self.game.bgm.channels {
+            if channel.name.is_some() {
+                channel.pending_load = true;
+            }
+        }
+        self.music = Some(mixer);
+    }
+
+    /// End a cutscene skip: the sounds come back and the frame fades back in
+    /// (`fade_in`), or the skip vanishes at once because a door, film or death
+    /// now owns the screen.
+    fn end_cutscene_skip(&mut self, fade_in: bool) {
+        self.restore_cutscene_skip_music();
+        self.game.play_timer_frozen = false;
+        self.tween.reset();
+        self.cutscene_skip = fade_in.then_some(CutsceneSkip {
+            phase: CutsceneSkipPhase::FadeIn,
+            ticks: 0,
+        });
+        // A button still held from the skip must be released before it acts.
+        self.swallow_action = true;
+    }
+
+    /// Advance the skip's fade-out or fade-in by one gameplay tick.
+    fn step_cutscene_skip_fade(&mut self) {
+        let Some(mut skip) = self.cutscene_skip else {
+            return;
+        };
+        skip.ticks += 1;
+        self.cutscene_skip = Some(skip);
+        let interrupted = self.cutscene_skip_interrupted();
+        match skip.phase {
+            CutsceneSkipPhase::FadeOut if interrupted => self.end_cutscene_skip(false),
+            CutsceneSkipPhase::FadeOut if skip.ticks >= CUTSCENE_SKIP_FADE_TICKS => {
+                self.cutscene_skip = Some(CutsceneSkip {
+                    phase: CutsceneSkipPhase::FastForward,
+                    ticks: 0,
+                });
+            }
+            CutsceneSkipPhase::FadeIn if interrupted || skip.ticks >= CUTSCENE_SKIP_FADE_TICKS => {
+                self.cutscene_skip = None;
+            }
+            _ => {}
+        }
+    }
+
+    /// One presented frame of the skip's fast-forward: run the scene's ticks
+    /// back to back with a neutral pad, no sound and the play timer held,
+    /// until the letterbox flag clears, something takes over the screen, the
+    /// safety cap runs out or this frame's time budget is spent. Message
+    /// windows are pressed through as they open so a line or its F7 wait
+    /// cannot stall the scene; a yes/no prompt ends the skip for the player
+    /// to answer.
+    fn tick_cutscene_fast_forward(&mut self, pack: &Pack) -> Result<()> {
+        let start = Instant::now();
+        self.game.play_timer_frozen = true;
+        let mut result = Ok(());
+        loop {
+            // A door the scene walks through while the letterbox is still up
+            // is part of the scene: skip its animation and carry on in the
+            // destination, as Classic REbirth's skip does.
+            if self.transition.is_some() && self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY) {
+                if !self.skip_transition(pack) {
+                    self.end_cutscene_skip(false);
+                    break;
+                }
+                continue;
+            }
+            if self.cutscene_skip_interrupted() {
+                // A door, film or death took over: it owns the screen now.
+                self.end_cutscene_skip(false);
+                break;
+            }
+            let prompt = self.game.flush_message(&self.loaded.room, &self.text);
+            let ticks = self.cutscene_skip.map_or(0, |skip| skip.ticks);
+            if prompt
+                || !self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY)
+                || ticks >= CUTSCENE_SKIP_MAX_TICKS
+            {
+                // The letterbox ramp has not seen the flag drop yet; settle
+                // the bars so the frame fades in on the uncovered room.
+                if !prompt && !self.game.flags[5].bit(game::MSF_SCREEN_INTENSITY) {
+                    self.sprite_anim_intensity = 0;
+                }
+                self.end_cutscene_skip(true);
+                break;
+            }
+            self.tween.advance();
+            if let Err(err) =
+                self.tick_inner(pack, UiInput::default(), player::Input::default(), false)
+            {
+                result = Err(err);
+                self.end_cutscene_skip(false);
+                break;
+            }
+            self.tick_screen_intensity();
+            if let Some(skip) = self.cutscene_skip.as_mut() {
+                skip.ticks += 1;
+            }
+            if start.elapsed() >= CUTSCENE_SKIP_BURST {
+                break;
+            }
+        }
+        self.game.play_timer_frozen = false;
+        self.follow_view();
+        result
+    }
+
+    /// Run a door transition to its end with its skip held, for a cutscene
+    /// skip's fast-forward; returns whether it finished.
+    fn skip_transition(&mut self, pack: &Pack) -> bool {
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            self.tick_transition(pack, true);
+            if let Some(skip) = self.cutscene_skip.as_mut() {
+                skip.ticks += 1;
+            }
+            if self.transition_finished {
+                self.finish_transition(pack);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The black the cutscene skip lays over the frame: ramping over the
+    /// fade-out and fade-in, opaque while the scene fast-forwards.
+    fn cutscene_skip_alpha(&self) -> Option<u8> {
+        let skip = self.cutscene_skip?;
+        let step = |ticks: u32| {
+            (ticks.min(CUTSCENE_SKIP_FADE_TICKS) * 255 / CUTSCENE_SKIP_FADE_TICKS) as u8
+        };
+        Some(match skip.phase {
+            CutsceneSkipPhase::FadeOut => step(skip.ticks),
+            CutsceneSkipPhase::FastForward => 255,
+            CutsceneSkipPhase::FadeIn => 255 - step(skip.ticks),
+        })
+    }
+
+    /// Enable or disable the action-button skips (see [`Self::skips_enabled`]).
+    fn set_skips_enabled(&mut self, enabled: bool) {
+        self.skips_enabled = enabled;
     }
 
     /// Move the presented band one tick toward the player.
@@ -2502,6 +2783,14 @@ impl GameSession {
             self.open_debug_menu(pack);
             return Ok(());
         }
+        // The action button in a letterboxed scene starts the cutscene skip
+        // (Classic REbirth 1.1.4's `CutSkip`); the press is spent on it.
+        if input.action_pressed && self.cutscene_skippable() {
+            self.begin_cutscene_skip();
+            ui = UiInput::default();
+            input = player::Input::default();
+            action = false;
+        }
 
         let was_active = self.game.message.active;
 
@@ -2717,7 +3006,7 @@ impl GameSession {
         // bank-2 calls: the item-box lid (0x20), the locked-door rattles, the
         // key turn and the desk cues all arrive here.
         let requests = std::mem::take(&mut self.game.sfx_requests);
-        if !requests.is_empty() {
+        if !requests.is_empty() && self.music.is_some() {
             let row = sfx::room_row(self.loaded.room.stage, self.loaded.room.room);
             for id in requests {
                 let Ok(column) = u8::try_from(id) else {
@@ -2991,6 +3280,10 @@ impl GameSession {
             return Ok(());
         }
         let mut session = MovieSession::open(pack, id, character)?;
+        // A film a skipped scene starts plays with its sound: the skip hands
+        // the mixer back before the film parks the game sounds, and ends at
+        // the top of the next fast-forward step.
+        self.restore_cutscene_skip_music();
         if let Some(mixer) = &mut self.music {
             mixer.pause_game_sounds();
             mixer.load_movie_audio(session.take_audio());
@@ -4711,6 +5004,10 @@ impl GameSession {
     /// tick its encoded delay clears it, arm the room-entry fade. No room
     /// script, entity, effect or player tick runs while the narration is up.
     fn tick_boot_message(&mut self, input: player::Input, action: bool) {
+        // A fresh action press skips the rest of the narration.
+        if self.skips_enabled && input.action_pressed {
+            self.game.cancel_message();
+        }
         self.game.update_message(
             MessageInput {
                 action,
@@ -4916,6 +5213,29 @@ impl GameSession {
                     None => self.view,
                 }
             };
+        }
+        // The cutscene skip's fast-forward shows only black: the scene is
+        // not drawn at all while its ticks run back to back.
+        if self.boot_message.is_none()
+            && self.movie.is_none()
+            && self.transition.is_none()
+            && self.death_screen.is_none()
+            && self
+                .cutscene_skip
+                .is_some_and(|skip| skip.phase == CutsceneSkipPhase::FastForward)
+        {
+            self.gpu_scene_visible = false;
+            self.framebuffer.clear();
+            self.framebuffer.fill_rect(
+                [
+                    0,
+                    0,
+                    self.framebuffer.width as i32,
+                    self.framebuffer.height as i32,
+                ],
+                [0, 0, 0, 255],
+            );
+            return;
         }
         // The screens below replace the whole frame, scene included.
         if self.boot_message.is_some()
@@ -5274,6 +5594,10 @@ impl GameSession {
                 ..
             } = self;
             framebuffer.with_screen(|screen| game.message.draw(screen, font, text));
+        }
+        // The cutscene skip's fade covers the scene and its message window.
+        if let Some(alpha) = self.cutscene_skip_alpha() {
+            self.framebuffer.fade_to_black(alpha);
         }
         // The debug overlay is drawn last so it stays legible over the frozen
         // frame and any message the room raised before it opened.
@@ -6006,6 +6330,9 @@ struct App {
     movie_action: Option<ScreenAction>,
     /// A film waiting to start on the next tick.
     pending_movie: Option<PendingMovie>,
+    /// Whether sessions let the action button skip the loading narration and
+    /// cutscenes: on for the interactive window, off for scripted runs.
+    skips_enabled: bool,
     /// Films queued to play back to back, with `(id, character)`; the chain's
     /// last film is followed by [`App::chain_action`] (or a quit when `None`).
     film_chain: VecDeque<(u8, u8)>,
@@ -6078,6 +6405,7 @@ impl App {
             movie_music: None,
             movie_action: None,
             pending_movie: None,
+            skips_enabled: false,
             film_chain: VecDeque::new(),
             chain_action: None,
             chain_active: false,
@@ -6429,9 +6757,19 @@ impl App {
         Ok(())
     }
 
+    /// Let the action button skip the loading narration and cutscenes, in the
+    /// running session and every later one.
+    fn enable_skips(&mut self) {
+        self.skips_enabled = true;
+        if let Mode::Play(session) = &mut self.mode {
+            session.set_skips_enabled(true);
+        }
+    }
+
     /// Enter a gameplay session, opening audio on the interactive path.
     fn start_session(&mut self, mut session: Box<GameSession>) {
         session.set_debug_menu(self.debug_menu);
+        session.set_skips_enabled(self.skips_enabled);
         session.set_bindings(self.bindings.clone());
         if self.audio {
             session.start_audio(&self.pack);
@@ -7684,6 +8022,7 @@ fn write_trace_capture(app: &App, options: &trace::TraceOptions<'_>, index: u32)
 /// display's `frame_rate` like [`run_session_loop`].
 fn run_app_loop(app: &mut App, display: &mut Display) -> Result<()> {
     let mut input = InputState::interactive();
+    app.enable_skips();
     app.set_bindings(input.bindings().clone());
     let mut event = SDL_Event::default();
     let mut clock = LoopClock::new(display.frame_rate(), false);
@@ -18385,6 +18724,263 @@ mod tests {
         );
     }
 
+    fn action_press() -> player::Input {
+        player::Input {
+            action_pressed: true,
+            action_held: true,
+            ..player::Input::default()
+        }
+    }
+
+    fn skip_phase(session: &GameSession) -> Option<CutsceneSkipPhase> {
+        session.cutscene_skip.map(|skip| skip.phase)
+    }
+
+    /// The action button in a letterboxed scene fades to black, runs the
+    /// scene's ticks back to back with the play timer held, and fades back in
+    /// once the letterbox flag clears.
+    #[test]
+    fn action_skips_a_letterboxed_cutscene() {
+        let dir = TempDir::new();
+        let (pack, a, _b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.set_skips_enabled(true);
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        for _ in 0..16 {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FadeOut));
+        assert!(session.swallow_action || !session.game.message.active);
+        let mut alphas = vec![session.cutscene_skip_alpha()];
+        for _ in 1..CUTSCENE_SKIP_FADE_TICKS {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+            alphas.push(session.cutscene_skip_alpha());
+        }
+        assert!(
+            alphas.windows(2).all(|pair| pair[0] < pair[1]),
+            "the fade-out darkens every tick: {alphas:?}"
+        );
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FastForward));
+        assert_eq!(session.cutscene_skip_alpha(), Some(255));
+
+        // The scene keeps running under the black frame, faster than one tick
+        // per call and without counting toward the clear time.
+        let timer = session.game.play_timer();
+        let frame = session.game.frame;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.game.frame > frame + 1,
+            "the fast-forward ran a burst"
+        );
+        assert_eq!(
+            session.game.play_timer(),
+            timer,
+            "the skip holds the play timer"
+        );
+        session.render(&pack);
+        assert!(
+            session
+                .framebuffer
+                .rgba
+                .chunks(4)
+                .all(|pixel| pixel[..3] == [0, 0, 0]),
+            "the fast-forward draws only black"
+        );
+
+        // The scene ends: the frame fades back in and control returns.
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 1);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FadeIn));
+        assert!(!session.game.play_timer_frozen);
+        let timer = session.game.play_timer();
+        for _ in 0..CUTSCENE_SKIP_FADE_TICKS {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(skip_phase(&session), None);
+        assert_eq!(session.cutscene_skip_alpha(), None);
+        assert!(
+            session.game.play_timer() > timer,
+            "the play timer runs again"
+        );
+    }
+
+    /// A scripted run (skips disabled) and a scene without the letterbox flag
+    /// both leave the action button alone.
+    #[test]
+    fn cutscene_skip_needs_the_letterbox_and_an_interactive_session() {
+        let dir = TempDir::new();
+        let (pack, a, _b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        assert_eq!(
+            skip_phase(&session),
+            None,
+            "skips are off for scripted runs"
+        );
+
+        session.set_skips_enabled(true);
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 1);
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        assert_eq!(skip_phase(&session), None, "no letterbox, no skip");
+    }
+
+    /// The fast-forward presses through message windows so a line cannot
+    /// stall the scene, and stops at a yes/no prompt for the player.
+    #[test]
+    fn cutscene_skip_presses_through_messages_but_stops_at_a_prompt() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.set_skips_enabled(true);
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        for _ in 1..CUTSCENE_SKIP_FADE_TICKS {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FastForward));
+
+        session.game.show_message(0x41, 0);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(!session.game.message.active, "the line was pressed through");
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FastForward));
+
+        session.game.show_message(0xC0, 0);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.game.message.active,
+            "the prompt waits for the player"
+        );
+        assert_eq!(
+            session.game.message.phase(),
+            crate::message::MessagePhase::YesNo
+        );
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FadeIn));
+    }
+
+    /// A door the scene walks through under the letterbox is skipped as part
+    /// of the scene; one after the letterbox dropped ends the skip at once,
+    /// without a fade-in over the door's own timeline.
+    #[test]
+    fn a_door_during_the_cutscene_skip_ends_it() {
+        let dir = TempDir::new();
+        let (pack, a, b) = two_room_door_pack(&dir);
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        trigger_test_door(&pack, &mut session);
+        let door = session.transition.take();
+        session.set_skips_enabled(true);
+        session.swallow_action = false;
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        for _ in 1..CUTSCENE_SKIP_FADE_TICKS {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FastForward));
+        session.transition = door;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(
+            session.transition.is_none(),
+            "the door ran inside the burst"
+        );
+        assert_eq!(
+            session.loaded.id, b,
+            "the scene carried on in the destination"
+        );
+        assert_eq!(skip_phase(&session), Some(CutsceneSkipPhase::FastForward));
+
+        // A door after the letterbox dropped is the player's: the skip ends
+        // and the door animates as usual.
+        let mut session = GameSession::from_room(&pack, a, Path::new("saves")).unwrap();
+        trigger_test_door(&pack, &mut session);
+        let door = session.transition.take();
+        session.set_skips_enabled(true);
+        session.swallow_action = false;
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 0);
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        for _ in 1..CUTSCENE_SKIP_FADE_TICKS {
+            session
+                .tick(&pack, UiInput::default(), player::Input::default(), false)
+                .unwrap();
+        }
+        session.game.apply_flag(5, game::MSF_SCREEN_INTENSITY, 1);
+        session.transition = door;
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert_eq!(skip_phase(&session), None);
+        assert!(session.transition.is_some());
+        assert!(!session.game.play_timer_frozen);
+        assert!(session.cutscene_skip_music.is_none());
+    }
+
+    /// The action button skips the rest of the loading narration in an
+    /// interactive session.
+    #[test]
+    fn action_skips_the_loading_narration() {
+        let dir = TempDir::new();
+        let pack_path = message_pack(&dir);
+        let pack = Pack::open(&pack_path).unwrap();
+        let mut session =
+            GameSession::from_room(&pack, RoomId::parse("100").unwrap(), Path::new("saves"))
+                .unwrap();
+        session.set_skips_enabled(true);
+        session.request_boot_message(0x41);
+        session
+            .tick(&pack, UiInput::default(), player::Input::default(), false)
+            .unwrap();
+        assert!(session.boot_message.is_some());
+        session
+            .tick(&pack, UiInput::default(), action_press(), true)
+            .unwrap();
+        assert!(
+            session.boot_message.is_none(),
+            "the press ended the narration"
+        );
+        assert!(!session.game.message.active);
+        assert_eq!(
+            session.room_fade_draw_alpha(),
+            Some(255),
+            "the room fades up from black as after a watched narration"
+        );
+    }
+
     #[test]
     fn a_transition_reruns_on_room_load_for_the_destination() {
         use crate::manifest;
@@ -22723,6 +23319,126 @@ off_0010:
             expected as u8,
             "the BioCard camera byte follows the re-homed cut"
         );
+    }
+
+    /// One app-loop step of a headless new game: a door transition runs its
+    /// animation, otherwise the room ticks with `input`.
+    fn app_step(session: &mut GameSession, pack: &Pack, input: player::Input) {
+        if session.transition.is_some() {
+            session.tick_transition(pack, false);
+            if session.transition_finished {
+                session.finish_transition(pack);
+            }
+            return;
+        }
+        session.movie = None;
+        session
+            .tick(pack, UiInput::default(), input, input.action_held)
+            .unwrap();
+    }
+
+    /// Skipping Jill's opening (room 106 through the door into 105, all under
+    /// the letterbox) lands on the same state as watching it, with the
+    /// skipped ticks kept off the play timer.
+    #[test]
+    #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
+    fn real_opening_cutscene_skip_matches_watching_it() {
+        let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
+            return;
+        };
+        let pack = Pack::open(Path::new(&path)).unwrap();
+        let letterbox =
+            |session: &GameSession| session.game.flags[5].bit(game::MSF_SCREEN_INTENSITY);
+        let start = || {
+            let mut session = GameSession::new(&pack, 1, Path::new("saves")).unwrap();
+            session.set_skips_enabled(true);
+            session.request_boot_message(game::MESSAGE_BOOT_NEW_GAME);
+            // The narration: skipped with a press, as the player would.
+            app_step(&mut session, &pack, player::Input::default());
+            app_step(&mut session, &pack, action_press());
+            assert!(
+                session.boot_message.is_none(),
+                "the press skipped the narration"
+            );
+            for _ in 0..600 {
+                if letterbox(&session) && !session.room_boot_gate {
+                    break;
+                }
+                session
+                    .game
+                    .flush_message(&session.loaded.room, &session.text);
+                app_step(&mut session, &pack, player::Input::default());
+            }
+            assert!(letterbox(&session), "the opening scene never started");
+            session
+        };
+
+        // Watched: every line pressed through until the letterbox drops.
+        let mut watched = start();
+        for _ in 0..6000 {
+            if !letterbox(&watched) && watched.transition.is_none() {
+                break;
+            }
+            watched
+                .game
+                .flush_message(&watched.loaded.room, &watched.text);
+            app_step(&mut watched, &pack, player::Input::default());
+        }
+        assert!(!letterbox(&watched), "the watched scene never ended");
+
+        // Skipped: one press, then the skip runs on its own.
+        let mut skipped = start();
+        let timer = skipped.game.play_timer();
+        app_step(&mut skipped, &pack, action_press());
+        assert!(
+            skipped.cutscene_skip.is_some(),
+            "the press started the skip"
+        );
+        let mut steps = 0;
+        while skip_phase(&skipped) != Some(CutsceneSkipPhase::FadeIn) {
+            assert!(
+                skipped.cutscene_skip.is_some(),
+                "the skip ended without its fade-in"
+            );
+            app_step(&mut skipped, &pack, player::Input::default());
+            steps += 1;
+            assert!(steps < 6000, "the skip never finished");
+        }
+        assert!(!letterbox(&skipped));
+        assert!(
+            skipped.game.play_timer() <= timer + CUTSCENE_SKIP_FADE_TICKS + 1,
+            "only the fade-out counts toward the clear time: {} -> {}",
+            timer,
+            skipped.game.play_timer()
+        );
+        assert!(
+            skipped.game.frame > watched.game.frame / 2,
+            "the scene's ticks still ran"
+        );
+
+        assert_eq!(skipped.loaded.id, watched.loaded.id);
+        assert_eq!(skipped.player.pos, watched.player.pos);
+        assert_eq!(skipped.player.angle, watched.player.angle);
+        assert_eq!(
+            skipped.game.camera.current_cut,
+            watched.game.camera.current_cut
+        );
+        assert_eq!(skipped.game.inventory, watched.game.inventory);
+        for bank in 0..game::FLAG_BANK_COUNT {
+            assert_eq!(
+                skipped.game.flags[bank], watched.game.flags[bank],
+                "flag bank {bank}"
+            );
+        }
+        for _ in 0..CUTSCENE_SKIP_FADE_TICKS {
+            app_step(&mut skipped, &pack, player::Input::default());
+        }
+        assert_eq!(
+            skip_phase(&skipped),
+            None,
+            "control is back after the fade-in"
+        );
+        assert!(skipped.music.is_none() && skipped.cutscene_skip_music.is_none());
     }
 
     /// The real new-game loading narration holds the room frozen until the

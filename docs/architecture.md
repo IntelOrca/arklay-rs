@@ -117,7 +117,23 @@ Films are paced by the wall clock, with the mixer's device-playback cursor
 (everything written to the stream minus what is still queued) accepted only
 within the original's -0.5 s/+0.25 s tolerance; the session decodes forward to
 the frame due now and keeps a two second audio lead queued so the cursor never
-starves. Whenever a room load completes, gameplay re-arms the
+starves.
+
+The confirm button skips the loading narration before the first room and,
+like Classic REbirth 1.1.4's hidden `CutSkip`, a letterboxed cutscene (bank-5
+`MSF_SCREEN_INTENSITY`). The cutscene skip never jumps the script: it fades
+to black over ten ticks with the scene still running, then runs the scene's
+ticks back to back under a black frame (a 12 ms burst per presented frame)
+with the mixer parked, every message window pressed through and the play
+timer held, until the letterbox flag drops, and fades back in over ten ticks.
+A door the scene walks through under the letterbox runs with its animation
+skipped; a film, the death sequence, a modal screen or a yes/no prompt ends
+the skip so the player gets them. When the mixer comes back every loaded BGM
+bank reloads, so the music is the scene's end state. Both skips are on only in
+the interactive loops, so scripted `--input` and `--trace` runs play every
+scene out like the reference.
+
+Whenever a room load completes, gameplay re-arms the
 original's entry fade: a black veil at accumulator `0x7FFF` whose alpha steps
 255, 207, ..., 15 over six fixed ticks (a slow `0xFF5D` counter while scenario
 flag `0x7D` is set).
