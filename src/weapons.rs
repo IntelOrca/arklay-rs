@@ -404,8 +404,14 @@ pub fn weapon_emw_entry(character: u8, weapon: u8) -> Option<String> {
 /// The held-weapon mesh file id for a scripted character and its behavior
 /// byte. `behavior_flags` 0 means the character holds nothing; the block
 /// clamps exactly like the original (above 4 folds onto the shared block 2).
+/// Only the init handlers of Chris, Jill, Barry, Rebecca, Wesker and their
+/// aliases (ids 0x20-0x24 and 0x2A-0x2E) load a weapon; every other id keeps
+/// its own weapon-joint object and holds nothing.
 pub fn character_weapon_id(id: u8, behavior_flags: u8) -> Option<u16> {
     if behavior_flags == 0 || behavior_flags > 6 {
+        return None;
+    }
+    if !matches!(id, 0x20..=0x24 | 0x2A..=0x2E) {
         return None;
     }
     let mut block = id.wrapping_sub(0x20);
@@ -2718,6 +2724,8 @@ mod tests {
             "ids above Wesker fold onto block 2"
         );
         assert_eq!(character_weapon_entry(0x20, 7), None, "out of range");
+        assert_eq!(character_weapon_entry(0x00, 4), None, "a player model");
+        assert_eq!(character_weapon_entry(0x27, 1), None, "Richard loads none");
     }
 
     #[test]
