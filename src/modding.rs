@@ -141,7 +141,12 @@ pub fn build_mod(dir: &Path, out: &Path, base: Option<&Path>) -> Result<ModSumma
         let new_paths: Vec<&str> = entries
             .iter()
             .map(|(path, _)| path.as_str())
-            .filter(|path| *path != manifest::ENTRY && !is_override(&base_pack, path))
+            // HD textures replace by pixel hash, not by path.
+            .filter(|path| {
+                *path != manifest::ENTRY
+                    && !path.starts_with(crate::htexture::ROOT)
+                    && !is_override(&base_pack, path)
+            })
             .collect();
         if !new_paths.is_empty() {
             warnings.push(format!(

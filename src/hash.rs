@@ -170,7 +170,7 @@ impl Surface {
 
     /// CRC-32 over `width` x `height` BGRA texels from the top-left corner,
     /// zero texels outside the surface, each passed through `finish`.
-    fn window_crc(&self, width: usize, height: usize, finish: impl Fn(u32) -> u32) -> u32 {
+    pub fn window_crc(&self, width: usize, height: usize, finish: impl Fn(u32) -> u32) -> u32 {
         let mut bytes = Vec::with_capacity(width * height * 4);
         for y in 0..height {
             for x in 0..width {
@@ -187,7 +187,7 @@ impl Surface {
 }
 
 /// One 15-bit colour as the game's 32-bit upload, alpha still clear.
-fn texel(colour: u16, expand: Expand) -> u32 {
+pub fn texel(colour: u16, expand: Expand) -> u32 {
     let widen = |v: u16| -> u32 {
         let v = u32::from(v & 31);
         match expand {
@@ -334,20 +334,63 @@ pub fn pix_surface(data: &[u8], expand: Expand) -> Result<Surface> {
     ))
 }
 
-/// The CRC-32 (IEEE 802.3) table-free implementation, matching zlib.
-pub fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
+/// The CRC-32 (IEEE 802.3) lookup tables for slicing by eight: row 0 is the
+/// classic byte table, row `k` advances a byte through `k` more zero bytes.
+const CRC_TABLES: [[u32; 256]; 8] = {
+    let mut tables = [[0u32; 256]; 8];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
             crc = if crc & 1 != 0 {
                 (crc >> 1) ^ 0xedb8_8320
             } else {
                 crc >> 1
             };
+            bit += 1;
         }
+        tables[0][index] = crc;
+        index += 1;
     }
-    !crc
+    let mut row = 1;
+    while row < 8 {
+        let mut index = 0;
+        while index < 256 {
+            let previous = tables[row - 1][index];
+            tables[row][index] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            index += 1;
+        }
+        row += 1;
+    }
+    tables
+};
+
+/// The CRC-32 (IEEE 802.3), matching zlib. Textures are hashed as they load,
+/// so this slices by eight bytes rather than shifting a bit at a time.
+pub fn crc32(bytes: &[u8]) -> u32 {
+    !crc32_update(0xffff_ffff, bytes)
+}
+
+/// Feed `bytes` into a running (pre-inverted) CRC-32 register.
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    let t = &CRC_TABLES;
+    let (words, rest) = bytes.as_chunks::<8>();
+    for word in words {
+        let low = crc ^ u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        crc = t[7][(low & 0xff) as usize]
+            ^ t[6][((low >> 8) & 0xff) as usize]
+            ^ t[5][((low >> 16) & 0xff) as usize]
+            ^ t[4][(low >> 24) as usize]
+            ^ t[3][usize::from(word[4])]
+            ^ t[2][usize::from(word[5])]
+            ^ t[1][usize::from(word[6])]
+            ^ t[0][usize::from(word[7])];
+    }
+    for &byte in rest {
+        crc = (crc >> 8) ^ t[0][((crc ^ u32::from(byte)) & 0xff) as usize];
+    }
+    crc
 }
 
 /// The 8-uppercase-hex-digit name of an HD replacement.

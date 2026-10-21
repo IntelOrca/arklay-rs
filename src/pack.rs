@@ -648,6 +648,9 @@ pub struct Pack {
     /// Requested display language (`--language`); the string catalog resolves
     /// it, falling back to the OS locale and then `en-US`.
     language: Option<String>,
+    /// `htexture/` replacements across the pack and its layers, indexed on
+    /// first use.
+    htexture: std::sync::OnceLock<crate::htexture::HdTable>,
 }
 
 impl Pack {
@@ -702,6 +705,7 @@ impl Pack {
             overlays: Vec::new(),
             warnings: Vec::new(),
             language: None,
+            htexture: std::sync::OnceLock::new(),
         };
         pack.manifest = pack.read_manifest()?;
         Ok(pack)
@@ -833,6 +837,7 @@ impl Pack {
                 .then_with(|| a.0.id.cmp(&b.0.id))
         });
         pack.overlays = applied.into_iter().map(|(_, layer)| layer).collect();
+        pack.htexture = std::sync::OnceLock::new();
         pack.warnings = warnings;
         Ok(pack)
     }
@@ -923,6 +928,7 @@ impl Pack {
             overlays: Vec::new(),
             warnings: Vec::new(),
             language: None,
+            htexture: std::sync::OnceLock::new(),
         };
         pack.manifest = pack.read_manifest()?;
         Ok(pack)
@@ -1173,6 +1179,12 @@ impl Pack {
     /// table of contents where [`Pack::paths`] is the merged view.
     pub fn own_paths(&self) -> impl Iterator<Item = &str> {
         self.entries.iter().map(|entry| entry.path.as_str())
+    }
+
+    /// The `htexture/` replacements this pack and its layers carry.
+    pub fn htexture(&self) -> &crate::htexture::HdTable {
+        self.htexture
+            .get_or_init(|| crate::htexture::HdTable::scan(self))
     }
 
     /// Original-case entry paths in table-of-contents order, or the merged

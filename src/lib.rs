@@ -28,6 +28,7 @@ pub mod gpu;
 pub mod hash;
 #[cfg(feature = "hd")]
 pub mod hdfilm;
+pub mod htexture;
 pub mod items;
 pub mod ivm;
 pub mod language;

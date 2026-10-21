@@ -268,6 +268,42 @@ several sources has no single source file. Classic REbirth's save screen is its 
 artwork: alpha 0 is transparent, and every other pixel keeps its colour, with black
 remapped to `0x000001`.
 
+### HD texture packs
+
+A mod replaces textures by these names under `htexture/`. On first use every image
+(`webp`, `png` or `bmp`) anywhere below `htexture/` is indexed by the first 8 hex
+digits of its file name, so `htexture/bgd/DD17F52F.webp`,
+`htexture/anything/DD17F52F.png` and `htexture/DD17F52F_3B.webp` all replace the
+texture hashing to `DD17F52F`; the subdirectories are only for organising files. When
+two files share a hash, a bare `<hash>` name wins over a suffixed `<hash>_XX` one.
+
+The lookup is the last step of loading a texture. The usual overrides by path decide
+which pixels load, and then the hash of those pixels picks the replacement, so an HD
+pack never changes which texture a room shows, and it composes with any mod that
+replaces the originals. If the pixels a mod supplies hash to no file, the texture is
+drawn as loaded.
+
+Replacements are drawn by the GPU renderer (`--renderer gpu`) at their own
+resolution. The software renderer is 320x240 and keeps the originals.
+
+- A background or mask image is sampled from the replacement in place of the
+  original. The replacement covers the texels its hash window covers: the whole
+  background, or 256 x 256 mask texels.
+- A model page keeps its original indices, which decide transparency and the STP
+  blend. Each CLUT row's colours come from that row's replacement. A 128-texel-wide
+  page is stretched to 256 before hashing, as the game uploads it, so its
+  replacement covers 128 x 256 texels.
+
+A texture with no replacement is reported once on stderr, with every hash that was
+tried:
+
+```text
+htexture: no replacement for 256x256 model page, CLUT row 1: 3D4A4499 ...
+```
+
+A complete pack should report nothing while playing. Missing reports mean either the
+pack lacks the texture or its name was hashed from different pixels.
+
 ## Language files
 
 A mod may ship `language/<tag>.txt` with any subset of strings. Every layer's

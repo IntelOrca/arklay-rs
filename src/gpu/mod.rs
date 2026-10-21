@@ -26,6 +26,13 @@
 //!   depth at their painter's key (a view-Z), shadows and effects test against
 //!   it, opaque mesh texels write it and STP texels blend in a second pass.
 //!
+//! * A pack's HD replacements ([`crate::htexture`]) are looked up as an image
+//!   or page is uploaded, from the hash of the pixels it would otherwise
+//!   upload. A replaced image is sampled at its own resolution
+//!   (`sprite.frag`'s `scale`); a replaced page keeps its indices for
+//!   transparency and STP and takes each CLUT row's colours from a layer of
+//!   an array texture (`mesh.frag`).
+//!
 //! The 2D overlays (menus, messages, fades) stay software. The session draws
 //! them twice, once over a black scene and once over a white one; every
 //! overlay operation is affine in the destination, so the composite shader
@@ -48,7 +55,9 @@ use sdl3_sys::pixels::SDL_FColor;
 use sdl3_sys::rect::SDL_Rect;
 use sdl3_sys::video::{SDL_GetWindowSizeInPixels, SDL_Window};
 
+use crate::htexture;
 use crate::model::{Texture8, Tmd};
+use crate::pack::Pack;
 use crate::render::{Framebuffer, GameplayScene, root_position};
 use crate::state::Image;
 use crate::video;
@@ -127,13 +136,28 @@ struct MeshBuffer {
     buffer: *mut SDL_GPUBuffer,
     vertex_count: u32,
     blend_start: u32,
+    /// The CLUT rows its packets read, one bit each.
+    rows: u32,
 }
 
-/// An indexed page: the `R8_UINT` index texture and its palette.
+/// An indexed page: the `R8_UINT` index texture and its palette, and the HD
+/// replacements of its CLUT rows (both null without one).
 #[derive(Clone, Copy)]
 struct PageTextures {
     indices: *mut SDL_GPUTexture,
     palette: *mut SDL_GPUTexture,
+    /// One RGBA layer per replaced row.
+    hd: *mut SDL_GPUTexture,
+    /// Per row, `mesh.frag`'s layer and extents.
+    hd_rows: *mut SDL_GPUTexture,
+}
+
+/// An uploaded RGBA image: the original or its HD replacement, with the
+/// replacement's texels per original texel.
+#[derive(Clone, Copy)]
+struct ImageTexture {
+    texture: *mut SDL_GPUTexture,
+    scale: [f32; 2],
 }
 
 /// The renderer's pipelines.
@@ -188,7 +212,10 @@ pub struct GpuRenderer {
     sprite_capacity: u32,
     meshes: HashMap<usize, Resident<MeshBuffer>>,
     pages: HashMap<usize, Resident<PageTextures>>,
-    images: HashMap<usize, Resident<*mut SDL_GPUTexture>>,
+    images: HashMap<usize, Resident<ImageTexture>>,
+    /// Bound in place of a page's replacements when it has none.
+    no_hd: *mut SDL_GPUTexture,
+    no_hd_rows: *mut SDL_GPUTexture,
     frame: u64,
     /// Set by [`GpuRenderer::retire`]: the next eviction keeps only what the
     /// frame that follows drew.
@@ -304,6 +331,8 @@ impl GpuRenderer {
             meshes: HashMap::new(),
             pages: HashMap::new(),
             images: HashMap::new(),
+            no_hd: std::ptr::null_mut(),
+            no_hd_rows: std::ptr::null_mut(),
             frame: 0,
             retiring: false,
             fresh: Vec::new(),
@@ -328,6 +357,13 @@ impl GpuRenderer {
         renderer.ensure_layers(LAYER_WIDTH, LAYER_HEIGHT)?;
         renderer.sampler = renderer.create_sampler(SDL_GPU_FILTER_NEAREST)?;
         renderer.linear = renderer.create_sampler(SDL_GPU_FILTER_LINEAR)?;
+        renderer.no_hd = renderer.array_texture(SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM, 1, 1, 1)?;
+        renderer.no_hd_rows = renderer.texture(
+            SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UINT,
+            2,
+            1,
+            SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        )?;
         renderer.build_scene_pipelines()?;
         renderer.clear_scene()?;
         Ok(renderer)
@@ -513,6 +549,32 @@ impl GpuRenderer {
         self.target(format, width, height, usage, SDL_GPU_SAMPLECOUNT_1)
     }
 
+    /// A sampled 2D array texture of `layers` layers.
+    fn array_texture(
+        &self,
+        format: SDL_GPUTextureFormat,
+        width: u32,
+        height: u32,
+        layers: u32,
+    ) -> Result<*mut SDL_GPUTexture> {
+        let info = SDL_GPUTextureCreateInfo {
+            r#type: SDL_GPU_TEXTURETYPE_2D_ARRAY,
+            format,
+            usage: SDL_GPU_TEXTUREUSAGE_SAMPLER,
+            width,
+            height,
+            layer_count_or_depth: layers,
+            num_levels: 1,
+            sample_count: SDL_GPU_SAMPLECOUNT_1,
+            ..Default::default()
+        };
+        let texture = unsafe { SDL_CreateGPUTexture(self.device, &info) };
+        if texture.is_null() {
+            bail!("SDL_CreateGPUTexture failed: {}", sdl_error());
+        }
+        Ok(texture)
+    }
+
     /// [`GpuRenderer::texture`] with `samples` per pixel.
     fn target(
         &self,
@@ -691,9 +753,9 @@ impl GpuRenderer {
         let colour = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
 
         let mesh_vert = self.shader(MESH_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 1)?;
-        let mesh_frag = self.shader(MESH_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 2, 1)?;
+        let mesh_frag = self.shader(MESH_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 4, 1)?;
         let sprite_vert = self.shader(SPRITE_VERT, SDL_GPU_SHADERSTAGE_VERTEX, 0, 0)?;
-        let sprite_frag = self.shader(SPRITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 0)?;
+        let sprite_frag = self.shader(SPRITE_FRAG, SDL_GPU_SHADERSTAGE_FRAGMENT, 1, 1)?;
         let mesh = |this: &Self, cull, blend, write| {
             this.pipeline(
                 mesh_vert.shader,
@@ -821,6 +883,20 @@ impl GpuRenderer {
         height: u32,
         bytes: &[u8],
     ) -> Result<()> {
+        self.upload_layer(copy, texture, 0, width, height, bytes)
+    }
+
+    /// [`GpuRenderer::upload_texture`] into the top-left `width` x `height`
+    /// of an array texture's `layer`.
+    fn upload_layer(
+        &self,
+        copy: *mut SDL_GPUCopyPass,
+        texture: *mut SDL_GPUTexture,
+        layer: u32,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
         let transfer = self.stage(bytes)?;
         let source = SDL_GPUTextureTransferInfo {
             transfer_buffer: transfer,
@@ -830,6 +906,7 @@ impl GpuRenderer {
         };
         let destination = SDL_GPUTextureRegion {
             texture,
+            layer,
             w: width,
             h: height,
             d: 1,
@@ -901,10 +978,14 @@ impl GpuRenderer {
             }
             buffer
         };
+        let rows = built.vertices.iter().fold(0u32, |rows, vertex| {
+            rows | 1u32.checked_shl((vertex.packed >> 8) & 0xFFFF).unwrap_or(0)
+        });
         let value = MeshBuffer {
             buffer,
             vertex_count: built.vertices.len() as u32,
             blend_start: built.blend_start,
+            rows,
         };
         self.fresh.push(Upload::Mesh(key));
         if let Some(old) = self.meshes.insert(
@@ -920,11 +1001,15 @@ impl GpuRenderer {
         Ok(value)
     }
 
-    /// Make an indexed page and its palette resident.
+    /// Make an indexed page and its palette resident, with the HD
+    /// replacements `pack` carries for its CLUT rows. A missing replacement
+    /// is reported only for the rows in `used`.
     fn ensure_page(
         &mut self,
         copy: *mut SDL_GPUCopyPass,
         texture: &Texture8,
+        used: u32,
+        pack: Option<&Pack>,
     ) -> Result<Option<PageTextures>> {
         // Like the software rasterizer, an empty page draws nothing; a
         // truncated one draws its missing texels as index 0 (transparent).
@@ -932,6 +1017,7 @@ impl GpuRenderer {
             return Ok(None);
         }
         let key = texture as *const Texture8 as usize;
+        let pack = pack.filter(|pack| !pack.htexture().is_empty());
         let fingerprint = scene::texture_fingerprint(texture);
         if let Some(entry) = self.pages.get_mut(&key)
             && entry.fingerprint == fingerprint
@@ -958,7 +1044,12 @@ impl GpuRenderer {
                 return Err(err);
             }
         };
-        let value = PageTextures { indices, palette };
+        let mut value = PageTextures {
+            indices,
+            palette,
+            hd: std::ptr::null_mut(),
+            hd_rows: std::ptr::null_mut(),
+        };
         let pixels = (texture.width * texture.height) as usize;
         let padded;
         let page_indices = if texture.indices.len() >= pixels {
@@ -981,6 +1072,10 @@ impl GpuRenderer {
                     rows,
                     &palette_rgba,
                 )
+            })
+            .and_then(|()| match pack {
+                Some(pack) => self.upload_page_hd(copy, &mut value, texture, used, pack),
+                None => Ok(()),
             });
         if let Err(err) = uploaded {
             self.release_page(value);
@@ -1000,12 +1095,146 @@ impl GpuRenderer {
         Ok(Some(value))
     }
 
-    /// Make an RGBA image resident.
+    /// Look up the replacement of each of `texture`'s CLUT rows and upload
+    /// the ones found into `page`; a miss is reported for the rows in `used`.
+    fn upload_page_hd(
+        &self,
+        copy: *mut SDL_GPUCopyPass,
+        page: &mut PageTextures,
+        texture: &Texture8,
+        used: u32,
+        pack: &Pack,
+    ) -> Result<()> {
+        let table = pack.htexture();
+        let row_count = texture
+            .palettes
+            .len()
+            .div_ceil(crate::model::PALETTE_ROW_LEN)
+            .max(1);
+        // Rows sharing a replacement share its layer.
+        let mut layers: Vec<(String, Image)> = Vec::new();
+        let mut placed = vec![[0u16; 8]; row_count];
+        for (row, place) in placed.iter_mut().enumerate() {
+            let candidates = htexture::page_candidates(texture, row);
+            let found = if used & 1u32.checked_shl(row as u32).unwrap_or(0) != 0 {
+                table.find(&candidates, || {
+                    format!(
+                        "{}x{} model page, CLUT row {row}",
+                        texture.width, texture.height
+                    )
+                })
+            } else {
+                table.find_quietly(&candidates)
+            };
+            let Some(found) = found else {
+                continue;
+            };
+            let layer = match layers.iter().position(|(path, _)| *path == found.path) {
+                Some(layer) => layer,
+                None => match htexture::load(pack, &found.path) {
+                    Ok(image) if image.width > 0 && image.height > 0 => {
+                        layers.push((found.path, image));
+                        layers.len() - 1
+                    }
+                    Ok(_) => continue,
+                    Err(err) => {
+                        eprintln!("htexture: {err:#}");
+                        continue;
+                    }
+                },
+            };
+            let image = &layers[layer].1;
+            *place = [
+                layer as u16 + 1,
+                found.frame[0].min(0xFFFF) as u16,
+                found.frame[1].min(0xFFFF) as u16,
+                0,
+                image.width.min(0xFFFF) as u16,
+                image.height.min(0xFFFF) as u16,
+                0,
+                0,
+            ];
+        }
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let width = layers
+            .iter()
+            .map(|(_, image)| image.width)
+            .max()
+            .unwrap_or(1);
+        let height = layers
+            .iter()
+            .map(|(_, image)| image.height)
+            .max()
+            .unwrap_or(1);
+        page.hd = self.array_texture(
+            SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
+            width,
+            height,
+            layers.len() as u32,
+        )?;
+        page.hd_rows = self.texture(
+            SDL_GPU_TEXTUREFORMAT_R16G16B16A16_UINT,
+            2,
+            row_count as u32,
+            SDL_GPU_TEXTUREUSAGE_SAMPLER,
+        )?;
+        for (layer, (_, image)) in layers.iter().enumerate() {
+            let bytes = &image.rgba[..(image.width * image.height * 4) as usize];
+            self.upload_layer(
+                copy,
+                page.hd,
+                layer as u32,
+                image.width,
+                image.height,
+                bytes,
+            )?;
+        }
+        let bytes: Vec<u8> = placed
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        self.upload_texture(copy, page.hd_rows, 2, row_count as u32, &bytes)
+    }
+
+    /// The HD replacement `pack` carries for `image`, and its texels per
+    /// original texel.
+    fn image_replacement(image: &Image, pack: &Pack) -> Option<(Image, [f32; 2])> {
+        let found = pack
+            .htexture()
+            .find(&htexture::image_candidates(image), || {
+                format!("{}x{} image", image.width, image.height)
+            })?;
+        match htexture::load(pack, &found.path) {
+            Ok(hd)
+                if hd.width > 0
+                    && hd.height > 0
+                    && hd.rgba.len() >= (hd.width * hd.height * 4) as usize =>
+            {
+                let scale = [
+                    hd.width as f32 / found.frame[0].max(1) as f32,
+                    hd.height as f32 / found.frame[1].max(1) as f32,
+                ];
+                Some((hd, scale))
+            }
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("htexture: {err:#}");
+                None
+            }
+        }
+    }
+
+    /// Make an RGBA image, or the HD replacement `pack` carries for it,
+    /// resident.
     fn ensure_image(
         &mut self,
         copy: *mut SDL_GPUCopyPass,
         image: &Image,
-    ) -> Result<Option<*mut SDL_GPUTexture>> {
+        pack: Option<&Pack>,
+    ) -> Result<Option<ImageTexture>> {
         if image.width == 0
             || image.height == 0
             || image.rgba.len() < (image.width * image.height * 4) as usize
@@ -1020,29 +1249,37 @@ impl GpuRenderer {
             entry.last_used = self.frame;
             return Ok(Some(entry.value));
         }
+        let replacement = pack
+            .filter(|pack| !pack.htexture().is_empty())
+            .and_then(|pack| Self::image_replacement(image, pack));
+        let (source, scale) = match &replacement {
+            Some((hd, scale)) => (hd, *scale),
+            None => (image, [1.0, 1.0]),
+        };
         let texture = self.texture(
             SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM,
-            image.width,
-            image.height,
+            source.width,
+            source.height,
             SDL_GPU_TEXTUREUSAGE_SAMPLER,
         )?;
-        let bytes = &image.rgba[..(image.width * image.height * 4) as usize];
-        if let Err(err) = self.upload_texture(copy, texture, image.width, image.height, bytes) {
+        let bytes = &source.rgba[..(source.width * source.height * 4) as usize];
+        if let Err(err) = self.upload_texture(copy, texture, source.width, source.height, bytes) {
             unsafe { SDL_ReleaseGPUTexture(self.device, texture) };
             return Err(err);
         }
+        let value = ImageTexture { texture, scale };
         self.fresh.push(Upload::Image(key));
         if let Some(old) = self.images.insert(
             key,
             Resident {
-                value: texture,
+                value,
                 fingerprint,
                 last_used: self.frame,
             },
         ) {
-            unsafe { SDL_ReleaseGPUTexture(self.device, old.value) };
+            unsafe { SDL_ReleaseGPUTexture(self.device, old.value.texture) };
         }
-        Ok(Some(texture))
+        Ok(Some(value))
     }
 
     fn release_mesh(&self, mesh: MeshBuffer) {
@@ -1055,6 +1292,11 @@ impl GpuRenderer {
         unsafe {
             SDL_ReleaseGPUTexture(self.device, page.indices);
             SDL_ReleaseGPUTexture(self.device, page.palette);
+            for texture in [page.hd, page.hd_rows] {
+                if !texture.is_null() {
+                    SDL_ReleaseGPUTexture(self.device, texture);
+                }
+            }
         }
     }
 
@@ -1100,7 +1342,7 @@ impl GpuRenderer {
             .collect();
         for key in images {
             if let Some(entry) = self.images.remove(&key) {
-                unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
+                unsafe { SDL_ReleaseGPUTexture(self.device, entry.value.texture) };
             }
         }
     }
@@ -1121,7 +1363,7 @@ impl GpuRenderer {
             self.release_page(entry.value);
         }
         for (_, entry) in std::mem::take(&mut self.images) {
-            unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
+            unsafe { SDL_ReleaseGPUTexture(self.device, entry.value.texture) };
         }
     }
 
@@ -1142,7 +1384,7 @@ impl GpuRenderer {
                 }
                 Upload::Image(key) => {
                     if let Some(entry) = self.images.remove(&key) {
-                        unsafe { SDL_ReleaseGPUTexture(self.device, entry.value) };
+                        unsafe { SDL_ReleaseGPUTexture(self.device, entry.value.texture) };
                     }
                 }
             }
@@ -1154,14 +1396,15 @@ impl GpuRenderer {
         (self.meshes.len(), self.pages.len(), self.images.len())
     }
 
-    /// Draw `scene` into the scene target. The result persists until the next
-    /// call, so a frozen frame (the pause menu) keeps compositing it.
-    pub fn record_scene(&mut self, scene: &GameplayScene<'_>) -> Result<()> {
+    /// Draw `scene` into the scene target, with the HD replacements `pack`
+    /// carries. The result persists until the next call, so a frozen frame
+    /// (the pause menu) keeps compositing it.
+    pub fn record_scene(&mut self, scene: &GameplayScene<'_>, pack: Option<&Pack>) -> Result<()> {
         self.follow_window()?;
         self.frame += 1;
         self.fresh.clear();
         let command = self.command_buffer()?;
-        let recorded = self.record_scene_into(command, scene);
+        let recorded = self.record_scene_into(command, scene, pack);
         let submitted = match recorded {
             Ok(()) => Self::submit(command),
             Err(err) => {
@@ -1182,6 +1425,7 @@ impl GpuRenderer {
         &mut self,
         command: *mut SDL_GPUCommandBuffer,
         scene: &GameplayScene<'_>,
+        pack: Option<&Pack>,
     ) -> Result<()> {
         // Uploads first: the residency checks and this frame's sprites.
         let copy = unsafe { SDL_BeginGPUCopyPass(command) };
@@ -1192,7 +1436,7 @@ impl GpuRenderer {
             let mut meshes = Vec::with_capacity(scene.meshes.len());
             for mesh in scene.meshes {
                 let buffer = self.ensure_mesh(copy, mesh.mesh)?;
-                let page = self.ensure_page(copy, mesh.texture)?;
+                let page = self.ensure_page(copy, mesh.texture, buffer.rows, pack)?;
                 meshes.push(page.map(|page| (buffer, page)));
             }
             let sprites = scene::scene_sprites(scene);
@@ -1200,7 +1444,7 @@ impl GpuRenderer {
             for run in sprites.before.iter().chain(&sprites.after) {
                 let key = run.image as *const Image as usize;
                 if let std::collections::hash_map::Entry::Vacant(slot) = sprite_textures.entry(key)
-                    && let Some(texture) = self.ensure_image(copy, run.image)?
+                    && let Some(texture) = self.ensure_image(copy, run.image, pack)?
                 {
                     slot.insert(texture);
                 }
@@ -1285,11 +1529,18 @@ impl GpuRenderer {
                     self.pipelines.sprite_test
                 };
                 let sampler = SDL_GPUTextureSamplerBinding {
-                    texture,
+                    texture: texture.texture,
                     sampler: self.sampler,
                 };
+                let scale = [texture.scale[0], texture.scale[1], 0.0, 0.0];
                 unsafe {
                     SDL_BindGPUGraphicsPipeline(pass, pipeline);
+                    SDL_PushGPUFragmentUniformData(
+                        command,
+                        0,
+                        scale.as_ptr().cast::<c_void>(),
+                        std::mem::size_of_val(&scale) as u32,
+                    );
                     SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
                     SDL_BindGPUFragmentSamplers(pass, 0, &sampler, 1);
                     SDL_DrawGPUPrimitives(pass, run.count, 1, run.first, 0);
@@ -1358,14 +1609,21 @@ impl GpuRenderer {
                     (false, true) => self.pipelines.mesh_opaque_unculled,
                     (true, true) => self.pipelines.mesh_blend_unculled,
                 };
+                let mut material = scene::material(mesh.blend_weight, blend_pass);
+                let hd = if page.hd.is_null() {
+                    [self.no_hd, self.no_hd_rows]
+                } else {
+                    material[2] = 1.0;
+                    [page.hd, page.hd_rows]
+                };
                 draw_mesh(
                     command,
                     pass,
                     pipeline,
                     &uniforms,
-                    scene::material(mesh.blend_weight, blend_pass),
+                    material,
                     buffer.buffer,
-                    [page.indices, page.palette],
+                    [page.indices, page.palette, hd[0], hd[1]],
                     self.sampler,
                     first,
                     count,
@@ -1693,7 +1951,7 @@ fn draw_mesh(
     uniforms: &DrawUniforms,
     material: [f32; 4],
     buffer: *mut SDL_GPUBuffer,
-    textures: [*mut SDL_GPUTexture; 2],
+    textures: [*mut SDL_GPUTexture; 4],
     sampler: *mut SDL_GPUSampler,
     first: u32,
     count: u32,
@@ -1716,7 +1974,7 @@ fn draw_mesh(
             std::mem::size_of_val(&material) as u32,
         );
         SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
-        SDL_BindGPUFragmentSamplers(pass, 0, samplers.as_ptr(), 2);
+        SDL_BindGPUFragmentSamplers(pass, 0, samplers.as_ptr(), samplers.len() as u32);
         SDL_DrawGPUPrimitives(pass, count, 1, first, 0);
     }
 }
@@ -1749,7 +2007,12 @@ impl Drop for GpuRenderer {
             for pipeline in pipelines.into_iter().filter(|p| !p.is_null()) {
                 SDL_ReleaseGPUGraphicsPipeline(self.device, pipeline);
             }
-            let textures = [self.layer_black, self.layer_white];
+            let textures = [
+                self.layer_black,
+                self.layer_white,
+                self.no_hd,
+                self.no_hd_rows,
+            ];
             for texture in textures.into_iter().filter(|t| !t.is_null()) {
                 SDL_ReleaseGPUTexture(self.device, texture);
             }
@@ -1910,7 +2173,7 @@ mod tests {
         };
         let mut software = Framebuffer::new();
         scene.draw(&mut software);
-        gpu.record_scene(&scene).unwrap();
+        gpu.record_scene(&scene, None).unwrap();
         let hardware = gpu.read_scene().unwrap();
         assert_eq!(hardware.len(), software.rgba.len());
 
@@ -1950,10 +2213,145 @@ mod tests {
             mirror_from: 0,
             ..scene
         };
-        gpu.record_scene(&empty).unwrap();
+        gpu.record_scene(&empty, None).unwrap();
         assert_eq!(gpu.resident_counts(), resident);
         gpu.retire();
-        gpu.record_scene(&empty).unwrap();
+        gpu.record_scene(&empty, None).unwrap();
         assert_eq!(gpu.resident_counts(), (0, 0, 0));
+    }
+
+    /// A pack's `htexture/` replacements are drawn in place of the background
+    /// and the model page whose pixels hash to their names, at their own
+    /// resolution.
+    #[test]
+    fn gpu_scene_draws_hd_replacements() {
+        let _lock = crate::audio::test_lock::sdl();
+        let Ok(_sdl) = crate::engine::SdlHandle::acquire() else {
+            eprintln!("skipping: SDL video unavailable");
+            return;
+        };
+        let mut gpu = match GpuRenderer::offscreen(1) {
+            Ok(gpu) => gpu,
+            Err(err) => {
+                eprintln!("skipping: {err:#}");
+                return;
+            }
+        };
+        let solid = |width: u32, height: u32, colour: fn(u32) -> [u8; 3]| Image {
+            width,
+            height,
+            rgba: (0..width * height)
+                .flat_map(|i| {
+                    let [r, g, b] = colour(i % width);
+                    [r, g, b, 255]
+                })
+                .collect(),
+        };
+        let background = solid(320, 240, |x| [(x / 2) as u8, 64, 64]);
+        // Twice the background's resolution: blue in the left half of the
+        // original's texels, green in the right.
+        let hd_background = solid(
+            640,
+            480,
+            |x| if x < 320 { [0, 0, 240] } else { [0, 240, 0] },
+        );
+        let (mesh, texture) = cube();
+        // The cube's 64-wide page covers 64 x 256 texels of its replacement.
+        let hd_page = solid(128, 512, |_| [240, 240, 240]);
+        let mut writer = crate::pack::PackWriter::new();
+        let background_hash = htexture::image_candidates(&background)[0].hash;
+        let page_hash = htexture::page_candidates(&texture, 0)[0].hash;
+        for (path, image) in [
+            (
+                format!("htexture/bgd/{background_hash:08X}.bmp"),
+                &hd_background,
+            ),
+            (format!("htexture/skin/{page_hash:08X}.bmp"), &hd_page),
+        ] {
+            writer
+                .add(&path, crate::bmp::encode_to_vec(image).unwrap())
+                .unwrap();
+        }
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+
+        let joints = [Mat4x3 {
+            r: crate::anim::rotation_matrix(200, 500, 0),
+            t: [100, -700, 0],
+        }];
+        let meshes = [EntityMesh {
+            mesh: &mesh,
+            texture: &texture,
+            joints: &joints,
+            tint: [255; 3],
+            blend_weight: None,
+            hidden_joints: 0,
+            light_pos: None,
+            per_joint_light: false,
+            light_rotation: None,
+            joint_colours: crate::render::NO_JOINT_COLOURS,
+            complex_object: None,
+            aliased_light: false,
+        }];
+        let camera = Camera::from_points([2600, -2400, 5200], [0, -700, 0], 600);
+        let lighting = Lighting {
+            ambient: [4096, 4096, 4096],
+            lights: Default::default(),
+        };
+        let scene = GameplayScene {
+            background: Some(&background),
+            origin: [0, 0],
+            colour: [255; 3],
+            meshes: &meshes,
+            shadows: &[],
+            camera: &camera,
+            lighting: &lighting,
+            mask_layer: None,
+            effect_layer: None,
+            mirror_from: meshes.len(),
+            mirror: None,
+        };
+        // Where the cube is: what its original draw changes.
+        let mut draw = |scene: &GameplayScene<'_>, pack: Option<&Pack>| {
+            gpu.release_residency();
+            gpu.record_scene(scene, pack).unwrap();
+            gpu.read_scene().unwrap()
+        };
+        let original = draw(&scene, None);
+        let bare = draw(
+            &GameplayScene {
+                meshes: &[],
+                mirror_from: 0,
+                ..scene
+            },
+            None,
+        );
+        let hardware = draw(&scene, Some(&pack));
+        let (mut cube_pixels, mut grey) = (0, 0);
+        for (index, ((hd, original), bare)) in hardware
+            .chunks(4)
+            .zip(original.chunks(4))
+            .zip(bare.chunks(4))
+            .enumerate()
+        {
+            let x = index % LAYER_WIDTH as usize;
+            let [r, g, b] = [hd[0], hd[1], hd[2]];
+            if original != bare {
+                // The cube: its faces' colours are replaced by grey.
+                cube_pixels += 1;
+                grey += usize::from(r.abs_diff(g) < 16 && g.abs_diff(b) < 16);
+            } else if x < 150 {
+                assert!(b > 200 && g < 40, "{index} is {:?}", [r, g, b]);
+            } else if x > 170 {
+                assert!(g > 200 && b < 40, "{index} is {:?}", [r, g, b]);
+            }
+        }
+        assert!(
+            cube_pixels > 5000,
+            "the cube covers only {cube_pixels} pixels"
+        );
+        assert!(
+            grey * 10 > cube_pixels * 9,
+            "{grey} of {cube_pixels} cube pixels are grey"
+        );
     }
 }
