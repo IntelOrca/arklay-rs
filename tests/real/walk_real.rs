@@ -279,3 +279,56 @@ fn real_room5000_footstep_plays_on_the_contact_frame() {
     assert_real_footstep(&pack, sound.name);
     assert_eq!(sound.pos, entity.pos, "the cue carries the entity position");
 }
+
+/// Issue #119: with `[game] quick_turn` on, BACKWARD + RUN turns the player
+/// 180 degrees over eight ticks without moving him, and the next backpedal
+/// tick moves again. The option off leaves the same pad as a plain backpedal.
+#[test]
+#[ignore = "requires both ARKLAY_RE1_ROOT and ARKLAY_RE1_PACK"]
+fn real_quick_turn_rotates_in_place() {
+    let Some((_root, pack_path)) = common::asset_env() else {
+        return;
+    };
+    let pack = Pack::open(&pack_path).unwrap();
+    let id = RoomId::parse("1001").unwrap();
+
+    fn enable(game: &mut GameState, _player: &mut player::PlayerState) {
+        game.player_options.quick_turn = true;
+    }
+    // BACKWARD from the first tick; RUN goes down on tick 2, the trigger.
+    fn turn(tick: usize) -> Input {
+        Input {
+            down: true,
+            run: tick >= 2,
+            run_pressed: tick == 2,
+            ..Input::default()
+        }
+    }
+
+    // Ticks 0..=2 end on the turn's first rotation; 0..=9 on its eighth.
+    let baseline = simulate_room_prepared(&pack, id, &[], 3, |_, _| {}, turn).unwrap();
+    let first = simulate_room_prepared(&pack, id, &[], 3, enable, turn).unwrap();
+    let done = simulate_room_prepared(&pack, id, &[], 10, enable, turn).unwrap();
+    let off = simulate_room_prepared(&pack, id, &[], 10, |_, _| {}, turn).unwrap();
+
+    assert_eq!(first.player.locked, player::LockedAction::QuickTurn);
+    assert_eq!(first.player.angle, (baseline.player.angle + 0x100) & 0x0FFF);
+    assert_eq!(done.player.locked, player::LockedAction::None);
+    assert_eq!(
+        done.player.angle,
+        (first.player.angle + 7 * 0x100) & 0x0FFF,
+        "eight ticks turn half the 12-bit circle"
+    );
+    assert_eq!(
+        done.player.pos, first.player.pos,
+        "the turn must not move the player"
+    );
+    assert_eq!(done.game.entities[0].angle, done.player.angle);
+    assert_eq!(done.game.entities[0].pos, done.player.pos);
+
+    // The option off: the same pad backpedals, so no rotation and a different
+    // position. RUN's press edge is ignored without the option.
+    assert_eq!(off.player.locked, player::LockedAction::None);
+    assert_eq!(off.player.angle, baseline.player.angle);
+    assert_ne!(off.player.pos, done.player.pos);
+}

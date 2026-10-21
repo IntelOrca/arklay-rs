@@ -3673,6 +3673,10 @@ pub struct GameState {
     /// (`api:register_save_screen`), or `None` for the ported original screen.
     /// It is pack-level UI state, not part of a save block.
     pub save_screen: Option<String>,
+    /// The player gameplay options from `arklay.toml`'s `[game]` table and the
+    /// matching command-line overrides. Runtime options, not part of a save
+    /// block.
+    pub player_options: crate::player::Options,
 }
 
 /// The initial entity array: only the player slot is spawned.
@@ -3825,6 +3829,7 @@ impl Default for GameState {
             effect_placeholder_hits: [0; effects::EFFECT_BEHAVIOR_COUNT],
             last_effect_spawn: None,
             save_screen: None,
+            player_options: crate::player::Options::default(),
         }
     }
 }

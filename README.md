@@ -269,6 +269,21 @@ then applies for the run only. Gamepads are picked up when plugged in; extra
 controller mappings can be dropped into `gamecontrollerdb.txt` in the config
 directory (or `SDL_GAMECONTROLLERCONFIG`).
 
+`[game]` holds gameplay options that stay at the original's behaviour unless
+turned on. `quick_turn` enables Classic REbirth's quick turn: while walking
+backward (including the back diagonals), pressing RUN turns the player 180
+degrees in place over eight ticks, plays the no-weapon walk animation and its
+footsteps, and hands control back to normal movement. The player does not
+move or collide during the turn, and the new facing is live for rendering,
+collision and scripts. `--quick-turn` and `--no-quick-turn` override the file
+for one run; scripted `--trace`/`--input` runs force it off unless
+`--quick-turn` is given explicitly, so existing traces are unchanged:
+
+```toml
+[game]
+quick_turn = true # BACKWARD + RUN turns the player 180 degrees
+```
+
 `F8` steps the window up to the next whole multiple of 320x240, switches to
 borderless fullscreen once the next size would not fit the display, and goes
 back to 320x240 after that; `Alt+Enter` toggles borderless fullscreen. The

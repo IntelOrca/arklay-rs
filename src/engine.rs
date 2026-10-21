@@ -350,6 +350,7 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
         false,
         false,
         None,
+        player::Options::default(),
         trace::TraceOptions::default(),
         Authoring::default(),
     )
@@ -363,7 +364,8 @@ pub fn run(pack: &Path, id: RoomId, capture: Option<&Path>, ticks: u32) -> Resul
 /// phases and prints the [`crate::stats`] report to stdout at exit; it runs
 /// without a capture and without opening a display. `_debug_menu` is retained
 /// for CLI compatibility: the port-only F1 room-select overlay is always
-/// enabled. `trace` enables the oracle trace of `oracle/trace-v1.md`: one line
+/// enabled. `player_options` are the `[game]` gameplay options this run uses.
+/// `trace` enables the oracle trace of `oracle/trace-v1.md`: one line
 /// per fixed tick (rendering each tick so the frame hash exists) plus the
 /// `--capture-every` BMP cadence.
 #[allow(clippy::too_many_arguments)] // the CLI run options are all needed
@@ -376,6 +378,7 @@ pub fn run_with_options(
     stats: bool,
     _debug_menu: bool,
     language: Option<&str>,
+    player_options: player::Options,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
@@ -391,6 +394,7 @@ pub fn run_with_options(
         let load_start = Instant::now();
         let mut loaded = load_room(&pack, id)?;
         let mut game = new_game_state(&pack, id, &loaded.room);
+        game.player_options = player_options;
         seed_room_items(&mut game);
         // The arbitrary-room boot seeds the selected character's start block
         // like the interactive `from_room` path, so a headless run starts with
@@ -638,6 +642,7 @@ pub fn run_with_options(
     // confirmed F9 return and the debug tools' load/clear game requests all
     // need the mode machine to own the next screen.
     let mut app = App::new(pack, save_dir, true);
+    app.player_options = player_options;
     app.start_session(session);
     run_app_loop(&mut app, &mut display, stats)
 }
@@ -6300,6 +6305,9 @@ struct App {
     /// sessions this app starts. Enabled by default; `--debug-menu` is
     /// retained for CLI compatibility.
     debug_menu: bool,
+    /// The `[game]` gameplay options (`--quick-turn`) every gameplay session
+    /// this app starts runs with.
+    player_options: player::Options,
     /// The active post-film ending sequence, or `None` outside one.
     ending: Option<EndingFlow>,
 }
@@ -6350,6 +6358,7 @@ impl App {
             prologue_pending: false,
             ui_sfx_cache: SfxCache::default(),
             debug_menu: true,
+            player_options: player::Options::default(),
             ending: None,
         }
     }
@@ -6704,6 +6713,7 @@ impl App {
         session.set_debug_menu(self.debug_menu);
         session.set_skips_enabled(self.skips_enabled);
         session.set_bindings(self.bindings.clone());
+        session.game.player_options = self.player_options;
         if self.audio {
             session.start_audio(&self.pack);
         }
@@ -7437,6 +7447,7 @@ pub fn run_ui_with_options(
         &ModOptions::default(),
         false,
         None,
+        player::Options::default(),
         trace::TraceOptions::default(),
         Authoring::default(),
     )
@@ -7448,7 +7459,8 @@ pub fn run_ui_with_options(
 /// `trace` enables the `--ui game` oracle run: `ticks` fixed updates with a
 /// trace line per tick and the `capture_every` BMP cadence. `authoring` adds
 /// the CLI's oracle seams: a `--load` continue boot, the `--setup-script`
-/// chunk and the `--save-out` dump.
+/// chunk and the `--save-out` dump. `player_options` are the `[game]`
+/// gameplay options the booted sessions run with.
 #[allow(clippy::too_many_arguments)] // the CLI boot options are all needed
 pub fn run_ui_with_mods(
     pack: &Path,
@@ -7461,6 +7473,7 @@ pub fn run_ui_with_mods(
     mods: &ModOptions,
     _debug_menu: bool,
     language: Option<&str>,
+    player_options: player::Options,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
@@ -7511,6 +7524,7 @@ pub fn run_ui_with_mods(
         mods,
         _debug_menu,
         language,
+        player_options,
         trace,
         authoring,
     )
@@ -7528,6 +7542,7 @@ pub fn run_root(
     _debug_menu: bool,
     language: Option<&str>,
     renderer: Graphics,
+    player_options: player::Options,
 ) -> Result<()> {
     run_ui_impl(
         pack,
@@ -7537,6 +7552,7 @@ pub fn run_root(
         mods,
         _debug_menu,
         language,
+        player_options,
         trace::TraceOptions::default(),
         Authoring {
             renderer,
@@ -7586,6 +7602,7 @@ fn run_ui_impl(
     mods: &ModOptions,
     _debug_menu: bool,
     language: Option<&str>,
+    player_options: player::Options,
     trace: trace::TraceOptions<'_>,
     authoring: Authoring<'_>,
 ) -> Result<()> {
@@ -7596,6 +7613,7 @@ fn run_ui_impl(
     {
         let pack = open_game_pack(pack, mods, language)?;
         let mut app = App::new(pack, save_dir.to_path_buf(), false);
+        app.player_options = player_options;
         match boot {
             // A root-boot capture is the title capture: no automatic films.
             AppBoot::Boot | AppBoot::Title => {
@@ -7774,6 +7792,7 @@ fn run_ui_impl(
 
     let pack = open_game_pack(pack, mods, language)?;
     let mut app = App::new(pack, save_dir.to_path_buf(), true);
+    app.player_options = player_options;
     app.boot(boot)?;
     if let Mode::Play(session) = &mut app.mode {
         session.run_setup_script(authoring.setup_script)?;
@@ -17543,6 +17562,7 @@ mod tests {
             &ModOptions::default(),
             false,
             None,
+            player::Options::default(),
             trace::TraceOptions::default(),
             Authoring {
                 setup_script: Some(&script),
@@ -17569,6 +17589,7 @@ mod tests {
             &ModOptions::default(),
             false,
             None,
+            player::Options::default(),
             trace::TraceOptions {
                 path: Some(&trace_path),
                 capture_every: 0,
@@ -17844,6 +17865,7 @@ mod tests {
                 },
                 false,
                 None,
+                player::Options::default(),
                 trace::TraceOptions::default(),
                 Authoring::default(),
             )
@@ -18026,6 +18048,7 @@ mod tests {
                 },
                 false,
                 None,
+                player::Options::default(),
                 trace::TraceOptions::default(),
                 Authoring::default(),
             )

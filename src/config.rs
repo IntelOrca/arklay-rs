@@ -6,8 +6,8 @@
 //! configuration. The grammar is the same small TOML subset the pack manifest
 //! uses — comments, blank lines and `key = "value"`, plus TOML's literal
 //! `key = 'value'` strings so a Windows path needs no escaping — with two
-//! root keys and three tables (the `[graphics]` table also takes bare integers
-//! and booleans):
+//! root keys and four tables (the `[graphics]` table also takes bare integers
+//! and booleans, and so does `[game]`):
 //!
 //! ```toml
 //! # Where saves are read and written (default: <config dir>/save).
@@ -19,6 +19,10 @@
 //! # left out keeps its default (see `crate::controls`).
 //! [bindings]
 //! aim = ["key:C", "mouse:right", "axis:lefttrigger+"]
+//!
+//! # Gameplay options (`--quick-turn` overrides the first one).
+//! [game]
+//! quick_turn = true      # BACKWARD + RUN turns the player 180 degrees
 //!
 //! # The interactive window (see `crate::video`); a key left out keeps its
 //! # default. F8 and Alt+Enter rewrite `fullscreen` and the window size, and
@@ -97,6 +101,17 @@ pub struct Config {
     pub graphics: Graphics,
     /// The `[mods]` enable/disable/order selection.
     pub mods: Mods,
+    /// The `[game]` gameplay options.
+    pub game: Game,
+}
+
+/// The `[game]` gameplay options.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Game {
+    /// Classic REbirth's quick turn: a RUN press while walking backward
+    /// turns the player 180 degrees in place over eight ticks. Off by
+    /// default, like the reference's `[DLL] QuickTurn`.
+    pub quick_turn: bool,
 }
 
 /// The table the parser is in.
@@ -106,6 +121,7 @@ enum Table {
     Bindings,
     Graphics,
     Mods,
+    Game,
     /// A table that could not be used; its keys are skipped.
     Ignored,
 }
@@ -202,9 +218,11 @@ impl Config {
         let mut table = Table::Root;
         let mut seen_graphics = false;
         let mut seen_mods = false;
+        let mut seen_game = false;
         let mut bound = Vec::new();
         let mut graphics_keys: Vec<String> = Vec::new();
         let mut mod_keys: Vec<String> = Vec::new();
+        let mut game_keys: Vec<String> = Vec::new();
         for (index, raw) in text.lines().enumerate() {
             let line = index + 1;
             let content = strip_comment(raw).trim();
@@ -225,7 +243,11 @@ impl Config {
                         seen_mods = true;
                         Table::Mods
                     }
-                    Some(name @ ("bindings" | "graphics" | "mods")) => {
+                    Some("game") if !seen_game => {
+                        seen_game = true;
+                        Table::Game
+                    }
+                    Some(name @ ("bindings" | "graphics" | "mods" | "game")) => {
                         warnings.push(format!("line {line}: duplicate [{name}] table ignored"));
                         Table::Ignored
                     }
@@ -247,6 +269,7 @@ impl Config {
                     parse_graphics_line(&mut config.graphics, &mut graphics_keys, content, line)
                 }
                 Table::Mods => parse_mods_line(&mut config.mods, &mut mod_keys, content, line),
+                Table::Game => parse_game_line(&mut config.game, &mut game_keys, content, line),
                 Table::Bindings => parse_binding_line(&mut config, &mut bound, content, line),
             };
             if let Err(err) = parsed {
@@ -300,6 +323,14 @@ impl Config {
                     .collect();
                 out.push_str(&format!("{} = [{}]\n", action.name(), names.join(", ")));
             }
+        }
+        let game = render_game(&self.game);
+        if !game.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[game]\n");
+            out.push_str(&game);
         }
         let graphics = render_graphics(&self.graphics);
         if !graphics.is_empty() {
@@ -544,6 +575,42 @@ fn render_mods(mods: &Mods) -> String {
             let ids: Vec<String> = ids.iter().map(|id| quote(id)).collect();
             out.push_str(&format!("{key} = [{}]\n", ids.join(", ")));
         }
+    }
+    out
+}
+
+/// Parse one `[game]` line into `game`; a bad line leaves its option at the
+/// default.
+fn parse_game_line(
+    game: &mut Game,
+    seen: &mut Vec<String>,
+    content: &str,
+    line: usize,
+) -> Result<()> {
+    let (key, value) = key_value(content, line)?;
+    if seen.iter().any(|seen| seen == key) {
+        bail!("line {line}: duplicate key `{key}`");
+    }
+    seen.push(key.to_string());
+    match key {
+        "quick_turn" => {
+            game.quick_turn = match value {
+                "true" => true,
+                "false" => false,
+                _ => bail!("line {line}: `quick_turn` expects true or false"),
+            };
+        }
+        other => bail!("line {line}: unknown key `{other}`"),
+    }
+    Ok(())
+}
+
+/// The `[game]` keys that differ from the defaults.
+fn render_game(game: &Game) -> String {
+    let defaults = Game::default();
+    let mut out = String::new();
+    if game.quick_turn != defaults.quick_turn {
+        out.push_str(&format!("quick_turn = {}\n", game.quick_turn));
     }
     out
 }
@@ -796,6 +863,7 @@ mod tests {
             bindings: None,
             graphics: Graphics::default(),
             mods: Mods::default(),
+            game: Game::default(),
         }
         .render();
         assert_eq!(text, "save_dir = \"/tmp/saves\"\nlanguage = \"en-US\"\n");
@@ -989,6 +1057,54 @@ mod tests {
         // A bindings table that locks out the menus falls back as a whole.
         let (config, warnings) = Config::parse_lenient("[bindings]\nconfirm = []\n");
         assert_eq!((config.bindings, warnings.len()), (None, 1));
+    }
+
+    #[test]
+    fn a_game_table_sets_the_gameplay_options() {
+        let config = Config::parse("[game]\nquick_turn = true  # BACKWARD + RUN\n").unwrap();
+        assert!(config.game.quick_turn);
+        let text = config.render();
+        assert_eq!(text, "[game]\nquick_turn = true\n");
+        assert_eq!(Config::parse(&text).unwrap(), config);
+        // The default is off and is not written.
+        assert!(!Config::parse("").unwrap().game.quick_turn);
+        assert_eq!(Config::default().render(), "");
+        assert_eq!(
+            Config::parse("[game]\nquick_turn = false\n")
+                .unwrap()
+                .render(),
+            ""
+        );
+    }
+
+    #[test]
+    fn bad_game_values_warn_and_keep_their_defaults() {
+        for text in [
+            "[game]\nquick_turn = \"yes\"\n",
+            "[game]\nquick_turn = 1\n",
+            "[game]\nunknown = true\n",
+            "[game]\n[game]\n",
+        ] {
+            assert!(Config::parse(text).is_err(), "{text:?} must be rejected");
+            let (config, warnings) = Config::parse_lenient(text);
+            assert!(!warnings.is_empty(), "{text:?} must warn");
+            assert!(!config.game.quick_turn, "{text:?}");
+        }
+        // A duplicate key warns and keeps the first value.
+        let text = "[game]\nquick_turn = true\nquick_turn = false\n";
+        assert!(Config::parse(text).is_err());
+        let (config, warnings) = Config::parse_lenient(text);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(config.game.quick_turn);
+        // Only the bad line falls back; the rest of the file still applies.
+        let (config, warnings) = Config::parse_lenient("[game]\nquick_turn = true\n");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(config.game.quick_turn);
+        let (config, warnings) = Config::parse_lenient(
+            "[game]\nquick_turn = true\n[bindings]\naim = [\"key:NoSuchKey\"]\n",
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(config.game.quick_turn);
     }
 
     #[test]

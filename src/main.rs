@@ -136,6 +136,16 @@ struct Cli {
     #[arg(long, requires = "pack")]
     no_mods: bool,
 
+    /// Enable Classic REbirth's quick turn for this run: while walking
+    /// backward, RUN turns the player 180 degrees in place over eight ticks.
+    /// Overrides `[game] quick_turn` in arklay.toml
+    #[arg(long, requires = "pack", overrides_with = "no_quick_turn")]
+    quick_turn: bool,
+
+    /// Disable the quick turn for this run, whatever `[game] quick_turn` says
+    #[arg(long, requires = "pack", overrides_with = "quick_turn")]
+    no_quick_turn: bool,
+
     /// Render one frame to a file and exit (headless testing)
     #[arg(long, value_name = "FILE", requires = "pack")]
     capture: Option<PathBuf>,
@@ -240,6 +250,15 @@ struct Cli {
 fn parse_aspect(value: &str) -> Result<arklay::video::Aspect, String> {
     arklay::video::Aspect::parse(value)
         .ok_or_else(|| format!("expected W:H from 4:3 to 32:9, got `{value}`"))
+}
+
+/// The quick-turn setting for this run.
+///
+/// An explicit `--quick-turn` (or `--no-quick-turn`) wins. Otherwise the
+/// config's `[game] quick_turn` applies, except to a scripted oracle run
+/// (`--trace`/`--input`), which stays off so its output is unchanged.
+fn quick_turn_enabled(explicit: Option<bool>, configured: bool, scripted: bool) -> bool {
+    explicit.unwrap_or(configured && !scripted)
 }
 
 /// Parse `--msaa`: one of [`arklay::video::MSAA_COUNTS`].
@@ -762,6 +781,20 @@ fn main() -> Result<()> {
             for warning in warnings {
                 eprintln!("warning: {warning}");
             }
+            // `--quick-turn`/`--no-quick-turn` override the config. Scripted
+            // oracle runs force it off unless the user asked for it explicitly,
+            // so existing traces and oracle output stay byte-identical.
+            let explicit_quick_turn = cli
+                .quick_turn
+                .then_some(true)
+                .or_else(|| cli.no_quick_turn.then_some(false));
+            let player_options = arklay::player::Options {
+                quick_turn: quick_turn_enabled(
+                    explicit_quick_turn,
+                    config.game.quick_turn,
+                    tracing || cli.input.is_some(),
+                ),
+            };
             let mut renderer = config.graphics;
             if let Some(kind) = cli.renderer {
                 renderer.renderer = match kind {
@@ -914,6 +947,7 @@ fn main() -> Result<()> {
                     &mods,
                     cli.debug_menu,
                     language.as_deref(),
+                    player_options,
                     trace_options,
                     authoring,
                 );
@@ -932,6 +966,7 @@ fn main() -> Result<()> {
                     &mods,
                     cli.debug_menu,
                     language.as_deref(),
+                    player_options,
                     trace_options,
                     authoring,
                 );
@@ -947,6 +982,7 @@ fn main() -> Result<()> {
                     cli.stats,
                     cli.debug_menu,
                     language.as_deref(),
+                    player_options,
                     trace_options,
                     authoring,
                 );
@@ -962,6 +998,7 @@ fn main() -> Result<()> {
                 cli.debug_menu,
                 language.as_deref(),
                 renderer,
+                player_options,
             )
         }
     }
@@ -1001,6 +1038,20 @@ mod tests {
         writer.add("bgm/013.wav", b"RIFF....WAVE".to_vec()).unwrap();
         writer.write(path).unwrap();
         Pack::open(path).unwrap()
+    }
+
+    #[test]
+    fn the_quick_turn_override_beats_the_config_but_not_a_trace() {
+        // No explicit flag: the config applies to gameplay runs, while a
+        // scripted oracle run keeps the reference default.
+        assert!(!quick_turn_enabled(None, false, false));
+        assert!(quick_turn_enabled(None, true, false));
+        assert!(!quick_turn_enabled(None, true, true));
+        // An explicit flag wins either way, including over a trace.
+        assert!(quick_turn_enabled(Some(true), false, false));
+        assert!(quick_turn_enabled(Some(true), false, true));
+        assert!(!quick_turn_enabled(Some(false), true, false));
+        assert!(!quick_turn_enabled(Some(false), true, true));
     }
 
     #[test]
