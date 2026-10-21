@@ -1896,6 +1896,9 @@ pub const UI_DECIDE: &str = "decide";
 /// Radio-transmit cue name: slot 7 of every character table, played by the
 /// RADIO tab's transmitting branch (`play_sfx(3, 7)`).
 pub const UI_RADIO: &str = "Chris08";
+/// Page-turn cue name: slot 8 of every character table, played by the FILE
+/// reader's page turns (`play_sfx(3, 8)`).
+pub const UI_PAGE_TURN: &str = "Chris10";
 
 /// The non-combat global sound banks (`g_st11`..=`g_st15`), one 16-slot row
 /// each. Only the entries the title, character-select, ending and misc screens

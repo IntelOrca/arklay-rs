@@ -975,6 +975,7 @@ fn cue_of(name: &str) -> Option<UiCue> {
         "select_confirm" => UiCue::SelectConfirm,
         "save_cursor" => UiCue::SaveCursor,
         "save_confirm" => UiCue::SaveConfirm,
+        "page_turn" => UiCue::PageTurn,
         _ => return None,
     })
 }

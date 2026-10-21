@@ -533,27 +533,42 @@ local function tick()
 end
 
 local function list_input(api, input)
+    -- The selector plays the cursor blip (character slot 4) only on a move
+    -- that lands, and the decide chime (slot 6) on the reader hand-off; the
+    -- cancel cue (slot 5) belongs to the tab's exit (`FUN_00481b90` and
+    -- `menu_file_state_machine` 0x00481980).
     if input.cancel then
+        api:sound("cancel")
         api:exit()
     elseif input.up then
         if s.slot ~= 0xFF then
-            s.slot = previous_listed_slot(api, s.book, s.slot) or s.slot
+            local slot = previous_listed_slot(api, s.book, s.slot)
+            if slot then
+                s.slot = slot
+                api:sound("cursor")
+            end
         end
     elseif input.down then
         if s.slot ~= 0xFF then
-            s.slot = next_listed_slot(api, s.book, s.slot) or s.slot
+            local slot = next_listed_slot(api, s.book, s.slot)
+            if slot then
+                s.slot = slot
+                api:sound("cursor")
+            end
         end
     elseif input.left then
         if s.book ~= 0 then
             s.book = 0
             s.slot = first_listed_slot(api, 0)
             s.slide_x = -0x78
+            api:sound("cursor")
         end
     elseif input.right then
         if s.book + 1 < BOOKS then
             s.book = 1
             s.slot = first_listed_slot(api, 1)
             s.slide_x = 0x78
+            api:sound("cursor")
         end
     elseif input.confirm then
         if s.slot ~= 0xFF then
@@ -561,6 +576,7 @@ local function list_input(api, input)
             -- frame and the reading mode starts when it reaches full.
             s.fade_in = true
             s.fade = 0
+            api:sound("decide")
         end
     end
 end
@@ -574,6 +590,12 @@ local function reader_input(api, input)
     -- The reader turns half-pages with the D-pad alone: right pages down,
     -- left pages up. The last half-page has to be acknowledged by a further
     -- page-down, which sets FILE_SAVEFLAG and lights the EXIT label.
+    --
+    -- The reference's `jpn_file_list_input` plays the page-turn sample
+    -- (character slot 8) on a turn and the cursor blip (slot 4) when the
+    -- last-page acknowledgement is raised or withdrawn; a silent edge plays
+    -- nothing. The cancel and the last-page confirm play the cancel cue
+    -- (slot 5) from the tab's state machine.
     if input.right then
         if s.page + 1 < page_count(entry) then
             s.reader_busy = true
@@ -582,18 +604,22 @@ local function reader_input(api, input)
             s.reader_state = "slide_out_left"
             -- The input state falls through into the slide.
             step_reader_out_left()
-        else
+            api:sound("page_turn")
+        elseif not s.reader_last_page then
             s.reader_last_page = true
+            api:sound("cursor")
         end
     elseif input.left then
         if s.reader_last_page then
             s.reader_last_page = false
+            api:sound("cursor")
         elseif s.page > 0 then
             s.reader_busy = true
             s.reader_slide = 0
             s.reader_speed = 1
             s.reader_state = "slide_out_right"
             step_reader_out_right()
+            api:sound("page_turn")
         end
     elseif input.cancel or (input.confirm and s.reader_last_page) then
         -- A cancel always slides the reader out; a confirm only once the
@@ -601,6 +627,7 @@ local function reader_input(api, input)
         -- the next frame, so this frame still draws the settled page.
         s.reader_busy = true
         s.reader_exit_request = true
+        api:sound("cancel")
     end
 end
 
