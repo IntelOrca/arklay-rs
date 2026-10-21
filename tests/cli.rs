@@ -647,6 +647,53 @@ fn stats_runs_without_a_capture_and_reports_ordered_counters() {
 }
 
 #[test]
+fn a_configured_quick_turn_never_changes_a_trace() {
+    let dir = TempDir::new("quick-turn-trace");
+    let pack = dir.join("game.akpak");
+    write_room_pack(&pack);
+    let config = dir.join("config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("arklay.toml"), "[game]\nquick_turn = true\n").unwrap();
+    let trace = |name: &str, extra: &[&str], env: &[(&str, &str)]| {
+        let path = dir.join(name);
+        let mut args = vec![
+            pack.to_str().unwrap(),
+            "--room",
+            "100",
+            "--ticks",
+            "30",
+            "--trace",
+            path.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        let output = run_env(&args, env);
+        assert!(output.status.success(), "stderr: {}", stderr(&output));
+        std::fs::read(&path).unwrap()
+    };
+    let plain = trace("plain.trace", &[], &[]);
+    assert!(!plain.is_empty());
+    let config_dir = config.to_str().unwrap();
+    assert!(
+        plain
+            == trace(
+                "configured.trace",
+                &[],
+                &[("ARKLAY_CONFIG_DIR", config_dir)]
+            ),
+        "a configured quick turn changed a --trace run without --quick-turn"
+    );
+    assert!(
+        plain
+            == trace(
+                "forced_off.trace",
+                &["--no-quick-turn"],
+                &[("ARKLAY_CONFIG_DIR", config_dir)]
+            ),
+        "--no-quick-turn changed the trace"
+    );
+}
+
+#[test]
 fn the_frame_rate_never_changes_a_trace() {
     let dir = TempDir::new("frame-rate-trace");
     let pack = dir.join("game.akpak");

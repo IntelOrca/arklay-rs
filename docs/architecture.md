@@ -50,7 +50,7 @@ responsibility.
 | `items` | Runtime | Item tables: names, classes, pickup rules, stacking |
 | `message` | Runtime | The seven-state message window and its byte grammar |
 | `save` | Runtime | The 0x800-byte BioCard block, slot I/O, the folder scan and explicit-path actions the screen API uses, `Apply_to`/`from_state` round-trip |
-| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]`, `[graphics]` and `[mods]`; the default `<config dir>/save` and `<config dir>/mods` locations |
+| `config` | Runtime | The user configuration file (`arklay.toml`): `save_dir`, `language`, `[bindings]`, `[game]`, `[graphics]` and `[mods]`; the default `<config dir>/save` and `<config dir>/mods` locations |
 | `audio` | Runtime | WAV parsing and the single SDL3 software mixer used for SE, voice, BGM and film audio |
 | `bgm` | Runtime | The three-channel music state machine, ramps and channel hand-off |
 | `sfx` | Runtime | Per-room sound-name tables and footstep resolution |

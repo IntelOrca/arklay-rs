@@ -643,7 +643,15 @@ pub fn update(
     player.input = input;
     if player.weapon.behavior == 0 {
         if !try_enter(game, player, clips) {
-            crate::player::update_with_room(player, room, clips.emd, clips.emw, clips.room, input);
+            crate::player::update_with_options(
+                player,
+                room,
+                clips.emd,
+                clips.emw,
+                clips.room,
+                input,
+                game.player_options,
+            );
             return;
         }
         // The reference's input path raises behavior 0x12 with action_state 0
@@ -2741,6 +2749,54 @@ mod tests {
 
         let (mut game, _player) = armed(ITEM_INGRAM, 0);
         assert_eq!(weapon_autoaim_check(&mut game), 4, "specials refill");
+    }
+
+    #[test]
+    fn a_locked_quick_turn_blocks_the_aim_entry() {
+        let (mut game, mut player) = armed(2, 15);
+        game.player_options.quick_turn = true;
+        let room = RoomState::default();
+        let emd = clip_bank(0x24, 8);
+        let weapon_clips = clip_bank(15, 8);
+        let (skeleton, keyframes) = rig(-2400);
+        let inputs = [
+            Input {
+                down: true,
+                ..Input::default()
+            },
+            Input {
+                down: true,
+                run: true,
+                run_pressed: true,
+                ..Input::default()
+            },
+            Input {
+                down: true,
+                run: true,
+                aim: true,
+                aim_pressed: true,
+                ..Input::default()
+            },
+        ];
+        for input in inputs {
+            let clips = WeaponClips {
+                emd: &emd,
+                emw: &emd,
+                room: &[],
+                weapon: &weapon_clips,
+                emd_keyframes: &keyframes,
+                emd_skeleton: &skeleton,
+                weapon_keyframes: &keyframes,
+                weapon_skeleton: &skeleton,
+            };
+            update(&mut game, &mut player, &room, &clips, input);
+        }
+        assert_eq!(player.locked, player::LockedAction::QuickTurn);
+        assert_eq!(
+            player.weapon.behavior, 0,
+            "the aim press did not raise the weapon"
+        );
+        assert_eq!(player.angle, 0x200, "the turn kept rotating");
     }
 
     #[test]

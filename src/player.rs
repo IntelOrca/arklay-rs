@@ -146,6 +146,16 @@ const JILL_FOOTFALL: [u8; 4] = [0x14, 0x16, 0x0F, 0x0F];
 /// Angular step of the PS1 trig tables: `2*pi / 4096`.
 const ANGLE_STEP: f64 = 0.0015339807880859375;
 
+/// The gameplay options the player's tick reads, from `arklay.toml`'s
+/// `[game]` table and the matching command-line overrides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Classic REbirth's quick turn (`[DLL] QuickTurn`): a RUN press while a
+    /// backward movement state owns the pad turns the player 180 degrees in
+    /// place over eight ticks. Off by default.
+    pub quick_turn: bool,
+}
+
 /// Keyboard state for one tick.
 ///
 /// `action_held` and `action_pressed` mirror the original's action button
@@ -439,6 +449,11 @@ pub enum LockedAction {
     /// `action_behavior 0x0c`: the object reach animation a gated action-key
     /// press selects before its item viewer opens.
     Interact,
+    /// Classic REbirth's quick turn: the `[DLL] QuickTurn` hook the game's
+    /// backward states 6/7/8 jump through, which turns the player 180
+    /// degrees in place over eight ticks (`action_behavior` 0, the no-weapon
+    /// walk motion).
+    QuickTurn,
 }
 
 /// The moving player: position, facing, collision radius and animation.
@@ -715,6 +730,27 @@ pub fn update_with_room(
     room_clips: &[Clip],
     input: Input,
 ) {
+    update_with_options(
+        player,
+        room,
+        emd_clips,
+        emw_clips,
+        room_clips,
+        input,
+        Options::default(),
+    );
+}
+
+/// [`update_with_room`] with the `[game]` gameplay options applied.
+pub fn update_with_options(
+    player: &mut PlayerState,
+    room: &RoomState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+    input: Input,
+    options: Options,
+) {
     player.input = input;
     player.idle_trace = None;
     player.trace_state = None;
@@ -740,6 +776,29 @@ pub fn update_with_room(
     if player.fresh_entry {
         player.fresh_entry = false;
         player.behavior = BEHAVIOR_ENTRY;
+    }
+
+    // Classic REbirth's quick turn: while a backward movement state owns the
+    // pad, the RUN press edge selects the quick-turn animation slot instead of
+    // running the backward handler. The state is chosen before the handler
+    // runs, so pressing BACKWARD and RUN on the same tick starts it too;
+    // holding RUN from before the backward press does not. The run and its
+    // stop re-read the pad under the frame-1 dispatch, so a turn never starts
+    // while one of those owns the tick. The lock keeps the aim and action
+    // probes off the turn, exactly like the reference's replaced control path.
+    let quick_turn = options.quick_turn
+        && player.locked == LockedAction::None
+        && player.run_stop_ticks == 0
+        && !player.stairs.climbing
+        && player.input_step_active()
+        && input.down
+        && !input.up
+        && input.run_pressed;
+    if quick_turn {
+        player.locked = LockedAction::QuickTurn;
+        player.action_state = 0;
+        update_locked(player, room, emd_clips, emw_clips, room_clips);
+        return;
     }
 
     let behavior = behavior_for(input);
@@ -1307,6 +1366,9 @@ fn update_locked(
         LockedAction::Ladder => 0x0B,
         LockedAction::Interact => 0x0C,
         LockedAction::Stairs => 0x11,
+        // The quick turn's handler leaves `action_behavior` at 0 and counts
+        // its ticks in `action_state`.
+        LockedAction::QuickTurn => 0,
         LockedAction::None => return,
     };
     match player.locked {
@@ -1315,6 +1377,7 @@ fn update_locked(
         LockedAction::Ladder => update_ladder(player, room, emd_clips, emw_clips, room_clips),
         LockedAction::Interact => update_interact(player, emd_clips, emw_clips, room_clips),
         LockedAction::Stairs => update_stairs(player, room, emd_clips, emw_clips, room_clips),
+        LockedAction::QuickTurn => update_quick_turn(player, emd_clips, emw_clips, room_clips),
         LockedAction::None => {}
     }
     // Mirror the locked behaviour's live bytes for the oracle trace: the
@@ -1335,6 +1398,49 @@ fn update_locked(
     } else {
         Some((behavior, player.action_state, None))
     };
+}
+
+/// Classic REbirth's quick-turn handler (`ddraw+0x6f300`).
+///
+/// The trigger selects animation slot 5, so this handler owns the tick: eight
+/// ticks that add `0x100` to the facing (half the 12-bit circle) while the
+/// no-weapon walk motion plays. The player neither translates nor collides.
+/// `action_state` counts the rotation; the first tick selects the walk motion
+/// with the reference's blend (`unk_8c = 3`) and carries the pending frame of
+/// the motion that was playing, so the stride and its contact frames continue.
+/// The last tick clears the behaviour and hands control back to the pad
+/// machine one tick before it selects the next locomotion state.
+fn update_quick_turn(
+    player: &mut PlayerState,
+    emd_clips: &[Clip],
+    emw_clips: &[Clip],
+    room_clips: &[Clip],
+) {
+    if player.action_state == 0 {
+        let frame = player.anim.frame;
+        player.set_clip(ClipSource::Emw, WALK_CLIP);
+        // The reference switches `attackAnim` without resetting
+        // `animation_frame_id`; `set_clip` does reset it, so carry the pending
+        // frame over (clamped to the walk clip's length).
+        player.anim.frame = match emw_clips.get(WALK_CLIP) {
+            Some(clip) if !clip.frames.is_empty() => frame.min(clip.frames.len() - 1),
+            _ => 0,
+        };
+        player.move_speed_current = 0;
+        player.action_state = 1;
+    } else {
+        player.action_state += 1;
+    }
+    player.angle = player.angle.wrapping_add(0x100) & 0x0FFF;
+    // The reference tests `animation_frame_id` and plays the A footstep
+    // before its `Joint_move`, exactly like the walk handler.
+    player.emit_footsteps(BEHAVIOR_WALK, emd_clips, emw_clips, room_clips);
+    player.advance(emd_clips, emw_clips, room_clips);
+    if player.action_state >= 8 {
+        player.action_state = 0;
+        player.locked = LockedAction::None;
+        player.release_to_pad();
+    }
 }
 
 /// `player_behavior_0c_interact` (0x00495e00): the object reach a gated
@@ -2022,6 +2128,13 @@ impl PlayerState {
     /// therefore deferred to the idle handler's own first tick: switching here
     /// would move this tick's shared weapon-joint tail onto the body pose.
     pub(crate) fn return_from_weapon(&mut self) {
+        self.release_to_pad();
+    }
+
+    /// Hand control back to the pad-driven machine without touching the clip:
+    /// the handler's own last pose stays on screen for the release tick and
+    /// the next tick's idle or locomotion entry selects its clip.
+    fn release_to_pad(&mut self) {
         self.behavior = BEHAVIOR_IDLE;
         self.idle_phase = 0;
         self.idle_ticks = 0;
@@ -4988,6 +5101,378 @@ mod tests {
         }
         assert_eq!(player.locked, LockedAction::None);
         assert_eq!(player.pos, [VAULT_SIDE, -VAULT_ACROSS, 0]);
+    }
+
+    /// One quick-turn tick with the `[game]` option on.
+    fn quick_step(
+        player: &mut PlayerState,
+        room: &RoomState,
+        emd: &[Clip],
+        emw: &[Clip],
+        input: Input,
+    ) {
+        update_with_options(
+            player,
+            room,
+            emd,
+            emw,
+            &[],
+            input,
+            Options { quick_turn: true },
+        );
+    }
+
+    /// The pad with BACKWARD held.
+    fn backing() -> Input {
+        Input {
+            down: true,
+            ..Input::default()
+        }
+    }
+
+    /// The pad with BACKWARD held and RUN on its press edge.
+    fn back_run_press() -> Input {
+        Input {
+            down: true,
+            run: true,
+            run_pressed: true,
+            ..Input::default()
+        }
+    }
+
+    #[test]
+    fn quick_turn_starts_on_the_run_press_while_backing() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+        update_with_options(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &[],
+            backing(),
+            Options { quick_turn: true },
+        );
+        assert_eq!(player.behavior, BEHAVIOR_BACK);
+        let pos = player.pos;
+        let angle = player.angle;
+
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+
+        assert_eq!(player.locked, LockedAction::QuickTurn);
+        assert_eq!(player.action_state, 1, "the trigger tick is turn tick 1");
+        assert_eq!(player.angle, (angle + 0x100) & 0x0FFF);
+        assert_eq!(player.clip_source, ClipSource::Emw);
+        assert_eq!(player.anim.clip, WALK_CLIP);
+        assert_eq!(player.pos, pos, "the turn does not move the player");
+        assert_eq!(player.trace_state, Some((0, 1, None)));
+        assert_eq!(player.last_behavior_id, 0);
+    }
+
+    #[test]
+    fn quick_turn_runs_eight_ticks_then_returns_to_the_backpedal() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+        update_with_options(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &[],
+            backing(),
+            Options { quick_turn: true },
+        );
+        let angle = player.angle;
+        let pos = player.pos;
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        for tick in 2..=8 {
+            let before = player.angle;
+            quick_step(&mut player, &room, &emd, &emw, backing());
+            assert_eq!(player.angle, (before + 0x100) & 0x0FFF, "tick {tick}");
+            assert_eq!(player.pos, pos, "tick {tick}");
+            assert_eq!(player.collision_mirror, [pos[0], pos[2]], "tick {tick}");
+            if tick < 8 {
+                assert_eq!(player.locked, LockedAction::QuickTurn, "tick {tick}");
+                assert_eq!(player.action_state, tick, "tick {tick}");
+            }
+        }
+        assert_eq!(player.angle, (angle + 0x800) & 0x0FFF);
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.action_state, 0);
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
+
+        // The next tick re-enters the ordinary backward locomotion.
+        quick_step(&mut player, &room, &emd, &emw, backing());
+        assert_eq!(player.behavior, BEHAVIOR_BACK);
+        assert_eq!(player.clip_source, ClipSource::Emd);
+        assert_eq!(player.anim.clip, BACK_CLIP);
+        assert_ne!(player.pos, pos, "the backpedal moves again");
+        assert_eq!(player.angle, (angle + 0x800) & 0x0FFF);
+    }
+
+    #[test]
+    fn quick_turn_starts_on_the_same_tick_as_backward_and_run() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+        let pos = player.pos;
+
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+
+        assert_eq!(player.locked, LockedAction::QuickTurn);
+        assert_eq!(player.action_state, 1);
+        assert_eq!(player.angle, 0x100);
+        assert_eq!(player.pos, pos);
+    }
+
+    #[test]
+    fn quick_turn_needs_the_run_press_edge() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+
+        // RUN held from before the backward press does not trigger it.
+        let held = Input {
+            down: true,
+            run: true,
+            ..Input::default()
+        };
+        for _ in 0..3 {
+            quick_step(&mut player, &room, &emd, &emw, held);
+            assert_eq!(player.locked, LockedAction::None);
+        }
+        assert_eq!(player.behavior, BEHAVIOR_BACK);
+        assert_ne!(player.pos, [1000, 0, 1000], "the backpedal still moves");
+
+        // A fresh press starts it, and a second press after it completes
+        // starts another.
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        assert_eq!(player.locked, LockedAction::QuickTurn);
+        assert_eq!(player.action_state, 1);
+        let angle = player.angle;
+        for _ in 0..7 {
+            quick_step(&mut player, &room, &emd, &emw, backing());
+        }
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.angle, (angle + 0x700) & 0x0FFF);
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        assert_eq!(player.locked, LockedAction::QuickTurn);
+        assert_eq!(player.action_state, 1);
+        assert_eq!(player.angle, (angle + 0x800) & 0x0FFF);
+    }
+
+    #[test]
+    fn quick_turn_ignores_forward_and_uses_the_fixed_right_turn() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+
+        // UP + DOWN + RUN is the run, not a backward state.
+        let mut player = player_at(1000, 1000);
+        quick_step(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            Input {
+                up: true,
+                down: true,
+                run: true,
+                run_pressed: true,
+                ..Input::default()
+            },
+        );
+        assert_eq!(player.locked, LockedAction::None);
+
+        // Both back diagonals trigger it, and the rotation is the reference's
+        // fixed `0x100` to the right rather than towards the diagonal.
+        for turn in [true, false] {
+            let mut player = player_at(1000, 1000);
+            let mut input = back_run_press();
+            input.left = turn;
+            input.right = !turn;
+            quick_step(&mut player, &room, &emd, &emw, input);
+            assert_eq!(player.locked, LockedAction::QuickTurn);
+            assert_eq!(player.angle, 0x100, "turn left: {turn}");
+            for tick in 2..=8 {
+                let before = player.angle;
+                quick_step(&mut player, &room, &emd, &emw, input);
+                assert_eq!(player.angle, (before + 0x100) & 0x0FFF, "tick {tick}");
+            }
+            assert_eq!(player.locked, LockedAction::None);
+            assert_eq!(player.angle, 0x800, "turn left: {turn}");
+        }
+    }
+
+    #[test]
+    fn quick_turn_completes_through_aim_action_and_release_inputs() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+        let angle = player.angle;
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+
+        // Released pad, an aim press, an action press and a forward press all
+        // leave the locked turn on its schedule; a second RUN press cannot
+        // restart the counter.
+        let inputs = [
+            Input::default(),
+            Input {
+                aim: true,
+                aim_pressed: true,
+                ..Input::default()
+            },
+            Input {
+                action_held: true,
+                action_pressed: true,
+                ..Input::default()
+            },
+            back_run_press(),
+            Input {
+                up: true,
+                ..Input::default()
+            },
+            backing(),
+            backing(),
+        ];
+        let count = inputs.len();
+        for (index, input) in inputs.into_iter().enumerate() {
+            let before = player.angle;
+            quick_step(&mut player, &room, &emd, &emw, input);
+            assert_eq!(player.angle, (before + 0x100) & 0x0FFF);
+            if index < count - 1 {
+                assert_eq!(player.locked, LockedAction::QuickTurn);
+            }
+        }
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.action_state, 0);
+        assert_eq!(player.angle, (angle + 0x800) & 0x0FFF);
+    }
+
+    #[test]
+    fn quick_turn_footsteps_follow_the_carried_walk_frame() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+
+        // Walk backward until the body clip's pending frame is 15, so the
+        // turn hands the walk motion frame 15 and crosses contact 0x16.
+        let mut player = player_at(1000, 1000);
+        for _ in 0..15 {
+            update_with_options(
+                &mut player,
+                &room,
+                &emd,
+                &emw,
+                &[],
+                backing(),
+                Options { quick_turn: true },
+            );
+        }
+        assert_eq!(player.anim.frame, 15);
+        player.take_footsteps();
+
+        let mut turn_events = Vec::new();
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        turn_events.extend(player.take_footsteps());
+        for _ in 0..7 {
+            quick_step(&mut player, &room, &emd, &emw, backing());
+            turn_events.extend(player.take_footsteps());
+        }
+        assert_eq!(
+            turn_events
+                .iter()
+                .map(|event| event.frame)
+                .collect::<Vec<_>>(),
+            [0x16],
+            "the turn crosses the walk's second contact exactly once"
+        );
+        assert!(turn_events.iter().all(|event| event.sound_type == 0));
+
+        // The same rule a plain walk from that frame follows: the pending
+        // contact frame fires before the frame is applied.
+        let mut walker = player_at(1000, 1000);
+        walker.behavior = BEHAVIOR_WALK;
+        walker.clip_source = ClipSource::Emw;
+        walker.anim.set_clip(WALK_CLIP);
+        walker.anim.frame = 15;
+        walker.anim.blend_counter = 0;
+        let mut walk_events = Vec::new();
+        for _ in 0..8 {
+            update_with_options(
+                &mut walker,
+                &room,
+                &emd,
+                &emw,
+                &[],
+                Input {
+                    up: true,
+                    ..Input::default()
+                },
+                Options { quick_turn: true },
+            );
+            walk_events.extend(walker.take_footsteps());
+        }
+        assert_eq!(
+            walk_events
+                .iter()
+                .map(|event| event.frame)
+                .collect::<Vec<_>>(),
+            [0x16]
+        );
+    }
+
+    #[test]
+    fn quick_turn_never_starts_while_the_run_or_stop_owns_the_tick() {
+        let room = RoomState::default();
+        let (emd, emw) = shipped_clips();
+        let mut player = player_at(1000, 1000);
+
+        // Pick up the run: the handover tick plays the walk, then the run
+        // owns the frame-1 dispatch.
+        let run = Input {
+            up: true,
+            run: true,
+            ..Input::default()
+        };
+        update_with_options(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &[],
+            run,
+            Options { quick_turn: true },
+        );
+        update_with_options(
+            &mut player,
+            &room,
+            &emd,
+            &emw,
+            &[],
+            run,
+            Options { quick_turn: true },
+        );
+        assert_eq!(player.behavior, BEHAVIOR_RUN);
+
+        // DOWN + RUN mid-run starts the run's stop, not the quick turn.
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        assert_eq!(player.locked, LockedAction::None);
+        assert_eq!(player.behavior, BEHAVIOR_RUN);
+        assert_eq!(player.run_stop_ticks, RUN_STOP_TICKS - 1);
+
+        // The stop owns the next ticks: even a fresh RUN press cannot start
+        // the turn until it has handed control back.
+        quick_step(&mut player, &room, &emd, &emw, back_run_press());
+        assert_eq!(player.locked, LockedAction::None);
+        assert_ne!(player.run_stop_ticks, 0);
+        for _ in 0..RUN_STOP_TICKS - 2 {
+            quick_step(&mut player, &room, &emd, &emw, backing());
+            assert_eq!(player.locked, LockedAction::None);
+        }
+        assert_eq!(player.run_stop_ticks, 0);
+        assert_eq!(player.behavior, BEHAVIOR_IDLE);
+        assert_eq!(player.locked, LockedAction::None);
     }
 
     #[test]
