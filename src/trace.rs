@@ -204,6 +204,7 @@ mod tests {
             rgba: vec![255, 0, 0, 255],
             clip: None,
             view: crate::video::View::default(),
+            hd: None,
         };
         assert_eq!(frame_hash(&one), 0x6dc1_4b23);
 
@@ -213,6 +214,7 @@ mod tests {
             rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
             clip: None,
             view: crate::video::View::default(),
+            hd: None,
         };
         assert_eq!(frame_hash(&two), 0xa4af_09a6);
 
@@ -222,6 +224,7 @@ mod tests {
             rgba: vec![0; 320 * 240 * 4],
             clip: None,
             view: crate::video::View::default(),
+            hd: None,
         };
         assert_eq!(frame_hash(&blank), 0xfae3_db1a);
     }

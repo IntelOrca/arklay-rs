@@ -293,6 +293,17 @@ resolution. The software renderer is 320x240 and keeps the originals.
   blend. Each CLUT row's colours come from that row's replacement. A 128-texel-wide
   page is stretched to 256 before hashing, as the game uploads it, so its
   replacement covers 128 x 256 texels.
+- The 2D screens (files, item pictures, the status screen and item box, maps,
+  `DATA/*.PIX` screens such as the select and epilogue backgrounds) are replaced per
+  draw. Each draw is still clipped and positioned as in software, so the HD art covers
+  exactly the original's texels, and text or highlights drawn over it stay on top.
+  A menu page is hashed unstretched with black kept as `0x000001`, in a 256 x 256
+  window, or at its own size when smaller. A `.PIX` screen is hashed like a `bgd`
+  but with shift widening.
+
+Some 2D art stays software: map room highlighting (drawn through a palette lookup),
+the fonts, the title screen and the raw save screen (`TYPE00.TIM`), whose hashes
+match no file in the RE1 HD pack.
 
 A texture with no replacement is reported once on stderr, with every hash that was
 tried:

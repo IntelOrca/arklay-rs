@@ -7,7 +7,9 @@
 //! flat `x, y, w, h` arguments in the layout space `api:width()` and
 //! `api:height()` report.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mlua::{Table, UserDataMethods, Value};
 
@@ -15,6 +17,7 @@ use crate::anim::{self, Mat4x3};
 use crate::assets::{Artwork, Geometry};
 use crate::budget;
 use crate::font::{GLYPH_HEIGHT, Tint};
+use crate::htexture::{self, Replacement};
 use crate::ivm::{self, Ivm};
 use crate::pack::{AssetClass, Pack};
 use crate::render::{Camera, EntityLight, EntityLightSource, Framebuffer};
@@ -62,7 +65,13 @@ pub(super) struct Assets {
     by_key: HashMap<String, usize>,
     /// Decoded bytes held, against [`budget::MAX_SCREEN_IMAGE_BYTES`].
     bytes: usize,
+    /// The HD replacement of each `(handle, CLUT row)` looked up so far. It
+    /// is pack art rather than the script's, so it is not budgeted.
+    hd: RefCell<HashMap<(usize, usize), HdArt>>,
 }
+
+/// A looked-up HD replacement of screen art; `None` when the pack has none.
+type HdArt = Option<Arc<Replacement>>;
 
 impl Assets {
     /// Load `key`'s art with `load` once, returning its 1-based handle. The
@@ -119,6 +128,36 @@ impl Assets {
         }
     }
 
+    /// The HD replacement `pack` carries for `handle`'s art drawn through
+    /// CLUT row `row` (ignored but for an indexed page), looked up once.
+    fn replacement(&self, pack: &Pack, handle: usize, row: usize) -> Option<Arc<Replacement>> {
+        let asset = self.get(handle).ok()?;
+        let row = match asset {
+            Asset::Page(Artwork::Indexed(_)) => row,
+            _ => 0,
+        };
+        if let Some(found) = self.hd.borrow().get(&(handle, row)) {
+            return found.clone();
+        }
+        let candidates = match asset {
+            Asset::Picture(image) | Asset::Page(Artwork::Rgba(image)) => {
+                htexture::image_candidates(image)
+            }
+            Asset::Page(Artwork::Indexed(texture)) => htexture::page_candidates(texture, row),
+            Asset::Model(..) => Vec::new(),
+        };
+        let found = if candidates.is_empty() || pack.htexture().is_empty() {
+            None
+        } else {
+            let (width, height) = asset.size();
+            htexture::replacement(pack, &candidates, || {
+                format!("{width}x{height} screen art (row {row})")
+            })
+        };
+        self.hd.borrow_mut().insert((handle, row), found.clone());
+        found
+    }
+
     fn model(&self, handle: usize) -> mlua::Result<&Ivm> {
         match self.get(handle)? {
             Asset::Model(model, _) => Ok(model),
@@ -127,6 +166,52 @@ impl Assets {
             ))),
         }
     }
+}
+
+/// The HD replacement of `handle`'s art through CLUT row `row`, when the
+/// frame being drawn captures replacements.
+fn hd_art(
+    assets: &Assets,
+    pack: &Pack,
+    framebuffer: &Framebuffer,
+    handle: usize,
+    row: usize,
+) -> Option<Arc<Replacement>> {
+    if framebuffer.captures_hd() {
+        assets.replacement(pack, handle, row)
+    } else {
+        None
+    }
+}
+
+/// The destination corners and normalised texture coordinates of a sprite
+/// drawing the `src` texels of art `hd` replaces into `dst`, flipped per
+/// axis by `mirror`.
+fn sprite_quad(
+    hd: &Replacement,
+    src: [i32; 4],
+    dst: [i32; 4],
+    mirror: [bool; 2],
+) -> ([f32; 4], [f32; 4]) {
+    let [sx, sy, sw, sh] = src.map(|v| v as f32);
+    let [dx, dy, dw, dh] = dst.map(|v| v as f32);
+    let [fw, fh] = hd.frame.map(|v| v as f32);
+    let (mut u0, mut u1) = (sx / fw, (sx + sw) / fw);
+    let (mut v0, mut v1) = (sy / fh, (sy + sh) / fh);
+    if mirror[0] {
+        std::mem::swap(&mut u0, &mut u1);
+    }
+    if mirror[1] {
+        std::mem::swap(&mut v0, &mut v1);
+    }
+    ([dx, dy, dx + dw, dy + dh], [u0, v0, u1, v1])
+}
+
+/// A sprite's colour multiplier: `tint` and then `scale`, as the software
+/// sprite applies them.
+fn sprite_colour(tint: Tint, scale: u8) -> [f32; 3] {
+    tint.rgb()
+        .map(|channel| f32::from(channel) / 255.0 * f32::from(scale) / 255.0)
 }
 
 /// A `(handle)` or `(nil, message)` load result.
@@ -523,13 +608,19 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             } = api;
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
             let art = host.assets.page(handle)?;
-            framebuffer.draw_page_sprite_ramp(
-                art,
-                rect(sx, sy, w, h),
-                rect(dx, dy, w, h),
-                0,
-                byte(ramp),
-            );
+            let (src, dst, ramp) = (rect(sx, sy, w, h), rect(dx, dy, w, h), byte(ramp));
+            let draw = |framebuffer: &mut Framebuffer| {
+                framebuffer.draw_page_sprite_ramp(art, src, dst, 0, ramp);
+            };
+            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, 0) {
+                Some(hd) => {
+                    let (corners, uv) = sprite_quad(&hd, src, dst, [false; 2]);
+                    // `2 * ramp`, unclamped like the software modulation.
+                    let colour = [f32::from(ramp) * 2.0 / 255.0; 3];
+                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                }
+                None => draw(framebuffer),
+            }
             Ok(())
         },
     );
@@ -565,12 +656,18 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             } = api;
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
             let image = host.assets.picture(handle)?;
-            framebuffer.draw_rgba_sprite_scaled(
-                image,
-                rect(sx, sy, sw, sh),
-                rect(dx, dy, dw, dh),
-                byte(scale),
-            );
+            let (src, dst, scale) = (rect(sx, sy, sw, sh), rect(dx, dy, dw, dh), byte(scale));
+            let draw = |framebuffer: &mut Framebuffer| {
+                framebuffer.draw_rgba_sprite_scaled(image, src, dst, scale);
+            };
+            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, 0) {
+                Some(hd) => {
+                    let (corners, uv) = sprite_quad(&hd, src, dst, [false; 2]);
+                    let colour = sprite_colour(Tint::White, scale);
+                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                }
+                None => draw(framebuffer),
+            }
             Ok(())
         },
     );
@@ -588,7 +685,18 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 byte(g.unwrap_or(255)),
                 byte(b.unwrap_or(255)),
             ];
-            framebuffer.draw_background(image, [coord(x), coord(y)], colour);
+            let origin = [coord(x), coord(y)];
+            let draw = |framebuffer: &mut Framebuffer| {
+                framebuffer.draw_background(image, origin, colour);
+            };
+            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, 0) {
+                Some(hd) => {
+                    let (corners, uv) = background_quad(&hd, image, framebuffer, origin);
+                    let colour = colour.map(|channel| f32::from(channel) / 255.0);
+                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                }
+                None => draw(framebuffer),
+            }
             Ok(())
         },
     );
@@ -650,15 +758,28 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             } = api;
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
             let art = host.assets.page(handle)?;
-            framebuffer.draw_page_sprite_mirrored(
-                art,
-                rect(sx, sy, sw, sh),
-                rect(dx, dy, dw, dh),
-                clut.min(255),
-                byte(brightness),
-                Tint::White,
-                [mirror_u, mirror_v],
-            );
+            let (src, dst, row) = (rect(sx, sy, sw, sh), rect(dx, dy, dw, dh), clut.min(255));
+            let (brightness, mirror) = (byte(brightness), [mirror_u, mirror_v]);
+            let draw = |framebuffer: &mut Framebuffer| {
+                framebuffer.draw_page_sprite_mirrored(
+                    art,
+                    src,
+                    dst,
+                    row,
+                    brightness,
+                    Tint::White,
+                    mirror,
+                );
+            };
+            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, row) {
+                Some(hd) => {
+                    let (corners, uv) = sprite_quad(&hd, src, dst, mirror);
+                    let scale = crate::render::brightness_scale(brightness);
+                    let colour = sprite_colour(Tint::White, scale);
+                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                }
+                None => draw(framebuffer),
+            }
             Ok(())
         },
     );
@@ -691,17 +812,48 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             } = api;
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
             let art = host.assets.page(handle)?;
-            framebuffer.draw_page_sprite_scaled(
-                art,
-                rect(sx, sy, sw, sh),
-                rect(dx, dy, dw, dh),
-                clut.min(255),
-                byte(scale),
-                tint,
-            );
+            let (src, dst, row) = (rect(sx, sy, sw, sh), rect(dx, dy, dw, dh), clut.min(255));
+            let scale = byte(scale);
+            let draw = |framebuffer: &mut Framebuffer| {
+                framebuffer.draw_page_sprite_scaled(art, src, dst, row, scale, tint);
+            };
+            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, row) {
+                Some(hd) => {
+                    let (corners, uv) = sprite_quad(&hd, src, dst, [false; 2]);
+                    let colour = sprite_colour(tint, scale);
+                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                }
+                None => draw(framebuffer),
+            }
             Ok(())
         },
     );
+}
+
+/// The destination corners and texture coordinates of a background drawn at
+/// display `origin`: [`Framebuffer::draw_background`] stretches the image over
+/// the logical 320x240 quad centred in the frame and repeats its edges past
+/// it, so the quad covers the whole framebuffer and samples past `0..=1`
+/// there.
+fn background_quad(
+    hd: &Replacement,
+    image: &Image,
+    framebuffer: &Framebuffer,
+    origin: [i32; 2],
+) -> ([f32; 4], [f32; 4]) {
+    let (width, height) = (framebuffer.width as f32, framebuffer.height as f32);
+    let left = origin[0] as f32 + (width - crate::render::WIDTH as f32) / 2.0;
+    let top = origin[1] as f32 + (height - crate::render::HEIGHT as f32) / 2.0;
+    // Logical-quad position to source texels, then to the replacement's frame.
+    let u =
+        |x: f32| (x - left) / crate::render::WIDTH as f32 * image.width as f32 / hd.frame[0] as f32;
+    let v = |y: f32| {
+        (y - top) / crate::render::HEIGHT as f32 * image.height as f32 / hd.frame[1] as f32
+    };
+    (
+        [0.0, 0.0, width, height],
+        [u(0.0), v(0.0), u(width), v(height)],
+    )
 }
 
 /// A screen camera's projection offset: the rasterizer projects about the
