@@ -1,2 +1,5 @@
+# Keep agent and test temp files off the small /tmp tmpfs. The path must
+# already exist for rustc, so point at the target directory itself, which
+# cargo creates before it invokes the compiler.
 [env]
-TMPDIR = { value = "target/tmp-test", relative = true, force = false }
+TMPDIR = { value = "target", relative = true, force = false }
