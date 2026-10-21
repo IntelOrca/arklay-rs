@@ -572,7 +572,7 @@ The F1 debug tools are a port-only development aid the retail game never
 shipped. They are always available (`--debug-menu` is accepted for
 compatibility only); they open only on F1, so captures and goldens that never
 press the key are unaffected. F1 freezes the room behind a dark panel listing
-nine tools; confirm opens one, cancel backs out one level and F1 closes from
+ten tools; confirm opens one, cancel backs out one level and F1 closes from
 anywhere. Reopening returns to the same tool, and ROOM SELECT follows the room
 the player moved to while the panel was hidden. `--ui debug` captures the list.
 
@@ -590,9 +590,9 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
 - FLAGS: thirteen flag banks (scenario, items, enemies, rooms, maps, ...)
   with port-only names; confirm toggles, L1/R1 set/clear.
 - CHEATS: INVINCIBLE pins health and blocks death; GHOST hides the player from
-  hostile characters' shared sight, range and pathfinding checks (partners
-  still follow). Scripts that read the player position directly are not yet
-  covered (issue #77). AMMO cycles OFF/RELOAD/INFINITE: RELOAD still spends
+  every hostile script, including those that read the player position directly
+  (partners still follow; the per-entity hidden flag is on the player entity).
+  AMMO cycles OFF/RELOAD/INFINITE: RELOAD still spends
   rounds and leaves the clip empty until the next trigger press, which plays
   the normal reload animation and fills the clip without using the reserve;
   INFINITE pins the clip at capacity and never decrements it. Session-only,
@@ -603,6 +603,17 @@ the player moved to while the panel was hidden. `--ui debug` captures the list.
 - ITEM BOX: opens the item box anywhere.
 - CLEAR GAME: plays ending 1-7 (defaulting to the one the current flags
   select) and the result screen.
+- CONTROLS: the input rebind screen (keyboard, mouse and gamepad), saving to
+  the `[bindings]` table of `arklay.toml`.
+- DISPLAY: the presented frame rate (30/60/120/144/165/240) and the aspect
+  ratio (`4:3`, `16:9`, `16:10`), saved to `[graphics]`.
+
+`[graphics] aspect` (also `--aspect`) presents a wider frame by cropping the
+320x240 view: in a room the band follows the player's chest row, films show the
+centred band, and the F1 panel stays a pillarboxed 4:3 frame. The message
+window and overlays draw in the band, while the pause menu and its sub-screens
+take a full-height canvas of the aspect's width. Captures, traces, the oracle
+and the goldens always run 4:3.
 
 The in-game F9 return-to-title prompt follows the original: the first F9
 freezes the room, dims the frame and pauses the game sounds; a second F9

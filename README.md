@@ -232,7 +232,7 @@ would not shrink also stays raw.
 | `Shift` | West (X / Square) | Run (hold) |
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
-| `F1` (gamepad Back / Select) | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls); Esc backs out one level, F1 closes |
+| `F1` (gamepad Back / Select) | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls, display); Esc backs out one level, F1 closes |
 | `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
 
 Every action except the fixed debug inputs (`F1` and the gamepad's Back
@@ -273,12 +273,12 @@ directory (or `SDL_GAMECONTROLLERCONFIG`).
 borderless fullscreen once the next size would not fit the display, and goes
 back to 320x240 after that; `Alt+Enter` toggles borderless fullscreen. The
 window cannot be resized by hand, but `window_width` and `window_height` can
-be set to any size. The 4:3 frame always fits the window or screen, centred
-with black bars where the shape differs: a whole zoom stays exactly
-pixel-sharp, and a fractional one keeps every pixel the same size, blending
-only along their edges. The window size, fullscreen and the display it is on
-are saved to the `[graphics]` table of `arklay.toml`, so the next run opens
-the same way on the same screen:
+be set to any size. The frame (4:3 by default, or the wider aspect set below)
+always fits the window or screen, centred with black bars where the shape
+differs: a whole zoom stays exactly pixel-sharp, and a fractional one keeps
+every pixel the same size, blending only along their edges. The window size,
+fullscreen, aspect and the display it is on are saved to the `[graphics]`
+table of `arklay.toml`, so the next run opens the same way on the same screen:
 
 ```toml
 [graphics]
@@ -287,6 +287,7 @@ fullscreen = false # borderless fullscreen (Alt+Enter)
 window_width = 960 # the window's client size in pixels (F8 sets multiples
 window_height = 720 # of 320x240); a window too big for its display shrinks
 display = 1        # the display to open on, numbered from 1
+aspect = "4:3"     # "16:9" or "16:10": crop the frame to the wider shape
 render_scale = 100 # GPU only: the 3D scene's resolution, % of the screen area it fills (25..400)
 msaa = 4           # GPU only: anti-aliasing samples per pixel (1, 2, 4 or 8)
 frame_rate = 120   # presented frames per second, 30..1000 (default 30)
@@ -302,6 +303,14 @@ caps it at the display's refresh rate; the title, menus and door transitions,
 which tick every 16 ms, present once per tick (about 62 fps) at any rate below
 that. The F1 menu's DISPLAY tool steps it through 30,
 60, 120, 144, 165 and 240 and saves the choice.
+
+`aspect` (also `--aspect` and the F1 DISPLAY tool) presents a wider frame by
+cropping the 320x240 view rather than pillarboxing it. In a room the visible
+band follows the player's chest row with a small dead zone; films show the
+centred band, while the F1 debug menu keeps the whole 4:3 frame, pillarboxed.
+The 2D screens lay out in the band, and the pause menu and its sub-screens
+take a full-height 16:9 or 16:10 canvas. Captures, traces, the oracle and the
+goldens always run 4:3, so a wider aspect changes presentation only.
 
 The GPU renderer draws its 3D scene at the size the frame fills on screen, so
 `render_scale` above 100 supersamples and below 100 trades sharpness for
