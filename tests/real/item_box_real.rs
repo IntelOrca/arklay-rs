@@ -169,12 +169,15 @@ fn real_item_box_capture_is_deterministic_and_draws_the_frame() {
 
     // The item box keeps the status panel's heartbeat sweeping (the original's
     // state 3 calls `menu_draw_health_bar` every frame): the capture must show
-    // the full-health green EKG inside its window.
+    // the full-health green EKG inside its window. The line primitive draws
+    // each channel through the reference's `/256 * 255` step, so the health
+    // colour's 0xFF green arrives as 0xFE.
     let ekg = (0x80..=0xB0usize)
         .flat_map(|y| (0x54..=0x83usize).map(move |x| (x, y)))
         .filter(|&(x, y)| {
             let offset = (y * image.width as usize + x) * 4;
-            image.rgba[offset..offset + 4] == [0, 255, 0, 255]
+            let pixel = &image.rgba[offset..offset + 4];
+            pixel[0] == 0 && pixel[1] > 200 && pixel[2] == 0
         })
         .count();
     assert!(

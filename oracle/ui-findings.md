@@ -291,6 +291,50 @@ The state trace is compared tick-for-tick and every frame pixel-by-pixel.
   from bit `0x20`. Landed with the examine-viewer rework (#57), so the
   `inventory_open` frames that showed 158 differing pixels during the dim
   phases (120-142/175-206/239-270) now match.
+- **Pause menu EKG.** `menu_draw_health_bar` queues the wave with the line
+  primitive, not a per-column polyline: it evaluates the head-side partial
+  from the selected record's slope, draws one line per record (joining the
+  records' own heights), and closes with a partial to the tail. arklay
+  sampled the spine per screen column, which thickened the steep QRS flanks
+  and missed the reference's segment joins. The trailing line's gradient is
+  not a per-pixel ramp either: `FUN_00438800` subtracts
+  `(colour >> 5) * (x0 - x1)` from the chain per segment and `FUN_00470e60`
+  submits only the chain's near colour, so the trail is a flat per-record
+  step (the 0xD8 chain draws 0xD7, 0xC5, 0xBF, ...) pre-faded by any
+  overshoot past the window's right edge. Four more details came with it:
+  - The line primitive itself. The original's line is a quad half a pixel
+    either side of the segment (`MarniDX::DrawLine`, submitted as two
+    triangles), and its colour bytes go through `byte / 256 * 255`, so every
+    EKG channel draws one step down (0xD8 -> 0xD7, 0xFF -> 0xFE).
+    `Framebuffer::draw_line` now rasterises that quad with the GPU's
+    top-left rule instead of a Bresenham walk: a horizontal run keeps its
+    lower row and drops the far column, a vertical run keeps the column left
+    of the segment, and a centre exactly on a diagonal edge follows the
+    edge's direction. That also brings the heal flush's rows onto the
+    reference's 47 columns instead of 48.
+  - The face flash `FUN_004387e0` threshold is a byte: the sweep's last four
+    heads (0x80..=0x83) wrap `head - 0x35` to 0x4B..=0x4E, so the word keeps
+    matching the danger span's tail rather than dropping to zero entries
+    (`ekg_poison` t=204-205, 73 pixels).
+  - A flush frame draws no condition word (case 2/3 replaces the whole
+    monitor). The port also draws nothing before its first monitor tick; the
+    reference cannot show that frame because case 0 falls through into case
+    1's draw as it first runs.
+  - The menu open resets `DAT_00ae9f48` to `0xFF`, so the *first* sweep's
+    variant draw folds a 3 away instead of a 0. arklay's seed was 0, which
+    picked the neighbouring wave whenever the first draw was 3 - visible
+    only when a wave's spike came into the window (`itembox_open` t=153+,
+    wave 15 against the reference's 12).
+  With these, every pixel the monitor draws (face word included) is
+  byte-identical on every frame of `inventory_open`, `inventory_nav`,
+  `inventory_examine`, `inventory_open_close`, `itembox_open`,
+  `itembox_page`, `file_open`, `file_pages`, `map_open`, `radio_use`,
+  `combine_ok`, `combine_refuse`, `equip_weapon`, `use_herb`,
+  `attacked_start` and the two new scenarios: `ekg_poison` (red poisoned
+  EKG, the serum's blue cure flush, the green+red mix's white heal-and-cure
+  flush) and `ekg_caution` (the orange and yellow states). The room keeps one
+  pixel a fade rounds one step differently (`map_open` t=262 at (119,160):
+  27,16,16 against 28,16,16); no EKG pixel differs in any run.
 
 With these, `inventory_open`, `inventory_examine`, `inventory_nav`,
 `inventory_open_close`, `radio_use`, `combine_ok`, `combine_refuse`,

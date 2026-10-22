@@ -1170,37 +1170,80 @@ impl Framebuffer {
         }
     }
 
-    /// Rasterize a 1-pixel Bresenham line from `(x0, y0)` to `(x1, y1)`
-    /// inclusive, clipped to the framebuffer (like [`Self::fill_rect`], it
-    /// ignores the sprite clip).
+    /// Rasterize a one-pixel line from `(x0, y0)` to `(x1, y1)`, clipped to
+    /// the framebuffer (like [`Self::fill_rect`], it ignores the sprite clip).
+    ///
+    /// The original's line primitive is a quad half a pixel either side of the
+    /// segment, submitted as two triangles and filled with the GPU's top-left
+    /// rule, so only pixels whose centres that quad keeps are painted. That
+    /// differs from a Bresenham walk at the ends and on ties: a horizontal run
+    /// from `(10, 10)` to `(13, 10)` paints `x = 10..=12` on row 10, and a
+    /// vertical run at `x = 20` paints column 19.
     pub fn draw_line(&mut self, from: [i32; 2], to: [i32; 2], color: [u8; 3]) {
         let [x0, y0] = from;
         let [x1, y1] = to;
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut error = dx + dy;
-        let (mut x, mut y) = (x0, y0);
-        loop {
-            if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
-                let offset = (y as usize * self.width as usize + x as usize) * 4;
-                if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
-                    pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
+        if self.width == 0 || self.height == 0 {
+            return;
+        }
+        // i128 keeps an off-screen segment's products exact, and the scan box
+        // is clipped to the framebuffer so only visible work is done.
+        let dx = i128::from(x1) - i128::from(x0);
+        let dy = i128::from(y1) - i128::from(y0);
+        let len2 = dx * dx + dy * dy;
+        if len2 == 0 {
+            return;
+        }
+        // The quad's two long edges and its two end caps, in the winding the
+        // reference submits. A pixel centre exactly on an edge is kept only
+        // when the fill rule keeps that edge: in window coordinates (y up) an
+        // edge is inclusive when it runs up, or runs left when horizontal.
+        let minus_edge = dy < 0 || (dy == 0 && dx < 0);
+        let plus_edge = dy > 0 || (dy == 0 && dx > 0);
+        let start_cap = dx > 0 || (dx == 0 && dy < 0);
+        let end_cap = dy < 0 || (dy == 0 && dx > 0);
+        // Work in doubled coordinates so pixel centres (`2*x + 1`) and the
+        // segment's endpoints (`2*x0`) are all integers: a centre is inside the
+        // quad when its distance to the segment is at most half a pixel
+        // (`cross^2 <= len2`) and it projects within the end caps.
+        let (ax, ay) = (2 * i128::from(x0), 2 * i128::from(y0));
+        let left = (i128::from(x0.min(x1)) - 1).clamp(0, i128::from(self.width) - 1) as i32;
+        let right = (i128::from(x0.max(x1)) + 1).clamp(0, i128::from(self.width) - 1) as i32;
+        let top = (i128::from(y0.min(y1)) - 1).clamp(0, i128::from(self.height) - 1) as i32;
+        let bottom = (i128::from(y0.max(y1)) + 1).clamp(0, i128::from(self.height) - 1) as i32;
+        for y in top..=bottom {
+            for x in left..=right {
+                let ex = 2 * i128::from(x) + 1 - ax;
+                let ey = 2 * i128::from(y) + 1 - ay;
+                let along = dx * ex + dy * ey;
+                if along < 0 || along > 2 * len2 {
+                    continue;
                 }
+                if (along == 0 && !start_cap) || (along == 2 * len2 && !end_cap) {
+                    continue;
+                }
+                let cross = dx * ey - dy * ex;
+                let Some(cross2) = cross.checked_mul(cross) else {
+                    continue;
+                };
+                if cross2 > len2 {
+                    continue;
+                }
+                if cross2 == len2 && !(if cross > 0 { plus_edge } else { minus_edge }) {
+                    continue;
+                }
+                self.plot_line_pixel(x, y, color);
             }
-            if x == x1 && y == y1 {
-                break;
-            }
-            let doubled = 2 * error;
-            if doubled >= dy {
-                error += dy;
-                x += sx;
-            }
-            if doubled <= dx {
-                error += dx;
-                y += sy;
-            }
+        }
+    }
+
+    /// Plot one line pixel, clipped to the framebuffer.
+    fn plot_line_pixel(&mut self, x: i32, y: i32, color: [u8; 3]) {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return;
+        }
+        let offset = (y as usize * self.width as usize + x as usize) * 4;
+        if let Some(pixel) = self.rgba.get_mut(offset..offset + 4) {
+            pixel.copy_from_slice(&[color[0], color[1], color[2], 255]);
         }
     }
 
@@ -3998,14 +4041,48 @@ mod tests {
     use crate::model::{TmdObject, TmdPrim};
 
     #[test]
-    fn draw_line_marks_its_endpoints_and_skips_offscreen_pixels() {
+    fn draw_line_covers_the_quad_and_skips_offscreen_pixels() {
         let mut framebuffer = Framebuffer::new();
+        let pixel = |framebuffer: &Framebuffer, x: i32, y: i32| {
+            let offset = (y as usize * framebuffer.width as usize + x as usize) * 4;
+            framebuffer.rgba[offset..offset + 3].to_vec()
+        };
+        // A horizontal run keeps the lower of the two tied rows, and the
+        // quad's far cap drops the last column.
         framebuffer.draw_line([10, 10], [13, 10], [255, 0, 0]);
-        for x in 10..=13 {
-            let offset = (10 * framebuffer.width as usize + x) * 4;
-            assert_eq!(&framebuffer.rgba[offset..offset + 4], &[255, 0, 0, 255]);
+        for x in 10..=12 {
+            assert_eq!(pixel(&framebuffer, x, 10), [255, 0, 0], "column {x}");
         }
-        framebuffer.draw_line([-5, -5], [-1, -1], [0, 255, 0]);
+        assert_eq!(pixel(&framebuffer, 13, 10), [0, 0, 0], "the far column");
+        // Painted left-to-right or right-to-left, the run is the same.
+        let mut reversed = Framebuffer::new();
+        reversed.draw_line([13, 10], [10, 10], [255, 0, 0]);
+        assert_eq!(reversed.rgba, framebuffer.rgba);
+        // A diagonal keeps one pixel per step and drops the far one.
+        framebuffer.draw_line([0, 0], [5, 5], [0, 255, 0]);
+        for step in 0..5 {
+            assert_eq!(pixel(&framebuffer, step, step), [0, 255, 0], "step {step}");
+        }
+        assert_eq!(pixel(&framebuffer, 5, 5), [0, 0, 0]);
+        // A vertical run keeps the column left of the segment (the quad's left
+        // edge is the one the fill rule keeps) and drops the far row.
+        framebuffer.draw_line([20, 30], [20, 34], [0, 0, 255]);
+        for y in 30..34 {
+            assert_eq!(pixel(&framebuffer, 19, y), [0, 0, 255], "row {y}");
+            assert_eq!(pixel(&framebuffer, 20, y), [0, 0, 0], "row {y}");
+        }
+        assert_eq!(pixel(&framebuffer, 19, 34), [0, 0, 0]);
+        // A 3-4-5 diagonal's tie lands on the edge the rule drops on one
+        // heading and keeps on the other.
+        framebuffer.draw_line([3, 0], [0, 4], [0, 255, 255]);
+        assert_eq!(pixel(&framebuffer, 2, 1), [0, 0, 0], "the dropped tie");
+        let mut mirrored = Framebuffer::new();
+        mirrored.draw_line([0, 0], [3, 4], [0, 255, 255]);
+        assert_eq!(pixel(&mirrored, 0, 1), [0, 255, 255], "the kept tie");
+        // Off-screen runs neither panic nor paint, and a crossing run paints.
+        framebuffer.draw_line([-5, -5], [-1, -1], [255, 255, 255]);
+        framebuffer.draw_line([-100, 100], [400, 100], [255, 255, 255]);
+        assert_eq!(pixel(&framebuffer, 0, 100), [255, 255, 255]);
     }
 
     #[test]

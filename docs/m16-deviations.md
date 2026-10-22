@@ -148,3 +148,11 @@ cadence and the headless transition follow.
   fallback is opaque and the random stream starts at the CRT default 1 and never
   reseeds. The synthetic unit expectations were re-baselined; the golden-frame
   harness would need its lit frames regenerated before comparing.
+- The pause menu's EKG (#99) now walks the wave's segment records and uses the
+  original's per-segment trail gradient, and its line primitive rasterises the
+  reference's one-pixel quad (`oracle/ui-findings.md`), so every capture that
+  draws the health monitor changes: `--ui menu`, `--ui map`, `--ui file`,
+  `--ui box` and `--ui view` each differ from their previous settled pose in
+  the health strip's EKG (14-20 pixels around rows 159-162, where the demoted
+  colours and the quad's endpoint rule land), so those captures' goldens need
+  regenerating.

@@ -1,0 +1,13 @@
+# EKG states: a Caution Chris at 50/140 shows the orange sweep; using the
+# green herb heals a third (96/140), which the next sweep's wrap latches as
+# the yellow state. Run 280 ticks so that sweep is on screen for a while.
+60 start
+61
+90 confirm
+91
+105 confirm
+106
+230 cancel
+231
+260 cancel
+261
