@@ -440,6 +440,15 @@ pub fn image_candidates(image: &Image) -> Vec<Candidate> {
                 frame: size,
             });
         }
+        // An item icon (one 40 x 30 cell of `ITEM_ALL.PIX`) is uploaded alone
+        // in the corner of a square power-of-two texture, 64 x 64.
+        let square = width.max(height).next_power_of_two();
+        if square < 256 && (width, height) != (square, square) {
+            candidates.push(Candidate {
+                hash: shifted.window_crc(square, square, finish_model),
+                frame: [square as u32; 2],
+            });
+        }
     }
     add_translations(&mut candidates);
     candidates
@@ -658,6 +667,40 @@ mod tests {
                 frame: [320, 240]
             }
         );
+    }
+
+    #[test]
+    fn an_item_icon_hashes_in_the_corner_of_a_64_square() {
+        // A 40x30 icon: black (keyed clear) on the left half, pure red on
+        // the right.
+        let image = Image {
+            width: 40,
+            height: 30,
+            rgba: (0..40 * 30)
+                .flat_map(|i| {
+                    if i % 40 < 20 {
+                        [0, 0, 0, 0]
+                    } else {
+                        [255, 0, 0, 255]
+                    }
+                })
+                .collect(),
+        };
+        let mut expected = Vec::new();
+        for y in 0..64 {
+            for x in 0..64 {
+                let texel: u32 = if y < 30 && (20..40).contains(&x) {
+                    0xfff8_0000
+                } else {
+                    0
+                };
+                expected.extend_from_slice(&texel.to_le_bytes());
+            }
+        }
+        assert!(image_candidates(&image).contains(&Candidate {
+            hash: crc32(&expected),
+            frame: [64, 64],
+        }));
     }
 
     #[test]

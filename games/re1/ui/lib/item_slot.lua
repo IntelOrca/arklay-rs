@@ -45,8 +45,10 @@ function Slot.draw_icon(api, item, x, y, source_v, height)
             return
         end
         local atlas = api:picture(ITEM_ALL_STEM, 0x000000, "shipped")
+        -- The PC game uploads each icon as a texture of its own, so its HD
+        -- replacement is found by the icon's cell.
         api:picture_sprite_scaled(atlas, 0, row * Slot.H + source_v, Slot.W, height,
-            x, y, Slot.W, height, 255)
+            x, y, Slot.W, height, 255, { 0, row * Slot.H, Slot.W, Slot.H })
     else
         api:page_sprite_mirrored(api:page(STAITEM_STEM), 0, (item - 0x6F) * Slot.H + source_v,
             Slot.W, height, x, y, Slot.W, height, 0, 0, false, false)

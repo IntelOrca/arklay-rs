@@ -58,10 +58,11 @@ pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    /// Optional `[x, y, w, h]` clip applied to sprite draws. The pause menu's
-    /// tab screens sit behind the panel's masking rects and frame, so their
-    /// sliding art is clipped to the panel's screen area instead of spilling
-    /// over the chrome.
+    /// Optional `[x, y, w, h]` clip applied to sprite and model draws. The
+    /// pause menu's tab screens sit behind the panel's masking rects and
+    /// frame, so their sliding art (and the examine viewer's model) is
+    /// clipped to the panel's screen area instead of spilling over the
+    /// chrome.
     pub clip: Option<[i32; 4]>,
     /// The rows a wider aspect presents ([`crate::video::View`]); the whole
     /// frame at 4:3. Drawing ignores it: the scene stays in 4:3 space, and
@@ -398,6 +399,36 @@ impl Framebuffer {
         draw(self);
         if let Some(overlay) = self.hd.as_mut() {
             overlay.punching = false;
+        }
+    }
+
+    /// Punch the whole of `dst` (`[x, y, w, h]`, cut to the clip rect) for
+    /// the draw being replaced, transparent texels included: for art the PC
+    /// game drew as one textured quad, whose HD replacement's own alpha says
+    /// what shows. Outside [`Framebuffer::draw_replaced`] it does nothing.
+    pub fn punch_rect(&mut self, dst: [i32; 4]) {
+        let [x, y, width, height] = dst;
+        let (mut x0, mut y0) = (x.max(0), y.max(0));
+        let mut x1 = x.saturating_add(width).min(self.width as i32);
+        let mut y1 = y.saturating_add(height).min(self.height as i32);
+        if let Some([clip_x, clip_y, clip_w, clip_h]) = self.clip {
+            x0 = x0.max(clip_x);
+            y0 = y0.max(clip_y);
+            x1 = x1.min(clip_x.saturating_add(clip_w));
+            y1 = y1.min(clip_y.saturating_add(clip_h));
+        }
+        let width = self.width as usize;
+        let Some(overlay) = Self::punching(&mut self.hd) else {
+            return;
+        };
+        for row in y0..y1 {
+            for column in x0..x1 {
+                let offset = (row as usize * width + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 3) {
+                    pixel.fill(overlay.hole);
+                    overlay.cover(column, row);
+                }
+            }
         }
     }
 
@@ -1568,8 +1599,16 @@ impl Framebuffer {
             }
         });
         let width = self.width as usize;
+        let clip = self.clip;
         let rgba = &mut self.rgba;
         crate::raster::draw_triangle(&vertices, self.width, self.height, |fragment| {
+            if let Some([x, y, w, h]) = clip {
+                let (fx, fy) = (fragment.x as i64, fragment.y as i64);
+                let (x, y) = (i64::from(x), i64::from(y));
+                if fx < x || fy < y || fx >= x + i64::from(w) || fy >= y + i64::from(h) {
+                    return;
+                }
+            }
             let pixel = fragment.y * width + fragment.x;
             let Some(stored) = depth.get_mut(pixel) else {
                 return;
@@ -3970,6 +4009,39 @@ mod tests {
     }
 
     #[test]
+    fn a_punched_rect_covers_clear_texels_within_the_clip() {
+        let replacement = std::sync::Arc::new(crate::htexture::Replacement {
+            image: Image {
+                width: 1,
+                height: 1,
+                rgba: vec![9; 4],
+            },
+            frame: [1, 1],
+        });
+        let mut framebuffer = Framebuffer::new();
+        // Outside a replaced draw the rect is left alone.
+        framebuffer.punch_rect([0, 0, 4, 4]);
+        assert_eq!(&framebuffer.rgba[..4], &[0, 0, 0, 0]);
+
+        framebuffer.capture_hd(255);
+        framebuffer.set_clip_rect(Some([12, 0, 100, 100]));
+        framebuffer.draw_replaced(
+            replacement,
+            [10.0, 10.0, 14.0, 13.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0; 3],
+            |framebuffer| framebuffer.punch_rect([10, 10, 4, 3]),
+        );
+        let overlay = framebuffer.hd.as_ref().unwrap();
+        let covered = (0..240 * 320).filter(|&i| overlay.coverage[i] == 1).count();
+        assert_eq!(covered, 2 * 3);
+        assert_eq!(overlay.coverage[10 * 320 + 11], 0);
+        assert_eq!(overlay.coverage[12 * 320 + 13], 1);
+        let offset = (12 * 320 + 13) * 4;
+        assert_eq!(&framebuffer.rgba[offset..offset + 3], &[255; 3]);
+    }
+
+    #[test]
     fn a_replaced_draw_punches_its_hole_and_queues_a_frame_quad() {
         let replacement = std::sync::Arc::new(crate::htexture::Replacement {
             image: Image {
@@ -6293,6 +6365,49 @@ mod tests {
         assert!(
             dropped.rgba.iter().all(|&byte| byte == 0),
             "half a quad survived a clipped corner"
+        );
+    }
+
+    #[test]
+    fn the_clip_rect_bounds_an_ivm_draw() {
+        use crate::ivm::{Ivm, IvmObject, IvmPrim, IvmPrimKind};
+        let model = Ivm {
+            texture: solid_texture([255, 255, 255, 255]),
+            objects: vec![IvmObject {
+                vertices: vec![[-3000, -3000, 1000], [0, 3000, 1000], [3000, -3000, 1000]],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![IvmPrim {
+                    kind: IvmPrimKind::Gouraud,
+                    vertex_count: 3,
+                    vertices: [0, 1, 2, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255; 3]; 3],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        };
+        let clip = [150, 110, 20, 20];
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_unlit(&model, &[identity()], &straight_camera());
+        let width = framebuffer.width as usize;
+        let painted: Vec<(usize, usize)> = framebuffer
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, pixel)| pixel[3] != 0)
+            .map(|(index, _)| (index % width, index / width))
+            .collect();
+        assert_eq!(painted.len(), 20 * 20, "the triangle should fill the clip");
+        assert!(
+            painted
+                .iter()
+                .all(|&(x, y)| (150..170).contains(&x) && (110..130).contains(&y))
         );
     }
 
