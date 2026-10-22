@@ -37,6 +37,7 @@ SAVES=(
     "radio_chris_101|101|0|0"
     "combine_chris_101|101|0|0"
     "use_chris_101|101|0|0"
+    "ekg_chris_101|101|0|0"
     "equip_chris_101|101|0|0"
     "itembox_chris_118|118|0|0"
     "itembox_cam_chris_118|118|0|0"

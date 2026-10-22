@@ -84,6 +84,10 @@ Save mode (each header names its save):
   combine flow for green+red and for the two-herbs refusal.
 - `use_herb.txt` — `use_chris_101.dat`: the USE action, the heal and the EKG
   flush.
+- `ekg_poison.txt` — `ekg_chris_101.dat`: the health monitor's other colour
+  and flush variants: a poisoned Chris at 20/140 (red EKG with the poisoned
+  wave group), the serum's blue cure flush, then the green+red mix's white
+  heal-and-cure flush.
 - `equip_weapon.txt` — `equip_chris_101.dat`: equip and unequip the Beretta
   through the action submenu.
 - `itembox_open.txt`, `itembox_page.txt` — `itembox_chris_118.dat`: the item

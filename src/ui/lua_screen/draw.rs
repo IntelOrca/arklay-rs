@@ -559,7 +559,9 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         },
     );
 
-    // `line(x0, y0, x1, y1, r, g, b)`: a one-pixel line, both ends drawn.
+    // `line(x0, y0, x1, y1, r, g, b)`: a one-pixel line as the original's
+    // GPU primitive draws it (a half-pixel quad, so the far end of each axis
+    // is excluded).
     methods.add_method_mut(
         "line",
         |_lua, api, (x0, y0, x1, y1, r, g, b): (i32, i32, i32, i32, i64, i64, i64)| {

@@ -9,6 +9,10 @@
 -- when only the status was cured, green when only health was restored, white
 -- for both.
 --
+-- The sweep queues one line per wave record (`FUN_00470c60`), the trailing
+-- line steps its colour down per record (`FUN_00438800`), and the flush draws
+-- its fading rows - all transcribed from `menu_draw_health_bar`.
+--
 -- The wave variant (and, when poisoned, the poison-pick bit) comes from the
 -- game's shared `rand()` stream (`api:rand()`), so the scripts' random draws
 -- stay in step with the reference.
@@ -109,8 +113,10 @@ function Bar.new()
         secondary_head = 0x84,
         secondary_color = HEALTH_COLORS[3],
         -- `DAT_00ae9f48`: the low two bits are the active wave variant and
-        -- bits 2-3 the wave group (health state, or 4 poisoned).
-        wave_variant = 0,
+        -- bits 2-3 the wave group (health state, or 4 poisoned). The menu
+        -- open resets it to `0xFF`, so the first sweep's variant draw folds
+        -- away a 3 rather than a 0.
+        wave_variant = 0xFF,
     }
 end
 
@@ -200,13 +206,11 @@ function Bar.secondary_span(bar)
 end
 
 -- The original's `FUN_004387e0`: count the span-table entries at or below
--- the sweep head's signed low byte minus `0x35`.
+-- the sweep head's low byte minus `0x35`. The subtraction lands in a byte, so
+-- the last four heads of a sweep (`0x80..=0x83`) wrap to `0x4B..0x4E` and keep
+-- matching the table's tail instead of dropping to zero entries.
 local function sweep_index(span, head)
-    local low = head & 0xFF
-    if low >= 0x80 then
-        low = low - 0x100
-    end
-    local threshold = low - 0x35
+    local threshold = (head - 0x35) & 0xFF
     local count = 0
     for _, byte in ipairs(span) do
         if byte > threshold then
@@ -243,6 +247,13 @@ local function draw_face(api, bar, ox, oy)
     draw_face_tile(api, ox, oy, select * 8 + base)
 end
 
+-- The original hands its EKG lines to the line primitive as colour bytes,
+-- which the reference converts through `byte / 256 * 255`, so every channel
+-- draws one step down: the 0xD8 yellow lands on 0xD7 and 0xFF on 0xFE.
+local function line_channel(value)
+    return (value * 255) // 256
+end
+
 -- The heal flush: the original's state-3 sweep draws up to 15 one-pixel
 -- lines downward from the flush base, their tint starting at `0xFF` (or the
 -- pre-faded value once the base has left the window) and dropping by `0x10`
@@ -268,9 +279,10 @@ local function draw_flush(api, bar, ox, oy)
         if y >= FLUSH_BOTTOM_Y then
             break
         end
-        local r = base[1] ~= 0 and tint or 0
-        local g = base[2] ~= 0 and tint or 0
-        local b = base[3] ~= 0 and tint or 0
+        local channel = line_channel(tint)
+        local r = base[1] ~= 0 and channel or 0
+        local g = base[2] ~= 0 and channel or 0
+        local b = base[3] ~= 0 and channel or 0
         api:line(ox + EKG_MIN_X, oy + y, ox + EKG_MAX_X, oy + y, r, g, b)
         if tint ~= 0 then
             tint = (tint - 0x10) & 0xFF
@@ -279,64 +291,130 @@ local function draw_flush(api, bar, ox, oy)
     end
 end
 
--- The record of `wave` whose segment covers screen x, as the original's
--- backwards walk selects it: the first record whose right edge is at or
--- left of x, else the last record. Returns its 1-based offset.
-local function wave_record(wave, x)
-    local selected = 1
-    for at = 1, #wave, 4 do
-        selected = at
-        if x >= wave[at] + EKG_MIN_X then
-            break
-        end
+-- One queued EKG line. A zero-length segment draws nothing: the original's
+-- GPU primitive builds a quad from the segment's perpendicular offsets, and a
+-- point has no area.
+local function queue_line(api, ox, oy, x0, y0, x1, y1, r, g, b)
+    if x0 == x1 and y0 == y1 then
+        return
     end
-    return selected
+    api:line(ox + x0, oy + y0, ox + x1, oy + y1, r, g, b)
 end
 
--- The wave's height at screen x.
-local function wave_y(wave, at, x)
-    return (x - (wave[at] + EKG_MIN_X)) * wave[at + 3] + wave[at + 2] + EKG_BASE_Y
-end
-
--- One trailing-line channel: the trail brightens past its left edge, by
--- 60% per pixel (saturating).
-local function trail_channel(value, distance)
-    if value == 0 then
-        return 0
-    end
-    local brightened = value + (value * distance * 3) // 5
-    if brightened > 255 then
-        return 255
-    end
-    return brightened
-end
-
--- One EKG sweep window as a per-column polyline, from the head (right) back
--- to the tail (left); `left` is always the larger edge.
-local function draw_wave_column(api, ox, oy, left, right, wave_index, color, primary)
-    local wave = EKG_WAVES[wave_index]
+-- The primary sweep. The original walks the wave's segment records from the
+-- head (its right edge, `DAT_00ae9f36`) back to the tail (`DAT_00ae9f38`,
+-- clamped into the window) and queues one line per record: a partial up to the
+-- first record's right edge, one line per whole record, then a partial from
+-- the last record's left edge to the tail. Only the partials evaluate the
+-- record's slope; a whole-record line joins the two records' own heights.
+local function draw_primary(api, ox, oy, bar)
+    local wave = EKG_WAVES[bar.wave]
     if wave == nil then
         return
     end
-    local previous_x, previous_y
-    for x = right, left do
-        local y = wave_y(wave, wave_record(wave, x), x)
-        if previous_x ~= nil then
-            local r, g, b = color[1], color[2], color[3]
-            if not primary then
-                local distance = left - x
-                r, g, b = trail_channel(r, distance), trail_channel(g, distance),
-                    trail_channel(b, distance)
-            end
-            api:line(ox + previous_x, oy + previous_y, ox + x, oy + y, r, g, b)
-        end
-        previous_x, previous_y = x, y
+    local r = line_channel(bar.color[1])
+    local g = line_channel(bar.color[2])
+    local b = line_channel(bar.color[3])
+    local x0 = clamp(bar.head + 0x0F, EKG_MIN_X, EKG_MAX_X)
+    local tail = clamp(bar.head, EKG_MIN_X, EKG_MAX_X)
+    -- The record whose right edge is at or left of the head side, else the
+    -- last (bottom) record.
+    local at = 1
+    while x0 < wave[at] + EKG_MIN_X do
+        at = at + 4
     end
+    local x1 = wave[at] + EKG_MIN_X
+    local y1 = wave[at + 2] + EKG_BASE_Y
+    local y0 = (x0 - x1) * wave[at + 3] + y1
+    if tail < x1 then
+        queue_line(api, ox, oy, x0, y0, x1, y1, r, g, b)
+        if wave[at] == 0 then
+            -- The bottom record: the original skips its tail draw.
+            return
+        end
+        at = at + 4
+        while tail < wave[at] + EKG_MIN_X do
+            queue_line(api, ox, oy, wave[at + 1] + EKG_MIN_X, wave[at - 2] + EKG_BASE_Y,
+                wave[at] + EKG_MIN_X, wave[at + 2] + EKG_BASE_Y, r, g, b)
+            at = at + 4
+        end
+        x0, y0 = wave[at + 1] + EKG_MIN_X, wave[at - 2] + EKG_BASE_Y
+        y1 = (tail - (wave[at] + EKG_MIN_X)) * wave[at + 3] + wave[at + 2] + EKG_BASE_Y
+    end
+    queue_line(api, ox, oy, x0, y0, tail, y1, r, g, b)
+end
+
+-- The trailing sweep. Each segment is queued in the chain's near colour and
+-- the chain then steps down by `colour >> 5` per pixel of the segment's width,
+-- so the trail brightens toward its right edge in flat per-record steps. The
+-- chain starts at the colour latched when the trail wrapped
+-- (`DAT_00ae9f33..35`), pre-faded by any overshoot past the window's right
+-- edge.
+local function draw_secondary(api, ox, oy, bar)
+    local wave = EKG_WAVES[bar.secondary_wave]
+    if wave == nil then
+        return
+    end
+    local base = bar.secondary_color
+    if base[1] == 0 and base[2] == 0 and base[3] == 0 then
+        base = bar.color
+    end
+    local step_r, step_g, step_b = base[1] >> 5, base[2] >> 5, base[3] >> 5
+    local near_r, near_g, near_b = base[1], base[2], base[3]
+    local right = bar.secondary_head + 0x1F
+    local x0
+    if right < 0x84 then
+        x0 = right
+    else
+        local fade = EKG_MAX_X - right
+        near_r = (near_r + step_r * fade) & 0xFF
+        near_g = (near_g + step_g * fade) & 0xFF
+        near_b = (near_b + step_b * fade) & 0xFF
+        x0 = EKG_MAX_X
+    end
+    local tail = clamp(bar.secondary_head, EKG_MIN_X, EKG_MAX_X)
+    -- Queue one segment in the near colour, then slide the chain to the
+    -- segment's far end (the original's `FUN_00438800`).
+    local function queue(xa, ya, xb, yb)
+        queue_line(api, ox, oy, xa, ya, xb, yb, line_channel(near_r), line_channel(near_g),
+            line_channel(near_b))
+        local delta = xa - xb
+        if delta ~= 0 then
+            near_r = (near_r - delta * step_r) & 0xFF
+            near_g = (near_g - delta * step_g) & 0xFF
+            near_b = (near_b - delta * step_b) & 0xFF
+        end
+    end
+    local at = 1
+    while x0 < wave[at] + EKG_MIN_X do
+        at = at + 4
+    end
+    local x1 = wave[at] + EKG_MIN_X
+    local y1 = wave[at + 2] + EKG_BASE_Y
+    local y0 = (x0 - x1) * wave[at + 3] + y1
+    if x1 <= tail then
+        queue(x0, y0, tail, y1)
+        return
+    end
+    queue(x0, y0, x1, y1)
+    if wave[at] == 0 then
+        return
+    end
+    at = at + 4
+    while tail < wave[at] + EKG_MIN_X do
+        queue(wave[at + 1] + EKG_MIN_X, wave[at - 2] + EKG_BASE_Y, wave[at] + EKG_MIN_X,
+            wave[at + 2] + EKG_BASE_Y)
+        at = at + 4
+    end
+    queue(wave[at + 1] + EKG_MIN_X, wave[at - 2] + EKG_BASE_Y, tail,
+        (tail - (wave[at] + EKG_MIN_X)) * wave[at + 3] + wave[at + 2] + EKG_BASE_Y)
 end
 
 --- Draw the health face and the EKG.
 function Bar.draw(api, bar, ox, oy)
-    draw_face(api, bar, ox, oy)
+    -- The original's face draw sits in the sweep states only: a flush frame
+    -- replaces the whole monitor (face included) with the fading lines, and a
+    -- monitor that has not ticked yet (state 0) has nothing to show.
     if bar.state == 2 or bar.state == 3 then
         draw_flush(api, bar, ox, oy)
         return
@@ -344,17 +422,12 @@ function Bar.draw(api, bar, ox, oy)
     if bar.state ~= 1 then
         return
     end
-    local left, right = Bar.primary_span(bar)
-    if right >= EKG_MIN_X and left > right then
-        draw_wave_column(api, ox, oy, left, right, bar.wave, bar.color, true)
+    draw_face(api, bar, ox, oy)
+    if bar.head + 0x0F > 0x53 and bar.head < 0x84 then
+        draw_primary(api, ox, oy, bar)
     end
-    left, right = Bar.secondary_span(bar)
-    if right >= EKG_MIN_X and left > right then
-        local color = bar.secondary_color
-        if color[1] == 0 and color[2] == 0 and color[3] == 0 then
-            color = bar.color
-        end
-        draw_wave_column(api, ox, oy, left, right, bar.secondary_wave, color, false)
+    if bar.secondary_head + 0x1F > 0x53 and bar.secondary_head < 0x84 then
+        draw_secondary(api, ox, oy, bar)
     end
 end
 

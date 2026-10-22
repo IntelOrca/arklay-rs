@@ -1,0 +1,20 @@
+# EKG states: the pause menu on a poisoned, badly hurt Chris (red EKG, the
+# poisoned wave group), the serum's blue cure flush, then the green+red mix's
+# white heal-and-cure flush. Covers the four health colours and the flush
+# variants that `use_herb` does not reach.
+60 start
+61
+90 confirm
+91
+105 confirm
+106
+140 right
+141
+150 confirm
+151
+165 confirm
+166
+230 cancel
+231
+250 cancel
+251

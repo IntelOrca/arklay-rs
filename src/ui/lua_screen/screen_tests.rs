@@ -3908,3 +3908,92 @@ fn health_monitor_poison_selects_the_poisoned_waves() {
     assert!(poisoned_group, "poison never selected the poisoned waves");
     assert_eq!(menu.eval::<i64>("return M.state.bar.health_state"), 3);
 }
+
+/// Draw the monitor through a recording stand-in for the drawing API and
+/// return the queued `api:line` calls as `{x0, y0, x1, y1, r, g, b}`.
+fn ekg_lines(menu: &Menu, setup: &str) -> Vec<Vec<i64>> {
+    menu.eval(&format!(
+        r#"
+        local Bar = require('lib/health_bar')
+        local calls = {{}}
+        local api = {{
+            line = function(_, x0, y0, x1, y1, r, g, b)
+                calls[#calls + 1] = {{ x0, y0, x1, y1, r, g, b }}
+            end,
+            page = function() return nil end,
+            page_sprite_mirrored = function() end,
+        }}
+        local bar = Bar.new()
+        bar.state = 1
+        bar.color = {{ 0xD8, 0xD8, 0x00 }}
+        bar.secondary_color = {{ 0xD8, 0xD8, 0x00 }}
+        {setup}
+        Bar.draw(api, bar, 0, 0)
+        return calls
+        "#
+    ))
+}
+
+#[test]
+fn health_monitor_walks_the_wave_records() {
+    let menu = Menu::open(menu_game());
+    // The reference's walk from the head side (`head + 0x0F`) back to the
+    // tail: a partial to the first record's right edge, one line per whole
+    // record, then a partial to the tail. Wave 15 at head 0x67 rises from
+    // (110, 163) to its apex (105, 148) and down to the tail. The colour is
+    // the health colour through the line primitive's `/256 * 255` step, so
+    // 0xD8 draws as 0xD7.
+    let lines = ekg_lines(
+        &menu,
+        "bar.head = 0x67 bar.wave = 15 bar.secondary_head = 0x35 bar.secondary_wave = 15",
+    );
+    let expected: [[i64; 7]; 6] = [
+        [118, 162, 116, 162, 0xD7, 0xD7, 0],
+        [116, 162, 114, 158, 0xD7, 0xD7, 0],
+        [114, 158, 111, 164, 0xD7, 0xD7, 0],
+        [111, 164, 110, 163, 0xD7, 0xD7, 0],
+        [110, 163, 105, 148, 0xD7, 0xD7, 0],
+        [105, 148, 103, 156, 0xD7, 0xD7, 0],
+    ];
+    assert_eq!(lines, expected.map(|line| line.to_vec()));
+}
+
+#[test]
+fn health_monitor_trail_dims_per_segment() {
+    let menu = Menu::open(menu_game());
+    // The trailing sweep queues each segment in the chain's near colour and
+    // then steps it down by `colour >> 5` (6 for 0xD8) per pixel of that
+    // segment's width, so the trail is brightest at its right edge. Wave 0's
+    // flat tail at secondary head 0x54 gives one line per record and a
+    // 0xD8 -> 0x89 chain, each channel through the same `/256 * 255` step.
+    let lines = ekg_lines(
+        &menu,
+        "bar.head = 0x30 bar.secondary_head = 0x54 bar.secondary_wave = 0",
+    );
+    let expected: [[i64; 7]; 12] = [
+        [115, 162, 112, 162, 215, 215, 0],
+        [112, 162, 111, 161, 197, 197, 0],
+        [111, 161, 110, 159, 191, 191, 0],
+        [110, 159, 109, 162, 185, 185, 0],
+        [109, 162, 108, 164, 179, 179, 0],
+        [108, 164, 107, 163, 173, 173, 0],
+        [107, 163, 106, 161, 167, 167, 0],
+        [106, 161, 105, 158, 161, 161, 0],
+        [105, 158, 104, 162, 155, 155, 0],
+        [104, 162, 103, 164, 149, 149, 0],
+        [103, 164, 102, 162, 143, 143, 0],
+        [102, 162, 84, 162, 137, 137, 0],
+    ];
+    assert_eq!(lines, expected.map(|line| line.to_vec()));
+}
+
+#[test]
+fn health_monitor_first_sweep_folds_against_the_open_reset() {
+    // The menu open resets `DAT_00ae9f48` to 0xFF, so the first sweep's
+    // variant draw folds a 3 (rather than a 0) away.
+    let menu = Menu::open(menu_game());
+    assert_eq!(
+        menu.eval::<i64>("return require('lib/health_bar').new().wave_variant"),
+        0xFF
+    );
+}
