@@ -350,15 +350,15 @@ frame that draws the reader (the entry's load window, both page-turn
 directions, the cancel frame, the exit slide, the sixteen-frame backdrop
 ramp-down, the black hold and the hand-off) is byte-identical, and the
 selector frames either side sit at the room/menu residual (~600 differing
-pixels, mean 0.2/255, plus the EKG line).
+pixels, mean 0.2/255: the panel portrait).
 
 `itembox_open` (which now runs the box cancel, exiting the whole menu through
 `menu_exit_cleanup` and resuming the room) and `itembox_page` sit at that same
 residual: their box frames differ by 441-513 pixels beyond the 8-step
 threshold (mean error 0.19-0.26/255, down from ~10700 / 14.4-15% before) and
 the opening fade hand-off frames by 443-469. Every pixel beyond the threshold
-is in the panel's portrait or health strip - the box overlay, its list, its
-preview column, the cursor and the swap are pixel-equal - and the other
+is in the panel's portrait - the box overlay, its list, its preview column,
+the cursor, the swap and the health strip are pixel-equal - and the other
 differing pixels are sub-threshold (the `0x70` dim rounding over the panel
 art).
 
