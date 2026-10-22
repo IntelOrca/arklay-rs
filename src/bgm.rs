@@ -257,7 +257,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
         return 0;
     };
     let mut slept = 0;
-    let mut fade_out_all = |game: &mut GameState| {
+    let mut fade_out = |game: &mut GameState| {
         fade_out_all(game);
         slept += FADE_OUT_ALL_FRAMES;
     };
@@ -265,7 +265,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
 
     if target == 0xFF {
         if previous != 0xFF {
-            fade_out_all(game);
+            fade_out(game);
         }
         game.bgm.target = 0xFF;
         game.bgm.state = 0xFF;
@@ -279,7 +279,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
     // A different track is coming and something is playing: tear the old banks
     // down before the switch below.
     if previous != 0xFF && previous & 0x38 != 0 && new_group != old_group {
-        fade_out_all(game);
+        fade_out(game);
     }
 
     // Type 2 consumes bit 7 before every other use.
@@ -295,7 +295,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
         0 => {
             if previous == 0xFF || new_group != old_group {
                 if previous != 0xFF {
-                    fade_out_all(game);
+                    fade_out(game);
                 }
                 load_and_start(game, id, effective);
                 start_secondary = true;
@@ -319,12 +319,12 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
         }
         // Always reload, never auto-start.
         1 => {
-            fade_out_all(game);
+            fade_out(game);
             load_and_start(game, id, effective);
         }
         // Force restart and auto-start.
         2 => {
-            fade_out_all(game);
+            fade_out(game);
             load_and_start(game, id, effective);
             start_secondary = true;
         }
@@ -343,8 +343,10 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -
 /// The frames [`update_room_bgm`] sleeps the original's task for room `id`
 /// right after a stage change's `init_room`, which resets `g_BGM_STATE` to
 /// `0xFF` before the destination loads: with nothing "playing" only the
-/// always-reload types 1 and 2 run `bgm_fade_out_all`. Call it before
-/// [`update_room_bgm`], which consumes a type-2 target's bit 7.
+/// always-reload types 1 and 2 run `bgm_fade_out_all`.
+///
+/// The original's attract demo also forces the room's target to `0xFF` in
+/// `init_room`; the port does not model that override yet (#141).
 ///
 /// The port keeps the outgoing state across the load (its BGM handoff tears
 /// the old banks down itself), so only the timing follows `init_room` here.
@@ -447,6 +449,18 @@ fn fade_out_all(game: &mut GameState) {
     game.voice.stop_requested = true;
     game.clear_voice_playing();
     game.bgm.stop_all = true;
+}
+
+/// Silence the banks a `bgm_fade_out_all` tore down, without loading the
+/// replacements yet: the original mutes and stops the old banks at the start
+/// of its sleeps and only loads the new group after them, which a held door
+/// tail models by calling [`apply_live`] once the sleeps are over.
+pub fn apply_stop(mixer: &mut Option<Mixer>, game: &mut GameState) {
+    if std::mem::take(&mut game.bgm.stop_all)
+        && let Some(mixer) = mixer.as_mut()
+    {
+        mixer.stop_all_bgm();
+    }
 }
 
 /// Reconcile the mixer with the game's BGM/voice state.
@@ -678,6 +692,7 @@ mod tests {
             (0xFF, 0),
         ] {
             set_row(&mut game, id, target);
+            // The live state is ignored: `init_room` reset it to `0xFF`.
             game.bgm.state = 0x08;
             assert_eq!(init_room_sleep(&game, id), frames, "target {target:#04x}");
         }

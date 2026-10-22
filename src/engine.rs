@@ -449,13 +449,18 @@ pub fn run_with_options(
             let mut no_mixer: Option<Mixer> = None;
             let mut sfx_cache = SfxCache::default();
             let mut door_transition: Option<TransitionMode> = None;
+            // The finished door's `update_room_bgm` sleeps still holding the
+            // tail (see [`TransitionMode::bgm_sleep`]).
+            let mut bgm_sleep: u8 = 0;
             for _ in 0..ticks {
                 let tick_start = Instant::now();
                 // A door transition owns the tick and follows into its
                 // destination room, exactly like the interactive session (but
                 // audio-free): the `--ticks` capture ends in the room the last
                 // scripted door led to.
-                if let Some(mut session) = door_transition.take() {
+                if bgm_sleep > 0 {
+                    bgm_sleep -= 1;
+                } else if let Some(mut session) = door_transition.take() {
                     let frame = session.transition.tick(false);
                     session.frame = frame;
                     for message in session.transition.stepper_mut().take_messages() {
@@ -475,7 +480,7 @@ pub fn run_with_options(
                         call_lua_room_load(lua.as_ref(), &mut game, loaded.id);
                         drain_mask_toggles(&mut loaded.room, &mut game);
                         apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
-                        bgm::update_room_bgm(&mut game, loaded.id, Some(from));
+                        bgm_sleep = update_transition_bgm(&mut game, &session, loaded.id, from);
                     } else {
                         door_transition = Some(session);
                     }
@@ -4695,8 +4700,9 @@ impl GameSession {
             // `update_room_bgm`'s `bgm_fade_out_all` sleeps hold the timeline's
             // last frame; the frame they end on runs the rest of the tail.
             session.bgm_sleep -= 1;
+            let done = session.bgm_sleep == 0;
             self.transition = Some(session);
-            if self.transition.as_ref().is_some_and(|s| s.bgm_sleep == 0) {
+            if done {
                 self.transition_finished = true;
                 self.end_transition_after_bgm(pack);
             }
@@ -4753,9 +4759,11 @@ impl GameSession {
 
     /// The tail of `room_transition_load` and `game_loop`'s return into
     /// gameplay, on the frame the animation task's exit is noticed: a
-    /// camera-only record re-tests the switch zones, the destination's BGM
-    /// handoff runs, the close SE plays and a full load arms the destination's
-    /// entry fade.
+    /// camera-only record re-tests the switch zones and the destination's BGM
+    /// handoff runs. Once its `bgm_fade_out_all` sleeps are over
+    /// ([`TransitionMode::bgm_sleep`]), [`GameSession::end_transition_after_bgm`]
+    /// loads the new banks, plays the close SE and arms a full load's entry
+    /// fade.
     fn end_transition(&mut self, pack: &Pack) {
         let Some(mut session) = self.transition.take() else {
             return;
@@ -4775,20 +4783,15 @@ impl GameSession {
         // script's `room_bgm_state_set` is visible here; a camera-only record
         // never left the source room and re-runs the same room's table.
         let from = session.source;
-        // A stage change's `init_room` resets `g_BGM_STATE`, which decides
-        // whether `update_room_bgm` fades the old banks out.
-        let stage_change = session.entered && session.door.next_room >= 0x20;
-        let init_room_sleep = bgm::init_room_sleep(&self.game, self.loaded.id);
-        let slept = bgm::update_room_bgm(&mut self.game, self.loaded.id, Some(from));
-        session.bgm_sleep = if stage_change { init_room_sleep } else { slept };
-        bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
+        session.bgm_sleep = update_transition_bgm(&mut self.game, &session, self.loaded.id, from);
         let sleeping = session.bgm_sleep > 0;
         self.transition = Some(session);
         if sleeping {
             // A track change tears the old banks down with `bgm_fade_out_all`,
-            // which sleeps `room_transition_load` before it returns: the
-            // timeline is not finished until those frames are over (see
-            // [`GameSession::tick_transition`]).
+            // which sleeps `room_transition_load` before it returns: the old
+            // banks go quiet now, and the timeline is not finished until those
+            // frames are over (see [`GameSession::tick_transition`]).
+            bgm::apply_stop(&mut self.music, &mut self.game);
             self.transition_finished = false;
             return;
         }
@@ -4796,9 +4799,10 @@ impl GameSession {
     }
 
     /// The rest of `room_transition_load`'s tail once `update_room_bgm`
-    /// returned: the close SE, then `game_loop` arms the destination's entry
-    /// fade after a full load.
+    /// returned: the new banks reach the mixer, the close SE plays, then
+    /// `game_loop` arms the destination's entry fade after a full load.
     fn end_transition_after_bgm(&mut self, pack: &Pack) {
+        bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
         let Some(session) = self.transition.as_ref() else {
             return;
         };
@@ -8513,6 +8517,9 @@ struct TransitionMode {
     entered: bool,
     /// The most recent timeline frame, for rendering.
     frame: transition::TransitionFrame,
+    /// A full load into another stage: the destination goes through
+    /// `init_room` (record byte `0x0D` of `0x20` and up).
+    stage_change: bool,
     /// Frames `room_transition_load` still sleeps inside `update_room_bgm`
     /// (each `bgm_fade_out_all` is [`bgm::FADE_OUT_ALL_FRAMES`]) after the
     /// timeline finished: the last frame stays up and the close SE and the
@@ -8655,6 +8662,7 @@ fn start_transition(
     // frame before its `room_set`.
     let stage_change = record.next_room >= 0x20;
     Ok(TransitionMode {
+        stage_change: stage_change && !camera_only,
         transition: transition::Transition::new(animation)
             .with_fade(fade.fade_type(), fade.counter(), fade.state())
             .with_load(camera_only, stage_change),
@@ -8845,6 +8853,25 @@ fn load_transition_destination(
     // feeds the .dor animation, so it must not seed the room camera.
     loaded.room.current_cut = 0;
     game.camera.current_cut = 0;
+}
+
+/// `room_transition_load`'s `update_room_bgm` for a finished transition into
+/// `id`, entered from `from`: returns the frames its `bgm_fade_out_all` calls
+/// sleep the task. A stage change's `init_room` reset `g_BGM_STATE` before the
+/// call, so its sleeps follow [`bgm::init_room_sleep`].
+fn update_transition_bgm(
+    game: &mut game::GameState,
+    session: &TransitionMode,
+    id: RoomId,
+    from: RoomId,
+) -> u8 {
+    let init_room_sleep = bgm::init_room_sleep(game, id);
+    let slept = bgm::update_room_bgm(game, id, Some(from));
+    if session.stage_change {
+        init_room_sleep
+    } else {
+        slept
+    }
 }
 
 /// Play the door transition's close SE (the original's `play_sfx(0, 1, 0)`
@@ -9338,6 +9365,9 @@ fn simulate_loaded_with(
     let mut sfx_cache = SfxCache::default();
     let mut door_transition: Option<TransitionMode> = None;
     let mut transitions: Vec<RoomId> = Vec::new();
+    // The finished door's `update_room_bgm` sleeps still holding the tail (see
+    // [`TransitionMode::bgm_sleep`]).
+    let mut bgm_sleep: u8 = 0;
 
     for tick in 0..ticks {
         // A film owns the tick while it plays: the room's scripts, entities,
@@ -9349,6 +9379,10 @@ fn simulate_loaded_with(
                 audit.bgm_at_end = Some(game.bgm);
                 film = None;
             }
+            continue;
+        }
+        if bgm_sleep > 0 {
+            bgm_sleep -= 1;
             continue;
         }
         // A door transition owns the tick: run its timeline (audio-free, like
@@ -9373,7 +9407,7 @@ fn simulate_loaded_with(
                 call_lua_room_load(lua.as_ref(), &mut game, loaded.id);
                 drain_mask_toggles(&mut loaded.room, &mut game);
                 apply_camera(&mut loaded.room, &mut game, Some(player_state.pos));
-                bgm::update_room_bgm(&mut game, loaded.id, Some(from));
+                bgm_sleep = update_transition_bgm(&mut game, &session, loaded.id, from);
                 transitions.push(loaded.id);
             } else {
                 door_transition = Some(session);
@@ -17001,6 +17035,7 @@ mod tests {
             placed: false,
             entered: false,
             frame: transition::TransitionFrame::default(),
+            stage_change: false,
             bgm_sleep: 0,
         };
         finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
@@ -17041,6 +17076,7 @@ mod tests {
             }),
             entered: false,
             frame: transition::TransitionFrame::default(),
+            stage_change: false,
             bgm_sleep: 0,
         };
         finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
@@ -19073,6 +19109,10 @@ mod tests {
                 .is_some_and(|transition| !transition.frame.finished);
             if !animating && !session.transition_finished {
                 bgm_sleep_frames += 1;
+                assert!(
+                    !session.room_boot_gate,
+                    "the entry fade must wait for room_transition_load to return"
+                );
             }
             if animating {
                 if session.loaded.id == target {
@@ -19100,12 +19140,75 @@ mod tests {
         // The group change runs `bgm_fade_out_all` twice, and its sleeps hold
         // `room_transition_load` before it returns.
         assert_eq!(bgm_sleep_frames, 2 * u32::from(bgm::FADE_OUT_ALL_FRAMES));
+        assert!(
+            session.room_boot_gate,
+            "the entry fade arms on the tick the hold ends"
+        );
         assert_eq!(session.game.bgm.state, 0x08);
         assert_eq!(
             session.game.bgm.channels[0].name,
             Some("Bgm_00"),
             "the destination's group is selected on the animation's final frame"
         );
+    }
+
+    #[test]
+    fn a_stage_change_door_holds_only_for_init_rooms_fade_out() {
+        let dir = TempDir::new();
+        let bmp_bytes = bmp::encode_to_vec(&test_image()).unwrap();
+        let source = RoomId {
+            stage: 1,
+            room: 0,
+            player_flag: 0,
+        };
+        // Destination byte 0x23 is stage 1 room 3 again but takes the stage
+        // change path, whose `init_room` resets the BGM state to 0xFF.
+        let target = RoomId {
+            stage: 1,
+            room: 3,
+            player_flag: 0,
+        };
+        let pack_path = dir.0.join("game.akpak");
+        let mut writer = PackWriter::new();
+        writer
+            .add(
+                &source.rdt_entry(),
+                synthetic_rdt(&door_init_record(0x23, [555, 0, 666], 1024, 0)),
+            )
+            .unwrap();
+        writer
+            .add(&target.rdt_entry(), synthetic_rdt(&[0x00, 0x00]))
+            .unwrap();
+        writer.add(&source.cut_entry(0), bmp_bytes.clone()).unwrap();
+        writer.add(&target.cut_entry(0), bmp_bytes).unwrap();
+        writer.write(&pack_path).unwrap();
+        let pack = Pack::open(&pack_path).unwrap();
+
+        let mut session = GameSession::from_room(&pack, source, Path::new("saves")).unwrap();
+        session.game.room_bgm[usize::from(source.room)] = 0x08;
+        bgm::update_room_bgm(&mut session.game, source, None);
+        // A type 0 target only fades out from `update_room_bgm` on a group
+        // change, which the stage change's 0xFF state never is.
+        assert_eq!(session.game.room_bgm[usize::from(target.room)] >> 6, 0);
+
+        trigger_test_door(&pack, &mut session);
+
+        let mut held = 0;
+        for _ in 0..MAX_TRANSITION_FRAMES {
+            session.tick_transition(&pack, false);
+            let animating = session
+                .transition
+                .as_ref()
+                .is_some_and(|transition| !transition.frame.finished);
+            if !animating && !session.transition_finished {
+                held += 1;
+            }
+            if session.transition_finished {
+                break;
+            }
+        }
+        assert!(session.transition_finished, "the transition never finished");
+        assert_eq!(held, 0, "a type 0 stage change does not sleep");
     }
 
     #[test]
