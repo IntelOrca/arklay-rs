@@ -402,6 +402,36 @@ impl Framebuffer {
         }
     }
 
+    /// Punch the whole of `dst` (`[x, y, w, h]`, cut to the clip rect) for
+    /// the draw being replaced, transparent texels included: for art the PC
+    /// game drew as one textured quad, whose HD replacement's own alpha says
+    /// what shows. Outside [`Framebuffer::draw_replaced`] it does nothing.
+    pub fn punch_rect(&mut self, dst: [i32; 4]) {
+        let [x, y, width, height] = dst;
+        let (mut x0, mut y0) = (x.max(0), y.max(0));
+        let mut x1 = x.saturating_add(width).min(self.width as i32);
+        let mut y1 = y.saturating_add(height).min(self.height as i32);
+        if let Some([clip_x, clip_y, clip_w, clip_h]) = self.clip {
+            x0 = x0.max(clip_x);
+            y0 = y0.max(clip_y);
+            x1 = x1.min(clip_x.saturating_add(clip_w));
+            y1 = y1.min(clip_y.saturating_add(clip_h));
+        }
+        let width = self.width as usize;
+        let Some(overlay) = Self::punching(&mut self.hd) else {
+            return;
+        };
+        for row in y0..y1 {
+            for column in x0..x1 {
+                let offset = (row as usize * width + column as usize) * 4;
+                if let Some(pixel) = self.rgba.get_mut(offset..offset + 3) {
+                    pixel.fill(overlay.hole);
+                    overlay.cover(column, row);
+                }
+            }
+        }
+    }
+
     /// The capture of the draw being replaced, which writes its hole grey
     /// in place of its texels and [`crate::htexture::Overlay::cover`]s them.
     fn punching(
@@ -3976,6 +4006,39 @@ mod tests {
             assert_eq!(&framebuffer.rgba[offset..offset + 4], &[255, 0, 0, 255]);
         }
         framebuffer.draw_line([-5, -5], [-1, -1], [0, 255, 0]);
+    }
+
+    #[test]
+    fn a_punched_rect_covers_clear_texels_within_the_clip() {
+        let replacement = std::sync::Arc::new(crate::htexture::Replacement {
+            image: Image {
+                width: 1,
+                height: 1,
+                rgba: vec![9; 4],
+            },
+            frame: [1, 1],
+        });
+        let mut framebuffer = Framebuffer::new();
+        // Outside a replaced draw the rect is left alone.
+        framebuffer.punch_rect([0, 0, 4, 4]);
+        assert_eq!(&framebuffer.rgba[..4], &[0, 0, 0, 0]);
+
+        framebuffer.capture_hd(255);
+        framebuffer.set_clip_rect(Some([12, 0, 100, 100]));
+        framebuffer.draw_replaced(
+            replacement,
+            [10.0, 10.0, 14.0, 13.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0; 3],
+            |framebuffer| framebuffer.punch_rect([10, 10, 4, 3]),
+        );
+        let overlay = framebuffer.hd.as_ref().unwrap();
+        let covered = (0..240 * 320).filter(|&i| overlay.coverage[i] == 1).count();
+        assert_eq!(covered, 2 * 3);
+        assert_eq!(overlay.coverage[10 * 320 + 11], 0);
+        assert_eq!(overlay.coverage[12 * 320 + 13], 1);
+        let offset = (12 * 320 + 13) * 4;
+        assert_eq!(&framebuffer.rgba[offset..offset + 3], &[255; 3]);
     }
 
     #[test]

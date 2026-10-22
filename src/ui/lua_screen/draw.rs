@@ -735,7 +735,14 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 Some((hd, src)) => {
                     let (corners, uv) = sprite_quad(&hd, src, dst, [false; 2]);
                     let colour = sprite_colour(Tint::White, scale);
-                    framebuffer.draw_replaced(hd, corners, uv, colour, draw);
+                    framebuffer.draw_replaced(hd, corners, uv, colour, |framebuffer| {
+                        // A cell is drawn as one quad, so its HD art covers
+                        // the cell's keyed-clear texels too.
+                        if cell.is_some() {
+                            framebuffer.punch_rect(dst);
+                        }
+                        draw(framebuffer);
+                    });
                 }
                 None => draw(framebuffer),
             }
