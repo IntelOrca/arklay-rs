@@ -425,11 +425,13 @@ from camera 0 with no input at all (state and pixels match for 200 ticks).
   renders as two alpha-blended triangles through the (llvmpipe) GPU, so the
   covered pixels differ on steep segments. Not exactly matchable without
   replicating the GPU quad coverage.
-- **Room/player frame backlog.** The room-close frames sit at the same ~4.9%
-  baseline as the plain room captures (player-mesh edges), unrelated to the
-  menu. In `file_open`/`file_pages` the room-entry frames before the menu opens
-  (t=5..60, the player mesh and the portrait) are the only frames above 1500
-  differing pixels (mean 0.53-0.58/255, max 164).
+- **Room/player frame backlog — resolved by #69.** The ~4.9% room-close
+  baseline (player-mesh edges) was the software rasteriser's approximation of
+  the reference's lit 3D geometry. With the llvmpipe-exact rasteriser and the
+  reference's per-position lighting, `scripts/oracle-sweep.sh` reports 320/320
+  runs with state MATCH and no run above 0.1% differing pixels (worst 512 p0 at
+  0.05%), so the room-entry frames in `file_open`/`file_pages` are no longer a
+  separate backlog item.
 
 ## Reaching more screens
 
