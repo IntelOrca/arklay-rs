@@ -669,7 +669,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line, both ends included. |
 | `api:blend_black_rect(x, y, w, h, alpha)` | Darken a rectangle. |
 | `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
-| `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale)` | A picture region, scaled. |
+| `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale[, cell])` | A picture region, scaled. `cell` (`{x, y, w, h}`) names the atlas cell the region lies in, so an HD replacement is looked up for that cell alone (an item icon) rather than the whole picture. |
 | `api:page_sprite_scaled(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, scale[, tint])` | A sheet region through CLUT row `clut`, scaled and tinted. |
 | `api:page_sprite_mirrored(page, sx, sy, sw, sh, dx, dy, dw, dh, clut, brightness, mirror_u, mirror_v)` | A sheet region flipped per axis. |
 | `api:page_lut(page, sx, sy, w, h, dx, dy, lut)` | An unscaled rect of an indexed page drawn through `lut`, a table of opaque `0xRRGGBB` colours keyed by texel index; an index without an entry (index 0 included) is transparent. |

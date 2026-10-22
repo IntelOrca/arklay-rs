@@ -58,10 +58,11 @@ pub struct Framebuffer {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
-    /// Optional `[x, y, w, h]` clip applied to sprite draws. The pause menu's
-    /// tab screens sit behind the panel's masking rects and frame, so their
-    /// sliding art is clipped to the panel's screen area instead of spilling
-    /// over the chrome.
+    /// Optional `[x, y, w, h]` clip applied to sprite and model draws. The
+    /// pause menu's tab screens sit behind the panel's masking rects and
+    /// frame, so their sliding art (and the examine viewer's model) is
+    /// clipped to the panel's screen area instead of spilling over the
+    /// chrome.
     pub clip: Option<[i32; 4]>,
     /// The rows a wider aspect presents ([`crate::video::View`]); the whole
     /// frame at 4:3. Drawing ignores it: the scene stays in 4:3 space, and
@@ -1568,8 +1569,16 @@ impl Framebuffer {
             }
         });
         let width = self.width as usize;
+        let clip = self.clip;
         let rgba = &mut self.rgba;
         crate::raster::draw_triangle(&vertices, self.width, self.height, |fragment| {
+            if let Some([x, y, w, h]) = clip {
+                let (fx, fy) = (fragment.x as i64, fragment.y as i64);
+                let (x, y) = (i64::from(x), i64::from(y));
+                if fx < x || fy < y || fx >= x + i64::from(w) || fy >= y + i64::from(h) {
+                    return;
+                }
+            }
             let pixel = fragment.y * width + fragment.x;
             let Some(stored) = depth.get_mut(pixel) else {
                 return;
@@ -6293,6 +6302,49 @@ mod tests {
         assert!(
             dropped.rgba.iter().all(|&byte| byte == 0),
             "half a quad survived a clipped corner"
+        );
+    }
+
+    #[test]
+    fn the_clip_rect_bounds_an_ivm_draw() {
+        use crate::ivm::{Ivm, IvmObject, IvmPrim, IvmPrimKind};
+        let model = Ivm {
+            texture: solid_texture([255, 255, 255, 255]),
+            objects: vec![IvmObject {
+                vertices: vec![[-3000, -3000, 1000], [0, 3000, 1000], [3000, -3000, 1000]],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![IvmPrim {
+                    kind: IvmPrimKind::Gouraud,
+                    vertex_count: 3,
+                    vertices: [0, 1, 2, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255; 3]; 3],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        };
+        let clip = [150, 110, 20, 20];
+        let mut framebuffer = Framebuffer::new();
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_unlit(&model, &[identity()], &straight_camera());
+        let width = framebuffer.width as usize;
+        let painted: Vec<(usize, usize)> = framebuffer
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, pixel)| pixel[3] != 0)
+            .map(|(index, _)| (index % width, index / width))
+            .collect();
+        assert_eq!(painted.len(), 20 * 20, "the triangle should fill the clip");
+        assert!(
+            painted
+                .iter()
+                .all(|&(x, y)| (150..170).contains(&x) && (110..130).contains(&y))
         );
     }
 

@@ -67,6 +67,10 @@ local ARROW_IDLE_U = 0x8C
 local ARROW_SIZE = 9
 -- The item-name line.
 local ITEM_NAME_Y = 0xBA
+-- The status panel's viewport inside its frame, `{x, y, w, h}`: the examine
+-- model is drawn behind the frame, so nothing of it shows past the frame's
+-- inner edge.
+local VIEWPORT = { 32, 24, 160, 104 }
 -- The red book, the second doom book and the medal the first one becomes.
 local ITEM_RED_BOOK = 0x3E
 local ITEM_DOOM_BOOK_2 = 0x3F
@@ -401,12 +405,17 @@ local function draw_model(api)
     for index, pos in ipairs(LIGHTS) do
         sources[index] = { pos = pos, color = { s.light, s.light, s.light } }
     end
+    if not s.pickup then
+        local ox, oy = api:width() // 2 - 160, api:height() // 2 - 120
+        api:clip(ox + VIEWPORT[1], oy + VIEWPORT[2], VIEWPORT[3], VIEWPORT[4])
+    end
     api:draw_ivm(s.model, {
         joints = { root },
         objects = objects,
         camera = CAMERA,
         light = { ambient = AMBIENT, sources = sources },
     })
+    api:clip()
 end
 
 function M.draw(api)

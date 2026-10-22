@@ -65,9 +65,11 @@ pub(super) struct Assets {
     by_key: HashMap<String, usize>,
     /// Decoded bytes held, against [`budget::MAX_SCREEN_IMAGE_BYTES`].
     bytes: usize,
-    /// The HD replacement of each `(handle, CLUT row)` looked up so far. It
-    /// is pack art rather than the script's, so it is not budgeted.
+    /// The HD replacement of each `(handle, CLUT row)` and of each
+    /// `(handle, picture cell)` looked up so far. It is pack art rather than
+    /// the script's, so it is not budgeted.
     hd: RefCell<HashMap<(usize, usize), HdArt>>,
+    hd_cells: RefCell<HashMap<(usize, [i32; 4]), HdArt>>,
 }
 
 /// A looked-up HD replacement of screen art; `None` when the pack has none.
@@ -158,6 +160,31 @@ impl Assets {
         found
     }
 
+    /// The HD replacement `pack` carries for the `cell` (`[x, y, w, h]`) of
+    /// picture `handle`, hashed as an upload of that cell alone, looked up
+    /// once.
+    fn cell_replacement(&self, pack: &Pack, handle: usize, cell: [i32; 4]) -> HdArt {
+        if let Some(found) = self.hd_cells.borrow().get(&(handle, cell)) {
+            return found.clone();
+        }
+        let found = match self.get(handle) {
+            Ok(Asset::Picture(image)) if !pack.htexture().is_empty() => {
+                crop(image, cell).and_then(|crop| {
+                    let candidates = htexture::image_candidates(&crop);
+                    let [x, y, w, h] = cell;
+                    htexture::replacement(pack, &candidates, || {
+                        format!("{w}x{h} screen art cell at ({x}, {y})")
+                    })
+                })
+            }
+            _ => None,
+        };
+        self.hd_cells
+            .borrow_mut()
+            .insert((handle, cell), found.clone());
+        found
+    }
+
     fn model(&self, handle: usize) -> mlua::Result<&Ivm> {
         match self.get(handle)? {
             Asset::Model(model, _) => Ok(model),
@@ -182,6 +209,33 @@ fn hd_art(
     } else {
         None
     }
+}
+
+/// The `[x, y, w, h]` region of `image`, or `None` when it is empty or not
+/// wholly inside the image.
+fn crop(image: &Image, [x, y, w, h]: [i32; 4]) -> Option<Image> {
+    let [x, y, w, h] = [x, y, w, h].map(|v| u32::try_from(v).ok());
+    let (x, y, w, h) = (x?, y?, w?, h?);
+    if w == 0 || h == 0 || x + w > image.width || y + h > image.height {
+        return None;
+    }
+    let stride = image.width as usize * 4;
+    let rgba = (y..y + h)
+        .flat_map(|row| {
+            let start = row as usize * stride + x as usize * 4;
+            image
+                .rgba
+                .get(start..start + w as usize * 4)
+                .unwrap_or(&[])
+                .iter()
+                .copied()
+        })
+        .collect::<Vec<u8>>();
+    (rgba.len() == (w * h * 4) as usize).then_some(Image {
+        width: w,
+        height: h,
+        rgba,
+    })
 }
 
 /// The destination corners and normalised texture coordinates of a sprite
@@ -639,7 +693,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         "picture_sprite_scaled",
         |_lua,
          api,
-         (handle, sx, sy, sw, sh, dx, dy, dw, dh, scale): (
+         (handle, sx, sy, sw, sh, dx, dy, dw, dh, scale, cell): (
             usize,
             i32,
             i32,
@@ -650,6 +704,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             i32,
             i32,
             i64,
+            Option<Table>,
         )| {
             let Api {
                 host, framebuffer, ..
@@ -657,11 +712,27 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             let framebuffer = framebuffer.as_deref_mut().ok_or_else(no_draw)?;
             let image = host.assets.picture(handle)?;
             let (src, dst, scale) = (rect(sx, sy, sw, sh), rect(dx, dy, dw, dh), byte(scale));
+            let cell = match cell {
+                Some(cell) => Some(rect(cell.get(1)?, cell.get(2)?, cell.get(3)?, cell.get(4)?)),
+                None => None,
+            };
             let draw = |framebuffer: &mut Framebuffer| {
                 framebuffer.draw_rgba_sprite_scaled(image, src, dst, scale);
             };
-            match hd_art(&host.assets, api.cx.pack, framebuffer, handle, 0) {
-                Some(hd) => {
+            // A cell is its own upload: its replacement covers the cell, so
+            // the source rect is taken relative to the cell's corner.
+            let hd = match cell {
+                Some(cell) if framebuffer.captures_hd() => host
+                    .assets
+                    .cell_replacement(api.cx.pack, handle, cell)
+                    .map(|hd| (hd, [src[0] - cell[0], src[1] - cell[1], src[2], src[3]])),
+                Some(_) => None,
+                None => {
+                    hd_art(&host.assets, api.cx.pack, framebuffer, handle, 0).map(|hd| (hd, src))
+                }
+            };
+            match hd {
+                Some((hd, src)) => {
                     let (corners, uv) = sprite_quad(&hd, src, dst, [false; 2]);
                     let colour = sprite_colour(Tint::White, scale);
                     framebuffer.draw_replaced(hd, corners, uv, colour, draw);
