@@ -4,16 +4,21 @@
 -- status/inventory panel is drawn behind it and this overlay draws the
 -- `ui/itemboxn` frame, the selected box slot's 40x30 icon with its quantity,
 -- the three-row item name list and the page-position ticks. The player cursor
--- stays on the inventory grid: confirming an inventory stack arms the swap,
--- up/down (or L1/R1) page the box cursor with a slide, and confirming again
--- performs it. Cancel (or confirming on a top-tab cursor) closes the screen.
+-- stays on the inventory grid (it only leaves it for the box's tab row):
+-- confirming an inventory stack arms the swap, up/down (or L1/R1) page the box
+-- cursor with a slide, and confirming again performs it. Cancel (or confirming
+-- on a top-tab cursor) closes the screen.
+-- The box only ever reaches the EXIT tab of the pause menu's top row: the
+-- greyed-out Map, File and Radio tabs are unselectable (`itembox_draw_cursor`
+-- draws every tab-row cursor on EXIT, and left/right do nothing there).
 --
 -- Args: `cursor`, the inventory panel's shared cursor the box adopts.
 --
 -- The screen publishes `cursor` (the inventory cursor, which the engine
--- mirrors onto the menu so the slot highlight and item name follow it) and,
--- on the frame a confirmed swap happens, `swap = true` with `swap_box` (the
--- box slot) and `swap_slot` (the inventory slot); the engine performs the
+-- mirrors onto the menu so the slot highlight and item name follow it; on the
+-- tab row it is already the drawn EXIT cursor, the original's `cursor | 2`)
+-- and, on the frame a confirmed swap happens, `swap = true` with `swap_box`
+-- (the box slot) and `swap_slot` (the inventory slot); the engine performs the
 -- swap. `api:exit()` closes the box and the pause menu. The engine tells the
 -- screen whether the menu has revealed its cursor with `M.cursor_shown(api,
 -- shown)` before each draw.
@@ -114,7 +119,7 @@ local s = {
     mode = "browse",
     -- The box cursor (`0..48`).
     box_cursor = 0,
-    -- The inventory cursor value (`8 + 2 * slot`).
+    -- The inventory cursor value (`8 + 2 * slot`), or `4`/`6` on the tab row.
     player_cursor = Grid.FIRST_SLOT_CURSOR,
     -- Inventory slots of the current character.
     slots = 6,
@@ -147,6 +152,39 @@ local function cursor_on_tab()
     return s.player_cursor < Grid.FIRST_SLOT_CURSOR
 end
 
+-- The cursor value both the box and the menu's tab highlight draw. The
+-- item-box cursor only ever reaches the original's tab-row values 4 and 6,
+-- and its `itembox_draw_cursor` (and the tab-art highlight) selects the tab
+-- with `cursor | 2`: both values draw on EXIT. The other three tabs are
+-- greyed out and unreachable.
+local function drawn_cursor()
+    if cursor_on_tab() then
+        return s.player_cursor | 2
+    end
+    return s.player_cursor
+end
+
+-- Down one inventory row (`menu_itembox_interaction` state 1). Unlike the
+-- pause menu's grid, the item box never wraps onto the Map/File row: past the
+-- last slot row it lands on the tab-row cursor in the same column, 4 or 6.
+local function move_down(cursor)
+    local moved = cursor + 4
+    if moved > s.slots * 2 + 6 then
+        return (cursor & 2) | 4
+    end
+    return moved
+end
+
+-- Up one row: from the first slot row onto the tab row (4 or 6), and from
+-- there back to the last slot row in the same column.
+local function move_up(cursor)
+    local moved = cursor - 4
+    if moved < 0 or moved & 0xFC == 0 then
+        return (cursor & 2) | (s.slots * 2 + 4)
+    end
+    return moved
+end
+
 -- The inventory slot under the player cursor.
 local function player_slot()
     local slot = Grid.slot_of_cursor(s.player_cursor)
@@ -172,13 +210,20 @@ function M.open(api, args)
     s.mode = "browse"
     s.box_cursor = 0
     s.player_cursor = args.cursor or Grid.FIRST_SLOT_CURSOR
+    -- The box's tab row is the EXIT cursor pair only. A caller that hands the
+    -- box a Map/File cursor (0/2) still opens on the row's own values, so no
+    -- greyed-out tab can be highlighted.
+    if s.player_cursor < Grid.FIRST_SLOT_CURSOR then
+        s.player_cursor = (s.player_cursor & 2) | 4
+    end
     s.slots = api:inventory_capacity()
     s.slide = 0
     s.slide_dir = 0
     s.cursor_blink = 0
     s.cursor_shown = false
-    api:set("cursor", s.player_cursor)
-    -- On a slot the box draws the shared cursor itself; on a tab the menu does.
+    api:set("cursor", drawn_cursor())
+    -- On a slot the box draws the shared cursor itself; on the tab row the
+    -- menu draws its tab highlight under the EXIT tab art.
     api:set("on_slot", not Grid.is_tab(s.player_cursor))
 end
 
@@ -231,13 +276,18 @@ local function browse_input(api, input)
         -- from the confirm frame on.
         s.cursor_blink = 0
     elseif input.left or input.right then
-        s.player_cursor = Grid.move_sideways(s.player_cursor)
+        -- The original ignores left/right on the tab row (its
+        -- `(cursor & 0xF8) == 0` guard); the blink still resets and the cue
+        -- still plays.
+        if not cursor_on_tab() then
+            s.player_cursor = Grid.move_sideways(s.player_cursor)
+        end
         s.cursor_blink = 0
     elseif input.up then
-        s.player_cursor = Grid.move_up(s.player_cursor, s.slots)
+        s.player_cursor = move_up(s.player_cursor)
         s.cursor_blink = 0
     elseif input.down then
-        s.player_cursor = Grid.move_down(s.player_cursor, s.slots)
+        s.player_cursor = move_down(s.player_cursor)
         s.cursor_blink = 0
     end
 end
@@ -289,7 +339,7 @@ function M.update(api, input)
         -- page-then-confirm sequence swaps the slot the slide landed on.
         armed_input(api, input)
     end
-    api:set("cursor", s.player_cursor)
+    api:set("cursor", drawn_cursor())
     api:set("on_slot", not Grid.is_tab(s.player_cursor))
 end
 

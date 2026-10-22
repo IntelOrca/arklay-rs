@@ -2907,6 +2907,128 @@ fn item_box_walks_the_shared_cursor_and_swaps_under_it() {
 }
 
 #[test]
+fn item_box_tab_row_only_reaches_exit() {
+    let mut game = box_game();
+    game.id.player_flag = 0;
+    game.add_item(0x41, 1);
+    // Six slots put cursor 16 on the first column's last row. Down wraps to
+    // the original's tab-row cursor 4, which the box and the menu's tab
+    // highlight both draw on EXIT (cursor | 2 = 6).
+    let mut item_box = ItemBoxScreen::new("box-exit-tab", game, 16);
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 4);
+    assert_eq!(
+        item_box.screen.value("cursor"),
+        6,
+        "the drawn cursor is EXIT"
+    );
+    assert_eq!(
+        item_box.screen.value("on_slot"),
+        0,
+        "the menu draws the tab cursor"
+    );
+    // Left/right do nothing on the tab row.
+    item_box.step(press(|input| input.left = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 4);
+    item_box.step(press(|input| input.right = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 4);
+    // Down returns to the first slot row's same column, never to Map/File.
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 8);
+    // Up from the first row lands on the tab row again; up from there wraps
+    // to the last slot row of the same column.
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 4);
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 16);
+
+    // Jill's eight slots wrap the same way (last row cursors 20/22).
+    let mut game = box_game();
+    game.id.player_flag = 1;
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-exit-jill", game, 20);
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 4);
+    assert_eq!(item_box.screen.value("cursor"), 6);
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 20);
+
+    // The right column wraps to cursor 6 and back to the last row's right
+    // column.
+    let mut game = box_game();
+    game.id.player_flag = 1;
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-exit-jill-right", game, 22);
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 6);
+    assert_eq!(item_box.screen.value("cursor"), 6);
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 22);
+}
+
+#[test]
+fn item_box_tab_row_wrap_keeps_the_column() {
+    let mut game = box_game();
+    game.id.player_flag = 0;
+    game.add_item(0x41, 1);
+    // The right column's last row wraps to cursor 6, still drawn on EXIT.
+    let mut item_box = ItemBoxScreen::new("box-exit-column", game, 18);
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 6);
+    assert_eq!(item_box.screen.value("cursor"), 6);
+    // Up returns to the last row's right column, not the left one.
+    item_box.step(press(|input| input.up = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 18);
+    // Left/right are ignored on the right column's tab cursor too, and down
+    // returns to the first row's right column.
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 6);
+    item_box.step(press(|input| input.left = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 6);
+    item_box.step(press(|input| input.right = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 6);
+    item_box.step(press(|input| input.down = true));
+    assert_eq!(item_box.int("M.state.player_cursor"), 10);
+
+    // The wrapped-to tab closes the box on confirm, as the original's
+    // `(cursor & 0xf8) == 0` check does.
+    let mut game = box_game();
+    game.id.player_flag = 0;
+    game.add_item(0x41, 1);
+    let mut item_box = ItemBoxScreen::new("box-exit-close", game, 16);
+    item_box.step(press(|input| input.down = true));
+    assert!(item_box.closes(confirm()));
+}
+
+#[test]
+fn item_box_opening_on_a_disabled_tab_uses_exit() {
+    // Map (0) and File (2) are not rows the box travels, so a caller that
+    // hands the box one still opens on the EXIT pair, keeping the column:
+    // 0 -> the left tab cursor (4), 2 -> the right one (6).
+    for (cursor, row_cursor, last_row) in [(0, 4, 16), (2, 6, 18)] {
+        let mut game = box_game();
+        game.id.player_flag = 0;
+        game.add_item(0x41, 1);
+        let mut item_box = ItemBoxScreen::new("box-open-tab", game, cursor);
+        assert_eq!(
+            item_box.int("M.state.player_cursor"),
+            row_cursor,
+            "cursor {cursor} adopts the box's tab row"
+        );
+        assert_eq!(
+            item_box.screen.value("cursor"),
+            6,
+            "the drawn cursor is EXIT"
+        );
+        // Up from the tab row wraps to the last slot row, never a negative
+        // cursor.
+        item_box.step(press(|input| input.up = true));
+        assert_eq!(item_box.int("M.state.player_cursor"), last_row);
+        assert!(!item_box.closes(neutral()));
+    }
+}
+
+#[test]
 fn item_box_without_art_draws_nothing() {
     let mut item_box = ItemBoxScreen::new("box-draw", box_game(), 8);
     let cx = UiContext {
