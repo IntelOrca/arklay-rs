@@ -71,8 +71,11 @@ local ITEM_NAME_Y = 0xBA
 -- model is drawn behind the frame, so nothing of it shows past the frame's
 -- inner edge.
 local VIEWPORT = { 32, 24, 160, 104 }
--- The viewport's navy backdrop behind the examine model, `{r, g, b}`
--- (Classic REbirth shows srgb(0, 0, 32) there while the viewer is up).
+-- The standalone viewer's navy backdrop behind the examine model, `{r, g, b}`
+-- (Classic REbirth shows srgb(0, 0, 32) there while the viewer is up). The
+-- viewer opened over the pause menu is an overlay on the panel's black
+-- instead: the reference's radio/CHECK view draws the same model, but its
+-- viewport is black there.
 local BACKDROP = { 0, 0, 0x20 }
 -- The red book, the second doom book and the medal the first one becomes.
 local ITEM_RED_BOOK = 0x3E
@@ -339,6 +342,7 @@ function M.open(api, args)
     s.item = args.item or 0
     s.quantity = args.quantity or 0
     s.pickup = args.pickup or false
+    s.menu = args.menu or false
     -- The examine viewer draws on black, so a wider aspect gives it a wider
     -- canvas; the pickup viewer draws in the inventory panel, which asks for
     -- the canvas itself.
@@ -424,8 +428,9 @@ end
 function M.draw(api)
     local ox, oy = api:width() // 2 - 160, api:height() // 2 - 120
     if not s.pickup and s.stage ~= "setup" and s.stage ~= "closed" then
+        local backdrop = s.menu and { 0, 0, 0 } or BACKDROP
         api:fill_rect(ox + VIEWPORT[1], oy + VIEWPORT[2], VIEWPORT[3], VIEWPORT[4],
-            BACKDROP[1], BACKDROP[2], BACKDROP[3])
+            backdrop[1], backdrop[2], backdrop[3])
     end
     draw_model(api)
     if s.pickup then

@@ -1544,11 +1544,14 @@ mod tests {
         let mut second = Framebuffer::new();
         window.draw(&mut second, &font, &text);
         assert_eq!(first.rgba, second.rgba);
-        // Re-baselined for the M16 glyph rasteriser; the JPN sheet renders
-        // deterministic pixels, only the checksum moved.
+        // Re-baselined after the message drop shadow was removed (25eafc7):
+        // the reference's text renderers leave the colour multipliers at
+        // 0x80, so the port no longer darkens every glyph edge. The checksum
+        // returns to the pre-M16 value now that the extra shadow pass is
+        // gone; the JPN sheet renders deterministic pixels.
         assert_eq!(
             fnv1a(&first.rgba),
-            0x6B12_0B29_58AB_EF63,
+            0xC284_792B_7C4E_4157,
             "ROOM1001 message 0 render changed"
         );
         let opaque = first

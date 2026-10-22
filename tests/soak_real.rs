@@ -46,8 +46,11 @@ const PASSES: usize = 3;
 const MAX_LIVE_DELTA_BYTES: usize = 32 << 20;
 /// Extra live bytes (above the pack's own allocation) a pass may peak at.
 const MAX_PASS_EXTRA_BYTES: usize = 512 << 20;
-/// Documented wall-clock ceiling for one full pass.
-const MAX_PASS_SECONDS: u64 = 900;
+/// Documented wall-clock ceiling for one full pass. The reference machine
+/// measured ~394s a pass; an 8-core machine measured ~1052s, so the ceiling
+/// keeps about 1.7x headroom over the slower machine instead of failing a
+/// healthy soak. It is a runaway guard, not a benchmark.
+const MAX_PASS_SECONDS: u64 = 1800;
 
 /// The only placeholder arm the shipped corpus dispatches, recorded in the M16
 /// audit and `docs/m17-deviations.md`: opcode `0x05` with an out-of-range flag

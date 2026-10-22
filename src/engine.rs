@@ -3853,19 +3853,26 @@ impl GameSession {
     /// menu. It starts on its setup state: the first
     /// [`GameSession::tick_examine`] runs the setup and the first intro frame
     /// together. A viewer that cannot open hands the menu straight back.
-    fn open_item_view(&mut self, pack: &Pack, item: u8) {
+    fn open_item_view(&mut self, pack: &Pack, item: u8, menu: bool) {
         let quantity = self
             .menu_slot()
             .and_then(|slot| self.game.inventory.get(slot))
             .map_or(0, |stack| stack.quantity);
+        let mut args = vec![
+            ("item", ScreenArg::Int(i64::from(item))),
+            ("quantity", ScreenArg::Int(i64::from(quantity))),
+        ];
+        if menu {
+            // The radio tab and CHECK open the viewer over the live pause
+            // menu; the reference draws that overlay on the panel's black,
+            // not on the standalone viewer's navy.
+            args.push(("menu", ScreenArg::Bool(true)));
+        }
         let screen = {
             let mut cx = self.ui_context(pack);
             ui::lua_screen::LuaScreen::open_screen(
                 "item_view",
-                &[
-                    ("item", ScreenArg::Int(i64::from(item))),
-                    ("quantity", ScreenArg::Int(i64::from(quantity))),
-                ],
+                &args,
                 ScreenAction::Resume,
                 &mut cx,
             )
@@ -3895,7 +3902,7 @@ impl GameSession {
             return;
         }
         if let MenuEvent::ViewItem(item) = self.tick_menu_screen(pack) {
-            self.open_item_view(pack, item);
+            self.open_item_view(pack, item, true);
         }
         let Some(mut viewer) = self.examine.take() else {
             return;
@@ -4580,7 +4587,7 @@ impl GameSession {
             MenuEvent::CloseSilent => self.begin_menu_close_silent(),
             // CHECK's slide-out finished: the viewer starts. The slide's own
             // frames run through `tick_examine`, which handles this itself.
-            MenuEvent::ViewItem(item) => self.open_item_view(pack, item),
+            MenuEvent::ViewItem(item) => self.open_item_view(pack, item, true),
             MenuEvent::Tab(cursor) => self.handle_tab(pack, cursor),
         }
     }
@@ -4619,7 +4626,7 @@ impl GameSession {
                     self.play_character_bank_cue(pack, sfx::UI_RADIO, 7);
                     self.begin_menu_close(pack);
                 } else {
-                    self.open_item_view(pack, ITEM_COMM_RADIO);
+                    self.open_item_view(pack, ITEM_COMM_RADIO, true);
                 }
             }
             _ => self.close_menu(),
@@ -6946,7 +6953,7 @@ impl App {
         session.seed_menu_capture();
         session.game.add_item(ITEM_KNIFE, 0);
         session.open_menu(&self.pack);
-        session.open_item_view(&self.pack, ITEM_KNIFE);
+        session.open_item_view(&self.pack, ITEM_KNIFE, false);
         self.start_session(session);
         Ok(())
     }
@@ -14216,32 +14223,19 @@ mod tests {
     #[test]
     #[ignore = "requires a converted pack via ARKLAY_RE1_PACK"]
     fn walk_animation_moves_the_model() {
+        let _sdl = crate::audio::test_lock::sdl();
         let Ok(path) = std::env::var("ARKLAY_RE1_PACK") else {
             return;
         };
         let pack = Pack::open(Path::new(&path)).unwrap();
-        let id = RoomId::parse("1001").unwrap();
-        let room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
+        let id = RoomId::parse("1010").unwrap();
+        let mut room = rdt::parse(&pack.read(&id.rdt_entry()).unwrap(), id).unwrap();
         let assets = load_player_assets(&pack, id).expect("player assets");
-        let mut player_state = player::spawn(id, &room);
+        let idle_player = player::spawn(id, &room);
+        let mut walking_player = idle_player.clone();
         let mut masks = MaskCache::default();
         let mut shadows = ShadowCache::default();
         let mut npc_models = enemy::EntityModelCache::default();
-
-        let mut idle = Framebuffer::new();
-        render_frame(
-            &mut idle,
-            &pack,
-            id,
-            &room,
-            &player_state,
-            &mut game::GameState::new(id, &room),
-            Some(&assets),
-            &mut npc_models,
-            &mut masks,
-            &mut shadows,
-            &mut EffectPageCache::default(),
-        );
 
         let input = player::Input {
             up: true,
@@ -14249,40 +14243,70 @@ mod tests {
         };
         for _ in 0..20 {
             player::update(
-                &mut player_state,
+                &mut walking_player,
                 &room,
                 &assets.emd.clips,
                 &assets.emw.clips,
                 input,
             );
         }
-        let mut walking = Framebuffer::new();
-        render_frame(
-            &mut walking,
-            &pack,
-            id,
-            &room,
-            &player_state,
-            &mut game::GameState::new(id, &room),
-            Some(&assets),
-            &mut npc_models,
-            &mut masks,
-            &mut shadows,
-            &mut EffectPageCache::default(),
-        );
 
-        let changed = idle
-            .rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(walking.rgba.as_chunks::<4>().0)
-            .filter(|(a, b)| a != b)
-            .count();
-        assert!(
-            changed > 100,
-            "expected the walk animation to move the model, {changed} pixels changed"
-        );
+        // The spawn walk zone does not necessarily sit in the default cut's
+        // view (the old room 1001 boot rendered a black corridor). Render the
+        // same pair on every cut and require at least one to show the
+        // animated player; this keeps the test about the walk pose rather
+        // than about the room's default camera.
+        let mut best = 0usize;
+        for cut in 0..room.cuts.len() {
+            room.current_cut = cut;
+            let mut idle_game = game::GameState::new(id, &room);
+            idle_game.sync_entity_from_player(&idle_player);
+            idle_game.entities[0].zone_flags |= 0x01;
+            let mut idle = Framebuffer::new();
+            render_frame(
+                &mut idle,
+                &pack,
+                id,
+                &room,
+                &idle_player,
+                &mut idle_game,
+                Some(&assets),
+                &mut npc_models,
+                &mut masks,
+                &mut shadows,
+                &mut EffectPageCache::default(),
+            );
+            let mut walk_game = game::GameState::new(id, &room);
+            walk_game.sync_entity_from_player(&walking_player);
+            walk_game.entities[0].zone_flags |= 0x01;
+            let mut walking = Framebuffer::new();
+            render_frame(
+                &mut walking,
+                &pack,
+                id,
+                &room,
+                &walking_player,
+                &mut walk_game,
+                Some(&assets),
+                &mut npc_models,
+                &mut masks,
+                &mut shadows,
+                &mut EffectPageCache::default(),
+            );
+            let changed = idle
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(walking.rgba.as_chunks::<4>().0)
+                .filter(|(a, b)| a != b)
+                .count();
+            best = best.max(changed);
+            if changed > 100 {
+                return;
+            }
+        }
+        panic!("expected the walk animation to move the model on some cut, {best} pixels changed");
     }
 
     #[test]
@@ -22679,7 +22703,7 @@ off_0010:
             )
             .unwrap();
         settle_menu_fade(&mut session, &pack);
-        session.open_item_view(&pack, 0x37);
+        session.open_item_view(&pack, 0x37, true);
         idle_until(&mut session, &pack, 0x80, |session| {
             session
                 .examine

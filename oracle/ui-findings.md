@@ -362,6 +362,29 @@ the cursor, the swap and the health strip are pixel-equal - and the other
 differing pixels are sub-threshold (the `0x70` dim rounding over the panel
 art).
 
+- **Herb combine prompt and MOVE close.** The MOVE confirm on a valid herb
+  pair opens the original's `0xF5` yes/no prompt (`menu_item_check_combine`
+  returns 2/3 without applying) and applies on Yes through
+  `menu_item_apply_combine`; the answer reaches the menu one tick after the
+  message task hides the window, and the four-tick MOVE-cursor retract runs
+  before the submenu's eight-frame close. `combine_ok` and the green+green
+  `combine_refuse` scenario drop from 7.8%/7.3% to the panel's portrait
+  residual (~2%).
+- **Pause-menu item viewer backdrop.** The radio-tab and CHECK viewers draw
+  over the live menu; the reference's viewport there is black, while the
+  standalone `--ui view` screen (a port-only capture) keeps the navy backdrop.
+  `item_view` takes a `menu` flag and fills black for the overlay, dropping
+  `radio_use`/`use_herb` from 22.3% to the portrait residual (~1.3-1.6%).
+- **Door/room fade rounding.** `render::draw_fade_overlay` truncated the alpha
+  blend; the reference rounds `(src*(255-a) + target*a) / 255`. The truncation
+  left up to 80% of a fading door frame one LSB dark; `door_101` now matches
+  all 411 frames byte-for-byte and `door_207` leaves only a 42-pixel residual.
+- **Run-to-walk hand-off.** The release tick now finishes the run handler
+  (`Joint_move`, run speed and steering) and writes the walk re-entry frame at
+  its tail; the walk handler applies it on the next tick with the three-step
+  blend. `walk_forward` drops from 1.41% on every frame after t=160 to a
+  one-pixel-per-frame residual.
+
 ## Save-mode oracle
 
 `scripts/oracle-ui.sh --save oracle/saves/<file>.dat` boots both engines from

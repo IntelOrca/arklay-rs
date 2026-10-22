@@ -1,5 +1,7 @@
 //! The real-asset integration suite: every real-asset test module in one
 //! binary, so the suite compiles and links once instead of once per file.
+//! The performance budgets live in their own `tests/perf_real.rs` binary so
+//! the suite's parallel tests cannot take the cores they measure.
 //!
 //! The real-asset tests here are `#[ignore]`d because they need the game
 //! install and a converted pack; `-- --ignored` runs them:
@@ -65,7 +67,6 @@ mod m6_wiring_real;
 mod mask_render_real;
 mod npc_real;
 mod objects_real;
-mod perf_real;
 mod save_real;
 mod shadow_real;
 mod stairs_real;
