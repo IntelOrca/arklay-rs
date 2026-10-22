@@ -212,14 +212,16 @@ fn real_view_capture_is_deterministic() {
 
     let decoded = arklay::bmp::decode(&first).unwrap();
     assert_eq!((decoded.width, decoded.height), (320, 240));
-    // The viewport around the model keeps the original's pure-black screen
-    // clear; only the model and the name line may paint over it.
+    // The viewport around the model is the original's navy (Classic REbirth
+    // shows srgb(0, 0, 32) there); only the model and the name line paint
+    // over it.
     let viewport = |x: usize, y: usize| -> [u8; 4] {
         let offset = (y * decoded.width as usize + x) * 4;
         decoded.rgba[offset..offset + 4].try_into().unwrap()
     };
-    assert_eq!(viewport(35, 60), [0, 0, 0, 255]);
-    assert_eq!(viewport(170, 100), [0, 0, 0, 255]);
+    const NAVY: [u8; 4] = [0, 0, 0x20, 255];
+    assert_eq!(viewport(35, 60), NAVY);
+    assert_eq!(viewport(170, 100), NAVY);
     let content = decoded
         .rgba
         .as_chunks::<4>()
@@ -232,7 +234,8 @@ fn real_view_capture_is_deterministic() {
     // A stale pack without `item/*.ivm` still shows the menu underneath, so
     // non-black alone cannot prove the model layer drew. The viewer must add a
     // known delta over the menu capture: the model (centre region, away from
-    // the inventory column and the name line) plus the examine name line.
+    // the inventory column and the name line, not counting the navy behind
+    // it) plus the examine name line.
     let menu = arklay::bmp::decode(&std::fs::read(&menu_path).unwrap()).unwrap();
     let changed = decoded
         .rgba
@@ -248,7 +251,10 @@ fn real_view_capture_is_deterministic() {
             if decoded.rgba[offset..offset + 4] == menu.rgba[offset..offset + 4] {
                 continue;
             }
-            if (40..200).contains(&x) && (20..170).contains(&y) {
+            if (40..200).contains(&x)
+                && (20..170).contains(&y)
+                && decoded.rgba[offset..offset + 4] != NAVY
+            {
                 centre += 1;
             }
             if y >= 180 {

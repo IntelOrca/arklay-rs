@@ -869,6 +869,9 @@ end
         assert_eq!(quads[0].uv, [0.0, 0.0, 4.0 / fw, 4.0 / fh]);
         assert_eq!(quads[0].colour, [1.0; 3]);
         assert_eq!(quads[0].clip, [0, 0, 320, 240]);
-        assert_eq!(quads[0].image.image.width, 8);
+        let crate::htexture::QuadImage::Art(image) = &quads[0].image else {
+            panic!("a model quad");
+        };
+        assert_eq!(image.image.width, 8);
     }
 }

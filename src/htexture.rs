@@ -222,7 +222,7 @@ pub fn replacement(
 /// software art would have been.
 #[derive(Clone, Debug)]
 pub struct Quad {
-    pub image: Arc<Replacement>,
+    pub image: QuadImage,
     /// `[x0, y0, x1, y1]` in frame pixels.
     pub dst: [f32; 4],
     /// `[u0, v0, u1, v1]` at the corners, normalised over the image; a
@@ -232,6 +232,50 @@ pub struct Quad {
     pub colour: [f32; 3],
     /// `[x, y, w, h]` in frame pixels the quad is cut to.
     pub clip: [i32; 4],
+}
+
+/// What a [`Quad`] draws.
+#[derive(Clone, Debug)]
+pub enum QuadImage {
+    /// A pack's HD image of 2D art.
+    Art(Arc<Replacement>),
+    /// A model the GPU renders at its own resolution first: the examine
+    /// viewer's item ([`crate::render::Framebuffer::draw_ivm_captured`]).
+    Model(Arc<Model>),
+}
+
+impl From<Arc<Replacement>> for QuadImage {
+    fn from(image: Arc<Replacement>) -> Self {
+        Self::Art(image)
+    }
+}
+
+/// A model draw the GPU renders into its own target, cleared to
+/// `backdrop`, and then draws as its [`Quad`] (whose `uv` spans the target).
+#[derive(Debug)]
+pub struct Model {
+    /// The model whose page the triangles sample.
+    pub ivm: Arc<crate::ivm::Ivm>,
+    /// Three per triangle, back to front, in the quad's clip space.
+    pub vertices: Vec<ModelVertex>,
+    /// The flat colour the software overlay had under the quad.
+    pub backdrop: [u8; 3],
+}
+
+/// One projected model corner (40 bytes), the input of `ivm.vert`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelVertex {
+    /// Clip-space position over the quad: `x`, `y` and the linear depth,
+    /// all times `w`, the view Z.
+    pub clip: [f32; 4],
+    /// Texel coordinates in the model's page.
+    pub uv: [f32; 2],
+    /// The lit colour in `0..=255`; `255` keeps the texel as stored.
+    pub shade: [f32; 3],
+    /// `palette_row << 8 | blend << 24 | untextured << 25`, as `mesh.frag`
+    /// reads it.
+    pub packed: u32,
 }
 
 /// The 2D replacements of one frame, captured while its overlay is drawn.

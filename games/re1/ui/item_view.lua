@@ -71,6 +71,9 @@ local ITEM_NAME_Y = 0xBA
 -- model is drawn behind the frame, so nothing of it shows past the frame's
 -- inner edge.
 local VIEWPORT = { 32, 24, 160, 104 }
+-- The viewport's navy backdrop behind the examine model, `{r, g, b}`
+-- (Classic REbirth shows srgb(0, 0, 32) there while the viewer is up).
+local BACKDROP = { 0, 0, 0x20 }
 -- The red book, the second doom book and the medal the first one becomes.
 local ITEM_RED_BOOK = 0x3E
 local ITEM_DOOM_BOOK_2 = 0x3F
@@ -419,11 +422,15 @@ local function draw_model(api)
 end
 
 function M.draw(api)
+    local ox, oy = api:width() // 2 - 160, api:height() // 2 - 120
+    if not s.pickup and s.stage ~= "setup" and s.stage ~= "closed" then
+        api:fill_rect(ox + VIEWPORT[1], oy + VIEWPORT[2], VIEWPORT[3], VIEWPORT[4],
+            BACKDROP[1], BACKDROP[2], BACKDROP[3])
+    end
     draw_model(api)
     if s.pickup then
         return
     end
-    local ox, oy = api:width() // 2 - 160, api:height() // 2 - 120
     if s.arrows then
         if s.status == nil then
             s.status = api:page("ui/status") or false

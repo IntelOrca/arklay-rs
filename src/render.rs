@@ -366,7 +366,7 @@ impl Framebuffer {
     /// `draw` simply runs.
     pub fn draw_replaced(
         &mut self,
-        image: std::sync::Arc<crate::htexture::Replacement>,
+        image: impl Into<crate::htexture::QuadImage>,
         dst: [f32; 4],
         uv: [f32; 4],
         colour: [f32; 3],
@@ -388,7 +388,7 @@ impl Framebuffer {
         if x0 < x1 && y0 < y1 {
             let (fx, fy) = (x as f32, y as f32);
             overlay.quads.push(crate::htexture::Quad {
-                image,
+                image: image.into(),
                 dst: [dst[0] + fx, dst[1] + fy, dst[2] + fx, dst[3] + fy],
                 uv,
                 colour,
@@ -1566,9 +1566,116 @@ impl Framebuffer {
     ) {
         let mut triangles: Vec<Triangle> = Vec::new();
         for (object, joint) in ivm.objects.iter().zip(joints) {
-            collect_ivm_triangles(object, joint, camera, light, &mut triangles);
+            collect_ivm_triangles(object, joint, camera, light, false, &mut triangles);
         }
         self.rasterize_triangles(&ivm.texture, triangles);
+    }
+
+    /// [`Framebuffer::draw_ivm`], but while the GPU renderer captures this
+    /// frame ([`Framebuffer::capture_hd`]) a model clipped to a rect of one
+    /// flat colour that no earlier HD quad covers is queued for the GPU
+    /// instead ([`crate::htexture::QuadImage::Model`]): it renders at the
+    /// window's resolution over that colour, cut to the clip rect, and the
+    /// rect is punched for it. Anything else under the model (art, an HD
+    /// quad, a gradient) keeps it on the software path, which draws over it.
+    pub fn draw_ivm_captured(
+        &mut self,
+        ivm: &std::sync::Arc<crate::ivm::Ivm>,
+        joints: &[anim::Mat4x3],
+        camera: &Camera,
+        light: Option<&EntityLight>,
+    ) {
+        let Some((rect, backdrop)) = self.model_backdrop() else {
+            self.draw_ivm(ivm, joints, camera, light);
+            return;
+        };
+        let mut triangles: Vec<Triangle> = Vec::new();
+        for (object, joint) in ivm.objects.iter().zip(joints) {
+            collect_ivm_triangles(object, joint, camera, light, true, &mut triangles);
+        }
+        // Nothing to draw leaves the backdrop as it is, as the software
+        // path would.
+        if triangles.is_empty() || ivm.texture.width == 0 || ivm.texture.height == 0 {
+            return;
+        }
+        triangles.sort_by(|a, b| b.depth.total_cmp(&a.depth));
+        let overlay = self.hd.as_mut().expect("model_backdrop requires a capture");
+        let [x, y, width, height] = rect;
+        let [offset_x, offset_y] = overlay.offset;
+        let vertices = triangles
+            .iter()
+            .flat_map(|triangle| {
+                let packed = (triangle.palette_row as u32 & 0xFFFF) << 8
+                    | u32::from(triangle.blend) << 24
+                    | u32::from(triangle.flat.is_some()) << 25;
+                triangle.raster.each_ref().map(|vertex| {
+                    let w = vertex.w;
+                    let ndc_x = (vertex.position[0] - x as f32) / width as f32 * 2.0 - 1.0;
+                    let ndc_y = 1.0 - (vertex.position[1] - y as f32) / height as f32 * 2.0;
+                    crate::htexture::ModelVertex {
+                        clip: [ndc_x * w, ndc_y * w, depth_ndc(w) * w, w],
+                        uv: [vertex.u, vertex.v],
+                        shade: vertex.shade.map(|channel| channel * 255.0),
+                        packed,
+                    }
+                })
+            })
+            .collect();
+        let (x0, y0) = ((x + offset_x) as f32, (y + offset_y) as f32);
+        overlay.quads.push(crate::htexture::Quad {
+            image: crate::htexture::QuadImage::Model(std::sync::Arc::new(crate::htexture::Model {
+                ivm: ivm.clone(),
+                vertices,
+                backdrop,
+            })),
+            dst: [x0, y0, x0 + width as f32, y0 + height as f32],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            colour: [1.0; 3],
+            clip: [x + offset_x, y + offset_y, width, height],
+        });
+        overlay.punching = true;
+        self.punch_rect(rect);
+        if let Some(overlay) = self.hd.as_mut() {
+            overlay.punching = false;
+        }
+    }
+
+    /// The clip rect, cut to the framebuffer, and its colour when a capture
+    /// is running, the rect is one flat colour and no HD quad covers any of
+    /// it: where [`Framebuffer::draw_ivm_captured`] hands its model to the
+    /// GPU. The model's target is cleared to that colour, so it could not
+    /// show a quad under it.
+    fn model_backdrop(&self) -> Option<([i32; 4], [u8; 3])> {
+        let overlay = self.hd.as_ref()?;
+        let [x, y, width, height] = self.clip?;
+        let (x0, y0) = (x.max(0), y.max(0));
+        let x1 = x.saturating_add(width).min(self.width as i32);
+        let y1 = y.saturating_add(height).min(self.height as i32);
+        if x0 >= x1 || y0 >= y1 {
+            return None;
+        }
+        let stride = self.width as usize * 4;
+        let pixel = |column: i32, row: i32| {
+            let offset = row as usize * stride + column as usize * 4;
+            [
+                self.rgba[offset],
+                self.rgba[offset + 1],
+                self.rgba[offset + 2],
+            ]
+        };
+        let covered = |column: i32, row: i32| {
+            let (x, y) = (column + overlay.offset[0], row + overlay.offset[1]);
+            x >= 0
+                && y >= 0
+                && (x as u32) < overlay.size[0]
+                && (y as u32) < overlay.size[1]
+                && overlay.coverage[y as usize * overlay.size[0] as usize + x as usize] != 0
+        };
+        let backdrop = pixel(x0, y0);
+        let flat = (y0..y1).all(|row| {
+            (x0..x1).all(|column| pixel(column, row) == backdrop && !covered(column, row))
+        });
+        flat.then_some(([x0, y0, x1 - x0, y1 - y0], backdrop))
     }
 
     fn rasterize_triangles(&mut self, texture: &Texture8, mut triangles: Vec<Triangle>) {
@@ -2764,6 +2871,20 @@ impl Camera {
         Some([sx as i32, sy as i32])
     }
 
+    /// [`Camera::project`] without the truncation: the screen position at
+    /// sub-pixel precision, for a renderer drawing above 320x240.
+    pub fn project_exact(&self, world: [i32; 3]) -> Option<[f32; 2]> {
+        let [vx, vy, vz] = self.view_position(world);
+        if vz <= 0 || i64::from(vz) < 2 * i64::from(self.fov) {
+            return None;
+        }
+        let scale = self.fov as f32 / vz as f32;
+        Some([
+            vx as f32 * scale + (CENTER_X + self.screen[0]) as f32,
+            (CENTER_Y + self.screen[1]) as f32 - vy as f32 * scale,
+        ])
+    }
+
     /// The 4.12 fixed-point view-space position of a world point.
     pub(crate) fn view_position(&self, world: [i32; 3]) -> [i32; 3] {
         std::array::from_fn(|row| {
@@ -3782,11 +3903,15 @@ pub(crate) fn reference_vertex_shade(
 /// backface-culls and a quad drops whole when any of its four corners is inside
 /// the near plane, exactly like the TMD path. The viewer uses a single palette
 /// row, so a textured prim samples row 0 and shades white.
+///
+/// With `exact` the corners keep their sub-pixel screen positions
+/// ([`Camera::project_exact`]) instead of the truncated ones.
 fn collect_ivm_triangles(
     object: &crate::ivm::IvmObject,
     joint: &anim::Mat4x3,
     camera: &Camera,
     light: Option<&EntityLight>,
+    exact: bool,
     triangles: &mut Vec<Triangle>,
 ) {
     let stored_camera = stored_camera_matrix(camera.from, camera.look_at);
@@ -3851,9 +3976,16 @@ fn collect_ivm_triangles(
                 continue;
             };
 
-            let position0 = [f64::from(screen0[0]), f64::from(screen0[1])];
-            let position1 = [f64::from(screen1[0]), f64::from(screen1[1])];
-            let position2 = [f64::from(screen2[0]), f64::from(screen2[1])];
+            let screen = |vertex: &[i32; 3], truncated: [i32; 2]| {
+                let exact = exact.then(|| camera.project_exact(*vertex)).flatten();
+                match exact {
+                    Some([x, y]) => [f64::from(x), f64::from(y)],
+                    None => [f64::from(truncated[0]), f64::from(truncated[1])],
+                }
+            };
+            let position0 = screen(vertex0, screen0);
+            let position1 = screen(vertex1, screen1);
+            let position2 = screen(vertex2, screen2);
             let area = (position1[0] - position0[0]) * (position2[1] - position0[1])
                 - (position2[0] - position0[0]) * (position1[1] - position0[1]);
             if !faces_camera(area) {
@@ -6485,6 +6617,134 @@ mod tests {
             painted
                 .iter()
                 .all(|&(x, y)| (150..170).contains(&x) && (110..130).contains(&y))
+        );
+    }
+
+    #[test]
+    fn a_captured_ivm_draw_over_a_flat_clip_goes_to_the_gpu() {
+        use crate::htexture::QuadImage;
+        use crate::ivm::{Ivm, IvmObject, IvmPrim, IvmPrimKind};
+        let model = std::sync::Arc::new(Ivm {
+            texture: solid_texture([255, 255, 255, 255]),
+            objects: vec![IvmObject {
+                vertices: vec![[-3000, -3000, 1000], [0, 3000, 1000], [3000, -3000, 1000]],
+                normals: vec![[0, 0, 4096]],
+                prims: vec![IvmPrim {
+                    kind: IvmPrimKind::Gouraud,
+                    vertex_count: 3,
+                    vertices: [0, 1, 2, 0],
+                    normals: [0; 4],
+                    uv: [[0, 0]; 4],
+                    colors: [[255; 3]; 3],
+                    clut: 0,
+                    tsb: 0,
+                    blend: false,
+                }],
+            }],
+        });
+        let clip = [150, 110, 20, 20];
+        let navy = |framebuffer: &mut Framebuffer| {
+            for y in 100..140 {
+                for x in 140..180 {
+                    let offset = (y * 320 + x) * 4;
+                    framebuffer.rgba[offset..offset + 4].copy_from_slice(&[0, 0, 0x20, 255]);
+                }
+            }
+        };
+        let pixel = |framebuffer: &Framebuffer, x: usize, y: usize| {
+            let offset = (y * 320 + x) * 4;
+            [
+                framebuffer.rgba[offset],
+                framebuffer.rgba[offset + 1],
+                framebuffer.rgba[offset + 2],
+            ]
+        };
+
+        let mut framebuffer = Framebuffer::new();
+        navy(&mut framebuffer);
+        framebuffer.capture_hd(255);
+        framebuffer.hd.as_mut().unwrap().offset = [8, 0];
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_captured(&model, &[identity()], &straight_camera(), None);
+        // The clip is punched whole and the model queued over its navy.
+        assert_eq!(pixel(&framebuffer, 150, 110), [255; 3]);
+        assert_eq!(pixel(&framebuffer, 169, 129), [255; 3]);
+        assert_eq!(pixel(&framebuffer, 149, 110), [0, 0, 0x20]);
+        let overlay = framebuffer.hd.as_ref().unwrap();
+        assert_eq!(overlay.coverage[110 * 320 + 158], 1);
+        assert_eq!(overlay.coverage[110 * 320 + 157], 0);
+        let [quad] = &overlay.quads[..] else {
+            panic!("expected one quad, got {}", overlay.quads.len());
+        };
+        assert_eq!(quad.dst, [158.0, 110.0, 178.0, 130.0]);
+        assert_eq!(quad.clip, [158, 110, 20, 20]);
+        let QuadImage::Model(queued) = &quad.image else {
+            panic!("an art quad");
+        };
+        assert!(std::sync::Arc::ptr_eq(&queued.ivm, &model));
+        assert_eq!(queued.backdrop, [0, 0, 0x20]);
+        assert_eq!(queued.vertices.len(), 3);
+        // Untextured, and the triangle spans the whole clip: its corners
+        // land outside the quad's clip space.
+        assert!(
+            queued
+                .vertices
+                .iter()
+                .all(|vertex| vertex.packed == 1 << 25)
+        );
+        assert!(queued.vertices.iter().all(|vertex| {
+            let [x, y, _, w] = vertex.clip;
+            w > 0.0 && (x / w).abs().max((y / w).abs()) > 1.0
+        }));
+
+        // Over art that is not one colour the software draws it.
+        let mut framebuffer = Framebuffer::new();
+        navy(&mut framebuffer);
+        framebuffer.rgba[(120 * 320 + 160) * 4] = 1;
+        framebuffer.capture_hd(255);
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_captured(&model, &[identity()], &straight_camera(), None);
+        assert!(framebuffer.hd_quads().is_empty());
+        assert_eq!(pixel(&framebuffer, 150, 110), [255; 3]);
+        assert_eq!(
+            framebuffer.hd.as_ref().unwrap().coverage[110 * 320 + 150],
+            0
+        );
+
+        // So it does over an earlier HD quad, which the model's backdrop
+        // would hide.
+        let mut framebuffer = Framebuffer::new();
+        navy(&mut framebuffer);
+        framebuffer.capture_hd(255);
+        framebuffer.hd.as_mut().unwrap().coverage[129 * 320 + 169] = 1;
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_captured(&model, &[identity()], &straight_camera(), None);
+        assert!(framebuffer.hd_quads().is_empty());
+        assert_eq!(pixel(&framebuffer, 150, 110), [255; 3]);
+
+        // So it does without a capture.
+        let mut framebuffer = Framebuffer::new();
+        navy(&mut framebuffer);
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_captured(&model, &[identity()], &straight_camera(), None);
+        assert_eq!(pixel(&framebuffer, 160, 120), [255; 3]);
+
+        // A model with nothing to draw queues nothing and leaves the
+        // backdrop unpunched.
+        let empty = std::sync::Arc::new(Ivm {
+            texture: solid_texture([255, 255, 255, 255]),
+            objects: Vec::new(),
+        });
+        let mut framebuffer = Framebuffer::new();
+        navy(&mut framebuffer);
+        framebuffer.capture_hd(255);
+        framebuffer.set_clip_rect(Some(clip));
+        framebuffer.draw_ivm_captured(&empty, &[], &straight_camera(), None);
+        assert!(framebuffer.hd_quads().is_empty());
+        assert_eq!(pixel(&framebuffer, 160, 120), [0, 0, 0x20]);
+        assert_eq!(
+            framebuffer.hd.as_ref().unwrap().coverage[120 * 320 + 160],
+            0
         );
     }
 

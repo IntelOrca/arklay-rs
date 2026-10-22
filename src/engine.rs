@@ -5165,16 +5165,11 @@ impl GameSession {
     /// it. Returns whether the frame shows the GPU scene; when it does not,
     /// `framebuffer` is the whole frame. See [`GameSession::white_frame`].
     ///
-    /// With a pack carrying HD replacements, 2D art the pack replaces is
+    /// 2D art the pack replaces in HD, and the examine viewer's model, are
     /// drawn on the GPU too ([`crate::htexture::Overlay`]); a frame with any
     /// is layered even when it shows no scene.
     fn render_layers(&mut self, pack: &Pack, gpu: &mut GpuRenderer) {
-        let hd = !pack.htexture().is_empty();
-        if hd {
-            self.framebuffer.capture_hd(0);
-        } else {
-            self.framebuffer.hd = None;
-        }
+        self.framebuffer.capture_hd(0);
         // The pause-menu fade is consumed as it draws; the white pass draws
         // the same one.
         let menu_fade = self.menu_fade_draw;
@@ -5189,11 +5184,7 @@ impl GameSession {
         self.menu_fade_draw = menu_fade;
         let mut white = self.framebuffer_white.take().unwrap_or_default();
         std::mem::swap(&mut self.framebuffer, &mut white);
-        if hd {
-            self.framebuffer.capture_hd(255);
-        } else {
-            self.framebuffer.hd = None;
-        }
+        self.framebuffer.capture_hd(255);
         self.render_pass(pack, ScenePass::White);
         std::mem::swap(&mut self.framebuffer, &mut white);
         self.framebuffer_white = Some(white);
@@ -16049,6 +16040,49 @@ mod tests {
             }
             assert!(display.gpu().is_some());
         }
+        // So does the item viewer's model, rendered on the GPU over its
+        // backdrop.
+        let mut palettes = vec![[0, 0, 0, 0]; crate::model::PALETTE_ROW_LEN];
+        palettes[1] = [255, 255, 255, 255];
+        let model = std::sync::Arc::new(crate::htexture::Model {
+            ivm: std::sync::Arc::new(crate::ivm::Ivm {
+                texture: crate::model::Texture8 {
+                    width: 1,
+                    height: 1,
+                    indices: vec![1],
+                    palettes,
+                    stp: vec![false; crate::model::PALETTE_ROW_LEN],
+                },
+                objects: Vec::new(),
+            }),
+            vertices: [[-1.0, 1.0], [1.0, 1.0], [-1.0, -1.0]]
+                .map(|[x, y]| crate::htexture::ModelVertex {
+                    clip: [x, y, 0.5, 1.0],
+                    uv: [0.0, 0.0],
+                    shade: [255.0, 0.0, 0.0],
+                    packed: 1 << 25,
+                })
+                .to_vec(),
+            backdrop: [0, 0, 32],
+        });
+        for (layer, hole) in [(&mut black, 0), (&mut white, 255)] {
+            layer.capture_hd(hole);
+            let overlay = layer.hd.as_mut().unwrap();
+            overlay.quads.push(crate::htexture::Quad {
+                image: crate::htexture::QuadImage::Model(model.clone()),
+                dst: [100.0, 80.0, 200.0, 160.0],
+                uv: [0.0, 0.0, 1.0, 1.0],
+                colour: [1.0; 3],
+                clip: [100, 80, 100, 80],
+            });
+            overlay.punching = true;
+            layer.punch_rect([100, 80, 100, 80]);
+            layer.hd.as_mut().unwrap().scene = false;
+        }
+        for _ in 0..2 {
+            display.present_layers(&black, Some(&white)).unwrap();
+        }
+        assert!(display.gpu().is_some());
         black.hd = None;
         white.hd = None;
         // An HD film frame is presented at its own size, and the layers

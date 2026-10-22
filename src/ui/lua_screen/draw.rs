@@ -32,7 +32,7 @@ enum Asset {
     /// A sprite page in its native shape: indexed with CLUT rows, or RGBA.
     Page(Artwork),
     /// An item-view model and the size of the file it was parsed from.
-    Model(Box<Ivm>, usize),
+    Model(Arc<Ivm>, usize),
 }
 
 impl Asset {
@@ -160,14 +160,17 @@ impl Assets {
         if let Some(found) = self.hd.borrow().get(&(handle, row)) {
             return found.clone();
         }
+        // The frame is captured without an HD pack too (for the viewer's
+        // model), so skip hashing the art when there is nothing to find.
         let candidates = match asset {
+            _ if pack.htexture().is_empty() => Vec::new(),
             Asset::Picture(image) | Asset::Page(Artwork::Rgba(image)) => {
                 htexture::image_candidates(image)
             }
             Asset::Page(Artwork::Indexed(texture)) => htexture::page_candidates(texture, row),
             Asset::Model(..) => Vec::new(),
         };
-        let found = if candidates.is_empty() || pack.htexture().is_empty() {
+        let found = if candidates.is_empty() {
             None
         } else {
             let (width, height) = asset.size();
@@ -204,7 +207,7 @@ impl Assets {
         found
     }
 
-    fn model(&self, handle: usize) -> mlua::Result<&Ivm> {
+    fn model(&self, handle: usize) -> mlua::Result<&Arc<Ivm>> {
         match self.get(handle)? {
             Asset::Model(model, _) => Ok(model),
             _ => Err(mlua::Error::RuntimeError(format!(
@@ -490,7 +493,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
         Ok(loaded(api.host.assets.load(cache_key, || {
             let bytes = pack.read(&entry)?;
             let model = ivm::parse(&bytes)?;
-            Ok(Asset::Model(Box::new(model), bytes.len()))
+            Ok(Asset::Model(Arc::new(model), bytes.len()))
         })))
     });
 
@@ -506,7 +509,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             let bytes = pack.read(&entry)?;
             let model =
                 ivm::parse(&bytes).map_err(|err| err.context(format!("invalid {entry}")))?;
-            Ok(Asset::Model(Box::new(model), bytes.len()))
+            Ok(Asset::Model(Arc::new(model), bytes.len()))
         })))
     });
 
@@ -592,6 +595,9 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     // joint chain `objects[i]`, and every object past the list the one
     // composed `joints` chain. `screen` offsets the projection centre,
     // which sits at the layout's centre (see [`band_centre`]).
+    // While the GPU renderer captures the frame, a model clipped to a rect
+    // of one flat colour renders on the GPU over that colour
+    // ([`Framebuffer::draw_ivm_captured`]).
     methods.add_method_mut("draw_ivm", |_lua, api, (handle, spec): (usize, Table)| {
         let Api {
             host, framebuffer, ..
@@ -620,7 +626,7 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
                 *slot = joint_matrix(Some(chain?))?;
             }
         }
-        framebuffer.draw_ivm(model, &joints, &camera, light.as_ref());
+        framebuffer.draw_ivm_captured(model, &joints, &camera, light.as_ref());
         Ok(())
     });
 
