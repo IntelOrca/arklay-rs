@@ -72,7 +72,8 @@ use sdl3_sys::render::{
     SDL_UpdateTexture,
 };
 use sdl3_sys::scancode::{
-    SDL_SCANCODE_F8, SDL_SCANCODE_KP_ENTER, SDL_SCANCODE_RETURN, SDL_Scancode,
+    SDL_SCANCODE_F2, SDL_SCANCODE_F3, SDL_SCANCODE_F8, SDL_SCANCODE_KP_ENTER, SDL_SCANCODE_RETURN,
+    SDL_Scancode,
 };
 use sdl3_sys::stdinc::SDL_free;
 use sdl3_sys::surface::{
@@ -122,6 +123,7 @@ use crate::save;
 use crate::scd;
 use crate::sfx;
 use crate::shadow;
+use crate::speed::Speed;
 use crate::state::{Image, RoomId, RoomState};
 use crate::stats;
 use crate::text::Text;
@@ -941,6 +943,9 @@ struct LoopClock {
     /// Unspent wall time since the last tick, in milliseconds.
     accumulator: f64,
     pacer: FramePacer,
+    /// The F2/F3 gameplay speed multiplier: the fixed tick runs this many
+    /// times per wall-clock tick interval.
+    speed: Speed,
     /// `--stats`: the presented frames and when the loop started.
     render: Option<(stats::RenderStats, u64)>,
 }
@@ -955,6 +960,7 @@ impl LoopClock {
             last_ns: now,
             accumulator: 0.0,
             pacer: FramePacer::new(frame_rate),
+            speed: Speed::default(),
             render: stats.then(|| (stats::RenderStats::new(frame_rate), now)),
         }
     }
@@ -992,6 +998,26 @@ impl LoopClock {
         self.pacer.set_rate(rate);
         if let Some((render, _)) = &mut self.render {
             render.frame_rate = rate.max(1);
+        }
+    }
+
+    /// Step the gameplay speed one notch up (`delta` > 0, F3) or down (F2),
+    /// clamped to the range in [`crate::speed`]. Reports real changes to the
+    /// terminal so the current speed is discoverable.
+    fn step_speed(&mut self, delta: i32) {
+        if self.speed.step(delta) {
+            eprintln!("speed: {:.1}x", self.speed.multiplier());
+        }
+    }
+
+    /// The tick interval at the current speed: `tick_ms` divided by the
+    /// multiplier, so the simulation runs that many ticks per wall-clock tick.
+    /// A screen the speed does not apply to keeps `tick_ms` unchanged.
+    fn scaled_tick_interval(&self, tick_ms: f64, scaled: bool) -> f64 {
+        if scaled {
+            tick_ms / self.speed.multiplier()
+        } else {
+            tick_ms
         }
     }
 
@@ -6614,6 +6640,14 @@ impl App {
         }
     }
 
+    /// Whether the F2/F3 game speed applies to the current screen. Films run
+    /// on their own audio-led clock (the mixer's played sample position), so
+    /// speeding their fixed ticks would put the picture ahead of the sound
+    /// device; they keep the original clock.
+    fn speed_applies(&self) -> bool {
+        !matches!(self.mode, Mode::Movie(_))
+    }
+
     /// Build the shared screen context.
     fn context(&self) -> UiContext<'_> {
         UiContext {
@@ -8148,11 +8182,21 @@ fn run_app_loop(app: &mut App, display: &mut Display, stats: bool) -> Result<()>
     let mut clock = LoopClock::new(display.frame_rate(), stats);
     loop {
         let mut cut_delta = 0i32;
-        if poll_events(&mut event, &mut input, &mut cut_delta, Some(display)) {
+        let mut speed_delta = 0i32;
+        if poll_events(
+            &mut event,
+            &mut input,
+            &mut cut_delta,
+            &mut speed_delta,
+            Some(display),
+        ) {
             return clock.report();
         }
         if cut_delta != 0 {
             app.step_camera_cut(cut_delta);
+        }
+        if speed_delta != 0 {
+            clock.step_speed(speed_delta);
         }
         if let Some(bindings) = app.take_bindings_change() {
             input.apply_bindings_change(bindings);
@@ -8171,7 +8215,7 @@ fn run_app_loop(app: &mut App, display: &mut Display, stats: bool) -> Result<()>
         // The film skip state advances on every loop pass, not the fixed
         // tick, exactly like the original's platform-driven film update.
         app.poll_movie_skip(movie_buttons_held(input.held_word()));
-        let tick_ms = app.tick_interval();
+        let tick_ms = clock.scaled_tick_interval(app.tick_interval(), app.speed_applies());
         while clock.accumulator >= tick_ms {
             let tick = input.tick();
             if let AppFlow::Quit = app.update(tick.ui, tick.player, tick.action)? {
@@ -8366,9 +8410,16 @@ fn run_font_ui(pack_path: &Path, capture: Option<&Path>, mods: &ModOptions) -> R
 
     let mut event = SDL_Event::default();
     let mut cut_delta = 0i32;
+    let mut speed_delta = 0i32;
     let mut input = InputState::default();
     loop {
-        if poll_events(&mut event, &mut input, &mut cut_delta, None) {
+        if poll_events(
+            &mut event,
+            &mut input,
+            &mut cut_delta,
+            &mut speed_delta,
+            None,
+        ) {
             return Ok(());
         }
         present(renderer, &mut texture, &framebuffer)?;
@@ -10016,6 +10067,7 @@ fn poll_events(
     event: &mut SDL_Event,
     input: &mut InputState,
     cut_delta: &mut i32,
+    speed_delta: &mut i32,
     mut display: Option<&mut Display>,
 ) -> bool {
     use controls::{Source, Wheel};
@@ -10029,6 +10081,15 @@ fn poll_events(
             let scancode = unsafe { event.key.scancode };
             let modifiers = unsafe { event.key.r#mod };
             let repeat = unsafe { event.key.repeat };
+            // F2/F3 slow down and speed up the simulation (see LoopClock).
+            // They are fixed port-only keys like F8, so they never reach the
+            // action bindings.
+            if matches!(scancode, SDL_SCANCODE_F2 | SDL_SCANCODE_F3) {
+                if !repeat {
+                    *speed_delta += if scancode == SDL_SCANCODE_F3 { 1 } else { -1 };
+                }
+                continue;
+            }
             if let Some(display) = display.as_deref_mut() {
                 if scancode == SDL_SCANCODE_F8 {
                     if !repeat {

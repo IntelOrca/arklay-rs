@@ -275,6 +275,7 @@ positive flag is passed, so existing traces stay byte-identical.
 | `Shift` + `,` | Previous camera cut |
 | `Shift` + `.` | Next camera cut |
 | `F1` (gamepad Back / Select) | Port-only debug tools: freeze the room and open the tool list (room select, inventory, player, flags, cheats, save/load, item box, clear game, controls, display); Esc backs out one level, F1 closes |
+| `F2`, `F3` | Port-only game speed: F2 steps down and F3 up, 1x to 3x in 0.5x steps |
 | `F9` | Return-to-title prompt: a second F9 returns to the title screen, any other key cancels |
 
 Every action except the fixed debug inputs (`F1` and the gamepad's Back
