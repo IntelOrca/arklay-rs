@@ -60,7 +60,11 @@ impl Asset {
 /// The art a screen loaded, by handle.
 #[derive(Default)]
 pub(super) struct Assets {
-    list: Vec<Asset>,
+    /// The art by handle - 1; a released handle's slot stays empty, so a
+    /// stale handle fails instead of drawing later art.
+    list: Vec<Option<Asset>>,
+    /// Loaded (unreleased) art, against [`budget::MAX_SCREEN_IMAGES`].
+    live: usize,
     /// Handle by load key, so asking twice returns the same art.
     by_key: HashMap<String, usize>,
     /// Decoded bytes held, against [`budget::MAX_SCREEN_IMAGE_BYTES`].
@@ -86,11 +90,7 @@ impl Assets {
         if let Some(&handle) = self.by_key.get(&key) {
             return Ok(handle);
         }
-        budget::check_len(
-            self.list.len() + 1,
-            budget::MAX_SCREEN_IMAGES,
-            "screen art count",
-        )?;
+        budget::check_len(self.live + 1, budget::MAX_SCREEN_IMAGES, "screen art count")?;
         let asset = load()?;
         let bytes = asset.bytes();
         budget::check_len(
@@ -99,16 +99,35 @@ impl Assets {
             "screen art bytes",
         )?;
         self.bytes = self.bytes.saturating_add(bytes);
-        self.list.push(asset);
+        self.live += 1;
+        self.list.push(Some(asset));
         let handle = self.list.len();
         self.by_key.insert(key, handle);
         Ok(handle)
+    }
+
+    /// Drop `handle`'s art, returning its bytes and count to the budget. The
+    /// handle is invalid afterwards and never handed out again; releasing an
+    /// unknown or already released handle does nothing.
+    fn release(&mut self, handle: usize) {
+        let Some(asset) = handle
+            .checked_sub(1)
+            .and_then(|index| self.list.get_mut(index))
+            .and_then(Option::take)
+        else {
+            return;
+        };
+        self.bytes = self.bytes.saturating_sub(asset.bytes());
+        self.live -= 1;
+        self.by_key.retain(|_, &mut held| held != handle);
+        self.hd.get_mut().retain(|&(held, _), _| held != handle);
     }
 
     fn get(&self, handle: usize) -> mlua::Result<&Asset> {
         handle
             .checked_sub(1)
             .and_then(|index| self.list.get(index))
+            .and_then(Option::as_ref)
             .ok_or_else(|| mlua::Error::RuntimeError(format!("invalid art handle {handle}")))
     }
 
@@ -487,6 +506,13 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     // `model_objects(model)`: the number of objects a model carries.
     methods.add_method("model_objects", |_lua, api, handle: usize| {
         Ok(api.host.assets.model(handle)?.objects.len())
+    });
+
+    // `release(handle)`: drop art the screen no longer draws, so a screen
+    // that pages through more art than the cache holds stays in budget.
+    methods.add_method_mut("release", |_lua, api, handle: usize| {
+        api.host.assets.release(handle);
+        Ok(())
     });
 
     methods.add_method("art_size", |_lua, api, handle: usize| {
@@ -951,6 +977,54 @@ fn band_centre(framebuffer: &Framebuffer, screen: [i32; 2]) -> [i32; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_art_returns_its_count_and_bytes_to_the_budget() {
+        let picture = || {
+            Ok(Asset::Picture(Image {
+                width: 2,
+                height: 2,
+                rgba: vec![0; 16],
+            }))
+        };
+        let mut assets = Assets::default();
+        for index in 0..budget::MAX_SCREEN_IMAGES {
+            assert_eq!(
+                assets.load(format!("art{index}"), picture).unwrap(),
+                index + 1
+            );
+        }
+        assert!(
+            assets.load("over".into(), picture).is_err(),
+            "the count is capped"
+        );
+        assert_eq!(assets.bytes, budget::MAX_SCREEN_IMAGES * 16);
+
+        assets.hd.get_mut().insert((3, 0), None);
+        assets.hd.get_mut().insert((4, 0), None);
+        assets.release(3);
+        assert!(assets.get(3).is_err(), "a released handle is invalid");
+        assert_eq!(assets.bytes, (budget::MAX_SCREEN_IMAGES - 1) * 16);
+        assert!(
+            !assets.hd.get_mut().contains_key(&(3, 0)),
+            "its HD lookup goes"
+        );
+        assert!(assets.hd.get_mut().contains_key(&(4, 0)));
+        assets.release(3);
+        assets.release(0);
+        assets.release(budget::MAX_SCREEN_IMAGES + 1);
+        assert_eq!(assets.live, budget::MAX_SCREEN_IMAGES - 1);
+        // The released key loads afresh under a new handle; the stale one
+        // stays invalid.
+        let handle = budget::MAX_SCREEN_IMAGES + 1;
+        assert_eq!(assets.load("art2".into(), picture).unwrap(), handle);
+        assert!(assets.get(3).is_err());
+        assert_eq!(
+            assets.load("art2".into(), || unreachable!()).unwrap(),
+            handle
+        );
+        assert!(assets.load("over".into(), picture).is_err());
+    }
 
     #[test]
     fn the_epilogue_light_is_the_reference_record() {

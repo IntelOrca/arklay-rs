@@ -1,5 +1,5 @@
--- The pause menu's FILE tab: the two-book document selector and the JPN
--- page reader, which the room's document pick-up also runs on its own.
+-- The pause menu's FILE tab: the two-book document selector and the page
+-- reader, which the room's document pick-up also runs on its own.
 --
 -- The tab shows `file/file000`/`file001` as book covers, each with eight
 -- document slots whose icons and cursor are baked into the same cover page.
@@ -10,6 +10,13 @@
 -- 256x128 half-pages. The book/page tables below are the Japanese build's
 -- per-document start/count/first-page tables; the reader advances one
 -- half-page per press and closes on confirm at the last page.
+--
+-- The Western build's reader (`pickup_screen_render` 0x004823a0) runs the
+-- same state machine without the backdrop: each document is a container of
+-- full 256x192 pages, converted to `file/<language>/<filem stem>_<page>`, and
+-- the page arrows come from `file/arror`. Each document reads the pages of
+-- the session language first, then English, French, German and finally the
+-- Japanese build's; a Japanese session prefers the Japanese pages.
 --
 -- Open arguments: `pickup` (a document item id, `0x5F..=0x6E`) opens the
 -- reader directly on that document for the room pick-up flow; the screen
@@ -62,6 +69,15 @@ local TEXTM_NAMES = list(
     "textm_v0", "textm_v1", "textm_v2", "textm_w0", "textm_w1", "textm_x0", "textm_y0", "textm_z0",
     "textm_00", "textm_01", "textm_02"
 )
+-- The Western build's per-document page counts (`g_itemMaxCounts`), title x
+-- offsets (the same table from 0x10) and container stems (`0x004d2350`).
+local WEST_PAGE_COUNT = list(4, 6, 11, 4, 2, 6, 7, 7, 10, 5, 5, 4, 3, 3, 3, 4)
+local WEST_TITLE_X = list(8, 8, 24, 52, 32, 20, 64, 40, 16, 0, 16, 16, 32, 32, 32, 32)
+local FILEM_NAMES = list(
+    "filem_l0", "filem_m0", "filem_n0", "filem_o0", "filem_p0", "filem_q0", "filem_r0", "filem_s0",
+    "filem_t0", "filem_u0", "filem_v0", "filem_w0", "filem_x0", "filem_y0", "filem_z0", "filem_00"
+)
+
 -- The 14 used per-document backdrop TIM names in `FILEI_INDEX` order; the
 -- tree has no `filei01/02/05`, so those indices are unused.
 local FILEI_NAMES = list(
@@ -84,6 +100,11 @@ local SLOT_X, SLOT_Y, SLOT_STEP = 0x8C, 0x29, 9
 
 -- The reader page position and size (one half of a TEXTM TIM).
 local PAGE_X, PAGE_Y, PAGE_W, PAGE_H = 0x18, 0x34, 0x100, 0x80
+-- The Western page position and size (`DAT_004d2888`).
+local WEST_PAGE_X, WEST_PAGE_Y, WEST_PAGE_W, WEST_PAGE_H = 0x18, 0x18, 0x100, 0xC0
+-- The selector title's y and the scroll arrows' x, per build.
+local JPN_TITLE_Y, WEST_TITLE_Y = 0xC0, 0xC1
+local JPN_SCROLL_X, WEST_SCROLL_X = 0x6F, 0x67
 -- The page arrows and the EXIT label.
 local PREV_ARROW_X, PREV_ARROW_Y = 0x18, 0x74
 local NEXT_ARROW_X, NEXT_ARROW_Y = 0x110, 0x74
@@ -188,7 +209,12 @@ local function next_listed_slot(api, book, slot)
     return nil
 end
 
+--- The reading length of document `entry`: half-pages for the Japanese
+--- reader, whole pages for the Western one.
 local function page_count(entry)
+    if s and s.west then
+        return WEST_PAGE_COUNT[entry] or 0
+    end
     return PAGE_COUNT[entry] or 0
 end
 
@@ -196,7 +222,7 @@ end
 --- an out-of-range document/page.
 local function page_index(entry, page)
     local start = PAGE_START[entry]
-    if start == nil or page >= page_count(entry) then
+    if start == nil or page >= (PAGE_COUNT[entry] or 0) then
         return nil
     end
     return start + page // 2
@@ -212,7 +238,68 @@ M.tables = {
     page_start = PAGE_START,
     textm = TEXTM_NAMES,
     filei = FILEI_NAMES,
+    west_page_count = WEST_PAGE_COUNT,
+    west_title_x = WEST_TITLE_X,
+    filem = FILEM_NAMES,
+    title_y = { jpn = JPN_TITLE_Y, west = WEST_TITLE_Y },
+    scroll_x = { jpn = JPN_SCROLL_X, west = WEST_SCROLL_X },
 }
+
+--- The pack stem of Western page `page` of document `entry` under `prefix`.
+local function west_page_stem(prefix, entry, page)
+    return ("%s/%s_%02d"):format(prefix, FILEM_NAMES[entry], page)
+end
+
+M.west_page_stem = west_page_stem
+
+--- The primary subtag of a session language tag (`ja-JP` -> `ja`), or nil.
+local function primary_language(language)
+    local primary = language and language:match("^%a+")
+    return primary and primary:lower()
+end
+
+--- The readers a session in `language` tries, most preferred first: a
+--- Western pages directory, or `jpn` for the Japanese build's pages.
+local function reader_order(language)
+    local primary = primary_language(language)
+    local order, seen = {}, {}
+    local function add(reader)
+        if not seen[reader] then
+            seen[reader] = true
+            order[#order + 1] = reader
+        end
+    end
+    if primary == "ja" then
+        add("jpn")
+    elseif primary then
+        add("file/" .. primary)
+    end
+    for _, west in ipairs({ "en", "fr", "de" }) do
+        add("file/" .. west)
+    end
+    add("jpn")
+    return order
+end
+
+--- The Western pages directory document `entry` reads from, or nil for the
+--- Japanese reader: the first of the session's readers that has the
+--- document's first page.
+local function document_pages(api, entry)
+    if entry == nil then
+        return nil
+    end
+    for _, reader in ipairs(s.readers) do
+        if reader == "jpn" then
+            local start = PAGE_START[entry]
+            if start and api:has_image("file/" .. TEXTM_NAMES[start]) then
+                return nil
+            end
+        elseif api:has_image(west_page_stem(reader, entry, 0)) then
+            return reader
+        end
+    end
+    return nil
+end
 
 -- ---- state -----------------------------------------------------------------
 
@@ -268,8 +355,21 @@ function M.open(api, args)
         fade_out = false,
         -- Loaded pages by stem (false once a load failed).
         pages = {},
+        -- The readers to try per document (`reader_order`).
+        readers = {},
+        -- The open document's Western pages directory (`file/en`, ...), or
+        -- nil for the Japanese reader.
+        west = nil,
+        -- Whether the selector lays its title out for the Western build.
+        west_title = false,
+        -- The Western page stem currently held, released on a page change.
+        west_held = nil,
     }
     M.state = s
+    local language = api:language()
+    s.readers = reader_order(language)
+    -- The title's offsets fit the session's text.
+    s.west_title = language ~= nil and primary_language(language) ~= "ja"
     reader_reset()
     local item = args and args.pickup
     if item then
@@ -286,6 +386,7 @@ function M.open(api, args)
                 break
             end
         end
+        s.west = document_pages(api, listed_entry(api, s.book, s.slot))
     else
         s.slot = first_listed_slot(api, 0)
         -- The original's file task starts on the frame after the tab row's
@@ -376,9 +477,11 @@ local function step_reader_slide_in_left()
     end
 end
 
---- Advance the reader one frame (`jpn_file_screen_render` 0x0042c080). Each
---- state's step runs before the frame draws; the falling-through states
---- (2->3, 5->6, 8->9, 0xb->0xc, 0xd->0xe) are single-frame steps here.
+--- Advance the reader one frame (`jpn_file_screen_render` 0x0042c080, or
+--- the Western `pickup_screen_render` 0x004823a0 without the backdrop
+--- ramps). Each state's step runs before the frame draws; the
+--- falling-through states (2->3, 5->6, 8->9, 0xb->0xc, 0xd->0xe) are
+--- single-frame steps here.
 local function tick_reader()
     if s.reader_exit_request then
         -- State 0xd clears the slide and speed and falls into 0xe.
@@ -388,7 +491,11 @@ local function tick_reader()
         s.reader_speed = 1
     end
     local state = s.reader_state
-    if state == "backdrop" then
+    if state == "backdrop" and s.west then
+        -- `pickup_screen_render` states 0/1: the arrow sheet and the page
+        -- container load in one frame; nothing draws yet.
+        s.reader_state = "page_load"
+    elseif state == "backdrop" then
         -- States 0/1: the frame pieces ramp to 0x80; nothing draws yet.
         s.reader_backdrop = s.reader_backdrop + READER_BACKDROP_STEP
         if s.reader_backdrop >= READER_BACKDROP_FULL then
@@ -441,6 +548,9 @@ local function tick_reader()
                 s.reader_state = "backdrop_out"
             end
         end
+    elseif state == "backdrop_out" and s.west then
+        -- The Western state 0xf has no ramp: a single black frame.
+        s.reader_state = "hold"
     elseif state == "backdrop_out" then
         -- State 0xf: the frame pieces ramp back down to black.
         s.reader_backdrop = s.reader_backdrop - READER_BACKDROP_STEP
@@ -472,7 +582,7 @@ end
 
 --- Advance one frame: the selector's slides or the reader's state machine,
 --- plus the blink counter and the hand-off fades.
-local function tick()
+local function tick(api)
     -- The original checks the busy lock before the render step that
     -- maintains it, so this frame's input sees the previous frame's lock.
     s.reader_busy_frame = s.reader_busy
@@ -486,6 +596,7 @@ local function tick()
             -- The reading mode's first frame is the renderer's state 0.
             s.mode = "reader"
             s.page = 0
+            s.west = document_pages(api, listed_entry(api, s.book, s.slot))
             reader_reset()
         end
         return
@@ -639,7 +750,7 @@ local function pressed(input)
 end
 
 function M.update(api, input)
-    tick()
+    tick(api)
     if pressed(input) and not input_locked() then
         if s.mode == "list" then
             list_input(api, input)
@@ -731,20 +842,80 @@ local function draw_list(api, ox, oy)
     end
     local name = api:item_name_bytes((entry + FILE_ITEM_BASE) & 0xFF)
     if name then
-        api:glyphs(ox + TITLE_X[entry] + 0x1E, oy + 0xC0, name, { brightness = 0 })
+        local x = (s.west_title and WEST_TITLE_X or TITLE_X)[entry]
+        local y = s.west_title and WEST_TITLE_Y or JPN_TITLE_Y
+        api:glyphs(ox + x + 0x1E, oy + y, name, { brightness = 0 })
     end
     -- Scroll arrows follow the cursor through the seen slots.
+    local scroll_x = ox + (s.west_title and WEST_SCROLL_X or JPN_SCROLL_X)
     if previous_listed_slot(api, s.book, s.slot) then
-        blit(api, cover, 0xD0 + blink * 8, 0, 8, 8, ox + 0x6F, oy + 0xB7)
+        blit(api, cover, 0xD0 + blink * 8, 0, 8, 8, scroll_x, oy + 0xB7)
     end
     if next_listed_slot(api, s.book, s.slot) then
-        blit(api, cover, 0xE0 + blink * 8, 0, 8, 8, ox + 0x6F, oy + 0xCF)
+        blit(api, cover, 0xE0 + blink * 8, 0, 8, 8, scroll_x, oy + 0xCF)
     end
+end
+
+--- Hold one Western page: release the previously held page's art first,
+--- since the documents' 84 pages would otherwise fill the screen's art
+--- cache.
+local function hold_west_page(api, stem)
+    if s.west_held ~= stem and s.west_held ~= nil then
+        local handle = s.pages[s.west_held]
+        if handle then
+            api:release(handle)
+        end
+        s.pages[s.west_held] = nil
+    end
+    s.west_held = stem
+    if stem then
+        return page(api, stem)
+    end
+    return nil
+end
+
+--- The EXIT label, lit once the last page has been acknowledged. The
+--- reference's colour multiplier is 0x50 / 0x20 over a 0x80 unity, so the
+--- drawn scale is twice the byte.
+local function draw_exit(api, entry, ox, oy)
+    if s.page + 1 >= page_count(entry) then
+        local status = page(api, "ui/status")
+        if status then
+            local scale = (s.reader_last_page and 0x50 or 0x20) * 2
+            api:page_sprite_scaled(status, 0x80, 0x88, 0x18, 0x10,
+                ox + EXIT_X, oy + EXIT_Y, 0x18, 0x10, 0, scale)
+        end
+    end
+end
+
+--- The Western reader (`pickup_screen_render`): one whole page, the arrows
+--- from `file/arror` and the EXIT label.
+local function draw_west_reader(api, entry, ox, oy)
+    local sheet = hold_west_page(api, s.reader_page_loaded and west_page_stem(s.west, entry, s.page) or nil)
+    if sheet then
+        blit(api, sheet, 0, 0, WEST_PAGE_W, WEST_PAGE_H, ox + WEST_PAGE_X + s.reader_slide, oy + WEST_PAGE_Y)
+    end
+    if s.reader_state ~= "idle" then
+        return
+    end
+    local arrows = page(api, "file/arror")
+    if arrows then
+        local blink = s.reader_last_page and 1 or blink_phase()
+        if s.page ~= 0 then
+            blit(api, arrows, blink * 8, 0, 8, 8, ox + PREV_ARROW_X, oy + PREV_ARROW_Y)
+        end
+        blit(api, arrows, 0x10 + blink * 8, 0, 8, 8, ox + NEXT_ARROW_X, oy + NEXT_ARROW_Y)
+    end
+    draw_exit(api, entry, ox, oy)
 end
 
 local function draw_reader(api, ox, oy)
     local entry = listed_entry(api, s.book, s.slot)
     if entry == nil then
+        return
+    end
+    if s.west then
+        draw_west_reader(api, entry, ox, oy)
         return
     end
     local backdrop = page(api, "file/" .. FILEI_NAMES[FILEI_INDEX[entry]])
@@ -776,17 +947,7 @@ local function draw_reader(api, ox, oy)
         blit(api, backdrop, 0xE0 + blink * 8, READER_ARROW_V, 8, 8, ox + PREV_ARROW_X, oy + PREV_ARROW_Y)
     end
     blit(api, backdrop, 0xF0 + blink * 8, READER_ARROW_V, 8, 8, ox + NEXT_ARROW_X, oy + NEXT_ARROW_Y)
-    -- The EXIT label lights once the last half-page has been acknowledged.
-    -- The reference's colour multiplier is 0x50 / 0x20 over a 0x80 unity, so
-    -- the drawn scale is twice the byte.
-    if s.page + 1 >= page_count(entry) then
-        local status = page(api, "ui/status")
-        if status then
-            local scale = (s.reader_last_page and 0x50 or 0x20) * 2
-            api:page_sprite_scaled(status, 0x80, 0x88, 0x18, 0x10,
-                ox + EXIT_X, oy + EXIT_Y, 0x18, 0x10, 0, scale)
-        end
-    end
+    draw_exit(api, entry, ox, oy)
 end
 
 --- Draw the tab over the framebuffer's current contents.
@@ -796,6 +957,8 @@ function M.draw(api)
     if s.mode == "list" then
         -- The selector draws over the inventory panel but under the panel's
         -- masking rects and frame, so it is clipped to the panel's area.
+        -- The reader's last page goes with it.
+        hold_west_page(api, nil)
         api:clip(ox + SCREEN_AREA[1], oy + SCREEN_AREA[2], SCREEN_AREA[3], SCREEN_AREA[4])
         draw_list(api, ox, oy)
         api:clip()

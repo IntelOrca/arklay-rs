@@ -172,7 +172,7 @@ is exact.
 | doors | (inside `door/*.dor`) | — | override the whole entry |
 | font sheets | `font/font`, `font/jpn`, `font/latin` | webp, png, bmp, tim | the shipped sheet's; at most 255 opaque colours |
 | map pages | `map/blue`, `map/map00` … `map/map0e` | webp, png, bmp, tim | the shipped page's; at most 255 opaque colours |
-| FILE pages | `file/file000`, `file/file001`, `file/filei*`, `file/textm_*` | webp, png, bmp, tim | the shipped page's |
+| FILE pages | `file/file000`, `file/file001`, `file/filei*`, `file/textm_*`, `file/arror`, `file/en/filem_l0_00` … `file/en/filem_00_03` (also `file/de/`, `file/fr/`) | webp, png, bmp, tim | the shipped page's; a converted `filem` page carries its black key at index 0 |
 | room effect sheets | `effspr/esp000`, `effspr/esp2xx` | webp, png, bmp, tim | the shipped page's (the room's own sprites composite onto it) |
 | player shadow | `shadow/kage` | webp, png, bmp, tim | the shipped page's; an RGBA page's alpha is the coverage |
 | BGM | `bgm/013`, `bgm/024_00` | ogg, wav | any |
@@ -647,6 +647,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:set(key, value)` | Publish an integer/boolean the engine reads back (`nil` clears it); up to 64 keys. |
 | `api:overlay(colour, alpha)` | A `"black"`/`"white"` full-screen overlay at `alpha`, or `nil` for none. |
 | `api:has_font()`, `api:has_text()` | Whether the pack has a game font / text table. |
+| `api:language()` | The session's selected language tag (`en-US`, `ja-JP`, ...); `nil` without a text table. |
 | `api:pack_bytes(entry)` | A pack entry's raw bytes as a string; `nil` when absent. |
 | `api:ui_bytes(key)` | The text table's font-encoded bytes for `key`; `nil` without a text table. |
 | `api:location_bytes(stage, room)` | The font-encoded location label of a save's room. |
@@ -664,6 +665,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:page_palette(page[, row])` | An indexed page's CLUT row (default 0) as a table of `0xRRGGBB` colours keyed by texel index `0..=255`; `nil` for a full-colour page. |
 | `api:ivm(entry)` | Load a model and return a handle. |
 | `api:art_size(handle)` | A handle's width and height. |
+| `api:release(handle)` | Drop loaded art the screen no longer draws, returning it to the cache's budget (64 handles); the handle is invalid afterwards. |
 | `api:clear()` | Clear the frame to black. |
 | `api:fill_rect(x, y, w, h, r, g, b[, a])` | A filled rectangle. |
 | `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line, both ends included. |

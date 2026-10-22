@@ -1760,6 +1760,8 @@ fn map_without_art_stays_blank() {
 /// The FILE tab over a game state whose FILE-collected bits are `files`.
 struct FileTab {
     harness: Harness,
+    pack: &'static Pack,
+    text: Option<&'static crate::text::Text>,
     game: crate::game::GameState,
     screen: LuaScreen,
     /// The cues the last [`FileTab::step`] queued.
@@ -1768,6 +1770,20 @@ struct FileTab {
 
 impl FileTab {
     fn new(label: &str, character: u8, files: &[u8], args: &[(&str, ScreenArg)]) -> Self {
+        Self::with_pack(label, character, files, args, empty_pack(), None)
+    }
+
+    /// The tab over `pack` with a session in `language` (no text when None).
+    fn with_pack(
+        label: &str,
+        character: u8,
+        files: &[u8],
+        args: &[(&str, ScreenArg)],
+        pack: &'static Pack,
+        language: Option<&str>,
+    ) -> Self {
+        let text: Option<&'static crate::text::Text> =
+            language.map(|tag| &*Box::leak(Box::new(crate::text::Text::load(pack, Some(tag)))));
         let harness = Harness::new(label);
         let mut game = crate::game::GameState::default();
         game.id.player_flag = character;
@@ -1776,6 +1792,8 @@ impl FileTab {
         }
         let screen = {
             let mut cx = UiContext {
+                pack,
+                text,
                 game: Some(&game),
                 ..harness.context()
             };
@@ -1783,6 +1801,8 @@ impl FileTab {
         };
         Self {
             harness,
+            pack,
+            text,
             game,
             screen,
             cues: Vec::new(),
@@ -1791,6 +1811,8 @@ impl FileTab {
 
     fn step(&mut self, input: UiInput) -> ScreenResult {
         let cx = UiContext {
+            pack: self.pack,
+            text: self.text,
             game: Some(&self.game),
             ..self.harness.context()
         };
@@ -1805,6 +1827,8 @@ impl FileTab {
 
     fn draw(&mut self) -> crate::render::Framebuffer {
         let cx = UiContext {
+            pack: self.pack,
+            text: self.text,
             game: Some(&self.game),
             ..self.harness.context()
         };
@@ -2364,6 +2388,284 @@ fn file_reader_blacks_out_the_screen_and_the_first_list_frame_draws_nothing() {
     );
     let framebuffer = tab.draw();
     assert!(framebuffer.rgba.chunks(4).all(|px| px == [0, 0, 0, 255]));
+}
+
+/// The Western build's page count per document.
+const WEST_COUNTS: [usize; 16] = [4, 6, 11, 4, 2, 6, 7, 7, 10, 5, 5, 4, 3, 3, 3, 4];
+
+/// The palette of the Western test pages: index 0 is the converter's black
+/// key, index 15 the white text and every other index its own red.
+fn west_palette(index: u16) -> u16 {
+    match index {
+        0 => 0,
+        15 => 0x7FFF,
+        index => index & 0x1F,
+    }
+}
+
+/// An 8bpp `width` x `height` TIM over [`west_palette`].
+fn sheet_tim(width: u16, height: u16, pixels: &[u8]) -> Vec<u8> {
+    let mut data = Vec::new();
+    data.extend_from_slice(&0x10u32.to_le_bytes());
+    data.extend_from_slice(&9u32.to_le_bytes());
+    data.extend_from_slice(&524u32.to_le_bytes());
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    data.extend_from_slice(&256u16.to_le_bytes());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    for index in 0..256u16 {
+        data.extend_from_slice(&west_palette(index).to_le_bytes());
+    }
+    data.extend_from_slice(&(12u32 + pixels.len() as u32).to_le_bytes());
+    data.extend_from_slice(&[0, 0, 0, 0]);
+    data.extend_from_slice(&(width / 2).to_le_bytes());
+    data.extend_from_slice(&height.to_le_bytes());
+    data.extend_from_slice(pixels);
+    data
+}
+
+/// A pack of Western document pages: under each `(language, documents)`,
+/// every page of the listed documents (all sixteen for None). Page `n` is a
+/// one-row sheet of palette index `n + 1` with a white texel at x 1. The
+/// arrow sheet's 8-pixel columns are indices 20..=23, and `textm` adds those
+/// Japanese build pages.
+fn west_pack(languages: &[(&str, Option<&[usize]>)], textm: &[&str]) -> &'static Pack {
+    const STEMS: [&str; 16] = [
+        "filem_l0", "filem_m0", "filem_n0", "filem_o0", "filem_p0", "filem_q0", "filem_r0",
+        "filem_s0", "filem_t0", "filem_u0", "filem_v0", "filem_w0", "filem_x0", "filem_y0",
+        "filem_z0", "filem_00",
+    ];
+    let mut writer = crate::pack::PackWriter::new();
+    for &(language, documents) in languages {
+        for (entry, (stem, count)) in STEMS.iter().zip(WEST_COUNTS).enumerate() {
+            if documents.is_some_and(|documents| !documents.contains(&entry)) {
+                continue;
+            }
+            for page in 0..count {
+                let mut pixels = vec![page as u8 + 1; 256];
+                pixels[1] = 15;
+                writer
+                    .add(
+                        &format!("file/{language}/{stem}_{page:02}.tim"),
+                        sheet_tim(256, 1, &pixels),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    let arrows: Vec<u8> = (0..32 * 8).map(|i| 20 + (i % 32) as u8 / 8).collect();
+    writer
+        .add("file/arror.tim", sheet_tim(32, 8, &arrows))
+        .unwrap();
+    for name in textm {
+        writer
+            .add(
+                &format!("file/{name}.tim"),
+                map_tim(&[1; 256], west_palette),
+            )
+            .unwrap();
+    }
+    Box::leak(Box::new(
+        Pack::from_bytes(writer.to_bytes().unwrap()).unwrap(),
+    ))
+}
+
+/// Every document's Western pages under each of `languages`.
+fn west_file_pack(languages: &[&str]) -> &'static Pack {
+    let languages: Vec<_> = languages.iter().map(|&language| (language, None)).collect();
+    west_pack(&languages, &[])
+}
+
+#[test]
+fn file_reader_follows_the_session_language() {
+    // The picked-up document `entry` (0x02 or 0x0F, both on Chris's list).
+    let west = |pack, language, entry: u8| -> Option<String> {
+        FileTab::with_pack(
+            "file-language",
+            0,
+            &[entry],
+            &[("pickup", ScreenArg::Int(0x5F + i64::from(entry)))],
+            pack,
+            language,
+        )
+        .screen
+        .test_eval("return M.state.west")
+    };
+    let both = west_file_pack(&["en", "fr"]);
+    assert_eq!(west(both, Some("fr-FR"), 0x0F).as_deref(), Some("file/fr"));
+    assert_eq!(
+        west(both, Some("de-DE"), 0x0F).as_deref(),
+        Some("file/en"),
+        "a language without pages reads the English ones"
+    );
+    assert_eq!(west(both, None, 0x0F).as_deref(), Some("file/en"));
+    assert_eq!(
+        west(both, Some("ja-JP"), 0x0F).as_deref(),
+        Some("file/en"),
+        "Japanese falls back to the English pages without its own"
+    );
+    let french = west_file_pack(&["fr"]);
+    assert_eq!(
+        west(french, Some("en-US"), 0x0F).as_deref(),
+        Some("file/fr"),
+        "a French-only tree serves an English session"
+    );
+    // A partial tree: the German pages of document 0x0F only.
+    let partial = west_pack(&[("de", Some(&[0x0F])), ("en", None)], &["textm_n0"]);
+    assert_eq!(
+        west(partial, Some("de-DE"), 0x0F).as_deref(),
+        Some("file/de")
+    );
+    assert_eq!(
+        west(partial, Some("de-DE"), 0x02).as_deref(),
+        Some("file/en"),
+        "each document falls back on its own"
+    );
+    assert_eq!(
+        west(partial, Some("ja-JP"), 0x02),
+        None,
+        "a Japanese session reads its own pages"
+    );
+    assert_eq!(
+        west(partial, Some("ja-JP"), 0x0F).as_deref(),
+        Some("file/en"),
+        "a Japanese document without its pages reads the English ones"
+    );
+    let japanese = west_pack(&[], &["textm_00"]);
+    assert_eq!(west(japanese, Some("en-US"), 0x0F), None);
+    assert_eq!(
+        west(empty_pack(), Some("en-US"), 0x0F),
+        None,
+        "no Western pages: the Japanese reader"
+    );
+}
+
+#[test]
+fn file_west_tables_match_the_reference() {
+    let tab = FileTab::with_pack(
+        "file-west-tables",
+        0,
+        &[],
+        &[],
+        west_file_pack(&["en"]),
+        None,
+    );
+    let counts: Vec<i64> = tab.screen.test_eval(
+        "local t = {} for i = 0, 15 do t[i + 1] = M.tables.west_page_count[i] end return t",
+    );
+    assert_eq!(counts, [4, 6, 11, 4, 2, 6, 7, 7, 10, 5, 5, 4, 3, 3, 3, 4]);
+    let title: Vec<i64> = tab.screen.test_eval(
+        "local t = {} for i = 0, 15 do t[i + 1] = M.tables.west_title_x[i] end return t",
+    );
+    assert_eq!(
+        title,
+        [8, 8, 24, 52, 32, 20, 64, 40, 16, 0, 16, 16, 32, 32, 32, 32]
+    );
+    assert_eq!(tab.int("M.tables.title_y.west"), 0xC1);
+    assert_eq!(tab.int("M.tables.title_y.jpn"), 0xC0);
+    assert_eq!(tab.int("M.tables.scroll_x.west"), 0x67);
+    assert_eq!(tab.int("M.tables.scroll_x.jpn"), 0x6F);
+    let stem: String = tab
+        .screen
+        .test_eval("return M.west_page_stem('file/en', 15, 3)");
+    assert_eq!(stem, "file/en/filem_00_03");
+}
+
+#[test]
+fn file_west_reader_draws_whole_pages_and_holds_one() {
+    let mut tab = FileTab::with_pack(
+        "file-west-pages",
+        0,
+        &[0x0F],
+        &[],
+        west_file_pack(&["en"]),
+        Some("en-US"),
+    );
+    tab.settle_list();
+    tab.step(press(|i| i.confirm = true));
+    while tab.flag("M.state.fade_in") {
+        tab.tick();
+    }
+    // States 0/1 are a single frame without the Japanese backdrop ramp.
+    assert_eq!(tab.state(), "backdrop");
+    tab.tick();
+    assert_eq!(tab.state(), "page_load");
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "reader");
+
+    // Document 0x0F is four whole pages in the Western build.
+    let count = tab.int("M.tables.west_page_count[0x0F]");
+    assert_eq!(count, 4);
+    let pixel = |framebuffer: &crate::render::Framebuffer, x: u32, y: u32| {
+        let offset = ((y * framebuffer.width + x) * 4) as usize;
+        [
+            framebuffer.rgba[offset],
+            framebuffer.rgba[offset + 1],
+            framebuffer.rgba[offset + 2],
+        ]
+    };
+    let red = |index: u32| ((index & 0x1F) * 255 / 31) as u8;
+    for page in 0..count {
+        if page > 0 {
+            tab.step(press(|i| i.right = true));
+            tab.settle_reader();
+        }
+        assert_eq!(tab.int("M.state.page"), page);
+        let framebuffer = tab.draw();
+        // The page's top-left texel sits at (0x18, 0x18), its white text
+        // beside it.
+        assert_eq!(
+            pixel(&framebuffer, 0x18, 0x18),
+            [red(page as u32 + 1), 0, 0],
+            "page {page}"
+        );
+        assert_eq!(
+            pixel(&framebuffer, 0x19, 0x18),
+            [255, 255, 255],
+            "page {page}"
+        );
+        // The next arrow always shows; the previous one from page 1 on.
+        // Each blink frame is its own 8-pixel column of `file/arror`.
+        let blink = tab.int("(M.state.blink & 0x30) == 0 and 1 or 0") as u32;
+        assert_eq!(
+            pixel(&framebuffer, 0x110, 0x74),
+            [red(22 + blink), 0, 0],
+            "page {page}"
+        );
+        let previous = pixel(&framebuffer, 0x18, 0x74);
+        if page == 0 {
+            assert!(previous != [red(20), 0, 0] && previous != [red(21), 0, 0]);
+        } else {
+            assert_eq!(previous, [red(20 + blink), 0, 0], "page {page}");
+        }
+        // Only the current page's art is held.
+        let held: i64 = tab.screen.test_eval(
+            "local n = 0 for stem, h in pairs(M.state.pages) do if stem:match('^file/en/') and h then n = n + 1 end end return n",
+        );
+        assert_eq!(held, 1, "page {page}");
+    }
+    tab.step(press(|i| i.right = true));
+    assert!(tab.flag("M.state.reader_last_page"));
+    // The arrows freeze lit on the acknowledged last page.
+    let framebuffer = tab.draw();
+    assert_eq!(pixel(&framebuffer, 0x110, 0x74), [red(23), 0, 0]);
+    tab.step(press(|i| i.confirm = true));
+    for _ in 0..32 {
+        if tab.state() == "backdrop_out" {
+            break;
+        }
+        tab.tick();
+    }
+    assert_eq!(tab.state(), "backdrop_out");
+    tab.tick();
+    assert_ne!(
+        tab.state(),
+        "backdrop_out",
+        "the Western state 0xf is a single frame"
+    );
+    tab.settle_reader();
+    assert_eq!(tab.mode(), "list", "confirm exits on the last page");
+    tab.draw();
+    assert!(tab.flag("M.state.west_held == nil"), "the page is released");
 }
 
 /// `ui/item_view.lua` against a game state the test drives (the message

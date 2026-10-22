@@ -1606,7 +1606,193 @@ fn copy_file_art(
         files.push((format!("file/{name}"), index[name].clone()));
     }
 
-    copy_raw_files(files, "file", writer, progress, jobs)
+    // The Western reader's document containers, one set per language tree,
+    // and its page arrows. A Japanese install has neither, so their absence
+    // is only reported when a Western tree is present but incomplete.
+    let mut documents = Vec::new();
+    for (language, extension) in DOCUMENT_LANGUAGES {
+        let mut missing = Vec::new();
+        let mut found = Vec::new();
+        for stem in FILEM_STEMS {
+            match index.get(&format!("{stem}.{extension}")) {
+                Some(path) => found.push((language, stem, path.clone())),
+                None => missing.push(format!("{stem}.{extension}")),
+            }
+        }
+        if !found.is_empty() && !missing.is_empty() {
+            warnings.push(format!(
+                "missing {} document page file(s) in {}: {}",
+                missing.len(),
+                searched_dirs(item_m2),
+                missing.join(", ")
+            ));
+        }
+        documents.extend(found);
+    }
+    match index.get("arror.tim") {
+        Some(path) => files.push(("file/arror.tim".to_string(), path.clone())),
+        None if !documents.is_empty() => warnings.push(format!(
+            "missing arror.tim in {}; the document reader draws no page arrows",
+            searched_dirs(item_m2)
+        )),
+        None => {}
+    }
+
+    let (count, bytes) = copy_raw_files(files, "file", writer, progress, jobs)?;
+    let (page_count, page_bytes) =
+        copy_document_pages(documents, writer, progress, warnings, jobs)?;
+    Ok((count + page_count, bytes + page_bytes))
+}
+
+/// The Western reader's per-document containers in document order
+/// (`0x004d2350`): `filem_l0` is document 0 through `filem_00`, document 15.
+const FILEM_STEMS: [&str; 16] = [
+    "filem_l0", "filem_m0", "filem_n0", "filem_o0", "filem_p0", "filem_q0", "filem_r0", "filem_s0",
+    "filem_t0", "filem_u0", "filem_v0", "filem_w0", "filem_x0", "filem_y0", "filem_z0", "filem_00",
+];
+
+/// The reader's page count of each document in [`FILEM_STEMS`] order
+/// (`g_itemMaxCounts`); every shipped tree matches it.
+const FILEM_PAGE_COUNTS: [usize; 16] = [4, 6, 11, 4, 2, 6, 7, 7, 10, 5, 5, 4, 3, 3, 3, 4];
+
+/// The Western trees' document containers: the pack's language directory
+/// and the container extension each release uses.
+const DOCUMENT_LANGUAGES: [(&str, &str); 3] = [("en", "pix"), ("de", "gpx"), ("fr", "fpx")];
+
+/// Unpack every `filem_*` container into its pages, packed as
+/// `file/<language>/<stem>_<page>.tim` (two-digit page numbers). The pages
+/// are optional art, so a container that fails to unpack is reported and
+/// skipped, as is a page count the reader's table does not expect.
+fn copy_document_pages(
+    documents: Vec<(&str, &str, PathBuf)>,
+    writer: &mut PackWriter,
+    progress: &mut Progress,
+    warnings: &mut Vec<String>,
+    jobs: usize,
+) -> Result<(usize, usize)> {
+    progress.begin("documents", documents.len() as u64);
+    let results = parallel_map(documents.len(), jobs, progress, |index| {
+        let (language, stem, source) = &documents[index];
+        let pages = fs::read(source)
+            .with_context(|| format!("failed to read {}", source.display()))
+            .and_then(|data| unpack_document_pages(&data))
+            .map_err(|error| format!("skipped {}: {error:#}", source.display()));
+        Ok((format!("file/{language}/{stem}"), 1, (*stem, source, pages)))
+    })?;
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+    for (prefix, (stem, source, pages)) in results {
+        let pages = match pages {
+            Ok(pages) => pages,
+            Err(warning) => {
+                warnings.push(warning);
+                continue;
+            }
+        };
+        let expected = FILEM_STEMS
+            .iter()
+            .position(|known| *known == stem)
+            .map(|document| FILEM_PAGE_COUNTS[document]);
+        if expected.is_some_and(|expected| expected != pages.len()) {
+            warnings.push(format!(
+                "{} holds {} page(s), the reader expects {}",
+                source.display(),
+                pages.len(),
+                expected.unwrap_or_default()
+            ));
+        }
+        for (number, page) in pages.into_iter().enumerate() {
+            let entry = format!("{prefix}_{number:02}.tim");
+            bytes += page.len();
+            count += 1;
+            writer
+                .add(&entry, page)
+                .with_context(|| format!("failed to add {entry}"))?;
+        }
+    }
+    progress.end_phase();
+    Ok((count, bytes))
+}
+
+/// Split a `filem_*.pix` container into its LZW-decoded TIM pages.
+///
+/// The container opens with a table of little-endian `u32` offsets, one per
+/// page plus the end of the data; the first offset is the table's own size
+/// and unused slots are zero. Each page is one `.pak` LZW stream
+/// (`pickup_unpack_list`, 0x004827c0), keyed by [`key_document_page`].
+fn unpack_document_pages(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let word = |index: usize| -> Option<usize> {
+        let bytes = data.get(index * 4..index * 4 + 4)?;
+        Some(u32::from_le_bytes(bytes.try_into().ok()?) as usize)
+    };
+    let table = word(0).context("truncated page table")?;
+    if table < 8 || table % 4 != 0 || table > data.len() {
+        bail!("invalid page table size {table}");
+    }
+    let offsets: Vec<usize> = (0..table / 4)
+        .map_while(|index| word(index).filter(|&offset| offset != 0))
+        .collect();
+    let mut pages = Vec::with_capacity(offsets.len().saturating_sub(1));
+    for (number, pair) in offsets.windows(2).enumerate() {
+        let (start, end) = (pair[0], pair[1]);
+        let stream = data
+            .get(start..end)
+            .with_context(|| format!("page {number} spans {start}..{end} of {}", data.len()))?;
+        let mut page =
+            lzw::decode(stream).with_context(|| format!("failed to LZW-decode page {number}"))?;
+        tim::mode(&page).with_context(|| format!("page {number} is not a TIM"))?;
+        key_document_page(&mut page);
+        pages.push(page);
+    }
+    if pages.is_empty() {
+        bail!("the container holds no pages");
+    }
+    Ok(pages)
+}
+
+/// Move a document page's transparency key to index 0, where the renderer
+/// keys every page. The pages put their white text at index 0 and the black
+/// background at a later index (7 in every shipped page); the PC loader
+/// keys the black entries of such a page instead (`TextureLoader.cpp`).
+/// Swapping the two entries and their texels keeps every texel's colour, so
+/// the page's HD hashes are unchanged. A page that is not a single-CLUT
+/// 4bpp TIM, or already keys index 0, is left alone.
+fn key_document_page(page: &mut [u8]) {
+    const CLUT_AT: usize = 8;
+    const ENTRIES_AT: usize = CLUT_AT + 12;
+    if tim::decode_4bpp(page).is_err() {
+        return;
+    }
+    let half = |page: &[u8], at: usize| u16::from_le_bytes([page[at], page[at + 1]]);
+    let clut_len = u32::from_le_bytes(page[CLUT_AT..CLUT_AT + 4].try_into().unwrap()) as usize;
+    let (width, height) = (half(page, CLUT_AT + 8), half(page, CLUT_AT + 10));
+    if height != 1 || width < 16 {
+        return;
+    }
+    let entry = |page: &[u8], index: usize| half(page, ENTRIES_AT + index * 2);
+    if entry(page, 0) & 0x7FFF == 0 {
+        return;
+    }
+    let Some(key) = (1..16).find(|&index| entry(page, index) & 0x7FFF == 0) else {
+        return;
+    };
+    let (zero, black) = (entry(page, 0), entry(page, key));
+    page[ENTRIES_AT..ENTRIES_AT + 2].copy_from_slice(&black.to_le_bytes());
+    page[ENTRIES_AT + key * 2..ENTRIES_AT + key * 2 + 2].copy_from_slice(&zero.to_le_bytes());
+    let key = key as u8;
+    let swap = |nibble: u8| match nibble {
+        0 => key,
+        n if n == key => 0,
+        n => n,
+    };
+    // `decode_4bpp` accepted the image block: its pixels follow a 12-byte
+    // header inside the block's length.
+    let image_at = CLUT_AT + clut_len;
+    let image_len = u32::from_le_bytes(page[image_at..image_at + 4].try_into().unwrap()) as usize;
+    let end = (image_at + image_len).min(page.len());
+    for byte in page.get_mut(image_at + 12..end).unwrap_or_default() {
+        *byte = swap(*byte & 0xF) | swap(*byte >> 4) << 4;
+    }
 }
 
 /// Add the map floor-plan TIMs to the pack under `map/`: the fifteen
@@ -4707,6 +4893,180 @@ mod tests {
         let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
         assert_eq!(count("item/"), 2);
         assert_eq!(count("file/"), 62);
+    }
+
+    /// A `filem_*` container over already-encoded page streams: a 16-slot
+    /// offset table (unused slots zero) then the streams back to back.
+    fn document_container(streams: &[Vec<u8>]) -> Vec<u8> {
+        let mut offsets = vec![0x40u32];
+        for stream in streams {
+            offsets.push(offsets.last().unwrap() + stream.len() as u32);
+        }
+        offsets.resize(16, 0);
+        let mut data: Vec<u8> = offsets.iter().flat_map(|o| o.to_le_bytes()).collect();
+        for stream in streams {
+            data.extend_from_slice(stream);
+        }
+        data
+    }
+
+    #[test]
+    fn unpacks_document_pages_from_the_offset_table() {
+        let streams = [camera_pak_at(2, 1), camera_pak_at(3, 2)];
+        let pages = unpack_document_pages(&document_container(&streams)).unwrap();
+        assert_eq!(pages.len(), 2);
+        for (page, stream) in pages.iter().zip(&streams) {
+            assert_eq!(page, &lzw::decode(stream).unwrap());
+        }
+
+        // A table that is not a table, an empty one and a page that is not a
+        // TIM are all rejected.
+        assert!(unpack_document_pages(&[4, 0, 0, 0]).is_err());
+        assert!(unpack_document_pages(&0x400u32.to_le_bytes()).is_err());
+        assert!(unpack_document_pages(&document_container(&[])).is_err());
+        let junk = lzw_literals(b"not a tim at all");
+        assert!(unpack_document_pages(&document_container(&[junk])).is_err());
+        let mut truncated = document_container(&streams);
+        truncated.truncate(truncated.len() - 1);
+        assert!(unpack_document_pages(&truncated).is_err());
+    }
+
+    #[test]
+    fn packs_the_western_document_pages_and_arrows() {
+        let root = TempDir::new("document-pages");
+        let dir = root.path.join("Item_m2");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("ARROR.TIM"), b"arrows").unwrap();
+        let container = document_container(&[camera_pak_at(2, 1), camera_pak_at(2, 2)]);
+        for stem in FILEM_STEMS {
+            fs::write(dir.join(format!("{stem}.pix")), &container).unwrap();
+        }
+        // An incomplete French tree is packed and reported; a German
+        // container that is not one is skipped.
+        fs::write(dir.join("FILEM_L0.FPX"), &container).unwrap();
+        fs::write(dir.join("FILEM_L0.GPX"), b"junk").unwrap();
+
+        let mut writer = PackWriter::new();
+        let mut progress = Progress::new("test", 1);
+        let mut warnings = Vec::new();
+        copy_file_art(
+            std::slice::from_ref(&dir),
+            &mut writer,
+            &mut progress,
+            &mut warnings,
+            1,
+        )
+        .unwrap();
+        let pack = crate::pack::Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        assert_eq!(pack.read("file/arror.tim").unwrap().as_ref(), b"arrows");
+        let page = lzw::decode(&camera_pak_at(2, 2)).unwrap();
+        assert_eq!(
+            pack.read("file/en/filem_00_01.tim").unwrap().as_ref(),
+            page.as_slice()
+        );
+        assert!(pack.read("file/fr/filem_l0_01.tim").is_ok());
+        let count = |prefix: &str| pack.paths().filter(|path| path.starts_with(prefix)).count();
+        assert_eq!(count("file/en/"), 32);
+        assert_eq!(count("file/fr/"), 2);
+        assert_eq!(count("file/de/"), 0);
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("15 document page file(s)")
+                    && warning.contains("filem_m0.fpx")),
+            "{warnings:?}"
+        );
+        let warned = |needle: &str| {
+            warnings
+                .iter()
+                .any(|warning| warning.to_lowercase().contains(needle))
+        };
+        assert!(warned("skipped") && warned("filem_l0.gpx"), "{warnings:?}");
+        assert!(
+            warned("filem_00.pix holds 2 page(s), the reader expects 4"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A 4bpp 8 x 2 TIM over a 16-entry CLUT.
+    fn document_page(clut: [u16; 16], nibbles: [u8; 16]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x10u32.to_le_bytes());
+        data.extend_from_slice(&8u32.to_le_bytes());
+        data.extend_from_slice(&(12u32 + 32).to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        for colour in clut {
+            data.extend_from_slice(&colour.to_le_bytes());
+        }
+        data.extend_from_slice(&(12u32 + 8).to_le_bytes());
+        data.extend_from_slice(&[0, 0, 0, 0]);
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        for pair in nibbles.chunks(2) {
+            data.push(pair[0] | pair[1] << 4);
+        }
+        data
+    }
+
+    #[test]
+    fn document_pages_key_their_black_at_index_zero() {
+        // The shipped pages' layout: white text at 0, the black key at 7.
+        let mut clut: [u16; 16] = std::array::from_fn(|index| index as u16 | 0x0400);
+        clut[0] = 0x7FFF;
+        clut[7] = 0;
+        let nibbles = [0, 7, 7, 0, 3, 7, 0, 15, 7, 7, 0, 0, 1, 2, 7, 0];
+        let original = document_page(clut, nibbles);
+        let mut page = original.clone();
+        key_document_page(&mut page);
+
+        let before = tim::decode_4bpp(&original).unwrap();
+        let after = tim::decode_4bpp(&page).unwrap();
+        assert_eq!(
+            after.palette(0, 0)[..3],
+            [0, 0, 0],
+            "index 0 is the black key"
+        );
+        assert_eq!(after.palette(0, 7), before.palette(0, 0));
+        let swapped: Vec<u8> = before
+            .indices
+            .iter()
+            .map(|&index| match index {
+                0 => 7,
+                7 => 0,
+                index => index,
+            })
+            .collect();
+        assert_eq!(after.indices, swapped);
+        // Every texel keeps its colour, so the HD lookup is unchanged.
+        let colours = |texture: &crate::model::Texture8| -> Vec<[u8; 4]> {
+            texture
+                .indices
+                .iter()
+                .map(|&index| texture.palette(0, index))
+                .collect()
+        };
+        assert_eq!(colours(&after), colours(&before));
+        let hashes = |texture: &crate::model::Texture8| -> Vec<u32> {
+            crate::htexture::page_candidates(texture, 0)
+                .iter()
+                .map(|candidate| candidate.hash)
+                .collect()
+        };
+        assert_eq!(hashes(&after), hashes(&before));
+
+        // A page whose index 0 is already black, or without a black entry,
+        // is left alone.
+        let mut keyed = page.clone();
+        key_document_page(&mut keyed);
+        assert_eq!(keyed, page);
+        let mut no_black = clut;
+        no_black[7] = 0x0007;
+        let opaque = document_page(no_black, nibbles);
+        let mut unchanged = opaque.clone();
+        key_document_page(&mut unchanged);
+        assert_eq!(unchanged, opaque);
     }
 
     #[test]

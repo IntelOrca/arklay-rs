@@ -1050,6 +1050,11 @@ impl UserData for Api<'_> {
 
         methods.add_method("has_font", |_lua, api, ()| Ok(api.cx.font.is_some()));
         methods.add_method("has_text", |_lua, api, ()| Ok(api.cx.text.is_some()));
+        // The session's selected language tag (`en-US`, `ja-JP`, ...); nil
+        // without a text table.
+        methods.add_method("language", |_lua, api, ()| {
+            Ok(api.cx.text.map(|text| text.selected_language().to_string()))
+        });
 
         // The font-encoded bytes of the text table's `key`; nil without a
         // text table. Draw them with `api:glyphs`.
