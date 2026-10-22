@@ -37,6 +37,7 @@ All saves were generated from the Japanese MediaKite assets at
 | `combine_chris_101.dat` | room 101, Chris | green herb (`0x44`), red herb (`0x43`) and a second green herb, for the mix and the refusal. |
 | `use_chris_101.dat` | room 101, Chris | health 30/140 + green herb + first-aid spray. |
 | `ekg_chris_101.dat` | room 101, Chris | health 20/140 with both poison flags + serum + green+red mix, for the red/poisoned monitor and the blue and white flushes. |
+| `ekg_caution_chris_101.dat` | room 101, Chris | health 50/140 + green herb, for the orange and yellow monitor states. |
 | `equip_chris_101.dat` | room 101, Chris | Beretta (`0x02`) + handgun ammo (`0x0B`). |
 | `itembox_chris_118.dat` | room 118, Chris | player inside the quiet B1 save room's item-box action rect + mixed inventory/box. |
 | `itembox_cam_chris_118.dat` | room 118, Chris | the same inventory/box, but the player stands in the camera 0 -> 1 switch strip facing the box, so camera 1 frames the box and its lid in the world (`itembox_chris_118` is on camera 0, which never shows the lid). |

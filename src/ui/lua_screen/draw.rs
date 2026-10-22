@@ -305,6 +305,13 @@ fn byte(value: i64) -> u8 {
     value.clamp(0, 255) as u8
 }
 
+/// A line-primitive colour channel. The original hands its line primitives a
+/// colour byte, which the reference converts to a float by `/ 256` and back by
+/// `* 255`, so every channel draws one step down (0xD8 as 0xD7, 0xFF as 0xFE).
+fn line_colour(value: u8) -> u8 {
+    (u16::from(value) * 255 / 256) as u8
+}
+
 /// An integer field of `table`, `0` when absent.
 fn field(table: &Table, key: &str) -> mlua::Result<i32> {
     Ok(table.get::<Option<i32>>(key)?.unwrap_or(0))
@@ -560,8 +567,9 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
     );
 
     // `line(x0, y0, x1, y1, r, g, b)`: a one-pixel line as the original's
-    // GPU primitive draws it (a half-pixel quad, so the far end of each axis
-    // is excluded).
+    // GPU primitive draws it - a half-pixel quad, so the far end of each axis
+    // is excluded, and each colour byte through the primitive's
+    // `byte / 256 * 255` conversion (0xD8 draws as 0xD7).
     methods.add_method_mut(
         "line",
         |_lua, api, (x0, y0, x1, y1, r, g, b): (i32, i32, i32, i32, i64, i64, i64)| {
@@ -569,7 +577,11 @@ pub(super) fn add_methods<'a, M: UserDataMethods<Api<'a>>>(methods: &mut M) {
             framebuffer.draw_line(
                 [coord(x0), coord(y0)],
                 [coord(x1), coord(y1)],
-                [byte(r), byte(g), byte(b)],
+                [
+                    line_colour(byte(r)),
+                    line_colour(byte(g)),
+                    line_colour(byte(b)),
+                ],
             );
             Ok(())
         },

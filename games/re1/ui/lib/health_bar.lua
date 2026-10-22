@@ -194,15 +194,10 @@ function Bar.start_flush(bar, healed, cured)
     bar.state = 2
 end
 
---- The primary sweep's left edge (clamped) and right edge.
+--- The primary sweep's tail (the clamped head, its left edge) and head-side
+--- right edge.
 function Bar.primary_span(bar)
-    return clamp(bar.head + 0x0F, EKG_MIN_X, EKG_MAX_X), clamp(bar.head, EKG_MIN_X, EKG_MAX_X)
-end
-
---- The trailing sweep's span.
-function Bar.secondary_span(bar)
-    return clamp(bar.secondary_head + 0x1F, EKG_MIN_X, EKG_MAX_X),
-        clamp(bar.secondary_head, EKG_MIN_X, EKG_MAX_X)
+    return clamp(bar.head, EKG_MIN_X, EKG_MAX_X), clamp(bar.head + 0x0F, EKG_MIN_X, EKG_MAX_X)
 end
 
 -- The original's `FUN_004387e0`: count the span-table entries at or below
@@ -247,13 +242,6 @@ local function draw_face(api, bar, ox, oy)
     draw_face_tile(api, ox, oy, select * 8 + base)
 end
 
--- The original hands its EKG lines to the line primitive as colour bytes,
--- which the reference converts through `byte / 256 * 255`, so every channel
--- draws one step down: the 0xD8 yellow lands on 0xD7 and 0xFF on 0xFE.
-local function line_channel(value)
-    return (value * 255) // 256
-end
-
 -- The heal flush: the original's state-3 sweep draws up to 15 one-pixel
 -- lines downward from the flush base, their tint starting at `0xFF` (or the
 -- pre-faded value once the base has left the window) and dropping by `0x10`
@@ -268,9 +256,6 @@ local function draw_flush(api, bar, ox, oy)
         local offset = (0x92 - bar.head) & 0xFF
         y = 0x92
         count = 0x0F - offset
-        if count < 0 then
-            count = 0
-        end
         tint = (0xFF - offset * 0x10) & 0xFF
     else
         y, count, tint = bar.head, 0x0F, 0xFF
@@ -279,10 +264,9 @@ local function draw_flush(api, bar, ox, oy)
         if y >= FLUSH_BOTTOM_Y then
             break
         end
-        local channel = line_channel(tint)
-        local r = base[1] ~= 0 and channel or 0
-        local g = base[2] ~= 0 and channel or 0
-        local b = base[3] ~= 0 and channel or 0
+        local r = base[1] ~= 0 and tint or 0
+        local g = base[2] ~= 0 and tint or 0
+        local b = base[3] ~= 0 and tint or 0
         api:line(ox + EKG_MIN_X, oy + y, ox + EKG_MAX_X, oy + y, r, g, b)
         if tint ~= 0 then
             tint = (tint - 0x10) & 0xFF
@@ -312,9 +296,7 @@ local function draw_primary(api, ox, oy, bar)
     if wave == nil then
         return
     end
-    local r = line_channel(bar.color[1])
-    local g = line_channel(bar.color[2])
-    local b = line_channel(bar.color[3])
+    local r, g, b = bar.color[1], bar.color[2], bar.color[3]
     local x0 = clamp(bar.head + 0x0F, EKG_MIN_X, EKG_MAX_X)
     local tail = clamp(bar.head, EKG_MIN_X, EKG_MAX_X)
     -- The record whose right edge is at or left of the head side, else the
@@ -356,9 +338,6 @@ local function draw_secondary(api, ox, oy, bar)
         return
     end
     local base = bar.secondary_color
-    if base[1] == 0 and base[2] == 0 and base[3] == 0 then
-        base = bar.color
-    end
     local step_r, step_g, step_b = base[1] >> 5, base[2] >> 5, base[3] >> 5
     local near_r, near_g, near_b = base[1], base[2], base[3]
     local right = bar.secondary_head + 0x1F
@@ -376,8 +355,7 @@ local function draw_secondary(api, ox, oy, bar)
     -- Queue one segment in the near colour, then slide the chain to the
     -- segment's far end (the original's `FUN_00438800`).
     local function queue(xa, ya, xb, yb)
-        queue_line(api, ox, oy, xa, ya, xb, yb, line_channel(near_r), line_channel(near_g),
-            line_channel(near_b))
+        queue_line(api, ox, oy, xa, ya, xb, yb, near_r, near_g, near_b)
         local delta = xa - xb
         if delta ~= 0 then
             near_r = (near_r - delta * step_r) & 0xFF

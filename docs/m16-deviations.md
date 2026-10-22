@@ -153,6 +153,6 @@ cadence and the headless transition follow.
   reference's one-pixel quad (`oracle/ui-findings.md`), so every capture that
   draws the health monitor changes: `--ui menu`, `--ui map`, `--ui file`,
   `--ui box` and `--ui view` each differ from their previous settled pose in
-  the health strip's EKG row (14-20 pixels on row 162, where the demoted
+  the health strip's EKG (14-20 pixels around rows 159-162, where the demoted
   colours and the quad's endpoint rule land), so those captures' goldens need
   regenerating.

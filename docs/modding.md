@@ -668,7 +668,7 @@ session's state for `open`, `update` and its hooks, so the methods marked
 | `api:release(handle)` | Drop loaded art the screen no longer draws, returning it to the cache's budget (64 handles); the handle is invalid afterwards. |
 | `api:clear()` | Clear the frame to black. |
 | `api:fill_rect(x, y, w, h, r, g, b[, a])` | A filled rectangle. |
-| `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line as the original's GPU line primitive, which is a quad half a pixel either side of the segment: only pixels whose centres the quad covers are painted, so the far end of each axis is excluded (a run from 10 to 13 paints 10..12) and an axis-aligned run keeps the lower edge. |
+| `api:line(x0, y0, x1, y1, r, g, b)` | A one-pixel opaque line as the original's line primitive draws it: a quad half a pixel either side of the segment, filled with the GPU's top-left rule, so the far end of each axis is excluded (a run from 10 to 13 paints 10..12, a downward run at x=20 paints column 19) and each colour byte goes through the primitive's `byte / 256 * 255` step (0xD8 draws 0xD7). |
 | `api:blend_black_rect(x, y, w, h, alpha)` | Darken a rectangle. |
 | `api:draw_background(picture, x, y[, r, g, b])` | Draw a picture tinted by `r, g, b`. |
 | `api:picture_sprite_scaled(picture, sx, sy, sw, sh, dx, dy, dw, dh, scale[, cell])` | A picture region, scaled. `cell` (`{x, y, w, h}`) names the atlas cell the region lies in, so an HD replacement is looked up for that cell alone (an item icon) rather than the whole picture. |
