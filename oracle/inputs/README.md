@@ -116,4 +116,7 @@ Save mode (each header names its save):
   task suspended, the placement and `init_room`'s one-frame yield, the door
   scene, the teardown and the room-entry fade, then 207's gameplay.
 - `door_101.txt` — `door_chris_103.dat`: the same for a same-stage door (103 to
-  101), whose `room_set` runs on the placement's frame.
+  101), whose `room_set` runs on the placement's frame. The destination's track
+  changes, so `update_room_bgm`'s `bgm_fade_out_all` holds the black tail for
+  six more frames before the room-entry fade arms. Run it for 400 ticks to
+  cover that hold and 101's gameplay after it.

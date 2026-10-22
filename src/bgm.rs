@@ -245,11 +245,21 @@ impl BgmCache {
 /// `from` is the room the player came from (the original's
 /// `g_AttractMode_RoomCameraId`); `None` for a direct boot, new game or save
 /// load, where there is no outgoing room.
-pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) {
+///
+/// Returns the frames the original's calling task sleeps inside the call:
+/// [`FADE_OUT_ALL_FRAMES`] per `bgm_fade_out_all` it runs (a group change
+/// runs it twice). `room_transition_load` only returns, and `game_loop` only
+/// arms the room-entry fade, once those sleeps are over.
+pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) -> u8 {
     let stage = usize::from(id.stage.saturating_sub(1));
     let room = usize::from(id.room);
     let Some(&target) = game.room_bgm.get(stage * 32 + room) else {
-        return;
+        return 0;
+    };
+    let mut slept = 0;
+    let mut fade_out_all = |game: &mut GameState| {
+        fade_out_all(game);
+        slept += FADE_OUT_ALL_FRAMES;
     };
     let previous = game.bgm.state;
 
@@ -259,7 +269,7 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) {
         }
         game.bgm.target = 0xFF;
         game.bgm.state = 0xFF;
-        return;
+        return slept;
     }
 
     let new_group = music::group_for(stage, room, target);
@@ -327,6 +337,24 @@ pub fn update_room_bgm(game: &mut GameState, id: RoomId, from: Option<RoomId>) {
     }
     game.bgm.target = effective;
     game.bgm.state = u16::from(effective);
+    slept
+}
+
+/// The frames [`update_room_bgm`] sleeps the original's task for room `id`
+/// right after a stage change's `init_room`, which resets `g_BGM_STATE` to
+/// `0xFF` before the destination loads: with nothing "playing" only the
+/// always-reload types 1 and 2 run `bgm_fade_out_all`. Call it before
+/// [`update_room_bgm`], which consumes a type-2 target's bit 7.
+///
+/// The port keeps the outgoing state across the load (its BGM handoff tears
+/// the old banks down itself), so only the timing follows `init_room` here.
+pub fn init_room_sleep(game: &GameState, id: RoomId) -> u8 {
+    let stage = usize::from(id.stage.saturating_sub(1));
+    let room = usize::from(id.room);
+    match game.room_bgm.get(stage * 32 + room) {
+        Some(&target) if target != 0xFF && matches!(target >> 6, 1 | 2) => FADE_OUT_ALL_FRAMES,
+        _ => 0,
+    }
 }
 
 /// Load the group's three channel banks for `state` (an already-decoded game
@@ -399,8 +427,13 @@ fn start_secondary_slots(game: &mut GameState, state: u8) {
     }
 }
 
+/// Frames `bgm_fade_out_all` sleeps its task: one after muting the secondary
+/// banks, four after stopping them and one after destroying the main bank.
+pub const FADE_OUT_ALL_FRAMES: u8 = 6;
+
 /// Tear every BGM bank down and stop the voice line, the original's
-/// `bgm_fade_out_all` (without its sleep-driven crossfade).
+/// `bgm_fade_out_all` (without its sleep-driven crossfade; the caller owns
+/// the [`FADE_OUT_ALL_FRAMES`] its task sleeps).
 ///
 /// The mixer banks are only signalled through the
 /// [`crate::game::BgmState::stop_all`] edge: [`apply_live`] consumes it and
@@ -528,7 +561,11 @@ mod tests {
         let mut game = game_for(id);
         // Group entry 0 of room 1000 is Bgm_13's group 0x0B.
         set_row(&mut game, id, 0x08);
-        update_room_bgm(&mut game, id, None);
+        assert_eq!(
+            update_room_bgm(&mut game, id, None),
+            0,
+            "nothing to fade out"
+        );
         assert_eq!(game.bgm.state, 0x08);
         assert_eq!(names(&game)[0], Some("Bgm_13"));
         assert!(game.bgm.channels[0].pending_load);
@@ -546,7 +583,7 @@ mod tests {
         game.bgm.state = 0x08;
         mark_loaded(&mut game, "Bgm_13");
         // `from` is the same room, so the resolved group is unchanged.
-        update_room_bgm(&mut game, id, Some(id));
+        assert_eq!(update_room_bgm(&mut game, id, Some(id)), 0);
         assert_eq!(game.bgm.state, 0x10);
         assert_eq!(game.bgm.channels[0].name, Some("Bgm_13"));
         assert!(!game.bgm.channels[0].restart, "channel 0's bit cleared");
@@ -567,7 +604,12 @@ mod tests {
         set_row(&mut game, id, 0x08);
         game.bgm.state = 0x08;
         mark_loaded(&mut game, "Bgm_00");
-        update_room_bgm(&mut game, id, Some(from));
+        // The teardown before the switch and the type-0 reload each run
+        // `bgm_fade_out_all`, exactly like the original.
+        assert_eq!(
+            update_room_bgm(&mut game, id, Some(from)),
+            2 * FADE_OUT_ALL_FRAMES
+        );
         assert_eq!(game.bgm.state, 0x08);
         assert_eq!(
             game.bgm.channels[0].name,
@@ -600,7 +642,7 @@ mod tests {
         // 0x88: type 2, channel 0; the low state is 0x08 after bit 7 drops.
         set_row(&mut game, id, 0x88);
         game.bgm.state = 0xFF;
-        update_room_bgm(&mut game, id, None);
+        assert_eq!(update_room_bgm(&mut game, id, None), FADE_OUT_ALL_FRAMES);
         assert_eq!(game.bgm.state, 0x08);
         assert_eq!(names(&game)[0], Some("Bgm_13"));
         assert!(game.bgm.channels[0].restart);
@@ -623,13 +665,35 @@ mod tests {
     }
 
     #[test]
+    fn init_room_sleep_only_counts_the_always_reload_types() {
+        let id = RoomId::parse("1000").unwrap();
+        let mut game = game_for(id);
+        // After `init_room` nothing is "playing": types 1 and 2 still run
+        // `bgm_fade_out_all`, type 0, type 3 and a silent room do not.
+        for (target, frames) in [
+            (0x08, 0),
+            (0x48, FADE_OUT_ALL_FRAMES),
+            (0x88, FADE_OUT_ALL_FRAMES),
+            (0xC0, 0),
+            (0xFF, 0),
+        ] {
+            set_row(&mut game, id, target);
+            game.bgm.state = 0x08;
+            assert_eq!(init_room_sleep(&game, id), frames, "target {target:#04x}");
+        }
+    }
+
+    #[test]
     fn ff_target_fades_and_destroys() {
         let id = RoomId::parse("1000").unwrap();
         let mut game = game_for(id);
         set_row(&mut game, id, 0xFF);
         game.bgm.state = 0x08;
         mark_loaded(&mut game, "Bgm_13");
-        update_room_bgm(&mut game, id, Some(id));
+        assert_eq!(
+            update_room_bgm(&mut game, id, Some(id)),
+            FADE_OUT_ALL_FRAMES
+        );
         assert_eq!(game.bgm.state, 0xFF);
         assert!(
             game.bgm

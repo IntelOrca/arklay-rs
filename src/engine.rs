@@ -4691,6 +4691,18 @@ impl GameSession {
         let Some(mut session) = self.transition.take() else {
             return;
         };
+        if session.bgm_sleep > 0 {
+            // `update_room_bgm`'s `bgm_fade_out_all` sleeps hold the timeline's
+            // last frame; the frame they end on runs the rest of the tail.
+            session.bgm_sleep -= 1;
+            self.transition = Some(session);
+            if self.transition.as_ref().is_some_and(|s| s.bgm_sleep == 0) {
+                self.transition_finished = true;
+                self.end_transition_after_bgm(pack);
+            }
+            self.tick_screen_intensity();
+            return;
+        }
         let frame = session.transition.tick(skip);
         session.frame = frame;
         session.door_yield = None;
@@ -4763,12 +4775,35 @@ impl GameSession {
         // script's `room_bgm_state_set` is visible here; a camera-only record
         // never left the source room and re-runs the same room's table.
         let from = session.source;
-        bgm::update_room_bgm(&mut self.game, self.loaded.id, Some(from));
+        // A stage change's `init_room` resets `g_BGM_STATE`, which decides
+        // whether `update_room_bgm` fades the old banks out.
+        let stage_change = session.entered && session.door.next_room >= 0x20;
+        let init_room_sleep = bgm::init_room_sleep(&self.game, self.loaded.id);
+        let slept = bgm::update_room_bgm(&mut self.game, self.loaded.id, Some(from));
+        session.bgm_sleep = if stage_change { init_room_sleep } else { slept };
         bgm::apply_live(&mut self.music, &mut self.game, &mut self.bgm_cache, pack);
-        play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, &session);
-        let entered = session.entered;
+        let sleeping = session.bgm_sleep > 0;
         self.transition = Some(session);
-        if entered {
+        if sleeping {
+            // A track change tears the old banks down with `bgm_fade_out_all`,
+            // which sleeps `room_transition_load` before it returns: the
+            // timeline is not finished until those frames are over (see
+            // [`GameSession::tick_transition`]).
+            self.transition_finished = false;
+            return;
+        }
+        self.end_transition_after_bgm(pack);
+    }
+
+    /// The rest of `room_transition_load`'s tail once `update_room_bgm`
+    /// returned: the close SE, then `game_loop` arms the destination's entry
+    /// fade after a full load.
+    fn end_transition_after_bgm(&mut self, pack: &Pack) {
+        let Some(session) = self.transition.as_ref() else {
+            return;
+        };
+        play_room_close_sfx(&mut self.music, &mut self.sfx_cache, pack, session);
+        if session.entered {
             self.arm_room_entry_fade();
         }
     }
@@ -8478,6 +8513,11 @@ struct TransitionMode {
     entered: bool,
     /// The most recent timeline frame, for rendering.
     frame: transition::TransitionFrame,
+    /// Frames `room_transition_load` still sleeps inside `update_room_bgm`
+    /// (each `bgm_fade_out_all` is [`bgm::FADE_OUT_ALL_FRAMES`]) after the
+    /// timeline finished: the last frame stays up and the close SE and the
+    /// room-entry fade wait until they are over.
+    bgm_sleep: u8,
 }
 
 /// Number of 30 Hz frames the no-art fallback holds black before finishing.
@@ -8631,6 +8671,7 @@ fn start_transition(
             black: true,
             ..transition::TransitionFrame::default()
         },
+        bgm_sleep: 0,
     })
 }
 
@@ -16960,6 +17001,7 @@ mod tests {
             placed: false,
             entered: false,
             frame: transition::TransitionFrame::default(),
+            bgm_sleep: 0,
         };
         finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
         assert_eq!(loaded.room.room_sfx, 1, "the record's sfx byte is live");
@@ -16999,6 +17041,7 @@ mod tests {
             }),
             entered: false,
             frame: transition::TransitionFrame::default(),
+            bgm_sleep: 0,
         };
         finish_transition(&mut session, &mut game, &mut player_state, &mut loaded);
         assert_eq!(loaded.id, target);
@@ -19021,9 +19064,17 @@ mod tests {
         trigger_test_door(&pack, &mut session);
 
         let mut loaded_during_animation = false;
+        let mut bgm_sleep_frames = 0;
         for _ in 0..MAX_TRANSITION_FRAMES {
             session.tick_transition(&pack, false);
-            if !session.transition_finished {
+            let animating = session
+                .transition
+                .as_ref()
+                .is_some_and(|transition| !transition.frame.finished);
+            if !animating && !session.transition_finished {
+                bgm_sleep_frames += 1;
+            }
+            if animating {
                 if session.loaded.id == target {
                     loaded_during_animation = true;
                 }
@@ -19046,11 +19097,14 @@ mod tests {
             loaded_during_animation,
             "the destination must boot while the animation still runs"
         );
+        // The group change runs `bgm_fade_out_all` twice, and its sleeps hold
+        // `room_transition_load` before it returns.
+        assert_eq!(bgm_sleep_frames, 2 * u32::from(bgm::FADE_OUT_ALL_FRAMES));
         assert_eq!(session.game.bgm.state, 0x08);
         assert_eq!(
             session.game.bgm.channels[0].name,
             Some("Bgm_00"),
-            "the destination's group starts on the animation's final frame"
+            "the destination's group is selected on the animation's final frame"
         );
     }
 
