@@ -5423,9 +5423,10 @@ impl GameSession {
                 && self.examine.is_none();
             // While the item box is open its interaction draws the shared slot
             // cursor itself (`itembox_draw_cursor`), with the box's own blink
-            // counter; the menu only keeps a cursor on the tab row, which the
-            // box's cursor movement cannot reach but a menu-opened box can
-            // inherit.
+            // counter. On the box's tab row it publishes the original's
+            // `cursor | 2` (the EXIT tab), which the menu draws as its tab
+            // highlight; the greyed-out Map/File/Radio tabs are never
+            // published.
             let box_owns_cursor = self
                 .item_box
                 .as_ref()
@@ -23450,6 +23451,77 @@ off_0010:
         assert_eq!(session.game.item_box[0].id, ITEM_HANDGUN_AMMO);
         assert!(!session.game.has_item(ITEM_HANDGUN_AMMO));
         assert_eq!(session.menu.as_ref().unwrap().value("cursor"), 10);
+
+        // Down past the last inventory row reaches the box's tab row, which
+        // is the EXIT tab (the raw 4/6 cursor draws as `cursor | 2`); the
+        // menu mirrors it and drops the item name. Map/File are never
+        // published; Radio is the left column's raw 4, covered by the
+        // screen's own tests.
+        //
+        // Put an item in the last slot row, so the name is non-zero right
+        // before the wrap and clearing it on the tab is observable.
+        let capacity = session.game.inventory_capacity();
+        session
+            .game
+            .inventory
+            .resize(capacity, game::InventoryItem::default());
+        session.game.inventory[5] = game::InventoryItem {
+            id: ITEM_SWORD_KEY,
+            quantity: 1,
+        };
+        let mut saw_named_row = false;
+        for step in 0..=8 {
+            session
+                .tick(
+                    &pack,
+                    UiInput {
+                        down: true,
+                        ..UiInput::default()
+                    },
+                    player::Input::default(),
+                    false,
+                )
+                .unwrap();
+            let cursor = session.item_box.as_ref().unwrap().value("cursor");
+            assert_ne!(cursor, 0, "step {step}: Map is unreachable");
+            assert_ne!(cursor, 2, "step {step}: File is unreachable");
+            if cursor == 18 {
+                assert_eq!(
+                    session.menu.as_ref().unwrap().value("selected_item"),
+                    i64::from(ITEM_SWORD_KEY),
+                    "step {step}: the name follows the last slot row"
+                );
+                saw_named_row = true;
+            }
+            if cursor == 6 {
+                break;
+            }
+        }
+        assert!(saw_named_row, "the walk passed the named slot row");
+        let item_box = session.item_box.as_ref().expect("the box is open");
+        assert_eq!(item_box.value("cursor"), 6, "the box drew the EXIT cursor");
+        assert_eq!(
+            item_box.value("on_slot"),
+            0,
+            "the menu draws the tab cursor"
+        );
+        let menu = session.menu.as_ref().expect("the panel stays open");
+        assert_eq!(menu.value("cursor"), 6, "the drawn EXIT tab follows");
+        assert_eq!(menu.value("selected_item"), 0, "no name on the EXIT tab");
+
+        // Confirm on the EXIT tab closes the whole menu, like a cancel.
+        session
+            .tick(
+                &pack,
+                UiInput {
+                    confirm: true,
+                    ..UiInput::default()
+                },
+                player::Input::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(session.menu_fade_phase, MenuFadePhase::Closing);
     }
 
     #[test]
