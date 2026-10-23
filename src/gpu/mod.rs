@@ -1321,13 +1321,21 @@ impl GpuRenderer {
     }
 
     /// The HD replacement `pack` carries for `image`, and its texels per
-    /// original texel.
-    fn image_replacement(image: &Image, pack: &Pack) -> Option<(Image, [f32; 2])> {
-        let found = pack
-            .htexture()
-            .find(&htexture::image_candidates(image), || {
-                format!("{}x{} image", image.width, image.height)
-            })?;
+    /// original texel. A room mask's `background` names its replacement
+    /// when the mask's own hashes don't.
+    fn image_replacement(
+        image: &Image,
+        background: Option<&Image>,
+        pack: &Pack,
+    ) -> Option<(Image, [f32; 2])> {
+        let table = pack.htexture();
+        let mut candidates = htexture::image_candidates(image);
+        if let Some(background) = background {
+            candidates.extend(table.paired_masks(&htexture::image_candidates(background)));
+        }
+        let found = table.find(&candidates, || {
+            format!("{}x{} image", image.width, image.height)
+        })?;
         match htexture::load(pack, &found.path) {
             Ok(hd)
                 if hd.width > 0
@@ -1354,6 +1362,7 @@ impl GpuRenderer {
         &mut self,
         copy: *mut SDL_GPUCopyPass,
         image: &Image,
+        background: Option<&Image>,
         pack: Option<&Pack>,
     ) -> Result<Option<ImageTexture>> {
         if image.width == 0
@@ -1372,7 +1381,7 @@ impl GpuRenderer {
         }
         let replacement = pack
             .filter(|pack| !pack.htexture().is_empty())
-            .and_then(|pack| Self::image_replacement(image, pack));
+            .and_then(|pack| Self::image_replacement(image, background, pack));
         let (source, scale) = match &replacement {
             Some((hd, scale)) => (hd, *scale),
             None => (image, [1.0, 1.0]),
@@ -1566,7 +1575,8 @@ impl GpuRenderer {
             for run in sprites.before.iter().chain(&sprites.after) {
                 let key = run.image as *const Image as usize;
                 if let std::collections::hash_map::Entry::Vacant(slot) = sprite_textures.entry(key)
-                    && let Some(texture) = self.ensure_image(copy, run.image, pack)?
+                    && let Some(texture) =
+                        self.ensure_image(copy, run.image, run.background, pack)?
                 {
                     slot.insert(texture);
                 }

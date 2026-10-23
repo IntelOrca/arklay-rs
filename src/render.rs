@@ -2052,16 +2052,119 @@ pub fn draw_door_scene(
     frame: &crate::door::vm::Frame<'_>,
 ) {
     framebuffer.clear();
-    let camera = Camera::from_points(frame.camera.from, frame.camera.to, frame.camera.focal);
-    let objects = frame.orders.iter().filter_map(|order| {
+    let camera = door_camera(frame);
+    let objects = door_draws(frame).map(|(order, mesh)| (mesh, &order.matrix));
+    framebuffer.draw_objects_unlit(objects, &dor.texture, &camera);
+    draw_fade_overlay(framebuffer, &frame.fade);
+}
+
+fn door_camera(frame: &crate::door::vm::Frame<'_>) -> Camera {
+    Camera::from_points(frame.camera.from, frame.camera.to, frame.camera.focal)
+}
+
+/// The orders of a door frame that submit a draw (bit `0x8000` plus a low
+/// nibble of 1, 2 or 3), with their TMD object.
+fn door_draws<'f, 'a>(
+    frame: &'f crate::door::vm::Frame<'a>,
+) -> impl Iterator<Item = (&'f crate::door::vm::OrderFrame<'a>, &'a TmdObject)> {
+    frame.orders.iter().filter_map(|order| {
         let draws = order.flags & 0x8000 != 0 && matches!(order.flags & 0xF, 1..=3);
         if !draws {
             return None;
         }
-        order.mesh.map(|mesh| (mesh, &order.matrix))
-    });
-    framebuffer.draw_objects_unlit(objects, &dor.texture, &camera);
-    draw_fade_overlay(framebuffer, &frame.fade);
+        order.mesh.map(|mesh| (order, mesh))
+    })
+}
+
+/// One frame of a door animation for the GPU scene: [`draw_door_scene`]'s
+/// draws as one mesh, so the door's page can take a pack's HD replacement
+/// like any model's. The fade is left to the overlay.
+pub struct DoorScene {
+    pub camera: Camera,
+    /// Full-bright: an ambient of `0x1000` and no lights shade every texel
+    /// as stored, as [`Framebuffer::draw_objects_unlit`] draws.
+    pub lighting: Lighting,
+    /// Each order's mesh copy (its vertex writes applied) as an object.
+    mesh: Tmd,
+    /// Each order's world matrix, a joint per object.
+    joints: Vec<anim::Mat4x3>,
+    /// The orders that don't draw this frame.
+    hidden: u32,
+}
+
+/// `mesh` with direct UVs and CLUT row: the door TIM is one 128x256 page
+/// with one CLUT row (see [`collect_triangles`]), so the page bits and the
+/// VRAM CLUT row the primitives carry (page 5, row 31) select nothing.
+fn door_object(mesh: &TmdObject) -> TmdObject {
+    let mut object = mesh.clone();
+    for prim in &mut object.prims {
+        prim.tsb &= !0x1F;
+        prim.clut = (prim.clut & !(0x01FF << 6)) | (480 << 6);
+    }
+    object
+}
+
+impl DoorScene {
+    pub fn new(frame: &crate::door::vm::Frame<'_>) -> Self {
+        let mut hidden = 0u32;
+        let mut objects = Vec::new();
+        let mut joints = Vec::new();
+        for (index, order) in frame.orders.iter().take(32).enumerate() {
+            let draws = order.flags & 0x8000 != 0 && matches!(order.flags & 0xF, 1..=3);
+            match order.mesh {
+                Some(mesh) if draws => objects.push(door_object(mesh)),
+                _ => {
+                    hidden |= 1 << index;
+                    objects.push(TmdObject::default());
+                }
+            }
+            joints.push(order.matrix);
+        }
+        Self {
+            camera: door_camera(frame),
+            lighting: Lighting {
+                ambient: [0x1000; 3],
+                lights: [Light::default(); 3],
+            },
+            mesh: Tmd { objects },
+            joints,
+            hidden,
+        }
+    }
+
+    pub fn meshes<'a>(&'a self, dor: &'a crate::door::Dor) -> [EntityMesh<'a>; 1] {
+        [EntityMesh {
+            mesh: &self.mesh,
+            texture: &dor.texture,
+            joints: &self.joints,
+            tint: [255; 3],
+            blend_weight: None,
+            hidden_joints: self.hidden,
+            light_pos: None,
+            per_joint_light: false,
+            complex_object: None,
+            aliased_light: false,
+            light_rotation: None,
+            joint_colours: NO_JOINT_COLOURS,
+        }]
+    }
+
+    /// The scene over black: the meshes and nothing else.
+    pub fn scene<'a>(&'a self, meshes: &'a [EntityMesh<'a>]) -> GameplayScene<'a> {
+        GameplayScene {
+            background: None,
+            origin: [0, 0],
+            colour: [255; 3],
+            meshes,
+            shadows: &[],
+            camera: &self.camera,
+            lighting: &self.lighting,
+            mask_layer: None,
+            effect_layer: None,
+            mirror_from: meshes.len(),
+            mirror: None,
+        }
+    }
 }
 
 /// Blend a full-screen fade overlay over the framebuffer.
@@ -6390,6 +6493,35 @@ mod tests {
             framebuffer_pixel(&framebuffer, 17, 11),
             [178, 178, 178, 255]
         );
+    }
+
+    #[test]
+    fn a_door_object_samples_its_single_page_and_clut_row() {
+        let prim = |clut: u16, tsb: u16| TmdPrim {
+            vertices: [0, 1, 2],
+            normals: [0, 0, 0],
+            uv: [[0, 0]; 3],
+            clut,
+            tsb,
+            textured: true,
+            blend: false,
+            raw_y: false,
+            flat_color: None,
+            quad: None,
+            uv_nudge: [0; 3],
+        };
+        let mesh = TmdObject {
+            vertices: vec![[0; 3]; 3],
+            normals: vec![[0, 0, 4096]],
+            prims: vec![prim(0x7FC0, 0x95), prim(ABE_BIT | 0x7FC0 | 0x3F, 0x75)],
+        };
+        let object = door_object(&mesh);
+        let rows: Vec<_> = object
+            .prims
+            .iter()
+            .map(|prim| (prim.clut, prim.tsb))
+            .collect();
+        assert_eq!(rows, [(480 << 6, 0x80), (ABE_BIT | 480 << 6 | 0x3F, 0x60)]);
     }
 
     #[test]
