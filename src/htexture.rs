@@ -462,14 +462,18 @@ fn finish_mask(texel: u32) -> u32 {
 }
 
 /// Japanese pages Classic REbirth swaps for their English versions before the
-/// game uploads them (`DATA/STATUS.TIM`, `DATA/TITLE.PIX`), as the hash of
-/// the Japanese page and of the English one. A pack made under CR names the
-/// English page, so a Japanese install also looks that hash up.
-const TRANSLATED: [(u32, u32); 2] = [
+/// game uploads them (`DATA/STATUS.TIM`, `DATA/TITLE.PIX`, `DATA/PBFONT0.TIM`),
+/// as the hash of the Japanese page and of the English one. A pack made under
+/// CR names the English page, so a Japanese install also looks that hash up.
+const TRANSLATED: [(u32, u32); 3] = [
     // The status screen's menu page, CLUT row 0.
     (0x440c_318f, 0x97de_3e43),
     // The title screen.
     (0xe0c7_ae8b, 0x3c52_c827),
+    // The font's glyph page: `FONT.TIM`'s left page ([`font_candidates`])
+    // and CR's Western `PBFONT0.TIM`, whose cells hold the same glyphs but
+    // for the hiragana block (see `crate::font`).
+    (0xb2dc_eba5, 0xcff9_d54d),
 ];
 
 /// Append the English page's hash, with the same frame, after each candidate
@@ -646,6 +650,34 @@ pub fn page_candidates(texture: &Texture8, row: usize) -> Vec<Candidate> {
     }
     add_translations(&mut candidates);
     candidates
+}
+
+/// The hashes the font sheet's glyph page may carry: the sheet's left
+/// 256 x 256 page through CLUT row 0, the page the glyphs Classic REbirth
+/// replaces live on.
+pub fn font_candidates(texture: &Texture8) -> Vec<Candidate> {
+    let width = texture.width.min(256);
+    let height = texture.height.min(256);
+    let stride = texture.width as usize;
+    if texture.indices.len() < stride * height as usize {
+        return Vec::new();
+    }
+    let indices = (0..height as usize)
+        .flat_map(|y| {
+            let start = y * stride;
+            texture.indices[start..start + width as usize]
+                .iter()
+                .copied()
+        })
+        .collect();
+    let page = Texture8 {
+        width,
+        height,
+        indices,
+        palettes: texture.palettes.clone(),
+        stp: texture.stp.clone(),
+    };
+    page_candidates(&page, 0)
 }
 
 #[cfg(test)]
@@ -888,6 +920,32 @@ mod tests {
                 frame: [128, 256]
             }
         );
+    }
+
+    #[test]
+    fn a_font_sheet_hashes_its_left_page() {
+        let mut palettes = vec![[0u8; 4]; PALETTE_ROW_LEN];
+        palettes[1] = [255; 4];
+        let sheet = Texture8 {
+            width: 768,
+            height: 256,
+            indices: (0..768 * 256).map(|i| ((i % 768) / 3 % 2) as u8).collect(),
+            palettes: palettes.clone(),
+            stp: vec![false; PALETTE_ROW_LEN],
+        };
+        let page = Texture8 {
+            width: 256,
+            height: 256,
+            indices: (0..256 * 256).map(|i| ((i % 256) / 3 % 2) as u8).collect(),
+            palettes,
+            stp: vec![false; PALETTE_ROW_LEN],
+        };
+        assert_eq!(font_candidates(&sheet), page_candidates(&page, 0));
+        let short = Texture8 {
+            indices: vec![0; 768],
+            ..sheet
+        };
+        assert!(font_candidates(&short).is_empty());
     }
 
     #[test]
