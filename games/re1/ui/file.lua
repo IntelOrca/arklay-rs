@@ -12,9 +12,10 @@
 -- half-page per press and closes on confirm at the last page.
 --
 -- The Western build's reader (`pickup_screen_render` 0x004823a0) runs the
--- same state machine without the backdrop: each document is a container of
--- full 256x192 pages, converted to `file/<language>/<filem stem>_<page>`, and
--- the page arrows come from `file/arror`. Each document reads the pages of
+-- same state machine over the same FILEI book art: each document is a
+-- container of full 256x192 transparent text pages, converted to
+-- `file/<language>/<filem stem>_<page>`, and the page arrows come from
+-- `file/arror`. Each document reads the pages of
 -- the session language first, then English, French, German and finally the
 -- Japanese build's; a Japanese session prefers the Japanese pages.
 --
@@ -478,8 +479,8 @@ local function step_reader_slide_in_left()
 end
 
 --- Advance the reader one frame (`jpn_file_screen_render` 0x0042c080, or
---- the Western `pickup_screen_render` 0x004823a0 without the backdrop
---- ramps). Each state's step runs before the frame draws; the
+--- the Western `pickup_screen_render` 0x004823a0). Each state's step runs
+--- before the frame draws; the
 --- falling-through states (2->3, 5->6, 8->9, 0xb->0xc, 0xd->0xe) are
 --- single-frame steps here.
 local function tick_reader()
@@ -491,12 +492,10 @@ local function tick_reader()
         s.reader_speed = 1
     end
     local state = s.reader_state
-    if state == "backdrop" and s.west then
-        -- `pickup_screen_render` states 0/1: the arrow sheet and the page
-        -- container load in one frame; nothing draws yet.
-        s.reader_state = "page_load"
-    elseif state == "backdrop" then
-        -- States 0/1: the frame pieces ramp to 0x80; nothing draws yet.
+    if state == "backdrop" then
+        -- States 0/1: the frame pieces ramp to 0x80; nothing draws yet. The
+        -- Western reader shares the ramp: its pages are transparent text
+        -- sheets drawn over the same FILEI book art.
         s.reader_backdrop = s.reader_backdrop + READER_BACKDROP_STEP
         if s.reader_backdrop >= READER_BACKDROP_FULL then
             s.reader_backdrop = READER_BACKDROP_FULL
@@ -548,9 +547,6 @@ local function tick_reader()
                 s.reader_state = "backdrop_out"
             end
         end
-    elseif state == "backdrop_out" and s.west then
-        -- The Western state 0xf has no ramp: a single black frame.
-        s.reader_state = "hold"
     elseif state == "backdrop_out" then
         -- State 0xf: the frame pieces ramp back down to black.
         s.reader_backdrop = s.reader_backdrop - READER_BACKDROP_STEP
@@ -889,8 +885,15 @@ local function draw_exit(api, entry, ox, oy)
 end
 
 --- The Western reader (`pickup_screen_render`): one whole page, the arrows
---- from `file/arror` and the EXIT label.
+--- from `file/arror` and the EXIT label, over the document's FILEI book art.
 local function draw_west_reader(api, entry, ox, oy)
+    local backdrop = page(api, "file/" .. FILEI_NAMES[FILEI_INDEX[entry]])
+    if s.reader_page_loaded and backdrop then
+        for _, piece in ipairs(READER_FRAME_PIECES) do
+            api:page_ramp(backdrop, piece[1], piece[2], piece[3], piece[4],
+                ox + piece[5], oy + piece[6], s.reader_backdrop)
+        end
+    end
     local sheet = hold_west_page(api, s.reader_page_loaded and west_page_stem(s.west, entry, s.page) or nil)
     if sheet then
         blit(api, sheet, 0, 0, WEST_PAGE_W, WEST_PAGE_H, ox + WEST_PAGE_X + s.reader_slide, oy + WEST_PAGE_Y)

@@ -2586,9 +2586,13 @@ fn file_west_reader_draws_whole_pages_and_holds_one() {
     while tab.flag("M.state.fade_in") {
         tab.tick();
     }
-    // States 0/1 are a single frame without the Japanese backdrop ramp.
+    // States 0/1 ramp the FILEI backdrop in over sixteen frames, like the
+    // Japanese reader.
     assert_eq!(tab.state(), "backdrop");
-    tab.tick();
+    for _ in 0..16 {
+        assert_eq!(tab.state(), "backdrop");
+        tab.tick();
+    }
     assert_eq!(tab.state(), "page_load");
     tab.settle_reader();
     assert_eq!(tab.mode(), "reader");
@@ -2657,12 +2661,12 @@ fn file_west_reader_draws_whole_pages_and_holds_one() {
         tab.tick();
     }
     assert_eq!(tab.state(), "backdrop_out");
-    tab.tick();
-    assert_ne!(
-        tab.state(),
-        "backdrop_out",
-        "the Western state 0xf is a single frame"
-    );
+    // State 0xf ramps the backdrop out over sixteen frames, like entry.
+    for _ in 0..16 {
+        assert_eq!(tab.state(), "backdrop_out");
+        tab.tick();
+    }
+    assert_ne!(tab.state(), "backdrop_out");
     tab.settle_reader();
     assert_eq!(tab.mode(), "list", "confirm exits on the last page");
     tab.draw();
