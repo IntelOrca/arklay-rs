@@ -68,10 +68,12 @@ stream directly. The roots' damage reactions (the state-2 reset and the
 inert states 3-5) are transcribed; the combat layer that enters them landed
 with E4. Every monster id the corpus spawns is now scripted — the full
 roster, the player weapons and the death/game-over flow are summarised in the
-milestone table and the per-milestone notes below. The attract demo, the
-endings, the DC-only Forest zombie and the documented render-contract items
-remain deferred; every one is listed below or in the milestone deviations
-files.
+milestone table and the per-milestone notes below. The attract demo plays the
+recorded reels from the title's idle timer, and the ending screens and
+next-cycle save run end to end under `--ending`, though normal play cannot
+reach them yet (see below). The DC-only Forest zombie and the documented
+render-contract items remain deferred; every one is listed below or in the
+milestone deviations files.
 
 E4 added the shared damage/death layer those scripts consume. The combat
 tables — the per-weapon hit ranges, both playthroughs' hit records, the
@@ -503,8 +505,8 @@ room-variant dispatch and the screen machine's frame counts and strip math;
 the real-asset `tests/real/death_real.rs` decodes the shipped page, captures the
 deterministic DIED screen, and kills ROOM100's player through the real damage
 helper to reach the screen and return to the title. Documented deviations: the
-Plant 42 DIED-screen joint-hide variant, the attract-demo replay and the
-countdown-timer death branch stay deferred (see `docs/m18-deviations.md`).
+Plant 42 DIED-screen joint-hide variant and the countdown-timer death branch
+stay deferred (see `docs/m18-deviations.md`).
 
 E7 ports the hound (id `0x02`) as `enemy/em02.lua` and the chimera (id `0x09`)
 as `enemy/em09.lua`. The hound script spells out the single 16-slot dispatch
@@ -570,7 +572,7 @@ character port and the monster scripts share one verified runtime. The pack
 reconverts deterministically with the `emw`/`tmd` rows green and
 the `tim` row at 124/124; the remaining 28 `rdt` failures are the documented
 four-byte stub rooms. The milestone deviations (render-contract items, the
-attract demo, the endings, the DC branches) are catalogued in
+remaining death-screen variants and the DC branches) are catalogued in
 `docs/m18-deviations.md` and the module docs.
 
 The F1 debug tools are a port-only development aid the retail game never
@@ -771,12 +773,14 @@ Still missing by design:
 
 ## `TODO(parity)` dispositions
 
-2 sites (`rg -n "TODO\(parity\)" src`):
+1 site (`rg -n "TODO\(parity\)" src`):
 
 | Group | Count | Sites | Disposition |
 |---|---|---|---|
-| Gameplay | 1 | backward clip `player.rs:62` | actor/world or death work |
-| UI | 1 | title idle timer `ui/title.rs:237` | blocked on the attract demo, which replays inputs over monster rooms |
+| Gameplay | 1 | backward clip `player.rs:64` | actor/world or death work |
+
+The UI site (the title idle timer) closed with the attract demo and the Lua
+title screen.
 
 E4 closed the force-init/saved-state restore site: `spawn_enemy` now consults
 the saved-enemy snapshot before re-initialising an occupied slot.
@@ -828,8 +832,6 @@ synthetic suites for every machine.
 
 Still open, by design:
 
-- The attract demo and the title idle timer (the four recorded reels replay
-  inputs over boss rooms; the title timer has no destination without them).
 - The ending path's gameplay trigger: the RESULT screen, the rocket-launcher
   epilogue and the next-cycle save run end to end under `--ending`, but no
   combat/boss path reaches `ending_state` yet, so the surviving flags stay

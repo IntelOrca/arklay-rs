@@ -110,11 +110,12 @@ predating those slices is read.
 | `src/player.rs:55` | gameplay | the backward-walk clip 2 fallback needs an enemy-visibility test |
 | `src/audio.rs:223` | audio | the DirectSound pan curve stays the M13 deviation |
 | `src/audio.rs:451` | audio | one-shot-vs-restart semantics stay the M13 deviation |
-| `src/ui/title.rs:204` | UI | the title idle timer waits on the attract/demo milestone |
 | `src/convert.rs:464` | conversion | held-weapon TMDs (`players/ws*.tmd`) wait on weapons |
 | `src/engine.rs:5823` | visual | per-record background blend weight/STP is drawn opaque |
 
-Every other `TODO(parity)` from the M16 inventory is closed by its slice:
+The UI site (the title idle timer) was closed after M16 by the attract-demo
+replay and the Lua title screen. Every other `TODO(parity)` from the M16
+inventory is closed by its slice:
 the camera/projection/roll, the platform random and BioCard word, the packet
 ABE/STP/cull/gouraud/near-plane rules, the per-vertex latched lighting and
 background modulation, the `room_sprite_hide` (0x49) sprite-mask pass, the

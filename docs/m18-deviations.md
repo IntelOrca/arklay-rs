@@ -119,10 +119,12 @@ reasons:
   (`player_anim_dispatch_4ba360`) now runs, but the port has no
   `g_deathAnimationFlag` field for the screen to read, so the standard corpse
   draws in that case. The head one-shot still applies.
-- **The attract-demo and countdown death branches.** The machine wires the
+- **The countdown death branch.** The machine wires the
   `MSF2_ATTRACT_DEMO`/`MSF2_DEATH_VARIANT` skips and the room dispatch
-  exactly, but the port has no attract-demo replay and no self-destruct
-  countdown timer, so those branches are never taken.
+  exactly. The attract branch is live: a reel that ends raises
+  `MSF2_ATTRACT_DEMO` and the screen takes the attract fade. The self-destruct
+  countdown timer is still absent, so the `MSF2_DEATH_VARIANT` branch is
+  never taken.
 - **The sound fade.** `BuildSndFadeTbl`'s volume ramp is not modelled: the
   screen stops the room BGM through the mixer when it opens instead of fading
   it out over the delay. Gameplay audio ends abruptly rather than ramping.

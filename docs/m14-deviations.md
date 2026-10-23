@@ -9,12 +9,14 @@ This document supersedes item 8 of `docs/m13-deviations.md` (FMV out of scope).
 
 1. **Attract demo and death film deferred.** The four `DATA/Pdemo*.dat` attract
    recordings (recorded pad input replayed over monster-filled scenes) and the
-   death film (id 2, `DIED.TIM`'s trigger) are not packed or played: the
-   attract path needs the title idle timer, and the death trigger needs the
-   damage/combat path this milestone excludes. The title therefore waits on
-   PRESS forever, with its `0x708` idle countdown still the documented TODO
-   from M13. The film tables and skip masks carry every row, so packing the
-   content later needs no table change.
+   death film (id 2, `DIED.TIM`'s trigger) are not packed or played at M14:
+   the attract path needed the title idle timer, and the death trigger needed
+   the damage/combat path this milestone excludes. The film tables and skip
+   masks carry every row, so packing the content later needs no table change.
+
+   *Since M14:* the attract reels and the title idle timer are implemented
+   (`src/demo.rs`), and the death flow opens the DIED screen from the combat
+   path (E11b). The death film itself remains unpacked.
 
 2. **Skip grace spent at the film gate's rate.** The original's 100-update
    grace advances once per platform loop iteration, and while a film owns the
