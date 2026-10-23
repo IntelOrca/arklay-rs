@@ -5308,6 +5308,8 @@ impl GameSession {
     }
 
     fn render_pass(&mut self, pack: &Pack, pass: ScenePass<'_>) {
+        // The white pass redraws over the black pass's GPU scene, if it showed.
+        let scene_shown = self.gpu_scene_visible;
         // A wider aspect's canvas replaces the 320x240 frame while a screen
         // that asks for one is up; everything else draws in 4:3 space.
         let canvas = self.canvas_width();
@@ -5394,7 +5396,12 @@ impl GameSession {
             return;
         }
         if let Some(transition) = &self.transition {
-            render_transition(&mut self.framebuffer, transition);
+            let pass = match pass {
+                ScenePass::White if !scene_shown => ScenePass::Software,
+                pass => pass,
+            };
+            self.gpu_scene_visible =
+                render_transition_on(&mut self.framebuffer, pass, pack, transition);
             return;
         }
         // The DIED screen owns the frame while it is up: the static backdrop,
@@ -8817,12 +8824,18 @@ fn load_door_animation(pack: &Pack, record: &game::Door, entry_camera: u8) -> Do
 /// the door panels over black with the accumulated fade overlay.
 fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
     framebuffer.clear();
-    if session.frame.black {
-        return;
+    if let Some((dor, frame)) = transition_frame(session) {
+        render::draw_door_scene(framebuffer, dor, &frame);
     }
-    let Some((dor, mut frame)) = session.transition.stepper().render_frame() else {
-        return;
-    };
+}
+
+/// The transition's door frame with the timeline's fade, or `None` while it
+/// shows black.
+fn transition_frame(session: &TransitionMode) -> Option<(&door::Dor, door::vm::Frame<'_>)> {
+    if session.frame.black {
+        return None;
+    }
+    let (dor, mut frame) = session.transition.stepper().render_frame()?;
     // The timeline owns the accumulated fade; feed it through the door
     // frame's fade fields so the shared overlay path draws it.
     match session.frame.overlay {
@@ -8838,7 +8851,51 @@ fn render_transition(framebuffer: &mut Framebuffer, session: &TransitionMode) {
         }
         None => frame.fade.state = -1,
     }
-    render::draw_door_scene(framebuffer, dor, &frame);
+    Some((dor, frame))
+}
+
+/// [`render_transition`] for one of [`GameSession::render_pass`]'s passes:
+/// the GPU draws the door so its page takes the pack's HD replacement, and
+/// the fade overlays it in both passes. Returns whether the GPU scene shows.
+fn render_transition_on(
+    framebuffer: &mut Framebuffer,
+    pass: ScenePass<'_>,
+    pack: &Pack,
+    session: &TransitionMode,
+) -> bool {
+    let gpu = match pass {
+        ScenePass::Software => None,
+        ScenePass::Record(gpu) => Some(gpu),
+        ScenePass::White => {
+            framebuffer.clear();
+            framebuffer.fill_rect(
+                [0, 0, framebuffer.width as i32, framebuffer.height as i32],
+                [255, 255, 255, 255],
+            );
+            if let Some((_, frame)) = transition_frame(session) {
+                render::draw_fade_overlay(framebuffer, &frame.fade);
+            }
+            return true;
+        }
+    };
+    let (Some(gpu), Some((dor, frame))) = (gpu, transition_frame(session)) else {
+        render_transition(framebuffer, session);
+        return false;
+    };
+    let door = render::DoorScene::new(&frame);
+    let meshes = door.meshes(dor);
+    match gpu.record_scene(&door.scene(&meshes), Some(pack)) {
+        Ok(()) => {
+            framebuffer.clear();
+            render::draw_fade_overlay(framebuffer, &frame.fade);
+            true
+        }
+        Err(err) => {
+            warn_gpu_scene_failed(&err);
+            render::draw_door_scene(framebuffer, dor, &frame);
+            false
+        }
+    }
 }
 
 /// Tear the transition down: swap in the destination room and place the
