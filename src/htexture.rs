@@ -64,6 +64,9 @@ type DecodedKey = (String, [u32; 2]);
 #[derive(Debug, Default)]
 pub struct HdTable {
     files: HashMap<u32, String>,
+    /// Room masks by the hash of their camera's background, from a TeamX
+    /// loader's `cache/ROOM*.dat` lists ([`HdTable::paired_masks`]).
+    paired: HashMap<u32, u32>,
     /// Textures already reported as having no replacement.
     reported: Mutex<HashSet<u32>>,
     /// Decoded 2D replacements by path and frame, held weakly: while any
@@ -79,9 +82,14 @@ impl HdTable {
     pub fn scan(pack: &Pack) -> Self {
         let mut files = HashMap::new();
         let mut suffixed = HashMap::new();
+        let mut lists = Vec::new();
         for path in pack.paths() {
             let lower = path.to_ascii_lowercase();
             if !lower.starts_with(ROOT) {
+                continue;
+            }
+            if is_room_list(&lower) {
+                lists.push(path.to_string());
                 continue;
             }
             let Some((stem, extension)) = lower.rsplit('/').next().and_then(|n| n.rsplit_once('.'))
@@ -107,8 +115,33 @@ impl HdTable {
         for (hash, path) in suffixed {
             files.entry(hash).or_insert(path);
         }
+        let is_mask = |hash: &u32| {
+            files.get(hash).is_some_and(|path| {
+                path.rsplit('/')
+                    .nth(1)
+                    .is_some_and(|dir| dir.eq_ignore_ascii_case("mask"))
+            })
+        };
+        let mut paired = HashMap::new();
+        for path in &lists {
+            let Ok(data) = pack.read(path) else {
+                continue;
+            };
+            let hashes: Vec<u32> = data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&bytes| u32::from_le_bytes(bytes))
+                .collect();
+            for pair in hashes.windows(2) {
+                if is_mask(&pair[0]) && !is_mask(&pair[1]) {
+                    paired.entry(pair[1]).or_insert(pair[0]);
+                }
+            }
+        }
         HdTable {
             files,
+            paired,
             reported: Mutex::new(HashSet::new()),
             decoded: Mutex::new(HashMap::new()),
         }
@@ -150,6 +183,26 @@ impl HdTable {
         found
     }
 
+    /// The room masks paired with a camera background known by any of
+    /// `background`, as candidates covering the mask's 256 x 256 window.
+    ///
+    /// Many masks' hashes depend on what the loader's surface held before
+    /// the mask was written, so their names can't be worked out from the
+    /// mask alone. The loader lists each room's hashes in load order
+    /// (`cache/ROOM0000.dat`, little-endian words), and a camera's mask is
+    /// loaded just before its background: an entry under a `mask/` directory
+    /// followed by one that isn't pairs the two.
+    pub fn paired_masks(&self, background: &[Candidate]) -> Vec<Candidate> {
+        background
+            .iter()
+            .filter_map(|candidate| self.paired.get(&candidate.hash))
+            .map(|&hash| Candidate {
+                hash,
+                frame: [256, 256],
+            })
+            .collect()
+    }
+
     /// [`HdTable::find`] without reporting a miss.
     pub fn find_quietly(&self, candidates: &[Candidate]) -> Option<Found> {
         candidates.iter().find_map(|candidate| {
@@ -159,6 +212,14 @@ impl HdTable {
             })
         })
     }
+}
+
+/// Whether `path` (lower case) is a loader's room list, `ROOM0000.dat`.
+fn is_room_list(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_prefix("room")
+        .and_then(|rest| rest.strip_suffix(".dat"))
+        .is_some_and(|id| id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// A decoded HD image and the source-texel extent it covers.
@@ -638,6 +699,60 @@ mod tests {
             Some("htexture/misc/ABCDEF01_8E.webp")
         );
         assert_eq!(find(0x1234_5678), None);
+    }
+
+    #[test]
+    fn a_room_list_pairs_each_mask_with_the_background_after_it() {
+        let words = |hashes: &[u32]| -> Vec<u8> {
+            hashes.iter().flat_map(|hash| hash.to_le_bytes()).collect()
+        };
+        let mut writer = crate::pack::PackWriter::new();
+        for path in [
+            "htexture/hires/mask/BE528391.webp",
+            "htexture/hires/mask/C5157461.webp",
+            "htexture/hires/bgd/F9E129D5.webp",
+        ] {
+            writer.add(path, Vec::new()).unwrap();
+        }
+        // A mask, its background (absent from the pack), a mask and its
+        // background, then two backgrounds and a trailing mask.
+        let list = words(&[
+            0xbe52_8391,
+            0xdd17_f52f,
+            0xc515_7461,
+            0xf9e1_29d5,
+            0x3c52_c827,
+            0xd1d1_44a8,
+            0xc515_7461,
+        ]);
+        writer
+            .add("htexture/hires/cache/ROOM0000.dat", list)
+            .unwrap();
+        // Not a room list: ignored.
+        writer
+            .add(
+                "htexture/hires/cache/notes.dat",
+                words(&[0xbe52_8391, 0x1234_5678]),
+            )
+            .unwrap();
+        let pack = Pack::from_bytes(writer.to_bytes().unwrap()).unwrap();
+        let table = HdTable::scan(&pack);
+        assert_eq!(table.len(), 3);
+        let paired = |hash| {
+            table
+                .paired_masks(&[Candidate {
+                    hash,
+                    frame: [320, 240],
+                }])
+                .iter()
+                .map(|candidate| (candidate.hash, candidate.frame))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paired(0xdd17_f52f), [(0xbe52_8391, [256, 256])]);
+        assert_eq!(paired(0xf9e1_29d5), [(0xc515_7461, [256, 256])]);
+        assert!(paired(0x3c52_c827).is_empty());
+        assert!(paired(0xd1d1_44a8).is_empty());
+        assert!(paired(0x1234_5678).is_empty());
     }
 
     #[test]

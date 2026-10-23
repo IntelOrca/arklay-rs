@@ -360,6 +360,10 @@ pub struct SpriteRun<'a> {
     /// Masks write depth so the meshes behind them are hidden; everything else
     /// only tests it.
     pub depth_write: bool,
+    /// The camera background a mask run's page belongs to, which names the
+    /// mask's HD replacement when its own hash doesn't
+    /// ([`crate::htexture::HdTable::paired_masks`]).
+    pub background: Option<&'a Image>,
 }
 
 /// The frame's sprites: `before` draws ahead of the meshes (background,
@@ -407,6 +411,7 @@ impl<'a> Sprites<'a> {
             first: first as u32,
             count: count as u32,
             depth_write,
+            background: None,
         })
     }
 }
@@ -457,7 +462,11 @@ pub fn scene_sprites<'a>(scene: &GameplayScene<'a>) -> Sprites<'a> {
                 SPRITE_TEXTURED,
             );
         }
-        sprites.before.extend(sprites.run(layer.page, first, true));
+        let run = sprites.run(layer.page, first, true).map(|run| SpriteRun {
+            background: scene.background,
+            ..run
+        });
+        sprites.before.extend(run);
     }
 
     // The shadows keep their perspective-correct UVs: each projected corner
